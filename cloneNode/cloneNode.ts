@@ -10,8 +10,8 @@ import https from 'https';
 import envMgr from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { isHdbInstalled } from '../core/utility/installation.js';
-import { getConfiguration, flattenConfig, createConfigFile, updateConfigValue } from '../core/config/configUtils';
-import assignCMDENVVariables from '../core/utility/assignCmdEnvVariables';
+import { getConfiguration, flattenConfig, createConfigFile, updateConfigValue } from '../core/config/configUtils.js';
+import assignCMDENVVariables from '../core/utility/assignCmdEnvVariables.js';
 
 import {
 	SYSTEM_SCHEMA_NAME,
@@ -23,7 +23,7 @@ import {
 	CONFIG_PARAM_MAP,
 	LICENSE_KEY_DIR_NAME,
 	JWT_ENUM,
-} from '../core/utility/hdbTerms';
+} from '../core/utility/hdbTerms.ts';
 
 /**
  * Environment Variables:
