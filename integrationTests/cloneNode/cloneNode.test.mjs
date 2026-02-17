@@ -1,0 +1,140 @@
+import { suite, test, before, after } from 'node:test';
+import { equal } from 'node:assert';
+import {
+	DEFAULT_ADMIN_USERNAME,
+	DEFAULT_ADMIN_PASSWORD,
+	OPERATIONS_API_PORT,
+	setupHarper,
+	teardownHarper,
+} from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
+	import.meta.dirname ?? module.path,
+	'..',
+	'..',
+	'dist',
+	'bin',
+	'harper.js'
+);
+
+async function sendOperation(node, operation) {
+	const response = await fetch(node.operationsAPIURL, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(operation),
+	});
+	const responseData = await response.json();
+	equal(response.status, 200, JSON.stringify(responseData));
+	return responseData;
+}
+
+async function waitForAvailableStatus(node, timeoutMs = 60000, checkInterval = 2000) {
+	const timeoutAt = Date.now() + timeoutMs;
+
+	while (Date.now() < timeoutAt) {
+		console.log('Waiting for cloned node status to become Available...');
+		await sleep(checkInterval);
+		let response;
+		try {
+			response = await sendOperation(node, { operation: 'get_status', id: 'availability' });
+		} catch (err) {}
+		if (response?.status === 'Available') return true;
+	}
+
+	throw new Error(`Node status did not become Available within ${timeoutMs}ms`);
+}
+
+suite('Clone Node', (ctx) => {
+	before(async () => {
+		ctx.nodes = [];
+		const nodeCtx = {};
+		await setupHarper(nodeCtx, {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false },
+			},
+			// set some random custom env var to verify it gets copied to the clone
+			env: {
+				HARPER_NO_FLUSH_ON_EXIT: true,
+				LOGGING_LEVEL: 'debug',
+				LOGGING_ROTATION_MAXSIZE: '101M',
+				MQTT_NETWORK_PORT: 1212,
+			},
+		});
+		ctx.nodes.push(nodeCtx.harper);
+
+		await sendOperation(nodeCtx.harper, {
+			operation: 'create_table',
+			table: 'test',
+			primary_key: 'id',
+			attributes: [
+				{ name: 'id', type: 'ID' },
+				{ name: 'name', type: 'String' },
+			],
+		});
+
+		await sendOperation(nodeCtx.harper, {
+			operation: 'upsert',
+			table: 'test',
+			records: [{ id: '1', name: 'test-clone' }],
+		});
+	});
+
+	after(async () => {
+		await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node })));
+	});
+
+	test('should clone a node successfully', async () => {
+		const cloneCtx = {};
+		await setupHarper(cloneCtx, {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false },
+			},
+			env: {
+				HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:${OPERATIONS_API_PORT}`,
+				HDB_LEADER_USERNAME: DEFAULT_ADMIN_USERNAME,
+				HDB_LEADER_PASSWORD: DEFAULT_ADMIN_PASSWORD,
+				ALLOW_SELF_SIGNED: true,
+				HARPER_NO_FLUSH_ON_EXIT: true,
+			},
+		});
+		ctx.nodes.push(cloneCtx.harper);
+
+		await waitForAvailableStatus(ctx.nodes[1]);
+
+		// Verify that configuration was cloned successfully by checking the operations API of the clone node
+		const responseClone = await sendOperation(ctx.nodes[1], {
+			operation: 'get_configuration',
+		});
+		equal(responseClone.logging?.level, 'debug', 'Logging level should be cloned');
+		equal(responseClone.logging?.rotation?.maxSize, '101M', 'Logging rotation maxSize should be cloned');
+		equal(responseClone.mqtt?.network?.port, 1212, 'MQTT network port should be cloned');
+		equal(responseClone.cloned, true, 'Node should be marked as cloned');
+
+		// Verify that cluster status shows both nodes connected to each other
+		const clusterStatusNode1 = await sendOperation(ctx.nodes[0], {
+			operation: 'cluster_status',
+		});
+		equal(clusterStatusNode1.connections.length, 1, 'Leader node should have 1 connection');
+		equal(clusterStatusNode1.connections?.[0]?.database_sockets.length, 2, 'Leader node should be connected to clone');
+
+		const clusterStatusNode2 = await sendOperation(ctx.nodes[1], {
+			operation: 'cluster_status',
+		});
+		equal(clusterStatusNode2.connections.length, 1, 'Clone node should have 1 connection');
+		equal(clusterStatusNode2.connections?.[0]?.database_sockets.length, 2, 'Clone node should be connected to leader');
+
+		// Verify that data was cloned successfully by querying the clone node for data that was inserted into the leader node before cloning
+		const responseData = await sendOperation(ctx.nodes[1], {
+			operation: 'search_by_id',
+			table: 'test',
+			get_attributes: ['id', 'name'],
+			ids: ['1'],
+		});
+		equal(responseData.length, 1, 'Should find 1 record in clone node');
+		equal(responseData[0].name, 'test-clone', 'Record name should match the original');
+	});
+});

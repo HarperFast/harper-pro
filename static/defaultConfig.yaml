@@ -59,6 +59,7 @@ operationsApi:
     securePort: 9925
 rootPath: null
 replication:
+  securePort: 9933
   databases: '*'
 storage:
   writeAsync: false
