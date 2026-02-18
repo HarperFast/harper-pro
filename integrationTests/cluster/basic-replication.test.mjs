@@ -8,6 +8,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { setupHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { targz } from '../../core/integrationTests/utils/targz.ts';
+import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -36,7 +37,9 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			Array(NODE_COUNT)
 				.fill(null)
 				.map(async () => {
-					const ctx = {};
+					const ctx = {
+						hostname: await getNextAvailableLoopbackAddress(),
+					};
 					await setupHarper(ctx, {
 						config: {
 							analytics: {
@@ -47,6 +50,9 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 								colors: false,
 								stdStreams: true,
 								console: true,
+							},
+							replication: {
+								securePort: ctx.hostname + ':9933',
 							},
 						},
 						env: {
@@ -87,14 +93,18 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 	});
 
 	test('connect nodes', async () => {
-		for (let i = 0; i < NODE_COUNT; i++) {
-			for (let j = i + 1; j < NODE_COUNT; j++) {
-				await sendOperation(ctx.nodes[i], {
-					operation: 'add_node',
-					hostname: ctx.nodes[j].hostname,
-					authorization: ctx.nodes[j].admin,
-				});
-			}
+		let response = await sendOperation(ctx.nodes[0], {
+			operation: 'create_authentication_tokens',
+			authorization: ctx.nodes[0].admin,
+		});
+		let token = response.operation_token;
+		for (let j = 1; j < NODE_COUNT; j++) {
+			await sendOperation(ctx.nodes[j], {
+				operation: 'add_node',
+				rejectUnauthorized: false,
+				hostname: ctx.nodes[0].hostname,
+				authorization: 'Bearer ' + token,
+			});
 		}
 		// wait for the cluster to connect
 		let retries = 0;

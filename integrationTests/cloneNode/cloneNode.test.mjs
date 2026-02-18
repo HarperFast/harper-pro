@@ -9,6 +9,7 @@ import {
 } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -49,11 +50,16 @@ async function waitForAvailableStatus(node, timeoutMs = 60000, checkInterval = 2
 suite('Clone Node', (ctx) => {
 	before(async () => {
 		ctx.nodes = [];
-		const nodeCtx = {};
+		const nodeCtx = {
+			hostname: getNextAvailableLoopbackAddress(),
+		};
 		await setupHarper(nodeCtx, {
 			config: {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
+				replication: {
+					port: nodeCtx.hostname + ':9933',
+				},
 			},
 			// set some random custom env var to verify it gets copied to the clone
 			env: {
