@@ -58,4 +58,3 @@ jobs:
           prerelease: ${{ steps.get-version-components.outputs.prerelease != '' }}
           draft: ${{ github.event.inputs.draft }}
           make_latest: ${{ github.event.inputs.draft == 'false' && steps.get-version-components.outputs.prerelease == '' }}
-

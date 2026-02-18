@@ -51,7 +51,7 @@ suite('Clone Node', (ctx) => {
 	before(async () => {
 		ctx.nodes = [];
 		const nodeCtx = {
-			hostname: getNextAvailableLoopbackAddress(),
+			hostname: await getNextAvailableLoopbackAddress(),
 		};
 		await setupHarper(nodeCtx, {
 			config: {
@@ -93,11 +93,16 @@ suite('Clone Node', (ctx) => {
 	});
 
 	test('should clone a node successfully', async () => {
-		const cloneCtx = {};
+        const cloneCtx = {
+            hostname: await getNextAvailableLoopbackAddress(),
+        };
 		await setupHarper(cloneCtx, {
 			config: {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
+                replication: {
+                    port: cloneCtx.hostname + ':9933',
+                },
 			},
 			env: {
 				HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:${OPERATIONS_API_PORT}`,
