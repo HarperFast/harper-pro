@@ -51,7 +51,10 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ steps.get-tag-version.outputs.tagVersion }}
           files: harperfast-harper-pro-*.tgz
+          fail_on_unmatched_files: true
+          generate_release_notes: true
           prerelease: ${{ steps.get-version-components.outputs.prerelease != '' }}
           draft: ${{ github.event.inputs.draft }}
-
+          make_latest: ${{ github.event.inputs.draft == 'false' && steps.get-version-components.outputs.prerelease == '' }}
