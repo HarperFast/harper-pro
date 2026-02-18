@@ -22,10 +22,10 @@ jobs:
           node-version: latest
           package-manager-cache: false
       - name: Get package.json version
-        id: get-package-version
+        id: package-version
         run: echo "packageVersion=$(npm pkg get version)" >> "$GITHUB_OUTPUT"
       - name: Get tag version
-        id: get-tag-version
+        id: tag-version
         run: |
           if [[ "${{ github.event.inputs.version }}" != "" ]]; then
             echo "tagVersion=${{ github.event.inputs.version }}"
@@ -34,24 +34,24 @@ jobs:
           fi >> "$GITHUB_OUTPUT"
       - name: Confirm tag version matches package.json version
         run: |
-          echo "Tag version: ${{ steps.get-tag-version.outputs.tagVersion }}"
-          echo "Package.json version: v${{ steps.get-package-version.outputs.packageVersion }}"
-          test "${{ steps.get-tag-version.outputs.tagVersion }}" == "v${{ steps.get-package-version.outputs.packageVersion }}"
+          echo "Tag version: ${{ steps.tag-version.outputs.tagVersion }}"
+          echo "Package.json version: v${{ steps.package-version.outputs.packageVersion }}"
+          test "${{ steps.tag-version.outputs.tagVersion }}" == "v${{ steps.package-version.outputs.packageVersion }}"
       - name: Package Harper Pro
         run: npm run package
       - name: Get version components
-        id: get-version-components
+        id: version-components
         uses: matt-usurp/validate-semver@v2
         with:
-          version: ${{ steps.get-tag-version.outputs.tagVersion }}
+          version: ${{ steps.tag-version.outputs.tagVersion }}
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ steps.get-tag-version.outputs.tagVersion }}
-          tag_name: ${{ steps.get-tag-version.outputs.tagVersion }}
+          name: ${{ steps.tag-version.outputs.tagVersion }}
+          tag_name: ${{ steps.tag-version.outputs.tagVersion }}
           files: harperfast-harper-pro-*.tgz
           fail_on_unmatched_files: true
           generate_release_notes: true
-          prerelease: ${{ steps.get-version-components.outputs.prerelease != '' }}
+          prerelease: ${{ steps.version-components.outputs.prerelease != '' }}
           draft: true
-          make_latest: ${{ github.event.inputs.draft == 'false' && steps.get-version-components.outputs.prerelease == '' }}
+          make_latest: ${{ github.event.inputs.draft == 'false' && steps.version-components.outputs.prerelease == '' }}
