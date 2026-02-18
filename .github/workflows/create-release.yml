@@ -51,7 +51,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: harperfast-harper-pro-*.zip
+          files: harperfast-harper-pro-*.tgz
           prerelease: ${{ steps.get-version-components.outputs.prerelease != '' }}
           draft: ${{ github.event.inputs.draft }}
 
