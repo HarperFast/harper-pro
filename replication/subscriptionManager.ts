@@ -143,7 +143,7 @@ export async function startOnMainThread(options) {
 			// deleted node
 			for (const [url, dbReplicationWorkers] of connectionReplicationMap) {
 				let foundNode;
-				for (const [database, { worker, nodes }] of dbReplicationWorkers) {
+				for (const [_database, { nodes }] of dbReplicationWorkers) {
 					const node = nodes[0];
 					if (!node) continue;
 					if (node.name == hostname) {
@@ -423,13 +423,12 @@ export async function startOnMainThread(options) {
 		}
 
 		mainWorkerEntry.nodes = [restoredNode]; // restart with just our own connection
-		let hasChanges = false;
 		for (const nodeWorkers of connectionReplicationMap.values()) {
 			const failOverConnections = nodeWorkers.get(connection.database);
 			if (!failOverConnections || failOverConnections == mainWorkerEntry) continue;
-			const { worker: failOverWorker, nodes: failOverNodes, connected } = failOverConnections;
+			const { nodes: failOverNodes, connected } = failOverConnections;
 			if (!failOverNodes) continue;
-			if (connected === false && failOverNodes[0].shard === restoredNode.shard && node.name === restoredNode.name) {
+			if (connected === false && failOverNodes[0].shard === restoredNode.shard && connection.url === restoredNode.url) {
 				// if it is not connected and has extra nodes, grab them
 				for (let node of failOverNodes) {
 					connectToNextWorker(node, connection.database);

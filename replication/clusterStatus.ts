@@ -1,6 +1,5 @@
 'use strict';
 
-import envMgr from '../core/utility/environment/environmentManager.js';
 import { parentPort } from 'worker_threads';
 import { onMessageByType } from '../core/server/threads/manageThreads.js';
 import { getThisNodeName } from '../core/server/nodeName.ts';

@@ -64,7 +64,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 		// create a table on each node
 		await Promise.all(
 			ctx.nodes.map(async (node) => {
-				const response = await sendOperation(node, {
+				await sendOperation(node, {
 					operation: 'create_table',
 					table: 'test',
 					primary_key: 'id',
@@ -261,7 +261,7 @@ function fetchWithRetry(url, options) {
 	let retries = options?.retries ?? 20;
 	let response = fetch(url, options);
 	if (retries > 0) {
-		response = response.catch((err) => {
+		response = response.catch(() => {
 			console.log('fetch failed, retrying...');
 			options ??= {};
 			options.retries = retries - 1;

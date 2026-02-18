@@ -15,7 +15,6 @@ function getIdMappingRecord(auditStore) {
 	}
 	// this is the default mapping for the local node (id of 0 is used for local)
 	const node_name = getThisNodeName();
-	const hasChanges = false;
 	idMappingRecord.nodeName = getThisNodeName();
 	const nameToId = idMappingRecord.remoteNameToId;
 	if (nameToId[node_name] !== 0) {
