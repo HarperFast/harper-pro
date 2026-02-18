@@ -1,0 +1,57 @@
+name: Create Release on Version Tag
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version; should look like v1.2.3(-[alpha|beta|rc].N])'
+        required: true
+      draft:
+        description: 'Create a draft (unpublished) release instead of a published one'
+        default: true
+        required: false
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: 'recursive'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: latest
+          package-manager-cache: false
+      - name: Package Harper Pro
+        run: npm run package
+      - name: Get package.json version
+        id: get-package-version
+        run: echo "packageVersion=$(npm pkg get version)" >> "$GITHUB_OUTPUT"
+      - name: Get tag version
+        id: get-tag-version
+        run: |
+          if [[ "${{ github.event.inputs.version }}" != "" ]]; then
+            echo "tagVersion=${{ github.event.inputs.version }}"
+          else
+            echo "tagVersion=${{ github.ref_name }}"
+          fi >> "$GITHUB_OUTPUT"
+      - name: Confirm tag version matches package.json version
+        run: |
+          echo "Tag version: ${{ steps.get-tag-version.outputs.tagVersion }}"
+          echo "Package.json version: ${{ steps.get-version.outputs.packageVersion }}"
+          test "${{ steps.get-tag-version.outputs.tagVersion }}" == "v${{ steps.get-version.outputs.packageVersion }}"
+      - name: Get version components
+        id: get-version-components
+        uses: matt-usurp/validate-semver@v2
+        with:
+          version: ${{ steps.get-tag-version.outputs.tagVersion }}
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: harperfast-harper-pro-*.zip
+          prerelease: ${{ steps.get-version-components.outputs.prerelease != '' }}
+          draft: ${{ github.event.inputs.draft }}
+
