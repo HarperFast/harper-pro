@@ -79,8 +79,8 @@ jobs:
             package.json
           retention-days: 1
 
-  run-integration-apiTests:
-    name: Integration API Tests (Node.js v${{ matrix.node-version }})
+  install-harper-pro:
+    name: Install Harper Pro (Node.js v${{ matrix.node-version }})
     needs: [generate-node-version-matrix, build]
     runs-on: ubuntu-latest
 
@@ -106,7 +106,7 @@ jobs:
         with:
           name: harper-build-artifacts-node-${{ matrix.node-version }}
 
-      - name: Setup Harper
+      - name: Setup Harper Pro
         env:
           DEFAULTS_MODE: 'dev'
           HDB_ADMIN_USERNAME: 'admin'
