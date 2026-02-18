@@ -11,7 +11,7 @@ on:
         required: true
 
 jobs:
-  package:
+  create-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
