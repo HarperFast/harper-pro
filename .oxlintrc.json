@@ -1,0 +1,43 @@
+{
+	"$schema": "./node_modules/oxlint/configuration_schema.json",
+	"plugins": ["unicorn", "typescript", "oxc"],
+	"categories": {},
+	"rules": {
+		"no-undef": "error",
+		"no-unused-vars": "error",
+		"no-console": "off",
+		"no-constant-condition": "off",
+		"prefer-const": "off",
+		"typescript/no-explicit-any": "off",
+		"typescript/no-var-requires": "off"
+	},
+	"settings": {
+		"jsdoc": {
+			"ignorePrivate": false,
+			"ignoreInternal": false,
+			"ignoreReplacesDocs": true,
+			"overrideReplacesDocs": true,
+			"augmentsExtendsReplacesDocs": false,
+			"implementsReplacesDocs": false,
+			"exemptDestructuredRootsFromChecks": false,
+			"tagNamePreference": {}
+		}
+	},
+	"env": {
+		"builtin": true,
+		"mocha": true,
+		"node": true,
+		"es2024": true
+	},
+	"globals": {
+		"server": "readonly",
+		"databases": "readonly",
+		"tables": "readonly",
+		"createBlob": "readonly",
+		"lockdown": "readonly",
+		"threads": "readonly",
+		"Resource": "readonly",
+		"headersTest": "readonly"
+	},
+	"ignorePatterns": []
+}

@@ -1,0 +1,73 @@
+{
+	"name": "@harperfast/harper-pro",
+	"version": "5.0.0-alpha.1",
+	"description": "Harper is a distributed database, caching service, streaming broker, and application development platform focused on performance and ease of use.",
+	"keywords": [
+		"database",
+		"nosql",
+		"api",
+		"distributed",
+		"broker",
+		"mqtt",
+		"real-time",
+		"enterprise",
+		"Fastify",
+		"NATS",
+		"HarperDB",
+		"Harper",
+		"clustering",
+		"replication",
+		"REST",
+		"WebSockets",
+		"decentralized",
+		"server-sent events",
+		"document store"
+	],
+	"main": "dist/bin/harper.js",
+	"bin": {
+		"harperdb": "dist/bin/harper.js",
+		"harper": "dist/bin/harper.js"
+	},
+	"files": [
+		"replication/",
+		"security/",
+		"static/",
+		"core/",
+		"dist/",
+		"*.d.ts",
+		"npm-shrinkwrap.json"
+	],
+	"engines": {
+		"minimum-node": "16.0.0",
+		"go-lang": "1.21.7",
+		"nats-server": "2.10.11"
+	},
+	"homepage": "https://www.harper.fast/",
+	"bugs": "support@harperdb.io",
+	"author": {
+		"name": "HarperDB",
+		"email": "support@harperdb.io"
+	},
+	"license": "Elastic-2.0",
+	"scripts": {
+		"build": "tsc --project tsconfig.json",
+		"build:watch": "npm run build -- --watch --incremental",
+		"package": "./build-tools/build-pro.sh",
+		"download-prebuilds": "node ./build-tools/download-prebuilds.js",
+		"prebuild": "date",
+		"format": "prettier .",
+		"format:fix": "npm run format -- --write",
+		"lint": "oxlint --deny-warnings .",
+		"lint:fix": "npm run lint -- --fix",
+		"lint:required": "oxlint --quiet .",
+		"test:integration": "node --test integrationTests/cluster/**.test.mjs",
+		"cluster:ip:local": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. build && docker compose -f docker-compose.ip.yml --project-directory ../.. up; popd",
+		"cluster:ip:latest": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. pull && docker compose -f docker-compose.ip.yml --project-directory ../.. up; popd",
+		"cluster:delete": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. down --remove-orphans; popd",
+		"cluster:hostname:local": "pushd utility/dev && docker compose -f docker-compose.hostname.yml --project-directory ../.. build && docker compose -f docker-compose.hostname.yml --project-directory ../.. up; popd",
+		"cluster:hostname:latest": "pushd utility/dev && docker compose -f docker-compose.hostname.yml --project-directory ../.. pull && docker compose -f docker-compose.hostname.yml --project-directory ../.. up; popd"
+	},
+	"dependencies": {
+		"harper": "./core"
+	}
+}
