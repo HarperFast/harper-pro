@@ -51,7 +51,7 @@ suite('Clone Node', (ctx) => {
 	before(async () => {
 		ctx.nodes = [];
 		const nodeCtx = {
-			hostname: getNextAvailableLoopbackAddress(),
+			hostname: await getNextAvailableLoopbackAddress(),
 		};
 		await setupHarper(nodeCtx, {
 			config: {
