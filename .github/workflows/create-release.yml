@@ -39,8 +39,8 @@ jobs:
       - name: Confirm tag version matches package.json version
         run: |
           echo "Tag version: ${{ steps.get-tag-version.outputs.tagVersion }}"
-          echo "Package.json version: ${{ steps.get-version.outputs.packageVersion }}"
-          test "${{ steps.get-tag-version.outputs.tagVersion }}" == "v${{ steps.get-version.outputs.packageVersion }}"
+          echo "Package.json version: ${{ steps.get-package-version.outputs.packageVersion }}"
+          test "${{ steps.get-tag-version.outputs.tagVersion }}" == "v${{ steps.get-package-version.outputs.packageVersion }}"
       - name: Package Harper Pro
         run: npm run package
       - name: Get version components
