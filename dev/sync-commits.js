@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// Last synced commit: cd20460b4110812e2751fd2e24e17b0e3a2c83d1
+
 const { execSync, exec } = require('node:child_process');
 const fs = require('node:fs');
 
