@@ -17,7 +17,7 @@ jobs:
           node-version: latest
       - name: Get release build
         env:
-          GH_TOKEN: ${{ secrets.GH_CLI_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: gh release download ${{ github.event.release.tag_name }} --pattern "harperfast-harper-pro-*.tgz"
       - name: Get version components
         id: version-components
