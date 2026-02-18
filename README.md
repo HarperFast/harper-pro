@@ -39,16 +39,17 @@ The complete [Harper Operations API documentation](https://docs.harperdb.io/docs
 
 ## Prerequisites
 
-Harper requires Node.js 14 or higher. Our fully tested and supported Node.js version is 18.15.0.
+Harper Pro runs on any supported version of Node.js.
+Node.js versions that are no longer supported [are marked as EoL on this page](https://nodejs.org/en/about/previous-releases).
 
-Harper has been tested on the following platforms
+Harper Pro has been tested on the following platforms:
 
 - Linux on AMD64
 - Linux on ARM64
-- MacOS on Intel
-- MacOS on Apple silicon (Rosetta AMD64 emulation required for Node.js versions older than Node.js 16)
+- macOS on Intel
+- macOS on Apple Silicon
 
-Other UNIX-like operating systems and other CPU architectures may be able to run Harper, but these have not been tested and may require the following
+Other UNIX-like operating systems and other CPU architectures may be able to run Harper, but these have not been tested and may require the following:
 
 - GCC
 - Make
@@ -56,7 +57,7 @@ Other UNIX-like operating systems and other CPU architectures may be able to run
 - Xcode (macOS)
 - Go 1.19.1
 
-Harper can run natively on Windows 10 & 11. Harper running on Windows is only intended for evaluation or development purposes.
+Harper Pro can run natively on Windows 10 & 11. Harper running on Windows is only intended for evaluation or development purposes.
 
 ## Installing Harper Pro
 
