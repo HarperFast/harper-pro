@@ -58,11 +58,11 @@ Other UNIX-like operating systems and other CPU architectures may be able to run
 
 Harper can run natively on Windows 10 & 11. Harper running on Windows is only intended for evaluation or development purposes.
 
-## Installing Harper
+## Installing Harper Pro
 
 ```
-npm install -g harperdb
-harperdb
+npm install -g @harperfast/harper-pro
+harper
 ```
 
 Harper will prompt you for configuration options during install, and then automatically start after install.
