@@ -9,10 +9,6 @@ on:
       version:
         description: 'Version; should look like v1.2.3(-[alpha|beta|rc].N])'
         required: true
-      draft:
-        description: 'Create a draft (unpublished) release instead of a published one'
-        default: true
-        required: false
 
 jobs:
   package:
@@ -57,5 +53,5 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
           prerelease: ${{ steps.get-version-components.outputs.prerelease != '' }}
-          draft: ${{ github.event.inputs.draft }}
+          draft: true
           make_latest: ${{ github.event.inputs.draft == 'false' && steps.get-version-components.outputs.prerelease == '' }}
