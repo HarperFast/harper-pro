@@ -1,0 +1,34 @@
+name: Publish NPM Package
+
+on:
+ release:
+   types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish-npm-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: latest
+      - name: Get release build
+        run: gh release download ${{ github.event.release.tag_name }} --pattern "harperfast-harper-pro-*.tgz"
+      - name: Get version components
+        id: version-components
+        uses: matt-usurp/validate-semver@v2
+        with:
+          version: ${{ github.event.release.tag_name }}
+      - name: Set package tag
+        id: package-tag
+        run: |
+          if [[ "${{ steps.version-components.outputs.prerelease }}" == '' ]]; then
+            echo "packageTag=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "packageTag=next" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish package to NPM registry
+        run: npm publish --dry-run --tag=${{ steps.package-tag.outputs.packageTag }} harperfast-harper-pro-*.tgz
