@@ -229,7 +229,7 @@ export function* iterateRoutes(options: { routes: (Route | any)[] }) {
 		}
 
 		yield {
-			replicates: !route.subscriptions, // if there is not a list of subscriptions, then this node is authorized to fully replicate
+			replicates: route.replicates ?? !route.subscriptions, // if there is not a list of subscriptions, then this node is authorized to fully replicate
 			name: host,
 			url,
 			port: route.port,
@@ -253,7 +253,7 @@ export function getNodeURL(node: Node): string {
 	// otherwise use the default port for the service
 	else port = securePort || env.get(CONFIG_PARAMS.REPLICATION_PORT) || 9933;
 	const lastColon = port?.lastIndexOf?.(':');
-	if (lastColon > 0) port = +port.slice(lastColon + 1).replace(/[\[\]]/g, '');
+	if (lastColon > 0) port = +port.slice(lastColon + 1).replace(/[[\]]/g, '');
 
 	return (securePort ? 'wss://' : 'ws://') + host + ':' + port; // now construct the full url
 }
