@@ -78,6 +78,8 @@ export const BACK_PRESSURE_RATIO_POSITION = 6;
 export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
 
+const MAX_PAYLOAD = 100_000_000;
+
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
 // when we receive messages from other nodes, we then forward them on to as a notification on these subscriptions
@@ -428,8 +430,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	const residencyMap = [];
 	const sentResidencyLists = [];
 	const receivedResidencyLists = [];
-	const MAX_OUTSTANDING_COMMITS = 150; // maximum before requesting that other nodes pause
-	const MAX_OUTSTANDING_BLOBS_BEING_SENT = 25;
+	const MAX_OUTSTANDING_COMMITS = env.get(CONFIG_PARAMS.REPLICATION_RECORDCONCURRENCY) ?? 150; // maximum before requesting that other nodes pause
+	const MAX_OUTSTANDING_BLOBS_BEING_SENT = env.get(CONFIG_PARAMS.REPLICATION_BLOBCONCURRENCY) ?? 5;
 	let outstandingCommits = 0;
 	let lastStructureLength = 0;
 	let replicationPaused = false;
@@ -669,6 +671,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							localTime: lastSequenceIdReceived,
 							remoteNodeIds: receivingDataFromNodeIds,
 						});
+						getSharedStatus();
+						replicationSharedStatus[RECEIVED_VERSION_POSITION] = lastSequenceIdReceived;
+						replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
+						replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
 						break;
 					case BLOB_CHUNK: {
 						// this is a blob chunk, we need to write it to the blob store
@@ -995,20 +1001,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 									subscribedNodeIds
 								);
 							const txnTime = auditRecord.version;
-							if (currentTransaction.txnTime !== txnTime) {
-								// send the queued transaction
-								if (currentTransaction.txnTime) {
-									if (DEBUG_MODE)
-										logger.trace?.(connectionId, 'new txn time, sending queued txn', currentTransaction.txnTime);
-									if (encodingBuffer[encodingStart] !== 66) {
-										logger.error?.('Invalid encoding of message');
-									}
-									sendQueuedData();
-								}
-								currentTransaction.txnTime = txnTime;
-								encodingStart = position;
-								writeFloat64(txnTime);
-							}
 
 							const residencyId = auditRecord.residencyId;
 							const residency = getResidence(residencyId, table);
@@ -1105,6 +1097,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								ws.send(encode([RESIDENCY_LIST, residency, residencyId]));
 								sentResidencyLists[residencyId] = true;
 							}
+							if (currentTransaction.txnTime !== txnTime) {
+								// send the queued transaction
+								if (currentTransaction.txnTime) {
+									if (DEBUG_MODE)
+										logger.trace?.(connectionId, 'new txn time, sending queued txn', currentTransaction.txnTime);
+									if (encodingBuffer[encodingStart] !== 66) {
+										logger.error?.('Invalid encoding of message');
+									}
+									sendQueuedData();
+								}
+								currentTransaction.txnTime = txnTime;
+								encodingStart = position;
+								writeFloat64(txnTime);
+							}
+
 							/*
 							TODO: At some point we may want some fancier logic to elide the version (which is the same as txnTime)
 							and username from subsequent audit entries in multiple entry transactions*/
@@ -1160,6 +1167,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						const sendQueuedData = () => {
 							if (position - encodingStart > 8) {
 								// if we have more than just a txn time, send it
+								if (checkExcessMessageSize(position - encodingStart)) return;
 								ws.send(encodingBuffer.subarray(encodingStart, position));
 								logger.debug?.(connectionId, 'Sent message, size:', position - encodingStart);
 								if (databaseName !== 'system') {
@@ -1239,7 +1247,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 										logger.warn?.('Invalid sequence id ' + currentSequenceId);
 										close(1008, 'Invalid sequence id' + currentSequenceId);
 									}
-									let queuedEntries;
 									let auditLogIterable: Iterable<AuditRecord>;
 									if (isFirst && !closed) {
 										isFirst = false;
@@ -1265,7 +1272,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 														entry.localTime
 													);
 													lastSequenceId = Math.max(entry.localTime ?? 1, lastSequenceId);
-													queuedEntries = true;
 													getSharedStatus()[SENDING_TIME_POSITION] = 1;
 													const encoded = createAuditEntry({
 														version: entry.version,
@@ -1316,12 +1322,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 												currentTransaction.txnTime = lastSequenceId;
 												writeFloat64(lastSequenceId);
 											}
-											sendAuditRecord(
-												{
-													type: 'end_txn',
-												},
-												lastSequenceId
-											);
+											if (position - encodingStart > 8) {
+												// if we have any queued transactions to send, send them now
+												sendAuditRecord(
+													{
+														type: 'end_txn',
+													},
+													currentSequenceId
+												);
+											}
 											getSharedStatus()[SENDING_TIME_POSITION] = 0;
 											currentSequenceId = lastSequenceId;
 										}
@@ -1357,15 +1366,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 										currentSequenceId = key;
 										await sendAuditRecord(auditRecord, key);
 										auditSubscription.startTime = key; // update so don't double send
-										queuedEntries = true;
 									}
-									if (queuedEntries)
+									if (position - encodingStart > 8) {
 										sendAuditRecord(
 											{
 												type: 'end_txn',
 											},
 											currentSequenceId
 										);
+									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
 									await whenNextTransaction(auditStore);
 								} while (!closed);
@@ -1610,6 +1619,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				recordAction(buffer.length, 'bytes-sent', `${remoteNodeName}.${databaseName}`, 'replication', 'blob');
 			}
 			logger.debug?.('Sending final blob chunk', id, 'length', lastBuffer.length);
+			if (checkExcessMessageSize(lastBuffer.length)) throw new Error('Blob chunk too large');
 			ws.send(
 				encode([
 					BLOB_CHUNK,
@@ -1907,7 +1917,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
 				);
 				blobsInFlight.delete(blobId);
-				stream.end();
+				stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
 			}
 		}
 	}, blobTimeout).unref();
@@ -1999,6 +2009,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 			encodingStart = 0;
 			encodingBuffer = newBuffer;
 			dataView = new DataView(encodingBuffer.buffer, 0, encodingBuffer.length);
+		}
+	}
+
+	function checkExcessMessageSize(messageSize) {
+		if (messageSize > MAX_PAYLOAD) {
+			logger.error?.(
+				connectionId,
+				'Message too large to send, size:',
+				messageSize,
+				'remote node:',
+				remoteNodeName,
+				'database:',
+				databaseName
+			);
+			return true;
 		}
 	}
 	// Check the attributes in the msg vs the table and if they dont match call ensureTable to create them
