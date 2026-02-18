@@ -21,8 +21,6 @@ import {
 	HDB_CONFIG_FILE,
 	DATABASES_DIR_NAME,
 	CONFIG_PARAM_MAP,
-	LICENSE_KEY_DIR_NAME,
-	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 
 /**
@@ -136,8 +134,6 @@ const leaderURL: string = values['leader-url'] || process.env.HDB_LEADER_URL;
 const leaderUsername: string = values['leader-username'] || process.env.HDB_LEADER_USERNAME;
 const leaderPassword: string = values['leader-password'] || process.env.HDB_LEADER_PASSWORD;
 const skipSyncMonitor: boolean = values['skip-sync-monitor'] ?? process.env.CLONE_SKIP_SYNC_MONITOR === 'true';
-const skipSSHKeys: boolean = values['skip-ssh-keys'] ?? process.env.CLONE_SKIP_SSH_KEYS === 'true';
-const skipJWTKeys: boolean = values['skip-jwt-keys'] ?? process.env.CLONE_SKIP_JWT_KEYS === 'true';
 const syncTimeoutMs: number = Math.max(
 	1,
 	parseInt(values['sync-timeout'] || process.env.CLONE_SYNC_TIMEOUT, 10) || DEFAULT_SYNC_TIMEOUT_MS
@@ -651,7 +647,7 @@ function pathExists(path: string): boolean {
 	try {
 		accessSync(path);
 		return true;
-	} catch (err) {
+	} catch {
 		return false;
 	}
 }

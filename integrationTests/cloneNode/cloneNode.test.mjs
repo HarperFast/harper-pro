@@ -40,7 +40,7 @@ async function waitForAvailableStatus(node, timeoutMs = 60000, checkInterval = 2
 		let response;
 		try {
 			response = await sendOperation(node, { operation: 'get_status', id: 'availability' });
-		} catch (err) {}
+		} catch {}
 		if (response?.status === 'Available') return true;
 	}
 
