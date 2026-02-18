@@ -1,0 +1,6 @@
+type Location @table @export {
+	id: Long @primaryKey
+	name: String @indexed
+	random: Float
+	image: Blob
+}

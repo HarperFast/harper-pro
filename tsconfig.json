@@ -1,0 +1,50 @@
+{
+	"include": [
+		"replication/**/*",
+		"security/**/*",
+		"bin/**/*",
+		"core/bin/**/*",
+		"core/components/**/*",
+		"core/config/**/*",
+		"core/dataLayer/**/*",
+		"core/json/**/*",
+		"core/launchServiceSCripts/**/*",
+		"core/resources/**/*",
+		"core/security/**/*",
+		"core/server/**/*",
+		"core/sqlTranslator/**/*",
+		"core/upgrade/**/*",
+		"core/utility/**/*",
+		"core/validation/**/*",
+		"core/globals.js",
+		"core/index.d.ts",
+		"core/index.js"
+	],
+	"compilerOptions": {
+		// Allow JS files for mixed codebase
+		"allowJs": true,
+		"outDir": "dist",
+		"esModuleInterop": true,
+		"noImplicitAny": false,
+		"target": "ES2022",
+		"moduleResolution": "NodeNext",
+		"module": "NodeNext",
+		"sourceMap": true,
+		"resolveJsonModule": true,
+		"allowSyntheticDefaultImports": true,
+		"allowImportingTsExtensions": true,
+
+		// Allow .ts extensions in imports (will be transpiled to .js by esbuild)
+		"rewriteRelativeImportExtensions": true,
+
+		// Enforce erasable syntax only so we can use Node.js type-stripping
+		"erasableSyntaxOnly": true,
+
+		"baseUrl": ".",
+		"paths": {
+			// Provide convenient path alias for compiled output
+			// Change this to ./* once we're fully in TypeStrip land
+			"@/*": ["./dist/*"]
+		}
+	}
+}
