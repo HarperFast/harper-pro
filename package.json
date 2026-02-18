@@ -61,6 +61,8 @@
 		"lint:fix": "npm run lint -- --fix",
 		"lint:required": "oxlint --quiet .",
 		"test:integration": "node --test integrationTests/**/*.test.mjs",
+		"test:unit": "mocha",
+		"test:unit:all": "npm run test:unit -- unitTests/",
 		"cluster:ip:local": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. build && docker compose -f docker-compose.ip.yml --project-directory ../.. up; popd",
 		"cluster:ip:latest": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. pull && docker compose -f docker-compose.ip.yml --project-directory ../.. up; popd",
 		"cluster:delete": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. down --remove-orphans; popd",
