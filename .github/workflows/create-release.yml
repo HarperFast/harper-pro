@@ -25,8 +25,6 @@ jobs:
         with:
           node-version: latest
           package-manager-cache: false
-      - name: Package Harper Pro
-        run: npm run package
       - name: Get package.json version
         id: get-package-version
         run: echo "packageVersion=$(npm pkg get version)" >> "$GITHUB_OUTPUT"
@@ -43,6 +41,8 @@ jobs:
           echo "Tag version: ${{ steps.get-tag-version.outputs.tagVersion }}"
           echo "Package.json version: ${{ steps.get-version.outputs.packageVersion }}"
           test "${{ steps.get-tag-version.outputs.tagVersion }}" == "v${{ steps.get-version.outputs.packageVersion }}"
+      - name: Package Harper Pro
+        run: npm run package
       - name: Get version components
         id: get-version-components
         uses: matt-usurp/validate-semver@v2
