@@ -1,0 +1,50 @@
+name: Notify release published
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  notify-slack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack release published notification
+        uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_KEY }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro v${{ needs.publish-npm-package.outputs.harper-pro-version }} GitHub release published",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro v${{ needs.publish-npm-package.outputs.harper-pro-version }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":white_check_mark: Published on :github:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.event.release.html_url }}|GitHub Release>"
+                    }
+                  ]
+                }
+              ]
+            }
+
