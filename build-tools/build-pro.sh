@@ -10,7 +10,7 @@ function cleanup {
 trap cleanup EXIT
 
 if [[ "$IGNORE_PACKAGE_JSON_DIFF" != "true" ]]; then
-  if ! git diff --quiet package.json ]]; then
+  if ! git diff --quiet package.json; then
     echo 'package.json has local changes; please restore or commit before running build'
     exit 1
   fi
