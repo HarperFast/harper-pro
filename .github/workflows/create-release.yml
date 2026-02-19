@@ -70,7 +70,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": ":hourglass_flowing_sand: In Progress"
+                      "text": ":hourglass_flowing_sand: In progress"
                     },
                     {
                       "type": "mrkdwn",
