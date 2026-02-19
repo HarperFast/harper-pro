@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       harper-pro-version: ${{ steps.package-version.outputs.packageVersion }}
+      draft-release-url: ${{ steps.create-release.outputs.url }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -99,6 +100,47 @@ jobs:
           make_latest: ${{ github.event.inputs.draft == 'false' && steps.version-components.outputs.prerelease == '' }}
       - name: Force failure to test Slack notification
         run: exit 1
+
+  send-slack-message-on-success:
+    if: success() && !cancelled()
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_KEY }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro v${{ needs.create-release.outputs.harper-pro-version }} draft release created",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro v${{ needs.create-release.outputs.harper-pro-version }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":github: Draft release waiting for review"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.create-release.outputs.draft-release-url }}|Review draft release>"
+                    }
+                  ]
+                }
+              ]
+            }
 
   send-slack-message-on-failure:
     if: failure() && !cancelled()
