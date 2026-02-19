@@ -41,6 +41,42 @@ jobs:
           echo "Tag version: ${{ steps.tag-version.outputs.tagVersion }}"
           echo "Package.json version: v${{ steps.package-version.outputs.packageVersion }}"
           test "${{ steps.tag-version.outputs.tagVersion }}" == "v${{ steps.package-version.outputs.packageVersion }}"
+      - name: Notify release in progress in Slack
+        uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_KEY }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro ${{ steps.tag-version.outputs.tagVersion }} release in progress",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro ${{ steps.tag-version.outputs.tagVersion }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "In Progress"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|run ${{ github.run_id }}>"
+                    }
+                  ]
+                }
+              ]
+            }
       - name: Package Harper Pro
         run: npm run package
       - name: Get version components
