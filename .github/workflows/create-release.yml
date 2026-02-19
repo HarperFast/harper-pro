@@ -95,3 +95,41 @@ jobs:
           prerelease: ${{ steps.version-components.outputs.prerelease != '' }}
           draft: true
           make_latest: ${{ github.event.inputs.draft == 'false' && steps.version-components.outputs.prerelease == '' }}
+
+  send-slack-message-on-failure:
+    if: failure() && !cancelled()
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_KEY }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro ${{ steps.tag-version.outputs.tagVersion }} release failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": "Harper Pro ${{ steps.tag-version.outputs.tagVersion }} release"
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":x: Failed"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|run ${{ github.run_id }}>"
+                    }
+                  ]
+                }
+              ]
+            }
