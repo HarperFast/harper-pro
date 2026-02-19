@@ -37,7 +37,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": ":white_check_mark: Published on :github:"
+                      "text": ":white_check_mark: Release approved and published on :github:"
                     },
                     {
                       "type": "mrkdwn",
