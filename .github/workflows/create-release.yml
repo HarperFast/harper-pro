@@ -67,7 +67,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "In Progress"
+                      "text": ":hourglass_flowing_sand: In Progress"
                     },
                     {
                       "type": "mrkdwn",
