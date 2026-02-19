@@ -17,6 +17,8 @@ concurrency:
 jobs:
   create-release:
     runs-on: ubuntu-latest
+    outputs:
+      harper-pro-version: ${{ steps.package-version.outputs.packageVersion }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -110,13 +112,13 @@ jobs:
           payload: |
             {
               "channel": "#development-ci",
-              "text": "Harper Pro ${{ steps.tag-version.outputs.tagVersion }} release failed",
+              "text": "Harper Pro v${{ needs.create-release.outputs.harper-pro-version }} release failed",
               "blocks": [
                 {
                   "type": "header",
                   "text": {
                     "type": "plain_text",
-                    "text": "Harper Pro ${{ steps.tag-version.outputs.tagVersion }} release"
+                    "text": "Harper Pro v${{ needs.create-release.outputs.harper-pro-version }} release"
                   }
                 },
                 {
