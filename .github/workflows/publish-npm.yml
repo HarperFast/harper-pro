@@ -38,3 +38,39 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_KEY }}
         run: npm publish --dry-run --tag=${{ steps.package-tag.outputs.packageTag }} harperfast-harper-pro-*.tgz
+      - name: Send Slack published notification
+        uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_KEY }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro ${{ github.event.release.tag_name }} has been published to NPM!",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro ${{ github.event.release.tag_name }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":white_check_mark: Published to :npm:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<https://www.npmjs.com/package/@harperfast/harper-pro/v/${{ steps.version-components.outputs.version }}|@harperfast/harper-pro@${{ steps.version-components.outputs.version }}>"
+                    }
+                  ]
+                }
+              ]
+            }
