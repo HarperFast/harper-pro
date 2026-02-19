@@ -3,15 +3,17 @@
 set -e
 
 function cleanup {
-	echo -e "\n📦 Restoring package.json & bin script"
-	git restore package.json
+  echo -e "\n📦 Restoring package.json & bin script"
+  git restore package.json
 }
 
 trap cleanup EXIT
 
-if ! git diff --quiet package.json; then
-	echo 'package.json has local changes; please restore or commit before running build'
-	exit 1
+if [[ "$IGNORE_PACKAGE_JSON_DIFF" != "true" ]]; then
+  if ! git diff --quiet package.json ]]; then
+    echo 'package.json has local changes; please restore or commit before running build'
+    exit 1
+  fi
 fi
 
 echo -e "\n📦 Installing base npm deps"
@@ -21,9 +23,9 @@ echo -e "\n📦 Updating core submodule"
 git submodule update --init --recursive
 
 echo -e "\n📦 Copying dependencies & devDependencies from core"
-deps=$(cd core; npm pkg get dependencies)
+deps=$(cd core && npm pkg get dependencies)
 npm pkg set "dependencies=${deps}" --json
-devDeps=$(cd core; npm pkg get devDependencies)
+devDeps=$(cd core && npm pkg get devDependencies)
 npm pkg set "devDependencies=${devDeps}" --json
 
 echo -e "\n📦 Installing core deps"
