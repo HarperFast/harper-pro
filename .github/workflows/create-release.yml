@@ -88,6 +88,7 @@ jobs:
         with:
           version: ${{ steps.tag-version.outputs.tagVersion }}
       - name: Create Release
+        id: create-release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ steps.tag-version.outputs.tagVersion }}
@@ -133,7 +134,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "<${{ github.server_url }}/${{ github.repository }}/releases/tag/v${{ needs.create-release.outputs.draft-release-url }}|Review draft release>"
+                      "text": "<${{ needs.create-release.outputs.draft-release-url }}|Review draft release>"
                     }
                   ]
                 }
