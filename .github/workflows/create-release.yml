@@ -114,7 +114,10 @@ jobs:
               "blocks": [
                 {
                   "type": "header",
-                  "text": "Harper Pro ${{ steps.tag-version.outputs.tagVersion }} release"
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro ${{ steps.tag-version.outputs.tagVersion }} release"
+                  }
                 },
                 {
                   "type": "context",
