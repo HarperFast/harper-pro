@@ -60,7 +60,7 @@ jobs:
                   "elements": [
                     {
                       "type": "mrkdwn",
-                      "*Status*"
+                      "text": "*Status*"
                     },
                     {
                       "type": "mrkdwn",
