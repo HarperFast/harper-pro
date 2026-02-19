@@ -19,13 +19,13 @@ jobs:
           payload: |
             {
               "channel": "#development-ci",
-              "text": "Harper Pro v${{ needs.publish-npm-package.outputs.harper-pro-version }} GitHub release published",
+              "text": "Harper Pro v${{ github.event.release.tag_name }} GitHub release published",
               "blocks": [
                 {
                   "type": "header",
                   "text": {
                     "type": "plain_text",
-                    "text": "Harper Pro v${{ needs.publish-npm-package.outputs.harper-pro-version }} release"
+                    "text": "Harper Pro v${{ github.event.release.tag_name }} release"
                   }
                 },
                 {
