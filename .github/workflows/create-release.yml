@@ -98,8 +98,6 @@ jobs:
           prerelease: ${{ steps.version-components.outputs.prerelease != '' }}
           draft: true
           make_latest: ${{ github.event.inputs.draft == 'false' && steps.version-components.outputs.prerelease == '' }}
-      - name: Force failure to test Slack notification
-        run: exit 1
 
   send-slack-message-on-success:
     if: success() && !cancelled()
