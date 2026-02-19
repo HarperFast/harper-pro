@@ -30,7 +30,7 @@ jobs:
           package-manager-cache: false
       - name: Get package.json version
         id: package-version
-        run: echo "packageVersion=$(npm pkg get version)" >> "$GITHUB_OUTPUT"
+        run: echo "packageVersion=$(npm pkg get version | tr -d '\"')" >> "$GITHUB_OUTPUT"
       - name: Get tag version
         id: tag-version
         run: |
