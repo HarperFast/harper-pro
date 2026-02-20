@@ -1,4 +1,5 @@
-name: publish-docker.yml
+name: Publish Docker Image
+
 on:
   release:
     types: [published]
@@ -10,7 +11,12 @@ concurrency:
 jobs:
   publish-docker-image:
     runs-on: ubuntu-latest
+    outputs:
+      docker-image-tag: ${{ steps.meta.outputs.tags[0] }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: 'recursive'
       - name: Setup Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -20,6 +26,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
+            type=sha
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -32,7 +39,91 @@ jobs:
       - name: Build and push Docker images
         uses: docker/build-push-action@v6
         with:
+          context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  send-slack-message-on-success:
+    if: success() && !cancelled()
+    needs: [publish-docker-image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack published notification
+        uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_KEY }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro v${{ needs.publish-docker-image.outputs.docker-image-tag }} has been published to Docker Hub",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro v${{ needs.publish-docker-image.outputs.docker-image-tag }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":white_check_mark: Published to :docker_logo:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro/${{ needs.publish-docker-image.outputs.docker-image-tag }}|harperfast/harper-pro:${{ needs.publish-docker-image.outputs.docker-image-tag }}>"
+                    }
+                  ]
+                }
+              ]
+            }
+
+  send-slack-message-on-failure:
+    if: failure() && !cancelled()
+    needs: [publish-docker-image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: slackapi/slack-github-action@v2
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_KEY }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro v${{ needs.publish-docker-image.outputs.docker-image-tag }} NPM publish failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro v${{ needs.publish-docker-image.outputs.docker-image-tag }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":x: Failed to publish to :npm:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow run ${{ github.run_id }}>"
+                    }
+                  ]
+                }
+              ]
+            }

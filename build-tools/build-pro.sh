@@ -2,15 +2,27 @@
 
 set -e
 
+function use_git {
+  # in some environments (e.g. Docker) we don't have the .git dir
+  if [[ -n "$NO_USE_GIT" ]]; then
+    return 1
+  fi
+  if command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+}
+
 function cleanup {
-  echo -e "\n📦 Restoring package.json & bin script"
-  git restore package.json
+  if use_git; then
+    echo -e "\n📦 Restoring package.json & bin script"
+    git restore package.json
+  fi
 }
 
 trap cleanup EXIT
 
 if [[ "$IGNORE_PACKAGE_JSON_DIFF" != "true" ]]; then
-  if ! git diff --quiet package.json; then
+  if use_git && ! git diff --quiet package.json; then
     echo 'package.json has local changes; please restore or commit before running build'
     exit 1
   fi
@@ -19,8 +31,10 @@ fi
 echo -e "\n📦 Installing base npm deps"
 npm install
 
-echo -e "\n📦 Updating core submodule"
-git submodule update --init --recursive
+if use_git; then
+  echo -e "\n📦 Updating core submodule"
+  git submodule update --init --recursive
+fi
 
 echo -e "\n📦 Copying dependencies & devDependencies from core"
 deps=$(cd core && npm pkg get dependencies)
