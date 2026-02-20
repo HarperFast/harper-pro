@@ -1,4 +1,5 @@
 name: Notify release published
+
 on:
   release:
     types: [published]
