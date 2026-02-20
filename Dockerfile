@@ -11,12 +11,6 @@ RUN env NO_USE_GIT=true npm run package
 
 FROM docker.io/node:${NODE_VERSION} AS run
 
-# Install pnpm
-RUN <<-EOF
-  wget -qO- https://get.pnpm.io/install.sh | ENV="$HOME/.bashrc" SHELL="$(which bash)" bash -
-  ln -nsf /home/harper/.local/share/pnpm/pnpm /usr/local/bin/pnpm
-EOF
-
 # Change node user to harper
 RUN <<-EOF
   mkdir -p /home/harperdb
@@ -30,6 +24,11 @@ WORKDIR /home/harperdb
 
 USER harperdb
 
+# Install pnpm
+RUN wget -qO- https://get.pnpm.io/install.sh | ENV="$HOME/.bashrc" SHELL="$(which bash)" bash -
+
+# Add pnpm to PATH
+ENV PATH=/home/harperdb/.local/share/pnpm:$PATH
 
 COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 
