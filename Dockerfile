@@ -19,36 +19,37 @@ EOF
 
 # Change node user to harper
 RUN <<-EOF
-  mkdir -p /home/harper
-  usermod -d /home/harper -l harper node
-  groupmod -n harper node
+  mkdir -p /home/harperdb
+  usermod -d /home/harperdb -l harperdb node
+  groupmod -n harperdb node
   rm -rf /home/node
-  chown -R harper:harper /home/harper
+  chown -R harperdb:harperdb /home/harperdb
 EOF
 
-WORKDIR /home/harper
+WORKDIR /home/harperdb
 
-USER harper
+USER harperdb
+
 
 COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 
 # Configure NPM
-ENV NPM_CONFIG_PREFIX=/home/harper/.npm-global
-ENV PATH=/home/harper/.npm-global/bin:$PATH
+ENV NPM_CONFIG_PREFIX=/home/harperdb/.npm-global
+ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 
-VOLUME /home/harper/harper
+VOLUME /home/harperdb/harper
 
 # Install Harper Pro globally
 RUN <<-EOF
   npm install --global harperfast-harper-pro-*.tgz
   rm harperfast-harper-pro-*.tgz
-  mkdir -p /home/harper/harper
-  chown harper:harper /home/harper/harper
+  mkdir -p /home/harperdb/harper
+  chown harperdb:harperdb /home/harperdb/harper
 EOF
 
 # Harper config parameters
 ENV HDB_ADMIN_USERNAME=admin
-ENV ROOTPATH=/home/harper/harper
+ENV ROOTPATH=/home/harperdb/harper
 ENV TC_AGREEMENT=yes
 ENV NETWORK_OPERATIONSAPI_PORT=9925
 ENV LOGGING_STDSTREAMS=true
