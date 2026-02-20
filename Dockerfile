@@ -27,9 +27,6 @@ USER harperdb
 # Install pnpm
 RUN wget -qO- https://get.pnpm.io/install.sh | ENV="$HOME/.bashrc" SHELL="$(which bash)" bash -
 
-# Add pnpm to PATH
-ENV PATH=/home/harperdb/.local/share/pnpm:$PATH
-
 COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 
 # Configure NPM
