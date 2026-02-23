@@ -14,8 +14,11 @@ function use_git {
 
 function cleanup {
   if use_git; then
-    echo -e "\n📦 Restoring package.json & bin script"
+    echo -e "\n📦 Restoring package.json & core files"
     git restore package.json
+    pushd core
+    git restore .
+    popd
   fi
 }
 
@@ -35,6 +38,9 @@ if use_git; then
   echo -e "\n📦 Updating core submodule"
   git submodule update --init --recursive
 fi
+
+echo -e "\n📦 Applying Harper Pro branding"
+perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/installer.js
 
 echo -e "\n📦 Copying dependencies & devDependencies from core"
 deps=$(cd core && npm pkg get dependencies)
