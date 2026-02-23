@@ -56,7 +56,7 @@
 		"download-prebuilds": "node ./build-tools/download-prebuilds.js",
 		"prebuild": "date",
 		"format": "prettier .",
-		"format:fix": "npm run format -- --write",
+		"format:write": "npm run format -- --write",
 		"lint": "oxlint --deny-warnings .",
 		"lint:fix": "npm run lint -- --fix",
 		"lint:required": "oxlint --quiet .",
