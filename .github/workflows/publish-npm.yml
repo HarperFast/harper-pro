@@ -39,7 +39,7 @@ jobs:
       - name: Publish package to NPM registry
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_KEY }}
-        run: npm publish --dry-run --tag=${{ steps.package-tag.outputs.packageTag }} harperfast-harper-pro-*.tgz
+        run: npm publish --tag=${{ steps.package-tag.outputs.packageTag }} harperfast-harper-pro-*.tgz
 
   send-slack-message-on-success:
     if: success() && !cancelled()
