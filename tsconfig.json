@@ -2,6 +2,7 @@
 	"include": [
 		"replication/**/*",
 		"security/**/*",
+		"licensing/**/*",
 		"bin/**/*",
 		"core/bin/**/*",
 		"core/components/**/*",
