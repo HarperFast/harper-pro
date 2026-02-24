@@ -71,5 +71,8 @@
 	},
 	"dependencies": {
 		"harper": "./core"
+	},
+	"devDependencies": {
+		"@harperdb/code-guidelines": "^0.0.6"
 	}
 }
