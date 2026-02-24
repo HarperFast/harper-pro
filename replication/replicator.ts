@@ -40,9 +40,13 @@ import { ServerError } from '../core/utility/errors/hdbError.js';
 import { isMainThread } from 'worker_threads';
 import type { Database } from 'lmdb';
 import { getHostnamesFromCertificate } from '../core/security/keys.js';
-import './setNode.ts'; // allow this to register operations
-import './clusterStatus.ts';
 import { clearThisNodeName } from '../core/server/nodeName';
+
+// allow this to register operations
+import './setNode.ts';
+import './clusterStatus.ts';
+import '../security/keyService.ts';
+import '../security/sshKeyOperations.ts';
 
 let replicationDisabled;
 let nextId = 1; // for request ids
