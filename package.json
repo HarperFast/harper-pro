@@ -31,6 +31,7 @@
 	"files": [
 		"replication/",
 		"security/",
+		"licensing/",
 		"static/",
 		"core/",
 		"dist/",
