@@ -273,7 +273,6 @@ export async function removeNodeBack(req) {
 	//  delete the record
 	await hdbNodes.delete(req.name);
 }
-console.error('registering operations');
 
 function reverseSubscription(subscription) {
 	const { subscribe, publish } = subscription;
