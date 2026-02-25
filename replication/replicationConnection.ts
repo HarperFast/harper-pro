@@ -923,6 +923,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						};
 						const currentTransaction = { txnTime: 0 };
 						let subscribedNodeIds, tableById;
+						let excludedNodes: string[]; // list of nodes to exclude from this subscription
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
 						const sendAuditRecord = (auditRecord, localTime) => {
@@ -968,9 +969,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								if (encoder.typedStructs) encoder.lastTypedStructuresLength = encoder.typedStructs.length;
 							}
 							const timeRange = subscribedNodeIds[nodeId];
-							const isWithinSubscriptionRange =
+							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
+							// in the subscribedNodeIds list, than it matches the subscription
+							const matchesSubscription = excludedNodes && timeRange === undefined ||
+								// if it is in the list, we check the timestamps to verify it matches
 								timeRange && timeRange.startTime < localTime && (!timeRange.endTime || timeRange.endTime > localTime);
-							if (!isWithinSubscriptionRange) {
+							if (!matchesSubscription) {
 								if (DEBUG_MODE)
 									logger.trace?.(
 										connectionId,
@@ -1199,11 +1203,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								tableById = tableSubscriptionToReplicator.tableById.map(tableToTableEntry);
 								subscribedNodeIds = [];
 								let subscribedNodeName: string;
-								for (const { name, startTime, endTime } of nodeSubscriptions) {
+								for (const { name, startTime, endTime, excluded } of nodeSubscriptions) {
 									const localId = getIdOfRemoteNode(name, auditStore);
 									logger.debug?.('subscription to', name, 'using local id', localId, 'starting', startTime);
 									subscribedNodeIds[localId] = { startTime, endTime };
 									subscribedNodeName = name;
+									excludedNodes = excluded;
+									for (let node of excluded) {
+										const localId = getIdOfRemoteNode(node, auditStore);
+										subscribedNodeIds[localId] = false;
+									}
 								}
 
 								sendDBSchema(databaseName);
@@ -1342,7 +1351,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 											start: currentSequenceId || 1,
 											exclusiveStart: true,
 											exactStart: false, // TODO: This should be enabled if we are starting from a previous transaction log entry (vs a table copy)
-											log: subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName,
+											log: excludedNodes ? undefined : subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName,
+											excludeLogs: excludedNodes,
 											snapshot: false, // don't want to use a snapshot, and we want to see new entries
 										});
 									logger.error(
