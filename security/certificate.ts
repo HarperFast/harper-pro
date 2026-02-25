@@ -42,7 +42,7 @@ export async function signCertificate(req) {
 		let private_key;
 		let cert_auth;
 		const certificateTable = getCertTable();
-		const privateKeys = getPrivateKeys();
+		const privateKeys: Map<string, string> = getPrivateKeys();
 		// Search hdbCertificate for a non-HDB CA that also has a local private key
 		for await (const cert of certificateTable.search([])) {
 			if (cert.is_authority && !cert.details.issuer.includes('HarperDB-Certificate-Authority')) {
@@ -149,7 +149,7 @@ export async function getReplicationCert() {
 	const SNICallback = createTLSSelector('operations-api');
 	const secureTarget = {
 		secureContexts: null,
-		setSecureContext: (ctx) => {},
+		setSecureContext: () => {},
 	};
 	await SNICallback.initialize(secureTarget);
 	const cert = secureTarget.secureContexts.get(getThisNodeName());
@@ -232,7 +232,7 @@ async function addCertificate(req: AddCertificateRequest) {
 	// Track whether we found a matching key among existing keys, and which one.
 	let matchingKeyFound: boolean = false;
 	let existingPrivateKeyName: string | undefined;
-	const privateKeys: Map<any, any> = getPrivateKeys();
+	const privateKeys: Map<string, string> = getPrivateKeys();
 
 	if (private_key) {
 		// A key was provided — check if we already have it stored so we don't duplicate it.
