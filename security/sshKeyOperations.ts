@@ -91,7 +91,7 @@ async function addSSHKey(req: AddSSHKeyRequest): Promise<{ message: string; repl
 	if (validation) throw new ClientError(validation.message);
 
 	const { name, key, host, hostname, known_hosts } = req;
-	harperLogger.trace('adding ssh key', name);
+	harperLogger?.trace('adding ssh key', name);
 
 	const { filePath, configFile, knownHostsFile } = getSSHPaths(name);
 
@@ -178,7 +178,7 @@ async function getSSHKey(req: {
 		throw new ClientError(`SSH key '${name}' does not exist.`);
 	}
 
-	harperLogger.trace(`getting ssh key`, name, filePath);
+	harperLogger?.trace(`getting ssh key`, name, filePath);
 
 	const key = await readFile(filePath, 'utf8');
 	const result: { name: string; key: string; host?: string; hostname?: string } = { name, key };
@@ -206,7 +206,7 @@ async function updateSSHKey(req: { name: string; key: string }): Promise<{ messa
 	if (validation) throw new ClientError(validation.message);
 
 	const { name, key } = req;
-	harperLogger.trace(`updating ssh key`, name);
+	harperLogger?.trace(`updating ssh key`, name);
 
 	const { filePath } = getSSHPaths(name);
 	if (!(await exists(filePath))) {
@@ -234,7 +234,7 @@ async function deleteSSHKey(req: { name: string }): Promise<{ message: string; r
 	if (validation) throw new ClientError(validation.message);
 
 	const { name } = req;
-	harperLogger.trace(`deleting ssh key`, name);
+	harperLogger?.trace(`deleting ssh key`, name);
 
 	const { filePath, configFile } = getSSHPaths(name);
 	if (!(await exists(filePath))) {
@@ -325,7 +325,7 @@ async function setSSHKnownHosts(req: { known_hosts: string }): Promise<{ message
 	if (validation) throw new ClientError(validation.message);
 
 	const { known_hosts } = req;
-	harperLogger.trace(`setting ssh known hosts`);
+	harperLogger?.trace(`setting ssh known hosts`);
 
 	const { knownHostsFile } = getSSHPaths(undefined);
 	await writeFileEnsureDir(knownHostsFile, known_hosts);
@@ -344,7 +344,7 @@ async function setSSHKnownHosts(req: { known_hosts: string }): Promise<{ message
  * or `null` if the file does not exist.
  */
 async function getSSHKnownHosts(): Promise<{ known_hosts: string | null }> {
-	harperLogger.trace(`getting ssh known hosts`);
+	harperLogger?.trace(`getting ssh known hosts`);
 	const { knownHostsFile } = getSSHPaths(undefined);
 	if (!(await exists(knownHostsFile))) {
 		return { known_hosts: null };
