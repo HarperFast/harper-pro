@@ -83,11 +83,9 @@ export function initUsageLicensing(params: UsageLicensingInitParams) {
 			if (!response.headers?.set) {
 				(response as any).headers = new Headers(response.headers);
 			}
-			if (await isLicensed()) {
-				response.headers.set('Server', 'Harper Pro');
-			} else {
+			if (!await isLicensed()) {
 				response.headers.set(
-					'Server',
+					'X-License-Info',
 					'Unlicensed Harper Pro, this should only be used for educational and development purposes'
 				);
 			}
