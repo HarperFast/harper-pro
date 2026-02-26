@@ -14,6 +14,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        node-version: [24, 25]
+        platform:
+          - linux/amd64
+          - linux/arm64
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
@@ -41,6 +45,9 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: |
+            NODE_BUILD_VERSION=${{ matrix.node-version }}
+            NODE_VERSION=${{ matrix.node-version }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=harperfast/harper-pro,push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
@@ -51,7 +58,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          name: digest-node${{ matrix.node-version }}-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -59,14 +66,24 @@ jobs:
   merge:
     runs-on: ubuntu-latest
     needs: [build]
+    strategy:
+      matrix:
+        node-version: [24, 25]
     outputs:
       docker-image-tag: ${{ steps.meta.outputs.version }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: Dockerfile
+          sparse-checkout-cone-mode: false
+      - name: Get default Node version
+        id: default
+        run: echo "node-version=$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile)" >> "$GITHUB_OUTPUT"
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digest-*
+          pattern: digest-node${{ matrix.node-version }}-*
           merge-multiple: true
       - name: Setup Docker metadata
         id: meta
@@ -74,10 +91,14 @@ jobs:
         with:
           images: harperfast/harper-pro
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha
+            type=semver,pattern={{version}},enable=${{ matrix.node-version == steps.default.outputs.node-version }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.node-version == steps.default.outputs.node-version }}
+            type=semver,pattern={{major}},enable=${{ matrix.node-version == steps.default.outputs.node-version }}
+            type=sha,enable=${{ matrix.node-version == steps.default.outputs.node-version }}
+            type=semver,pattern={{version}},suffix=-node${{ matrix.node-version }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-node${{ matrix.node-version }}
+            type=semver,pattern={{major}},suffix=-node${{ matrix.node-version }}
+            type=sha,suffix=-node${{ matrix.node-version }}
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -90,7 +111,7 @@ jobs:
             $(printf 'harperfast/harper-pro@sha256:%s ' *)
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect harperfast/harper-pro:${{ steps.meta.outputs.version }}
+          docker buildx imagetools inspect harperfast/harper-pro:${{ steps.meta.outputs.version }}-node${{ matrix.node-version }}
 
   send-slack-message-on-success:
     if: success() && !cancelled()
