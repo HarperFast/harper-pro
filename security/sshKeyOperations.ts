@@ -86,7 +86,7 @@ interface AddSSHKeyRequest {
  * @param req.known_hosts - Optional known_hosts entries to append to the known_hosts file.
  * @returns An object containing a success message and optional replication results.
  */
-async function addSSHKey(req: AddSSHKeyRequest): Promise<{ message: string; replicated?: unknown[] }> {
+export async function addSSHKey(req: AddSSHKeyRequest): Promise<{ message: string; replicated?: unknown[] }> {
 	const validation = validateBySchema(req, addValidationSchema);
 	if (validation) throw new ClientError(validation.message);
 

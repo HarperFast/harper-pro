@@ -9,6 +9,7 @@ import {
 } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { readFileSync } from 'node:fs';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
@@ -71,6 +72,7 @@ suite('Clone Node', (ctx) => {
 		});
 		ctx.nodes.push(nodeCtx.harper);
 
+		// Create a table and insert some data to verify that it gets cloned properly
 		await sendOperation(nodeCtx.harper, {
 			operation: 'create_table',
 			table: 'test',
@@ -85,6 +87,23 @@ suite('Clone Node', (ctx) => {
 			operation: 'upsert',
 			table: 'test',
 			records: [{ id: '1', name: 'test-clone' }],
+		});
+
+		// Create authentication tokens to verify that they get cloned properly
+		await sendOperation(nodeCtx.harper, {
+			operation: 'create_authentication_tokens',
+			username: DEFAULT_ADMIN_USERNAME,
+			password: DEFAULT_ADMIN_PASSWORD
+		});
+
+		// Add an SSH key to verify that it gets cloned properly
+		await sendOperation(nodeCtx.harper, {
+			operation: 'add_ssh_key',
+			name: 'clonetestkey1',
+			key: 'clonerandom\nstring',
+			host: 'testkey1.gitlab.com',
+			hostname: 'gitlab.com',
+			known_hosts: 'gitlab.com fake1\ngitlab.com fake2',
 		});
 	});
 
@@ -147,5 +166,11 @@ suite('Clone Node', (ctx) => {
 		});
 		equal(responseData.length, 1, 'Should find 1 record in clone node');
 		equal(responseData[0].name, 'test-clone', 'Record name should match the original');
+
+		const sshKeys = await sendOperation(ctx.nodes[1], {
+			operation: 'list_ssh_keys',
+		});
+		equal(sshKeys.length, 1, 'Should find 1 SSH key in clone node');
+		equal(sshKeys[0].name, 'clonetestkey1', 'SSH key name should match the original');
 	});
 });
