@@ -29,7 +29,7 @@ async function sendOperation(node, operation) {
 	return responseData;
 }
 
-const NODE_COUNT = 3;
+const NODE_COUNT = 4;
 suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 	before(async () => {
 		// start up the nodes
@@ -152,7 +152,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			operation: 'upsert',
 			table: 'test',
 			records: [{ id: '1', name: 'test' }],
-			replicatedConfirmation: 2,
+			replicatedConfirmation: NODE_COUNT - 1,
 		});
 		console.log('sent upsert to node 1, waiting for replication to node 2 and 3...');
 		let response;
@@ -188,31 +188,26 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			operation: 'update',
 			table: 'test',
 			records: [{ id: '1', name: 'test2' }],
-			replicatedConfirmation: 2,
+			replicatedConfirmation: NODE_COUNT - 1,
 		});
-		let response = await sendOperation(ctx.nodes[0], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 1);
-		equal(response[0].name, 'test2');
-		response = await sendOperation(ctx.nodes[2], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 1);
-		equal(response[0].name, 'test2');
+		for (let i = 0; i < NODE_COUNT; i++)
+		{
+			let response = await sendOperation(ctx.nodes[0], {
+				operation: 'search_by_id',
+				table: 'test',
+				get_attributes: ['id', 'name'],
+				ids: ['1'],
+			});
+			equal(response.length, 1);
+			equal(response[0].name, 'test2');
+		}
 	});
 	test('replicate delete from node 3', async () => {
 		await sendOperation(ctx.nodes[2], {
 			operation: 'delete',
 			table: 'test',
 			ids: ['1'],
-			replicatedConfirmation: 2,
+			replicatedConfirmation: NODE_COUNT - 1,
 		});
 		let response = await sendOperation(ctx.nodes[0], {
 			operation: 'search_by_id',
