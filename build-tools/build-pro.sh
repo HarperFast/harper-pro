@@ -57,6 +57,8 @@ npm run build || true
 echo -e "\n📦 Creating shrinkwrap"
 npm shrinkwrap
 
+./build-tools/build-studio.sh
+
 echo -e "\n📦 Building package"
 npm pack
 
