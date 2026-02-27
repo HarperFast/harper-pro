@@ -9,7 +9,6 @@ import {
 } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { readFileSync } from 'node:fs';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
