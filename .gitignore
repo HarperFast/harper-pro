@@ -1,8 +1,12 @@
 node_modules/
 
 /dist/
+/studio/
+/studio-src/
 
 /package-lock.json
 /npm-shrinkwrap.json
 
 /harperfast-harper-pro-*.tgz
+
+.DS_Store
