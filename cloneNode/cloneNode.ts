@@ -25,7 +25,6 @@ import {
 	LICENSE_KEY_DIR_NAME,
 	JWT_ENUM
 } from '../core/utility/hdbTerms.ts';
-import {addSSHKey} from "../security/sshKeyOperations";
 
 /**
  * Environment Variables:
@@ -470,7 +469,7 @@ async function cloneSSHKeys() {
 	const { addSSHKey } = await import('../security/sshKeyOperations.js');
 	try {
 		const keys: Record<string, any> = await leaderRequest({ operation: 'list_ssh_keys' });
-		if (!keys?.length || keys.length === 0) {
+		if (!keys?.length) {
 			log('No SSH keys found on leader node to clone');
 			return;
 		}
@@ -497,7 +496,7 @@ async function cloneJWTKeys(): Promise<void> {
 
 	try {
 		log('Cloning JWT keys');
-		const keysDir: string = join(rootPath, LICENSE_KEY_DIR_NAME);
+		const keysDir = join(rootPath, LICENSE_KEY_DIR_NAME);
 
 		const jwtPublic: Record<string, any> = await leaderRequest({
 			operation: 'get_key',
