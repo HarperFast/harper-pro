@@ -104,6 +104,7 @@ type NodeSubscription = {
 	tables: string[];
 	startTime: number;
 	endTime: number;
+	excluded?: string[];
 };
 
 let replicationSecureContext: tls.SecureContext & { caCount?: number; derivedFromContext?: tls.SecureContext };
@@ -1208,10 +1209,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 									logger.debug?.('subscription to', name, 'using local id', localId, 'starting', startTime);
 									subscribedNodeIds[localId] = { startTime, endTime };
 									subscribedNodeName = name;
-									excludedNodes = excluded;
-									for (let node of excluded) {
-										const localId = getIdOfRemoteNode(node, auditStore);
-										subscribedNodeIds[localId] = false;
+									if (excluded) {
+										excludedNodes = excluded;
+										for (let node of excluded) {
+											const localId = getIdOfRemoteNode(node, auditStore);
+											subscribedNodeIds[localId] = false;
+										}
 									}
 								}
 
@@ -1806,6 +1809,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				startTime,
 				isLeader: node.isLeader,
 				endTime: node.endTime,
+				excluded: node.excluded, // excluded nodes passed from subscription manager
 			};
 		});
 
