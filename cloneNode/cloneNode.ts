@@ -21,7 +21,11 @@ import {
 	HDB_CONFIG_FILE,
 	DATABASES_DIR_NAME,
 	CONFIG_PARAM_MAP,
+	HARPER_CONFIG_FILE,
+	LICENSE_KEY_DIR_NAME,
+	JWT_ENUM
 } from '../core/utility/hdbTerms.ts';
+import {addSSHKey} from "../security/sshKeyOperations";
 
 /**
  * Environment Variables:
@@ -139,6 +143,8 @@ const syncTimeoutMs: number = Math.max(
 	parseInt(values['sync-timeout'] || process.env.CLONE_SYNC_TIMEOUT, 10) || DEFAULT_SYNC_TIMEOUT_MS
 );
 const replicationPort: string = values['replication-port'] || process.env.REPLICATION_PORT;
+const skipSSHKeys: boolean = values['skip-ssh-keys'] ?? process.env.CLONE_SKIP_SSH_KEYS === 'true';
+const skipJWTKeys: boolean = values['skip-jwt-keys'] ?? process.env.CLONE_SKIP_JWT_KEYS === 'true';
 const forceClone: boolean = values['force-clone'] ?? process.env.FORCE_CLONE === 'true';
 const allowSelfSigned: boolean = values['allow-self-signed'] ?? process.env.ALLOW_SELF_SIGNED === 'true';
 const nodeHostname: string = values['node-hostname'] || process.env.NODE_HOSTNAME || process.env.REPLICATION_HOSTNAME;
@@ -174,15 +180,27 @@ export async function cloneNode(): Promise<void> {
 		await leaderRequest({ operation: OPERATIONS_ENUM.GET_STATUS });
 	}
 
-	// Check to see if there is an existing harperdb-config.yaml to read additional config from
-	const hdbConfigPath: string = join(rootPath, HDB_CONFIG_FILE);
-	if (pathExists(hdbConfigPath)) {
+	// Check to see if there is an existing config file to read additional config from
+	const cfgPath: string = join(rootPath, HARPER_CONFIG_FILE);
+	const oldCfgPath: string = join(rootPath, HDB_CONFIG_FILE);
+	let harperConfigPath: string | undefined;
+	if (pathExists(cfgPath)) {
+		harperConfigPath = cfgPath;
+		log(`Existing config file found at ${cfgPath}, reading config from this file`);
+	} else if (pathExists(oldCfgPath)) {
+		harperConfigPath = oldCfgPath;
+		log(`Existing config file found at ${oldCfgPath}, reading config from this file`);
+	} else {
+		log('No existing config file found, starting with empty config');
+	}
+
+	if (harperConfigPath) {
 		try {
-			const yamlContent: string = readFileSync(hdbConfigPath, 'utf8');
+			const yamlContent: string = readFileSync(harperConfigPath, 'utf8');
 			const hdbConfigJson: Record<string, any> = yaml.parse(yamlContent);
 			hdbConfig = flattenConfig(hdbConfigJson);
 		} catch (err) {
-			log(`Error reading existing harperdb-config.yaml on clone: ${err}`, 'error');
+			log(`Error reading existing config file ${harperConfigPath} on clone: ${err}`, 'error');
 		}
 	}
 
@@ -259,9 +277,10 @@ export async function cloneNode(): Promise<void> {
 
 	// Not possible to clone JWT keys using operations API
 	if (!cloneUsingSetNode) {
-		// TODO will implement cloning JWT keys in upcoming PR
-		//await cloneJWTKeys();
+		await cloneJWTKeys();
 	}
+
+	await cloneSSHKeys();
 
 	// Monitor the synchronization status of the databases after cloning and update availability status once sync is complete
 	await monitorSync();
@@ -442,22 +461,24 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 	return mostRecent;
 }
 
-// TODO: Need to add SSH operation in upcoming PR
-/*async function cloneSSH() {
+/**
+ * Clones SSH keys from the leader node by requesting a list of keys and then fetching each key's data to add to this node.
+ */
+async function cloneSSHKeys() {
 	if (skipSSHKeys) return;
 
-	const { addSSHKey } = require('../../components/operations.js');
+	const { addSSHKey } = await import('../security/sshKeyOperations.js');
 	try {
-		const keys = await leaderReq({ operation: OPERATIONS_ENUM.LIST_SSH_KEYS });
-		if (!keys?.results?.length || keys.results.length === 0) {
-			logger.info?.('No SSH keys found on leader node to clone');
+		const keys: Record<string, any> = await leaderRequest({ operation: 'list_ssh_keys' });
+		if (!keys?.length || keys.length === 0) {
+			log('No SSH keys found on leader node to clone');
 			return;
 		}
 
-		for (const keyName of keys.results) {
-			logger.info?.('Cloning SSH key:', keyName.name);
-			const keyData = await leaderReq({
-				operation: OPERATIONS_ENUM.GET_SSH_KEY,
+		for (const keyName of keys) {
+			log('Cloning SSH key:', keyName.name);
+			const keyData: Record<string, any> = await leaderRequest({
+				operation: 'get_ssh_key',
 				name: keyName.name,
 			});
 
@@ -466,36 +487,39 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 	} catch (err) {
 		log(`Error cloning SSH keys: ${err}`, 'error');
 	}
-}*/
+}
 
-// TODO: Need to add JWT operation in upcoming PR
-/*async function cloneJWTKeys(): Promise<void> {
+/**
+ * Clones JWT keys from the leader node by requesting each key's data and writing it to the local file system.
+ */
+async function cloneJWTKeys(): Promise<void> {
 	if (skipJWTKeys) return;
 
 	try {
 		log('Cloning JWT keys');
-		const keysDir = join(rootPath, LICENSE_KEY_DIR_NAME);
-		const jwtPublic = await leaderRequest({
-			operation: OPERATIONS_ENUM.GET_KEY,
+		const keysDir: string = join(rootPath, LICENSE_KEY_DIR_NAME);
+
+		const jwtPublic: Record<string, any> = await leaderRequest({
+			operation: 'get_key',
 			name: '.jwtPublic',
 		});
 		writeFileSync(join(keysDir, JWT_ENUM.JWT_PUBLIC_KEY_NAME), jwtPublic.message);
 
-		const jwtPrivate = await leaderRequest({
-			operation: OPERATIONS_ENUM.GET_KEY,
+		const jwtPrivate: Record<string, any> = await leaderRequest({
+			operation: 'get_key',
 			name: '.jwtPrivate',
 		});
 		writeFileSync(join(keysDir, JWT_ENUM.JWT_PRIVATE_KEY_NAME), jwtPrivate.message);
 
-		const jwtPass = await leaderRequest({
-			operation: OPERATIONS_ENUM.GET_KEY,
+		const jwtPass: Record<string, any> = await leaderRequest({
+			operation: 'get_key',
 			name: '.jwtPass',
 		});
 		writeFileSync(join(keysDir, JWT_ENUM.JWT_PASSPHRASE_NAME), jwtPass.message);
 	} catch (err) {
 		log(`Error cloning JWT keys: ${err}`, 'error');
 	}
-}*/
+}
 
 async function cloneConfig(): Promise<void> {
 	log('Cloning config from leader');
@@ -555,7 +579,7 @@ async function cloneConfig(): Promise<void> {
  * Send a request to the leader node for the given operation, using either WebSockets or HTTP based on the useWS flag
  * @param operation
  */
-async function leaderRequest(operation: { operation: string }): Promise<Record<string, any>> {
+async function leaderRequest(operation: { operation: string; [key: string]: any }): Promise<Record<string, any>> {
 	if (!cloneUsingSetNode) {
 		// Dynamically importing the replicator module because it was causing early import of rootpath var on
 		// install before it was initialized.
