@@ -34,7 +34,7 @@ import {
 	getNodeURL,
 } from './knownNodes.ts';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import { exportIdMapping } from './nodeIdMapping.ts';
+import { exportIdMapping, getIdOfRemoteNode } from './nodeIdMapping.ts';
 import * as tls from 'node:tls';
 import { ServerError } from '../core/utility/errors/hdbError.js';
 import { isMainThread } from 'worker_threads';
@@ -580,6 +580,7 @@ export function getThisNodeId(auditStore: any) {
 server.replication = {
 	getThisNodeId,
 	exportIdMapping,
+	getIdOfRemoteNode
 };
 export function urlToNodeName(nodeUrl) {
 	if (nodeUrl) return new URL(nodeUrl).hostname; // this the part of the URL that is the node name, as we want it to match common name in the certificate
