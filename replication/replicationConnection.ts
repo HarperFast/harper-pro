@@ -438,22 +438,43 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	let subscriptionRequest, auditSubscription;
 	let nodeSubscriptions;
 	let remoteShortIdToLocalId: Map<number, number>;
-	ws.on('message', onWSMessageWhenAuthorized);
-	// handle messages that we receive before authorization is complete/resolved
-	async function onWSMessageWhenAuthorized(body: Buffer) {
-		authorization = await authorization;
+	ws.on('message', onWSMessage);
+	let authorizationFinished = false;
+	function checkAuthorization(): boolean {
+		authorizationFinished = true;
 		if (!authorization) {
 			logger.error?.(connectionId, 'No authorization provided');
 			// don't send disconnect because we want the client to potentially retry
 			close(1008, 'Unauthorized');
-			return;
+			return false;
 		}
-		onWSMessage(body);
-		// once resolved, we can skip this whole function and go directly to the message handler
-		ws.off('message', onWSMessageWhenAuthorized);
-		ws.on('message', onWSMessage);
+		return true;
 	}
 	function onWSMessage(body: Buffer) {
+		if (!authorizationFinished) {
+			if (authorization?.then) {
+				return authorization.then(
+					(resolvedAuth) => {
+						authorization = resolvedAuth;
+						if (checkAuthorization()) {
+							onWSMessage(body); // continue on, now that authorization succeeded
+						}
+					},
+					(error) => {
+						authorizationFinished = true;
+						logger.error?.(connectionId, 'Authorization failed', error);
+						// don't send disconnect because we want the client to potentially retry
+						close(1008, 'Unauthorized');
+					}
+				);
+			} else {
+				if (checkAuthorization()) {
+					onWSMessage(body); // continue on, now that authorization succeeded
+				}
+			}
+			return; // we recursively call onWSMessage if authorization succeeded/completed
+		}
+		if (!authorization) return;
 		// A replication header should begin with either a transaction timestamp or messagepack message of
 		// of an array that begins with the command code
 		lastMessageTime = performance.now();
@@ -1201,6 +1222,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								let subscribedNodeName: string;
 								for (const { name, startTime, endTime } of nodeSubscriptions) {
 									const localId = getIdOfRemoteNode(name, auditStore);
+									auditStore.ensureLogExists(name);
 									logger.debug?.('subscription to', name, 'using local id', localId, 'starting', startTime);
 									subscribedNodeIds[localId] = { startTime, endTime };
 									subscribedNodeName = name;
