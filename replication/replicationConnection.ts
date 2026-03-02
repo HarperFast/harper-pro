@@ -1373,7 +1373,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 											currentSequenceId = lastSequenceId;
 										}
 									}
-									logger.error('getting audit log iterator', databaseName, remoteNodeName, currentSequenceId);
 									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 									auditLogIterable =
 										(auditStore.reusableIterable && auditLogIterable) ??
@@ -1386,12 +1385,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 											excludeLogs: excludedNodes,
 											snapshot: false, // don't want to use a snapshot, and we want to see new entries
 										});
-									logger.error(
-										'iterating audit log',
-										subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName,
-										databaseName,
-										remoteNodeName
-									);
 									for (const auditRecord of auditLogIterable) {
 										const key: number = auditRecord.localTime ?? auditRecord.version;
 										if (closed) return;
