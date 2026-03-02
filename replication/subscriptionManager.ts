@@ -100,13 +100,6 @@ export async function startOnMainThread(options) {
 			}
 		}
 		if (getHDBNodeTable().primaryStore.get(thisName)) ensureThisNode(); // if this node record already exists, check for config changes
-
-		// Pre-populate nodeMap with all nodes before calling onNodeUpdate, so excluded list can be built correctly
-		for (const node of nodes) {
-			if (node.name && node.name !== thisName) {
-				nodeMap.set(node.name, node);
-			}
-		}
 		for (const route of iterateRoutes(options)) {
 			try {
 				const replicateAll = !route.subscriptions;
@@ -118,24 +111,12 @@ export async function startOnMainThread(options) {
 				}
 				routes.push(route);
 				if (nodes.find((node) => node.name === route.name)) continue;
-				// Pre-populate nodeMap with route nodes
-				if (route.name) {
-					nodeMap.set(route.name, route);
-				}
+				// just tentatively add this node to the list of nodes in memory
+				onNodeUpdate(route);
 			} catch (error) {
 				console.error(error);
 			}
 		}
-
-		// Now call onNodeUpdate for all nodes - nodeMap is complete so excluded lists will be correct
-		for (const node of nodes) {
-			onNodeUpdate(node);
-		}
-		for (const route of iterateRoutes(options)) {
-			if (nodes.find((node) => node.name === route.name)) continue;
-			onNodeUpdate(route);
-		}
-
 		subscribeToNodeUpdates(onNodeUpdate);
 	});
 	let isFullyReplicating;
@@ -233,18 +214,7 @@ export async function startOnMainThread(options) {
 			logger.trace('Setting up replication for database', databaseName, 'on node', node.name);
 			const existingEntry = dbReplicationWorkers.get(databaseName);
 			let worker;
-
-			// Build excluded nodes list - all other nodes we will be/are subscribing to for this database
-			const excluded: string[] = [];
-			for (const [otherNodeName, otherNode] of nodeMap) {
-				if (otherNodeName === node.name) continue; // skip the current node
-				// Check if we should replicate to this other node for this database
-				if (shouldReplicateToNode(otherNode, databaseName)) {
-					excluded.push(otherNodeName);
-				}
-			}
-
-			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node, excluded: excluded.length > 0 ? excluded : undefined }];
+			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node }];
 			// Self catchup is done in case we have replicated any records that weren't actually written to our storage
 			// before a crash.
 			if (selfCatchupOfDatabase.has(databaseName) && env.get(CONFIG_PARAMS.REPLICATION_FAILOVER)) {
