@@ -869,6 +869,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						// permission check to make sure that this node is allowed to subscribe to this database, that is that
 						// we have publish permission for this node/database
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
+						let sentNodeIds = new Set<number>();
 						let closed = false;
 						if (tableSubscriptionToReplicator) {
 							if (databaseName !== tableSubscriptionToReplicator.databaseName && !tableSubscriptionToReplicator.then) {
@@ -1091,6 +1092,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								}
 								return new Promise(setImmediate); // we still need to yield (otherwise we might never send a sequence id update)
 							}
+							if (!sentNodeIds.has(auditRecord.nodeId)) {
+								sentNodeIds.add(auditRecord.nodeId)
+								// If this is a nodeId that we have not sent yet, send a message to the remote node with the node id
+								// mapping, indicating how each node name is mapped to a short id
+								// and a list of the node names that are subscribed to this node
+								ws.send(
+									encode([
+										NODE_NAME_TO_ID_MAP,
+										exportIdMapping(tableSubscriptionToReplicator.auditStore),
+										nodeSubscriptions.map(({ name }) => name),
+									])
+								);
+							}
 
 							const typedStructs = encoder.typedStructs;
 							const structures = encoder.structures;
@@ -1227,7 +1241,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								let subscribedNodeName: string;
 								for (const { name, startTime, endTime, excluded } of nodeSubscriptions) {
 									const localId = getIdOfRemoteNode(name, auditStore);
-									auditStore.ensureLogExists(name);
 									logger.debug?.('subscription to', name, 'using local id', localId, 'starting', startTime);
 									subscribedNodeIds[localId] = { startTime, endTime };
 									subscribedNodeName = name;
@@ -1261,15 +1274,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 										dbRemovalListener?.remove();
 									});
 								}
-								// Send a message to the remote node with the node id mapping, indicating how each node name is mapped to a short id
-								// and a list of the node names that are subscribed to this node
-								ws.send(
-									encode([
-										NODE_NAME_TO_ID_MAP,
-										exportIdMapping(tableSubscriptionToReplicator.auditStore),
-										nodeSubscriptions.map(({ name }) => name),
-									])
-								);
 
 								let isFirst = true;
 								do {
@@ -1370,13 +1374,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 										}
 									}
 									logger.error('getting audit log iterator', databaseName, remoteNodeName, currentSequenceId);
+									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 									auditLogIterable =
 										(auditStore.reusableIterable && auditLogIterable) ??
 										auditStore.getRange({
 											start: currentSequenceId || 1,
 											exclusiveStart: true,
 											exactStart: false, // TODO: This should be enabled if we are starting from a previous transaction log entry (vs a table copy)
-											log: excludedNodes ? undefined : subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName,
+											log: excludedNodes ? undefined : logName,
+											startByLog: new Map([[logName, currentSequenceId || 1]]),
 											excludeLogs: excludedNodes,
 											snapshot: false, // don't want to use a snapshot, and we want to see new entries
 										});
@@ -1563,8 +1569,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							lastSequenceIdCommitted = null;
 						}, COMMITTED_UPDATE_DELAY);
 					}
-					lastSequenceIdCommitted = sequenceIdReceived;
-					logger.debug?.('last sequence committed', new Date(sequenceIdReceived), databaseName);
+					if (sequenceIdReceived) {
+						lastSequenceIdCommitted = sequenceIdReceived;
+					}
+					logger.debug?.('last sequence committed', new Date(lastSequenceIdCommitted), databaseName);
 				},
 			});
 		} catch (error) {
@@ -1776,6 +1784,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 			}
 
 			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
+			auditStore.ensureLogExists(node.name);
 			const sequenceEntry = tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('seq'), nodeId]) ?? 1;
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
@@ -1831,9 +1840,39 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				startTime,
 				isLeader: node.isLeader,
 				endTime: node.endTime,
-				excluded: node.excluded, // excluded nodes passed from subscription manager
 			};
 		});
+
+		// Build excluded nodes list for each subscription - should include all other qualified nodes we're subscribing to
+		if (nodeSubscriptions) {
+			const hdbNodesTable = getHDBNodeTable();
+			const thisNodeName = getThisNodeName();
+			const allQualifiedNodes: string[] = [];
+
+			// Collect all qualified nodes from hdb_nodes table
+			for (const hdbNode of hdbNodesTable.search([])) {
+				if (hdbNode.name && hdbNode.name !== thisNodeName) {
+					// Check if this node qualifies for replication to this database
+					const qualifies =
+						(hdbNode.replicates === true || hdbNode.replicates?.sends) ||
+						hdbNode.subscriptions?.some(
+							(sub) => (sub.database || sub.schema) === databaseName && sub.subscribe !== false
+						);
+					if (qualifies) {
+						allQualifiedNodes.push(hdbNode.name);
+					}
+				}
+			}
+
+			// Set excluded list for each subscription (all other qualified nodes except itself)
+			for (const subscription of nodeSubscriptions) {
+				const excluded = allQualifiedNodes.filter((nodeName) => nodeName !== subscription.name);
+				if (excluded.length > 0) {
+					// TODO: Reenable this
+				//	subscription.excluded = excluded;
+				}
+			}
+		}
 
 		if (nodeSubscriptions) {
 			logger.debug?.(
