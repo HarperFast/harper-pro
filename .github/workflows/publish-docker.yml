@@ -111,7 +111,7 @@ jobs:
             $(printf 'harperfast/harper-pro@sha256:%s ' *)
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect harperfast/harper-pro:${{ steps.meta.outputs.version }}-node${{ matrix.node-version }}
+          docker buildx imagetools inspect harperfast/harper-pro:${{ steps.meta.outputs.version }}
 
   send-slack-message-on-success:
     if: success() && !cancelled()
