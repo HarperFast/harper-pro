@@ -21,7 +21,6 @@
 		"core/index.d.ts",
 		"core/index.js"
 	],
-  	"extends": "@harperdb/code-guidelines/tsconfig.node.json",
 	"compilerOptions": {
 		// Allow JS files for mixed codebase
 		"allowJs": true,
