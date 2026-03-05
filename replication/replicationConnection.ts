@@ -78,7 +78,7 @@ export const BACK_PRESSURE_RATIO_POSITION = 6;
 export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
 
-const MAX_PAYLOAD = 100_000_000;
+const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
 
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
@@ -334,6 +334,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	let databaseName = options.database;
 	const dbSubscriptions = options.databaseSubscriptions || databaseSubscriptions;
 	let auditStore: any;
+	let auditLogIterable: Iterable<AuditRecord>; // reusable iterator for a subscription
 	let replicationSharedStatus: Float64Array;
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
@@ -1286,7 +1287,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 										logger.warn?.('Invalid sequence id ' + currentSequenceId);
 										close(1008, 'Invalid sequence id' + currentSequenceId);
 									}
-									let auditLogIterable: Iterable<AuditRecord>;
 									if (isFirst && !closed) {
 										isFirst = false;
 										if (currentSequenceId === 0) {
@@ -1841,7 +1841,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		if (nodeSubscriptions) {
 			const hdbNodesTable = getHDBNodeTable();
 			const thisNodeName = getThisNodeName();
-			const allQualifiedNodes: string[] = [];
+			const allQualifiedNodes: string[] = [thisNodeName];
 
 			// Collect all qualified nodes from hdb_nodes table
 			for (const hdbNode of hdbNodesTable.search([])) {
@@ -1862,8 +1862,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 			for (const subscription of nodeSubscriptions) {
 				const excluded = allQualifiedNodes.filter((nodeName) => nodeName !== subscription.name);
 				if (excluded.length > 0) {
-					// TODO: Reenable this
-				//	subscription.excluded = excluded;
+					subscription.excluded = excluded;
 				}
 			}
 		}
