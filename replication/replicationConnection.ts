@@ -439,6 +439,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	let replicationPaused = false;
 	let subscriptionRequest, auditSubscription;
 	let nodeSubscriptions;
+	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	let remoteShortIdToLocalId: Map<number, number>;
 	ws.on('message', onWSMessage);
 	let authorizationFinished = false;
@@ -867,6 +868,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					}
 					case SUBSCRIPTION_REQUEST: {
 						nodeSubscriptions = data;
+						excludedNodes = message[2]; // use the third argument for exclusion list
 						// permission check to make sure that this node is allowed to subscribe to this database, that is that
 						// we have publish permission for this node/database
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
@@ -947,7 +949,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						};
 						const currentTransaction = { txnTime: 0 };
 						let subscribedNodeIds, tableById;
-						let excludedNodes: string[]; // list of nodes to exclude from this subscription
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
 						const sendAuditRecord = (auditRecord, localTime) => {
@@ -1232,6 +1233,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						for (const { startTime } of nodeSubscriptions) {
 							if (startTime < currentSequenceId) currentSequenceId = startTime;
 						}
+
 						// wait for internal subscription, might be waiting for a table to be registered
 						(whenSubscribedToHdbNodes || Promise.resolve())
 							.then(async () => {
@@ -1239,20 +1241,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								auditStore = tableSubscriptionToReplicator.auditStore;
 								tableById = tableSubscriptionToReplicator.tableById.map(tableToTableEntry);
 								subscribedNodeIds = [];
+								if (excludedNodes) {
+									for (let node of excludedNodes) {
+										const localId = getIdOfRemoteNode(node, auditStore);
+										subscribedNodeIds[localId] = false;
+									}
+								}
 								let subscribedNodeName: string;
-								for (const { name, startTime, endTime, excluded } of nodeSubscriptions) {
+								for (const { name, startTime, endTime } of nodeSubscriptions) {
 									const localId = getIdOfRemoteNode(name, auditStore);
 									auditStore.ensureLogExists(name);
 									logger.debug?.('subscription to', name, 'using local id', localId, 'starting', startTime);
 									subscribedNodeIds[localId] = { startTime, endTime };
 									subscribedNodeName = name;
-									if (excluded) {
-										excludedNodes = excluded;
-										for (let node of excluded) {
-											const localId = getIdOfRemoteNode(node, auditStore);
-											subscribedNodeIds[localId] = false;
-										}
-									}
 								}
 
 								sendDBSchema(databaseName);
@@ -1836,12 +1837,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				endTime: node.endTime,
 			};
 		});
-
+		let excluded: string[];
 		// Build excluded nodes list for each subscription - should include all other qualified nodes we're subscribing to
 		if (nodeSubscriptions) {
 			const hdbNodesTable = getHDBNodeTable();
 			const thisNodeName = getThisNodeName();
-			const allQualifiedNodes: string[] = [thisNodeName];
+			const allDirectlySubscribedNodes: string[] = [thisNodeName];
 
 			// Collect all qualified nodes from hdb_nodes table
 			for (const hdbNode of hdbNodesTable.search([])) {
@@ -1853,18 +1854,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							(sub) => (sub.database || sub.schema) === databaseName && sub.subscribe !== false
 						);
 					if (qualifies) {
-						allQualifiedNodes.push(hdbNode.name);
+						allDirectlySubscribedNodes.push(hdbNode.name);
 					}
 				}
 			}
 
 			// Set excluded list for each subscription (all other qualified nodes except itself)
-			for (const subscription of nodeSubscriptions) {
-				const excluded = allQualifiedNodes.filter((nodeName) => nodeName !== subscription.name);
-				if (excluded.length > 0) {
-					subscription.excluded = excluded;
-				}
-			}
+			excluded = allDirectlySubscribedNodes.filter((nodeName) => !nodeSubscriptions.some((subscription) => nodeName === subscription.name));
 		}
 
 		if (nodeSubscriptions) {
@@ -1875,7 +1871,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				tableSubscriptionToReplicator?.dbisDB?.path
 			);
 			clearTimeout(delayedClose);
-			if (nodeSubscriptions.length > 0) ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions]));
+			if (nodeSubscriptions.length > 0) ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded]));
 			else {
 				// no nodes means we are unsubscribing/disconnecting
 				// don't immediately close the connection, but wait a bit to see if we get any messages, since opening new connections is a bit expensive
