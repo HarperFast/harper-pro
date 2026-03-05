@@ -68,6 +68,7 @@ const SEQUENCE_ID_UPDATE = 143;
 const COMMITTED_UPDATE = 144;
 const DB_SCHEMA = 145;
 const BLOB_CHUNK = 146;
+const SUBSCRIPTION_UPDATE = 147;
 export const CONFIRMATION_STATUS_POSITION = 0;
 export const RECEIVED_VERSION_POSITION = 1;
 export const RECEIVED_TIME_POSITION = 2;
@@ -441,6 +442,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	let remoteShortIdToLocalId: Map<number, number>;
+	let subscribedNodeIds; // map of node IDs to their subscription time ranges
 	ws.on('message', onWSMessage);
 	let authorizationFinished = false;
 	function checkAuthorization(): boolean {
@@ -866,6 +868,48 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						awaitingResponse.delete(message[1]);
 						break;
 					}
+					case SUBSCRIPTION_UPDATE: {
+						// Handle dynamic updates to subscription exclusion list
+						const nodesToExclude = data?.excludeNodes || [];
+						const nodesToInclude = data?.includeNodes || [];
+
+						logger.debug?.(connectionId, 'received subscription update, excluding:', nodesToExclude, 'including:', nodesToInclude);
+
+						if (!excludedNodes) excludedNodes = [];
+
+						// Add new excluded nodes (remove their logs from the iterator)
+						for (const nodeName of nodesToExclude) {
+							if (!excludedNodes.includes(nodeName)) {
+								excludedNodes.push(nodeName);
+								// Update the subscribedNodeIds to mark this node as excluded
+								if (auditStore && subscribedNodeIds) {
+									const localId = getIdOfRemoteNode(nodeName, auditStore);
+									subscribedNodeIds[localId] = false;
+								}
+								// Remove this log from the iterator
+								auditLogIterable?.removeLog(nodeName);
+								logger.debug?.(connectionId, 'removed log from iterator:', nodeName);
+							}
+						}
+
+						// Remove nodes from exclusion list (add their logs to the iterator)
+						for (const nodeName of nodesToInclude) {
+							const index = excludedNodes.indexOf(nodeName);
+							if (index !== -1) {
+								excludedNodes.splice(index, 1);
+								// Update the subscribedNodeIds to remove the exclusion
+								if (auditStore && subscribedNodeIds) {
+									const localId = getIdOfRemoteNode(nodeName, auditStore);
+									delete subscribedNodeIds[localId];
+								}
+								// Add this log back to the iterator
+								auditLogIterable?.addLog(nodeName);
+								logger.debug?.(connectionId, 'added log to iterator:', nodeName);
+							}
+						}
+
+						break;
+					}
 					case SUBSCRIPTION_REQUEST: {
 						nodeSubscriptions = data;
 						excludedNodes = message[2]; // use the third argument for exclusion list
@@ -948,7 +992,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							}
 						};
 						const currentTransaction = { txnTime: 0 };
-						let subscribedNodeIds, tableById;
+						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
 						const sendAuditRecord = (auditRecord, localTime) => {
@@ -993,7 +1037,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								encoder._mergeStructures(encoder.getStructures());
 								if (encoder.typedStructs) encoder.lastTypedStructuresLength = encoder.typedStructs.length;
 							}
-							const timeRange = subscribedNodeIds[nodeId];
+							const timeRange = subscribedNodeIds?.[nodeId];
 							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
 							// in the subscribedNodeIds list, than it matches the subscription
 							const matchesSubscription = excludedNodes && timeRange === undefined ||
@@ -1602,6 +1646,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		clearInterval(blobsTimer);
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
+		if (hdbNodesSubscription) hdbNodesSubscription.end();
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
@@ -1724,12 +1769,61 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		}
 		return localBlob;
 	}
+	let hdbNodesSubscription;
+	let lastSentExcludedNodes: string[] = [];
 	function sendSubscriptionRequestUpdate() {
 		// once we have received the node name, and we know the database name that this connection is for,
 		// we can send a subscription request, if no other threads have subscribed.
 		if (!subscribed) {
 			subscribed = true;
 			options.connection?.on('subscriptions-updated', sendSubscriptionRequestUpdate);
+
+			// Subscribe to hdbNodesTable changes to dynamically update excluded nodes
+			if (options.connection) {
+				getHDBNodeTable().subscribe({}).then(async (subscription) => {
+					hdbNodesSubscription = subscription;
+					for await (const event of subscription) {
+						if (event.type === 'delete') {
+							// Node was removed, no action needed on excluded list
+							continue;
+						}
+
+						const node = event.value;
+						const nodeName = event.id;
+						const thisNodeName = getThisNodeName();
+
+						if (nodeName === thisNodeName || !nodeName) continue;
+
+						// Check if this node qualifies for replication
+						const qualifies =
+							(node?.replicates === true || node?.replicates?.sends) ||
+							node?.subscriptions?.some(
+								(sub) => (sub.database || sub.schema) === databaseName && sub.subscribe !== false
+							);
+
+						// Get current state of excluded nodes based on last sent list
+						const currentlyExcluded = lastSentExcludedNodes.includes(nodeName);
+
+						// Determine if we should exclude this node
+						const shouldExclude = qualifies && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName);
+
+						if (shouldExclude && !currentlyExcluded) {
+							// Need to add to excluded list (exclude this node's log)
+							logger.debug?.(connectionId, 'sending subscription update to exclude node:', nodeName);
+							ws.send(encode([SUBSCRIPTION_UPDATE, { excludeNodes: [nodeName] }]));
+							lastSentExcludedNodes.push(nodeName);
+						} else if (!shouldExclude && currentlyExcluded) {
+							// Need to remove from excluded list (include this node's log)
+							logger.debug?.(connectionId, 'sending subscription update to include node:', nodeName);
+							ws.send(encode([SUBSCRIPTION_UPDATE, { includeNodes: [nodeName] }]));
+							const index = lastSentExcludedNodes.indexOf(nodeName);
+							if (index !== -1) lastSentExcludedNodes.splice(index, 1);
+						}
+					}
+				}).catch((error) => {
+					logger.error?.(connectionId, 'Error subscribing to hdb_nodes for dynamic exclusion updates:', error);
+				});
+			}
 		}
 		if (!auditStore && tableSubscriptionToReplicator) auditStore = tableSubscriptionToReplicator.auditStore;
 		if (options.connection?.isFinished)
@@ -1871,7 +1965,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				tableSubscriptionToReplicator?.dbisDB?.path
 			);
 			clearTimeout(delayedClose);
-			if (nodeSubscriptions.length > 0) ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded]));
+			if (nodeSubscriptions.length > 0) {
+				ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded]));
+				// Track the excluded list we just sent
+				lastSentExcludedNodes = excluded ? [...excluded] : [];
+			}
 			else {
 				// no nodes means we are unsubscribing/disconnecting
 				// don't immediately close the connection, but wait a bit to see if we get any messages, since opening new connections is a bit expensive
