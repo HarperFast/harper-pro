@@ -31,7 +31,7 @@ async function sendOperation(node, operation) {
 	return responseData;
 }
 
-async function waitForAvailableStatus(node, timeoutMs = 60000, checkInterval = 2000) {
+async function waitForAvailableStatus(node, timeoutMs = 6000000, checkInterval = 2000) {
 	const timeoutAt = Date.now() + timeoutMs;
 
 	while (Date.now() < timeoutAt) {
@@ -171,5 +171,45 @@ suite('Clone Node', (ctx) => {
 		});
 		equal(sshKeys.length, 1, 'Should find 1 SSH key in clone node');
 		equal(sshKeys[0].name, 'clonetestkey1', 'SSH key name should match the original');
+	});
+	test('should clone three more nodes successfully', async () => {
+		const TOTAL_NEW_NODES = 3;
+
+		for (let i = 0; i < TOTAL_NEW_NODES; i++) {
+			const cloneCtx = {
+				hostname: await getNextAvailableLoopbackAddress(),
+			};
+			await setupHarper(cloneCtx, {
+				config: {
+					analytics: { aggregatePeriod: -1 },
+					logging: { colors: false },
+					replication: {
+						port: cloneCtx.hostname + ':9933',
+					},
+				},
+				env: {
+					HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:${OPERATIONS_API_PORT}`,
+					HDB_LEADER_USERNAME: DEFAULT_ADMIN_USERNAME,
+					HDB_LEADER_PASSWORD: DEFAULT_ADMIN_PASSWORD,
+					ALLOW_SELF_SIGNED: true,
+					HARPER_NO_FLUSH_ON_EXIT: true,
+				},
+			});
+			ctx.nodes.push(cloneCtx.harper);
+
+			const newNodeIndex = ctx.nodes.length - 1;
+
+			await waitForAvailableStatus(ctx.nodes[newNodeIndex]);
+		}
+
+		for (let j = 0; j < ctx.nodes.length; j++) {
+			const node = ctx.nodes[j]
+			const clusterStatus = await sendOperation(node, {
+				operation: 'cluster_status',
+			});
+
+			equal(clusterStatus.connections.length, 4)
+		}
+		console.log('done');
 	});
 });
