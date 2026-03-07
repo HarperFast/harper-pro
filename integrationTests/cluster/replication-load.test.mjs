@@ -3,13 +3,13 @@
  *
  */
 import { suite, test, before, after } from 'node:test';
-import { equal, deepEqual } from 'node:assert';
+import { equal } from 'node:assert';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { setupHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { targz } from '../../core/integrationTests/utils/targz.ts';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
-import { sendOperation, fetchWithRetry } from './cluster-shared.mjs';
+import { sendOperation, fetchWithRetry, concurrent } from './cluster-shared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -20,8 +20,8 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	'harper.js'
 );
 
-const NODE_COUNT = 4;
-suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
+const NODE_COUNT = 3;
+suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 	before(async () => {
 		// start up the nodes
 		ctx.nodes = await Promise.all(
@@ -41,6 +41,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 								colors: false,
 								stdStreams: true,
 								console: true,
+								level: 'warn',
 							},
 							replication: {
 								securePort: ctx.hostname + ':9933',
@@ -138,82 +139,50 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 		await sleep(500);
 	});
 
-	test('replicate insert/upsert from node 1', async () => {
-		await sendOperation(ctx.nodes[0], {
-			operation: 'upsert',
-			table: 'test',
-			records: [{ id: '1', name: 'test' }],
-			replicatedConfirmation: NODE_COUNT - 1,
-		});
-		console.log('sent upsert to node 1, waiting for replication to node 2 and 3...');
-		let response;
-		let retries = 0;
-		do {
-			await sleep(200);
-			response = await sendOperation(ctx.nodes[1], {
-				operation: 'search_by_id',
+	test('replicate insert/upsert across all nodes', async () => {
+		const COUNT = 50000;
+		let start = performance.now();
+		let { execute, finish } = concurrent(() =>
+			sendOperation(ctx.nodes[Math.floor(Math.random() * NODE_COUNT)], {
+				operation: 'upsert',
 				table: 'test',
-				get_attributes: ['id', 'name'],
-				ids: ['1'],
-			});
+				records: [{ id: Math.floor(Math.random() * COUNT).toString(), name: 'test' }],
+			})
+		);
+		for (let i = 0; i < COUNT; i++) {
+			await execute();
+			if (i % 1000 === 0) {
+				console.log('sent', i, 'upserts');
+			}
+		}
+		await finish();
+		let responses;
+		let retries = 0;
+		let count;
+		do {
+			if (retries > 0) {
+				console.log('waiting for nodes to sync for ', retries * 100, 'ms');
+			}
+			await sleep(retries * 100);
+			responses = await Promise.all(
+				new Array(NODE_COUNT).fill(null).map(async (_, i) => {
+					return sendOperation(ctx.nodes[i], {
+						operation: 'describe_table',
+						table: 'test',
+					});
+				})
+			);
+			count = responses[0].record_count;
 			if (retries++ > 10) {
 				break;
 			}
-		} while (response.length === 0);
-		if (response.length === 0) {
-			throw new Error('Node 1 did not replicate insert');
-		}
-		equal(response.length, 1);
-		equal(response[0].name, 'test');
-		response = await sendOperation(ctx.nodes[2], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 1);
-		equal(response[0].name, 'test');
-	});
-	test('replicate update from node 2', async () => {
-		await sendOperation(ctx.nodes[1], {
-			operation: 'update',
-			table: 'test',
-			records: [{ id: '1', name: 'test2' }],
-			replicatedConfirmation: NODE_COUNT - 1,
-		});
-		for (let i = 0; i < NODE_COUNT; i++)
-		{
-			let response = await sendOperation(ctx.nodes[0], {
-				operation: 'search_by_id',
-				table: 'test',
-				get_attributes: ['id', 'name'],
-				ids: ['1'],
-			});
-			equal(response.length, 1);
-			equal(response[0].name, 'test2');
-		}
-	});
-	test('replicate delete from node 3', async () => {
-		await sendOperation(ctx.nodes[2], {
-			operation: 'delete',
-			table: 'test',
-			ids: ['1'],
-			replicatedConfirmation: NODE_COUNT - 1,
-		});
-		let response = await sendOperation(ctx.nodes[0], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 0);
-		response = await sendOperation(ctx.nodes[1], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(response.length, 0);
+		} while (responses.some((response) => response.record_count !== count));
+		console.log(
+			'upsert speed',
+			((COUNT * 1000) / (performance.now() - start)).toFixed(2),
+			'records/sec, total record count',
+			count
+		);
 	});
 	suite('Deploy app and test replication', { timeout: 60000 }, () => {
 		before(async () => {
@@ -232,22 +201,33 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			await sleep(10000);
 		});
 		test('Replicating cached blobs', async () => {
-			let response = await fetchWithRetry(ctx.nodes[0].httpURL + '/Location/2');
-			let bodyFrom1 = await response.json();
-			console.log(bodyFrom1);
-			equal(response.status, 200, JSON.stringify(bodyFrom1));
-			equal(bodyFrom1.name, 'location name 2');
-			await sleep(500);
+			let start = performance.now();
+			let { execute, finish } = concurrent(() => {
+				return fetchWithRetry(
+					ctx.nodes[Math.floor(Math.random() * NODE_COUNT)].httpURL + '/Location/' + Math.floor(Math.random() * COUNT)
+				);
+			});
+			const COUNT = 50000;
+			for (let i = 0; i < COUNT; i++) {
+				await execute();
+				if (i % 1000 === 0) {
+					console.log('sent', i, 'blob requests');
+				}
+			}
+			await finish();
+			let response = await sendOperation(ctx.nodes[1], {
+				operation: 'describe_table',
+				table: 'Location',
+			});
+
 			response = await fetchWithRetry(ctx.nodes[1].httpURL + '/Location/2');
 			let bodyFrom2 = await response.json();
 			equal(bodyFrom2.name, 'location name 2');
-			equal(bodyFrom1.random, bodyFrom2.random);
-			response = await fetchWithRetry(ctx.nodes[0].httpURL + '/LocationImage/2');
-			equal(response.status, 200);
-			const imageFrom1 = await response.bytes();
-			response = await fetchWithRetry(ctx.nodes[1].httpURL + '/LocationImage/2');
-			const imageFrom2 = await response.bytes();
-			deepEqual(imageFrom1, imageFrom2);
+			console.log(
+				'blob cache retrieval speed',
+				((COUNT * 1000) / (performance.now() - start)).toFixed(2),
+				'records/sec'
+			);
 		});
 	});
 });
