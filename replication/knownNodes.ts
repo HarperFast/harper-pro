@@ -75,6 +75,20 @@ export function getReplicationSharedStatus(
 	);
 }
 export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {
+	server.nodes = [];
+	server.shards = new Map();
+
+	for (let entry of getHDBNodeTable().primaryStore.getRange({})) {
+		const { value: node } = entry;
+		server.nodes.push(node);
+		if (node.shard != undefined) {
+			let nodesForShard = server.shards.get(node.shard);
+			if (!nodesForShard) {
+				server.shards.set(node.shard, (nodesForShard = []));
+			}
+			nodesForShard.push(node);
+		}
+	}
 	getHDBNodeTable()
 		.subscribe({})
 		.then(async (events) => {
