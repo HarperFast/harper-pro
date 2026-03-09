@@ -1301,7 +1301,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								let subscribedNodeName: string;
 								for (const { name, startTime, endTime } of nodeSubscriptions) {
 									const localId = getIdOfRemoteNode(name, auditStore);
-									auditStore.ensureLogExists(name);
 									logger.debug?.('subscription to', name, 'using local id', localId, 'starting', startTime);
 									subscribedNodeIds[localId] = { startTime, endTime };
 									subscribedNodeName = name;
@@ -1526,6 +1525,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								id: auditRecord.recordId,
 								type: auditRecord.type,
 								nodeId: remoteShortIdToLocalId.get(auditRecord.nodeId),
+								viaNodeId: receivingDataFromNodeIds[0],
 								residencyList,
 								timestamp: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
