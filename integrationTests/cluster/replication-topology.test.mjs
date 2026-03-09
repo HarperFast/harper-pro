@@ -21,7 +21,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 const NODE_COUNT = 4;
-suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
+suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 	before(async () => {
 		// start up the nodes
 		ctx.nodes = await Promise.all(
@@ -44,6 +44,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 							},
 							replication: {
 								securePort: ctx.hostname + ':9933',
+								databases: ['data'], // don't replicate system/nodes
 							},
 						},
 						env: {
@@ -84,17 +85,13 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 	});
 
 	test('connect nodes', async () => {
-		let response = await sendOperation(ctx.nodes[0], {
-			operation: 'create_authentication_tokens',
-			authorization: ctx.nodes[0].admin,
-		});
-		let token = response.operation_token;
 		for (let j = 1; j < NODE_COUNT; j++) {
 			await sendOperation(ctx.nodes[j], {
+				// without replicating the nodes, this should result in a star-topology
 				operation: 'add_node',
 				rejectUnauthorized: false,
 				hostname: ctx.nodes[0].hostname,
-				authorization: 'Bearer ' + token,
+				authorization: ctx.nodes[j].admin,
 			});
 		}
 		// wait for the cluster to connect
@@ -107,11 +104,16 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 					})
 				)
 			);
+			console.log('Cluster status', responses);
 			if (
 				responses.every(
-					(response) =>
-						response.connections.length === NODE_COUNT - 1 &&
-						response.connections.every((connection) => connection.database_sockets.every((socket) => socket.connected))
+					(response, i) =>
+						response.connections.length === (i === 0 ? NODE_COUNT - 1 : 1) && // veryify the star topology
+						response.connections.every(
+							(connection) =>
+								connection.database_sockets.length === 1 &&
+								connection.database_sockets.every((socket) => socket.connected)
+						)
 				)
 			) {
 				// everyone is connected
@@ -179,8 +181,10 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			operation: 'update',
 			table: 'test',
 			records: [{ id: '1', name: 'test2' }],
-			replicatedConfirmation: NODE_COUNT - 1,
+			replicatedConfirmation: 1,
 		});
+		// we don't really have anyway of know when the message transitively replicated to the next node, so just wait
+		await sleep(200);
 		for (let i = 0; i < NODE_COUNT; i++) {
 			let response = await sendOperation(ctx.nodes[i], {
 				operation: 'search_by_id',
@@ -197,7 +201,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			operation: 'delete',
 			table: 'test',
 			ids: ['1'],
-			replicatedConfirmation: NODE_COUNT - 1,
+			replicatedConfirmation: 1,
 		});
 		let response = await sendOperation(ctx.nodes[0], {
 			operation: 'search_by_id',
@@ -206,6 +210,8 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			ids: ['1'],
 		});
 		equal(response.length, 0);
+		// we don't really have anyway of know when the message transitively replicated to the next node, so just wait
+		await sleep(200);
 		response = await sendOperation(ctx.nodes[1], {
 			operation: 'search_by_id',
 			table: 'test',
@@ -213,40 +219,5 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			ids: ['1'],
 		});
 		equal(response.length, 0);
-	});
-	suite('Deploy app and test replication', { timeout: 60000 }, () => {
-		before(async () => {
-			const project = 'test-application';
-			const payload = await targz(join(import.meta.dirname, 'fixture'));
-			console.log('deploying app');
-			const response = await sendOperation(ctx.nodes[0], {
-				operation: 'deploy_component',
-				project,
-				payload,
-				replicated: true,
-				restart: true,
-			});
-			console.log('deployed app', response);
-			equal(response.message, 'Successfully deployed: test-application, restarting Harper');
-			await sleep(10000);
-		});
-		test('Replicating cached blobs', async () => {
-			let response = await fetchWithRetry(ctx.nodes[0].httpURL + '/Location/2');
-			let bodyFrom1 = await response.json();
-			console.log(bodyFrom1);
-			equal(response.status, 200, JSON.stringify(bodyFrom1));
-			equal(bodyFrom1.name, 'location name 2');
-			await sleep(500);
-			response = await fetchWithRetry(ctx.nodes[1].httpURL + '/Location/2');
-			let bodyFrom2 = await response.json();
-			equal(bodyFrom2.name, 'location name 2');
-			equal(bodyFrom1.random, bodyFrom2.random);
-			response = await fetchWithRetry(ctx.nodes[0].httpURL + '/LocationImage/2');
-			equal(response.status, 200);
-			const imageFrom1 = await response.bytes();
-			response = await fetchWithRetry(ctx.nodes[1].httpURL + '/LocationImage/2');
-			const imageFrom2 = await response.bytes();
-			deepEqual(imageFrom1, imageFrom2);
-		});
 	});
 });
