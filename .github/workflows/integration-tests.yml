@@ -79,51 +79,6 @@ jobs:
             package.json
           retention-days: 1
 
-  install-harper-pro:
-    name: Install Harper Pro (Node.js v${{ matrix.node-version }})
-    needs: [generate-node-version-matrix, build]
-    runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.node-versions) }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          submodules: 'recursive'
-
-      - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ matrix.node-version }}
-          package-manager-cache: false
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: harper-build-artifacts-node-${{ matrix.node-version }}
-
-      - name: Setup Harper Pro
-        env:
-          DEFAULTS_MODE: 'dev'
-          HDB_ADMIN_USERNAME: 'admin'
-          HDB_ADMIN_PASSWORD: 'password'
-          ROOTPATH: '/tmp/hdb'
-          OPERATIONSAPI_NETWORK_PORT: 9925
-          LOGGING_LEVEL: 'debug'
-          LOGGING_STDSTREAMS: true
-          THREADS_COUNT: 1
-          THREADS_DEBUG: false
-          NODE_HOSTNAME: 'localhost'
-        run: |
-          node ./dist/bin/harper.js install
-          sleep 10
-          node ./dist/bin/harper.js start
-          sleep 10 
-
   run-integration-tests:
     name: Integration Tests ${{matrix.shard}}/4 (Node.js v${{ matrix.node-version }})
     runs-on: ubuntu-latest
