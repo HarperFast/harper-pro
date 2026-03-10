@@ -4,12 +4,12 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { equal } from 'node:assert';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { setupHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { targz } from '../../core/integrationTests/utils/targz.ts';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
-import { sendOperation, fetchWithRetry, concurrent } from './cluster-shared.mjs';
+import { sendOperation, fetchWithRetry, concurrent } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -134,9 +134,9 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 				console.log('hdb_nodes status in timeout', responses);
 				throw new Error('Timed out waiting for cluster to connect');
 			}
-			await sleep(200 * retries);
+			await delay(200 * retries);
 		} while (true);
-		await sleep(500);
+		await delay(500);
 	});
 
 	test('replicate insert/upsert across all nodes', async () => {
@@ -163,7 +163,7 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 			if (retries > 0) {
 				console.log('waiting for nodes to sync for ', retries * 100, 'ms');
 			}
-			await sleep(retries * 100);
+			await delay(retries * 100);
 			responses = await Promise.all(
 				new Array(NODE_COUNT).fill(null).map(async (_, i) => {
 					return sendOperation(ctx.nodes[i], {
@@ -198,7 +198,7 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 			});
 			console.log('deployed app', response);
 			equal(response.message, 'Successfully deployed: test-application, restarting Harper');
-			await sleep(10000);
+			await delay(10000);
 		});
 		test('Replicating cached blobs', async () => {
 			let start = performance.now();

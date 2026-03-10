@@ -4,12 +4,12 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, deepEqual } from 'node:assert';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { setupHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { targz } from '../../core/integrationTests/utils/targz.ts';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
-import { sendOperation, fetchWithRetry } from './cluster-shared.mjs';
+import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -80,7 +80,6 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 				return teardownHarper({ harper: node });
 			})
 		);
-		console.log('finished tearing down nodes');
 	});
 
 	test('connect nodes', async () => {
@@ -133,9 +132,9 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 				console.log('hdb_nodes status in timeout', responses);
 				throw new Error('Timed out waiting for cluster to connect');
 			}
-			await sleep(200 * retries);
+			await delay(200 * retries);
 		} while (true);
-		await sleep(500);
+		await delay(500);
 	});
 
 	test('replicate insert/upsert from node 1', async () => {
@@ -145,11 +144,10 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			records: [{ id: '1', name: 'test' }],
 			replicatedConfirmation: NODE_COUNT - 1,
 		});
-		console.log('sent upsert to node 1, waiting for replication to node 2 and 3...');
 		let response;
 		let retries = 0;
 		do {
-			await sleep(200);
+			await delay(200);
 			response = await sendOperation(ctx.nodes[1], {
 				operation: 'search_by_id',
 				table: 'test',
@@ -228,15 +226,14 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			});
 			console.log('deployed app', response);
 			equal(response.message, 'Successfully deployed: test-application, restarting Harper');
-			await sleep(10000);
+			await delay(10000);
 		});
 		test('Replicating cached blobs', async () => {
 			let response = await fetchWithRetry(ctx.nodes[0].httpURL + '/Location/2');
 			let bodyFrom1 = await response.json();
-			console.log(bodyFrom1);
 			equal(response.status, 200, JSON.stringify(bodyFrom1));
 			equal(bodyFrom1.name, 'location name 2');
-			await sleep(500);
+			await delay(500);
 			response = await fetchWithRetry(ctx.nodes[1].httpURL + '/Location/2');
 			let bodyFrom2 = await response.json();
 			equal(bodyFrom2.name, 'location name 2');

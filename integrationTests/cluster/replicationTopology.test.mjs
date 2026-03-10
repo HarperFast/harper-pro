@@ -3,13 +3,12 @@
  *
  */
 import { suite, test, before, after } from 'node:test';
-import { equal, deepEqual } from 'node:assert';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { equal } from 'node:assert';
+import { setTimeout as delay } from 'node:timers/promises';
 import { setupHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
-import { targz } from '../../core/integrationTests/utils/targz.ts';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
-import { sendOperation, fetchWithRetry } from './cluster-shared.mjs';
+import { sendOperation } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -135,9 +134,9 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 				console.log('hdb_nodes status in timeout', responses);
 				throw new Error('Timed out waiting for cluster to connect');
 			}
-			await sleep(200 * retries);
+			await delay(200 * retries);
 		} while (true);
-		await sleep(500);
+		await delay(500);
 	});
 
 	test('replicate insert/upsert from node 1', async () => {
@@ -151,7 +150,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		let response;
 		let retries = 0;
 		do {
-			await sleep(200);
+			await delay(200);
 			response = await sendOperation(ctx.nodes[1], {
 				operation: 'search_by_id',
 				table: 'test',
@@ -184,7 +183,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 			replicatedConfirmation: 1,
 		});
 		// we don't really have anyway of know when the message transitively replicated to the next node, so just wait
-		await sleep(200);
+		await delay(200);
 		for (let i = 0; i < NODE_COUNT; i++) {
 			let response = await sendOperation(ctx.nodes[i], {
 				operation: 'search_by_id',
@@ -211,7 +210,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		});
 		equal(response.length, 0);
 		// we don't really have anyway of know when the message transitively replicated to the next node, so just wait
-		await sleep(200);
+		await delay(200);
 		response = await sendOperation(ctx.nodes[1], {
 			operation: 'search_by_id',
 			table: 'test',

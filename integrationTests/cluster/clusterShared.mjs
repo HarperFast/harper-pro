@@ -1,5 +1,5 @@
 import { equal } from 'node:assert';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 
 /**
  * Send an operation to a Harper node and validate the response
@@ -33,7 +33,7 @@ export function fetchWithRetry(url, options) {
 			console.log('fetch failed, retrying...');
 			options ??= {};
 			options.retries = retries - 1;
-			return sleep(500).then(() => fetchWithRetry(url, options));
+			return delay(500).then(() => fetchWithRetry(url, options));
 		});
 	}
 	return response;

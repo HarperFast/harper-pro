@@ -75,20 +75,6 @@ export function getReplicationSharedStatus(
 	);
 }
 export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {
-	server.nodes = [];
-	server.shards = new Map();
-
-	for (let entry of getHDBNodeTable().primaryStore.getRange()) {
-		const { value: node } = entry;
-		server.nodes.push(node);
-		if (node.shard != undefined) {
-			let nodesForShard = server.shards.get(node.shard);
-			if (!nodesForShard) {
-				server.shards.set(node.shard, (nodesForShard = []));
-			}
-			nodesForShard.push(node);
-		}
-	}
 	getHDBNodeTable()
 		.subscribe({})
 		.then(async (events) => {
@@ -120,10 +106,30 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 				}
 			}
 		});
+	server.nodes = [];
+	server.shards = new Map();
+
+	for (let entry of getHDBNodeTable().primaryStore.getRange({})) {
+		const { value: node } = entry;
+		server.nodes.push(node);
+		if (node.shard != undefined) {
+			let nodesForShard = server.shards.get(node.shard);
+			if (!nodesForShard) {
+				server.shards.set(node.shard, (nodesForShard = []));
+			}
+			nodesForShard.push(node);
+		}
+	}
+	logger.debug?.(
+		'Known nodes at startup',
+		server.nodes.map((node) => node.name)
+	);
 }
 
 export function shouldReplicateToNode(node: Node, databaseName: string) {
-	const databaseReplications = env.get(CONFIG_PARAMS.REPLICATION_DATABASES);
+	const databaseReplications: string | Array<string | { name: string; sharded?: boolean }> = env.get(
+		CONFIG_PARAMS.REPLICATION_DATABASES
+	);
 	return (
 		((node.replicates === true || node.replicates?.sends) &&
 			databases[databaseName] &&
