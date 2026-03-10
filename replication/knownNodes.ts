@@ -78,7 +78,7 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 	server.nodes = [];
 	server.shards = new Map();
 
-	for (let entry of getHDBNodeTable().primaryStore.getRange({})) {
+	for (let entry of getHDBNodeTable().primaryStore.getRange()) {
 		const { value: node } = entry;
 		server.nodes.push(node);
 		if (node.shard != undefined) {
@@ -152,9 +152,9 @@ export let commitsAwaitingReplication: Map<string, AwaitingReplication[]>;
 
 replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void> => {
 	if (confirmationCount > server.nodes.length) {
-		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys({}));
+		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
 		throw new ClientError(
-			`Cannot confirm replication to more nodes (${confirmationCount}) than are in the network (${server.nodes.length} nodes: ${server.nodes.map((node) => node.name)}, all in table ${nodesInTable.join(', ')})`
+			`Cannot confirm replication to more nodes (${confirmationCount}) than are in the network (${server.nodes.length} nodes: ${server.nodes.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
 		);
 	}
 	if (!commitsAwaitingReplication) {

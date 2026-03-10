@@ -442,7 +442,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	let remoteShortIdToLocalId: Map<number, number>;
-	let subscribedNodeIds; // map of node IDs to their subscription time ranges
+	let subscribedNodeIds: Array<boolean | { startTime: number, endTime?: number}> | undefined; // map of node IDs to their subscription time ranges
 	ws.on('message', onWSMessage);
 	let authorizationFinished = false;
 	function checkAuthorization(): boolean {
