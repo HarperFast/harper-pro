@@ -234,7 +234,14 @@ export type Route = {
 export type Node = {
 	name: string;
 	subscriptions: { database: string; schema: string; subscribe: boolean }[];
-	replicates: boolean | { sends?: boolean; sendsTo?: ({ target: string; database: string } | string)[] };
+	replicates:
+		| boolean
+		| {
+				sends?: boolean;
+				sendsTo?: ({ target: string; database: string } | string)[];
+				receives?: boolean;
+				receivesFrom?: ({ source: string; database: string } | string)[];
+		  };
 	url?: string;
 	port?: number;
 	startTime?: number;

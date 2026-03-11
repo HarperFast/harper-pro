@@ -442,7 +442,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	let remoteShortIdToLocalId: Map<number, number>;
-	let subscribedNodeIds: Array<boolean | { startTime: number, endTime?: number}> | undefined; // map of node IDs to their subscription time ranges
+	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
 	ws.on('message', onWSMessage);
 	let authorizationFinished = false;
 	function checkAuthorization(): boolean {
@@ -956,9 +956,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 											!(
 												node?.replicates === true ||
 												node?.replicates?.receives ||
-												node?.subscriptions?.some(
-													// TODO: Verify the table permissions for each table listed in the subscriptions
-													(sub) => (sub.database || sub.schema) === databaseName && sub.publish !== false
+												node?.replicates?.receivesFrom?.some(
+													(sub) => sub.source === getThisNodeName() && sub.database === databaseName
 												)
 											)
 										) {
