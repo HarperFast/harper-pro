@@ -18,7 +18,7 @@ import {
 	subscribeToNodeUpdates,
 	getHDBNodeTable,
 	iterateRoutes,
-	shouldReplicateToNode,
+	shouldReplicateFromNode,
 	type Node,
 	type Route,
 	getNodeURL,
@@ -229,7 +229,7 @@ export async function startOnMainThread(options) {
 				});
 				selfCatchupOfDatabase.delete(databaseName);
 			}
-			const shouldSubscribe = shouldReplicateToNode(node, databaseName);
+			const shouldSubscribe = shouldReplicateFromNode(node, databaseName);
 			const httpWorkers = workers.filter((worker) => worker.name === 'http');
 			if (existingEntry) {
 				worker = existingEntry.worker;
@@ -561,34 +561,6 @@ export async function ensureNode(name: string, node) {
 	if (!existing) {
 		await table.patch(node);
 	} else {
-		if (node.replicates && !env.get(CONFIG_PARAMS.CLUSTERING_ENABLED)) node.subscriptions = null; // if we are fully replicating without NATS, we don't need to have subscriptions
-		for (const key in node) {
-			if (existing[key] !== node[key] && key === 'subscriptions' && node[key] && existing[key]) {
-				// Update any existing subscriptions or append to subscriptions array
-				const newSubs = [];
-				const existingSubs = cloneDeep(existing[key]);
-				for (const newSub of node[key]) {
-					let matchFound = false;
-					for (const existingSub of existingSubs) {
-						if (
-							(newSub.database ?? newSub.schema) === (existingSub.database ?? existingSub.schema) &&
-							newSub.table === existingSub.table
-						) {
-							existingSub.publish = newSub.publish;
-							existingSub.subscribe = newSub.subscribe;
-							matchFound = true;
-							break;
-						}
-					}
-
-					if (!matchFound) newSubs.push(newSub);
-				}
-
-				node.subscriptions = [...existingSubs, ...newSubs];
-				break;
-			}
-		}
-
 		if (Array.isArray(node.revoked_certificates)) {
 			const existingRevoked = existing.revoked_certificates || [];
 			node.revoked_certificates = [...new Set([...existingRevoked, ...node.revoked_certificates])];

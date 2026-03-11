@@ -126,21 +126,30 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 	);
 }
 
-export function shouldReplicateToNode(node: Node, databaseName: string) {
+export function shouldReplicateFromNode(node: Node, databaseName: string) {
 	const databaseReplications: string | Array<string | { name: string; sharded?: boolean }> = env.get(
 		CONFIG_PARAMS.REPLICATION_DATABASES
 	);
 	return (
-		((node.replicates === true || node.replicates?.sends) &&
+		((typeof node.replicates === 'object'
+			? node.replicates?.sends ||
+				node.replicates?.sendsTo?.some?.((sendsTo) =>
+					typeof sendsTo === 'object'
+						? (!sendsTo.target || sendsTo.target === getThisNodeName()) &&
+							(!sendsTo.database || sendsTo.database === databaseName)
+						: sendsTo === getThisNodeName()
+				)
+			: node.replicates) &&
 			databases[databaseName] &&
 			(!databaseReplications ||
 				databaseReplications === '*' ||
-				databaseReplications?.find?.((dbReplication) => {
-					return (
-						(dbReplication.name ?? dbReplication) === databaseName &&
-						(!dbReplication.sharded || node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD))
-					);
-				})) &&
+				(Array.isArray(databaseReplications) &&
+					databaseReplications.find?.((dbReplication) => {
+						return typeof dbReplication === 'string'
+							? dbReplication === databaseName
+							: dbReplication.name === databaseName &&
+									(!dbReplication.sharded || node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD));
+					}))) &&
 			getHDBNodeTable().primaryStore.get(getThisNodeName())?.replicates) ||
 		node.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe)
 	);
@@ -225,7 +234,7 @@ export type Route = {
 export type Node = {
 	name: string;
 	subscriptions: { database: string; schema: string; subscribe: boolean }[];
-	replicates: boolean;
+	replicates: boolean | { sends?: boolean; sendsTo?: ({ target: string; database: string } | string)[] };
 	url?: string;
 	port?: number;
 	startTime?: number;

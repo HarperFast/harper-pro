@@ -29,7 +29,7 @@ import {
 	subscribeToNodeUpdates,
 	getHDBNodeTable,
 	iterateRoutes,
-	shouldReplicateToNode,
+	shouldReplicateFromNode,
 	getReplicationSharedStatus,
 	getNodeURL,
 } from './knownNodes.ts';
@@ -547,7 +547,7 @@ export function subscribeToNode(request: any) {
 		}
 		connection.subscribe(
 			request.nodes.filter((node) => {
-				return shouldReplicateToNode(node, request.database);
+				return shouldReplicateFromNode(node, request.database);
 			}),
 			request.replicateByDefault
 		);
@@ -580,7 +580,7 @@ export function getThisNodeId(auditStore: any) {
 server.replication = {
 	getThisNodeId,
 	exportIdMapping,
-	getIdOfRemoteNode
+	getIdOfRemoteNode,
 };
 export function urlToNodeName(nodeUrl) {
 	if (nodeUrl) return new URL(nodeUrl).hostname; // this the part of the URL that is the node name, as we want it to match common name in the certificate
