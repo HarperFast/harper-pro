@@ -30,7 +30,6 @@ export function fetchWithRetry(url, options) {
 	let response = fetch(url, options);
 	if (retries > 0) {
 		response = response.catch(() => {
-			console.log('fetch failed, retrying...');
 			options ??= {};
 			options.retries = retries - 1;
 			return delay(500).then(() => fetchWithRetry(url, options));
@@ -45,7 +44,7 @@ export function fetchWithRetry(url, options) {
  * @param {number} [concurrency=100] - Maximum number of concurrent tasks
  * @returns {Object} Object with execute and finish methods
  */
-export function concurrent(task, concurrency = 100) {
+export function concurrent(task, concurrency = 20) {
 	let tasks = new Array(concurrency);
 	let i = 0;
 	return {
