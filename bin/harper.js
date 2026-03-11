@@ -17,7 +17,10 @@ const { values } = parseArgs({
 });
 const HDB_LEADER_URL = values['leader-url'] || process.env.HDB_LEADER_URL || values['HDB_LEADER_URL'];
 
-if (HDB_LEADER_URL) {
+// Check to see if extra args are passed to harper, this could be the case with api-ops through the CLI
+const hasPositionalArg = Boolean(process.argv[2] && !process.argv[2].startsWith('-'));
+
+if (HDB_LEADER_URL && !hasPositionalArg) {
 	// If rootpath is provided ensure that an uppercase version of the arg is also added to process.argv so it can be picked
 	// by anything expecting it in uppercase.
 	if (!process.argv.includes('--ROOTPATH') && values['rootpath']) process.argv.push('--ROOTPATH', values['rootpath']);
