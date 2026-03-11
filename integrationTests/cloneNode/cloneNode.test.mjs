@@ -51,14 +51,16 @@ suite('Clone Node', (ctx) => {
 	before(async () => {
 		ctx.nodes = [];
 		const nodeCtx = {
-			hostname: await getNextAvailableLoopbackAddress(),
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
 		};
 		await setupHarper(nodeCtx, {
 			config: {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: {
-					port: nodeCtx.hostname + ':9933',
+					port: nodeCtx.harper.hostname + ':9933',
 				},
 			},
 			// set some random custom env var to verify it gets copied to the clone

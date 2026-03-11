@@ -28,7 +28,9 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 				.fill(null)
 				.map(async () => {
 					const ctx = {
-						hostname: await getNextAvailableLoopbackAddress(),
+						harper: {
+							hostname: await getNextAvailableLoopbackAddress(),
+						},
 					};
 					await setupHarper(ctx, {
 						config: {
@@ -42,7 +44,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 								console: true,
 							},
 							replication: {
-								securePort: ctx.hostname + ':9933',
+								securePort: ctx.harper.hostname + ':9933',
 								databases: ['data'], // don't replicate system/nodes
 							},
 						},

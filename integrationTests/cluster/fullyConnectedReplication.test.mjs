@@ -28,9 +28,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			Array(NODE_COUNT)
 				.fill(null)
 				.map(async () => {
-					const ctx = {
-						hostname: await getNextAvailableLoopbackAddress(),
-					};
+					const ctx = {};
 					await setupHarper(ctx, {
 						config: {
 							analytics: {
@@ -43,7 +41,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 								console: true,
 							},
 							replication: {
-								securePort: ctx.hostname + ':9933',
+								securePort: ctx.harper.hostname + ':9933',
 							},
 						},
 						env: {

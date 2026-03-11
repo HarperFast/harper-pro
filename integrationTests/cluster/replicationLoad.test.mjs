@@ -29,7 +29,9 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 				.fill(null)
 				.map(async () => {
 					const ctx = {
-						hostname: await getNextAvailableLoopbackAddress(),
+						harper: {
+							hostname: await getNextAvailableLoopbackAddress(),
+						},
 					};
 					await setupHarper(ctx, {
 						config: {
@@ -44,7 +46,7 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 								level: 'warn',
 							},
 							replication: {
-								securePort: ctx.hostname + ':9933',
+								securePort: ctx.harper.hostname + ':9933',
 							},
 						},
 						env: {
