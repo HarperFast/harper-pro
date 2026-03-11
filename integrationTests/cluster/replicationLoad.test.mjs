@@ -43,7 +43,7 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 								colors: false,
 								stdStreams: true,
 								console: true,
-								level: 'warn',
+								level: 'debug',
 							},
 							replication: {
 								securePort: ctx.harper.hostname + ':9933',

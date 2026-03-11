@@ -28,7 +28,11 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			Array(NODE_COUNT)
 				.fill(null)
 				.map(async () => {
-					const ctx = {};
+					const ctx = {
+						harper: {
+							hostname: await getNextAvailableLoopbackAddress(),
+						},
+					};
 					await setupHarper(ctx, {
 						config: {
 							analytics: {
