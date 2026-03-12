@@ -1,7 +1,7 @@
 /**
  * This module is responsible for managing the mapping of node/host names to node ids.
  */
-import * as logger from '../core/utility/logging/logger.ts';
+import { logger } from '../core/utility/logging/logger.ts';
 import { lastTimeInAuditStore } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { pack, unpack } from 'msgpackr';
