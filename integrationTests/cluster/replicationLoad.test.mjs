@@ -200,7 +200,7 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 			});
 			console.log('deployed app', response);
 			equal(response.message, 'Successfully deployed: test-application, restarting Harper');
-			await delay(25000);
+			await delay(35000);
 		});
 		test('Replicating cached blobs', async () => {
 			let start = performance.now();
