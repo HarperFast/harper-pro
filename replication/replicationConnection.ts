@@ -1,3 +1,4 @@
+import type { Logger } from '../core/utility/logging/logger.ts';
 import {
 	getDatabases,
 	databases,
@@ -51,7 +52,7 @@ import {
 } from '../core/resources/blob.ts';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
-const logger = forComponent('replication').conditional;
+const logger = forComponent('replication').conditional as Logger;
 
 // these are the codes we use for the different commands
 const SUBSCRIPTION_REQUEST = 129;

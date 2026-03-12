@@ -1,3 +1,4 @@
+import type { Logger } from '../core/utility/logging/logger.ts';
 import { type ValidatedLicense, validateLicense, initPublicKey } from './validation.ts';
 import { ClientError } from '../core/utility/errors/hdbError.js';
 import { onAnalyticsAggregate } from '../core/resources/analytics/write.ts';
@@ -15,7 +16,7 @@ import type { Scope } from "../core/components/Scope.ts";
 // eslint-disable-next-line no-unused-vars
 export const suppressHandleApplicationWarning = true;
 
-let logger: any;
+let logger: Logger;
 
 class ExistingLicenseError extends Error {}
 
@@ -61,7 +62,7 @@ interface LicenseParams {
 
 interface UsageLicensingInitParams {
 	server: Server,
-	logger: any,
+	logger: Logger,
 	license: LicenseParams,
 }
 
