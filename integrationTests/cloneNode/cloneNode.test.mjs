@@ -210,7 +210,7 @@ suite('Clone Node', (ctx) => {
 				operation: 'cluster_status',
 			});
 
-			equal(clusterStatus.connections.length, 4);
+			equal(clusterStatus.connections.length, 4, JSON.stringify(clusterStatus));
 		}
 	});
 });
