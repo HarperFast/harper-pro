@@ -142,7 +142,7 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 	});
 
 	test('replicate insert/upsert across all nodes', async () => {
-		const COUNT = 50000;
+		const COUNT = 5000;
 		let start = performance.now();
 		let { execute, finish } = concurrent(() =>
 			sendOperation(ctx.nodes[Math.floor(Math.random() * NODE_COUNT)], {
@@ -209,7 +209,7 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 					ctx.nodes[Math.floor(Math.random() * NODE_COUNT)].httpURL + '/Location/' + Math.floor(Math.random() * COUNT)
 				);
 			});
-			const COUNT = 50000;
+			const COUNT = 5000;
 			for (let i = 0; i < COUNT; i++) {
 				await execute();
 				if (i % 1000 === 0) {

@@ -1,5 +1,5 @@
 import { suite, test, before, after } from 'node:test';
-import { equal } from 'node:assert';
+import { equal, ok } from 'node:assert';
 import {
 	DEFAULT_ADMIN_USERNAME,
 	DEFAULT_ADMIN_PASSWORD,
@@ -61,6 +61,7 @@ suite('Clone Node', (ctx) => {
 				logging: { colors: false },
 				replication: {
 					port: nodeCtx.harper.hostname + ':9933',
+					securePort: null,
 				},
 			},
 			// set some random custom env var to verify it gets copied to the clone
@@ -114,14 +115,17 @@ suite('Clone Node', (ctx) => {
 
 	test('should clone a node successfully', async () => {
 		const cloneCtx = {
-			hostname: await getNextAvailableLoopbackAddress(),
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
 		};
 		await setupHarper(cloneCtx, {
 			config: {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: {
-					port: cloneCtx.hostname + ':9933',
+					port: cloneCtx.harper.hostname + ':9933',
+					securePort: null,
 				},
 			},
 			env: {
@@ -179,14 +183,17 @@ suite('Clone Node', (ctx) => {
 
 		for (let i = 0; i < TOTAL_NEW_NODES; i++) {
 			const cloneCtx = {
-				hostname: await getNextAvailableLoopbackAddress(),
+				harper: {
+					hostname: await getNextAvailableLoopbackAddress(),
+				},
 			};
 			await setupHarper(cloneCtx, {
 				config: {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false },
 					replication: {
-						port: cloneCtx.hostname + ':9933',
+						port: cloneCtx.harper.hostname + ':9933',
+						securePort: null,
 					},
 				},
 				env: {
@@ -211,6 +218,12 @@ suite('Clone Node', (ctx) => {
 			});
 
 			equal(clusterStatus.connections.length, 4, JSON.stringify(clusterStatus));
+			for (let connection of clusterStatus.connections) {
+				equal(connection.database_sockets.length, 2, JSON.stringify(connection));
+				for (let socket of connection.database_sockets) {
+					ok(socket.connected, 'connected');
+				}
+			}
 		}
 	});
 });
