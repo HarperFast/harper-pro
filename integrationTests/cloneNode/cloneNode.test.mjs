@@ -1,5 +1,5 @@
 import { suite, test, before, after } from 'node:test';
-import { equal } from 'node:assert';
+import { equal, ok } from 'node:assert';
 import {
 	DEFAULT_ADMIN_USERNAME,
 	DEFAULT_ADMIN_PASSWORD,
@@ -51,14 +51,17 @@ suite('Clone Node', (ctx) => {
 	before(async () => {
 		ctx.nodes = [];
 		const nodeCtx = {
-			hostname: await getNextAvailableLoopbackAddress(),
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
 		};
 		await setupHarper(nodeCtx, {
 			config: {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: {
-					port: nodeCtx.hostname + ':9933',
+					port: nodeCtx.harper.hostname + ':9933',
+					securePort: null,
 				},
 			},
 			// set some random custom env var to verify it gets copied to the clone
@@ -92,7 +95,7 @@ suite('Clone Node', (ctx) => {
 		await sendOperation(nodeCtx.harper, {
 			operation: 'create_authentication_tokens',
 			username: DEFAULT_ADMIN_USERNAME,
-			password: DEFAULT_ADMIN_PASSWORD
+			password: DEFAULT_ADMIN_PASSWORD,
 		});
 
 		// Add an SSH key to verify that it gets cloned properly
@@ -111,16 +114,19 @@ suite('Clone Node', (ctx) => {
 	});
 
 	test('should clone a node successfully', async () => {
-        const cloneCtx = {
-            hostname: await getNextAvailableLoopbackAddress(),
-        };
+		const cloneCtx = {
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
+		};
 		await setupHarper(cloneCtx, {
 			config: {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
-                replication: {
-                    port: cloneCtx.hostname + ':9933',
-                },
+				replication: {
+					port: cloneCtx.harper.hostname + ':9933',
+					securePort: null,
+				},
 			},
 			env: {
 				HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:${OPERATIONS_API_PORT}`,
@@ -171,5 +177,53 @@ suite('Clone Node', (ctx) => {
 		});
 		equal(sshKeys.length, 1, 'Should find 1 SSH key in clone node');
 		equal(sshKeys[0].name, 'clonetestkey1', 'SSH key name should match the original');
+	});
+	test('should clone three more nodes successfully', async () => {
+		const TOTAL_NEW_NODES = 3;
+
+		for (let i = 0; i < TOTAL_NEW_NODES; i++) {
+			const cloneCtx = {
+				harper: {
+					hostname: await getNextAvailableLoopbackAddress(),
+				},
+			};
+			await setupHarper(cloneCtx, {
+				config: {
+					analytics: { aggregatePeriod: -1 },
+					logging: { colors: false },
+					replication: {
+						port: cloneCtx.harper.hostname + ':9933',
+						securePort: null,
+					},
+				},
+				env: {
+					HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:${OPERATIONS_API_PORT}`,
+					HDB_LEADER_USERNAME: DEFAULT_ADMIN_USERNAME,
+					HDB_LEADER_PASSWORD: DEFAULT_ADMIN_PASSWORD,
+					ALLOW_SELF_SIGNED: true,
+					HARPER_NO_FLUSH_ON_EXIT: true,
+				},
+			});
+			ctx.nodes.push(cloneCtx.harper);
+
+			const newNodeIndex = ctx.nodes.length - 1;
+
+			await waitForAvailableStatus(ctx.nodes[newNodeIndex]);
+		}
+
+		for (let j = 0; j < ctx.nodes.length; j++) {
+			const node = ctx.nodes[j];
+			const clusterStatus = await sendOperation(node, {
+				operation: 'cluster_status',
+			});
+
+			equal(clusterStatus.connections.length, 4, JSON.stringify(clusterStatus));
+			for (let connection of clusterStatus.connections) {
+				equal(connection.database_sockets.length, 2, JSON.stringify(connection));
+				for (let socket of connection.database_sockets) {
+					ok(socket.connected, 'connected');
+				}
+			}
+		}
 	});
 });

@@ -10,7 +10,7 @@ import { isMainThread } from 'worker_threads';
 import { ClientError } from '../core/utility/errors/hdbError.js';
 import env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import * as logger from '../core/utility/logging/logger.js';
+import * as logger from '../core/utility/logging/logger.ts';
 
 let hdbNodeTable;
 server.nodes = [];
@@ -106,21 +106,50 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 				}
 			}
 		});
+	server.nodes = [];
+	server.shards = new Map();
+
+	for (let entry of getHDBNodeTable().primaryStore.getRange({})) {
+		const { value: node } = entry;
+		server.nodes.push(node);
+		if (node.shard != undefined) {
+			let nodesForShard = server.shards.get(node.shard);
+			if (!nodesForShard) {
+				server.shards.set(node.shard, (nodesForShard = []));
+			}
+			nodesForShard.push(node);
+		}
+	}
+	logger.debug?.(
+		'Known nodes at startup',
+		server.nodes.map((node) => node.name)
+	);
 }
 
-export function shouldReplicateToNode(node: Node, databaseName: string) {
-	const databaseReplications = env.get(CONFIG_PARAMS.REPLICATION_DATABASES);
+export function shouldReplicateFromNode(node: Node, databaseName: string) {
+	const databaseReplications: string | Array<string | { name: string; sharded?: boolean }> = env.get(
+		CONFIG_PARAMS.REPLICATION_DATABASES
+	);
 	return (
-		((node.replicates === true || node.replicates?.sends) &&
+		((typeof node.replicates === 'object'
+			? node.replicates?.sends ||
+				node.replicates?.sendsTo?.some?.((sendsTo) =>
+					typeof sendsTo === 'object'
+						? (!sendsTo.target || sendsTo.target === getThisNodeName()) &&
+							(!sendsTo.database || sendsTo.database === databaseName)
+						: sendsTo === getThisNodeName()
+				)
+			: node.replicates) &&
 			databases[databaseName] &&
 			(!databaseReplications ||
 				databaseReplications === '*' ||
-				databaseReplications?.find?.((dbReplication) => {
-					return (
-						dbReplication.name === databaseName &&
-						(!dbReplication.sharded || node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD))
-					);
-				})) &&
+				(Array.isArray(databaseReplications) &&
+					databaseReplications.find?.((dbReplication) => {
+						return typeof dbReplication === 'string'
+							? dbReplication === databaseName
+							: dbReplication.name === databaseName &&
+									(!dbReplication.sharded || node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD));
+					}))) &&
 			getHDBNodeTable().primaryStore.get(getThisNodeName())?.replicates) ||
 		node.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe)
 	);
@@ -138,8 +167,9 @@ export let commitsAwaitingReplication: Map<string, AwaitingReplication[]>;
 
 replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void> => {
 	if (confirmationCount > server.nodes.length) {
+		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
 		throw new ClientError(
-			`Cannot confirm replication to more nodes (${confirmationCount}) than are in the network (${server.nodes.length})`
+			`Cannot confirm replication to more nodes (${confirmationCount}) than are in the network (${server.nodes.length} nodes: ${server.nodes.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
 		);
 	}
 	if (!commitsAwaitingReplication) {
@@ -204,7 +234,14 @@ export type Route = {
 export type Node = {
 	name: string;
 	subscriptions: { database: string; schema: string; subscribe: boolean }[];
-	replicates: boolean;
+	replicates:
+		| boolean
+		| {
+				sends?: boolean;
+				sendsTo?: ({ target: string; database: string } | string)[];
+				receives?: boolean;
+				receivesFrom?: ({ source: string; database: string } | string)[];
+		  };
 	url?: string;
 	port?: number;
 	startTime?: number;

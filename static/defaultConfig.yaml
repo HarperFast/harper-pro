@@ -23,6 +23,10 @@ authentication:
 analytics:
   aggregatePeriod: 60
   replicate: false
+applications:
+  allowedShellCommands:
+    - npm
+    - node
 componentsRoot: null
 localStudio:
   enabled: true
