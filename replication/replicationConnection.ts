@@ -1395,7 +1395,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 														},
 														entry.localTime
 													);
-													logger.error(
+													logger.debug(
 														'sent record from table',
 														entry.key,
 														'length:',
@@ -1403,7 +1403,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 														encoded.slice(0, 10)
 													);
 												}
-												logger.error('Finished copy table', tableName, remoteNodeName);
+												logger.info('Finished copy table', tableName, remoteNodeName);
 											}
 											currentSequenceId = lastSequenceId;
 											if (!currentTransaction.txnTime) {

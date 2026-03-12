@@ -10,7 +10,7 @@ import { isMainThread } from 'worker_threads';
 import { ClientError } from '../core/utility/errors/hdbError.js';
 import env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import * as logger from '../core/utility/logging/logger.js';
+import * as logger from '../core/utility/logging/logger.ts';
 
 let hdbNodeTable;
 server.nodes = [];
