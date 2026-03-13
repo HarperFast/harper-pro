@@ -698,7 +698,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							remoteNodeIds: receivingDataFromNodeIds,
 						});
 						getSharedStatus();
-						replicationSharedStatus[RECEIVED_VERSION_POSITION] = lastSequenceIdReceived;
+						replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+							// ensure monotonicity
+							lastSequenceIdReceived,
+							replicationSharedStatus[RECEIVED_VERSION_POSITION]
+						);
+
 						replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 						replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
 						break;
@@ -1487,7 +1492,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					// this is an empty txn ending, but need to record the timestamps
 					decoder.position++;
 					lastSequenceIdReceived = sequenceIdReceived = decoder.readFloat64();
-					replicationSharedStatus[RECEIVED_VERSION_POSITION] = lastSequenceIdReceived;
+					replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+						// ensure monotonicity
+						lastSequenceIdReceived,
+						replicationSharedStatus[RECEIVED_VERSION_POSITION]
+					);
 					replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 					replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
 					tableSubscriptionToReplicator.send({
@@ -1555,7 +1564,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					'nodeId',
 					event.nodeId
 				);
-				replicationSharedStatus[RECEIVED_VERSION_POSITION] = auditRecord.version;
+				replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+					// ensure monotonicity
+					auditRecord.version,
+					replicationSharedStatus[RECEIVED_VERSION_POSITION]
+				);
 				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
 
