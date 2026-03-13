@@ -253,12 +253,18 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		// and the gets passed on to the other node
 		equal(response.length, 1);
 		equal(response[0].name, 'test while disconnected');
-		response = await sendOperation(ctx.nodes[2], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['2'],
-		});
+		do {
+			await delay(200);
+			response = await sendOperation(ctx.nodes[2], {
+				operation: 'search_by_id',
+				table: 'test',
+				get_attributes: ['id', 'name'],
+				ids: ['2'],
+			});
+			if (retries++ > 10) {
+				break;
+			}
+		} while (response.length === 0);
 		equal(response.length, 1);
 		equal(response[0].name, 'test while disconnected');
 	});
