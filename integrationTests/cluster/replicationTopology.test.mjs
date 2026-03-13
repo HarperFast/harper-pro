@@ -5,7 +5,12 @@
 import { suite, test, before, after } from 'node:test';
 import { equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { setupHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import {
+	killHarper,
+	setupHarper,
+	startHarper,
+	teardownHarper,
+} from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
 import { sendOperation } from './clusterShared.mjs';
@@ -105,7 +110,6 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 					})
 				)
 			);
-			console.log('Cluster status', responses);
 			if (
 				responses.every(
 					(response, i) =>
@@ -148,7 +152,6 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 			records: [{ id: '1', name: 'test' }],
 			replicatedConfirmation: NODE_COUNT - 1,
 		});
-		console.log('sent upsert to node 1, waiting for replication to node 2 and 3...');
 		let response;
 		let retries = 0;
 		do {
@@ -220,5 +223,43 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 			ids: ['1'],
 		});
 		equal(response.length, 0);
+	});
+	test('take down the central node, do writes and verify catchup afterwards', async () => {
+		await killHarper({ harper: ctx.nodes[0] });
+		await sendOperation(ctx.nodes[1], {
+			operation: 'upsert',
+			table: 'test',
+			records: [{ id: '2', name: 'test while disconnected' }],
+		});
+		let response;
+		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] })).harper;
+		let retries = 0;
+		// ensure the data gets to the central node
+		do {
+			await delay(200);
+			response = await sendOperation(ctx.nodes[0], {
+				operation: 'search_by_id',
+				table: 'test',
+				get_attributes: ['id', 'name'],
+				ids: ['2'],
+			});
+			if (retries++ > 10) {
+				break;
+			}
+		} while (response.length === 0);
+		if (response.length === 0) {
+			throw new Error('Node 1 did not replicate insert');
+		}
+		// and the gets passed on to the other node
+		equal(response.length, 1);
+		equal(response[0].name, 'test while disconnected');
+		response = await sendOperation(ctx.nodes[2], {
+			operation: 'search_by_id',
+			table: 'test',
+			get_attributes: ['id', 'name'],
+			ids: ['2'],
+		});
+		equal(response.length, 1);
+		equal(response[0].name, 'test while disconnected');
 	});
 });
