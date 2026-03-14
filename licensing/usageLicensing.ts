@@ -10,7 +10,7 @@ import type { Stats } from 'node:fs';
 import * as configUtils from '../core/config/configUtils.js';
 import * as terms from '../core/utility/hdbTerms.ts';
 import type { Server } from '../core/server/Server.ts';
-import type { Scope } from "../core/components/Scope.ts";
+import type { Scope } from '../core/components/Scope.ts';
 
 // eslint-disable-next-line no-unused-vars
 export const suppressHandleApplicationWarning = true;
@@ -55,14 +55,14 @@ export function handleApplication({ server, logger, options }: Scope) {
 }
 
 interface LicenseParams {
-	region: string,
-	mode: string,
+	region: string;
+	mode: string;
 }
 
 interface UsageLicensingInitParams {
-	server: Server,
-	logger: any,
-	license: LicenseParams,
+	server: Server;
+	logger: any;
+	license: LicenseParams;
 }
 
 export function initUsageLicensing(params: UsageLicensingInitParams) {
@@ -83,7 +83,7 @@ export function initUsageLicensing(params: UsageLicensingInitParams) {
 			if (!response.headers?.set) {
 				(response as any).headers = new Headers(response.headers);
 			}
-			if (!await isLicensed()) {
+			if (!(await isLicensed())) {
 				response.headers.set(
 					'X-License-Info',
 					'Unlicensed Harper Pro, this should only be used for educational and development purposes'

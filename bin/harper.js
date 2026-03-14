@@ -4,7 +4,7 @@
 
 process.env.HARPER_BUILTIN_COMPONENTS =
 	(process.env.HARPER_BUILTIN_COMPONENTS ? process.env.HARPER_BUILTIN_COMPONENTS + ',' : '') +
-	'replication=@/dist/replication/replicator.js,license=@/dist/licensing/usageLicensing.js';
+	'replication=@/dist/replication/replicator.js,license=@/dist/licensing/usageLicensing.js,analytics=@/dist/analytics/profile.js';
 
 import { parseArgs } from 'node:util';
 
