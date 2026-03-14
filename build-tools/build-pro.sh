@@ -45,6 +45,8 @@ perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/insta
 echo -e "\n📦 Copying dependencies & devDependencies from core"
 deps=$(cd core && npm pkg get dependencies)
 npm pkg set "dependencies=${deps}" --json
+# re-add @datadog/pprof back to the dependencies
+npm install @datadog/pprof
 devDeps=$(cd core && npm pkg get devDependencies)
 npm pkg set "devDependencies=${devDeps}" --json
 

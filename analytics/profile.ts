@@ -33,7 +33,7 @@ export function handleApplication({ options }: Scope) {
 			profilerStarted = true;
 			timeProfiler.start({ intervalMicros: SAMPLING_INTERVAL_IN_MICROSECONDS });
 		}
-		capturePeriod = ((options.get('analytics', 'aggregatePeriod') as number) ?? 60) * 1000;
+		capturePeriod = ((options.get(['aggregatePeriod']) as number) ?? 60) * 1000;
 		if (capturePeriod > 0) {
 			profilerTimer = setTimeout(() => {
 				captureProfile(capturePeriod);
