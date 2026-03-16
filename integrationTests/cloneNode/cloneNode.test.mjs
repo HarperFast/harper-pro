@@ -225,5 +225,6 @@ suite('Clone Node', (ctx) => {
 				}
 			}
 		}
+		console.log('done');
 	});
 });

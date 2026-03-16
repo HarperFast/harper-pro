@@ -55,7 +55,7 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 					});
 					console.log(
 						'finished setting up node: ',
-						ctx.harper.installDir.split('/').slice(-2).join(' /'),
+						ctx.harper.dataRootDir.split('/').slice(-2).join(' /'),
 						ctx.harper.process.pid
 					);
 					return ctx.harper;
