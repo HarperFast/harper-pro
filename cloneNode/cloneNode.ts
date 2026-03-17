@@ -218,6 +218,10 @@ export async function cloneNode(): Promise<void> {
 		await installHarper();
 	}
 
+	// Start Harper to prepare for clone operations
+	const { main } = await import('../core/bin/run.js');
+	await main();
+
 	logger.initLogSettings();
 	harperLogger = logger.loggerWithTag('cloneNode');
 
@@ -256,9 +260,10 @@ export async function cloneNode(): Promise<void> {
 		}
 	}
 
-	// Start Harper to prepare for clone operations
-	const { main } = await import('../core/bin/run.js');
-	await main();
+	// Restarting workers to ensure new configuration it loaded.
+	log('Restarting workers to apply new configuration');
+	const { restartWorkers } = await import('../core/server/threads/manageThreads.js');
+	await restartWorkers();
 
 	// Dynamically importing setNode because it was causing early usage of rootpath var install before it was initialized.
 	const { setNode } = await import('../replication/setNode.js');
