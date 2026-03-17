@@ -639,7 +639,7 @@ export function lastTimeInAuditStore(auditStore: Database) {
 
 export async function replicateOperation(req) {
 	const response = { message: '' };
-	if (req.replicated) {
+	if (req.replicated !== false) {
 		req.replicated = false; // don't send a replicated flag to the nodes we are sending to
 		logger.trace?.(
 			'Replicating operation',
