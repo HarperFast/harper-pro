@@ -150,7 +150,11 @@ export function start(options) {
 				} else {
 					logger.error(
 						`Incoming client connection from ${request.peerCertificate?.subjectaltname ?? request.ip} did not have valid certificate, you may need turn on enableRootCAs in the config if you are using a publicly signed certificate, or add the CA to the server's trusted CAs`,
-						authorizationError
+						authorizationError,
+						'certificate issuer',
+						request.peerCertificate.issuer,
+						'did not match any available CAs',
+						Array.from(Array.from(wsServers[0].secureContexts.values())[0].options.availableCAs.keys())
 					);
 				}
 			}
