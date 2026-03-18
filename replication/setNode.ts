@@ -153,7 +153,7 @@ export async function setNode(req: any) {
 		if (targetNodeResponse.certificate) {
 			await setCertTable({
 				name: getThisNodeName(),
-				uses: ['https', 'operations', 'wss'],
+				uses: ['https', 'operations', 'wss', 'replication'],
 				certificate: targetNodeResponse.certificate,
 				private_key_name: rep?.options?.key_file,
 				is_authority: false,

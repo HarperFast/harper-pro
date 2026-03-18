@@ -1,3 +1,4 @@
+import type { Logger } from '../core/utility/logging/logger.ts';
 import {
 	getDatabases,
 	databases,
@@ -51,7 +52,7 @@ import {
 } from '../core/resources/blob.ts';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
-const logger = forComponent('replication').conditional;
+const logger = forComponent('replication').conditional as Logger;
 
 // these are the codes we use for the different commands
 const SUBSCRIPTION_REQUEST = 129;
@@ -121,10 +122,9 @@ export async function createWebSocket(
 	if (url == null) {
 		throw new TypeError(`Invalid URL: Expected a string URL for node "${node_name}" but received ${url}`);
 	}
-
 	if (url.includes('wss://')) {
 		if (!secureContexts) {
-			const SNICallback = createTLSSelector('operations-api');
+			const SNICallback = createTLSSelector('replication');
 			const secureTarget = {
 				secureContexts: null,
 			};
@@ -133,10 +133,22 @@ export async function createWebSocket(
 		}
 		secureContext = secureContexts.get(node_name);
 		if (secureContext) {
-			logger.debug?.('Creating web socket for URL', url, 'with certificate named:', secureContext.name);
+			logger.debug?.(
+				'Creating web socket for URL',
+				url,
+				'with certificate named:',
+				secureContext.name,
+				'is_self_signed',
+				secureContext.is_self_signed
+			);
 		}
 		if (!secureContext && rejectUnauthorized !== false) {
-			throw new Error('Unable to find a valid certificate to use for replication to connect to ' + url);
+			throw new Error(
+				'Unable to find a valid certificate to use for replication to connect to ' +
+					url +
+					' available:' +
+					Array.from(secureContexts.keys())
+			);
 		}
 	}
 	const headers = {};

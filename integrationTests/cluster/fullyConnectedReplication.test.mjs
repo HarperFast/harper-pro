@@ -41,7 +41,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 							},
 							logging: {
 								colors: false,
-								stdStreams: true,
+								stdStreams: false,
 								console: true,
 							},
 							replication: {
@@ -55,7 +55,8 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 					console.log(
 						'finished setting up node: ',
 						ctx.harper.installDir.split('/').slice(-2).join(' /'),
-						ctx.harper.process.pid
+						ctx.harper.process.pid,
+						ctx.harper.hostname
 					);
 					return ctx.harper;
 				})
@@ -118,8 +119,16 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 				// everyone is connected
 				break;
 			}
-			if (retries++ > 10) {
-				console.log('Cluster status in timeout', responses);
+			if (retries++ > 20) {
+				for (let response of responses) {
+					if (response.connections.length !== NODE_COUNT - 1) {
+						console.log('Cluster missing a connection', JSON.stringify(response, null, '  '));
+					} else if (
+						!response.connections.every((connection) => connection.database_sockets.every((socket) => socket.connected))
+					) {
+						console.log('Cluster has disconnected socket', JSON.stringify(response, null, '  '));
+					}
+				}
 				responses = await Promise.all(
 					ctx.nodes.map((node) =>
 						sendOperation(node, {
