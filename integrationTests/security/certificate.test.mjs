@@ -3,7 +3,7 @@ import { equal, ok } from 'node:assert';
 import { join } from 'node:path';
 import { createCA, createCert } from 'mkcert';
 import forge from 'node-forge';
-import { setupHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -30,7 +30,7 @@ suite('Certificate', (ctx) => {
 	let testCertificate;
 
 	before(async () => {
-		await setupHarper(ctx);
+		await startHarper(ctx);
 		testCA = await createCA({
 			organization: 'Unit Test CA',
 			countryCode: 'USA',
