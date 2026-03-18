@@ -5,7 +5,7 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, deepEqual } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { setupHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { targz } from '../../core/integrationTests/utils/targz.ts';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
@@ -33,7 +33,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 							hostname: await getNextAvailableLoopbackAddress(),
 						},
 					};
-					await setupHarper(ctx, {
+					await startHarper(ctx, {
 						config: {
 							analytics: {
 								// turn off analytics, it is too noisy and gets in the way
