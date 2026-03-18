@@ -23,7 +23,8 @@ export {
 	type FileEntryEvent,
 	type AddDirectoryEvent,
 	type UnlinkDirectoryEvent,
-	type DirectoryEntryEvent } from './components/EntryHandler.ts';
+	type DirectoryEntryEvent,
+} from './components/EntryHandler.ts';
 declare global {
 	const tables: typeof dbTables;
 	const databases: typeof dbDatabases;
