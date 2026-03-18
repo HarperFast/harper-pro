@@ -110,7 +110,7 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 	server.shards = new Map();
 
 	for (let entry of getHDBNodeTable().primaryStore.getRange({})) {
-		const { value: node } = entry;
+		const { value: node, key } = entry;
 		server.nodes.push(node);
 		if (node.shard != undefined) {
 			let nodesForShard = server.shards.get(node.shard);
@@ -119,6 +119,7 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 			}
 			nodesForShard.push(node);
 		}
+		listener(node, key);
 	}
 	logger.debug?.(
 		'Known nodes at startup',

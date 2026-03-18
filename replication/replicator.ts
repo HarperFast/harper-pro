@@ -265,6 +265,7 @@ export function start(options) {
 export function monitorNodeCAs(listener: () => void) {
 	let lastCaCount = 0;
 	subscribeToNodeUpdates((node) => {
+		logger.debug('Adding node CA', node?.ca?.slice(0, 60));
 		if (node?.ca) {
 			// we only care about nodes that have a CA
 			replicationCertificateAuthorities.add(node.ca);

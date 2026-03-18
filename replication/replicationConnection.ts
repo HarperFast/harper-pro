@@ -125,7 +125,7 @@ export async function createWebSocket(
 
 	if (url.includes('wss://')) {
 		if (!secureContexts) {
-			const SNICallback = createTLSSelector('operations-api');
+			const SNICallback = createTLSSelector('replication');
 			const secureTarget = {
 				secureContexts: null,
 			};
@@ -134,10 +134,22 @@ export async function createWebSocket(
 		}
 		secureContext = secureContexts.get(node_name);
 		if (secureContext) {
-			logger.debug?.('Creating web socket for URL', url, 'with certificate named:', secureContext.name);
+			logger.debug?.(
+				'Creating web socket for URL',
+				url,
+				'with certificate named:',
+				secureContext.name,
+				'is_self_signed',
+				secureContext.is_self_signed
+			);
 		}
 		if (!secureContext && rejectUnauthorized !== false) {
-			throw new Error('Unable to find a valid certificate to use for replication to connect to ' + url);
+			throw new Error(
+				'Unable to find a valid certificate to use for replication to connect to ' +
+					url +
+					'available:' +
+					Array.from(secureContexts.keys())
+			);
 		}
 	}
 	const headers = {};
