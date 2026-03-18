@@ -121,7 +121,6 @@ export async function createWebSocket(
 	if (url == null) {
 		throw new TypeError(`Invalid URL: Expected a string URL for node "${node_name}" but received ${url}`);
 	}
-
 	if (url.includes('wss://')) {
 		if (!secureContexts) {
 			const SNICallback = createTLSSelector('replication');
@@ -146,7 +145,7 @@ export async function createWebSocket(
 			throw new Error(
 				'Unable to find a valid certificate to use for replication to connect to ' +
 					url +
-					'available:' +
+					' available:' +
 					Array.from(secureContexts.keys())
 			);
 		}
