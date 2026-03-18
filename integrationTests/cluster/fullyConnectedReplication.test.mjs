@@ -55,7 +55,8 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 					console.log(
 						'finished setting up node: ',
 						ctx.harper.installDir.split('/').slice(-2).join(' /'),
-						ctx.harper.process.pid
+						ctx.harper.process.pid,
+						ctx.harper.hostname
 					);
 					return ctx.harper;
 				})
@@ -119,7 +120,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 				break;
 			}
 			if (retries++ > 10) {
-				console.log('Cluster status in timeout', responses);
+				console.log('Cluster status in timeout', JSON.stringify(responses, null, '  '));
 				responses = await Promise.all(
 					ctx.nodes.map((node) =>
 						sendOperation(node, {
