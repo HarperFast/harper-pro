@@ -4,7 +4,7 @@ import {
 	DEFAULT_ADMIN_USERNAME,
 	DEFAULT_ADMIN_PASSWORD,
 	OPERATIONS_API_PORT,
-	setupHarper,
+	startHarper,
 	teardownHarper,
 } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
@@ -55,7 +55,7 @@ suite('Clone Node', (ctx) => {
 				hostname: await getNextAvailableLoopbackAddress(),
 			},
 		};
-		await setupHarper(nodeCtx, {
+		await startHarper(nodeCtx, {
 			config: {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
@@ -119,7 +119,7 @@ suite('Clone Node', (ctx) => {
 				hostname: await getNextAvailableLoopbackAddress(),
 			},
 		};
-		await setupHarper(cloneCtx, {
+		await startHarper(cloneCtx, {
 			config: {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
@@ -187,7 +187,7 @@ suite('Clone Node', (ctx) => {
 					hostname: await getNextAvailableLoopbackAddress(),
 				},
 			};
-			await setupHarper(cloneCtx, {
+			await startHarper(cloneCtx, {
 				config: {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false },
