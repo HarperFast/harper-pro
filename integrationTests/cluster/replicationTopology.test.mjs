@@ -48,13 +48,13 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 								databases: ['data'], // don't replicate system/nodes
 							},
 						},
-						env: {
+						/*env: {
 							HARPER_NO_FLUSH_ON_EXIT: true, // faster teardown
-						},
+						},*/
 					});
 					console.log(
 						'finished setting up node: ',
-						ctx.harper.installDir.split('/').slice(-2).join(' /'),
+						ctx.harper.dataRootDir.split('/').slice(-2).join(' /'),
 						ctx.harper.process.pid
 					);
 					return ctx.harper;
@@ -245,7 +245,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		if (response.length === 0) {
 			throw new Error('Node 1 did not replicate insert');
 		}
-		// and the gets passed on to the other node
+		// and the data is passed on to the other node
 		equal(response.length, 1);
 		equal(response[0].name, 'test while disconnected');
 		do {
@@ -262,5 +262,85 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		} while (response.length === 0);
 		equal(response.length, 1);
 		equal(response[0].name, 'test while disconnected');
+	});
+	test('Replicate data from a legacy node', async () => {
+		const legacyPath = process.env.HARPER_LEGACY_VERSION_PATH;
+		if (!legacyPath) return;
+		const hostname = await getNextAvailableLoopbackAddress();
+		const legacyContext = {
+			harper: {
+				hostname,
+			},
+		};
+		await startHarper(legacyContext, {
+			config: {
+				logging: {
+					colors: false,
+					stdStreams: true,
+					console: true,
+				},
+				replication: {
+					securePort: hostname + ':9933',
+					databases: ['data'], // don't replicate system/nodes
+				},
+			},
+			env: {
+				TC_AGREEMENT: 'yes',
+				REPLICATION_HOSTNAME: hostname,
+			},
+			harperBinPath: join(legacyPath, 'bin', 'harperdb.js'),
+		});
+		ctx.nodes.push(legacyContext.harper); // make it gets cleaned up
+		// load data:
+		await sendOperation(legacyContext.harper, {
+			operation: 'create_table',
+			table: 'test',
+			primary_key: 'id',
+			attributes: [
+				{ name: 'id', type: 'ID' },
+				{ name: 'name', type: 'String' },
+			],
+		});
+		await sendOperation(legacyContext.harper, {
+			operation: 'upsert',
+			table: 'test',
+			records: [{ id: 'old-data-1', name: 'old data test' }],
+		});
+		await sendOperation(ctx.nodes[0], {
+			// connect the central node
+			operation: 'add_node',
+			rejectUnauthorized: false,
+			hostname,
+			authorization: ctx.nodes[0].admin,
+		});
+		let retries = 0;
+		let response;
+		do {
+			response = await sendOperation(ctx.nodes[0], {
+				operation: 'cluster_status',
+			});
+			if (retries++ > 10) {
+				break;
+			}
+			await delay(200 * retries);
+		} while (
+			!response.connections.some((connection) => connection.name === hostname && connection.database_sockets.length > 0)
+		);
+		for (let i = 0; i < NODE_COUNT; i++) {
+			do {
+				response = await sendOperation(ctx.nodes[i], {
+					operation: 'search_by_id',
+					table: 'test',
+					get_attributes: ['id', 'name'],
+					ids: ['old-data-1'],
+				});
+				if (retries++ > 10) {
+					break;
+				}
+				await delay(200 * retries);
+			} while (response.length === 0);
+			equal(response.length, 1, `Node ${i} ${ctx.nodes[i].hostname} did not replicate data from legacy node`);
+			equal(response[0].name, 'old data test');
+		}
 	});
 });
