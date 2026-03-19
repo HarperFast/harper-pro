@@ -14,11 +14,11 @@ jobs:
     outputs:
       harper-pro-version: ${{ steps.version-components.outputs.version }}
     steps:
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: latest
           registry-url: 'https://registry.npmjs.org'
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - name: Get release build
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Send Slack published notification
-        uses: slackapi/slack-github-action@v2
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_KEY }}
@@ -92,7 +92,7 @@ jobs:
     needs: [publish-npm-package]
     runs-on: ubuntu-latest
     steps:
-      - uses: slackapi/slack-github-action@v2
+      - uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_KEY }}
