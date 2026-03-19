@@ -1,7 +1,7 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, deepEqual, ok } from 'node:assert';
 import { join } from 'node:path';
-import { setupHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -24,7 +24,7 @@ async function sendOperation(node, operation) {
 
 suite('SSH Key Operations', (ctx) => {
 	before(async () => {
-		await setupHarper(ctx);
+		await startHarper(ctx);
 	});
 
 	after(async () => {

@@ -150,7 +150,11 @@ export function start(options) {
 				} else {
 					logger.error(
 						`Incoming client connection from ${request.peerCertificate?.subjectaltname ?? request.ip} did not have valid certificate, you may need turn on enableRootCAs in the config if you are using a publicly signed certificate, or add the CA to the server's trusted CAs`,
-						authorizationError
+						authorizationError,
+						'certificate issuer',
+						request.peerCertificate.issuer,
+						'did not match any available CAs',
+						Array.from(Array.from(wsServers[0].secureContexts.values())[0].options.availableCAs.keys())
 					);
 				}
 			}
@@ -265,6 +269,7 @@ export function start(options) {
 export function monitorNodeCAs(listener: () => void) {
 	let lastCaCount = 0;
 	subscribeToNodeUpdates((node) => {
+		logger.debug('Adding node CA', node?.ca?.slice(0, 60));
 		if (node?.ca) {
 			// we only care about nodes that have a CA
 			replicationCertificateAuthorities.add(node.ca);
@@ -639,7 +644,7 @@ export function lastTimeInAuditStore(auditStore: Database) {
 
 export async function replicateOperation(req) {
 	const response = { message: '' };
-	if (req.replicated) {
+	if (req.replicated !== false) {
 		req.replicated = false; // don't send a replicated flag to the nodes we are sending to
 		logger.trace?.(
 			'Replicating operation',

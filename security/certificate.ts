@@ -1,3 +1,4 @@
+import type { Logger } from '../core/utility/logging/logger.ts';
 import Joi from 'joi';
 import forge from 'node-forge';
 import { access, constants, readFile, writeFile, unlink } from 'node:fs/promises';
@@ -25,7 +26,7 @@ import { server } from '../core/server/Server.ts';
 import { replicateOperation } from '../replication/replicator.ts';
 
 const { forComponent } = harperLogger;
-const logger = forComponent('certificate').conditional;
+const logger = forComponent('certificate').conditional as Logger;
 const pki = forge.pki;
 const CERT_VALIDITY_DAYS = 3650;
 

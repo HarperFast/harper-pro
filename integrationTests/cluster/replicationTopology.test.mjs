@@ -5,12 +5,7 @@
 import { suite, test, before, after } from 'node:test';
 import { equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import {
-	killHarper,
-	setupHarper,
-	startHarper,
-	teardownHarper,
-} from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { killHarper, startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
 import { sendOperation } from './clusterShared.mjs';
@@ -37,7 +32,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 							hostname: await getNextAvailableLoopbackAddress(),
 						},
 					};
-					await setupHarper(ctx, {
+					await startHarper(ctx, {
 						config: {
 							analytics: {
 								// turn off analytics, it is too noisy and gets in the way

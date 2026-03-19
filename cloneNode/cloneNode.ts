@@ -23,7 +23,7 @@ import {
 	CONFIG_PARAM_MAP,
 	HARPER_CONFIG_FILE,
 	LICENSE_KEY_DIR_NAME,
-	JWT_ENUM
+	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 
 /**
