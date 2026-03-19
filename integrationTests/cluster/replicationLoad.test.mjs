@@ -41,7 +41,6 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 							},
 							logging: {
 								colors: false,
-								stdStreams: true,
 								console: true,
 								level: 'debug',
 							},
@@ -54,9 +53,10 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 						},
 					});
 					console.log(
-						'finished setting up node: ',
+						'started node:',
 						ctx.harper.dataRootDir.split('/').slice(-2).join(' /'),
-						ctx.harper.process.pid
+						ctx.harper.process.pid,
+						ctx.harper.hostname
 					);
 					return ctx.harper;
 				})
@@ -202,13 +202,19 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 	test('replicate insert/upsert across all nodes', async () => {
 		const COUNT = 5000;
 		let start = performance.now();
-		let { execute, finish } = concurrent(() =>
-			sendOperation(ctx.nodes[Math.floor(Math.random() * NODE_COUNT)], {
+		const writtenIds = [];
+		let { execute, finish } = concurrent(() => {
+			const id = Math.floor(Math.random() * COUNT).toString();
+			// we want to stress the structure updates, but do so with uneven distribution
+			const additionalPropertyName = 'property-' + Math.floor(Math.pow(Math.random(), 4) * 50);
+			const record = { id, name: 'test' + id, [additionalPropertyName]: 'test' };
+			writtenIds.push(id);
+			return sendOperation(ctx.nodes[Math.floor(Math.random() * NODE_COUNT)], {
 				operation: 'upsert',
 				table: 'test',
-				records: [{ id: Math.floor(Math.random() * COUNT).toString(), name: 'test' }],
-			})
-		);
+				records: [record],
+			});
+		});
 		for (let i = 0; i < COUNT; i++) {
 			await execute();
 			if (i % 1000 === 0) {
@@ -243,6 +249,24 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 			'records/sec, total record count',
 			count
 		);
+		// spot check a few
+		for (let nodeI = 0; nodeI < NODE_COUNT; nodeI++) {
+			for (let i = 0; i < 10; i++) {
+				const record = (
+					await sendOperation(ctx.nodes[nodeI], {
+						operation: 'search_by_value',
+						search_attribute: 'id',
+						search_value: writtenIds[i],
+						table: 'test',
+					})
+				)[0];
+				equal(record.name, 'test' + writtenIds[i]);
+				ok(
+					Object.keys(record).length >= 3,
+					'should have at least three properties: id, name, and the additional property: ' + JSON.stringify(record)
+				);
+			}
+		}
 	});
 	suite('Deploy app and test replication', { timeout: 60000 }, () => {
 		before(async () => {
