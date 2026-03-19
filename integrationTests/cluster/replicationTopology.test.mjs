@@ -219,6 +219,50 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		});
 		equal(response.length, 0);
 	});
+	test('take down the central node, do writes and verify catchup afterwards', async () => {
+		await killHarper({ harper: ctx.nodes[0] });
+		await sendOperation(ctx.nodes[1], {
+			operation: 'upsert',
+			table: 'test',
+			records: [{ id: '2', name: 'test while disconnected' }],
+		});
+		let response;
+		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] })).harper;
+		let retries = 0;
+		// ensure the data gets to the central node
+		do {
+			await delay(200);
+			response = await sendOperation(ctx.nodes[0], {
+				operation: 'search_by_id',
+				table: 'test',
+				get_attributes: ['id', 'name'],
+				ids: ['2'],
+			});
+			if (retries++ > 10) {
+				break;
+			}
+		} while (response.length === 0);
+		if (response.length === 0) {
+			throw new Error('Node 1 did not replicate insert');
+		}
+		// and the data is passed on to the other node
+		equal(response.length, 1);
+		equal(response[0].name, 'test while disconnected');
+		do {
+			await delay(200);
+			response = await sendOperation(ctx.nodes[2], {
+				operation: 'search_by_id',
+				table: 'test',
+				get_attributes: ['id', 'name'],
+				ids: ['2'],
+			});
+			if (retries++ > 10) {
+				break;
+			}
+		} while (response.length === 0);
+		equal(response.length, 1);
+		equal(response[0].name, 'test while disconnected');
+	});
 	test('Replicate data from a legacy node', async () => {
 		const legacyPath = process.env.HARPER_LEGACY_VERSION_PATH;
 		if (!legacyPath) return;
@@ -228,7 +272,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 				hostname,
 			},
 		};
-		await setupHarper(legacyContext, {
+		await startHarper(legacyContext, {
 			config: {
 				logging: {
 					colors: false,
@@ -298,49 +342,5 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 			equal(response.length, 1, `Node ${i} ${ctx.nodes[i].hostname} did not replicate data from legacy node`);
 			equal(response[0].name, 'old data test');
 		}
-	});
-	test('take down the central node, do writes and verify catchup afterwards', async () => {
-		await killHarper({ harper: ctx.nodes[0] });
-		await sendOperation(ctx.nodes[1], {
-			operation: 'upsert',
-			table: 'test',
-			records: [{ id: '2', name: 'test while disconnected' }],
-		});
-		let response;
-		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] })).harper;
-		let retries = 0;
-		// ensure the data gets to the central node
-		do {
-			await delay(200);
-			response = await sendOperation(ctx.nodes[0], {
-				operation: 'search_by_id',
-				table: 'test',
-				get_attributes: ['id', 'name'],
-				ids: ['2'],
-			});
-			if (retries++ > 10) {
-				break;
-			}
-		} while (response.length === 0);
-		if (response.length === 0) {
-			throw new Error('Node 1 did not replicate insert');
-		}
-		// and the data is passed on to the other node
-		equal(response.length, 1);
-		equal(response[0].name, 'test while disconnected');
-		do {
-			await delay(200);
-			response = await sendOperation(ctx.nodes[2], {
-				operation: 'search_by_id',
-				table: 'test',
-				get_attributes: ['id', 'name'],
-				ids: ['2'],
-			});
-			if (retries++ > 10) {
-				break;
-			}
-		} while (response.length === 0);
-		equal(response.length, 1);
-		equal(response[0].name, 'test while disconnected');
 	});
 });
