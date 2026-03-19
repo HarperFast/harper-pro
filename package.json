@@ -32,6 +32,7 @@
 		"replication/",
 		"security/",
 		"licensing/",
+		"analytics/",
 		"static/",
 		"core/",
 		"studio/",
@@ -39,6 +40,28 @@
 		"*.d.ts",
 		"npm-shrinkwrap.json"
 	],
+	"imports": {
+		"#src/*": {
+			"import": {
+				"typestrip": "./*.ts",
+				"default": "./dist/*.js"
+			},
+			"require": {
+				"typestrip": "./*.ts",
+				"default": "./dist/*.js"
+			}
+		},
+		"#js/*": {
+			"import": {
+				"typestrip": "./*.js",
+				"default": "./dist/*.js"
+			},
+			"require": {
+				"typestrip": "./*.js",
+				"default": "./dist/*.js"
+			}
+		}
+	},
 	"engines": {
 		"minimum-node": "16.0.0",
 		"go-lang": "1.21.7",
@@ -71,6 +94,7 @@
 		"cluster:hostname:latest": "pushd utility/dev && docker compose -f docker-compose.hostname.yml --project-directory ../.. pull && docker compose -f docker-compose.hostname.yml --project-directory ../.. up; popd"
 	},
 	"dependencies": {
+		"@datadog/pprof": "^5.13.5",
 		"harper": "./core"
 	},
 	"devDependencies": {

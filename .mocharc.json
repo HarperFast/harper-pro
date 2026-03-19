@@ -1,0 +1,10 @@
+{
+	"timeout": 0,
+	"ui": "bdd",
+	"extension": ["js", "mjs"],
+	"recursive": true,
+	"enable-source-maps": true,
+	"exclude": ["unitTests/testApp/**"],
+	"node-option": ["expose-internals", "enable-source-maps", "experimental-vm-modules"],
+	"exit": true
+}

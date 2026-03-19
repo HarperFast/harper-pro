@@ -3,6 +3,7 @@
 		"replication/**/*",
 		"security/**/*",
 		"licensing/**/*",
+		"analytics/**/*",
 		"bin/**/*",
 		"core/bin/**/*",
 		"core/components/**/*",
