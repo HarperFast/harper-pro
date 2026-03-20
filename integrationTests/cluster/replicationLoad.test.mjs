@@ -3,7 +3,7 @@
  *
  */
 import { suite, test, before, after } from 'node:test';
-import { equal } from 'node:assert';
+import { equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
@@ -139,6 +139,64 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 			await delay(200 * retries);
 		} while (true);
 		await delay(500);
+	});
+	test('replicate across many databases', async () => {
+		const DB_COUNT = 10;
+		for (let i = 0; i < DB_COUNT; i++) {
+			const db = 'db' + i;
+			// create a table on each node
+			await Promise.all(
+				ctx.nodes.map(async (node) => {
+					await sendOperation(node, {
+						operation: 'create_table',
+						database: db,
+						table: 'test',
+						primary_key: 'id',
+						attributes: [
+							{ name: 'id', type: 'ID' },
+							{ name: 'name', type: 'String' },
+						],
+					});
+				})
+			);
+		}
+		console.log('created tables');
+		await delay(10000);
+		let start = performance.now();
+		for (let i = 0; i < DB_COUNT; i++) {
+			const db = 'db' + i;
+			for (let j = 0; j < NODE_COUNT; j++) {
+				await sendOperation(ctx.nodes[j], {
+					operation: 'upsert',
+					database: db,
+					table: 'test',
+					records: [{ id: 'from-node-' + j, name: 'test' }],
+				});
+			}
+		}
+		for (let i = 0; i < DB_COUNT; i++) {
+			const db = 'db' + i;
+			for (let j = 0; j < NODE_COUNT; j++) {
+				let retries = 0;
+				let response;
+				do {
+					response = await sendOperation(ctx.nodes[j], {
+						operation: 'search_by_value',
+						database: db,
+						table: 'test',
+						search_attribute: 'name',
+						search_value: '*',
+					});
+					if (retries++ > 0) {
+						if (retries > 10) {
+							ok(false, 'Timed out waiting for replication');
+						}
+						await delay(retries * 100);
+					}
+				} while (response.length != NODE_COUNT);
+			}
+		}
+		console.log('done');
 	});
 
 	test('replicate insert/upsert across all nodes', async () => {

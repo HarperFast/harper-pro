@@ -38,7 +38,26 @@
 		"studio/",
 		"dist/",
 		"*.d.ts",
-		"npm-shrinkwrap.json"
+		"npm-shrinkwrap.json",
+		"!core/.*",
+		"!core/build-tools/",
+		"!core/config-app.schema.json",
+		"!core/config-root.schema.json",
+		"!core/dev/",
+		"!core/CONTRIBUTING.md",
+		"!core/CODE_OF_CONDUCT.md",
+		"!core/dependencies.md",
+		"!core/Dockerfile",
+		"!core/globals.js",
+		"!core/integrationTests/",
+		"!core/package.json",
+		"!core/prettier.config.mjs",
+		"!core/renovate.json",
+		"!core/schema.graphql",
+		"!core/storage-format.md",
+		"!core/SUPPORT.md",
+		"!core/tsconfig.*",
+		"!core/unitTests/"
 	],
 	"imports": {
 		"#src/*": {
