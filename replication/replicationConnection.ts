@@ -1558,10 +1558,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						(blob) => receiveBlobs(blob, id)
 					);
 				} catch (error) {
-					error.message += ' record id: ' + id;
-					error.message += ' typed structures for current decoder' + JSON.stringify(tableDecoder.decoder.typedStructs);
-					error.message += ' structures for current decoder' + JSON.stringify(tableDecoder.decoder.structures);
-					throw error;
+					logger.error?.(
+						'Error decoding replication message, record id: ' + id,
+						' typed structures for current decoder' + JSON.stringify(tableDecoder.decoder.typedStructs),
+						' structures for current decoder' + JSON.stringify(tableDecoder.decoder.structures),
+						'encoded message',
+						auditRecord.encoded.subarray(0, 1000),
+						auditRecord,
+						error
+					);
 				}
 				beginTxn = false;
 				// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
