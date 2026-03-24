@@ -4,7 +4,9 @@ export class PublicKey {
 	pem: string;
 
 	constructor(mode?: string) {
-		if (mode && (mode === 'test' || mode === 'development')) {
+		if (process.env.HARPER_LICENSE_PUBLIC_KEY) {
+			this.pem = process.env.HARPER_LICENSE_PUBLIC_KEY;
+		} else if (mode && (mode === 'test' || mode === 'development')) {
 			this.pem = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAO301jvpO12znGdK/Izrre518pgmQNk9hSMXf4wDMucM=
 -----END PUBLIC KEY-----
