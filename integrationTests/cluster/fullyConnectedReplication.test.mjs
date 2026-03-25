@@ -28,12 +28,13 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			Array(NODE_COUNT)
 				.fill(null)
 				.map(async () => {
-					const ctx = {
+					const nodeCtx = {
+						name: ctx.name,
 						harper: {
 							hostname: await getNextAvailableLoopbackAddress(),
 						},
 					};
-					await startHarper(ctx, {
+					await startHarper(nodeCtx, {
 						config: {
 							analytics: {
 								// turn off analytics, it is too noisy and gets in the way
@@ -45,7 +46,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 								console: true,
 							},
 							replication: {
-								securePort: ctx.harper.hostname + ':9933',
+								securePort: nodeCtx.harper.hostname + ':9933',
 							},
 						},
 						env: {
@@ -54,11 +55,11 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 					});
 					console.log(
 						'finished setting up node: ',
-						ctx.harper.dataRootDir.split('/').slice(-2).join(' /'),
-						ctx.harper.process.pid,
-						ctx.harper.hostname
+						nodeCtx.harper.dataRootDir.split('/').slice(-2).join(' /'),
+						nodeCtx.harper.process.pid,
+						nodeCtx.harper.hostname
 					);
-					return ctx.harper;
+					return nodeCtx.harper;
 				})
 		);
 		// create a table on each node
@@ -78,6 +79,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 	});
 
 	after(async () => {
+		if (!ctx.nodes) return;
 		await Promise.all(
 			ctx.nodes.map((node) => {
 				return teardownHarper({ harper: node });

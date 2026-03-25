@@ -34,7 +34,7 @@ const ONLY = values.only ?? false;
 
 const TEST_FILES = positionals.length > 0 ? positionals : ['integrationTests/**/*.test.mjs'];
 
-run({
+const stream = run({
 	concurrency: ISOLATION === 'none' ? undefined : CONCURRENCY,
 	isolation: ISOLATION,
 	globPatterns: TEST_FILES,
@@ -43,9 +43,14 @@ run({
 		index: SHARD_INDEX,
 		total: SHARD_TOTAL,
 	},
-})
-	.on('test:fail', () => {
-		process.exitCode = 1;
-	})
-	.compose(spec)
-	.pipe(process.stdout);
+});
+
+stream.on('test:fail', () => {
+	process.exitCode = 1;
+});
+
+stream.on('end', () => {
+	process.exit(process.exitCode || 0);
+});
+
+stream.compose(spec).pipe(process.stdout);

@@ -51,6 +51,7 @@ suite('Clone Node', (ctx) => {
 	before(async () => {
 		ctx.nodes = [];
 		const nodeCtx = {
+			name: ctx.name,
 			harper: {
 				hostname: await getNextAvailableLoopbackAddress(),
 			},
@@ -115,6 +116,7 @@ suite('Clone Node', (ctx) => {
 
 	test('should clone a node successfully', async () => {
 		const cloneCtx = {
+			name: ctx.name,
 			harper: {
 				hostname: await getNextAvailableLoopbackAddress(),
 			},
@@ -183,6 +185,7 @@ suite('Clone Node', (ctx) => {
 
 		for (let i = 0; i < TOTAL_NEW_NODES; i++) {
 			const cloneCtx = {
+				name: ctx.name,
 				harper: {
 					hostname: await getNextAvailableLoopbackAddress(),
 				},
