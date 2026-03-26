@@ -1,9 +1,12 @@
 import type { Logger } from '../core/utility/logging/logger.ts';
+import harperLogger from '../core/utility/logging/harper_logger.js';
 import { type ValidatedLicense, validateLicense, initPublicKey } from './validation.ts';
 import { ClientError } from '../core/utility/errors/hdbError.js';
 import { onAnalyticsAggregate } from '../core/resources/analytics/write.ts';
-import { transaction } from '../core/resources/transaction.ts';
 import { databases } from '../core/resources/databases.ts';
+import { transaction } from '../core/resources/transaction.ts';
+import { get as envGet } from '../core/utility/environment/environmentManager.js';
+import { parentPort } from 'worker_threads';
 import { watch } from 'chokidar';
 import path from 'node:path';
 import * as fs from 'node:fs/promises';
@@ -16,7 +19,8 @@ import type { Scope } from '../core/components/Scope.ts';
 // eslint-disable-next-line no-unused-vars
 export const suppressHandleApplicationWarning = true;
 
-let logger: Logger;
+const { forComponent } = harperLogger;
+const logger: Logger = forComponent('licensing').conditional;
 
 class ExistingLicenseError extends Error {}
 
@@ -49,10 +53,15 @@ let licenseConsoleErrorPrinted = false;
 let licenseWarningIntervalId: NodeJS.Timeout;
 const LICENSE_NAG_PERIOD = 600000; // ten minutes
 
-export function handleApplication({ server, logger, options }: Scope) {
+// Register analytics listener on the main thread where aggregation runs
+if (!parentPort) {
+	onAnalyticsAggregate(recordUsage);
+}
+
+export function handleApplication({ server, options }: Scope) {
 	const region = options.get(terms.CONFIG_PARAMS.LICENSE_REGION.split('_')) as string;
 	const mode = options.get(terms.CONFIG_PARAMS.LICENSE_MODE.split('_')) as string;
-	initUsageLicensing({ server, logger, license: { region, mode } });
+	initUsageLicensing({ server, license: { region, mode } });
 }
 
 interface LicenseParams {
@@ -62,13 +71,10 @@ interface LicenseParams {
 
 interface UsageLicensingInitParams {
 	server: Server;
-	logger: Logger;
 	license: LicenseParams;
 }
 
 export function initUsageLicensing(params: UsageLicensingInitParams) {
-	logger = params.logger;
-
 	initPublicKey(params.license.mode);
 
 	licenseRegion = params.license.region;
@@ -93,8 +99,6 @@ export function initUsageLicensing(params: UsageLicensingInitParams) {
 		}
 		return response;
 	});
-
-	onAnalyticsAggregate(recordUsage);
 
 	server.registerOperation?.({
 		name: 'install_usage_license',
@@ -154,13 +158,14 @@ export function isActiveLicense(license: UsageLicense): boolean {
 	);
 }
 
-export async function getActiveLicense(): Promise<UsageLicense | undefined> {
+export async function getActiveLicense(region?: string): Promise<UsageLicense | undefined> {
+	const effectiveRegion = region ?? licenseRegion;
 	const licenseQuery = {
 		sort: { attribute: '__createdtime__' },
 		conditions: [{ attribute: 'expiration', comparator: 'greater_than', value: new Date().toISOString() }],
 	};
-	if (licenseRegion !== undefined) {
-		licenseQuery.conditions.push({ attribute: 'region', comparator: 'equals', value: licenseRegion });
+	if (effectiveRegion !== undefined) {
+		licenseQuery.conditions.push({ attribute: 'region', comparator: 'equals', value: effectiveRegion });
 	}
 	const results = databases.system.hdb_license?.search(licenseQuery as any);
 	for await (const license of results ?? []) {
@@ -177,13 +182,36 @@ export async function isLicensed(): Promise<boolean> {
 }
 
 async function recordUsage(analytics: any) {
+	const region = licenseRegion ?? (envGet(terms.CONFIG_PARAMS.LICENSE_REGION) as string);
+
 	logger.trace?.('Recording usage into license from analytics');
-	const activeLicenseId = (await getActiveLicense())?.id;
+	const activeLicenseId = (await getActiveLicense(region))?.id;
 	if (activeLicenseId) {
 		logger.trace?.('Found license to record usage into:', activeLicenseId);
-		const context: any = {};
-		transaction(context, () => {
-			const updatableActiveLicense = databases.system.hdb_license.update(activeLicenseId, context);
+
+		// Read latest node-storage metrics from analytics, sum latest per node
+		let totalStorage: number | undefined;
+		try {
+			totalStorage = 0;
+			const seenNodes = new Set<number>();
+			for await (const record of databases.system.hdb_analytics?.search({
+				conditions: [{ attribute: 'metric', comparator: 'equals', value: 'node-storage' }],
+				sort: { attribute: 'id', descending: true },
+			} as any) ?? []) {
+				const nodeId = record.id?.[1];
+				if (nodeId !== undefined && !seenNodes.has(nodeId)) {
+					seenNodes.add(nodeId);
+					totalStorage += record.size ?? 0;
+				}
+			}
+		} catch (err) {
+			logger.error?.('Failed to read storage metrics:', err);
+			totalStorage = undefined;
+		}
+
+		// Atomic transaction for all license updates
+		await transaction(async () => {
+			const updatableActiveLicense = await databases.system.hdb_license.update(activeLicenseId, {});
 			for (const analyticsRecord of analytics) {
 				logger.trace?.('Processing analytics record:', analyticsRecord);
 				switch (analyticsRecord.metric) {
@@ -211,6 +239,10 @@ async function recordUsage(analytics: any) {
 					default:
 						logger.trace?.('Skipping metric:', analyticsRecord.metric);
 				}
+			}
+			// Set storage at the end
+			if (totalStorage !== undefined) {
+				updatableActiveLicense.usedStorage = totalStorage;
 			}
 		});
 	} else if (!process.env.DEV_MODE) {

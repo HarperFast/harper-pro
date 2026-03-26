@@ -1,0 +1,4 @@
+type TestRecord @table @export {
+	id: ID @primaryKey
+	value: String
+}
