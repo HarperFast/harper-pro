@@ -117,6 +117,7 @@
 		"harper": "./core"
 	},
 	"devDependencies": {
-		"@harperdb/code-guidelines": "^0.0.6"
+		"@harperdb/code-guidelines": "^0.0.6",
+		"oxlint": "^1.50.0"
 	}
 }

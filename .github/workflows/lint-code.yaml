@@ -1,0 +1,20 @@
+name: Lint Source Code
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    - cron: '17 14 * * 1-5' # Run M-F at 2:17pm UTC (7:17am MST / 8:17am MDT)
+  workflow_dispatch:
+
+jobs:
+  runLinter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+      - run: npm i
+      - run: npm run lint:required

@@ -164,7 +164,6 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 		}
 		console.log('created tables');
 		await delay(10000);
-		let start = performance.now();
 		for (let i = 0; i < DB_COUNT; i++) {
 			const db = 'db' + i;
 			for (let j = 0; j < NODE_COUNT; j++) {
