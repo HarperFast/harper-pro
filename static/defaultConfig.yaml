@@ -24,6 +24,9 @@ analytics:
   aggregatePeriod: 60
   replicate: false
 applications:
+  lockdown: freeze
+  containment: vm
+  dependencyContainment: auto
   allowedShellCommands:
     - npm
     - node

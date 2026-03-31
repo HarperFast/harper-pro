@@ -8,7 +8,7 @@ import { pack, unpack } from 'msgpackr';
 
 const REMOTE_NODE_IDS = Symbol.for('remote-ids');
 function getIdMappingRecord(auditStore) {
-	const idMappingRecordBuffer = auditStore.get(REMOTE_NODE_IDS);
+	const idMappingRecordBuffer = auditStore.getBinary(REMOTE_NODE_IDS);
 	let idMappingRecord = idMappingRecordBuffer ? unpack(idMappingRecordBuffer) : null;
 	if (!idMappingRecord) {
 		idMappingRecord = { remoteNameToId: {} };
