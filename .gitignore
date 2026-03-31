@@ -10,3 +10,6 @@ node_modules/
 /harperfast-harper-pro-*.tgz
 
 .DS_Store
+
+unitTests/server/replication/envDir
+unitTests/envDir
