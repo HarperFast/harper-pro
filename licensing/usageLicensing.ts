@@ -12,6 +12,7 @@ import * as configUtils from '../core/config/configUtils.js';
 import * as terms from '../core/utility/hdbTerms.ts';
 import type { Server } from '../core/server/Server.ts';
 import type { Scope } from '../core/components/Scope.ts';
+import { universalHeaders } from '../core/server/http.ts';
 
 // eslint-disable-next-line no-unused-vars
 export const suppressHandleApplicationWarning = true;
@@ -72,27 +73,6 @@ export function initUsageLicensing(params: UsageLicensingInitParams) {
 	initPublicKey(params.license.mode);
 
 	licenseRegion = params.license.region;
-
-	const { server } = params;
-
-	// TODO: This only injects this header on resource API requests.
-	//       It might be good to add a way for internal plugins to
-	//       add headers to operations API requests as well.
-	server.http(async (request, nextHandler) => {
-		const response = nextHandler(request);
-		if (response) {
-			if (!response.headers?.set) {
-				(response as any).headers = new Headers(response.headers);
-			}
-			if (!(await isLicensed())) {
-				response.headers.set(
-					'X-License-Info',
-					'Unlicensed Harper Pro, this should only be used for educational and development purposes'
-				);
-			}
-		}
-		return response;
-	});
 
 	onAnalyticsAggregate(recordUsage);
 
@@ -213,17 +193,27 @@ async function recordUsage(analytics: any) {
 				}
 			}
 		});
-	} else if (!process.env.DEV_MODE) {
-		const msg =
-			'This server does not have valid usage licenses, this should only be used for educational and development purposes.';
-		if (!licenseConsoleErrorPrinted) {
-			console.error(msg);
-			licenseConsoleErrorPrinted = true;
-		}
-		if (licenseWarningIntervalId === undefined) {
-			licenseWarningIntervalId = setInterval(() => {
-				logger.notify?.(msg);
-			}, LICENSE_NAG_PERIOD).unref();
+		universalHeaders.splice(0, universalHeaders.length); // clear out any previous license nag headers
+	} else {
+		// assign license nag header
+		universalHeaders.splice(
+			0,
+			universalHeaders.length,
+			'X-License-Info',
+			'Unlicensed Harper Pro, this should only be used for educational and development purposes'
+		);
+		if (!process.env.DEV_MODE) {
+			const msg =
+				'This server does not have valid usage licenses, this should only be used for educational and development purposes.';
+			if (!licenseConsoleErrorPrinted) {
+				console.error(msg);
+				licenseConsoleErrorPrinted = true;
+			}
+			if (licenseWarningIntervalId === undefined) {
+				licenseWarningIntervalId = setInterval(() => {
+					logger.notify?.(msg);
+				}, LICENSE_NAG_PERIOD).unref();
+			}
 		}
 	}
 }
