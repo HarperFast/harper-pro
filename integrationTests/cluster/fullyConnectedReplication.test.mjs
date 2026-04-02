@@ -21,7 +21,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 const NODE_COUNT = 4;
-suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
+function clusterReplication(ctx) {
 	before(async () => {
 		// start up the nodes
 		ctx.nodes = await Promise.all(
@@ -47,6 +47,9 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 							},
 							replication: {
 								securePort: nodeCtx.harper.hostname + ':9933',
+							},
+							storage: {
+								engine: ctx.testLMDB ? 'lmdb' : 'rocksdb',
 							},
 						},
 						env: {
@@ -192,6 +195,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			records: [{ id: '1', name: 'test2' }],
 			replicatedConfirmation: NODE_COUNT - 1,
 		});
+		if (ctx.testLMDB) await delay(400); // confirmation isn't working for LMDB
 		for (let i = 0; i < NODE_COUNT; i++) {
 			let response = await sendOperation(ctx.nodes[i], {
 				operation: 'search_by_id',
@@ -210,6 +214,7 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			ids: ['1'],
 			replicatedConfirmation: NODE_COUNT - 1,
 		});
+		if (ctx.testLMDB) await delay(400);
 		let response = await sendOperation(ctx.nodes[0], {
 			operation: 'search_by_id',
 			table: 'test',
@@ -259,4 +264,9 @@ suite('Cluster Replication', { timeout: 120000 }, (ctx) => {
 			deepEqual(imageFrom1, imageFrom2);
 		});
 	});
+}
+suite('Cluster Replication', { timeout: 120000 }, clusterReplication);
+suite('Cluster Replication with LMDB', { timeout: 120000 }, (ctx) => {
+	ctx.testLMDB = true;
+	clusterReplication(ctx);
 });
