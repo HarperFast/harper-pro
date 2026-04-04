@@ -27,7 +27,7 @@ applications:
   lockdown: freeze
   containment: vm
   dependencyContainment: auto
-  allowedShellCommands:
+  allowedSpawnCommands:
     - npm
     - node
 componentsRoot: null
