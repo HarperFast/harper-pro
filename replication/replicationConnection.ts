@@ -427,7 +427,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	}
 	setInterval(updateBackPressureRatio, BACK_PRESSURE_INTERVAL).unref();
 	function getSharedStatus() {
-		if (!remoteNodeName || !databaseName) {
+		if (!remoteNodeName || !databaseName || !auditStore) {
 			return;
 		}
 		if (!replicationSharedStatus) {

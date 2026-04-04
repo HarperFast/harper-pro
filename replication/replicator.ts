@@ -112,7 +112,7 @@ export function start(options) {
 
 	options = {
 		// We generally expect this to use the same settings as the operations API port
-		isOperationsServer: true, // we default to using the operations server ports
+		usageType: 'replication', // indicate usage type for cert selection
 		maxPayload: 10 * 1024 * 1024 * 1024, // 10 GB max payload, primarily to support replicating applications
 		...options,
 		mtls: mtlsConfig, // mTLS with optional certificate verification (always overrides)
@@ -424,7 +424,7 @@ export function setReplicator(dbName: string, table: any, options: any) {
 								logger.warn('Error in load from node', bestNode, error);
 								if (!firstError) firstError = error;
 							}
-							// eslint-disable-next-line no-constant-condition
+							//
 						} while (true);
 					}
 				}
