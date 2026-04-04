@@ -83,7 +83,7 @@ export async function setNode(req: any) {
 		rep = await getReplicationCert();
 		const caRecord = await getReplicationCertAuth();
 		if (!rep) throw new Error('Unable to find a certificate to use for replication');
-		if (rep.options.is_self_signed) {
+		if (rep.options.is_self_signed || req.force_signing) {
 			// Create the certificate signing request that will be sent to the other node
 			csr = await createCsr();
 			hdbLogger.info('Sending CSR to target node:', url);
@@ -152,8 +152,9 @@ export async function setNode(req: any) {
 
 		if (targetNodeResponse.certificate) {
 			await setCertTable({
-				name: getThisNodeName(),
-				uses: ['https', 'operations', 'wss', 'replication'],
+				// give it a different name so we don't interfere with existing certificates
+				name: getThisNodeName() + '-replication',
+				uses: ['replication'],
 				certificate: targetNodeResponse.certificate,
 				private_key_name: rep?.options?.key_file,
 				is_authority: false,
