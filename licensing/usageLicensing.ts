@@ -194,6 +194,11 @@ async function recordUsage(analytics: any) {
 			}
 		});
 		universalHeaders.splice(0, universalHeaders.length); // clear out any previous license nag headers
+		if (licenseWarningIntervalId !== undefined) {
+			clearInterval(licenseWarningIntervalId);
+			licenseWarningIntervalId = undefined;
+			licenseConsoleErrorPrinted = false;
+		}
 	} else {
 		// assign license nag header
 		universalHeaders.splice(
