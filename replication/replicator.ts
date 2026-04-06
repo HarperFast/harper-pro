@@ -424,7 +424,6 @@ export function setReplicator(dbName: string, table: any, options: any) {
 								logger.warn('Error in load from node', bestNode, error);
 								if (!firstError) firstError = error;
 							}
-							//
 						} while (true);
 					}
 				}
