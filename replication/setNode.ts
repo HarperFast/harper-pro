@@ -153,7 +153,7 @@ export async function setNode(req: any) {
 		if (targetNodeResponse.certificate) {
 			await setCertTable({
 				// give it a different name so we don't interfere with existing certificates
-				name: getThisNodeName() + '-replication',
+				name: `${getThisNodeName()}-replication`,
 				uses: ['replication'],
 				certificate: targetNodeResponse.certificate,
 				private_key_name: rep?.options?.key_file,
