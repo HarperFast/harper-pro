@@ -14,7 +14,7 @@ import type { Server } from '../core/server/Server.ts';
 import type { Scope } from '../core/components/Scope.ts';
 import { universalHeaders } from '../core/server/http.ts';
 
-// eslint-disable-next-line no-unused-vars
+//
 export const suppressHandleApplicationWarning = true;
 
 let logger: Logger;
@@ -47,7 +47,7 @@ interface GetUsageLicensesReq extends GetUsageLicenseParams {
 
 let licenseRegion: string | undefined;
 let licenseConsoleErrorPrinted = false;
-let licenseWarningIntervalId: NodeJS.Timeout;
+let licenseWarningIntervalId: NodeJS.Timeout | undefined;
 const LICENSE_NAG_PERIOD = 600000; // ten minutes
 
 export function handleApplication({ server, logger, options }: Scope) {
