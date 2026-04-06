@@ -4,7 +4,6 @@ node_modules/
 /studio/
 /studio-src/
 
-/package-lock.json
 /npm-shrinkwrap.json
 
 /harperfast-harper-pro-*.tgz
