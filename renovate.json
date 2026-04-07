@@ -11,6 +11,10 @@
 	"lockFileMaintenance": { "enabled": false },
 	"packageRules": [
 		{
+			"matchFiles": ["package.json"],
+			"enabled": false
+		},
+		{
 			"groupName": "pin digests",
 			"groupSlug": "all-digests",
 			"matchDepTypes": ["action"],
