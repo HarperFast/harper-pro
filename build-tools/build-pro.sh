@@ -14,11 +14,14 @@ function use_git {
 
 function cleanup {
   if use_git; then
-    echo -e "\n📦 Restoring package.json & core files"
-    git restore package.json
+    echo -e "\n📦 Restoring core files"
     pushd core
     git restore .
     popd
+    echo -e "\n📦 Restoring package-lock.json"
+    git restore package-lock.json
+    echo -e "\n📦 Removing npm-shrinkwrap.json"
+    rm npm-shrinkwrap.json
   fi
 }
 
@@ -31,27 +34,11 @@ if [[ "$IGNORE_PACKAGE_JSON_DIFF" != "true" ]]; then
   fi
 fi
 
-echo -e "\n📦 Installing base npm deps"
-npm install
-
-if use_git; then
-  echo -e "\n📦 Updating core submodule"
-  git submodule update --init --recursive
-fi
+echo -e "\n📦 Installing production deps"
+npm ci
 
 echo -e "\n📦 Applying Harper Pro branding"
 perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/installer.js
-
-echo -e "\n📦 Copying dependencies & devDependencies from core"
-deps=$(cd core && npm pkg get dependencies)
-npm pkg set "dependencies=${deps}" --json
-# re-add @datadog/pprof back to the dependencies
-npm install @datadog/pprof
-devDeps=$(cd core && npm pkg get devDependencies)
-npm pkg set "devDependencies=${devDeps}" --json
-
-echo -e "\n📦 Installing core deps"
-npm install
 
 echo -e "\n📦 Building project"
 npm run build || true

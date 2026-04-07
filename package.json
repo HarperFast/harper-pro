@@ -97,6 +97,7 @@
 	"scripts": {
 		"build": "tsc --project tsconfig.json",
 		"build:watch": "npm run build -- --watch --incremental",
+		"core:sync": "./build-tools/sync-core.sh",
 		"package": "./build-tools/build-pro.sh",
 		"download-prebuilds": "node ./build-tools/download-prebuilds.js",
 		"prebuild": "date",
@@ -116,7 +117,6 @@
 		".": "./dist/core/index.js"
 	},
 	"dependencies": {
-		"@datadog/pprof": "^5.13.5",
 		"harper": "./core"
 	},
 	"devDependencies": {
