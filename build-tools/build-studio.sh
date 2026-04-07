@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 
+echo -e "\n📦 Building local studio..."
 rm -Rf studio-src studio
 mkdir studio-src
 cd studio-src
