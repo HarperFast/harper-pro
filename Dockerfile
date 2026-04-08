@@ -38,6 +38,7 @@ RUN <<-EOF
   npm install --global harperfast-harper-pro-*.tgz
   rm harperfast-harper-pro-*.tgz
   mkdir -p /home/harperdb/harper
+  chown harperdb:harperdb /home/harperdb/harper
 EOF
 
 VOLUME /home/harperdb/harper
