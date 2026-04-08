@@ -36,9 +36,6 @@ interface JWTRSAKeys {
  * @returns The resolved key material as a string.
  */
 async function keyResolver(req: KeyResolverRequest): Promise<string> {
-	// This is here to block this function from being called by operations API. It can be called by replication or a resource
-	if (req.bypass_auth !== true) throw new ClientError('Unauthorized', '401');
-
 	const validation = validateBySchema(
 		req,
 		Joi.object({
