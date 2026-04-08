@@ -2,6 +2,14 @@
 
 set -e
 
+SKIP_INSTALL=false
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    --skip-install) SKIP_INSTALL=true ;;
+  esac
+  shift
+done
+
 function use_git {
   # in some environments (e.g. Docker) we don't have the .git dir
   if [[ -n "$NO_USE_GIT" ]]; then
@@ -21,7 +29,6 @@ fi
 
 if use_git; then
   echo -e "\n📦 Updating core submodule"
-  git submodule update --init --recursive
   git submodule update --remote --recursive
 fi
 
@@ -38,7 +45,11 @@ npm pkg set "overrides=${overrides}" --json
 optionalDependencies=$(cd core && npm pkg get optionalDependencies)
 npm pkg set "optionalDependencies=${optionalDependencies}" --json
 
-echo -e "\n📦 Installing core deps"
-npm install
+if [[ "$SKIP_INSTALL" != "true" ]]; then
+  echo -e "\n📦 Installing core deps"
+  npm install
+else
+  echo -e "\n📦 Skipping core deps installation"
+fi
 
 echo -e "\n🎉 Synchronized!"
