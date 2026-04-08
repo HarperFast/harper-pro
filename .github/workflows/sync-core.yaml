@@ -1,6 +1,8 @@
 name: Sync Core
 
 on:
+  repository_dispatch:
+    types: [ sync_core ]
   workflow_dispatch:
 
 permissions:
