@@ -1,12 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
-import {
-	DEFAULT_ADMIN_USERNAME,
-	DEFAULT_ADMIN_PASSWORD,
-	OPERATIONS_API_PORT,
-	startHarper,
-	teardownHarper,
-} from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
@@ -95,8 +89,8 @@ suite('Clone Node', (ctx) => {
 		// Create authentication tokens to verify that they get cloned properly
 		await sendOperation(nodeCtx.harper, {
 			operation: 'create_authentication_tokens',
-			username: DEFAULT_ADMIN_USERNAME,
-			password: DEFAULT_ADMIN_PASSWORD,
+			username: nodeCtx.harper.admin.username,
+			password: nodeCtx.harper.admin.password,
 		});
 
 		// Add an SSH key to verify that it gets cloned properly
@@ -137,7 +131,7 @@ suite('Clone Node', (ctx) => {
 				},
 			},
 			env: {
-				HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:${OPERATIONS_API_PORT}`,
+				HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:9925`,
 				HDB_LEADER_TOKEN: createTokenResponse.operation_token,
 				ALLOW_SELF_SIGNED: true,
 				HARPER_NO_FLUSH_ON_EXIT: true,
@@ -224,9 +218,9 @@ suite('Clone Node', (ctx) => {
 					},
 				},
 				env: {
-					HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:${OPERATIONS_API_PORT}`,
-					HDB_LEADER_USERNAME: DEFAULT_ADMIN_USERNAME,
-					HDB_LEADER_PASSWORD: DEFAULT_ADMIN_PASSWORD,
+					HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:9925`,
+					HDB_LEADER_USERNAME: ctx.nodes[0].admin.username,
+					HDB_LEADER_PASSWORD: ctx.nodes[0].admin.password,
 					ALLOW_SELF_SIGNED: true,
 					HARPER_NO_FLUSH_ON_EXIT: true,
 				},
