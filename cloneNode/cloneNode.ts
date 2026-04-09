@@ -32,14 +32,14 @@ import {
  * Clone Methods:
  * This script supports two cloning approaches:
  * 1. Certificate-based: Uses pre-setup certs for authentication over WebSocket connections
- * 2. set_node cloning: Uses credentials (username/password) with fetch calls between nodes
+ * 2. username/password or JWT token cloning: Uses credentials (username/password or token) with fetch calls between nodes
  *
  * Required (if not via CLI):
  * - HDB_LEADER_URL: URL of the leader node to clone from
  *
- * Required for set_node cloning:
- * - HDB_LEADER_USERNAME: Admin username for credential-based authentication
- * - HDB_LEADER_PASSWORD: Admin password for credential-based authentication
+ * Required for username/password or JWT token cloning:
+ * - HDB_LEADER_USERNAME + HDB_LEADER_PASSWORD: Admin credentials for username/password authentication
+ * - HDB_LEADER_TOKEN: JWT authentication token for the leader node
  *
  * Optional:
  * - CLONE_SSH_KEYS: Clone SSH keys from leader (default: true)
@@ -104,6 +104,7 @@ type ParsedValues = {
 	'leader-url'?: string;
 	'leader-username'?: string;
 	'leader-password'?: string;
+	'leader-token'?: string;
 	'rootpath'?: string;
 	'node-hostname'?: string;
 	'replication-port'?: string;
@@ -120,6 +121,7 @@ const { values } = parseArgs({
 		'leader-url': { type: 'string' },
 		'leader-username': { type: 'string' },
 		'leader-password': { type: 'string' },
+		'leader-token': { type: 'string' },
 		'rootpath': { type: 'string' },
 		'node-hostname': { type: 'string' },
 		'replication-port': { type: 'string' },
@@ -136,6 +138,7 @@ const { values } = parseArgs({
 const leaderURL: string = values['leader-url'] || process.env.HDB_LEADER_URL;
 const leaderUsername: string = values['leader-username'] || process.env.HDB_LEADER_USERNAME;
 const leaderPassword: string = values['leader-password'] || process.env.HDB_LEADER_PASSWORD;
+const leaderToken: string = values['leader-token'] || process.env.HDB_LEADER_TOKEN;
 const skipSyncMonitor: boolean = values['skip-sync-monitor'] ?? process.env.CLONE_SKIP_SYNC_MONITOR === 'true';
 const syncTimeoutMs: number = Math.max(
 	1,
@@ -148,16 +151,15 @@ const forceClone: boolean = values['force-clone'] ?? process.env.FORCE_CLONE ===
 const allowSelfSigned: boolean = values['allow-self-signed'] ?? process.env.ALLOW_SELF_SIGNED === 'true';
 const nodeHostname: string = values['node-hostname'] || process.env.NODE_HOSTNAME || process.env.REPLICATION_HOSTNAME;
 let rootPath: string = values['rootpath'] || values['ROOTPATH'] || process.env.ROOTPATH;
-const cloneUsingSetNode: boolean = !!(leaderUsername && leaderPassword);
+const usingCertAuth: boolean = !(leaderUsername && leaderPassword) && !leaderToken;
 let harperLogger: any;
 let leaderReplicationURL: string;
 let hdbConfig: Record<string, any> = {};
 let freshClone: boolean = false;
 
 export async function cloneNode(): Promise<void> {
-	// Use the set_node method to clone if both leader username and password are provided; otherwise, clone using only
-	// websockets and certificate-based authorization
-	log(`Starting clone node from leader: ${leaderURL} using ${cloneUsingSetNode ? 'set_node' : 'websockets'} method`);
+	// Clone using websockets with certificate-based auth, or with credential/token auth if provided
+	log(`Starting clone node from leader: ${leaderURL} using ${usingCertAuth ? 'certificate' : 'credential'} auth`);
 
 	// If a root path was provided, use it. Otherwise, check for existing install to get root path or start a fresh clone and generate a new root path.
 	resolveRootPath();
@@ -173,7 +175,7 @@ export async function cloneNode(): Promise<void> {
 
 	if (allowSelfSigned) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-	if (cloneUsingSetNode) {
+	if (!usingCertAuth) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
 		// Cannot check if cloning with WS - module initialization order prevents access to required variables
 		await leaderRequest({ operation: OPERATIONS_ENUM.GET_STATUS });
@@ -233,10 +235,12 @@ export async function cloneNode(): Promise<void> {
 		operation: string;
 		verify_tls: boolean;
 		url: string;
-		authorization?: {
-			username: string;
-			password: string;
-		};
+		authorization?:
+			| {
+					username: string;
+					password: string;
+			  }
+			| string;
 	};
 
 	const setNodeRequest: SetNodeRequest = {
@@ -245,12 +249,16 @@ export async function cloneNode(): Promise<void> {
 		url: leaderReplicationURL,
 	};
 
-	if (cloneUsingSetNode) {
-		// If cloning using set_node, we need to include the leader credentials in the set node request so that the leader can authenticate this node
-		setNodeRequest.authorization = {
-			username: leaderUsername,
-			password: leaderPassword,
-		};
+	if (!usingCertAuth) {
+		// If cloning using credential/token auth, we need to include the leader credentials in the set node request so that the leader can authenticate this node
+		if (leaderToken) {
+			setNodeRequest.authorization = 'Bearer ' + leaderToken;
+		} else {
+			setNodeRequest.authorization = {
+				username: leaderUsername,
+				password: leaderPassword,
+			};
+		}
 	} else {
 		// We delete the clone-temp-admin user because now that HDB is installed we want user to come from the leader via replication
 		// systemExists check will show if this is the first time clone is being run.
@@ -274,10 +282,7 @@ export async function cloneNode(): Promise<void> {
 	const setNodeResponse = await setNode(setNodeRequest);
 	log(`Response from set node: ${setNodeResponse}`);
 
-	// Not possible to clone JWT keys using operations API
-	if (!cloneUsingSetNode) {
-		await cloneJWTKeys();
-	}
+	await cloneJWTKeys();
 
 	await cloneSSHKeys();
 
@@ -579,7 +584,7 @@ async function cloneConfig(): Promise<void> {
  * @param operation
  */
 async function leaderRequest(operation: { operation: string; [key: string]: any }): Promise<Record<string, any>> {
-	if (!cloneUsingSetNode) {
+	if (usingCertAuth) {
 		// Dynamically importing the replicator module because it was causing early import of rootpath var on
 		// install before it was initialized.
 		const { sendOperationToNode } = await import('../replication/replicator.js');
@@ -588,18 +593,24 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 		});
 	}
 
-	const isHttps = leaderURL.startsWith('https://');
+	const headers: Record<string, string> = {
+		'Content-Type': 'application/json',
+	};
+
+	if (leaderToken) {
+		headers.Authorization = `Bearer ${leaderToken}`;
+	} else {
+		headers.Authorization = `Basic ${Buffer.from(`${leaderUsername}:${leaderPassword}`).toString('base64')}`;
+	}
 
 	const fetchOptions: RequestInit = {
 		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json',
-			'Authorization': `Basic ${Buffer.from(`${leaderUsername}:${leaderPassword}`).toString('base64')}`,
-		},
+		headers,
 		body: JSON.stringify(operation),
 	};
 
 	// Only add agent for HTTPS
+	const isHttps = leaderURL.startsWith('https://');
 	if (isHttps) {
 		// @ts-ignore - agent option exists but TypeScript definitions may not include it
 		fetchOptions.agent = new https.Agent({
@@ -642,8 +653,8 @@ function log(message: string, level: LogLevel = 'notify'): void {
 async function installHarper(): Promise<void> {
 	log(`Clone installing Harper at root path: ${rootPath}`);
 
-	if (!cloneUsingSetNode) {
-		// Set temporary admin credentials if cloning without set_node to allow installation to complete.
+	if (usingCertAuth || leaderToken) {
+		// Set temporary admin credentials if cloning without username/password to allow installation to complete.
 		// These values will be replaced during the clone process after syncing system tables from the leader.
 		process.env.HDB_ADMIN_USERNAME = 'clone-temp-admin';
 		process.env.HDB_ADMIN_PASSWORD = randomBytes(20).toString('base64').slice(0, 10);
