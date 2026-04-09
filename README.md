@@ -2,40 +2,46 @@
 
 # Harper Pro
 
-## Contents
+Harper Pro is the source-available distribution of Harper, built on top of the [open-source Harper core](https://github.com/HarperFast/harper). It includes additional enterprise features and is licensed under the [Elastic License 2.0](https://www.elastic.co/licensing/elastic-license).
 
-1. [Harper Overview](#harper-overview)
-2. [Harper Studio](#harper-studio)
-3. [Harper APIs](#harper-apis)
-4. [Documentation and Support](#documentation-and-support)
-5. [Prerequisites](#prerequisites)
-6. [Installing Harper](#installing-harper)
+Harper is a Node.js unified development platform that fuses database, cache, application, and messaging layers into one in-memory process. With Harper you can build ultra-high-performance services without boilerplate code and scale them horizontally.
 
-## Harper Overview
+**Key Features:**
 
-Harper eliminates the complexity typically synonymous with distributed services by combining an ultra-fast document data store, in-memory cache, real-time message broker, and your application components into a single distributed technology. When clustered and geo-distributed, Harper nodes instantly synchronize data creating a real-time service fabric, ensuring low-latency in-region responses for clients worldwide. In addition to massive cost savings at scale, Harper’s REST, GraphQL, SQL, and real-time interfaces make light work of servicing frontend requirements. Install and manage on your hardware with npm, or have us host your services with Harper Cloud. For questions, reach us at [hello@harperdb.io](mailto:hello@harperdb.io).
+**Unified Runtime:** Database, cache, application logic, and messaging all operate within a single in-memory Node.js process, eliminating external dependencies and reducing latency.
 
-[Learn more about Harper](https://www.harpersystems.dev/?utm_source=repo&utm_medium=npm)
+**In-Memory Performance:** Data and compute share memory space for microsecond-level access times and exceptional throughput under load.
 
-## Harper Studio
+**Native Messaging:** Built-in publish/subscribe messaging with Websockets and MQTT enables real-time communication between nodes and clients without external brokers.
 
-Every Installation of Harper can be administered online using Harper Studio. This web-based interface provides you the ability to set up new schemas and tables, configure users and roles, manage data replication, and purchase and deploy enterprise licenses.
+**Developer Simplicity:** Annotate your data schema with `@export` to instantly generate REST APIs. Extend functionality by defining custom endpoints in JavaScript.
 
-- Simplify Administration – handle all Harper administration tasks from one simple interface
+---
 
-[Harper Studio](https://studio.harperdb.io/sign-up)
+**Deploy with [Harper Fabric](https://fabric.harper.fast/#/sign-in) for Horizontal Scalability:** Distribute workloads across multiple Harper nodes by selecting your regions and latency targets.
 
-## Harper APIs
+---
 
-The preferred way to interact with Harper for typical querying, accessing, and updating data (CRUD) operations is through the REST interface, described in the REST documentation.
+## Getting Started
 
-The complete [Harper Operations API documentation](https://docs.harperdb.io/docs/operations-api) provides important administrative functions. Generally it is recommended that use the [RESTful interface](https://docs.harperdb.io/docs/rest/) as your primary interface for scalable and performant data interaction for building production applications, and the operations API for administrative purposes.
+1. [Install Harper Pro](https://docs.harperdb.io/docs/getting-started/installation)
+2. [Create Your First App](https://docs.harperdb.io/docs/getting-started/quickstart)
 
-## Documentation and Support
+For full documentation, visit [docs.harperdb.io](https://docs.harperdb.io/).
 
-[Docs](https://docs.harperdb.io/)
+## Open Source Core
 
-[Support](https://harperdb.io/support/)
+Harper Pro is built on top of [Harper](https://github.com/HarperFast/harper), the open-source core licensed under Apache-2.0. The open-source core includes the foundational database, cache, application, and messaging layers. Harper Pro extends the core with additional enterprise features.
+
+If you want to contribute to Harper or report bugs in the underlying platform, please do so in the [Harper repository](https://github.com/HarperFast/harper).
+
+## License
+
+Harper Pro is source-available software licensed under the [Elastic License 2.0 (ELv2)](https://www.elastic.co/licensing/elastic-license). You may view and modify the source, but you may not provide it as a hosted or managed service to third parties. See the LICENSE file for the full license text.
+
+The open-source Harper core is licensed under Apache-2.0.
+
+For more information, see the [License FAQ](https://www.harper.fast/resources/licensing-faq).
 
 ## Prerequisites
 
@@ -49,15 +55,7 @@ Harper Pro has been tested on the following platforms:
 - macOS on Intel
 - macOS on Apple Silicon
 
-Other UNIX-like operating systems and other CPU architectures may be able to run Harper, but these have not been tested and may require the following:
-
-- GCC
-- Make
-- Python v3.7, v3.8, v3.9, or v3.10
-- Xcode (macOS)
-- Go 1.19.1
-
-Harper Pro can run natively on Windows 10 & 11. Harper running on Windows is only intended for evaluation or development purposes.
+Harper Pro can run natively on Windows 10 & 11 for evaluation or development purposes.
 
 ## Installing Harper Pro
 
@@ -68,4 +66,6 @@ harper
 
 Harper will prompt you for configuration options during install, and then automatically start after install.
 
----
+## Contributing
+
+Harper Pro does not accept external contributions. To contribute to the open-source core, see the [Harper contributing guide](https://github.com/HarperFast/harper/blob/main/CONTRIBUTING.md).
