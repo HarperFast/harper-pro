@@ -2,7 +2,7 @@
 
 # Harper Pro
 
-Harper Pro is the source-available distribution of Harper, built on top of the [open-source Harper core](https://github.com/HarperFast/harper). It includes additional enterprise features and is licensed under the [Elastic License 2.0](https://www.elastic.co/licensing/elastic-license).
+Harper Pro is the source-available distribution of Harper, built on top of the [open-source Harper core](https://github.com/HarperFast/harper). It extends the core with enterprise features including multi-node replication, certificate management, and extended profiling and analytics. It is licensed under the [Elastic License 2.0](https://www.elastic.co/licensing/elastic-license).
 
 Harper is a Node.js unified development platform that fuses database, cache, application, and messaging layers into one in-memory process. With Harper you can build ultra-high-performance services without boilerplate code and scale them horizontally.
 
@@ -54,8 +54,7 @@ Harper Pro has been tested on the following platforms:
 - Linux on ARM64
 - macOS on Intel
 - macOS on Apple Silicon
-
-Harper Pro can run natively on Windows 10 & 11 for evaluation or development purposes.
+- Windows
 
 ## Installing Harper Pro
 
