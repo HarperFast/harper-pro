@@ -670,3 +670,4 @@ export async function replicateOperation(req) {
 	return response;
 }
 server.replication.replicateOperation = replicateOperation;
+server.replication.monitorNodeCAs = monitorNodeCAs;
