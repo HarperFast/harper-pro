@@ -671,3 +671,4 @@ export async function replicateOperation(req) {
 }
 server.replication.replicateOperation = replicateOperation;
 server.replication.monitorNodeCAs = monitorNodeCAs;
+server.replication.sendOperationToNode = sendOperationToNode;

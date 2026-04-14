@@ -244,6 +244,14 @@ function clusterReplication(ctx) {
 			});
 			console.log('deployed app', response);
 			equal(response.message, 'Successfully deployed: test-application, restarting Harper');
+			/* can additionally test restart_service
+				response = await sendOperation(ctx.nodes[0], {
+				operation: 'restart_service',
+				service: 'http_workers',
+				replicated: true,
+			});
+
+			 */
 			await delay(10000);
 		});
 		test('Replicating cached blobs', async () => {
