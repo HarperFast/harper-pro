@@ -102,12 +102,13 @@ suite('Certificate', (ctx) => {
 			operation: 'create_csr',
 		});
 		ok(
-			csrResponse.message?.includes('BEGIN CERTIFICATE REQUEST'),
+			csrResponse.pem?.includes('BEGIN CERTIFICATE REQUEST'),
 			'Response should include a certificate signing request'
 		);
+		ok(csrResponse.privateKeyName, 'Response should include the private key name');
 
 		// Parse the CSR - will throw if malformed
-		const forgeCsr = forge.pki.certificationRequestFromPem(csrResponse.message);
+		const forgeCsr = forge.pki.certificationRequestFromPem(csrResponse.pem);
 		// Verify the self-signature
 		ok(forgeCsr.verify(), 'CSR signature should be valid');
 
@@ -127,7 +128,7 @@ suite('Certificate', (ctx) => {
 
 		const signResponse = await sendOperation(ctx.harper, {
 			operation: 'sign_certificate',
-			csr: csr.message,
+			csr: csr.pem,
 		});
 
 		ok(signResponse.hasOwnProperty('signingCA'), 'Response should include the signing CA certificate');
