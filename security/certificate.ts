@@ -110,11 +110,33 @@ export async function signCertificate(req) {
 }
 
 export async function createCsr() {
-	const rep = await getReplicationCert();
-	const opsCert = pki.certificateFromPem(rep.options.cert);
-	const opsPrivateKey = pki.privateKeyFromPem(rep.options.key);
+	// The CSR should always use the self-signed HarperDB cert (RSA), even when
+	// the active replication cert is a non-RSA cert (e.g. Let's Encrypt EC).
+	const certificateTable = getCertTable();
+	const privateKeys: Map<string, string> = getPrivateKeys();
+	let opsCert, opsPrivateKey, certName, privateKeyName;
+	for await (const cert of certificateTable.search([])) {
+		if (cert.is_self_signed && !cert.is_authority) {
+			const key = privateKeys.get(cert.private_key_name);
+			if (key) {
+				opsCert = pki.certificateFromPem(cert.certificate);
+				opsPrivateKey = pki.privateKeyFromPem(key);
+				certName = cert.name;
+				privateKeyName = cert.private_key_name;
+				break;
+			}
+		}
+	}
+	if (!opsCert || !opsPrivateKey) {
+		// Fall back to the replication cert (original behavior)
+		const rep = await getReplicationCert();
+		opsCert = pki.certificateFromPem(rep.options.cert);
+		opsPrivateKey = pki.privateKeyFromPem(rep.options.key);
+		certName = rep.name;
+		privateKeyName = rep.options.key_file;
+	}
 
-	logger.info?.('Creating CSR with cert named:', rep.name);
+	logger.info?.('Creating CSR with cert named:', certName);
 
 	const csr = pki.createCertificationRequest();
 	csr.publicKey = opsCert.publicKey;
@@ -143,11 +165,11 @@ export async function createCsr() {
 
 	csr.sign(opsPrivateKey);
 
-	return forge.pki.certificationRequestToPem(csr);
+	return { pem: forge.pki.certificationRequestToPem(csr), privateKeyName };
 }
 
 export async function getReplicationCert() {
-	const SNICallback = createTLSSelector('operations-api');
+	const SNICallback = createTLSSelector('replication');
 	const secureTarget = {
 		secureContexts: null,
 		setSecureContext: () => {},
