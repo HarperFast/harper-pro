@@ -18,6 +18,9 @@ RUN <<-EOF
   groupmod -n harperdb node
   rm -rf /home/node
   chown -R harperdb:harperdb /home/harperdb
+  apt-get update
+  apt-get install -y --no-install-recommends zstd
+  rm -rf /var/lib/apt/lists/*
 EOF
 
 WORKDIR /home/harperdb
