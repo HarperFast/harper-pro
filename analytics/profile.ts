@@ -201,9 +201,7 @@ async function getGpuUtilization(): Promise<number | null> {
 		const descendants = findAllDescendants(currentPid);
 		const pidsToMonitor = new Set([currentPid, ...descendants]);
 
-		const { stdout } = await execFileAsync('nvidia-smi', ['pmon', '-c', '1', '-s', 'u'], {
-			timeout: 5000,
-		});
+		const { stdout } = await execFileAsync('nvidia-smi', ['pmon', '-c', '1', '-s', 'u']);
 
 		let totalSmPercent = 0;
 		for (const line of stdout.split('\n')) {
