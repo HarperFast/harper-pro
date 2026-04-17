@@ -33,8 +33,6 @@ COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 ENV NPM_CONFIG_PREFIX=/home/harperdb/.npm-global
 ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 
-VOLUME /home/harperdb/harper
-
 # Install Harper Pro globally
 RUN <<-EOF
   npm install --global harperfast-harper-pro-*.tgz
@@ -42,6 +40,8 @@ RUN <<-EOF
   mkdir -p /home/harperdb/harper
   chown harperdb:harperdb /home/harperdb/harper
 EOF
+
+VOLUME /home/harperdb/harper
 
 # Harper config parameters
 ENV HDB_ADMIN_USERNAME=admin
