@@ -46,6 +46,7 @@ export function handleApplication({ options }: Scope) {
 	}, 1000); // wait for everything to load before we start the profiler
 }
 let lastChildCpuTime = 0;
+let gpuAvailable = true;
 
 export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) * 1000): Promise<void> {
 	clearTimeout(profilerTimer);
@@ -63,7 +64,7 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	let totalUserCount = 0;
 	let totalHarperCount = 0;
 	// Start GPU measurement early so it runs in parallel with CPU profiling work
-	const gpuPromise = getWorkerIndex() === 0 ? getGpuUtilization() : null;
+	const gpuPromise = getWorkerIndex() === 0 && gpuAvailable ? getGpuUtilization() : null;
 	try {
 		const profile = timeProfiler.stop(true);
 		const strings = profile.stringTable.strings;
@@ -220,6 +221,7 @@ async function getGpuUtilization(): Promise<number | null> {
 		// e.g. 50% utilization over 60s = 30 GPU-seconds
 		return (totalSmPercent / 100) * (capturePeriod / 1000);
 	} catch {
+		gpuAvailable = false;
 		return null;
 	}
 }
