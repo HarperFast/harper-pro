@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/harper-pro",
-	"version": "5.0.1",
+	"version": "5.0.2",
 	"description": "Harper is a distributed database, caching service, streaming broker, and application development platform focused on performance and ease of use.",
 	"keywords": [
 		"database",

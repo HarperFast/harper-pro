@@ -6,6 +6,10 @@ import { recordAction } from '../core/resources/analytics/write.ts';
 import { getHdbBasePath } from '../core/utility/environment/environmentManager.js';
 import { PACKAGE_ROOT } from '../core/utility/packageUtils.js';
 import { realpathSync, readFileSync, readdirSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 import { time as timeProfiler } from '@datadog/pprof';
 import { getWorkerIndex } from '../core/server/threads/manageThreads.js';
 import * as log from '../core/utility/logging/harper_logger.js';
@@ -42,6 +46,7 @@ export function handleApplication({ options }: Scope) {
 	}, 1000); // wait for everything to load before we start the profiler
 }
 let lastChildCpuTime = 0;
+let gpuAvailable = true;
 
 export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) * 1000): Promise<void> {
 	clearTimeout(profilerTimer);
@@ -58,6 +63,8 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	const samplesByLocationId = new Map<number, number>();
 	let totalUserCount = 0;
 	let totalHarperCount = 0;
+	// Start GPU measurement early so it runs in parallel with CPU profiling work
+	const gpuPromise = getWorkerIndex() === 0 && gpuAvailable ? getGpuUtilization() : null;
 	try {
 		const profile = timeProfiler.stop(true);
 		const strings = profile.stringTable.strings;
@@ -88,6 +95,11 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 				if (childCpuTimeInInterval > CHILD_TIME_THRESHOLD)
 					recordAction(childCpuTimeInInterval, 'cpu-usage', 'user', 'child-processes');
 				lastChildCpuTime = childCpuTime;
+			}
+			// Record GPU utilization for this process and child processes
+			const gpuSeconds = await gpuPromise;
+			if (gpuSeconds !== null) {
+				recordAction(gpuSeconds, 'gpu-usage', 'user');
 			}
 		}
 	} catch (error) {
@@ -173,6 +185,41 @@ function getChildProcessCpuTime(): number | null {
 		return totalCpuTime;
 	} catch {
 		// Silently return null if /proc is not available (non-Linux) or read fails
+		return null;
+	}
+}
+
+/**
+ * Get the total SM (shader/streaming multiprocessor) utilization percentage across all GPUs
+ * for this process and all descendant processes.
+ * Uses nvidia-smi pmon for per-process GPU utilization.
+ * Only works on Linux with NVIDIA GPUs. Returns null if unavailable.
+ */
+async function getGpuUtilization(): Promise<number | null> {
+	try {
+		const currentPid = process.pid;
+		const descendants = findAllDescendants(currentPid);
+		const pidsToMonitor = new Set([currentPid, ...descendants]);
+
+		const { stdout } = await execFileAsync('nvidia-smi', ['pmon', '-c', '1', '-s', 'u']);
+
+		let totalSmPercent = 0;
+		for (const line of stdout.split('\n')) {
+			if (line.startsWith('#') || !line.trim()) continue;
+			const parts = line.trim().split(/\s+/);
+			// pmon -s u format: gpu pid type fb sm enc dec jpg ofa command
+			if (parts.length < 5) continue;
+			const pid = parseInt(parts[1], 10);
+			if (isNaN(pid) || !pidsToMonitor.has(pid)) continue;
+			const sm = parseInt(parts[4], 10); // SM utilization %
+			if (!isNaN(sm)) totalSmPercent += sm;
+		}
+
+		// Convert SM utilization % to GPU-seconds over the capture period
+		// e.g. 50% utilization over 60s = 30 GPU-seconds
+		return (totalSmPercent / 100) * (capturePeriod / 1000);
+	} catch {
+		gpuAvailable = false;
 		return null;
 	}
 }
