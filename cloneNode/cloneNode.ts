@@ -175,12 +175,6 @@ export async function cloneNode(): Promise<void> {
 
 	if (allowSelfSigned) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-	if (!usingCertAuth) {
-		// Request to leader to verify connectivity and credentials before proceeding with clone
-		// Cannot check if cloning with WS - module initialization order prevents access to required variables
-		await leaderRequest({ operation: OPERATIONS_ENUM.GET_STATUS });
-	}
-
 	// Check to see if there is an existing config file to read additional config from
 	const cfgPath: string = join(rootPath, HARPER_CONFIG_FILE);
 	const oldCfgPath: string = join(rootPath, HDB_CONFIG_FILE);
@@ -211,6 +205,12 @@ export async function cloneNode(): Promise<void> {
 		envMgr.initSync();
 		const { main } = await import('../core/bin/run.js');
 		return main();
+	}
+
+	if (!usingCertAuth) {
+		// Request to leader to verify connectivity and credentials before proceeding with clone
+		// Cannot check if cloning with WS - module initialization order prevents access to required variables
+		await leaderRequest({ operation: OPERATIONS_ENUM.GET_STATUS });
 	}
 
 	// Install Harper if this is a fresh clone or if the system database does not exist
