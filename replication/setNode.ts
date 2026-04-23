@@ -51,7 +51,7 @@ export async function setNode(req: any) {
 			await sendOperationToNode(
 				{ url: record.url },
 				{
-					operation: OPERATIONS_ENUM.REMOVE_NODE_BACK,
+					operation: 'remove_node_back',
 					name:
 						record?.subscriptions?.length > 0
 							? getThisNodeName() // if we are doing a removal with explicit subscriptions, we want to the other node to remove the record for this node
@@ -299,6 +299,11 @@ server.registerOperation?.({
 	execute: addNodeBack,
 	httpMethod: 'PUT',
 	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],
+});
+server.registerOperation?.({
+	name: 'remove_node_back;',
+	execute: removeNodeBack,
+	httpMethod: 'DELETE',
 });
 server.registerOperation?.({
 	name: 'remove_node',
