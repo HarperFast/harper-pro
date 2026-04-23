@@ -173,8 +173,6 @@ export async function cloneNode(): Promise<void> {
 		.replace('https://', 'wss://')
 		.replace(/:(\d+)/, `:${replicationPort || DEFAULT_REPLICATION_PORT}`);
 
-	if (allowSelfSigned) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-
 	// Check to see if there is an existing config file to read additional config from
 	const cfgPath: string = join(rootPath, HARPER_CONFIG_FILE);
 	const oldCfgPath: string = join(rootPath, HDB_CONFIG_FILE);
@@ -206,6 +204,9 @@ export async function cloneNode(): Promise<void> {
 		const { main } = await import('../core/bin/run.js');
 		return main();
 	}
+
+	const originalTlsSetting = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+	if (allowSelfSigned) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 	if (!usingCertAuth) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
@@ -291,6 +292,15 @@ export async function cloneNode(): Promise<void> {
 
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
+
+	// Restore original TLS setting to avoid side effects on subsequent operations
+	if (allowSelfSigned) {
+		if (originalTlsSetting === undefined) {
+			delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
+		} else {
+			process.env.NODE_TLS_REJECT_UNAUTHORIZED = originalTlsSetting;
+		}
+	}
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
