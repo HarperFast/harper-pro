@@ -245,7 +245,7 @@ export async function cloneNode(): Promise<void> {
 
 	const setNodeRequest: SetNodeRequest = {
 		operation: OPERATIONS_ENUM.ADD_NODE,
-		verify_tls: !allowSelfSigned,
+		verify_tls: false, // set node cross-signs the cluster with harper self-signed certs
 		url: leaderReplicationURL,
 	};
 
