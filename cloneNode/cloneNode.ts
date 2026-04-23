@@ -205,9 +205,6 @@ export async function cloneNode(): Promise<void> {
 		return main();
 	}
 
-	const originalTlsSetting = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-	if (allowSelfSigned) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-
 	if (!usingCertAuth) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
 		// Cannot check if cloning with WS - module initialization order prevents access to required variables
@@ -292,15 +289,6 @@ export async function cloneNode(): Promise<void> {
 
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
-
-	// Restore original TLS setting to avoid side effects on subsequent operations
-	if (allowSelfSigned) {
-		if (originalTlsSetting === undefined) {
-			delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-		} else {
-			process.env.NODE_TLS_REJECT_UNAUTHORIZED = originalTlsSetting;
-		}
-	}
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
