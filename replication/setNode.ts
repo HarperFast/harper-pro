@@ -4,7 +4,7 @@ import { validateBySchema } from '../core/validation/validationWrapper.js';
 import Joi from 'joi';
 const { pki } = require('node-forge');
 import { get } from '../core/utility/environment/environmentManager.js';
-import { OPERATIONS_ENUM, CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import { getHDBNodeTable } from './knownNodes.ts';
 import { sendOperationToNode, urlToNodeName } from './replicator.ts';
