@@ -16,7 +16,7 @@ import {
 	AuditRecord,
 	readAuditEntry,
 } from '../core/resources/auditStore.ts';
-import { exportIdMapping, getIdOfRemoteNode, remoteToLocalNodeId } from './nodeIdMapping.ts';
+import { exportIdMapping, getIdOfRemoteNode, remoteToLocalNodeId } from '../core/resources/nodeIdMapping.ts';
 import { whenNextTransaction } from '../core/resources/transactionBroadcast.ts';
 import {
 	replicationCertificateAuthorities,

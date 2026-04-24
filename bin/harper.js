@@ -49,7 +49,6 @@ if (HDB_LEADER_URL && !hasPositionalArg) {
 		});
 } else {
 	const { harper } = require('../core/bin/harper');
-	require('../replication/replicator');
 
 	harper()
 		.then((message) => {
