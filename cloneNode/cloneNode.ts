@@ -173,8 +173,6 @@ export async function cloneNode(): Promise<void> {
 		.replace('https://', 'wss://')
 		.replace(/:(\d+)/, `:${replicationPort || DEFAULT_REPLICATION_PORT}`);
 
-	if (allowSelfSigned) process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-
 	// Check to see if there is an existing config file to read additional config from
 	const cfgPath: string = join(rootPath, HARPER_CONFIG_FILE);
 	const oldCfgPath: string = join(rootPath, HDB_CONFIG_FILE);
@@ -245,7 +243,7 @@ export async function cloneNode(): Promise<void> {
 
 	const setNodeRequest: SetNodeRequest = {
 		operation: OPERATIONS_ENUM.ADD_NODE,
-		verify_tls: !allowSelfSigned,
+		verify_tls: false, // set node cross-signs the cluster with harper self-signed certs
 		url: leaderReplicationURL,
 	};
 
