@@ -34,11 +34,10 @@ import {
 	getNodeURL,
 } from './knownNodes.ts';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import { exportIdMapping, getIdOfRemoteNode } from './nodeIdMapping.ts';
+import { exportIdMapping, getIdOfRemoteNode } from '../core/resources/nodeIdMapping.ts';
 import * as tls from 'node:tls';
 import { ServerError } from '../core/utility/errors/hdbError.js';
 import { isMainThread } from 'worker_threads';
-import type { Database } from 'lmdb';
 import { getHostnamesFromCertificate } from '../core/security/keys.js';
 import { clearThisNodeName } from '../core/server/nodeName';
 
@@ -578,11 +577,7 @@ export async function unsubscribeFromNode({ url, nodes, database }) {
 	}
 }
 
-export function getThisNodeId(auditStore: any) {
-	return exportIdMapping(auditStore)?.[server.hostname];
-}
 server.replication = {
-	getThisNodeId,
 	exportIdMapping,
 	getIdOfRemoteNode,
 };
@@ -625,19 +620,6 @@ function hasExplicitlyReplicatedTable(databaseName) {
 	for (const tableName in database) {
 		const table = database[tableName];
 		if (table.replicate) return true;
-	}
-}
-
-/**
- * Get the last time that an audit record was added to the audit store
- * @param auditStore
- */
-export function lastTimeInAuditStore(auditStore: Database) {
-	for (const timestamp of auditStore.getKeys({
-		limit: 1,
-		reverse: true,
-	})) {
-		return timestamp;
 	}
 }
 

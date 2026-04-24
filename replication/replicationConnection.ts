@@ -16,12 +16,16 @@ import {
 	AuditRecord,
 	readAuditEntry,
 } from '../core/resources/auditStore.ts';
-import { exportIdMapping, getIdOfRemoteNode, remoteToLocalNodeId } from './nodeIdMapping.ts';
+import {
+	exportIdMapping,
+	getIdOfRemoteNode,
+	remoteToLocalNodeId,
+	getThisNodeId,
+} from '../core/resources/nodeIdMapping.ts';
 import { whenNextTransaction } from '../core/resources/transactionBroadcast.ts';
 import {
 	replicationCertificateAuthorities,
 	forEachReplicatedDatabase,
-	getThisNodeId,
 	enabledDatabases,
 	urlToNodeName,
 } from './replicator.ts';

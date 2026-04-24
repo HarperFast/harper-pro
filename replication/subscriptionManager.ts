@@ -5,13 +5,8 @@
  */
 import { getDatabases } from '../core/resources/databases.ts';
 import { workers, onMessageByType, whenThreadsStarted } from '../core/server/threads/manageThreads.js';
-import {
-	subscribeToNode,
-	urlToNodeName,
-	forEachReplicatedDatabase,
-	unsubscribeFromNode,
-	lastTimeInAuditStore,
-} from './replicator.ts';
+import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
+import { subscribeToNode, urlToNodeName, forEachReplicatedDatabase, unsubscribeFromNode } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
 import { parentPort } from 'worker_threads';
 import {
