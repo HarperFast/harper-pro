@@ -1,18 +1,13 @@
+/**
+ * Tests node cloning functionality.
+ * Verifies cloning with authentication tokens and username/password,
+ * configuration cloning (logging level, MQTT port, etc.),
+ * data replication, SSH key cloning, and JWT key cloning.
+ */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
-import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
-import { join } from 'node:path';
+import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
-
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
-	'..',
-	'..',
-	'dist',
-	'bin',
-	'harper.js'
-);
 
 async function sendOperation(node, operation) {
 	const response = await fetch(node.operationsAPIURL, {

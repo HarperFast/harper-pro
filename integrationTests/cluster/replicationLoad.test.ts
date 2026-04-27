@@ -1,24 +1,14 @@
 /**
- * Cluster test
- *
+ * Performance and load testing for cluster replication.
+ * Tests replication across many databases simultaneously,
+ * load tests concurrent upserts, and blob cache retrieval speed.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { startHarper, teardownHarper, targz, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { targz } from '../../core/integrationTests/utils/targz.ts';
-import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
-import { sendOperation, fetchWithRetry, concurrent } from './clusterShared.mjs';
-
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
-	'..',
-	'..',
-	'dist',
-	'bin',
-	'harper.js'
-);
+import { sendOperation, fetchWithRetry, concurrent } from './clusterShared.js';
 
 const NODE_COUNT = 3;
 suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {

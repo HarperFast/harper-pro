@@ -1,16 +1,12 @@
+/**
+ * Tests SSH key management operations.
+ * Verifies add_ssh_key, list_ssh_keys, get_ssh_key, delete_ssh_key, update_ssh_key,
+ * set_ssh_known_hosts, get_ssh_known_hosts, auto-fetching known_hosts for github.com,
+ * and error cases (duplicate keys, nonexistent keys).
+ */
 import { suite, test, before, after } from 'node:test';
 import { equal, deepEqual, ok } from 'node:assert';
-import { join } from 'node:path';
-import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
-
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
-	'..',
-	'..',
-	'dist',
-	'bin',
-	'harper.js'
-);
+import { startHarper, teardownHarper } from '@harperfast/integration-testing';
 
 async function sendOperation(node, operation) {
 	const response = await fetch(node.operationsAPIURL, {

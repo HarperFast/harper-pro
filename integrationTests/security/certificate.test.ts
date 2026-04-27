@@ -1,18 +1,13 @@
+/**
+ * Tests certificate management operations.
+ * Verifies add_certificate, list_certificates, remove_certificate,
+ * create_csr (Certificate Signing Request), and sign_certificate with Harper's internal CA.
+ */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
-import { join } from 'node:path';
 import { createCA, createCert } from 'mkcert';
 import forge from 'node-forge';
-import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
-
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
-	'..',
-	'..',
-	'dist',
-	'bin',
-	'harper.js'
-);
+import { startHarper, teardownHarper } from '@harperfast/integration-testing';
 
 async function sendOperation(node, operation) {
 	const response = await fetch(node.operationsAPIURL, {

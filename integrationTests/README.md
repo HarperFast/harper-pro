@@ -1,0 +1,109 @@
+# Harper Pro Integration Tests
+
+This directory contains the integration tests for Harper Pro. They run against the built Harper Pro distribution using the [`@harperfast/integration-testing`](https://github.com/HarperFast/integration-testing) framework and its included Node.js test runner script.
+
+For full background on the testing philosophy, framework APIs, and runner configuration, see the **[`@harperfast/integration-testing` documentation](https://github.com/HarperFast/integration-testing#readme)**. This document covers what is specific to running and writing tests in this repository.
+
+## Setup
+
+### Build Harper Pro
+
+Integration tests require a built distribution of Harper Pro. Run this before executing any tests:
+
+```sh
+npm run build
+```
+
+### Loopback Addresses
+
+Running tests concurrently requires multiple loopback addresses. Linux systems have these enabled by default; macOS and Windows do not.
+
+```sh
+npx harper-integration-test-setup-loopback
+```
+
+This script requires `sudo`. Only needs to be run once per machine (or after a restart on macOS).
+
+## Running Tests
+
+Run the full integration test suite:
+
+```sh
+npm run test:integration:all
+```
+
+Run a specific file or glob pattern:
+
+```sh
+npm run test:integration -- "integrationTests/cluster/replicationTopology.test.ts"
+npm run test:integration -- "integrationTests/cluster/*.test.ts"
+```
+
+Run sequentially (no loopback pool required — useful for quick debugging):
+
+```sh
+npm run test:integration -- --isolation=none integrationTests/**/*.test.ts
+# or for a specific file:
+npm run test:integration -- --isolation=none "integrationTests/security/certificate.test.ts"
+```
+
+### Reproducing a CI Failure
+
+The CI workflow shards tests across multiple runners. If a specific shard fails, you can reproduce it locally by passing the same `--shard` value the job used:
+
+```sh
+# Reproduce what "Integration Tests 3/4" ran
+npm run test:integration:all -- --shard=3/4
+```
+
+### Server Log Capture
+
+To capture Harper's logs during a test run, set `HARPER_INTEGRATION_TEST_LOG_DIR`. Logs from passing suites are cleaned up automatically; only failing suite logs are retained.
+
+```sh
+HARPER_INTEGRATION_TEST_LOG_DIR=/tmp/harper-test-logs npm run test:integration:all
+```
+
+This is how CI captures logs for failed jobs — the log directory is uploaded as a workflow artifact.
+
+## Writing Tests
+
+### Requirements
+
+- Files must use the Node.js `node:test` API (`suite`, `test`, `before`, `after`, etc.) with assertions from `node:assert` or `node:assert/strict`
+- Files must end in `.test.ts`
+- Files must be implemented in ESM TypeScript
+- Each file must begin with a JSDoc comment describing exactly what it tests — include relevant GitHub issue or PR links if they exist
+- File names should be short, hyphen-separated words
+
+### File independence
+
+The runner executes each file in its own process. For concurrent execution to be safe, every test file must be **independent** (no shared state with other files), **hermetic** (no external side-effects), and **deterministic** (same output for the same input, every time).
+
+### Template
+
+```ts
+/**
+ * Describe what this file tests.
+ * Include as much detail as necessary.
+ * Link to relevant GitHub issues or PRs if applicable.
+ */
+import { suite, test, before, after } from 'node:test';
+import { strictEqual } from 'node:assert/strict';
+import { startHarper, teardownHarper, type ContextWithHarper } from '@harperfast/integration-testing';
+
+suite('short description', (ctx: ContextWithHarper) => {
+	before(async () => {
+		await startHarper(ctx);
+	});
+
+	after(async () => {
+		await teardownHarper(ctx);
+	});
+
+	test('test description', async () => {
+		const response = await fetch(ctx.harper.httpURL);
+		strictEqual(response.status, 200);
+	});
+});
+```

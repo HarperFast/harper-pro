@@ -1,24 +1,15 @@
 /**
- * Cluster test
- *
+ * Tests fully connected cluster replication (all nodes connected to all nodes).
+ * Verifies token-based authentication for node connection, fully connected topology,
+ * replication with replicatedConfirmation, LMDB storage engine variant,
+ * and blob replication via deployed application.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, deepEqual } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { startHarper, teardownHarper, targz, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { targz } from '../../core/integrationTests/utils/targz.ts';
-import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
-import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
-
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
-	'..',
-	'..',
-	'dist',
-	'bin',
-	'harper.js'
-);
+import { sendOperation, fetchWithRetry } from './clusterShared.js';
 
 const NODE_COUNT = 4;
 function clusterReplication(ctx) {
@@ -244,14 +235,6 @@ function clusterReplication(ctx) {
 			});
 			console.log('deployed app', response);
 			equal(response.message, 'Successfully deployed: test-application, restarting Harper');
-			/* can additionally test restart_service
-				response = await sendOperation(ctx.nodes[0], {
-				operation: 'restart_service',
-				service: 'http_workers',
-				replicated: true,
-			});
-
-			 */
 			await delay(10000);
 		});
 		test('Replicating cached blobs', async () => {

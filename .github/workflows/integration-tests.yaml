@@ -28,8 +28,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          submodules: 'recursive'
 
       - name: Set Node versions
         id: set-node-versions
@@ -95,8 +93,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          submodules: 'recursive'
 
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
@@ -109,17 +105,20 @@ jobs:
         with:
           name: harper-build-artifacts-node-${{ matrix.node-version }}
 
+      - name: Relink bin scripts
+        run: npm install --ignore-scripts
+
       - name: Install harperdb@4 for legacy tests
         run: |
           mkdir -p /tmp/harperdb-legacy
-          npm install --prefix /tmp/harperdb-legacy harperdb@4
+          npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
 
       - name: Run Integration Test Shard ${{ matrix.shard }}
         env:
           HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
           HARPER_LEGACY_VERSION_PATH: /tmp/harperdb-legacy/node_modules/harperdb
         run: |
-          npm run test:integration -- --shard=${{ matrix.shard }}/4
+          npm run test:integration:all -- --shard=${{ matrix.shard }}/4
 
       - name: Upload Harper server logs
         if: failure()
