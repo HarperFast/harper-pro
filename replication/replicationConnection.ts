@@ -313,6 +313,7 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.sessionResolve = resolve;
 			this.sessionReject = reject;
 		});
+		this.session.catch(() => {}); // suppress any unhandled errors
 	}
 	subscribe(nodeSubscriptions, replicateTablesByDefault) {
 		this.nodeSubscriptions = nodeSubscriptions;
