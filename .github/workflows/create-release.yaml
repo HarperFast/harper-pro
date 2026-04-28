@@ -84,12 +84,12 @@ jobs:
         run: npm run package
       - name: Get version components
         id: version-components
-        uses: matt-usurp/validate-semver@7bbc9584679de1aeef57aa531504ab00438481ab # v2.1.0
+        uses: matt-usurp/validate-semver@c5050374644a5ab2e03ddca02ce8d282911620ce # v3.0.0
         with:
           version: ${{ steps.tag-version.outputs.tagVersion }}
       - name: Create Release
         id: create-release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           name: ${{ steps.tag-version.outputs.tagVersion }}
           tag_name: ${{ steps.tag-version.outputs.tagVersion }}
