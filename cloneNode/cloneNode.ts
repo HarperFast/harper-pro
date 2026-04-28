@@ -11,6 +11,7 @@ import envMgr from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { isHdbInstalled } from '../core/utility/installation.js';
 import { getConfiguration, flattenConfig, createConfigFile, updateConfigValue } from '../core/config/configUtils.js';
+import { composeConfigFromEnv } from '../core/config/harperConfigEnvVars.ts';
 import assignCMDENVVariables from '../core/utility/assignCmdEnvVariables.js';
 
 import {
@@ -49,15 +50,19 @@ import {
  * - CLONE_SYNC_TIMEOUT: Sync timeout in milliseconds (default: 30000)
  * - REPLICATION_PORT: Port for replication
  * - FORCE_CLONE: Force clone even if node exists (default: false)
- * - ROOTPATH: HarperDB installation root path
+ * - ROOTPATH: Harper installation root path
  * - NODE_HOSTNAME: Hostname for this node
+ *
+ * rootPath, node_hostname, and replication.port can also be supplied via HARPER_SET_CONFIG
+ * or HARPER_DEFAULT_CONFIG as a fallback when no CLI flag or dedicated env var is set, e.g.
+ * HARPER_SET_CONFIG='{"rootPath":"/data/hdb","node_hostname":"node-a","replication":{"port":9933}}'.
  *
  * CLI Arguments:
  * Boolean flags are presence-based: include the flag to enable, omit to disable.
  * --leader-url: URL of the leader node to clone from
  * --leader-username: Admin username for credential-based authentication
  * --leader-password: Admin password for credential-based authentication
- * --rootpath: HarperDB installation root path
+ * --rootpath: Harper installation root path
  * --node-hostname: Hostname for this node
  * --replication-port: Port for replication
  * --skip-sync-monitor: Skip monitoring sync status (default: false)
@@ -135,6 +140,9 @@ const { values } = parseArgs({
 	strict: false,
 }) as { values: ParsedValues };
 
+// Compose HARPER_DEFAULT_CONFIG / HARPER_SET_CONFIG so the config-shaped reads below can
+// fall back to the JSON config env vars when no CLI flag or dedicated env var is set.
+const composedConfig = composeConfigFromEnv();
 const leaderURL: string = values['leader-url'] || process.env.HDB_LEADER_URL;
 const leaderUsername: string = values['leader-username'] || process.env.HDB_LEADER_USERNAME;
 const leaderPassword: string = values['leader-password'] || process.env.HDB_LEADER_PASSWORD;
@@ -144,13 +152,19 @@ const syncTimeoutMs: number = Math.max(
 	1,
 	parseInt(values['sync-timeout'] || process.env.CLONE_SYNC_TIMEOUT, 10) || DEFAULT_SYNC_TIMEOUT_MS
 );
-const replicationPort: string = values['replication-port'] || process.env.REPLICATION_PORT;
+const replicationPort: string =
+	values['replication-port'] || process.env.REPLICATION_PORT || composedConfig.replication?.port?.toString();
 const skipSSHKeys: boolean = values['skip-ssh-keys'] ?? process.env.CLONE_SKIP_SSH_KEYS === 'true';
 const skipJWTKeys: boolean = values['skip-jwt-keys'] ?? process.env.CLONE_SKIP_JWT_KEYS === 'true';
 const forceClone: boolean = values['force-clone'] ?? process.env.FORCE_CLONE === 'true';
 const allowSelfSigned: boolean = values['allow-self-signed'] ?? process.env.ALLOW_SELF_SIGNED === 'true';
-const nodeHostname: string = values['node-hostname'] || process.env.NODE_HOSTNAME || process.env.REPLICATION_HOSTNAME;
-let rootPath: string = values['rootpath'] || values['ROOTPATH'] || process.env.ROOTPATH;
+const nodeHostname: string =
+	values['node-hostname'] ||
+	process.env.NODE_HOSTNAME ||
+	process.env.REPLICATION_HOSTNAME ||
+	composedConfig.node_hostname ||
+	composedConfig.replication?.hostname;
+let rootPath: string = values['rootpath'] || values['ROOTPATH'] || process.env.ROOTPATH || composedConfig.rootPath;
 const usingCertAuth: boolean = !(leaderUsername && leaderPassword) && !leaderToken;
 let harperLogger: any;
 let leaderReplicationURL: string;
