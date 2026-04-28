@@ -16,6 +16,7 @@
  *   --branch <name>   Release branch (default: v5.0)
  *   --source <name>   Source branch (default: main)
  *   --label <name>    PR label to filter on (default: patch)
+ *   --bump <type>     npm version bump type: patch|minor|major (default: patch)
  *   --dry-run         Preview without making changes
  *
  * AI conflict resolution:
@@ -33,6 +34,7 @@ const DRY_RUN = argv.includes('--dry-run');
 const RELEASE_BRANCH = getArg('--branch', 'v5.0');
 const SOURCE_BRANCH = getArg('--source', 'main');
 const LABEL = getArg('--label', 'patch');
+const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major
 
 function getArg(flag, def) {
   const i = argv.indexOf(flag);
@@ -96,6 +98,29 @@ function detectGhRepo() {
   const match = remote.match(/github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?$/);
   if (!match) throw new Error(`Cannot parse GitHub repo from remote: ${remote}`);
   return match[1];
+}
+
+// ── Version bump ──────────────────────────────────────────────────────────────
+function bumpVersion(name) {
+  if (DRY_RUN) {
+    ok(`  [dry-run] Would run: npm version ${VERSION_BUMP}`);
+    return;
+  }
+  log(`\n  Bumping ${VERSION_BUMP} version in ${name}...`);
+  try {
+    const result = run(`npm version ${VERSION_BUMP} --no-git-tag-version`);
+    const newVersion = result.trim();
+    ok(`  Version bumped to ${newVersion}`);
+
+    // Commit the package.json change, then tag
+    run(`git add package.json package-lock.json 2>/dev/null || git add package.json`);
+    run(`git commit -m "Release ${newVersion}"`);
+    run(`git tag "${newVersion}"`);
+    ok(`  Tagged ${newVersion}`);
+  } catch (e) {
+    err(`  Version bump failed: ${e.message}`);
+    process.exit(1);
+  }
 }
 
 function hasBranch(branch) {
@@ -292,8 +317,13 @@ async function patchRepo({ absPath, name }) {
   if (results['already-present']?.length)  log(`  Already present: ${results['already-present'].map((p) => '#' + p.number).join(', ')}`);
   if (results.skipped?.length)            warn(`  Skipped:         ${results.skipped.map((p) => '#' + p.number).join(', ')}`);
 
+  if (results.applied?.length || DRY_RUN) {
+    bumpVersion(name);
+  }
+
   if (!DRY_RUN && results.applied?.length) {
-    log(`\n  Ready to push: git push origin ${RELEASE_BRANCH}`);
+    const newVer = run('node -p "require(\'./package.json\').version"');
+    log(`\n  Ready to push: git push origin ${RELEASE_BRANCH} && git push origin v${newVer}`);
   }
 
   if (!DRY_RUN && originalBranch && originalBranch !== RELEASE_BRANCH) {
