@@ -1,9 +1,8 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
-import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,

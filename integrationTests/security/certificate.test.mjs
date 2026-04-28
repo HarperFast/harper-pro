@@ -3,7 +3,7 @@ import { equal, ok } from 'node:assert';
 import { join } from 'node:path';
 import { createCA, createCert } from 'mkcert';
 import forge from 'node-forge';
-import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { startHarper, teardownHarper } from '@harperfast/integration-testing';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,

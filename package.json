@@ -107,7 +107,8 @@
 		"lint": "oxlint --deny-warnings .",
 		"lint:fix": "npm run lint -- --fix",
 		"lint:required": "oxlint --quiet .",
-		"test:integration": "node integrationTests/run.mjs",
+		"test:integration": "HARPER_INTEGRATION_TEST_INSTALL_SCRIPT=dist/bin/harper.js harper-integration-test-run",
+		"test:integration:all": "npm run test:integration -- integrationTests/**/*.test.ts",
 		"cluster:ip:local": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. build && docker compose -f docker-compose.ip.yml --project-directory ../.. up; popd",
 		"cluster:ip:latest": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. pull && docker compose -f docker-compose.ip.yml --project-directory ../.. up; popd",
 		"cluster:delete": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. down --remove-orphans; popd",
@@ -201,6 +202,7 @@
 	},
 	"devDependencies": {
 		"@harperdb/code-guidelines": "^0.0.6",
+		"@harperfast/integration-testing": "^0.2.0",
 		"@types/fs-extra": "^11.0.4",
 		"@types/gunzip-maybe": "^1.4.3",
 		"@types/jsonwebtoken": "^9.0.10",
