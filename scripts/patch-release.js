@@ -1,25 +1,30 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * Cherry-picks patch-labeled PRs from main onto a release branch.
+ * Applies patch-labeled PRs to the release branch across core and harper-pro,
+ * then syncs the core submodule and its dependencies.
+ *
+ * Order:
+ *   1. Cherry-pick patch PRs onto core (HarperFast/harper) v5.0
+ *   2. Cherry-pick patch PRs onto harper-pro v5.0
+ *   3. Run build-tools/sync-core.sh (updates submodule pointer + deps)
  *
  * Usage:
  *   node scripts/patch-release.js [options]
  *
  * Options:
- *   --branch <name>   Release branch to patch (default: v5.0)
- *   --source <name>   Source branch to pull patches from (default: main)
+ *   --branch <name>   Release branch (default: v5.0)
+ *   --source <name>   Source branch (default: main)
  *   --label <name>    PR label to filter on (default: patch)
- *   --dry-run         Show what would be done without making changes
+ *   --dry-run         Preview without making changes
  *
  * AI conflict resolution:
- *   Set ANTHROPIC_API_KEY in your environment and ensure @anthropic-ai/sdk is
- *   installed (npm install -g @anthropic-ai/sdk) to enable Claude-assisted
- *   conflict resolution.
+ *   Set ANTHROPIC_API_KEY and install @anthropic-ai/sdk (npm install -g @anthropic-ai/sdk).
  */
 
 const { execSync, spawnSync } = require('child_process');
 const { readFileSync, writeFileSync } = require('fs');
+const path = require('path');
 const readline = require('readline');
 
 // ── Args ──────────────────────────────────────────────────────────────────────
@@ -41,6 +46,7 @@ const ok = (m) => console.log(C.green + m + C.reset);
 const warn = (m) => console.warn(C.yellow + m + C.reset);
 const err = (m) => console.error(C.red + m + C.reset);
 const info = (m) => console.log(C.cyan + m + C.reset);
+const header = (m) => log(`\n${C.bold}${C.cyan}${'━'.repeat(60)}\n  ${m}\n${'━'.repeat(60)}${C.reset}`);
 
 // ── Shell helpers ─────────────────────────────────────────────────────────────
 function run(cmd, opts = {}) {
@@ -55,7 +61,6 @@ function runSafe(cmd) {
 // ── Anthropic SDK (optional) ──────────────────────────────────────────────────
 let anthropicClient = null;
 try {
-  // Support both locally installed and globally installed SDK
   const Anthropic = require('@anthropic-ai/sdk');
   const Cls = Anthropic.default ?? Anthropic;
   if (process.env.ANTHROPIC_API_KEY) {
@@ -69,10 +74,16 @@ try {
   warn('  To enable: npm install -g @anthropic-ai/sdk  (and set ANTHROPIC_API_KEY)');
 }
 
-// ── Git helpers ───────────────────────────────────────────────────────────────
+// ── User prompt ───────────────────────────────────────────────────────────────
+async function prompt(question) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => rl.question(question, (ans) => { rl.close(); resolve(ans.trim()); }));
+}
+
+// ── Git helpers (run from cwd) ────────────────────────────────────────────────
 function isMergeCommit(sha) {
-  const info = run(`git cat-file -p "${sha}"`);
-  return info.split('\n').filter((l) => l.startsWith('parent ')).length > 1;
+  const out = run(`git cat-file -p "${sha}"`);
+  return out.split('\n').filter((l) => l.startsWith('parent ')).length > 1;
 }
 
 function getConflictedFiles() {
@@ -80,19 +91,27 @@ function getConflictedFiles() {
   return r.out ? r.out.split('\n').filter(Boolean) : [];
 }
 
+function detectGhRepo() {
+  const remote = run('git remote get-url origin');
+  const match = remote.match(/github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?$/);
+  if (!match) throw new Error(`Cannot parse GitHub repo from remote: ${remote}`);
+  return match[1];
+}
+
+function hasBranch(branch) {
+  return (
+    runSafe(`git show-ref --verify "refs/heads/${branch}"`).code === 0 ||
+    runSafe(`git show-ref --verify "refs/remotes/origin/${branch}"`).code === 0
+  );
+}
+
 // ── GitHub helpers ────────────────────────────────────────────────────────────
-function getPatchPRs() {
+function getPatchPRs(ghRepo) {
   const json = run(
-    `gh pr list --label "${LABEL}" --state merged --base "${SOURCE_BRANCH}" ` +
+    `gh pr list --repo "${ghRepo}" --label "${LABEL}" --state merged --base "${SOURCE_BRANCH}" ` +
       `--json number,title,mergeCommit,body --limit 200`
   );
   return JSON.parse(json).filter((pr) => pr.mergeCommit?.oid);
-}
-
-// ── User prompt ───────────────────────────────────────────────────────────────
-async function prompt(question) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => rl.question(question, (ans) => { rl.close(); resolve(ans.trim()); }));
 }
 
 // ── AI conflict resolution ────────────────────────────────────────────────────
@@ -114,21 +133,13 @@ ${pr.body?.trim() || '(none)'}
 
 The following files have conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`).
 For each file, decide the correct resolution — usually accepting the incoming change
-(HEAD changes are the release branch; the incoming \`>>>>>>>\` side is the patch being applied).
+(HEAD is the release branch; the \`>>>>>>>\` side is the patch being applied).
 
 Respond with valid JSON only, shaped like:
 {
   "files": [
-    {
-      "path": "relative/path/to/file.js",
-      "status": "resolved",
-      "content": "<full resolved file content as a string>"
-    },
-    {
-      "path": "relative/path/to/other.js",
-      "status": "unresolvable",
-      "reason": "<brief explanation of why>"
-    }
+    { "path": "relative/path/file.js", "status": "resolved", "content": "<full file content>" },
+    { "path": "relative/path/other.js", "status": "unresolvable", "reason": "<why>" }
   ]
 }
 
@@ -147,7 +158,6 @@ ${filesBlock}`;
     return { resolved: [], unresolvable: conflictedFiles };
   }
 
-  // Parse JSON — strip markdown fences if present
   const jsonText = responseText.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '').trim();
   let parsed;
   try {
@@ -159,7 +169,6 @@ ${filesBlock}`;
 
   const resolved = [];
   const unresolvable = [];
-
   for (const file of parsed.files ?? []) {
     if (file.status === 'resolved') {
       writeFileSync(file.path, file.content);
@@ -171,163 +180,173 @@ ${filesBlock}`;
       unresolvable.push(file.path);
     }
   }
-
   return { resolved, unresolvable };
 }
 
-// ── Cherry-pick a single PR ───────────────────────────────────────────────────
+// ── Cherry-pick one PR ────────────────────────────────────────────────────────
 async function cherryPickPR(pr) {
   const sha = pr.mergeCommit.oid;
   const mergeFlag = isMergeCommit(sha) ? '-m 1 ' : '';
   const pickCmd = `git cherry-pick ${mergeFlag}${sha}`;
 
-  log(`  Commit: ${sha.slice(0, 8)}  cmd: ${pickCmd}`);
+  log(`  Commit: ${sha.slice(0, 8)}  (${pickCmd})`);
 
-  if (DRY_RUN) {
-    ok('  [dry-run] Would apply.');
-    return 'applied';
-  }
+  if (DRY_RUN) { ok('  [dry-run] Would apply.'); return 'applied'; }
 
   const r = runSafe(pickCmd);
 
-  if (r.code === 0) {
-    ok('  Applied cleanly.');
-    return 'applied';
-  }
+  if (r.code === 0) { ok('  Applied cleanly.'); return 'applied'; }
 
-  // Already applied (empty cherry-pick)
-  if (r.errText.includes('nothing to commit') || r.errText.includes('allow-empty') || r.out.includes('nothing to commit')) {
+  if (r.errText.includes('nothing to commit') || r.out.includes('nothing to commit')) {
     runSafe('git cherry-pick --skip');
-    warn('  Changes already present on release branch — skipped.');
+    warn('  Changes already present — skipped.');
     return 'already-present';
   }
 
-  // Conflict
-  err(`  Conflict detected!`);
+  err('  Conflict detected!');
   const conflicted = getConflictedFiles();
   log(`  Conflicted: ${conflicted.join(', ')}`);
 
   const { resolved, unresolvable } = await resolveWithAI(pr, conflicted);
 
   if (unresolvable.length === 0 && resolved.length > 0) {
-    // All conflicts resolved by AI
     const cont = runSafe('git cherry-pick --continue --no-edit');
-    if (cont.code === 0) {
-      ok('  All conflicts resolved by AI. Cherry-pick complete.');
-      return 'applied';
-    }
+    if (cont.code === 0) { ok('  All conflicts resolved by AI. Cherry-pick complete.'); return 'applied'; }
     err('  --continue failed after AI resolution: ' + cont.errText);
   }
 
-  // Manual intervention required
   if (unresolvable.length > 0) {
     warn(`\n  ${unresolvable.length} file(s) need manual resolution:`);
     unresolvable.forEach((f) => warn(`    ${f}`));
   }
 
-  log('');
-  warn('  Options:');
-  warn('    r — I have resolved all conflicts manually, continue the cherry-pick');
-  warn('    s — Skip this PR (abort cherry-pick)');
-  warn('    q — Quit');
+  warn('\n  Options:');
+  warn('    r — resolved manually, continue cherry-pick');
+  warn('    s — skip this PR');
+  warn('    q — quit');
 
   while (true) {
     const ans = await prompt('  Choice [r/s/q]: ');
-    if (ans === 'q') {
-      runSafe('git cherry-pick --abort');
-      err('Aborted.');
-      process.exit(1);
-    }
-    if (ans === 's') {
-      runSafe('git cherry-pick --abort');
-      warn(`  Skipped PR #${pr.number}.`);
-      return 'skipped';
-    }
+    if (ans === 'q') { runSafe('git cherry-pick --abort'); err('Aborted.'); process.exit(1); }
+    if (ans === 's') { runSafe('git cherry-pick --abort'); warn(`  Skipped PR #${pr.number}.`); return 'skipped'; }
     if (ans === 'r') {
       const remaining = getConflictedFiles();
-      if (remaining.length > 0) {
-        warn(`  Still conflicted: ${remaining.join(', ')}`);
-        continue;
-      }
+      if (remaining.length > 0) { warn(`  Still conflicted: ${remaining.join(', ')}`); continue; }
       runSafe('git add -A');
       const cont = runSafe('git cherry-pick --continue --no-edit');
-      if (cont.code === 0) {
-        ok('  Manually resolved. Cherry-pick complete.');
-        return 'applied';
-      }
+      if (cont.code === 0) { ok('  Manually resolved. Cherry-pick complete.'); return 'applied'; }
       err('  Continue failed: ' + cont.errText);
     }
   }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-async function main() {
-  // Prereqs
-  try { run('gh --version'); } catch { err('gh CLI not found (https://cli.github.com)'); process.exit(1); }
+// ── Patch one repo ────────────────────────────────────────────────────────────
+async function patchRepo({ absPath, name }) {
+  header(`Patching ${name}`);
+  process.chdir(absPath);
 
-  const repoRoot = run('git rev-parse --show-toplevel');
-  process.chdir(repoRoot);
+  const ghRepo = detectGhRepo();
+  info(`  GitHub repo: ${ghRepo}`);
 
-  const branchCheck = runSafe(
-    `git show-ref --verify "refs/heads/${RELEASE_BRANCH}" || ` +
-    `git show-ref --verify "refs/remotes/origin/${RELEASE_BRANCH}"`
-  );
-  if (branchCheck.code !== 0) {
-    err(`Release branch "${RELEASE_BRANCH}" not found locally or on origin.`);
+  if (!hasBranch(RELEASE_BRANCH)) {
+    err(`  Release branch "${RELEASE_BRANCH}" not found in ${name}.`);
     process.exit(1);
   }
 
-  log(`\nFetching from origin...`);
+  log(`  Fetching from origin...`);
   run('git fetch origin');
 
-  log(`\nLooking for PRs labeled "${LABEL}" merged into "${SOURCE_BRANCH}"...`);
-  const prs = getPatchPRs();
+  log(`  Looking for PRs labeled "${LABEL}" merged into "${SOURCE_BRANCH}"...`);
+  const prs = getPatchPRs(ghRepo);
 
   if (prs.length === 0) {
-    log(`No merged PRs with label "${LABEL}" on ${SOURCE_BRANCH}.`);
-    return;
+    warn(`  No merged PRs with label "${LABEL}" found — nothing to do.`);
+    return { applied: [] };
   }
 
-  log(`\nFound ${prs.length} PR(s):\n`);
+  log(`\n  Found ${prs.length} PR(s):\n`);
   for (const pr of prs) {
-    log(`  #${pr.number.toString().padEnd(5)} ${pr.mergeCommit.oid.slice(0, 8)}  ${pr.title}`);
+    log(`    #${pr.number.toString().padEnd(5)} ${pr.mergeCommit.oid.slice(0, 8)}  ${pr.title}`);
   }
 
-  if (DRY_RUN) {
-    log('\n[dry-run mode — no changes will be made]\n');
-  } else {
-    const confirm = await prompt(`\nApply ${prs.length} PR(s) onto ${RELEASE_BRANCH}? [Y/n]: `);
-    if (confirm.toLowerCase() === 'n') { log('Aborted.'); return; }
+  if (!DRY_RUN) {
+    const confirm = await prompt(`\n  Apply ${prs.length} PR(s) onto ${RELEASE_BRANCH}? [Y/n]: `);
+    if (confirm.toLowerCase() === 'n') { warn('  Skipped.'); return { applied: [] }; }
   }
 
   const originalBranch = run('git branch --show-current');
-
-  log(`\nChecking out ${RELEASE_BRANCH}...`);
+  log(`\n  Checking out ${RELEASE_BRANCH}...`);
   if (!DRY_RUN) run(`git checkout "${RELEASE_BRANCH}"`);
 
   const results = { applied: [], 'already-present': [], skipped: [] };
 
   for (const pr of prs) {
-    log(`\n${'─'.repeat(60)}`);
-    log(`PR #${pr.number}: ${pr.title}`);
+    log(`\n  ${'─'.repeat(56)}`);
+    log(`  PR #${pr.number}: ${pr.title}`);
     const outcome = await cherryPickPR(pr);
     (results[outcome] = results[outcome] ?? []).push(pr);
   }
 
-  // Summary
-  log(`\n${'═'.repeat(60)}`);
-  log(`${C.bold}Summary${C.reset}`);
-  if (results.applied?.length)          ok(`  Applied:         ${results.applied.map((p) => '#' + p.number).join(', ')}`);
-  if (results['already-present']?.length) log(`  Already present: ${results['already-present'].map((p) => '#' + p.number).join(', ')}`);
-  if (results.skipped?.length)          warn(`  Skipped:         ${results.skipped.map((p) => '#' + p.number).join(', ')}`);
+  log(`\n  ${'═'.repeat(56)}`);
+  if (results.applied?.length)            ok(`  Applied:         ${results.applied.map((p) => '#' + p.number).join(', ')}`);
+  if (results['already-present']?.length)  log(`  Already present: ${results['already-present'].map((p) => '#' + p.number).join(', ')}`);
+  if (results.skipped?.length)            warn(`  Skipped:         ${results.skipped.map((p) => '#' + p.number).join(', ')}`);
 
   if (!DRY_RUN && results.applied?.length) {
-    log(`\nReady to push: git push origin ${RELEASE_BRANCH}`);
+    log(`\n  Ready to push: git push origin ${RELEASE_BRANCH}`);
   }
 
   if (!DRY_RUN && originalBranch && originalBranch !== RELEASE_BRANCH) {
-    const back = await prompt(`\nReturn to "${originalBranch}"? [Y/n]: `);
+    const back = await prompt(`\n  Return to "${originalBranch}" in ${name}? [Y/n]: `);
     if (back.toLowerCase() !== 'n') run(`git checkout "${originalBranch}"`);
+  }
+
+  return results;
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+async function main() {
+  try { run('gh --version'); } catch { err('gh CLI not found (https://cli.github.com)'); process.exit(1); }
+
+  // Resolve harper-pro root (the directory containing this script's parent)
+  const harperProRoot = path.resolve(__dirname, '..');
+  process.chdir(harperProRoot);
+
+  // Ensure core submodule is initialized
+  log('\nInitializing core submodule if needed...');
+  run('git submodule update --init core');
+
+  const corePath = path.join(harperProRoot, 'core');
+
+  // ── Step 1: patch core ─────────────────────────────────────────────────────
+  await patchRepo({ absPath: corePath, name: 'harper (core)' });
+
+  // ── Step 2: patch harper-pro ───────────────────────────────────────────────
+  process.chdir(harperProRoot);
+  await patchRepo({ absPath: harperProRoot, name: 'harper-pro' });
+
+  // ── Step 3: sync core submodule + deps ─────────────────────────────────────
+  header('Syncing core submodule + dependencies');
+  process.chdir(harperProRoot);
+
+  if (DRY_RUN) {
+    ok('[dry-run] Would run: ./build-tools/sync-core.sh');
+  } else {
+    log('Running build-tools/sync-core.sh...\n');
+    try {
+      execSync('./build-tools/sync-core.sh', { stdio: 'inherit' });
+      ok('\nSync complete.');
+    } catch (e) {
+      err(`sync-core.sh failed (exit ${e.status})`);
+      process.exit(e.status ?? 1);
+    }
+  }
+
+  header('All done');
+  if (!DRY_RUN) {
+    log('Next steps:');
+    log(`  git -C core push origin ${RELEASE_BRANCH}`);
+    log(`  git push origin ${RELEASE_BRANCH}`);
   }
 }
 
