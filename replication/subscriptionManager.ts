@@ -269,6 +269,7 @@ export async function startOnMainThread(options) {
 				const nodeName = nodes[0].name ?? (nodes[0].url && new URL(nodes[0].url).hostname);
 				logger.warn(`Setting up subscription with leader ${leaderName} for node ${nodeName}`);
 				nodes[0].isLeader = !leaderName || nodeName === leaderName;
+				nodes[0].url ??= getNodeURL(nodes[0]);
 				setTimeout(() => {
 					const request = {
 						...nodes[0],
