@@ -35,7 +35,7 @@ if [[ "$IGNORE_PACKAGE_JSON_DIFF" != "true" ]]; then
 fi
 
 echo -e "\n📦 Installing production deps"
-npm ci
+npm install
 
 echo -e "\n📦 Applying Harper Pro branding"
 perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/installer.js
