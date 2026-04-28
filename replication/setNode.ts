@@ -125,7 +125,7 @@ export async function setNode(req: any) {
 
 	let targetNodeResponse: any;
 	let targetNodeResponseError: Error;
-	hdbLogger.notify('sending add_node_back operation', targetAddNodeObj);
+	hdbLogger.debug('sending add_node_back operation', targetAddNodeObj);
 	try {
 		targetNodeResponse = await sendOperationToNode({ url }, targetAddNodeObj, req);
 	} catch (err) {
