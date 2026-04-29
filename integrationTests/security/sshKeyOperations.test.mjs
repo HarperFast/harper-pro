@@ -1,7 +1,7 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, deepEqual, ok } from 'node:assert';
 import { join } from 'node:path';
-import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { startHarper, teardownHarper } from '@harperfast/integration-testing';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,

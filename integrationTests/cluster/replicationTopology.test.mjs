@@ -5,9 +5,8 @@
 import { suite, test, before, after } from 'node:test';
 import { equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { killHarper, startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { killHarper, startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
 import { sendOperation } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
