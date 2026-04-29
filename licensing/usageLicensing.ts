@@ -103,7 +103,7 @@ async function installUsageLicenseOp(req: InstallLicenseRequest): Promise<string
 	try {
 		await installUsageLicense(license);
 	} catch (cause) {
-		const error = new ClientError('Failed to install usage license; ' + cause.message);
+		const error = new ClientError('Failed to install usage license; ' + cause.message, 409);
 		error.cause = cause;
 		throw error;
 	}
