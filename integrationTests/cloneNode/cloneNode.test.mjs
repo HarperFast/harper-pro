@@ -249,3 +249,78 @@ suite('Clone Node', (ctx) => {
 		console.log('done');
 	});
 });
+
+// Exercises the fallback chain for replication.port: when neither --replication-port nor
+// REPLICATION_PORT are supplied, cloneNode must derive the port from HARPER_SET_CONFIG.
+// Uses a non-default port so the test fails loudly if cloneNode silently falls back to
+// DEFAULT_REPLICATION_PORT (9933) instead of honoring the composed config.
+suite('Clone Node - replication.port from HARPER_SET_CONFIG', (ctx) => {
+	const REPLICATION_PORT = 19933;
+
+	before(async () => {
+		ctx.nodes = [];
+		const leaderCtx = {
+			name: ctx.name,
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
+		};
+		await startHarper(leaderCtx, {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false },
+				replication: {
+					port: `${leaderCtx.harper.hostname}:${REPLICATION_PORT}`,
+					securePort: null,
+				},
+			},
+			env: {
+				HARPER_NO_FLUSH_ON_EXIT: true,
+			},
+		});
+		ctx.nodes.push(leaderCtx.harper);
+	});
+
+	after(async () => {
+		await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node })));
+	});
+
+	test('cloneNode reads replication.port from HARPER_SET_CONFIG when no flag/env is set', async () => {
+		const cloneCtx = {
+			name: ctx.name,
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
+		};
+		await startHarper(cloneCtx, {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false },
+				replication: {
+					port: `${cloneCtx.harper.hostname}:${REPLICATION_PORT}`,
+					securePort: null,
+				},
+			},
+			env: {
+				HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:9925`,
+				HDB_LEADER_USERNAME: ctx.nodes[0].admin.username,
+				HDB_LEADER_PASSWORD: ctx.nodes[0].admin.password,
+				ALLOW_SELF_SIGNED: true,
+				HARPER_NO_FLUSH_ON_EXIT: true,
+				// Intentionally NOT setting REPLICATION_PORT here, and no --replication-port CLI flag is passed,
+				// so the only source for the port is composeConfigFromEnv reading HARPER_SET_CONFIG.
+			},
+		});
+		ctx.nodes.push(cloneCtx.harper);
+
+		await waitForAvailableStatus(ctx.nodes[1]);
+
+		// Verify the leader sees the clone connected on the non-default replication port.
+		const clusterStatusLeader = await sendOperation(ctx.nodes[0], { operation: 'cluster_status' });
+		equal(clusterStatusLeader.connections.length, 1, JSON.stringify(clusterStatusLeader));
+		ok(
+			clusterStatusLeader.connections[0].url?.includes(`:${REPLICATION_PORT}`),
+			`Leader should see clone on port ${REPLICATION_PORT}, got: ${clusterStatusLeader.connections[0].url}`
+		);
+	});
+});

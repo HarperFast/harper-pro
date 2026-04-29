@@ -152,8 +152,14 @@ const syncTimeoutMs: number = Math.max(
 	1,
 	parseInt(values['sync-timeout'] || process.env.CLONE_SYNC_TIMEOUT, 10) || DEFAULT_SYNC_TIMEOUT_MS
 );
+// `replication.port` in HARPER_SET_CONFIG / HARPER_DEFAULT_CONFIG accepts both a numeric port
+// and a `host:port` string; cloneNode treats `replicationPort` as a port number (substituted
+// into the leader URL and written to REPLICATION_PORT), so strip any leading `host:`.
+const composedReplicationPort = composedConfig.replication?.port;
+const composedReplicationPortFallback =
+	composedReplicationPort != null ? String(composedReplicationPort).split(':').pop() : undefined;
 const replicationPort: string =
-	values['replication-port'] || process.env.REPLICATION_PORT || composedConfig.replication?.port?.toString();
+	values['replication-port'] || process.env.REPLICATION_PORT || composedReplicationPortFallback;
 const skipSSHKeys: boolean = values['skip-ssh-keys'] ?? process.env.CLONE_SKIP_SSH_KEYS === 'true';
 const skipJWTKeys: boolean = values['skip-jwt-keys'] ?? process.env.CLONE_SKIP_JWT_KEYS === 'true';
 const forceClone: boolean = values['force-clone'] ?? process.env.FORCE_CLONE === 'true';
