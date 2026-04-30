@@ -217,34 +217,60 @@ async function cherryPickPR(pr) {
   const conflicted = getConflictedFiles();
   log(`  Conflicted: ${conflicted.join(', ')}`);
 
-  const { resolved, unresolvable } = resolveWithGemini(pr, conflicted);
-
-  if (unresolvable.length === 0 && resolved.length > 0) {
-    const cont = runSafe('git cherry-pick --continue --no-edit');
-    if (cont.code === 0) { ok('  All conflicts resolved by Gemini. Cherry-pick complete.'); return 'applied'; }
-    err('  --continue failed after Gemini resolution: ' + cont.errText);
-  }
-
-  if (unresolvable.length > 0) {
-    warn(`\n  ${unresolvable.length} file(s) need manual resolution:`);
-    unresolvable.forEach((f) => warn(`    ${f}`));
-  }
-
   warn('\n  Options:');
-  warn('    r — resolved manually, continue cherry-pick');
+  warn('    t — accept theirs (incoming patch) for all conflicted files');
+  warn('    o — accept ours (release branch) for all conflicted files');
+  if (GEMINI_AVAILABLE) warn('    g — ask Gemini to resolve');
+  warn('    r — I resolved manually, continue cherry-pick');
   warn('    s — skip this PR');
   warn('    q — quit');
 
+  const menuChoices = GEMINI_AVAILABLE ? '[t/o/g/r/s/q]' : '[t/o/r/s/q]';
+
   while (true) {
-    const ans = await prompt('  Choice [r/s/q]: ');
+    const ans = await prompt(`  Choice ${menuChoices}: `);
+
     if (ans === 'q') { runSafe('git cherry-pick --abort'); err('Aborted.'); process.exit(1); }
+
     if (ans === 's') { runSafe('git cherry-pick --abort'); warn(`  Skipped PR #${pr.number}.`); return 'skipped'; }
+
+    if (ans === 't' || ans === 'o') {
+      const strategy = ans === 't' ? 'theirs' : 'ours';
+      const current = getConflictedFiles();
+      for (const f of current) {
+        run(`git checkout --${strategy} "${f}"`);
+        run(`git add "${f}"`);
+      }
+      ok(`  Accepted ${strategy} for: ${current.join(', ')}`);
+      const cont = runSafe('git cherry-pick --continue --no-edit');
+      if (cont.code === 0) { ok(`  Cherry-pick complete.`); return 'applied'; }
+      // Some files may still be conflicted after strategy (e.g. binary conflicts)
+      const stillConflicted = getConflictedFiles();
+      if (stillConflicted.length > 0) {
+        warn(`  Still conflicted after --${strategy}: ${stillConflicted.join(', ')}`);
+        continue;
+      }
+      err('  --continue failed: ' + cont.errText);
+    }
+
+    if (ans === 'g' && GEMINI_AVAILABLE) {
+      const { resolved, unresolvable } = resolveWithGemini(pr, getConflictedFiles());
+      if (unresolvable.length === 0 && resolved.length > 0) {
+        const cont = runSafe('git cherry-pick --continue --no-edit');
+        if (cont.code === 0) { ok('  All conflicts resolved by Gemini. Cherry-pick complete.'); return 'applied'; }
+        err('  --continue failed after Gemini resolution: ' + cont.errText);
+      }
+      if (unresolvable.length > 0) {
+        warn(`  Gemini could not resolve: ${unresolvable.join(', ')}`);
+      }
+    }
+
     if (ans === 'r') {
       const remaining = getConflictedFiles();
       if (remaining.length > 0) { warn(`  Still conflicted: ${remaining.join(', ')}`); continue; }
       runSafe('git add -A');
       const cont = runSafe('git cherry-pick --continue --no-edit');
-      if (cont.code === 0) { ok('  Manually resolved. Cherry-pick complete.'); return 'applied'; }
+      if (cont.code === 0) { ok('  Cherry-pick complete.'); return 'applied'; }
       err('  Continue failed: ' + cont.errText);
     }
   }
