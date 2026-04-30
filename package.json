@@ -201,6 +201,7 @@
 	},
 	"devDependencies": {
 		"@harperdb/code-guidelines": "^0.0.6",
+		"@harperfast/integration-testing": "^0.2.0",
 		"@types/fs-extra": "^11.0.4",
 		"@types/gunzip-maybe": "^1.4.3",
 		"@types/jsonwebtoken": "^9.0.10",
