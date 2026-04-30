@@ -104,6 +104,17 @@ function hasBranch(branch) {
   );
 }
 
+// Check if a commit's patch is already present in the release branch.
+// git cherry compares patch-ids (content, not SHA), so it correctly identifies
+// commits that were cherry-picked into the release branch with a different SHA.
+// Syntax: git cherry <upstream> <head> <limit> shows commits in head..limit
+// not already in upstream; "- sha" = already there, "+ sha" = not there.
+function isAlreadyApplied(sha) {
+  const r = runSafe(`git cherry "origin/${RELEASE_BRANCH}" "${sha}" "${sha}^"`);
+  if (r.code !== 0) return false; // conservative: assume not applied on error
+  return r.out.startsWith('-');
+}
+
 // ── GitHub helpers ────────────────────────────────────────────────────────────
 function getPatchPRs(ghRepo) {
   const json = run(
@@ -289,26 +300,56 @@ async function patchRepo({ absPath, name }) {
     return { applied: [] };
   }
 
-  log(`\n  Found ${prs.length} PR(s):\n`);
+  // Pre-check which PRs are already in the release branch (by patch content, not SHA)
+  log(`  Checking which PRs are already in ${RELEASE_BRANCH}...`);
+  const newPRs = [];
+  const preApplied = [];
   for (const pr of prs) {
-    log(`    #${pr.number.toString().padEnd(5)} ${pr.mergeCommit.oid.slice(0, 8)}  ${pr.title}`);
+    if (isAlreadyApplied(pr.mergeCommit.oid)) {
+      preApplied.push(pr);
+    } else {
+      newPRs.push(pr);
+    }
+  }
+
+  log('');
+  if (preApplied.length) {
+    log(`  Already in ${RELEASE_BRANCH}:`);
+    for (const pr of preApplied) {
+      log(`    ${C.yellow}✓${C.reset} #${pr.number.toString().padEnd(5)} ${pr.mergeCommit.oid.slice(0, 8)}  ${pr.title}`);
+    }
+  }
+  if (newPRs.length) {
+    log(`  New (will be applied):`);
+    for (const pr of newPRs) {
+      log(`    ${C.green}+${C.reset} #${pr.number.toString().padEnd(5)} ${pr.mergeCommit.oid.slice(0, 8)}  ${pr.title}`);
+    }
+  }
+
+  if (newPRs.length === 0) {
+    ok(`  All ${prs.length} PR(s) already present in ${RELEASE_BRANCH} — nothing to apply.`);
+    return { applied: [], 'already-present': preApplied };
   }
 
   if (!DRY_RUN) {
-    const confirm = await prompt(`\n  Apply ${prs.length} PR(s) onto ${RELEASE_BRANCH}? [Y/n]: `);
-    if (confirm.toLowerCase() === 'n') { warn('  Skipped.'); return { applied: [] }; }
+    const confirm = await prompt(`\n  Apply ${newPRs.length} new PR(s) onto ${RELEASE_BRANCH}? [Y/n]: `);
+    if (confirm.toLowerCase() === 'n') { warn('  Skipped.'); return { applied: [], 'already-present': preApplied }; }
   }
 
   log(`\n  Checking out ${RELEASE_BRANCH}...`);
   if (!DRY_RUN) run(`git checkout "${RELEASE_BRANCH}"`);
 
-  const results = { applied: [], 'already-present': [], skipped: [] };
+  const results = { applied: [], 'already-present': preApplied, skipped: [] };
 
-  for (const pr of prs) {
+  for (const pr of newPRs) {
     log(`\n  ${'─'.repeat(56)}`);
     log(`  PR #${pr.number}: ${pr.title}`);
     const outcome = await cherryPickPR(pr);
-    (results[outcome] = results[outcome] ?? []).push(pr);
+    if (outcome === 'already-present') {
+      results['already-present'].push(pr);
+    } else {
+      (results[outcome] = results[outcome] ?? []).push(pr);
+    }
   }
 
   log(`\n  ${'═'.repeat(56)}`);
