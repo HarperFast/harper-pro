@@ -5,9 +5,12 @@
  * then syncs the core submodule and its dependencies.
  *
  * Order:
- *   1. Cherry-pick patch PRs onto core (HarperFast/harper) v5.0
- *   2. Cherry-pick patch PRs onto harper-pro v5.0
- *   3. Run build-tools/sync-core.sh (updates submodule pointer + deps)
+ *   1. Cherry-pick patch PRs onto core (HarperFast/harper) release branch
+ *   2. Bump core version + tag
+ *   3. Cherry-pick patch PRs onto harper-pro release branch
+ *   4. Run build-tools/sync-core.sh (skipping submodule update — core stays on
+ *      the release branch we just patched)
+ *   5. Bump harper-pro version + tag (commit includes core ref + synced deps)
  *
  * Usage:
  *   node scripts/patch-release.js [options]
@@ -16,15 +19,16 @@
  *   --branch <name>   Release branch (default: v5.0)
  *   --source <name>   Source branch (default: main)
  *   --label <name>    PR label to filter on (default: patch)
- *   --bump <type>     npm version bump type: patch|minor|major (default: patch)
+ *   --bump <type>     npm version bump: patch|minor|major (default: patch)
  *   --dry-run         Preview without making changes
  *
  * AI conflict resolution:
- *   Set ANTHROPIC_API_KEY and install @anthropic-ai/sdk (npm install -g @anthropic-ai/sdk).
+ *   Requires the Gemini CLI: https://github.com/google-gemini/gemini-cli
+ *   Install and authenticate, then `gemini` must be on your PATH.
  */
 
 const { execSync, spawnSync } = require('child_process');
-const { readFileSync, writeFileSync } = require('fs');
+const { existsSync, readFileSync, writeFileSync } = require('fs');
 const path = require('path');
 const readline = require('readline');
 
@@ -60,20 +64,13 @@ function runSafe(cmd) {
   return { out: r.stdout.trim(), errText: r.stderr.trim(), code: r.status ?? 1 };
 }
 
-// ── Anthropic SDK (optional) ──────────────────────────────────────────────────
-let anthropicClient = null;
-try {
-  const Anthropic = require('@anthropic-ai/sdk');
-  const Cls = Anthropic.default ?? Anthropic;
-  if (process.env.ANTHROPIC_API_KEY) {
-    anthropicClient = new Cls();
-    info('AI conflict resolution enabled.');
-  } else {
-    warn('ANTHROPIC_API_KEY not set — AI conflict resolution disabled.');
-  }
-} catch {
-  warn('@anthropic-ai/sdk not found — AI conflict resolution disabled.');
-  warn('  To enable: npm install -g @anthropic-ai/sdk  (and set ANTHROPIC_API_KEY)');
+// ── Gemini CLI detection ──────────────────────────────────────────────────────
+const GEMINI_AVAILABLE = runSafe('which gemini').code === 0;
+if (GEMINI_AVAILABLE) {
+  info('AI conflict resolution enabled (Gemini CLI).');
+} else {
+  warn('gemini CLI not found — AI conflict resolution disabled.');
+  warn('  Install: https://github.com/google-gemini/gemini-cli');
 }
 
 // ── User prompt ───────────────────────────────────────────────────────────────
@@ -82,7 +79,7 @@ async function prompt(question) {
   return new Promise((resolve) => rl.question(question, (ans) => { rl.close(); resolve(ans.trim()); }));
 }
 
-// ── Git helpers (run from cwd) ────────────────────────────────────────────────
+// ── Git helpers ───────────────────────────────────────────────────────────────
 function isMergeCommit(sha) {
   const out = run(`git cat-file -p "${sha}"`);
   return out.split('\n').filter((l) => l.startsWith('parent ')).length > 1;
@@ -98,29 +95,6 @@ function detectGhRepo() {
   const match = remote.match(/github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?$/);
   if (!match) throw new Error(`Cannot parse GitHub repo from remote: ${remote}`);
   return match[1];
-}
-
-// ── Version bump ──────────────────────────────────────────────────────────────
-function bumpVersion(name) {
-  if (DRY_RUN) {
-    ok(`  [dry-run] Would run: npm version ${VERSION_BUMP}`);
-    return;
-  }
-  log(`\n  Bumping ${VERSION_BUMP} version in ${name}...`);
-  try {
-    const result = run(`npm version ${VERSION_BUMP} --no-git-tag-version`);
-    const newVersion = result.trim();
-    ok(`  Version bumped to ${newVersion}`);
-
-    // Commit the package.json change, then tag
-    run(`git add package.json package-lock.json 2>/dev/null || git add package.json`);
-    run(`git commit -m "Release ${newVersion}"`);
-    run(`git tag "${newVersion}"`);
-    ok(`  Tagged ${newVersion}`);
-  } catch (e) {
-    err(`  Version bump failed: ${e.message}`);
-    process.exit(1);
-  }
 }
 
 function hasBranch(branch) {
@@ -139,26 +113,26 @@ function getPatchPRs(ghRepo) {
   return JSON.parse(json).filter((pr) => pr.mergeCommit?.oid);
 }
 
-// ── AI conflict resolution ────────────────────────────────────────────────────
-async function resolveWithAI(pr, conflictedFiles) {
-  if (!anthropicClient) return { resolved: [], unresolvable: conflictedFiles };
+// ── Gemini conflict resolution ────────────────────────────────────────────────
+function resolveWithGemini(pr, conflictedFiles) {
+  if (!GEMINI_AVAILABLE) return { resolved: [], unresolvable: conflictedFiles };
 
-  log('\n  Asking Claude to resolve conflicts...');
+  log('\n  Asking Gemini to resolve conflicts...');
 
   const filesBlock = conflictedFiles
     .map((f) => `### File: ${f}\n\`\`\`\n${readFileSync(f, 'utf8')}\n\`\`\``)
     .join('\n\n');
 
-  const userMessage = `You are a senior engineer helping resolve git cherry-pick merge conflicts.
+  const promptText = `You are a senior engineer helping resolve git cherry-pick merge conflicts.
 
 Context: PR #${pr.number} "${pr.title}" is being cherry-picked onto a release branch.
 
 PR description:
 ${pr.body?.trim() || '(none)'}
 
-The following files have conflict markers (\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`).
+The following files have conflict markers (<<<<<<<, =======, >>>>>>>).
 For each file, decide the correct resolution — usually accepting the incoming change
-(HEAD is the release branch; the \`>>>>>>>\` side is the patch being applied).
+(HEAD is the release branch; the >>>>>>> side is the patch being applied).
 
 Respond with valid JSON only, shaped like:
 {
@@ -170,25 +144,25 @@ Respond with valid JSON only, shaped like:
 
 ${filesBlock}`;
 
-  let responseText;
-  try {
-    const message = await anthropicClient.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 16384,
-      messages: [{ role: 'user', content: userMessage }],
-    });
-    responseText = message.content[0].text;
-  } catch (e) {
-    warn(`  Claude API error: ${e.message}`);
+  // -p '' triggers headless mode; prompt text goes via stdin (appended per CLI docs)
+  const r = spawnSync('gemini', ['-p', ''], {
+    input: promptText,
+    encoding: 'utf8',
+    timeout: 120000,
+    maxBuffer: 20 * 1024 * 1024,
+  });
+
+  if (r.status !== 0) {
+    warn(`  Gemini CLI error: ${r.stderr || r.stdout}`);
     return { resolved: [], unresolvable: conflictedFiles };
   }
 
-  const jsonText = responseText.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '').trim();
+  const jsonText = r.stdout.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '').trim();
   let parsed;
   try {
     parsed = JSON.parse(jsonText);
   } catch {
-    warn('  Claude returned unparseable JSON — falling back to manual resolution.');
+    warn('  Gemini returned unparseable JSON — falling back to manual resolution.');
     return { resolved: [], unresolvable: conflictedFiles };
   }
 
@@ -232,12 +206,12 @@ async function cherryPickPR(pr) {
   const conflicted = getConflictedFiles();
   log(`  Conflicted: ${conflicted.join(', ')}`);
 
-  const { resolved, unresolvable } = await resolveWithAI(pr, conflicted);
+  const { resolved, unresolvable } = resolveWithGemini(pr, conflicted);
 
   if (unresolvable.length === 0 && resolved.length > 0) {
     const cont = runSafe('git cherry-pick --continue --no-edit');
-    if (cont.code === 0) { ok('  All conflicts resolved by AI. Cherry-pick complete.'); return 'applied'; }
-    err('  --continue failed after AI resolution: ' + cont.errText);
+    if (cont.code === 0) { ok('  All conflicts resolved by Gemini. Cherry-pick complete.'); return 'applied'; }
+    err('  --continue failed after Gemini resolution: ' + cont.errText);
   }
 
   if (unresolvable.length > 0) {
@@ -265,7 +239,33 @@ async function cherryPickPR(pr) {
   }
 }
 
+// ── Version bump + tag ────────────────────────────────────────────────────────
+// Call this while cwd is the repo root and the release branch is checked out.
+// Any already-staged changes (e.g. core submodule ref, synced deps) are folded
+// into the release commit automatically.
+function bumpVersion(repoLabel) {
+  if (DRY_RUN) {
+    ok(`  [dry-run] Would run: npm version ${VERSION_BUMP} and tag`);
+    return null;
+  }
+  log(`\n  Bumping ${VERSION_BUMP} version in ${repoLabel}...`);
+  const newVersion = run(`npm version ${VERSION_BUMP} --no-git-tag-version`).trim(); // e.g. "v5.0.5"
+  ok(`  Version bumped to ${newVersion}`);
+
+  // Stage the version change (plus any previously staged files like core ref or deps)
+  const toStage = ['package.json'];
+  if (existsSync('package-lock.json')) toStage.push('package-lock.json');
+  run(`git add ${toStage.join(' ')}`);
+
+  run(`git commit -m "Release ${newVersion}"`);
+  run(`git tag "${newVersion}"`);
+  ok(`  Tagged ${newVersion}`);
+  return newVersion;
+}
+
 // ── Patch one repo ────────────────────────────────────────────────────────────
+// Checks out the release branch, cherry-picks labeled PRs, and returns results.
+// Leaves cwd at absPath on the release branch (or original branch if no changes).
 async function patchRepo({ absPath, name }) {
   header(`Patching ${name}`);
   process.chdir(absPath);
@@ -285,7 +285,7 @@ async function patchRepo({ absPath, name }) {
   const prs = getPatchPRs(ghRepo);
 
   if (prs.length === 0) {
-    warn(`  No merged PRs with label "${LABEL}" found — nothing to do.`);
+    warn(`  No merged PRs with label "${LABEL}" found.`);
     return { applied: [] };
   }
 
@@ -299,7 +299,6 @@ async function patchRepo({ absPath, name }) {
     if (confirm.toLowerCase() === 'n') { warn('  Skipped.'); return { applied: [] }; }
   }
 
-  const originalBranch = run('git branch --show-current');
   log(`\n  Checking out ${RELEASE_BRANCH}...`);
   if (!DRY_RUN) run(`git checkout "${RELEASE_BRANCH}"`);
 
@@ -313,23 +312,9 @@ async function patchRepo({ absPath, name }) {
   }
 
   log(`\n  ${'═'.repeat(56)}`);
-  if (results.applied?.length)            ok(`  Applied:         ${results.applied.map((p) => '#' + p.number).join(', ')}`);
+  if (results.applied?.length)             ok(`  Applied:         ${results.applied.map((p) => '#' + p.number).join(', ')}`);
   if (results['already-present']?.length)  log(`  Already present: ${results['already-present'].map((p) => '#' + p.number).join(', ')}`);
   if (results.skipped?.length)            warn(`  Skipped:         ${results.skipped.map((p) => '#' + p.number).join(', ')}`);
-
-  if (results.applied?.length || DRY_RUN) {
-    bumpVersion(name);
-  }
-
-  if (!DRY_RUN && results.applied?.length) {
-    const newVer = run('node -p "require(\'./package.json\').version"');
-    log(`\n  Ready to push: git push origin ${RELEASE_BRANCH} && git push origin v${newVer}`);
-  }
-
-  if (!DRY_RUN && originalBranch && originalBranch !== RELEASE_BRANCH) {
-    const back = await prompt(`\n  Return to "${originalBranch}" in ${name}? [Y/n]: `);
-    if (back.toLowerCase() !== 'n') run(`git checkout "${originalBranch}"`);
-  }
 
   return results;
 }
@@ -338,21 +323,36 @@ async function patchRepo({ absPath, name }) {
 async function main() {
   try { run('gh --version'); } catch { err('gh CLI not found (https://cli.github.com)'); process.exit(1); }
 
-  // Resolve harper-pro root (the directory containing this script's parent)
   const harperProRoot = path.resolve(__dirname, '..');
   process.chdir(harperProRoot);
 
-  // Ensure core submodule is initialized
+  const harperProOriginalBranch = run('git branch --show-current');
+
   log('\nInitializing core submodule if needed...');
   run('git submodule update --init core');
 
   const corePath = path.join(harperProRoot, 'core');
 
   // ── Step 1: patch core ─────────────────────────────────────────────────────
-  await patchRepo({ absPath: corePath, name: 'harper (core)' });
+  process.chdir(corePath);
+  const coreOriginalBranch = run('git branch --show-current');
+
+  const coreResults = await patchRepo({ absPath: corePath, name: 'harper (core)' });
+
+  // Bump core version if any PRs were applied (leaves core on release branch)
+  let coreVersion = null;
+  if (coreResults.applied?.length || DRY_RUN) {
+    process.chdir(corePath);
+    coreVersion = bumpVersion('harper (core)');
+    if (!DRY_RUN && coreVersion) {
+      log(`\n  Ready to push core: git -C core push origin ${RELEASE_BRANCH} --follow-tags`);
+    }
+  }
 
   // ── Step 2: patch harper-pro ───────────────────────────────────────────────
   process.chdir(harperProRoot);
+  // Checkout harper-pro release branch before patching
+  if (!DRY_RUN) run(`git checkout "${RELEASE_BRANCH}"`);
   await patchRepo({ absPath: harperProRoot, name: 'harper-pro' });
 
   // ── Step 3: sync core submodule + deps ─────────────────────────────────────
@@ -360,23 +360,55 @@ async function main() {
   process.chdir(harperProRoot);
 
   if (DRY_RUN) {
-    ok('[dry-run] Would run: ./build-tools/sync-core.sh');
+    ok('[dry-run] Would sync core submodule to release branch and run sync-core.sh');
   } else {
+    // Point core submodule at the release branch (not main) before syncing deps
+    run(`git -C core checkout "${RELEASE_BRANCH}"`);
+
+    // Run sync-core.sh with NO_USE_GIT=true so it skips `git submodule update --remote`
+    // (which would reset core back to main per .gitmodules). We manage the ref ourselves.
     log('Running build-tools/sync-core.sh...\n');
     try {
-      execSync('./build-tools/sync-core.sh', { stdio: 'inherit' });
-      ok('\nSync complete.');
+      execSync('./build-tools/sync-core.sh', {
+        stdio: 'inherit',
+        env: { ...process.env, NO_USE_GIT: 'true', IGNORE_PACKAGE_JSON_DIFF: 'true' },
+      });
     } catch (e) {
       err(`sync-core.sh failed (exit ${e.status})`);
       process.exit(e.status ?? 1);
     }
+
+    // Stage core submodule ref + synced deps so they roll into the release commit
+    const toStage = ['core', 'package.json'];
+    if (existsSync('package-lock.json')) toStage.push('package-lock.json');
+    run(`git add ${toStage.join(' ')}`);
+    ok('\nSync staged.');
   }
 
+  // ── Step 4: bump harper-pro version ───────────────────────────────────────
+  // Always bump: every patch release bumps harper-pro regardless of whether
+  // it had its own labeled PRs (core patches + sync always constitute a change).
+  process.chdir(harperProRoot);
+  const proVersion = bumpVersion('harper-pro');
+
+  // ── Done ───────────────────────────────────────────────────────────────────
   header('All done');
   if (!DRY_RUN) {
-    log('Next steps:');
-    log(`  git -C core push origin ${RELEASE_BRANCH}`);
-    log(`  git push origin ${RELEASE_BRANCH}`);
+    log('Push commands:');
+    if (coreVersion) log(`  git -C core push origin ${RELEASE_BRANCH} --follow-tags`);
+    log(`  git push origin ${RELEASE_BRANCH} --follow-tags`);
+
+    // Offer to return to original branches
+    process.chdir(corePath);
+    if (coreOriginalBranch && coreOriginalBranch !== RELEASE_BRANCH) {
+      const back = await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
+      if (back.toLowerCase() !== 'n') run(`git checkout "${coreOriginalBranch}"`);
+    }
+    process.chdir(harperProRoot);
+    if (harperProOriginalBranch && harperProOriginalBranch !== RELEASE_BRANCH) {
+      const back = await prompt(`Return harper-pro to "${harperProOriginalBranch}"? [Y/n]: `);
+      if (back.toLowerCase() !== 'n') run(`git checkout "${harperProOriginalBranch}"`);
+    }
   }
 }
 
