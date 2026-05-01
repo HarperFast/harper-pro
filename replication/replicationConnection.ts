@@ -1542,7 +1542,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					);
 				}
 				const id = auditRecord.recordId;
-				event = undefined;
+				event = undefined; // reset before each decode attempt
 				try {
 					decodeBlobsWithWrites(
 						() => {
