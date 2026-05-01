@@ -1542,6 +1542,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					);
 				}
 				const id = auditRecord.recordId;
+				event = undefined;
 				try {
 					decodeBlobsWithWrites(
 						() => {
@@ -1594,7 +1595,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
 
-				tableSubscriptionToReplicator.send(event);
+				if (event) tableSubscriptionToReplicator.send(event);
 				decoder.position = start + eventLength;
 			} while (decoder.position < body.byteLength);
 			outstandingCommits++;
