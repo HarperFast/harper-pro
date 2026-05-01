@@ -1803,10 +1803,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		if (finished) {
 			finished.blobId = blobId;
 			outstandingBlobsToFinish.push(finished);
-			finished.finally(() => {
-				logger.debug?.(`Finished receiving blob stream ${blobId}`);
-				outstandingBlobsToFinish.splice(outstandingBlobsToFinish.indexOf(finished), 1);
-			});
+			finished
+				.catch((err) => logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err))
+				.finally(() => {
+					logger.debug?.(`Finished receiving blob stream ${blobId}`);
+					const index = outstandingBlobsToFinish.indexOf(finished);
+					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
+				});
 		}
 		return localBlob;
 	}
