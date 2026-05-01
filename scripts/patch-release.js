@@ -104,16 +104,27 @@ function hasBranch(branch) {
   );
 }
 
-// Detect squash merges by GitHub's default commit message convention: "Title (#N)".
-// For a squash merge the PR's branch may have had N commits, but only one lands on
-// main. We must NOT walk back sha~(N-1) for squash merges — those ancestors belong
-// to other PRs, not this one.
+// Detect squash merges. Two heuristics, in order:
+//   1. GitHub's default squash convention appends "(#N)" to the PR title.
+//   2. For rebase merges GitHub preserves each commit message verbatim, so the
+//      merge commit subject will equal the last branch commit's subject. If the
+//      subjects DIFFER, it can't be a rebase → must be squash.
+// Squash PRs with custom titles (no "(#N)") that happen to match the last branch
+// commit's subject are the only undetectable edge case; they'd be treated as rebase,
+// which is the safer default (checks all predecessors rather than assuming done).
 function isSquashMerge(pr) {
   if (pr._isSquash !== undefined) return pr._isSquash;
   const sha = pr.mergeCommit.oid;
   const subject = run(`git log -1 --format=%s "${sha}"`);
-  pr._isSquash = subject.includes(`(#${pr.number})`);
-  return pr._isSquash;
+  // Heuristic 1: standard GitHub squash suffix
+  if (subject.includes(`(#${pr.number})`)) return (pr._isSquash = true);
+  // Heuristic 2: rebase preserves the last branch commit's subject verbatim
+  const commits = getPRCommits(pr);
+  if (commits.length > 1) {
+    const lastSubject = commits[commits.length - 1]?.messageHeadline ?? '';
+    if (lastSubject && subject !== lastSubject) return (pr._isSquash = true);
+  }
+  return (pr._isSquash = false);
 }
 
 // Returns the ordered list of SHAs to cherry-pick for a PR, based on merge strategy:
@@ -170,17 +181,22 @@ function getPatchPRs(ghRepo) {
   return prs;
 }
 
-// Returns the number of commits in a PR — used only for single-parent merge commits
-// to distinguish squash (1 commit) from rebase (N commits). Result is cached on pr.
-function getPRCommitCount(pr) {
-  if (pr._commitCount !== undefined) return pr._commitCount;
+// Returns the PR's branch commits from the GitHub API. Cached on pr.
+function getPRCommits(pr) {
+  if (pr._commits !== undefined) return pr._commits;
   try {
     const json = run(`gh pr view ${pr.number} --repo "${pr._ghRepo}" --json commits`);
-    pr._commitCount = JSON.parse(json).commits?.length ?? 1;
+    pr._commits = JSON.parse(json).commits ?? [];
   } catch {
-    pr._commitCount = 1; // assume squash on error
+    pr._commits = [];
   }
-  return pr._commitCount;
+  return pr._commits;
+}
+
+// Returns the number of commits in a PR — used to distinguish squash (1 result) from rebase (N).
+function getPRCommitCount(pr) {
+  const commits = getPRCommits(pr);
+  return commits.length || 1;
 }
 
 // ── Gemini conflict resolution ────────────────────────────────────────────────
