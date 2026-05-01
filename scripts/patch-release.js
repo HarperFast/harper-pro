@@ -104,9 +104,21 @@ function hasBranch(branch) {
   );
 }
 
+// Detect squash merges by GitHub's default commit message convention: "Title (#N)".
+// For a squash merge the PR's branch may have had N commits, but only one lands on
+// main. We must NOT walk back sha~(N-1) for squash merges — those ancestors belong
+// to other PRs, not this one.
+function isSquashMerge(pr) {
+  if (pr._isSquash !== undefined) return pr._isSquash;
+  const sha = pr.mergeCommit.oid;
+  const subject = run(`git log -1 --format=%s "${sha}"`);
+  pr._isSquash = subject.includes(`(#${pr.number})`);
+  return pr._isSquash;
+}
+
 // Returns the ordered list of SHAs to cherry-pick for a PR, based on merge strategy:
 //   Merge commit  → [{sha, flag:'-m 1 '}]          (single pick, combined diff)
-//   Squash merge  → [{sha, flag:''}]                (single pick)
+//   Squash merge  → [{sha, flag:''}]                (single pick — N branch commits collapsed)
 //   Rebase merge  → [{sha:oldest,flag:''}, ..., {sha:newest,flag:''}]  (N picks)
 // Rebase-merged PRs report mergeCommit as the LAST commit; earlier commits are
 // reconstructed by walking back sha~(N-1)..sha using the commit count from the API.
@@ -114,7 +126,7 @@ function getPRPickList(pr) {
   const sha = pr.mergeCommit.oid;
   if (isMergeCommit(sha)) return [{ sha, flag: '-m 1 ' }];
   const count = getPRCommitCount(pr);
-  if (count <= 1) return [{ sha, flag: '' }];
+  if (count <= 1 || isSquashMerge(pr)) return [{ sha, flag: '' }];
   // Rebase merge: reconstruct oldest→newest
   const list = [];
   for (let i = count - 1; i >= 0; i--) {
@@ -131,11 +143,19 @@ function getPRPickList(pr) {
 function isAlreadyApplied(pr) {
   const sha = pr.mergeCommit.oid;
   if (isMergeCommit(sha)) return false; // checked live by cherry-pick
-  const pickList = getPRPickList(pr);
-  return pickList.every(({ sha: s }) => {
-    const r = runSafe(`git cherry "origin/${RELEASE_BRANCH}" "${s}" "${s}^"`);
-    return r.code === 0 && r.out.startsWith('-');
-  });
+  // Always check the merge commit itself first
+  const mainR = runSafe(`git cherry "origin/${RELEASE_BRANCH}" "${sha}" "${sha}^"`);
+  if (!(mainR.code === 0 && mainR.out.startsWith('-'))) return false;
+  // Squash or single-commit: merge commit is the only thing to check
+  const count = getPRCommitCount(pr);
+  if (count <= 1 || isSquashMerge(pr)) return true;
+  // Rebase merge: all predecessor commits must also be present
+  for (let i = 1; i <= count - 1; i++) {
+    const predSha = run(`git rev-parse "${sha}~${i}"`);
+    const r = runSafe(`git cherry "origin/${RELEASE_BRANCH}" "${predSha}" "${predSha}^"`);
+    if (!(r.code === 0 && r.out.startsWith('-'))) return false;
+  }
+  return true;
 }
 
 // ── GitHub helpers ────────────────────────────────────────────────────────────
@@ -207,12 +227,18 @@ ${filesBlock}`;
     return { resolved: [], unresolvable: conflictedFiles };
   }
 
-  const jsonText = r.stdout.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '').trim();
+  // Extract JSON from Gemini's response, which may include preamble/postamble text
+  // or markdown code fences. Find the outermost { ... } block.
   let parsed;
   try {
-    parsed = JSON.parse(jsonText);
+    const raw = r.stdout;
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start === -1 || end === -1 || end < start) throw new Error('no JSON object found');
+    parsed = JSON.parse(raw.slice(start, end + 1));
   } catch {
     warn('  Gemini returned unparseable JSON — falling back to manual resolution.');
+    warn(`  Raw output: ${r.stdout.slice(0, 300)}`);
     return { resolved: [], unresolvable: conflictedFiles };
   }
 
