@@ -525,7 +525,7 @@ async function main() {
   // Always bump: every patch release bumps harper-pro regardless of whether
   // it had its own labeled PRs (core patches + sync always constitute a change).
   process.chdir(harperProRoot);
-  const proVersion = bumpVersion('harper-pro');
+  bumpVersion('harper-pro');
 
   // ── Done ───────────────────────────────────────────────────────────────────
   header('All done');

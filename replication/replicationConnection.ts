@@ -1542,6 +1542,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					);
 				}
 				const id = auditRecord.recordId;
+				event = undefined; // reset before each decode attempt
 				try {
 					decodeBlobsWithWrites(
 						() => {
@@ -1573,19 +1574,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						error
 					);
 				}
-				beginTxn = false;
-				// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
-				logger.debug?.(
-					connectionId,
-					'received replication message',
-					auditRecord.type,
-					'id',
-					event.id,
-					'version',
-					new Date(auditRecord.version),
-					'nodeId',
-					event.nodeId
-				);
 				replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
 					// ensure monotonicity
 					auditRecord.version,
@@ -1594,7 +1582,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
 
-				tableSubscriptionToReplicator.send(event);
+				if (event) {
+					beginTxn = false;
+					// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
+					logger.debug?.(
+						connectionId,
+						'received replication message',
+						auditRecord.type,
+						'id',
+						event.id,
+						'version',
+						new Date(auditRecord.version),
+						'nodeId',
+						event.nodeId
+					);
+					tableSubscriptionToReplicator.send(event);
+				}
 				decoder.position = start + eventLength;
 			} while (decoder.position < body.byteLength);
 			outstandingCommits++;
@@ -1803,10 +1806,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		if (finished) {
 			finished.blobId = blobId;
 			outstandingBlobsToFinish.push(finished);
-			finished.finally(() => {
-				logger.debug?.(`Finished receiving blob stream ${blobId}`);
-				outstandingBlobsToFinish.splice(outstandingBlobsToFinish.indexOf(finished), 1);
-			});
+			finished
+				.catch((err) => logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err))
+				.finally(() => {
+					logger.debug?.(`Finished receiving blob stream ${blobId}`);
+					const index = outstandingBlobsToFinish.indexOf(finished);
+					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
+				});
 		}
 		return localBlob;
 	}
