@@ -15,6 +15,7 @@ import {
 	HAS_BLOBS,
 	AuditRecord,
 	readAuditEntry,
+	ACTION_32_BIT,
 } from '../core/resources/auditStore.ts';
 import {
 	exportIdMapping,
@@ -32,7 +33,7 @@ import {
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import { HAS_STRUCTURE_UPDATE, lastMetadata, METADATA } from '../core/resources/RecordEncoder.ts';
+import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { WebSocket } from 'ws';
 import { threadId } from 'worker_threads';
@@ -1391,11 +1392,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 														previousVersion: null,
 														nodeId,
 														type: 'put',
-														encodedRecord: decodeWithBlobCallback(
-															() => table.primaryStore.encoder.encode(entry.value),
-															(blob) => sendBlobs(blob, entry.key)
-														),
-														extendedType: entry.metadataFlags & ~0xff, // exclude the lower bits that define the type
+														encodedRecord: (() => {
+															decodeWithBlobCallback(
+																() => table.primaryStore.encoder.encode(entry.value),
+																(blob) => sendBlobs(blob, entry.key)
+															);
+															return lastValueEncoding!;
+														})(),
+														extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
 														residencyId: entry.residencyId,
 														previousResidencyId: null,
 														expiresAt: entry.expiresAt,
