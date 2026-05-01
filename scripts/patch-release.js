@@ -104,15 +104,38 @@ function hasBranch(branch) {
   );
 }
 
+// Returns the ordered list of SHAs to cherry-pick for a PR, based on merge strategy:
+//   Merge commit  → [{sha, flag:'-m 1 '}]          (single pick, combined diff)
+//   Squash merge  → [{sha, flag:''}]                (single pick)
+//   Rebase merge  → [{sha:oldest,flag:''}, ..., {sha:newest,flag:''}]  (N picks)
+// Rebase-merged PRs report mergeCommit as the LAST commit; earlier commits are
+// reconstructed by walking back sha~(N-1)..sha using the commit count from the API.
+function getPRPickList(pr) {
+  const sha = pr.mergeCommit.oid;
+  if (isMergeCommit(sha)) return [{ sha, flag: '-m 1 ' }];
+  const count = getPRCommitCount(pr);
+  if (count <= 1) return [{ sha, flag: '' }];
+  // Rebase merge: reconstruct oldest→newest
+  const list = [];
+  for (let i = count - 1; i >= 0; i--) {
+    list.push({ sha: run(`git rev-parse "${sha}~${i}"`), flag: '' });
+  }
+  return list;
+}
+
 // Check if a commit's patch is already present in the release branch.
 // git cherry compares patch-ids (content, not SHA), so it correctly identifies
 // commits that were cherry-picked into the release branch with a different SHA.
-// Syntax: git cherry <upstream> <head> <limit> shows commits in head..limit
-// not already in upstream; "- sha" = already there, "+ sha" = not there.
-function isAlreadyApplied(sha) {
-  const r = runSafe(`git cherry "origin/${RELEASE_BRANCH}" "${sha}" "${sha}^"`);
-  if (r.code !== 0) return false; // conservative: assume not applied on error
-  return r.out.startsWith('-');
+// For rebase-merged PRs, ALL commits must be present to consider the PR applied.
+// Merge commits are not checked here (too complex); cherry-pick detects them live.
+function isAlreadyApplied(pr) {
+  const sha = pr.mergeCommit.oid;
+  if (isMergeCommit(sha)) return false; // checked live by cherry-pick
+  const pickList = getPRPickList(pr);
+  return pickList.every(({ sha: s }) => {
+    const r = runSafe(`git cherry "origin/${RELEASE_BRANCH}" "${s}" "${s}^"`);
+    return r.code === 0 && r.out.startsWith('-');
+  });
 }
 
 // ── GitHub helpers ────────────────────────────────────────────────────────────
@@ -121,7 +144,23 @@ function getPatchPRs(ghRepo) {
     `gh pr list --repo "${ghRepo}" --label "${LABEL}" --state merged --base "${SOURCE_BRANCH}" ` +
       `--json number,title,mergeCommit,body --limit 200`
   );
-  return JSON.parse(json).filter((pr) => pr.mergeCommit?.oid);
+  const prs = JSON.parse(json).filter((pr) => pr.mergeCommit?.oid);
+  // Tag each PR with its repo so helpers can make follow-up API calls if needed
+  prs.forEach((pr) => { pr._ghRepo = ghRepo; });
+  return prs;
+}
+
+// Returns the number of commits in a PR — used only for single-parent merge commits
+// to distinguish squash (1 commit) from rebase (N commits). Result is cached on pr.
+function getPRCommitCount(pr) {
+  if (pr._commitCount !== undefined) return pr._commitCount;
+  try {
+    const json = run(`gh pr view ${pr.number} --repo "${pr._ghRepo}" --json commits`);
+    pr._commitCount = JSON.parse(json).commits?.length ?? 1;
+  } catch {
+    pr._commitCount = 1; // assume squash on error
+  }
+  return pr._commitCount;
 }
 
 // ── Gemini conflict resolution ────────────────────────────────────────────────
@@ -193,18 +232,16 @@ ${filesBlock}`;
   return { resolved, unresolvable };
 }
 
-// ── Cherry-pick one PR ────────────────────────────────────────────────────────
-async function cherryPickPR(pr) {
-  const sha = pr.mergeCommit.oid;
-  const mergeFlag = isMergeCommit(sha) ? '-m 1 ' : '';
-  const pickCmd = `git cherry-pick ${mergeFlag}${sha}`;
+// ── Cherry-pick helpers ───────────────────────────────────────────────────────
 
+// Pick a single SHA; handles conflicts interactively. Returns 'applied' | 'already-present' | 'skipped'.
+async function pickOneSha(sha, flag, pr) {
+  const pickCmd = `git cherry-pick ${flag}${sha}`;
   log(`  Commit: ${sha.slice(0, 8)}  (${pickCmd})`);
 
   if (DRY_RUN) { ok('  [dry-run] Would apply.'); return 'applied'; }
 
   const r = runSafe(pickCmd);
-
   if (r.code === 0) { ok('  Applied cleanly.'); return 'applied'; }
 
   if (r.errText.includes('nothing to commit') || r.out.includes('nothing to commit')) {
@@ -229,30 +266,19 @@ async function cherryPickPR(pr) {
 
   while (true) {
     const ans = await prompt(`  Choice ${menuChoices}: `);
-
     if (ans === 'q') { runSafe('git cherry-pick --abort'); err('Aborted.'); process.exit(1); }
-
     if (ans === 's') { runSafe('git cherry-pick --abort'); warn(`  Skipped PR #${pr.number}.`); return 'skipped'; }
-
     if (ans === 't' || ans === 'o') {
       const strategy = ans === 't' ? 'theirs' : 'ours';
       const current = getConflictedFiles();
-      for (const f of current) {
-        run(`git checkout --${strategy} "${f}"`);
-        run(`git add "${f}"`);
-      }
+      for (const f of current) { run(`git checkout --${strategy} "${f}"`); run(`git add "${f}"`); }
       ok(`  Accepted ${strategy} for: ${current.join(', ')}`);
       const cont = runSafe('git cherry-pick --continue --no-edit');
-      if (cont.code === 0) { ok(`  Cherry-pick complete.`); return 'applied'; }
-      // Some files may still be conflicted after strategy (e.g. binary conflicts)
-      const stillConflicted = getConflictedFiles();
-      if (stillConflicted.length > 0) {
-        warn(`  Still conflicted after --${strategy}: ${stillConflicted.join(', ')}`);
-        continue;
-      }
+      if (cont.code === 0) { ok('  Cherry-pick complete.'); return 'applied'; }
+      const still = getConflictedFiles();
+      if (still.length > 0) { warn(`  Still conflicted after --${strategy}: ${still.join(', ')}`); continue; }
       err('  --continue failed: ' + cont.errText);
     }
-
     if (ans === 'g' && GEMINI_AVAILABLE) {
       const { resolved, unresolvable } = resolveWithGemini(pr, getConflictedFiles());
       if (unresolvable.length === 0 && resolved.length > 0) {
@@ -260,11 +286,8 @@ async function cherryPickPR(pr) {
         if (cont.code === 0) { ok('  All conflicts resolved by Gemini. Cherry-pick complete.'); return 'applied'; }
         err('  --continue failed after Gemini resolution: ' + cont.errText);
       }
-      if (unresolvable.length > 0) {
-        warn(`  Gemini could not resolve: ${unresolvable.join(', ')}`);
-      }
+      if (unresolvable.length > 0) warn(`  Gemini could not resolve: ${unresolvable.join(', ')}`);
     }
-
     if (ans === 'r') {
       const remaining = getConflictedFiles();
       if (remaining.length > 0) { warn(`  Still conflicted: ${remaining.join(', ')}`); continue; }
@@ -274,6 +297,22 @@ async function cherryPickPR(pr) {
       err('  Continue failed: ' + cont.errText);
     }
   }
+}
+
+// Cherry-pick all commits that make up a PR (handles merge / squash / rebase strategies).
+async function cherryPickPR(pr) {
+  const pickList = getPRPickList(pr);
+  if (pickList.length > 1) {
+    log(`  Rebase-merged PR: picking ${pickList.length} commits individually`);
+  }
+  let anyApplied = false;
+  for (const { sha, flag } of pickList) {
+    const outcome = await pickOneSha(sha, flag, pr);
+    if (outcome === 'applied') { anyApplied = true; }
+    else if (outcome === 'skipped') { return 'skipped'; }
+    // 'already-present' → continue to next commit
+  }
+  return anyApplied ? 'applied' : 'already-present';
 }
 
 // ── Version bump + tag ────────────────────────────────────────────────────────
@@ -331,12 +370,16 @@ async function patchRepo({ absPath, name }) {
   const newPRs = [];
   const preApplied = [];
   for (const pr of prs) {
-    if (isAlreadyApplied(pr.mergeCommit.oid)) {
+    if (isAlreadyApplied(pr)) {
       preApplied.push(pr);
     } else {
       newPRs.push(pr);
     }
   }
+  // Apply oldest PR first: reduces ordering issues where a newer rebase-merged PR's
+  // commit range overlaps an older PR's commits (the older PR will be picked first,
+  // so the overlapping commits are already-present when the newer PR is processed).
+  newPRs.sort((a, b) => a.number - b.number);
 
   log('');
   if (preApplied.length) {
