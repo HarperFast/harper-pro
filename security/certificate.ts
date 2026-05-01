@@ -116,7 +116,7 @@ export async function createCsr() {
 	const privateKeys: Map<string, string> = getPrivateKeys();
 	let opsCert, opsPrivateKey, certName, privateKeyName;
 	for await (const cert of certificateTable.search([])) {
-		if (cert.is_self_signed && !cert.is_authority) {
+		if (cert.is_self_signed && (cert.details?.issuer?.includes('Harper-Certificate-Authority') || cert.details?.issuer?.includes('HarperDB-Certificate-Authority'))) {
 			const key = privateKeys.get(cert.private_key_name);
 			if (key) {
 				opsCert = pki.certificateFromPem(cert.certificate);
