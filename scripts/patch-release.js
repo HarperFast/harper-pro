@@ -147,9 +147,21 @@ function getPRPickList(pr) {
   return list;
 }
 
+// Cache of all commit subjects on the release branch — loaded lazily on first use.
+let _releaseBranchSubjects = null;
+function releaseBranchSubjects() {
+  if (_releaseBranchSubjects === null) {
+    const r = runSafe(`git log "origin/${RELEASE_BRANCH}" --format=%s`);
+    _releaseBranchSubjects = new Set(r.code === 0 ? r.out.split('\n').filter(Boolean) : []);
+  }
+  return _releaseBranchSubjects;
+}
+
 // Check if a commit's patch is already present in the release branch.
-// git cherry compares patch-ids (content, not SHA), so it correctly identifies
-// commits that were cherry-picked into the release branch with a different SHA.
+// Primary check: git cherry compares patch-ids (content, not SHA), correctly
+// identifying cherry-picks regardless of SHA.
+// Fallback: if the patch-id differs (e.g. conflict resolved differently), check
+// whether a commit with the same subject already exists in the release branch.
 // For rebase-merged PRs, ALL commits must be present to consider the PR applied.
 // Merge commits are not checked here (too complex); cherry-pick detects them live.
 function isAlreadyApplied(pr) {
@@ -159,8 +171,13 @@ function isAlreadyApplied(pr) {
   const mainR = runSafe(`git cherry "origin/${RELEASE_BRANCH}" "${sha}" "${sha}^"`);
   const mergeCommitPresent = mainR.code === 0 && mainR.out.startsWith('-');
   if (!mergeCommitPresent) {
-    if (DEBUG) warn(`    [debug] #${pr.number}: merge commit ${sha.slice(0,8)} not in ${RELEASE_BRANCH} (git cherry: ${JSON.stringify(mainR.out || mainR.errText)})`);
-    return false;
+    // Fallback: patch-id can differ when a cherry-pick had conflicts resolved
+    // differently (common for package-lock.json). Check subject instead.
+    const subject = run(`git log -1 --format=%s "${sha}"`);
+    const foundBySubject = releaseBranchSubjects().has(subject);
+    if (DEBUG) warn(`    [debug] #${pr.number}: merge commit ${sha.slice(0,8)} not in ${RELEASE_BRANCH} by patch-id; subject match=${foundBySubject}`);
+    if (!foundBySubject) return false;
+    // Subject found → treat as applied (patch-id mismatch due to conflict resolution)
   }
   // Squash or single-commit: merge commit is the only thing to check
   const count = getPRCommitCount(pr);
@@ -404,6 +421,7 @@ function bumpVersion(repoLabel) {
 async function patchRepo({ absPath, name }) {
   header(`Patching ${name}`);
   process.chdir(absPath);
+  _releaseBranchSubjects = null; // reset cache for each repo
 
   const ghRepo = detectGhRepo();
   info(`  GitHub repo: ${ghRepo}`);
