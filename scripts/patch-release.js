@@ -35,6 +35,7 @@ const readline = require('readline');
 // ── Args ──────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
 const DRY_RUN = argv.includes('--dry-run');
+const DEBUG = argv.includes('--debug');
 const RELEASE_BRANCH = getArg('--branch', 'v5.0');
 const SOURCE_BRANCH = getArg('--source', 'main');
 const LABEL = getArg('--label', 'patch');
@@ -156,15 +157,31 @@ function isAlreadyApplied(pr) {
   if (isMergeCommit(sha)) return false; // checked live by cherry-pick
   // Always check the merge commit itself first
   const mainR = runSafe(`git cherry "origin/${RELEASE_BRANCH}" "${sha}" "${sha}^"`);
-  if (!(mainR.code === 0 && mainR.out.startsWith('-'))) return false;
+  const mergeCommitPresent = mainR.code === 0 && mainR.out.startsWith('-');
+  if (!mergeCommitPresent) {
+    if (DEBUG) warn(`    [debug] #${pr.number}: merge commit ${sha.slice(0,8)} not in ${RELEASE_BRANCH} (git cherry: ${JSON.stringify(mainR.out || mainR.errText)})`);
+    return false;
+  }
   // Squash or single-commit: merge commit is the only thing to check
   const count = getPRCommitCount(pr);
-  if (count <= 1 || isSquashMerge(pr)) return true;
+  const squash = isSquashMerge(pr);
+  if (DEBUG) {
+    const subject = run(`git log -1 --format=%s "${sha}"`);
+    const commits = getPRCommits(pr);
+    const lastSubject = commits[commits.length - 1]?.messageHeadline ?? '(none)';
+    warn(`    [debug] #${pr.number}: merge=${sha.slice(0,8)} count=${count} squash=${squash}`);
+    warn(`    [debug]   merge subject:      ${JSON.stringify(subject)}`);
+    warn(`    [debug]   last branch subject: ${JSON.stringify(lastSubject)}`);
+  }
+  if (count <= 1 || squash) return true;
   // Rebase merge: all predecessor commits must also be present
   for (let i = 1; i <= count - 1; i++) {
     const predSha = run(`git rev-parse "${sha}~${i}"`);
     const r = runSafe(`git cherry "origin/${RELEASE_BRANCH}" "${predSha}" "${predSha}^"`);
-    if (!(r.code === 0 && r.out.startsWith('-'))) return false;
+    if (!(r.code === 0 && r.out.startsWith('-'))) {
+      if (DEBUG) warn(`    [debug] #${pr.number}: predecessor ${predSha.slice(0,8)} (~${i}) not in ${RELEASE_BRANCH}`);
+      return false;
+    }
   }
   return true;
 }
