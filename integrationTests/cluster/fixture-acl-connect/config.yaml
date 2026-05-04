@@ -1,0 +1,4 @@
+'@harperdb/acl-connect':
+  package: '@harperdb/acl-connect'
+  database: data
+  files: connect.json
