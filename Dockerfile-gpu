@@ -1,0 +1,82 @@
+ARG NODE_BUILD_VERSION=24
+ARG NODE_VERSION=24
+ARG CUDA_VERSION=12.8.1
+
+FROM docker.io/node:${NODE_BUILD_VERSION} AS build
+
+WORKDIR /usr/src/harper-pro
+
+COPY . .
+
+RUN env NO_USE_GIT=true npm run package
+
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04 AS run
+
+ARG NODE_VERSION=24
+
+# Required by NVIDIA Container Runtime to expose GPUs to the container
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+USER root
+
+# Install Node.js via NodeSource plus required utilities
+RUN <<-EOF
+    apt-get update
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg wget zstd
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+    NODE_MAJOR="$(echo "$NODE_VERSION" | cut -d. -f1)"
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+        | tee /etc/apt/sources.list.d/nodesource.list
+    apt-get update
+    apt-get install -y nodejs
+    groupadd --gid 1000 harperdb
+    useradd --uid 1000 --gid 1000 --home-dir /home/harperdb --shell /bin/bash --no-create-home harperdb
+    mkdir -p /home/harperdb
+    chown harperdb:harperdb /home/harperdb
+    rm -rf /var/lib/apt/lists/*
+EOF
+
+WORKDIR /home/harperdb
+
+USER harperdb
+
+# Install pnpm
+RUN wget -qO- https://get.pnpm.io/install.sh | ENV="$HOME/.bashrc" SHELL="$(which bash)" bash -
+
+COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
+
+# Configure NPM
+ENV NPM_CONFIG_PREFIX=/home/harperdb/.npm-global
+ENV PATH=/home/harperdb/.npm-global/bin:$PATH
+
+# Install Harper Pro globally
+RUN <<-EOF
+  npm install --global harperfast-harper-pro-*.tgz
+  rm harperfast-harper-pro-*.tgz
+  mkdir -p /home/harperdb/harper
+  chown harperdb:harperdb /home/harperdb/harper
+EOF
+
+VOLUME /home/harperdb/harper
+
+# Harper config parameters
+ENV HDB_ADMIN_USERNAME=admin
+ENV HDB_ADMIN_PASSWORD=password
+ENV ROOTPATH=/home/harperdb/harper
+ENV TC_AGREEMENT=yes
+ENV OPERATIONSAPI_NETWORK_PORT=9925
+ENV LOGGING_STDSTREAMS=true
+ENV NODE_HOSTNAME=localhost
+ENV DEFAULTS_MODE=prod
+
+EXPOSE 9925
+EXPOSE 9926
+EXPOSE 9932
+EXPOSE 9933
+
+ENTRYPOINT ["harper"]
+
+CMD ["run"]
