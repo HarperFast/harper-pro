@@ -15,6 +15,7 @@ import {
 	HAS_BLOBS,
 	AuditRecord,
 	readAuditEntry,
+	ACTION_32_BIT,
 } from '../core/resources/auditStore.ts';
 import {
 	exportIdMapping,
@@ -32,7 +33,7 @@ import {
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import { HAS_STRUCTURE_UPDATE, lastMetadata, METADATA } from '../core/resources/RecordEncoder.ts';
+import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { WebSocket } from 'ws';
 import { threadId } from 'worker_threads';
@@ -1391,11 +1392,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 														previousVersion: null,
 														nodeId,
 														type: 'put',
-														encodedRecord: decodeWithBlobCallback(
-															() => table.primaryStore.encoder.encode(entry.value),
-															(blob) => sendBlobs(blob, entry.key)
-														),
-														extendedType: entry.metadataFlags & ~0xff, // exclude the lower bits that define the type
+														encodedRecord: (() => {
+															decodeWithBlobCallback(
+																() => table.primaryStore.encoder.encode(entry.value),
+																(blob) => sendBlobs(blob, entry.key)
+															);
+															return lastValueEncoding!;
+														})(),
+														extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
 														residencyId: entry.residencyId,
 														previousResidencyId: null,
 														expiresAt: entry.expiresAt,
@@ -1542,6 +1546,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					);
 				}
 				const id = auditRecord.recordId;
+				event = undefined; // reset before each decode attempt
 				try {
 					decodeBlobsWithWrites(
 						() => {
@@ -1573,19 +1578,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						error
 					);
 				}
-				beginTxn = false;
-				// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
-				logger.debug?.(
-					connectionId,
-					'received replication message',
-					auditRecord.type,
-					'id',
-					event.id,
-					'version',
-					new Date(auditRecord.version),
-					'nodeId',
-					event.nodeId
-				);
 				replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
 					// ensure monotonicity
 					auditRecord.version,
@@ -1594,7 +1586,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
 
-				tableSubscriptionToReplicator.send(event);
+				if (event) {
+					beginTxn = false;
+					// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
+					logger.debug?.(
+						connectionId,
+						'received replication message',
+						auditRecord.type,
+						'id',
+						event.id,
+						'version',
+						new Date(auditRecord.version),
+						'nodeId',
+						event.nodeId
+					);
+					tableSubscriptionToReplicator.send(event);
+				}
 				decoder.position = start + eventLength;
 			} while (decoder.position < body.byteLength);
 			outstandingCommits++;
@@ -1803,10 +1810,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		if (finished) {
 			finished.blobId = blobId;
 			outstandingBlobsToFinish.push(finished);
-			finished.finally(() => {
-				logger.debug?.(`Finished receiving blob stream ${blobId}`);
-				outstandingBlobsToFinish.splice(outstandingBlobsToFinish.indexOf(finished), 1);
-			});
+			finished
+				.catch((err) => logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err))
+				.finally(() => {
+					logger.debug?.(`Finished receiving blob stream ${blobId}`);
+					const index = outstandingBlobsToFinish.indexOf(finished);
+					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
+				});
 		}
 		return localBlob;
 	}
