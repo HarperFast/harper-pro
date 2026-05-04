@@ -292,3 +292,86 @@ jobs:
                 }
               ]
             }
+
+  send-slack-message-gpu-on-success:
+    if: success() && !cancelled()
+    needs: [merge-gpu]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack GPU published notification
+        uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} has been published to Docker Hub",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":white_check_mark: Published to :docker_logo:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro-gpu/${{ needs.merge-gpu.outputs.docker-image-tag }}|harperfast/harper-pro-gpu:${{ needs.merge-gpu.outputs.docker-image-tag }}>"
+                    }
+                  ]
+                }
+              ]
+            }
+
+  send-slack-message-gpu-on-failure:
+    if: failure() && !cancelled()
+    needs: [merge-gpu]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} Docker publish failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":x: Failed to publish to :docker_logo:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow run ${{ github.run_id }}>"
+                    }
+                  ]
+                }
+              ]
+            }
