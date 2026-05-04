@@ -3,6 +3,17 @@ name: Publish Docker Image
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Which image to build and push'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - standard
+          - gpu
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -10,6 +21,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'standard'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -64,6 +76,7 @@ jobs:
           retention-days: 1
 
   merge:
+    if: github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'standard'
     runs-on: ubuntu-latest
     needs: [build]
     strategy:
@@ -112,6 +125,105 @@ jobs:
       - name: Inspect image
         run: |
           docker buildx imagetools inspect harperfast/harper-pro:${{ steps.meta.outputs.version }}
+
+  build-gpu:
+    if: github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'gpu'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [24, 25]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+      - name: Setup Docker metadata
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: harperfast/harper-pro-gpu
+      - name: Login to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile-gpu
+          platforms: linux/amd64
+          build-args: |
+            NODE_BUILD_VERSION=${{ matrix.node-version }}
+            NODE_VERSION=${{ matrix.node-version }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=harperfast/harper-pro-gpu,push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-gpu-node${{ matrix.node-version }}-amd64
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-gpu:
+    if: github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'gpu'
+    runs-on: ubuntu-latest
+    needs: [build-gpu]
+    strategy:
+      matrix:
+        node-version: [24, 25]
+    outputs:
+      docker-image-tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: Dockerfile-gpu
+          sparse-checkout-cone-mode: false
+      - name: Get default Node version
+        id: default
+        run: echo "node-version=$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile-gpu)" >> "$GITHUB_OUTPUT"
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digest-gpu-node${{ matrix.node-version }}-*
+          merge-multiple: true
+      - name: Setup Docker metadata
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: harperfast/harper-pro-gpu
+          tags: |
+            type=semver,pattern={{version}},suffix=-node${{ matrix.node-version }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-node${{ matrix.node-version }}
+            type=semver,pattern={{major}},suffix=-node${{ matrix.node-version }}
+            type=sha,suffix=-node${{ matrix.node-version }}
+            type=semver,pattern={{version}},enable=${{ matrix.node-version == steps.default.outputs.node-version }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.node-version == steps.default.outputs.node-version }}
+            type=semver,pattern={{major}},enable=${{ matrix.node-version == steps.default.outputs.node-version }}
+            type=sha,enable=${{ matrix.node-version == steps.default.outputs.node-version }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'harperfast/harper-pro-gpu@sha256:%s ' *)
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect harperfast/harper-pro-gpu:${{ steps.meta.outputs.version }}
 
   send-slack-message-on-success:
     if: success() && !cancelled()
@@ -174,6 +286,89 @@ jobs:
                   "text": {
                     "type": "plain_text",
                     "text": "Harper Pro v${{ needs.merge.outputs.docker-image-tag }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":x: Failed to publish to :docker_logo:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow run ${{ github.run_id }}>"
+                    }
+                  ]
+                }
+              ]
+            }
+
+  send-slack-message-gpu-on-success:
+    if: success() && !cancelled()
+    needs: [merge-gpu]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack GPU published notification
+        uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} has been published to Docker Hub",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status*"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": ":white_check_mark: Published to :docker_logo:"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro-gpu/${{ needs.merge-gpu.outputs.docker-image-tag }}|harperfast/harper-pro-gpu:${{ needs.merge-gpu.outputs.docker-image-tag }}>"
+                    }
+                  ]
+                }
+              ]
+            }
+
+  send-slack-message-gpu-on-failure:
+    if: failure() && !cancelled()
+    needs: [merge-gpu]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} Docker publish failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro GPU v${{ needs.merge-gpu.outputs.docker-image-tag }} release"
                   }
                 },
                 {
