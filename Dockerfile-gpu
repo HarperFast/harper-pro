@@ -36,6 +36,9 @@ RUN <<-EOF
     useradd --uid 1000 --gid 1000 --home-dir /home/harperdb --shell /bin/bash --no-create-home harperdb
     mkdir -p /home/harperdb
     chown harperdb:harperdb /home/harperdb
+    mkdir -p /home/harperdb/.harperdb
+    printf 'settings_path = /home/harperdb/harper/harperdb-config.yaml\ninstall_user = harperdb\n' > /home/harperdb/.harperdb/hdb_boot_properties.file
+    chown -R harperdb:harperdb /home/harperdb/.harperdb
     rm -rf /var/lib/apt/lists/*
 EOF
 
