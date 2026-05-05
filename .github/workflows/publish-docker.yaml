@@ -190,7 +190,7 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Get default Node version
         id: default
-        run: echo "node-version=$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile-gpu)" >> "$GITHUB_OUTPUT"
+        run: echo "node-version=$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile-gpu | head -1)" >> "$GITHUB_OUTPUT"
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
