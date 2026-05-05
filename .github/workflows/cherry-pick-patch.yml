@@ -2,8 +2,10 @@ name: Cherry-pick patch PRs to release branch
 
 on:
   pull_request:
-    types: [closed, labeled]
+    types: [closed]
     branches: [main]
+  issues:
+    types: [labeled]
 
 permissions:
   contents: write
@@ -15,12 +17,17 @@ jobs:
     runs-on: ubuntu-latest
     # Run when a PR with the patch label is merged into main.
     # Handles two triggering paths:
-    #   closed  — PR merged with patch label already present
-    #   labeled — patch label added to an already-merged PR
+    #   pull_request/closed — PR merged with patch label already present
+    #   issues/labeled      — patch label added to an already-merged PR
+    #                         (GitHub fires 'issues' not 'pull_request' for label
+    #                          changes on closed/merged PRs)
     if: >-
-      github.event.pull_request.merged == true &&
-      contains(github.event.pull_request.labels.*.name, 'patch') &&
-      (github.event.action == 'closed' || github.event.label.name == 'patch')
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       contains(github.event.pull_request.labels.*.name, 'patch')) ||
+      (github.event_name == 'issues' &&
+       github.event.label.name == 'patch' &&
+       github.event.issue.pull_request.merged_at != '')
 
     env:
       RELEASE_BRANCH: ${{ vars.RELEASE_BRANCH || 'v5.0' }}
@@ -38,11 +45,18 @@ jobs:
       - name: Cherry-pick onto ${{ env.RELEASE_BRANCH }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+          PR_TITLE: ${{ github.event.pull_request.title || github.event.issue.title }}
+          MERGE_SHA_FROM_EVENT: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           set -euo pipefail
+
+          # For issues/labeled events, merge SHA isn't in the payload; fetch it.
+          if [ -n "$MERGE_SHA_FROM_EVENT" ]; then
+            MERGE_SHA="$MERGE_SHA_FROM_EVENT"
+          else
+            MERGE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.merge_commit_sha')
+          fi
 
           # Fetch enough history for subject-match checks and ancestor lookups
           # (cherry-pick needs MERGE_SHA^ to compute the diff; rebase merges need
