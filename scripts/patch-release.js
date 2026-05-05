@@ -483,7 +483,10 @@ async function patchRepo({ absPath, name }) {
   }
 
   log(`\n  Checking out ${RELEASE_BRANCH}...`);
-  if (!DRY_RUN) run(`git checkout "${RELEASE_BRANCH}"`);
+  if (!DRY_RUN) {
+    run(`git checkout "${RELEASE_BRANCH}"`);
+    run(`git merge --ff-only "origin/${RELEASE_BRANCH}"`);
+  }
 
   const results = { applied: [], 'already-present': preApplied, skipped: [] };
 
@@ -551,6 +554,8 @@ async function main() {
   } else {
     // Point core submodule at the release branch (not main) before syncing deps
     run(`git -C core checkout "${RELEASE_BRANCH}"`);
+    run(`git -C core merge --ff-only "origin/${RELEASE_BRANCH}"`);
+
 
     // Run sync-core.sh with NO_USE_GIT=true so it skips `git submodule update --remote`
     // (which would reset core back to main per .gitmodules). We manage the ref ourselves.
