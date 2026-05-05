@@ -18,6 +18,9 @@ RUN <<-EOF
   groupmod -n harperdb node
   rm -rf /home/node
   chown -R harperdb:harperdb /home/harperdb
+  mkdir -p /home/harperdb/.harperdb
+  printf 'settings_path = /home/harperdb/harper/harperdb-config.yaml\ninstall_user = harperdb\n' > /home/harperdb/.harperdb/hdb_boot_properties.file
+  chown -R harperdb:harperdb /home/harperdb/.harperdb
   apt-get update
   apt-get install -y --no-install-recommends zstd
   rm -rf /var/lib/apt/lists/*
