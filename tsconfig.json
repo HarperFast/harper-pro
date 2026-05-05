@@ -19,8 +19,7 @@
 		"core/utility/**/*",
 		"core/validation/**/*",
 		"core/globals.js",
-		"core/index.d.ts",
-		"core/index.js"
+		"core/index.ts"
 	],
 	"compilerOptions": {
 		// Allow JS files for mixed codebase
