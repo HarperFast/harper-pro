@@ -4,6 +4,75 @@ Harper Pro is a source-available project licensed under [the Elastic License 2.0
 Currently we do not accept contributions to Harper Pro, but [Harper](https://github.com/HarperFast/harper)
 (which Harper Pro builds upon) is open source and does accept contributions.
 
+<<<<<<< HEAD
+=======
+## Local Git Setup
+
+### Reducing package-lock.json merge conflicts
+
+The repository includes a `.gitattributes` entry that registers `npm-merge-driver` as the merge strategy for `package-lock.json`. To enable automatic conflict resolution when merging or rebasing locally, install it once:
+
+```bash
+npx npm-merge-driver install --global
+```
+
+This is optional — without it you'll see standard merge conflict behavior. The driver is not used for server-side PR merges on GitHub.
+
+## Patch Release Procedure
+
+> This section is for maintainers creating patch releases against a stable release branch (e.g. `v5.0`).
+
+The `scripts/patch-release.js` script automates the full patch release workflow:
+
+1. Cherry-picks PRs labeled **`patch`** from `main` onto the release branch in both `core` ([HarperFast/harper](https://github.com/HarperFast/harper)) and `harper-pro`.
+2. Bumps the patch version in `package.json`, commits it, and creates a git tag in each repo.
+3. Runs `build-tools/sync-core.sh` to update the core submodule pointer and sync core's dependencies into harper-pro.
+
+### Marking a PR for patching
+
+Add the **`patch`** label to any merged PR on `main` that should be included in the next patch release. Squash-merging is strongly recommended so there is exactly one commit SHA to cherry-pick.
+
+### Running the script
+
+```bash
+node scripts/patch-release.js
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--branch <name>` | `v5.0` | Release branch to apply patches to |
+| `--source <name>` | `main` | Source branch to pull patches from |
+| `--label <name>` | `patch` | PR label to filter on |
+| `--bump <type>` | `patch` | npm version bump type: `patch`, `minor`, or `major` |
+| `--dry-run` | — | Preview all actions without making changes |
+
+**Example — preview what would be applied:**
+```bash
+node scripts/patch-release.js --dry-run
+```
+
+**After the script completes**, push both repos and their new tags:
+```bash
+git -C core push origin v5.0 --follow-tags
+git push origin v5.0 --follow-tags
+```
+
+### AI-assisted conflict resolution (optional)
+
+If a cherry-pick produces conflicts, the script can ask Claude to resolve them automatically. To enable:
+
+```bash
+npm install -g @anthropic-ai/sdk
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+When AI resolution is not available or leaves unresolvable files, the script pauses and prompts for manual resolution before continuing.
+
+---
+
+>>>>>>> cb27303 (document npm-merge-driver setup in CONTRIBUTING.md)
 ## Repository Sync Procedure
 
 > This section is only relevant to repository maintainers responsible for the
