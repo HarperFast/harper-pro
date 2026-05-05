@@ -4,8 +4,6 @@ Harper Pro is a source-available project licensed under [the Elastic License 2.0
 Currently we do not accept contributions to Harper Pro, but [Harper](https://github.com/HarperFast/harper)
 (which Harper Pro builds upon) is open source and does accept contributions.
 
-<<<<<<< HEAD
-=======
 ## Local Git Setup
 
 ### Reducing package-lock.json merge conflicts
@@ -72,7 +70,6 @@ When AI resolution is not available or leaves unresolvable files, the script pau
 
 ---
 
->>>>>>> cb27303 (document npm-merge-driver setup in CONTRIBUTING.md)
 ## Repository Sync Procedure
 
 > This section is only relevant to repository maintainers responsible for the
