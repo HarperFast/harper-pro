@@ -1,0 +1,9 @@
+{
+	"acls": [
+		{
+			"topicFilter": "dog/#",
+			"publishers": ["dogPublisher"],
+			"subscribers": ["dogSubscriber"]
+		}
+	]
+}
