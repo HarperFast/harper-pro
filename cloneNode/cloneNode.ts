@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import yaml from 'yaml';
-import https from 'https';
+import { decode as cborDecode } from 'cbor-x';
 
 import envMgr from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -247,6 +247,9 @@ export async function cloneNode(): Promise<void> {
 
 	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
 	await cloneConfig();
+
+	// Clone applications that are deployed on the leader but not referenced in harper-config
+	await cloneApplications();
 
 	// Base set node request
 	type SetNodeRequest = {
@@ -598,6 +601,57 @@ async function cloneConfig(): Promise<void> {
 }
 
 /**
+ * Clones applications from the leader that are deployed to the applications directory but not referenced in harper-config.
+ * Applications referenced in harper-config are handled by normal config cloning and reinstalled on startup.
+ */
+async function cloneApplications(): Promise<void> {
+	log('Cloning filesystem-only applications from leader');
+
+	let applicationsResponse: Record<string, any>;
+	try {
+		applicationsResponse = await leaderRequest({ operation: OPERATIONS_ENUM.GET_COMPONENTS });
+	} catch (err) {
+		log(`Failed to get applications from leader: ${err}`, 'error');
+		return;
+	}
+
+	const entries: Array<Record<string, any>> = applicationsResponse?.entries ?? [];
+	// filesystem-only applications will not have a `package` property
+	const filesystemOnlyApplications = entries.filter((entry) => Array.isArray(entry.entries) && !entry.package);
+
+	if (filesystemOnlyApplications.length === 0) {
+		log('No filesystem-only applications found on leader to clone');
+		return;
+	}
+
+	log(`Cloning ${filesystemOnlyApplications.length} application(s) not referenced in harper-config`);
+
+	const { Application, prepareApplication } = await import('../core/components/Application.ts');
+
+	for (const entry of filesystemOnlyApplications) {
+		const applicationName: string = entry.name;
+		log(`Cloning application: ${applicationName}`);
+		try {
+			const packageResponse = await leaderRequest({
+				operation: OPERATIONS_ENUM.PACKAGE_COMPONENT,
+				project: applicationName,
+				skip_node_modules: true,
+			});
+
+			const application = new Application({
+				name: applicationName,
+				payload: packageResponse.payload,
+			});
+
+			await prepareApplication(application);
+			log(`Successfully cloned application: ${applicationName}`);
+		} catch (err) {
+			log(`Failed to clone application '${applicationName}': ${err}`, 'error');
+		}
+	}
+}
+
+/**
  * Send a request to the leader node for the given operation, using either WebSockets or HTTP based on the useWS flag
  * @param operation
  */
@@ -613,6 +667,7 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 
 	const headers: Record<string, string> = {
 		'Content-Type': 'application/json',
+		'Accept': 'application/cbor',
 	};
 
 	if (leaderToken) {
@@ -627,12 +682,13 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 		body: JSON.stringify(operation),
 	};
 
-	// Only add agent for HTTPS
+	// Only add dispatcher for HTTPS — native fetch (undici) ignores the legacy `agent` option
 	const isHttps = leaderURL.startsWith('https://');
 	if (isHttps) {
-		// @ts-ignore - agent option exists but TypeScript definitions may not include it
-		fetchOptions.agent = new https.Agent({
-			rejectUnauthorized: !allowSelfSigned,
+		const { Agent } = await import('undici');
+		// @ts-ignore - dispatcher is not in the TypeScript RequestInit type but is supported by undici fetch
+		fetchOptions.dispatcher = new Agent({
+			connect: { rejectUnauthorized: !allowSelfSigned },
 		});
 	}
 
@@ -641,6 +697,10 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 		throw new Error(`Leader request failed: ${response.status} ${response.statusText}`);
 	}
 
+	const contentType = response.headers.get('content-type') ?? '';
+	if (contentType.includes('application/cbor')) {
+		return cborDecode(new Uint8Array(await response.arrayBuffer()));
+	}
 	return response.json();
 }
 
