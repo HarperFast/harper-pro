@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   review:
-    uses: HarperFast/ai-review-prompts/.github/workflows/_claude-review.yml@53d4f5015c8bac691fa108c5c3d0440151bd66af # main 2026-05-06
+    uses: HarperFast/ai-review-prompts/.github/workflows/_claude-review.yml@f6daed301f8a7ece74593506de38c6e80820b00b # main 2026-05-06
     with:
       # Same SHA as the `uses:` ref above. The reusable uses this to
       # check out HarperFast/ai-review-prompts (layer files + bash
@@ -32,7 +32,7 @@ jobs:
       # introspect their own ref (`github.workflow_ref` resolves to
       # the CALLER's ref in `workflow_call` context), and `uses: …@<ref>`
       # is parsed literally so we can't interpolate a variable.
-      ai-review-prompts-ref: 53d4f5015c8bac691fa108c5c3d0440151bd66af
+      ai-review-prompts-ref: f6daed301f8a7ece74593506de38c6e80820b00b
       review-layers: |
         universal
         harper/common
