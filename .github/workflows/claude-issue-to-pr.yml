@@ -1,0 +1,45 @@
+name: Claude Issue to PR
+
+# Thin caller of the reusable in HarperFast/ai-review-prompts.
+
+on:
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: claude-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  work:
+    uses: HarperFast/ai-review-prompts/.github/workflows/_claude-issue-to-pr.yml@11872cb1cc2d0e90659659ade6d8ddbbdfbf1d05 # main 2026-05-06
+    with:
+      # Same SHA as the `uses:` ref above. See claude-review.yml in
+      # this repo for why the duplication is unavoidable.
+      ai-review-prompts-ref: 11872cb1cc2d0e90659659ade6d8ddbbdfbf1d05
+      repo-specific-conventions: |
+        ## Harper Pro notes
+
+        - Linter is **oxlint**, not eslint. `npm run lint` runs
+          oxlint with `--deny-warnings`. Don't add eslint config or
+          invoke `eslint` directly.
+        - Storage substrate matches Harper core: **RocksDB** primary,
+          LMDB available via `HARPER_STORAGE_ENGINE=lmdb`.
+        - There is no `npm test` / `test:unit` script — only
+          `npm run test:integration`.
+      pre-commit-validation: |
+        - `claude-fix:typo` / `claude-fix:docs` (doc-only changes
+          to `*.md` or `package.json` keyword/description fields):
+          run `npm run lint`. Skip `npm run build` /
+          `npm run test:integration` — they are not affected and
+          waste turns.
+        - `claude-fix:deps` / `claude-fix:bug` or any change that
+          touches code: run `npm run build && npm run lint`. Run
+          `npm run test:integration` only if the change plausibly
+          affects integration behavior.
+
+        When in doubt, err toward the fuller validation.
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      HARPERFAST_AI_CLIENT_ID: ${{ secrets.HARPERFAST_AI_CLIENT_ID }}
+      HARPERFAST_AI_APP_PRIVATE_KEY: ${{ secrets.HARPERFAST_AI_APP_PRIVATE_KEY }}

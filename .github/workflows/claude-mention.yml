@@ -1,0 +1,51 @@
+name: Claude Mention Handler
+
+# Thin caller of the reusable in HarperFast/ai-review-prompts.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+concurrency:
+  group: claude-mention-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  mention:
+    uses: HarperFast/ai-review-prompts/.github/workflows/_claude-mention.yml@11872cb1cc2d0e90659659ade6d8ddbbdfbf1d05 # main 2026-05-06
+    with:
+      # Same SHA as the `uses:` ref above. See claude-review.yml in
+      # this repo for why the duplication is unavoidable.
+      ai-review-prompts-ref: 11872cb1cc2d0e90659659ade6d8ddbbdfbf1d05
+      repo-specific-conventions: |
+        ## Harper Pro notes
+
+        - Linter is **oxlint**, not eslint. `npm run lint` runs
+          oxlint with `--deny-warnings`. Don't add eslint config or
+          invoke `eslint` directly.
+        - Storage substrate matches Harper core: **RocksDB** primary,
+          LMDB available via `HARPER_STORAGE_ENGINE=lmdb`.
+        - There is no `npm test` / `test:unit` script — only
+          `npm run test:integration`. Integration tests are slow;
+          run only when the change plausibly affects integration
+          behavior.
+      pre-commit-validation: |
+        Scale validation to the kind of change you made:
+
+        - Doc-only change (only `*.md` or `package.json`
+          keyword/description edits): run `npm run lint`. Skip
+          `npm run build` / `npm run test:integration` — they are
+          not affected and waste turns.
+        - Code change that affects behavior: run `npm ci` first
+          (deps aren't pre-installed in this workflow), then
+          `npm run build && npm run lint`. Run
+          `npm run test:integration` only if the change plausibly
+          affects integration behavior.
+
+        When in doubt, err toward the fuller validation.
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      HARPERFAST_AI_CLIENT_ID: ${{ secrets.HARPERFAST_AI_CLIENT_ID }}
+      HARPERFAST_AI_APP_PRIVATE_KEY: ${{ secrets.HARPERFAST_AI_APP_PRIVATE_KEY }}

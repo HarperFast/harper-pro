@@ -1,0 +1,63 @@
+name: Claude PR Review
+
+# Thin caller of the reusable in HarperFast/ai-review-prompts. The
+# single `uses:` ref pin below controls everything that moves
+# together — workflow logic, layer files, bash scripts, auth-gate
+# behavior. Bumping the pin is the entire upgrade motion.
+#
+# Pre-requisites (per-repo secrets):
+#   - HARPERFAST_AI_CLIENT_ID       (the App's Client ID, like Iv23li…)
+#   - HARPERFAST_AI_APP_PRIVATE_KEY (.pem file contents)
+#   - ANTHROPIC_API_KEY             (required)
+#   - AI_REVIEW_LOG_TOKEN           (optional — if set, threads each run
+#                                   into a per-PR issue in HarperFast/ai-review-log)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    uses: HarperFast/ai-review-prompts/.github/workflows/_claude-review.yml@11872cb1cc2d0e90659659ade6d8ddbbdfbf1d05 # main 2026-05-06
+    with:
+      # Same SHA as the `uses:` ref above. The reusable uses this to
+      # check out HarperFast/ai-review-prompts (layer files + bash
+      # scripts) at the same ref as the workflow logic itself.
+      #
+      # The duplication is unavoidable: reusable workflows can't
+      # introspect their own ref (`github.workflow_ref` resolves to
+      # the CALLER's ref in `workflow_call` context), and `uses: …@<ref>`
+      # is parsed literally so we can't interpolate a variable.
+      ai-review-prompts-ref: 11872cb1cc2d0e90659659ade6d8ddbbdfbf1d05
+      review-layers: |
+        universal
+        harper/common
+        harper/v5
+      repo-specific-checks: |
+        ## Repo-specific checks (Harper Pro)
+
+        Harper Pro is the proprietary layer on top of Harper core
+        (HarperFast/harper). Code here may add or modify Pro-only
+        resources/APIs and pull from Harper core internals.
+
+        - **Linter is oxlint, not eslint.** `npm run lint` runs
+          oxlint with `--deny-warnings`. Advice in layers that
+          references ESLint doesn't apply.
+        - **Documentation scope.** Harper docs at
+          https://docs.harperdb.io are authoritative for Harper
+          mechanics. Pro-side docs should describe Pro-only
+          surface, not re-explain core behavior.
+        - **Storage.** Same substrate as Harper core — RocksDB
+          primary, LMDB available via `HARPER_STORAGE_ENGINE=lmdb`.
+        - **Tests.** No unit-test split — `npm run test:integration`
+          is the test surface. Use it judiciously; integration
+          tests are slow.
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      AI_REVIEW_LOG_TOKEN: ${{ secrets.AI_REVIEW_LOG_TOKEN }}
+      HARPERFAST_AI_CLIENT_ID: ${{ secrets.HARPERFAST_AI_CLIENT_ID }}
+      HARPERFAST_AI_APP_PRIVATE_KEY: ${{ secrets.HARPERFAST_AI_APP_PRIVATE_KEY }}
