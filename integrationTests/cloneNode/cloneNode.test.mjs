@@ -101,6 +101,28 @@ suite('Clone Node', (ctx) => {
 			hostname: 'gitlab.com',
 			known_hosts: 'gitlab.com fake1\ngitlab.com fake2',
 		});
+
+		// Deploy a filesystem-only application file-by-file using set_component_file.
+		// This creates the component on disk without a config entry and without triggering
+		// loadComponent validation, which exercises the new cloneApplications() path in cloneNode.
+		const fixtureDir = join(import.meta.dirname, 'fixture', 'test-app');
+		const { readFileSync } = await import('node:fs');
+		for (const file of ['config.yaml', 'resources.js', 'schema.graphql']) {
+			await sendOperation(nodeCtx.harper, {
+				operation: 'set_component_file',
+				project: 'filesystem-app',
+				file,
+				payload: readFileSync(join(fixtureDir, file), 'utf8'),
+			});
+		}
+
+		// Deploy a config-referenced application via payload so it gets a config entry.
+		// cloneApplications() should skip this — it will be reinstalled via config on the clone.
+		await sendOperation(nodeCtx.harper, {
+			operation: 'deploy_component',
+			project: 'config-app',
+			package: 'HarperFast/application-template',
+		});
 	});
 
 	after(async () => {
@@ -195,6 +217,18 @@ suite('Clone Node', (ctx) => {
 				`JWT key ${keyName} should match between leader and clone`
 			);
 		}
+
+		// Verify both applications were cloned to the clone node
+		const cloneApps = await sendOperation(ctx.nodes[1], { operation: 'get_components' });
+		const appEntries = cloneApps.entries ?? [];
+
+		const filesystemApp = appEntries.find((e) => e.name === 'filesystem-app');
+		const configApp = appEntries.find((e) => e.name === 'config-app');
+
+		ok(filesystemApp, 'filesystem-only application should be cloned to the clone node');
+		ok(configApp, 'config-referenced application should be cloned to the clone node');
+		ok(!filesystemApp?.package, 'filesystem-only application should not have a config package reference on the clone');
+		ok(configApp?.package, 'config-referenced application should retain its package reference on the clone');
 	});
 
 	test('should clone three more nodes successfully', async () => {
