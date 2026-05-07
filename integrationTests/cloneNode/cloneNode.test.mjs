@@ -1,6 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
-import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
+import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
