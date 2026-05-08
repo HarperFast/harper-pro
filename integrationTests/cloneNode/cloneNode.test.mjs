@@ -1,14 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
-<<<<<<< HEAD
-<<<<<<< HEAD
-import { startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
-=======
-import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
->>>>>>> 1e6d174 (expand clone node to clone filesystem-only applications)
-=======
-import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
->>>>>>> 6123298 (add cone node test fixtures)
+import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/harperLifecycle.ts';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
