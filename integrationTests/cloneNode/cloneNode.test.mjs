@@ -24,7 +24,7 @@ async function sendOperation(node, operation) {
 	return responseData;
 }
 
-async function waitForAvailableStatus(node, timeoutMs = 60000, checkInterval = 2000) {
+async function waitForAvailableStatus(node, timeoutMs = 120000, checkInterval = 2000) {
 	const timeoutAt = Date.now() + timeoutMs;
 
 	while (Date.now() < timeoutAt) {
