@@ -204,12 +204,31 @@ function isAlreadyApplied(pr) {
 }
 
 // ── GitHub helpers ────────────────────────────────────────────────────────────
+// Returns ISO date of the most recent semver tag reachable from origin/RELEASE_BRANCH,
+// or null if no such tag exists. Used to filter PR list to only those merged
+// after the last release.
+function getLastReleaseDate() {
+  const tagR = runSafe(`git describe --tags --abbrev=0 --match 'v*.*.*' "origin/${RELEASE_BRANCH}"`);
+  if (tagR.code !== 0 || !tagR.out) return null;
+  const tag = tagR.out;
+  const dateR = runSafe(`git log -1 --format=%aI "${tag}"`);
+  if (dateR.code !== 0 || !dateR.out) return null;
+  return { tag, date: dateR.out };
+}
+
 function getPatchPRs(ghRepo) {
   const json = run(
     `gh pr list --repo "${ghRepo}" --label "${LABEL}" --state merged --base "${SOURCE_BRANCH}" ` +
-      `--json number,title,mergeCommit,body --limit 200`
+      `--json number,title,mergeCommit,mergedAt,body --limit 200`
   );
-  const prs = JSON.parse(json).filter((pr) => pr.mergeCommit?.oid);
+  let prs = JSON.parse(json).filter((pr) => pr.mergeCommit?.oid);
+  // Filter to PRs merged after the last release tag — older PRs are either
+  // already in the branch or were intentionally skipped.
+  const last = getLastReleaseDate();
+  if (last) {
+    info(`  Last release: ${last.tag} (${last.date}); only considering PRs merged after this.`);
+    prs = prs.filter((pr) => pr.mergedAt && pr.mergedAt > last.date);
+  }
   // Tag each PR with its repo so helpers can make follow-up API calls if needed
   prs.forEach((pr) => { pr._ghRepo = ghRepo; });
   return prs;
@@ -541,8 +560,14 @@ async function main() {
 
   // ── Step 2: patch harper-pro ───────────────────────────────────────────────
   process.chdir(harperProRoot);
-  // Checkout harper-pro release branch before patching
-  if (!DRY_RUN) run(`git checkout "${RELEASE_BRANCH}"`);
+  // Checkout harper-pro release branch and fast-forward to remote before patching.
+  // ff-only ensures the version bump in Step 4 lands on top of any commits the
+  // cherry-pick CI workflow has pushed remotely.
+  if (!DRY_RUN) {
+    run(`git checkout "${RELEASE_BRANCH}"`);
+    run('git fetch origin');
+    run(`git merge --ff-only "origin/${RELEASE_BRANCH}"`);
+  }
   await patchRepo({ absPath: harperProRoot, name: 'harper-pro' });
 
   // ── Step 3: sync core submodule + deps ─────────────────────────────────────
@@ -586,9 +611,20 @@ async function main() {
   // ── Done ───────────────────────────────────────────────────────────────────
   header('All done');
   if (!DRY_RUN) {
-    log('Push commands:');
-    if (coreVersion) log(`  git -C core push origin ${RELEASE_BRANCH} --follow-tags`);
-    log(`  git push origin ${RELEASE_BRANCH} --follow-tags`);
+    const push = await prompt(`\nPush ${RELEASE_BRANCH} commits and tags for both repos? [Y/n]: `);
+    if (push.toLowerCase() !== 'n') {
+      if (coreVersion) {
+        log(`  Pushing core ${RELEASE_BRANCH}...`);
+        execSync(`git -C "${corePath}" push origin "${RELEASE_BRANCH}" --follow-tags`, { stdio: 'inherit' });
+      }
+      log(`  Pushing harper-pro ${RELEASE_BRANCH}...`);
+      execSync(`git -C "${harperProRoot}" push origin "${RELEASE_BRANCH}" --follow-tags`, { stdio: 'inherit' });
+      ok('  Push complete.');
+    } else {
+      log('Push commands (run manually):');
+      if (coreVersion) log(`  git -C core push origin ${RELEASE_BRANCH} --follow-tags`);
+      log(`  git push origin ${RELEASE_BRANCH} --follow-tags`);
+    }
 
     // Offer to return to original branches
     process.chdir(corePath);
