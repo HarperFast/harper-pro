@@ -685,7 +685,8 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 	// Only add dispatcher for HTTPS — native fetch (undici) ignores the legacy `agent` option
 	const isHttps = leaderURL.startsWith('https://');
 	if (isHttps) {
-		const { Agent } = await import('undici');
+		// @ts-ignore - node:undici types require @types/node >=22
+		const { Agent } = await import('node:undici');
 		// @ts-ignore - dispatcher is not in the TypeScript RequestInit type but is supported by undici fetch
 		fetchOptions.dispatcher = new Agent({
 			connect: { rejectUnauthorized: !allowSelfSigned },
