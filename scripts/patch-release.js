@@ -260,13 +260,16 @@ async function main() {
   const proVersion = bumpVersion('harper-pro');
 
   // ── Step 5: push ───────────────────────────────────────────────────────────
+  // Push the branch and the specific tag explicitly. `npm version` creates a
+  // lightweight tag, which `--follow-tags` ignores (it only pushes annotated
+  // tags), so we name the tag in the refspec list.
   header('Pushing');
   if (coreVersion) {
     log(`  Pushing core ${RELEASE_BRANCH} ${coreVersion}...`);
-    execSync(`git -C "${corePath}" push origin "${RELEASE_BRANCH}" --follow-tags`, { stdio: 'inherit' });
+    execSync(`git -C "${corePath}" push origin "${RELEASE_BRANCH}" "${coreVersion}"`, { stdio: 'inherit' });
   }
   log(`  Pushing harper-pro ${RELEASE_BRANCH} ${proVersion}...`);
-  execSync(`git -C "${harperProRoot}" push origin "${RELEASE_BRANCH}" --follow-tags`, { stdio: 'inherit' });
+  execSync(`git -C "${harperProRoot}" push origin "${RELEASE_BRANCH}" "${proVersion}"`, { stdio: 'inherit' });
   ok('\n✅ Done.');
 
   // ── Step 6: offer to return to original branches ───────────────────────────
