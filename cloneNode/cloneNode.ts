@@ -727,7 +727,7 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 	}
 
 	if (contentType.includes('application/cbor')) {
-		return cborDecode(new Uint8Array(responseBody));
+		return cborDecode(responseBody);
 	}
 	return JSON.parse(responseBody.toString('utf8'));
 }
