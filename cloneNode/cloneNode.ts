@@ -4,6 +4,8 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { request as httpsRequest } from 'node:https';
+import { request as httpRequest } from 'node:http';
 import yaml from 'yaml';
 import { decode as cborDecode } from 'cbor-x';
 
@@ -676,33 +678,58 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 		headers.Authorization = `Basic ${Buffer.from(`${leaderUsername}:${leaderPassword}`).toString('base64')}`;
 	}
 
-	const fetchOptions: RequestInit = {
-		method: 'POST',
-		headers,
-		body: JSON.stringify(operation),
-	};
+	const body = JSON.stringify(operation);
+	const url = new URL(leaderURL);
+	const isHttps = url.protocol === 'https:';
+	const port = url.port ? parseInt(url.port, 10) : isHttps ? 443 : 80;
+	const path = url.pathname + url.search;
+	const requestHeaders = { ...headers, 'Content-Length': Buffer.byteLength(body) };
 
-	// Only add dispatcher for HTTPS — native fetch (undici) ignores the legacy `agent` option
-	const isHttps = leaderURL.startsWith('https://');
-	if (isHttps) {
-		// @ts-ignore - node:undici types require @types/node >=22
-		const { Agent } = await import('node:undici');
-		// @ts-ignore - dispatcher is not in the TypeScript RequestInit type but is supported by undici fetch
-		fetchOptions.dispatcher = new Agent({
-			connect: { rejectUnauthorized: !allowSelfSigned },
-		});
+	const { statusCode, statusMessage, contentType, responseBody } = await new Promise<{
+		statusCode: number;
+		statusMessage: string;
+		contentType: string;
+		responseBody: Buffer;
+	}>((resolve, reject) => {
+		const callback = (res: import('node:http').IncomingMessage) => {
+			const chunks: Buffer[] = [];
+			res.on('data', (chunk: Buffer) => chunks.push(chunk));
+			res.on('end', () =>
+				resolve({
+					statusCode: res.statusCode!,
+					statusMessage: res.statusMessage!,
+					contentType: (res.headers['content-type'] as string) ?? '',
+					responseBody: Buffer.concat(chunks),
+				})
+			);
+			res.on('error', reject);
+		};
+		const req = isHttps
+			? httpsRequest(
+					{
+						hostname: url.hostname,
+						port,
+						path,
+						method: 'POST',
+						headers: requestHeaders,
+						rejectUnauthorized: !allowSelfSigned,
+					},
+					callback
+				)
+			: httpRequest({ hostname: url.hostname, port, path, method: 'POST', headers: requestHeaders }, callback);
+		req.on('error', reject);
+		req.write(body);
+		req.end();
+	});
+
+	if (statusCode < 200 || statusCode >= 300) {
+		throw new Error(`Leader request failed: ${statusCode} ${statusMessage}`);
 	}
 
-	const response = await fetch(leaderURL, fetchOptions);
-	if (!response.ok) {
-		throw new Error(`Leader request failed: ${response.status} ${response.statusText}`);
-	}
-
-	const contentType = response.headers.get('content-type') ?? '';
 	if (contentType.includes('application/cbor')) {
-		return cborDecode(new Uint8Array(await response.arrayBuffer()));
+		return cborDecode(new Uint8Array(responseBody));
 	}
-	return response.json();
+	return JSON.parse(responseBody.toString('utf8'));
 }
 
 /**
