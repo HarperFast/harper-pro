@@ -5,9 +5,8 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, deepEqual } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { targz } from '../../core/integrationTests/utils/targz.ts';
 import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(

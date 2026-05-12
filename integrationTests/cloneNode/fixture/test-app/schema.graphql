@@ -1,5 +1,5 @@
 type CloneTestRecord @table @export {
-  id: ID @primaryKey
-  name: String @indexed
-  value: String
+	id: ID @primaryKey
+	name: String @indexed
+	value: String
 }
