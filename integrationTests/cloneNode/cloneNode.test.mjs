@@ -265,21 +265,37 @@ suite('Clone Node', (ctx) => {
 			await waitForAvailableStatus(ctx.nodes[newNodeIndex]);
 		}
 
-		for (let j = 0; j < ctx.nodes.length; j++) {
-			const node = ctx.nodes[j];
-			const clusterStatus = await sendOperation(node, {
-				operation: 'cluster_status',
-			});
+		// wait for the full mesh to establish — reaching Available status does not guarantee
+		// that all cross-node replication sockets have connected yet
+		let retries = 0;
+		let statuses;
+		while (true) {
+			statuses = await Promise.all(ctx.nodes.map((node) => sendOperation(node, { operation: 'cluster_status' })));
+			const fullyConnected = statuses.every(
+				(status) =>
+					status.connections.length === ctx.nodes.length - 1 &&
+					status.connections.every(
+						(connection) =>
+							connection.database_sockets.length === 2 &&
+							connection.database_sockets.every((socket) => socket.connected)
+					)
+			);
+			if (fullyConnected) break;
+			if (retries++ > 20) {
+				throw new Error(`Cluster did not fully connect: ${JSON.stringify(statuses)}`);
+			}
+			await sleep(500 * retries);
+		}
 
-			equal(clusterStatus.connections.length, 4, JSON.stringify(clusterStatus));
-			for (let connection of clusterStatus.connections) {
+		for (const clusterStatus of statuses) {
+			equal(clusterStatus.connections.length, ctx.nodes.length - 1, JSON.stringify(clusterStatus));
+			for (const connection of clusterStatus.connections) {
 				equal(connection.database_sockets.length, 2, JSON.stringify(connection));
-				for (let socket of connection.database_sockets) {
+				for (const socket of connection.database_sockets) {
 					ok(socket.connected, 'connected');
 				}
 			}
 		}
-		console.log('done');
 	});
 });
 

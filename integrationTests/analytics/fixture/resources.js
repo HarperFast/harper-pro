@@ -12,8 +12,11 @@ export class CpuWork extends Resource {
 		}
 		if (data?.spawnChildren) {
 			const children = [];
+			const runId = Date.now();
 			for (let i = 0; i < 3; i++) {
-				const child = spawn('node', ['-e', 'const s = Date.now(); while (Date.now() - s < 200) {}']);
+				const child = spawn('node', ['-e', 'const s = Date.now(); while (Date.now() - s < 200) {}'], {
+					name: `cpu-work-child-${runId}-${i}`,
+				});
 				children.push(child);
 			}
 			await Promise.all(children.map((child) => new Promise((resolve) => child.on('exit', resolve))));
