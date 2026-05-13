@@ -70,7 +70,7 @@ These are written concurrently by `replicationConnection.ts` without explicit sy
 
 ### `hdb_nodes` system table (knownNodes.ts:18–61)
 
-Schema: `name` (PK), `subscriptions[]`, `system_info`, `url`, `routes`, `ca`, `ca_info`, `replicates`, `revoked_certificates`. Subscription updates trigger `subscribeToNodeUpdates` (knownNodes.ts:270), which fans out to `monitorNodeCAs` → refresh `replicationCertificateAuthorities` (replicator.ts:56).
+Schema: `name` (PK), `subscriptions[]`, `system_info`, `url`, `routes`, `ca`, `ca_info`, `replicates`, `revoked_certificates`. Subscription updates trigger `subscribeToNodeUpdates` (knownNodes.ts:77), which fans out to `monitorNodeCAs` → refresh `replicationCertificateAuthorities` (replicator.ts:56).
 
 ---
 
