@@ -162,18 +162,43 @@ function showRepoStatus({ absPath, name }) {
   return { prs, commits, lastTag: last?.tag ?? null };
 }
 
+// ── Semver helpers ────────────────────────────────────────────────────────────
+function parseSemver(v) {
+  const m = String(v).replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)/);
+  if (!m) throw new Error(`Cannot parse semver: ${v}`);
+  return [+m[1], +m[2], +m[3]];
+}
+
+function bumpSemver(version, type) {
+  const [maj, min, pat] = parseSemver(version);
+  if (type === 'major') return `${maj + 1}.0.0`;
+  if (type === 'minor') return `${maj}.${min + 1}.0`;
+  return `${maj}.${min}.${pat + 1}`;
+}
+
+function cmpSemver(a, b) {
+  const A = parseSemver(a);
+  const B = parseSemver(b);
+  return (A[0] - B[0]) || (A[1] - B[1]) || (A[2] - B[2]);
+}
+
+function readPackageVersion() {
+  return run('npm pkg get version').replace(/"/g, '').trim();
+}
+
 // ── Version bump + tag ────────────────────────────────────────────────────────
 // Call with cwd on the repo root and release branch checked out.
+// `targetVersion` is the explicit version to set (without leading 'v').
 // Folds any already-staged changes (core submodule ref, synced deps) into the
 // release commit.
-function bumpVersion(repoLabel) {
+function setVersion(repoLabel, targetVersion) {
   if (DRY_RUN) {
-    ok(`  [dry-run] Would run: npm version ${VERSION_BUMP} and tag`);
-    return null;
+    ok(`  [dry-run] Would set ${repoLabel} version to v${targetVersion}`);
+    return `v${targetVersion}`;
   }
-  log(`\n  Bumping ${VERSION_BUMP} version in ${repoLabel}...`);
-  const newVersion = run(`npm version ${VERSION_BUMP} --no-git-tag-version`); // e.g. "v5.0.5"
-  ok(`  Version bumped to ${newVersion}`);
+  log(`\n  Setting ${repoLabel} version to v${targetVersion}...`);
+  const newVersion = run(`npm version ${targetVersion} --no-git-tag-version`); // returns "v5.0.5"
+  ok(`  Version set to ${newVersion}`);
 
   const toStage = ['package.json'];
   if (existsSync('package-lock.json')) toStage.push('package-lock.json');
@@ -219,13 +244,35 @@ async function main() {
     return;
   }
 
+  // ── Compute target version (sync core and harper-pro) ──────────────────────
+  // When both bump, sync to the highest of their natural next versions —
+  // this catches up either repo that fell behind on a prior release.
+  process.chdir(corePath);
+  const coreCurrent = readPackageVersion();
+  process.chdir(harperProRoot);
+  const proCurrent = readPackageVersion();
+  const coreBumping = coreStatus.commits.length > 0;
+  const coreNext = bumpSemver(coreCurrent, VERSION_BUMP);
+  const proNext = bumpSemver(proCurrent, VERSION_BUMP);
+  const effectiveCore = coreBumping ? coreNext : coreCurrent;
+  const target = cmpSemver(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
+
+  info(`\n  Current:  core=v${coreCurrent}  harper-pro=v${proCurrent}`);
+  info(`  Target:   v${target}`);
+  if (coreBumping && coreNext !== target) {
+    info(`            (core skipping v${coreNext} → v${target} to sync with harper-pro)`);
+  }
+  if (proNext !== target) {
+    info(`            (harper-pro skipping v${proNext} → v${target} to sync with core)`);
+  }
+
   // ── Step 1: bump core (if it has new commits) ──────────────────────────────
   process.chdir(corePath);
   run(`git checkout "${RELEASE_BRANCH}"`);
   run(`git merge --ff-only "origin/${RELEASE_BRANCH}"`);
   let coreVersion = null;
-  if (coreStatus.commits.length > 0) {
-    coreVersion = bumpVersion('harper (core)');
+  if (coreBumping) {
+    coreVersion = setVersion('harper (core)', target);
   } else {
     info(`  No new commits on core's ${RELEASE_BRANCH} since ${coreStatus.lastTag} — skipping core version bump.`);
   }
@@ -257,7 +304,7 @@ async function main() {
   ok('\nSync staged.');
 
   // ── Step 4: bump harper-pro version ────────────────────────────────────────
-  const proVersion = bumpVersion('harper-pro');
+  const proVersion = setVersion('harper-pro', target);
 
   // ── Step 5: push ───────────────────────────────────────────────────────────
   // Push the branch and the specific tag explicitly. `npm version` creates a
