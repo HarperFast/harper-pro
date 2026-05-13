@@ -78,7 +78,24 @@ suite('Issue #135: Resource SDK search after graceful restart (Scenario A)', { t
 		// 35s matches the delay used in replicationLoad.test.mjs after deploy_component.
 		await delay(35000);
 		await pollHealth(ctx.harper);
-		console.log('Harper is up after initial deploy');
+
+		// Poll until the schema has actually been applied (deploy + health-OK doesn't guarantee
+		// the component finished loading the graphql schema — race seen in single-node tests
+		// where `database 'data' does not exist` comes back from the first insert).
+		let schemaReady = false;
+		for (let i = 0; i < 30; i++) {
+			const desc = await sendOperation(ctx.harper, {
+				operation: 'describe_table',
+				table: 'ScoreEvidence',
+			}).catch((err) => ({ __error: err.message }));
+			if (desc && !desc.__error && desc.name === 'ScoreEvidence') {
+				schemaReady = true;
+				break;
+			}
+			await delay(1000);
+		}
+		if (!schemaReady) throw new Error('ScoreEvidence table did not become available after deploy');
+		console.log('Harper is up after initial deploy and schema is ready');
 	});
 
 	after(async () => {
@@ -99,7 +116,6 @@ suite('Issue #135: Resource SDK search after graceful restart (Scenario A)', { t
 			table: 'ScoreEvidence',
 			records,
 		});
-		console.log(`Inserted ${ROW_COUNT} rows`);
 
 		// Sanity: ops API sees all rows before restart.
 		const beforeRestart = await sendOperation(node, {
@@ -142,13 +158,8 @@ suite('Issue #135: Resource SDK search after graceful restart (Scenario A)', { t
 		);
 	});
 
-	// Scenario B: write on node 0 → replicate to node 1 → restart node 1 → Resource SDK search on node 1.
-	// This is the most likely repro vector: index entries for REPLICATED (not locally-written) rows
-	// may not survive a restart on the receiving node.
-	// SKIPPED: multi-node cluster setup requires JWT encryption keys via create_authentication_tokens,
-	// which fails in the integration test environment ("unable to generate JWT as there are no
-	// encryption keys"). The same failure blocks replicationLoad.test.mjs and fullyConnectedReplication.
-	// Unblock by: fixing encryption key generation in the integration-testing harness for Pro nodes,
-	// or reproducing manually on a Fabric cluster using the issue #135 repro steps.
-	test.skip('Scenario B: replicated write → restart receiving node → Resource SDK search', async () => {});
+	// Scenario B (multi-node replicated write → restart receiving node) is in a separate file:
+	// issue135-replicated-search-after-restart.test.mjs. They're split because node --test runs
+	// top-level suites concurrently, and the cluster startup interferes with this scenario's
+	// single-node restart timing when colocated.
 });
