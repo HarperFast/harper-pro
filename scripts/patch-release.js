@@ -33,6 +33,7 @@ const { execSync, spawnSync } = require('child_process');
 const { existsSync } = require('fs');
 const path = require('path');
 const readline = require('readline');
+const semver = require('semver');
 
 // ── Args ──────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -163,25 +164,6 @@ function showRepoStatus({ absPath, name }) {
 }
 
 // ── Semver helpers ────────────────────────────────────────────────────────────
-function parseSemver(v) {
-  const m = String(v).replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)/);
-  if (!m) throw new Error(`Cannot parse semver: ${v}`);
-  return [+m[1], +m[2], +m[3]];
-}
-
-function bumpSemver(version, type) {
-  const [maj, min, pat] = parseSemver(version);
-  if (type === 'major') return `${maj + 1}.0.0`;
-  if (type === 'minor') return `${maj}.${min + 1}.0`;
-  return `${maj}.${min}.${pat + 1}`;
-}
-
-function cmpSemver(a, b) {
-  const A = parseSemver(a);
-  const B = parseSemver(b);
-  return (A[0] - B[0]) || (A[1] - B[1]) || (A[2] - B[2]);
-}
-
 function readPackageVersion() {
   return run('npm pkg get version').replace(/"/g, '').trim();
 }
@@ -241,10 +223,10 @@ async function main() {
   process.chdir(harperProRoot);
   const proCurrent = readPackageVersion();
   const coreBumping = coreStatus.commits.length > 0;
-  const coreNext = bumpSemver(coreCurrent, VERSION_BUMP);
-  const proNext = bumpSemver(proCurrent, VERSION_BUMP);
+  const coreNext = semver.inc(coreCurrent, VERSION_BUMP);
+  const proNext = semver.inc(proCurrent, VERSION_BUMP);
   const effectiveCore = coreBumping ? coreNext : coreCurrent;
-  const target = cmpSemver(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
+  const target = semver.compare(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
 
   info(`\n  Current:  core=v${coreCurrent}  harper-pro=v${proCurrent}`);
   info(`  Target:   v${target}`);
