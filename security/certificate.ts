@@ -114,13 +114,19 @@ export async function createCsr() {
 	// the active replication cert is a non-RSA cert (e.g. Let's Encrypt EC).
 	const certificateTable = getCertTable();
 	const privateKeys: Map<string, string> = getPrivateKeys();
+	const hdbKeysDir = join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME);
 	let opsCert, opsPrivateKey, certName, privateKeyName;
 	for await (const cert of certificateTable.search([])) {
 		if (cert.is_self_signed && (cert.details?.issuer?.includes('Harper-Certificate-Authority') || cert.details?.issuer?.includes('HarperDB-Certificate-Authority'))) {
-			const key = privateKeys.get(cert.private_key_name);
+			// privateKeys Map is populated from config-referenced paths only, so a Harper CA key
+			// on disk but not referenced in config won't appear there — fall back to reading it.
+			let key: string | Buffer | undefined = privateKeys.get(cert.private_key_name);
+			if (!key && cert.private_key_name && (await fileExists(join(hdbKeysDir, cert.private_key_name)))) {
+				key = await readFile(join(hdbKeysDir, cert.private_key_name));
+			}
 			if (key) {
 				opsCert = pki.certificateFromPem(cert.certificate);
-				opsPrivateKey = pki.privateKeyFromPem(key);
+				opsPrivateKey = pki.privateKeyFromPem(key as string);
 				certName = cert.name;
 				privateKeyName = cert.private_key_name;
 				break;
