@@ -202,7 +202,7 @@ async function main() {
 
   // ── Show status for both repos ─────────────────────────────────────────────
   const coreStatus = showRepoStatus({ absPath: corePath, name: 'harper (core)' });
-  const proStatus = showRepoStatus({ absPath: harperProRoot, name: 'harper-pro' });
+  showRepoStatus({ absPath: harperProRoot, name: 'harper-pro' });
 
   log('');
   log(`${C.bold}Visual check:${C.reset} verify each labeled PR has a corresponding commit on ${RELEASE_BRANCH}.`);
