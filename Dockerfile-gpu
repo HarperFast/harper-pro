@@ -1,6 +1,5 @@
 ARG NODE_BUILD_VERSION=24
 ARG NODE_VERSION=24
-ARG CUDA_VERSION=12.8.1
 
 FROM docker.io/node:${NODE_BUILD_VERSION} AS build
 
@@ -10,7 +9,7 @@ COPY . .
 
 RUN env NO_USE_GIT=true npm run package
 
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04 AS run
+FROM nvidia/cuda:13.1.2-cudnn-runtime-ubuntu22.04 AS run
 
 ARG NODE_VERSION=24
 
