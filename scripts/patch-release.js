@@ -233,17 +233,6 @@ async function main() {
   log(`${C.bold}Visual check:${C.reset} verify each labeled PR has a corresponding commit on ${RELEASE_BRANCH}.`);
   log('If any PRs are missing commits, a cherry-pick may have failed or conflicted — abort and resolve before proceeding.');
 
-  if (DRY_RUN) {
-    warn('\n[dry-run] Skipping version bump, sync, and push.');
-    return;
-  }
-
-  const confirm = await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
-  if (confirm.toLowerCase() !== 'y') {
-    warn('Aborted.');
-    return;
-  }
-
   // ── Compute target version (sync core and harper-pro) ──────────────────────
   // When both bump, sync to the highest of their natural next versions —
   // this catches up either repo that fell behind on a prior release.
@@ -264,6 +253,17 @@ async function main() {
   }
   if (proNext !== target) {
     info(`            (harper-pro skipping v${proNext} → v${target} to sync with core)`);
+  }
+
+  if (DRY_RUN) {
+    warn('\n[dry-run] Skipping version bump, sync, and push.');
+    return;
+  }
+
+  const confirm = await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
+  if (confirm.toLowerCase() !== 'y') {
+    warn('Aborted.');
+    return;
   }
 
   // ── Step 1: bump core (if it has new commits) ──────────────────────────────
