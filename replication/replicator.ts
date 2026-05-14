@@ -267,6 +267,22 @@ export function start(options) {
 }
 export function monitorNodeCAs(listener: () => void) {
 	let lastCaCount = 0;
+	// subscribeToNodeUpdates only invokes the listener for future put/delete events,
+	// not for rows already present in hdb_nodes when this worker starts up. Without
+	// this initial load, the dynamic trust set only contains CAs from peers added or
+	// updated after startup — a worker that restarts can stop trusting peers whose
+	// rows are quietly already there, which presents as TLS handshake failures
+	// (SELF_SIGNED_CERT_IN_CHAIN / no matching CA) for incoming replication.
+	for (const entry of getHDBNodeTable().primaryStore.getRange({})) {
+		const node = entry?.value;
+		if (node?.ca) {
+			replicationCertificateAuthorities.add(node.ca);
+		}
+	}
+	if (replicationCertificateAuthorities.size !== lastCaCount) {
+		lastCaCount = replicationCertificateAuthorities.size;
+		listener?.();
+	}
 	subscribeToNodeUpdates((node) => {
 		logger.debug('Adding node CA', node?.ca?.slice(0, 60));
 		if (node?.ca) {
