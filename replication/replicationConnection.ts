@@ -565,9 +565,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 										schemaUpdateListener = forEachReplicatedDatabase(options, (database, databaseName) => {
 											if (checkDatabaseAccess(databaseName)) sendDBSchema(databaseName);
 										});
-										ws.on('close', () => {
-											schemaUpdateListener?.remove();
-										});
+										// onWSMessage is async, so the WS may have already closed by the time we get
+										// here — in that case 'close' has fired and adding the cleanup listener now
+										// would silently leak. Drop the registration immediately.
+										if (wsClosed) {
+											schemaUpdateListener.remove();
+											schemaUpdateListener = undefined;
+										} else {
+											ws.on('close', () => {
+												schemaUpdateListener?.remove();
+											});
+										}
 									}
 								} catch (error) {
 									// if this fails, we should close the connection and indicate that we should not reconnect
@@ -1381,6 +1389,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 											close();
 										}
 									});
+									// We are inside an async .then(); if the WS closed while waiting for it to
+									// resolve, attaching a 'close' handler now will not fire and the listeners
+									// above would stay subscribed on the global databaseEventsEmitter forever.
+									if (wsClosed) {
+										schemaUpdateListener.remove();
+										dbRemovalListener.remove();
+										schemaUpdateListener = undefined;
+										dbRemovalListener = undefined;
+										return;
+									}
 									ws.on('close', () => {
 										schemaUpdateListener?.remove();
 										dbRemovalListener?.remove();

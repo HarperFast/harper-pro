@@ -595,12 +595,21 @@ export function forEachReplicatedDatabase(options, callback) {
 	for (const databaseName of Object.getOwnPropertyNames(databases)) {
 		forDatabase(databaseName);
 	}
-	onRemovedDB((databaseName) => {
+	// Both listeners must be returned through the same handle, otherwise callers that
+	// .remove() the result still leak the dropDatabase listener forever — which over time
+	// trips MaxListenersExceededWarning on the global databaseEventsEmitter.
+	const removedListener = onRemovedDB((databaseName) => {
 		forDatabase(databaseName);
 	});
-	return onUpdatedTable((Table) => {
+	const updatedListener = onUpdatedTable((Table) => {
 		forDatabase(Table.databaseName);
 	});
+	return {
+		remove() {
+			removedListener.remove();
+			updatedListener.remove();
+		},
+	};
 	function forDatabase(databaseName) {
 		const database = databases[databaseName];
 		logger.trace('Checking replication status of ', databaseName, options?.databases);
