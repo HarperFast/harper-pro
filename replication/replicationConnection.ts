@@ -1877,15 +1877,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 			tableSubscriptionToReplicator.auditStore?.rootStore
 		);
 		if (finished) {
-			finished.blobId = blobId;
-			outstandingBlobsToFinish.push(finished);
-			finished
+			// We log the rejection via .catch() and also need the resulting promise — not the
+			// raw `finished` — to be what we hand to `Promise.all(outstandingBlobsToFinish)` in
+			// the end_txn onCommit path below. If we pushed `finished` directly, a save
+			// rejection would surface to that `await Promise.all(...)` as an unhandled error
+			// even though we already logged it here, and it would escape onCommit as an
+			// uncaughtException — observed in prod as ~35/sec ENOENT spam during catch-up.
+			const tracked = finished
 				.catch((err) => logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err))
 				.finally(() => {
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
-					const index = outstandingBlobsToFinish.indexOf(finished);
+					const index = outstandingBlobsToFinish.indexOf(tracked);
 					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
 				});
+			tracked.blobId = blobId;
+			outstandingBlobsToFinish.push(tracked);
 		}
 		return localBlob;
 	}
