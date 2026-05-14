@@ -484,10 +484,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	// Without serialization, awaiting inside the handler would let concurrent message handlers
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
+	let wsClosed = false;
 	ws.on('message', (body: Buffer) => {
 		messageProcessing = messageProcessing.then(
-			() => onWSMessage(body),
-			() => onWSMessage(body)
+			() => (wsClosed ? undefined : onWSMessage(body)),
+			() => (wsClosed ? undefined : onWSMessage(body))
 		);
 	});
 	let authorizationFinished = false;
@@ -1738,6 +1739,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	});
 	ws.on('close', (code, reasonBuffer) => {
 		// cleanup
+		wsClosed = true;
 		clearInterval(sendPingInterval);
 		clearTimeout(receivePingTimer);
 		clearInterval(blobsTimer);
