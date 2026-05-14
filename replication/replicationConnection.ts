@@ -86,6 +86,11 @@ export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
 
 const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
+// When receiving a replication message, we apply per-record backpressure to keep a single
+// large batch from synchronously decoding thousands of records and ballooning the worker
+// heap past its limit. If the local replicator queue grows beyond this threshold we pause
+// the WS connection and wait for it to drain before continuing the decode loop.
+const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWaterMark') ?? 100;
 
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
@@ -455,13 +460,36 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	const MAX_OUTSTANDING_BLOBS_BEING_SENT = env.get(CONFIG_PARAMS.REPLICATION_BLOBCONCURRENCY) ?? 5;
 	let outstandingCommits = 0;
 	let lastStructureLength = 0;
-	let replicationPaused = false;
+	// Multiple independent conditions can ask to pause receive on this WS (commit backlog,
+	// consumer queue full, blob write backpressure). We refcount the reasons so that resuming
+	// one does not race ahead of another that still wants the WS paused.
+	let pauseReasons = 0;
+	let commitBacklogPaused = false;
+	function addPauseReason(): void {
+		if (pauseReasons === 0) ws.pause();
+		pauseReasons++;
+	}
+	function removePauseReason(): void {
+		if (pauseReasons === 0) return;
+		pauseReasons--;
+		if (pauseReasons === 0) ws.resume();
+	}
 	let subscriptionRequest, auditSubscription;
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
-	ws.on('message', onWSMessage);
+	// Serialize message handling so that async backpressure inside onWSMessage doesn't allow
+	// the WS library to start processing the next frame before the current one is fully decoded.
+	// Without serialization, awaiting inside the handler would let concurrent message handlers
+	// share the consumer queue and defeat the per-record backpressure below.
+	let messageProcessing: Promise<void> = Promise.resolve();
+	ws.on('message', (body: Buffer) => {
+		messageProcessing = messageProcessing.then(
+			() => onWSMessage(body),
+			() => onWSMessage(body)
+		);
+	});
 	let authorizationFinished = false;
 	function checkAuthorization(): boolean {
 		authorizationFinished = true;
@@ -473,29 +501,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		}
 		return true;
 	}
-	function onWSMessage(body: Buffer) {
+	async function onWSMessage(body: Buffer): Promise<void> {
 		if (!authorizationFinished) {
 			if (authorization?.then) {
-				return authorization.then(
-					(resolvedAuth) => {
-						authorization = resolvedAuth;
-						if (checkAuthorization()) {
-							onWSMessage(body); // continue on, now that authorization succeeded
-						}
-					},
-					(error) => {
-						authorizationFinished = true;
-						logger.error?.(connectionId, 'Authorization failed', error);
-						// don't send disconnect because we want the client to potentially retry
-						close(1008, 'Unauthorized');
-					}
-				);
-			} else {
-				if (checkAuthorization()) {
-					onWSMessage(body); // continue on, now that authorization succeeded
+				try {
+					authorization = await authorization;
+				} catch (error) {
+					authorizationFinished = true;
+					logger.error?.(connectionId, 'Authorization failed', error);
+					// don't send disconnect because we want the client to potentially retry
+					close(1008, 'Unauthorized');
+					return;
 				}
+				if (!checkAuthorization()) return;
+			} else if (!checkAuthorization()) {
+				return;
 			}
-			return; // we recursively call onWSMessage if authorization succeeded/completed
+			// fall through to handle this message now that authorization succeeded
 		}
 		if (!authorization) return;
 		// A replication header should begin with either a transaction timestamp or messagepack message of
@@ -773,7 +795,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 									);
 								} else stream.end(blobBody);
 								if (stream.connectedToBlob) blobsInFlight.delete(fileId);
-							} else stream.write(blobBody);
+							} else if (!stream.write(blobBody)) {
+								// The PassThrough's internal queue is over its HWM, meaning the downstream
+								// file write (via pipeline in saveBlob) can't keep up. Pause the WS until the
+								// stream drains so blob chunks don't accumulate in memory faster than they
+								// can be flushed to disk. Also listen for 'close' so a destroyed stream
+								// (e.g. saveBlob error) doesn't strand the pause reason.
+								addPauseReason();
+								const release = () => {
+									stream.off('drain', release);
+									stream.off('close', release);
+									removePauseReason();
+								};
+								stream.on('drain', release);
+								stream.on('close', release);
+							}
 						} catch (error) {
 							logger.error?.(
 								`Error receiving blob for ${stream.recordId} from ${remoteNodeName} and streaming to storage`,
@@ -1601,6 +1637,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						event.nodeId
 					);
 					tableSubscriptionToReplicator.send(event);
+					// Per-record backpressure: a single large WS message can synchronously decode
+					// thousands of records, each holding a decoded value object and a closure over
+					// the source buffer. Without yielding here the consumer can never drain the
+					// queue mid-message and the worker heap balloons until it OOMs.
+					const queueLength = tableSubscriptionToReplicator.queue?.length ?? 0;
+					if (queueLength > RECEIVE_EVENT_HIGH_WATER_MARK) {
+						addPauseReason();
+						try {
+							await tableSubscriptionToReplicator.waitForDrain();
+						} finally {
+							removePauseReason();
+						}
+					}
 				}
 				decoder.position = start + eventLength;
 			} while (decoder.position < body.byteLength);
@@ -1614,9 +1663,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					'ingest'
 				);
 			}
-			if (outstandingCommits > MAX_OUTSTANDING_COMMITS && !replicationPaused) {
-				replicationPaused = true;
-				ws.pause();
+			if (outstandingCommits > MAX_OUTSTANDING_COMMITS && !commitBacklogPaused) {
+				commitBacklogPaused = true;
+				addPauseReason();
 				logger.debug?.(
 					`Commit backlog causing replication back-pressure, requesting that ${remoteNodeName} pause replication`
 				);
@@ -1639,9 +1688,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						}
 					}
 					outstandingCommits--;
-					if (replicationPaused) {
-						replicationPaused = false;
-						ws.resume();
+					if (commitBacklogPaused) {
+						commitBacklogPaused = false;
+						removePauseReason();
 						logger.debug?.(`Replication resuming ${remoteNodeName}`);
 					}
 					// if there are outstanding blobs to finish writing, delay commit receipts until they are finished (so that if we are interrupting
