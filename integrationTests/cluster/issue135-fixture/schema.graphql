@@ -1,0 +1,5 @@
+type ScoreEvidence @table @export {
+	id: ID @primaryKey
+	snapshotId: String @indexed
+	data: String
+}
