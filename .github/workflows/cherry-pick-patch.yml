@@ -20,7 +20,14 @@ on:
         description: 'PR number to cherry-pick onto the release branch'
         required: true
         type: string
-  pull_request:
+  # `pull_request_target` (not `pull_request`) so the workflow definition is
+  # always loaded from `main` regardless of what's on the PR's head ref. With
+  # `pull_request`, PRs branched off `main` before this workflow landed still
+  # use their own (outdated) copy and won't trigger on label events. The token
+  # has write scope; we mitigate the usual `pull_request_target` risk by
+  # pinning checkout to `main` and only running `git` against PR commits (no
+  # npm install or PR-controlled scripts executed in this workflow).
+  pull_request_target:
     types: [labeled, unlabeled, synchronize, closed]
     branches: [main]
 
@@ -39,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && (
+      (github.event_name == 'pull_request_target' && (
         (github.event.action == 'labeled' && github.event.label.name == 'patch') ||
         (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'patch')) ||
         (github.event.action == 'unlabeled' && github.event.label.name == 'patch') ||
