@@ -1100,11 +1100,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							const table = tableEntry.table;
 							const primaryStore = table.primaryStore;
 							const encoder = primaryStore.encoder;
+							// Force a reload the first time this connection touches each table:
+							// `primaryStore.encoder` is a process-wide singleton, so its typedStructs
+							// may have been populated to a stale length by prior activity on this
+							// thread, and this connection's initial TABLE_FIXED_STRUCTURE must reflect
+							// what's actually in LMDB right now. After this, HAS_STRUCTURE_UPDATE on
+							// subsequent audit records keeps the encoder in sync, since every
+							// typed-struct addition produces a flagged audit record.
 							if (
+								!tableEntry.structuresLoaded ||
 								auditRecord.extendedType & HAS_STRUCTURE_UPDATE ||
 								!encoder.typedStructs ||
 								auditRecord.structureVersion > encoder.typedStructs.length + encoder.structures.length
 							) {
+								tableEntry.structuresLoaded = true;
 								// there is a structure update, we need to reload the structure from storage.
 								// this is copied from msgpackr's struct, may want to expose as public method
 								encoder._mergeStructures(encoder.getStructures());
