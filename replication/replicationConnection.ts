@@ -206,6 +206,11 @@ export class NodeReplicationConnection extends EventEmitter {
 	retries = 0;
 	isConnected = true; // we start out assuming we will be connected
 	isFinished = false;
+	// Set when this connection should never reconnect: user-driven unsubscribe(), or the
+	// empty-subscription delayed close inside replicateOverWS. Distinct from `isFinished`,
+	// which is the post-close terminal marker. Anything else (protocol errors, peer
+	// DISCONNECT, etc.) leaves this false so the close handler schedules a retry.
+	intentionallyUnsubscribed = false;
 	nodeSubscriptions?: NodeSubscription[];
 	latency = 0;
 	replicateTablesByDefault: boolean;
@@ -248,18 +253,36 @@ export class NodeReplicationConnection extends EventEmitter {
 				});
 			}
 			this.isConnected = true;
-			session = replicateOverWS(
-				this.socket,
-				{
-					database: this.databaseName,
-					subscription: this.subscription,
-					url: this.url,
-					connection: this,
-					isSubscriptionConnection: this.nodeSubscriptions !== undefined,
-				},
-				{ replicates: true } // pre-authorized, but should only make publish: true if we are allowing reverse subscriptions
-			);
-			this.sessionResolve(session);
+			try {
+				session = replicateOverWS(
+					this.socket,
+					{
+						database: this.databaseName,
+						subscription: this.subscription,
+						url: this.url,
+						connection: this,
+						isSubscriptionConnection: this.nodeSubscriptions !== undefined,
+					},
+					{ replicates: true } // pre-authorized, but should only make publish: true if we are allowing reverse subscriptions
+				);
+				this.sessionResolve(session);
+			} catch (error) {
+				// replicateOverWS does a fair amount of synchronous setup (setDatabase, audit
+				// store wiring, ping bookkeeping) and any of it can throw — most worryingly,
+				// audit decoder corruption surfaced via setDatabase or the immediate getRange.
+				// Without this guard the throw escapes the WS 'open' listener as an
+				// uncaughtException, the socket stays open, sessionResolve is never called, no
+				// 'close' fires, and the retry timer in the close handler never gets scheduled —
+				// leaving the (peer, db) pair stuck with `connected: false` on main but no further
+				// activity until a process restart. Terminating the socket forces the close
+				// handler to run, which now retries.
+				logger.error?.(
+					`Error setting up replication session to ${this.url} (db: "${this.databaseName}"), terminating to retry`,
+					error
+				);
+				this.sessionReject(error);
+				this.socket.terminate();
+			}
 		});
 		this.socket.on('error', (error) => {
 			if (error.code === 'SELF_SIGNED_CERT_IN_CHAIN') {
@@ -277,21 +300,27 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.sessionReject(error);
 		});
 		this.socket.on('close', (code, reasonBuffer) => {
-			// if we get disconnected, notify subscriptions manager so we can reroute through another node
+			// Only treat the close as terminal when something explicitly marked it as a deliberate
+			// teardown (user unsubscribe or the empty-subscription delayed close). Protocol-level
+			// closes — peer DISCONNECT, unauthorized after open, node-name-mismatch, invalid
+			// sequence id, etc. — used to also set `isFinished` via replicateOverWS's close()
+			// helper, which left the connection silently dead and required hdb_nodes churn to
+			// recover. Those now fall through to the retry path below.
+			const intentional = this.intentionallyUnsubscribed;
 			if (this.isConnected) {
 				if (this.nodeSubscriptions) {
 					disconnectedFromNode({
 						name: this.nodeName,
 						database: this.databaseName,
 						url: this.url,
-						finished: this.socket.isFinished,
+						finished: intentional,
 					});
 				}
 				this.isConnected = false;
 			}
 			this.removeAllListeners('subscriptions-updated');
 
-			if (this.socket.isFinished) {
+			if (intentional) {
 				this.isFinished = true;
 				session?.end();
 				this.emit('finished');
@@ -327,7 +356,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.emit('subscriptions-updated', nodeSubscriptions);
 	}
 	unsubscribe() {
-		this.socket.isFinished = true;
+		this.intentionallyUnsubscribed = true;
 		this.socket.close(1008, 'No longer subscribed');
 	}
 
@@ -1100,11 +1129,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							const table = tableEntry.table;
 							const primaryStore = table.primaryStore;
 							const encoder = primaryStore.encoder;
+							// Force a reload the first time this connection touches each table:
+							// `primaryStore.encoder` is a process-wide singleton, so its typedStructs
+							// may have been populated to a stale length by prior activity on this
+							// thread, and this connection's initial TABLE_FIXED_STRUCTURE must reflect
+							// what's actually in LMDB right now. After this, HAS_STRUCTURE_UPDATE on
+							// subsequent audit records keeps the encoder in sync, since every
+							// typed-struct addition produces a flagged audit record.
 							if (
+								!tableEntry.structuresLoaded ||
 								auditRecord.extendedType & HAS_STRUCTURE_UPDATE ||
 								!encoder.typedStructs ||
 								auditRecord.structureVersion > encoder.typedStructs.length + encoder.structures.length
 							) {
+								tableEntry.structuresLoaded = true;
 								// there is a structure update, we need to reload the structure from storage.
 								// this is copied from msgpackr's struct, may want to expose as public method
 								encoder._mergeStructures(encoder.getStructures());
@@ -1770,12 +1808,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
 	});
 
-	function close(code?, reason?) {
+	function close(code?, reason?, intentional?: boolean) {
 		try {
-			ws.isFinished = true;
+			// Only the deliberate "we are done with this connection" call sites pass intentional=true
+			// (currently just the empty-subscription delayed close below). Everything else — auth
+			// failures after open, peer-initiated DISCONNECT, schema/sequence errors — is a
+			// transient protocol close that should reconnect, so we let the WS close event fall
+			// through to NodeReplicationConnection's normal retry path instead of marking the
+			// connection as finished or emitting 'finished' (which would remove it from the
+			// worker's connections map).
+			if (intentional && options.connection) options.connection.intentionallyUnsubscribed = true;
 			logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, code, reason);
 			ws.close(code, reason);
-			options.connection?.emit('finished'); // we want to synchronously indicate that the connection is finished, so it is not accidently reused
+			if (intentional) options.connection?.emit('finished'); // synchronously indicate that the connection is finished, so it is not accidentally reused
 		} catch (error) {
 			logger.error?.(connectionId, 'Error closing connection', error);
 		}
@@ -2110,7 +2155,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					const scheduled = performance.now();
 					delayedClose = setTimeout(() => {
 						// if we have not received any messages in a while, we can close the connection
-						if (lastMessageTime <= scheduled) close(1008, 'Connection has no subscriptions and is no longer used');
+						if (lastMessageTime <= scheduled)
+							close(1008, 'Connection has no subscriptions and is no longer used', true);
 						else scheduleClose();
 					}, DELAY_CLOSE_TIME).unref();
 				};
