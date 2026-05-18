@@ -262,6 +262,7 @@ export async function cloneNode(): Promise<void> {
 				password: leaderPassword,
 			};
 		}
+<<<<<<< HEAD
 	} else {
 		// We delete the clone-temp-admin user because now that HDB is installed we want user to come from the leader via replication
 		// systemExists check will show if this is the first time clone is being run.
@@ -269,6 +270,8 @@ export async function cloneNode(): Promise<void> {
 			const { databases } = await import('../core/resources/databases.js');
 			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
 		}
+=======
+>>>>>>> ab1b613 (fix: move clone-temp-admin deletion to after monitorSync)
 	}
 
 	// Restarting workers to ensure new configuration it loaded.
@@ -291,6 +294,19 @@ export async function cloneNode(): Promise<void> {
 
 	// Monitor the synchronization status of the databases after cloning and update availability status once sync is complete
 	await monitorSync();
+
+	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
+	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
+	// node with no users during setNode(), which prevents replication from being established.
+	// Runs on retry too (when systemExists but cloned not yet set) via !hdbConfig?.cloned.
+	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
+		try {
+			const { databases } = await import('../core/resources/databases.js');
+			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
+		} catch (err) {
+			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
+		}
+	}
 
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
