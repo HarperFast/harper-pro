@@ -206,6 +206,11 @@ export class NodeReplicationConnection extends EventEmitter {
 	retries = 0;
 	isConnected = true; // we start out assuming we will be connected
 	isFinished = false;
+	// Set when this connection should never reconnect: user-driven unsubscribe(), or the
+	// empty-subscription delayed close inside replicateOverWS. Distinct from `isFinished`,
+	// which is the post-close terminal marker. Anything else (protocol errors, peer
+	// DISCONNECT, etc.) leaves this false so the close handler schedules a retry.
+	intentionallyUnsubscribed = false;
 	nodeSubscriptions?: NodeSubscription[];
 	latency = 0;
 	replicateTablesByDefault: boolean;
@@ -301,7 +306,7 @@ export class NodeReplicationConnection extends EventEmitter {
 			// sequence id, etc. — used to also set `isFinished` via replicateOverWS's close()
 			// helper, which left the connection silently dead and required hdb_nodes churn to
 			// recover. Those now fall through to the retry path below.
-			const intentional = this.socket.intentionallyUnsubscribed === true;
+			const intentional = this.intentionallyUnsubscribed;
 			if (this.isConnected) {
 				if (this.nodeSubscriptions) {
 					disconnectedFromNode({
@@ -351,7 +356,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.emit('subscriptions-updated', nodeSubscriptions);
 	}
 	unsubscribe() {
-		this.socket.intentionallyUnsubscribed = true;
+		this.intentionallyUnsubscribed = true;
 		this.socket.close(1008, 'No longer subscribed');
 	}
 
@@ -1810,9 +1815,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 			// failures after open, peer-initiated DISCONNECT, schema/sequence errors — is a
 			// transient protocol close that should reconnect, so we let the WS close event fall
 			// through to NodeReplicationConnection's normal retry path instead of marking the
-			// socket as finished or emitting 'finished' (which would remove it from the worker's
-			// connections map).
-			if (intentional) ws.intentionallyUnsubscribed = true;
+			// connection as finished or emitting 'finished' (which would remove it from the
+			// worker's connections map).
+			if (intentional && options.connection) options.connection.intentionallyUnsubscribed = true;
 			logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, code, reason);
 			ws.close(code, reason);
 			if (intentional) options.connection?.emit('finished'); // synchronously indicate that the connection is finished, so it is not accidentally reused
