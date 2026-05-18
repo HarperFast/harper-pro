@@ -8,7 +8,7 @@ import { getThisNodeName } from '../core/server/nodeName.ts';
 import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
 import { isMainThread } from 'worker_threads';
 import { ClientError } from '../core/utility/errors/hdbError.js';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 

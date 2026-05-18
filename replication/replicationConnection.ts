@@ -31,7 +31,7 @@ import {
 	urlToNodeName,
 } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';

@@ -6,7 +6,7 @@ import { validateBySchema } from '../core/validation/validationWrapper.js';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 import { ClientError } from '../core/utility/errors/hdbError.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { replicateOperation } from '../replication/replicator.ts';
 
 // SSH key name can only be alphanumeric, dash and underscores
