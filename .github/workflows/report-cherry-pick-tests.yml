@@ -28,7 +28,11 @@ jobs:
       RUN_URL: ${{ github.event.workflow_run.html_url }}
 
     steps:
+      # Pin to `main` so the helper script is present. workflow_run already
+      # defaults to the default branch, but pin for clarity.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
 
       - name: Update sticky comment
         env:

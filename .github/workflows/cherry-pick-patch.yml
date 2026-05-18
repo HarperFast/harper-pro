@@ -52,8 +52,13 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
 
     steps:
+      # Pin to `main` so the helper script (.github/scripts/...) is always
+      # present in the working tree. For `pull_request` events the default
+      # checkout is the PR head — if the PR branched off before this script
+      # landed on main, the script is missing and the workflow fails.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
