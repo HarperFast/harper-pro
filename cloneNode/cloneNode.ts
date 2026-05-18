@@ -282,12 +282,17 @@ export async function cloneNode(): Promise<void> {
 				password: leaderPassword,
 			};
 		}
-	} else {
-		// We delete the clone-temp-admin user because now that HDB is installed we want user to come from the leader via replication
-		// systemExists check will show if this is the first time clone is being run.
-		if (!systemExists) {
+	}
+
+	// Delete the clone-temp-admin user now that replication will sync real users from the leader.
+	// Mirrors the creation condition in installHarper(): both cert-auth and token-auth paths create it.
+	// Also retries deletion when systemExists but cloned is not set, covering a failed-first-run retry.
+	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
+		try {
 			const { databases } = await import('../core/resources/databases.js');
 			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
+		} catch (err) {
+			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
 		}
 	}
 
