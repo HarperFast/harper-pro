@@ -284,18 +284,6 @@ export async function cloneNode(): Promise<void> {
 		}
 	}
 
-	// Delete the clone-temp-admin user now that replication will sync real users from the leader.
-	// Mirrors the creation condition in installHarper(): both cert-auth and token-auth paths create it.
-	// Also retries deletion when systemExists but cloned is not set, covering a failed-first-run retry.
-	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
-		try {
-			const { databases } = await import('../core/resources/databases.js');
-			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
-		} catch (err) {
-			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
-		}
-	}
-
 	// Restarting workers to ensure new configuration it loaded.
 	log('Restarting workers to apply new configuration');
 	const { restartWorkers } = await import('../core/server/threads/manageThreads.js');
@@ -316,6 +304,19 @@ export async function cloneNode(): Promise<void> {
 
 	// Monitor the synchronization status of the databases after cloning and update availability status once sync is complete
 	await monitorSync();
+
+	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
+	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
+	// node with no users during setNode(), which prevents replication from being established.
+	// Runs on retry too (when systemExists but cloned not yet set) via !hdbConfig?.cloned.
+	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
+		try {
+			const { databases } = await import('../core/resources/databases.js');
+			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
+		} catch (err) {
+			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
+		}
+	}
 
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
