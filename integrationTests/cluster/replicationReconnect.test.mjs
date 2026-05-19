@@ -25,12 +25,8 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import {
-	killHarper,
-	startHarper,
-	teardownHarper,
-	getNextAvailableLoopbackAddress,
-} from '@harperfast/integration-testing';
+import { killHarper, startHarper, teardownHarper } from '../../core/integrationTests/utils/harperLifecycle.ts';
+import { getNextAvailableLoopbackAddress } from '../../core/integrationTests/utils/loopbackAddressPool.ts';
 import { join } from 'node:path';
 import { sendOperation } from './clusterShared.mjs';
 
