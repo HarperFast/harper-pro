@@ -262,16 +262,6 @@ export async function cloneNode(): Promise<void> {
 				password: leaderPassword,
 			};
 		}
-<<<<<<< HEAD
-	} else {
-		// We delete the clone-temp-admin user because now that HDB is installed we want user to come from the leader via replication
-		// systemExists check will show if this is the first time clone is being run.
-		if (!systemExists) {
-			const { databases } = await import('../core/resources/databases.js');
-			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
-		}
-=======
->>>>>>> ab1b613 (fix: move clone-temp-admin deletion to after monitorSync)
 	}
 
 	// Restarting workers to ensure new configuration it loaded.
