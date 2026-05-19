@@ -232,14 +232,18 @@ if (!stressEnabled()) {
 
 			// (3) Convergence on record_count after the drain loop above.
 			// Allow ≤1% drift to absorb the last few in-flight commits that may
-			// not have replicated by the deadline — small keyspace means even a
-			// 1-record gap is >1% only at KEYSPACE < 100. For KEYSPACE=80 the
-			// gap must be 0; for KEYSPACE=200 a 1-record tail is OK.
+			// not have replicated by the deadline.
+			//
+			// We intentionally do NOT assert an upper bound against KEYSPACE —
+			// Harper's `sourcedFrom` cache may create new audit/record versions
+			// on each cache miss under high churn, so the live record_count can
+			// substantially exceed the unique-key count. The orphan repro is
+			// about blob lifecycle, not exact record cardinality.
 			const minCount = Math.min(aCount, bCount);
 			const maxCount = Math.max(aCount, bCount);
 			const drift = maxCount > 0 ? (maxCount - minCount) / maxCount : 0;
 			ok(drift < 0.01, `record_count diverged > 1%: A=${aCount} B=${bCount} drift ${(drift * 100).toFixed(2)}%`);
-			ok(maxCount > 0 && maxCount <= KEYSPACE, `record_count ${maxCount} outside (0, ${KEYSPACE}]`);
+			ok(maxCount > 0, `record_count must be > 0 (saw ${maxCount}); was the churn actually firing?`);
 
 			console.log(
 				`[orphan] completed: writes=${writes} aCount=${aCount} bCount=${bCount} ` +
