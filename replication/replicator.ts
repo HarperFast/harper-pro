@@ -21,7 +21,7 @@ import {
 	LATENCY_POSITION,
 } from './replicationConnection.ts';
 import { server } from '../core/server/Server.ts';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { verifyCertificate } from '../core/security/certificateVerification/index.ts';
 export { startOnMainThread } from './subscriptionManager.ts';
@@ -595,12 +595,21 @@ export function forEachReplicatedDatabase(options, callback) {
 	for (const databaseName of Object.getOwnPropertyNames(databases)) {
 		forDatabase(databaseName);
 	}
-	onRemovedDB((databaseName) => {
+	// Both listeners must be returned through the same handle, otherwise callers that
+	// .remove() the result still leak the dropDatabase listener forever — which over time
+	// trips MaxListenersExceededWarning on the global databaseEventsEmitter.
+	const removedListener = onRemovedDB((databaseName) => {
 		forDatabase(databaseName);
 	});
-	return onUpdatedTable((Table) => {
+	const updatedListener = onUpdatedTable((Table) => {
 		forDatabase(Table.databaseName);
 	});
+	return {
+		remove() {
+			removedListener.remove();
+			updatedListener.remove();
+		},
+	};
 	function forDatabase(databaseName) {
 		const database = databases[databaseName];
 		logger.trace('Checking replication status of ', databaseName, options?.databases);

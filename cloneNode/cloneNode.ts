@@ -9,7 +9,7 @@ import { request as httpRequest } from 'node:http';
 import yaml from 'yaml';
 import { decode as cborDecode } from 'cbor-x';
 
-import envMgr from '../core/utility/environment/environmentManager.js';
+import * as envMgr from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { isHdbInstalled } from '../core/utility/installation.js';
 import { getConfiguration, flattenConfig, createConfigFile, updateConfigValue } from '../core/config/configUtils.js';
@@ -282,13 +282,6 @@ export async function cloneNode(): Promise<void> {
 				password: leaderPassword,
 			};
 		}
-	} else {
-		// We delete the clone-temp-admin user because now that HDB is installed we want user to come from the leader via replication
-		// systemExists check will show if this is the first time clone is being run.
-		if (!systemExists) {
-			const { databases } = await import('../core/resources/databases.js');
-			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
-		}
 	}
 
 	// Restarting workers to ensure new configuration it loaded.
@@ -311,6 +304,19 @@ export async function cloneNode(): Promise<void> {
 
 	// Monitor the synchronization status of the databases after cloning and update availability status once sync is complete
 	await monitorSync();
+
+	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
+	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
+	// node with no users during setNode(), which prevents replication from being established.
+	// Runs on retry too (when systemExists but cloned not yet set) via !hdbConfig?.cloned.
+	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
+		try {
+			const { databases } = await import('../core/resources/databases.js');
+			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
+		} catch (err) {
+			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
+		}
+	}
 
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);

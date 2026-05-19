@@ -21,7 +21,7 @@ import {
 import * as logger from '../core/utility/logging/harper_logger.js';
 import lodash from 'lodash';
 const { cloneDeep } = lodash;
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { X509Certificate } from 'crypto';
 import minimist from 'minimist';
@@ -46,6 +46,13 @@ type ReplicationConnectionStatus = {
 type DBReplicationStatusMap = Map<string, ReplicationConnectionStatus> & { iterator: any };
 
 const NODE_SUBSCRIBE_DELAY = 200; // delay before sending node subscribe to other nodes, so operations can complete first
+// When a worker dies it may have been holding subscriptions for many (database, node) pairs.
+// All of those pairs fire onDatabase reassignments in the same tick, which would otherwise
+// slam a fresh worker with a burst of catchup connections and is the kind of pressure that
+// caused the OOM in the first place. We stagger the re-subscriptions in time so the new
+// worker(s) absorb them gradually.
+const WORKER_EXIT_REASSIGN_STAGGER_MS = 100;
+let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
 export let disconnectedFromNode; // this is set by thread to handle when a node is disconnected (or notify main thread so it can handle)
 export let connectedToNode; // this is set by thread to handle when a node is connected (or notify main thread so it can handle)
@@ -249,7 +256,10 @@ export async function startOnMainThread(options) {
 					if (dbReplicationWorkers.get(databaseName)?.worker === worker) {
 						// first verify it is still the worker
 						dbReplicationWorkers.delete(databaseName);
-						onDatabase(databaseName, tablesReplicateByDefault);
+						const now = Date.now();
+						nextWorkerExitReassignAt = Math.max(now, nextWorkerExitReassignAt) + WORKER_EXIT_REASSIGN_STAGGER_MS;
+						const delay = nextWorkerExitReassignAt - now;
+						setTimeout(() => onDatabase(databaseName, tablesReplicateByDefault), delay).unref();
 					}
 				});
 			}

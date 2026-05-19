@@ -10,6 +10,28 @@ This file provides guidance when working with code in this repository.
 
 ---
 
+## Submodule / Git Setup — Read Before Any Git Operation
+
+The `core/` subdirectory is a git submodule. Its git data lives at `.git/modules/core/`.
+
+**Do not run `git submodule deinit core` followed by re-init.** Doing so regenerates
+`.git/modules/core/config` without the required `core.worktree = ../../../core` setting.
+When that setting is absent, git treats the git data dir as its own work tree; the next
+`git checkout` deposits source files (including a `config/` directory) directly into
+`.git/modules/core/`, permanently shadowing git's config file and breaking all subsequent
+git operations for every agent until manually repaired.
+
+If `.git/modules/core/config` is ever recreated from scratch it **must** contain:
+```
+[core]
+    worktree = ../../../core
+```
+
+If you see source-tree directories (e.g. `server/`, `resources/`, `config/`) appearing
+inside `.git/modules/core/`, remove them immediately — they are corrupting the git data dir.
+
+---
+
 ## Pro-specific notes
 
 - **Linter**: oxlint with `--deny-warnings` (`npm run lint`), same as core.

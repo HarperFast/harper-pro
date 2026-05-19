@@ -1,6 +1,9 @@
 name: Sync Core
 
 on:
+  schedule:
+    # Nightly at 07:00 UTC (~midnight PT / 03:00 ET)
+    - cron: '0 7 * * *'
   repository_dispatch:
     types: [ sync_core ]
   workflow_dispatch:
@@ -13,8 +16,21 @@ jobs:
   sync-core:
     runs-on: ubuntu-latest
     steps:
+      # Mint a GitHub App token so the PR is authored by the HarperFast AI
+      # App, not GITHUB_TOKEN. This is required for downstream `pull_request`
+      # workflows (integration-tests, lint) to run on the PR — without them,
+      # auto-merge has no checks to gate on.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aefc7379e # v2.0.6
+        with:
+          app-id: ${{ secrets.HARPERFAST_AI_CLIENT_ID }}
+          private-key: ${{ secrets.HARPERFAST_AI_APP_PRIVATE_KEY }}
+
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -26,15 +42,28 @@ jobs:
         run: npm run core:sync
 
       - name: Create Pull Request
+        id: cpr
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           commit-message: 'feat: Sync Core'
           branch: sync-core-submodule
           title: 'chore: Sync Core'
           body: |
             Sync core submodule and update package.json dependencies.
             This PR was automatically created by the Sync Core workflow.
+
+            Auto-merge is enabled: this PR will merge automatically once
+            required status checks pass. If checks fail, the PR stays open
+            for manual review.
           labels: |
             automated pr
             core sync
+
+      - name: Enable auto-merge
+        if: steps.cpr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh pr merge --auto --squash --delete-branch \
+            "${{ steps.cpr.outputs.pull-request-number }}"

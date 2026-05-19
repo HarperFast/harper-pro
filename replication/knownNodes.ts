@@ -8,7 +8,7 @@ import { getThisNodeName } from '../core/server/nodeName.ts';
 import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
 import { isMainThread } from 'worker_threads';
 import { ClientError } from '../core/utility/errors/hdbError.js';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 
@@ -80,9 +80,9 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 		.then(async (events) => {
 			for await (const event of events) {
 				// remove any nodes that have been updated or deleted
-				const node_name = event?.value?.name;
+				const node_name = event?.value?.name || event?.id;
 				logger.debug?.('adding node', node_name, 'on  node', getThisNodeName(), ' on process', process.pid);
-				server.nodes = server.nodes.filter((node) => node.name !== node_name);
+				server.nodes = server.nodes.filter((node) => node && node.name !== node_name);
 				if (event.type === 'put' && node_name !== getThisNodeName()) {
 					// add any new nodes
 					if (event.value) server.nodes.push(event.value);
@@ -92,6 +92,7 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 				}
 				const shards = new Map();
 				for await (const node of getHDBNodeTable().search({})) {
+					if (!node) continue;
 					if (node.shard != undefined) {
 						let nodesForShard = shards.get(node.shard);
 						if (!nodesForShard) {
@@ -111,6 +112,7 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 
 	for (let entry of getHDBNodeTable().primaryStore.getRange({})) {
 		const { value: node, key } = entry;
+		if (!node) continue;
 		server.nodes.push(node);
 		if (node.shard != undefined) {
 			let nodesForShard = server.shards.get(node.shard);
@@ -194,6 +196,7 @@ replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void
 });
 function startSubscriptionToReplications() {
 	subscribeToNodeUpdates((nodeRecord) => {
+		if (!nodeRecord) return;
 		forEachReplicatedDatabase({}, (database, databaseName) => {
 			const node_name = nodeRecord.name;
 			let confirmationsForNode = replicationConfirmationFloat64s.get(node_name);

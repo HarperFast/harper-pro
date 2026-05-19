@@ -171,6 +171,10 @@ suite('Clone Node', (ctx) => {
 		equal(responseClone.mqtt?.network?.port, 1212, 'MQTT network port should be cloned');
 		equal(responseClone.cloned, true, 'Node should be marked as cloned');
 
+		// Verify clone-temp-admin was cleaned up after token-auth clone
+		const cloneUsers = await sendOperation(ctx.nodes[1], { operation: 'list_users' });
+		ok(!cloneUsers.some((u) => u.username === 'clone-temp-admin'), 'clone-temp-admin should not exist on cloned node');
+
 		// Verify that cluster status shows both nodes connected to each other
 		const clusterStatusNode1 = await sendOperation(ctx.nodes[0], {
 			operation: 'cluster_status',

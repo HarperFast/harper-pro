@@ -31,7 +31,7 @@ import {
 	urlToNodeName,
 } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
@@ -86,6 +86,11 @@ export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
 
 const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
+// When receiving a replication message, we apply per-record backpressure to keep a single
+// large batch from synchronously decoding thousands of records and ballooning the worker
+// heap past its limit. If the local replicator queue grows beyond this threshold we pause
+// the WS connection and wait for it to drain before continuing the decode loop.
+const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWaterMark') ?? 100;
 
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
@@ -201,6 +206,11 @@ export class NodeReplicationConnection extends EventEmitter {
 	retries = 0;
 	isConnected = true; // we start out assuming we will be connected
 	isFinished = false;
+	// Set when this connection should never reconnect: user-driven unsubscribe(), or the
+	// empty-subscription delayed close inside replicateOverWS. Distinct from `isFinished`,
+	// which is the post-close terminal marker. Anything else (protocol errors, peer
+	// DISCONNECT, etc.) leaves this false so the close handler schedules a retry.
+	intentionallyUnsubscribed = false;
 	nodeSubscriptions?: NodeSubscription[];
 	latency = 0;
 	replicateTablesByDefault: boolean;
@@ -243,18 +253,36 @@ export class NodeReplicationConnection extends EventEmitter {
 				});
 			}
 			this.isConnected = true;
-			session = replicateOverWS(
-				this.socket,
-				{
-					database: this.databaseName,
-					subscription: this.subscription,
-					url: this.url,
-					connection: this,
-					isSubscriptionConnection: this.nodeSubscriptions !== undefined,
-				},
-				{ replicates: true } // pre-authorized, but should only make publish: true if we are allowing reverse subscriptions
-			);
-			this.sessionResolve(session);
+			try {
+				session = replicateOverWS(
+					this.socket,
+					{
+						database: this.databaseName,
+						subscription: this.subscription,
+						url: this.url,
+						connection: this,
+						isSubscriptionConnection: this.nodeSubscriptions !== undefined,
+					},
+					{ replicates: true } // pre-authorized, but should only make publish: true if we are allowing reverse subscriptions
+				);
+				this.sessionResolve(session);
+			} catch (error) {
+				// replicateOverWS does a fair amount of synchronous setup (setDatabase, audit
+				// store wiring, ping bookkeeping) and any of it can throw — most worryingly,
+				// audit decoder corruption surfaced via setDatabase or the immediate getRange.
+				// Without this guard the throw escapes the WS 'open' listener as an
+				// uncaughtException, the socket stays open, sessionResolve is never called, no
+				// 'close' fires, and the retry timer in the close handler never gets scheduled —
+				// leaving the (peer, db) pair stuck with `connected: false` on main but no further
+				// activity until a process restart. Terminating the socket forces the close
+				// handler to run, which now retries.
+				logger.error?.(
+					`Error setting up replication session to ${this.url} (db: "${this.databaseName}"), terminating to retry`,
+					error
+				);
+				this.sessionReject(error);
+				this.socket.terminate();
+			}
 		});
 		this.socket.on('error', (error) => {
 			if (error.code === 'SELF_SIGNED_CERT_IN_CHAIN') {
@@ -272,21 +300,27 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.sessionReject(error);
 		});
 		this.socket.on('close', (code, reasonBuffer) => {
-			// if we get disconnected, notify subscriptions manager so we can reroute through another node
+			// Only treat the close as terminal when something explicitly marked it as a deliberate
+			// teardown (user unsubscribe or the empty-subscription delayed close). Protocol-level
+			// closes — peer DISCONNECT, unauthorized after open, node-name-mismatch, invalid
+			// sequence id, etc. — used to also set `isFinished` via replicateOverWS's close()
+			// helper, which left the connection silently dead and required hdb_nodes churn to
+			// recover. Those now fall through to the retry path below.
+			const intentional = this.intentionallyUnsubscribed;
 			if (this.isConnected) {
 				if (this.nodeSubscriptions) {
 					disconnectedFromNode({
 						name: this.nodeName,
 						database: this.databaseName,
 						url: this.url,
-						finished: this.socket.isFinished,
+						finished: intentional,
 					});
 				}
 				this.isConnected = false;
 			}
 			this.removeAllListeners('subscriptions-updated');
 
-			if (this.socket.isFinished) {
+			if (intentional) {
 				this.isFinished = true;
 				session?.end();
 				this.emit('finished');
@@ -322,7 +356,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.emit('subscriptions-updated', nodeSubscriptions);
 	}
 	unsubscribe() {
-		this.socket.isFinished = true;
+		this.intentionallyUnsubscribed = true;
 		this.socket.close(1008, 'No longer subscribed');
 	}
 
@@ -455,13 +489,37 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	const MAX_OUTSTANDING_BLOBS_BEING_SENT = env.get(CONFIG_PARAMS.REPLICATION_BLOBCONCURRENCY) ?? 5;
 	let outstandingCommits = 0;
 	let lastStructureLength = 0;
-	let replicationPaused = false;
+	// Multiple independent conditions can ask to pause receive on this WS (commit backlog,
+	// consumer queue full, blob write backpressure). We refcount the reasons so that resuming
+	// one does not race ahead of another that still wants the WS paused.
+	let pauseReasons = 0;
+	let commitBacklogPaused = false;
+	function addPauseReason(): void {
+		if (pauseReasons === 0) ws.pause();
+		pauseReasons++;
+	}
+	function removePauseReason(): void {
+		if (pauseReasons === 0) return;
+		pauseReasons--;
+		if (pauseReasons === 0) ws.resume();
+	}
 	let subscriptionRequest, auditSubscription;
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
-	ws.on('message', onWSMessage);
+	// Serialize message handling so that async backpressure inside onWSMessage doesn't allow
+	// the WS library to start processing the next frame before the current one is fully decoded.
+	// Without serialization, awaiting inside the handler would let concurrent message handlers
+	// share the consumer queue and defeat the per-record backpressure below.
+	let messageProcessing: Promise<void> = Promise.resolve();
+	let wsClosed = false;
+	ws.on('message', (body: Buffer) => {
+		messageProcessing = messageProcessing.then(
+			() => (wsClosed ? undefined : onWSMessage(body)),
+			() => (wsClosed ? undefined : onWSMessage(body))
+		);
+	});
 	let authorizationFinished = false;
 	function checkAuthorization(): boolean {
 		authorizationFinished = true;
@@ -473,29 +531,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		}
 		return true;
 	}
-	function onWSMessage(body: Buffer) {
+	async function onWSMessage(body: Buffer): Promise<void> {
 		if (!authorizationFinished) {
 			if (authorization?.then) {
-				return authorization.then(
-					(resolvedAuth) => {
-						authorization = resolvedAuth;
-						if (checkAuthorization()) {
-							onWSMessage(body); // continue on, now that authorization succeeded
-						}
-					},
-					(error) => {
-						authorizationFinished = true;
-						logger.error?.(connectionId, 'Authorization failed', error);
-						// don't send disconnect because we want the client to potentially retry
-						close(1008, 'Unauthorized');
-					}
-				);
-			} else {
-				if (checkAuthorization()) {
-					onWSMessage(body); // continue on, now that authorization succeeded
+				try {
+					authorization = await authorization;
+				} catch (error) {
+					authorizationFinished = true;
+					logger.error?.(connectionId, 'Authorization failed', error);
+					// don't send disconnect because we want the client to potentially retry
+					close(1008, 'Unauthorized');
+					return;
 				}
+				if (!checkAuthorization()) return;
+			} else if (!checkAuthorization()) {
+				return;
 			}
-			return; // we recursively call onWSMessage if authorization succeeded/completed
+			// fall through to handle this message now that authorization succeeded
 		}
 		if (!authorization) return;
 		// A replication header should begin with either a transaction timestamp or messagepack message of
@@ -542,9 +594,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 										schemaUpdateListener = forEachReplicatedDatabase(options, (database, databaseName) => {
 											if (checkDatabaseAccess(databaseName)) sendDBSchema(databaseName);
 										});
-										ws.on('close', () => {
-											schemaUpdateListener?.remove();
-										});
+										// onWSMessage is async, so the WS may have already closed by the time we get
+										// here — in that case 'close' has fired and adding the cleanup listener now
+										// would silently leak. Drop the registration immediately.
+										if (wsClosed) {
+											schemaUpdateListener.remove();
+											schemaUpdateListener = undefined;
+										} else {
+											ws.on('close', () => {
+												schemaUpdateListener?.remove();
+											});
+										}
 									}
 								} catch (error) {
 									// if this fails, we should close the connection and indicate that we should not reconnect
@@ -773,7 +833,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 									);
 								} else stream.end(blobBody);
 								if (stream.connectedToBlob) blobsInFlight.delete(fileId);
-							} else stream.write(blobBody);
+							} else if (!stream.write(blobBody)) {
+								// The PassThrough's internal queue is over its HWM, meaning the downstream
+								// file write (via pipeline in saveBlob) can't keep up. Pause the WS until the
+								// stream drains so blob chunks don't accumulate in memory faster than they
+								// can be flushed to disk. Also listen for 'close' so a destroyed stream
+								// (e.g. saveBlob error) doesn't strand the pause reason.
+								addPauseReason();
+								const release = () => {
+									stream.off('drain', release);
+									stream.off('close', release);
+									removePauseReason();
+								};
+								stream.on('drain', release);
+								stream.on('close', release);
+							}
 						} catch (error) {
 							logger.error?.(
 								`Error receiving blob for ${stream.recordId} from ${remoteNodeName} and streaming to storage`,
@@ -1055,11 +1129,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							const table = tableEntry.table;
 							const primaryStore = table.primaryStore;
 							const encoder = primaryStore.encoder;
+							// Force a reload the first time this connection touches each table:
+							// `primaryStore.encoder` is a process-wide singleton, so its typedStructs
+							// may have been populated to a stale length by prior activity on this
+							// thread, and this connection's initial TABLE_FIXED_STRUCTURE must reflect
+							// what's actually in LMDB right now. After this, HAS_STRUCTURE_UPDATE on
+							// subsequent audit records keeps the encoder in sync, since every
+							// typed-struct addition produces a flagged audit record.
 							if (
+								!tableEntry.structuresLoaded ||
 								auditRecord.extendedType & HAS_STRUCTURE_UPDATE ||
 								!encoder.typedStructs ||
 								auditRecord.structureVersion > encoder.typedStructs.length + encoder.structures.length
 							) {
+								tableEntry.structuresLoaded = true;
 								// there is a structure update, we need to reload the structure from storage.
 								// this is copied from msgpackr's struct, may want to expose as public method
 								encoder._mergeStructures(encoder.getStructures());
@@ -1344,6 +1427,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 											close();
 										}
 									});
+									// We are inside an async .then(); if the WS closed while waiting for it to
+									// resolve, attaching a 'close' handler now will not fire and the listeners
+									// above would stay subscribed on the global databaseEventsEmitter forever.
+									if (wsClosed) {
+										schemaUpdateListener.remove();
+										dbRemovalListener.remove();
+										schemaUpdateListener = undefined;
+										dbRemovalListener = undefined;
+										return;
+									}
 									ws.on('close', () => {
 										schemaUpdateListener?.remove();
 										dbRemovalListener?.remove();
@@ -1601,6 +1694,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						event.nodeId
 					);
 					tableSubscriptionToReplicator.send(event);
+					// Per-record backpressure: a single large WS message can synchronously decode
+					// thousands of records, each holding a decoded value object and a closure over
+					// the source buffer. Without yielding here the consumer can never drain the
+					// queue mid-message and the worker heap balloons until it OOMs.
+					const queueLength = tableSubscriptionToReplicator.queue?.length ?? 0;
+					if (queueLength > RECEIVE_EVENT_HIGH_WATER_MARK) {
+						addPauseReason();
+						try {
+							await tableSubscriptionToReplicator.waitForDrain();
+						} finally {
+							removePauseReason();
+						}
+					}
 				}
 				decoder.position = start + eventLength;
 			} while (decoder.position < body.byteLength);
@@ -1614,9 +1720,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					'ingest'
 				);
 			}
-			if (outstandingCommits > MAX_OUTSTANDING_COMMITS && !replicationPaused) {
-				replicationPaused = true;
-				ws.pause();
+			if (outstandingCommits > MAX_OUTSTANDING_COMMITS && !commitBacklogPaused) {
+				commitBacklogPaused = true;
+				addPauseReason();
 				logger.debug?.(
 					`Commit backlog causing replication back-pressure, requesting that ${remoteNodeName} pause replication`
 				);
@@ -1639,9 +1745,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						}
 					}
 					outstandingCommits--;
-					if (replicationPaused) {
-						replicationPaused = false;
-						ws.resume();
+					if (commitBacklogPaused) {
+						commitBacklogPaused = false;
+						removePauseReason();
 						logger.debug?.(`Replication resuming ${remoteNodeName}`);
 					}
 					// if there are outstanding blobs to finish writing, delay commit receipts until they are finished (so that if we are interrupting
@@ -1689,6 +1795,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	});
 	ws.on('close', (code, reasonBuffer) => {
 		// cleanup
+		wsClosed = true;
 		clearInterval(sendPingInterval);
 		clearTimeout(receivePingTimer);
 		clearInterval(blobsTimer);
@@ -1701,12 +1808,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
 	});
 
-	function close(code?, reason?) {
+	function close(code?, reason?, intentional?: boolean) {
 		try {
-			ws.isFinished = true;
+			// Only the deliberate "we are done with this connection" call sites pass intentional=true
+			// (currently just the empty-subscription delayed close below). Everything else — auth
+			// failures after open, peer-initiated DISCONNECT, schema/sequence errors — is a
+			// transient protocol close that should reconnect, so we let the WS close event fall
+			// through to NodeReplicationConnection's normal retry path instead of marking the
+			// connection as finished or emitting 'finished' (which would remove it from the
+			// worker's connections map).
+			if (intentional && options.connection) options.connection.intentionallyUnsubscribed = true;
 			logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, code, reason);
 			ws.close(code, reason);
-			options.connection?.emit('finished'); // we want to synchronously indicate that the connection is finished, so it is not accidently reused
+			if (intentional) options.connection?.emit('finished'); // synchronously indicate that the connection is finished, so it is not accidentally reused
 		} catch (error) {
 			logger.error?.(connectionId, 'Error closing connection', error);
 		}
@@ -1808,15 +1922,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 			tableSubscriptionToReplicator.auditStore?.rootStore
 		);
 		if (finished) {
-			finished.blobId = blobId;
-			outstandingBlobsToFinish.push(finished);
-			finished
+			// We log the rejection via .catch() and also need the resulting promise — not the
+			// raw `finished` — to be what we hand to `Promise.all(outstandingBlobsToFinish)` in
+			// the end_txn onCommit path below. If we pushed `finished` directly, a save
+			// rejection would surface to that `await Promise.all(...)` as an unhandled error
+			// even though we already logged it here, and it would escape onCommit as an
+			// uncaughtException — observed in prod as ~35/sec ENOENT spam during catch-up.
+			const tracked = finished
 				.catch((err) => logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err))
 				.finally(() => {
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
-					const index = outstandingBlobsToFinish.indexOf(finished);
+					const index = outstandingBlobsToFinish.indexOf(tracked);
 					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
 				});
+			tracked.blobId = blobId;
+			outstandingBlobsToFinish.push(tracked);
 		}
 		return localBlob;
 	}
@@ -2035,7 +2155,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					const scheduled = performance.now();
 					delayedClose = setTimeout(() => {
 						// if we have not received any messages in a while, we can close the connection
-						if (lastMessageTime <= scheduled) close(1008, 'Connection has no subscriptions and is no longer used');
+						if (lastMessageTime <= scheduled)
+							close(1008, 'Connection has no subscriptions and is no longer used', true);
 						else scheduleClose();
 					}, DELAY_CLOSE_TIME).unref();
 				};
