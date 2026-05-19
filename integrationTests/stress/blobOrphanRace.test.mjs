@@ -126,7 +126,10 @@ if (!stressEnabled()) {
 		});
 
 		test('heavy supersede churn does not orphan blobs on the sender', async () => {
-			const [A, B] = ctx.nodes;
+			const A = ctx.nodes[0];
+			// `B` reassigned after mid-test restart below so post-restart
+			// reads (operations, readLog) see the new harper handle.
+			let B = ctx.nodes[1];
 			const startedAt = Date.now();
 			const endAt = startedAt + TOTAL_MINUTES * 60_000;
 
@@ -163,18 +166,28 @@ if (!stressEnabled()) {
 				if (!restarted && Date.now() >= restartAt) {
 					console.log(`[orphan] mid-test restart of B (${B.hostname})`);
 					await killHarper({ harper: B });
-					await startHarper(
-						{ name: ctx.name, harper: { dataRootDir: B.dataRootDir, hostname: B.hostname } },
-						{
-							config: {
-								analytics: { aggregatePeriod: -1 },
-								logging: { colors: false, console: true, level: 'debug' },
-								replication: { securePort: B.hostname + ':9933' },
-								threads: { count: THREADS_PER_NODE },
-							},
-							env: { HARPER_NO_FLUSH_ON_EXIT: true },
-						}
-					);
+					// Capture the new harper handle and update ctx.nodes[1] (and
+					// the local `B` alias via reassignment below) so all later
+					// references — including `readLog(B)` at assertion time —
+					// see the post-restart context. The `logDir` path happens
+					// to be hostname-derived and stable across restarts, so
+					// log capture would work either way; this is still the
+					// right hygiene, matching the soak + adversity tests.
+					const restartCtx = {
+						name: ctx.name,
+						harper: { dataRootDir: B.dataRootDir, hostname: B.hostname },
+					};
+					await startHarper(restartCtx, {
+						config: {
+							analytics: { aggregatePeriod: -1 },
+							logging: { colors: false, console: true, level: 'debug' },
+							replication: { securePort: B.hostname + ':9933' },
+							threads: { count: THREADS_PER_NODE },
+						},
+						env: { HARPER_NO_FLUSH_ON_EXIT: true },
+					});
+					ctx.nodes[1] = restartCtx.harper;
+					B = restartCtx.harper;
 					restarted = true;
 				}
 				const minsLeft = Math.ceil((endAt - Date.now()) / 60_000);
