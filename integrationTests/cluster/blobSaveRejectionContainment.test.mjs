@@ -93,17 +93,22 @@ suite('Receive-side blob save rejection containment', { timeout: 180000 }, (ctx)
 			await delay(200 * (retries + 1));
 		}
 
-		// Deploy the blob-bearing Location component to A. `replicated: true` causes
-		// it to be installed on B as well — the injector + Location coexist on B.
-		const payload = await targz(join(import.meta.dirname, 'fixture'));
+		// Deploy a blob-bearing component to A. `replicated: true` causes it to be
+		// installed on B as well, where the injector + LargeLocation coexist.
+		// Using fixture-large-blob-source rather than the shared `fixture/` because
+		// the latter's blobs are 7,500 bytes — under Harper's FILE_STORAGE_THRESHOLD
+		// (8192) so they're stored inline and never hit createWriteStream on B,
+		// defeating this test. LargeLocation produces 50 KB blobs which always
+		// go through the file-backed write path.
+		const payload = await targz(join(import.meta.dirname, 'fixture-large-blob-source'));
 		const deployResp = await sendOperation(ctx.nodes[0], {
 			operation: 'deploy_component',
-			project: 'test-application',
+			project: 'large-blob-source',
 			payload,
 			replicated: true,
 			restart: true,
 		});
-		equal(deployResp.message, 'Successfully deployed: test-application, restarting Harper');
+		equal(deployResp.message, 'Successfully deployed: large-blob-source, restarting Harper');
 		// Give both nodes time to come back up after the restart.
 		await delay(35000);
 
@@ -124,12 +129,12 @@ suite('Receive-side blob save rejection containment', { timeout: 180000 }, (ctx)
 	test('blob save ENOENT is logged exactly once and never escapes as uncaughtException', async () => {
 		const [A, B] = ctx.nodes;
 
-		// Generate blob-bearing replication traffic by hitting /Location/{id} on A.
-		// Each request triggers `sourcedFrom.get(id)` on A → record + streamed blob
-		// committed → replicated to B → B's createWriteStream is patched to fail
+		// Generate blob-bearing replication traffic by hitting /LargeLocation/{id} on A.
+		// Each request triggers `sourcedFrom.get(id)` on A → record + 50 KB streamed
+		// blob committed → replicated to B → B's createWriteStream is patched to fail
 		// every FAIL_INTERVALth call.
 		const { execute, finish } = concurrent(
-			() => fetchWithRetry(A.httpURL + '/Location/' + Math.floor(Math.random() * BLOB_REQUESTS)),
+			() => fetchWithRetry(A.httpURL + '/LargeLocation/' + Math.floor(Math.random() * BLOB_REQUESTS)),
 			20
 		);
 		for (let i = 0; i < BLOB_REQUESTS; i++) await execute();
@@ -178,12 +183,12 @@ suite('Receive-side blob save rejection containment', { timeout: 180000 }, (ctx)
 		await sendOperation(A, {
 			operation: 'upsert',
 			database: 'data',
-			table: 'Location',
-			records: [{ id: 999_999, name: 'liveness probe', random: 0.5 }],
+			table: 'LargeLocation',
+			records: [{ id: 999_999, name: 'liveness probe' }],
 		});
 		let liveness = false;
 		for (let r = 0; r < 20; r++) {
-			const resp = await fetchWithRetry(B.httpURL + '/Location/999999', { retries: 0 }).catch(() => null);
+			const resp = await fetchWithRetry(B.httpURL + '/LargeLocation/999999', { retries: 0 }).catch(() => null);
 			if (resp?.ok) {
 				const body = await resp.json();
 				if (body?.name === 'liveness probe') {
