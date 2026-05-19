@@ -43,7 +43,7 @@ import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptio
 import { EventEmitter } from 'events';
 import { createTLSSelector } from '../core/security/keys.js';
 import * as tls from 'node:tls';
-import { getHDBNodeTable, getNodeURL, getReplicationSharedStatus, type Node } from './knownNodes.ts';
+import { getHDBNodeTable, getNodeURL, getReplicationSharedStatus } from './knownNodes.ts';
 import * as process from 'node:process';
 import { isIP } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';

@@ -14,7 +14,6 @@ import {
 	getHDBNodeTable,
 	iterateRoutes,
 	shouldReplicateFromNode,
-	type Node,
 	type Route,
 	getNodeURL,
 } from './knownNodes.ts';
