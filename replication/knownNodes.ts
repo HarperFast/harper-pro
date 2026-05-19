@@ -240,7 +240,7 @@ function startSubscriptionToReplications() {
 				if (auditStore) break;
 			}
 			if (auditStore) {
-				const replicatedTime = getReplicationSharedStatus(auditStore, databaseName, nodeNameAtUpdate, () => {
+				const replicatedTime: Float64Array & { lastTime?: number } = getReplicationSharedStatus(auditStore, databaseName, nodeNameAtUpdate, () => {
 					const updatedTime = replicatedTime[0];
 					const lastTime = replicatedTime.lastTime;
 					for (const { txnTime, onConfirm } of commitsAwaitingReplication.get(databaseName) || []) {
@@ -314,7 +314,7 @@ export function* iterateRoutes(options: { routes: (Route | any)[] }) {
 
 export function getNodeURL(node: Node): string {
 	if (node.url) return node.url;
-	const host = node.name;
+	let host = node.name;
 	const securePort = env.get(CONFIG_PARAMS.REPLICATION_SECUREPORT);
 	let port: any;
 	// if the host includes a port, use that port
