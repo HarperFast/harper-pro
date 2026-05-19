@@ -9,7 +9,7 @@ import { request as httpRequest } from 'node:http';
 import yaml from 'yaml';
 import { decode as cborDecode } from 'cbor-x';
 
-import envMgr from '../core/utility/environment/environmentManager.js';
+import * as envMgr from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { isHdbInstalled } from '../core/utility/installation.js';
 import { getConfiguration, flattenConfig, createConfigFile, updateConfigValue } from '../core/config/configUtils.js';

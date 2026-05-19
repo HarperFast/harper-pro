@@ -18,7 +18,7 @@ import {
 	getPrimaryHostName,
 	setCertTable,
 } from '../core/security/keys.js';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { LICENSE_KEY_DIR_NAME } from '../core/utility/hdbTerms.ts';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 import { getThisNodeName } from '../core/server/nodeName.ts';
@@ -117,7 +117,11 @@ export async function createCsr() {
 	const hdbKeysDir = join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME);
 	let opsCert, opsPrivateKey, certName, privateKeyName;
 	for await (const cert of certificateTable.search([])) {
-		if (cert.is_self_signed && (cert.details?.issuer?.includes('Harper-Certificate-Authority') || cert.details?.issuer?.includes('HarperDB-Certificate-Authority'))) {
+		if (
+			cert.is_self_signed &&
+			(cert.details?.issuer?.includes('Harper-Certificate-Authority') ||
+				cert.details?.issuer?.includes('HarperDB-Certificate-Authority'))
+		) {
 			// privateKeys Map is populated from config-referenced paths only, so a Harper CA key
 			// on disk but not referenced in config won't appear there — fall back to reading it.
 			let key: string | Buffer | undefined = privateKeys.get(cert.private_key_name);

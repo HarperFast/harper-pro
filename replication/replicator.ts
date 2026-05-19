@@ -21,7 +21,7 @@ import {
 	LATENCY_POSITION,
 } from './replicationConnection.ts';
 import { server } from '../core/server/Server.ts';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { verifyCertificate } from '../core/security/certificateVerification/index.ts';
 export { startOnMainThread } from './subscriptionManager.ts';

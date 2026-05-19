@@ -21,7 +21,7 @@ import {
 import * as logger from '../core/utility/logging/harper_logger.js';
 import lodash from 'lodash';
 const { cloneDeep } = lodash;
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { X509Certificate } from 'crypto';
 import minimist from 'minimist';
