@@ -61,19 +61,29 @@ export function concurrent(task, concurrency = 20) {
 
 /**
  * Read the hdb.log file for a given Harper node.
+ *
+ * When the integration-testing harness is configured with
+ * `HARPER_INTEGRATION_TEST_LOG_DIR` (as it is in CI), Harper's `logging.root` is
+ * redirected to a per-suite directory exposed on `ctx.harper.logDir` rather than
+ * `{dataRootDir}/log`. We check both so the helper works locally and in CI.
+ *
  * Reads the full file each time — fine for short replays, callers needing only
  * recent lines can filter by timestamp themselves.
  */
 export async function readLog(node) {
 	const { readFile } = await import('node:fs/promises');
 	const { join } = await import('node:path');
-	const path = join(node.dataRootDir, 'log', 'hdb.log');
-	try {
-		return await readFile(path, 'utf8');
-	} catch (err) {
-		if (err.code === 'ENOENT') return '';
-		throw err;
+	const candidates = [];
+	if (node.logDir) candidates.push(join(node.logDir, 'hdb.log'));
+	if (node.dataRootDir) candidates.push(join(node.dataRootDir, 'log', 'hdb.log'));
+	for (const path of candidates) {
+		try {
+			return await readFile(path, 'utf8');
+		} catch (err) {
+			if (err.code !== 'ENOENT') throw err;
+		}
 	}
+	return '';
 }
 
 /**
