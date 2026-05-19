@@ -179,7 +179,11 @@ suite('Receive-side blob save rejection containment', { timeout: 180000 }, (ctx)
 			'B should still report A connected on every database socket'
 		);
 
-		// Liveness: a fresh write on A should still propagate to B.
+		// Liveness: a fresh write on A should still propagate to B. We check via
+		// `describe_table` on both sides — a direct, unambiguous count comparison
+		// that doesn't depend on REST routing semantics for a `sourcedFrom` table
+		// (where GET on a partial record can re-invoke the cache miss handler).
+		const beforeB = (await sendOperation(B, { operation: 'describe_table', table: 'LargeLocation' })).record_count;
 		await sendOperation(A, {
 			operation: 'upsert',
 			database: 'data',
@@ -188,13 +192,10 @@ suite('Receive-side blob save rejection containment', { timeout: 180000 }, (ctx)
 		});
 		let liveness = false;
 		for (let r = 0; r < 20; r++) {
-			const resp = await fetchWithRetry(B.httpURL + '/LargeLocation/999999', { retries: 0 }).catch(() => null);
-			if (resp?.ok) {
-				const body = await resp.json();
-				if (body?.name === 'liveness probe') {
-					liveness = true;
-					break;
-				}
+			const afterB = (await sendOperation(B, { operation: 'describe_table', table: 'LargeLocation' })).record_count;
+			if (afterB > beforeB) {
+				liveness = true;
+				break;
 			}
 			await delay(500);
 		}
