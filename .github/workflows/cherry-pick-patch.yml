@@ -198,8 +198,13 @@ jobs:
             "$STICKY_MARKER" "$RELEASE_BRANCH" "$CONFLICTS" "$BRANCH" "$BRANCH" "$BRANCH" "$PR_NUMBER" "$RELEASE_BRANCH")
           node "$RUNNER_TEMP/upsert-sticky-comment.js" "$PR_NUMBER" "$STICKY_MARKER" "$BODY"
 
-      # ── Success path (open PR): trigger integration tests ───────────────
-      - name: Trigger integration tests
+      # ── Success path (open PR): trigger integration tests, wait, report ─
+      #
+      # We poll for completion inline instead of using a separate
+      # `workflow_run`-triggered workflow because `workflow_run` events do not
+      # fire for `workflow_dispatch`-triggered runs on non-default branches —
+      # so a downstream reporter never sees the cherry-pick run finish.
+      - name: Trigger integration tests and wait for completion
         if: github.event.action != 'unlabeled' && steps.pick.outputs.is_merged != 'true' && steps.pick.outputs.conflicts == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -208,23 +213,48 @@ jobs:
           BRANCH="${{ steps.pick.outputs.branch }}"
           gh workflow run integration-tests.yaml --ref "$BRANCH" --repo "$GITHUB_REPOSITORY"
 
-          # Best-effort: find the dispatched run id (poll briefly)
-          RUN_URL=""
+          # Locate the dispatched run id (workflow run creation is async)
+          RUN_ID=""
           for _ in 1 2 3 4 5 6 7 8 9 10; do
             sleep 3
             RUN_ID=$(gh run list --workflow=integration-tests.yaml --branch "$BRANCH" --limit 1 --json databaseId --jq '.[0].databaseId' || true)
-            if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
-              RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
-              break
-            fi
+            if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then break; fi
           done
 
-          if [ -n "$RUN_URL" ]; then
-            RUN_LINE="Integration tests: $RUN_URL"
-          else
-            RUN_LINE="Integration tests dispatched; the report-cherry-pick-tests workflow will update this comment on completion."
+          post_sticky() {
+            local heading="$1"
+            local run_line="$2"
+            local body
+            body=$(printf '%s\n## Patch cherry-pick: %s\n\nCherry-picked PR #%s onto `%s` at branch [`%s`](../tree/%s).\n%s\n\nOn merge of this PR the cherry-pick branch will be fast-forwarded into `%s`.\n' \
+              "$STICKY_MARKER" "$heading" "$PR_NUMBER" "$RELEASE_BRANCH" "$BRANCH" "$BRANCH" "$run_line" "$RELEASE_BRANCH")
+            node "$RUNNER_TEMP/upsert-sticky-comment.js" "$PR_NUMBER" "$STICKY_MARKER" "$body"
+          }
+
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            post_sticky "tests dispatched" "Integration tests dispatched; could not locate run id to wait on."
+            exit 0
           fi
 
-          BODY=$(printf '%s\n## Patch cherry-pick: tests running\n\nCherry-picked PR #%s onto `%s` at branch [`%s`](../tree/%s).\n%s\n\nOn merge of this PR the cherry-pick branch will be fast-forwarded into `%s`.\n' \
-            "$STICKY_MARKER" "$PR_NUMBER" "$RELEASE_BRANCH" "$BRANCH" "$BRANCH" "$RUN_LINE" "$RELEASE_BRANCH")
-          node "$RUNNER_TEMP/upsert-sticky-comment.js" "$PR_NUMBER" "$STICKY_MARKER" "$BODY"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
+          post_sticky "tests running" "Integration tests: $RUN_URL"
+
+          # Poll until completion (30s interval, ~30 min max)
+          STATUS=""
+          CONCLUSION=""
+          for _ in $(seq 1 60); do
+            sleep 30
+            RUN_JSON=$(gh run view "$RUN_ID" --json status,conclusion --repo "$GITHUB_REPOSITORY" 2>/dev/null || true)
+            STATUS=$(echo "$RUN_JSON" | jq -r '.status // empty')
+            CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion // empty')
+            if [ "$STATUS" = "completed" ]; then break; fi
+          done
+
+          case "$CONCLUSION" in
+            success) STATUS_LINE='✅ passed' ;;
+            failure) STATUS_LINE='❌ failed' ;;
+            cancelled) STATUS_LINE='⚪ cancelled' ;;
+            "") STATUS_LINE='⏱️ timed out waiting' ;;
+            *) STATUS_LINE="⚠️ $CONCLUSION" ;;
+          esac
+
+          post_sticky "tests $STATUS_LINE" "Integration tests: **$STATUS_LINE** — $RUN_URL"
