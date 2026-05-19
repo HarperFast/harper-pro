@@ -225,19 +225,23 @@ if (!stressEnabled()) {
 				await killHarper({ harper: victim });
 
 				// Restart — preserves dataRootDir and hostname so it rejoins the
-				// existing cluster state.
-				await startHarper(
-					{ name: ctx.name, harper: { dataRootDir: victim.dataRootDir, hostname: victim.hostname } },
-					{
-						config: {
-							analytics: { aggregatePeriod: -1 },
-							logging: { colors: false, console: true, level: 'warn' },
-							replication: { securePort: victim.hostname + ':9933' },
-							threads: { count: THREADS_PER_NODE },
-						},
-						env: { HARPER_NO_FLUSH_ON_EXIT: true },
-					}
-				);
+				// existing cluster state. Update ctx.nodes[victimIdx] with the new
+				// handle so subsequent same-node cycles (when round-robin wraps)
+				// kill the actually-running process, not a stale reference.
+				const restartCtx = {
+					name: ctx.name,
+					harper: { dataRootDir: victim.dataRootDir, hostname: victim.hostname },
+				};
+				await startHarper(restartCtx, {
+					config: {
+						analytics: { aggregatePeriod: -1 },
+						logging: { colors: false, console: true, level: 'warn' },
+						replication: { securePort: victim.hostname + ':9933' },
+						threads: { count: THREADS_PER_NODE },
+					},
+					env: { HARPER_NO_FLUSH_ON_EXIT: true },
+				});
+				ctx.nodes[victimIdx] = restartCtx.harper;
 				const restartedAt = Date.now();
 				cycleEvents.push({ cycle, victimIdx, downMs: restartedAt - killAt, beforeSnap: before });
 
