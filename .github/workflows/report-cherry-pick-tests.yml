@@ -15,26 +15,44 @@ permissions:
 
 jobs:
   report:
-    # Reject runs originating from forks — head_branch is attacker-controlled
-    # there and could be named to spoof a cherry-pick branch.
-    if: >-
-      startsWith(github.event.workflow_run.head_branch, 'cherry-pick/') &&
-      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     env:
       STICKY_MARKER: '<!-- patch-ci -->'
       HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
       CONCLUSION: ${{ github.event.workflow_run.conclusion }}
       RUN_URL: ${{ github.event.workflow_run.html_url }}
 
     steps:
+      - name: Debug event payload
+        run: |
+          echo "head_branch=$HEAD_BRANCH"
+          echo "head_repository.full_name=$HEAD_REPO"
+          echo "github.repository=${{ github.repository }}"
+          echo "conclusion=$CONCLUSION"
+          echo "run_url=$RUN_URL"
+
+      # Reject runs originating from forks — head_branch is attacker-controlled
+      # there and could be named to spoof a cherry-pick branch.
+      - name: Gate on cherry-pick branch + same-repo
+        id: gate
+        run: |
+          if [[ "$HEAD_BRANCH" == cherry-pick/* ]] && [[ "$HEAD_REPO" == "${{ github.repository }}" ]]; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            echo "Not a cherry-pick branch / not same repo, skipping."
+          fi
+
       # Pin to `main` so the helper script is present. workflow_run already
       # defaults to the default branch, but pin for clarity.
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: steps.gate.outputs.match == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: main
 
       - name: Update sticky comment
+        if: steps.gate.outputs.match == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
