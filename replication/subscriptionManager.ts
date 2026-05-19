@@ -56,6 +56,10 @@ let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
 export let disconnectedFromNode; // this is set by thread to handle when a node is disconnected (or notify main thread so it can handle)
 export let connectedToNode; // this is set by thread to handle when a node is connected (or notify main thread so it can handle)
+// Assigned by startOnMainThread; called by cloneNode after full-copy sync completes to pick up
+// hdb_nodes entries that were written on worker threads (which don't trigger the main-thread
+// RocksDB subscription).
+export let rescanKnownNodes: (() => void) | undefined;
 const nodeMap = new Map(); // this is a map of all nodes that are available to connect to
 const selfCatchupOfDatabase = new Map<string, number>(); // this is a map of databases that need to catch up to themselves, and the time of the last audit entry (to start from)
 const routes: Route[] = [];
@@ -120,6 +124,21 @@ export async function startOnMainThread(options) {
 			}
 		}
 		subscribeToNodeUpdates(onNodeUpdate);
+
+		// Expose a rescan function for cloneNode to call after full-copy sync. During cloning,
+		// hdb_nodes entries for peer nodes arrive via worker-thread full-copy sync writes, which
+		// do not trigger the main thread's RocksDB subscription. Re-reading from the main thread
+		// after sync ensures those nodes are connected.
+		rescanKnownNodes = () => {
+			for (const entry of getHDBNodeTable().primaryStore.getRange({})) {
+				const node = entry.value;
+				if (!node || node.name === getThisNodeName()) continue;
+				if (!connectionReplicationMap.has(getNodeURL(node))) {
+					logger.notify('Rescan found unconnected node after clone sync, setting up replication:', node.name);
+					onNodeUpdate(node, node.name);
+				}
+			}
+		};
 	});
 	let isFullyReplicating;
 	/**

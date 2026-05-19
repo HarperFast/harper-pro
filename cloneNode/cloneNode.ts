@@ -305,6 +305,14 @@ export async function cloneNode(): Promise<void> {
 	// Monitor the synchronization status of the databases after cloning and update availability status once sync is complete
 	await monitorSync();
 
+	// After full-copy sync, hdb_nodes entries for peer nodes (written by worker threads) may not
+	// have triggered the main-thread subscription due to RocksDB's same-thread commit events.
+	// Re-scan from the main thread so outbound replication connections to all cluster peers are established.
+	{
+		const { rescanKnownNodes } = await import('../replication/subscriptionManager.ts');
+		rescanKnownNodes?.();
+	}
+
 	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
 	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
 	// node with no users during setNode(), which prevents replication from being established.
