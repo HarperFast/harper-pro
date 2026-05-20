@@ -642,6 +642,34 @@ export async function replicateOperation(req) {
 			'to nodes',
 			server.nodes.map((node) => node.name)
 		);
+
+		// `deploy_component` with a staged payload is replicated via direct-HTTPS multipart
+		// streaming rather than the default WS sendOperation path — the latter buffers the
+		// whole operation into a single WS frame, which can't carry payloads larger than the
+		// 2 GB Buffer cap. The staged path is set by core's deployComponent when there's a
+		// streaming payload AND peers to replicate to. See HarperFast/harper#524.
+		const useDeployRelay = req.operation === 'deploy_component' && typeof req._stagedPayloadPath === 'string';
+		if (useDeployRelay) {
+			const { relayDeployToNode } = await import('./deployRelay.ts');
+			const payloadPath = req._stagedPayloadPath;
+			const replicatedResults = await Promise.allSettled(
+				server.nodes.map((node) => relayDeployToNode(node, req, payloadPath))
+			);
+			(response as any).replicated = replicatedResults.map((settledResult, index) => {
+				if (settledResult.status === 'rejected') {
+					return {
+						node: server.nodes[index]?.name,
+						status: 'failed',
+						reason: settledResult.reason?.toString?.() ?? String(settledResult.reason),
+					};
+				}
+				const result = settledResult.value as { node?: string; [key: string]: unknown };
+				if (!result.node) result.node = server.nodes[index]?.name;
+				return result;
+			});
+			return response;
+		}
+
 		const replicatedResults = await Promise.allSettled(
 			server.nodes.map((node) => {
 				// do all the nodes in parallel
