@@ -129,14 +129,22 @@ jobs:
 
           # ── Determine commits to pick ───────────────────────────────────
           if [ "$IS_MERGED" = "true" ]; then
-            # Merged: pick the merge commit (squash/rebase/merge all work)
             PARENT_COUNT=$(git cat-file -p "$MERGE_SHA" | grep -c "^parent ")
             if [ "$PARENT_COUNT" -gt 1 ]; then
+              # True merge commit: cherry-pick it directly with -m 1
               PICK_FLAGS="-m 1"
               PICK_SHAS="$MERGE_SHA"
             else
+              # Squash or rebase merge: pick the original PR commits so we get
+              # the full set. For squash this is equivalent (same net diff). For
+              # rebase, MERGE_SHA is only the last rebased commit — the earlier
+              # ones would be silently skipped if we picked MERGE_SHA alone.
+              MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
               PICK_FLAGS=""
-              PICK_SHAS="$MERGE_SHA"
+              PICK_SHAS=$(git rev-list --reverse "${MERGE_BASE}..${HEAD_SHA}" | tr '\n' ' ')
+              if [ -z "$(echo "$PICK_SHAS" | tr -d ' ')" ]; then
+                PICK_SHAS="$MERGE_SHA"
+              fi
             fi
           else
             # Open PR: pick the commit range merge_base..HEAD
@@ -190,12 +198,32 @@ jobs:
         if: github.event.action != 'unlabeled' && steps.pick.outputs.conflicts != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_MERGED: ${{ steps.pick.outputs.is_merged }}
+          PR_TITLE: ${{ steps.pick.outputs.pr_title }}
         run: |
           set -euo pipefail
           BRANCH="${{ steps.pick.outputs.branch }}"
           CONFLICTS="${{ steps.pick.outputs.conflicts }}"
-          BODY=$(printf '%s\n## Patch cherry-pick: conflict\n\nCherry-pick onto `%s` produced conflicts on commit(s): `%s`\n\nThe conflict markers are committed on branch [`%s`](../tree/%s).\nIntegration tests are **not** running until conflicts are resolved.\n\n@claude please review branch `%s` and suggest a patch that resolves the conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`) introduced by cherry-picking PR #%s onto `%s`. Post the suggested patch as a comment on this PR — do not push.\n' \
-            "$STICKY_MARKER" "$RELEASE_BRANCH" "$CONFLICTS" "$BRANCH" "$BRANCH" "$BRANCH" "$PR_NUMBER" "$RELEASE_BRANCH")
+
+          if [ "$IS_MERGED" = "true" ]; then
+            # PR already merged — open a release-branch PR so the conflict can
+            # be resolved and merged without any future trigger from the original PR.
+            PATCH_PR_URL=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+              --base "$RELEASE_BRANCH" --head "$BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+            if [ -z "$PATCH_PR_URL" ] || [ "$PATCH_PR_URL" = "null" ]; then
+              PATCH_PR_URL=$(gh pr create --repo "$GITHUB_REPOSITORY" \
+                --base "$RELEASE_BRANCH" \
+                --head "$BRANCH" \
+                --title "cherry-pick: ${PR_TITLE} (conflicts → ${RELEASE_BRANCH})" \
+                --body "$(printf 'Cherry-pick of PR #%s onto \`%s\` produced conflicts on commit(s): \`%s\`.\n\nResolve the conflict markers on branch \`%s\` and merge this PR.\n\n@claude please review branch \`%s\` and suggest a patch that resolves the conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`) introduced by cherry-picking PR #%s onto \`%s\`. Post the suggested patch as a comment here — do not push.\n' \
+                  "$PR_NUMBER" "$RELEASE_BRANCH" "$CONFLICTS" "$BRANCH" "$BRANCH" "$PR_NUMBER" "$RELEASE_BRANCH")")
+            fi
+            BODY=$(printf '%s\n## Patch cherry-pick: conflict\n\nCherry-pick onto `%s` produced conflicts on commit(s): `%s`\n\nThe conflict markers are committed on branch [`%s`](../tree/%s).\nA pull request has been opened to land this patch: %s\n' \
+              "$STICKY_MARKER" "$RELEASE_BRANCH" "$CONFLICTS" "$BRANCH" "$BRANCH" "$PATCH_PR_URL")
+          else
+            BODY=$(printf '%s\n## Patch cherry-pick: conflict\n\nCherry-pick onto `%s` produced conflicts on commit(s): `%s`\n\nThe conflict markers are committed on branch [`%s`](../tree/%s).\nIntegration tests are **not** running until conflicts are resolved.\n\n@claude please review branch `%s` and suggest a patch that resolves the conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`) introduced by cherry-picking PR #%s onto `%s`. Post the suggested patch as a comment on this PR — do not push.\n' \
+              "$STICKY_MARKER" "$RELEASE_BRANCH" "$CONFLICTS" "$BRANCH" "$BRANCH" "$BRANCH" "$PR_NUMBER" "$RELEASE_BRANCH")
+          fi
           node "$RUNNER_TEMP/upsert-sticky-comment.js" "$PR_NUMBER" "$STICKY_MARKER" "$BODY"
 
       # ── Success path (open PR): trigger integration tests, wait, report ─
