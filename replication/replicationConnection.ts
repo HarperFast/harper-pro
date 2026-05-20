@@ -1640,6 +1640,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 				}
 				const id = auditRecord.recordId;
 				event = undefined; // reset before each decode attempt
+				let receivedBlobs: any[] | undefined;
 				try {
 					decodeBlobsWithWrites(
 						() => {
@@ -1658,7 +1659,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							};
 						},
 						auditStore?.rootStore,
-						(blob) => receiveBlobs(blob, id)
+						(blob) => {
+							const localBlob = receiveBlobs(blob, id);
+							(receivedBlobs ??= []).push(localBlob);
+							return localBlob;
+						}
 					);
 				} catch (error) {
 					logger.error?.(
@@ -1670,6 +1675,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						auditRecord,
 						error
 					);
+				}
+				if (!event && receivedBlobs) {
+					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
+					// a window to complete, then unlink the files. (mirrors the pattern at the relocate path above.)
+					setTimeout(() => receivedBlobs.forEach(deleteBlob), 60000).unref();
 				}
 				replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
 					// ensure monotonicity
