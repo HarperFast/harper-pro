@@ -9,7 +9,13 @@
  * 5. Node B sends back the audit records
  */
 
-import { databases, getDatabases, onUpdatedTable, onRemovedDB } from '../core/resources/databases.ts';
+import {
+	databases,
+	databaseEventsEmitter,
+	getDatabases,
+	onUpdatedTable,
+	onRemovedDB,
+} from '../core/resources/databases.ts';
 import { Resource } from '../core/resources/Resource.ts';
 import { IterableEventQueue } from '../core/resources/IterableEventQueue.ts';
 import {
@@ -46,6 +52,13 @@ import './setNode.ts';
 import './clusterStatus.ts';
 import '../security/keyService.ts';
 import '../security/sshKeyOperations.ts';
+
+// Each active replication connection legitimately registers a small handful of updateTable / dropDatabase
+// listeners on the global databaseEventsEmitter (one per subscriptionManager iterator and per per-DB WS), so a
+// modest cluster blows past Node's default 10-listener cap even with every listener correctly torn down on
+// disconnect. Raise the limit so we don't spam MaxListenersExceededWarning under normal multi-peer load while
+// still leaving headroom small enough that a real listener leak would eventually trip the warning.
+databaseEventsEmitter.setMaxListeners(1000);
 
 let replicationDisabled;
 let nextId = 1; // for request ids
@@ -586,23 +599,36 @@ export function urlToNodeName(nodeUrl) {
 }
 
 /**
+ * Iterate through all the databases and tables that are currently replicated, calling the callback for each.
+ * Use this when you only need a one-shot pass over the present state — it does not register any listeners
+ * on databaseEventsEmitter, so callers can invoke it in a hot path (e.g. inside a per-node-update handler)
+ * without leaking listeners and tripping MaxListenersExceededWarning.
+ * @param options
+ * @param callback
+ */
+export function iterateReplicatedDatabases(options, callback) {
+	for (const databaseName of Object.getOwnPropertyNames(databases)) {
+		forReplicatedDatabase(databaseName, options, callback);
+	}
+}
+
+/**
  * Iterate through all the databases and tables that are replicated, both those that exist now, and future databases that
- * are added or removed, calling the callback for each
+ * are added or removed, calling the callback for each. Returns a handle whose remove() unsubscribes both watchers — the
+ * caller must call remove() when done, otherwise listeners accumulate on databaseEventsEmitter for the life of the process.
  * @param options
  * @param callback
  */
 export function forEachReplicatedDatabase(options, callback) {
-	for (const databaseName of Object.getOwnPropertyNames(databases)) {
-		forDatabase(databaseName);
-	}
+	iterateReplicatedDatabases(options, callback);
 	// Both listeners must be returned through the same handle, otherwise callers that
 	// .remove() the result still leak the dropDatabase listener forever — which over time
 	// trips MaxListenersExceededWarning on the global databaseEventsEmitter.
 	const removedListener = onRemovedDB((databaseName) => {
-		forDatabase(databaseName);
+		forReplicatedDatabase(databaseName, options, callback);
 	});
 	const updatedListener = onUpdatedTable((Table) => {
-		forDatabase(Table.databaseName);
+		forReplicatedDatabase(Table.databaseName, options, callback);
 	});
 	return {
 		remove() {
@@ -610,19 +636,20 @@ export function forEachReplicatedDatabase(options, callback) {
 			updatedListener.remove();
 		},
 	};
-	function forDatabase(databaseName) {
-		const database = databases[databaseName];
-		logger.trace('Checking replication status of ', databaseName, options?.databases);
-		if (
-			options?.databases === undefined ||
-			options.databases === '*' ||
-			options.databases.includes(databaseName) ||
-			options.databases.some?.((dbConfig) => dbConfig.name === databaseName) ||
-			!database
-		)
-			callback(database, databaseName, true);
-		else if (hasExplicitlyReplicatedTable(databaseName)) callback(database, databaseName, false);
-	}
+}
+
+function forReplicatedDatabase(databaseName, options, callback) {
+	const database = databases[databaseName];
+	logger.trace('Checking replication status of ', databaseName, options?.databases);
+	if (
+		options?.databases === undefined ||
+		options.databases === '*' ||
+		options.databases.includes(databaseName) ||
+		options.databases.some?.((dbConfig) => dbConfig.name === databaseName) ||
+		!database
+	)
+		callback(database, databaseName, true);
+	else if (hasExplicitlyReplicatedTable(databaseName)) callback(database, databaseName, false);
 }
 function hasExplicitlyReplicatedTable(databaseName) {
 	const database = databases[databaseName];
