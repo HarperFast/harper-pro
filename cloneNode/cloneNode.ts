@@ -336,12 +336,6 @@ export async function cloneNode(): Promise<void> {
 					if (foundReplicatedUser) break;
 					await sleep(200);
 				}
-				// IMPORTANT: pass the primary key as a string, NOT as `{ username: ... }`.
-				// Resource.delete with an object that has no `.id` field is treated as a
-				// collection delete (isCollection=true) and runs an unfiltered full-table
-				// scan, wiping every row in hdb_user — including HDB_ADMIN — and the
-				// resulting tombstones replicate cluster-wide. See Resource.transactional
-				// (core/resources/Resource.ts) and Table.delete (core/resources/Table.ts).
 				await databases.system.hdb_user.delete('clone-temp-admin');
 			}
 		} catch (err) {
