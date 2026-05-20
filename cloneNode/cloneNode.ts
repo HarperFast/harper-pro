@@ -292,11 +292,10 @@ export async function cloneNode(): Promise<void> {
 	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
 		try {
 			const { databases } = await import('../core/resources/databases.js');
-			// Only delete clone-temp-admin if it actually exists. If install used CLI/env args that
-			// supplied a real admin username (e.g. integration tests pass --HDB_ADMIN_USERNAME=admin),
-			// `clone-temp-admin` was never created and calling delete on a missing primary key here
-			// can transiently empty the in-memory users cache, breaking authorizeLocal for callers
-			// that rely on getSuperUser().
+			// Only delete clone-temp-admin if it actually exists. If install used CLI/env args
+			// that supplied a real admin username (e.g. integration tests pass
+			// --HDB_ADMIN_USERNAME=admin), `clone-temp-admin` was never created and there is
+			// nothing to clean up — skip the delete entirely.
 			const existing = await databases.system.hdb_user.get('clone-temp-admin');
 			if (existing) {
 				// Wait until at least one non-clone-temp-admin user is present (replicated from leader)
@@ -317,7 +316,7 @@ export async function cloneNode(): Promise<void> {
 					if (foundReplicatedUser) break;
 					await sleep(200);
 				}
-				await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
+				await databases.system.hdb_user.delete('clone-temp-admin');
 			}
 		} catch (err) {
 			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
