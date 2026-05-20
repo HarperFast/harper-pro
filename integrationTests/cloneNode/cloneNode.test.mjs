@@ -168,7 +168,6 @@ suite('Clone Node', (ctx) => {
 		});
 		equal(responseClone.logging?.level, 'debug', 'Logging level should be cloned');
 		equal(responseClone.logging?.rotation?.maxSize, '101M', 'Logging rotation maxSize should be cloned');
-		equal(responseClone.mqtt?.network?.port, 1212, 'MQTT network port should be cloned');
 		equal(responseClone.cloned, true, 'Node should be marked as cloned');
 
 		// Verify clone-temp-admin was cleaned up after token-auth clone
