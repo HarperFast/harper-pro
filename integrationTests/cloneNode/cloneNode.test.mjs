@@ -175,6 +175,24 @@ suite('Clone Node', (ctx) => {
 		const cloneUsers = await sendOperation(ctx.nodes[1], { operation: 'list_users' });
 		ok(!cloneUsers.some((u) => u.username === 'clone-temp-admin'), 'clone-temp-admin should not exist on cloned node');
 
+		// Regression guard: a previous version of the cleanup called
+		// `databases.system.hdb_user.delete({ username: 'clone-temp-admin' })`. Because the argument
+		// is an object without `.id`, Resource.transactional treated it as a collection delete and
+		// ran an unfiltered full-table scan, wiping every row in hdb_user on the cloning node. The
+		// resulting tombstones then replicated cluster-wide and emptied the leader's user table too,
+		// breaking authentication for every subsequent clone attempt. Assert that the real admin
+		// user survived on both the clone and the leader.
+		ok(
+			cloneUsers.some((u) => u.username === ctx.nodes[0].admin.username),
+			`Leader's admin user (${ctx.nodes[0].admin.username}) should be replicated and present on the cloned node`
+		);
+		const leaderUsers = await sendOperation(ctx.nodes[0], { operation: 'list_users' });
+		ok(leaderUsers.length > 0, 'Leader hdb_user must not be emptied by clone cleanup');
+		ok(
+			leaderUsers.some((u) => u.username === ctx.nodes[0].admin.username),
+			`Leader's admin user (${ctx.nodes[0].admin.username}) should still exist on the leader after clone cleanup`
+		);
+
 		// Verify that cluster status shows both nodes connected to each other
 		const clusterStatusNode1 = await sendOperation(ctx.nodes[0], {
 			operation: 'cluster_status',
