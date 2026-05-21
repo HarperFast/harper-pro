@@ -12,3 +12,5 @@ fs.mkdirSync(testDir, { recursive: true });
 process.env.STORAGE_PATH = testDir;
 process.env._DISABLE_NATS = 'true';
 process.env.LOGGING_STDSTREAMS = 'false';
+
+process.on('exit', () => fs.rmSync(testDir, { recursive: true, force: true }));
