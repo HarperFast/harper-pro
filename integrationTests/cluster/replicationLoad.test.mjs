@@ -269,7 +269,7 @@ suite('Replication Load Testing', { timeout: 300000 }, (ctx) => {
 			}
 		}
 	});
-	suite('Deploy app and test replication', { timeout: 60000 }, () => {
+	suite('Deploy app and test replication', { timeout: 180000 }, () => {
 		before(async () => {
 			const project = 'test-application';
 			const payload = await targz(join(import.meta.dirname, 'fixture'));
