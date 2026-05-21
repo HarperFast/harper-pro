@@ -35,6 +35,6 @@ inside `.git/modules/core/`, remove them immediately — they are corrupting the
 ## Pro-specific notes
 
 - **Linter**: oxlint with `--deny-warnings` (`npm run lint`), same as core.
-- **Tests**: only `npm run test:integration` exists here. There is no `test:unit` split — Pro relies on core for unit-test coverage of the substrate it inherits. `test:integration` is slow; run only when the change plausibly affects integration behavior.
+- **Tests**: `npm run test:unit` runs `unitTests/**/*.test.mjs` via mocha (fast, no server required — requires a built `dist/`, run `npm run build` first). `npm run test:integration` is slow; run only when the change plausibly affects integration behavior.
 - **Storage substrate**: same as core — RocksDB primary, LMDB available via `HARPER_STORAGE_ENGINE=lmdb`.
 - **Documentation scope**: https://docs.harperdb.io is authoritative for Harper mechanics. Pro docs describe Pro-only surface, not core behavior.
