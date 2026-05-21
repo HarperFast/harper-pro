@@ -14,7 +14,6 @@ import {
 	getHDBNodeTable,
 	iterateRoutes,
 	shouldReplicateFromNode,
-	type Node,
 	type Route,
 	getNodeURL,
 } from './knownNodes.ts';
@@ -28,11 +27,12 @@ import minimist from 'minimist';
 const cliArgs = minimist(process.argv);
 
 type ConnectedWorkerStatus = {
-	worker: Worker | null;
+	worker: any;
 	connected?: boolean;
 	latency?: number;
 };
 type ReplicationConnectionStatus = {
+	url?: string;
 	nodes: ({
 		name: string;
 		url: string;
@@ -41,9 +41,12 @@ type ReplicationConnectionStatus = {
 		startTime?: number;
 		endTime?: number;
 		shard?: string;
+		subscriptions?: any;
+		worker?: any;
+		isLeader?: boolean;
 	} & ConnectedWorkerStatus)[];
 } & ConnectedWorkerStatus;
-type DBReplicationStatusMap = Map<string, ReplicationConnectionStatus> & { iterator: any };
+type DBReplicationStatusMap = Map<string, ReplicationConnectionStatus> & { iterator?: any };
 
 const NODE_SUBSCRIBE_DELAY = 200; // delay before sending node subscribe to other nodes, so operations can complete first
 // When a worker dies it may have been holding subscriptions for many (database, node) pairs.
@@ -71,7 +74,7 @@ export async function startOnMainThread(options) {
 		for (const tableName in database) {
 			const table = database[tableName];
 			if (table.auditStore) {
-				selfCatchupOfDatabase.set(dbName, lastTimeInAuditStore(table.auditStore));
+				selfCatchupOfDatabase.set(dbName, lastTimeInAuditStore(table.auditStore) as number);
 				break;
 			}
 		}
@@ -102,7 +105,7 @@ export async function startOnMainThread(options) {
 			}
 		}
 		if (getHDBNodeTable().primaryStore.get(thisName)) ensureThisNode(); // if this node record already exists, check for config changes
-		for (const route of iterateRoutes(options)) {
+		for (const route of iterateRoutes(options) as any) {
 			try {
 				const replicateAll = !route.subscriptions;
 				if (replicateAll) {
@@ -353,7 +356,7 @@ export async function startOnMainThread(options) {
 				// if failover is disabled, immediately return
 				return;
 			}
-			const mainNode = existingWorkerEntry.nodes[0];
+			const mainNode: any = existingWorkerEntry.nodes[0];
 			if (!(mainNode.replicates === true || mainNode.replicates?.sends || mainNode.subscriptions?.length)) {
 				// no replication, so just return
 				return;
@@ -462,7 +465,7 @@ export async function startOnMainThread(options) {
 			}
 		}
 	};
-	function connectToNextWorker(node: Node, database: string, connectingNode = node) {
+	function connectToNextWorker(node: any, database: string, connectingNode = node) {
 		const httpWorkers = workers.filter((worker: any) => worker.name === 'http');
 		nextWorkerIndex = nextWorkerIndex % httpWorkers.length; // wrap around as necessary
 		const worker = httpWorkers[nextWorkerIndex++];
@@ -489,7 +492,7 @@ export async function startOnMainThread(options) {
  * @param message
  * @param port
  */
-export function requestClusterStatus(message, port) {
+export function requestClusterStatus(message?, port?) {
 	const connections = [];
 	for (const [node_name, node] of nodeMap) {
 		try {

@@ -43,11 +43,12 @@ import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptio
 import { EventEmitter } from 'events';
 import { createTLSSelector } from '../core/security/keys.js';
 import * as tls from 'node:tls';
-import { getHDBNodeTable, getNodeURL, getReplicationSharedStatus, type Node } from './knownNodes.ts';
+import { getHDBNodeTable, getNodeURL, getReplicationSharedStatus } from './knownNodes.ts';
 import * as process from 'node:process';
 import { isIP } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';
 import {
+	createBlob,
 	decodeBlobsWithWrites,
 	decodeFromDatabase,
 	decodeWithBlobCallback,
@@ -161,7 +162,7 @@ export async function createWebSocket(
 			);
 		}
 	}
-	const headers = {};
+	const headers: Record<string, string> = {};
 	if (authorization) {
 		headers.Authorization = authorization;
 	}
@@ -222,6 +223,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	databaseName: string;
 	nodeName?: string;
 	authorization?: string;
+	tentativeNode?: any;
 	constructor(url: string, subscription: any, databaseName: string, nodeName?: string, authorization?: string) {
 		super();
 		this.url = url;
@@ -370,7 +372,7 @@ export class NodeReplicationConnection extends EventEmitter {
 /**
  * This handles both incoming and outgoing WS allowing either one to issue a subscription and get replication and/or handle subscription requests
  */
-export function replicateOverWS(ws: WebSocket, options: any, authorization: Promise<Node | undefined>) {
+export function replicateOverWS(ws: WebSocket, options: any, authorization: any) {
 	const p = options.port || options.securePort;
 	const connectionId =
 		(process.pid % 1000) +
@@ -387,7 +389,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 	let databaseName = options.database;
 	const dbSubscriptions = options.databaseSubscriptions || databaseSubscriptions;
 	let auditStore: any;
-	let auditLogIterable: Iterable<AuditRecord>; // reusable iterator for a subscription
+	let auditLogIterable: Iterable<AuditRecord> & { removeLog?: (name: string) => void; addLog?: (name: string) => void }; // reusable iterator for a subscription
 	let replicationSharedStatus: Float64Array;
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
@@ -554,7 +556,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		// of an array that begins with the command code
 		lastMessageTime = performance.now();
 		try {
-			const decoder = (body.dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
+			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
 			if (body[0] > 127) {
 				// not a transaction, special message
 				const message = decode(body);
@@ -726,7 +728,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 								freezeData: true,
 								typedStructs: data.typedStructs,
 								structures: data.structures,
-							}),
+							} as any),
 							getEntry(id) {
 								return table.primaryStore.getEntry(id);
 							},
@@ -765,7 +767,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							'replication',
 							'committed-update'
 						);
-						getSharedStatus().buffer.notify();
+						(getSharedStatus().buffer as any).notify();
 						break;
 					case SEQUENCE_ID_UPDATE:
 						// we need to record the sequence number that the remote node has received
@@ -1154,7 +1156,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							const matchesSubscription =
 								(excludedNodes && timeRange === undefined) ||
 								// if it is in the list, we check the timestamps to verify it matches
-								(timeRange && timeRange.startTime < localTime && (!timeRange.endTime || timeRange.endTime > localTime));
+								(timeRange && (timeRange as any).startTime < localTime && (!(timeRange as any).endTime || (timeRange as any).endTime > localTime));
 							if (!matchesSubscription) {
 								if (DEBUG_MODE)
 									logger.trace?.(
@@ -1496,7 +1498,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 														residencyId: entry.residencyId,
 														previousResidencyId: null,
 														expiresAt: entry.expiresAt,
-													});
+													} as any);
 													await sendAuditRecord(
 														{
 															// make it look like an audit record
@@ -1855,7 +1857,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 						])
 					);
 				}
-				lastBuffer = buffer;
+				lastBuffer = buffer as Buffer;
 				if (ws._socket.writableNeedDrain) {
 					logger.debug?.('draining', id);
 					await new Promise((resolve) => ws._socket.once('drain', resolve));
@@ -1911,7 +1913,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		stream.connectedToBlob = true;
 		stream.lastChunk = Date.now();
 		stream.recordId = id;
-		if (remoteBlob.size === undefined && stream.expectedSize) remoteBlob.size = stream.expectedSize;
+		if (remoteBlob.size === undefined && stream.expectedSize) (remoteBlob as any).size = stream.expectedSize;
 		const localBlob = stream.blob ?? createBlob(stream, remoteBlob);
 		stream.blob = localBlob; // record the blob so we can reuse it if another request uses the same blob
 
@@ -1935,7 +1937,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 					const index = outstandingBlobsToFinish.indexOf(tracked);
 					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
 				});
-			tracked.blobId = blobId;
+			(tracked as any).blobId = blobId;
 			outstandingBlobsToFinish.push(tracked);
 		}
 		return localBlob;
@@ -2203,7 +2205,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		const thisNodeName = getThisNodeName();
 		if (thisNodeName === remoteNodeName) {
 			if (!thisNodeName) throw new Error('Node name not defined');
-			else throw new Error('Should not connect to self', thisNodeName);
+			else throw new Error('Should not connect to self: ' + thisNodeName);
 		}
 		sendNodeDBName(thisNodeName, databaseName);
 		return true;

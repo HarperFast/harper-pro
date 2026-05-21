@@ -204,8 +204,7 @@ async function recordUsage(analytics: any) {
 		universalHeaders.splice(
 			0,
 			universalHeaders.length,
-			'X-License-Info',
-			'Unlicensed Harper Pro, this should only be used for educational and development purposes'
+			['X-License-Info', 'Unlicensed Harper Pro, this should only be used for educational and development purposes']
 		);
 		if (!process.env.DEV_MODE) {
 			const msg =

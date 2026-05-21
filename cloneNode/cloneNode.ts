@@ -527,7 +527,7 @@ async function cloneSSHKeys() {
 
 	const { addSSHKey } = await import('../security/sshKeyOperations.js');
 	try {
-		const keys: Record<string, any> = await leaderRequest({ operation: 'list_ssh_keys' });
+		const keys: any = await leaderRequest({ operation: 'list_ssh_keys' });
 		if (!keys?.length) {
 			log('No SSH keys found on leader node to clone');
 			return;
@@ -535,7 +535,7 @@ async function cloneSSHKeys() {
 
 		for (const keyName of keys) {
 			log('Cloning SSH key:', keyName.name);
-			const keyData: Record<string, any> = await leaderRequest({
+			const keyData: any = await leaderRequest({
 				operation: 'get_ssh_key',
 				name: keyName.name,
 			});
