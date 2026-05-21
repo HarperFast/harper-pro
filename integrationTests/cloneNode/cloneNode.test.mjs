@@ -205,14 +205,25 @@ suite('Clone Node', (ctx) => {
 		equal(clusterStatusNode2.connections.length, 1, 'Clone node should have 1 connection');
 		equal(clusterStatusNode2.connections?.[0]?.database_sockets.length, 2, 'Clone node should be connected to leader');
 
-		// Verify that data was cloned successfully by querying the clone node for data that was inserted into the leader node before cloning
-		const responseData = await sendOperation(ctx.nodes[1], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(responseData.length, 1, 'Should find 1 record in clone node');
+		// Verify that data was cloned successfully by querying the clone node for data that was inserted into the leader node before cloning.
+		// "Available" status doesn't guarantee all data has finished copying, so retry until the record appears.
+		let responseData;
+		for (let retries = 0; ; retries++) {
+			try {
+				responseData = await sendOperation(ctx.nodes[1], {
+					operation: 'search_by_id',
+					table: 'test',
+					get_attributes: ['id', 'name'],
+					ids: ['1'],
+				});
+				if (responseData.length === 1) break;
+			} catch {}
+			if (retries >= 20) {
+				equal(responseData?.length ?? 0, 1, 'Should find 1 record in clone node');
+				break;
+			}
+			await sleep(500);
+		}
 		equal(responseData[0].name, 'test-clone', 'Record name should match the original');
 
 		const sshKeys = await sendOperation(ctx.nodes[1], {
