@@ -4,6 +4,7 @@
 	"extension": ["js", "mjs"],
 	"recursive": true,
 	"enable-source-maps": true,
+	"require": ["unitTests/unitTestSetup.cjs"],
 	"exclude": ["unitTests/testApp/**"],
 	"node-option": ["expose-internals", "enable-source-maps", "experimental-vm-modules"],
 	"exit": true

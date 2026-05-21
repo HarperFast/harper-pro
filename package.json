@@ -106,6 +106,7 @@
 		"lint": "oxlint --deny-warnings .",
 		"lint:fix": "npm run lint -- --fix",
 		"lint:required": "oxlint --quiet .",
+		"test:unit": "mocha 'unitTests/**/*.test.mjs'",
 		"test:integration": "HARPER_INTEGRATION_TEST_INSTALL_SCRIPT=dist/bin/harper.js harper-integration-test-run",
 		"test:integration:all": "npm run test:integration -- integrationTests/**/*.test.*s",
 		"cluster:ip:local": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. build && docker compose -f docker-compose.ip.yml --project-directory ../.. up; popd",
