@@ -234,6 +234,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	}
 
 	async connect() {
+		if (this.intentionallyUnsubscribed) return;
 		if (!this.session) this.resetSession();
 		// TODO: Need to do this specifically for each node
 		this.socket = await createWebSocket(this.url, { serverName: this.nodeName, authorization: this.authorization });
@@ -359,7 +360,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	}
 	unsubscribe() {
 		this.intentionallyUnsubscribed = true;
-		this.socket.close(1008, 'No longer subscribed');
+		this.socket?.close(1008, 'No longer subscribed');
 	}
 
 	getRecord(request) {
@@ -1156,7 +1157,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							const matchesSubscription =
 								(excludedNodes && timeRange === undefined) ||
 								// if it is in the list, we check the timestamps to verify it matches
-								(timeRange && (timeRange as any).startTime < localTime && (!(timeRange as any).endTime || (timeRange as any).endTime > localTime));
+								(timeRange &&
+									(timeRange as any).startTime < localTime &&
+									(!(timeRange as any).endTime || (timeRange as any).endTime > localTime));
 							if (!matchesSubscription) {
 								if (DEBUG_MODE)
 									logger.trace?.(

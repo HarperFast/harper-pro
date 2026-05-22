@@ -146,6 +146,7 @@ export async function startOnMainThread(options) {
 		logger.info('Setting up node replication for', node);
 		if (!node) {
 			// deleted node
+			nodeMap.delete(hostname);
 			for (const [url, dbReplicationWorkers] of connectionReplicationMap) {
 				let foundNode;
 				for (const [_database, { nodes }] of dbReplicationWorkers) {

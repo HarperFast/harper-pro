@@ -476,7 +476,9 @@ function getSubscriptionConnection(
 			(connection = new NodeReplicationConnection(connectingUrl, subscription, dbName, nodeName, authorization))
 		);
 		connection.connect();
-		connection.once('finished', () => dbConnections.delete(dbName));
+		connection.once('finished', () => {
+			if (dbConnections.get(dbName) === connection) dbConnections.delete(dbName);
+		});
 		return connection;
 	}
 }
