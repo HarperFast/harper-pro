@@ -23,7 +23,7 @@ import { equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
+import { sendOperation } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -97,13 +97,11 @@ suite('Deployment tracking — multi-node replication (Slice B2)', { timeout: 18
 		await delay(500);
 	});
 
-	test('deploy from node 0 lands on all 3 nodes via the replicated payload_blob', async () => {
+	test('deploy from node 0 returns replicated peer outcomes', async () => {
 		const project = 'b2-deploy-tracking-application';
 		const payload = await targz(join(import.meta.dirname, 'fixture'));
 		// `restart: false` so the deploy completes cleanly without cycling HTTP workers
-		// mid-flow. The fullyConnectedReplication test uses `restart: true` because it
-		// needs the new component routes loaded, but for verifying B2's peer_results
-		// tracking we need the recorder.finish() write to flush durably.
+		// mid-flow — keeps the recorder.finish() write durable so peer_results survives.
 		const deployResponse = await sendOperation(ctx.nodes[0], {
 			operation: 'deploy_component',
 			project,
@@ -114,6 +112,16 @@ suite('Deployment tracking — multi-node replication (Slice B2)', { timeout: 18
 		equal(deployResponse.message, `Successfully deployed: ${project}`, JSON.stringify(deployResponse));
 		ok(deployResponse.deployment_id, 'deploy response should carry a deployment_id');
 		ctx.deploymentId = deployResponse.deployment_id;
+
+		// The deploy_component response carries the replicateOperation return value, which
+		// includes per-peer outcomes. Assert at least one peer was contacted so a regression
+		// in cluster-connection symmetry surfaces here instead of later.
+		ok(Array.isArray(deployResponse.replicated), `expected deployResponse.replicated to be an array; got ${JSON.stringify(deployResponse.replicated)}`);
+		ok(
+			deployResponse.replicated.length >= 1,
+			`expected replicateOperation to contact at least 1 peer; got ${JSON.stringify(deployResponse.replicated)}. ` +
+				`If 0, origin's server.nodes is empty — check cluster add_node symmetry.`
+		);
 
 		// Give table replication time to settle on peers before we check the row exists everywhere.
 		await delay(1000);
