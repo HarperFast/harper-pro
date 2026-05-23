@@ -97,12 +97,12 @@ export function start(options) {
 	logger.notify('Starting replication server');
 	if (options.hostname && !env.get('node_hostname')) {
 		// for back-compat, carry this over
-		env.setProperty('node_hostname');
+		env.setProperty('node_hostname', options.hostname);
 		clearThisNodeName();
 	}
 	if (options.url && !env.get('node_url')) {
 		// for back-compat, carry this over
-		env.setProperty('node_url');
+		env.setProperty('node_url', options.url);
 		clearThisNodeName();
 	}
 	if (!options.port && !options.securePort) {
@@ -152,7 +152,7 @@ export function start(options) {
 	server.http(async (request, nextHandler) => {
 		if (request.isWebSocket && request.headers.get('Sec-WebSocket-Protocol') === 'harperdb-replication-v1') {
 			logger.debug('Incoming replication WS connection received, authorized: ' + request.authorized);
-			const authorizationError = request._nodeRequest.socket.authorizationError;
+			const authorizationError = (request._nodeRequest.socket as any).authorizationError;
 			if (authorizationError) {
 				if (authorizationError === 'CERT_HAS_EXPIRED') {
 					logger.error(
@@ -166,7 +166,7 @@ export function start(options) {
 						'certificate issuer',
 						request.peerCertificate.issuer,
 						'did not match any available CAs',
-						Array.from(Array.from(wsServers[0].secureContexts.values())[0].options.availableCAs.keys())
+						Array.from((Array.from(wsServers[0].secureContexts.values())[0] as any).options.availableCAs.keys())
 					);
 				}
 			}
@@ -249,7 +249,7 @@ export function start(options) {
 				// add a big performance penalty on connection setup
 				const contextsToUpdate = new Set(wsServer.secureContexts.values());
 				if (wsServer.defaultContext) contextsToUpdate.add(wsServer.defaultContext);
-				for (const context of contextsToUpdate) {
+				for (const context of contextsToUpdate as Set<any>) {
 					try {
 						const ca = Array.from(replicationCertificateAuthorities);
 						// add the replication CAs (and root CAs) to any existing CAs for the context
@@ -344,6 +344,7 @@ export function setReplicator(dbName: string, table: any, options: any) {
 	// We may try to consult this to get the other nodes for back-compat
 	// const { hub_routes } = getClusteringRoutes();
 	table.sourcedFrom(
+		// @ts-expect-error: static side intentionally differs from Resource
 		class Replicator extends Resource {
 			/**
 			 * This subscribes to the other nodes. Subscription events are notifications rather than
@@ -475,7 +476,9 @@ function getSubscriptionConnection(
 			(connection = new NodeReplicationConnection(connectingUrl, subscription, dbName, nodeName, authorization))
 		);
 		connection.connect();
-		connection.once('finished', () => dbConnections.delete(dbName));
+		connection.once('finished', () => {
+			if (dbConnections.get(dbName) === connection) dbConnections.delete(dbName);
+		});
 		return connection;
 	}
 }
@@ -502,7 +505,7 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 	return connection;
 }
 
-export async function sendOperationToNode(node, operation, options) {
+export async function sendOperationToNode(node, operation, options?) {
 	if (!options) options = {};
 	options.serverName = node.name;
 	const socket = await createWebSocket(getNodeURL(node), options);
@@ -590,7 +593,7 @@ export async function unsubscribeFromNode({ url, nodes, database }) {
 	}
 }
 
-server.replication = {
+(server as any).replication = {
 	exportIdMapping,
 	getIdOfRemoteNode,
 };
@@ -660,7 +663,7 @@ function hasExplicitlyReplicatedTable(databaseName) {
 }
 
 export async function replicateOperation(req) {
-	const response = { message: '' };
+	const response: { message: string; replicated?: any[] } = { message: '' };
 	if (req.replicated !== false) {
 		req.replicated = false; // don't send a replicated flag to the nodes we are sending to
 		logger.trace?.(
@@ -677,7 +680,7 @@ export async function replicateOperation(req) {
 		);
 		// map the settled results to the response
 		response.replicated = replicatedResults.map((settledResult, index) => {
-			const result =
+			const result: any =
 				settledResult.status === 'rejected'
 					? { status: 'failed', reason: settledResult.reason.toString() }
 					: settledResult.value;

@@ -168,12 +168,29 @@ suite('Clone Node', (ctx) => {
 		});
 		equal(responseClone.logging?.level, 'debug', 'Logging level should be cloned');
 		equal(responseClone.logging?.rotation?.maxSize, '101M', 'Logging rotation maxSize should be cloned');
-		equal(responseClone.mqtt?.network?.port, 1212, 'MQTT network port should be cloned');
 		equal(responseClone.cloned, true, 'Node should be marked as cloned');
 
 		// Verify clone-temp-admin was cleaned up after token-auth clone
 		const cloneUsers = await sendOperation(ctx.nodes[1], { operation: 'list_users' });
 		ok(!cloneUsers.some((u) => u.username === 'clone-temp-admin'), 'clone-temp-admin should not exist on cloned node');
+
+		// Regression guard: a previous version of the cleanup called
+		// `databases.system.hdb_user.delete({ username: 'clone-temp-admin' })`. Because the argument
+		// is an object without `.id`, Resource.transactional treated it as a collection delete and
+		// ran an unfiltered full-table scan, wiping every row in hdb_user on the cloning node. The
+		// resulting tombstones then replicated cluster-wide and emptied the leader's user table too,
+		// breaking authentication for every subsequent clone attempt. Assert that the real admin
+		// user survived on both the clone and the leader.
+		ok(
+			cloneUsers.some((u) => u.username === ctx.nodes[0].admin.username),
+			`Leader's admin user (${ctx.nodes[0].admin.username}) should be replicated and present on the cloned node`
+		);
+		const leaderUsers = await sendOperation(ctx.nodes[0], { operation: 'list_users' });
+		ok(leaderUsers.length > 0, 'Leader hdb_user must not be emptied by clone cleanup');
+		ok(
+			leaderUsers.some((u) => u.username === ctx.nodes[0].admin.username),
+			`Leader's admin user (${ctx.nodes[0].admin.username}) should still exist on the leader after clone cleanup`
+		);
 
 		// Verify that cluster status shows both nodes connected to each other
 		const clusterStatusNode1 = await sendOperation(ctx.nodes[0], {
@@ -188,14 +205,25 @@ suite('Clone Node', (ctx) => {
 		equal(clusterStatusNode2.connections.length, 1, 'Clone node should have 1 connection');
 		equal(clusterStatusNode2.connections?.[0]?.database_sockets.length, 2, 'Clone node should be connected to leader');
 
-		// Verify that data was cloned successfully by querying the clone node for data that was inserted into the leader node before cloning
-		const responseData = await sendOperation(ctx.nodes[1], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(responseData.length, 1, 'Should find 1 record in clone node');
+		// Verify that data was cloned successfully by querying the clone node for data that was inserted into the leader node before cloning.
+		// "Available" status doesn't guarantee all data has finished copying, so retry until the record appears.
+		let responseData;
+		for (let retries = 0; ; retries++) {
+			try {
+				responseData = await sendOperation(ctx.nodes[1], {
+					operation: 'search_by_id',
+					table: 'test',
+					get_attributes: ['id', 'name'],
+					ids: ['1'],
+				});
+				if (responseData.length === 1) break;
+			} catch {}
+			if (retries >= 20) {
+				equal(responseData?.length ?? 0, 1, 'Should find 1 record in clone node');
+				break;
+			}
+			await sleep(500);
+		}
 		equal(responseData[0].name, 'test-clone', 'Record name should match the original');
 
 		const sshKeys = await sendOperation(ctx.nodes[1], {

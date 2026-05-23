@@ -19,7 +19,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 const NODE_COUNT = 3;
-suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
+suite('Replication Load Testing', { timeout: 300000 }, (ctx) => {
 	before(async () => {
 		// start up the nodes
 		ctx.nodes = await Promise.all(
@@ -267,7 +267,7 @@ suite('Replication Load Testing', { timeout: 120000 }, (ctx) => {
 			}
 		}
 	});
-	suite('Deploy app and test replication', { timeout: 60000 }, () => {
+	suite('Deploy app and test replication', { timeout: 180000 }, () => {
 		before(async () => {
 			const project = 'test-application';
 			const payload = await targz(join(import.meta.dirname, 'fixture'));

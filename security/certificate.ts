@@ -36,7 +36,7 @@ const fileExists = async (path: string): Promise<boolean> =>
 		.catch(() => false);
 
 export async function signCertificate(req) {
-	const response = {};
+	const response: any = {};
 	const hdbKeysDir = join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME);
 
 	if (req.csr) {
@@ -365,7 +365,7 @@ async function removeCertificate(req: { name: string }): Promise<{ message: stri
 		);
 
 		// Only delete the key file if this is the only cert referencing it.
-		if (matchingKeys.length === 1 && matchingKeys[0].name === name) {
+		if (matchingKeys.length === 1 && (matchingKeys[0] as any).name === name) {
 			try {
 				logger.info?.('Removing private key named', private_key_name);
 				await unlink(join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME, private_key_name));
