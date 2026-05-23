@@ -129,18 +129,37 @@ suite('Deployment tracking — multi-node replication (Slice B2)', { timeout: 18
 
 	test('hdb_deployment row replicates to peers', async () => {
 		// Slice A's replicated row should be visible from any node in the cluster.
-		await delay(500);
+		// Poll each peer for the terminal-state row rather than relying on a fixed sleep —
+		// slower CI shards (especially Node v22) need more wall-clock time for the final
+		// finish() put to propagate via table replication.
+		const POLL_TIMEOUT_MS = 15000;
+		const POLL_INTERVAL_MS = 250;
 		for (let i = 0; i < NODE_COUNT; i++) {
-			const response = await sendOperation(ctx.nodes[i], {
-				operation: 'get_deployment',
-				deployment_id: ctx.deploymentId,
-			});
+			const deadline = Date.now() + POLL_TIMEOUT_MS;
+			let response;
+			while (Date.now() < deadline) {
+				response = await sendOperation(ctx.nodes[i], {
+					operation: 'get_deployment',
+					deployment_id: ctx.deploymentId,
+				});
+				if (
+					response.deployment_id === ctx.deploymentId &&
+					TERMINAL_STATUSES.has(response.status) &&
+					response.payload_blob_present
+				) {
+					break;
+				}
+				await delay(POLL_INTERVAL_MS);
+			}
 			equal(
 				response.deployment_id,
 				ctx.deploymentId,
 				`node ${i} should be able to read the replicated hdb_deployment row`
 			);
-			ok(TERMINAL_STATUSES.has(response.status), `node ${i} sees row in terminal state; saw ${response.status}`);
+			ok(
+				TERMINAL_STATUSES.has(response.status),
+				`node ${i} sees row in terminal state within ${POLL_TIMEOUT_MS}ms; saw ${response.status}`
+			);
 			ok(response.payload_blob_present, `node ${i} should have the payload_blob replicated`);
 		}
 	});
