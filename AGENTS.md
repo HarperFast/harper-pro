@@ -47,7 +47,8 @@ npm run lint:fix
 npm run format:write       # prettier
 npm run lint:required      # quiet — for CI
 
-# Tests — only integration here
+# Tests
+npm run test:unit                  # mocha unit tests (fast, no server — build first)
 npm run test:integration
 npm run test:integration:all   # all *.test.ts in integrationTests/
 
@@ -58,7 +59,7 @@ npm run core:set-branch        # pin core to a different branch
 
 The `cluster:*` scripts in `package.json` reference `utility/dev/docker-compose.*.yml` files that are not present in the repository — they're likely produced by a private dev tooling step. Don't expect them to work out of the box.
 
-**No `test:unit` exists.** Pro relies on core's unit suite for the substrate it inherits. `test:integration` is slow — run only when the change plausibly affects integration behavior.
+`test:unit` runs `unitTests/**/*.test.mjs` via mocha (requires a built `dist/` — run `npm run build` first). `test:integration` is slow — run only when the change plausibly affects integration behavior.
 
 ---
 
@@ -97,7 +98,7 @@ When a feature spans both, prefer landing as much as possible in `core/` and glu
 ### Pro tests
 
 - **`integrationTests/`** — end-to-end, runs full Harper instances. `run.mjs` is the custom test harness with shard support. Subdirs mirror source (`analytics/`, `cloneNode/`, `cluster/`, `licensing/`, `security/`).
-- **`unitTests/`** — small. `testUtils.js` (mock helpers, db reset) and `setupTestApp.mjs` (in-memory app scaffold).
+- **`unitTests/`** — mocha unit tests (`npm run test:unit`). `testUtils.js` (mock helpers, db reset), `setupTestApp.mjs` (in-memory app scaffold), `unitTestSetup.cjs` (env bootstrap required before ESM module load).
 
 ### Pro non-source
 
