@@ -662,7 +662,7 @@ function hasExplicitlyReplicatedTable(databaseName) {
 	}
 }
 
-export async function replicateOperation(req) {
+export async function replicateOperation(req, options?: { onPeerResult?: (result: any) => void }) {
 	const response: { message: string; replicated?: any[] } = { message: '' };
 	if (req.replicated !== false) {
 		req.replicated = false; // don't send a replicated flag to the nodes we are sending to
@@ -672,21 +672,35 @@ export async function replicateOperation(req) {
 			'to nodes',
 			server.nodes.map((node) => node.name)
 		);
-		const replicatedResults = await Promise.allSettled(
-			server.nodes.map((node) => {
-				// do all the nodes in parallel
-				return sendOperationToNode(node, req);
-			})
+		// Dispatch all peers in parallel. Each promise resolves to a normalized result
+		// (with `.node` attached), and the optional `onPeerResult` callback fires as
+		// each peer settles — letting callers surface per-peer progress in real time
+		// rather than waiting for the aggregate at the end.
+		const onPeerResult = options?.onPeerResult;
+		const perPeer = server.nodes.map((node, index) =>
+			sendOperationToNode(node, req)
+				.then((value: any) => {
+					const result: any = value && typeof value === 'object' ? value : { value };
+					result.node = server.nodes[index]?.name;
+					return result;
+				})
+				.catch((reason) => ({
+					status: 'failed',
+					reason: reason?.toString?.() ?? String(reason),
+					node: server.nodes[index]?.name,
+				}))
+				.then((result) => {
+					if (onPeerResult) {
+						try {
+							onPeerResult(result);
+						} catch (err) {
+							logger.warn?.('onPeerResult callback threw; ignoring', err);
+						}
+					}
+					return result;
+				})
 		);
-		// map the settled results to the response
-		response.replicated = replicatedResults.map((settledResult, index) => {
-			const result: any =
-				settledResult.status === 'rejected'
-					? { status: 'failed', reason: settledResult.reason.toString() }
-					: settledResult.value;
-			result.node = server.nodes[index]?.name; // add the node to the result so we know which node succeeded/failed
-			return result;
-		});
+		response.replicated = await Promise.all(perPeer);
 	}
 	return response;
 }

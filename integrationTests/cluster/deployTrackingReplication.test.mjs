@@ -1,22 +1,17 @@
 /**
- * Cluster test for Slice B2 of deployment-tracking redesign (HarperFast/harper#641).
+ * Cluster test for deployment-tracking multi-node replication.
  *
- * Verifies that after Slice B2's changes to harper's `deployComponent`, multi-node
- * deploys deliver the payload via the replicated `hdb_deployment.payload_blob` row
- * attribute (using Harper's existing `BLOB_CHUNK` channel) instead of carrying the
- * payload in the `replicateOperation` body.
+ * Verifies that multi-node deploys deliver the payload via the replicated
+ * `hdb_deployment.payload_blob` row attribute (using Harper's existing
+ * `BLOB_CHUNK` channel) instead of carrying the payload in the `replicateOperation`
+ * body.
  *
  * Assertions:
  *   1. Deploy from node A succeeds on a 3-node cluster.
- *   2. Component is loaded on all three nodes (responds to HTTP).
- *   3. The hdb_deployment row replicates to peers (queryable from node B).
- *   4. The row's `peer_results` is populated on the origin with success entries
- *      for the two peer nodes — proving the origin captured per-peer outcomes
- *      from `replicateOperation`'s return.
- *
- * The OSS-side counterpart for B2 (HarperFast/harper#760) tests the peer-side
- * branch in isolation on a single node; this test verifies the full multi-node
- * round trip the new design depends on.
+ *   2. The hdb_deployment row replicates to peers (queryable from any node).
+ *   3. The row's `peer_results` is populated on the origin with per-peer outcomes
+ *      — proving the origin captured them via the onPeerResult callback (real-time
+ *      per-peer updates) or, failing that, the aggregate return value.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
@@ -37,7 +32,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 const NODE_COUNT = 3;
 const TERMINAL_STATUSES = new Set(['success', 'failed', 'rolled_back']);
 
-suite('Deployment tracking — multi-node replication (Slice B2)', { timeout: 180000 }, (ctx) => {
+suite('Deployment tracking — multi-node replication', { timeout: 180000 }, (ctx) => {
 	before(async () => {
 		ctx.nodes = await Promise.all(
 			Array(NODE_COUNT)
@@ -116,7 +111,10 @@ suite('Deployment tracking — multi-node replication (Slice B2)', { timeout: 18
 		// The deploy_component response carries the replicateOperation return value, which
 		// includes per-peer outcomes. Assert at least one peer was contacted so a regression
 		// in cluster-connection symmetry surfaces here instead of later.
-		ok(Array.isArray(deployResponse.replicated), `expected deployResponse.replicated to be an array; got ${JSON.stringify(deployResponse.replicated)}`);
+		ok(
+			Array.isArray(deployResponse.replicated),
+			`expected deployResponse.replicated to be an array; got ${JSON.stringify(deployResponse.replicated)}`
+		);
 		ok(
 			deployResponse.replicated.length >= 1,
 			`expected replicateOperation to contact at least 1 peer; got ${JSON.stringify(deployResponse.replicated)}. ` +
@@ -128,7 +126,7 @@ suite('Deployment tracking — multi-node replication (Slice B2)', { timeout: 18
 	});
 
 	test('hdb_deployment row replicates to peers', async () => {
-		// Slice A's replicated row should be visible from any node in the cluster.
+		// The deployment row should be visible from any node in the cluster.
 		// Poll each peer for the terminal-state row rather than relying on a fixed sleep —
 		// slower CI shards (especially Node v22) need more wall-clock time for the final
 		// finish() put to propagate via table replication.
@@ -176,11 +174,7 @@ suite('Deployment tracking — multi-node replication (Slice B2)', { timeout: 18
 			`expected ${NODE_COUNT - 1} peer_results, got ${response.peer_results.length}: ${JSON.stringify(response.peer_results)}`
 		);
 		for (const peer of response.peer_results) {
-			equal(
-				peer.status,
-				'success',
-				`each peer should have status=success; got ${JSON.stringify(peer)}`
-			);
+			equal(peer.status, 'success', `each peer should have status=success; got ${JSON.stringify(peer)}`);
 			ok(peer.node, `each peer_result should record the node name; got ${JSON.stringify(peer)}`);
 		}
 	});
