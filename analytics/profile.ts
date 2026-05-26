@@ -32,6 +32,10 @@ const SAMPLING_INTERVAL_IN_MICROSECONDS = 50000;
 export function handleApplication({ options }: Scope) {
 	setTimeout(async () => {
 		if (userCodeFolders.length === 0) return;
+		if (options.get(['profiling']) === false) {
+			log.info?.('Profiling disabled by configuration');
+			return;
+		}
 		// start the profiler
 		if (!profilerStarted) {
 			profilerStarted = true;

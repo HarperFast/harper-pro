@@ -8,7 +8,7 @@ import { getThisNodeName } from '../core/server/nodeName.ts';
 import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
 import { isMainThread } from 'worker_threads';
 import { ClientError } from '../core/utility/errors/hdbError.js';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 
@@ -194,14 +194,43 @@ replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void
 		});
 	});
 });
+// Per-node confirmation watchers. Previously the per-node-update callback below called
+// forEachReplicatedDatabase and discarded the returned remove handle, so every hdb_nodes
+// update added two listeners (updateTable + dropDatabase) on the global databaseEventsEmitter
+// and they accumulated unboundedly across the lifetime of the process — tripping
+// MaxListenersExceededWarning once a cluster had ~5+ peers (or after a few node-table churn
+// events). We need the future-DB watching aspect of forEachReplicatedDatabase here so that
+// new databases added after this node started up still get replicationConfirmation tracking
+// wired up; without it, commits on those databases would never receive their onConfirm()
+// callback and hang. Keep one watcher per node and replace it on each node update so the
+// callback closes over the latest nodeRecord rather than a stale one.
+const confirmationWatchersByNode = new Map<string, { remove: () => void }>();
 function startSubscriptionToReplications() {
-	subscribeToNodeUpdates((nodeRecord) => {
-		if (!nodeRecord) return;
-		forEachReplicatedDatabase({}, (database, databaseName) => {
-			const node_name = nodeRecord.name;
-			let confirmationsForNode = replicationConfirmationFloat64s.get(node_name);
+	subscribeToNodeUpdates((nodeRecord, nodeId) => {
+		// subscribeToNodeUpdates fires the listener for both 'put' and 'delete' events; on delete
+		// the value is undefined but the id (node name) is still passed. Tear down any existing
+		// watcher in both cases so we don't accumulate stale watchers when nodes are removed.
+		const nodeNameAtUpdate = nodeRecord?.name ?? nodeId;
+		if (!nodeNameAtUpdate) return;
+		confirmationWatchersByNode.get(nodeNameAtUpdate)?.remove();
+		confirmationWatchersByNode.delete(nodeNameAtUpdate);
+		if (!nodeRecord) {
+			// Node was removed — release its shared-buffer entries so the map doesn't accumulate
+			// stale node entries across long-running clusters where nodes churn.
+			replicationConfirmationFloat64s.delete(nodeNameAtUpdate);
+			return;
+		}
+		const handle = forEachReplicatedDatabase({}, (database, databaseName) => {
+			let confirmationsForNode = replicationConfirmationFloat64s.get(nodeNameAtUpdate);
 			if (!confirmationsForNode) {
-				replicationConfirmationFloat64s.set(node_name, (confirmationsForNode = new Map()));
+				replicationConfirmationFloat64s.set(nodeNameAtUpdate, (confirmationsForNode = new Map()));
+			}
+			if (!database) {
+				// dropDatabase notification — clear the entry so a later create-then-recreate of the
+				// same databaseName will re-register confirmation tracking instead of being skipped
+				// by the .has() guard below.
+				confirmationsForNode.delete(databaseName);
+				return;
 			}
 			if (confirmationsForNode.has(databaseName)) return;
 			let auditStore;
@@ -211,7 +240,7 @@ function startSubscriptionToReplications() {
 				if (auditStore) break;
 			}
 			if (auditStore) {
-				const replicatedTime = getReplicationSharedStatus(auditStore, databaseName, node_name, () => {
+				const replicatedTime: Float64Array & { lastTime?: number } = getReplicationSharedStatus(auditStore, databaseName, nodeNameAtUpdate, () => {
 					const updatedTime = replicatedTime[0];
 					const lastTime = replicatedTime.lastTime;
 					for (const { txnTime, onConfirm } of commitsAwaitingReplication.get(databaseName) || []) {
@@ -225,6 +254,7 @@ function startSubscriptionToReplications() {
 				confirmationsForNode.set(databaseName, replicatedTime);
 			}
 		});
+		confirmationWatchersByNode.set(nodeNameAtUpdate, handle);
 	});
 }
 export type Route = {
@@ -284,7 +314,7 @@ export function* iterateRoutes(options: { routes: (Route | any)[] }) {
 
 export function getNodeURL(node: Node): string {
 	if (node.url) return node.url;
-	const host = node.name;
+	let host = node.name;
 	const securePort = env.get(CONFIG_PARAMS.REPLICATION_SECUREPORT);
 	let port: any;
 	// if the host includes a port, use that port
