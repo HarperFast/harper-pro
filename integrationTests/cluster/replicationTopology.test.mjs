@@ -572,11 +572,15 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		// Pick a non-bridge v5 node to ensure the write goes through the v5
 		// mesh first, then transits the bridge back to v4. The bridge node is
 		// ctx.nodes[0] (the legacy peer was added to that node).
+		//
+		// The suite builds a star topology (ctx.nodes[1..3] only know the
+		// central node), so a leaf write can confirm against exactly one peer.
+		// We then poll the legacy v4 node for arrival.
 		await sendOperation(ctx.nodes[1], {
 			operation: 'upsert',
 			table: 'test',
 			records: [{ id: 'v5-originated-1', name: 'written on v5' }],
-			replicatedConfirmation: NODE_COUNT - 1,
+			replicatedConfirmation: 1,
 		});
 
 		// The legacy v4 peer should observe the write once it propagates
@@ -629,12 +633,14 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		);
 
 		// v5 mesh must still be intact: a write on one v5 node still
-		// propagates to the others.
+		// propagates to the others. ctx.nodes[2] is a leaf in the star
+		// topology, so it only has one peer (the central node) — confirm
+		// against that and then poll for transitive arrival at the others.
 		await sendOperation(ctx.nodes[2], {
 			operation: 'upsert',
 			table: 'test',
 			records: [{ id: 'post-teardown-1', name: 'written after teardown' }],
-			replicatedConfirmation: NODE_COUNT - 1,
+			replicatedConfirmation: 1,
 		});
 		for (let i = 0; i < NODE_COUNT; i++) {
 			let response;
