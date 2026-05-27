@@ -71,17 +71,28 @@ describe('findStaleNodeUrls', () => {
 		expect(findStaleNodeUrls(map, [live])).to.deep.equal(new Set(['ws://b:9933']));
 	});
 
-	it('does not flag entries whose worker is undefined (no http workers available at registration time)', () => {
-		// onDatabase legitimately stores an entry with `worker: undefined` when no http
-		// workers were available — those should NOT be treated as stale, otherwise we'd
-		// reassign forever in single-worker test environments.
+	it('flags entries with no worker assigned when live workers are available (workers came back after startup)', () => {
+		// onDatabase stores `worker: undefined` if it ran during a window when no http
+		// workers existed. Once workers come back, the reconcile must flag these so they
+		// get rebound — otherwise the subscription is silently dead for the process life.
 		const live = makeWorker('http');
 		const map = makeConnectionMap([
 			['ws://a:9933', [['data', { worker: undefined }]]],
 			['ws://b:9933', [['data', { worker: live }]]],
 		]);
 
-		expect(findStaleNodeUrls(map, [live])).to.deep.equal(new Set());
+		expect(findStaleNodeUrls(map, [live])).to.deep.equal(new Set(['ws://a:9933']));
+	});
+
+	it('returns empty when no live workers exist (no point reassigning to nothing)', () => {
+		// Guard against endless no-op reassignment loops when the http pool is momentarily
+		// empty (or during workerless unit-test scenarios).
+		const map = makeConnectionMap([
+			['ws://a:9933', [['data', { worker: undefined }]]],
+			['ws://b:9933', [['data', { worker: makeWorker('http') /* dead — not in pool */ }]]],
+		]);
+
+		expect(findStaleNodeUrls(map, [])).to.deep.equal(new Set());
 	});
 
 	it('flags all stale node urls and ignores the live ones in a mixed map', () => {
