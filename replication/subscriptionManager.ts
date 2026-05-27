@@ -61,14 +61,19 @@ const WORKER_EXIT_REASSIGN_STAGGER_MS = 100;
 const RECONCILE_INTERVAL_MS = 30_000;
 let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
-// Returns the set of node URLs whose replication entries point at a worker that is no longer
-// in the supplied http worker pool. Pure helper so the reconcile pass below — and its unit
-// tests — can verify the broken-chain detection without spinning up real workers.
+// Returns the set of node URLs whose replication entries either point at a worker no longer
+// in the supplied http pool, OR have no worker assigned at all while live workers exist.
+// The second case covers "all workers were down at registration time" — onDatabase stores
+// `worker: undefined` when httpWorkers is empty, and without this the entry would never
+// get reassigned once workers came back. Pure helper so the reconcile pass below — and its
+// unit tests — can verify the broken-chain detection without spinning up real workers.
 export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatusMap>, httpWorkers: any[]): Set<string> {
 	const staleNodeUrls = new Set<string>();
+	// No live workers to reassign to — flagging here would cause endless no-op reassignments.
+	if (httpWorkers.length === 0) return staleNodeUrls;
 	for (const [url, dbReplicationWorkers] of connectionMap) {
 		for (const entry of dbReplicationWorkers.values()) {
-			if (entry.worker && !httpWorkers.includes(entry.worker)) {
+			if (!entry.worker || !httpWorkers.includes(entry.worker)) {
 				staleNodeUrls.add(url);
 				break;
 			}
@@ -259,10 +264,12 @@ export async function startOnMainThread(options) {
 			// Defensively detect entries that point at a worker no longer in the http pool.
 			// This happens when the worker.on('exit') handler below never fired (hung WebSocket
 			// refs blocking exit), the identity check rejected the reassignment, or its
-			// setTimeout retry was lost. Without this check, the early-return branch keeps
-			// the entry pinned to a dead worker and the subscription never recovers.
-			if (existingEntry?.worker && !httpWorkers.includes(existingEntry.worker)) {
-				logger.warn(`Subscription for ${databaseName} on node ${node.name} pointed at an exited worker; reassigning`);
+			// setTimeout retry was lost. We also catch the case where the entry has no worker
+			// assigned at all (all workers were down at registration time) so it gets rebound
+			// once workers come back. Without these checks, the early-return branch keeps the
+			// entry stuck and the subscription never recovers.
+			if (existingEntry && httpWorkers.length > 0 && !httpWorkers.includes(existingEntry.worker as any)) {
+				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
 				dbReplicationWorkers.delete(databaseName);
 				existingEntry = undefined;
 			}

@@ -81,21 +81,29 @@ export function getReplicationSharedStatus(
 // node-update tracking. Per-event errors are caught individually so they cannot tear down
 // the loop.
 const NODE_WATCHER_RESTART_DELAY_MS = 1000;
+// Cap the exponential backoff so a persistent failure (subscribe throws every time)
+// doesn't run a tight 1s log+retry loop forever — back off up to 30s instead.
+const NODE_WATCHER_MAX_DELAY_MS = 30_000;
 type WatcherOptions = {
 	subscribe?: () => Promise<AsyncIterable<any>> | AsyncIterable<any>;
 	processEvent?: (event: any, listener: (node: any, id: string) => void) => Promise<void> | void;
 	restartDelayMs?: number;
+	maxDelayMs?: number;
 	maxRestarts?: number;
 };
 export async function runNodeUpdateWatcher(listener: (node: any, id: string) => void, options: WatcherOptions = {}) {
 	const subscribe = options.subscribe ?? (() => getHDBNodeTable().subscribe({}));
 	const processEvent = options.processEvent ?? processNodeUpdateEvent;
 	const restartDelayMs = options.restartDelayMs ?? NODE_WATCHER_RESTART_DELAY_MS;
+	const maxDelayMs = options.maxDelayMs ?? NODE_WATCHER_MAX_DELAY_MS;
 	const maxRestarts = options.maxRestarts ?? Infinity;
 	let restarts = 0;
+	let consecutiveFailures = 0;
 	while (restarts < maxRestarts) {
+		let iteratedSuccessfully = false;
 		try {
 			const events = await subscribe();
+			iteratedSuccessfully = true; // we got past subscribe — any later throw is a fresh failure
 			for await (const event of events) {
 				try {
 					await processEvent(event, listener);
@@ -111,9 +119,12 @@ export async function runNodeUpdateWatcher(listener: (node: any, id: string) => 
 		} catch (error) {
 			logger.error?.('hdb_nodes watcher failed; restarting', error);
 		}
+		// Successful subscribe → reset backoff so a fresh failure restarts quickly.
+		consecutiveFailures = iteratedSuccessfully ? 0 : consecutiveFailures + 1;
 		restarts++;
 		if (restarts >= maxRestarts) return;
-		await new Promise((resolve) => setTimeout(resolve, restartDelayMs));
+		const delay = Math.min(restartDelayMs * Math.pow(2, Math.min(consecutiveFailures, 5)), maxDelayMs);
+		await new Promise((resolve) => setTimeout(resolve, delay));
 	}
 }
 async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
