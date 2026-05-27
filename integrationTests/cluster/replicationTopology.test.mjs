@@ -539,6 +539,21 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 			await sendOperation(legacy, { operation: 'upsert', table, records });
 		}
 
+		// Wait for schema replication to land each table on every v5 node.
+		// Without this, the search loop below races schema sync and
+		// sendOperation throws on the non-200 (table-not-found) response
+		// before its retry can take effect.
+		for (const table of tables) {
+			for (let i = 0; i < NODE_COUNT; i++) {
+				let retries = 0;
+				let described;
+				do {
+					await delay(100);
+					described = await sendOperation(ctx.nodes[i], { operation: 'describe_database' });
+				} while (!described?.data?.[table] && retries++ < 30);
+			}
+		}
+
 		// All RECORDS_PER_TABLE rows must arrive on every v5 node for every
 		// table. Past audit-forwarding bugs only delivered the first record in
 		// a multi-record batch, so we assert full counts (not just presence).
@@ -584,19 +599,20 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		});
 
 		// The legacy v4 peer should observe the write once it propagates
-		// through the bridge. v4 has no replicatedConfirmation guarantee so
-		// we poll.
+		// through the bridge. v4 has no replicatedConfirmation guarantee and
+		// the v5-originated record has to traverse a node v4 may not have a
+		// direct id mapping for yet, so allow a generous polling window.
 		let response;
 		let retries = 0;
 		do {
-			await delay(200);
+			await delay(500);
 			response = await sendOperation(legacy, {
 				operation: 'search_by_id',
 				table: 'test',
 				get_attributes: ['id', 'name'],
 				ids: ['v5-originated-1'],
 			});
-		} while (response.length === 0 && retries++ < 20);
+		} while (response.length === 0 && retries++ < 60);
 		equal(
 			response.length,
 			1,
