@@ -74,39 +74,75 @@ export function getReplicationSharedStatus(
 		)
 	);
 }
-export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {
-	getHDBNodeTable()
-		.subscribe({})
-		.then(async (events) => {
+// If the async iterator for hdb_nodes throws or completes, the watcher used to die silently
+// and the node lost the ability to (re)establish outbound replication subscriptions for the
+// lifetime of the process. Run the watcher inside a restart loop so a single transient error
+// (e.g. WebSocket close, schema mismatch, downstream throw) does not permanently disable
+// node-update tracking. Per-event errors are caught individually so they cannot tear down
+// the loop.
+const NODE_WATCHER_RESTART_DELAY_MS = 1000;
+type WatcherOptions = {
+	subscribe?: () => Promise<AsyncIterable<any>> | AsyncIterable<any>;
+	processEvent?: (event: any, listener: (node: any, id: string) => void) => Promise<void> | void;
+	restartDelayMs?: number;
+	maxRestarts?: number;
+};
+export async function runNodeUpdateWatcher(listener: (node: any, id: string) => void, options: WatcherOptions = {}) {
+	const subscribe = options.subscribe ?? (() => getHDBNodeTable().subscribe({}));
+	const processEvent = options.processEvent ?? processNodeUpdateEvent;
+	const restartDelayMs = options.restartDelayMs ?? NODE_WATCHER_RESTART_DELAY_MS;
+	const maxRestarts = options.maxRestarts ?? Infinity;
+	let restarts = 0;
+	while (restarts < maxRestarts) {
+		try {
+			const events = await subscribe();
 			for await (const event of events) {
-				// remove any nodes that have been updated or deleted
-				const node_name = event?.value?.name || event?.id;
-				logger.debug?.('adding node', node_name, 'on  node', getThisNodeName(), ' on process', process.pid);
-				server.nodes = server.nodes.filter((node) => node && node.name !== node_name);
-				if (event.type === 'put' && node_name !== getThisNodeName()) {
-					// add any new nodes
-					if (event.value) server.nodes.push(event.value);
-					else {
-						console.error('Invalid node update event', event);
-					}
-				}
-				const shards = new Map();
-				for await (const node of getHDBNodeTable().search({})) {
-					if (!node) continue;
-					if (node.shard != undefined) {
-						let nodesForShard = shards.get(node.shard);
-						if (!nodesForShard) {
-							shards.set(node.shard, (nodesForShard = []));
-						}
-						nodesForShard.push(node);
-					}
-				}
-				server.shards = shards;
-				if (event.type === 'put' || event.type === 'delete') {
-					listener(event.value, event.id);
+				try {
+					await processEvent(event, listener);
+				} catch (error) {
+					// Don't let a single bad event tear down the watcher — log and continue.
+					logger.error('Error processing hdb_nodes update event', error);
 				}
 			}
-		});
+			logger.warn('hdb_nodes subscription ended unexpectedly; restarting watcher');
+		} catch (error) {
+			logger.error('hdb_nodes watcher failed; restarting', error);
+		}
+		restarts++;
+		if (restarts >= maxRestarts) return;
+		await new Promise((resolve) => setTimeout(resolve, restartDelayMs));
+	}
+}
+async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
+	// remove any nodes that have been updated or deleted
+	const node_name = event?.value?.name || event?.id;
+	logger.debug?.('adding node', node_name, 'on  node', getThisNodeName(), ' on process', process.pid);
+	server.nodes = server.nodes.filter((node) => node && node.name !== node_name);
+	if (event.type === 'put' && node_name !== getThisNodeName()) {
+		// add any new nodes
+		if (event.value) server.nodes.push(event.value);
+		else {
+			console.error('Invalid node update event', event);
+		}
+	}
+	const shards = new Map();
+	for await (const node of getHDBNodeTable().search({})) {
+		if (!node) continue;
+		if (node.shard != undefined) {
+			let nodesForShard = shards.get(node.shard);
+			if (!nodesForShard) {
+				shards.set(node.shard, (nodesForShard = []));
+			}
+			nodesForShard.push(node);
+		}
+	}
+	server.shards = shards;
+	if (event.type === 'put' || event.type === 'delete') {
+		listener(event.value, event.id);
+	}
+}
+export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {
+	runNodeUpdateWatcher(listener);
 	server.nodes = [];
 	server.shards = new Map();
 
@@ -240,16 +276,21 @@ function startSubscriptionToReplications() {
 				if (auditStore) break;
 			}
 			if (auditStore) {
-				const replicatedTime: Float64Array & { lastTime?: number } = getReplicationSharedStatus(auditStore, databaseName, nodeNameAtUpdate, () => {
-					const updatedTime = replicatedTime[0];
-					const lastTime = replicatedTime.lastTime;
-					for (const { txnTime, onConfirm } of commitsAwaitingReplication.get(databaseName) || []) {
-						if (txnTime > lastTime && txnTime <= updatedTime) {
-							onConfirm();
+				const replicatedTime: Float64Array & { lastTime?: number } = getReplicationSharedStatus(
+					auditStore,
+					databaseName,
+					nodeNameAtUpdate,
+					() => {
+						const updatedTime = replicatedTime[0];
+						const lastTime = replicatedTime.lastTime;
+						for (const { txnTime, onConfirm } of commitsAwaitingReplication.get(databaseName) || []) {
+							if (txnTime > lastTime && txnTime <= updatedTime) {
+								onConfirm();
+							}
 						}
+						replicatedTime.lastTime = updatedTime;
 					}
-					replicatedTime.lastTime = updatedTime;
-				});
+				);
 				replicatedTime.lastTime = 0;
 				confirmationsForNode.set(databaseName, replicatedTime);
 			}
