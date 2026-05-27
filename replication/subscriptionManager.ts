@@ -56,9 +56,13 @@ const NODE_SUBSCRIBE_DELAY = 200; // delay before sending node subscribe to othe
 // worker(s) absorb them gradually.
 const WORKER_EXIT_REASSIGN_STAGGER_MS = 100;
 // Cadence of the per-process safety-net reconcile that rebinds subscriptions whose
-// worker no longer exists. Pure read-side filter against `workers` and `connectionReplicationMap`
-// on each tick when nothing is wrong, so a generous interval keeps it cheap.
-const RECONCILE_INTERVAL_MS = 30_000;
+// worker no longer exists. Pure read-side filter against `workers` and
+// `connectionReplicationMap` on each tick when nothing is wrong, so a short interval
+// is cheap. Sized for the deploy-time rapid-restart-storm pattern (stacked
+// `restart_http_workers` at ~1.5s spacing under live write traffic), where the per-
+// worker exit chain races against shutdown and silently drops half the subscription
+// assignments — this is the user-visible recovery latency for the resulting drift.
+const RECONCILE_INTERVAL_MS = 5_000;
 let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
 // Returns the set of node URLs whose replication entries either point at a worker no longer
