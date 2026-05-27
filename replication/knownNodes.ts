@@ -101,12 +101,15 @@ export async function runNodeUpdateWatcher(listener: (node: any, id: string) => 
 					await processEvent(event, listener);
 				} catch (error) {
 					// Don't let a single bad event tear down the watcher — log and continue.
-					logger.error('Error processing hdb_nodes update event', error);
+					// Optional chaining: this `logger` is the level-conditional one, where
+					// `.error` is undefined when the configured level filters it out, and an
+					// uncaught TypeError here would defeat the whole recovery loop.
+					logger.error?.('Error processing hdb_nodes update event', error);
 				}
 			}
-			logger.warn('hdb_nodes subscription ended unexpectedly; restarting watcher');
+			logger.warn?.('hdb_nodes subscription ended unexpectedly; restarting watcher');
 		} catch (error) {
-			logger.error('hdb_nodes watcher failed; restarting', error);
+			logger.error?.('hdb_nodes watcher failed; restarting', error);
 		}
 		restarts++;
 		if (restarts >= maxRestarts) return;
