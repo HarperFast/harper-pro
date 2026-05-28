@@ -316,14 +316,18 @@ export function getExcludedTablesForRouteEntries(
 	databaseName: string
 ): Set<string> | null {
 	if (!entries) return null;
+	let excluded: Set<string> | null = null;
 	for (const entry of entries) {
 		if (typeof entry === 'string') continue;
 		const entryPeer = entry.target ?? entry.source;
 		if ((!entryPeer || entryPeer === peerName) && (!entry.database || entry.database === databaseName)) {
-			if (entry.excludeTables?.length) return new Set(entry.excludeTables);
+			if (entry.excludeTables?.length) {
+				if (!excluded) excluded = new Set(entry.excludeTables);
+				else for (const t of entry.excludeTables) excluded.add(t);
+			}
 		}
 	}
-	return null;
+	return excluded;
 }
 
 export function* iterateRoutes(options: { routes: (Route | any)[] }) {

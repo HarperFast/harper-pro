@@ -1109,7 +1109,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						let sentSequenceId; // the last sequence number we have sent
 						// Tables excluded from outgoing replication to this peer+database (from sendsTo config)
 						const sendExcludedTables =
-							typeof authorization?.replicates === 'object'
+							authorization?.replicates && typeof authorization.replicates === 'object'
 								? getExcludedTablesForRouteEntries(authorization.replicates.sendsTo, remoteNodeName, databaseName)
 								: null;
 						const sendAuditRecord = (auditRecord, localTime) => {
@@ -1647,12 +1647,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				if (!tableDecoder) {
 					logger.error?.(`No table found with an id of ${auditRecord.tableId}`);
 				}
-				// Lazily compute receive-side exclusions once remoteNodeName is known
+				// Lazily compute receive-side exclusions once remoteNodeName is known.
+				// Prefer routeReplicates from the subscriber-side connection; fall back to
+				// authorization.replicates when this is the server-side handler.
 				if (receiveExcludedTables === undefined) {
 					const firstNode = options.connection?.nodeSubscriptions?.[0];
+					const receivesFromEntries =
+						firstNode?.routeReplicates?.receivesFrom ??
+						(authorization?.replicates && typeof authorization.replicates === 'object'
+							? authorization.replicates.receivesFrom
+							: undefined);
 					receiveExcludedTables =
-						getExcludedTablesForRouteEntries(firstNode?.routeReplicates?.receivesFrom, remoteNodeName, databaseName) ??
-						null;
+						getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName) ?? null;
 				}
 				if (tableDecoder && receiveExcludedTables?.has(tableDecoder.name)) {
 					logger.trace?.(
