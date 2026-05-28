@@ -203,7 +203,6 @@ suite('ACL Connect Cross-Node Delivery', { timeout: 180_000 }, (ctx) => {
 			if (retries++ > 20) throw new Error('Timed out waiting for cluster to connect');
 			await sleep(200 * retries);
 		}
-		await sleep(500);
 
 		// tar the fixture and deploy as payload — pointing `package:` at a
 		// directory makes Harper symlink and skip `npm install`, which leaves
