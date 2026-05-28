@@ -623,8 +623,9 @@ async function cloneJWTKeys(): Promise<void> {
 function extractPort(value: unknown): number | undefined {
 	if (value === null || value === undefined || value === '') return undefined;
 	const str = String(value);
-	const portPart = str.includes(':') ? str.split(':').pop() : str;
-	const port = parseInt(portPart!, 10);
+	const colon = str.lastIndexOf(':');
+	const portPart = colon >= 0 ? str.slice(colon + 1) : str;
+	const port = parseInt(portPart, 10);
 	return Number.isFinite(port) ? port : undefined;
 }
 
@@ -667,8 +668,13 @@ function deriveLeaderReplicationURL(leaderConfig: Record<string, any> | undefine
 
 	if (!scheme || port == null) return fallback;
 
-	const leaderURLObj = new URL(leaderURL);
-	return `${scheme}://${leaderURLObj.hostname}:${port}`;
+	let hostname: string;
+	try {
+		hostname = new URL(leaderURL).hostname;
+	} catch {
+		return fallback;
+	}
+	return `${scheme}://${hostname}:${port}`;
 }
 
 async function cloneConfig(): Promise<Record<string, any>> {
@@ -797,6 +803,10 @@ async function cloneSchemas(): Promise<void> {
 		allDb = await leaderRequest({ operation: OPERATIONS_ENUM.DESCRIBE_ALL });
 	} catch (err) {
 		log(`Failed to describe leader databases for schema clone: ${err}`, 'error');
+		return;
+	}
+	if (!allDb || typeof allDb !== 'object') {
+		log(`Leader returned unexpected describe_all shape (${typeof allDb}); skipping schema clone`, 'error');
 		return;
 	}
 
