@@ -805,9 +805,26 @@ async function cloneSchemas(): Promise<void> {
 	const { createSchema, createTable } = await import('../core/dataLayer/schema.js');
 	const { databases } = await import('../core/resources/databases.js');
 
+	// Filter by this node's `replication.databases` so we don't materialize empty databases the
+	// clone isn't even subscribing to. Matches the gating used by `shouldReplicateFromNode` in
+	// `replication/knownNodes.ts`: `undefined` or `'*'` accept everything; an array accepts only
+	// the names it lists (objects with `.name` are sharded-database entries).
+	const databaseReplications = envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES);
+	const isReplicatedDatabase = (dbName: string): boolean => {
+		if (!databaseReplications || databaseReplications === '*') return true;
+		if (!Array.isArray(databaseReplications)) return true;
+		return databaseReplications.some((entry: any) =>
+			typeof entry === 'string' ? entry === dbName : entry?.name === dbName
+		);
+	};
+
 	for (const dbName of Object.keys(allDb)) {
 		const dbDescribe = allDb[dbName];
 		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;
+		if (!isReplicatedDatabase(dbName)) {
+			log(`Skipping schema pre-create for '${dbName}' (not in replication.databases)`, 'debug');
+			continue;
+		}
 
 		if (!databases[dbName]) {
 			try {
