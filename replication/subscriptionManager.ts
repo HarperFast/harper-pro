@@ -174,7 +174,16 @@ export async function startOnMainThread(options) {
 		if (isSelf) return;
 		let dbReplicationWorkers = connectionReplicationMap.get(getNodeURL(node));
 		if (dbReplicationWorkers) dbReplicationWorkers.iterator.remove(); // we need to remove the old iterator so we can create a new one
-		if (!(node.replicates === true || node.replicates?.sends) && !node.subscriptions?.length && !dbReplicationWorkers)
+		if (
+			!(
+				node.replicates === true ||
+				node.replicates?.sends ||
+				node.replicates?.sendsTo?.length ||
+				node.replicates?.receivesFrom?.length
+			) &&
+			!node.subscriptions?.length &&
+			!dbReplicationWorkers
+		)
 			return; // we don't have any subscriptions and we haven't connected yet, so just return
 		logger.info(`Added node ${node.name} at ${getNodeURL(node)} for process ${getThisNodeName()}`);
 		if (node.replicates && node.subscriptions) {
@@ -362,7 +371,15 @@ export async function startOnMainThread(options) {
 				return;
 			}
 			const mainNode: any = existingWorkerEntry.nodes[0];
-			if (!(mainNode.replicates === true || mainNode.replicates?.sends || mainNode.subscriptions?.length)) {
+			if (
+				!(
+					mainNode.replicates === true ||
+					mainNode.replicates?.sends ||
+					mainNode.replicates?.sendsTo?.length ||
+					mainNode.replicates?.receivesFrom?.length ||
+					mainNode.subscriptions?.length
+				)
+			) {
 				// no replication, so just return
 				return;
 			}
