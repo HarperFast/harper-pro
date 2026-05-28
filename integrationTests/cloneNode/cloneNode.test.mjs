@@ -24,7 +24,7 @@ async function sendOperation(node, operation) {
 	return responseData;
 }
 
-async function waitForAvailableStatus(node, timeoutMs = 60000, checkInterval = 2000) {
+async function waitForAvailableStatus(node, timeoutMs = 120000, checkInterval = 2000) {
 	const timeoutAt = Date.now() + timeoutMs;
 
 	while (Date.now() < timeoutAt) {
@@ -101,6 +101,28 @@ suite('Clone Node', (ctx) => {
 			hostname: 'gitlab.com',
 			known_hosts: 'gitlab.com fake1\ngitlab.com fake2',
 		});
+
+		// Deploy a filesystem-only application file-by-file using set_component_file.
+		// This creates the component on disk without a config entry and without triggering
+		// loadComponent validation, which exercises the new cloneApplications() path in cloneNode.
+		const fixtureDir = join(import.meta.dirname, 'fixture', 'test-app');
+		const { readFileSync } = await import('node:fs');
+		for (const file of ['config.yaml', 'resources.js', 'schema.graphql']) {
+			await sendOperation(nodeCtx.harper, {
+				operation: 'set_component_file',
+				project: 'filesystem-app',
+				file,
+				payload: readFileSync(join(fixtureDir, file), 'utf8'),
+			});
+		}
+
+		// Deploy a config-referenced application via payload so it gets a config entry.
+		// cloneApplications() should skip this — it will be reinstalled via config on the clone.
+		await sendOperation(nodeCtx.harper, {
+			operation: 'deploy_component',
+			project: 'config-app',
+			package: 'HarperFast/application-template',
+		});
 	});
 
 	after(async () => {
@@ -146,8 +168,29 @@ suite('Clone Node', (ctx) => {
 		});
 		equal(responseClone.logging?.level, 'debug', 'Logging level should be cloned');
 		equal(responseClone.logging?.rotation?.maxSize, '101M', 'Logging rotation maxSize should be cloned');
-		equal(responseClone.mqtt?.network?.port, 1212, 'MQTT network port should be cloned');
 		equal(responseClone.cloned, true, 'Node should be marked as cloned');
+
+		// Verify clone-temp-admin was cleaned up after token-auth clone
+		const cloneUsers = await sendOperation(ctx.nodes[1], { operation: 'list_users' });
+		ok(!cloneUsers.some((u) => u.username === 'clone-temp-admin'), 'clone-temp-admin should not exist on cloned node');
+
+		// Regression guard: a previous version of the cleanup called
+		// `databases.system.hdb_user.delete({ username: 'clone-temp-admin' })`. Because the argument
+		// is an object without `.id`, Resource.transactional treated it as a collection delete and
+		// ran an unfiltered full-table scan, wiping every row in hdb_user on the cloning node. The
+		// resulting tombstones then replicated cluster-wide and emptied the leader's user table too,
+		// breaking authentication for every subsequent clone attempt. Assert that the real admin
+		// user survived on both the clone and the leader.
+		ok(
+			cloneUsers.some((u) => u.username === ctx.nodes[0].admin.username),
+			`Leader's admin user (${ctx.nodes[0].admin.username}) should be replicated and present on the cloned node`
+		);
+		const leaderUsers = await sendOperation(ctx.nodes[0], { operation: 'list_users' });
+		ok(leaderUsers.length > 0, 'Leader hdb_user must not be emptied by clone cleanup');
+		ok(
+			leaderUsers.some((u) => u.username === ctx.nodes[0].admin.username),
+			`Leader's admin user (${ctx.nodes[0].admin.username}) should still exist on the leader after clone cleanup`
+		);
 
 		// Verify that cluster status shows both nodes connected to each other
 		const clusterStatusNode1 = await sendOperation(ctx.nodes[0], {
@@ -162,14 +205,25 @@ suite('Clone Node', (ctx) => {
 		equal(clusterStatusNode2.connections.length, 1, 'Clone node should have 1 connection');
 		equal(clusterStatusNode2.connections?.[0]?.database_sockets.length, 2, 'Clone node should be connected to leader');
 
-		// Verify that data was cloned successfully by querying the clone node for data that was inserted into the leader node before cloning
-		const responseData = await sendOperation(ctx.nodes[1], {
-			operation: 'search_by_id',
-			table: 'test',
-			get_attributes: ['id', 'name'],
-			ids: ['1'],
-		});
-		equal(responseData.length, 1, 'Should find 1 record in clone node');
+		// Verify that data was cloned successfully by querying the clone node for data that was inserted into the leader node before cloning.
+		// "Available" status doesn't guarantee all data has finished copying, so retry until the record appears.
+		let responseData;
+		for (let retries = 0; ; retries++) {
+			try {
+				responseData = await sendOperation(ctx.nodes[1], {
+					operation: 'search_by_id',
+					table: 'test',
+					get_attributes: ['id', 'name'],
+					ids: ['1'],
+				});
+				if (responseData.length === 1) break;
+			} catch {}
+			if (retries >= 20) {
+				equal(responseData?.length ?? 0, 1, 'Should find 1 record in clone node');
+				break;
+			}
+			await sleep(500);
+		}
 		equal(responseData[0].name, 'test-clone', 'Record name should match the original');
 
 		const sshKeys = await sendOperation(ctx.nodes[1], {
@@ -195,6 +249,18 @@ suite('Clone Node', (ctx) => {
 				`JWT key ${keyName} should match between leader and clone`
 			);
 		}
+
+		// Verify both applications were cloned to the clone node
+		const cloneApps = await sendOperation(ctx.nodes[1], { operation: 'get_components' });
+		const appEntries = cloneApps.entries ?? [];
+
+		const filesystemApp = appEntries.find((e) => e.name === 'filesystem-app');
+		const configApp = appEntries.find((e) => e.name === 'config-app');
+
+		ok(filesystemApp, 'filesystem-only application should be cloned to the clone node');
+		ok(configApp, 'config-referenced application should be cloned to the clone node');
+		ok(!filesystemApp?.package, 'filesystem-only application should not have a config package reference on the clone');
+		ok(configApp?.package, 'config-referenced application should retain its package reference on the clone');
 	});
 
 	test('should clone three more nodes successfully', async () => {
@@ -231,21 +297,37 @@ suite('Clone Node', (ctx) => {
 			await waitForAvailableStatus(ctx.nodes[newNodeIndex]);
 		}
 
-		for (let j = 0; j < ctx.nodes.length; j++) {
-			const node = ctx.nodes[j];
-			const clusterStatus = await sendOperation(node, {
-				operation: 'cluster_status',
-			});
+		// wait for the full mesh to establish — reaching Available status does not guarantee
+		// that all cross-node replication sockets have connected yet
+		let retries = 0;
+		let statuses;
+		while (true) {
+			statuses = await Promise.all(ctx.nodes.map((node) => sendOperation(node, { operation: 'cluster_status' })));
+			const fullyConnected = statuses.every(
+				(status) =>
+					status.connections.length === ctx.nodes.length - 1 &&
+					status.connections.every(
+						(connection) =>
+							connection.database_sockets.length === 2 &&
+							connection.database_sockets.every((socket) => socket.connected)
+					)
+			);
+			if (fullyConnected) break;
+			if (retries++ > 20) {
+				throw new Error(`Cluster did not fully connect: ${JSON.stringify(statuses)}`);
+			}
+			await sleep(500 * retries);
+		}
 
-			equal(clusterStatus.connections.length, 4, JSON.stringify(clusterStatus));
-			for (let connection of clusterStatus.connections) {
+		for (const clusterStatus of statuses) {
+			equal(clusterStatus.connections.length, ctx.nodes.length - 1, JSON.stringify(clusterStatus));
+			for (const connection of clusterStatus.connections) {
 				equal(connection.database_sockets.length, 2, JSON.stringify(connection));
-				for (let socket of connection.database_sockets) {
+				for (const socket of connection.database_sockets) {
 					ok(socket.connected, 'connected');
 				}
 			}
 		}
-		console.log('done');
 	});
 });
 

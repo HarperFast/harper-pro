@@ -4,10 +4,12 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { request as httpsRequest } from 'node:https';
+import { request as httpRequest } from 'node:http';
 import yaml from 'yaml';
-import https from 'https';
+import { decode as cborDecode } from 'cbor-x';
 
-import envMgr from '../core/utility/environment/environmentManager.js';
+import * as envMgr from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { isHdbInstalled } from '../core/utility/installation.js';
 import { getConfiguration, flattenConfig, createConfigFile, updateConfigValue } from '../core/config/configUtils.js';
@@ -248,6 +250,9 @@ export async function cloneNode(): Promise<void> {
 	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
 	await cloneConfig();
 
+	// Clone applications that are deployed on the leader but not referenced in harper-config
+	await cloneApplications();
+
 	// Base set node request
 	type SetNodeRequest = {
 		operation: string;
@@ -277,13 +282,6 @@ export async function cloneNode(): Promise<void> {
 				password: leaderPassword,
 			};
 		}
-	} else {
-		// We delete the clone-temp-admin user because now that HDB is installed we want user to come from the leader via replication
-		// systemExists check will show if this is the first time clone is being run.
-		if (!systemExists) {
-			const { databases } = await import('../core/resources/databases.js');
-			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
-		}
 	}
 
 	// Restarting workers to ensure new configuration it loaded.
@@ -306,6 +304,44 @@ export async function cloneNode(): Promise<void> {
 
 	// Monitor the synchronization status of the databases after cloning and update availability status once sync is complete
 	await monitorSync();
+
+	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
+	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
+	// node with no users during setNode(), which prevents replication from being established.
+	// Runs on retry too (when systemExists but cloned not yet set) via !hdbConfig?.cloned.
+	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
+		try {
+			const { databases } = await import('../core/resources/databases.js');
+			// Only delete clone-temp-admin if it actually exists. If install used CLI/env args
+			// that supplied a real admin username (e.g. integration tests pass
+			// --HDB_ADMIN_USERNAME=admin), `clone-temp-admin` was never created and there is
+			// nothing to clean up — skip the delete entirely.
+			const existing = await databases.system.hdb_user.get('clone-temp-admin');
+			if (existing) {
+				// Wait until at least one non-clone-temp-admin user is present (replicated from leader)
+				// before deleting, so the node still has a super_user available for local-auth.
+				const waitDeadline = Date.now() + syncTimeoutMs;
+				while (Date.now() < waitDeadline) {
+					let foundReplicatedUser = false;
+					try {
+						for await (const user of databases.system.hdb_user.search([])) {
+							if (user?.username && user.username !== 'clone-temp-admin') {
+								foundReplicatedUser = true;
+								break;
+							}
+						}
+					} catch (err) {
+						log(`Error scanning hdb_user while waiting for replicated user: ${err}`, 'error');
+					}
+					if (foundReplicatedUser) break;
+					await sleep(200);
+				}
+				await databases.system.hdb_user.delete('clone-temp-admin');
+			}
+		} catch (err) {
+			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
+		}
+	}
 
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
@@ -491,7 +527,7 @@ async function cloneSSHKeys() {
 
 	const { addSSHKey } = await import('../security/sshKeyOperations.js');
 	try {
-		const keys: Record<string, any> = await leaderRequest({ operation: 'list_ssh_keys' });
+		const keys: any = await leaderRequest({ operation: 'list_ssh_keys' });
 		if (!keys?.length) {
 			log('No SSH keys found on leader node to clone');
 			return;
@@ -499,7 +535,7 @@ async function cloneSSHKeys() {
 
 		for (const keyName of keys) {
 			log('Cloning SSH key:', keyName.name);
-			const keyData: Record<string, any> = await leaderRequest({
+			const keyData: any = await leaderRequest({
 				operation: 'get_ssh_key',
 				name: keyName.name,
 			});
@@ -598,6 +634,57 @@ async function cloneConfig(): Promise<void> {
 }
 
 /**
+ * Clones applications from the leader that are deployed to the applications directory but not referenced in harper-config.
+ * Applications referenced in harper-config are handled by normal config cloning and reinstalled on startup.
+ */
+async function cloneApplications(): Promise<void> {
+	log('Cloning filesystem-only applications from leader');
+
+	let applicationsResponse: Record<string, any>;
+	try {
+		applicationsResponse = await leaderRequest({ operation: OPERATIONS_ENUM.GET_COMPONENTS });
+	} catch (err) {
+		log(`Failed to get applications from leader: ${err}`, 'error');
+		return;
+	}
+
+	const entries: Array<Record<string, any>> = applicationsResponse?.entries ?? [];
+	// filesystem-only applications will not have a `package` property
+	const filesystemOnlyApplications = entries.filter((entry) => Array.isArray(entry.entries) && !entry.package);
+
+	if (filesystemOnlyApplications.length === 0) {
+		log('No filesystem-only applications found on leader to clone');
+		return;
+	}
+
+	log(`Cloning ${filesystemOnlyApplications.length} application(s) not referenced in harper-config`);
+
+	const { Application, prepareApplication } = await import('../core/components/Application.ts');
+
+	for (const entry of filesystemOnlyApplications) {
+		const applicationName: string = entry.name;
+		log(`Cloning application: ${applicationName}`);
+		try {
+			const packageResponse = await leaderRequest({
+				operation: OPERATIONS_ENUM.PACKAGE_COMPONENT,
+				project: applicationName,
+				skip_node_modules: true,
+			});
+
+			const application = new Application({
+				name: applicationName,
+				payload: packageResponse.payload,
+			});
+
+			await prepareApplication(application);
+			log(`Successfully cloned application: ${applicationName}`);
+		} catch (err) {
+			log(`Failed to clone application '${applicationName}': ${err}`, 'error');
+		}
+	}
+}
+
+/**
  * Send a request to the leader node for the given operation, using either WebSockets or HTTP based on the useWS flag
  * @param operation
  */
@@ -613,6 +700,7 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 
 	const headers: Record<string, string> = {
 		'Content-Type': 'application/json',
+		'Accept': 'application/cbor',
 	};
 
 	if (leaderToken) {
@@ -621,27 +709,58 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 		headers.Authorization = `Basic ${Buffer.from(`${leaderUsername}:${leaderPassword}`).toString('base64')}`;
 	}
 
-	const fetchOptions: RequestInit = {
-		method: 'POST',
-		headers,
-		body: JSON.stringify(operation),
-	};
+	const body = JSON.stringify(operation);
+	const url = new URL(leaderURL);
+	const isHttps = url.protocol === 'https:';
+	const port = url.port ? parseInt(url.port, 10) : isHttps ? 443 : 80;
+	const path = url.pathname + url.search;
+	const requestHeaders = { ...headers, 'Content-Length': Buffer.byteLength(body) };
 
-	// Only add agent for HTTPS
-	const isHttps = leaderURL.startsWith('https://');
-	if (isHttps) {
-		// @ts-ignore - agent option exists but TypeScript definitions may not include it
-		fetchOptions.agent = new https.Agent({
-			rejectUnauthorized: !allowSelfSigned,
-		});
+	const { statusCode, statusMessage, contentType, responseBody } = await new Promise<{
+		statusCode: number;
+		statusMessage: string;
+		contentType: string;
+		responseBody: Buffer;
+	}>((resolve, reject) => {
+		const callback = (res: import('node:http').IncomingMessage) => {
+			const chunks: Buffer[] = [];
+			res.on('data', (chunk: Buffer) => chunks.push(chunk));
+			res.on('end', () =>
+				resolve({
+					statusCode: res.statusCode!,
+					statusMessage: res.statusMessage!,
+					contentType: (res.headers['content-type'] as string) ?? '',
+					responseBody: Buffer.concat(chunks),
+				})
+			);
+			res.on('error', reject);
+		};
+		const req = isHttps
+			? httpsRequest(
+					{
+						hostname: url.hostname,
+						port,
+						path,
+						method: 'POST',
+						headers: requestHeaders,
+						rejectUnauthorized: !allowSelfSigned,
+					},
+					callback
+				)
+			: httpRequest({ hostname: url.hostname, port, path, method: 'POST', headers: requestHeaders }, callback);
+		req.on('error', reject);
+		req.write(body);
+		req.end();
+	});
+
+	if (statusCode < 200 || statusCode >= 300) {
+		throw new Error(`Leader request failed: ${statusCode} ${statusMessage}`);
 	}
 
-	const response = await fetch(leaderURL, fetchOptions);
-	if (!response.ok) {
-		throw new Error(`Leader request failed: ${response.status} ${response.statusText}`);
+	if (contentType.includes('application/cbor')) {
+		return cborDecode(responseBody);
 	}
-
-	return response.json();
+	return JSON.parse(responseBody.toString('utf8'));
 }
 
 /**

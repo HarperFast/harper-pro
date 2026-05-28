@@ -19,8 +19,7 @@
 		"core/utility/**/*",
 		"core/validation/**/*",
 		"core/globals.js",
-		"core/index.d.ts",
-		"core/index.js"
+		"core/index.ts"
 	],
 	"compilerOptions": {
 		// Allow JS files for mixed codebase
@@ -41,6 +40,9 @@
 
 		// Enforce erasable syntax only so we can use Node.js type-stripping
 		"erasableSyntaxOnly": true,
+
+		// Required: third-party type declarations (alasql, mathjs, msgpackr) have incompatible type errors
+		"skipLibCheck": true,
 
 		"baseUrl": ".",
 		"paths": {

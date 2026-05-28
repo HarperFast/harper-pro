@@ -4,6 +4,18 @@ Harper Pro is a source-available project licensed under [the Elastic License 2.0
 Currently we do not accept contributions to Harper Pro, but [Harper](https://github.com/HarperFast/harper)
 (which Harper Pro builds upon) is open source and does accept contributions.
 
+## Local Git Setup
+
+### Reducing package-lock.json merge conflicts
+
+The repository includes a `.gitattributes` entry that registers `npm-merge-driver` as the merge strategy for `package-lock.json`. To enable automatic conflict resolution when merging or rebasing locally, install it once:
+
+```bash
+npx npm-merge-driver install --global
+```
+
+This is optional — without it you'll see standard merge conflict behavior. The driver is not used for server-side PR merges on GitHub.
+
 ## Patch Release Procedure
 
 > This section is for maintainers creating patch releases against a stable release branch (e.g. `v5.0`).

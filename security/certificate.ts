@@ -18,7 +18,7 @@ import {
 	getPrimaryHostName,
 	setCertTable,
 } from '../core/security/keys.js';
-import env from '../core/utility/environment/environmentManager.js';
+import * as env from '../core/utility/environment/environmentManager.js';
 import { LICENSE_KEY_DIR_NAME } from '../core/utility/hdbTerms.ts';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 import { getThisNodeName } from '../core/server/nodeName.ts';
@@ -36,7 +36,7 @@ const fileExists = async (path: string): Promise<boolean> =>
 		.catch(() => false);
 
 export async function signCertificate(req) {
-	const response = {};
+	const response: any = {};
 	const hdbKeysDir = join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME);
 
 	if (req.csr) {
@@ -114,13 +114,23 @@ export async function createCsr() {
 	// the active replication cert is a non-RSA cert (e.g. Let's Encrypt EC).
 	const certificateTable = getCertTable();
 	const privateKeys: Map<string, string> = getPrivateKeys();
+	const hdbKeysDir = join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME);
 	let opsCert, opsPrivateKey, certName, privateKeyName;
 	for await (const cert of certificateTable.search([])) {
-		if (cert.is_self_signed && (cert.details?.issuer?.includes('Harper-Certificate-Authority') || cert.details?.issuer?.includes('HarperDB-Certificate-Authority'))) {
-			const key = privateKeys.get(cert.private_key_name);
+		if (
+			cert.is_self_signed &&
+			(cert.details?.issuer?.includes('Harper-Certificate-Authority') ||
+				cert.details?.issuer?.includes('HarperDB-Certificate-Authority'))
+		) {
+			// privateKeys Map is populated from config-referenced paths only, so a Harper CA key
+			// on disk but not referenced in config won't appear there — fall back to reading it.
+			let key: string | Buffer | undefined = privateKeys.get(cert.private_key_name);
+			if (!key && cert.private_key_name && (await fileExists(join(hdbKeysDir, cert.private_key_name)))) {
+				key = await readFile(join(hdbKeysDir, cert.private_key_name));
+			}
 			if (key) {
 				opsCert = pki.certificateFromPem(cert.certificate);
-				opsPrivateKey = pki.privateKeyFromPem(key);
+				opsPrivateKey = pki.privateKeyFromPem(key as string);
 				certName = cert.name;
 				privateKeyName = cert.private_key_name;
 				break;
@@ -355,7 +365,7 @@ async function removeCertificate(req: { name: string }): Promise<{ message: stri
 		);
 
 		// Only delete the key file if this is the only cert referencing it.
-		if (matchingKeys.length === 1 && matchingKeys[0].name === name) {
+		if (matchingKeys.length === 1 && (matchingKeys[0] as any).name === name) {
 			try {
 				logger.info?.('Removing private key named', private_key_name);
 				await unlink(join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME, private_key_name));

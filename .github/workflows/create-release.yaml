@@ -46,7 +46,7 @@ jobs:
           echo "Package.json version: v${{ steps.package-version.outputs.packageVersion }}"
           test "${{ steps.tag-version.outputs.tagVersion }}" == "v${{ steps.package-version.outputs.packageVersion }}"
       - name: Notify release in progress in Slack
-        uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -90,9 +90,9 @@ jobs:
             echo "## What's Changed"
             echo ""
             if [ -n "$PREV_TAG" ]; then
-              git log --format="- %s" "${PREV_TAG}..HEAD" | grep -v "^- Release v"
+              git log --format="- %s" "${PREV_TAG}..HEAD" | { grep -v "^- Release v" || true; }
             else
-              git log --format="- %s" | grep -v "^- Release v" | head -50
+              git log --format="- %s" | { grep -v "^- Release v" || true; } | head -50
             fi
             echo ""
             if [ -n "$PREV_TAG" ]; then
@@ -122,7 +122,7 @@ jobs:
     needs: [create-release]
     runs-on: ubuntu-latest
     steps:
-      - uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+      - uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -163,7 +163,7 @@ jobs:
     needs: [create-release]
     runs-on: ubuntu-latest
     steps:
-      - uses: slackapi/slack-github-action@af78098f536edbc4de71162a307590698245be95 # v3.0.1
+      - uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}

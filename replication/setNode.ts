@@ -97,7 +97,7 @@ export async function setNode(req: any) {
 	}
 
 	// This is the record that will be added to the other nodes hdbNodes table
-	const targetAddNodeObj = {
+	const targetAddNodeObj: any = {
 		operation: 'add_node_back',
 		hostname: getThisNodeName(),
 		target_hostname: hostname,
@@ -167,7 +167,7 @@ export async function setNode(req: any) {
 		cert_auth = targetNodeResponse.signingCA;
 	}
 
-	const nodeRecord = { url, ca: targetNodeResponse?.usingCA };
+	const nodeRecord: any = { url, ca: targetNodeResponse?.usingCA };
 	if (req.hostname) nodeRecord.name = req.hostname;
 	if (req.subscriptions) nodeRecord.subscriptions = req.subscriptions;
 	else nodeRecord.replicates = true;
@@ -180,7 +180,7 @@ export async function setNode(req: any) {
 	else if (req.shard !== undefined) nodeRecord.shard = req.shard;
 
 	if (nodeRecord.replicates) {
-		const thisNode = {
+		const thisNode: any = {
 			url: thisUrl,
 			ca: cert_auth,
 			replicates: true,
@@ -212,7 +212,7 @@ export async function setNode(req: any) {
 export async function addNodeBack(req) {
 	hdbLogger.trace('addNodeBack received request:', req);
 
-	let certs = {};
+	let certs: any = {};
 	// If the add_node req has a CSR attached, return the CA that was used to issue the CSR,
 	// else return whatever CA this node is using for replication
 	let originCa: string;
@@ -230,7 +230,7 @@ export async function addNodeBack(req) {
 		);
 	}
 
-	const nodeRecord = { url: req.url, ca: originCa };
+	const nodeRecord: any = { url: req.url, ca: originCa };
 	if (req.subscriptions) nodeRecord.subscriptions = req.subscriptions;
 	else {
 		nodeRecord.replicates = true;
@@ -243,7 +243,7 @@ export async function addNodeBack(req) {
 
 	const repCa = await getReplicationCertAuth();
 	if (nodeRecord.replicates) {
-		const thisNode = {
+		const thisNode: any = {
 			url: getThisNodeUrl(),
 			ca: repCa?.certificate,
 			replicates: true,
