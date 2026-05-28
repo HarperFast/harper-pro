@@ -100,18 +100,21 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 
 4. **Shared-buffer concurrency.** The Float64Array status buffers are touched from multiple threads with no lock. Treat them as eventually consistent; use the callback param of `subscribeToNodeUpdates` if you need notification.
 
+5. **Per-route table exclusion (`excludeTables`).** Route entries in `sendsTo`/`receivesFrom` can specify `excludeTables: ['hdb_nodes']` to prevent specific tables from crossing the wire. Three layers enforce this: (a) subscriber omits them from SUBSCRIPTION_REQUEST (in `sendSubscriptionRequestUpdate`); (b) sender skips their audit records before streaming (in `sendAuditRecord`); (c) receiver drops any that arrive (in the incoming message loop). Route config `routeReplicates` is threaded from `subscriptionManager.ts` onto `nodeSubscriptions` objects so static-route exclusions are available inside HTTP worker threads where `replicateOverWS` runs. Primary use case: v4→v5 migration bridges that share `system` database users/roles but must keep per-cluster `hdb_nodes` topology tables isolated.
+
 ---
 
 ## Tests
 
 **Integration tests** live in `../integrationTests/cluster/`:
 
-| File                                 | Purpose                                          |
-| ------------------------------------ | ------------------------------------------------ |
-| `clusterShared.mjs`                  | Shared fixture/helper (cluster boot, node setup) |
-| `fullyConnectedReplication.test.mjs` | Full-mesh topology                               |
-| `replicationTopology.test.mjs`       | Dynamic membership changes                       |
-| `replicationLoad.test.mjs`           | Concurrent-write load                            |
+| File                                   | Purpose                                                  |
+| -------------------------------------- | -------------------------------------------------------- |
+| `clusterShared.mjs`                    | Shared fixture/helper (cluster boot, node setup)         |
+| `fullyConnectedReplication.test.mjs`   | Full-mesh topology                                       |
+| `replicationTopology.test.mjs`         | Dynamic membership changes                               |
+| `replicationLoad.test.mjs`             | Concurrent-write load                                    |
+| `excludeTablesReplication.test.mjs`    | Per-route `excludeTables` bridge migration (issue #239)  |
 
 There is no dedicated `unitTests/replication/` directory — replication is exercised entirely via integration tests that spin up multi-node clusters.
 
@@ -129,3 +132,4 @@ There is no dedicated `unitTests/replication/` directory — replication is exer
 | Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `SUBSCRIPTION_UPDATE`) |
 | Where is `hdb_nodes` schema?              | `knownNodes.ts → getHDBNodeTable`                                                              |
 | What does `cluster_status` return?        | `clusterStatus.ts` (82 lines, whole file)                                                      |
+| Where is per-route table exclusion logic? | `knownNodes.ts → getExcludedTablesForRouteEntries`; threaded via `subscriptionManager.ts → routeReplicates` |
