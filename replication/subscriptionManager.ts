@@ -220,7 +220,11 @@ export async function startOnMainThread(options) {
 			logger.trace('Setting up replication for database', databaseName, 'on node', node.name);
 			const existingEntry = dbReplicationWorkers.get(databaseName);
 			let worker;
-			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node }];
+			// Find the matching route config for this peer so we can pass its receivesFrom/sendsTo
+			// exclusions to the worker thread (via the node subscription payload).
+			const matchingRoute = routes.find((r) => r.name === node.name);
+			const routeReplicates = typeof matchingRoute?.replicates === 'object' ? matchingRoute.replicates : null;
+			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node, routeReplicates }];
 			// Self catchup is done in case we have replicated any records that weren't actually written to our storage
 			// before a crash.
 			if (selfCatchupOfDatabase.has(databaseName) && env.get(CONFIG_PARAMS.REPLICATION_FAILOVER)) {
