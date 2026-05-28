@@ -230,9 +230,15 @@ export async function startOnMainThread(options) {
 			const existingEntry = dbReplicationWorkers.get(databaseName);
 			let worker;
 			// Find the matching route config for this peer so we can pass its receivesFrom/sendsTo
-			// exclusions to the worker thread (via the node subscription payload).
+			// exclusions to the worker thread (via the node subscription payload). For dynamic
+			// routes (add_node), fall back to the node's own hdb_nodes replicates object.
 			const matchingRoute = routes.find((r) => r.name === node.name);
-			const routeReplicates = typeof matchingRoute?.replicates === 'object' ? matchingRoute.replicates : null;
+			const routeReplicates =
+				typeof matchingRoute?.replicates === 'object'
+					? matchingRoute.replicates
+					: node.replicates && typeof node.replicates === 'object'
+						? node.replicates
+						: null;
 			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node, routeReplicates }];
 			// Self catchup is done in case we have replicated any records that weren't actually written to our storage
 			// before a crash.
