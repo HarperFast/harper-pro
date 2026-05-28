@@ -141,6 +141,21 @@ export function createReceiveWatchdog(opts: {
 	// during a large copy) so we do not churn setTimeout/clearTimeout per frame. Granularity loss
 	// is small relative to intervalMs — at worst the watchdog fires this much earlier or later.
 	const throttleMs = Math.min(1000, Math.max(100, opts.intervalMs / 30));
+	function check() {
+		const current = opts.getBytesRead();
+		if (current === bytesReadAtArm) {
+			timer = undefined;
+			opts.onSilence();
+			return;
+		}
+		// Bytes advanced since the last arm — but the activity may have been swallowed by the
+		// reset() throttle, so we cannot rely on an external caller to re-arm us. Re-arm from
+		// the new baseline; otherwise a throttled-reset-then-silence sequence would leave the
+		// watchdog permanently inactive (see PR #234 review).
+		bytesReadAtArm = current;
+		lastResetAt = Date.now();
+		timer = setTimeout(check, opts.intervalMs).unref();
+	}
 	return {
 		reset() {
 			const now = Date.now();
@@ -148,9 +163,7 @@ export function createReceiveWatchdog(opts: {
 			lastResetAt = now;
 			if (timer) clearTimeout(timer);
 			bytesReadAtArm = opts.getBytesRead();
-			timer = setTimeout(() => {
-				if (opts.getBytesRead() === bytesReadAtArm) opts.onSilence();
-			}, opts.intervalMs).unref();
+			timer = setTimeout(check, opts.intervalMs).unref();
 		},
 		stop() {
 			if (timer) {

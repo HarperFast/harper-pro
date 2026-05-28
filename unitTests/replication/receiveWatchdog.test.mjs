@@ -210,11 +210,9 @@ describe('createReceiveWatchdog', () => {
 		}
 	});
 
-	it('throttle does not break correctness: silence is still detected after rapid resets stop', () => {
-		// Regression guard for the throttle: if a message storm reset()s the watchdog at high
-		// frequency and then silence falls, the pending timer (armed by the FIRST reset of the
-		// storm) must still fire correctly. Failing to re-arm under throttle is OK as long as
-		// the in-flight timer fires intervalMs after the most recent un-throttled reset.
+	it('silence is detected after a normal sequence of un-throttled resets stops', () => {
+		// Spaced at >= throttleMs (1s here), so each reset bypasses the throttle and re-arms
+		// cleanly. This is the typical "peer was healthy, then dies" trajectory.
 		const onSilence = sinon.spy();
 		const watchdog = createReceiveWatchdog({
 			intervalMs: 60_000,
@@ -222,7 +220,6 @@ describe('createReceiveWatchdog', () => {
 			onSilence,
 		});
 
-		// 30s of "message storm": 30 resets at 1s spacing (so each one gets through the throttle).
 		for (let i = 0; i < 30; i++) {
 			watchdog.reset();
 			clock.tick(1_000);
@@ -231,6 +228,38 @@ describe('createReceiveWatchdog', () => {
 		// Clock is now at t=30s. Timer is scheduled to fire at t=89s — i.e. 59s from here.
 		expect(onSilence.callCount).to.equal(0);
 		clock.tick(58_999);
+		expect(onSilence.callCount).to.equal(0);
+		clock.tick(1);
+		expect(onSilence.callCount).to.equal(1);
+	});
+
+	it('regression: silence is still detected when the last activity was a *throttled* reset', () => {
+		// PR #234 review bug shape: external reset() while within the throttle window is dropped
+		// (no clear+reschedule). The in-flight timer eventually fires, observes that bytesRead
+		// has advanced (so it does not call onSilence), and previously did not re-arm — leaving
+		// the watchdog permanently dead under exactly the sequence it exists to recover from:
+		// peer goes quiet right after a burst, our sendPing tick fails to terminate, no further
+		// activity ever triggers reset() again.
+		const onSilence = sinon.spy();
+		let bytesRead = 0;
+		const watchdog = createReceiveWatchdog({
+			intervalMs: 60_000,
+			getBytesRead: () => bytesRead,
+			onSilence,
+		});
+
+		watchdog.reset(); // t=0, un-throttled, snapshot = 0, timer fires at t=60s
+		clock.tick(500);
+		bytesRead = 100;
+		watchdog.reset(); // t=500, THROTTLED — snapshot stays at 0, timer still at t=60s
+
+		// Silence from here on (bytesRead frozen at 100).
+		// At t=60s the timer fires; bytes changed (0 → 100), so it must re-arm rather than die.
+		clock.tick(59_500);
+		expect(onSilence.callCount).to.equal(0);
+
+		// The re-armed timer schedules `intervalMs` from when it fired, so it fires at t=120s.
+		clock.tick(59_999);
 		expect(onSilence.callCount).to.equal(0);
 		clock.tick(1);
 		expect(onSilence.callCount).to.equal(1);
