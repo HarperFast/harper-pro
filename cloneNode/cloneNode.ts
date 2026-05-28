@@ -190,6 +190,11 @@ export async function cloneNode(): Promise<void> {
 	// This is especially important for local testing where multiple Harper versions are running on the same machine.
 	envMgr.setHdbBasePath(rootPath);
 
+	// Initial heuristic-based replication URL: convert http(s)→ws(s) and substitute the
+	// configured (or default) replication port. This may be wrong against leaders that bind
+	// the replication port as TLS only (e.g. Harper v4 default, which binds `securePort: 9933`
+	// with no plain WS sibling). For credential/token auth we refine it below once we've fetched
+	// the leader's config via HTTP; cert-auth has no other choice but to use this heuristic.
 	leaderReplicationURL = leaderURL
 		.replace('http://', 'ws://')
 		.replace('https://', 'wss://')
@@ -248,10 +253,42 @@ export async function cloneNode(): Promise<void> {
 	harperLogger = logger.loggerWithTag('cloneNode');
 
 	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
-	await cloneConfig();
+	const leaderConfigData = await cloneConfig();
+
+	// Refine the leader replication URL using the leader's own config. This is the only way to
+	// pick the right scheme (ws:// vs wss://) when bootstrapping against a leader whose
+	// replication port is TLS-only — most notably v4 leaders, whose default config binds
+	// `replication.securePort: 9933` with no plain WS sibling. The initial heuristic above
+	// emits `ws://` which v4 silently refuses (TCP-level reset), so the v5 → v4 clone never
+	// completes the set_node handshake.
+	const refinedLeaderReplicationURL = deriveLeaderReplicationURL(leaderConfigData, leaderReplicationURL);
+	if (refinedLeaderReplicationURL !== leaderReplicationURL) {
+		log(
+			`Adjusted leader replication URL from ${leaderReplicationURL} to ${refinedLeaderReplicationURL} based on leader config`
+		);
+		leaderReplicationURL = refinedLeaderReplicationURL;
+	}
 
 	// Clone applications that are deployed on the leader but not referenced in harper-config
 	await cloneApplications();
+
+	// Pre-create the leader's user databases (and any tables we don't already have locally) on
+	// this clone *before* establishing replication. Replication subscriptions are only set up for
+	// databases that already exist locally — see `forEachReplicatedDatabase` in
+	// `replication/replicator.ts`, which iterates `databases` and only fires subscriptions for the
+	// ones it finds. If we leave the user databases for the leader's incoming push to "create"
+	// them, the v5 clone never opens an outgoing subscription to the leader and never asks for
+	// the historical data. That manifests as the clone sitting at "Available never reached" with
+	// `database 'data' does not exist` errors in the log, because the leader (especially v4) does
+	// not push schema for user databases unless this side has explicitly subscribed.
+	//
+	// Doing this only matters for credential / token auth (HTTP `describe_all` available); cert
+	// auth has no way to talk to the leader before replication is up, so we skip there and rely on
+	// the existing self-bootstrap (cert-auth users are bootstrapping inside an already-clustered
+	// environment that has the cluster CA chain).
+	if (!usingCertAuth) {
+		await cloneSchemas();
+	}
 
 	// Base set node request
 	type SetNodeRequest = {
@@ -579,7 +616,62 @@ async function cloneJWTKeys(): Promise<void> {
 	}
 }
 
-async function cloneConfig(): Promise<void> {
+/**
+ * Extract just a port number from a Harper config port value, which may be either a bare port
+ * (number/string) or a `host:port` string. Returns undefined for null/undefined/unparseable values.
+ */
+function extractPort(value: unknown): number | undefined {
+	if (value === null || value === undefined || value === '') return undefined;
+	const str = String(value);
+	const portPart = str.includes(':') ? str.split(':').pop() : str;
+	const port = parseInt(portPart!, 10);
+	return Number.isFinite(port) ? port : undefined;
+}
+
+/**
+ * Pick the correct WebSocket URL for replication against the leader, given the leader's own
+ * `get_configuration` response. v5 nodes that use `replication.port` (plain WS) and v4 nodes
+ * that use `replication.securePort` (WSS) need different schemes; the previous heuristic
+ * always emitted `ws://` against http URLs, which silently fails against v4 because v4 binds
+ * 9933 as TLS only and the WS handshake gets cut at TCP level.
+ *
+ * Precedence:
+ *   1. Explicit override via `HDB_LEADER_REPLICATION_URL`.
+ *   2. The leader's own `replication.url` if it explicitly set one.
+ *   3. Derived from the leader's `replication.port` / `replication.securePort` and the leader's
+ *      hostname. If both ports are present we prefer the secure port (matches `connect` behavior
+ *      on the rest of the cluster). `REPLICATION_PORT` from this node's env, if set, overrides
+ *      the port number but not the scheme decision.
+ *   4. Falls back to whatever caller already computed (the http→ws heuristic).
+ */
+function deriveLeaderReplicationURL(leaderConfig: Record<string, any> | undefined, fallback: string): string {
+	const explicit = process.env.HDB_LEADER_REPLICATION_URL;
+	if (explicit) return explicit;
+
+	const repl = leaderConfig?.replication ?? {};
+	if (typeof repl.url === 'string' && repl.url) return repl.url;
+
+	const securePort = extractPort(repl.securePort);
+	const plainPort = extractPort(repl.port);
+	const userOverridePort = extractPort(replicationPort);
+
+	let scheme: 'ws' | 'wss' | undefined;
+	let port: number | undefined;
+	if (securePort != null) {
+		scheme = 'wss';
+		port = userOverridePort ?? securePort;
+	} else if (plainPort != null) {
+		scheme = 'ws';
+		port = userOverridePort ?? plainPort;
+	}
+
+	if (!scheme || port == null) return fallback;
+
+	const leaderURLObj = new URL(leaderURL);
+	return `${scheme}://${leaderURLObj.hostname}:${port}`;
+}
+
+async function cloneConfig(): Promise<Record<string, any>> {
 	log('Cloning config from leader');
 	const leaderConfigData = await leaderRequest({ operation: OPERATIONS_ENUM.GET_CONFIGURATION });
 	if (!leaderConfigData.hasOwnProperty('rootPath')) {
@@ -631,6 +723,8 @@ async function cloneConfig(): Promise<void> {
 
 	// Write final configuration to file
 	createConfigFile(configData, true);
+
+	return leaderConfigData;
 }
 
 /**
@@ -680,6 +774,89 @@ async function cloneApplications(): Promise<void> {
 			log(`Successfully cloned application: ${applicationName}`);
 		} catch (err) {
 			log(`Failed to clone application '${applicationName}': ${err}`, 'error');
+		}
+	}
+}
+
+/**
+ * Pre-create the leader's user databases and tables on this clone so the replication subsystem
+ * has them registered locally when `setNode` is called. Without this, the v5 clone never sets
+ * up an outgoing subscription for the leader's data databases (replication only iterates over
+ * databases that already exist in the local `databases` map) and the full-table-copy from the
+ * leader silently never starts. This is the only thing standing between cloneNode and a
+ * working bootstrap from a v4 leader, where the leader does not push schemas spontaneously.
+ *
+ * The system database is intentionally skipped — it already exists on this node from
+ * `installHarper`, and its tables are managed by harper itself. Tables we already have locally
+ * are also left alone so a re-run of cloneNode is safe.
+ */
+async function cloneSchemas(): Promise<void> {
+	log('Cloning database/table schemas from leader');
+	let allDb: Record<string, any>;
+	try {
+		allDb = await leaderRequest({ operation: OPERATIONS_ENUM.DESCRIBE_ALL });
+	} catch (err) {
+		log(`Failed to describe leader databases for schema clone: ${err}`, 'error');
+		return;
+	}
+
+	// `describe_all` returns `{ databaseName: { tableName: { name, schema, attributes, hash_attribute, ... } } }`,
+	// plus a `requestId` sibling we need to skip.
+	const { createSchema, createTable } = await import('../core/dataLayer/schema.js');
+	const { databases } = await import('../core/resources/databases.js');
+
+	for (const dbName of Object.keys(allDb)) {
+		const dbDescribe = allDb[dbName];
+		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;
+
+		if (!databases[dbName]) {
+			try {
+				await createSchema({ database: dbName, operation: OPERATIONS_ENUM.CREATE_DATABASE });
+				log(`Pre-created database '${dbName}' from leader schema`);
+			} catch (err) {
+				// `already exists` is fine; anything else we surface and continue so the other
+				// databases still get a chance.
+				const msg = (err as Error)?.message ?? String(err);
+				if (!/already exists|database.*exists/i.test(msg)) {
+					log(`Failed to pre-create database '${dbName}': ${msg}`, 'error');
+					continue;
+				}
+			}
+		}
+
+		for (const tableName of Object.keys(dbDescribe)) {
+			const tableDesc = dbDescribe[tableName];
+			if (!tableDesc || typeof tableDesc !== 'object') continue;
+			if (databases[dbName]?.[tableName]) continue;
+
+			// describe_all `attributes` entries use `{ attribute, type, is_primary_key }` — translate to
+			// create_table's `{ name, type, isPrimaryKey }` shape. Skip server-managed attributes
+			// (created/updated timestamp columns are auto-added).
+			const attributes = (tableDesc.attributes ?? [])
+				.filter((att: any) => !att.assigned_created_time && !att.assigned_updated_time)
+				.map((att: any) => ({
+					name: att.attribute ?? att.name,
+					type: att.type,
+					isPrimaryKey: att.is_primary_key ?? att.isPrimaryKey,
+				}));
+
+			const primaryKey = tableDesc.hash_attribute ?? attributes.find((a: any) => a.isPrimaryKey)?.name ?? 'id';
+
+			try {
+				await createTable({
+					database: dbName,
+					table: tableName,
+					primary_key: primaryKey,
+					attributes,
+					operation: OPERATIONS_ENUM.CREATE_TABLE,
+				});
+				log(`Pre-created table '${dbName}.${tableName}' from leader schema`);
+			} catch (err) {
+				const msg = (err as Error)?.message ?? String(err);
+				if (!/already exists|table.*exists/i.test(msg)) {
+					log(`Failed to pre-create table '${dbName}.${tableName}': ${msg}`, 'error');
+				}
+			}
 		}
 	}
 }
