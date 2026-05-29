@@ -762,7 +762,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							remoteNodeName
 						);
 						recordAction(
-							data,
+							body.length,
 							'bytes-received',
 							`${remoteNodeName}.${databaseName}`,
 							'replication',
