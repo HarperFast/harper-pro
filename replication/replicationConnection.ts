@@ -759,7 +759,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 							remoteNodeName
 						);
 						recordAction(
-							data,
+							body.length,
 							'bytes-received',
 							`${remoteNodeName}.${databaseName}`,
 							'replication',
