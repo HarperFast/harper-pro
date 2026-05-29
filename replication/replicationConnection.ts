@@ -1627,7 +1627,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										isFirst = false;
 										if (currentSequenceId === 0) {
 											logger.info?.('Replicating all tables to', remoteNodeName);
-											let lastSequenceId = Date.now(); // we need at least a default time point in case there are no records
+											// Capture the resume point BEFORE iterating. The bulk copy walks the primary store in
+											// key order (snapshot: false), but the follower resumes replication from the audit log in
+											// time order. Using copyStartTime — not max(localTime) of the copied records — guarantees
+											// the post-copy audit replay re-delivers every write committed during the copy, including
+											// ones to keys we already passed; resuming from max(localTime) would skip those (data loss).
+											const copyStartTime = Date.now();
 											const nodeId = getThisNodeId(auditStore);
 											for (const tableName in tables) {
 												if (!tableToTableEntry(tableName)) continue; // if we aren't replicating this table, skip it
@@ -1646,7 +1651,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														entry.key,
 														entry.localTime
 													);
-													lastSequenceId = Math.max(entry.localTime ?? 1, lastSequenceId);
 													getSharedStatus()[SENDING_TIME_POSITION] = 1;
 													const encoded = createAuditEntry({
 														version: entry.version,
@@ -1694,11 +1698,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												}
 												logger.info?.('Finished copy table', tableName, remoteNodeName);
 											}
-											currentSequenceId = lastSequenceId;
+											currentSequenceId = copyStartTime;
 											if (!currentTransaction.txnTime) {
 												// if we haven't sent any records, force a txn start and end so the subscribers records a timestamp
-												currentTransaction.txnTime = lastSequenceId;
-												writeFloat64(lastSequenceId);
+												currentTransaction.txnTime = copyStartTime;
+												writeFloat64(copyStartTime);
 											}
 											if (position - encodingStart > 8) {
 												// if we have any queued transactions to send, send them now
@@ -1710,7 +1714,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												);
 											}
 											getSharedStatus()[SENDING_TIME_POSITION] = 0;
-											currentSequenceId = lastSequenceId;
+											currentSequenceId = copyStartTime;
 										}
 									}
 									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
