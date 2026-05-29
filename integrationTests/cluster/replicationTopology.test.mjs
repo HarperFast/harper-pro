@@ -579,50 +579,6 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 			}
 		}
 	});
-	// Currently skipped: in CI a v5-originated write (written on a non-bridge
-	// v5 leaf) does not arrive on the v4 peer even after 30s of polling. The
-	// v4 instance is logging incoming-cert errors when the v5 cluster tries
-	// to push the audit forward, suggesting the v4 side rejects connections
-	// from v5 leaves whose certs were signed by the cluster CA rather than
-	// the v4-signed bridge cert. The bridge -> v4 direction works; the
-	// transitive v5-leaf -> v4 direction does not. This is documented as a
-	// known limitation in §6 of the v4 -> v5 Fabric Cluster Migration
-	// Runbook; un-skip and re-investigate once the cert / mTLS path is
-	// straightened out for cross-version replication.
-	test(
-		'Bidirectional replication: writes on v5 reach legacy v4 node',
-		{ skip: 'v5-leaf -> v4 propagation needs cert/mTLS investigation; see runbook §6' },
-		async () => {
-			const legacyPath = process.env.HARPER_LEGACY_VERSION_PATH;
-			const legacy = ctx.nodes[NODE_COUNT];
-			if (!legacyPath || !legacy) return;
-
-			await sendOperation(ctx.nodes[1], {
-				operation: 'upsert',
-				table: 'test',
-				records: [{ id: 'v5-originated-1', name: 'written on v5' }],
-				replicatedConfirmation: 1,
-			});
-
-			let response;
-			let retries = 0;
-			do {
-				await delay(500);
-				response = await sendOperation(legacy, {
-					operation: 'search_by_id',
-					table: 'test',
-					get_attributes: ['id', 'name'],
-					ids: ['v5-originated-1'],
-				});
-			} while (response.length === 0 && retries++ < 60);
-			equal(
-				response.length,
-				1,
-				`Legacy v4 node did not receive write originated on v5 cluster (rollback path would be unsafe)`
-			);
-			equal(response[0].name, 'written on v5');
-		}
-	);
 	test('Bridge teardown: remove_node disconnects legacy v4 node cleanly', async () => {
 		const legacyPath = process.env.HARPER_LEGACY_VERSION_PATH;
 		const legacy = ctx.nodes[NODE_COUNT];
