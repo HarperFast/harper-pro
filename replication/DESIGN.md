@@ -84,7 +84,7 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 
 **Data propagation** — Audit-record iteration → forwarding; blob streaming with concurrency cap `MAX_OUTSTANDING_BLOBS_BEING_SENT` (declared inside `replicateOverWS`); commit confirmation batched on `COMMITTED_UPDATE_DELAY` (2 ms).
 
-**Latency awareness** — Ping every `PING_INTERVAL` (30 s); latency captured on pong; `Replicator.load()` routes cache-miss fetches to the lowest-latency node.
+**Latency awareness** — Ping every `PING_INTERVAL` (default 30 s, `replication.pingInterval`); a connection with no socket activity for `PING_TIMEOUT` (default 2× interval, `replication.pingTimeout`) is terminated; latency captured on pong; `Replicator.load()` routes cache-miss fetches to the lowest-latency node.
 
 **Node discovery & TLS** — `hdb_nodes` subscriptions, `setNode.ts` for member ops, `buildReplicationMtlsConfig()` (`replicator.ts`), `monitorNodeCAs()` (`replicator.ts`).
 
@@ -102,6 +102,8 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 
 5. **Per-route table exclusion (`excludeTables`).** Route entries in `sendsTo`/`receivesFrom` can specify `excludeTables: ['hdb_nodes']` to prevent specific tables from crossing the wire. Three layers enforce this: (a) subscriber omits them from SUBSCRIPTION_REQUEST (in `sendSubscriptionRequestUpdate`); (b) sender skips their audit records before streaming (in `sendAuditRecord`); (c) receiver drops any that arrive (in the incoming message loop). Route config `routeReplicates` is threaded from `subscriptionManager.ts` onto `nodeSubscriptions` objects so static-route exclusions are available inside HTTP worker threads where `replicateOverWS` runs. Primary use case: v4→v5 migration bridges that share `system` database users/roles but must keep per-cluster `hdb_nodes` topology tables isolated.
 
+6. **Keep-alive is measured from byte activity, not a single ping interval.** `shouldTerminateIdlePing` terminates a connection only after no socket bytes have moved in either direction for the full `PING_TIMEOUT`. A bulk transfer — notably the initial clone copy of a large table — makes slow but real progress (the sender's buffer drains in bursts as the peer consumes), so bytes keep moving within the window and it is not killed mid-copy (the old "no bytes since last ping → terminate" heuristic restarted the copy from zero — issue #241). A genuinely dead peer moves no bytes and still trips the timeout — including the case where the sender filled its socket buffer and the `drain` event never fires. The sole exemption is `pauseReasons > 0` (the receiver intentionally stopped reading to drain its own queue): that stall is local and self-clearing, so the caller keeps liveness fresh while paused. Relatedly, the receive decode loop in `replicateOverWS` yields the event loop on a time budget (`RECEIVE_YIELD_INTERVAL`) — not only when the consumer queue exceeds `RECEIVE_EVENT_HIGH_WATER_MARK` — so a single large message can't decode in one synchronous turn and starve ping responses (core's `MAX_EVENT_DELAY_TIME` monitor).
+
 ---
 
 ## Tests
@@ -116,7 +118,7 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 | `replicationLoad.test.mjs`             | Concurrent-write load                                    |
 | `excludeTablesReplication.test.mjs`    | Per-route `excludeTables` bridge migration (issue #239)  |
 
-There is no dedicated `unitTests/replication/` directory — replication is exercised entirely via integration tests that spin up multi-node clusters.
+Most replication behavior is exercised via integration tests that spin up multi-node clusters. A few function-level invariants that don't need a cluster live in `../unitTests/replication/` (e.g. `listenerLifecycle.test.mjs`, `pingKeepalive.test.mjs`).
 
 ---
 
