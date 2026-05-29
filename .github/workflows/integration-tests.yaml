@@ -15,7 +15,7 @@ on:
           - 'all'
           - '22'
           - '24'
-          - '25'
+          - '26'
 
 jobs:
   generate-node-version-matrix:
@@ -34,7 +34,7 @@ jobs:
         id: set-node-versions
         run: |
           if [ "${{ github.event.inputs.node-version }}" == "all" ] || [ -z "${{ github.event.inputs.node-version }}" ]; then
-            echo "node-versions=[22, 24, 25]" >> $GITHUB_OUTPUT
+            echo "node-versions=[22, 24, 26]" >> $GITHUB_OUTPUT
           else
             echo "node-versions=[${{ github.event.inputs.node-version }}]" >> $GITHUB_OUTPUT
           fi
