@@ -539,13 +539,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
 	let blobSentCallback: (v?: any) => void;
+	// Refresh the keep-alive liveness clock from observed socket byte movement. If the underlying
+	// _socket isn't observable (test mocks, pre-connect, or a change in the ws library internals),
+	// bytesRead/bytesWritten read as undefined; we can't measure activity, so treat the connection as
+	// live rather than let the keep-alive falsely terminate a healthy peer.
+	function noteByteActivity(): void {
+		const read = ws._socket?.bytesRead;
+		const written = ws._socket?.bytesWritten;
+		if (read === undefined || written === undefined || read !== bytesRead || written !== bytesWritten) {
+			lastByteActivity = performance.now();
+		}
+	}
 	if (options.url) {
 		const sendPing = () => {
-			// Note any socket activity since the last interval: an incoming pong/data or our own send
-			// buffer draining as the peer consumes. Either proves the peer is still alive.
-			if (bytesRead !== ws._socket?.bytesRead || bytesWritten !== ws._socket?.bytesWritten) {
-				lastByteActivity = performance.now();
-			}
+			// Note any socket activity since the last interval (incoming pong/data or our send buffer
+			// draining as the peer consumes) — either proves the peer is still alive.
+			noteByteActivity();
 			if (shouldTerminateIdlePing(performance.now() - lastByteActivity, PING_TIMEOUT, pauseReasons)) {
 				ws.terminate(); // no socket activity within the timeout — peer is gone
 				return;
