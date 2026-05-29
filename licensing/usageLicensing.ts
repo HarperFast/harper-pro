@@ -1,4 +1,3 @@
-import type { Logger } from '../core/utility/logging/logger.ts';
 import { type ValidatedLicense, validateLicense, initPublicKey } from './validation.ts';
 import { ClientError } from '../core/utility/errors/hdbError.js';
 import { onAnalyticsAggregate } from '../core/resources/analytics/write.ts';
@@ -9,15 +8,9 @@ import path from 'node:path';
 import * as fs from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import * as configUtils from '../core/config/configUtils.js';
-import * as terms from '../core/utility/hdbTerms.ts';
-import type { Server } from '../core/server/Server.ts';
-import type { Scope } from '../core/components/Scope.ts';
+import * as logger from '../core/utility/logging/harper_logger.js';
+import { server } from '../core/server/Server.ts';
 import { universalHeaders } from '../core/server/http.ts';
-
-//
-export const suppressHandleApplicationWarning = true;
-
-let logger: Logger;
 
 class ExistingLicenseError extends Error {}
 
@@ -45,36 +38,27 @@ interface GetUsageLicensesReq extends GetUsageLicenseParams {
 	operation: 'get_usage_licenses';
 }
 
+interface LicenseComponentConfig {
+	region?: string;
+	mode?: string;
+}
+
 let licenseRegion: string | undefined;
 let licenseConsoleErrorPrinted = false;
 let licenseWarningIntervalId: NodeJS.Timeout | undefined;
 const LICENSE_NAG_PERIOD = 600000; // ten minutes
 
-export function handleApplication({ server, logger, options }: Scope) {
-	const region = options.get(terms.CONFIG_PARAMS.LICENSE_REGION.split('_')) as string;
-	const mode = options.get(terms.CONFIG_PARAMS.LICENSE_MODE.split('_')) as string;
-	initUsageLicensing({ server, logger, license: { region, mode } });
-}
-
-interface LicenseParams {
-	region: string;
-	mode: string;
-}
-
-interface UsageLicensingInitParams {
-	server: Server;
-	logger: Logger;
-	license: LicenseParams;
-}
-
-export function initUsageLicensing(params: UsageLicensingInitParams) {
-	logger = params.logger;
-
-	initPublicKey(params.license.mode);
-
-	licenseRegion = params.license.region;
-
-	onAnalyticsAggregate(recordUsage);
+/**
+ * Main-thread entry point.
+ *
+ * In v5.1+ the operations API only runs on the main thread, so
+ * `install_usage_license` and `get_usage_licenses` must register here. The
+ * licenses-directory watcher also lives on the main thread so it isn't
+ * duplicated per worker.
+ */
+export function startOnMainThread(options: LicenseComponentConfig) {
+	initPublicKey(options.mode);
+	licenseRegion = options.region;
 
 	server.registerOperation?.({
 		name: 'install_usage_license',
@@ -96,6 +80,18 @@ export function initUsageLicensing(params: UsageLicensingInitParams) {
 		ignored: (file: string, stats: Stats) => stats?.isFile() && !file.endsWith('.txt'),
 	};
 	watch(licensesPath, watchOptions).on('add', loadLicenseFile);
+}
+
+/**
+ * Worker-thread entry point.
+ *
+ * Per-worker bookkeeping — analytics aggregates fire on the worker that
+ * owns the metric, so each worker subscribes here and rolls usage up into
+ * the active license.
+ */
+export function start(options: LicenseComponentConfig) {
+	licenseRegion = options.region;
+	onAnalyticsAggregate(recordUsage);
 }
 
 async function installUsageLicenseOp(req: InstallLicenseRequest): Promise<string> {
