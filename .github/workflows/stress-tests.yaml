@@ -29,6 +29,14 @@ on:
         description: 'Rapid-reconnect duration in minutes (Priority 4)'
         required: false
         default: '30'
+      backlog-offline-minutes:
+        description: 'Backlog-recovery offline window in minutes'
+        required: false
+        default: '30'
+      slow-minutes:
+        description: 'Slow-consumer churn duration in minutes'
+        required: false
+        default: '30'
   schedule:
     # 06:11 UTC on Sundays (off-peak, off the canonical :00 mark)
     - cron: '11 6 * * 0'
@@ -86,6 +94,15 @@ jobs:
           - name: 'rapid-reconnect-adversity'
             file: 'integrationTests/stress/rapidReconnectAdversity.test.mjs'
             env_vars: 'HARPER_STRESS_ADVERSITY_MINUTES'
+          - name: 'replay-catchup-seam'
+            file: 'integrationTests/stress/replayCatchupSeam.test.mjs'
+            env_vars: ''
+          - name: 'backlog-recovery'
+            file: 'integrationTests/stress/backlogRecovery.test.mjs'
+            env_vars: 'HARPER_STRESS_BACKLOG_OFFLINE_MINUTES'
+          - name: 'slow-consumer-backpressure'
+            file: 'integrationTests/stress/slowConsumerBackpressure.test.mjs'
+            env_vars: 'HARPER_STRESS_SLOW_MINUTES'
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -110,6 +127,8 @@ jobs:
           HARPER_STRESS_SOAK_MINUTES: ${{ inputs.soak-minutes || '240' }}
           HARPER_STRESS_ORPHAN_MINUTES: ${{ inputs.orphan-minutes || '60' }}
           HARPER_STRESS_ADVERSITY_MINUTES: ${{ inputs.adversity-minutes || '30' }}
+          HARPER_STRESS_BACKLOG_OFFLINE_MINUTES: ${{ inputs.backlog-offline-minutes || '30' }}
+          HARPER_STRESS_SLOW_MINUTES: ${{ inputs.slow-minutes || '30' }}
         run: |
           node --experimental-test-coverage=false integrationTests/run.mjs ${{ matrix.test.file }}
       - name: Upload Harper server logs
