@@ -833,20 +833,36 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 									);
 								} else stream.end(blobBody);
 								if (stream.connectedToBlob) blobsInFlight.delete(fileId);
+							} else if (stream.destroyed || stream.writableEnded) {
+								// The stream was already torn down before this mid-blob chunk arrived —
+								// typically because saveBlob's pipeline failed (e.g. ENOENT on
+								// createWriteStream) and destroyed the PassThrough source, firing 'close'.
+								// We must NOT fall into the backpressure branch below: writing to a dead
+								// stream returns false, and pausing to wait for a 'drain'/'close' that has
+								// already fired strands the pause reason forever, wedging the entire
+								// receive loop (observed in prod: receiver goes silent, sender stuck
+								// reconnecting, replication never recovers). Drop the orphaned chunk and
+								// forget the stream instead.
+								blobsInFlight.delete(fileId);
 							} else if (!stream.write(blobBody)) {
 								// The PassThrough's internal queue is over its HWM, meaning the downstream
 								// file write (via pipeline in saveBlob) can't keep up. Pause the WS until the
 								// stream drains so blob chunks don't accumulate in memory faster than they
-								// can be flushed to disk. Also listen for 'close' so a destroyed stream
-								// (e.g. saveBlob error) doesn't strand the pause reason.
-								addPauseReason();
-								const release = () => {
-									stream.off('drain', release);
-									stream.off('close', release);
-									removePauseReason();
-								};
-								stream.on('drain', release);
-								stream.on('close', release);
+								// can be flushed to disk.
+								if (stream.destroyed || stream.writableEnded) {
+									// write() itself may have torn the stream down (e.g. a late error). If so,
+									// 'drain'/'close' won't arrive — skip pausing rather than strand the reason.
+									blobsInFlight.delete(fileId);
+								} else {
+									addPauseReason();
+									const release = () => {
+										stream.off('drain', release);
+										stream.off('close', release);
+										removePauseReason();
+									};
+									stream.on('drain', release);
+									stream.on('close', release);
+								}
 							}
 						} catch (error) {
 							logger.error?.(
