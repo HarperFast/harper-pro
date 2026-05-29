@@ -312,7 +312,32 @@ export async function cloneNode(): Promise<void> {
 	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
 		try {
 			const { databases } = await import('../core/resources/databases.js');
-			await databases.system.hdb_user.delete({ username: 'clone-temp-admin' });
+			// Only delete clone-temp-admin if it actually exists. If install used CLI/env args
+			// that supplied a real admin username (e.g. integration tests pass
+			// --HDB_ADMIN_USERNAME=admin), `clone-temp-admin` was never created and there is
+			// nothing to clean up — skip the delete entirely.
+			const existing = await databases.system.hdb_user.get('clone-temp-admin');
+			if (existing) {
+				// Wait until at least one non-clone-temp-admin user is present (replicated from leader)
+				// before deleting, so the node still has a super_user available for local-auth.
+				const waitDeadline = Date.now() + syncTimeoutMs;
+				while (Date.now() < waitDeadline) {
+					let foundReplicatedUser = false;
+					try {
+						for await (const user of databases.system.hdb_user.search([])) {
+							if (user?.username && user.username !== 'clone-temp-admin') {
+								foundReplicatedUser = true;
+								break;
+							}
+						}
+					} catch (err) {
+						log(`Error scanning hdb_user while waiting for replicated user: ${err}`, 'error');
+					}
+					if (foundReplicatedUser) break;
+					await sleep(200);
+				}
+				await databases.system.hdb_user.delete('clone-temp-admin');
+			}
 		} catch (err) {
 			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
 		}
@@ -502,7 +527,7 @@ async function cloneSSHKeys() {
 
 	const { addSSHKey } = await import('../security/sshKeyOperations.js');
 	try {
-		const keys: Record<string, any> = await leaderRequest({ operation: 'list_ssh_keys' });
+		const keys: any = await leaderRequest({ operation: 'list_ssh_keys' });
 		if (!keys?.length) {
 			log('No SSH keys found on leader node to clone');
 			return;
@@ -510,7 +535,7 @@ async function cloneSSHKeys() {
 
 		for (const keyName of keys) {
 			log('Cloning SSH key:', keyName.name);
-			const keyData: Record<string, any> = await leaderRequest({
+			const keyData: any = await leaderRequest({
 				operation: 'get_ssh_key',
 				name: keyName.name,
 			});

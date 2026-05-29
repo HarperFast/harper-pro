@@ -152,6 +152,43 @@ suite('Replication Reconnect', { timeout: 120000 }, (ctx) => {
 		);
 	});
 
+	test('remove_node while peer is down stops retries permanently', async () => {
+		// Ensure replication is active.
+		let status = await sendOperation(ctx.nodes[1], { operation: 'cluster_status' });
+		if (status.connections.length === 0) {
+			await sendOperation(ctx.nodes[1], {
+				operation: 'add_node',
+				rejectUnauthorized: false,
+				hostname: ctx.nodes[0].hostname,
+				authorization: ctx.nodes[1].admin,
+			});
+			await waitForConnected(ctx.nodes[1], 1);
+		}
+
+		// Kill node0 to put node1 into the retry-connect state.
+		await killHarper({ harper: ctx.nodes[0] });
+		// Brief pause to let node1 detect the disconnect and schedule a retry.
+		await delay(800);
+
+		// remove_node while the peer is unreachable. This must stop all retry
+		// attempts — the intentionallyUnsubscribed guard in connect() ensures the
+		// pending retry timer fires but returns immediately rather than opening a
+		// new socket.
+		await sendOperation(ctx.nodes[1], {
+			operation: 'remove_node',
+			hostname: ctx.nodes[0].hostname,
+		});
+		const afterRemove = await waitForConnected(ctx.nodes[1], 0, false);
+		equal(afterRemove.connections.length, 0, 'expected 0 connections immediately after remove_node');
+
+		// Restart node0. If the retry loop was not properly stopped, node1 would
+		// reconnect once node0 is reachable again. Verify it does not.
+		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] })).harper;
+		await delay(2000);
+		status = await sendOperation(ctx.nodes[1], { operation: 'cluster_status' });
+		equal(status.connections.length, 0, 'node1 must not reconnect to a removed node even after that node restarts');
+	});
+
 	test('kill + restart of peer recovers replication connectivity', async () => {
 		// Assume previous test left replication active. If not, re-establish.
 		let status = await sendOperation(ctx.nodes[1], { operation: 'cluster_status' });
