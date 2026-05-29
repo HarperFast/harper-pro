@@ -5,7 +5,12 @@
 import { suite, test, before, after } from 'node:test';
 import { equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { killHarper, startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import {
+	killHarper,
+	startHarper,
+	teardownHarper,
+	getNextAvailableLoopbackAddress,
+} from '@harperfast/integration-testing';
 import { join } from 'node:path';
 import { sendOperation } from './clusterShared.mjs';
 
@@ -501,6 +506,133 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 				response.length,
 				0,
 				`Node ${i} ${ctx.nodes[i].hostname} did not evict all legacy-ttl records past expiresAt (still has ${response.length})`
+			);
+		}
+	});
+	// The tests below exercise the v4 -> v5 cluster-migration bridge scenario
+	// described in the "v4 -> v5 Fabric Cluster Migration Runbook". They build
+	// on the legacy node set up by 'Replicate data from a legacy node' above
+	// (ctx.nodes[NODE_COUNT]) and run in order: larger-dataset catch-up,
+	// bidirectional replication (rollback safety), then bridge teardown last
+	// since it removes the legacy peer from the cluster.
+	test('Replicate larger v4 dataset across multiple tables', async () => {
+		const legacyPath = process.env.HARPER_LEGACY_VERSION_PATH;
+		const legacy = ctx.nodes[NODE_COUNT];
+		if (!legacyPath || !legacy) return;
+
+		const tables = ['orders', 'users', 'events'];
+		const RECORDS_PER_TABLE = 100;
+		for (const table of tables) {
+			await sendOperation(legacy, {
+				operation: 'create_table',
+				table,
+				primary_key: 'id',
+				attributes: [
+					{ name: 'id', type: 'ID' },
+					{ name: 'name', type: 'String' },
+				],
+			});
+			const records = [];
+			for (let i = 0; i < RECORDS_PER_TABLE; i++) {
+				records.push({ id: `${table}-${i}`, name: `${table} record ${i}` });
+			}
+			await sendOperation(legacy, { operation: 'upsert', table, records });
+		}
+
+		// Wait for schema replication to land each table on every v5 node.
+		// Without this, the search loop below races schema sync and
+		// sendOperation throws on the non-200 (table-not-found) response
+		// before its retry can take effect.
+		for (const table of tables) {
+			for (let i = 0; i < NODE_COUNT; i++) {
+				let retries = 0;
+				let described;
+				do {
+					await delay(100);
+					described = await sendOperation(ctx.nodes[i], { operation: 'describe_database' });
+				} while (!described?.data?.[table] && retries++ < 30);
+			}
+		}
+
+		// All RECORDS_PER_TABLE rows must arrive on every v5 node for every
+		// table. Past audit-forwarding bugs only delivered the first record in
+		// a multi-record batch, so we assert full counts (not just presence).
+		for (const table of tables) {
+			for (let i = 0; i < NODE_COUNT; i++) {
+				let response;
+				let retries = 0;
+				do {
+					await delay(200);
+					response = await sendOperation(ctx.nodes[i], {
+						operation: 'search_by_value',
+						search_attribute: 'id',
+						search_value: '*',
+						table,
+						get_attributes: ['id', 'name'],
+					});
+				} while (response.length < RECORDS_PER_TABLE && retries++ < 30);
+				equal(
+					response.length,
+					RECORDS_PER_TABLE,
+					`Node ${i} ${ctx.nodes[i].hostname} only has ${response.length}/${RECORDS_PER_TABLE} records in table ${table}`
+				);
+			}
+		}
+	});
+	test('Bridge teardown: remove_node disconnects legacy v4 node cleanly', async () => {
+		const legacyPath = process.env.HARPER_LEGACY_VERSION_PATH;
+		const legacy = ctx.nodes[NODE_COUNT];
+		if (!legacyPath || !legacy) return;
+
+		// The legacy node was added to ctx.nodes[0] in 'Replicate data from
+		// a legacy node', so remove it from there.
+		await sendOperation(ctx.nodes[0], {
+			operation: 'remove_node',
+			hostname: legacy.hostname,
+		});
+
+		// cluster_status on the bridge should no longer list the legacy peer.
+		let retries = 0;
+		let status;
+		do {
+			await delay(200);
+			status = await sendOperation(ctx.nodes[0], { operation: 'cluster_status' });
+		} while (
+			status.connections.some((conn) => conn.name === legacy.hostname && conn.database_sockets?.length > 0) &&
+			retries++ < 20
+		);
+		equal(
+			status.connections.some((conn) => conn.name === legacy.hostname && conn.database_sockets?.length > 0),
+			false,
+			'Legacy peer connection still present on bridge after remove_node'
+		);
+
+		// v5 mesh must still be intact: a write on one v5 node still
+		// propagates to the others. ctx.nodes[2] is a leaf in the star
+		// topology, so it only has one peer (the central node) — confirm
+		// against that and then poll for transitive arrival at the others.
+		await sendOperation(ctx.nodes[2], {
+			operation: 'upsert',
+			table: 'test',
+			records: [{ id: 'post-teardown-1', name: 'written after teardown' }],
+			replicatedConfirmation: 1,
+		});
+		for (let i = 0; i < NODE_COUNT; i++) {
+			let response;
+			retries = 0;
+			do {
+				await delay(200);
+				response = await sendOperation(ctx.nodes[i], {
+					operation: 'search_by_id',
+					table: 'test',
+					get_attributes: ['id', 'name'],
+					ids: ['post-teardown-1'],
+				});
+			} while (response.length === 0 && retries++ < 20);
+			equal(
+				response.length,
+				1,
+				`v5 mesh broken after bridge teardown: node ${i} ${ctx.nodes[i].hostname} did not receive post-teardown write`
 			);
 		}
 	});
