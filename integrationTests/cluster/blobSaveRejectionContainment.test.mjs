@@ -49,7 +49,14 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 const FAIL_INTERVAL = 7; // every 7th /blobs/ createWriteStream fails on B
 const BLOB_REQUESTS = 400; // /Location/{n} hits — each creates a blob on A → replicates to B
 
-suite('Receive-side blob save rejection containment', { timeout: 180000 }, (ctx) => {
+// Heavy multi-node suite. Gated out of the regular integration matrix, where it
+// contended with the other multi-node suites in the same shard and blew the
+// 15-minute job cap. It runs in the stress workflow, which sets
+// HARPER_RUN_STRESS_TESTS=1. `skip` on the suite suppresses its before/after
+// hooks too, so no Harper instances spin up in the normal matrix.
+const STRESS = process.env.HARPER_RUN_STRESS_TESTS === '1';
+
+suite('Receive-side blob save rejection containment', { skip: !STRESS, timeout: 180000 }, (ctx) => {
 	before(async () => {
 		// Bring up A (clean) and B (with the fault-injection component preloaded).
 		const nodeA = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };

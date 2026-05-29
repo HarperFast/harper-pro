@@ -118,6 +118,10 @@ jobs:
         env:
           HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
           HARPER_LEGACY_VERSION_PATH: /tmp/harperdb-legacy/node_modules/harperdb
+          # Cap concurrent test files at 2: several multi-node replication suites
+          # run heavy clusters, and the default (availableParallelism/2+1) let too
+          # many run at once on CI runners, starving each other into shard timeouts.
+          HARPER_INTEGRATION_TEST_CONCURRENCY: '2'
         run: |
           npm run test:integration:all -- --shard=${{ matrix.shard }}/4
 

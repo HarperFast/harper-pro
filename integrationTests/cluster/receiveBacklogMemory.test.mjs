@@ -45,7 +45,12 @@ const NODE_COUNT = 2;
 const BACKLOG_TRANSACTIONS = 40; // each carries a 500-record batch → 20 000 records total
 const BATCH_SIZE = 500; // tuned to comfortably exceed RECEIVE_EVENT_HIGH_WATER_MARK = 100
 
-suite('Replication receive-side backlog memory bound', { timeout: 240000 }, (ctx) => {
+// Heavy multi-node suite — gated out of the regular integration matrix (shard
+// contention / 15-min job cap). Runs in the stress workflow, which sets
+// HARPER_RUN_STRESS_TESTS=1. `skip` also suppresses the before/after hooks.
+const STRESS = process.env.HARPER_RUN_STRESS_TESTS === '1';
+
+suite('Replication receive-side backlog memory bound', { skip: !STRESS, timeout: 240000 }, (ctx) => {
 	before(async () => {
 		ctx.nodes = await Promise.all(
 			Array(NODE_COUNT)
