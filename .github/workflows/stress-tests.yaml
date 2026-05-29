@@ -103,6 +103,17 @@ jobs:
           - name: 'slow-consumer-backpressure'
             file: 'integrationTests/stress/slowConsumerBackpressure.test.mjs'
             env_vars: 'HARPER_STRESS_SLOW_MINUTES'
+          # Receive-side regression suites. They live in integrationTests/cluster/
+          # and are gated behind HARPER_RUN_STRESS_TESTS (which this workflow sets),
+          # so they're skipped in the regular PR matrix but exercised here. The files
+          # land via PR #243 (the blob-receive stall fix); these entries become live
+          # once that merges.
+          - name: 'blob-save-rejection-containment'
+            file: 'integrationTests/cluster/blobSaveRejectionContainment.test.mjs'
+            env_vars: ''
+          - name: 'receive-backlog-memory'
+            file: 'integrationTests/cluster/receiveBacklogMemory.test.mjs'
+            env_vars: ''
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
