@@ -35,6 +35,7 @@ import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
+import { createStructon } from 'structon';
 import { WebSocket } from 'ws';
 import { threadId } from 'worker_threads';
 import harperLogger from '../core/utility/logging/harper_logger.js';
@@ -59,6 +60,14 @@ import {
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 const logger = forComponent('replication').conditional as Logger;
+
+// msgpackr v2 removed the built-in `randomAccessStructure` option; that random-access
+// struct support now lives in the `structon` package (the same wrapper core's
+// RecordEncoder uses). Replication decoders must be structon-wrapped so they install
+// the `_readStruct` hook and can decode typed-struct records — without it, struct
+// marker bytes (0x20–0x3f) decode as plain integers and the decode aborts with
+// "Data read, but end of buffer not reached".
+const StructonPackr = createStructon(Packr);
 
 // these are the codes we use for the different commands
 const SUBSCRIPTION_REQUEST = 129;
@@ -723,9 +732,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// of the table id to the decoder so we can decode the binary data for each table.
 						tableDecoders[tableId] = {
 							name: tableName,
-							decoder: new Packr({
+							decoder: new StructonPackr({
 								useBigIntExtension: true,
-								randomAccessStructure: true,
 								freezeData: true,
 								typedStructs: data.typedStructs,
 								structures: data.structures,
