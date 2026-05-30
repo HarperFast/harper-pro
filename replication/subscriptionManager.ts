@@ -55,8 +55,36 @@ const NODE_SUBSCRIBE_DELAY = 200; // delay before sending node subscribe to othe
 // caused the OOM in the first place. We stagger the re-subscriptions in time so the new
 // worker(s) absorb them gradually.
 const WORKER_EXIT_REASSIGN_STAGGER_MS = 100;
+// Cadence of the per-process safety-net reconcile that rebinds subscriptions whose
+// worker no longer exists. Pure read-side filter against `workers` and
+// `connectionReplicationMap` on each tick when nothing is wrong, so a short interval
+// is cheap. Sized for the deploy-time rapid-restart-storm pattern (stacked
+// `restart_http_workers` at ~1.5s spacing under live write traffic), where the per-
+// worker exit chain races against shutdown and silently drops half the subscription
+// assignments — this is the user-visible recovery latency for the resulting drift.
+const RECONCILE_INTERVAL_MS = 5_000;
 let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
+// Returns the set of node URLs whose replication entries either point at a worker no longer
+// in the supplied http pool, OR have no worker assigned at all while live workers exist.
+// The second case covers "all workers were down at registration time" — onDatabase stores
+// `worker: undefined` when httpWorkers is empty, and without this the entry would never
+// get reassigned once workers came back. Pure helper so the reconcile pass below — and its
+// unit tests — can verify the broken-chain detection without spinning up real workers.
+export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatusMap>, httpWorkers: any[]): Set<string> {
+	const staleNodeUrls = new Set<string>();
+	// No live workers to reassign to — flagging here would cause endless no-op reassignments.
+	if (httpWorkers.length === 0) return staleNodeUrls;
+	for (const [url, dbReplicationWorkers] of connectionMap) {
+		for (const entry of dbReplicationWorkers.values()) {
+			if (!entry.worker || !httpWorkers.includes(entry.worker)) {
+				staleNodeUrls.add(url);
+				break;
+			}
+		}
+	}
+	return staleNodeUrls;
+}
 export let disconnectedFromNode; // this is set by thread to handle when a node is disconnected (or notify main thread so it can handle)
 export let connectedToNode; // this is set by thread to handle when a node is connected (or notify main thread so it can handle)
 const nodeMap = new Map(); // this is a map of all nodes that are available to connect to
@@ -218,7 +246,7 @@ export async function startOnMainThread(options) {
 
 		function onDatabase(databaseName, tablesReplicateByDefault) {
 			logger.trace('Setting up replication for database', databaseName, 'on node', node.name);
-			const existingEntry = dbReplicationWorkers.get(databaseName);
+			let existingEntry = dbReplicationWorkers.get(databaseName);
 			let worker;
 			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node }];
 			// Self catchup is done in case we have replicated any records that weren't actually written to our storage
@@ -237,6 +265,18 @@ export async function startOnMainThread(options) {
 			}
 			const shouldSubscribe = shouldReplicateFromNode(node, databaseName);
 			const httpWorkers = workers.filter((worker) => worker.name === 'http');
+			// Defensively detect entries that point at a worker no longer in the http pool.
+			// This happens when the worker.on('exit') handler below never fired (hung WebSocket
+			// refs blocking exit), the identity check rejected the reassignment, or its
+			// setTimeout retry was lost. We also catch the case where the entry has no worker
+			// assigned at all (all workers were down at registration time) so it gets rebound
+			// once workers come back. Without these checks, the early-return branch keeps the
+			// entry stuck and the subscription never recovers.
+			if (existingEntry && httpWorkers.length > 0 && !httpWorkers.includes(existingEntry.worker as any)) {
+				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
+				dbReplicationWorkers.delete(databaseName);
+				existingEntry = undefined;
+			}
 			if (existingEntry) {
 				worker = existingEntry.worker;
 				existingEntry.nodes = nodes;
@@ -482,6 +522,32 @@ export async function startOnMainThread(options) {
 			});
 		} else subscribeToNode({ url: getNodeURL(connectingNode), name: connectingNode.name, database, nodes: [node] });
 	}
+	// Periodic safety net for stale subscription entries. The existing per-database
+	// worker.on('exit') chain reassigns to a healthy worker after a worker dies, but a
+	// single broken link in that chain (identity check failing, setTimeout retry being
+	// lost under load, shouldSubscribe early-return pinning to a dead worker before
+	// the defensive check was added) used to leave the entry permanently pointing at
+	// an exited worker, silently breaking outbound replication for the lifetime of the
+	// process. This reconciles independently of the chain so the broken-state node
+	// can never get stuck.
+	function reconcileWorkers() {
+		const httpWorkers = workers.filter((worker) => worker.name === 'http');
+		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
+		if (staleNodeUrls.size === 0) return;
+		logger.warn(
+			'Reconciling replication subscriptions for nodes pointing at exited workers:',
+			Array.from(staleNodeUrls)
+		);
+		for (const node of nodeMap.values()) {
+			if (!staleNodeUrls.has(getNodeURL(node))) continue;
+			try {
+				onNodeUpdate(node);
+			} catch (error) {
+				logger.error('Error reconciling node', node?.name, error);
+			}
+		}
+	}
+	setInterval(reconcileWorkers, RECONCILE_INTERVAL_MS).unref();
 	onMessageByType('disconnected-from-node', disconnectedFromNode);
 	onMessageByType('connected-to-node', connectedToNode);
 	onMessageByType('request-cluster-status', requestClusterStatus);
