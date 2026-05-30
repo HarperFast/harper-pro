@@ -36,8 +36,15 @@ echo -e "\n📦 Copying lock file from core"
 cp core/package-lock.json ./
 
 echo -e "\n📦 Copying dependencies & devDependencies from core"
+# @datadog/pprof is a harper-pro-only dependency (used by analytics/profile.ts,
+# which does not exist in core). Capture harper-pro's pinned version so the
+# wholesale dependency copy below doesn't drop or downgrade it.
+pprof_version=$(npm pkg get 'dependencies.@datadog/pprof')
 deps=$(cd core && npm pkg get dependencies)
 npm pkg set "dependencies=${deps}" --json
+if [[ -n "$pprof_version" && "$pprof_version" != "{}" ]]; then
+  npm pkg set "dependencies.@datadog/pprof=${pprof_version}" --json
+fi
 devDeps=$(cd core && npm pkg get devDependencies)
 npm pkg set "devDependencies=${devDeps}" --json
 overrides=$(cd core && npm pkg get overrides)
