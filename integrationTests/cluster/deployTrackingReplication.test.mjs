@@ -128,9 +128,9 @@ suite('Deployment tracking — multi-node replication', { timeout: 180000 }, (ct
 	test('hdb_deployment row replicates to peers', async () => {
 		// The deployment row should be visible from any node in the cluster.
 		// Poll each peer for the terminal-state row rather than relying on a fixed sleep —
-		// slower CI shards (especially Node v22) need more wall-clock time for the final
+		// slower CI shards (especially Node v26) need more wall-clock time for the final
 		// finish() put to propagate via table replication.
-		const POLL_TIMEOUT_MS = 15000;
+		const POLL_TIMEOUT_MS = 30000;
 		const POLL_INTERVAL_MS = 250;
 		for (let i = 0; i < NODE_COUNT; i++) {
 			const deadline = Date.now() + POLL_TIMEOUT_MS;
