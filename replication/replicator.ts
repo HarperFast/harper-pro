@@ -677,17 +677,17 @@ export async function replicateOperation(req, options?: { onPeerResult?: (result
 		// each peer settles — letting callers surface per-peer progress in real time
 		// rather than waiting for the aggregate at the end.
 		const onPeerResult = options?.onPeerResult;
-		const perPeer = server.nodes.map((node, index) =>
+		const perPeer = server.nodes.map((node) =>
 			sendOperationToNode(node, req)
 				.then((value: any) => {
 					const result: any = value && typeof value === 'object' ? value : { value };
-					result.node = server.nodes[index]?.name;
+					result.node = node.name;
 					return result;
 				})
 				.catch((reason) => ({
 					status: 'failed',
 					reason: reason?.toString?.() ?? String(reason),
-					node: server.nodes[index]?.name,
+					node: node.name,
 				}))
 				.then((result) => {
 					if (onPeerResult) {
