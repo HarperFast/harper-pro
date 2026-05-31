@@ -1,0 +1,100 @@
+name: YCSB Cluster Nightly (self-hosted)
+
+# Runs the 3-node cluster YCSB load test on a FIXED self-hosted runner (label
+# `harper-bench`) so throughput/latency trends are comparable night to night —
+# the shared GitHub runners are too small/variable for a 3 x (threads.count=4)
+# cluster. Records trends + regression alerts via github-action-benchmark and
+# uploads the raw JSON.
+#
+# Triggers are schedule + manual dispatch ONLY (never pull_request): the job
+# executes on a self-hosted machine, so untrusted PR code must never run here.
+
+on:
+  schedule:
+    - cron: '0 10 * * *' # ~03:00-04:00 America/Denver (UTC)
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: 'Workload scale'
+        required: true
+        type: choice
+        default: 'standard'
+        options:
+          - 'quick'
+          - 'standard'
+          - 'heavy'
+      workloads:
+        description: 'Comma-separated workloads (D excluded by default; see README)'
+        required: false
+        type: string
+        default: 'C,B,A,F,E'
+
+permissions:
+  contents: write # github-action-benchmark pushes trend history to the gh-pages branch
+
+jobs:
+  ycsb-cluster:
+    name: YCSB 3-node cluster
+    runs-on: [self-hosted, linux, harper-bench]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout (with core submodule)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build || true # repo currently has type errors; ignore per integration-tests.yaml
+
+      - name: Verify build output
+        run: test -f dist/bin/harper.js || { echo "dist/bin/harper.js missing — build failed"; exit 1; }
+
+      - name: Run cluster YCSB load test
+        # Inputs via env, not ${{ }} shell interpolation, to avoid script injection.
+        env:
+          SCALE: ${{ github.event.inputs.scale || 'standard' }}
+          WORKLOADS: ${{ github.event.inputs.workloads || 'C,B,A,F,E' }}
+        run: |
+          node benchmarks/ycsb/run-cluster.mts --scale="$SCALE" --workloads="$WORKLOADS"
+
+      - name: Convert results to benchmark format
+        run: node core/benchmarks/ycsb/to-benchmark-json.mts core/benchmarks/ycsb/results/ycsb-cluster-latest.json core/benchmarks/ycsb/bench-out
+
+      - name: Track cluster throughput trend
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
+        with:
+          name: YCSB Cluster Throughput
+          tool: customBiggerIsBetter
+          output-file-path: core/benchmarks/ycsb/bench-out/throughput.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          comment-on-alert: true
+          fail-on-alert: false
+          alert-threshold: '130%'
+          alert-comment-cc-users: '@kriszyp'
+
+      - name: Track cluster latency (p99) trend
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
+        with:
+          name: YCSB Cluster Latency p99
+          tool: customSmallerIsBetter
+          output-file-path: core/benchmarks/ycsb/bench-out/latency.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.ref == 'refs/heads/main' }}
+          comment-on-alert: true
+          fail-on-alert: false
+          alert-threshold: '160%'
+          alert-comment-cc-users: '@kriszyp'
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ycsb-cluster-results
+          path: core/benchmarks/ycsb/results/*.json
+          retention-days: 90
+          if-no-files-found: warn
