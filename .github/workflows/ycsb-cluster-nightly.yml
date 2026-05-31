@@ -10,10 +10,6 @@ name: YCSB Cluster Nightly (self-hosted)
 # executes on a self-hosted machine, so untrusted PR code must never run here.
 
 on:
-  # TEMPORARY: validate the self-hosted runner before this workflow is on main
-  # (workflow_dispatch needs the file on the default branch). Remove before merge.
-  push:
-    branches: ['kris/ycsb-cluster']
   schedule:
     - cron: '0 10 * * *' # ~03:00-04:00 America/Denver (UTC)
   workflow_dispatch:
@@ -60,8 +56,7 @@ jobs:
       - name: Run cluster YCSB load test
         # Inputs via env, not ${{ }} shell interpolation, to avoid script injection.
         env:
-          # push-triggered validation runs use quick scale; dispatch/schedule use standard.
-          SCALE: ${{ github.event.inputs.scale || (github.event_name == 'push' && 'quick') || 'standard' }}
+          SCALE: ${{ github.event.inputs.scale || 'standard' }}
           WORKLOADS: ${{ github.event.inputs.workloads || 'C,B,A,F,E' }}
         run: |
           node benchmarks/ycsb/run-cluster.mts --scale="$SCALE" --workloads="$WORKLOADS"
