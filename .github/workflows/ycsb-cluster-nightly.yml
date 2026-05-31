@@ -89,6 +89,10 @@ jobs:
           tool: customSmallerIsBetter
           output-file-path: core/benchmarks/ycsb/bench-out/latency.json
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # The throughput step already fetched gh-pages this job; reuse that checkout so this
+          # second step doesn't re-fetch (which would conflict with the first step's local commit
+          # when auto-push is off). On main, each step pushes before the next, so this is safe too.
+          skip-fetch-gh-pages: true
           auto-push: ${{ github.ref == 'refs/heads/main' }}
           comment-on-alert: true
           fail-on-alert: false
