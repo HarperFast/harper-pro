@@ -44,9 +44,19 @@ async function sendOperation(node: Node, operation: Record<string, unknown>): Pr
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(operation),
 	});
-	const data = await response.json();
-	if (response.status !== 200)
-		throw new Error(`operation ${operation.operation} -> ${response.status}: ${JSON.stringify(data)}`);
+	// Read text then parse, so a non-JSON error body (gateway error, plain text) surfaces the
+	// real status instead of masking it with a JSON SyntaxError.
+	const text = await response.text();
+	let data: any;
+	try {
+		data = JSON.parse(text);
+	} catch {
+		data = text;
+	}
+	if (response.status !== 200) {
+		const detail = typeof data === 'string' ? data.slice(0, 200) : JSON.stringify(data);
+		throw new Error(`operation ${operation.operation} -> ${response.status}: ${detail}`);
+	}
 	return data;
 }
 
@@ -55,10 +65,8 @@ async function waitForRoute(url: string, deadlineMs: number): Promise<void> {
 	while (Date.now() < deadline) {
 		try {
 			const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-			if (res.status < 500) {
-				await res.body?.cancel();
-				return;
-			}
+			await res.body?.cancel(); // always drain, even on 5xx, so the socket is freed
+			if (res.status < 500) return;
 		} catch {
 			// not accepting connections yet (or this probe timed out)
 		}
@@ -67,8 +75,9 @@ async function waitForRoute(url: string, deadlineMs: number): Promise<void> {
 	throw new Error(`timed out waiting for ${url}`);
 }
 
-// Pushes each started node into `nodes` as it comes up (rather than returning), so that if a
-// sibling's startup rejects, the caller's finally still tears down the ones that did start.
+// Pushes each started node into `nodes` as it comes up. Uses allSettled (not Promise.all) so
+// every startup has fully settled before we return/throw — otherwise a sibling's rejection would
+// let other in-flight startups complete and push *after* the caller's teardown ran, orphaning them.
 async function startNodes(
 	nodes: Node[],
 	count: number,
@@ -76,7 +85,7 @@ async function startNodes(
 	engine: string,
 	startupTimeoutMs: number
 ): Promise<void> {
-	await Promise.all(
+	const outcomes = await Promise.allSettled(
 		Array.from({ length: count }, async (_, i) => {
 			const hostname = await getNextAvailableLoopbackAddress();
 			// Pre-install the app on each node (each gets the usertable schema locally), so no
@@ -100,6 +109,13 @@ async function startNodes(
 			console.log(`  node ${i} up at ${ctx.harper.httpURL} (pid ${ctx.harper.process.pid})`);
 		})
 	);
+	const failures = outcomes.filter((o) => o.status === 'rejected') as PromiseRejectedResult[];
+	if (failures.length > 0) {
+		throw new AggregateError(
+			failures.map((f) => f.reason),
+			`${failures.length} of ${count} nodes failed to start`
+		);
+	}
 }
 
 async function connectCluster(nodes: Node[]): Promise<void> {
