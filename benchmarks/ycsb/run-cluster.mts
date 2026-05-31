@@ -65,8 +65,10 @@ async function waitForRoute(url: string, deadlineMs: number): Promise<void> {
 	while (Date.now() < deadline) {
 		try {
 			const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-			await res.body?.cancel(); // always drain, even on 5xx, so the socket is freed
-			if (res.status < 500) return;
+			await res.body?.cancel(); // always drain so the socket is freed
+			// Require 2xx: after startHarper resolves the HTTP stack is up but the usertable route
+			// may not be registered yet, and a 404 from the router would falsely pass a < 500 check.
+			if (res.status >= 200 && res.status < 300) return;
 		} catch {
 			// not accepting connections yet (or this probe timed out)
 		}
