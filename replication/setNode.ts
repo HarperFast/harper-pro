@@ -23,6 +23,7 @@ const validationSchema = Joi.object({
 	subscriptions: Joi.array(),
 	revoked_certificates: Joi.array(),
 	shard: Joi.number(),
+	isLeader: Joi.boolean(),
 });
 
 /**
@@ -189,6 +190,10 @@ export async function setNode(req: any) {
 	if (req.revoked_certificates) nodeRecord.revoked_certificates = req.revoked_certificates;
 	if (targetNodeResponse?.shard !== undefined) nodeRecord.shard = targetNodeResponse.shard;
 	else if (req.shard !== undefined) nodeRecord.shard = req.shard;
+	// isLeader is LOCAL-ONLY: it means "this peer is my leader; request a full-table copy from it".
+	// It must NOT be forwarded to the peer via targetAddNodeObj — doing so would cause the peer
+	// to treat this node as its leader and attempt to full-copy in the wrong direction.
+	if (req.isLeader !== undefined) nodeRecord.isLeader = req.isLeader;
 
 	if (nodeRecord.replicates) {
 		const thisNode: any = {
