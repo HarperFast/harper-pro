@@ -1779,19 +1779,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											}
 											currentSequenceId = copyStartTime;
 											if (!currentTransaction.txnTime) {
-												// if we haven't sent any records, force a txn start and end so the subscribers records a timestamp
+												// no records pending (none sent, or the last batch landed on a checkpoint flush):
+												// force a txn so the end_txn below still carries the sequence update
 												currentTransaction.txnTime = copyStartTime;
 												writeFloat64(copyStartTime);
 											}
-											if (position - encodingStart > 8) {
-												// if we have any queued transactions to send, send them now
-												sendAuditRecord(
-													{
-														type: 'end_txn',
-													},
-													currentSequenceId
-												);
-											}
+											// ALWAYS emit the final end_txn at copyStartTime. It carries the REMOTE_SEQUENCE_UPDATE
+											// that advances the follower's seqId and received-version watermark to copyStartTime —
+											// the sole signal that the copy is synced (per-record watermark advance is suppressed
+											// during the copy). Skipping it when the last rows landed exactly on a checkpoint flush
+											// would leave the clone unable to ever reach Available.
+											sendAuditRecord(
+												{
+													type: 'end_txn',
+												},
+												currentSequenceId
+											);
 											// The full copy is done — tell the follower to clear its resume cursor and fall back to
 											// normal audit-log replication from the persisted seqId (which is copyStartTime).
 											ws.send(encode([COPY_COMPLETE]));
