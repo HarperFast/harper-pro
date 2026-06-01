@@ -1686,10 +1686,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// If resuming, the follower already committed every table before currentTable (records commit
 											// in stable iteration order), so skip to currentTable and continue after its last committed key.
 											let reachedResumeTable = !copyResume;
-											if (copyResume && !(copyResume.currentTable in tables)) {
-												// the table we were mid-copy on is gone (schema changed) — safest to recopy from scratch
+											if (copyResume && !tableToTableEntry(copyResume.currentTable)) {
+												// cursor table is gone or no longer replicated — the skip loop would never reach it and
+												// would omit every later table, so recopy from scratch (idempotent puts, copyStartTime reset)
 												logger.warn?.(
-													'Copy-resume table no longer present, restarting full copy',
+													'Copy-resume table missing or unreplicated, restarting full copy',
 													copyResume.currentTable
 												);
 												copyResume = undefined;
@@ -2037,6 +2038,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					`Commit backlog causing replication back-pressure, requesting that ${remoteNodeName} pause replication`
 				);
 			}
+			// Is this a bulk-copy frame? Only frames received before COPY_COMPLETE are part of the
+			// primary-key copy; later audit-replay frames must not be recorded as the resume cursor.
+			const isCopyFrame = inCopyMode && !copyCompleteReceived;
 			tableSubscriptionToReplicator.send({
 				type: 'end_txn',
 				localTime: lastSequenceIdReceived,
@@ -2067,7 +2071,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// Persist/clear the resume cursor only AFTER this batch's blobs are durable too. The cursor
 					// means "fully copied through this key"; advancing it before blob writes finish would let a
 					// crash skip re-requesting an unfinished blob, leaving the record pointing at missing data.
-					if (inCopyMode && event && copyFromNodeId !== undefined) {
+					if (isCopyFrame && event && copyFromNodeId !== undefined) {
 						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], {
 							copyStartTime: copyModeStartTime,
 							currentTable: event.table,
