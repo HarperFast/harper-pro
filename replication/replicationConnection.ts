@@ -528,14 +528,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let copyModeStartTime = 0;
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
 	let copyCompleteReceived = false;
-	// Remove the resume cursor only once the copy is signalled complete AND every copied batch has
-	// durably committed (outstandingCommits drained, which includes the final end_txn that advances the
-	// resume seqId to copyStartTime). Clearing it earlier — e.g. synchronously when COPY_COMPLETE is
-	// decoded while batches are still queued — risks a crash that loses both the cursor and the
-	// not-yet-committed rows, leaving the next start to resume from seqId with gaps.
-	function maybeClearCopyCursor() {
+	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
+	// received AND every copied batch has committed (outstandingCommits drained, which includes the final
+	// end_txn that advances the resume seqId to copyStartTime). We deliberately stay in copy mode until
+	// then so batches still committing keep advancing the cursor (onCommit). Finishing earlier — e.g.
+	// synchronously when COPY_COMPLETE is decoded while batches are still queued — would freeze the cursor
+	// and risk a crash that loses both the cursor and the not-yet-durable rows, leaving the next start to
+	// resume from seqId with gaps.
+	function maybeFinishCopy() {
 		if (copyCompleteReceived && outstandingCommits === 0 && copyFromNodeId !== undefined) {
 			tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+			inCopyMode = false;
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 		}
@@ -959,11 +962,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
 					case COPY_COMPLETE:
-						// copy finished — stop tracking the cursor and clear it once all batches are durable
-						// (maybeClearCopyCursor defers removal until outstanding commits drain).
-						inCopyMode = false;
+						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
+						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
 						copyCompleteReceived = true;
-						maybeClearCopyCursor();
+						maybeFinishCopy();
 						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
 						break;
 					case SEQUENCE_ID_UPDATE:
@@ -2073,7 +2075,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 					}
 					// once the last copied batch (incl. its blobs) is durable, it's safe to drop the cursor
-					maybeClearCopyCursor();
+					maybeFinishCopy();
 					if (!lastSequenceIdCommitted && sequenceIdReceived) {
 						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
 						setTimeout(() => {
