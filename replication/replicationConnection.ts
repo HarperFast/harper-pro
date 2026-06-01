@@ -1686,7 +1686,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// If resuming, the follower already committed every table before currentTable (records commit
 											// in stable iteration order), so skip to currentTable and continue after its last committed key.
 											let reachedResumeTable = !copyResume;
-											if (copyResume && !tableToTableEntry(copyResume.currentTable)) {
+											// currentTable must be one the loop below will actually visit (present in `tables` AND passing
+											// the same replication filter); otherwise the skip loop never reaches it and would omit every
+											// later table. Mirror the loop's own check so a dropped/unreplicated cursor table forces a restart.
+											if (
+												copyResume &&
+												!(copyResume.currentTable in tables && tableToTableEntry(copyResume.currentTable))
+											) {
 												// cursor table is gone or no longer replicated — the skip loop would never reach it and
 												// would omit every later table, so recopy from scratch (idempotent puts, copyStartTime reset)
 												logger.warn?.(
