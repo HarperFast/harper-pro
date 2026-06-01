@@ -90,6 +90,8 @@ const COMMITTED_UPDATE = 144;
 const DB_SCHEMA = 145;
 const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
+const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime
+const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
 export const CONFIRMATION_STATUS_POSITION = 0;
 export const RECEIVED_VERSION_POSITION = 1;
 export const RECEIVED_TIME_POSITION = 2;
@@ -112,6 +114,10 @@ const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWater
 // (MAX_EVENT_DELAY_TIME = 3 s). Yield the event loop at least this often (ms) while decoding so the
 // worker stays responsive during a bulk copy/clone.
 const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 100;
+// During a bulk clone copy the leader flushes a checkpoint transaction every this many records so the
+// follower commits incrementally and persists a resume cursor. On reconnect the copy resumes from that
+// cursor instead of restarting from zero. Larger = less overhead but coarser resume granularity.
+const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 1000;
 
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
@@ -516,6 +522,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	remoteNodeName = authorization.name;
 	if (remoteNodeName && options.connection) options.connection.nodeName = remoteNodeName;
 	let lastSequenceIdReceived, lastSequenceIdCommitted;
+	// Bulk-copy resume state (receiver side). While inCopyMode, each committed batch persists a cursor
+	// (copyStartTime + last committed table/key) so an interrupted copy can resume instead of restarting.
+	let inCopyMode = false;
+	let copyModeStartTime = 0;
+	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	let blobsTimer;
@@ -926,6 +937,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							'committed-update'
 						);
 						(getSharedStatus().buffer as any).notify();
+						break;
+					case COPY_START:
+						// the leader is (re)starting a bulk copy; track a resume cursor for it
+						inCopyMode = true;
+						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
+						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
+						break;
+					case COPY_COMPLETE:
+						// copy finished — clear the cursor so the next connection resumes normally from seqId
+						inCopyMode = false;
+						if (copyFromNodeId !== undefined)
+							tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
 						break;
 					case SEQUENCE_ID_UPDATE:
 						// we need to record the sequence number that the remote node has received
@@ -1556,8 +1581,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							subscriptionToHdbNodes?.end();
 						});
 						// find the earliest start time of the subscriptions
-						for (const { startTime } of nodeSubscriptions) {
-							if (startTime < currentSequenceId) currentSequenceId = startTime;
+						let copyResume: { copyStartTime: number; currentTable: string; afterKey: any } | undefined;
+						for (const subscription of nodeSubscriptions) {
+							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
+							// a follower resuming an interrupted bulk copy sends back where it left off
+							if (subscription.copyResume) copyResume = subscription.copyResume;
 						}
 
 						// wait for internal subscription, might be waiting for a table to be registered
@@ -1632,16 +1660,40 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// time order. Using copyStartTime — not max(localTime) of the copied records — guarantees
 											// the post-copy audit replay re-delivers every write committed during the copy, including
 											// ones to keys we already passed; resuming from max(localTime) would skip those (data loss).
-											const copyStartTime = Date.now();
+											// When the follower is resuming an interrupted copy, keep the original copy start time so
+											// the post-copy resume point stays anchored to when the copy first began (see safety note).
+											const copyStartTime = copyResume?.copyStartTime ?? Date.now();
 											const nodeId = getThisNodeId(auditStore);
+											// Tell the follower a bulk copy is starting and its anchor time, so it tracks a resume cursor.
+											ws.send(encode([COPY_START, copyStartTime]));
+											let recordsSinceCheckpoint = 0;
+											// If resuming, the follower already committed every table before currentTable (records commit
+											// in stable iteration order), so skip to currentTable and continue after its last committed key.
+											let reachedResumeTable = !copyResume;
+											if (copyResume && !(copyResume.currentTable in tables)) {
+												// the table we were mid-copy on is gone (schema changed) — safest to recopy from scratch
+												logger.warn?.(
+													'Copy-resume table no longer present, restarting full copy',
+													copyResume.currentTable
+												);
+												copyResume = undefined;
+												reachedResumeTable = true;
+											}
 											for (const tableName in tables) {
 												if (!tableToTableEntry(tableName)) continue; // if we aren't replicating this table, skip it
+												if (!reachedResumeTable) {
+													if (tableName !== copyResume!.currentTable) continue; // already committed on the follower
+													reachedResumeTable = true;
+												}
 												const table = tables[tableName];
-												for (const entry of table.primaryStore.getRange({
-													snapshot: false,
-													versions: true,
-													// values: false, // TODO: eventually, we don't want to decode, we want to use fast binary transfer
-												})) {
+												const rangeOptions: any = { snapshot: false, versions: true };
+												// values: false, // TODO: eventually, we don't want to decode, we want to use fast binary transfer
+												if (copyResume && tableName === copyResume.currentTable) {
+													// resume this table after the last key the follower committed
+													rangeOptions.start = copyResume.afterKey;
+													rangeOptions.exclusiveStart = true;
+												}
+												for (const entry of table.primaryStore.getRange(rangeOptions)) {
 													if (closed) return;
 													logger.trace?.(
 														connectionId,
@@ -1695,6 +1747,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														encoded.length,
 														encoded.slice(0, 10)
 													);
+													// Periodically flush a checkpoint transaction so the follower commits incrementally and
+													// persists its resume cursor. Timed at copyStartTime so the persisted seqId stays pinned
+													// there (never a record's localTime, which could skip concurrent writes on resume).
+													if (++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS) {
+														recordsSinceCheckpoint = 0;
+														sendAuditRecord({ type: 'end_txn' }, copyStartTime);
+													}
 												}
 												logger.info?.('Finished copy table', tableName, remoteNodeName);
 											}
@@ -1713,6 +1772,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													currentSequenceId
 												);
 											}
+											// The full copy is done — tell the follower to clear its resume cursor and fall back to
+											// normal audit-log replication from the persisted seqId (which is copyStartTime).
+											ws.send(encode([COPY_COMPLETE]));
 											getSharedStatus()[SENDING_TIME_POSITION] = 0;
 											currentSequenceId = copyStartTime;
 										}
@@ -1959,6 +2021,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								'ingest'
 							);
 						}
+					}
+					// Persist the bulk-copy resume cursor AFTER this batch commits, so the cursor never gets
+					// ahead of committed data — a resume may re-copy a few records (idempotent puts) but never
+					// skips. Records commit in receive order, so the last event in this message is the cursor.
+					if (inCopyMode && event && copyFromNodeId !== undefined) {
+						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], {
+							copyStartTime: copyModeStartTime,
+							currentTable: event.table,
+							afterKey: event.id,
+						});
 					}
 					outstandingCommits--;
 					if (commitBacklogPaused) {
@@ -2278,6 +2350,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 			auditStore?.ensureLogExists?.(node.name);
 			const sequenceEntry = tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('seq'), nodeId]) ?? 1;
+			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
+			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
+			// data predates copyStartTime and would never be delivered by an audit-log resume).
+			const copyCursor =
+				nodeId === undefined
+					? undefined
+					: tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('copyCursor'), nodeId]);
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
 				sequenceEntry?.seqId ?? 1,
@@ -2324,6 +2403,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					startTime = Date.now() - 60000;
 				}
 			}
+			let copyResume;
+			if (copyCursor) {
+				startTime = 0; // request a copy; the cursor tells the leader where to resume
+				copyResume = {
+					copyStartTime: copyCursor.copyStartTime,
+					currentTable: copyCursor.currentTable,
+					afterKey: copyCursor.afterKey,
+				};
+				logger.warn?.(
+					`Resuming interrupted copy of database ${databaseName} from ${getNodeURL(node)} at table ${copyCursor.currentTable}`
+				);
+			}
 			logger.trace?.(connectionId, 'defining subscription request', node.name, databaseName, new Date(startTime));
 			return {
 				name: node.name,
@@ -2332,6 +2423,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				startTime,
 				isLeader: node.isLeader,
 				endTime: node.endTime,
+				copyResume, // present only when resuming an interrupted bulk copy
 			};
 		});
 		let excluded: string[];
