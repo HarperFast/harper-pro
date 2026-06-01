@@ -13,7 +13,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 
 // Big enough (and fat enough per record) that the bulk copy spans many checkpoints and takes long
 // enough to reliably catch it mid-copy before killing the follower.
-const RECORD_COUNT = 2000;
+const RECORD_COUNT = 4000;
 const PAYLOAD = 'x'.repeat(2048);
 
 async function sendOperation(node, operation) {
@@ -110,9 +110,10 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				HDB_LEADER_TOKEN: tokenResponse.operation_token,
 				ALLOW_SELF_SIGNED: true,
 				HARPER_NO_FLUSH_ON_EXIT: true,
-				// frequent checkpoints + slow ingestion so the copy spans the interrupt window
-				REPLICATION_COPYCHECKPOINTRECORDS: 20,
-				REPLICATION_RECEIVEEVENTHIGHWATERMARK: 20,
+				// frequent checkpoints + aggressive receive throttling so the copy is slow enough to
+				// reliably catch (and kill) mid-stream before it finishes
+				REPLICATION_COPYCHECKPOINTRECORDS: 25,
+				REPLICATION_RECEIVEEVENTHIGHWATERMARK: 5,
 			},
 		};
 		ctx.cloneCtx = cloneCtx;
@@ -128,7 +129,7 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				break;
 			}
 			if (count === RECORD_COUNT) break; // copy finished before we could interrupt
-			await sleep(200);
+			await sleep(25);
 		}
 		await killHarper(cloneCtx);
 

@@ -527,6 +527,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let inCopyMode = false;
 	let copyModeStartTime = 0;
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
+	let copyCompleteReceived = false;
+	// Remove the resume cursor only once the copy is signalled complete AND every copied batch has
+	// durably committed (outstandingCommits drained, which includes the final end_txn that advances the
+	// resume seqId to copyStartTime). Clearing it earlier — e.g. synchronously when COPY_COMPLETE is
+	// decoded while batches are still queued — risks a crash that loses both the cursor and the
+	// not-yet-committed rows, leaving the next start to resume from seqId with gaps.
+	function maybeClearCopyCursor() {
+		if (copyCompleteReceived && outstandingCommits === 0 && copyFromNodeId !== undefined) {
+			tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+			copyCompleteReceived = false;
+			copyFromNodeId = undefined;
+		}
+	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	let blobsTimer;
@@ -946,10 +959,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
 					case COPY_COMPLETE:
-						// copy finished — clear the cursor so the next connection resumes normally from seqId
+						// copy finished — stop tracking the cursor and clear it once all batches are durable
+						// (maybeClearCopyCursor defers removal until outstanding commits drain).
 						inCopyMode = false;
-						if (copyFromNodeId !== undefined)
-							tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+						copyCompleteReceived = true;
+						maybeClearCopyCursor();
 						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
 						break;
 					case SEQUENCE_ID_UPDATE:
@@ -1747,12 +1761,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														encoded.length,
 														encoded.slice(0, 10)
 													);
-													// Periodically flush a checkpoint transaction so the follower commits incrementally and
-													// persists its resume cursor. Timed at copyStartTime so the persisted seqId stays pinned
-													// there (never a record's localTime, which could skip concurrent writes on resume).
-													if (++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS) {
+													// Periodically flush the accumulated records as a message so the follower commits this
+													// batch and advances its resume cursor. This is a plain flush with NO sequence update:
+													// emitting an end_txn here would advance the follower's received-version watermark to
+													// copyStartTime mid-copy, which monitorSync could read as "caught up" and mark the clone
+													// Available/cloned with rows still uncopied. (Records with differing versions already flush
+													// naturally above; this also bounds same-version bulk data into committable batches.) The
+													// watermark is only advanced to copyStartTime by the single end_txn after the whole copy.
+													if (++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS && position - encodingStart > 8) {
 														recordsSinceCheckpoint = 0;
-														sendAuditRecord({ type: 'end_txn' }, copyStartTime);
+														sendQueuedData();
+														encodingStart = position;
+														currentTransaction.txnTime = 0;
 													}
 												}
 												logger.info?.('Finished copy table', tableName, remoteNodeName);
@@ -2033,6 +2053,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 					}
 					outstandingCommits--;
+					// once the last copied batch is durable, it's safe to drop the resume cursor
+					maybeClearCopyCursor();
 					if (commitBacklogPaused) {
 						commitBacklogPaused = false;
 						removePauseReason();
