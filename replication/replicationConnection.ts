@@ -536,8 +536,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// and risk a crash that loses both the cursor and the not-yet-durable rows, leaving the next start to
 	// resume from seqId with gaps.
 	function maybeFinishCopy() {
-		if (copyCompleteReceived && outstandingCommits === 0 && copyFromNodeId !== undefined) {
-			tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+		if (copyCompleteReceived && outstandingCommits === 0) {
+			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
+			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
+			// (received-version watermark suppressed) and it could never reach Available.
+			if (copyFromNodeId !== undefined)
+				tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
@@ -1689,10 +1693,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// currentTable must be one the loop below will actually visit (present in `tables` AND passing
 											// the same replication filter); otherwise the skip loop never reaches it and would omit every
 											// later table. Mirror the loop's own check so a dropped/unreplicated cursor table forces a restart.
-											if (
-												copyResume &&
-												!(copyResume.currentTable in tables && tableToTableEntry(copyResume.currentTable))
-											) {
+											if (copyResume && !tableToTableEntry(tables[copyResume.currentTable])) {
 												// cursor table is gone or no longer replicated — the skip loop would never reach it and
 												// would omit every later table, so recopy from scratch (idempotent puts, copyStartTime reset)
 												logger.warn?.(
@@ -1702,18 +1703,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												copyResume = undefined;
 												reachedResumeTable = true;
 											}
+											const resumeCurrentTable = copyResume?.currentTable;
+											const resumeAfterKey = copyResume?.afterKey;
 											for (const tableName in tables) {
-												if (!tableToTableEntry(tableName)) continue; // if we aren't replicating this table, skip it
+												const table = tables[tableName];
+												if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
 												if (!reachedResumeTable) {
-													if (tableName !== copyResume!.currentTable) continue; // already committed on the follower
+													if (tableName !== resumeCurrentTable) continue; // already committed on the follower
 													reachedResumeTable = true;
 												}
-												const table = tables[tableName];
 												const rangeOptions: any = { snapshot: false, versions: true };
 												// values: false, // TODO: eventually, we don't want to decode, we want to use fast binary transfer
-												if (copyResume && tableName === copyResume.currentTable) {
+												if (tableName === resumeCurrentTable) {
 													// resume this table after the last key the follower committed
-													rangeOptions.start = copyResume.afterKey;
+													rangeOptions.start = resumeAfterKey;
 													rangeOptions.exclusiveStart = true;
 												}
 												for (const entry of table.primaryStore.getRange(rangeOptions)) {
@@ -1791,6 +1794,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												// no records pending (none sent, or the last batch landed on a checkpoint flush):
 												// force a txn so the end_txn below still carries the sequence update
 												currentTransaction.txnTime = copyStartTime;
+												encodingStart = position;
 												writeFloat64(copyStartTime);
 											}
 											// ALWAYS emit the final end_txn at copyStartTime. It carries the REMOTE_SEQUENCE_UPDATE
