@@ -1962,11 +1962,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// a window to complete, then unlink the files. (mirrors the pattern at the relocate path above.)
 					setTimeout(() => receivedBlobs.forEach(deleteBlob), 60000).unref();
 				}
-				replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
-					// ensure monotonicity
-					auditRecord.version,
-					replicationSharedStatus[RECEIVED_VERSION_POSITION]
-				);
+				// During a bulk copy, do NOT advance the received-version watermark per copied record:
+				// records arrive in primary-key order carrying their original (possibly newest) versions, so a
+				// single record at the leader's latest timestamp would otherwise let checkSyncStatus mark the
+				// clone Available with rows still uncopied. The watermark is advanced to copyStartTime by the
+				// single end_txn after the whole copy (the REMOTE_SEQUENCE_UPDATE branch above).
+				if (!inCopyMode) {
+					replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+						// ensure monotonicity
+						auditRecord.version,
+						replicationSharedStatus[RECEIVED_VERSION_POSITION]
+					);
+				}
 				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
 
@@ -2042,19 +2049,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							);
 						}
 					}
-					// Persist the bulk-copy resume cursor AFTER this batch commits, so the cursor never gets
-					// ahead of committed data — a resume may re-copy a few records (idempotent puts) but never
-					// skips. Records commit in receive order, so the last event in this message is the cursor.
-					if (inCopyMode && event && copyFromNodeId !== undefined) {
-						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], {
-							copyStartTime: copyModeStartTime,
-							currentTable: event.table,
-							afterKey: event.id,
-						});
-					}
 					outstandingCommits--;
-					// once the last copied batch is durable, it's safe to drop the resume cursor
-					maybeClearCopyCursor();
 					if (commitBacklogPaused) {
 						commitBacklogPaused = false;
 						removePauseReason();
@@ -2064,6 +2059,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// we correctly resend the blobs)
 					if (outstandingBlobsToFinish.length > 0) await Promise.all(outstandingBlobsToFinish);
 					logger.trace?.('All blobs finished');
+					// Persist/clear the resume cursor only AFTER this batch's blobs are durable too. The cursor
+					// means "fully copied through this key"; advancing it before blob writes finish would let a
+					// crash skip re-requesting an unfinished blob, leaving the record pointing at missing data.
+					if (inCopyMode && event && copyFromNodeId !== undefined) {
+						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], {
+							copyStartTime: copyModeStartTime,
+							currentTable: event.table,
+							afterKey: event.id,
+						});
+					}
+					// once the last copied batch (incl. its blobs) is durable, it's safe to drop the cursor
+					maybeClearCopyCursor();
 					if (!lastSequenceIdCommitted && sequenceIdReceived) {
 						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
 						setTimeout(() => {
