@@ -27,6 +27,7 @@ jobs:
         run: |
           for i in 1 2 3 4 5; do
             gh release download ${{ github.event.release.tag_name }} --pattern "harperfast-harper-pro-*.tgz" && break
+            if [ "$i" -eq 5 ]; then echo "All attempts failed"; exit 1; fi
             echo "Attempt $i failed; retrying in 15s..."
             sleep 15
           done
