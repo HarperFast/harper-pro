@@ -90,6 +90,8 @@ const COMMITTED_UPDATE = 144;
 const DB_SCHEMA = 145;
 const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
+const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime
+const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
 export const CONFIRMATION_STATUS_POSITION = 0;
 export const RECEIVED_VERSION_POSITION = 1;
 export const RECEIVED_TIME_POSITION = 2;
@@ -112,6 +114,10 @@ const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWater
 // (MAX_EVENT_DELAY_TIME = 3 s). Yield the event loop at least this often (ms) while decoding so the
 // worker stays responsive during a bulk copy/clone.
 const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 100;
+// During a bulk clone copy the leader flushes a checkpoint transaction every this many records so the
+// follower commits incrementally and persists a resume cursor. On reconnect the copy resumes from that
+// cursor instead of restarting from zero. Larger = less overhead but coarser resume granularity.
+const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 1000;
 
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
@@ -516,6 +522,31 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	remoteNodeName = authorization.name;
 	if (remoteNodeName && options.connection) options.connection.nodeName = remoteNodeName;
 	let lastSequenceIdReceived, lastSequenceIdCommitted;
+	// Bulk-copy resume state (receiver side). While inCopyMode, each committed batch persists a cursor
+	// (copyStartTime + last committed table/key) so an interrupted copy can resume instead of restarting.
+	let inCopyMode = false;
+	let copyModeStartTime = 0;
+	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
+	let copyCompleteReceived = false;
+	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
+	// received AND every copied batch has committed (outstandingCommits drained, which includes the final
+	// end_txn that advances the resume seqId to copyStartTime). We deliberately stay in copy mode until
+	// then so batches still committing keep advancing the cursor (onCommit). Finishing earlier — e.g.
+	// synchronously when COPY_COMPLETE is decoded while batches are still queued — would freeze the cursor
+	// and risk a crash that loses both the cursor and the not-yet-durable rows, leaving the next start to
+	// resume from seqId with gaps.
+	function maybeFinishCopy() {
+		if (copyCompleteReceived && outstandingCommits === 0) {
+			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
+			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
+			// (received-version watermark suppressed) and it could never reach Available.
+			if (copyFromNodeId !== undefined)
+				tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+			inCopyMode = false;
+			copyCompleteReceived = false;
+			copyFromNodeId = undefined;
+		}
+	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	let blobsTimer;
@@ -926,6 +957,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							'committed-update'
 						);
 						(getSharedStatus().buffer as any).notify();
+						break;
+					case COPY_START:
+						// the leader is (re)starting a bulk copy; track a resume cursor for it
+						inCopyMode = true;
+						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
+						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
+						break;
+					case COPY_COMPLETE:
+						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
+						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
+						copyCompleteReceived = true;
+						maybeFinishCopy();
+						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
 						break;
 					case SEQUENCE_ID_UPDATE:
 						// we need to record the sequence number that the remote node has received
@@ -1556,8 +1601,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							subscriptionToHdbNodes?.end();
 						});
 						// find the earliest start time of the subscriptions
-						for (const { startTime } of nodeSubscriptions) {
-							if (startTime < currentSequenceId) currentSequenceId = startTime;
+						let copyResume: { copyStartTime: number; currentTable: string; afterKey: any } | undefined;
+						for (const subscription of nodeSubscriptions) {
+							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
+							// a follower resuming an interrupted bulk copy sends back where it left off
+							if (subscription.copyResume) copyResume = subscription.copyResume;
 						}
 
 						// wait for internal subscription, might be waiting for a table to be registered
@@ -1627,16 +1675,51 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										isFirst = false;
 										if (currentSequenceId === 0) {
 											logger.info?.('Replicating all tables to', remoteNodeName);
-											let lastSequenceId = Date.now(); // we need at least a default time point in case there are no records
+											// Capture the resume point BEFORE iterating. The bulk copy walks the primary store in
+											// key order (snapshot: false), but the follower resumes replication from the audit log in
+											// time order. Using copyStartTime — not max(localTime) of the copied records — guarantees
+											// the post-copy audit replay re-delivers every write committed during the copy, including
+											// ones to keys we already passed; resuming from max(localTime) would skip those (data loss).
+											// When the follower is resuming an interrupted copy, keep the original copy start time so
+											// the post-copy resume point stays anchored to when the copy first began (see safety note).
+											const copyStartTime = copyResume?.copyStartTime ?? Date.now();
 											const nodeId = getThisNodeId(auditStore);
+											// Tell the follower a bulk copy is starting and its anchor time, so it tracks a resume cursor.
+											ws.send(encode([COPY_START, copyStartTime]));
+											let recordsSinceCheckpoint = 0;
+											// If resuming, the follower already committed every table before currentTable (records commit
+											// in stable iteration order), so skip to currentTable and continue after its last committed key.
+											let reachedResumeTable = !copyResume;
+											// currentTable must be one the loop below will actually visit (present in `tables` AND passing
+											// the same replication filter); otherwise the skip loop never reaches it and would omit every
+											// later table. Mirror the loop's own check so a dropped/unreplicated cursor table forces a restart.
+											if (copyResume && !tableToTableEntry(tables[copyResume.currentTable])) {
+												// cursor table is gone or no longer replicated — the skip loop would never reach it and
+												// would omit every later table, so recopy from scratch (idempotent puts, copyStartTime reset)
+												logger.warn?.(
+													'Copy-resume table missing or unreplicated, restarting full copy',
+													copyResume.currentTable
+												);
+												copyResume = undefined;
+												reachedResumeTable = true;
+											}
+											const resumeCurrentTable = copyResume?.currentTable;
+											const resumeAfterKey = copyResume?.afterKey;
 											for (const tableName in tables) {
-												if (!tableToTableEntry(tableName)) continue; // if we aren't replicating this table, skip it
 												const table = tables[tableName];
-												for (const entry of table.primaryStore.getRange({
-													snapshot: false,
-													versions: true,
-													// values: false, // TODO: eventually, we don't want to decode, we want to use fast binary transfer
-												})) {
+												if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
+												if (!reachedResumeTable) {
+													if (tableName !== resumeCurrentTable) continue; // already committed on the follower
+													reachedResumeTable = true;
+												}
+												const rangeOptions: any = { snapshot: false, versions: true };
+												// values: false, // TODO: eventually, we don't want to decode, we want to use fast binary transfer
+												if (tableName === resumeCurrentTable) {
+													// resume this table after the last key the follower committed
+													rangeOptions.start = resumeAfterKey;
+													rangeOptions.exclusiveStart = true;
+												}
+												for (const entry of table.primaryStore.getRange(rangeOptions)) {
 													if (closed) return;
 													logger.trace?.(
 														connectionId,
@@ -1646,7 +1729,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														entry.key,
 														entry.localTime
 													);
-													lastSequenceId = Math.max(entry.localTime ?? 1, lastSequenceId);
 													getSharedStatus()[SENDING_TIME_POSITION] = 1;
 													const encoded = createAuditEntry({
 														version: entry.version,
@@ -1691,26 +1773,46 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														encoded.length,
 														encoded.slice(0, 10)
 													);
+													// Periodically flush the accumulated records as a message so the follower commits this
+													// batch and advances its resume cursor. This is a plain flush with NO sequence update:
+													// emitting an end_txn here would advance the follower's received-version watermark to
+													// copyStartTime mid-copy, which monitorSync could read as "caught up" and mark the clone
+													// Available/cloned with rows still uncopied. (Records with differing versions already flush
+													// naturally above; this also bounds same-version bulk data into committable batches.) The
+													// watermark is only advanced to copyStartTime by the single end_txn after the whole copy.
+													if (++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS && position - encodingStart > 8) {
+														recordsSinceCheckpoint = 0;
+														sendQueuedData();
+														encodingStart = position;
+														currentTransaction.txnTime = 0;
+													}
 												}
 												logger.info?.('Finished copy table', tableName, remoteNodeName);
 											}
-											currentSequenceId = lastSequenceId;
+											currentSequenceId = copyStartTime;
 											if (!currentTransaction.txnTime) {
-												// if we haven't sent any records, force a txn start and end so the subscribers records a timestamp
-												currentTransaction.txnTime = lastSequenceId;
-												writeFloat64(lastSequenceId);
+												// no records pending (none sent, or the last batch landed on a checkpoint flush):
+												// force a txn so the end_txn below still carries the sequence update
+												currentTransaction.txnTime = copyStartTime;
+												encodingStart = position;
+												writeFloat64(copyStartTime);
 											}
-											if (position - encodingStart > 8) {
-												// if we have any queued transactions to send, send them now
-												sendAuditRecord(
-													{
-														type: 'end_txn',
-													},
-													currentSequenceId
-												);
-											}
+											// ALWAYS emit the final end_txn at copyStartTime. It carries the REMOTE_SEQUENCE_UPDATE
+											// that advances the follower's seqId and received-version watermark to copyStartTime —
+											// the sole signal that the copy is synced (per-record watermark advance is suppressed
+											// during the copy). Skipping it when the last rows landed exactly on a checkpoint flush
+											// would leave the clone unable to ever reach Available.
+											sendAuditRecord(
+												{
+													type: 'end_txn',
+												},
+												currentSequenceId
+											);
+											// The full copy is done — tell the follower to clear its resume cursor and fall back to
+											// normal audit-log replication from the persisted seqId (which is copyStartTime).
+											ws.send(encode([COPY_COMPLETE]));
 											getSharedStatus()[SENDING_TIME_POSITION] = 0;
-											currentSequenceId = lastSequenceId;
+											currentSequenceId = copyStartTime;
 										}
 									}
 									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
@@ -1876,11 +1978,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// a window to complete, then unlink the files. (mirrors the pattern at the relocate path above.)
 					setTimeout(() => receivedBlobs.forEach(deleteBlob), 60000).unref();
 				}
-				replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
-					// ensure monotonicity
-					auditRecord.version,
-					replicationSharedStatus[RECEIVED_VERSION_POSITION]
-				);
+				// During a bulk copy, do NOT advance the received-version watermark per copied record:
+				// records arrive in primary-key order carrying their original (possibly newest) versions, so a
+				// single record at the leader's latest timestamp would otherwise let checkSyncStatus mark the
+				// clone Available with rows still uncopied. The watermark is advanced to copyStartTime by the
+				// single end_txn after the whole copy (the REMOTE_SEQUENCE_UPDATE branch above).
+				if (!inCopyMode) {
+					replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+						// ensure monotonicity
+						auditRecord.version,
+						replicationSharedStatus[RECEIVED_VERSION_POSITION]
+					);
+				}
 				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
 
@@ -1939,6 +2048,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					`Commit backlog causing replication back-pressure, requesting that ${remoteNodeName} pause replication`
 				);
 			}
+			// Is this a bulk-copy frame? Only frames received before COPY_COMPLETE are part of the
+			// primary-key copy; later audit-replay frames must not be recorded as the resume cursor.
+			const isCopyFrame = inCopyMode && !copyCompleteReceived;
 			tableSubscriptionToReplicator.send({
 				type: 'end_txn',
 				localTime: lastSequenceIdReceived,
@@ -1966,6 +2078,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// we correctly resend the blobs)
 					if (outstandingBlobsToFinish.length > 0) await Promise.all(outstandingBlobsToFinish);
 					logger.trace?.('All blobs finished');
+					// Persist/clear the resume cursor only AFTER this batch's blobs are durable too. The cursor
+					// means "fully copied through this key"; advancing it before blob writes finish would let a
+					// crash skip re-requesting an unfinished blob, leaving the record pointing at missing data.
+					if (isCopyFrame && event && copyFromNodeId !== undefined) {
+						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], {
+							copyStartTime: copyModeStartTime,
+							currentTable: event.table,
+							afterKey: event.id,
+						});
+					}
+					// once the last copied batch (incl. its blobs) is durable, it's safe to drop the cursor
+					maybeFinishCopy();
 					if (!lastSequenceIdCommitted && sequenceIdReceived) {
 						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
 						setTimeout(() => {
@@ -2274,6 +2398,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 			auditStore?.ensureLogExists?.(node.name);
 			const sequenceEntry = tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('seq'), nodeId]) ?? 1;
+			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
+			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
+			// data predates copyStartTime and would never be delivered by an audit-log resume).
+			const copyCursor =
+				nodeId === undefined
+					? undefined
+					: tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('copyCursor'), nodeId]);
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
 				sequenceEntry?.seqId ?? 1,
@@ -2320,6 +2451,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					startTime = Date.now() - 60000;
 				}
 			}
+			let copyResume;
+			if (copyCursor) {
+				startTime = 0; // request a copy; the cursor tells the leader where to resume
+				copyResume = {
+					copyStartTime: copyCursor.copyStartTime,
+					currentTable: copyCursor.currentTable,
+					afterKey: copyCursor.afterKey,
+				};
+				logger.warn?.(
+					`Resuming interrupted copy of database ${databaseName} from ${getNodeURL(node)} at table ${copyCursor.currentTable}`
+				);
+			}
 			logger.trace?.(connectionId, 'defining subscription request', node.name, databaseName, new Date(startTime));
 			return {
 				name: node.name,
@@ -2328,6 +2471,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				startTime,
 				isLeader: node.isLeader,
 				endTime: node.endTime,
+				copyResume, // present only when resuming an interrupted bulk copy
 			};
 		});
 		let excluded: string[];
