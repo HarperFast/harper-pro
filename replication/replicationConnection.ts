@@ -1059,13 +1059,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									subscriptionToHdbNodes = subscription;
 									for await (const event of subscriptionToHdbNodes) {
 										const node = event.value;
+										// Authorize the subscription if the peer's hdb_nodes record indicates a
+										// replication relationship with us. `replicates === true` is full
+										// replication; `replicates.receives`/`replicates.sends` are set by the
+										// add_node operation (which stores `{ sends: true, sendsTo, receivesFrom }`).
+										// Match sendsTo/receivesFrom route entries with the SAME convention as
+										// getExcludedTablesForRouteEntries (knownNodes.ts): the peer is
+										// `target ?? source` and a missing peer or database means "matches any".
+										// add_node-derived entries carry neither field, so they wildcard-match.
+										const authorizesDatabase = (entries) =>
+											entries?.some((sub) => {
+												if (typeof sub !== 'object') return false;
+												const entryPeer = sub.target ?? sub.source;
+												return (
+													(!entryPeer || entryPeer === remoteNodeName) &&
+													(!sub.database || sub.database === databaseName)
+												);
+											});
 										if (
 											!(
 												node?.replicates === true ||
 												node?.replicates?.receives ||
-												node?.replicates?.receivesFrom?.some(
-													(sub) => sub.source === getThisNodeName() && sub.database === databaseName
-												)
+												node?.replicates?.sends ||
+												authorizesDatabase(node?.replicates?.receivesFrom) ||
+												authorizesDatabase(node?.replicates?.sendsTo)
 											)
 										) {
 											closed = true;
@@ -1481,6 +1498,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											const nodeId = getThisNodeId(auditStore);
 											for (const tableName in tables) {
 												if (!tableToTableEntry(tableName)) continue; // if we aren't replicating this table, skip it
+												// Honor excludeTables on the full-copy path too. The audit-log-forwarding
+												// path skips excluded tables via sendExcludedTables (see sendAuditRecord);
+												// without this, a from-scratch full copy would ship excluded tables
+												// (e.g. system.hdb_nodes) and leak the source cluster's topology.
+												if (sendExcludedTables?.has(tableName)) continue;
 												const table = tables[tableName];
 												for (const entry of table.primaryStore.getRange({
 													snapshot: false,
