@@ -689,7 +689,7 @@ export async function ensureNode(name: string, node) {
 	const existing = table.primaryStore.get(name);
 	logger.debug(`Ensuring node ${name} at ${getNodeURL(node)}, existing record:`, existing, 'new record:', node);
 	if (!existing) {
-		await table.patch(node);
+		await table.put(node);
 	} else {
 		if (Array.isArray(node.revoked_certificates)) {
 			const existingRevoked = existing.revoked_certificates || [];
@@ -697,6 +697,6 @@ export async function ensureNode(name: string, node) {
 		}
 
 		logger.info(`Updating node ${name} at ${getNodeURL(node)}`);
-		await table.patch(node);
+		await table.put({ ...existing, ...node });
 	}
 }
