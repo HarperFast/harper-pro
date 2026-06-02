@@ -612,7 +612,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "<https://hub.docker.com/r/harperfast/harper-pro-openshift|harperfast/harper-pro-openshift>  ·  <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run>"
+                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro-openshift/${{ needs.merge-openshift.outputs.docker-image-tag }}|harperfast/harper-pro-openshift:${{ needs.merge-openshift.outputs.docker-image-tag }}>  ·  <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run>"
                     }
                   ]
                 }
