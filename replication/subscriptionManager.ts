@@ -252,6 +252,21 @@ export async function startOnMainThread(options) {
 				}
 			}
 		}
+		// When this peer is our leader, bootstrap subscriptions for configured databases
+		// that don't exist locally yet — they need a full-table copy from the leader.
+		// forEachReplicatedDatabase above only iterates local databases, so an empty node
+		// joining a populated leader would never schedule the catchup without this.
+		if (node.isLeader && Array.isArray(options?.databases)) {
+			for (const dbConfig of options.databases) {
+				const databaseName = typeof dbConfig === 'string' ? dbConfig : dbConfig?.name;
+				if (databaseName && !databases[databaseName]) {
+					logger.warn(
+						`isLeader: bootstrapping full-copy subscription for non-existent database ${databaseName} from ${node.name}`
+					);
+					onDatabase(databaseName, true);
+				}
+			}
+		}
 
 		function onDatabase(databaseName, tablesReplicateByDefault) {
 			logger.trace('Setting up replication for database', databaseName, 'on node', node.name);
@@ -353,8 +368,7 @@ export async function startOnMainThread(options) {
 				//   3. an explicitly configured leader (env/cli/routes) matches this node.
 				// We deliberately do NOT honour nodeName === leaderName when leaderName came
 				// from the "first other node in hdb_nodes" fallback — that's just a guess.
-				nodes[0].isLeader =
-					nodes[0].isLeader || !leaderName || (hasExplicitLeader && nodeName === leaderName);
+				nodes[0].isLeader = nodes[0].isLeader || !leaderName || (hasExplicitLeader && nodeName === leaderName);
 				nodes[0].url ??= getNodeURL(nodes[0]);
 				setTimeout(() => {
 					const request = {

@@ -183,6 +183,11 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 	const databaseReplications: string | Array<string | { name: string; sharded?: boolean }> = env.get(
 		CONFIG_PARAMS.REPLICATION_DATABASES
 	);
+	// When this peer is our leader, the database may not exist locally yet — that's the
+	// whole point of the full-table copy bootstrap. Skip the local-presence precondition
+	// so the subscription can be scheduled and the leader can push records (and schema)
+	// to create the database on this node.
+	const hasLocalDatabase = !!databases[databaseName] || !!node.isLeader;
 	return (
 		((typeof node.replicates === 'object'
 			? node.replicates?.sends ||
@@ -193,7 +198,7 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 						: sendsTo === getThisNodeName()
 				)
 			: node.replicates) &&
-			databases[databaseName] &&
+			hasLocalDatabase &&
 			(!databaseReplications ||
 				databaseReplications === '*' ||
 				(Array.isArray(databaseReplications) &&
@@ -354,6 +359,7 @@ export type Node = {
 	startTime?: number;
 	revoked_certificates?: string[];
 	shard?: number;
+	isLeader?: boolean;
 };
 
 /**
