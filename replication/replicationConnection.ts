@@ -2272,7 +2272,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 
 			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
-			auditStore.ensureLogExists?.(node.name);
+			auditStore?.ensureLogExists?.(node.name);
 			const sequenceEntry = tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('seq'), nodeId]) ?? 1;
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(

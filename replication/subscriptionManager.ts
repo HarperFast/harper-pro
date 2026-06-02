@@ -252,6 +252,21 @@ export async function startOnMainThread(options) {
 				}
 			}
 		}
+		// When this peer is our leader, bootstrap subscriptions for configured databases
+		// that don't exist locally yet — they need a full-table copy from the leader.
+		// forEachReplicatedDatabase above only iterates local databases, so an empty node
+		// joining a populated leader would never schedule the catchup without this.
+		if (node.isLeader && Array.isArray(options?.databases)) {
+			for (const dbConfig of options.databases) {
+				const databaseName = typeof dbConfig === 'string' ? dbConfig : dbConfig?.name;
+				if (databaseName && !databases[databaseName]) {
+					logger.warn(
+						`isLeader: bootstrapping full-copy subscription for non-existent database ${databaseName} from ${node.name}`
+					);
+					onDatabase(databaseName, true);
+				}
+			}
+		}
 
 		function onDatabase(databaseName, tablesReplicateByDefault) {
 			logger.trace('Setting up replication for database', databaseName, 'on node', node.name);
@@ -331,6 +346,12 @@ export async function startOnMainThread(options) {
 					cliArgs.HDB_LEADER_URL ?? // first see if there was a leader explicitly specified
 					process.env.HDB_LEADER_URL ??
 					routes[0]?.url; // if we have routes, use the first one
+				// Track whether the leader is explicitly configured (env/cli/routes). The
+				// fallback "first other node in hdb_nodes" is only a guess and must NOT be
+				// treated as authoritative — otherwise a bidirectional add_node handshake
+				// where the responder has no leader config will incorrectly mark the
+				// requester as its leader and trigger a reverse full-table copy.
+				const hasExplicitLeader = !!leaderUrl;
 
 				let leaderName = leaderUrl
 					? new URL(leaderUrl).hostname
@@ -341,7 +362,13 @@ export async function startOnMainThread(options) {
 						)[0]; // try to find the first node
 				const nodeName = nodes[0].name ?? (nodes[0].url && new URL(nodes[0].url).hostname);
 				logger.warn(`Setting up subscription with leader ${leaderName} for node ${nodeName}`);
-				nodes[0].isLeader = !leaderName || nodeName === leaderName;
+				// isLeader is true only if:
+				//   1. it was explicitly persisted (e.g. by add_node { isLeader: true }), OR
+				//   2. there is no leader candidate at all, OR
+				//   3. an explicitly configured leader (env/cli/routes) matches this node.
+				// We deliberately do NOT honour nodeName === leaderName when leaderName came
+				// from the "first other node in hdb_nodes" fallback — that's just a guess.
+				nodes[0].isLeader = nodes[0].isLeader || !leaderName || (hasExplicitLeader && nodeName === leaderName);
 				nodes[0].url ??= getNodeURL(nodes[0]);
 				setTimeout(() => {
 					const request = {
