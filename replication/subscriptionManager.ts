@@ -341,7 +341,9 @@ export async function startOnMainThread(options) {
 						)[0]; // try to find the first node
 				const nodeName = nodes[0].name ?? (nodes[0].url && new URL(nodes[0].url).hostname);
 				logger.warn(`Setting up subscription with leader ${leaderName} for node ${nodeName}`);
-				nodes[0].isLeader = !leaderName || nodeName === leaderName;
+				// Preserve a persisted isLeader (set by add_node) — only fall back to the
+				// hostname/leaderName heuristic when no explicit value is stored.
+				nodes[0].isLeader = nodes[0].isLeader || !leaderName || nodeName === leaderName;
 				nodes[0].url ??= getNodeURL(nodes[0]);
 				setTimeout(() => {
 					const request = {
