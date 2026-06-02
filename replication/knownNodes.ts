@@ -312,6 +312,12 @@ function startSubscriptionToReplications() {
 		confirmationWatchersByNode.set(nodeNameAtUpdate, handle);
 	});
 }
+export type RouteEntry = {
+	target?: string;
+	source?: string;
+	database?: string;
+	excludeTables?: string[];
+};
 export type Route = {
 	url?: string;
 	subscriptions?: { database: string; schema: string; subscribe: boolean }[];
@@ -319,6 +325,18 @@ export type Route = {
 	host?: string;
 	port?: any;
 	routes?: any[];
+	sendsTo?: (RouteEntry | string)[];
+	receivesFrom?: (RouteEntry | string)[];
+	// yielded by iterateRoutes (may differ from raw config shape)
+	name?: string;
+	replicates?:
+		| boolean
+		| {
+				sends?: boolean;
+				sendsTo?: (RouteEntry | string)[];
+				receives?: boolean;
+				receivesFrom?: (RouteEntry | string)[];
+		  };
 };
 export type Node = {
 	name: string;
@@ -327,9 +345,9 @@ export type Node = {
 		| boolean
 		| {
 				sends?: boolean;
-				sendsTo?: ({ target: string; database: string } | string)[];
+				sendsTo?: (RouteEntry | string)[];
 				receives?: boolean;
-				receivesFrom?: ({ source: string; database: string } | string)[];
+				receivesFrom?: (RouteEntry | string)[];
 		  };
 	url?: string;
 	port?: number;
@@ -337,6 +355,30 @@ export type Node = {
 	revoked_certificates?: string[];
 	shard?: number;
 };
+
+/**
+ * Returns the set of tables to exclude for a given peer+database from a sendsTo or receivesFrom
+ * route-entry array. Returns null when there are no exclusions (hot path: avoids a Set allocation).
+ */
+export function getExcludedTablesForRouteEntries(
+	entries: (RouteEntry | string)[] | undefined,
+	peerName: string,
+	databaseName: string
+): Set<string> | null {
+	if (!entries) return null;
+	let excluded: Set<string> | null = null;
+	for (const entry of entries) {
+		if (typeof entry === 'string') continue;
+		const entryPeer = entry.target ?? entry.source;
+		if ((!entryPeer || entryPeer === peerName) && (!entry.database || entry.database === databaseName)) {
+			if (entry.excludeTables?.length) {
+				if (!excluded) excluded = new Set(entry.excludeTables);
+				else for (const t of entry.excludeTables) excluded.add(t);
+			}
+		}
+	}
+	return excluded;
+}
 
 export function* iterateRoutes(options: { routes: (Route | any)[] }) {
 	for (const route of options.routes || []) {
@@ -354,8 +396,17 @@ export function* iterateRoutes(options: { routes: (Route | any)[] }) {
 			continue;
 		}
 
+		// Support sendsTo/receivesFrom either nested under replicates: or as top-level route keys
+		let replicates = route.replicates;
+		if (replicates === undefined) {
+			if (route.sendsTo || route.receivesFrom) {
+				replicates = { sendsTo: route.sendsTo, receivesFrom: route.receivesFrom };
+			} else {
+				replicates = !route.subscriptions; // if there is not a list of subscriptions, then this node is authorized to fully replicate
+			}
+		}
 		yield {
-			replicates: route.replicates ?? !route.subscriptions, // if there is not a list of subscriptions, then this node is authorized to fully replicate
+			replicates,
 			name: host,
 			url,
 			port: route.port,

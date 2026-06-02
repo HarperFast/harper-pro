@@ -44,7 +44,12 @@ import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptio
 import { EventEmitter } from 'events';
 import { createTLSSelector } from '../core/security/keys.js';
 import * as tls from 'node:tls';
-import { getHDBNodeTable, getNodeURL, getReplicationSharedStatus } from './knownNodes.ts';
+import {
+	getHDBNodeTable,
+	getNodeURL,
+	getReplicationSharedStatus,
+	getExcludedTablesForRouteEntries,
+} from './knownNodes.ts';
 import * as process from 'node:process';
 import { isIP } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';
@@ -605,6 +610,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let subscriptionRequest, auditSubscription;
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
+	// undefined = not yet computed; null = computed, no exclusions; Set = tables to drop on receive
+	let receiveExcludedTables: Set<string> | null | undefined;
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
 	// Serialize message handling so that async backpressure inside onWSMessage doesn't allow
@@ -1198,6 +1205,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
+						// Tables excluded from outgoing replication to this peer+database (from sendsTo config)
+						const sendExcludedTables =
+							authorization?.replicates && typeof authorization.replicates === 'object'
+								? getExcludedTablesForRouteEntries(authorization.replicates.sendsTo, remoteNodeName, databaseName)
+								: null;
 						const sendAuditRecord = (auditRecord, localTime) => {
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnTime) {
@@ -1228,6 +1240,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								}
 							}
 							const table = tableEntry.table;
+							if (sendExcludedTables?.has(table.tableName)) {
+								return skipAuditRecord();
+							}
 							const primaryStore = table.primaryStore;
 							const encoder = primaryStore.encoder;
 							// Force a reload the first time this connection touches each table:
@@ -1730,6 +1745,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				if (!tableDecoder) {
 					logger.error?.(`No table found with an id of ${auditRecord.tableId}`);
 				}
+				// Lazily compute receive-side exclusions once remoteNodeName is known.
+				// Prefer routeReplicates from the subscriber-side connection; fall back to
+				// authorization.replicates when this is the server-side handler.
+				if (receiveExcludedTables === undefined) {
+					const firstNode = options.connection?.nodeSubscriptions?.[0];
+					const receivesFromEntries =
+						firstNode?.routeReplicates?.receivesFrom ??
+						(authorization?.replicates && typeof authorization.replicates === 'object'
+							? authorization.replicates.receivesFrom
+							: undefined);
+					receiveExcludedTables =
+						getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName) ?? null;
+				}
+				if (tableDecoder && receiveExcludedTables?.has(tableDecoder.name)) {
+					logger.trace?.(
+						connectionId,
+						'dropping incoming replication for excluded table',
+						databaseName + '.' + tableDecoder.name,
+						'from',
+						remoteNodeName
+					);
+					decoder.position = start + eventLength;
+					continue;
+				}
 				let residencyList;
 				if (auditRecord.residencyId) {
 					residencyList = receivedResidencyLists[auditRecord.residencyId];
@@ -2141,14 +2180,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		const nodeSubscriptions = options.connection?.nodeSubscriptions.map((node: any) => {
 			const tableSubs = [];
 			let { replicateByDefault } = node;
+			// Tables excluded by this node's receivesFrom config for this peer+database
+			const receiverExcludedTables = getExcludedTablesForRouteEntries(
+				node.routeReplicates?.receivesFrom,
+				node.name,
+				databaseName
+			);
 			if (node.subscriptions) {
 				// if the node has explicit subscriptions, we need to use that to determine subscriptions
 				for (const subscription of node.subscriptions) {
 					// if there is an explicit subscription listed
 					if (subscription.subscribe && (subscription.schema || subscription.database) === databaseName) {
 						const tableName = subscription.table;
-						if (tables?.[tableName]?.replicate !== false)
-							// if replication is enabled for this table
+						if (tables?.[tableName]?.replicate !== false && !receiverExcludedTables?.has(tableName))
+							// if replication is enabled for this table and not excluded
 							tableSubs.push(tableName);
 					}
 				}
@@ -2156,7 +2201,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			} else {
 				// note that if replicateByDefault is enabled, we are listing the *excluded* tables
 				for (const tableName in tables) {
-					if (replicateByDefault ? tables[tableName].replicate === false : tables[tableName].replicate) {
+					if (
+						replicateByDefault
+							? tables[tableName].replicate === false || receiverExcludedTables?.has(tableName)
+							: tables[tableName].replicate && !receiverExcludedTables?.has(tableName)
+					) {
 						tableSubs.push(tableName);
 					}
 				}

@@ -17,7 +17,9 @@ const { HTTP_STATUS_CODES } = hdbErrors;
 const validationSchema = Joi.object({
 	hostname: Joi.string(),
 	verify_tls: Joi.boolean(),
-	replicates: Joi.boolean(),
+	replicates: Joi.alternatives().try(Joi.boolean(), Joi.object()),
+	sendsTo: Joi.array(),
+	receivesFrom: Joi.array(),
 	subscriptions: Joi.array(),
 	revoked_certificates: Joi.array(),
 	shard: Joi.number(),
@@ -112,6 +114,13 @@ export async function setNode(req: any) {
 		targetAddNodeObj.subscriptions = req.subscriptions.map(reverseSubscription);
 	} else targetAddNodeObj.subscriptions = null;
 
+	// Pass route exclusions to the peer with directions swapped: what LOCAL sends to PEER
+	// becomes what PEER receives from LOCAL, and vice versa.
+	if (req.sendsTo || req.receivesFrom) {
+		targetAddNodeObj.sendsTo = req.receivesFrom;
+		targetAddNodeObj.receivesFrom = req.sendsTo;
+	}
+
 	if (req.hasOwnProperty('subscribe') || req.hasOwnProperty('publish')) {
 		const rev = reverseSubscription(req);
 		targetAddNodeObj.subscribe = rev.subscribe;
@@ -170,6 +179,8 @@ export async function setNode(req: any) {
 	const nodeRecord: any = { url, ca: targetNodeResponse?.usingCA };
 	if (req.hostname) nodeRecord.name = req.hostname;
 	if (req.subscriptions) nodeRecord.subscriptions = req.subscriptions;
+	else if (req.sendsTo || req.receivesFrom)
+		nodeRecord.replicates = { sends: true, sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
 	else nodeRecord.replicates = true;
 	if (req.start_time) {
 		nodeRecord.start_time = typeof req.start_time === 'string' ? new Date(req.start_time).getTime() : req.start_time;
@@ -232,7 +243,10 @@ export async function addNodeBack(req) {
 
 	const nodeRecord: any = { url: req.url, ca: originCa };
 	if (req.subscriptions) nodeRecord.subscriptions = req.subscriptions;
-	else {
+	else if (req.sendsTo || req.receivesFrom) {
+		nodeRecord.replicates = { sends: true, sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
+		nodeRecord.subscriptions = null;
+	} else {
 		nodeRecord.replicates = true;
 		nodeRecord.subscriptions = null;
 	}
