@@ -115,6 +115,73 @@ const SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY = 300;
 // (but still allow for batching so we aren't sending out a message for every update under load)
 const COMMITTED_UPDATE_DELAY = 2;
 const PING_INTERVAL = 30000;
+// The receive-side watchdog fires after this much silence on a replication WS. Both client and
+// server arm it: the client also runs an active 30s sendPing tick that should normally catch a
+// silent peer first, but if that tick is missed (event-loop stall, ws.terminate() not propagating
+// to 'close', etc.) this timer-based watchdog is the belt-and-suspenders that forces the
+// reconnect — see harper-pro#233.
+const RECEIVE_SILENCE_THRESHOLD_MS = PING_INTERVAL * 2;
+
+/**
+ * Receive-side silence watchdog. Arm with `reset()` whenever incoming activity is observed
+ * (peer ping, pong, message). If `intervalMs` elapses with the underlying socket's `bytesRead`
+ * unchanged, `onSilence` is invoked exactly once.
+ *
+ * Only `bytesRead` is checked — `bytesWritten` reflects our own outbound traffic (pings, blob
+ * sends) and is not proof that the peer is alive. Including it would let our own keepalive
+ * pings suppress the watchdog in the exact missed-sendPing scenario this is meant to recover.
+ *
+ * Callers should suspend the watchdog (via `stop()`) when the underlying WS is intentionally
+ * paused for backpressure: `bytesRead` is frozen by design while paused and would otherwise
+ * cause a spurious termination of a healthy connection.
+ *
+ * Exported so the timer logic can be exercised in isolation by `unitTests/replication/
+ * receiveWatchdog.test.mjs` — production callers go through `replicateOverWS`.
+ */
+export function createReceiveWatchdog(opts: {
+	intervalMs: number;
+	getBytesRead: () => number;
+	onSilence: () => void;
+}): { reset: () => void; stop: () => void } {
+	let timer: NodeJS.Timeout | undefined;
+	let bytesReadAtArm = 0;
+	let lastResetAt = 0;
+	// Coalesce rapid reset() calls (e.g. message frames arriving thousands of times per second
+	// during a large copy) so we do not churn setTimeout/clearTimeout per frame. Granularity loss
+	// is small relative to intervalMs — at worst the watchdog fires this much earlier or later.
+	const throttleMs = Math.min(1000, Math.max(100, opts.intervalMs / 30));
+	function check() {
+		const current = opts.getBytesRead();
+		if (current === bytesReadAtArm) {
+			timer = undefined;
+			opts.onSilence();
+			return;
+		}
+		// Bytes advanced since the last arm — but the activity may have been swallowed by the
+		// reset() throttle, so we cannot rely on an external caller to re-arm us. Re-arm from
+		// the new baseline; otherwise a throttled-reset-then-silence sequence would leave the
+		// watchdog permanently inactive (see PR #234 review).
+		bytesReadAtArm = current;
+		lastResetAt = Date.now();
+		timer = setTimeout(check, opts.intervalMs).unref();
+	}
+	return {
+		reset() {
+			const now = Date.now();
+			if (timer && now - lastResetAt < throttleMs) return;
+			lastResetAt = now;
+			if (timer) clearTimeout(timer);
+			bytesReadAtArm = opts.getBytesRead();
+			timer = setTimeout(check, opts.intervalMs).unref();
+		},
+		stop() {
+			if (timer) {
+				clearTimeout(timer);
+				timer = undefined;
+			}
+		},
+	};
+}
 let secureContexts: Map<string, tls.SecureContext>;
 /**
  * Handles reconnection, and requesting catch-up
@@ -417,7 +484,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	remoteNodeName = authorization.name;
 	if (remoteNodeName && options.connection) options.connection.nodeName = remoteNodeName;
 	let lastSequenceIdReceived, lastSequenceIdCommitted;
-	let sendPingInterval, receivePingTimer, lastPingTime, skippedMessageSequenceUpdateTimer;
+	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
+	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	let blobsTimer;
 	const DELAY_CLOSE_TIME = 60000; // amount of time to wait before closing the connection if we haven't any activity and there are no subscriptions
 	let delayedClose: NodeJS.Timeout;
@@ -444,22 +512,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		};
 		sendPingInterval = setInterval(sendPing, PING_INTERVAL).unref();
 		sendPing(); // send the first ping immediately so we can measure latency
-	} else {
-		resetPingTimer();
 	}
+	// Both client and server arm the receive watchdog. On the client this is independent of the
+	// sendPing tick above: if that tick is missed or its ws.terminate() does not propagate a
+	// 'close' event, the watchdog forces the reconnect path. See harper-pro#233 for the failure
+	// modes observed in the field.
+	receiveWatchdog = createReceiveWatchdog({
+		intervalMs: RECEIVE_SILENCE_THRESHOLD_MS,
+		getBytesRead: () => ws._socket?.bytesRead ?? 0,
+		onSilence: () => {
+			// Warn-level: if the active sendPing was healthy this watchdog should not have fired,
+			// so it is a signal that something is wrong upstream (event-loop stall, keepalive timer
+			// misbehaving, peer accepting bytes but not progressing the protocol). Surface it so
+			// operators have something to grep for.
+			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+			const direction = options.url ? 'no activity from' : 'no ping from';
+			logger.warn?.(
+				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${RECEIVE_SILENCE_THRESHOLD_MS}ms — terminating connection and reconnecting`
+			);
+			ws.terminate();
+		},
+	});
+	const resetPingTimer = receiveWatchdog.reset;
+	resetPingTimer();
 	ws._socket?.setMaxListeners(200); // we should allow a lot of drain listeners for concurrent blob streams
-	function resetPingTimer() {
-		clearTimeout(receivePingTimer);
-		bytesRead = ws._socket?.bytesRead;
-		bytesWritten = ws._socket?.bytesWritten;
-		receivePingTimer = setTimeout(() => {
-			// double check to make sure we aren't just waiting for other data to flow
-			if (bytesRead === ws._socket?.bytesRead && bytesWritten === ws._socket?.bytesWritten) {
-				logger.warn?.(`Timeout waiting for ping from ${remoteNodeName}, terminating connection and reconnecting`);
-				ws.terminate();
-			}
-		}, PING_INTERVAL * 2).unref();
-	}
 	let ratioOfBackPressureTime = 0;
 	let lastBackPressureCheck = 0;
 	let isPausedForBackPressure = false;
@@ -507,13 +583,24 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let pauseReasons = 0;
 	let commitBacklogPaused = false;
 	function addPauseReason(): void {
-		if (pauseReasons === 0) ws.pause();
+		if (pauseReasons === 0) {
+			ws.pause();
+			// Suspend the receive watchdog while the socket is intentionally paused — `bytesRead`
+			// is frozen by `ws.pause()` so the byte check cannot tell legitimate backpressure
+			// from peer silence, and firing here would terminate a healthy mid-ingest connection.
+			receiveWatchdog?.stop();
+		}
 		pauseReasons++;
 	}
 	function removePauseReason(): void {
 		if (pauseReasons === 0) return;
 		pauseReasons--;
-		if (pauseReasons === 0) ws.resume();
+		if (pauseReasons === 0) {
+			ws.resume();
+			// Restart the silence window from the resume point — we deliberately do not penalize
+			// the connection for the time it spent paused.
+			receiveWatchdog?.reset();
+		}
 	}
 	let subscriptionRequest, auditSubscription;
 	let nodeSubscriptions;
@@ -527,6 +614,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let messageProcessing: Promise<void> = Promise.resolve();
 	let wsClosed = false;
 	ws.on('message', (body: Buffer) => {
+		// Reset the receive watchdog synchronously on every frame — async processing below may
+		// take a long time and we want a single late frame to count as proof of life immediately.
+		resetPingTimer();
 		messageProcessing = messageProcessing.then(
 			() => (wsClosed ? undefined : onWSMessage(body)),
 			() => (wsClosed ? undefined : onWSMessage(body))
@@ -1796,6 +1886,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 	}
 	ws.on('ping', resetPingTimer);
+	ws.on('pong', resetPingTimer);
 	ws.on('pong', () => {
 		if (options.connection) {
 			// every pong we can use to update our connection information (and latency)
@@ -1820,7 +1911,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// cleanup
 		wsClosed = true;
 		clearInterval(sendPingInterval);
-		clearTimeout(receivePingTimer);
+		receiveWatchdog?.stop();
 		clearInterval(blobsTimer);
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
