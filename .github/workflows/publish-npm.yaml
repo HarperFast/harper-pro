@@ -22,7 +22,14 @@ jobs:
       - name: Get release build
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download ${{ github.event.release.tag_name }} --pattern "harperfast-harper-pro-*.tgz"
+        # Retry up to 5 times with 15s backoff: GitHub can briefly make assets
+        # unavailable via the API when a draft release is published.
+        run: |
+          for i in 1 2 3 4 5; do
+            gh release download ${{ github.event.release.tag_name }} --pattern "harperfast-harper-pro-*.tgz" && break
+            echo "Attempt $i failed; retrying in 15s..."
+            sleep 15
+          done
       - name: Get version components
         id: version-components
         uses: matt-usurp/validate-semver@c5050374644a5ab2e03ddca02ce8d282911620ce # v3.0.0
