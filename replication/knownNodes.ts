@@ -138,6 +138,11 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		else {
 			console.error('Invalid node update event', event);
 		}
+	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
+		// add_node { isLeader: true } reaches us as a patch event; read the merged
+		// record from LMDB so server.nodes reflects the full record (including isLeader).
+		const fullRecord = getHDBNodeTable().primaryStore.get(node_name);
+		if (fullRecord) server.nodes.push(fullRecord);
 	}
 	const shards = new Map();
 	for await (const node of getHDBNodeTable().search({})) {
@@ -153,6 +158,10 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 	server.shards = shards;
 	if (event.type === 'put' || event.type === 'delete') {
 		listener(event.value, event.id);
+	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
+		// isLeader patches need to drive subscription bootstrap; pass the merged record.
+		const fullRecord = getHDBNodeTable().primaryStore.get(event.id);
+		if (fullRecord) listener(fullRecord, event.id);
 	}
 }
 export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {

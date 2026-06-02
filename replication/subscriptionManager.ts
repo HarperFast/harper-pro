@@ -90,10 +90,6 @@ export let connectedToNode; // this is set by thread to handle when a node is co
 const nodeMap = new Map(); // this is a map of all nodes that are available to connect to
 const selfCatchupOfDatabase = new Map<string, number>(); // this is a map of databases that need to catch up to themselves, and the time of the last audit entry (to start from)
 const routes: Route[] = [];
-// Direct notification path for isLeader nodes — bypasses the hdb_nodes subscription
-// event mechanism, which is unreliable for table.patch/put calls made outside the
-// normal subscription flow.
-let _directNodeUpdateFn: ((node: any) => void) | null = null;
 export async function startOnMainThread(options) {
 	// we do all of the main management of tracking connections and subscriptions on the main thread and delegate
 	// the actual work to the worker threads
@@ -154,7 +150,6 @@ export async function startOnMainThread(options) {
 				console.error(error);
 			}
 		}
-		_directNodeUpdateFn = onNodeUpdate;
 		subscribeToNodeUpdates(onNodeUpdate);
 	});
 	let isFullyReplicating;
@@ -703,13 +698,5 @@ export async function ensureNode(name: string, node) {
 
 		logger.info(`Updating node ${name} at ${getNodeURL(node)}`);
 		await table.patch(node);
-	}
-	// If this node is flagged as our leader, directly trigger onNodeUpdate so the
-	// subscription manager sets up the full-copy bootstrap immediately — without
-	// relying on the hdb_nodes subscription event (which may emit 'patch' type events
-	// that subscribeToNodeUpdates ignores).
-	if (node.isLeader !== undefined && _directNodeUpdateFn) {
-		const storedRecord = table.primaryStore.get(name) || node;
-		_directNodeUpdateFn(storedRecord);
 	}
 }
