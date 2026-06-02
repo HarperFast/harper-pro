@@ -5,6 +5,7 @@
 		"licensing/**/*",
 		"analytics/**/*",
 		"bin/**/*",
+		"core/agent/**/*",
 		"core/bin/**/*",
 		"core/components/**/*",
 		"core/config/**/*",
