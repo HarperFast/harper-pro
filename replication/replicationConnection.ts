@@ -106,6 +106,12 @@ const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
 // heap past its limit. If the local replicator queue grows beyond this threshold we pause
 // the WS connection and wait for it to drain before continuing the decode loop.
 const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWaterMark') ?? 100;
+// Even when the consumer keeps up (queue below the high-water mark), a single large inbound message
+// would otherwise decode thousands of records in one synchronous turn — pegging the worker, blocking
+// replication ping responses, and tripping core's "JavaScript execution has taken too long" monitor
+// (MAX_EVENT_DELAY_TIME = 3 s). Yield the event loop at least this often (ms) while decoding so the
+// worker stays responsive during a bulk copy/clone.
+const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 100;
 
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
@@ -119,13 +125,34 @@ const SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY = 300;
 // We want it be fairly quick so we can let the sending node know that we have received and committed the update.
 // (but still allow for batching so we aren't sending out a message for every update under load)
 const COMMITTED_UPDATE_DELAY = 2;
-const PING_INTERVAL = 30000;
+const PING_INTERVAL = env.get(CONFIG_PARAMS.REPLICATION_PINGINTERVAL) ?? 30000;
+// Time (ms) without any socket activity before a connection is treated as dead.
+const PING_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_PINGTIMEOUT) ?? PING_INTERVAL * 2;
 // The receive-side watchdog fires after this much silence on a replication WS. Both client and
 // server arm it: the client also runs an active 30s sendPing tick that should normally catch a
 // silent peer first, but if that tick is missed (event-loop stall, ws.terminate() not propagating
 // to 'close', etc.) this timer-based watchdog is the belt-and-suspenders that forces the
 // reconnect — see harper-pro#233.
-const RECEIVE_SILENCE_THRESHOLD_MS = PING_INTERVAL * 2;
+const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
+
+/**
+ * Decide whether an idle replication connection should be terminated as dead.
+ *
+ * Liveness is measured from the last observed socket byte movement (in either direction), not from a
+ * single ping interval. A bulk transfer — notably the initial clone copy of a large table — makes
+ * slow but real progress: the sender's socket buffer drains in bursts as the peer consumes, so bytes
+ * keep moving within the timeout window even while it is otherwise stalled. A genuinely dead or
+ * unreachable peer moves no bytes at all, so it still trips the timeout. We deliberately do NOT exempt
+ * the sender's `isPausedForBackPressure` drain-wait here: if the peer dies after we have filled our
+ * socket buffer, the drain event never fires, and exempting it would hang the connection forever.
+ *
+ * The one exemption is `pauseReasons > 0`: the receiver has intentionally stopped reading to drain its
+ * own queue. That stall is local and self-clearing (it does not depend on the peer), so it is never a
+ * death signal; the caller keeps liveness fresh while paused and resumes normal detection afterward.
+ */
+export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pauseReasons: number): boolean {
+	return pauseReasons === 0 && idleMs >= pingTimeout;
+}
 
 /**
  * Receive-side silence watchdog. Arm with `reset()` whenever incoming activity is observed
@@ -498,22 +525,51 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// track bytes read and written so we can verify if a connection is really dead on pings
 	let bytesRead = 0;
 	let bytesWritten = 0;
+	// wall-clock time of the last observed socket activity (bytes moved in either direction); the
+	// keep-alive timeout is measured from this so a legitimately slow-but-progressing transfer stays
+	// alive while a truly idle/dead peer is still terminated.
+	let lastByteActivity = performance.now();
+	// Multiple independent conditions can ask to pause receive on this WS (commit backlog, consumer
+	// queue full, blob write backpressure). We refcount the reasons so that resuming one does not race
+	// ahead of another that still wants the WS paused. Declared before the ping setup below because the
+	// immediate sendPing() reads it.
+	let pauseReasons = 0;
 	const blobTimeout = env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 120000;
 	const blobsInFlight = new Map();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
 	let blobSentCallback: (v?: any) => void;
+	// Refresh the keep-alive liveness clock from observed socket byte movement. If the underlying
+	// _socket isn't observable (test mocks, pre-connect, or a change in the ws library internals),
+	// bytesRead/bytesWritten read as undefined; we can't measure activity, so treat the connection as
+	// live rather than let the keep-alive falsely terminate a healthy peer.
+	function noteByteActivity(): void {
+		const read = ws._socket?.bytesRead;
+		const written = ws._socket?.bytesWritten;
+		if (read === undefined || written === undefined || read !== bytesRead || written !== bytesWritten) {
+			lastByteActivity = performance.now();
+		}
+	}
 	if (options.url) {
 		const sendPing = () => {
-			// if we have not received a message in the last ping interval, we should terminate the connection (but check to make sure we aren't just waiting for other data to flow)
-			if (lastPingTime && bytesRead === ws._socket?.bytesRead && bytesWritten === ws._socket?.bytesWritten)
-				ws.terminate(); // timeout
-			else {
-				lastPingTime = performance.now();
-				ws.ping();
-				bytesRead = ws._socket?.bytesRead;
-				bytesWritten = ws._socket?.bytesWritten;
+			// Note any socket activity since the last interval (incoming pong/data or our send buffer
+			// draining as the peer consumes) — either proves the peer is still alive.
+			noteByteActivity();
+			if (shouldTerminateIdlePing(performance.now() - lastByteActivity, PING_TIMEOUT, pauseReasons)) {
+				ws.terminate(); // no socket activity within the timeout — peer is gone
+				return;
 			}
+			// While paused for receiver backpressure, keep our own liveness fresh: the stall is local and
+			// self-clearing (it doesn't depend on the peer), so we must not time the peer out for it.
+			if (pauseReasons > 0) lastByteActivity = performance.now();
+			// Always send the keep-alive ping. ws.pause() only stops reads, not writes, and the accepted
+			// peer relies on our pings to keep its own receive timer alive even when it has no data to send
+			// us. Record byte counts AFTER the ping so the ping's own bytes aren't later mistaken for peer
+			// activity.
+			lastPingTime = performance.now();
+			ws.ping();
+			bytesRead = ws._socket?.bytesRead;
+			bytesWritten = ws._socket?.bytesWritten;
 		};
 		sendPingInterval = setInterval(sendPing, PING_INTERVAL).unref();
 		sendPing(); // send the first ping immediately so we can measure latency
@@ -582,10 +638,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	const MAX_OUTSTANDING_BLOBS_BEING_SENT = env.get(CONFIG_PARAMS.REPLICATION_BLOBCONCURRENCY) ?? 5;
 	let outstandingCommits = 0;
 	let lastStructureLength = 0;
-	// Multiple independent conditions can ask to pause receive on this WS (commit backlog,
-	// consumer queue full, blob write backpressure). We refcount the reasons so that resuming
-	// one does not race ahead of another that still wants the WS paused.
-	let pauseReasons = 0;
 	let commitBacklogPaused = false;
 	function addPauseReason(): void {
 		if (pauseReasons === 0) {
@@ -1717,6 +1769,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			let beginTxn = true;
 			let event; // could also get txnTime from decoder.getFloat64(0);
 			let sequenceIdReceived;
+			let lastYieldTime = performance.now();
 			do {
 				getSharedStatus();
 				const eventLength = decoder.readInt();
@@ -1858,6 +1911,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						} finally {
 							removePauseReason();
 						}
+						lastYieldTime = performance.now();
+					} else if (performance.now() - lastYieldTime >= RECEIVE_YIELD_INTERVAL) {
+						// The high-water-mark pause only fires under heap pressure. When the consumer keeps
+						// up, yield on a time budget anyway so a large message doesn't decode in one
+						// synchronous turn and stall ping responses (see RECEIVE_YIELD_INTERVAL).
+						await new Promise(setImmediate);
+						lastYieldTime = performance.now();
 					}
 				}
 				decoder.position = start + eventLength;
