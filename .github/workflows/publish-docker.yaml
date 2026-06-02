@@ -534,12 +534,45 @@ jobs:
               ]
             }
 
-  send-slack-message-openshift-on-success:
-    if: success() && !cancelled()
-    needs: [merge-openshift]
+  send-slack-message-openshift:
+    # Notify whenever the OpenShift image was part of this run. !cancelled() lets this
+    # run even when certify-openshift is skipped (cert disabled); the build-openshift
+    # skip guard avoids firing on standard/gpu-only runs. Reports publish + Red Hat
+    # certification status from the upstream job results.
+    if: ${{ !cancelled() && needs.build-openshift.result != 'skipped' }}
+    needs: [build-openshift, merge-openshift, certify-openshift]
     runs-on: ubuntu-latest
     steps:
-      - name: Send Slack OpenShift published notification
+      - name: Compose status message
+        id: status
+        env:
+          PUBLISH_RESULT: ${{ needs.merge-openshift.result }}
+          CERT_RESULT: ${{ needs.certify-openshift.result }}
+        run: |
+          #!/usr/bin/env bash
+          if [ "${PUBLISH_RESULT}" = "success" ]; then
+            headline=":white_check_mark: Succeeded"
+            fallback="Harper Pro OpenShift published to Docker Hub"
+            publish_line=":white_check_mark: Published to :docker_logo:"
+            case "${CERT_RESULT}" in
+              success) cert_line=":white_check_mark: Red Hat preflight passed, submitted for certification";;
+              failure) cert_line=":x: Red Hat preflight checks failed (not submitted)";;
+              skipped) cert_line=":heavy_minus_sign: Red Hat certification disabled (REDHAT_CERTIFY_ENABLED not set)";;
+              *)       cert_line=":grey_question: Red Hat certification: ${CERT_RESULT:-unknown}";;
+            esac
+          else
+            headline=":x: Failed"
+            fallback="Harper Pro OpenShift Docker publish failed"
+            publish_line=":x: Failed to publish to :docker_logo:"
+            cert_line=":heavy_minus_sign: Certification not attempted (publish failed)"
+          fi
+          {
+            echo "headline=${headline}"
+            echo "fallback=${fallback}"
+            echo "publish_line=${publish_line}"
+            echo "cert_line=${cert_line}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Send Slack OpenShift notification
         uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
         with:
           method: chat.postMessage
@@ -547,7 +580,7 @@ jobs:
           payload: |
             {
               "channel": "#development-ci",
-              "text": "Harper Pro OpenShift v${{ needs.merge-openshift.outputs.docker-image-tag }} has been published to Docker Hub",
+              "text": "${{ steps.status.outputs.fallback }} (v${{ needs.merge-openshift.outputs.docker-image-tag }})",
               "blocks": [
                 {
                   "type": "header",
@@ -561,56 +594,19 @@ jobs:
                   "elements": [
                     {
                       "type": "mrkdwn",
-                      "text": "*Status*"
+                      "text": "*Status* ${{ steps.status.outputs.headline }}"
                     },
                     {
                       "type": "mrkdwn",
-                      "text": ":white_check_mark: Published to :docker_logo: (Red Hat certification submitted if enabled)"
+                      "text": "${{ steps.status.outputs.publish_line }}"
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro-openshift/${{ needs.merge-openshift.outputs.docker-image-tag }}|harperfast/harper-pro-openshift:${{ needs.merge-openshift.outputs.docker-image-tag }}>"
-                    }
-                  ]
-                }
-              ]
-            }
-
-  send-slack-message-openshift-on-failure:
-    if: failure() && !cancelled()
-    needs: [merge-openshift]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
-        with:
-          method: chat.postMessage
-          token: ${{ secrets.SLACK_BOT_TOKEN }}
-          payload: |
-            {
-              "channel": "#development-ci",
-              "text": "Harper Pro OpenShift v${{ needs.merge-openshift.outputs.docker-image-tag }} Docker publish failed",
-              "blocks": [
-                {
-                  "type": "header",
-                  "text": {
-                    "type": "plain_text",
-                    "text": "Harper Pro OpenShift v${{ needs.merge-openshift.outputs.docker-image-tag }} release"
-                  }
-                },
-                {
-                  "type": "context",
-                  "elements": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Status*"
+                      "text": "${{ steps.status.outputs.cert_line }}"
                     },
                     {
                       "type": "mrkdwn",
-                      "text": ":x: Failed to publish to :docker_logo:"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow run ${{ github.run_id }}>"
+                      "text": "<https://hub.docker.com/r/harperfast/harper-pro-openshift|harperfast/harper-pro-openshift>  ·  <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run>"
                     }
                   ]
                 }
