@@ -1,0 +1,7 @@
+type Prerender @table @export {
+	id: String @primaryKey
+	device: String @indexed
+	random: Float
+	cached_at: Date
+	body: Blob
+}
