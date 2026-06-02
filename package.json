@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/harper-pro",
-	"version": "5.0.23",
+	"version": "5.0.24",
 	"description": "Harper is a distributed database, caching service, streaming broker, and application development platform focused on performance and ease of use.",
 	"keywords": [
 		"database",
@@ -162,7 +162,7 @@
 		"json-bigint-fixes": "1.1.0",
 		"jsonata": "1.8.7",
 		"jsonwebtoken": "9.0.3",
-		"lmdb": "3.5.4",
+		"lmdb": "3.5.5",
 		"lodash": "^4.17.23",
 		"mathjs": "11.12.0",
 		"micromatch": "^4.0.8",
