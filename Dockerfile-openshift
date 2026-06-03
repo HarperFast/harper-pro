@@ -1,0 +1,123 @@
+# Red Hat OpenShift (OCP) certified image for Harper Pro.
+#
+# Built on Red Hat UBI so it can be submitted to Red Hat Connect for
+# certification (catalog.redhat.com). Unlike the standard Dockerfile, OpenShift
+# runs containers as an *arbitrary* non-root UID that always belongs to the root
+# group (GID 0). Every path the process writes to must therefore be group-owned
+# by GID 0 and group-writable (`chmod -R g=u`), and we must NOT depend on a fixed
+# UID existing in /etc/passwd.
+#
+# NOTE: NODE_VERSION must match an available `ubi9/nodejs-<v>-minimal` tag on
+# registry.access.redhat.com. Confirmed available (multi-arch amd64/arm64):
+# 18, 20, 22, 24 — see github.com/sclorg/s2i-nodejs-container. Keep
+# NODE_BUILD_VERSION in step with NODE_VERSION to avoid native-addon ABI
+# mismatches.
+ARG NODE_BUILD_VERSION=24
+ARG NODE_VERSION=24
+
+############################
+# Build / package stage
+############################
+FROM docker.io/node:${NODE_BUILD_VERSION} AS build
+
+WORKDIR /usr/src/harper-pro
+
+COPY . .
+
+RUN env NO_USE_GIT=true npm run package
+
+############################
+# Runtime stage (UBI9)
+############################
+FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION}-minimal:latest AS run
+
+ARG NODE_VERSION
+ARG HARPER_VERSION
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VCS_TYPE=git
+
+# Image home + npm global prefix live here; both must be writable by GID 0 so an
+# arbitrary OpenShift UID can write to them.
+ENV HOME=/home/harperdb
+ENV NPM_CONFIG_PREFIX=/home/harperdb/.npm-global
+ENV PATH=/home/harperdb/.npm-global/bin:$PATH
+
+USER 0
+
+# Install runtime utilities Harper expects, then lay down a GID-0-writable home.
+RUN <<-EOF
+    microdnf install --assumeyes --nodocs --refresh hostname git procps-ng zstd
+    microdnf clean all
+    mkdir -p /home/harperdb/harper /home/harperdb/.npm-global
+    # arbitrary-UID support: own by uid 1001, group root(0), group == user perms
+    chown -R 1001:0 /home/harperdb
+    chmod -R g=u /home/harperdb
+EOF
+
+WORKDIR /home/harperdb
+
+# Install Harper Pro globally from the tarball produced in the build stage.
+COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
+RUN <<-EOF
+    npm install --global harperfast-harper-pro-*.tgz
+    npm cache clean --force
+    rm -f harperfast-harper-pro-*.tgz
+    chown -R 1001:0 /home/harperdb
+    chmod -R g=u /home/harperdb
+EOF
+
+# Red Hat Container Certification (RHCC) requires license files under /licenses.
+COPY LICENSE.md /licenses/LICENSE.md
+
+# ---- metadata for labels ----
+ENV SUMMARY="Harper Pro: a unified Node.js platform fusing database, cache, application, and messaging into one in-memory process."
+ENV DESCRIPTION="Harper Pro is the source-available distribution of Harper, built on the open-source Harper core and licensed under the Elastic License 2.0. Harper is a Node.js unified development platform that fuses database, cache, application, and messaging layers into a single in-memory process, delivering microsecond-level data access and high throughput. Build ultra-high-performance services without boilerplate, generate REST APIs from your schema, and scale horizontally. Harper Pro extends the core with enterprise features including multi-node replication, certificate management, and extended profiling and analytics."
+
+LABEL name="harperfast/harper-pro-openshift"
+LABEL vendor="Harper"
+LABEL version="${HARPER_VERSION}"
+LABEL release="${HARPER_VERSION}"
+LABEL maintainer="support@harperdb.io"
+LABEL summary="${SUMMARY}"
+LABEL description="${DESCRIPTION}"
+LABEL help="https://docs.harperdb.io/"
+LABEL url="https://hub.docker.com/r/harperfast/harper-pro-openshift"
+LABEL usage="https://hub.docker.com/r/harperfast/harper-pro-openshift"
+
+# pulled from the GitHub Actions build
+LABEL build-date="${BUILD_DATE}"
+LABEL vcs-ref="${VCS_REF}"
+LABEL vcs-type="${VCS_TYPE}"
+
+# inherited labels we override
+LABEL io.k8s.description="${DESCRIPTION}"
+LABEL io.k8s.display-name="Harper Pro"
+LABEL io.openshift.expose-services="9925:HTTP,9926:HTTP,9932:TCP"
+LABEL io.openshift.tags="harper,database,edge"
+LABEL com.redhat.component="harper-pro-container"
+
+# ---- Harper runtime configuration ----
+ENV TC_AGREEMENT=yes
+ENV ROOTPATH=/home/harperdb/harper
+ENV OPERATIONSAPI_NETWORK_PORT=9925
+ENV HDB_ADMIN_USERNAME=admin
+ENV HDB_ADMIN_PASSWORD=password
+ENV LOGGING_STDSTREAMS=true
+ENV NODE_HOSTNAME=localhost
+ENV DEFAULTS_MODE=prod
+
+VOLUME /home/harperdb/harper
+
+EXPOSE 9925
+EXPOSE 9926
+EXPOSE 9932
+EXPOSE 9933
+
+# Default OpenShift-friendly UID. OpenShift overrides this with a random UID at
+# runtime; the GID-0 permissions above keep the image writable either way.
+USER 1001
+
+ENTRYPOINT ["harper"]
+
+CMD ["run"]
