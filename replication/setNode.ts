@@ -31,7 +31,7 @@ const validationSchema = Joi.object({
  * @param req
  */
 export async function setNode(req: any) {
-	if (req.node_name && !req.hostname) req.hostname = req.node_name;
+	if (!req.hostname) req.hostname = req.node_name || req.name;
 	if (req.verify_tls !== undefined) req.rejectUnauthorized = req.verify_tls;
 	let { url, hostname } = req;
 	if (!url) url = hostnameToUrl(hostname);
