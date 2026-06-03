@@ -31,7 +31,7 @@ COPY . .
 RUN env NO_USE_GIT=true npm run package
 
 ############################
-# Runtime stage (UBI9)
+# Runtime stage (UBI10)
 ############################
 FROM registry.access.redhat.com/ubi10/nodejs-${NODE_VERSION}-minimal:latest AS run
 
