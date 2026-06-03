@@ -7,11 +7,15 @@
 # by GID 0 and group-writable (`chmod -R g=u`), and we must NOT depend on a fixed
 # UID existing in /etc/passwd.
 #
-# NOTE: NODE_VERSION must match an available `ubi9/nodejs-<v>-minimal` tag on
-# registry.access.redhat.com. Confirmed available (multi-arch amd64/arm64):
-# 18, 20, 22, 24 — see github.com/sclorg/s2i-nodejs-container. Keep
-# NODE_BUILD_VERSION in step with NODE_VERSION to avoid native-addon ABI
-# mismatches.
+# NOTE: runtime is UBI10 (RHEL 10), NOT UBI9. Harper's RocksDB native addon
+# (@harperfast/rocksdb-js) requires libstdc++ GLIBCXX_3.4.30 (GCC 12+). RHEL 9
+# only ships GCC 11's libstdc++ (max 3.4.29) as a shared lib — gcc-toolset
+# provides newer libstdc++ statically only, which can't satisfy a prebuilt
+# .node — so the image crashes at startup on UBI9. UBI10 ships GCC 14's
+# libstdc++ (>= 3.4.30) and is still a certifiable Red Hat UBI base.
+# NODE_VERSION must match an available `ubi10/nodejs-<v>-minimal` tag (UBI10
+# offers 22 and 24; 24 is newest). Keep NODE_BUILD_VERSION in step to avoid
+# native-addon ABI mismatches.
 ARG NODE_BUILD_VERSION=24
 ARG NODE_VERSION=24
 
@@ -27,9 +31,9 @@ COPY . .
 RUN env NO_USE_GIT=true npm run package
 
 ############################
-# Runtime stage (UBI9)
+# Runtime stage (UBI10)
 ############################
-FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION}-minimal:latest AS run
+FROM registry.access.redhat.com/ubi10/nodejs-${NODE_VERSION}-minimal:latest AS run
 
 ARG NODE_VERSION
 ARG HARPER_VERSION
