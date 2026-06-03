@@ -22,6 +22,14 @@ concurrency:
 
 jobs:
   review:
+    # Always-on toggle — see ai-review-prompts USAGE.md "Reviewers & the
+    # always-on toggle". CLAUDE_ALWAYS_ON=true (repo/org variable) → auto-
+    # review trusted-author PRs; unset → opt-in. NOTE: this pin predates
+    # label-gated opt-in, and the trigger above doesn't include `labeled`
+    # yet — the `|| labeled` clause activates once the pin is bumped (see
+    # the open ai-review-prompts pin-bump PR) and `labeled` is added to
+    # the trigger. Until then this toggle controls the auto-review path.
+    if: ${{ vars.CLAUDE_ALWAYS_ON == 'true' || github.event.action == 'labeled' }}
     uses: HarperFast/ai-review-prompts/.github/workflows/_claude-review.yml@3278ce4e63c5af33cd1db68602aad9580e60dce7 # main 2026-05-09 (post #20 — title format + areas-not-traced + dev/prod dep rule)
     with:
       # Same SHA as the `uses:` ref above. The reusable uses this to
