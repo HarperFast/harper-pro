@@ -14,6 +14,7 @@ on:
           - all
           - standard
           - gpu
+          - openshift
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -225,6 +226,166 @@ jobs:
         run: |
           docker buildx imagetools inspect harperfast/harper-pro-gpu:${{ steps.meta.outputs.version }}
 
+  build-openshift:
+    if: github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'openshift'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+      - name: Get package version
+        id: version
+        run: echo "version=$(npm pkg get version | tr -d '\"')" >> "$GITHUB_OUTPUT"
+      - name: Setup Docker metadata
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: harperfast/harper-pro-openshift
+      - name: Login to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile-openshift
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            HARPER_VERSION=${{ steps.version.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=harperfast/harper-pro-openshift,push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-openshift-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-openshift:
+    if: github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'openshift'
+    runs-on: ubuntu-latest
+    needs: [build-openshift]
+    outputs:
+      docker-image-tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/digests
+          pattern: digest-openshift-*
+          merge-multiple: true
+      - name: Setup Docker metadata
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: harperfast/harper-pro-openshift
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+      - name: Login to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'harperfast/harper-pro-openshift@sha256:%s ' *)
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect harperfast/harper-pro-openshift:${{ steps.meta.outputs.version }}
+
+  # Submit the published image to Red Hat Connect for OpenShift certification.
+  # Gated on the REDHAT_CERTIFY_ENABLED repo variable so the workflow stays green
+  # until the Red Hat Connect component is provisioned. To enable:
+  #   1. Create the container image component at connect.redhat.com and copy its
+  #      certification component ID (the {component-id} segment of
+  #      connect.redhat.com/component/{listing-id}/{component-id}/images/...) into
+  #      the REDHAT_CERTIFICATION_COMPONENT_ID repo variable.
+  #   2. Add the REDHAT_PYXIS_KEY secret (org-scoped Pyxis API token).
+  #   3. Set the REDHAT_CERTIFY_ENABLED repo variable to 'true'.
+  # The Docker Hub pull auth preflight uses is built from the existing
+  # DOCKERHUB_USERNAME / DOCKERHUB_TOKEN creds (the image is public, but
+  # authenticating avoids Docker Hub anonymous-pull rate limits), so no separate
+  # registry-auth secret is required.
+  certify-openshift:
+    if: >-
+      vars.REDHAT_CERTIFY_ENABLED == 'true' &&
+      (github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'openshift')
+    runs-on: ubuntu-latest
+    needs: [merge-openshift]
+    timeout-minutes: 20
+    steps:
+      # Install preflight directly (not via redhat-actions/openshift-tools-installer,
+      # which still runs on the deprecated Node 20) with a pinned version and a
+      # verified checksum, so this secret-bearing certification path is deterministic.
+      # Runner is amd64 (ubuntu-latest); update PREFLIGHT_SHA256 if bumping the version.
+      - name: Install OpenShift preflight (pinned + checksum-verified)
+        env:
+          PREFLIGHT_VERSION: '1.19.0'
+          PREFLIGHT_SHA256: '1d7a845c4528f9476c8ef9a551b4da5c06d62de558e56a37054c6fa737d583e5'
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          curl -fsSL -o preflight \
+            "https://github.com/redhat-openshift-ecosystem/openshift-preflight/releases/download/${PREFLIGHT_VERSION}/preflight-linux-amd64"
+          echo "${PREFLIGHT_SHA256}  preflight" | sha256sum -c -
+          chmod +x preflight
+          sudo mv preflight /usr/local/bin/preflight
+          preflight version
+      - name: Submit image to Red Hat Connect
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          PYXIS_API_TOKEN: ${{ secrets.REDHAT_PYXIS_KEY }}
+          CERTIFICATION_COMPONENT_ID: ${{ vars.REDHAT_CERTIFICATION_COMPONENT_ID }}
+          container_registry: 'registry.hub.docker.com'
+          container_image: 'harperfast/harper-pro-openshift'
+          container_tag: ${{ needs.merge-openshift.outputs.docker-image-tag }}
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Build a docker config.json for preflight's pull, from existing Docker Hub
+          # creds. Authenticating (vs anonymous) avoids Docker Hub pull rate limits.
+          auth=$(printf '%s:%s' "${DOCKERHUB_USERNAME}" "${DOCKERHUB_TOKEN}" | base64 -w0)
+          cat > docker-config.json <<EOF
+          {"auths":{"https://index.docker.io/v1/":{"auth":"${auth}"},"registry.hub.docker.com":{"auth":"${auth}"}}}
+          EOF
+
+          echo "preflighting ${container_image}:${container_tag} (component ${CERTIFICATION_COMPONENT_ID})"
+          preflight check container "${container_registry}/${container_image}:${container_tag}" \
+            --pyxis-api-token="${PYXIS_API_TOKEN}" \
+            --certification-component-id="${CERTIFICATION_COMPONENT_ID}" \
+            --docker-config ./docker-config.json \
+            --submit >> "${GITHUB_STEP_SUMMARY}"
+
   send-slack-message-on-success:
     if: success() && !cancelled()
     needs: [merge]
@@ -385,6 +546,85 @@ jobs:
                     {
                       "type": "mrkdwn",
                       "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow run ${{ github.run_id }}>"
+                    }
+                  ]
+                }
+              ]
+            }
+
+  send-slack-message-openshift:
+    # Notify whenever the OpenShift image was part of this run. !cancelled() lets this
+    # run even when certify-openshift is skipped (cert disabled); the build-openshift
+    # skip guard avoids firing on standard/gpu-only runs. Reports publish + Red Hat
+    # certification status from the upstream job results.
+    if: ${{ !cancelled() && needs.build-openshift.result != 'skipped' }}
+    needs: [build-openshift, merge-openshift, certify-openshift]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compose status message
+        id: status
+        env:
+          PUBLISH_RESULT: ${{ needs.merge-openshift.result }}
+          CERT_RESULT: ${{ needs.certify-openshift.result }}
+        run: |
+          #!/usr/bin/env bash
+          if [ "${PUBLISH_RESULT}" = "success" ]; then
+            headline=":white_check_mark: Succeeded"
+            fallback="Harper Pro OpenShift published to Docker Hub"
+            publish_line=":white_check_mark: Published to :docker_logo:"
+            case "${CERT_RESULT}" in
+              success) cert_line=":white_check_mark: Red Hat preflight passed, submitted for certification";;
+              failure) cert_line=":x: Red Hat preflight checks failed (not submitted)";;
+              skipped) cert_line=":heavy_minus_sign: Red Hat certification disabled (REDHAT_CERTIFY_ENABLED not set)";;
+              *)       cert_line=":grey_question: Red Hat certification: ${CERT_RESULT:-unknown}";;
+            esac
+          else
+            headline=":x: Failed"
+            fallback="Harper Pro OpenShift Docker publish failed"
+            publish_line=":x: Failed to publish to :docker_logo:"
+            cert_line=":heavy_minus_sign: Certification not attempted (publish failed)"
+          fi
+          {
+            echo "headline=${headline}"
+            echo "fallback=${fallback}"
+            echo "publish_line=${publish_line}"
+            echo "cert_line=${cert_line}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Send Slack OpenShift notification
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "#development-ci",
+              "text": "${{ steps.status.outputs.fallback }} (v${{ needs.merge-openshift.outputs.docker-image-tag }})",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "Harper Pro OpenShift v${{ needs.merge-openshift.outputs.docker-image-tag }} release"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status* ${{ steps.status.outputs.headline }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "${{ steps.status.outputs.publish_line }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "${{ steps.status.outputs.cert_line }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "<https://hub.docker.com/layers/harperfast/harper-pro-openshift/${{ needs.merge-openshift.outputs.docker-image-tag }}|harperfast/harper-pro-openshift:${{ needs.merge-openshift.outputs.docker-image-tag }}>  ·  <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run>"
                     }
                   ]
                 }
