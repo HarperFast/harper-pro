@@ -48,8 +48,7 @@ import {
  * - CLONE_SSH_KEYS: Clone SSH keys from leader (default: true)
  * - CLONE_JWT_KEYS: Clone JWT keys from leader (default: true)
  * - ALLOW_SELF_SIGNED: Allow self-signed certificates to be used for authentication (default: false)
- * - CLONE_NODE_UPDATE_STATUS: Update node status during clone (default: false)
- * - CLONE_SYNC_TIMEOUT: Sync timeout in milliseconds (default: 30000)
+ * - CLONE_SYNC_TIMEOUT: Sync timeout in milliseconds (default: 300000)
  * - REPLICATION_PORT: Port for replication
  * - FORCE_CLONE: Force clone even if node exists (default: false)
  * - ROOTPATH: Harper installation root path
@@ -68,7 +67,7 @@ import {
  * --node-hostname: Hostname for this node
  * --replication-port: Port for replication
  * --skip-sync-monitor: Skip monitoring sync status (default: false)
- * --sync-timeout: Sync timeout in milliseconds (default: 30000)
+ * --sync-timeout: Sync timeout in milliseconds (default: 300000)
  * --skip-ssh-keys: Skip cloning SSH keys (default: false)
  * --skip-jwt-keys: Skip cloning JWT keys (default: false)
  * --force-clone: Force clone even if node exists (default: false)
@@ -339,8 +338,24 @@ export async function cloneNode(): Promise<void> {
 
 	await cloneSSHKeys();
 
-	// Monitor the synchronization status of the databases after cloning and update availability status once sync is complete
-	await monitorSync();
+	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
+	// once sync is confirmed and availability has been published as Available — a timeout or failure
+	// must not be treated as success.
+	const syncOutcome = await monitorSync();
+	if (syncOutcome === 'failed') {
+		// Leave Harper running so get_status stays queryable for the control plane (availability is
+		// now Unavailable). Throwing here would propagate to bin/harper.js and exit the already-started
+		// process. Explicitly clear the cloned flag rather than just skipping the write: on a forced
+		// reclone, cloneConfig() has already carried the previous `cloned: true` into the rewritten
+		// config, so a bare return would leave it set and the next non-forced start would skip cloning
+		// despite the unconfirmed sync. Clearing it ensures a subsequent start retries the clone.
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		log(
+			`Clone from leader node ${leaderURL} did not complete synchronization; node is running but Unavailable and not marked as cloned`,
+			'error'
+		);
+		return;
+	}
 
 	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
 	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
@@ -387,20 +402,68 @@ export async function cloneNode(): Promise<void> {
 }
 
 /**
- * Monitors database synchronization status after cloning and updates availability status once complete.
- * Polls at regular intervals until sync completes or timeout is reached.
+ * Result of monitoring clone synchronization.
+ * - `synced`: sync was confirmed and `availability` was published as Available.
+ * - `skipped`: sync monitoring was disabled (skip-sync-monitor); `availability` is left untouched.
+ * - `failed`: sync was not confirmed (timeout, missing targets, or a failed status write);
+ *   `availability` is left Unavailable and the node must not be marked as cloned.
  */
-async function monitorSync(): Promise<void> {
-	if (skipSyncMonitor) return;
-	const { clusterStatus } = await import('../replication/clusterStatus.js');
+type SyncOutcome = 'synced' | 'skipped' | 'failed';
+
+/**
+ * Monitors database synchronization after cloning and drives this node's `availability` status.
+ *
+ * `availability` is a cooperative, multi-writer status whose contract is owned by core; this is the
+ * clone producer upholding it. It is published as Unavailable up front so `get_status` always
+ * carries a definite signal for the control plane — never an absent field — and is only flipped to
+ * Available once sync is confirmed and that write succeeds. On any failure it is left Unavailable.
+ *
+ * Polls at regular intervals until sync completes or the timeout is reached.
+ */
+async function monitorSync(): Promise<SyncOutcome> {
 	const { set: setStatus } = await import('../core/server/status/index.js');
+
+	if (skipSyncMonitor) {
+		// The operator opted out of the sync gate, so the clone is declared ready. Publish Available
+		// (best-effort) — this also clears any Unavailable persisted by a prior failed attempt, since
+		// hdb_status is not replicated and survives restarts — keeping availability consistent with the
+		// cloned flag the caller sets for this outcome.
+		log('Skipping sync monitor (skip-sync-monitor); marking node Available without verifying sync');
+		try {
+			await setStatus({ id: 'availability', status: 'Available' });
+		} catch (err) {
+			log(`Failed to set availability status to Available: ${err}`, 'error');
+		}
+		return 'skipped';
+	}
+
+	const { clusterStatus } = await import('../replication/clusterStatus.js');
+
+	// The node is not ready to serve traffic until the clone has caught up with the leader. Publish
+	// Unavailable up front so get_status always carries a definite availability signal for the whole
+	// sync wait. Best-effort: a failed write here must not abort the clone (the loop still runs and
+	// publishes Available on success).
+	try {
+		await setStatus({ id: 'availability', status: 'Unavailable' });
+	} catch (err) {
+		log(`Failed to set availability status to Unavailable: ${err}`, 'error');
+	}
+
+	// Test/diagnostic hook (not a user-facing option): deterministically exercise the
+	// unconfirmed-sync failure path. Loopback replication is too fast and bidirectional to force a
+	// real sync timeout in tests, so this lets the failure-branch behavior — stay Unavailable, do not
+	// mark cloned, keep the node running — be asserted deterministically.
+	if (process.env.CLONE_SIMULATE_SYNC_FAILURE === 'true') {
+		log('CLONE_SIMULATE_SYNC_FAILURE set; treating clone sync as unconfirmed', 'error');
+		return 'failed';
+	}
 
 	// Get last updated record timestamps for all DB and write to file
 	// These values can be used for checking when the clone replication has caught up with the leader
 	const targetTimestamps = await getLastUpdatedRecord();
 	if (!targetTimestamps || Object.keys(targetTimestamps).length === 0) {
-		log('No target timestamps available to check synchronization status', 'error');
-		return;
+		log('No target timestamps available to check synchronization status; leaving availability Unavailable', 'error');
+		return 'failed';
 	}
 
 	log(
@@ -408,24 +471,26 @@ async function monitorSync(): Promise<void> {
 	);
 
 	const timeoutAt: number = Date.now() + syncTimeoutMs;
-	let syncComplete: boolean = false;
 	let loopCount: number = 0;
 
-	while (!syncComplete && Date.now() < timeoutAt) {
+	while (Date.now() < timeoutAt) {
 		try {
-			syncComplete = await checkSyncStatus(targetTimestamps, clusterStatus);
+			const syncComplete = await checkSyncStatus(targetTimestamps, clusterStatus);
 
 			if (syncComplete) {
 				log('All databases synchronized');
 
+				// Only report Available — and let the caller finalize the clone — once the status
+				// write itself succeeds. A failed write must not be treated as a successful sync,
+				// otherwise the node would be marked cloned without a readiness signal.
 				try {
 					await setStatus({ id: 'availability', status: 'Available' });
 				} catch (err) {
-					// Don't fail sync monitoring due to status update failure
-					log(`Failed to update availability status: ${err}`, 'error');
+					log(`Synchronized but failed to set availability to Available: ${err}; leaving Unavailable`, 'error');
+					return 'failed';
 				}
 
-				break; // Exit loop on successful sync
+				return 'synced';
 			}
 
 			// Log every other iteration to reduce noise
@@ -440,6 +505,12 @@ async function monitorSync(): Promise<void> {
 			await sleep(DEFAULT_SYNC_CHECK_INTERVAL_MS); // Still wait on error
 		}
 	}
+
+	log(
+		`Databases did not synchronize within ${Math.round(syncTimeoutMs / 60000)} minutes; leaving availability Unavailable and not marking node as cloned`,
+		'error'
+	);
+	return 'failed';
 }
 
 /**
