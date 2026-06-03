@@ -342,11 +342,23 @@ jobs:
     needs: [merge-openshift]
     timeout-minutes: 20
     steps:
-      - name: Install OpenShift preflight
-        uses: redhat-actions/openshift-tools-installer@144527c7d98999f2652264c048c7a9bd103f8a82 # v1.13.1
-        with:
-          source: 'github'
-          preflight: 'latest'
+      # Install preflight directly (not via redhat-actions/openshift-tools-installer,
+      # which still runs on the deprecated Node 20) with a pinned version and a
+      # verified checksum, so this secret-bearing certification path is deterministic.
+      # Runner is amd64 (ubuntu-latest); update PREFLIGHT_SHA256 if bumping the version.
+      - name: Install OpenShift preflight (pinned + checksum-verified)
+        env:
+          PREFLIGHT_VERSION: '1.19.0'
+          PREFLIGHT_SHA256: '1d7a845c4528f9476c8ef9a551b4da5c06d62de558e56a37054c6fa737d583e5'
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          curl -fsSL -o preflight \
+            "https://github.com/redhat-openshift-ecosystem/openshift-preflight/releases/download/${PREFLIGHT_VERSION}/preflight-linux-amd64"
+          echo "${PREFLIGHT_SHA256}  preflight" | sha256sum -c -
+          chmod +x preflight
+          sudo mv preflight /usr/local/bin/preflight
+          preflight version
       - name: Submit image to Red Hat Connect
         env:
           DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
