@@ -315,3 +315,90 @@ suite('Clone Node', (ctx) => {
 		console.log('done');
 	});
 });
+
+// Failure path: when clone sync does not confirm, the node must publish availability: Unavailable
+// (get_status must never carry an absent availability field), must NOT be marked cloned, and must
+// stay running and queryable for the control plane.
+//
+// CLONE_SIMULATE_SYNC_FAILURE drives monitorSync down the unconfirmed-sync branch deterministically.
+// Loopback replication is too fast and bidirectional to force a real sync timeout in a test, so this
+// diagnostic hook is the only reliable way to assert the failure-branch behavior.
+suite('Clone Node - unconfirmed sync leaves node Unavailable and uncloned', (ctx) => {
+	before(async () => {
+		ctx.nodes = [];
+		const leaderCtx = {
+			name: ctx.name,
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
+		};
+		await startHarper(leaderCtx, {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false },
+				replication: {
+					port: leaderCtx.harper.hostname + ':9933',
+					securePort: null,
+				},
+			},
+			env: {
+				HARPER_NO_FLUSH_ON_EXIT: true,
+			},
+		});
+		ctx.nodes.push(leaderCtx.harper);
+	});
+
+	after(async () => {
+		await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node })));
+	});
+
+	test('reports Unavailable, stays queryable, and is not marked cloned', async () => {
+		const cloneCtx = {
+			name: ctx.name,
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
+		};
+		await startHarper(cloneCtx, {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false },
+				replication: {
+					port: cloneCtx.harper.hostname + ':9933',
+					securePort: null,
+				},
+			},
+			env: {
+				HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:9925`,
+				HDB_LEADER_USERNAME: ctx.nodes[0].admin.username,
+				HDB_LEADER_PASSWORD: ctx.nodes[0].admin.password,
+				ALLOW_SELF_SIGNED: true,
+				HARPER_NO_FLUSH_ON_EXIT: true,
+				// Deterministically drive the unconfirmed-sync failure branch in monitorSync.
+				CLONE_SIMULATE_SYNC_FAILURE: true,
+			},
+		});
+		ctx.nodes.push(cloneCtx.harper);
+
+		// The failure path publishes Unavailable up front, but status propagation to the operations
+		// API can lag on a freshly-started node, so poll rather than checking once after a fixed sleep.
+		let availability;
+		const deadline = Date.now() + 30000;
+		while (Date.now() < deadline) {
+			try {
+				availability = await sendOperation(ctx.nodes[1], { operation: 'get_status', id: 'availability' });
+			} catch {}
+			if (availability && typeof availability.status === 'string') break;
+			await sleep(2000);
+		}
+
+		// get_status must respond (node is still running) and must carry a definite availability value —
+		// never an absent field, which was the original bug on the failure path.
+		ok(availability && typeof availability.status === 'string', 'get_status must always carry an availability status');
+		equal(availability.status, 'Unavailable', 'an unconfirmed clone must report availability Unavailable');
+
+		// A node whose sync never confirmed must not be marked cloned, so a restart can retry the clone.
+		const config = await sendOperation(ctx.nodes[1], { operation: 'get_configuration' });
+		ok(config.cloned !== true, 'an unconfirmed clone must not be marked cloned');
+	});
+});
