@@ -47,6 +47,8 @@ jobs:
     # review trusted-author PRs; unset → opt-in via the gemini-review
     # label. The reusable's authorize job still owns WHO is admitted
     # (CODEOWNERS trust set; the labeler, not the author, on `labeled`).
+    # NB: the `gemini-review` label name is matched there too —
+    # `_gemini-review.yml`'s authorize `if:`, not in this caller.
     if: ${{ vars.GEMINI_ALWAYS_ON == 'true' || github.event.action == 'labeled' }}
     uses: HarperFast/ai-review-prompts/.github/workflows/_gemini-review.yml@2be0f702b114e39b90eed90962922ef64df58482 # main 2026-06-03 (post #52 — calibration: Harper-aware wiring for the Gemini leg, skills-ref v1.7.0, surface-findings rule, access-control blocker guidance, public-skill dedup)
     # Caller-side permissions at the calling-job level (NOT workflow-
