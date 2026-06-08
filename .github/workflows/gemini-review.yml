@@ -68,7 +68,7 @@ jobs:
       # duplication is unavoidable: reusable workflows can't introspect
       # their own ref (`github.workflow_ref` resolves to the CALLER's
       # ref in workflow_call context), and `uses: …@<ref>` is literal.
-      ai-review-prompts-ref: 2be0f702b114e39b90eed90962922ef64df58482
+      ai-review-prompts-ref: 3f2300a39910a0983eb74967dedeebd8c3c98adc
       review-layers: |
         universal
         harper/common
