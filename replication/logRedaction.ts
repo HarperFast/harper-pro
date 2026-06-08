@@ -25,9 +25,16 @@ export function redactOperationForLog(operation: any): any {
 	// registryAuth is an array of { registry, token, scope? }; mask each token while keeping the
 	// non-secret registry/scope visible for debugging.
 	if (Array.isArray(operation.registryAuth)) {
-		ensureCopy().registryAuth = operation.registryAuth.map((entry: any) =>
-			entry && typeof entry === 'object' && 'token' in entry ? { ...entry, token: '[redacted]' } : entry
-		);
+		let redactedAuth = false;
+		const maskedAuth = operation.registryAuth.map((entry: any) => {
+			if (entry && typeof entry === 'object' && 'token' in entry) {
+				redactedAuth = true;
+				return { ...entry, token: '[redacted]' };
+			}
+			return entry;
+		});
+		// Only allocate a copy if a token was actually present, preserving the no-allocation fast path.
+		if (redactedAuth) ensureCopy().registryAuth = maskedAuth;
 	}
 	return masked ?? operation;
 }
