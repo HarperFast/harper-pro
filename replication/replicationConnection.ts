@@ -32,6 +32,7 @@ import {
 	enabledDatabases,
 	urlToNodeName,
 } from './replicator.ts';
+import { redactOperationForLog } from './logRedaction.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -1505,7 +1506,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					case OPERATION_REQUEST:
 						try {
 							const isAuthorizedNode = authorization?.replicates || authorization?.subscribers || authorization?.name;
-							logger.debug?.('Received operation request', data, 'from', remoteNodeName);
+							// data may carry a secret (registry token / ssh key / password); redact before
+							// logging. The conditional logger skips arg evaluation when debug is inactive.
+							logger.debug?.('Received operation request', redactOperationForLog(data), 'from', remoteNodeName);
 							server.operation(data, { user: authorization }, !isAuthorizedNode).then(
 								(response) => {
 									logger.debug?.('Requested request from finished', remoteNodeName, response);
