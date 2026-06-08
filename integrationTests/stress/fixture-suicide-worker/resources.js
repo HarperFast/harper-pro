@@ -1,8 +1,8 @@
 // Test-only component that exposes a `/suicide-worker` endpoint. Hitting it
-// kills the worker thread that received the request via process.exit(137) —
-// the conventional exit code for SIGKILL-like termination. Harper's worker
-// supervisor will respawn a fresh worker and trigger replication subscription
-// reassignment, which is the codepath PR #147's stagger fix protects.
+// kills the worker thread that received the request — the conventional exit
+// code 137 (128 + 9, SIGKILL) is used. Harper's worker supervisor will respawn
+// a fresh worker and trigger replication subscription reassignment, which is
+// the codepath PR #147's stagger fix protects.
 //
 // Authorized via Harper's normal auth so the test driver must provide creds.
 // Returns 200 immediately, then schedules the exit on the next tick so the
@@ -16,9 +16,13 @@ export class SuicideWorker extends Resource {
 	get() {
 		// Schedule the exit asynchronously so the HTTP response can flush.
 		setImmediate(() => {
-			// 137 = 128 + 9 (SIGKILL convention), but we use process.exit so the
-			// node test harness still sees a clean exit code from the worker.
-			process.exit(137);
+			// core/server/threads/workerProcessGuard intercepts `process.exit()` in
+			// worker threads (so component code cannot terminate a worker), exposing
+			// `process._realExit` as the escape hatch for a genuine termination. We
+			// must use it here to actually kill the worker; a plain `process.exit`
+			// would be logged-and-ignored and the worker would survive. Fall back to
+			// `process.exit` for environments where the guard isn't loaded.
+			(process._realExit ?? process.exit)(137);
 		});
 		return {
 			threadId,
