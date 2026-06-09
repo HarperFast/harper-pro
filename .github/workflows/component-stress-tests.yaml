@@ -58,9 +58,9 @@ jobs:
             ref: main
             dir: template-redirector
           - component: early-hints
-            repo: HarperFast/early-hints
+            repo: HarperFast/template-early-hints
             ref: main
-            dir: early-hints
+            dir: template-early-hints
 
     env:
       NODE_VERSION: ${{ github.event.inputs.node-version || '24' }}

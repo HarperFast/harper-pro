@@ -19,10 +19,10 @@ export const COMPONENTS = {
 		project: 'template-redirector',
 	},
 	'early-hints': {
-		repo: 'HarperFast/early-hints',
+		repo: 'HarperFast/template-early-hints',
 		ref: 'main',
-		dir: 'early-hints',
-		project: 'early-hints',
+		dir: 'template-early-hints',
+		project: 'template-early-hints',
 	},
 	// acl-connect-example bundles @harperdb/acl-connect@1.0.9 from npm; no release tags, pin to commit.
 	'acl-connect': {
