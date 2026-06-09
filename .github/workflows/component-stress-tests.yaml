@@ -20,6 +20,7 @@ on:
           - all
           - risk-query
           - redirector
+          - early-hints
       node-version:
         description: 'Node.js version'
         type: string
@@ -56,6 +57,10 @@ jobs:
             repo: HarperFast/template-redirector
             ref: main
             dir: template-redirector
+          - component: early-hints
+            repo: HarperFast/early-hints
+            ref: main
+            dir: early-hints
 
     env:
       NODE_VERSION: ${{ github.event.inputs.node-version || '24' }}

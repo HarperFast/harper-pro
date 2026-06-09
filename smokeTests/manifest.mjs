@@ -20,7 +20,7 @@ export const COMPONENTS = {
 	},
 	'early-hints': {
 		repo: 'HarperFast/early-hints',
-		ref: 'v1.1.2',
+		ref: 'main',
 		dir: 'early-hints',
 		project: 'early-hints',
 	},
