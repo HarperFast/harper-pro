@@ -53,9 +53,9 @@ jobs:
             ref: main
             dir: risk-query
           - component: redirector
-            repo: HarperFast/redirector
+            repo: HarperFast/template-redirector
             ref: main
-            dir: redirector
+            dir: template-redirector
 
     env:
       NODE_VERSION: ${{ github.event.inputs.node-version || '24' }}
