@@ -364,8 +364,11 @@ export async function startOnMainThread(options) {
 			if (existingEntry) {
 				worker = existingEntry.worker;
 				existingEntry.nodes = nodes;
-				if (shouldSubscribe) {
-					// already subscribed, don't need to do anything
+				if (shouldSubscribe && existingEntry.connected !== false) {
+					// already subscribed and connected (or connection state still pending) — nothing to do.
+					// A connected:false entry falls through to re-post subscribe-to-node on the same worker,
+					// which is how the reconcile recovers a wedged connection (the worker then reuses a
+					// still-retrying connection or builds a fresh one — replicator.isReusableConnection).
 					return;
 				}
 			} else if (shouldSubscribe) {
@@ -663,15 +666,14 @@ export async function startOnMainThread(options) {
 			const isWedged = wedgedNodeUrls.has(url);
 			if (!staleNodeUrls.has(url) && !isWedged) continue;
 			if (isWedged) {
-				// onDatabase early-returns ("already subscribed") for an existing entry on a live worker
-				// and would only log without re-subscribing. Drop the wedged db entries so onNodeUpdate
-				// takes the re-subscribe path and re-posts subscribe-to-node; the worker then rebuilds the
-				// connection (a terminal one is no longer reusable — replicator.isReusableConnection, while
-				// a still-retrying one is reused as-is). Keep the url's map (and its iterator) so
-				// onNodeUpdate cleans the iterator up; a fresh entry also re-stamps disconnectedAt on its
-				// next disconnect, bounding re-drives of a still-unreachable peer to one per threshold window.
+				// Restart the disconnect clock before re-driving so a peer that is still unreachable after
+				// the re-subscribe (it stays connected:false, which does not re-stamp disconnectedAt) is
+				// retried at most once per threshold window rather than on every reconcile tick.
+				// onNodeUpdate -> onDatabase then re-posts subscribe-to-node for the connected:false entry
+				// (it no longer early-returns), reusing the existing worker — so no entry/listener churn.
 				const entries = connectionReplicationMap.get(url);
-				if (entries) for (const db of [...entries.keys()]) entries.delete(db);
+				if (entries)
+					for (const entry of entries.values()) if (entry.connected === false) entry.disconnectedAt = Date.now();
 			}
 			try {
 				onNodeUpdate(node);
