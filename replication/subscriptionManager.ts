@@ -100,33 +100,29 @@ export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatus
 // the peer is reachable and still subscribed. findStaleNodeUrls does not catch this because the
 // worker is alive. Re-driving these through onNodeUpdate creates a fresh connection (the prior one is
 // no longer reusable — see replicator.isReusableConnection). A threshold well above the normal
-// reconnect backoff keeps this from firing on connections that are merely mid-retry. See
-// harper-pro#233 / #289.
+// reconnect backoff keeps this from firing on connections that are merely mid-retry.
+// `isDesired` must be the same predicate onDatabase uses to decide shouldSubscribe
+// (shouldReplicateFromNode), so a connection intentionally unsubscribed because this node should NOT
+// subscribe (replication off, or a sendsTo/subscription targeting another database) is not flagged
+// and re-driven forever. See harper-pro#233 / #289.
 export function findWedgedNodeUrls(
 	connectionMap: Map<string, DBReplicationStatusMap>,
 	httpWorkers: any[],
 	now: number,
-	thresholdMs: number
+	thresholdMs: number,
+	isDesired: (node: any, database: string) => boolean
 ): Set<string> {
 	const wedgedNodeUrls = new Set<string>();
 	if (httpWorkers.length === 0) return wedgedNodeUrls;
 	for (const [url, dbReplicationWorkers] of connectionMap) {
-		for (const entry of dbReplicationWorkers.values()) {
-			const mainNode: any = entry.nodes?.[0]; // replicates may be a flag or an object; matches usage elsewhere
-			const desired =
-				mainNode &&
-				(mainNode.replicates === true ||
-					mainNode.replicates?.sends ||
-					mainNode.replicates?.sendsTo?.length ||
-					mainNode.replicates?.receivesFrom?.length ||
-					mainNode.subscriptions?.length);
+		for (const [database, entry] of dbReplicationWorkers) {
 			if (
-				desired &&
 				entry.connected === false &&
 				entry.worker &&
 				httpWorkers.includes(entry.worker) &&
 				entry.disconnectedAt != null &&
-				now - entry.disconnectedAt >= thresholdMs
+				now - entry.disconnectedAt >= thresholdMs &&
+				isDesired(entry.nodes?.[0], database)
 			) {
 				wedgedNodeUrls.add(url);
 				break;
@@ -648,7 +644,8 @@ export async function startOnMainThread(options) {
 			connectionReplicationMap,
 			httpWorkers,
 			Date.now(),
-			WEDGE_RECONCILE_THRESHOLD_MS
+			WEDGE_RECONCILE_THRESHOLD_MS,
+			shouldReplicateFromNode
 		);
 		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0) return;
 		if (staleNodeUrls.size > 0)
