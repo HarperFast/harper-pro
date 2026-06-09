@@ -39,5 +39,5 @@
 		"Resource": "readonly",
 		"headersTest": "readonly"
 	},
-	"ignorePatterns": []
+	"ignorePatterns": ["smokeTests/k6/**", "stressTests/k6/**", "smokeTests/.components/**"]
 }
