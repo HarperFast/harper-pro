@@ -203,7 +203,7 @@ export async function startOnMainThread(options) {
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
 	 */
-	function onNodeUpdate(node, hostname = node?.name) {
+	function onNodeUpdate(node, hostname = node?.name, forceResubscribe = false) {
 		const isSelf =
 			(getThisNodeName() && hostname === getThisNodeName()) || (getThisNodeUrl() && node?.url === getThisNodeUrl());
 		if (isSelf) {
@@ -281,9 +281,9 @@ export async function startOnMainThread(options) {
 		}
 		dbReplicationWorkers.iterator = forEachReplicatedDatabase(options, (database, databaseName, replicateByDefault) => {
 			if (replicateByDefault) {
-				onDatabase(databaseName, true);
+				onDatabase(databaseName, true, forceResubscribe);
 			} else {
-				onDatabase(databaseName, false);
+				onDatabase(databaseName, false, forceResubscribe);
 			}
 		});
 		// check to see if there are any explicit subscriptions to databases that don't exist yet
@@ -294,7 +294,7 @@ export async function startOnMainThread(options) {
 				const databaseName = sub.database || sub.schema;
 				if (!databases[databaseName]) {
 					logger.warn(`Database ${databaseName} not found for node ${node.name}, making a subscription anyway`);
-					onDatabase(databaseName, false);
+					onDatabase(databaseName, false, forceResubscribe);
 				}
 			}
 		}
@@ -309,12 +309,12 @@ export async function startOnMainThread(options) {
 					logger.warn(
 						`isLeader: bootstrapping full-copy subscription for non-existent database ${databaseName} from ${node.name}`
 					);
-					onDatabase(databaseName, true);
+					onDatabase(databaseName, true, forceResubscribe);
 				}
 			}
 		}
 
-		function onDatabase(databaseName, tablesReplicateByDefault) {
+		function onDatabase(databaseName, tablesReplicateByDefault, forceResubscribe = false) {
 			logger.trace('Setting up replication for database', databaseName, 'on node', node.name);
 			let existingEntry = dbReplicationWorkers.get(databaseName);
 			let worker;
@@ -360,11 +360,13 @@ export async function startOnMainThread(options) {
 			if (existingEntry) {
 				worker = existingEntry.worker;
 				existingEntry.nodes = nodes;
-				if (shouldSubscribe && existingEntry.connected !== false) {
-					// already subscribed and connected (or connection state still pending) — nothing to do.
-					// A connected:false entry falls through to re-post subscribe-to-node on the same worker,
-					// which is how the reconcile recovers a wedged connection (the worker then reuses a
-					// still-retrying connection or builds a fresh one — replicator.isReusableConnection).
+				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
+				// forceResubscribe for a connection that has been connected:false past the threshold: that
+				// falls through to re-post subscribe-to-node on the same worker (the worker then reuses a
+				// still-retrying connection or builds a fresh one — replicator.isReusableConnection). We
+				// deliberately do NOT re-subscribe every connected:false entry on an ordinary onNodeUpdate —
+				// doing so disrupts in-flight replication (e.g. an active legacy-node base copy).
+				if (shouldSubscribe && !(forceResubscribe && existingEntry.connected === false)) {
 					return;
 				}
 			} else if (shouldSubscribe) {
@@ -673,7 +675,9 @@ export async function startOnMainThread(options) {
 					for (const entry of entries.values()) if (entry.connected === false) entry.disconnectedAt = Date.now();
 			}
 			try {
-				onNodeUpdate(node);
+				// forceResubscribe only for wedged entries, so a normal stale-worker reconcile keeps its
+				// original behavior and ordinary onNodeUpdate calls never re-subscribe live subscriptions.
+				onNodeUpdate(node, undefined, isWedged);
 			} catch (error) {
 				logger.error('Error reconciling node', node?.name, error);
 			}
