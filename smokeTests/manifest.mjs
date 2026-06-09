@@ -14,7 +14,7 @@ export const COMPONENTS = {
 	},
 	'redirector': {
 		repo: 'HarperFast/redirector',
-		ref: 'v1.1.2',
+		ref: 'main',
 		dir: 'redirector',
 		project: 'redirector',
 	},

@@ -17,6 +17,7 @@ on:
         options:
           - all
           - risk-query
+          - redirector
       node-version:
         description: 'Node.js version'
         type: string
@@ -48,6 +49,10 @@ jobs:
             repo: HarperFast/risk-query
             ref: main
             dir: risk-query
+          - component: redirector
+            repo: HarperFast/redirector
+            ref: main
+            dir: redirector
 
     env:
       NODE_VERSION: ${{ github.event.inputs.node-version || '24' }}

@@ -1,0 +1,8 @@
+/p/shirts/
+/p/hats/
+/p/shoes/
+/p/dresses/
+/p/makeup/
+/c/sale/
+/c/new-arrivals/
+/home/
