@@ -1,0 +1,12 @@
+{
+	"name": "acl-connect-fixture",
+	"version": "1.0.0",
+	"description": "Vendored acl-connect wrapper for harper-pro component smoke tests. Bundles the connect.json topology and JWT user mapping that @harperdb/acl-connect needs to enforce.",
+	"type": "module",
+	"main": "resources.js",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"@harperdb/acl-connect": "github:HarperFast/acl-connect#main",
+		"jsonwebtoken": "^9.0.2"
+	}
+}

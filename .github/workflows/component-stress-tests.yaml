@@ -62,10 +62,11 @@ jobs:
             repo: HarperFast/template-early-hints
             ref: main
             dir: template-early-hints
+          # acl-connect is deployed from the vendored fixture (no clone). repo/ref are informational.
           - component: acl-connect
-            repo: HarperFast/acl-connect-example
+            repo: HarperFast/acl-connect
             ref: main
-            dir: acl-connect-example
+            dir: acl-connect
 
     env:
       NODE_VERSION: ${{ github.event.inputs.node-version || '24' }}
@@ -90,7 +91,9 @@ jobs:
           submodules: recursive
           token: ${{ steps.app-token.outputs.token }}
 
+      # acl-connect runs from the vendored fixture in smokeTests/fixtures/acl-connect/, skip the clone.
       - name: Checkout component (${{ matrix.repo }}@${{ matrix.ref }})
+        if: matrix.component != 'acl-connect'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ${{ matrix.repo }}

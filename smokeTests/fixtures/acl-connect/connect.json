@@ -1,0 +1,15 @@
+{
+	"options": {
+		"clientId": "clientID",
+		"userName": "username",
+		"authorizations": "authGroups"
+	},
+	"acls": [
+		{
+			"topicFilter": "dog/#",
+			"publishers": ["dogPublisher"],
+			"subscribers": ["dogSubscriber"],
+			"anonymousSubscriber": false
+		}
+	]
+}
