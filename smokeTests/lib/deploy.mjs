@@ -18,9 +18,11 @@ function run(cmd, args, cwd) {
 }
 
 function hasDependencies(dir) {
+	// devDependencies count too: a pure-TS component may declare typescript only there,
+	// and skipping npm install would leave tsc unavailable for the subsequent build.
 	try {
 		const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
-		return Object.keys(pkg.dependencies ?? {}).length > 0;
+		return Object.keys(pkg.dependencies ?? {}).length > 0 || Object.keys(pkg.devDependencies ?? {}).length > 0;
 	} catch {
 		return false;
 	}
