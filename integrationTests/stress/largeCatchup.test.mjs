@@ -86,7 +86,7 @@ if (!stressEnabled()) {
 		before(async () => {
 			const cfg = (host) => ({
 				analytics: { aggregatePeriod: -1 },
-				logging: { colors: false, console: true, level: 'info' },
+				logging: { colors: false, console: true, level: 'warn' },
 				replication: { securePort: host + ':9933' },
 				threads: { count: 4 },
 			});
@@ -193,7 +193,7 @@ if (!stressEnabled()) {
 			await startHarper(bRestartCtx, {
 				config: {
 					analytics: { aggregatePeriod: -1 },
-					logging: { colors: false, console: true, level: 'info' },
+					logging: { colors: false, console: true, level: 'warn' },
 					replication: { securePort: B.hostname + ':9933' },
 					threads: { count: 4 },
 				},

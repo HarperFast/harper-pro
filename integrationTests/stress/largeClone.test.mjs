@@ -74,7 +74,7 @@ if (!stressEnabled()) {
 			await startHarper(leaderCtx, {
 				config: {
 					analytics: { aggregatePeriod: -1 },
-					logging: { colors: false, console: true, level: 'info' },
+					logging: { colors: false, console: true, level: 'warn' },
 					replication: { port: leaderCtx.harper.hostname + ':9933', securePort: null },
 					threads: { count: 4 },
 				},
@@ -155,7 +155,7 @@ if (!stressEnabled()) {
 			await startHarper(cloneCtx, {
 				config: {
 					analytics: { aggregatePeriod: -1 },
-					logging: { colors: false, console: true, level: 'info' },
+					logging: { colors: false, console: true, level: 'warn' },
 					replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
 					threads: { count: 4 },
 				},
