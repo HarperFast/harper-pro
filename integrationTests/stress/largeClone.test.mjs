@@ -74,18 +74,6 @@ if (!stressEnabled()) {
 
 	const PAYLOAD = 'x'.repeat(PAYLOAD_SIZE);
 
-	async function waitForAvailableStatus(node, timeoutMs) {
-		const deadline = Date.now() + timeoutMs;
-		while (Date.now() < deadline) {
-			await delay(2_000);
-			try {
-				const resp = await sendOperation(node, { operation: 'get_status', id: 'availability' });
-				if (resp?.status === 'Available') return true;
-			} catch {}
-		}
-		throw new Error(`Node did not become Available within ${timeoutMs}ms`);
-	}
-
 	suite(`Large clone — ${TARGET_GB} GB`, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		before(async () => {
 			const leaderCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
