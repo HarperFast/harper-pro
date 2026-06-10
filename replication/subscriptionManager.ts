@@ -55,10 +55,6 @@ const NODE_SUBSCRIBE_DELAY = 200; // delay before sending node subscribe to othe
 // caused the OOM in the first place. We stagger the re-subscriptions in time so the new
 // worker(s) absorb them gradually.
 const WORKER_EXIT_REASSIGN_STAGGER_MS = 100;
-<<<<<<< HEAD
-let nextWorkerExitReassignAt = 0;
-const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
-=======
 // Cadence of the per-process safety-net reconcile that rebinds subscriptions whose
 // worker no longer exists. Pure read-side filter against `workers` and
 // `connectionReplicationMap` on each tick when nothing is wrong, so a short interval
@@ -132,7 +128,6 @@ export function findWedgedNodeUrls(
 	}
 	return wedgedNodeUrls;
 }
->>>>>>> a86b7f5 (Merge pull request #303 from HarperFast/kris/replication-revive-unsubscribed-conn)
 export let disconnectedFromNode; // this is set by thread to handle when a node is disconnected (or notify main thread so it can handle)
 export let connectedToNode; // this is set by thread to handle when a node is connected (or notify main thread so it can handle)
 const nodeMap = new Map(); // this is a map of all nodes that are available to connect to
@@ -290,24 +285,6 @@ export async function startOnMainThread(options) {
 				}
 			}
 		}
-<<<<<<< HEAD
-=======
-		// When this peer is our leader, bootstrap subscriptions for configured databases
-		// that don't exist locally yet — they need a full-table copy from the leader.
-		// forEachReplicatedDatabase above only iterates local databases, so an empty node
-		// joining a populated leader would never schedule the catchup without this.
-		if (node.isLeader && Array.isArray(options?.databases)) {
-			for (const dbConfig of options.databases) {
-				const databaseName = typeof dbConfig === 'string' ? dbConfig : dbConfig?.name;
-				if (databaseName && !databases[databaseName]) {
-					logger.warn(
-						`isLeader: bootstrapping full-copy subscription for non-existent database ${databaseName} from ${node.name}`
-					);
-					onDatabase(databaseName, true, forceResubscribe);
-				}
-			}
-		}
->>>>>>> a86b7f5 (Merge pull request #303 from HarperFast/kris/replication-revive-unsubscribed-conn)
 
 		function onDatabase(databaseName, tablesReplicateByDefault, forceResubscribe = false) {
 			logger.trace('Setting up replication for database', databaseName, 'on node', node.name);
@@ -584,8 +561,6 @@ export async function startOnMainThread(options) {
 			});
 		} else subscribeToNode({ url: getNodeURL(connectingNode), name: connectingNode.name, database, nodes: [node] });
 	}
-<<<<<<< HEAD
-=======
 	// Periodic safety net for stale subscription entries. The existing per-database
 	// worker.on('exit') chain reassigns to a healthy worker after a worker dies, but a
 	// single broken link in that chain (identity check failing, setTimeout retry being
@@ -639,7 +614,6 @@ export async function startOnMainThread(options) {
 		}
 	}
 	setInterval(reconcileWorkers, RECONCILE_INTERVAL_MS).unref();
->>>>>>> a86b7f5 (Merge pull request #303 from HarperFast/kris/replication-revive-unsubscribed-conn)
 	onMessageByType('disconnected-from-node', disconnectedFromNode);
 	onMessageByType('connected-to-node', connectedToNode);
 	onMessageByType('request-cluster-status', requestClusterStatus);
@@ -688,6 +662,18 @@ export function requestClusterStatus(message, port) {
 	return { connections };
 }
 
+// threadServer.js starts servers at import time on non-main workers, and job workers import this
+// module (replication is a HARPER_BUILTIN_COMPONENT), so importing it at module load would spuriously
+// start servers / keep job workers alive. Lazily import it only when a subscribe/unsubscribe actually
+// arrives — which only happens on HTTP/replication workers, where threadServer is already loaded, so
+// the dynamic import resolves to the cached module with no side effect. Cached after first use.
+let componentsLoadedPromise: Promise<unknown> | undefined;
+function whenWorkerComponentsLoaded(): Promise<unknown> {
+	return (componentsLoadedPromise ??= import('../core/server/threads/threadServer.js').then(
+		(threadServer) => threadServer.whenComponentsLoaded
+	));
+}
+
 if (parentPort) {
 	disconnectedFromNode = (connection) => {
 		parentPort.postMessage({ type: 'disconnected-from-node', ...connection });
@@ -696,10 +682,19 @@ if (parentPort) {
 		parentPort.postMessage({ type: 'connected-to-node', ...connection });
 	};
 	onMessageByType('subscribe-to-node', (message) => {
-		subscribeToNode(message);
+		// Defer until this worker has finished loading components (databases/tables + persisted hdb_nodes
+		// rows). subscribeToNode re-checks shouldReplicateFromNode, which reads that thread-local state; if
+		// it runs before the state is loaded it filters the request down to empty and arms a permanent
+		// "no subscriptions" close, wedging the (peer, db) until restart (harper-pro#289 / #233). Once
+		// components are loaded the predicate is authoritative. In steady state the promise is already
+		// resolved, so this is effectively synchronous.
+		whenWorkerComponentsLoaded().then(() => subscribeToNode(message));
 	});
 	onMessageByType('unsubscribe-from-node', (message) => {
-		unsubscribeFromNode(message);
+		// Defer through the same gate as subscribe-to-node so the two stay ordered: a pre-load
+		// subscribe followed by an unsubscribe must apply in that order (else the deferred subscribe
+		// would run after the unsubscribe and re-open a connection the main thread already removed).
+		whenWorkerComponentsLoaded().then(() => unsubscribeFromNode(message));
 	});
 }
 
