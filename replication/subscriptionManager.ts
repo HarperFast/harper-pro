@@ -5,6 +5,7 @@
  */
 import { getDatabases } from '../core/resources/databases.ts';
 import { workers, onMessageByType, whenThreadsStarted } from '../core/server/threads/manageThreads.js';
+import { whenComponentsLoaded } from '../core/server/threads/threadServer.js';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import { subscribeToNode, urlToNodeName, forEachReplicatedDatabase, unsubscribeFromNode } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
@@ -534,7 +535,13 @@ if (parentPort) {
 		parentPort.postMessage({ type: 'connected-to-node', ...connection });
 	};
 	onMessageByType('subscribe-to-node', (message) => {
-		subscribeToNode(message);
+		// Defer until this worker has finished loading components (databases/tables + persisted hdb_nodes
+		// rows). subscribeToNode re-checks shouldReplicateFromNode, which reads that thread-local state; if
+		// it runs before the state is loaded it filters the request down to empty and arms a permanent
+		// "no subscriptions" close, wedging the (peer, db) until restart (harper-pro#289 / #233). Once
+		// components are loaded the predicate is authoritative. In steady state the promise is already
+		// resolved, so this is effectively synchronous. Promise.resolve() guards a missing signal.
+		Promise.resolve(whenComponentsLoaded).then(() => subscribeToNode(message));
 	});
 	onMessageByType('unsubscribe-from-node', (message) => {
 		unsubscribeFromNode(message);
