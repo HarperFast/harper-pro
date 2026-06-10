@@ -5,7 +5,6 @@
  */
 import { getDatabases } from '../core/resources/databases.ts';
 import { workers, onMessageByType, whenThreadsStarted } from '../core/server/threads/manageThreads.js';
-import { whenComponentsLoaded } from '../core/server/threads/threadServer.js';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import { subscribeToNode, urlToNodeName, forEachReplicatedDatabase, unsubscribeFromNode } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
@@ -527,6 +526,18 @@ export function requestClusterStatus(message, port) {
 	return { connections };
 }
 
+// threadServer.js starts servers at import time on non-main workers, and job workers import this
+// module (replication is a HARPER_BUILTIN_COMPONENT), so importing it at module load would spuriously
+// start servers / keep job workers alive. Lazily import it only when a subscribe/unsubscribe actually
+// arrives — which only happens on HTTP/replication workers, where threadServer is already loaded, so
+// the dynamic import resolves to the cached module with no side effect. Cached after first use.
+let componentsLoadedPromise: Promise<unknown> | undefined;
+function whenWorkerComponentsLoaded(): Promise<unknown> {
+	return (componentsLoadedPromise ??= import('../core/server/threads/threadServer.js').then(
+		(threadServer) => threadServer.whenComponentsLoaded
+	));
+}
+
 if (parentPort) {
 	disconnectedFromNode = (connection) => {
 		parentPort.postMessage({ type: 'disconnected-from-node', ...connection });
@@ -540,14 +551,14 @@ if (parentPort) {
 		// it runs before the state is loaded it filters the request down to empty and arms a permanent
 		// "no subscriptions" close, wedging the (peer, db) until restart (harper-pro#289 / #233). Once
 		// components are loaded the predicate is authoritative. In steady state the promise is already
-		// resolved, so this is effectively synchronous. Promise.resolve() guards a missing signal.
-		Promise.resolve(whenComponentsLoaded).then(() => subscribeToNode(message));
+		// resolved, so this is effectively synchronous.
+		whenWorkerComponentsLoaded().then(() => subscribeToNode(message));
 	});
 	onMessageByType('unsubscribe-from-node', (message) => {
 		// Defer through the same gate as subscribe-to-node so the two stay ordered: a pre-load
 		// subscribe followed by an unsubscribe must apply in that order (else the deferred subscribe
 		// would run after the unsubscribe and re-open a connection the main thread already removed).
-		Promise.resolve(whenComponentsLoaded).then(() => unsubscribeFromNode(message));
+		whenWorkerComponentsLoaded().then(() => unsubscribeFromNode(message));
 	});
 }
 
