@@ -134,6 +134,7 @@ jobs:
         env:
           HARPER_RUN_STRESS_TESTS: '1'
           HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
+          HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR: /home/runner
           # Per-test duration knobs, sourced from workflow inputs (or scheduled defaults)
           HARPER_STRESS_SOAK_MINUTES: ${{ inputs.soak-minutes || '240' }}
           HARPER_STRESS_ORPHAN_MINUTES: ${{ inputs.orphan-minutes || '60' }}
