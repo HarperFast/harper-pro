@@ -148,21 +148,17 @@ export function nodeRecordPhysicallyExists(name: string): boolean {
 }
 
 /**
- * Decide whether a change-stream event with no usable decoded value represents a genuine
- * node deletion. A nullish value is ambiguous: it can be a real `delete`, OR a `put`/`patch`
- * whose value failed to decode while the record is still physically present. Treating the
- * latter as a deletion tears down every one of a peer's replication subscriptions (the
- * "Node was deleted" storm observed in harper#1163). Only a genuine `delete` whose record is
- * actually gone from storage should be handled as a deletion.
+ * Decide whether a change-stream event that carried *no usable decoded value* represents a
+ * genuine node deletion. (Callers only reach this for a nullish value; an event with a
+ * decoded value is always an upsert.) A nullish value is ambiguous: it can be a real
+ * `delete`, OR a `put`/`patch` whose value failed to decode while the record is still
+ * physically present. Treating the latter as a deletion tears down every one of a peer's
+ * replication subscriptions (the "Node was deleted" storm observed in harper#1163). Only a
+ * genuine `delete` whose record is actually gone from storage should be handled as a deletion.
  *
  * Pure/injectable for unit testing — production passes `nodeRecordPhysicallyExists`.
  */
-export function isGenuineNodeDeletion(
-	eventType: string,
-	hasDecodedValue: boolean,
-	recordPhysicallyExists: () => boolean
-): boolean {
-	if (hasDecodedValue) return false; // a usable value is an upsert, never a deletion
+export function isGenuineNodeDeletion(eventType: string, recordPhysicallyExists: () => boolean): boolean {
 	if (eventType !== 'delete') return false; // put/patch with no value = decode failure, not a delete
 	return !recordPhysicallyExists(); // genuine delete only if the row is truly gone
 }
@@ -200,7 +196,7 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		if (event.value != null) {
 			// normal upsert with a decoded value
 			listener(event.value, event.id);
-		} else if (isGenuineNodeDeletion(event.type, false, () => nodeRecordPhysicallyExists(event.id))) {
+		} else if (isGenuineNodeDeletion(event.type, () => nodeRecordPhysicallyExists(event.id))) {
 			// genuine deletion — forward the nullish value so the listener tears the node down
 			listener(event.value, event.id);
 		} else {
