@@ -20,38 +20,28 @@ import { isGenuineNodeDeletion } from '#src/replication/knownNodes';
 const present = () => true; // record still physically in the store
 const absent = () => false; // record genuinely gone
 
+// The helper is only reached for events with no decodable value, so it takes just the
+// event type and a storage-existence probe.
 describe('isGenuineNodeDeletion', () => {
 	it('treats a real delete whose record is gone as a genuine deletion', () => {
-		expect(isGenuineNodeDeletion('delete', false, absent)).to.equal(true);
+		expect(isGenuineNodeDeletion('delete', absent)).to.equal(true);
 	});
 
 	it('does NOT treat a delete event as a deletion while the record is still present (decode failure)', () => {
 		// This is the production case: a "delete"-shaped signal for a row that is still on
 		// disk but undecodable. Tearing the peer down here is exactly the #1163 blast radius.
-		expect(isGenuineNodeDeletion('delete', false, present)).to.equal(false);
+		expect(isGenuineNodeDeletion('delete', present)).to.equal(false);
 	});
 
 	it('does NOT treat a put with no decodable value as a deletion (regardless of storage)', () => {
 		// A put always carries a value; a nullish value means it failed to decode.
-		expect(isGenuineNodeDeletion('put', false, present)).to.equal(false);
-		expect(isGenuineNodeDeletion('put', false, absent)).to.equal(false);
+		expect(isGenuineNodeDeletion('put', present)).to.equal(false);
+		expect(isGenuineNodeDeletion('put', absent)).to.equal(false);
 	});
 
 	it('does NOT treat a patch with no decodable value as a deletion', () => {
-		expect(isGenuineNodeDeletion('patch', false, present)).to.equal(false);
-		expect(isGenuineNodeDeletion('patch', false, absent)).to.equal(false);
-	});
-
-	it('never treats an event that carried a usable value as a deletion', () => {
-		// hasDecodedValue short-circuits before the storage probe is even consulted.
-		let probed = false;
-		const probe = () => {
-			probed = true;
-			return false;
-		};
-		expect(isGenuineNodeDeletion('delete', true, probe)).to.equal(false);
-		expect(isGenuineNodeDeletion('put', true, probe)).to.equal(false);
-		expect(probed).to.equal(false);
+		expect(isGenuineNodeDeletion('patch', present)).to.equal(false);
+		expect(isGenuineNodeDeletion('patch', absent)).to.equal(false);
 	});
 
 	it('only consults storage for delete events (puts/patches short-circuit)', () => {
@@ -60,10 +50,10 @@ describe('isGenuineNodeDeletion', () => {
 			calls++;
 			return false;
 		};
-		isGenuineNodeDeletion('put', false, probe);
-		isGenuineNodeDeletion('patch', false, probe);
+		isGenuineNodeDeletion('put', probe);
+		isGenuineNodeDeletion('patch', probe);
 		expect(calls).to.equal(0);
-		isGenuineNodeDeletion('delete', false, probe);
+		isGenuineNodeDeletion('delete', probe);
 		expect(calls).to.equal(1);
 	});
 });
