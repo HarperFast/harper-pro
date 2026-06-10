@@ -31,7 +31,7 @@
 import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { join } from 'node:path';
+import { resolve } from 'node:path';
 import {
 	startHarper,
 	teardownHarper,
@@ -50,7 +50,7 @@ import {
 	mb,
 } from './stressShared.mjs';
 
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
+process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = resolve(
 	import.meta.dirname ?? module.path,
 	'..',
 	'..',

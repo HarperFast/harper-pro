@@ -16,10 +16,10 @@ import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { join } from 'node:path';
+import { resolve } from 'node:path';
 import { sendOperation } from './clusterShared.mjs';
 
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
+process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = resolve(
 	import.meta.dirname ?? module.path,
 	'..',
 	'..',
