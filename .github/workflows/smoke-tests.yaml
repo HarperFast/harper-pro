@@ -83,7 +83,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build
         run: npm run build || true # known type errors are ignored here, same as integration-tests

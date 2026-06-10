@@ -25,20 +25,25 @@ export { sendOperation };
 
 /**
  * Start nodeCount nodes on isolated loopback addresses and fully connect them.
+ * Loopback addresses are allocated sequentially to avoid file-lock contention on the
+ * shared pool (concurrent acquisitions amplify retry waits and flake on shared
+ * runners). Harper processes themselves still start in parallel.
  * @returns {Promise<object[]>} the started harper contexts
  */
 export async function startCluster(nodeCount = 2, { testLMDB = false } = {}) {
+	const hostnames = [];
+	for (let i = 0; i < nodeCount; i++) {
+		hostnames.push(await getNextAvailableLoopbackAddress());
+	}
+
 	const nodes = await Promise.all(
-		Array.from({ length: nodeCount }, async () => {
-			const nodeCtx = {
-				name: 'component',
-				harper: { hostname: await getNextAvailableLoopbackAddress() },
-			};
+		hostnames.map(async (hostname) => {
+			const nodeCtx = { name: 'component', harper: { hostname } };
 			await startHarper(nodeCtx, {
 				config: {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, stdStreams: false, console: true },
-					replication: { securePort: nodeCtx.harper.hostname + ':9933' },
+					replication: { securePort: hostname + ':9933' },
 					storage: { engine: testLMDB ? 'lmdb' : 'rocksdb' },
 				},
 				env: { HARPER_NO_FLUSH_ON_EXIT: true },
