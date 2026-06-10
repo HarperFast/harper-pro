@@ -161,6 +161,29 @@ export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pau
 }
 
 /**
+ * On reconnect the follower reads its persisted copy-resume cursor (`{copyStartTime, currentTable,
+ * afterKey}` under `dbisDB[Symbol.for('copyCursor'), nodeId]`) and forwards it to the leader so the
+ * bulk copy can resume mid-stream. If the cursor on disk is malformed — specifically `currentTable`
+ * missing or nullish (harper-pro#321) — the leader's resume check falls into the warn-and-recopy
+ * branch on every reconnect: the cluster never converges, and COPY_COMPLETE never arrives to clear
+ * the cursor while the loop is active.
+ *
+ * Recovery: detect the bad cursor and remove it from disk so the next subscription request goes out
+ * as a clean full-copy request instead of forwarding the malformed value. Returns the cursor
+ * unchanged when well-formed; returns `undefined` after a side-effecting `remove` when malformed.
+ *
+ * Exported so the predicate + side effect can be exercised in isolation by
+ * `unitTests/replication/discardMalformedCopyCursor.test.mjs`; production callers go through
+ * `replicateOverWS`.
+ */
+export function discardMalformedCopyCursor(copyCursor: any, dbisDB: any, nodeId: any, warn?: () => void): any {
+	if (!copyCursor || copyCursor.currentTable) return copyCursor;
+	warn?.();
+	if (nodeId !== undefined) dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
+	return undefined;
+}
+
+/**
  * Receive-side silence watchdog. Arm with `reset()` whenever incoming activity is observed
  * (peer ping, pong, message). If `intervalMs` elapses with the underlying socket's `bytesRead`
  * unchanged, `onSilence` is invoked exactly once.
@@ -1709,14 +1732,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// currentTable must be one the loop below will actually visit (present in `tables` AND passing
 											// the same replication filter); otherwise the skip loop never reaches it and would omit every
 											// later table. Mirror the loop's own check so a dropped/unreplicated cursor table forces a restart.
-											// Optional-chain BOTH `tables` and `copyResume.currentTable`: a freshly-joined peer can hit
-											// this with `tables` itself undefined, and a malformed cursor can have `currentTable` undefined
-											// (harper-pro#321). Either case must fall into the warn-and-recopy branch, not throw — the
-											// throw bubbles to the outer .catch as a 1008 close (silent channel death).
+											// `tables` can be undefined on a freshly-joined peer, and a malformed cursor can have an
+											// undefined currentTable (#321); the `?.` makes both fall into the warn-and-recopy branch
+											// instead of throwing, which would bubble to the outer .catch and close the channel (1008).
 											if (copyResume && !tableToTableEntry(tables?.[copyResume.currentTable])) {
 												// cursor table is gone, unreplicated, or the cursor itself is malformed — the skip loop
 												// would never reach it and would omit every later table, so recopy from scratch
-												// (idempotent puts, copyStartTime preserved at L1701 from copyResume?.copyStartTime).
+												// (idempotent puts; copyStartTime is captured above, so the resume anchor survives the reset).
 												logger.warn?.(
 													'Copy-resume table missing or unreplicated, restarting full copy',
 													copyResume.currentTable
@@ -1852,7 +1874,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										const key: number = auditRecord.localTime ?? auditRecord.version;
 										if (closed) return;
 										logger.debug?.('sending audit record', key, auditRecord.recordId);
-										if (tables.test)
+										if (tables?.test)
 											logger.debug?.(
 												'audit record version',
 												auditRecord.version,
@@ -2424,24 +2446,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
 			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
 			// data predates copyStartTime and would never be delivered by an audit-log resume).
-			let copyCursor =
+			const copyCursor = discardMalformedCopyCursor(
 				nodeId === undefined
 					? undefined
-					: tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('copyCursor'), nodeId]);
-			// Recovery for harper-pro#321: a malformed cursor on disk (currentTable missing/nullish) would
-			// be sent verbatim to the leader, which falls into the warn-and-recopy branch every reconnect.
-			// Drop it so we request a clean full copy instead — wedged clusters recover on next connect
-			// without waiting for a COPY_COMPLETE that may never arrive while the loop is active.
-			if (copyCursor && !copyCursor.currentTable) {
-				logger.warn?.(
-					'Discarding malformed copy-resume cursor (no currentTable) for',
-					node.name,
-					databaseName
-				);
-				if (nodeId !== undefined)
-					tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), nodeId]);
-				copyCursor = undefined;
-			}
+					: tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('copyCursor'), nodeId]),
+				tableSubscriptionToReplicator?.dbisDB,
+				nodeId,
+				() =>
+					logger.warn?.(
+						'Discarding malformed copy-resume cursor (no currentTable) for',
+						node.name,
+						databaseName
+					)
+			);
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
 				sequenceEntry?.seqId ?? 1,
