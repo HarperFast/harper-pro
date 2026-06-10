@@ -29,11 +29,7 @@ import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
-import {
-	startHarper,
-	teardownHarper,
-	getNextAvailableLoopbackAddress,
-} from '@harperfast/integration-testing';
+import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import {
 	stressEnabled,
 	sendOperation,
@@ -64,27 +60,13 @@ if (!stressEnabled()) {
 	const BATCH_SIZE = 20;
 	const CONCURRENCY = 8;
 	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_RSS_CAP_MB ?? 3072);
-	const CLONE_BUDGET_SECS = Number(
-		process.env.HARPER_STRESS_LARGE_CLONE_BUDGET_SECS ?? Math.max(600, TARGET_GB * 180)
-	);
+	const CLONE_BUDGET_SECS = Number(process.env.HARPER_STRESS_LARGE_CLONE_BUDGET_SECS ?? Math.max(600, TARGET_GB * 180));
 	const WRITE_BUDGET_SECS = TARGET_GB * 300 + 600;
 	const SUITE_TIMEOUT_MS = (WRITE_BUDGET_SECS + CLONE_BUDGET_SECS + 600) * 1000;
 	const TOTAL_RECORDS = Math.ceil((TARGET_GB * 1024 * 1024 * 1024) / PAYLOAD_SIZE);
 	const BATCH_COUNT = Math.ceil(TOTAL_RECORDS / BATCH_SIZE);
 
 	const PAYLOAD = 'x'.repeat(PAYLOAD_SIZE);
-
-	async function waitForAvailableStatus(node, timeoutMs) {
-		const deadline = Date.now() + timeoutMs;
-		while (Date.now() < deadline) {
-			await delay(2_000);
-			try {
-				const resp = await sendOperation(node, { operation: 'get_status', id: 'availability' });
-				if (resp?.status === 'Available') return true;
-			} catch {}
-		}
-		throw new Error(`Node did not become Available within ${timeoutMs}ms`);
-	}
 
 	suite(`Large clone — ${TARGET_GB} GB`, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		before(async () => {
@@ -193,8 +175,9 @@ if (!stressEnabled()) {
 						available = true;
 						break;
 					}
-					const count = (await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large' }))
-						?.record_count ?? -1;
+					const count =
+						(await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large' }))?.record_count ??
+						-1;
 					const remaining = Math.ceil((deadline - Date.now()) / 1000);
 					console.log(
 						`[large-clone] clone progress: count=${count}/${ctx.leaderRecordCount} status=${resp?.status ?? 'unknown'} (${remaining}s remaining)`
