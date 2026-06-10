@@ -11,6 +11,7 @@ import { ClientError } from '../core/utility/errors/hdbError.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
+import { isLeaderDesignated } from './leaderDesignation.ts';
 
 let hdbNodeTable;
 server.nodes = [];
@@ -138,9 +139,12 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		else {
 			console.error('Invalid node update event', event);
 		}
-	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
-		// add_node { isLeader: true } reaches us as a patch event; read the merged
-		// record from LMDB so server.nodes reflects the full record (including isLeader).
+	} else if (event.type === 'patch' && node_name !== getThisNodeName() && isLeaderDesignated(node_name)) {
+		// A node-local add_node { isLeader: true } reaches us as a patch event (ensureNode always
+		// patches). The leader designation is recorded node-locally (leaderDesignation.ts), NOT on
+		// the record, so this only fires on the node that issued add_node { isLeader } — never from
+		// a peer's replicated record (harper-pro#246). Read the merged record so server.nodes
+		// reflects the full record and the bridge schedules its full-copy bootstrap.
 		const fullRecord = getHDBNodeTable().primaryStore.get(node_name);
 		if (fullRecord) server.nodes.push(fullRecord);
 	}
@@ -158,8 +162,10 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 	server.shards = shards;
 	if (event.type === 'put' || event.type === 'delete') {
 		listener(event.value, event.id);
-	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
-		// isLeader patches need to drive subscription bootstrap; pass the merged record.
+	} else if (event.type === 'patch' && isLeaderDesignated(event.id)) {
+		// A node-local leader designation needs to drive the bridge's full-copy bootstrap; pass the
+		// merged record. Only fires on the node that locally issued add_node { isLeader } — a peer's
+		// replicated record no longer carries isLeader, so this never fires from mesh replication.
 		const fullRecord = getHDBNodeTable().primaryStore.get(event.id);
 		if (fullRecord) listener(fullRecord, event.id);
 	}
@@ -195,8 +201,10 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 	// When this peer is our leader, the database may not exist locally yet — that's the
 	// whole point of the full-table copy bootstrap. Skip the local-presence precondition
 	// so the subscription can be scheduled and the leader can push records (and schema)
-	// to create the database on this node.
-	const hasLocalDatabase = !!databases[databaseName] || !!node.isLeader;
+	// to create the database on this node. The leader designation is NODE-LOCAL (never the
+	// replicated record) so only the node that issued add_node { isLeader } bypasses the
+	// precondition; every other mesh node still requires the local database (harper-pro#246).
+	const hasLocalDatabase = !!databases[databaseName] || isLeaderDesignated(node.name);
 	return (
 		((typeof node.replicates === 'object'
 			? node.replicates?.sends ||

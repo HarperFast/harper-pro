@@ -7,6 +7,7 @@ import { get } from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import { getHDBNodeTable } from './knownNodes.ts';
+import { setLeaderDesignation } from './leaderDesignation.ts';
 import { sendOperationToNode, urlToNodeName } from './replicator.ts';
 import { getThisNodeName, hostnameToUrl, getThisNodeUrl } from '../core/server/nodeName.ts';
 import * as hdbLogger from '../core/utility/logging/harper_logger.js';
@@ -190,10 +191,12 @@ export async function setNode(req: any) {
 	if (req.revoked_certificates) nodeRecord.revoked_certificates = req.revoked_certificates;
 	if (targetNodeResponse?.shard !== undefined) nodeRecord.shard = targetNodeResponse.shard;
 	else if (req.shard !== undefined) nodeRecord.shard = req.shard;
-	// isLeader is LOCAL-ONLY: it means "this peer is my leader; request a full-table copy from it".
-	// It must NOT be forwarded to the peer via targetAddNodeObj — doing so would cause the peer
-	// to treat this node as its leader and attempt to full-copy in the wrong direction.
-	if (req.isLeader !== undefined) nodeRecord.isLeader = req.isLeader;
+	// isLeader is NODE-LOCAL: it means "this peer is MY leader; I should request a full-table copy
+	// from it". It must NOT be persisted onto nodeRecord — that record replicates to the rest of the
+	// mesh, and every other v5 node would then adopt this peer as its own leader and open a direct
+	// full-copy subscription, which fails cert validation in a reconnect loop (harper-pro#246).
+	// Record the designation node-locally instead (see leaderDesignation.ts). The leader-honoring
+	// sites (subscriptionManager, knownNodes) consult that node-local flag, never the record.
 
 	if (nodeRecord.replicates) {
 		const thisNode: any = {
@@ -208,10 +211,11 @@ export async function setNode(req: any) {
 		if (req.start_time) thisNode.start_time = req.start_time;
 		await ensureNode(getThisNodeName(), thisNode);
 	}
-	await ensureNode(
-		targetNodeResponse ? targetNodeResponse.nodeName : (nodeRecord.name ?? urlToNodeName(url)),
-		nodeRecord
-	);
+	const targetNodeName = targetNodeResponse ? targetNodeResponse.nodeName : (nodeRecord.name ?? urlToNodeName(url));
+	// Apply the node-local leader designation BEFORE writing the record, so the main-thread
+	// subscription manager sees the flag when it processes the resulting hdb_nodes event.
+	if (req.isLeader !== undefined) setLeaderDesignation(targetNodeName, req.isLeader);
+	await ensureNode(targetNodeName, nodeRecord);
 	let message: string;
 	if (req.operation === 'update_node') {
 		message = `Successfully updated '${url}'`;

@@ -17,6 +17,7 @@ import {
 	type Route,
 	getNodeURL,
 } from './knownNodes.ts';
+import { isLeaderDesignated } from './leaderDesignation.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import lodash from 'lodash';
 const { cloneDeep } = lodash;
@@ -301,8 +302,9 @@ export async function startOnMainThread(options) {
 		// When this peer is our leader, bootstrap subscriptions for configured databases
 		// that don't exist locally yet — they need a full-table copy from the leader.
 		// forEachReplicatedDatabase above only iterates local databases, so an empty node
-		// joining a populated leader would never schedule the catchup without this.
-		if (node.isLeader && Array.isArray(options?.databases)) {
+		// joining a populated leader would never schedule the catchup without this. The
+		// leader designation is NODE-LOCAL (never the replicated record) per harper-pro#246.
+		if (isLeaderDesignated(node.name) && Array.isArray(options?.databases)) {
 			for (const dbConfig of options.databases) {
 				const databaseName = typeof dbConfig === 'string' ? dbConfig : dbConfig?.name;
 				if (databaseName && !databases[databaseName]) {
@@ -413,13 +415,17 @@ export async function startOnMainThread(options) {
 						)[0]; // try to find the first node
 				const nodeName = nodes[0].name ?? (nodes[0].url && new URL(nodes[0].url).hostname);
 				logger.warn(`Setting up subscription with leader ${leaderName} for node ${nodeName}`);
-				// isLeader is true only if:
-				//   1. it was explicitly persisted (e.g. by add_node { isLeader: true }), OR
+				// isLeader is true only if THIS node locally designates the peer as leader. The
+				// designation is NODE-LOCAL and must never come from the peer's replicated hdb_nodes
+				// record (harper-pro#246) — a node that merely received the record via mesh
+				// replication must NOT adopt the peer as its leader. Sources, in order:
+				//   1. a node-local add_node { isLeader: true } designation (leaderDesignation.ts), OR
 				//   2. there is no leader candidate at all, OR
 				//   3. an explicitly configured leader (env/cli/routes) matches this node.
 				// We deliberately do NOT honour nodeName === leaderName when leaderName came
 				// from the "first other node in hdb_nodes" fallback — that's just a guess.
-				nodes[0].isLeader = nodes[0].isLeader || !leaderName || (hasExplicitLeader && nodeName === leaderName);
+				nodes[0].isLeader =
+					isLeaderDesignated(nodeName) || !leaderName || (hasExplicitLeader && nodeName === leaderName);
 				nodes[0].url ??= getNodeURL(nodes[0]);
 				setTimeout(() => {
 					const request = {
