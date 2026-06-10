@@ -19,10 +19,10 @@ import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { join } from 'node:path';
+import { resolve } from 'node:path';
 import { sendOperation } from './clusterShared.mjs';
 
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
+process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = resolve(
 	import.meta.dirname ?? module.path,
 	'..',
 	'..',
@@ -119,6 +119,7 @@ suite('Non-replicated database', { timeout: 180000 }, (ctx) => {
 			);
 			const allConnected = responses.every(
 				(response) =>
+					Array.isArray(response?.connections) &&
 					response.connections.length >= 1 &&
 					response.connections.every((conn) =>
 						conn.database_sockets?.some((s) => s.connected && s.database === SHARED_DB)
