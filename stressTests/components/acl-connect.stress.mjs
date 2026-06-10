@@ -31,8 +31,16 @@ suite(`stress: ${NAME}`, { timeout: 1_800_000 }, () => {
 		const dir = componentDir(NAME);
 		prepareComponent(dir);
 		nodes = await startCluster(2);
-		await deployComponent(nodes, dir, COMPONENTS[NAME].project, { settleMs: 15000 });
-		await waitForMqtts(nodes[0].hostname, MQTTS_PORT);
+		// Tear the cluster down on setup failure: node:test does not guarantee after() runs
+		// if before() throws, which would orphan the in-process Harper processes.
+		try {
+			await deployComponent(nodes, dir, COMPONENTS[NAME].project, { settleMs: 15000 });
+			await waitForMqtts(nodes[0].hostname, MQTTS_PORT);
+		} catch (e) {
+			await teardownCluster(nodes);
+			nodes = [];
+			throw e;
+		}
 	});
 
 	after(async () => {

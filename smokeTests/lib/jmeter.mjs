@@ -16,18 +16,50 @@ export function hasJMeter() {
 	}
 }
 
-/** Parse a JTL (CSV) and return { total, failed } based on the success column. */
+/**
+ * Parse one JTL/CSV line, honoring double-quoted fields. JMeter quotes values containing commas
+ * (e.g. failureMessage, url), so a naive split would shift the success column. Embedded `""`
+ * escapes within quoted fields are uncommon in xmeter output and are not handled here.
+ */
+function parseCsvLine(line) {
+	const cols = [];
+	let cur = '';
+	let inQuotes = false;
+	for (let i = 0; i < line.length; i++) {
+		const c = line[i];
+		if (c === '"') inQuotes = !inQuotes;
+		else if (c === ',' && !inQuotes) {
+			cols.push(cur);
+			cur = '';
+		} else cur += c;
+	}
+	cols.push(cur);
+	return cols;
+}
+
+/**
+ * Parse a JTL (CSV) and return { total, failed } based on the success column. Throws if the
+ * header is missing the success column (a misconfigured saveConfig would otherwise silently pass).
+ * Skips empty lines and rows too short to address the column.
+ */
 function summarizeJtl(jtlPath) {
 	const lines = readFileSync(jtlPath, 'utf8').trim().split(/\r?\n/);
 	if (lines.length <= 1) return { total: 0, failed: 0 };
-	const header = lines[0].split(',');
+	const header = parseCsvLine(lines[0]);
 	const successIdx = header.indexOf('success');
+	if (successIdx === -1) {
+		throw new Error(`JTL header missing "success" column at ${jtlPath}. Check JMeter saveConfig.`);
+	}
+	let total = 0;
 	let failed = 0;
 	for (const line of lines.slice(1)) {
-		const cols = line.split(',');
-		if (successIdx >= 0 && cols[successIdx] !== 'true') failed++;
+		if (!line.trim()) continue;
+		const cols = parseCsvLine(line);
+		if (cols.length <= successIdx) continue;
+		total++;
+		if (cols[successIdx] !== 'true') failed++;
 	}
-	return { total: lines.length - 1, failed };
+	return { total, failed };
 }
 
 /**

@@ -23,9 +23,17 @@ suite(`smoke: ${NAME}`, { timeout: 600_000 }, () => {
 		const dir = componentDir(NAME);
 		prepareComponent(dir);
 		nodes = await startCluster(2);
-		// Extra settle time for MQTT listeners to bind after the deploy restart.
-		await deployComponent(nodes, dir, COMPONENTS[NAME].project, { settleMs: 15000 });
-		await waitForMqtts(nodes[0].hostname, MQTTS_PORT);
+		// Tear the cluster down on setup failure: node:test does not guarantee after() runs
+		// if before() throws, which would orphan the in-process Harper processes.
+		try {
+			// Extra settle time for MQTT listeners to bind after the deploy restart.
+			await deployComponent(nodes, dir, COMPONENTS[NAME].project, { settleMs: 15000 });
+			await waitForMqtts(nodes[0].hostname, MQTTS_PORT);
+		} catch (e) {
+			await teardownCluster(nodes);
+			nodes = [];
+			throw e;
+		}
 	});
 
 	after(async () => {
