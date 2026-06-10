@@ -40,7 +40,7 @@ import {
 	getNodeURL,
 } from './knownNodes.ts';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import { getThisNodeName } from '../core/server/nodeName.ts';
+import { whenComponentsLoaded } from '../core/server/threads/threadServer.js';
 import { exportIdMapping, getIdOfRemoteNode } from '../core/resources/nodeIdMapping.ts';
 import * as tls from 'node:tls';
 import { ServerError } from '../core/utility/errors/hdbError.js';
@@ -60,6 +60,15 @@ import '../security/sshKeyOperations.ts';
 // disconnect. Raise the limit so we don't spam MaxListenersExceededWarning under normal multi-peer load while
 // still leaving headroom small enough that a real listener leak would eventually trip the warning.
 databaseEventsEmitter.setMaxListeners(1000);
+
+// Monotonic startup flag: false until this worker finishes loadRootComponents (databases/tables and
+// the persisted hdb_nodes rows that shouldReplicateFromNode consults). Used to tell a startup-race
+// empty subscription (state not loaded yet → trust the main thread) from a genuine one (state loaded,
+// node really not desired → respect the re-check). See harper-pro#289 / #233.
+let componentsLoaded = false;
+whenComponentsLoaded?.then(() => {
+	componentsLoaded = true;
+});
 
 let replicationDisabled;
 let nextId = 1; // for request ids
@@ -563,25 +572,6 @@ export function selectSubscriptionNodes(
 }
 
 /**
- * Whether this worker has loaded enough local state to trust its own shouldReplicateFromNode re-check
- * for `databaseName`: the target database must be registered locally (or this is an isLeader bootstrap
- * of a not-yet-existent database), and this node's own hdb_nodes record must be present (the record
- * whose `replicates` flag the predicate consults, plus the system table backing it). If either is still
- * loading at startup, a false re-check is a race rather than a real "don't replicate". The own-record
- * check distinguishes "not loaded" (record absent → not ready) from "deliberately disabled"
- * (record present with replicates:false → ready, so the predicate is respected).
- */
-function isLocalSubscriptionStateReady(databaseName: string, nodes: any[]): boolean {
-	try {
-		const databaseReady = !!databases?.[databaseName] || nodes?.some?.((node) => node?.isLeader);
-		const ownRecordReady = !!getHDBNodeTable()?.primaryStore?.get(getThisNodeName());
-		return Boolean(databaseReady && ownRecordReady);
-	} catch {
-		return false; // can't determine state → treat as not ready → defer to the main thread's decision
-	}
-}
-
-/**
  * Subscribe to a node for a database, getting the necessary connection and subscription and signaling the start of the subscription
  * @param request
  */
@@ -623,7 +613,7 @@ export function subscribeToNode(request: any) {
 			selectSubscriptionNodes(
 				request.nodes,
 				(node) => shouldReplicateFromNode(node, request.database),
-				isLocalSubscriptionStateReady(request.database, request.nodes)
+				componentsLoaded
 			),
 			request.replicateByDefault
 		);
