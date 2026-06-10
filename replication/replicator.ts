@@ -447,6 +447,16 @@ export function setReplicator(dbName: string, table: any, options: any) {
 }
 const connections = new Map<string, Map<string, NodeReplicationConnection>>();
 
+// A connection that was intentionally torn down — the empty-subscription delayed close marks it
+// intentionallyUnsubscribed/isFinished — must not be handed back out of the cache. connect()
+// early-returns forever on intentionallyUnsubscribed, so a peer whose subscription set transiently
+// emptied (e.g. during a peer restart) and was then restored would otherwise stay permanently dead
+// on a connected:false connection that never retries. Callers drop a non-reusable cached connection
+// and create a fresh one through the normal connect path. See harper-pro#233 / #289.
+export function isReusableConnection(connection?: NodeReplicationConnection): boolean {
+	return !!connection && !connection.isFinished && !connection.intentionallyUnsubscribed;
+}
+
 /**
  * Get or create a connection to the specified node
  * @param url
@@ -468,7 +478,7 @@ function getSubscriptionConnection(
 		connections.set(connectionKey, dbConnections);
 	}
 	let connection = dbConnections.get(dbName);
-	if (connection) return connection;
+	if (isReusableConnection(connection)) return connection;
 	if (subscription) {
 		dbConnections.set(
 			dbName,
@@ -490,7 +500,7 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 		nodeNameToRetrievalConnections.set(nodeName, dbConnections);
 	}
 	let connection = dbConnections.get(dbName);
-	if (connection) return connection;
+	if (isReusableConnection(connection)) return connection;
 	const node = getHDBNodeTable().primaryStore.get(nodeName);
 	if (node?.url) {
 		connection = new NodeReplicationConnection(getNodeURL(node), subscription, dbName, nodeName, node.authorization);

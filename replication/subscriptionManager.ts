@@ -31,6 +31,9 @@ type ConnectedWorkerStatus = {
 	worker: Worker | null;
 	connected?: boolean;
 	latency?: number;
+	// Timestamp (ms) of the most recent transition to connected:false, used by the reconcile to
+	// distinguish a connection that is briefly retrying from one that is wedged. Cleared on connect.
+	disconnectedAt?: number;
 };
 type ReplicationConnectionStatus = {
 	nodes: ({
@@ -52,8 +55,79 @@ const NODE_SUBSCRIBE_DELAY = 200; // delay before sending node subscribe to othe
 // caused the OOM in the first place. We stagger the re-subscriptions in time so the new
 // worker(s) absorb them gradually.
 const WORKER_EXIT_REASSIGN_STAGGER_MS = 100;
+// Cadence of the per-process safety-net reconcile that rebinds subscriptions whose
+// worker no longer exists. Pure read-side filter against `workers` and
+// `connectionReplicationMap` on each tick when nothing is wrong, so a short interval
+// is cheap. Sized for the deploy-time rapid-restart-storm pattern (stacked
+// `restart_http_workers` at ~1.5s spacing under live write traffic), where the per-
+// worker exit chain races against shutdown and silently drops half the subscription
+// assignments — this is the user-visible recovery latency for the resulting drift.
+const RECONCILE_INTERVAL_MS = 5_000;
+// A connection that is connected:false but still actively retrying reconnects within seconds (the
+// retry backoff starts at 500ms). Only re-drive a connection that has stayed disconnected well
+// beyond that, so the reconcile targets genuinely wedged connections (e.g. an intentionally-closed
+// connection with no pending retry) rather than churning connections that are mid-reconnect.
+const WEDGE_RECONCILE_THRESHOLD_MS = 30_000;
 let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
+// Returns the set of node URLs whose replication entries either point at a worker no longer
+// in the supplied http pool, OR have no worker assigned at all while live workers exist.
+// The second case covers "all workers were down at registration time" — onDatabase stores
+// `worker: undefined` when httpWorkers is empty, and without this the entry would never
+// get reassigned once workers came back. Pure helper so the reconcile pass below — and its
+// unit tests — can verify the broken-chain detection without spinning up real workers.
+export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatusMap>, httpWorkers: any[]): Set<string> {
+	const staleNodeUrls = new Set<string>();
+	// No live workers to reassign to — flagging here would cause endless no-op reassignments.
+	if (httpWorkers.length === 0) return staleNodeUrls;
+	for (const [url, dbReplicationWorkers] of connectionMap) {
+		for (const entry of dbReplicationWorkers.values()) {
+			if (!entry.worker || !httpWorkers.includes(entry.worker)) {
+				staleNodeUrls.add(url);
+				break;
+			}
+		}
+	}
+	return staleNodeUrls;
+}
+// Returns the set of node URLs that have a desired replication subscription but have been
+// connected:false on a *live* worker for longer than `thresholdMs`. This is the recovery path for a
+// connection that wedged without a pending retry — most notably the empty-subscription delayed close
+// (intentionallyUnsubscribed) firing during a peer restart and then never re-establishing even though
+// the peer is reachable and still subscribed. findStaleNodeUrls does not catch this because the
+// worker is alive. Re-driving these through onNodeUpdate creates a fresh connection (the prior one is
+// no longer reusable — see replicator.isReusableConnection). A threshold well above the normal
+// reconnect backoff keeps this from firing on connections that are merely mid-retry.
+// `isDesired` must be the same predicate onDatabase uses to decide shouldSubscribe
+// (shouldReplicateFromNode), so a connection intentionally unsubscribed because this node should NOT
+// subscribe (replication off, or a sendsTo/subscription targeting another database) is not flagged
+// and re-driven forever. See harper-pro#233 / #289.
+export function findWedgedNodeUrls(
+	connectionMap: Map<string, DBReplicationStatusMap>,
+	httpWorkers: any[],
+	now: number,
+	thresholdMs: number,
+	isDesired: (node: any, database: string) => boolean
+): Set<string> {
+	const wedgedNodeUrls = new Set<string>();
+	if (httpWorkers.length === 0) return wedgedNodeUrls;
+	for (const [url, dbReplicationWorkers] of connectionMap) {
+		for (const [database, entry] of dbReplicationWorkers) {
+			if (
+				entry.connected === false &&
+				entry.worker &&
+				httpWorkers.includes(entry.worker) &&
+				entry.disconnectedAt != null &&
+				now - entry.disconnectedAt >= thresholdMs &&
+				isDesired(entry.nodes?.[0], database)
+			) {
+				wedgedNodeUrls.add(url);
+				break;
+			}
+		}
+	}
+	return wedgedNodeUrls;
+}
 export let disconnectedFromNode; // this is set by thread to handle when a node is disconnected (or notify main thread so it can handle)
 export let connectedToNode; // this is set by thread to handle when a node is connected (or notify main thread so it can handle)
 const nodeMap = new Map(); // this is a map of all nodes that are available to connect to
@@ -126,7 +200,7 @@ export async function startOnMainThread(options) {
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
 	 */
-	function onNodeUpdate(node, hostname = node?.name) {
+	function onNodeUpdate(node, hostname = node?.name, forceResubscribe = false) {
 		const isSelf =
 			(getThisNodeName() && hostname === getThisNodeName()) || (getThisNodeUrl() && node?.url === getThisNodeUrl());
 		if (isSelf) {
@@ -194,9 +268,9 @@ export async function startOnMainThread(options) {
 		}
 		dbReplicationWorkers.iterator = forEachReplicatedDatabase(options, (database, databaseName, replicateByDefault) => {
 			if (replicateByDefault) {
-				onDatabase(databaseName, true);
+				onDatabase(databaseName, true, forceResubscribe);
 			} else {
-				onDatabase(databaseName, false);
+				onDatabase(databaseName, false, forceResubscribe);
 			}
 		});
 		// check to see if there are any explicit subscriptions to databases that don't exist yet
@@ -207,12 +281,12 @@ export async function startOnMainThread(options) {
 				const databaseName = sub.database || sub.schema;
 				if (!databases[databaseName]) {
 					logger.warn(`Database ${databaseName} not found for node ${node.name}, making a subscription anyway`);
-					onDatabase(databaseName, false);
+					onDatabase(databaseName, false, forceResubscribe);
 				}
 			}
 		}
 
-		function onDatabase(databaseName, tablesReplicateByDefault) {
+		function onDatabase(databaseName, tablesReplicateByDefault, forceResubscribe = false) {
 			logger.trace('Setting up replication for database', databaseName, 'on node', node.name);
 			const existingEntry = dbReplicationWorkers.get(databaseName);
 			let worker;
@@ -236,8 +310,13 @@ export async function startOnMainThread(options) {
 			if (existingEntry) {
 				worker = existingEntry.worker;
 				existingEntry.nodes = nodes;
-				if (shouldSubscribe) {
-					// already subscribed, don't need to do anything
+				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
+				// forceResubscribe for a connection that has been connected:false past the threshold: that
+				// falls through to re-post subscribe-to-node on the same worker (the worker then reuses a
+				// still-retrying connection or builds a fresh one — replicator.isReusableConnection). We
+				// deliberately do NOT re-subscribe every connected:false entry on an ordinary onNodeUpdate —
+				// doing so disrupts in-flight replication (e.g. an active legacy-node base copy).
+				if (shouldSubscribe && !(forceResubscribe && existingEntry.connected === false)) {
 					return;
 				}
 			} else if (shouldSubscribe) {
@@ -345,6 +424,9 @@ export async function startOnMainThread(options) {
 				logger.warn('Disconnected node not found in replication map', connection.database, dbReplicationWorkers);
 				return;
 			}
+			// Record the first transition to disconnected so the reconcile can tell a wedged connection
+			// from one that is briefly mid-retry; don't reset it on repeated disconnect notifications.
+			if (existingWorkerEntry.connected !== false) existingWorkerEntry.disconnectedAt = Date.now();
 			existingWorkerEntry.connected = false;
 			if (connection.finished) {
 				return;
@@ -413,6 +495,7 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		mainWorkerEntry.connected = true;
+		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
 		const restoredNode = mainWorkerEntry.nodes[0];
 		if (!restoredNode) {
@@ -478,6 +561,59 @@ export async function startOnMainThread(options) {
 			});
 		} else subscribeToNode({ url: getNodeURL(connectingNode), name: connectingNode.name, database, nodes: [node] });
 	}
+	// Periodic safety net for stale subscription entries. The existing per-database
+	// worker.on('exit') chain reassigns to a healthy worker after a worker dies, but a
+	// single broken link in that chain (identity check failing, setTimeout retry being
+	// lost under load, shouldSubscribe early-return pinning to a dead worker before
+	// the defensive check was added) used to leave the entry permanently pointing at
+	// an exited worker, silently breaking outbound replication for the lifetime of the
+	// process. This reconciles independently of the chain so the broken-state node
+	// can never get stuck.
+	function reconcileWorkers() {
+		const httpWorkers = workers.filter((worker) => worker.name === 'http');
+		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
+		const wedgedNodeUrls = findWedgedNodeUrls(
+			connectionReplicationMap,
+			httpWorkers,
+			Date.now(),
+			WEDGE_RECONCILE_THRESHOLD_MS,
+			shouldReplicateFromNode
+		);
+		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0) return;
+		if (staleNodeUrls.size > 0)
+			logger.warn(
+				'Reconciling replication subscriptions for nodes pointing at exited workers:',
+				Array.from(staleNodeUrls)
+			);
+		if (wedgedNodeUrls.size > 0)
+			logger.warn(
+				'Reconciling replication subscriptions for nodes wedged disconnected on a live worker:',
+				Array.from(wedgedNodeUrls)
+			);
+		for (const node of nodeMap.values()) {
+			const url = getNodeURL(node);
+			const isWedged = wedgedNodeUrls.has(url);
+			if (!staleNodeUrls.has(url) && !isWedged) continue;
+			if (isWedged) {
+				// Restart the disconnect clock before re-driving so a peer that is still unreachable after
+				// the re-subscribe (it stays connected:false, which does not re-stamp disconnectedAt) is
+				// retried at most once per threshold window rather than on every reconcile tick.
+				// onNodeUpdate -> onDatabase then re-posts subscribe-to-node for the connected:false entry
+				// (it no longer early-returns), reusing the existing worker — so no entry/listener churn.
+				const entries = connectionReplicationMap.get(url);
+				if (entries)
+					for (const entry of entries.values()) if (entry.connected === false) entry.disconnectedAt = Date.now();
+			}
+			try {
+				// forceResubscribe only for wedged entries, so a normal stale-worker reconcile keeps its
+				// original behavior and ordinary onNodeUpdate calls never re-subscribe live subscriptions.
+				onNodeUpdate(node, undefined, isWedged);
+			} catch (error) {
+				logger.error('Error reconciling node', node?.name, error);
+			}
+		}
+	}
+	setInterval(reconcileWorkers, RECONCILE_INTERVAL_MS).unref();
 	onMessageByType('disconnected-from-node', disconnectedFromNode);
 	onMessageByType('connected-to-node', connectedToNode);
 	onMessageByType('request-cluster-status', requestClusterStatus);
