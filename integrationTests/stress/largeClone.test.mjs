@@ -116,6 +116,8 @@ if (!stressEnabled()) {
 			const writeStart = Date.now();
 			let batchIndex = 0;
 
+			const writeDeadline = writeStart + WRITE_BUDGET_SECS * 1000;
+
 			const pool = concurrent(async () => {
 				const bi = batchIndex++;
 				const start = bi * BATCH_SIZE;
@@ -128,7 +130,7 @@ if (!stressEnabled()) {
 				await sendOperation(ctx.leader, { operation: 'upsert', table: 'large', records });
 			}, CONCURRENCY);
 
-			for (let b = 0; b < BATCH_COUNT; b++) {
+			for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
 				await pool.execute();
 				if (b % 200 === 0) {
 					const pct = Math.round((b / BATCH_COUNT) * 100);
@@ -139,9 +141,9 @@ if (!stressEnabled()) {
 			await pool.finish();
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
-			const writeMBps = (TARGET_GB * 1024) / writeSecs;
 			const leaderCount = (await sendOperation(ctx.leader, { operation: 'describe_table', table: 'large' }))
 				?.record_count;
+			const writeMBps = (leaderCount * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
 			console.log(
 				`[large-clone] write done: ${leaderCount} records in ${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 			);
