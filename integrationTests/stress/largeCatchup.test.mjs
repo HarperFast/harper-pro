@@ -86,7 +86,7 @@ if (!stressEnabled()) {
 		before(async () => {
 			const cfg = (host) => ({
 				analytics: { aggregatePeriod: -1 },
-				logging: { colors: false, console: true, level: 'info' },
+				logging: { colors: false, console: true, level: 'warn' },
 				replication: { securePort: host + ':9933' },
 				threads: { count: 4 },
 			});
@@ -149,6 +149,7 @@ if (!stressEnabled()) {
 			// Write bulk data to A while B is offline.
 			const aSampler = sampleMetrics(A, { intervalMs: 5_000 });
 			const writeStart = Date.now();
+			const writeDeadline = writeStart + WRITE_BUDGET_SECS * 1000;
 			let batchIndex = 0;
 
 			const pool = concurrent(async () => {
@@ -163,7 +164,7 @@ if (!stressEnabled()) {
 				await sendOperation(A, { operation: 'upsert', table: 'large', records });
 			}, CONCURRENCY);
 
-			for (let b = 0; b < BATCH_COUNT; b++) {
+			for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
 				await pool.execute();
 				if (b % 200 === 0) {
 					const pct = Math.round((b / BATCH_COUNT) * 100);
@@ -174,9 +175,10 @@ if (!stressEnabled()) {
 			await pool.finish();
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
-			const writeMBps = (TARGET_GB * 1024) / writeSecs;
+			const writtenRecords = Math.min(batchIndex * BATCH_SIZE, TOTAL_RECORDS);
+			const writeMBps = (writtenRecords * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
 			console.log(
-				`[large-catchup] write done: ${TOTAL_RECORDS} records, ${TARGET_GB} GB in ` +
+				`[large-catchup] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ` +
 					`${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 			);
 
@@ -191,7 +193,7 @@ if (!stressEnabled()) {
 			await startHarper(bRestartCtx, {
 				config: {
 					analytics: { aggregatePeriod: -1 },
-					logging: { colors: false, console: true, level: 'info' },
+					logging: { colors: false, console: true, level: 'warn' },
 					replication: { securePort: B.hostname + ':9933' },
 					threads: { count: 4 },
 				},

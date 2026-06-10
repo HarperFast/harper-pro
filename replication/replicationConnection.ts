@@ -2124,12 +2124,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// Persist/clear the resume cursor only AFTER this batch's blobs are durable too. The cursor
 					// means "fully copied through this key"; advancing it before blob writes finish would let a
 					// crash skip re-requesting an unfinished blob, leaving the record pointing at missing data.
-					if (isCopyFrame && event && copyFromNodeId !== undefined) {
+					if (isCopyFrame && event?.table && copyFromNodeId !== undefined) {
 						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], {
 							copyStartTime: copyModeStartTime,
 							currentTable: event.table,
 							afterKey: event.id,
 						});
+					} else if (isCopyFrame && event && !event.table && copyFromNodeId !== undefined) {
+						logger.warn?.(connectionId, 'copy cursor not advanced: event has no table name', databaseName);
 					}
 					// once the last copied batch (incl. its blobs) is durable, it's safe to drop the cursor
 					maybeFinishCopy();
