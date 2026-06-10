@@ -74,6 +74,20 @@ export function getReplicationSharedStatus(
 		)
 	);
 }
+/**
+ * Decide whether a change-stream event that carried *no usable decoded value* represents a
+ * genuine node deletion. (Callers only reach this for a nullish value; an event with a
+ * decoded value is always an upsert.) The ambiguity is only for `put`/`patch` events, where
+ * a decode failure can produce a null value while the record still physically exists.
+ * A `delete` event from the change stream is already the reliable signal that the record is
+ * truly gone — the physical-existence check was overly conservative and caused genuine
+ * `remove_node` deletes to be suppressed because LMDB/RocksDB reads open against an older
+ * snapshot that predates the delete commit (harper#1163 regression).
+ */
+export function isGenuineNodeDeletion(eventType: string): boolean {
+	return eventType === 'delete'; // put/patch with null value = decode failure; delete events are genuine
+}
+
 export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {
 	getHDBNodeTable()
 		.subscribe({})
@@ -103,7 +117,23 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 				}
 				server.shards = shards;
 				if (event.type === 'put' || event.type === 'delete') {
-					listener(event.value, event.id);
+					if (event.value != null) {
+						// normal upsert with a decoded value
+						listener(event.value, event.id);
+					} else if (isGenuineNodeDeletion(event.type)) {
+						// genuine deletion — forward the nullish value so the listener tears the node down
+						listener(event.value, event.id);
+					} else {
+						// A put/patch with no decodable value is a transient decode failure (e.g. stale
+						// msgpackr shared-structures, harper#1163) — NOT a node removal. Forwarding it here
+						// would make onNodeUpdate treat the nullish value as a deletion and unsubscribe the
+						// peer from every database. Drop it instead; the next decodable event self-heals.
+						logger.warn?.(
+							'hdb_nodes change event for',
+							event.id,
+							'had no decodable value; treating as a transient decode failure (see harper#1163), not a node deletion'
+						);
+					}
 				}
 			}
 		});
