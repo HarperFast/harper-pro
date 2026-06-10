@@ -40,6 +40,7 @@ import {
 	getNodeURL,
 } from './knownNodes.ts';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import { getThisNodeName } from '../core/server/nodeName.ts';
 import { exportIdMapping, getIdOfRemoteNode } from '../core/resources/nodeIdMapping.ts';
 import * as tls from 'node:tls';
 import { ServerError } from '../core/utility/errors/hdbError.js';
@@ -543,12 +544,41 @@ export async function sendOperationToNode(node, operation, options?) {
  * own hdb_nodes record), which lags the main thread's during startup. If that re-check filters a
  * non-empty request all the way down to empty, sending that empty subscription arms a permanent
  * "no subscriptions" intentional close that never revives even once the state finishes loading
- * (harper-pro#289 / #233). In that case trust the main thread's decision and keep the requested nodes.
- * A genuinely empty request (a real unsubscribe / database removal) is preserved as-is.
+ * (harper-pro#289 / #233).
+ *
+ * `localStateReady` says whether this worker's state is loaded enough to trust its own re-check:
+ *  - not ready → the empty is a startup race, so trust the main thread and keep the requested nodes;
+ *  - ready → respect the re-check, so a genuinely undesired node (this node's replication disabled, db
+ *    removed, or a stale request that raced NODE_SUBSCRIBE_DELAY) is correctly left unsubscribed.
+ * A genuinely empty request (a real unsubscribe / database removal) is always preserved as-is.
  */
-export function selectSubscriptionNodes(requestNodes: any[], isDesired: (node: any) => boolean): any[] {
+export function selectSubscriptionNodes(
+	requestNodes: any[],
+	isDesired: (node: any) => boolean,
+	localStateReady: boolean
+): any[] {
 	const desired = requestNodes.filter(isDesired);
-	return desired.length === 0 && requestNodes.length > 0 ? requestNodes : desired;
+	if (desired.length === 0 && requestNodes.length > 0 && !localStateReady) return requestNodes;
+	return desired;
+}
+
+/**
+ * Whether this worker has loaded enough local state to trust its own shouldReplicateFromNode re-check
+ * for `databaseName`: the target database must be registered locally (or this is an isLeader bootstrap
+ * of a not-yet-existent database), and this node's own hdb_nodes record must be present (the record
+ * whose `replicates` flag the predicate consults, plus the system table backing it). If either is still
+ * loading at startup, a false re-check is a race rather than a real "don't replicate". The own-record
+ * check distinguishes "not loaded" (record absent → not ready) from "deliberately disabled"
+ * (record present with replicates:false → ready, so the predicate is respected).
+ */
+function isLocalSubscriptionStateReady(databaseName: string, nodes: any[]): boolean {
+	try {
+		const databaseReady = !!databases?.[databaseName] || nodes?.some?.((node) => node?.isLeader);
+		const ownRecordReady = !!getHDBNodeTable()?.primaryStore?.get(getThisNodeName());
+		return Boolean(databaseReady && ownRecordReady);
+	} catch {
+		return false; // can't determine state → treat as not ready → defer to the main thread's decision
+	}
 }
 
 /**
@@ -590,7 +620,11 @@ export function subscribeToNode(request: any) {
 			connection.nodeName = request.nodes[0].name;
 		}
 		connection.subscribe(
-			selectSubscriptionNodes(request.nodes, (node) => shouldReplicateFromNode(node, request.database)),
+			selectSubscriptionNodes(
+				request.nodes,
+				(node) => shouldReplicateFromNode(node, request.database),
+				isLocalSubscriptionStateReady(request.database, request.nodes)
+			),
 			request.replicateByDefault
 		);
 	} catch (error) {
