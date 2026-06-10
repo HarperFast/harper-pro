@@ -30,6 +30,9 @@ type ConnectedWorkerStatus = {
 	worker: any;
 	connected?: boolean;
 	latency?: number;
+	// Timestamp (ms) of the most recent transition to connected:false, used by the reconcile to
+	// distinguish a connection that is briefly retrying from one that is wedged. Cleared on connect.
+	disconnectedAt?: number;
 };
 type ReplicationConnectionStatus = {
 	url?: string;
@@ -63,6 +66,11 @@ const WORKER_EXIT_REASSIGN_STAGGER_MS = 100;
 // worker exit chain races against shutdown and silently drops half the subscription
 // assignments — this is the user-visible recovery latency for the resulting drift.
 const RECONCILE_INTERVAL_MS = 5_000;
+// A connection that is connected:false but still actively retrying reconnects within seconds (the
+// retry backoff starts at 500ms). Only re-drive a connection that has stayed disconnected well
+// beyond that, so the reconcile targets genuinely wedged connections (e.g. an intentionally-closed
+// connection with no pending retry) rather than churning connections that are mid-reconnect.
+const WEDGE_RECONCILE_THRESHOLD_MS = 30_000;
 let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
 // Returns the set of node URLs whose replication entries either point at a worker no longer
@@ -84,6 +92,44 @@ export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatus
 		}
 	}
 	return staleNodeUrls;
+}
+// Returns the set of node URLs that have a desired replication subscription but have been
+// connected:false on a *live* worker for longer than `thresholdMs`. This is the recovery path for a
+// connection that wedged without a pending retry — most notably the empty-subscription delayed close
+// (intentionallyUnsubscribed) firing during a peer restart and then never re-establishing even though
+// the peer is reachable and still subscribed. findStaleNodeUrls does not catch this because the
+// worker is alive. Re-driving these through onNodeUpdate creates a fresh connection (the prior one is
+// no longer reusable — see replicator.isReusableConnection). A threshold well above the normal
+// reconnect backoff keeps this from firing on connections that are merely mid-retry.
+// `isDesired` must be the same predicate onDatabase uses to decide shouldSubscribe
+// (shouldReplicateFromNode), so a connection intentionally unsubscribed because this node should NOT
+// subscribe (replication off, or a sendsTo/subscription targeting another database) is not flagged
+// and re-driven forever. See harper-pro#233 / #289.
+export function findWedgedNodeUrls(
+	connectionMap: Map<string, DBReplicationStatusMap>,
+	httpWorkers: any[],
+	now: number,
+	thresholdMs: number,
+	isDesired: (node: any, database: string) => boolean
+): Set<string> {
+	const wedgedNodeUrls = new Set<string>();
+	if (httpWorkers.length === 0) return wedgedNodeUrls;
+	for (const [url, dbReplicationWorkers] of connectionMap) {
+		for (const [database, entry] of dbReplicationWorkers) {
+			if (
+				entry.connected === false &&
+				entry.worker &&
+				httpWorkers.includes(entry.worker) &&
+				entry.disconnectedAt != null &&
+				now - entry.disconnectedAt >= thresholdMs &&
+				isDesired(entry.nodes?.[0], database)
+			) {
+				wedgedNodeUrls.add(url);
+				break;
+			}
+		}
+	}
+	return wedgedNodeUrls;
 }
 export let disconnectedFromNode; // this is set by thread to handle when a node is disconnected (or notify main thread so it can handle)
 export let connectedToNode; // this is set by thread to handle when a node is connected (or notify main thread so it can handle)
@@ -157,7 +203,7 @@ export async function startOnMainThread(options) {
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
 	 */
-	function onNodeUpdate(node, hostname = node?.name) {
+	function onNodeUpdate(node, hostname = node?.name, forceResubscribe = false) {
 		const isSelf =
 			(getThisNodeName() && hostname === getThisNodeName()) || (getThisNodeUrl() && node?.url === getThisNodeUrl());
 		if (isSelf) {
@@ -235,9 +281,9 @@ export async function startOnMainThread(options) {
 		}
 		dbReplicationWorkers.iterator = forEachReplicatedDatabase(options, (database, databaseName, replicateByDefault) => {
 			if (replicateByDefault) {
-				onDatabase(databaseName, true);
+				onDatabase(databaseName, true, forceResubscribe);
 			} else {
-				onDatabase(databaseName, false);
+				onDatabase(databaseName, false, forceResubscribe);
 			}
 		});
 		// check to see if there are any explicit subscriptions to databases that don't exist yet
@@ -248,7 +294,7 @@ export async function startOnMainThread(options) {
 				const databaseName = sub.database || sub.schema;
 				if (!databases[databaseName]) {
 					logger.warn(`Database ${databaseName} not found for node ${node.name}, making a subscription anyway`);
-					onDatabase(databaseName, false);
+					onDatabase(databaseName, false, forceResubscribe);
 				}
 			}
 		}
@@ -263,12 +309,12 @@ export async function startOnMainThread(options) {
 					logger.warn(
 						`isLeader: bootstrapping full-copy subscription for non-existent database ${databaseName} from ${node.name}`
 					);
-					onDatabase(databaseName, true);
+					onDatabase(databaseName, true, forceResubscribe);
 				}
 			}
 		}
 
-		function onDatabase(databaseName, tablesReplicateByDefault) {
+		function onDatabase(databaseName, tablesReplicateByDefault, forceResubscribe = false) {
 			logger.trace('Setting up replication for database', databaseName, 'on node', node.name);
 			let existingEntry = dbReplicationWorkers.get(databaseName);
 			let worker;
@@ -314,8 +360,13 @@ export async function startOnMainThread(options) {
 			if (existingEntry) {
 				worker = existingEntry.worker;
 				existingEntry.nodes = nodes;
-				if (shouldSubscribe) {
-					// already subscribed, don't need to do anything
+				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
+				// forceResubscribe for a connection that has been connected:false past the threshold: that
+				// falls through to re-post subscribe-to-node on the same worker (the worker then reuses a
+				// still-retrying connection or builds a fresh one — replicator.isReusableConnection). We
+				// deliberately do NOT re-subscribe every connected:false entry on an ordinary onNodeUpdate —
+				// doing so disrupts in-flight replication (e.g. an active legacy-node base copy).
+				if (shouldSubscribe && !(forceResubscribe && existingEntry.connected === false)) {
 					return;
 				}
 			} else if (shouldSubscribe) {
@@ -435,6 +486,9 @@ export async function startOnMainThread(options) {
 				logger.warn('Disconnected node not found in replication map', connection.database, dbReplicationWorkers);
 				return;
 			}
+			// Record the first transition to disconnected so the reconcile can tell a wedged connection
+			// from one that is briefly mid-retry; don't reset it on repeated disconnect notifications.
+			if (existingWorkerEntry.connected !== false) existingWorkerEntry.disconnectedAt = Date.now();
 			existingWorkerEntry.connected = false;
 			if (connection.finished) {
 				return;
@@ -511,6 +565,7 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		mainWorkerEntry.connected = true;
+		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
 		const restoredNode = mainWorkerEntry.nodes[0];
 		if (!restoredNode) {
@@ -587,15 +642,42 @@ export async function startOnMainThread(options) {
 	function reconcileWorkers() {
 		const httpWorkers = workers.filter((worker) => worker.name === 'http');
 		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
-		if (staleNodeUrls.size === 0) return;
-		logger.warn(
-			'Reconciling replication subscriptions for nodes pointing at exited workers:',
-			Array.from(staleNodeUrls)
+		const wedgedNodeUrls = findWedgedNodeUrls(
+			connectionReplicationMap,
+			httpWorkers,
+			Date.now(),
+			WEDGE_RECONCILE_THRESHOLD_MS,
+			shouldReplicateFromNode
 		);
+		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0) return;
+		if (staleNodeUrls.size > 0)
+			logger.warn(
+				'Reconciling replication subscriptions for nodes pointing at exited workers:',
+				Array.from(staleNodeUrls)
+			);
+		if (wedgedNodeUrls.size > 0)
+			logger.warn(
+				'Reconciling replication subscriptions for nodes wedged disconnected on a live worker:',
+				Array.from(wedgedNodeUrls)
+			);
 		for (const node of nodeMap.values()) {
-			if (!staleNodeUrls.has(getNodeURL(node))) continue;
+			const url = getNodeURL(node);
+			const isWedged = wedgedNodeUrls.has(url);
+			if (!staleNodeUrls.has(url) && !isWedged) continue;
+			if (isWedged) {
+				// Restart the disconnect clock before re-driving so a peer that is still unreachable after
+				// the re-subscribe (it stays connected:false, which does not re-stamp disconnectedAt) is
+				// retried at most once per threshold window rather than on every reconcile tick.
+				// onNodeUpdate -> onDatabase then re-posts subscribe-to-node for the connected:false entry
+				// (it no longer early-returns), reusing the existing worker — so no entry/listener churn.
+				const entries = connectionReplicationMap.get(url);
+				if (entries)
+					for (const entry of entries.values()) if (entry.connected === false) entry.disconnectedAt = Date.now();
+			}
 			try {
-				onNodeUpdate(node);
+				// forceResubscribe only for wedged entries, so a normal stale-worker reconcile keeps its
+				// original behavior and ordinary onNodeUpdate calls never re-subscribe live subscriptions.
+				onNodeUpdate(node, undefined, isWedged);
 			} catch (error) {
 				logger.error('Error reconciling node', node?.name, error);
 			}
@@ -650,6 +732,18 @@ export function requestClusterStatus(message?, port?) {
 	return { connections };
 }
 
+// threadServer.js starts servers at import time on non-main workers, and job workers import this
+// module (replication is a HARPER_BUILTIN_COMPONENT), so importing it at module load would spuriously
+// start servers / keep job workers alive. Lazily import it only when a subscribe/unsubscribe actually
+// arrives — which only happens on HTTP/replication workers, where threadServer is already loaded, so
+// the dynamic import resolves to the cached module with no side effect. Cached after first use.
+let componentsLoadedPromise: Promise<unknown> | undefined;
+function whenWorkerComponentsLoaded(): Promise<unknown> {
+	return (componentsLoadedPromise ??= import('../core/server/threads/threadServer.js').then(
+		(threadServer) => threadServer.whenComponentsLoaded
+	));
+}
+
 if (parentPort) {
 	disconnectedFromNode = (connection) => {
 		parentPort.postMessage({ type: 'disconnected-from-node', ...connection });
@@ -658,10 +752,19 @@ if (parentPort) {
 		parentPort.postMessage({ type: 'connected-to-node', ...connection });
 	};
 	onMessageByType('subscribe-to-node', (message) => {
-		subscribeToNode(message);
+		// Defer until this worker has finished loading components (databases/tables + persisted hdb_nodes
+		// rows). subscribeToNode re-checks shouldReplicateFromNode, which reads that thread-local state; if
+		// it runs before the state is loaded it filters the request down to empty and arms a permanent
+		// "no subscriptions" close, wedging the (peer, db) until restart (harper-pro#289 / #233). Once
+		// components are loaded the predicate is authoritative. In steady state the promise is already
+		// resolved, so this is effectively synchronous.
+		whenWorkerComponentsLoaded().then(() => subscribeToNode(message));
 	});
 	onMessageByType('unsubscribe-from-node', (message) => {
-		unsubscribeFromNode(message);
+		// Defer through the same gate as subscribe-to-node so the two stay ordered: a pre-load
+		// subscribe followed by an unsubscribe must apply in that order (else the deferred subscribe
+		// would run after the unsubscribe and re-open a connection the main thread already removed).
+		whenWorkerComponentsLoaded().then(() => unsubscribeFromNode(message));
 	});
 }
 
