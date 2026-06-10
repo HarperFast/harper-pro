@@ -544,7 +544,10 @@ if (parentPort) {
 		Promise.resolve(whenComponentsLoaded).then(() => subscribeToNode(message));
 	});
 	onMessageByType('unsubscribe-from-node', (message) => {
-		unsubscribeFromNode(message);
+		// Defer through the same gate as subscribe-to-node so the two stay ordered: a pre-load
+		// subscribe followed by an unsubscribe must apply in that order (else the deferred subscribe
+		// would run after the unsubscribe and re-open a connection the main thread already removed).
+		Promise.resolve(whenComponentsLoaded).then(() => unsubscribeFromNode(message));
 	});
 }
 
