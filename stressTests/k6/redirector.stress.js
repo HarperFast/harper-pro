@@ -48,9 +48,11 @@ export const options = {
 	discardResponseBodies: true,
 	systemTags: ['scenario'],
 	scenarios,
-	thresholds: Object.fromEntries(
-		RATE_LEVELS.map((rate) => [`http_req_duration{scenario:rps_${rate}}`, [`p(95)<${DUR_P95}`]])
-	),
+	thresholds: {
+		// p95 alone misses fast 4xx/5xx responses (status errors return quickly), so gate on failures too.
+		http_req_failed: ['rate==0'],
+		...Object.fromEntries(RATE_LEVELS.map((rate) => [`http_req_duration{scenario:rps_${rate}}`, [`p(95)<${DUR_P95}`]])),
+	},
 };
 
 export default function () {
