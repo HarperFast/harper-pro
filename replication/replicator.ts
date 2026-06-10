@@ -40,7 +40,6 @@ import {
 	getNodeURL,
 } from './knownNodes.ts';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import { whenComponentsLoaded } from '../core/server/threads/threadServer.js';
 import { exportIdMapping, getIdOfRemoteNode } from '../core/resources/nodeIdMapping.ts';
 import * as tls from 'node:tls';
 import { ServerError } from '../core/utility/errors/hdbError.js';
@@ -60,15 +59,6 @@ import '../security/sshKeyOperations.ts';
 // disconnect. Raise the limit so we don't spam MaxListenersExceededWarning under normal multi-peer load while
 // still leaving headroom small enough that a real listener leak would eventually trip the warning.
 databaseEventsEmitter.setMaxListeners(1000);
-
-// Monotonic startup flag: false until this worker finishes loadRootComponents (databases/tables and
-// the persisted hdb_nodes rows that shouldReplicateFromNode consults). Used to tell a startup-race
-// empty subscription (state not loaded yet → trust the main thread) from a genuine one (state loaded,
-// node really not desired → respect the re-check). See harper-pro#289 / #233.
-let componentsLoaded = false;
-whenComponentsLoaded?.then(() => {
-	componentsLoaded = true;
-});
 
 let replicationDisabled;
 let nextId = 1; // for request ids
@@ -547,31 +537,6 @@ export async function sendOperationToNode(node, operation, options?) {
 }
 
 /**
- * Choose which nodes to actually subscribe to for a subscribe-to-node request. The main thread has
- * already applied shouldReplicateFromNode before dispatching, so re-checking it here is only defensive
- * — and shouldReplicateFromNode reads this worker's thread-local state (loaded `databases`, this node's
- * own hdb_nodes record), which lags the main thread's during startup. If that re-check filters a
- * non-empty request all the way down to empty, sending that empty subscription arms a permanent
- * "no subscriptions" intentional close that never revives even once the state finishes loading
- * (harper-pro#289 / #233).
- *
- * `localStateReady` says whether this worker's state is loaded enough to trust its own re-check:
- *  - not ready → the empty is a startup race, so trust the main thread and keep the requested nodes;
- *  - ready → respect the re-check, so a genuinely undesired node (this node's replication disabled, db
- *    removed, or a stale request that raced NODE_SUBSCRIBE_DELAY) is correctly left unsubscribed.
- * A genuinely empty request (a real unsubscribe / database removal) is always preserved as-is.
- */
-export function selectSubscriptionNodes(
-	requestNodes: any[],
-	isDesired: (node: any) => boolean,
-	localStateReady: boolean
-): any[] {
-	const desired = requestNodes.filter(isDesired);
-	if (desired.length === 0 && requestNodes.length > 0 && !localStateReady) return requestNodes;
-	return desired;
-}
-
-/**
  * Subscribe to a node for a database, getting the necessary connection and subscription and signaling the start of the subscription
  * @param request
  */
@@ -610,11 +575,9 @@ export function subscribeToNode(request: any) {
 			connection.nodeName = request.nodes[0].name;
 		}
 		connection.subscribe(
-			selectSubscriptionNodes(
-				request.nodes,
-				(node) => shouldReplicateFromNode(node, request.database),
-				componentsLoaded
-			),
+			request.nodes.filter((node) => {
+				return shouldReplicateFromNode(node, request.database);
+			}),
 			request.replicateByDefault
 		);
 	} catch (error) {
