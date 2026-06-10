@@ -537,6 +537,21 @@ export async function sendOperationToNode(node, operation, options?) {
 }
 
 /**
+ * Choose which nodes to actually subscribe to for a subscribe-to-node request. The main thread has
+ * already applied shouldReplicateFromNode before dispatching, so re-checking it here is only defensive
+ * — and shouldReplicateFromNode reads this worker's thread-local state (loaded `databases`, this node's
+ * own hdb_nodes record), which lags the main thread's during startup. If that re-check filters a
+ * non-empty request all the way down to empty, sending that empty subscription arms a permanent
+ * "no subscriptions" intentional close that never revives even once the state finishes loading
+ * (harper-pro#289 / #233). In that case trust the main thread's decision and keep the requested nodes.
+ * A genuinely empty request (a real unsubscribe / database removal) is preserved as-is.
+ */
+export function selectSubscriptionNodes(requestNodes: any[], isDesired: (node: any) => boolean): any[] {
+	const desired = requestNodes.filter(isDesired);
+	return desired.length === 0 && requestNodes.length > 0 ? requestNodes : desired;
+}
+
+/**
  * Subscribe to a node for a database, getting the necessary connection and subscription and signaling the start of the subscription
  * @param request
  */
@@ -575,9 +590,7 @@ export function subscribeToNode(request: any) {
 			connection.nodeName = request.nodes[0].name;
 		}
 		connection.subscribe(
-			request.nodes.filter((node) => {
-				return shouldReplicateFromNode(node, request.database);
-			}),
+			selectSubscriptionNodes(request.nodes, (node) => shouldReplicateFromNode(node, request.database)),
 			request.replicateByDefault
 		);
 	} catch (error) {
