@@ -106,7 +106,118 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 					listener(event.value, event.id);
 				}
 			}
+<<<<<<< HEAD
 		});
+=======
+			logger.warn?.('hdb_nodes subscription ended unexpectedly; restarting watcher');
+		} catch (error) {
+			logger.error?.('hdb_nodes watcher failed; restarting', error);
+		}
+		// Successful subscribe → reset backoff so a fresh failure restarts quickly.
+		consecutiveFailures = iteratedSuccessfully ? 0 : consecutiveFailures + 1;
+		restarts++;
+		if (restarts >= maxRestarts) return;
+		const delay = Math.min(restartDelayMs * Math.pow(2, Math.min(consecutiveFailures, 5)), maxDelayMs);
+		await new Promise((resolve) => setTimeout(resolve, delay));
+	}
+}
+/**
+ * Raw existence check for an hdb_nodes record that does NOT decode the stored value.
+ * A decode failure (e.g. stale msgpackr shared-structures, harper#1163) must not be
+ * misread as the record being absent: `primaryStore.get()` would throw/return undefined
+ * for an undecodable-but-present row, so we probe at the bytes level instead.
+ */
+export function nodeRecordPhysicallyExists(name: string): boolean {
+	const store: any = getHDBNodeTable().primaryStore;
+	if (typeof store.doesExist === 'function') return store.doesExist(name);
+	// getBinaryFast returns the raw value bytes (or undefined when the key is absent).
+	if (typeof store.getBinaryFast === 'function') return store.getBinaryFast(name) != null;
+	// Last-resort fallback: a present-but-undecodable record will still throw here, so be
+	// conservative and treat a throw as "present" (don't let it look like a deletion).
+	try {
+		return store.get(name) != null;
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * Decide whether a change-stream event with no usable decoded value represents a genuine
+ * node deletion. A nullish value is ambiguous: it can be a real `delete`, OR a `put`/`patch`
+ * whose value failed to decode while the record is still physically present. Treating the
+ * latter as a deletion tears down every one of a peer's replication subscriptions (the
+ * "Node was deleted" storm observed in harper#1163). Only a genuine `delete` whose record is
+ * actually gone from storage should be handled as a deletion.
+ *
+ * Pure/injectable for unit testing — production passes `nodeRecordPhysicallyExists`.
+ */
+export function isGenuineNodeDeletion(
+	eventType: string,
+	hasDecodedValue: boolean,
+	recordPhysicallyExists: () => boolean
+): boolean {
+	if (hasDecodedValue) return false; // a usable value is an upsert, never a deletion
+	if (eventType !== 'delete') return false; // put/patch with no value = decode failure, not a delete
+	return !recordPhysicallyExists(); // genuine delete only if the row is truly gone
+}
+
+async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
+	// remove any nodes that have been updated or deleted
+	const node_name = event?.value?.name || event?.id;
+	logger.debug?.('adding node', node_name, 'on  node', getThisNodeName(), ' on process', process.pid);
+	server.nodes = server.nodes.filter((node) => node && node.name !== node_name);
+	if (event.type === 'put' && node_name !== getThisNodeName()) {
+		// add any new nodes
+		if (event.value) server.nodes.push(event.value);
+		else {
+			console.error('Invalid node update event', event);
+		}
+	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
+		// add_node { isLeader: true } reaches us as a patch event; read the merged
+		// record from LMDB so server.nodes reflects the full record (including isLeader).
+		const fullRecord = getHDBNodeTable().primaryStore.get(node_name);
+		if (fullRecord) server.nodes.push(fullRecord);
+	}
+	const shards = new Map();
+	for await (const node of getHDBNodeTable().search({})) {
+		if (!node) continue;
+		if (node.shard != undefined) {
+			let nodesForShard = shards.get(node.shard);
+			if (!nodesForShard) {
+				shards.set(node.shard, (nodesForShard = []));
+			}
+			nodesForShard.push(node);
+		}
+	}
+	server.shards = shards;
+	if (event.type === 'put' || event.type === 'delete') {
+		if (event.value != null) {
+			// normal upsert with a decoded value
+			listener(event.value, event.id);
+		} else if (isGenuineNodeDeletion(event.type, false, () => nodeRecordPhysicallyExists(event.id))) {
+			// genuine deletion — forward the nullish value so the listener tears the node down
+			listener(event.value, event.id);
+		} else {
+			// A put/patch with no decodable value, or a "delete" whose record is still
+			// physically present, is a transient decode failure (e.g. stale msgpackr
+			// shared-structures, harper#1163) — NOT a node removal. Forwarding it here would
+			// make onNodeUpdate treat the nullish value as a deletion and unsubscribe the peer
+			// from every database. Drop it instead; the next decodable event self-heals.
+			logger.warn?.(
+				'hdb_nodes change event for',
+				event.id,
+				'had no decodable value but the record is still present; treating as a transient decode failure (see harper#1163), not a node deletion'
+			);
+		}
+	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
+		// isLeader patches need to drive subscription bootstrap; pass the merged record.
+		const fullRecord = getHDBNodeTable().primaryStore.get(event.id);
+		if (fullRecord) listener(fullRecord, event.id);
+	}
+}
+export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {
+	runNodeUpdateWatcher(listener);
+>>>>>>> 23c7197 (fix(replication): don't treat an undecodable hdb_nodes event as a node deletion)
 	server.nodes = [];
 	server.shards = new Map();
 
