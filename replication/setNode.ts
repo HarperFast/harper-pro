@@ -194,6 +194,12 @@ export async function setNode(req: any) {
 	// It must NOT be forwarded to the peer via targetAddNodeObj — doing so would cause the peer
 	// to treat this node as its leader and attempt to full-copy in the wrong direction.
 	if (req.isLeader !== undefined) nodeRecord.isLeader = req.isLeader;
+	// An isLeader bridge peer (e.g. a v4 source in a v4->v5 migration) must stay invisible to the
+	// rest of the mesh: its hdb_nodes row carries replicates.sends, so if it replicated to v5 leaves
+	// they would each open a direct (and unauthorized) subscription to it. Persist the row with the
+	// LOCAL_ONLY metadata bit so it lives in the normal hdb_nodes table (driving this node's own
+	// watcher/subscription/full-copy and surviving restart) but is never sent to any peer (harper-pro #246).
+	const writeNodeLocalOnly = req.isLeader === true;
 
 	if (nodeRecord.replicates) {
 		const thisNode: any = {
@@ -210,7 +216,8 @@ export async function setNode(req: any) {
 	}
 	await ensureNode(
 		targetNodeResponse ? targetNodeResponse.nodeName : (nodeRecord.name ?? urlToNodeName(url)),
-		nodeRecord
+		nodeRecord,
+		writeNodeLocalOnly ? { localOnly: true } : undefined
 	);
 	let message: string;
 	if (req.operation === 'update_node') {
