@@ -1709,9 +1709,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// currentTable must be one the loop below will actually visit (present in `tables` AND passing
 											// the same replication filter); otherwise the skip loop never reaches it and would omit every
 											// later table. Mirror the loop's own check so a dropped/unreplicated cursor table forces a restart.
-											if (copyResume && !tableToTableEntry(tables[copyResume.currentTable])) {
-												// cursor table is gone or no longer replicated — the skip loop would never reach it and
-												// would omit every later table, so recopy from scratch (idempotent puts, copyStartTime reset)
+											// Optional-chain BOTH `tables` and `copyResume.currentTable`: a freshly-joined peer can hit
+											// this with `tables` itself undefined, and a malformed cursor can have `currentTable` undefined
+											// (harper-pro#321). Either case must fall into the warn-and-recopy branch, not throw — the
+											// throw bubbles to the outer .catch as a 1008 close (silent channel death).
+											if (copyResume && !tableToTableEntry(tables?.[copyResume.currentTable])) {
+												// cursor table is gone, unreplicated, or the cursor itself is malformed — the skip loop
+												// would never reach it and would omit every later table, so recopy from scratch
+												// (idempotent puts, copyStartTime preserved at L1701 from copyResume?.copyStartTime).
 												logger.warn?.(
 													'Copy-resume table missing or unreplicated, restarting full copy',
 													copyResume.currentTable
@@ -2417,10 +2422,24 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
 			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
 			// data predates copyStartTime and would never be delivered by an audit-log resume).
-			const copyCursor =
+			let copyCursor =
 				nodeId === undefined
 					? undefined
 					: tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('copyCursor'), nodeId]);
+			// Recovery for harper-pro#321: a malformed cursor on disk (currentTable missing/nullish) would
+			// be sent verbatim to the leader, which falls into the warn-and-recopy branch every reconnect.
+			// Drop it so we request a clean full copy instead — wedged clusters recover on next connect
+			// without waiting for a COPY_COMPLETE that may never arrive while the loop is active.
+			if (copyCursor && !copyCursor.currentTable) {
+				logger.warn?.(
+					'Discarding malformed copy-resume cursor (no currentTable) for',
+					node.name,
+					databaseName
+				);
+				if (nodeId !== undefined)
+					tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), nodeId]);
+				copyCursor = undefined;
+			}
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
 				sequenceEntry?.seqId ?? 1,
