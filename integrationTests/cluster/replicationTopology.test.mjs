@@ -24,6 +24,38 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 const NODE_COUNT = 4;
+// Build the harper config for a node. Captured as a function (not a constant) so a
+// restart (`startHarper({ harper: ctx.nodes[i] }, nodeStartOptions(node))`) reuses the
+// same `replication.databases` filter the node was originally started with. Without
+// this, the restart call passed no `options.config`, which set HARPER_SET_CONFIG to
+// `{}` and the env-config layer then *deletes* the previously-set replication settings
+// (handleDeletions in core/config/harperConfigEnvVars.ts) — so the restarted node lost
+// `databases: ['data']`, tried to bring up `db: system` replication to its peers, and
+// every peer rejected those connections with `Access to database "system" is not
+// permitted`. Symptoms: ECONNRESET to the bridged legacy v4 peer, and data not
+// replicating because the restarted central node never opened a `db: data` connection.
+function nodeStartOptions(node) {
+	return {
+		config: {
+			analytics: {
+				// turn off analytics, it is too noisy and gets in the way
+				aggregatePeriod: -1,
+			},
+			logging: {
+				colors: false,
+				stdStreams: true,
+				console: true,
+			},
+			replication: {
+				securePort: node.hostname + ':9933',
+				databases: ['data'], // don't replicate system/nodes
+			},
+		},
+		/*env: {
+			HARPER_NO_FLUSH_ON_EXIT: true, // faster teardown
+		},*/
+	};
+}
 suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 	before(async () => {
 		// start up the nodes
@@ -37,26 +69,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 							hostname: await getNextAvailableLoopbackAddress(),
 						},
 					};
-					await startHarper(nodeCtx, {
-						config: {
-							analytics: {
-								// turn off analytics, it is too noisy and gets in the way
-								aggregatePeriod: -1,
-							},
-							logging: {
-								colors: false,
-								stdStreams: true,
-								console: true,
-							},
-							replication: {
-								securePort: nodeCtx.harper.hostname + ':9933',
-								databases: ['data'], // don't replicate system/nodes
-							},
-						},
-						/*env: {
-							HARPER_NO_FLUSH_ON_EXIT: true, // faster teardown
-						},*/
-					});
+					await startHarper(nodeCtx, nodeStartOptions(nodeCtx.harper));
 					console.log(
 						'finished setting up node: ',
 						nodeCtx.harper.dataRootDir.split('/').slice(-2).join(' /'),
@@ -233,7 +246,10 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 			records: [{ id: '2', name: 'test while disconnected' }],
 		});
 		let response;
-		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] })).harper;
+		// Reapply the original config on restart — without it, HARPER_SET_CONFIG=`{}`
+		// would delete `replication.databases: ['data']` and the restarted node would
+		// try to open `db: system` replication to its peers (which they reject).
+		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
 		let retries = 0;
 		// ensure the data gets to the central node
 		do {
