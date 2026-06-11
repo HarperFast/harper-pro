@@ -1,0 +1,121 @@
+name: Large-Data Stress Tests
+
+# Catch-up and clone performance at production data scale (10–20 GB).
+# Requires the self-hosted harper-bench runner (adequate disk, no GH runner
+# disk cap). Runs nightly to catch replication throughput regressions early.
+
+on:
+  workflow_dispatch:
+    inputs:
+      node-version:
+        description: 'Node.js version'
+        required: true
+        type: choice
+        default: '24'
+        options:
+          - '22'
+          - '24'
+          - '25'
+      data-gb:
+        description: 'Dataset size in GB'
+        required: false
+        default: '10'
+      test-filter:
+        description: 'Which test to run (leave blank for both)'
+        required: false
+        type: choice
+        default: 'both'
+        options:
+          - 'both'
+          - 'large-catchup'
+          - 'large-clone'
+  schedule:
+    # 06:00 UTC nightly (midnight MDT)
+    - cron: '0 6 * * *'
+
+jobs:
+  build:
+    name: Build Harper Pro (Node.js v${{ inputs.node-version || '24' }})
+    runs-on: [self-hosted, harper-bench]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+      - name: Setup Node.js ${{ inputs.node-version || '24' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version || '24' }}
+          package-manager-cache: false
+      - name: Install dependencies
+        run: npm install
+      - name: Build
+        run: npm run build || true
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harper-large-stress-build-${{ inputs.node-version || '24' }}
+          path: |
+            dist/
+            static/
+            node_modules/
+            package.json
+          retention-days: 1
+
+  large-data-stress:
+    name: Large-data ${{ matrix.test.name }} (Node.js v${{ inputs.node-version || '24' }})
+    needs: build
+    runs-on: [self-hosted, harper-bench]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - name: 'large-catchup'
+            file: 'integrationTests/stress/largeCatchup.test.mjs'
+          - name: 'large-clone'
+            file: 'integrationTests/stress/largeClone.test.mjs'
+        exclude:
+          - test:
+              name: ${{ (inputs.test-filter == 'large-clone') && 'large-catchup' || '' }}
+          - test:
+              name: ${{ (inputs.test-filter == 'large-catchup') && 'large-clone' || '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+      - name: Setup Node.js ${{ inputs.node-version || '24' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version || '24' }}
+          package-manager-cache: false
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harper-large-stress-build-${{ inputs.node-version || '24' }}
+      - name: Relink bin scripts
+        run: npm install --ignore-scripts
+      - name: Run ${{ matrix.test.name }}
+        env:
+          HARPER_RUN_STRESS_TESTS: '1'
+          HARPER_INTEGRATION_TEST_LOG_DIR: /home/runner/harper-large-stress-logs
+          HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR: /home/runner
+          HARPER_STRESS_LARGE_DATA_GB: ${{ inputs.data-gb || '10' }}
+        run: |
+          # No coverage: run.mjs's run() defaults coverage off, and passing
+          # --experimental-test-coverage (even =false) actually ENABLES collection —
+          # its mere presence turns it on. On a ~400s stress run the coverage blob is
+          # huge and its serialization across the process-isolation boundary truncates,
+          # which node:test then reports as a file-level failure even when every test
+          # passes. Omitting the flag keeps coverage off and the run clean.
+          node integrationTests/run.mjs ${{ matrix.test.file }}
+      - name: Upload Harper server logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: large-stress-logs-${{ matrix.test.name }}-node-${{ inputs.node-version || '24' }}
+          path: /home/runner/harper-large-stress-logs/
+          retention-days: 7
+          if-no-files-found: ignore

@@ -368,7 +368,13 @@ export class NodeReplicationConnection extends EventEmitter {
 			setTimeout(() => {
 				this.connect();
 			}, this.retryTime).unref();
-			this.retryTime += this.retryTime >> 8; // increase by 0.4% each time
+			// Double the interval each retry, capped at 30 s. The previous ~0.4%/retry
+			// growth took >1000 retries to reach any meaningful delay, so rapid
+			// reconnects to a dead peer (symphony accepts the TLS handshake then drops
+			// it) would still accumulate unreleased native TLS state faster than V8 can
+			// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
+			// Doubling reaches 30 s in ~6 retries (~62 s total) and resets on success.
+			this.retryTime = Math.min(this.retryTime << 1, 30_000);
 		});
 	}
 	resetSession() {
@@ -522,7 +528,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 			lastBackPressureCheck = now;
 		}
 	}
-	setInterval(updateBackPressureRatio, BACK_PRESSURE_INTERVAL).unref();
+	const backPressureInterval = setInterval(updateBackPressureRatio, BACK_PRESSURE_INTERVAL).unref();
 	function getSharedStatus() {
 		if (!remoteNodeName || !databaseName || !auditStore) {
 			return;
@@ -1885,6 +1891,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: Prom
 		clearInterval(sendPingInterval);
 		clearTimeout(receivePingTimer);
 		clearInterval(blobsTimer);
+		clearInterval(backPressureInterval);
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
 		if (hdbNodesSubscription) hdbNodesSubscription.end();
