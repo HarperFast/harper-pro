@@ -38,6 +38,7 @@ import {
 	readLog,
 	sampleMetrics,
 	summariseSamples,
+	fabricRocksConfig,
 	mb,
 } from './stressShared.mjs';
 
@@ -59,7 +60,15 @@ if (!stressEnabled()) {
 	const PAYLOAD_SIZE = 100 * 1024; // 100 KB per record
 	const BATCH_SIZE = 20;
 	const CONCURRENCY = 8;
-	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_RSS_CAP_MB ?? 3072);
+	// RSS is a loose ceiling, not a tight bound: process RSS counts the reclaimable
+	// page cache of Harper's PROT_READ mmap'd transaction logs (read in full during the
+	// clone copy), so it legitimately reaches several GB at 10 GB scale without any memory
+	// problem. Sized to catch a true blow-up while ignoring reclaimable cache; the tight
+	// regression guard is ANON_CAP_MB below, on genuine (unreclaimable) memory.
+	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_RSS_CAP_MB ?? 12288);
+	// Cap on genuine, unreclaimable memory — container-wide cgroup `anon`. The real
+	// OOM-risk signal, robust to the reclaimable file cache that inflates RSS.
+	const ANON_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_ANON_CAP_MB ?? 5120);
 	const CLONE_BUDGET_SECS = Number(process.env.HARPER_STRESS_LARGE_CLONE_BUDGET_SECS ?? Math.max(600, TARGET_GB * 180));
 	const WRITE_BUDGET_SECS = TARGET_GB * 300 + 600;
 	const SUITE_TIMEOUT_MS = (WRITE_BUDGET_SECS + CLONE_BUDGET_SECS + 600) * 1000;
@@ -76,6 +85,7 @@ if (!stressEnabled()) {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, console: true, level: 'warn' },
 					replication: { port: leaderCtx.harper.hostname + ':9933', securePort: null },
+					storage: { rocks: fabricRocksConfig() },
 					threads: { count: 4 },
 				},
 				env: { HARPER_NO_FLUSH_ON_EXIT: true },
@@ -187,6 +197,7 @@ if (!stressEnabled()) {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, console: true, level: 'warn' },
 					replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
+					storage: { rocks: fabricRocksConfig() },
 					threads: { count: 4 },
 				},
 				env: {
@@ -226,6 +237,13 @@ if (!stressEnabled()) {
 					`throughput=${cloneMBps.toFixed(1)} MB/s ` +
 					`clone_peakRSS=${mb(cloneSummary.peakRss)}`
 			);
+			// Container-level cgroup breakdown: anon = genuine/unreclaimable; file = reclaimable
+			// page cache (incl. the mmap'd txn log read during the clone copy); dirty = pending writeback.
+			console.log(
+				`[large-clone] cgroup peaks: current=${mb(cloneSummary.peakCgroupCurrent)} ` +
+					`anon=${mb(cloneSummary.peakCgroupAnon)} file=${mb(cloneSummary.peakCgroupFile)} ` +
+					`dirty=${mb(cloneSummary.peakCgroupDirty)}`
+			);
 
 			const cloneLog = await readLog(cloneCtx.harper);
 			const oomRe = /JavaScript heap out of memory|FATAL ERROR.*Allocation failed/g;
@@ -233,9 +251,13 @@ if (!stressEnabled()) {
 
 			ok(available, `Clone did not reach Available within ${CLONE_BUDGET_SECS}s`);
 			const peakMb = cloneSummary.peakRss / 1024 / 1024;
-			ok(peakMb < RSS_CAP_MB, `Clone peak RSS ${peakMb.toFixed(0)} MB exceeded cap ${RSS_CAP_MB} MB`);
+			ok(peakMb < RSS_CAP_MB, `Clone peak RSS ${peakMb.toFixed(0)} MB exceeded ceiling ${RSS_CAP_MB} MB`);
 			ok((cloneLog.match(oomRe) ?? []).length === 0, 'clone logged OOM');
 			ok((cloneLog.match(uncaughtRe) ?? []).length === 0, 'clone logged uncaughtException');
+			// Tight guard on genuine memory: cgroup anon. 0 when cgroup v2 unavailable — skip.
+			const anonMb = cloneSummary.peakCgroupAnon / 1024 / 1024;
+			if (anonMb > 0)
+				ok(anonMb < ANON_CAP_MB, `clone peak anon ${anonMb.toFixed(0)} MB exceeded cap ${ANON_CAP_MB} MB`);
 
 			// Verify SQL row count matches after clone completes.
 			// Use COUNT(*) rather than describe_table.record_count — the latter is an

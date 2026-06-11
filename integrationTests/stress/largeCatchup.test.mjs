@@ -47,6 +47,7 @@ import {
 	waitForAllConnected,
 	sampleMetrics,
 	summariseSamples,
+	fabricRocksConfig,
 	mb,
 } from './stressShared.mjs';
 
@@ -68,7 +69,17 @@ if (!stressEnabled()) {
 	const PAYLOAD_SIZE = 100 * 1024; // 100 KB per record
 	const BATCH_SIZE = 20;
 	const CONCURRENCY = 8;
-	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_RSS_CAP_MB ?? 3072);
+	// RSS is a loose ceiling, not a tight bound: process RSS counts the reclaimable
+	// page cache of Harper's PROT_READ mmap'd transaction logs (read in full during
+	// catch-up), so it legitimately reaches several GB at 10 GB scale without any
+	// memory problem. The ceiling is sized to catch a true blow-up (the original #339
+	// OOM hit ~15.8 GB) while ignoring reclaimable cache. The tight regression guard is
+	// ANON_CAP_MB below, on genuine (unreclaimable) memory.
+	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_RSS_CAP_MB ?? 12288);
+	// Cap on genuine, unreclaimable memory — container-wide cgroup `anon` (heap + native
+	// allocations + RocksDB block cache/memtables). This is the real OOM-risk signal,
+	// robust to the reclaimable file cache that inflates RSS. Observed ~2.4–3.6 GB.
+	const ANON_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_ANON_CAP_MB ?? 5120);
 	// Budget: longer offline = larger backlog = more catch-up time needed.
 	const CATCHUP_BUDGET_SECS = Number(
 		process.env.HARPER_STRESS_LARGE_CATCHUP_BUDGET_SECS ?? Math.max(600, TARGET_GB * 180)
@@ -88,6 +99,7 @@ if (!stressEnabled()) {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false, console: true, level: 'warn' },
 				replication: { securePort: host + ':9933' },
+				storage: { rocks: fabricRocksConfig() },
 				threads: { count: 4 },
 			});
 
@@ -205,7 +217,7 @@ if (!stressEnabled()) {
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
 			const writtenRecords = Math.min(batchIndex * BATCH_SIZE, TOTAL_RECORDS);
-			const writeMBps = (writtenRecords * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
+			const writeMBps = (writtenRecords * PAYLOAD_SIZE) / 1024 / 1024 / writeSecs;
 			console.log(
 				`[large-catchup] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ` +
 					`${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
@@ -224,6 +236,7 @@ if (!stressEnabled()) {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, console: true, level: 'warn' },
 					replication: { securePort: B.hostname + ':9933' },
+					storage: { rocks: fabricRocksConfig() },
 					threads: { count: 4 },
 				},
 				env: { HARPER_NO_FLUSH_ON_EXIT: true },
@@ -245,9 +258,7 @@ if (!stressEnabled()) {
 					break;
 				}
 				const remaining = Math.ceil((deadline - Date.now()) / 1000);
-				console.log(
-					`[large-catchup] catchup poll: B=${lastCount}/${targetCount} (${remaining}s remaining)`
-				);
+				console.log(`[large-catchup] catchup poll: B=${lastCount}/${targetCount} (${remaining}s remaining)`);
 				await delay(5_000);
 			}
 
@@ -261,6 +272,14 @@ if (!stressEnabled()) {
 					`throughput=${catchupMBps.toFixed(1)} MB/s ` +
 					`A_peakRSS=${mb(aSummary.peakRss)} B_peakRSS=${mb(bSummary.peakRss)}`
 			);
+			// Container-level cgroup breakdown (whole job container = both nodes + runner).
+			// anon = genuine/unreclaimable; file = reclaimable page cache (incl. mmap'd txn
+			// log read during catchup); dirty = pending writeback (vm.dirty_ratio concern).
+			console.log(
+				`[large-catchup] cgroup peaks: current=${mb(aSummary.peakCgroupCurrent)} ` +
+					`anon=${mb(aSummary.peakCgroupAnon)} file=${mb(aSummary.peakCgroupFile)} ` +
+					`dirty=${mb(aSummary.peakCgroupDirty)}`
+			);
 
 			const oomRe = /JavaScript heap out of memory|FATAL ERROR.*Allocation failed/g;
 			const uncaughtRe = /\[error\]: uncaughtException/g;
@@ -272,10 +291,15 @@ if (!stressEnabled()) {
 				['B', bSummary, logB],
 			]) {
 				const peakMb = summary.peakRss / 1024 / 1024;
-				ok(peakMb < RSS_CAP_MB, `${name} peak RSS ${peakMb.toFixed(0)} MB exceeded cap ${RSS_CAP_MB} MB`);
+				ok(peakMb < RSS_CAP_MB, `${name} peak RSS ${peakMb.toFixed(0)} MB exceeded ceiling ${RSS_CAP_MB} MB`);
 				ok((log.match(oomRe) ?? []).length === 0, `${name} logged OOM`);
 				ok((log.match(uncaughtRe) ?? []).length === 0, `${name} logged uncaughtException`);
 			}
+			// Tight guard on genuine memory: container-wide cgroup anon (both nodes + runner).
+			// 0 when cgroup v2 is unavailable (e.g. local non-container dev) — skip there.
+			const anonMb = aSummary.peakCgroupAnon / 1024 / 1024;
+			if (anonMb > 0)
+				ok(anonMb < ANON_CAP_MB, `container peak anon ${anonMb.toFixed(0)} MB exceeded cap ${ANON_CAP_MB} MB`);
 			} finally {
 				// Signal pool tasks to swallow errors — prevents unhandled rejections
 				// from in-flight requests that time out after the test exits.

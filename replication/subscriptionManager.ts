@@ -59,6 +59,11 @@ const NODE_SUBSCRIBE_DELAY = 200; // delay before sending node subscribe to othe
 // caused the OOM in the first place. We stagger the re-subscriptions in time so the new
 // worker(s) absorb them gradually.
 const WORKER_EXIT_REASSIGN_STAGGER_MS = 100;
+// When the wedge reconcile re-drives disconnected subscriptions, each one opens a new WebSocket
+// (and for TLS, a full TLS handshake). Firing hundreds simultaneously can spike memory (each
+// replicateOverWS instance + TLS buffer). Stagger them so at most ~1 new connection starts
+// per RECONNECT_STAGGER_MS, keeping peak concurrent connection setup bounded.
+const RECONNECT_STAGGER_MS = 50;
 // Cadence of the per-process safety-net reconcile that rebinds subscriptions whose
 // worker no longer exists. Pure read-side filter against `workers` and
 // `connectionReplicationMap` on each tick when nothing is wrong, so a short interval
@@ -679,21 +684,48 @@ export async function startOnMainThread(options) {
 			const isWedged = wedgedNodeUrls.has(url);
 			if (!staleNodeUrls.has(url) && !isWedged) continue;
 			if (isWedged) {
-				// Restart the disconnect clock before re-driving so a peer that is still unreachable after
-				// the re-subscribe (it stays connected:false, which does not re-stamp disconnectedAt) is
-				// retried at most once per threshold window rather than on every reconcile tick.
-				// onNodeUpdate -> onDatabase then re-posts subscribe-to-node for the connected:false entry
-				// (it no longer early-returns), reusing the existing worker — so no entry/listener churn.
+				// Re-drive ONLY the existing connected:false entries, not the full onNodeUpdate pass.
+				//
+				// onNodeUpdate calls forEachReplicatedDatabase → Object.getOwnPropertyNames(databases),
+				// which fires subscribe-to-node for EVERY database in the process — including any that
+				// aren't yet in dbReplicationWorkers. In a cluster with many databases this creates
+				// hundreds of simultaneous replicateOverWS + TLS-handshake instances and can OOM.
+				// The updatedListener in forEachReplicatedDatabase already handles newly-added databases
+				// during normal operation; the wedge reconcile should only reconnect entries that are
+				// already tracked and stuck in connected:false.
 				const entries = connectionReplicationMap.get(url);
-				if (entries)
-					for (const entry of entries.values()) if (entry.connected === false) entry.disconnectedAt = Date.now();
-			}
-			try {
-				// forceResubscribe only for wedged entries, so a normal stale-worker reconcile keeps its
-				// original behavior and ordinary onNodeUpdate calls never re-subscribe live subscriptions.
-				onNodeUpdate(node, undefined, isWedged);
-			} catch (error) {
-				logger.error('Error reconciling node', node?.name, error);
+				if (!entries) continue;
+				let reconnectCount = 0;
+				for (const [databaseName, entry] of entries) {
+					if (entry.connected !== false) continue;
+					// Restart the disconnect clock so this entry is not re-driven on every reconcile
+					// tick until it either connects or exceeds the threshold again.
+					entry.disconnectedAt = Date.now();
+					const worker = entry.worker;
+					const nodes = entry.nodes;
+					if (!worker || !nodes) continue;
+					const request = {
+						...nodes[0],
+						type: 'subscribe-to-node',
+						database: databaseName,
+						nodes,
+					};
+					// Stagger reconnects (RECONNECT_STAGGER_MS apart) so opening N TLS connections
+					// simultaneously does not spike memory when there are many databases.
+					const delay = NODE_SUBSCRIBE_DELAY + reconnectCount * RECONNECT_STAGGER_MS;
+					reconnectCount++;
+					setTimeout(() => worker.postMessage(request), delay).unref();
+				}
+				if (reconnectCount > 0)
+					logger.warn(
+						`Reconciling ${reconnectCount} wedged subscription(s) for ${url} (staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms)`
+					);
+			} else {
+				try {
+					onNodeUpdate(node);
+				} catch (error) {
+					logger.error('Error reconciling node', node?.name, error);
+				}
 			}
 		}
 	}
