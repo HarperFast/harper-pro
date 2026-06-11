@@ -4,6 +4,7 @@
  * lost and delegating subscriptions through other nodes
  */
 import { getDatabases } from '../core/resources/databases.ts';
+import { transaction } from '../core/resources/transaction.ts';
 import { workers, onMessageByType, whenThreadsStarted } from '../core/server/threads/manageThreads.js';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import { subscribeToNode, urlToNodeName, forEachReplicatedDatabase, unsubscribeFromNode } from './replicator.ts';
@@ -768,7 +769,7 @@ if (parentPort) {
 	});
 }
 
-export async function ensureNode(name: string, node) {
+export async function ensureNode(name: string, node, options?: { localOnly?: boolean }) {
 	const table = getHDBNodeTable();
 	name = name ?? urlToNodeName(node.url);
 	node.name = name;
@@ -791,15 +792,35 @@ export async function ensureNode(name: string, node) {
 
 	const existing = table.primaryStore.get(name);
 	logger.debug(`Ensuring node ${name} at ${getNodeURL(node)}, existing record:`, existing, 'new record:', node);
-	if (!existing) {
-		await table.patch(node);
-	} else {
-		if (Array.isArray(node.revoked_certificates)) {
-			const existingRevoked = existing.revoked_certificates || [];
-			node.revoked_certificates = [...new Set([...existingRevoked, ...node.revoked_certificates])];
-		}
+	if (existing && Array.isArray(node.revoked_certificates)) {
+		const existingRevoked = existing.revoked_certificates || [];
+		node.revoked_certificates = [...new Set([...existingRevoked, ...node.revoked_certificates])];
+	}
+	if (existing) logger.info(`Updating node ${name} at ${getNodeURL(node)}`);
 
-		logger.info(`Updating node ${name} at ${getNodeURL(node)}`);
+	// LOCAL_ONLY is sticky: once a node row is a cross-cluster bridge peer (harper-pro #246) it must
+	// STAY local-only across subsequent writes, even when this particular update doesn't request it
+	// (e.g. an `update_node` or a reconnect path that omits `isLeader`). The metadata bit is per-write,
+	// not inherited, so without re-asserting it the next plain patch() would clear it and the row would
+	// replicate to the mesh again, re-opening #246. We key off the existing record's `isLeader` field
+	// (already loaded above; written together with the LOCAL_ONLY bit by setNode) rather than the
+	// metadata bit — `isLeader === true` IS the bridge-peer marker. `node.isLeader === false` is an
+	// explicit demotion, which is allowed to clear it.
+	const alreadyLocalOnly = existing?.isLeader === true && node.isLeader !== false;
+
+	if (options?.localOnly || alreadyLocalOnly) {
+		// Persist the node row with the LOCAL_ONLY metadata bit so it never replicates to peers
+		// (e.g. a v4 bridge peer that must stay invisible to the rest of the v5 mesh — harper-pro #246).
+		// The public patch() API has no per-write option slot, so write through the resource's internal
+		// _writeUpdate, which threads { localOnly } down to the record encoder. Wrapped in a transaction
+		// to mirror the transactional() boundary that the public patch()/put() path provides.
+		await transaction(async (txn) => {
+			const context = (txn as any).getContext();
+			const resource: any = await table.getResource(name, context, { async: true });
+			await resource._writeUpdate(name, node, false, { localOnly: true });
+			await resource.save?.();
+		});
+	} else {
 		await table.patch(node);
 	}
 }

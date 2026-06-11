@@ -17,6 +17,7 @@ import {
 	readAuditEntry,
 	ACTION_32_BIT,
 	auditRetention,
+	LOCAL_ONLY,
 } from '../core/resources/auditStore.ts';
 import {
 	exportIdMapping,
@@ -1404,6 +1405,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								currentTransaction.txnTime = 0;
 								return; // end of transaction, nothing more to do
 							}
+							// Local-only records (e.g. a v4 bridge peer's hdb_nodes row) are never forwarded to
+							// peers. The flag rides the audit entry's extendedType, so this is a pure bitmask test
+							// on an already-decoded integer — no record value decode is added to the send path.
+							if (auditRecord.extendedType & LOCAL_ONLY) {
+								return skipAuditRecord();
+							}
 							const nodeId = auditRecord.nodeId;
 							const tableId = auditRecord.tableId;
 							let tableEntry = tableById[tableId];
@@ -1835,6 +1842,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												}
 												for (const entry of table.primaryStore.getRange(rangeOptions)) {
 													if (closed) return;
+													// Local-only records must never be full-copied to a peer. metadataFlags is the
+													// already-available record metadata integer from the range entry — a pure bitmask
+													// test, no record value decode added to this send path.
+													if (entry.metadataFlags & LOCAL_ONLY) continue;
 													logger.trace?.(
 														connectionId,
 														'Copying record from',
@@ -2032,6 +2043,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						connectionId,
 						'dropping incoming replication for excluded table',
 						databaseName + '.' + tableDecoder.name,
+						'from',
+						remoteNodeName
+					);
+					decoder.position = start + eventLength;
+					continue;
+				}
+				// Defense-in-depth: a correct sender never forwards local-only records, but if one ever
+				// arrives (older/misconfigured peer), drop it here. The flag rides the audit entry's
+				// extendedType — a bitmask test on the already-decoded header, no record value decode.
+				if (auditRecord.extendedType & LOCAL_ONLY) {
+					logger.trace?.(
+						connectionId,
+						'dropping incoming local-only replication record',
+						databaseName,
+						auditRecord.recordId,
 						'from',
 						remoteNodeName
 					);
