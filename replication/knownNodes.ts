@@ -161,6 +161,23 @@ export function isGenuineNodeDeletion(eventType: string): boolean {
 	return eventType === 'delete'; // put/patch with null value = decode failure; delete events are genuine
 }
 
+/**
+ * An hdb_nodes record is a node descriptor object; lookups that return anything else (null,
+ * an empty array, an object missing both `name` and `url`) are corrupt or partial-decoded
+ * state and must not be treated as a matched peer. Observed in the field as `[]` returned
+ * from `primaryStore.get()` for v4-era entries after a partial v4 to v5 migration; without
+ * this guard, the cert-auth path in replicator.ts treats the truthy `[]` as a match,
+ * short-circuits the IP fallback, and rejects valid peers with 1008 Unauthorized.
+ */
+export function isValidNodeRecord(record: unknown): boolean {
+	return (
+		!!record &&
+		typeof record === 'object' &&
+		!Array.isArray(record) &&
+		(typeof (record as any).name === 'string' || typeof (record as any).url === 'string')
+	);
+}
+
 async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
 	// remove any nodes that have been updated or deleted
 	const node_name = event?.value?.name || event?.id;

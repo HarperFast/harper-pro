@@ -38,6 +38,7 @@ import {
 	shouldReplicateFromNode,
 	getReplicationSharedStatus,
 	getNodeURL,
+	isValidNodeRecord,
 } from './knownNodes.ts';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { exportIdMapping, getIdOfRemoteNode } from '../core/resources/nodeIdMapping.ts';
@@ -176,8 +177,12 @@ export function start(options) {
 				const hostnames = getHostnamesFromCertificate(request.peerCertificate);
 				let node: any;
 				for (const hostname of hostnames) {
-					node = hostname && (hdbNodesStore.get(hostname) || routeByHostname.get(hostname));
-					if (node) break;
+					if (!hostname) continue;
+					const candidate = hdbNodesStore.get(hostname) || routeByHostname.get(hostname);
+					if (isValidNodeRecord(candidate)) {
+						node = candidate;
+						break;
+					}
 				}
 				if (node) {
 					// Perform certificate verification
@@ -222,9 +227,9 @@ export function start(options) {
 				}
 			} else if (request.ip) {
 				// try by IP address
-				const node = hdbNodesStore.get(request.ip) || routeByHostname.get(request.ip);
-				if (node) {
-					request.user = node;
+				const candidate = hdbNodesStore.get(request.ip) || routeByHostname.get(request.ip);
+				if (isValidNodeRecord(candidate)) {
+					request.user = candidate;
 				} else if (!authorizationError) {
 					logger.info(
 						`No node found for IP address ${request.ip}, available nodes are ${Array.from(
