@@ -20,6 +20,15 @@ on:
         description: 'Dataset size in GB'
         required: false
         default: '10'
+      test-filter:
+        description: 'Which test to run (leave blank for both)'
+        required: false
+        type: choice
+        default: 'both'
+        options:
+          - 'both'
+          - 'large-catchup'
+          - 'large-clone'
   schedule:
     # 06:00 UTC nightly (midnight MDT)
     - cron: '0 6 * * *'
@@ -67,6 +76,11 @@ jobs:
             file: 'integrationTests/stress/largeCatchup.test.mjs'
           - name: 'large-clone'
             file: 'integrationTests/stress/largeClone.test.mjs'
+        exclude:
+          - test:
+              name: ${{ (inputs.test-filter == 'large-clone') && 'large-catchup' || '' }}
+          - test:
+              name: ${{ (inputs.test-filter == 'large-catchup') && 'large-clone' || '' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
