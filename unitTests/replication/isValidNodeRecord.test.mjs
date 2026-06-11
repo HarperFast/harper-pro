@@ -17,8 +17,8 @@ describe('isValidNodeRecord', () => {
 		expect(isValidNodeRecord({ name: 'node-a', url: 'wss://node-a:9933' })).to.equal(true);
 	});
 
-	it('accepts a node record with a url but no name', () => {
-		expect(isValidNodeRecord({ url: 'wss://node-a:9933' })).to.equal(true);
+	it('rejects a record with a url but no name', () => {
+		expect(isValidNodeRecord({ url: 'wss://node-a:9933' })).to.equal(false);
 	});
 
 	it('rejects null', () => {
@@ -37,7 +37,7 @@ describe('isValidNodeRecord', () => {
 		expect(isValidNodeRecord([{ name: 'node-a' }])).to.equal(false);
 	});
 
-	it('rejects an object that has neither name nor url', () => {
+	it('rejects an object with no name', () => {
 		expect(isValidNodeRecord({ subscriptions: [], replicates: true })).to.equal(false);
 	});
 
