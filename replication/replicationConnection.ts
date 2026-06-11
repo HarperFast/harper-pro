@@ -1059,6 +1059,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												remoteNodeName
 										)
 									);
+								} else if (stream.destroyed || stream.writableEnded) {
+									// The stream was torn down mid-blob and intentionally left in blobsInFlight
+									// (see the destroyed branch below) so intervening chunks were dropped rather
+									// than recreating a reader-less stream. Now that the blob is complete it will
+									// never connect to a record — forget it instead of writing to a dead stream.
+									blobsInFlight.delete(fileId);
 								} else stream.end(blobBody);
 								if (stream.connectedToBlob) blobsInFlight.delete(fileId);
 							} else if (stream.destroyed || stream.writableEnded) {
@@ -1069,9 +1075,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								// stream returns false, and pausing to wait for a 'drain'/'close' that has
 								// already fired strands the pause reason forever, wedging the entire
 								// receive loop (observed in prod: receiver goes silent, sender stuck
-								// reconnecting, replication never recovers). Drop the orphaned chunk and
-								// forget the stream instead.
-								blobsInFlight.delete(fileId);
+								// reconnecting, replication never recovers). Drop the orphaned chunk.
+								// Deliberately keep the dead stream in blobsInFlight: deleting it here would
+								// make the next chunk for this fileId recreate a fresh, reader-less PassThrough
+								// that backpressures and re-wedges the WS. Holding the destroyed stream routes
+								// every subsequent chunk back through this branch (dropped), and it is removed
+								// when the final chunk arrives (above) or by the blobsTimer timeout sweep.
 							} else if (!stream.write(blobBody)) {
 								// The PassThrough's internal queue is over its HWM, meaning the downstream
 								// file write (via pipeline in saveBlob) can't keep up. Pause the WS until the
@@ -1080,7 +1089,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								if (stream.destroyed || stream.writableEnded) {
 									// write() itself may have torn the stream down (e.g. a late error). If so,
 									// 'drain'/'close' won't arrive — skip pausing rather than strand the reason.
-									blobsInFlight.delete(fileId);
+									// Keep the dead stream in blobsInFlight for the same reason as above.
 								} else {
 									addPauseReason();
 									const release = () => {
