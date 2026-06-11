@@ -69,7 +69,17 @@ if (!stressEnabled()) {
 	const PAYLOAD_SIZE = 100 * 1024; // 100 KB per record
 	const BATCH_SIZE = 20;
 	const CONCURRENCY = 8;
-	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_RSS_CAP_MB ?? 3072);
+	// RSS is a loose ceiling, not a tight bound: process RSS counts the reclaimable
+	// page cache of Harper's PROT_READ mmap'd transaction logs (read in full during
+	// catch-up), so it legitimately reaches several GB at 10 GB scale without any
+	// memory problem. The ceiling is sized to catch a true blow-up (the original #339
+	// OOM hit ~15.8 GB) while ignoring reclaimable cache. The tight regression guard is
+	// ANON_CAP_MB below, on genuine (unreclaimable) memory.
+	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_RSS_CAP_MB ?? 12288);
+	// Cap on genuine, unreclaimable memory — container-wide cgroup `anon` (heap + native
+	// allocations + RocksDB block cache/memtables). This is the real OOM-risk signal,
+	// robust to the reclaimable file cache that inflates RSS. Observed ~2.4–3.6 GB.
+	const ANON_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_ANON_CAP_MB ?? 5120);
 	// Budget: longer offline = larger backlog = more catch-up time needed.
 	const CATCHUP_BUDGET_SECS = Number(
 		process.env.HARPER_STRESS_LARGE_CATCHUP_BUDGET_SECS ?? Math.max(600, TARGET_GB * 180)
@@ -281,10 +291,15 @@ if (!stressEnabled()) {
 				['B', bSummary, logB],
 			]) {
 				const peakMb = summary.peakRss / 1024 / 1024;
-				ok(peakMb < RSS_CAP_MB, `${name} peak RSS ${peakMb.toFixed(0)} MB exceeded cap ${RSS_CAP_MB} MB`);
+				ok(peakMb < RSS_CAP_MB, `${name} peak RSS ${peakMb.toFixed(0)} MB exceeded ceiling ${RSS_CAP_MB} MB`);
 				ok((log.match(oomRe) ?? []).length === 0, `${name} logged OOM`);
 				ok((log.match(uncaughtRe) ?? []).length === 0, `${name} logged uncaughtException`);
 			}
+			// Tight guard on genuine memory: container-wide cgroup anon (both nodes + runner).
+			// 0 when cgroup v2 is unavailable (e.g. local non-container dev) — skip there.
+			const anonMb = aSummary.peakCgroupAnon / 1024 / 1024;
+			if (anonMb > 0)
+				ok(anonMb < ANON_CAP_MB, `container peak anon ${anonMb.toFixed(0)} MB exceeded cap ${ANON_CAP_MB} MB`);
 			} finally {
 				// Signal pool tasks to swallow errors — prevents unhandled rejections
 				// from in-flight requests that time out after the test exits.
