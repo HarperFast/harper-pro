@@ -17,11 +17,17 @@ REPO="${REPO:-HarperFast/harper-pro}"
 IMAGE="${IMAGE:-harper-bench-runner}"
 LABELS="${LABELS:-harper-bench}"
 RUNNER_CPUS="${RUNNER_CPUS:-16}" # leave cores for the host desktop
+# Memory limit for the container. Harper auto-tunes its RocksDB block cache to
+# 25% of process.constrainedMemory(), which reads the cgroup limit set here.
+# Without a limit Harper uses 25% of totalmem() (~7.5 GB on a 30 GB machine),
+# which combined with compaction pressure triggers OOM during 10 GB stress tests.
+# 16 GB → 4 GB block cache; leaves ~14 GB headroom for the host desktop.
+RUNNER_MEMORY="${RUNNER_MEMORY:-16g}"
 
 command -v docker >/dev/null || { echo "docker not found"; exit 1; }
 command -v gh >/dev/null || { echo "gh not found"; exit 1; }
 
-echo "[bench-runner] repo=${REPO} image=${IMAGE} labels=${LABELS} cpus=${RUNNER_CPUS}"
+echo "[bench-runner] repo=${REPO} image=${IMAGE} labels=${LABELS} cpus=${RUNNER_CPUS} memory=${RUNNER_MEMORY}"
 trap 'echo "[bench-runner] stopping"; exit 0' INT TERM
 
 while true; do
@@ -30,6 +36,7 @@ while true; do
 	echo "[bench-runner] starting ephemeral container (online, waiting for a job)..."
 	docker run --rm \
 		--cpus "${RUNNER_CPUS}" \
+		--memory "${RUNNER_MEMORY}" \
 		-e RUNNER_REPO_URL="https://github.com/${REPO}" \
 		-e RUNNER_TOKEN="${TOKEN}" \
 		-e RUNNER_LABELS="${LABELS}" \
