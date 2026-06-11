@@ -94,6 +94,16 @@ if (!stressEnabled()) {
 			});
 
 			// Write TARGET_GB of data to the leader.
+			// Monitor leader's process: if Harper crashes during the write phase, abort
+			// immediately rather than hanging until the write-budget deadline.
+			let leaderProcessExited = false;
+			const leaderExitWatcher = new Promise((_, reject) => {
+				ctx.leader.process?.once('exit', (code, signal) => {
+					leaderProcessExited = true;
+					reject(new Error(`[large-clone] Harper leader exited unexpectedly (${signal ?? code}) during write phase`));
+				});
+			});
+
 			console.log(`[large-clone] writing ${TARGET_GB} GB (${TOTAL_RECORDS} records) to leader`);
 			const writeStart = Date.now();
 			let batchIndex = 0;
@@ -109,27 +119,36 @@ if (!stressEnabled()) {
 					id: `bulk-${start + j}`,
 					payload: PAYLOAD,
 				}));
-				await sendOperation(ctx.leader, { operation: 'upsert', table: 'large', records });
+				// 30 s per-request timeout so a dead leader fails fast rather than
+				// hanging until the 60-minute write-budget deadline.
+				await sendOperation(ctx.leader, { operation: 'upsert', table: 'large', records }, { timeoutMs: 30_000 });
 			}, CONCURRENCY);
 
-			for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
-				await pool.execute();
-				if (b % 200 === 0) {
-					const pct = Math.round((b / BATCH_COUNT) * 100);
-					const elapsed = ((Date.now() - writeStart) / 1000).toFixed(0);
-					console.log(`[large-clone] write ${pct}% (batch ${b}/${BATCH_COUNT}, ${elapsed}s elapsed)`);
-				}
-			}
-			await pool.finish();
+			// Race the write loop against the leader-process exit watcher.
+			await Promise.race([
+				(async () => {
+					for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
+						await pool.execute();
+						if (b % 200 === 0) {
+							const pct = Math.round((b / BATCH_COUNT) * 100);
+							const elapsed = ((Date.now() - writeStart) / 1000).toFixed(0);
+							console.log(`[large-clone] write ${pct}% (batch ${b}/${BATCH_COUNT}, ${elapsed}s elapsed)`);
+						}
+					}
+					await pool.finish();
+				})(),
+				leaderExitWatcher,
+			]);
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
-			const leaderCount = (await sendOperation(ctx.leader, { operation: 'describe_table', table: 'large' }))
-				?.record_count;
-			const writeMBps = (leaderCount * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
+			// Use actual written record count (not describe_table.record_count which
+			// returns an internal storage counter, not the logical row count).
+			const writtenRecords = Math.min(batchIndex * BATCH_SIZE, TOTAL_RECORDS);
+			const writeMBps = (writtenRecords * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
 			console.log(
-				`[large-clone] write done: ${leaderCount} records in ${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
+				`[large-clone] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 			);
-			ctx.leaderRecordCount = leaderCount;
+			ctx.leaderRecordCount = writtenRecords;
 		});
 
 		after(async () => {

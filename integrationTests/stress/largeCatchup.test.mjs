@@ -147,6 +147,16 @@ if (!stressEnabled()) {
 			await killHarper({ harper: B });
 
 			// Write bulk data to A while B is offline.
+			// Monitor A's process: if Harper crashes during the write phase, abort
+			// immediately rather than hanging until the write-budget deadline.
+			let aProcessExited = false;
+			const aExitWatcher = new Promise((_, reject) => {
+				A.process?.once('exit', (code, signal) => {
+					aProcessExited = true;
+					reject(new Error(`[large-catchup] Harper A exited unexpectedly (${signal ?? code}) during write phase`));
+				});
+			});
+
 			const aSampler = sampleMetrics(A, { intervalMs: 5_000 });
 			const writeStart = Date.now();
 			const writeDeadline = writeStart + WRITE_BUDGET_SECS * 1000;
@@ -161,18 +171,27 @@ if (!stressEnabled()) {
 					id: `bulk-${start + j}`,
 					payload: PAYLOAD,
 				}));
-				await sendOperation(A, { operation: 'upsert', table: 'large', records });
+				// 30 s per-request timeout so a dead A node fails fast rather than
+				// hanging until the 60-minute write-budget deadline.
+				await sendOperation(A, { operation: 'upsert', table: 'large', records }, { timeoutMs: 30_000 });
 			}, CONCURRENCY);
 
-			for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
-				await pool.execute();
-				if (b % 200 === 0) {
-					const pct = Math.round((b / BATCH_COUNT) * 100);
-					const elapsed = ((Date.now() - writeStart) / 1000).toFixed(0);
-					console.log(`[large-catchup] write ${pct}% (batch ${b}/${BATCH_COUNT}, ${elapsed}s elapsed)`);
-				}
-			}
-			await pool.finish();
+			// Race the write loop against the A-process exit watcher so a crash
+			// surfaces immediately instead of blocking until the write-budget deadline.
+			await Promise.race([
+				(async () => {
+					for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
+						await pool.execute();
+						if (b % 200 === 0) {
+							const pct = Math.round((b / BATCH_COUNT) * 100);
+							const elapsed = ((Date.now() - writeStart) / 1000).toFixed(0);
+							console.log(`[large-catchup] write ${pct}% (batch ${b}/${BATCH_COUNT}, ${elapsed}s elapsed)`);
+						}
+					}
+					await pool.finish();
+				})(),
+				aExitWatcher,
+			]);
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
 			const writtenRecords = Math.min(batchIndex * BATCH_SIZE, TOTAL_RECORDS);
