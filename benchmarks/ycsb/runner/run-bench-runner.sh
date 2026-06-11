@@ -17,19 +17,23 @@ REPO="${REPO:-HarperFast/harper-pro}"
 IMAGE="${IMAGE:-harper-bench-runner}"
 LABELS="${LABELS:-harper-bench}"
 RUNNER_CPUS="${RUNNER_CPUS:-16}" # leave cores for the host desktop
-# Container memory limits, modeled on a Fabric instance (host-manager compose):
-#   --memory            -> cgroup memory.max  (hard limit; OOM boundary)
+# Container memory limits:
+#   --memory             -> cgroup memory.max  (hard limit; OOM boundary)
 #   --memory-reservation -> cgroup memory.low (soft reservation / reclaim floor)
-# Fabric's per-instance shape is roughly reservation:hard = 1:2, so 4 GB / 8 GB
-# exercises real memory pressure (the 10 GB working set must be served largely
-# from reclaimable file cache). cgroup memory.high — the proactive throttle that
-# keeps usage off the OOM boundary — cannot be set via `docker run`, so we place
-# the container under a systemd slice (RUNNER_CGROUP_PARENT) whose MemoryHigh is
-# configured out-of-band (see the harper-bench.slice unit). Leave RUNNER_CGROUP_PARENT
-# empty to skip the slice (no memory.high).
-RUNNER_MEMORY="${RUNNER_MEMORY:-8g}"
-RUNNER_MEMORY_RESERVATION="${RUNNER_MEMORY_RESERVATION:-4g}"
-RUNNER_CGROUP_PARENT="${RUNNER_CGROUP_PARENT:-harper-bench.slice}"
+# Default 16 GB / 8 GB: the large-catchup test runs BOTH Harper nodes plus the
+# test runner inside this one container, so it needs roughly twice a single
+# Fabric instance's budget to complete a 10 GB catch-up without timing out.
+#
+# To exercise tighter, Fabric-instance-scale memory pressure with a proactive
+# throttle, set RUNNER_CGROUP_PARENT to a systemd slice whose MemoryHigh is
+# configured out-of-band (docker can't set cgroup memory.high directly), e.g.
+#   sudo: create harper-bench.slice with [Slice] MemoryHigh=<N>G
+#   RUNNER_MEMORY=8g RUNNER_MEMORY_RESERVATION=4g \
+#     RUNNER_CGROUP_PARENT=harper-bench.slice ./run-bench-runner.sh
+# Empty (default) skips the slice — no memory.high, fully portable.
+RUNNER_MEMORY="${RUNNER_MEMORY:-16g}"
+RUNNER_MEMORY_RESERVATION="${RUNNER_MEMORY_RESERVATION:-8g}"
+RUNNER_CGROUP_PARENT="${RUNNER_CGROUP_PARENT:-}"
 
 command -v docker >/dev/null || { echo "docker not found"; exit 1; }
 command -v gh >/dev/null || { echo "gh not found"; exit 1; }
