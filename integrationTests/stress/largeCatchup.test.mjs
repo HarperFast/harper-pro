@@ -266,6 +266,14 @@ if (!stressEnabled()) {
 					`throughput=${catchupMBps.toFixed(1)} MB/s ` +
 					`A_peakRSS=${mb(aSummary.peakRss)} B_peakRSS=${mb(bSummary.peakRss)}`
 			);
+			// Container-level cgroup breakdown (whole job container = both nodes + runner).
+			// anon = genuine/unreclaimable; file = reclaimable page cache (incl. mmap'd txn
+			// log read during catchup); dirty = pending writeback (vm.dirty_ratio concern).
+			console.log(
+				`[large-catchup] cgroup peaks: current=${mb(aSummary.peakCgroupCurrent)} ` +
+					`anon=${mb(aSummary.peakCgroupAnon)} file=${mb(aSummary.peakCgroupFile)} ` +
+					`dirty=${mb(aSummary.peakCgroupDirty)}`
+			);
 
 			const oomRe = /JavaScript heap out of memory|FATAL ERROR.*Allocation failed/g;
 			const uncaughtRe = /\[error\]: uncaughtException/g;

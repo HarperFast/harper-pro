@@ -9,8 +9,33 @@
 
 import { equal } from 'node:assert';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+
+/**
+ * Read the current process's cgroup v2 memory breakdown. Because the stress
+ * tests run inside the CI job container, this reflects the WHOLE container
+ * (all Harper nodes + the test runner) — i.e. exactly what the container's
+ * memory.max / OOM killer sees. Returns bytes split into anon (genuine,
+ * unreclaimable) vs file (reclaimable page cache) vs fileDirty (pending
+ * writeback — the vm.dirty_ratio concern), or null when cgroup v2 is absent
+ * (non-Linux dev runs). Sampling from inside the container is reliable even
+ * when the host is swap-thrashing, unlike host-side cgroup polling.
+ */
+export function readCgroupMem() {
+	try {
+		const current = Number(readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim());
+		const stat = readFileSync('/sys/fs/cgroup/memory.stat', 'utf8');
+		const field = (name) => {
+			const m = stat.match(new RegExp(`^${name} (\\d+)`, 'm'));
+			return m ? Number(m[1]) : 0;
+		};
+		return { current, anon: field('anon'), file: field('file'), fileDirty: field('file_dirty') };
+	} catch {
+		return null;
+	}
+}
 
 export function stressEnabled() {
 	return process.env.HARPER_RUN_STRESS_TESTS === '1';
@@ -189,6 +214,7 @@ export function sampleMetrics(node, opts = {}) {
 			samples.push({
 				t: Date.now(),
 				rss: info.memory?.rss ?? 0,
+				cgroup: readCgroupMem(),
 				threads: (info.threads ?? []).map((th) => ({
 					threadId: th.threadId ?? 0,
 					name: th.name ?? '',
@@ -215,10 +241,24 @@ export function sampleMetrics(node, opts = {}) {
  * Summarise a samples array (from sampleMetrics) into peak/avg figures.
  */
 export function summariseSamples(samples) {
-	if (samples.length === 0) return { peakRss: 0, avgRss: 0, peakThreadFootprint: 0, sampleCount: 0 };
+	if (samples.length === 0)
+		return {
+			peakRss: 0,
+			avgRss: 0,
+			peakThreadFootprint: 0,
+			peakCgroupCurrent: 0,
+			peakCgroupAnon: 0,
+			peakCgroupFile: 0,
+			peakCgroupDirty: 0,
+			sampleCount: 0,
+		};
 	let peakRss = 0;
 	let sumRss = 0;
 	let peakThreadFootprint = 0;
+	let peakCgroupCurrent = 0;
+	let peakCgroupAnon = 0;
+	let peakCgroupFile = 0;
+	let peakCgroupDirty = 0;
 	for (const s of samples) {
 		if (s.rss > peakRss) peakRss = s.rss;
 		sumRss += s.rss;
@@ -226,11 +266,21 @@ export function summariseSamples(samples) {
 			const f = (t.heapUsed || 0) + (t.externalMemory || 0) + (t.arrayBuffers || 0);
 			if (f > peakThreadFootprint) peakThreadFootprint = f;
 		}
+		if (s.cgroup) {
+			if (s.cgroup.current > peakCgroupCurrent) peakCgroupCurrent = s.cgroup.current;
+			if (s.cgroup.anon > peakCgroupAnon) peakCgroupAnon = s.cgroup.anon;
+			if (s.cgroup.file > peakCgroupFile) peakCgroupFile = s.cgroup.file;
+			if (s.cgroup.fileDirty > peakCgroupDirty) peakCgroupDirty = s.cgroup.fileDirty;
+		}
 	}
 	return {
 		peakRss,
 		avgRss: Math.floor(sumRss / samples.length),
 		peakThreadFootprint,
+		peakCgroupCurrent,
+		peakCgroupAnon,
+		peakCgroupFile,
+		peakCgroupDirty,
 		sampleCount: samples.length,
 	};
 }
