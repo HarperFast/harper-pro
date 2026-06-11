@@ -155,12 +155,12 @@ if (!stressEnabled()) {
 			console.log(
 				`[large-clone] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 			);
-			// Use describe_table.record_count for clone verification — the leader and
-			// the clone both use the same internal storage counter, so they match when
-			// replication completes. (This counter may exceed writtenRecords due to
-			// internal Harper metadata rows.)
-			const leaderDesc = await sendOperation(ctx.leader, { operation: 'describe_table', table: 'large' });
-			ctx.leaderRecordCount = leaderDesc.record_count;
+			// Use SQL COUNT(*) for clone verification — describe_table.record_count is an
+			// internal storage counter that diverges between leader and clone (the clone
+			// accumulates different internal entries during the bulk-copy process).
+			const countRows = await sendOperation(ctx.leader, { operation: 'sql', sql: 'SELECT COUNT(*) AS c FROM data.large' });
+			ctx.leaderRecordCount = countRows[0]?.c ?? 0;
+			console.log(`[large-clone] leader record count (SQL): ${ctx.leaderRecordCount}`);
 		});
 
 		after(async () => {
@@ -209,9 +209,8 @@ if (!stressEnabled()) {
 						available = true;
 						break;
 					}
-					const count =
-						(await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large' }))?.record_count ??
-						-1;
+					const countRows = await trySendOperation(cloneCtx.harper, { operation: 'sql', sql: 'SELECT COUNT(*) AS c FROM data.large' });
+					const count = countRows?.[0]?.c ?? -1;
 					const remaining = Math.ceil((deadline - Date.now()) / 1000);
 					console.log(
 						`[large-clone] clone progress: count=${count}/${ctx.leaderRecordCount} status=${resp?.status ?? 'unknown'} (${remaining}s remaining)`
@@ -240,11 +239,13 @@ if (!stressEnabled()) {
 			ok((cloneLog.match(oomRe) ?? []).length === 0, 'clone logged OOM');
 			ok((cloneLog.match(uncaughtRe) ?? []).length === 0, 'clone logged uncaughtException');
 
-			// Verify row count matches after clone completes.
+			// Verify SQL row count matches after clone completes.
+			// Use COUNT(*) rather than describe_table.record_count — the latter is an
+			// internal storage counter that diverges between nodes during bulk copy.
 			let finalCount = -1;
 			for (let i = 0; i < 30; i++) {
-				const resp = await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large' });
-				finalCount = resp?.record_count ?? -1;
+				const rows = await trySendOperation(cloneCtx.harper, { operation: 'sql', sql: 'SELECT COUNT(*) AS c FROM data.large' });
+				finalCount = rows?.[0]?.c ?? -1;
 				if (finalCount >= ctx.leaderRecordCount) break;
 				await delay(2_000);
 			}
