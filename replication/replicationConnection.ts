@@ -368,11 +368,13 @@ export class NodeReplicationConnection extends EventEmitter {
 			setTimeout(() => {
 				this.connect();
 			}, this.retryTime).unref();
-			// Increase by ~0.4% each retry, capped at 30 s. Without a cap, rapid
-			// reconnects to a dead peer (e.g. symphony accepts the TLS handshake then
-			// drops it) accumulate unreleased native TLS state faster than V8 can GC
-			// under CPU-saturated bulk-write conditions, leading to OOM.
-			this.retryTime = Math.min(this.retryTime + (this.retryTime >> 8), 30_000);
+			// Double the interval each retry, capped at 30 s. The previous ~0.4%/retry
+			// growth took >1000 retries to reach any meaningful delay, so rapid
+			// reconnects to a dead peer (symphony accepts the TLS handshake then drops
+			// it) would still accumulate unreleased native TLS state faster than V8 can
+			// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
+			// Doubling reaches 30 s in ~6 retries (~62 s total) and resets on success.
+			this.retryTime = Math.min(this.retryTime << 1, 30_000);
 		});
 	}
 	resetSession() {
