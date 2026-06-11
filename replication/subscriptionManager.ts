@@ -132,6 +132,36 @@ export function findWedgedNodeUrls(
 	}
 	return wedgedNodeUrls;
 }
+// Tear down the failover subscription(s) a restored node left behind on another connection's
+// worker, and prune it from that entry's nodes list. The unsubscribe must mirror the subscribe-time
+// connectionKey built in replicator.getSubscriptionConnection (connectingUrl + '-' + subscriptionUrl),
+// so `url` is the failover entry's own (connecting) url, not the restored node's url.
+export function removeRestoredNodeFromFailoverEntry(
+	failOverConnections: ReplicationConnectionStatus,
+	restoredNode: { name: string },
+	database: string,
+	unsubscribe: (request: any) => void = unsubscribeFromNode
+) {
+	const failOverNodes = failOverConnections.nodes;
+	const filtered = failOverNodes.filter((node) => {
+		if (!node) return false;
+		if (node.name !== restoredNode.name) return true;
+		const request = {
+			type: 'unsubscribe-from-node',
+			database,
+			url: failOverConnections.url,
+			nodes: [node],
+		};
+		// single-threaded instances have no worker assigned; unsubscribe directly on this thread
+		if (node.worker) node.worker.postMessage(request);
+		else unsubscribe(request);
+		return false;
+	});
+	if (filtered.length < failOverNodes.length) {
+		// if we were in the list, reset the nodes list
+		failOverConnections.nodes = filtered;
+	}
+}
 export let disconnectedFromNode; // this is set by thread to handle when a node is disconnected (or notify main thread so it can handle)
 export let connectedToNode; // this is set by thread to handle when a node is connected (or notify main thread so it can handle)
 const nodeMap = new Map(); // this is a map of all nodes that are available to connect to
@@ -595,24 +625,7 @@ export async function startOnMainThread(options) {
 				}
 			} else {
 				// remove the restored node from any other connections list of node
-				const filtered = failOverNodes.filter((node) => {
-					if (node) {
-						if (node.name === restoredNode.name && node.worker) {
-							node.worker.postMessage({
-								type: 'unsubscribe-to-node',
-								database: connection.database,
-								url: connection.url,
-								nodes: [node],
-							});
-							return false;
-						}
-						return true;
-					}
-				});
-				if (filtered.length < failOverNodes.length) {
-					// if we were in the list, reset the nodes list
-					failOverConnections.nodes = filtered;
-				}
+				removeRestoredNodeFromFailoverEntry(failOverConnections, restoredNode, connection.database);
 			}
 		}
 	};
