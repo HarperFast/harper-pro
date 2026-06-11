@@ -13,10 +13,10 @@ export const COMPONENTS = {
 		project: 'risk-query',
 	},
 	'redirector': {
-		repo: 'HarperFast/redirector',
-		ref: 'v1.1.2',
-		dir: 'redirector',
-		project: 'redirector',
+		repo: 'HarperFast/template-redirector',
+		ref: 'main',
+		dir: 'template-redirector',
+		project: 'template-redirector',
 	},
 	'early-hints': {
 		repo: 'HarperFast/early-hints',

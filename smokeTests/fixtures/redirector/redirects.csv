@@ -1,0 +1,9 @@
+utcStartTime,utcEndTime,path,host,version,redirectURL,operations,statusCode,regex
+,,/p/shirts/,,0,/shop/shirts,,301,
+,,/p/hats/,,0,/shop/hats,,301,
+,,/p/shoes/,,0,/shop/shoes,,301,
+,,/p/dresses/,,0,/shop/dresses,,301,
+,,/p/makeup/,,0,/shop/makeup,,301,
+,,/c/sale/,,0,/shop/sale,,302,
+,,/c/new-arrivals/,,0,/shop/new,,302,
+,,/home/,,0,/,,301,
