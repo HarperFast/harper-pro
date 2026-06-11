@@ -21,6 +21,7 @@ on:
           - risk-query
           - redirector
           - early-hints
+          - acl-connect
       node-version:
         description: 'Node.js version'
         type: string
@@ -61,10 +62,20 @@ jobs:
             repo: HarperFast/template-early-hints
             ref: main
             dir: template-early-hints
+          # acl-connect is deployed from the vendored fixture (no clone). repo/ref are informational.
+          - component: acl-connect
+            repo: HarperFast/acl-connect
+            ref: main
+            dir: acl-connect
 
     env:
       NODE_VERSION: ${{ github.event.inputs.node-version || '24' }}
       HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-component-stress-logs
+      # acl-connect at v5 defaults (20000 subscribers) overwhelms a GitHub runner; dial down for CI.
+      # Local runs use v5-faithful defaults; see stressTests/components/acl-connect.stress.mjs.
+      STRESS_SUB_THREADS: '2000'
+      STRESS_SUB_RAMPUP_SEC: '60'
+      STRESS_DURATION_SEC: '300'
 
     steps:
       - name: Generate app token
@@ -80,7 +91,9 @@ jobs:
           submodules: recursive
           token: ${{ steps.app-token.outputs.token }}
 
+      # acl-connect runs from the vendored fixture in smokeTests/fixtures/acl-connect/, skip the clone.
       - name: Checkout component (${{ matrix.repo }}@${{ matrix.ref }})
+        if: matrix.component != 'acl-connect'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ${{ matrix.repo }}
@@ -101,6 +114,7 @@ jobs:
         run: npm run build || true
 
       - name: Install k6
+        if: matrix.component != 'acl-connect'
         run: |
           sudo gpg -k
           sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
@@ -109,6 +123,21 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/k6.list
           sudo apt-get update
           sudo apt-get install -y k6
+
+      - name: Install Java + JMeter + mqtt-xmeter plugin
+        if: matrix.component == 'acl-connect'
+        env:
+          JMETER_VERSION: 5.6.3
+          XMETER_VERSION: 2.0.2
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y default-jre
+          curl -fsSL "https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${JMETER_VERSION}.tgz" -o /tmp/jmeter.tgz
+          sudo tar -xzf /tmp/jmeter.tgz -C /opt
+          curl -fsSL "https://github.com/emqx/mqtt-jmeter/releases/download/${XMETER_VERSION}/mqtt-xmeter-${XMETER_VERSION}-jar-with-dependencies.jar" \
+            -o "/opt/apache-jmeter-${JMETER_VERSION}/lib/ext/mqtt-xmeter.jar"
+          echo "/opt/apache-jmeter-${JMETER_VERSION}/bin" >> "$GITHUB_PATH"
 
       - name: Run component stress test (${{ matrix.component }})
         run: node stressTests/run-stress.mjs --component=${{ matrix.component }}

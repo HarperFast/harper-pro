@@ -19,6 +19,7 @@ on:
           - risk-query
           - redirector
           - early-hints
+          - acl-connect
       node-version:
         description: 'Node.js version'
         type: string
@@ -58,6 +59,11 @@ jobs:
             repo: HarperFast/template-early-hints
             ref: main
             dir: template-early-hints
+          # acl-connect is deployed from the vendored fixture (no clone). repo/ref are informational.
+          - component: acl-connect
+            repo: HarperFast/acl-connect
+            ref: main
+            dir: acl-connect
 
     env:
       NODE_VERSION: ${{ github.event.inputs.node-version || '24' }}
@@ -78,7 +84,9 @@ jobs:
           submodules: recursive
           token: ${{ steps.app-token.outputs.token }}
 
+      # acl-connect runs from the vendored fixture in smokeTests/fixtures/acl-connect/, skip the clone.
       - name: Checkout component (${{ matrix.repo }}@${{ matrix.ref }})
+        if: matrix.component != 'acl-connect'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: ${{ matrix.repo }}
@@ -99,6 +107,7 @@ jobs:
         run: npm run build || true # known type errors are ignored here, same as integration-tests
 
       - name: Install k6
+        if: matrix.component != 'acl-connect'
         run: |
           sudo gpg -k
           sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
@@ -107,6 +116,21 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/k6.list
           sudo apt-get update
           sudo apt-get install -y k6
+
+      - name: Install Java + JMeter + mqtt-xmeter plugin
+        if: matrix.component == 'acl-connect'
+        env:
+          JMETER_VERSION: 5.6.3
+          XMETER_VERSION: 2.0.2
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y default-jre
+          curl -fsSL "https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${JMETER_VERSION}.tgz" -o /tmp/jmeter.tgz
+          sudo tar -xzf /tmp/jmeter.tgz -C /opt
+          curl -fsSL "https://github.com/emqx/mqtt-jmeter/releases/download/${XMETER_VERSION}/mqtt-xmeter-${XMETER_VERSION}-jar-with-dependencies.jar" \
+            -o "/opt/apache-jmeter-${JMETER_VERSION}/lib/ext/mqtt-xmeter.jar"
+          echo "/opt/apache-jmeter-${JMETER_VERSION}/bin" >> "$GITHUB_PATH"
 
       - name: Run smoke canary (${{ matrix.component }})
         run: node smokeTests/run-smoke.mjs --component=${{ matrix.component }}
