@@ -47,6 +47,7 @@ import {
 	waitForAllConnected,
 	sampleMetrics,
 	summariseSamples,
+	fabricRocksConfig,
 	mb,
 } from './stressShared.mjs';
 
@@ -81,11 +82,6 @@ if (!stressEnabled()) {
 
 	// Build payload once; reused across all records to avoid per-record allocation.
 	const PAYLOAD = 'x'.repeat(PAYLOAD_SIZE);
-	// Cap RocksDB block cache to 1 GB per node. The default (25% of system
-	// memory) can reach 7+ GB on a 30 GB machine, allowing compaction reads to
-	// fill the cache during bulk writes and exhaust available RAM.
-	// Declared at suite scope so both before() and the test() callback can use it.
-	const ROCKS_BLOCK_CACHE_MB = Number(process.env.HARPER_STRESS_ROCKS_BLOCK_CACHE_MB ?? 1024);
 
 	suite(`Large catch-up — ${TARGET_GB} GB`, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		before(async () => {
@@ -93,7 +89,7 @@ if (!stressEnabled()) {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false, console: true, level: 'warn' },
 				replication: { securePort: host + ':9933' },
-				storage: { rocks: { blockCacheSize: ROCKS_BLOCK_CACHE_MB * 1024 * 1024 } },
+				storage: { rocks: fabricRocksConfig() },
 				threads: { count: 4 },
 			});
 
@@ -230,7 +226,7 @@ if (!stressEnabled()) {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, console: true, level: 'warn' },
 					replication: { securePort: B.hostname + ':9933' },
-					storage: { rocks: { blockCacheSize: ROCKS_BLOCK_CACHE_MB * 1024 * 1024 } },
+					storage: { rocks: fabricRocksConfig() },
 					threads: { count: 4 },
 				},
 				env: { HARPER_NO_FLUSH_ON_EXIT: true },
