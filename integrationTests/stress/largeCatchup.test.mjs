@@ -81,13 +81,14 @@ if (!stressEnabled()) {
 
 	// Build payload once; reused across all records to avoid per-record allocation.
 	const PAYLOAD = 'x'.repeat(PAYLOAD_SIZE);
+	// Cap RocksDB block cache to 1 GB per node. The default (25% of system
+	// memory) can reach 7+ GB on a 30 GB machine, allowing compaction reads to
+	// fill the cache during bulk writes and exhaust available RAM.
+	// Declared at suite scope so both before() and the test() callback can use it.
+	const ROCKS_BLOCK_CACHE_MB = Number(process.env.HARPER_STRESS_ROCKS_BLOCK_CACHE_MB ?? 1024);
 
 	suite(`Large catch-up — ${TARGET_GB} GB`, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		before(async () => {
-			// Cap RocksDB block cache to 1 GB per node. The default (25% of system
-			// memory) can reach 7+ GB on a 30 GB machine, allowing compaction reads to
-			// fill the cache during bulk writes and exhaust available RAM.
-			const ROCKS_BLOCK_CACHE_MB = Number(process.env.HARPER_STRESS_ROCKS_BLOCK_CACHE_MB ?? 1024);
 			const cfg = (host) => ({
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false, console: true, level: 'warn' },
@@ -210,7 +211,7 @@ if (!stressEnabled()) {
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
 			const writtenRecords = Math.min(batchIndex * BATCH_SIZE, TOTAL_RECORDS);
-			const writeMBps = (writtenRecords * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
+			const writeMBps = (writtenRecords * PAYLOAD_SIZE) / 1024 / 1024 / writeSecs;
 			console.log(
 				`[large-catchup] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ` +
 					`${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
@@ -251,9 +252,7 @@ if (!stressEnabled()) {
 					break;
 				}
 				const remaining = Math.ceil((deadline - Date.now()) / 1000);
-				console.log(
-					`[large-catchup] catchup poll: B=${lastCount}/${targetCount} (${remaining}s remaining)`
-				);
+				console.log(`[large-catchup] catchup poll: B=${lastCount}/${targetCount} (${remaining}s remaining)`);
 				await delay(5_000);
 			}
 
