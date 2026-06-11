@@ -110,6 +110,7 @@ if (!stressEnabled()) {
 
 			const writeDeadline = writeStart + WRITE_BUDGET_SECS * 1000;
 
+			let writeDone = false;
 			const pool = concurrent(async () => {
 				const bi = batchIndex++;
 				const start = bi * BATCH_SIZE;
@@ -121,7 +122,14 @@ if (!stressEnabled()) {
 				}));
 				// 30 s per-request timeout so a dead leader fails fast rather than
 				// hanging until the 60-minute write-budget deadline.
-				await sendOperation(ctx.leader, { operation: 'upsert', table: 'large', records }, { timeoutMs: 30_000 });
+				// Silently drop errors after writeDone so abandoned in-flight requests
+				// don't become unhandled rejections.
+				try {
+					await sendOperation(ctx.leader, { operation: 'upsert', table: 'large', records }, { timeoutMs: 30_000 });
+				} catch (err) {
+					if (writeDone) return;
+					throw err;
+				}
 			}, CONCURRENCY);
 
 			// Race the write loop against the leader-process exit watcher.
@@ -139,16 +147,20 @@ if (!stressEnabled()) {
 				})(),
 				leaderExitWatcher,
 			]);
+			writeDone = true;
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
-			// Use actual written record count (not describe_table.record_count which
-			// returns an internal storage counter, not the logical row count).
 			const writtenRecords = Math.min(batchIndex * BATCH_SIZE, TOTAL_RECORDS);
 			const writeMBps = (writtenRecords * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
 			console.log(
 				`[large-clone] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 			);
-			ctx.leaderRecordCount = writtenRecords;
+			// Use describe_table.record_count for clone verification — the leader and
+			// the clone both use the same internal storage counter, so they match when
+			// replication completes. (This counter may exceed writtenRecords due to
+			// internal Harper metadata rows.)
+			const leaderDesc = await sendOperation(ctx.leader, { operation: 'describe_table', table: 'large' });
+			ctx.leaderRecordCount = leaderDesc.record_count;
 		});
 
 		after(async () => {

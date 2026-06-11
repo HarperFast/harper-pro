@@ -159,6 +159,7 @@ if (!stressEnabled()) {
 
 			const aSampler = sampleMetrics(A, { intervalMs: 5_000 });
 			let bSampler = null;
+			let testDone = false;
 			try {
 			const writeStart = Date.now();
 			const writeDeadline = writeStart + WRITE_BUDGET_SECS * 1000;
@@ -175,7 +176,14 @@ if (!stressEnabled()) {
 				}));
 				// 30 s per-request timeout so a dead A node fails fast rather than
 				// hanging until the 60-minute write-budget deadline.
-				await sendOperation(A, { operation: 'upsert', table: 'large', records }, { timeoutMs: 30_000 });
+				// Silently drop errors after testDone so that in-flight requests
+				// abandoned when Promise.race settles don't become unhandled rejections.
+				try {
+					await sendOperation(A, { operation: 'upsert', table: 'large', records }, { timeoutMs: 30_000 });
+				} catch (err) {
+					if (testDone) return;
+					throw err;
+				}
 			}, CONCURRENCY);
 
 			// Race the write loop against the A-process exit watcher so a crash
@@ -269,6 +277,9 @@ if (!stressEnabled()) {
 				ok((log.match(uncaughtRe) ?? []).length === 0, `${name} logged uncaughtException`);
 			}
 			} finally {
+				// Signal pool tasks to swallow errors — prevents unhandled rejections
+				// from in-flight requests that time out after the test exits.
+				testDone = true;
 				// Always stop samplers so their timers don't keep the event loop alive
 				// after an early exit (e.g. Harper crash during write phase).
 				aSampler.stop();
