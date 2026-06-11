@@ -12,3 +12,12 @@ node_modules/
 
 unitTests/server/replication/envDir
 unitTests/envDir
+
+# Smoke- and stress-test component checkouts and run artifacts
+smokeTests/.components/
+smokeTests/**/*.jtl
+smokeTests/**/k6_summary.json
+stressTests/**/*.jtl
+stressTests/**/k6_summary.json
+# JMeter writes a startup log in the working directory (repo root) before -j redirects it
+/jmeter.log

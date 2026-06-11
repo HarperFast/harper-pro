@@ -1,0 +1,118 @@
+name: Component Stress Tests
+
+# Heavy-tier load tests for the customer-facing components, adapted verbatim from the v5 perf
+# reports: k6 RPS scenarios 50/100/300/500/900 x 60s plateau for the HTTP components, and the v5
+# JMeter MQTT profile (1 publisher + 20000 subscribers x 600s) for acl-connect. Runs weekly + on
+# demand. Distinct from the replication-layer "Stress Tests" workflow (which uses
+# integrationTests/stress/ and HARPER_RUN_STRESS_TESTS gating). See stressTests/README.md.
+
+on:
+  schedule:
+    # Weekly, Sundays at 08:00 UTC (after Sync Core 07:00 and the replication Stress 06:11).
+    - cron: '0 8 * * 0'
+  workflow_dispatch:
+    inputs:
+      component:
+        description: 'Which component(s) to stress test'
+        type: choice
+        default: 'all'
+        options:
+          - all
+          - risk-query
+          - redirector
+      node-version:
+        description: 'Node.js version'
+        type: string
+        default: '24'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: component-stress-tests-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    name: Stress ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    # Each k6 leg is ~6 min wall-clock; acl-connect (dialled-down) ~6 min plus JMeter overhead.
+    # Generous head-room for cluster boot, npm install, build, and JMeter shutdown.
+    timeout-minutes: 60
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event.inputs.component == 'all' ||
+      github.event.inputs.component == matrix.component
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep refs in sync with smokeTests/manifest.mjs.
+        include:
+          - component: risk-query
+            repo: HarperFast/risk-query
+            ref: main
+            dir: risk-query
+          - component: redirector
+            repo: HarperFast/template-redirector
+            ref: main
+            dir: template-redirector
+
+    env:
+      NODE_VERSION: ${{ github.event.inputs.node-version || '24' }}
+      HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-component-stress-logs
+
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.HARPERFAST_AI_CLIENT_ID }}
+          private-key: ${{ secrets.HARPERFAST_AI_APP_PRIVATE_KEY }}
+
+      - name: Checkout harper-pro
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Checkout component (${{ matrix.repo }}@${{ matrix.ref }})
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.ref }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: smokeTests/.components/${{ matrix.dir }}
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build || true
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - name: Run component stress test (${{ matrix.component }})
+        run: node stressTests/run-stress.mjs --component=${{ matrix.component }}
+
+      - name: Upload Harper server logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harper-component-stress-logs-${{ matrix.component }}
+          path: ${{ env.HARPER_INTEGRATION_TEST_LOG_DIR }}/
+          retention-days: 5
+          if-no-files-found: ignore
