@@ -16,6 +16,8 @@ import {
 	AuditRecord,
 	readAuditEntry,
 	ACTION_32_BIT,
+	auditRetention,
+	LOCAL_ONLY,
 } from '../core/resources/auditStore.ts';
 import {
 	exportIdMapping,
@@ -118,6 +120,34 @@ const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 10
 // follower commits incrementally and persists a resume cursor. On reconnect the copy resumes from that
 // cursor instead of restarting from zero. Larger = less overhead but coarser resume granularity.
 const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 1000;
+
+/**
+ * Decide whether an incremental replication start must be upgraded to a bounded base copy because
+ * the requested start predates the transaction-log history the sender still retains. Audit-log
+ * retention is time-based (auditRetention purges whole files by mtime), so a peer behind by more
+ * than the retention window can no longer be caught up incrementally — the entries it needs were
+ * purged. Serving it incremental replay instead would either silently skip the purged entries
+ * (data loss) or replay an unbounded history (the heap-unbounded path that OOMs, harper#1114).
+ * Returning true routes the peer through the existing base-copy path (startTime = 0). See harper-pro#277.
+ *
+ * The retention floor is max(oldestRetainedTime, retentionCutoffTime): the oldest actually-retained
+ * entry catches purges more aggressive than nominal retention (cleanup runs with a dynamic divisor),
+ * while the cutoff catches a fully-purged/idle log whose data still lives in the primary store but
+ * has no surviving audit entry to compare against.
+ *
+ * @param requestedStartTime peer's requested incremental start (epoch ms); 0 already means base copy
+ * @param oldestRetainedTime timestamp of the oldest retained audit entry, or undefined if none retained
+ * @param retentionCutoffTime Date.now() - auditRetention, the nominal time-based purge floor
+ */
+export function shouldForceBaseCopyForRetention(
+	requestedStartTime: number,
+	oldestRetainedTime: number | undefined,
+	retentionCutoffTime: number
+): boolean {
+	// 0 means a base copy was already requested; guard against non-positive/NaN starts too.
+	if (!(requestedStartTime > 0)) return false;
+	return requestedStartTime < Math.max(oldestRetainedTime ?? 0, retentionCutoffTime);
+}
 
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
@@ -1059,6 +1089,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												remoteNodeName
 										)
 									);
+								} else if (stream.destroyed || stream.writableEnded) {
+									// The stream was torn down mid-blob and intentionally left in blobsInFlight
+									// (see the destroyed branch below) so intervening chunks were dropped rather
+									// than recreating a reader-less stream. Now that the blob is complete it will
+									// never connect to a record — forget it instead of writing to a dead stream.
+									blobsInFlight.delete(fileId);
 								} else stream.end(blobBody);
 								if (stream.connectedToBlob) blobsInFlight.delete(fileId);
 							} else if (stream.destroyed || stream.writableEnded) {
@@ -1069,9 +1105,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								// stream returns false, and pausing to wait for a 'drain'/'close' that has
 								// already fired strands the pause reason forever, wedging the entire
 								// receive loop (observed in prod: receiver goes silent, sender stuck
-								// reconnecting, replication never recovers). Drop the orphaned chunk and
-								// forget the stream instead.
-								blobsInFlight.delete(fileId);
+								// reconnecting, replication never recovers). Drop the orphaned chunk.
+								// Deliberately keep the dead stream in blobsInFlight: deleting it here would
+								// make the next chunk for this fileId recreate a fresh, reader-less PassThrough
+								// that backpressures and re-wedges the WS. Holding the destroyed stream routes
+								// every subsequent chunk back through this branch (dropped), and it is removed
+								// when the final chunk arrives (above) or by the blobsTimer timeout sweep.
 							} else if (!stream.write(blobBody)) {
 								// The PassThrough's internal queue is over its HWM, meaning the downstream
 								// file write (via pipeline in saveBlob) can't keep up. Pause the WS until the
@@ -1080,7 +1119,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								if (stream.destroyed || stream.writableEnded) {
 									// write() itself may have torn the stream down (e.g. a late error). If so,
 									// 'drain'/'close' won't arrive — skip pausing rather than strand the reason.
-									blobsInFlight.delete(fileId);
+									// Keep the dead stream in blobsInFlight for the same reason as above.
 								} else {
 									addPauseReason();
 									const release = () => {
@@ -1365,6 +1404,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								encodingStart = position;
 								currentTransaction.txnTime = 0;
 								return; // end of transaction, nothing more to do
+							}
+							// Local-only records (e.g. a v4 bridge peer's hdb_nodes row) are never forwarded to
+							// peers. The flag rides the audit entry's extendedType, so this is a pure bitmask test
+							// on an already-decoded integer — no record value decode is added to the send path.
+							if (auditRecord.extendedType & LOCAL_ONLY) {
+								return skipAuditRecord();
 							}
 							const nodeId = auditRecord.nodeId;
 							const tableId = auditRecord.tableId;
@@ -1712,6 +1757,39 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									}
 									if (isFirst && !closed) {
 										isFirst = false;
+										// If the requested incremental start predates the transaction-log history we still
+										// retain, the entries needed to catch up incrementally have been purged (retention is
+										// time-based). Upgrade to the bounded base-copy path instead of audit replay, which would
+										// otherwise silently skip the purged entries or replay an unbounded history (harper#1114).
+										if (currentSequenceId > 0) {
+											const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+											let oldestRetainedTime: number | undefined;
+											// Mirror the replay scope below (single log, or all non-excluded logs) and take the
+											// first (oldest) entry; getRange yields ascending by audit-log key. Use the same key
+											// basis as the replay loop (localTime ?? version) and retention cleanup — on LMDB audit
+											// stores localTime (the log key) differs from version (the originating record timestamp).
+											for (const entry of auditStore.getRange({
+												start: 1,
+												log: excludedNodes ? undefined : oldestLogName,
+												excludeLogs: excludedNodes,
+												snapshot: false,
+											})) {
+												oldestRetainedTime = entry.localTime ?? entry.version;
+												break;
+											}
+											if (
+												shouldForceBaseCopyForRetention(
+													currentSequenceId,
+													oldestRetainedTime,
+													Date.now() - auditRetention
+												)
+											) {
+												logger.warn?.(
+													`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
+												);
+												currentSequenceId = 0;
+											}
+										}
 										if (currentSequenceId === 0) {
 											logger.info?.('Replicating all tables to', remoteNodeName);
 											// Capture the resume point BEFORE iterating. The bulk copy walks the primary store in
@@ -1764,6 +1842,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												}
 												for (const entry of table.primaryStore.getRange(rangeOptions)) {
 													if (closed) return;
+													// Local-only records must never be full-copied to a peer. metadataFlags is the
+													// already-available record metadata integer from the range entry — a pure bitmask
+													// test, no record value decode added to this send path.
+													if (entry.metadataFlags & LOCAL_ONLY) continue;
 													logger.trace?.(
 														connectionId,
 														'Copying record from',
@@ -1961,6 +2043,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						connectionId,
 						'dropping incoming replication for excluded table',
 						databaseName + '.' + tableDecoder.name,
+						'from',
+						remoteNodeName
+					);
+					decoder.position = start + eventLength;
+					continue;
+				}
+				// Defense-in-depth: a correct sender never forwards local-only records, but if one ever
+				// arrives (older/misconfigured peer), drop it here. The flag rides the audit entry's
+				// extendedType — a bitmask test on the already-decoded header, no record value decode.
+				if (auditRecord.extendedType & LOCAL_ONLY) {
+					logger.trace?.(
+						connectionId,
+						'dropping incoming local-only replication record',
+						databaseName,
+						auditRecord.recordId,
 						'from',
 						remoteNodeName
 					);
