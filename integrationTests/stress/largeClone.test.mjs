@@ -155,12 +155,10 @@ if (!stressEnabled()) {
 			console.log(
 				`[large-clone] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 			);
-			// Use SQL COUNT(*) for clone verification — describe_table.record_count is an
-			// internal storage counter that diverges between leader and clone (the clone
-			// accumulates different internal entries during the bulk-copy process).
-			const countRows = await sendOperation(ctx.leader, { operation: 'sql', sql: 'SELECT COUNT(*) AS c FROM data.large' });
-			ctx.leaderRecordCount = countRows[0]?.c ?? 0;
-			console.log(`[large-clone] leader record count (SQL): ${ctx.leaderRecordCount}`);
+			// Track exact write count for clone verification. Avoid SQL COUNT(*) here
+			// because it does a full scan on the leader's 10 GB dataset (slow). We know
+			// the exact number of records from the write loop.
+			ctx.leaderRecordCount = writtenRecords;
 		});
 
 		after(async () => {
