@@ -96,10 +96,10 @@ if (!stressEnabled()) {
 			// Write TARGET_GB of data to the leader.
 			// Monitor leader's process: if Harper crashes during the write phase, abort
 			// immediately rather than hanging until the write-budget deadline.
-			let leaderProcessExited = false;
+			let _leaderProcessExited = false;
 			const leaderExitWatcher = new Promise((_, reject) => {
 				ctx.leader.process?.once('exit', (code, signal) => {
-					leaderProcessExited = true;
+					_leaderProcessExited = true;
 					reject(new Error(`[large-clone] Harper leader exited unexpectedly (${signal ?? code}) during write phase`));
 				});
 			});

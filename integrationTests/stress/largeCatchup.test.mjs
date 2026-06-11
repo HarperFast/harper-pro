@@ -149,10 +149,10 @@ if (!stressEnabled()) {
 			// Write bulk data to A while B is offline.
 			// Monitor A's process: if Harper crashes during the write phase, abort
 			// immediately rather than hanging until the write-budget deadline.
-			let aProcessExited = false;
+			let _aProcessExited = false;
 			const aExitWatcher = new Promise((_, reject) => {
 				A.process?.once('exit', (code, signal) => {
-					aProcessExited = true;
+					_aProcessExited = true;
 					reject(new Error(`[large-catchup] Harper A exited unexpectedly (${signal ?? code}) during write phase`));
 				});
 			});
