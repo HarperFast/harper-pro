@@ -17,17 +17,24 @@ REPO="${REPO:-HarperFast/harper-pro}"
 IMAGE="${IMAGE:-harper-bench-runner}"
 LABELS="${LABELS:-harper-bench}"
 RUNNER_CPUS="${RUNNER_CPUS:-16}" # leave cores for the host desktop
-# Memory limit for the container. Harper auto-tunes its RocksDB block cache to
-# 25% of process.constrainedMemory(), which reads the cgroup limit set here.
-# Without a limit Harper uses 25% of totalmem() (~7.5 GB on a 30 GB machine),
-# which combined with compaction pressure triggers OOM during 10 GB stress tests.
-# 16 GB → 4 GB block cache; leaves ~14 GB headroom for the host desktop.
-RUNNER_MEMORY="${RUNNER_MEMORY:-16g}"
+# Container memory limits, modeled on a Fabric instance (host-manager compose):
+#   --memory            -> cgroup memory.max  (hard limit; OOM boundary)
+#   --memory-reservation -> cgroup memory.low (soft reservation / reclaim floor)
+# Fabric's per-instance shape is roughly reservation:hard = 1:2, so 4 GB / 8 GB
+# exercises real memory pressure (the 10 GB working set must be served largely
+# from reclaimable file cache). cgroup memory.high — the proactive throttle that
+# keeps usage off the OOM boundary — cannot be set via `docker run`, so we place
+# the container under a systemd slice (RUNNER_CGROUP_PARENT) whose MemoryHigh is
+# configured out-of-band (see the harper-bench.slice unit). Leave RUNNER_CGROUP_PARENT
+# empty to skip the slice (no memory.high).
+RUNNER_MEMORY="${RUNNER_MEMORY:-8g}"
+RUNNER_MEMORY_RESERVATION="${RUNNER_MEMORY_RESERVATION:-4g}"
+RUNNER_CGROUP_PARENT="${RUNNER_CGROUP_PARENT:-harper-bench.slice}"
 
 command -v docker >/dev/null || { echo "docker not found"; exit 1; }
 command -v gh >/dev/null || { echo "gh not found"; exit 1; }
 
-echo "[bench-runner] repo=${REPO} image=${IMAGE} labels=${LABELS} cpus=${RUNNER_CPUS} memory=${RUNNER_MEMORY}"
+echo "[bench-runner] repo=${REPO} image=${IMAGE} labels=${LABELS} cpus=${RUNNER_CPUS} memory=${RUNNER_MEMORY} reservation=${RUNNER_MEMORY_RESERVATION} cgroup-parent=${RUNNER_CGROUP_PARENT:-<none>}"
 trap 'echo "[bench-runner] stopping"; exit 0' INT TERM
 
 while true; do
@@ -37,6 +44,8 @@ while true; do
 	docker run --rm \
 		--cpus "${RUNNER_CPUS}" \
 		--memory "${RUNNER_MEMORY}" \
+		--memory-reservation "${RUNNER_MEMORY_RESERVATION}" \
+		${RUNNER_CGROUP_PARENT:+--cgroup-parent "${RUNNER_CGROUP_PARENT}"} \
 		-e RUNNER_REPO_URL="https://github.com/${REPO}" \
 		-e RUNNER_TOKEN="${TOKEN}" \
 		-e RUNNER_LABELS="${LABELS}" \

@@ -291,6 +291,27 @@ export function mb(bytes) {
 }
 
 /**
+ * Fabric-style RocksDB memory tuning for stress tests, mirroring host-manager's
+ * instanceController: block cache = 15% and WriteBufferManager = 5% of a notional
+ * per-instance hard limit (default 8 GB — the per-node size the bench container
+ * targets). costToCache unifies memtable + cache accounting (the WBM charge shows
+ * up in block-cache-usage). The WBM cap is the structural ceiling on total
+ * memtable memory across all column families, which the default (no WBM) leaves
+ * unbounded — a meaningful source of write-burst anon. Returns a `storage.rocks`
+ * config object; all three knobs are env-overridable for ad-hoc tuning.
+ */
+export function fabricRocksConfig() {
+	const hardMb = Number(process.env.HARPER_STRESS_ROCKS_INSTANCE_HARD_MB ?? 8192);
+	const blockCacheMb = Number(process.env.HARPER_STRESS_ROCKS_BLOCK_CACHE_MB ?? Math.floor(hardMb * 0.15));
+	const wbmMb = Number(process.env.HARPER_STRESS_ROCKS_WBM_MB ?? Math.floor(hardMb * 0.05));
+	return {
+		blockCacheSize: blockCacheMb * MB,
+		writeBufferManagerSize: wbmMb * MB,
+		writeBufferManagerCostToCache: true,
+	};
+}
+
+/**
  * Generate a deterministic-but-varied prerender-style record id like
  * "https://example.com/path/<n>|<device>". Mimics the Norton URL+device
  * tuple pattern from the wtk prerender table without depending on a real
