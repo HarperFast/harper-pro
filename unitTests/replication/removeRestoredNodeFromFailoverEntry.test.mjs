@@ -1,16 +1,13 @@
 /**
- * Regression coverage for harper-pro#328: when a failed-over node reconnects, the restore flow
- * must tear down the failover subscription the old worker is still holding. Two silent failures
- * are pinned here:
+ * When a failed-over node reconnects, the restore flow tears down the failover subscription the
+ * old worker still holds. These tests pin two invariants of that teardown (harper-pro#328):
  *
- *   1) The posted message type must be 'unsubscribe-from-node' — the previously posted
- *      'unsubscribe-to-node' had no registered handler, so the worker dropped the message and
- *      kept a phantom subscription.
- *   2) The `url` must be the failover entry's own url (the subscribe-time connectingUrl), not the
- *      restored node's url. The worker registers the connection under
- *      `connectingUrl + '-' + node.url` (replicator.getSubscriptionConnection), so an unsubscribe
- *      keyed by the restored node's url never matches and the teardown is a no-op even with the
- *      correct type.
+ *   1) The posted message type is 'unsubscribe-from-node' — the registered handler. An unhandled
+ *      type would be silently dropped, leaving a phantom subscription.
+ *   2) The `url` is the failover entry's own (connecting) url, not the restored node's url. The
+ *      worker registers the connection under `connectingUrl + '-' + node.url`
+ *      (replicator.getSubscriptionConnection), so a teardown keyed by the restored node's url
+ *      would not match.
  *
  * Also covers the single-threaded fallback (no worker assigned: unsubscribe directly on this
  * thread, mirroring the subscribe/unsubscribe fallbacks elsewhere in subscriptionManager).

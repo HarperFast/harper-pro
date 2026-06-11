@@ -1,9 +1,8 @@
 /**
- * Contract check for harper-pro#328's bug class: a postMessage type with no registered handler is
- * silently dropped (manageThreads dispatches by type and ignores unknown types), so a typo like
- * 'unsubscribe-to-node' vs 'unsubscribe-from-node' produces no error, no log, and a phantom
- * subscription. This scans subscriptionManager.ts and asserts every message type it posts has a
- * matching onMessageByType registration in the same file, so the class can't be reintroduced.
+ * Contract check (harper-pro#328): manageThreads dispatches worker messages by type and ignores
+ * unknown types, so a postMessage type with no registered handler is silently dropped — no error,
+ * no log. This scans subscriptionManager.ts and asserts every message type it posts has a matching
+ * onMessageByType registration in the same file.
  */
 
 import { expect } from 'chai';

@@ -132,11 +132,9 @@ export function findWedgedNodeUrls(
 	return wedgedNodeUrls;
 }
 // Tear down the failover subscription(s) a restored node left behind on another connection's
-// worker, and prune it from that entry's nodes list. The unsubscribe request must mirror the
-// subscribe-time connectionKey — entry url + '-' + node url (replicator.getSubscriptionConnection) —
-// so `url` is the entry's own url, NOT the restored node's url. See harper-pro#328: this previously
-// posted the unhandled type 'unsubscribe-to-node' with the restored node's url, so the worker-side
-// teardown silently never happened.
+// worker, and prune it from that entry's nodes list. The unsubscribe must mirror the subscribe-time
+// connectionKey built in replicator.getSubscriptionConnection (connectingUrl + '-' + subscriptionUrl),
+// so `url` is the failover entry's own (connecting) url, not the restored node's url.
 export function removeRestoredNodeFromFailoverEntry(
 	failOverConnections: ReplicationConnectionStatus,
 	restoredNode: { name: string },
