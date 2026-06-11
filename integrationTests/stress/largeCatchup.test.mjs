@@ -158,6 +158,8 @@ if (!stressEnabled()) {
 			});
 
 			const aSampler = sampleMetrics(A, { intervalMs: 5_000 });
+			let bSampler = null;
+			try {
 			const writeStart = Date.now();
 			const writeDeadline = writeStart + WRITE_BUDGET_SECS * 1000;
 			let batchIndex = 0;
@@ -222,7 +224,7 @@ if (!stressEnabled()) {
 			B = bRestartCtx.harper;
 
 			const catchupStart = Date.now();
-			const bSampler = sampleMetrics(B, { intervalMs: 5_000 });
+			bSampler = sampleMetrics(B, { intervalMs: 5_000 });
 
 			const deadline = Date.now() + CATCHUP_BUDGET_SECS * 1000;
 			let lastCount = -1;
@@ -265,6 +267,12 @@ if (!stressEnabled()) {
 				ok(peakMb < RSS_CAP_MB, `${name} peak RSS ${peakMb.toFixed(0)} MB exceeded cap ${RSS_CAP_MB} MB`);
 				ok((log.match(oomRe) ?? []).length === 0, `${name} logged OOM`);
 				ok((log.match(uncaughtRe) ?? []).length === 0, `${name} logged uncaughtException`);
+			}
+			} finally {
+				// Always stop samplers so their timers don't keep the event loop alive
+				// after an early exit (e.g. Harper crash during write phase).
+				aSampler.stop();
+				bSampler?.stop();
 			}
 		});
 	});

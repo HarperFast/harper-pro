@@ -170,6 +170,7 @@ if (!stressEnabled()) {
 			// Note: sampleMetrics won't capture until the node is up, but we start
 			// it here so we get coverage from the moment the process is alive.
 			const cloneStart = Date.now();
+			try {
 
 			await startHarper(cloneCtx, {
 				config: {
@@ -236,6 +237,11 @@ if (!stressEnabled()) {
 				await delay(2_000);
 			}
 			equal(finalCount, ctx.leaderRecordCount, `Clone row count ${finalCount} != leader ${ctx.leaderRecordCount}`);
+			} finally {
+				// Always stop the sampler so its timer doesn't keep the event loop
+				// alive after an early exit (e.g. startHarper throws).
+				cloneSampler.stop();
+			}
 		});
 	});
 }
