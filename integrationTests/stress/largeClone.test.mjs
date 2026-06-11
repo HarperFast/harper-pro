@@ -94,12 +94,23 @@ if (!stressEnabled()) {
 			});
 
 			// Write TARGET_GB of data to the leader.
+			// Monitor leader's process: if Harper crashes during the write phase, abort
+			// immediately rather than hanging until the write-budget deadline.
+			let _leaderProcessExited = false;
+			const leaderExitWatcher = new Promise((_, reject) => {
+				ctx.leader.process?.once('exit', (code, signal) => {
+					_leaderProcessExited = true;
+					reject(new Error(`[large-clone] Harper leader exited unexpectedly (${signal ?? code}) during write phase`));
+				});
+			});
+
 			console.log(`[large-clone] writing ${TARGET_GB} GB (${TOTAL_RECORDS} records) to leader`);
 			const writeStart = Date.now();
 			let batchIndex = 0;
 
 			const writeDeadline = writeStart + WRITE_BUDGET_SECS * 1000;
 
+			let writeDone = false;
 			const pool = concurrent(async () => {
 				const bi = batchIndex++;
 				const start = bi * BATCH_SIZE;
@@ -109,27 +120,45 @@ if (!stressEnabled()) {
 					id: `bulk-${start + j}`,
 					payload: PAYLOAD,
 				}));
-				await sendOperation(ctx.leader, { operation: 'upsert', table: 'large', records });
+				// 30 s per-request timeout so a dead leader fails fast rather than
+				// hanging until the 60-minute write-budget deadline.
+				// Silently drop errors after writeDone so abandoned in-flight requests
+				// don't become unhandled rejections.
+				try {
+					await sendOperation(ctx.leader, { operation: 'upsert', table: 'large', records }, { timeoutMs: 30_000 });
+				} catch (err) {
+					if (writeDone) return;
+					throw err;
+				}
 			}, CONCURRENCY);
 
-			for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
-				await pool.execute();
-				if (b % 200 === 0) {
-					const pct = Math.round((b / BATCH_COUNT) * 100);
-					const elapsed = ((Date.now() - writeStart) / 1000).toFixed(0);
-					console.log(`[large-clone] write ${pct}% (batch ${b}/${BATCH_COUNT}, ${elapsed}s elapsed)`);
-				}
-			}
-			await pool.finish();
+			// Race the write loop against the leader-process exit watcher.
+			await Promise.race([
+				(async () => {
+					for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
+						await pool.execute();
+						if (b % 200 === 0) {
+							const pct = Math.round((b / BATCH_COUNT) * 100);
+							const elapsed = ((Date.now() - writeStart) / 1000).toFixed(0);
+							console.log(`[large-clone] write ${pct}% (batch ${b}/${BATCH_COUNT}, ${elapsed}s elapsed)`);
+						}
+					}
+					await pool.finish();
+				})(),
+				leaderExitWatcher,
+			]);
+			writeDone = true;
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
-			const leaderCount = (await sendOperation(ctx.leader, { operation: 'describe_table', table: 'large' }))
-				?.record_count;
-			const writeMBps = (leaderCount * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
+			const writtenRecords = Math.min(batchIndex * BATCH_SIZE, TOTAL_RECORDS);
+			const writeMBps = (writtenRecords * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
 			console.log(
-				`[large-clone] write done: ${leaderCount} records in ${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
+				`[large-clone] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 			);
-			ctx.leaderRecordCount = leaderCount;
+			// Track exact write count for clone verification. Avoid SQL COUNT(*) here
+			// because it does a full scan on the leader's 10 GB dataset (slow). We know
+			// the exact number of records from the write loop.
+			ctx.leaderRecordCount = writtenRecords;
 		});
 
 		after(async () => {
@@ -151,6 +180,7 @@ if (!stressEnabled()) {
 			// Note: sampleMetrics won't capture until the node is up, but we start
 			// it here so we get coverage from the moment the process is alive.
 			const cloneStart = Date.now();
+			try {
 
 			await startHarper(cloneCtx, {
 				config: {
@@ -177,9 +207,8 @@ if (!stressEnabled()) {
 						available = true;
 						break;
 					}
-					const count =
-						(await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large' }))?.record_count ??
-						-1;
+					const countRows = await trySendOperation(cloneCtx.harper, { operation: 'sql', sql: 'SELECT COUNT(*) AS c FROM data.large' });
+					const count = countRows?.[0]?.c ?? -1;
 					const remaining = Math.ceil((deadline - Date.now()) / 1000);
 					console.log(
 						`[large-clone] clone progress: count=${count}/${ctx.leaderRecordCount} status=${resp?.status ?? 'unknown'} (${remaining}s remaining)`
@@ -208,15 +237,22 @@ if (!stressEnabled()) {
 			ok((cloneLog.match(oomRe) ?? []).length === 0, 'clone logged OOM');
 			ok((cloneLog.match(uncaughtRe) ?? []).length === 0, 'clone logged uncaughtException');
 
-			// Verify row count matches after clone completes.
+			// Verify SQL row count matches after clone completes.
+			// Use COUNT(*) rather than describe_table.record_count — the latter is an
+			// internal storage counter that diverges between nodes during bulk copy.
 			let finalCount = -1;
 			for (let i = 0; i < 30; i++) {
-				const resp = await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large' });
-				finalCount = resp?.record_count ?? -1;
+				const rows = await trySendOperation(cloneCtx.harper, { operation: 'sql', sql: 'SELECT COUNT(*) AS c FROM data.large' });
+				finalCount = rows?.[0]?.c ?? -1;
 				if (finalCount >= ctx.leaderRecordCount) break;
 				await delay(2_000);
 			}
 			equal(finalCount, ctx.leaderRecordCount, `Clone row count ${finalCount} != leader ${ctx.leaderRecordCount}`);
+			} finally {
+				// Always stop the sampler so its timer doesn't keep the event loop
+				// alive after an early exit (e.g. startHarper throws).
+				cloneSampler.stop();
+			}
 		});
 	});
 }

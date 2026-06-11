@@ -21,12 +21,14 @@ export function stressEnabled() {
  * Mirrors clusterShared.sendOperation; duplicated here to keep stress tests
  * independent of the cluster test surface.
  */
-export async function sendOperation(node, operation) {
-	const response = await fetch(node.operationsAPIURL, {
+export async function sendOperation(node, operation, { timeoutMs } = {}) {
+	const fetchOpts = {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(operation),
-	});
+	};
+	if (timeoutMs != null) fetchOpts.signal = AbortSignal.timeout(timeoutMs);
+	const response = await fetch(node.operationsAPIURL, fetchOpts);
 	const data = await response.json();
 	equal(response.status, 200, JSON.stringify(data));
 	return data;

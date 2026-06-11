@@ -147,7 +147,20 @@ if (!stressEnabled()) {
 			await killHarper({ harper: B });
 
 			// Write bulk data to A while B is offline.
+			// Monitor A's process: if Harper crashes during the write phase, abort
+			// immediately rather than hanging until the write-budget deadline.
+			let _aProcessExited = false;
+			const aExitWatcher = new Promise((_, reject) => {
+				A.process?.once('exit', (code, signal) => {
+					_aProcessExited = true;
+					reject(new Error(`[large-catchup] Harper A exited unexpectedly (${signal ?? code}) during write phase`));
+				});
+			});
+
 			const aSampler = sampleMetrics(A, { intervalMs: 5_000 });
+			let bSampler = null;
+			let testDone = false;
+			try {
 			const writeStart = Date.now();
 			const writeDeadline = writeStart + WRITE_BUDGET_SECS * 1000;
 			let batchIndex = 0;
@@ -161,18 +174,34 @@ if (!stressEnabled()) {
 					id: `bulk-${start + j}`,
 					payload: PAYLOAD,
 				}));
-				await sendOperation(A, { operation: 'upsert', table: 'large', records });
+				// 30 s per-request timeout so a dead A node fails fast rather than
+				// hanging until the 60-minute write-budget deadline.
+				// Silently drop errors after testDone so that in-flight requests
+				// abandoned when Promise.race settles don't become unhandled rejections.
+				try {
+					await sendOperation(A, { operation: 'upsert', table: 'large', records }, { timeoutMs: 30_000 });
+				} catch (err) {
+					if (testDone) return;
+					throw err;
+				}
 			}, CONCURRENCY);
 
-			for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
-				await pool.execute();
-				if (b % 200 === 0) {
-					const pct = Math.round((b / BATCH_COUNT) * 100);
-					const elapsed = ((Date.now() - writeStart) / 1000).toFixed(0);
-					console.log(`[large-catchup] write ${pct}% (batch ${b}/${BATCH_COUNT}, ${elapsed}s elapsed)`);
-				}
-			}
-			await pool.finish();
+			// Race the write loop against the A-process exit watcher so a crash
+			// surfaces immediately instead of blocking until the write-budget deadline.
+			await Promise.race([
+				(async () => {
+					for (let b = 0; b < BATCH_COUNT && Date.now() < writeDeadline; b++) {
+						await pool.execute();
+						if (b % 200 === 0) {
+							const pct = Math.round((b / BATCH_COUNT) * 100);
+							const elapsed = ((Date.now() - writeStart) / 1000).toFixed(0);
+							console.log(`[large-catchup] write ${pct}% (batch ${b}/${BATCH_COUNT}, ${elapsed}s elapsed)`);
+						}
+					}
+					await pool.finish();
+				})(),
+				aExitWatcher,
+			]);
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
 			const writtenRecords = Math.min(batchIndex * BATCH_SIZE, TOTAL_RECORDS);
@@ -203,7 +232,7 @@ if (!stressEnabled()) {
 			B = bRestartCtx.harper;
 
 			const catchupStart = Date.now();
-			const bSampler = sampleMetrics(B, { intervalMs: 5_000 });
+			bSampler = sampleMetrics(B, { intervalMs: 5_000 });
 
 			const deadline = Date.now() + CATCHUP_BUDGET_SECS * 1000;
 			let lastCount = -1;
@@ -246,6 +275,15 @@ if (!stressEnabled()) {
 				ok(peakMb < RSS_CAP_MB, `${name} peak RSS ${peakMb.toFixed(0)} MB exceeded cap ${RSS_CAP_MB} MB`);
 				ok((log.match(oomRe) ?? []).length === 0, `${name} logged OOM`);
 				ok((log.match(uncaughtRe) ?? []).length === 0, `${name} logged uncaughtException`);
+			}
+			} finally {
+				// Signal pool tasks to swallow errors — prevents unhandled rejections
+				// from in-flight requests that time out after the test exits.
+				testDone = true;
+				// Always stop samplers so their timers don't keep the event loop alive
+				// after an early exit (e.g. Harper crash during write phase).
+				aSampler.stop();
+				bSampler?.stop();
 			}
 		});
 	});

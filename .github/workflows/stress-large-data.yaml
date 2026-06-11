@@ -21,8 +21,8 @@ on:
         required: false
         default: '10'
   schedule:
-    # 07:30 UTC nightly (off-peak, off the canonical :00 mark)
-    - cron: '30 7 * * *'
+    # 06:00 UTC nightly (midnight MDT)
+    - cron: '0 6 * * *'
 
 jobs:
   build:
