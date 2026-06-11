@@ -104,7 +104,13 @@ jobs:
           HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR: /home/runner
           HARPER_STRESS_LARGE_DATA_GB: ${{ inputs.data-gb || '10' }}
         run: |
-          node --experimental-test-coverage=false integrationTests/run.mjs ${{ matrix.test.file }}
+          # No coverage: run.mjs's run() defaults coverage off, and passing
+          # --experimental-test-coverage (even =false) actually ENABLES collection —
+          # its mere presence turns it on. On a ~400s stress run the coverage blob is
+          # huge and its serialization across the process-isolation boundary truncates,
+          # which node:test then reports as a file-level failure even when every test
+          # passes. Omitting the flag keeps coverage off and the run clean.
+          node integrationTests/run.mjs ${{ matrix.test.file }}
       - name: Upload Harper server logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

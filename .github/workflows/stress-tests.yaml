@@ -1,0 +1,156 @@
+name: Stress Tests
+
+# Long-running replication stress regressions. These are gated on the
+# HARPER_RUN_STRESS_TESTS env var so they never run in the normal
+# integration matrix (they'd blow the 15-minute shard timeout). Triggered
+# manually from the Actions tab or on a weekly cadence.
+
+on:
+  workflow_dispatch:
+    inputs:
+      node-version:
+        description: 'Node.js version'
+        required: true
+        type: choice
+        default: '24'
+        options:
+          - '22'
+          - '24'
+          - '25'
+      soak-minutes:
+        description: 'Soak duration in minutes (Priority 1)'
+        required: false
+        default: '240'
+      orphan-minutes:
+        description: 'Orphan-race duration in minutes (Priority 3)'
+        required: false
+        default: '60'
+      adversity-minutes:
+        description: 'Rapid-reconnect duration in minutes (Priority 4)'
+        required: false
+        default: '30'
+      backlog-offline-minutes:
+        description: 'Backlog-recovery offline window in minutes'
+        required: false
+        default: '30'
+      slow-minutes:
+        description: 'Slow-consumer churn duration in minutes'
+        required: false
+        default: '30'
+  schedule:
+    # 06:11 UTC on Sundays (off-peak, off the canonical :00 mark)
+    - cron: '11 6 * * 0'
+
+jobs:
+  build:
+    name: Build Harper Pro (Node.js v${{ inputs.node-version || '24' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+      - name: Setup Node.js ${{ inputs.node-version || '24' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version || '24' }}
+          package-manager-cache: false
+      - name: Install dependencies
+        run: npm install
+      - name: Build
+        run: npm run build || true # tolerate the same pre-existing TS errors as the regular integration workflow
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harper-stress-build-${{ inputs.node-version || '24' }}
+          path: |
+            dist/
+            static/
+            node_modules/
+            package.json
+          retention-days: 1
+
+  stress:
+    name: Stress ${{ matrix.test.name }} (Node.js v${{ inputs.node-version || '24' }})
+    needs: build
+    runs-on: ubuntu-latest
+    # Each test gets its own slot; the soak's worst case (240 min) drives
+    # the overall budget. Other tests will finish well before this.
+    timeout-minutes: 260
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - name: 'worker-exit-cascade'
+            file: 'integrationTests/stress/workerExitCascade.test.mjs'
+            env_vars: ''
+          - name: 'soak-rolling-restarts'
+            file: 'integrationTests/stress/soakWithRollingRestarts.test.mjs'
+            env_vars: 'HARPER_STRESS_SOAK_MINUTES'
+          - name: 'blob-orphan-race'
+            file: 'integrationTests/stress/blobOrphanRace.test.mjs'
+            env_vars: 'HARPER_STRESS_ORPHAN_MINUTES'
+          - name: 'rapid-reconnect-adversity'
+            file: 'integrationTests/stress/rapidReconnectAdversity.test.mjs'
+            env_vars: 'HARPER_STRESS_ADVERSITY_MINUTES'
+          - name: 'replay-catchup-seam'
+            file: 'integrationTests/stress/replayCatchupSeam.test.mjs'
+            env_vars: ''
+          - name: 'backlog-recovery'
+            file: 'integrationTests/stress/backlogRecovery.test.mjs'
+            env_vars: 'HARPER_STRESS_BACKLOG_OFFLINE_MINUTES'
+          - name: 'slow-consumer-backpressure'
+            file: 'integrationTests/stress/slowConsumerBackpressure.test.mjs'
+            env_vars: 'HARPER_STRESS_SLOW_MINUTES'
+          # Receive-side regression suites. They live in integrationTests/cluster/
+          # and are gated behind HARPER_RUN_STRESS_TESTS (which this workflow sets),
+          # so they're skipped in the regular PR matrix but exercised here. The files
+          # land via PR #243 (the blob-receive stall fix); these entries become live
+          # once that merges.
+          - name: 'blob-save-rejection-containment'
+            file: 'integrationTests/cluster/blobSaveRejectionContainment.test.mjs'
+            env_vars: ''
+          - name: 'receive-backlog-memory'
+            file: 'integrationTests/cluster/receiveBacklogMemory.test.mjs'
+            env_vars: ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+      - name: Setup Node.js ${{ inputs.node-version || '24' }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ inputs.node-version || '24' }}
+          package-manager-cache: false
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harper-stress-build-${{ inputs.node-version || '24' }}
+      - name: Relink bin scripts
+        run: npm install --ignore-scripts
+      - name: Run ${{ matrix.test.name }}
+        env:
+          HARPER_RUN_STRESS_TESTS: '1'
+          HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
+          HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR: /home/runner
+          # Per-test duration knobs, sourced from workflow inputs (or scheduled defaults)
+          HARPER_STRESS_SOAK_MINUTES: ${{ inputs.soak-minutes || '240' }}
+          HARPER_STRESS_ORPHAN_MINUTES: ${{ inputs.orphan-minutes || '60' }}
+          HARPER_STRESS_ADVERSITY_MINUTES: ${{ inputs.adversity-minutes || '30' }}
+          HARPER_STRESS_BACKLOG_OFFLINE_MINUTES: ${{ inputs.backlog-offline-minutes || '30' }}
+          HARPER_STRESS_SLOW_MINUTES: ${{ inputs.slow-minutes || '30' }}
+        run: |
+          # No coverage: run.mjs defaults it off, and passing --experimental-test-coverage
+          # (even =false) ENABLES collection — its presence turns it on — whose large-blob
+          # serialization can be reported as a spurious file-level failure on long runs.
+          node integrationTests/run.mjs ${{ matrix.test.file }}
+      - name: Upload Harper server logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stress-logs-${{ matrix.test.name }}-node-${{ inputs.node-version || '24' }}
+          path: /tmp/harper-integration-test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
