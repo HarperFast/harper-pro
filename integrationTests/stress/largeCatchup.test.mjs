@@ -84,10 +84,15 @@ if (!stressEnabled()) {
 
 	suite(`Large catch-up — ${TARGET_GB} GB`, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		before(async () => {
+			// Cap RocksDB block cache to 1 GB per node. The default (25% of system
+			// memory) can reach 7+ GB on a 30 GB machine, allowing compaction reads to
+			// fill the cache during bulk writes and exhaust available RAM.
+			const ROCKS_BLOCK_CACHE_MB = Number(process.env.HARPER_STRESS_ROCKS_BLOCK_CACHE_MB ?? 1024);
 			const cfg = (host) => ({
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false, console: true, level: 'warn' },
 				replication: { securePort: host + ':9933' },
+				storage: { rocks: { blockCacheSize: ROCKS_BLOCK_CACHE_MB * 1024 * 1024 } },
 				threads: { count: 4 },
 			});
 
@@ -224,6 +229,7 @@ if (!stressEnabled()) {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, console: true, level: 'warn' },
 					replication: { securePort: B.hostname + ':9933' },
+					storage: { rocks: { blockCacheSize: ROCKS_BLOCK_CACHE_MB * 1024 * 1024 } },
 					threads: { count: 4 },
 				},
 				env: { HARPER_NO_FLUSH_ON_EXIT: true },

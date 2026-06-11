@@ -60,6 +60,9 @@ if (!stressEnabled()) {
 	const BATCH_SIZE = 20;
 	const CONCURRENCY = 8;
 	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_RSS_CAP_MB ?? 3072);
+	// Cap RocksDB block cache to 1 GB. The default (25% of system memory) can
+	// reach 7+ GB on a 30 GB machine and trigger OOM during bulk writes.
+	const ROCKS_BLOCK_CACHE_MB = Number(process.env.HARPER_STRESS_ROCKS_BLOCK_CACHE_MB ?? 1024);
 	const CLONE_BUDGET_SECS = Number(process.env.HARPER_STRESS_LARGE_CLONE_BUDGET_SECS ?? Math.max(600, TARGET_GB * 180));
 	const WRITE_BUDGET_SECS = TARGET_GB * 300 + 600;
 	const SUITE_TIMEOUT_MS = (WRITE_BUDGET_SECS + CLONE_BUDGET_SECS + 600) * 1000;
@@ -76,6 +79,7 @@ if (!stressEnabled()) {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, console: true, level: 'warn' },
 					replication: { port: leaderCtx.harper.hostname + ':9933', securePort: null },
+					storage: { rocks: { blockCacheSize: ROCKS_BLOCK_CACHE_MB * 1024 * 1024 } },
 					threads: { count: 4 },
 				},
 				env: { HARPER_NO_FLUSH_ON_EXIT: true },
@@ -187,6 +191,7 @@ if (!stressEnabled()) {
 					analytics: { aggregatePeriod: -1 },
 					logging: { colors: false, console: true, level: 'warn' },
 					replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
+					storage: { rocks: { blockCacheSize: ROCKS_BLOCK_CACHE_MB * 1024 * 1024 } },
 					threads: { count: 4 },
 				},
 				env: {
