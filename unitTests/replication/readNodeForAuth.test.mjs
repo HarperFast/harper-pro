@@ -2,18 +2,21 @@
  * Coverage for resolveNodeForAuth — the replication cert/IP auth-path read of hdb_nodes.
  *
  * Root cause (harper-pro#352, field variant #345): during a rolling in-place v4->v5 upgrade, a
- * node still on v4 receives v5-encoded hdb_nodes rows from already-flipped peers. Those rows are
- * msgpackr *shared-structure* records (the value bytes only reference a structure id), but v4 never
- * persists the `Symbol.for('structures')` table that defines that id. When the node flips to v5 and
- * the auth path reads the row, there is no structure to resolve the id, so msgpackr throws and the
- * decode yields null/`[]`. The #345 guard (isValidNodeRecord) correctly refuses the misread, but on
- * a replication socket the "require credentials" fallback can never succeed — the peer is rejected
- * with cycling 1008 Unauthorized and its post-flip writes strand at origin.
+ * freshly-flipped node's replication auth path reads a peer's hdb_nodes row via the POINT lookup
+ * (`primaryStore.get()`) very early at boot. A v5-era msgpackr *shared-structure* row can
+ * transiently misread through that point-lookup path — yielding `[]`/null (it does not necessarily
+ * throw) — even though the row and the table's shared structures are present on disk (the misread
+ * loses a race with the hdb_nodes base-copy resync that heals it within seconds; the SCAN path
+ * lists the key reliably the whole time). The #345 guard (isValidNodeRecord) correctly refuses the
+ * misread, but on a replication socket the "require credentials" fallback can never succeed — the
+ * peer is rejected with cycling 1008 Unauthorized and its post-flip writes strand at origin.
  *
- * resolveNodeForAuth fixes the wedge at the auth decision: a present-but-undecodable row is
- * recovered to a minimal `{ name }` descriptor (the name is the primary key, which is always
- * available), so a certificate-validated peer is authorized instead of stranded. A genuinely
- * unknown hostname still returns undefined.
+ * resolveNodeForAuth fixes the wedge at the auth decision: when the point lookup yields no valid
+ * record but the key is RANGE-VISIBLE (a known peer), it is recovered to a minimal `{ name }`
+ * descriptor (the name is the primary key, which the scan path lists reliably), so a
+ * certificate-validated peer is authorized instead of stranded. Keying off range-visibility — not
+ * the point-lookup `doesExist`/`get`, which is the very path that misreads — is deliberate. A
+ * genuinely unknown (not range-visible) hostname still returns undefined.
  *
  * The first block tests the resolution logic against a fake store modeling each failure mode. The
  * second block proves the *precondition* is real: a v5-era shared-structure row, decoded with its
@@ -26,9 +29,14 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { resolveNodeForAuth, isValidNodeRecord } from '#src/replication/knownNodes';
 
-/** Minimal store stub: `data` holds decoded values; `present` is the byte-level existence set. */
-function fakeStore({ data = {}, present = null, throwOnGet = new Set() } = {}) {
+/**
+ * Minimal store stub. `data` holds decoded values; `present` is the point-lookup existence set
+ * (doesExist); `rangeKeys` is the scan-path key set (getKeys) and defaults to `present` unless
+ * overridden — overriding it lets a test model the point/range split that is the #352 signature.
+ */
+function fakeStore({ data = {}, present = null, rangeKeys = null, throwOnGet = new Set() } = {}) {
 	const presentSet = present ?? new Set(Object.keys(data));
+	const rangeSet = rangeKeys ?? presentSet;
 	return {
 		get(key) {
 			if (throwOnGet.has(key)) throw new Error('Record id is not defined for 0');
@@ -36,6 +44,13 @@ function fakeStore({ data = {}, present = null, throwOnGet = new Set() } = {}) {
 		},
 		doesExist(key) {
 			return presentSet.has(key);
+		},
+		// Models lmdb-js getKeys: keys >= start ascending, capped by limit. Never decodes values,
+		// which is why the scan path stays reliable while the point lookup transiently misreads.
+		getKeys({ start, limit } = {}) {
+			const keys = [...rangeSet].sort();
+			const from = start == null ? keys : keys.filter((k) => k >= start);
+			return limit == null ? from : from.slice(0, limit);
 		},
 	};
 }
@@ -63,7 +78,15 @@ describe('resolveNodeForAuth', () => {
 		expect(resolveNodeForAuth(store, 'ipnode4')).to.deep.equal({ name: 'ipnode4' });
 	});
 
-	it('returns undefined when the hostname is genuinely unknown (no row, no route)', () => {
+	it('reconstructs { name } when range-visible even though the point lookup (doesExist) is falsy', () => {
+		// THE observed #352 shape: the scan path lists the peer while the point lookup misreads. The
+		// fix must key off range-visibility, NOT doesExist (the path that fails), or the wedge stays open.
+		const store = fakeStore({ data: { ipnode4: [] }, present: new Set(), rangeKeys: new Set(['ipnode4']) });
+		expect(store.doesExist('ipnode4')).to.equal(false); // point lookup claims "absent"
+		expect(resolveNodeForAuth(store, 'ipnode4')).to.deep.equal({ name: 'ipnode4' });
+	});
+
+	it('returns undefined when the hostname is genuinely unknown (not range-visible, no route)', () => {
 		const store = fakeStore({ data: {}, present: new Set() });
 		expect(resolveNodeForAuth(store, 'stranger')).to.equal(undefined);
 	});
@@ -125,11 +148,13 @@ describe('readNodeForAuth precondition (real msgpackr shared-structure decode)',
  * Authoritative regression for harper-pro#352.
  *
  * The lab e2e (incidents/inplace-upgrade-2026-06-11) does NOT reliably reproduce the wedge: the
- * trigger is timing-dependent (a v5-era hdb_nodes row must land on a node before it flips), and
- * baseline beta.3 passed the lab gates in our runs. This test reproduces the *exact on-disk
- * condition* deterministically — a present-but-undecodable shared-structure row — using a real
- * `lmdb` store (not a hand-rolled fake), then drives the production resolution logic and asserts
- * the end-to-end auth contract that the bug broke.
+ * trigger is timing-dependent (a v5-era shared-structure hdb_nodes row must misread on the point
+ * lookup at boot before the resync heals it), and baseline beta.3 passed the lab gates in our runs.
+ * This test reproduces the *auth-path condition* deterministically — a row that is present and
+ * range-visible but fails to decode through the point lookup — using a real `lmdb` store (not a
+ * hand-rolled fake; here the decode fails because the structure table is absent, the durable
+ * variant of production's transient misread), then drives the production resolution logic and
+ * asserts the end-to-end auth contract that the bug broke.
  *
  * Layer exercised: `resolveNodeForAuth(store, name, routeRecord)` — the pure core of
  * `readNodeForAuth(name)`, which in production reads `getHDBNodeTable().primaryStore`. We pass the
@@ -167,10 +192,11 @@ describe('resolveNodeForAuth against a real lmdb shared-structure store (harper-
 		expect(raw[0] & 0xe0).to.equal(0x40);
 		await writerDb.close();
 
-		// Phase 2 — the late-flipped node reads the same data WITHOUT the shared-structures table
-		// (v4 never persisted Symbol.for('structures'); reopening without sharedStructuresKey models
-		// that the defining structure is absent on this node). get() now throws on decode, while the
-		// row physically exists (doesExist === true). This is the exact replicator.ts auth condition.
+		// Phase 2 — reopen the store so the point decode fails (here by opening WITHOUT
+		// sharedStructuresKey, so the defining structure can't be resolved): get() throws while the
+		// row stays present and range-visible (doesExist/getKeys still list the key). This is the
+		// auth-path condition replicator.ts hits — production reaches it transiently (the structures
+		// are on disk but the point read loses a boot race); this is its durable, deterministic proxy.
 		undecodableStore = open({ path: path.join(lmdbDir, 'hdb_nodes'), encoding: 'msgpack' });
 
 		emptyStore = open({ path: path.join(lmdbDir, 'empty'), encoding: 'msgpack' });

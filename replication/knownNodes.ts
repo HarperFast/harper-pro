@@ -129,12 +129,12 @@ export async function runNodeUpdateWatcher(listener: (node: any, id: string) => 
 }
 /**
  * Raw existence check for an hdb_nodes record that does NOT decode the stored value.
- * A decode failure (e.g. stale msgpackr shared-structures, harper#1163) must not be
- * misread as the record being absent: `primaryStore.get()` would throw/return undefined
- * for an undecodable-but-present row, so we probe at the bytes level instead.
+ * A decode failure (e.g. stale msgpackr shared-structures, harper#1163 / harper-pro#352) must not
+ * be misread as the record being absent: `primaryStore.get()` would throw/return undefined for an
+ * undecodable-but-present row, so we probe via the scan path (`getKeys`) instead.
  */
 export function nodeRecordPhysicallyExists(name: string): boolean {
-	return storeRecordPhysicallyExists(getHDBNodeTable().primaryStore, name);
+	return storeRecordRangeVisible(getHDBNodeTable().primaryStore, name);
 }
 
 /**
@@ -172,28 +172,39 @@ export function isValidNodeRecord(record: unknown): boolean {
 /**
  * Resolve an hdb_nodes record for the replication auth path (cert common-name / IP lookup).
  *
- * Root cause of harper-pro#352 / #345: during a rolling in-place v4→v5 upgrade, a node that is
- * still on v4 receives v5-encoded `hdb_nodes` rows from already-flipped peers. Those rows are
- * msgpackr *shared-structure* records (the value bytes only reference a structure id), but v4 has
- * no concept of the `Symbol.for('structures')` buffer, so the structure table that defines that
- * id is never persisted on this node. When the node later flips to v5, the auth path reads those
- * rows via `primaryStore.get()`; with no structure to resolve the id, msgpackr throws and
- * `RecordEncoder.decode` returns `null` (older builds surfaced `[]`). `isValidNodeRecord` then
- * (correctly) refuses the misread — but on a replication socket the "require credentials" fallback
- * can never succeed, so the peer is rejected with cycling 1008 Unauthorized and its post-flip
- * writes strand at origin. No read-path codec change can recover the row: the bytes it needs are
- * genuinely absent on this node.
+ * Root cause of harper-pro#352 (field variant #345): during a rolling in-place v4→v5 upgrade, a
+ * freshly-flipped node's replication auth path reads a peer's `hdb_nodes` row via the POINT lookup
+ * (`primaryStore.get()`) very early at boot. A v5-era msgpackr *shared-structure* row can
+ * transiently misread through that point-lookup path — yielding `[]` / a non-record (it does not
+ * necessarily throw) — even though the row is present on disk and the table's shared structures are
+ * present too. (Diagnosis: on the wedged node the local log replay had already completed and the
+ * read-path structures key `[Symbol.for('structures'), 'hdb_nodes']` was present and valid; the
+ * point decode simply loses a race with the `hdb_nodes` base-copy resync that re-encodes the row
+ * against local structures and heals it within seconds. The SCAN path lists the key reliably the
+ * whole time.) `isValidNodeRecord` then (correctly) refuses the misread — but on a replication
+ * socket the "require credentials" fallback can never succeed, so the peer is rejected with cycling
+ * 1008 Unauthorized and its post-flip writes strand at origin.
  *
  * The information the auth decision actually needs is the peer's `name`, which is the table's
- * primary key — and that key IS available (the row physically exists; `getKeys()`/`getRange()`
- * even list it). So when a peer's row is present-but-undecodable, reconstruct a minimal node
- * descriptor from the key. This is safe: the connection's certificate is independently validated
- * by TLS and `verifyCertificate` in replicator.ts before this record is consulted, and the
- * hostname must already be a known node (the row exists) to be reconstructed at all — we are not
- * inventing a peer, we are recovering the identity of one whose descriptor failed to decode.
+ * primary key — and the SCAN path (`getKeys`/`getRange`) lists that key reliably even while the
+ * point decode transiently fails. So when the point lookup yields no valid record but the key is
+ * range-visible (a known peer), reconstruct a minimal node descriptor from the key. This is safe:
+ * the connection's certificate is independently validated by TLS and `verifyCertificate` in
+ * replicator.ts before this record is consulted, and the hostname must already be a range-visible
+ * known node to be reconstructed at all — we are not inventing a peer, we are recovering the
+ * identity of one whose descriptor transiently failed to decode; the full record self-heals on the
+ * next decodable update.
  *
- * Returns a valid node record, or `undefined` when the hostname is genuinely unknown (no row and
- * no route). `isValidNodeRecord` is retained as defense-in-depth at the call sites.
+ * Note: keying the reconstruction off range-visibility (not the point-lookup `doesExist`/`get`) is
+ * deliberate — the point lookup is exactly the path that misreads, so depending on it would leave
+ * the wedge open in the observed failure shape.
+ *
+ * (Separate, latent: `replayLogs` persists replication-applied structure updates under the plain
+ * key `Symbol.for('structures')`, which the RocksDB decode path — composite `[Symbol.for('structures'),
+ * name]` — never reads. Not the proximate trigger here, tracked separately.)
+ *
+ * Returns a valid node record, or `undefined` when the hostname is genuinely unknown (not range-
+ * visible and no route). `isValidNodeRecord` is retained as defense-in-depth at the call sites.
  */
 export function readNodeForAuth(name: string, routeRecord?: any): any {
 	return resolveNodeForAuth(getHDBNodeTable().primaryStore, name, routeRecord);
@@ -217,24 +228,40 @@ export function resolveNodeForAuth(store: any, name: string, routeRecord?: any):
 	// A static-route record (from replication.routes config) is already a valid descriptor and
 	// carries fields the reconstructed minimal record cannot (e.g. revoked_certificates) — prefer it.
 	if (isValidNodeRecord(routeRecord)) return routeRecord;
-	// The decoded value was missing/corrupt. If the row is physically present, this is the
-	// v5-era-row-on-a-late-flipped-node case: reconstruct the peer's identity from its key so a
-	// cryptographically-validated peer is not stranded by an undecodable descriptor.
-	if (storeRecordPhysicallyExists(store, name)) {
+	// The point lookup yielded no valid record. If the key is RANGE-VISIBLE (the scan path reliably
+	// lists v5-era rows even while the point decode transiently misreads — harper-pro#352), this is
+	// a known peer: reconstruct its identity from the key so a cryptographically-validated peer is
+	// not stranded by a transiently-undecodable descriptor.
+	if (storeRecordRangeVisible(store, name)) {
 		logger.warn?.(
 			'hdb_nodes record for',
 			name,
-			'is present but did not decode to a valid node descriptor (likely a v5-era shared-structure row whose structure table is absent after an in-place upgrade; see harper-pro#352). Authorizing the peer by its certificate-validated name; the full record self-heals on the next decodable update.'
+			'did not decode to a valid node descriptor on the point lookup but is range-visible (likely a v5-era shared-structure row transiently misreading at boot during an in-place upgrade; see harper-pro#352). Authorizing the peer by its certificate-validated name; the full record self-heals on the next decodable update.'
 		);
 		return { name };
 	}
 	return undefined;
 }
 
-/** Byte-level existence probe against a given store (see nodeRecordPhysicallyExists). */
-function storeRecordPhysicallyExists(store: any, name: string): boolean {
-	if (typeof store.doesExist === 'function') return store.doesExist(name);
-	if (typeof store.getBinaryFast === 'function') return store.getBinaryFast(name) != null;
+/**
+ * Existence probe for an hdb_nodes key that prefers the RANGE/scan path. A v5-era shared-structure
+ * row can transiently misread to `[]`/null through the point lookup (`doesExist`/`get`) at early
+ * boot (harper-pro#352), but `getKeys` lists the key reliably because it never decodes the value.
+ * Falls back to point checks only if `getKeys` is unavailable.
+ */
+function storeRecordRangeVisible(store: any, name: string): boolean {
+	if (typeof store.getKeys === 'function') {
+		try {
+			for (const key of store.getKeys({ start: name, limit: 1 })) {
+				return key === name;
+			}
+			return false;
+		} catch {
+			// fall through to point checks
+		}
+	}
+	if (typeof store.doesExist === 'function' && store.doesExist(name)) return true;
+	if (typeof store.getBinaryFast === 'function' && store.getBinaryFast(name) != null) return true;
 	try {
 		return store.get(name) != null;
 	} catch {
