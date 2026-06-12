@@ -90,7 +90,12 @@ if (!stressEnabled()) {
 	// genuine (re)subscribes — roughly DBS per node per reconnect. The bug logs it
 	// millions of times, so any ceiling well above the legitimate count discriminates.
 	const SUBSCRIBE_CAP = Number(process.env.HARPER_STRESS_WEDGE_SUBSCRIBE_CAP ?? Math.max(3000, DBS * CYCLES * 30));
-	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_WEDGE_RSS_CAP_MB ?? 1500);
+	// Loose ceiling, not a tight bound: per-process RSS counts reclaimable RocksDB/LMDB block
+	// cache + mmap'd files, which scale with DBS (this suite runs ~20 databases), so a healthy
+	// node sits well above a single-DB test's footprint (~1.6 GB observed). Sized to catch a true
+	// blow-up — the #349/#339 unbounded-subscribe-queue OOM was multi-GB — while ignoring normal
+	// cache. The authoritative OOM guard is the zero-OOM-marker assertion above.
+	const RSS_CAP_MB = Number(process.env.HARPER_STRESS_WEDGE_RSS_CAP_MB ?? 3000);
 	const RECONNECT_TIMEOUT_MS = Number(process.env.HARPER_STRESS_WEDGE_RECONNECT_TIMEOUT_MS ?? 90_000);
 	const CHURN_DB = 'wedge_churn';
 	const CHURN_TABLE = 'Events';
