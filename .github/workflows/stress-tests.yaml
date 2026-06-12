@@ -3,7 +3,11 @@ name: Stress Tests
 # Long-running replication stress regressions. These are gated on the
 # HARPER_RUN_STRESS_TESTS env var so they never run in the normal
 # integration matrix (they'd blow the 15-minute shard timeout). Triggered
-# manually from the Actions tab or on a weekly cadence.
+# manually from the Actions tab, or on a schedule: a full-duration soak weekly
+# (Sundays) plus a short-soak regression pass nightly (Mon–Sat) for early
+# warning. The nightly run shortens only the 4-hour soak (see the
+# HARPER_STRESS_SOAK_MINUTES expression below); the other, already-brief knobs
+# are unchanged.
 
 on:
   workflow_dispatch:
@@ -38,8 +42,10 @@ on:
         required: false
         default: '30'
   schedule:
-    # 06:11 UTC on Sundays (off-peak, off the canonical :00 mark)
+    # Full-duration soak — 06:11 UTC on Sundays (off-peak, off the canonical :00 mark)
     - cron: '11 6 * * 0'
+    # Short-soak nightly regression pass — 06:11 UTC Mon–Sat (soak trimmed below)
+    - cron: '11 6 * * 1-6'
 
 jobs:
   build:
@@ -138,8 +144,10 @@ jobs:
           HARPER_RUN_STRESS_TESTS: '1'
           HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
           HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR: /home/runner
-          # Per-test duration knobs, sourced from workflow inputs (or scheduled defaults)
-          HARPER_STRESS_SOAK_MINUTES: ${{ inputs.soak-minutes || '240' }}
+          # Per-test duration knobs, sourced from workflow inputs (or scheduled defaults).
+          # The nightly Mon–Sat cron runs a 60-minute soak for early regression warning;
+          # the weekly Sunday cron (and manual dispatch) keep the full 240-minute soak.
+          HARPER_STRESS_SOAK_MINUTES: ${{ inputs.soak-minutes || (github.event.schedule == '11 6 * * 1-6' && '60' || '240') }}
           HARPER_STRESS_ORPHAN_MINUTES: ${{ inputs.orphan-minutes || '60' }}
           HARPER_STRESS_ADVERSITY_MINUTES: ${{ inputs.adversity-minutes || '30' }}
           HARPER_STRESS_BACKLOG_OFFLINE_MINUTES: ${{ inputs.backlog-offline-minutes || '30' }}
