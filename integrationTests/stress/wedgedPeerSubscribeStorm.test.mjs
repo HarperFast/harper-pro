@@ -115,14 +115,16 @@ if (!stressEnabled()) {
 			last = await clusterSnapshot(node).catch(() => null);
 			if (last) {
 				const survivors = last.peers.filter((p) => !(p.url ?? '').includes(deadHostname) && p.name !== deadHostname);
-				// Require each peer to have re-opened all of its db sockets (>= the DBS+1 databases we
-				// created), not just an empty set: right after a reconnect there's a window where the
-				// control connection is up but `dbs` is still `{}`, and `[].every()` is vacuously true.
+				// Require each peer to have at least one connected db socket, not an empty set: right
+				// after a reconnect there's a window where the control connection is up but `dbs` is
+				// still `{}`, and `[].every()` is vacuously true. (cluster_status reports a small,
+				// multiplexed set of database_sockets per peer — NOT one per user database — so this is
+				// a `> 0` floor, not a per-database count.)
 				if (
 					survivors.length >= expectedPeers &&
 					survivors.every((p) => {
 						const dbs = Object.values(p.dbs);
-						return dbs.length >= DBS + 1 && dbs.every((d) => d.connected);
+						return dbs.length > 0 && dbs.every((d) => d.connected);
 					})
 				)
 					return last;
