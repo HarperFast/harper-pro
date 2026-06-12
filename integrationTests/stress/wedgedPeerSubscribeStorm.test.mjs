@@ -184,16 +184,22 @@ if (!stressEnabled()) {
 				attributes: [{ name: 'id', type: 'ID' }],
 			});
 
-			// Let the schema replicate so every survivor carries all DBS+1 databases.
+			// Let the schema replicate so every survivor carries all DBS+1 databases. Wait per-node
+			// in parallel (each with its own deadline) and throw if any node fails to settle — a
+			// shared sequential deadline would starve later nodes, and a silent exit would let the
+			// test continue on an under-replicated cluster.
 			const expected = DBS + 1;
-			const settleDeadline = Date.now() + 60_000;
-			for (let i = 1; i < ctx.nodes.length; i++) {
-				while (Date.now() < settleDeadline) {
-					const all = await trySendOperation(ctx.nodes[i], { operation: 'describe_all' });
-					if (all && Object.keys(all).length >= expected) break;
-					await delay(1000);
-				}
-			}
+			await Promise.all(
+				ctx.nodes.slice(1).map(async (node) => {
+					const settleDeadline = Date.now() + 60_000;
+					while (Date.now() < settleDeadline) {
+						const all = await trySendOperation(node, { operation: 'describe_all' });
+						if (all && Object.keys(all).length >= expected) return;
+						await delay(1000);
+					}
+					throw new Error(`Node ${node.hostname} did not replicate ${expected} databases within 60s`);
+				})
+			);
 		});
 
 		after(async () => {
@@ -210,7 +216,10 @@ if (!stressEnabled()) {
 			// Every survivor incarnation we ever start — a restart writes to a fresh log dir
 			// (HARPER_INTEGRATION_TEST_LOG_DIR), so the end-of-run log scan must read all of them,
 			// not just the latest handle, or an earlier incarnation's storm/leak/OOM is missed.
-			const incarnations = [...survivors];
+			// Snapshots, not live handles: a restart updates the live node object in place (below),
+			// so we must capture each incarnation's log location at the time it was running.
+			const logHandle = (n) => ({ logDir: n.logDir, dataRootDir: n.dataRootDir, hostname: n.hostname });
+			const incarnations = survivors.map(logHandle);
 
 			const samplers = survivors.map((n) => sampleMetrics(n, { intervalMs: 2000 }));
 
@@ -260,12 +269,12 @@ if (!stressEnabled()) {
 					await delay(1000);
 					const restartCtx = { name: ctx.name, harper: { dataRootDir: target.dataRootDir, hostname: target.hostname } };
 					await startHarper(restartCtx, { config: baseConfig(target.hostname), env: { HARPER_NO_FLUSH_ON_EXIT: true } });
-					// Replace the handle in both arrays so later cycles/teardown use the live one,
-					// and record the new incarnation so its log is scanned at the end.
-					const idx = ctx.nodes.indexOf(target);
-					ctx.nodes[idx] = restartCtx.harper;
-					survivors[survivors.indexOf(target)] = restartCtx.harper;
-					incarnations.push(restartCtx.harper);
+					// Record the new incarnation's log location for the end-of-run scan, then update the
+					// SAME `target` object in place. ctx.nodes/survivors and the metrics sampler all hold
+					// `target`, so Object.assign transitions them to the restarted node's port/creds/log
+					// without losing references (a fresh object would leave the sampler polling the dead one).
+					incarnations.push(logHandle(restartCtx.harper));
+					Object.assign(target, restartCtx.harper);
 				} else {
 					console.log(`[wedge] cycle ${cycle}: remove_node + add_node ${target.hostname}`);
 					// remove_node/add_node are the reliability operations under test — if either fails,
@@ -296,13 +305,15 @@ if (!stressEnabled()) {
 			const uncaughtRe = /\[error\]: uncaughtException/g;
 			const oomRe = /JavaScript heap out of memory|FATAL ERROR.*Allocation failed|ERR_WORKER_OUT_OF_MEMORY/g;
 
-			// Scan every incarnation's log, deduped by log location (restarts without
-			// HARPER_INTEGRATION_TEST_LOG_DIR share dataRootDir/log/hdb.log).
-			const seenLogKeys = new Set();
+			// Scan every incarnation's log, deduped by the RESOLVED log-file path (matching readLog's
+			// resolution) so incarnations with different logDir/dataRootDir combinations that point at
+			// the same physical file — e.g. restarts without HARPER_INTEGRATION_TEST_LOG_DIR share
+			// dataRootDir/log/hdb.log — aren't scanned twice.
+			const seenLogPaths = new Set();
 			const scanned = incarnations.filter((n) => {
-				const key = n.logDir || n.dataRootDir;
-				if (seenLogKeys.has(key)) return false;
-				seenLogKeys.add(key);
+				const path = n.logDir ? join(n.logDir, 'hdb.log') : n.dataRootDir ? join(n.dataRootDir, 'log', 'hdb.log') : null;
+				if (!path || seenLogPaths.has(path)) return false;
+				seenLogPaths.add(path);
 				return true;
 			});
 			const logs = await Promise.all(scanned.map((n) => readLog(n)));
