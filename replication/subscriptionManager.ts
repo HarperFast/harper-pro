@@ -79,6 +79,53 @@ const RECONCILE_INTERVAL_MS = 5_000;
 const WEDGE_RECONCILE_THRESHOLD_MS = 30_000;
 let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
+
+// harper-pro#351 defense-in-depth. Pure helper so the fail-loud identity check (and its unit
+// tests) don't need the live subscription machinery. Given this node's resolved name/url and
+// the set of nodes registered in hdb_nodes, return a loud warning string when there ARE
+// registered peers but none of them is this node (by name or url) — i.e. this node's identity
+// does not match what the cluster knows it as. In that state
+// `primaryStore.get(thisName)?.replicates` is undefined, which is treated as "replication off"
+// and silently unsubscribes from every peer for user databases (system keeps syncing, so the
+// node looks healthy). Returns undefined when there's no mismatch (or no registered peers yet,
+// since a brand-new/unjoined node legitimately has no self row).
+export function describeIdentityMismatch(
+	thisName: string | undefined,
+	thisUrl: string | undefined,
+	nodes: Array<{ name?: string; url?: string } | null | undefined>
+): string | undefined {
+	if (!nodes || nodes.length === 0) return undefined;
+	const selfRow = nodes.find((node) => (thisName && node?.name === thisName) || (thisUrl && node?.url === thisUrl));
+	if (selfRow) return undefined;
+	const registered = nodes
+		.map((n) => n?.name)
+		.filter(Boolean)
+		.join(', ');
+	return (
+		`Replication identity mismatch: this node identifies as "${thisName}" (url ${thisUrl}) but no matching row ` +
+		`exists in system.hdb_nodes (which has ${nodes.length} node(s): ${registered}). User-database replication ` +
+		`will NOT run for this node until its identity matches a registered node name. This usually means ` +
+		`node.hostname / replication.hostname resolves to the wrong value (e.g. an in-place v4->v5 upgrade boot ` +
+		`planted node.hostname: localhost — see harper-pro#351). Set node.hostname to the name this node is ` +
+		`registered under in hdb_nodes, or remove it to fall back to replication.hostname.`
+	);
+}
+
+// harper-pro#351 defense-in-depth. Emit the identity-mismatch error at most once per process: the
+// silent-disable decision point below runs per-database, so without this the same warning would be
+// logged once for every user database. `describeIdentityMismatch` is the gate — it returns undefined
+// (no log) whenever a self row exists, so a node with replication legitimately off, or a correct
+// identity that is merely mid-boot, never trips it; only a genuine name/url mismatch does.
+let identityMismatchReported = false;
+function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string } | null | undefined>): void {
+	if (identityMismatchReported) return;
+	const warning = describeIdentityMismatch(getThisNodeName(), getThisNodeUrl(), nodes);
+	if (warning) {
+		identityMismatchReported = true;
+		logger.error(warning);
+	}
+}
+
 // Returns the set of node URLs whose replication entries either point at a worker no longer
 // in the supplied http pool, OR have no worker assigned at all while live workers exist.
 // The second case covers "all workers were down at registration time" — onDatabase stores
@@ -198,6 +245,17 @@ export async function startOnMainThread(options) {
 			nodes.push(node);
 		}
 		const thisName = getThisNodeName();
+		// Fail loud on identity mismatch (harper-pro#351 defense-in-depth). If there are peers
+		// registered in hdb_nodes but none of them is THIS node (by name or url), then this
+		// node's identity does not match what the cluster knows it as. Downstream that means
+		// `getHDBNodeTable().primaryStore.get(thisName)?.replicates` is undefined, which is
+		// treated as "replication off" and silently unsubscribes from every peer for user
+		// databases while system keeps syncing — the node looks healthy but quietly drops
+		// replicated writes (silent split-brain). Surface it loudly instead of failing silent.
+		// This early check is a no-op when hdb_nodes hasn't loaded yet on this boot path (empty
+		// nodes → brand-new-node case); the authoritative check is at the unsubscribe decision
+		// point in onDatabase below, which has the loaded hdb_nodes rows in hand (harper-pro#351).
+		reportIdentityMismatchOnce(nodes);
 		function ensureThisNode() {
 			// If it doesn't exist and or needs to be updated.
 			const existing = getHDBNodeTable().primaryStore.get(thisName);
@@ -477,16 +535,28 @@ export async function startOnMainThread(options) {
 					hasDatabase: !!databases[databaseName],
 					thisReplicates: getHDBNodeTable().primaryStore.get(getThisNodeName())?.replicates,
 				});
-				if (!getHDBNodeTable().primaryStore.get(getThisNodeName())?.replicates) {
+				const nodeStore = getHDBNodeTable().primaryStore;
+				const selfNodeRow = nodeStore.get(getThisNodeName());
+				if (!selfNodeRow?.replicates) {
 					// if we are not fully replicating because it is turned off, make sure we set this
 					// flag so that we actually turn on subscriptions if full replication is turned on
 					isFullyReplicating = false;
-					logger.info(
-						'Disabling replication, this node name',
-						getThisNodeName(),
-						getHDBNodeTable().primaryStore.get(getThisNodeName()),
-						databaseName
-					);
+					logger.info('Disabling replication, this node name', getThisNodeName(), selfNodeRow, databaseName);
+					// harper-pro#351: this is the authoritative silent-disable point — it runs with the
+					// loaded hdb_nodes rows in hand, unlike the brand-new-node startup check which sees an
+					// empty table. Reaching it with NO self row (as opposed to a self row with
+					// replicates:false, the legitimate "replication off") while OTHER nodes are registered
+					// means this node's identity doesn't match what the cluster knows it as, so replication
+					// is being silently disabled for a harmful reason. Surface it loudly. Only enumerate the
+					// table when the self row is actually absent, so the legitimate replication-off path
+					// stays a cheap point read.
+					if (!selfNodeRow) {
+						const registeredNodes = Array.from(nodeStore.getKeys({})).map((name) => ({
+							name,
+							...nodeStore.get(name),
+						}));
+						reportIdentityMismatchOnce(registeredNodes);
+					}
 				}
 				const request = {
 					type: 'unsubscribe-from-node',
