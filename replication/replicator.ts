@@ -39,6 +39,7 @@ import {
 	getReplicationSharedStatus,
 	getNodeURL,
 	isValidNodeRecord,
+	readNodeForAuth,
 } from './knownNodes.ts';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { exportIdMapping, getIdOfRemoteNode } from '../core/resources/nodeIdMapping.ts';
@@ -178,7 +179,10 @@ export function start(options) {
 				let node: any;
 				for (const hostname of hostnames) {
 					if (!hostname) continue;
-					const candidate = hdbNodesStore.get(hostname) || routeByHostname.get(hostname);
+					// readNodeForAuth decodes the hdb_nodes row (falling back to the static route record,
+					// then to a key-reconstructed identity for a present-but-undecodable row — the
+					// harper-pro#352 in-place-upgrade case). isValidNodeRecord stays as defense-in-depth.
+					const candidate = readNodeForAuth(hostname, routeByHostname.get(hostname));
 					if (isValidNodeRecord(candidate)) {
 						node = candidate;
 						break;
@@ -226,8 +230,8 @@ export function start(options) {
 					);
 				}
 			} else if (request.ip) {
-				// try by IP address
-				const candidate = hdbNodesStore.get(request.ip) || routeByHostname.get(request.ip);
+				// try by IP address (readNodeForAuth: same decode-then-reconstruct path as the cert lookup)
+				const candidate = readNodeForAuth(request.ip, routeByHostname.get(request.ip));
 				if (isValidNodeRecord(candidate)) {
 					request.user = candidate;
 				} else if (!authorizationError) {

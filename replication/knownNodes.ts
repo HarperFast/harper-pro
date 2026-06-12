@@ -134,17 +134,7 @@ export async function runNodeUpdateWatcher(listener: (node: any, id: string) => 
  * for an undecodable-but-present row, so we probe at the bytes level instead.
  */
 export function nodeRecordPhysicallyExists(name: string): boolean {
-	const store: any = getHDBNodeTable().primaryStore;
-	if (typeof store.doesExist === 'function') return store.doesExist(name);
-	// getBinaryFast returns the raw value bytes (or undefined when the key is absent).
-	if (typeof store.getBinaryFast === 'function') return store.getBinaryFast(name) != null;
-	// Last-resort fallback: a present-but-undecodable record will still throw here, so be
-	// conservative and treat a throw as "present" (don't let it look like a deletion).
-	try {
-		return store.get(name) != null;
-	} catch {
-		return true;
-	}
+	return storeRecordPhysicallyExists(getHDBNodeTable().primaryStore, name);
 }
 
 /**
@@ -177,6 +167,79 @@ export function isValidNodeRecord(record: unknown): boolean {
 		!Array.isArray(record) &&
 		typeof (record as any).name === 'string'
 	);
+}
+
+/**
+ * Resolve an hdb_nodes record for the replication auth path (cert common-name / IP lookup).
+ *
+ * Root cause of harper-pro#352 / #345: during a rolling in-place v4→v5 upgrade, a node that is
+ * still on v4 receives v5-encoded `hdb_nodes` rows from already-flipped peers. Those rows are
+ * msgpackr *shared-structure* records (the value bytes only reference a structure id), but v4 has
+ * no concept of the `Symbol.for('structures')` buffer, so the structure table that defines that
+ * id is never persisted on this node. When the node later flips to v5, the auth path reads those
+ * rows via `primaryStore.get()`; with no structure to resolve the id, msgpackr throws and
+ * `RecordEncoder.decode` returns `null` (older builds surfaced `[]`). `isValidNodeRecord` then
+ * (correctly) refuses the misread — but on a replication socket the "require credentials" fallback
+ * can never succeed, so the peer is rejected with cycling 1008 Unauthorized and its post-flip
+ * writes strand at origin. No read-path codec change can recover the row: the bytes it needs are
+ * genuinely absent on this node.
+ *
+ * The information the auth decision actually needs is the peer's `name`, which is the table's
+ * primary key — and that key IS available (the row physically exists; `getKeys()`/`getRange()`
+ * even list it). So when a peer's row is present-but-undecodable, reconstruct a minimal node
+ * descriptor from the key. This is safe: the connection's certificate is independently validated
+ * by TLS and `verifyCertificate` in replicator.ts before this record is consulted, and the
+ * hostname must already be a known node (the row exists) to be reconstructed at all — we are not
+ * inventing a peer, we are recovering the identity of one whose descriptor failed to decode.
+ *
+ * Returns a valid node record, or `undefined` when the hostname is genuinely unknown (no row and
+ * no route). `isValidNodeRecord` is retained as defense-in-depth at the call sites.
+ */
+export function readNodeForAuth(name: string, routeRecord?: any): any {
+	return resolveNodeForAuth(getHDBNodeTable().primaryStore, name, routeRecord);
+}
+
+/**
+ * Pure resolution logic for {@link readNodeForAuth}, taking the store explicitly so it can be
+ * unit-tested against a real (or fake) store without standing up a server. See readNodeForAuth
+ * for the full root-cause rationale (harper-pro#352).
+ */
+export function resolveNodeForAuth(store: any, name: string, routeRecord?: any): any {
+	let record: any;
+	try {
+		record = store.get(name);
+	} catch {
+		// A present-but-undecodable row throws here (missing shared structure); fall through to
+		// the physical-existence check below rather than treating the peer as unknown.
+		record = undefined;
+	}
+	if (isValidNodeRecord(record)) return record;
+	// A static-route record (from replication.routes config) is already a valid descriptor and
+	// carries fields the reconstructed minimal record cannot (e.g. revoked_certificates) — prefer it.
+	if (isValidNodeRecord(routeRecord)) return routeRecord;
+	// The decoded value was missing/corrupt. If the row is physically present, this is the
+	// v5-era-row-on-a-late-flipped-node case: reconstruct the peer's identity from its key so a
+	// cryptographically-validated peer is not stranded by an undecodable descriptor.
+	if (storeRecordPhysicallyExists(store, name)) {
+		logger.warn?.(
+			'hdb_nodes record for',
+			name,
+			'is present but did not decode to a valid node descriptor (likely a v5-era shared-structure row whose structure table is absent after an in-place upgrade; see harper-pro#352). Authorizing the peer by its certificate-validated name; the full record self-heals on the next decodable update.'
+		);
+		return { name };
+	}
+	return undefined;
+}
+
+/** Byte-level existence probe against a given store (see nodeRecordPhysicallyExists). */
+function storeRecordPhysicallyExists(store: any, name: string): boolean {
+	if (typeof store.doesExist === 'function') return store.doesExist(name);
+	if (typeof store.getBinaryFast === 'function') return store.getBinaryFast(name) != null;
+	try {
+		return store.get(name) != null;
+	} catch {
+		return true;
+	}
 }
 
 async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
