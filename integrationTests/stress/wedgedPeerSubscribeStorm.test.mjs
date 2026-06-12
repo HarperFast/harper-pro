@@ -115,9 +115,15 @@ if (!stressEnabled()) {
 			last = await clusterSnapshot(node).catch(() => null);
 			if (last) {
 				const survivors = last.peers.filter((p) => !(p.url ?? '').includes(deadHostname) && p.name !== deadHostname);
+				// Require each peer to have re-opened all of its db sockets (>= the DBS+1 databases we
+				// created), not just an empty set: right after a reconnect there's a window where the
+				// control connection is up but `dbs` is still `{}`, and `[].every()` is vacuously true.
 				if (
 					survivors.length >= expectedPeers &&
-					survivors.every((p) => Object.values(p.dbs).every((d) => d.connected))
+					survivors.every((p) => {
+						const dbs = Object.values(p.dbs);
+						return dbs.length >= DBS + 1 && dbs.every((d) => d.connected);
+					})
 				)
 					return last;
 			}
@@ -216,6 +222,9 @@ if (!stressEnabled()) {
 			let writes = 0;
 			for (let cycle = 0; cycle < CYCLES; cycle++) {
 				// Schema churn → fires updateTable across the cluster (drives the leaked-listener path).
+				// These run against the bootstrap leader, which is never killed/removed, so they must
+				// succeed — let any failure throw and fail the test rather than masking a schema/ingest
+				// regression behind a "pass".
 				const churnDb = `wedge_db_${cycle % DBS}`;
 				const churnTable = `Cycle_${cycle}`;
 				await sendOperation(leader, {
@@ -224,13 +233,13 @@ if (!stressEnabled()) {
 					table: churnTable,
 					primary_key: 'id',
 					attributes: [{ name: 'id', type: 'ID' }],
-				}).catch((e) => console.log(`[wedge] create_table cycle ${cycle} failed: ${e.message}`));
+				});
 				if (cycle > 0) {
 					await sendOperation(leader, {
 						operation: 'drop_table',
 						database: `wedge_db_${(cycle - 1) % DBS}`,
 						table: `Cycle_${cycle - 1}`,
-					}).catch((e) => console.log(`[wedge] drop_table cycle ${cycle} failed: ${e.message}`));
+					});
 				}
 
 				// Steady writes to the churn table for convergence.
@@ -240,7 +249,7 @@ if (!stressEnabled()) {
 					database: CHURN_DB,
 					table: CHURN_TABLE,
 					records: batch,
-				}).catch((e) => console.log(`[wedge] insert cycle ${cycle} failed: ${e.message}`));
+				});
 
 				// Alternate the reliability action: even = restart, odd = remove/re-add.
 				// Rotate the target across survivors[1..] (never the bootstrap leader).
@@ -259,16 +268,16 @@ if (!stressEnabled()) {
 					incarnations.push(restartCtx.harper);
 				} else {
 					console.log(`[wedge] cycle ${cycle}: remove_node + add_node ${target.hostname}`);
-					await sendOperation(leader, { operation: 'remove_node', hostname: target.hostname }).catch((e) =>
-						console.log(`[wedge] remove_node failed: ${e.message}`)
-					);
+					// remove_node/add_node are the reliability operations under test — if either fails,
+					// that IS the regression, so let it throw rather than swallowing it.
+					await sendOperation(leader, { operation: 'remove_node', hostname: target.hostname });
 					await delay(2000);
 					await sendOperation(target, {
 						operation: 'add_node',
 						rejectUnauthorized: false,
 						hostname: leader.hostname,
 						authorization: ctx.leaderToken,
-					}).catch((e) => console.log(`[wedge] re-add_node failed: ${e.message}`));
+					});
 				}
 
 				// Reliability gate: the surviving mesh must fully reconnect this cycle.
@@ -329,19 +338,31 @@ if (!stressEnabled()) {
 				ok(peakMb < RSS_CAP_MB, `${survivors[i].hostname} peak RSS ${peakMb.toFixed(0)} MB exceeded cap ${RSS_CAP_MB} MB`);
 			}
 
-			// (4) Final mesh + convergence among survivors.
+			// (4) Final mesh + convergence among survivors. Poll for convergence rather than
+			// asserting immediately — under CI CPU/IO load a freshly re-added survivor may need a
+			// few seconds beyond the per-cycle dwell to drain its replication backlog.
 			for (const s of survivors) await waitForSurvivorMesh(s, deadHostname, { expectedPeers: SURVIVORS - 1 });
-			const counts = await Promise.all(
-				survivors.map((n) =>
-					sendOperation(n, { operation: 'describe_table', database: CHURN_DB, table: CHURN_TABLE })
-						.then((r) => r.record_count ?? -1)
-						.catch(() => -1)
-				)
-			);
-			console.log(`[wedge] final churn counts: ${JSON.stringify(counts)} (wrote ${writes})`);
+			const convergeDeadline = Date.now() + RECONNECT_TIMEOUT_MS;
+			let counts = [];
+			let converged = false;
+			while (Date.now() < convergeDeadline) {
+				counts = await Promise.all(
+					survivors.map((n) =>
+						sendOperation(n, { operation: 'describe_table', database: CHURN_DB, table: CHURN_TABLE })
+							.then((r) => r.record_count ?? -1)
+							.catch(() => -1)
+					)
+				);
+				if (counts.every((c) => c === writes)) {
+					converged = true;
+					break;
+				}
+				await delay(1000);
+			}
+			console.log(`[wedge] final churn counts: ${JSON.stringify(counts)} (wrote ${writes}) converged=${converged}`);
 			ok(
-				counts.every((c) => c === counts[0] && c > 0),
-				`survivors did not converge on ${CHURN_DB}.${CHURN_TABLE}: ${JSON.stringify(counts)}`
+				converged,
+				`survivors did not converge on ${CHURN_DB}.${CHURN_TABLE} at ${writes} records: ${JSON.stringify(counts)}`
 			);
 		});
 	});
