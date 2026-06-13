@@ -53,6 +53,13 @@ jobs:
       - name: Verify build output
         run: test -f dist/bin/harper.js || { echo "dist/bin/harper.js missing — build failed"; exit 1; }
 
+      # `npm install` above can rewrite package-lock.json (e.g. when it lags a version
+      # bump in package.json), dirtying the working tree. The auto-push benchmark steps
+      # below `git checkout gh-pages`, which aborts on a dirty tree. Discard the lockfile
+      # churn so the checkout succeeds.
+      - name: Restore lockfile churn
+        run: git checkout -- package-lock.json
+
       - name: Run cluster YCSB load test
         # Inputs via env, not ${{ }} shell interpolation, to avoid script injection.
         env:
