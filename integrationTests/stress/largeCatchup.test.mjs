@@ -15,7 +15,7 @@
  *  2. Create a table on A; seed a small baseline so B has a non-zero start.
  *  3. Take B offline (clean teardown).
  *  4. Write TARGET_GB of bulk row data to A while B is offline.
- *  5. Restart B. Time until its record_count converges with A.
+ *  5. Restart B. Time until its row count (exact SQL COUNT(*)) converges with A.
  *  6. Assert: convergence within CATCHUP_BUDGET_SECS; no OOM on either node.
  *  7. Emit write throughput and catch-up throughput.
  *
@@ -29,7 +29,7 @@
  */
 
 import { suite, test, before, after } from 'node:test';
-import { ok } from 'node:assert';
+import { ok, equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { resolve } from 'node:path';
 import {
@@ -223,9 +223,14 @@ if (!stressEnabled()) {
 					`${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 			);
 
-			const aDescribe = await sendOperation(A, { operation: 'describe_table', table: 'large' });
-			const targetCount = aDescribe.record_count;
-			console.log(`[large-catchup] A record_count=${targetCount}; restarting B`);
+			// Convergence target is the exact count of distinct records on A: the bulk
+			// rows just written plus the small seed batch. We use the known write count
+			// rather than describe_table.record_count — the latter is a rounded RocksDB
+			// estimate (see getRecordCount) that is wildly inflated and non-monotonic
+			// during/after a bulk load, so it cannot detect convergence. This mirrors
+			// the same lesson already applied in largeClone.test.mjs.
+			const targetCount = writtenRecords + seedRecords.length;
+			console.log(`[large-catchup] A target record count=${targetCount}; restarting B`);
 
 			const bRestartCtx = {
 				name: ctx.name,
@@ -251,8 +256,14 @@ if (!stressEnabled()) {
 			let lastCount = -1;
 			let convergedAt = null;
 			while (Date.now() < deadline) {
-				const resp = await trySendOperation(B, { operation: 'describe_table', table: 'large' });
-				lastCount = resp?.record_count ?? -1;
+				// Measure convergence with an exact SQL COUNT(*), not
+				// describe_table.record_count — the latter is a rounded RocksDB
+				// estimate that diverges between nodes during bulk catch-up.
+				const rows = await trySendOperation(B, {
+					operation: 'sql',
+					sql: 'SELECT COUNT(*) AS c FROM data.large',
+				});
+				lastCount = rows?.[0]?.c ?? -1;
 				if (lastCount >= targetCount) {
 					convergedAt = Date.now();
 					break;
@@ -286,6 +297,11 @@ if (!stressEnabled()) {
 			const [logA, logB] = await Promise.all([readLog(A), readLog(B)]);
 
 			ok(convergedAt !== null, `B did not converge within ${CATCHUP_BUDGET_SECS}s; last count=${lastCount}`);
+			// Now that the count is exact, require equality — not just >=. B replays A's
+			// writes (distinct ids), so a count above the target would signal duplicated
+			// or over-replicated rows, which is exactly the kind of catch-up regression
+			// this test should catch.
+			equal(lastCount, targetCount, `B row count ${lastCount} != A target ${targetCount} after catch-up`);
 			for (const [name, summary, log] of [
 				['A', aSummary, logA],
 				['B', bSummary, logB],
