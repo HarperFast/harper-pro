@@ -29,7 +29,7 @@
  */
 
 import { suite, test, before, after } from 'node:test';
-import { ok, equal } from 'node:assert';
+import { ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { resolve } from 'node:path';
 import {
@@ -264,7 +264,13 @@ if (!stressEnabled()) {
 					sql: 'SELECT COUNT(*) AS c FROM data.large',
 				});
 				lastCount = rows?.[0]?.c ?? -1;
-				if (lastCount >= targetCount) {
+				// B replays A's distinct-id upserts, so its row count can only climb up
+				// to the target. A count above it means duplicated/over-replicated rows —
+				// a real catch-up regression — so fail fast rather than waiting out the
+				// deadline. (Polling on the exact count keeps the break condition and this
+				// guard symmetric: we converge on ===, and > is always an error.)
+				ok(lastCount <= targetCount, `B row count ${lastCount} exceeds A target ${targetCount} — over-replicated`);
+				if (lastCount === targetCount) {
 					convergedAt = Date.now();
 					break;
 				}
@@ -297,11 +303,6 @@ if (!stressEnabled()) {
 			const [logA, logB] = await Promise.all([readLog(A), readLog(B)]);
 
 			ok(convergedAt !== null, `B did not converge within ${CATCHUP_BUDGET_SECS}s; last count=${lastCount}`);
-			// Now that the count is exact, require equality — not just >=. B replays A's
-			// writes (distinct ids), so a count above the target would signal duplicated
-			// or over-replicated rows, which is exactly the kind of catch-up regression
-			// this test should catch.
-			equal(lastCount, targetCount, `B row count ${lastCount} != A target ${targetCount} after catch-up`);
 			for (const [name, summary, log] of [
 				['A', aSummary, logA],
 				['B', bSummary, logB],
