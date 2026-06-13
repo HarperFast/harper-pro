@@ -164,6 +164,11 @@ const COMMITTED_UPDATE_DELAY = 2;
 const PING_INTERVAL = env.get(CONFIG_PARAMS.REPLICATION_PINGINTERVAL) ?? 30000;
 // Time (ms) without any socket activity before a connection is treated as dead.
 const PING_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_PINGTIMEOUT) ?? PING_INTERVAL * 2;
+// On RocksDB the audit log is keyed by the record version directly (version === the log key), so a
+// record's `version` IS a valid resume-cursor value. On LMDB the log key is a separate local audit time
+// (`localTime`) that differs from `version` (the origin record timestamp) — and the receive side does not
+// carry `localTime` per record (readAuditEntry decodes only `version`). Mirrors core databases.ts.
+const STORAGE_IS_ROCKSDB = (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_PARAMS.STORAGE_ENGINE)) !== 'lmdb';
 // The receive-side watchdog fires after this much silence on a replication WS. Both client and
 // server arm it: the client also runs an active 30s sendPing tick that should normally catch a
 // silent peer first, but if that tick is missed (event-loop stall, ws.terminate() not propagating
@@ -762,6 +767,37 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
 	let wsClosed = false;
+	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
+	// committed AND its blob (and all earlier blobs) have finished saving; the persisted replication
+	// resume cursor must never advance past that point. We track this with an ASYNC watermark rather
+	// than blocking the apply loop on blobs:
+	//   - `committedSequence` = the highest sequence id (end_txn localTime/version) the apply loop has
+	//     committed so far. Commit == visibility; this advances synchronously in onCommit.
+	//   - `lastDurableSequenceId` = the durable watermark = the highest committed sequence whose blobs
+	//     (and all earlier ones) are durably saved. It is what we persist as the resume cursor.
+	// The watermark advances to `committedSequence` only when there is no in-flight blob AND no gap:
+	// in onCommit when `outstandingBlobsToFinish` is empty, and in the blob save `.finally` (success
+	// path) when the last in-flight blob drains. Because the cursor only ever advances to a sequence
+	// whose blobs are all durable, a crash/restart resumes from the watermark and re-streams — and
+	// re-saves — any record whose blob wasn't durable; nothing is lost.
+	// `hasBlobGap` is set when a blob save FAILS (see receiveBlobs); from then on the watermark holds
+	// (the advance is gated on `!hasBlobGap`) until a reconnect re-streams the disrupted blob.
+	// This design removes the synchronous `await Promise.all(outstandingBlobsToFinish)` that used to
+	// run inside onCommit, which (combined with receive backpressure pausing the WS, and thus the
+	// BLOB_CHUNK frames those blobs need) produced a circular wait / permanent deadlock during
+	// catch-up. The apply loop now never blocks on blobs; the cursor simply lags within the bounded
+	// in-flight window (sender caps concurrent blobs at MAX_OUTSTANDING_BLOBS_BEING_SENT) and holds on
+	// a gap. See onCommit, the blob save `.finally`, and the sequence-update branches.
+	let hasBlobGap = false;
+	let lastDurableSequenceId = 0;
+	let committedSequence = 0;
+	// The cursor must not advance past a sequence id whose blobs are not yet durable — whether a blob has
+	// already failed (`hasBlobGap`) OR is still in flight and might fail. A sequence-update can arrive while
+	// a slow blob (e.g. one about to hit the stream timeout) is still saving; advancing on it would push the
+	// cursor past a blob that then fails, before `hasBlobGap` is ever set. The data-record onCommit awaits
+	// `outstandingBlobsToFinish` before it clamps, so it only needs `hasBlobGap`; the sequence-update sites
+	// don't await, so they also gate on outstanding blobs.
+	const cursorBlockedByBlob = () => hasBlobGap || outstandingBlobsToFinish.length > 0;
 	ws.on('message', (body: Buffer) => {
 		// Reset the receive watchdog synchronously on every frame — async processing below may
 		// take a long time and we want a single late frame to count as proof of life immediately.
@@ -1036,7 +1072,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						lastSequenceIdReceived = data;
 						tableSubscriptionToReplicator.send({
 							type: 'end_txn',
-							localTime: lastSequenceIdReceived,
+							// Clamp: a sequence-id update carries no commit/blob-durability gate, so while any blob is
+							// not yet durable it must not push the resume cursor past the last fully-durable point (same
+							// as the inline REMOTE_SEQUENCE_UPDATE branch below).
+							localTime: cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived,
 							remoteNodeIds: receivingDataFromNodeIds,
 						});
 						getSharedStatus();
@@ -1181,7 +1220,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							if (binaryEntry) {
 								let valueBuffer = table.primaryStore.decoder.decode(binaryEntry, { valueAsBuffer: true });
 								const entry: any = lastMetadata || {};
-								entry.version = getLastVersion();
+								// getLastVersion() reads lmdb-native thread-local state that doesn't exist for a
+								// RocksDB store — calling it there throws, silently failing every on-demand record
+								// fetch (GET_RECORD) on RocksDB. Only call it on LMDB. On RocksDB the version is carried
+								// inline on the decoded metadata: when the record has a metadata prefix the decoder
+								// returns that metadata object (=== lastMetadata, value bytes under `.value`, version
+								// already on `entry`); when it doesn't, `valueBuffer` is the plain value buffer and the
+								// version isn't available here (left undefined) — never fall through to getLastVersion().
+								if (table.primaryStore.decoder.isRocksDB) {
+									if (valueBuffer === lastMetadata && lastMetadata != null) {
+										valueBuffer = lastMetadata.value;
+									}
+								} else {
+									entry.version = getLastVersion();
+								}
 								if (lastMetadata && lastMetadata[METADATA] & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
 									// but first, the decoding process can destroy our buffer above, so we need to copy it
@@ -2002,6 +2054,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			let beginTxn = true;
 			let event; // could also get txnTime from decoder.getFloat64(0);
 			let sequenceIdReceived;
+			let maxBatchVersion; // highest record version in this batch (non-copy); end_txn resume cursor when no sequence-update set lastSequenceIdReceived
 			let lastYieldTime = performance.now();
 			do {
 				getSharedStatus();
@@ -2019,7 +2072,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
 					tableSubscriptionToReplicator.send({
 						type: 'end_txn',
-						localTime: lastSequenceIdReceived,
+						// Clamp: an empty sequence update carries no commit/blob-durability gate, so while any
+						// blob is not yet durable it must not push the resume cursor past the last fully-durable point.
+						localTime: cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived,
 						remoteNodeIds: receivingDataFromNodeIds,
 					});
 					logger.trace?.('received remote sequence update', lastSequenceIdReceived, databaseName);
@@ -2136,6 +2191,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						replicationSharedStatus[RECEIVED_VERSION_POSITION]
 					);
 				}
+				// Only on RocksDB is `version` a valid resume-cursor value (version === audit-log key). On LMDB
+				// the cursor must stay on the sender's audit sequence id (lastSequenceIdReceived); advancing it
+				// to a record `version` could push it past the leader's actual log position and skip entries.
+				if (STORAGE_IS_ROCKSDB && !inCopyMode && auditRecord.version > (maxBatchVersion ?? 0))
+					maxBatchVersion = auditRecord.version;
 				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
 
@@ -2197,9 +2257,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Is this a bulk-copy frame? Only frames received before COPY_COMPLETE are part of the
 			// primary-key copy; later audit-replay frames must not be recorded as the resume cursor.
 			const isCopyFrame = inCopyMode && !copyCompleteReceived;
-			tableSubscriptionToReplicator.send({
+			// Capture the end_txn in a const so onCommit can clamp its `localTime` before the apply loop reads
+			// it: core Table.ts awaits onCommit and only THEN reads `event.localTime` to persist the resume
+			// cursor (same object — onCommit being callable proves the event isn't cloned across send()).
+			const endTxnEvent: any = {
 				type: 'end_txn',
-				localTime: lastSequenceIdReceived,
+				localTime:
+					isCopyFrame || maxBatchVersion == null
+						? lastSequenceIdReceived
+						: Math.max(lastSequenceIdReceived ?? 0, maxBatchVersion), // resume cursor from the batch even without a sequence-update
 				remoteNodeIds: receivingDataFromNodeIds,
 				async onCommit() {
 					if (event) {
@@ -2220,10 +2286,39 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						removePauseReason();
 						logger.debug?.(`Replication resuming ${remoteNodeName}`);
 					}
-					// if there are outstanding blobs to finish writing, delay commit receipts until they are finished (so that if we are interrupting
-					// we correctly resend the blobs)
-					if (outstandingBlobsToFinish.length > 0) await Promise.all(outstandingBlobsToFinish);
-					logger.trace?.('All blobs finished');
+					// Record the highest committed sequence (this batch's resume cursor value). Commit ==
+					// visibility; this is monotonic across batches. The durable watermark below only ever
+					// catches up TO this value, never past it.
+					committedSequence = Math.max(committedSequence, endTxnEvent.localTime ?? 0);
+					if (isCopyFrame) {
+						// COPY MODE retains the synchronous blob-wait. The copy-cursor put and maybeFinishCopy()
+						// below rely on the copied batch's blobs being durable before the copy cursor advances,
+						// and copy is the lower-frequency initial bulk-copy path (the deadlock was observed in
+						// non-copy catch-up). Awaiting here keeps copy durability exactly as before. The
+						// non-copy catch-up/live path (the deadlock-prone one) uses the async watermark instead
+						// and never blocks the apply loop on blobs.
+						if (outstandingBlobsToFinish.length > 0) await Promise.all(outstandingBlobsToFinish);
+						logger.trace?.('All copy blobs finished');
+						if (hasBlobGap) {
+							// A copy blob save failed; hold the copy cursor at the last fully-durable point so the
+							// next reconnect/restart re-streams and re-saves it rather than advancing over the gap.
+							endTxnEvent.localTime = lastDurableSequenceId;
+						} else {
+							lastDurableSequenceId = Math.max(lastDurableSequenceId, committedSequence);
+							endTxnEvent.localTime = lastDurableSequenceId;
+						}
+					} else {
+						// NON-COPY: do NOT await blobs (that await is what deadlocked). Advance the durable
+						// watermark immediately only when there is nothing in flight and no gap — the common
+						// blob-less or already-saved case advances the cursor normally. Otherwise the watermark
+						// stays where it is and the in-flight blobs' `.finally` will advance it once the last one
+						// drains. A failed blob (`hasBlobGap`) holds the watermark until a reconnect re-streams it.
+						if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
+						// Persist the resume cursor at the durable watermark. Because the watermark only includes
+						// durable blobs, the cursor never advances past an unfinished or failed blob — preserving
+						// the no-data-loss guarantee — while the apply loop no longer blocks on blob saves.
+						endTxnEvent.localTime = lastDurableSequenceId;
+					}
 					// Persist/clear the resume cursor only AFTER this batch's blobs are durable too. The cursor
 					// means "fully copied through this key"; advancing it before blob writes finish would let a
 					// crash skip re-requesting an unfinished blob, leaving the record pointing at missing data.
@@ -2241,8 +2336,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					if (!lastSequenceIdCommitted && sequenceIdReceived) {
 						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
 						setTimeout(() => {
-							ws.send(encode([COMMITTED_UPDATE, lastSequenceIdCommitted]));
-							logger.trace?.(connectionId, 'sent confirmation of a commit at', lastSequenceIdCommitted);
+							// Gate the receipt on the durable watermark. Now that onCommit no longer awaits the
+							// blob saves, a commit's blobs may still be in flight at send time; confirming the raw
+							// committed sequence would tell the sender we durably hold past `lastDurableSequenceId`
+							// and let it discard a blob we haven't yet saved. Clamp to the watermark so we never
+							// claim durability beyond what we'd actually resume from after a crash. (Copy frames
+							// already awaited their blobs above, so the watermark covers them too.)
+							const confirmed = Math.min(lastSequenceIdCommitted, lastDurableSequenceId);
+							ws.send(encode([COMMITTED_UPDATE, confirmed]));
+							logger.trace?.(connectionId, 'sent confirmation of a commit at', confirmed);
 							lastSequenceIdCommitted = null;
 						}, COMMITTED_UPDATE_DELAY);
 					}
@@ -2251,7 +2353,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					}
 					logger.debug?.('last sequence committed', new Date(lastSequenceIdCommitted), databaseName);
 				},
-			});
+			};
+			tableSubscriptionToReplicator.send(endTxnEvent);
 		} catch (error) {
 			logger.error?.(connectionId, 'Error handling incoming replication message', error);
 		}
@@ -2415,11 +2518,26 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// even though we already logged it here, and it would escape onCommit as an
 			// uncaughtException — observed in prod as ~35/sec ENOENT spam during catch-up.
 			const tracked = finished
-				.catch((err) => logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err))
+				.catch((err) => {
+					logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err);
+					// Mark a blob gap. We deliberately do NOT tear down here: this .catch runs inside the same
+					// microtask chain that onCommit's `await Promise.all(outstandingBlobsToFinish)` is waiting on.
+					// Once set, onCommit and the sequence-update branch clamp the persisted resume cursor at the
+					// last fully-durable transaction (lastDurableSequenceId) instead of advancing over the gap;
+					// records keep flowing live and the next reconnect/restart resumes from the clamp and re-saves
+					// the disrupted blob. A transient catch-up fault (e.g. a blob-stream timeout) clears on resume.
+					hasBlobGap = true;
+				})
 				.finally(() => {
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
 					const index = outstandingBlobsToFinish.indexOf(tracked);
 					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
+					// Advance the durable watermark when the LAST in-flight blob drains successfully. The splice
+					// above runs first so the length check sees the post-removal count; a save FAILURE set
+					// `hasBlobGap` in the `.catch` (which runs before this `.finally`), so the `!hasBlobGap` guard
+					// keeps the watermark pinned on a gap. On clean drain the watermark catches up to the highest
+					// committed sequence, which the next end_txn/sequence-update persists as the resume cursor.
+					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
 				});
 			(tracked as any).blobId = blobId;
 			outstandingBlobsToFinish.push(tracked);
@@ -2556,12 +2674,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					: tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('copyCursor'), nodeId]),
 				tableSubscriptionToReplicator?.dbisDB,
 				nodeId,
-				() =>
-					logger.warn?.(
-						'Discarding malformed copy-resume cursor (no currentTable) for',
-						node.name,
-						databaseName
-					)
+				() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
 			);
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(

@@ -350,6 +350,23 @@ if (!stressEnabled()) {
 				);
 			}
 
+			// Receiver-side blob diagnostics. The production failure mode this soak guards against is a
+			// catch-up blob-stream failure/timeout that disrupts a record's blob (and, before the resync
+			// fix, advanced the resume cursor past it — permanent divergence). Assertion (3) only catches
+			// the *sender* ENOENT signature; these are the *receiver-side* signatures. We don't fail on them
+			// (a transient failure now triggers a resync), but surface the counts so a convergence failure
+			// below is attributable to the blob path instead of an opaque drift.
+			const blobDiag = [];
+			for (let i = 0; i < ctx.nodes.length; i++) {
+				const log = await readLog(ctx.nodes[i]);
+				const saveFailed = (log.match(/\[error\] \[replication\]: Blob save failed for /g) ?? []).length;
+				const streamTimeout = (log.match(/Timeout waiting for blob stream/g) ?? []).length;
+				const resyncs = (log.match(/Resyncing replication from .* after a blob save failure/g) ?? []).length;
+				if (saveFailed || streamTimeout || resyncs)
+					blobDiag.push(`node ${i}: saveFailed=${saveFailed} streamTimeout=${streamTimeout} resync=${resyncs}`);
+			}
+			console.log(`[soak] receiver-side blob diagnostics: ${blobDiag.length ? blobDiag.join(' | ') : 'none'}`);
+
 			// (4) Convergence: every node has the same Prerender record_count.
 			// Allow up to 1% drift to absorb in-flight writes from the moment
 			// traffic was stopped — the goal is "no permanent divergence",
@@ -359,7 +376,9 @@ if (!stressEnabled()) {
 			const drift = maxCount > 0 ? (maxCount - minCount) / maxCount : 0;
 			ok(
 				drift < 0.01,
-				`record counts diverged > 1% across nodes: ${JSON.stringify(finalCounts)} (drift ${(drift * 100).toFixed(2)}%)`
+				`record counts diverged > 1% across nodes: ${JSON.stringify(finalCounts)} (drift ${(drift * 100).toFixed(2)}%). ` +
+					`Receiver-side blob activity: ${blobDiag.length ? blobDiag.join(' | ') : 'none'} ` +
+					`(non-zero saveFailed/streamTimeout with unrecovered drift points at the blob-stream catch-up path)`
 			);
 
 			// (5) Per-node peak RSS under the limit.
