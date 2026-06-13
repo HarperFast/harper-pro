@@ -63,7 +63,10 @@ import {
 	deleteBlob,
 	saveBlob,
 	getFileId,
+	findBlobsInObject,
+	getFilePathForBlob,
 } from '../core/resources/blob.ts';
+import { promises as fsPromises } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 const logger = forComponent('replication').conditional as Logger;
@@ -120,6 +123,20 @@ const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 10
 // follower commits incrementally and persists a resume cursor. On reconnect the copy resumes from that
 // cursor instead of restarting from zero. Larger = less overhead but coarser resume granularity.
 const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 1000;
+
+// Leading-duplicate fast-skip (PR B, stacks on the #368 clamp work). On resume the leader re-streams
+// from the follower's resume cursor, so the first records of a resumed stream are records this follower
+// already applied. Each such record otherwise flows into core Table.ts's apply loop and triggers the
+// per-record CRDT resequencing walk (`auditStore.get` scans) only to be dropped as a duplicate. When this
+// is enabled, the receive path recognizes a *provably-already-applied* leading duplicate and skips
+// dispatching it, avoiding the audit-walk cost during catch-up. This is a pure optimization: it only ever
+// suppresses dispatch of a record the apply loop would itself have dropped as an identity tie. Disable
+// (set false) to fall back to dispatching everything to the apply loop. See LeadingDuplicateSkip below.
+const LEADING_DUP_SKIP_ENABLED = env.get('replication_leadingDuplicateSkip') ?? true;
+// Distinctive log substring tests grep for to confirm the fast-skip path engaged. Keep stable.
+export const LEADING_DUP_SKIP_LOG = 'leading-duplicate fast-skip';
+// Process-wide counter of records suppressed by the fast-skip, for in-process tests/observability.
+export let leadingDuplicateSkipCount = 0;
 
 /**
  * Decide whether an incremental replication start must be upgraded to a bounded base copy because
@@ -856,6 +873,110 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// `outstandingBlobsToFinish` before it clamps, so it only needs `hasBlobGap`; the sequence-update sites
 	// don't await, so they also gate on outstanding blobs.
 	const cursorBlockedByBlob = () => hasBlobGap || outstandingBlobsToFinish.length > 0;
+
+	// ── Leading-duplicate fast-skip state ───────────────────────────────────────────────────────────
+	// Per *source node* (NOT a single global flag): the resume cursor we asked this node to re-stream
+	// from. On resume the leader re-streams from this version, so every incoming record from that node
+	// whose version is `<= cursor` is a record we already received and applied before the disconnect —
+	// a leading duplicate. A proxied/multi-node subscription interleaves records from independent source
+	// nodes with independent version spaces, so the latch MUST be keyed by source node id, and gated by
+	// version: once a record from a node arrives with `version > cursor`, that node has streamed past the
+	// already-applied tail and we drop its entry so nothing newer is ever treated as a duplicate.
+	// Keyed by the *local* node id (matching `event.nodeId` = remoteShortIdToLocalId.get(...)).
+	const leadingDupCursorByNode: Map<number, number> = new Map();
+
+	/**
+	 * Decide whether an incoming record is a *provably-already-applied* leading duplicate that can be
+	 * skipped before it ever reaches core's apply loop. CORRECTNESS IS PARAMOUNT: this returns true only
+	 * for a TRUE identity tie (same version AND same source node as the record already stored locally),
+	 * within the per-node resume-cursor window, and only when skipping cannot lose data or block a repair.
+	 * Anything ambiguous (older version, different node, no existing record, missing blob, decode/read
+	 * failure) returns false and the record flows to the apply loop untouched — exactly as today.
+	 *
+	 * @param tableDecoder per-table decoder (exposes getEntry against the live primaryStore)
+	 * @param id           record primary key
+	 * @param incomingVersion incoming record version (scalar timestamp)
+	 * @param sourceNodeId    local id of the originating node (`event.nodeId`)
+	 * @param hasBlobs        whether the audit header's HAS_BLOBS bit is set on the incoming record
+	 *
+	 * NOTE: the blob-present check intentionally inspects the EXISTING (already-applied) record's blobs,
+	 * not the incoming duplicate's — they share fileIds, and the existing record reflects the durable
+	 * on-disk state we must not skip a repair for. So the incoming value is not needed here.
+	 */
+	async function isSkippableLeadingDuplicate(
+		tableDecoder: any,
+		id: any,
+		incomingVersion: number,
+		sourceNodeId: number | undefined,
+		hasBlobs: boolean
+	): Promise<boolean> {
+		if (!LEADING_DUP_SKIP_ENABLED) return false;
+		// No mapped source node id → cannot reason about its version space. Let it flow.
+		if (sourceNodeId === undefined) return false;
+		const cursor = leadingDupCursorByNode.get(sourceNodeId);
+		if (cursor === undefined) return false; // this node has already streamed past its resume tail
+		if (incomingVersion > cursor) {
+			// This node has caught up to live data; stop treating anything from it as a leading duplicate.
+			leadingDupCursorByNode.delete(sourceNodeId);
+			return false;
+		}
+		// Within the leading-duplicate window. Read the existing record to confirm a TRUE identity tie.
+		let existing;
+		try {
+			existing = tableDecoder?.getEntry?.(id);
+		} catch (error) {
+			logger.trace?.(connectionId, 'leading-dup-skip: getEntry threw, letting record flow', id, error);
+			return false;
+		}
+		if (!existing) return false; // nothing stored locally → not a duplicate; must apply.
+		// Defensive: a synchronous getEntry(id) is expected here, but if a store ever hands back a thenable
+		// we must not treat it as an entry — let the record flow (safe, just unoptimized).
+		if (typeof existing.then === 'function') return false;
+		// Identity tie = SAME version AND SAME node. This is exactly the condition core Table.ts's apply loop
+		// uses to drop a duplicate: `precedesExistingVersion(txnTime, existingEntry, nodeId) === 0` early-
+		// matches when `txnTime === existingEntry.version && nodeId === existingEntry.nodeId`. We read the
+		// existing entry via the SAME getEntry the apply loop reads, and `incomingVersion`/`sourceNodeId` are
+		// the same `txnTime`/`options.nodeId` the apply loop sees — so a true here is a guaranteed tie-drop
+		// there. A different node or an older/newer version is a real CRDT input the apply loop's resequencing
+		// must still fold — never skip those.
+		if (existing.version !== incomingVersion) return false;
+		if ((existing.nodeId ?? 0) !== sourceNodeId) return false;
+		// Intentionally broader than `_writeDelete`'s tie check (`<= 0` here vs `< 0` there): this only
+		// elides re-delivered idempotent re-deletes whose version and node already match locally — safe.
+		// Blob handling. A leading duplicate carrying a file-backed blob may be skipped only if the blob
+		// file is already present on disk (the prior apply saved it); a MISSING blob must NOT be skipped —
+		// it has to reach the apply loop so the dangling reference can be repaired (separate PR). A record
+		// with no blob is always fine to skip. We inspect the *existing* record's blobs (same fileIds as
+		// the duplicate) so the check reflects the durable on-disk state, not the still-in-flight resave.
+		if (hasBlobs) {
+			let allPresent = true;
+			let sawBlob = false;
+			const blobPaths: string[] = [];
+			try {
+				findBlobsInObject(existing.value, (blob) => {
+					sawBlob = true;
+					const path = getFilePathForBlob(blob as any);
+					if (path) blobPaths.push(path);
+					else allPresent = false;
+				});
+			} catch (error) {
+				logger.trace?.(connectionId, 'leading-dup-skip: blob inspection threw, letting record flow', id, error);
+				return false;
+			}
+			// Header said HAS_BLOBS but we could not find a blob to verify (e.g. blob lives only in a patch
+			// chain) — be conservative and let it flow.
+			if (!sawBlob || !allPresent) return false;
+			// Check each blob path asynchronously (avoids blocking the event loop under load).
+			// fsPromises.access resolves if present, throws if missing — treat a throw as "not present".
+			try {
+				await Promise.all(blobPaths.map((p) => fsPromises.access(p)));
+			} catch {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	ws.on('message', (body: Buffer) => {
 		// Reset the receive watchdog synchronously on every frame — async processing below may
 		// take a long time and we want a single late frame to count as proof of life immediately.
@@ -2258,6 +2379,41 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
 
 				if (event) {
+					// Leading-duplicate fast-skip: on a resumed stream the first records re-streamed from the
+					// resume cursor are records this follower already applied. If this is a provably-already-
+					// applied identity-tie duplicate (and not part of a bulk copy), suppress the dispatch so it
+					// never incurs core's per-record CRDT resequencing walk. This only ever drops a record the
+					// apply loop would itself have discarded as a tie — see isSkippableLeadingDuplicate.
+					if (
+						!inCopyMode &&
+						(await isSkippableLeadingDuplicate(
+							tableDecoder,
+							event.id,
+							auditRecord.version,
+							event.nodeId,
+							!!(auditRecord.extendedType & HAS_BLOBS)
+						))
+					) {
+						leadingDuplicateSkipCount++;
+						logger.trace?.(
+							connectionId,
+							LEADING_DUP_SKIP_LOG,
+							'id',
+							event.id,
+							'version',
+							auditRecord.version,
+							'nodeId',
+							event.nodeId,
+							'table',
+							event.table
+						);
+						// A skipped record still carries any blob chunks (delivered as their own BLOB_CHUNK
+						// messages and written independently) and does not affect txn framing: we simply do not
+						// enqueue it for the apply loop. Leave `beginTxn` as-is so the first record we *do*
+						// dispatch still correctly opens the transaction. Advance the decoder past this record.
+						decoder.position = start + eventLength;
+						continue;
+					}
 					beginTxn = false;
 					// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
 					logger.debug?.(
@@ -2739,6 +2895,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				sequenceEntry?.seqId ?? 1,
 				(typeof node.startTime === 'string' ? new Date(node.startTime).getTime() : node.startTime) ?? 1
 			);
+			// A genuine resume = we have a persisted last-received sequence id (>1) for this node. Only then
+			// does the leader re-stream an already-applied tail worth fast-skipping. A fresh subscription
+			// (no persisted seqId, which later falls back to `Date.now() - 60000`) has no such tail, so we
+			// must NOT arm the latch from that synthetic start point. NOTE: this checks the DIRECT sequence
+			// cursor only; a resume that derives its start point from a proxy node's seqId (indirect path
+			// below) is deliberately left un-armed — conservative (we simply forgo the optimization for that
+			// case rather than risk arming from a cursor whose version space we can't cleanly attribute).
+			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
 			logger.debug?.(
 				'Starting time recorded in db',
 				node.name,
@@ -2793,6 +2957,29 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				);
 			}
 			logger.trace?.(connectionId, 'defining subscription request', node.name, databaseName, new Date(startTime));
+			// Arm the leading-duplicate fast-skip for this source node. The leader will re-stream from
+			// `startTime`, so incoming records from this node with version <= startTime are the
+			// already-applied tail. Only arm for a genuine incremental resume from a real prior cursor:
+			//   - copyResume / startTime === 0  → a bulk copy re-streams in key order carrying original
+			//     (possibly newest) versions, so "version <= cursor" is NOT a duplicate signal there.
+			//   - startTime <= 1 / a fresh "now - 60s" start → no prior applied tail to dedupe.
+			// Keyed by local node id so a proxied multi-node subscription gets an independent latch.
+			if (nodeId !== undefined && !copyResume && hasPersistedResumeCursor && startTime > 1) {
+				leadingDupCursorByNode.set(nodeId, startTime);
+				logger.debug?.(
+					connectionId,
+					'armed leading-duplicate fast-skip',
+					node.name,
+					nodeId,
+					databaseName,
+					'resume cursor',
+					startTime
+				);
+			} else if (nodeId !== undefined) {
+				// Re-subscription without a resumable cursor (or a copy): clear any stale latch so we never
+				// dedupe against an old window.
+				leadingDupCursorByNode.delete(nodeId);
+			}
 			return {
 				name: node.name,
 				replicateByDefault,
