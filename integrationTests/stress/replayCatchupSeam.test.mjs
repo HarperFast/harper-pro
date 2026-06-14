@@ -213,14 +213,15 @@ if (!stressEnabled()) {
 			// post-restart activity goes to the restart's. Concatenate both so every B-side assertion
 			// (replay happened, no replay errors, no uncaught/OOM) sees the full picture. When
 			// HARPER_INTEGRATION_TEST_LOG_DIR is unset, both resolve to the shared dataRootDir log and
-			// readLog returns identical content, so de-dupe to avoid double-counting.
+			// readLog returns identical content; the Set de-dupes that case and filter(Boolean) drops
+			// an empty/missing log so no stray newline is introduced.
 			const [logA, logBkilled, logBrestart, logC] = await Promise.all([
 				readLog(A),
 				readLog(killedB),
 				readLog(B),
 				readLog(C),
 			]);
-			const logB = logBkilled === logBrestart ? logBrestart : `${logBkilled}\n${logBrestart}`;
+			const logB = [...new Set([logBkilled, logBrestart].filter(Boolean))].join('\n');
 
 			// (1) Convergence — strict drift bound, but tolerate a few in-flight rows.
 			const vals = Object.values(counts);
