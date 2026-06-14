@@ -145,6 +145,47 @@ if (!stressEnabled()) {
 			const [A, , C, D] = ctx.nodes;
 			let B = ctx.nodes[1];
 
+			// Warm-up: seed a small batch through the peers and wait for B to receive it
+			// BEFORE taking B offline. This is what makes the test exercise backlog *drain*
+			// (audit-log resume) rather than a cold from-scratch join. Replication records a
+			// per-source resume position (last received seqId) only once B has actually
+			// received data for the `data` db; that position lives in B's durable audit log,
+			// so it survives the SIGKILL below. Without it, B's `data` db restarts "from
+			// scratch" (startTime === 1) and — per the explicit-leader design (#254) — a
+			// plain, non-leader node starts replicating from ~now (Date.now() - 60s), so it
+			// would silently skip the entire accumulated backlog and never converge.
+			// replayCatchupSeam dodges this implicitly by churning for 45s before its kill;
+			// we do the equivalent here, and assert B saw it so a regression can't slip back
+			// into the "0 records forever" failure mode this test was written to catch.
+			const peers = [A, C, D];
+			const WARMUP_WRITES = Math.min(KEYSPACE, 60);
+			console.log(`[backlog] warm-up: seeding ${WARMUP_WRITES} writes so B has a resume position before going offline`);
+			for (let i = 0; i < WARMUP_WRITES; i++) {
+				const id = prerenderId(i % KEYSPACE);
+				try {
+					await fetchWithRetry(peers[i % peers.length].httpURL + '/Prerender/' + encodeURIComponent(id), {
+						retries: 1,
+					});
+				} catch {
+					// transient errors during warm-up are fine
+				}
+			}
+			// Wait until B has actually received (and committed) the warm-up — a positive
+			// record_count is the durable signal that B holds a `data` resume position.
+			const warmupDeadline = Date.now() + 60_000;
+			let warmupCount = 0;
+			while (Date.now() < warmupDeadline) {
+				const b = await sendOperation(B, { operation: 'describe_table', table: 'Prerender' }).catch(() => null);
+				warmupCount = b?.record_count ?? 0;
+				if (warmupCount > 0) break;
+				await delay(1000);
+			}
+			ok(
+				warmupCount > 0,
+				`warm-up failed: B never received the seed writes (count=${warmupCount}); cannot establish a data-db resume position, so the offline-backlog drain path can't be exercised`
+			);
+			console.log(`[backlog] warm-up done; B holds ${warmupCount} records (resume position established)`);
+
 			// Sample memory on peers A/C/D for the whole offline window.
 			const peerSamplers = [A, C, D].map((n) => sampleMetrics(n, { intervalMs: 2000 }));
 
@@ -159,7 +200,6 @@ if (!stressEnabled()) {
 			// the backlog isn't entirely on one peer's queue.
 			let stopChurn = false;
 			let writes = 0;
-			const peers = [A, C, D];
 			const driver = concurrent(async () => {
 				if (stopChurn) return;
 				const id = prerenderId(writes++ % KEYSPACE);
