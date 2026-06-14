@@ -174,6 +174,13 @@ if (!stressEnabled()) {
 				},
 				env: { HARPER_NO_FLUSH_ON_EXIT: true },
 			});
+			// Keep a reference to the pre-restart (killed) instance: its log dir is where the
+			// restart's startup replay actually lands. With HARPER_INTEGRATION_TEST_LOG_DIR set (CI),
+			// each startHarper mints a fresh timestamped log dir, but on boot Harper replays the
+			// transaction log *before* the runtime config override repoints logging.root — so the
+			// "Replayed N records" line is written to the killed instance's log dir, not the restarted
+			// one. readLog(B) alone would miss it (see assertion (2) below).
+			const killedB = B;
 			ctx.nodes[1] = restartCtx.harper;
 			B = restartCtx.harper;
 			console.log(`[replay] B restarted; ${POST_KILL_SECS}s post-kill churn`);
@@ -201,7 +208,19 @@ if (!stressEnabled()) {
 			}
 			console.log(`[replay] convergence done: ${JSON.stringify(counts)}`);
 
-			const [logA, logB, logC] = await Promise.all([readLog(A), readLog(B), readLog(C)]);
+			// B's log spans two instances: the killed one and the restart. The startup replay is
+			// written to the killed instance's log dir (see the killedB comment above), while live
+			// post-restart activity goes to the restart's. Concatenate both so every B-side assertion
+			// (replay happened, no replay errors, no uncaught/OOM) sees the full picture. When
+			// HARPER_INTEGRATION_TEST_LOG_DIR is unset, both resolve to the shared dataRootDir log and
+			// readLog returns identical content, so de-dupe to avoid double-counting.
+			const [logA, logBkilled, logBrestart, logC] = await Promise.all([
+				readLog(A),
+				readLog(killedB),
+				readLog(B),
+				readLog(C),
+			]);
+			const logB = logBkilled === logBrestart ? logBrestart : `${logBkilled}\n${logBrestart}`;
 
 			// (1) Convergence — strict drift bound, but tolerate a few in-flight rows.
 			const vals = Object.values(counts);
@@ -216,7 +235,7 @@ if (!stressEnabled()) {
 			const replayLines = logB.match(replayedRe) ?? [];
 			ok(
 				replayLines.length > 0,
-				`B did not log any "Replayed N records" — test did not exercise replay (HARPER_NO_FLUSH_ON_EXIT not honored, or kill happened before any unflushed writes). Sample of B log tail:\n${logB.slice(-2000)}`
+				`B did not log any "Replayed N records" — test did not exercise replay. This searches both the killed and restarted instance logs, so the cause is genuinely that replay did not fire: HARPER_NO_FLUSH_ON_EXIT not honored, or the kill happened before any unflushed writes existed. Sample of B log tail:\n${logB.slice(-2000)}`
 			);
 
 			// (3) No replay errors on any node.
