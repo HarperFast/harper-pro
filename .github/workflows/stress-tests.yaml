@@ -126,6 +126,9 @@ jobs:
           - name: 'blob-resync-on-failure'
             file: 'integrationTests/cluster/replicationBlobResyncOnFailure.test.mjs'
             env_vars: ''
+          - name: 'blob-gap-deadlock'
+            file: 'integrationTests/cluster/blobGapDeadlock.test.mjs'
+            env_vars: ''
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
