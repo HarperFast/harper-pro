@@ -188,6 +188,39 @@ export function start(options) {
 						break;
 					}
 				}
+				// Self-registration for the truly-absent case (distinct from #352's range-visible
+				// undecodable-row recovery): when no hdb_nodes entry exists for the peer at all
+				// but mTLS already validated the cert chain against the cluster CA, register the
+				// peer from the cert SAN. Breaks the chicken-and-egg on in-place v4 to v5 upgrades
+				// where the receiver's entry for the upgraded peer never replicated (harper-pro#373).
+				// The CA chain is the trust boundary mTLS already asserted; registration follows
+				// that trust. Auto-registered records are flagged so operators can audit the
+				// population path; canonical gossip overwrites the entry on the next decodable update.
+				if (!node) {
+					const certName = hostnames.find((h) => h);
+					if (certName) {
+						try {
+							const port =
+								env.get(CONFIG_PARAMS.REPLICATION_SECUREPORT) ??
+								env.get(CONFIG_PARAMS.REPLICATION_PORT) ??
+								9933;
+							const url = `wss://${certName}:${port}`;
+							await getHDBNodeTable().patch({
+								name: certName,
+								url,
+								replicates: true,
+								auto_registered: true,
+							});
+							logger.info(
+								`Auto-registered peer ${certName} at ${url} from CA-valid cert (harper-pro#373)`
+							);
+							const refreshed = readNodeForAuth(certName, routeByHostname.get(certName));
+							if (isValidNodeRecord(refreshed)) node = refreshed;
+						} catch (err: any) {
+							logger.warn(`Failed to auto-register peer ${certName}: ${err?.message ?? err}`);
+						}
+					}
+				}
 				if (node) {
 					// Perform certificate verification
 					// Pass the mtls config (which may contain certificateVerification settings)
