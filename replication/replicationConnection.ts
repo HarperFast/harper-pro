@@ -196,6 +196,46 @@ export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pau
 }
 
 /**
+ * Decide whether an in-flight blob stream has genuinely stalled and should be destroyed by the
+ * `blobsTimer` sweep. The clock (`lastChunk`) advances every time a chunk is processed, so a healthy
+ * transfer never trips this. The subtlety — and the bug this guards (harper-pro#368, the
+ * soak-rolling-restarts trigger) — is that the receiver pauses its OWN socket reads under back-pressure
+ * (commit backlog / consumer queue / blob-write drain). While paused no chunks are processed, so
+ * `lastChunk` freezes even though the transfer is fine; counting that paused interval against
+ * `blobTimeout` spuriously destroys the stream, which surfaces downstream as a swallowed "Blob save
+ * failed" and replication record loss. The fix keeps the predicate purely about elapsed (non-paused)
+ * time: callers refresh `lastChunk` on resume (see `refreshBlobStreamsOnResume`) so paused time never
+ * accumulates here. A genuinely stuck local blob write still trips it — its stream is not paused, so its
+ * clock keeps advancing.
+ *
+ * Exported as a pure predicate so the accounting can be unit-tested deterministically (mirrors
+ * `shouldTerminateIdlePing`); production callers go through the `blobsTimer` in `replicateOverWS`.
+ */
+export function isBlobStreamTimedOut(lastChunk: number, blobTimeout: number, now: number): boolean {
+	return lastChunk + blobTimeout < now;
+}
+
+/**
+ * Credit the back-pressure pause back to every in-flight blob stream at the moment the receiver resumes
+ * (the point where the pause-reason refcount drops to zero). Because reads are suspended while paused,
+ * these streams processed no chunks during the pause and their `lastChunk` would otherwise make
+ * `isBlobStreamTimedOut` fire on the next sweep even though the transfer is healthy. Shifting `lastChunk`
+ * forward by EXACTLY `pausedMs` (not resetting to `now`) discounts only the paused interval while
+ * preserving any genuine pre-pause idle time — so repeated pause/resume churn can't keep a truly stuck
+ * stream alive forever (a reset-to-now would). See harper-pro#368 — this is the spurious-timeout trigger
+ * of the soak-rolling-restarts record loss.
+ *
+ * Exported so the resume accounting can be unit-tested in isolation; production callers go through
+ * `removePauseReason` in `replicateOverWS`. `blobsInFlight` values are the stream objects.
+ */
+export function refreshBlobStreamsOnResume(blobsInFlight: Map<any, { lastChunk?: number }>, pausedMs: number): void {
+	if (!(pausedMs > 0)) return;
+	for (const stream of blobsInFlight.values()) {
+		if (stream.lastChunk !== undefined) stream.lastChunk += pausedMs;
+	}
+}
+
+/**
  * On reconnect the follower reads its persisted copy-resume cursor (`{copyStartTime, currentTable,
  * afterKey}` under `dbisDB[Symbol.for('copyCursor'), nodeId]`) and forwards it to the leader so the
  * bulk copy can resume mid-stream. If the cursor on disk is malformed — specifically `currentTable`
@@ -734,9 +774,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let outstandingCommits = 0;
 	let lastStructureLength = 0;
 	let commitBacklogPaused = false;
+	// Wall-clock at which the current back-pressure pause began (0 when not paused). Used to discount the
+	// paused interval from the blob-stream timeout: while paused no chunks are processed so every in-flight
+	// stream's `lastChunk` freezes, and counting that time against `blobTimeout` would spuriously destroy a
+	// healthy transfer (harper-pro#368). The blobsTimer adds the *ongoing* pause duration in its check, and
+	// `removePauseReason` shifts each stream's `lastChunk` forward by the *total* paused duration on resume.
+	let pauseStartTime = 0;
 	function addPauseReason(): void {
 		if (pauseReasons === 0) {
 			ws.pause();
+			pauseStartTime = Date.now();
 			// Suspend the receive watchdog while the socket is intentionally paused — `bytesRead`
 			// is frozen by `ws.pause()` so the byte check cannot tell legitimate backpressure
 			// from peer silence, and firing here would terminate a healthy mid-ingest connection.
@@ -752,6 +799,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Restart the silence window from the resume point — we deliberately do not penalize
 			// the connection for the time it spent paused.
 			receiveWatchdog?.reset();
+			// Same reasoning for in-flight blob streams: while paused we stop reading the socket, so no
+			// blob chunks are processed and each stream's `lastChunk` clock goes stale even though the
+			// transfer is perfectly healthy. The blobsTimer below would then count the paused interval
+			// against blobTimeout and spuriously destroy a live stream — observed as a swallowed "Blob save
+			// failed" during post-restart catch-up, the root-cause trigger of the soak-rolling-restarts
+			// record loss (harper-pro#368). Shift each stream's `lastChunk` forward by EXACTLY the paused
+			// duration so only time spent *not* paused counts toward the timeout — and, crucially, so genuine
+			// pre-pause idle time is preserved (resetting to `now` would let repeated pause/resume churn keep
+			// a truly stuck stream alive forever). A genuinely stuck local blob write still times out: its
+			// clock keeps advancing across resumes since the shift only credits actual paused time.
+			refreshBlobStreamsOnResume(blobsInFlight, Date.now() - pauseStartTime);
 		}
 	}
 	let subscriptionRequest, auditSubscription;
@@ -2890,8 +2948,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		ws.send(encode([DB_SCHEMA, tables, databaseName]));
 	}
 	blobsTimer = setInterval(() => {
+		const now = Date.now();
+		// Discount the time spent in the *current* (not-yet-ended) back-pressure pause: a pause can outlast
+		// blobTimeout, and this sweep fires independently of the pause, so without crediting the ongoing
+		// pause it would destroy a healthy stream mid-pause before `removePauseReason` ever runs (harper-pro
+		// #368). Shifting `lastChunk` forward by the ongoing pause duration here mirrors the permanent shift
+		// `removePauseReason` applies on resume.
+		const ongoingPauseMs = pauseReasons > 0 ? now - pauseStartTime : 0;
 		for (const [blobId, stream] of blobsInFlight) {
-			if (stream.lastChunk + blobTimeout < Date.now()) {
+			if (isBlobStreamTimedOut(stream.lastChunk + ongoingPauseMs, blobTimeout, now)) {
 				logger.warn?.(
 					`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
 				);
