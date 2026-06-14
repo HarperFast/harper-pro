@@ -749,6 +749,110 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			receiveWatchdog?.reset();
 		}
 	}
+	// Apply a single decoded BLOB_CHUNK command frame to its in-flight blob stream. Extracted from
+	// the onWSMessage switch so it can run OFF the serialized messageProcessing chain (see ws.on
+	// 'message' below): the apply loop's end_txn onCommit waits on `outstandingBlobsToFinish`, those
+	// blobs are fed by these chunks, and a data frame paused in `waitForDrain` would otherwise hold
+	// the whole chain — and thus every queued BLOB_CHUNK — hostage, deadlocking the receiver. This is
+	// self-contained and order-independent relative to data frames: it finds/creates the stream by
+	// fileId and the existing dead/destroyed guards handle a chunk arriving before or after its
+	// referencing record. Its only async (the blob-write backpressure pause below) is independent of
+	// the apply queue, so it can make progress while a data frame is drain-paused.
+	function handleBlobChunk(message: any): void {
+		// this is a blob chunk, we need to write it to the blob store
+		const blobInfo = message[1];
+		const { fileId, size, finished, error } = blobInfo;
+		let stream = blobsInFlight.get(fileId);
+		logger.debug?.(
+			'Received blob',
+			fileId,
+			'has stream',
+			!!stream,
+			'connectedToBlob',
+			!!stream?.connectedToBlob,
+			'length',
+			message[2].length,
+			'finished',
+			finished
+		);
+
+		if (!stream) {
+			stream = new PassThrough();
+			stream.expectedSize = size;
+			blobsInFlight.set(fileId, stream);
+		}
+		stream.lastChunk = Date.now();
+		const blobBody = message[2];
+		recordAction(blobBody.byteLength, 'bytes-received', `${remoteNodeName}.${databaseName}`, 'replication', 'blob');
+		try {
+			if (finished) {
+				if (error) {
+					stream.on('error', () => {}); // don't treat this as an uncaught error
+					stream.destroy(
+						new Error(
+							'Blob error: ' + error + ' for record ' + (stream.recordId ?? 'unknown') + ' from ' + remoteNodeName
+						)
+					);
+				} else if (stream.destroyed || stream.writableEnded) {
+					// The stream was torn down mid-blob and intentionally left in blobsInFlight
+					// (see the destroyed branch below) so intervening chunks were dropped rather
+					// than recreating a reader-less stream. Now that the blob is complete it will
+					// never connect to a record — forget it instead of writing to a dead stream.
+					blobsInFlight.delete(fileId);
+				} else stream.end(blobBody);
+				if (stream.connectedToBlob) blobsInFlight.delete(fileId);
+			} else if (stream.destroyed || stream.writableEnded) {
+				// The stream was already torn down before this mid-blob chunk arrived —
+				// typically because saveBlob's pipeline failed (e.g. ENOENT on
+				// createWriteStream) and destroyed the PassThrough source, firing 'close'.
+				// We must NOT fall into the backpressure branch below: writing to a dead
+				// stream returns false, and pausing to wait for a 'drain'/'close' that has
+				// already fired strands the pause reason forever, wedging the entire
+				// receive loop (observed in prod: receiver goes silent, sender stuck
+				// reconnecting, replication never recovers). Drop the orphaned chunk.
+				// Deliberately keep the dead stream in blobsInFlight: deleting it here would
+				// make the next chunk for this fileId recreate a fresh, reader-less PassThrough
+				// that backpressures and re-wedges the WS. Holding the destroyed stream routes
+				// every subsequent chunk back through this branch (dropped), and it is removed
+				// when the final chunk arrives (above) or by the blobsTimer timeout sweep.
+			} else if (!stream.write(blobBody)) {
+				// The PassThrough's internal queue is over its HWM, meaning the downstream
+				// file write (via pipeline in saveBlob) can't keep up. Pause the WS until the
+				// stream drains so blob chunks don't accumulate in memory faster than they
+				// can be flushed to disk.
+				if (stream.destroyed || stream.writableEnded) {
+					// write() itself may have torn the stream down (e.g. a late error). If so,
+					// 'drain'/'close' won't arrive — skip pausing rather than strand the reason.
+					// Keep the dead stream in blobsInFlight for the same reason as above.
+				} else if (!stream.connectedToBlob) {
+					// Deadlock break: this blob's chunks arrived BEFORE its referencing record, so the
+					// PassThrough has no reader yet — `saveBlob` is only wired up in `receiveBlobs` when
+					// the record is applied on the data-frame path. Pausing the socket here would freeze
+					// the very data frame that carries that record, so the stream would never get a reader,
+					// never drain, and the 'drain'/'close' we'd wait on would never fire — wedging the
+					// receiver permanently (observed: receiver goes silent right after a chunk for an
+					// unconnected blob). Skip the socket pause for unconnected streams; the buffer growth
+					// is bounded (the connecting record follows shortly and starts draining it), and the
+					// blobsTimer sweep reclaims any stream whose record never arrives.
+				} else {
+					addPauseReason();
+					const release = () => {
+						stream.off('drain', release);
+						stream.off('close', release);
+						removePauseReason();
+					};
+					stream.on('drain', release);
+					stream.on('close', release);
+				}
+			}
+		} catch (error) {
+			logger.error?.(
+				`Error receiving blob for ${stream.recordId} from ${remoteNodeName} and streaming to storage`,
+				error
+			);
+			blobsInFlight.delete(fileId);
+		}
+	}
 	let subscriptionRequest, auditSubscription;
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
@@ -766,6 +870,41 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// Reset the receive watchdog synchronously on every frame — async processing below may
 		// take a long time and we want a single late frame to count as proof of life immediately.
 		resetPingTimer();
+		if (wsClosed) return;
+		// Deadlock break: BLOB_CHUNK frames must NOT queue behind a data frame that is parked in
+		// `waitForDrain` (the per-record apply-queue backpressure). The apply loop's end_txn onCommit
+		// awaits `outstandingBlobsToFinish`, and those blobs only complete when their BLOB_CHUNK frames
+		// are applied — so if blob chunks sit behind a drain-paused data frame on the single
+		// messageProcessing chain, the queue can never drain (onCommit is stuck waiting on blobs) and
+		// the receiver wedges permanently. Command frames are prefixed `body[0] > 127` (data frames
+		// begin with a transaction timestamp); decode just those to detect BLOB_CHUNK and apply it
+		// immediately, bypassing the chain. handleBlobChunk is self-contained and order-independent vs.
+		// data frames; WS delivers frames in order so same-fileId chunks stay ordered. All other frames
+		// (including non-BLOB_CHUNK command frames) keep their existing serialization. The decoded
+		// message is threaded into onWSMessage so command frames are not decoded twice.
+		if (body[0] > 127) {
+			let message: any;
+			try {
+				message = decode(body);
+			} catch {
+				message = undefined; // let onWSMessage surface/log the decode failure on the normal path
+			}
+			if (message !== undefined) {
+				if (message[0] === BLOB_CHUNK) {
+					try {
+						handleBlobChunk(message);
+					} catch (error) {
+						logger.error?.(connectionId, 'Error handling incoming blob chunk', error);
+					}
+					return;
+				}
+				messageProcessing = messageProcessing.then(
+					() => (wsClosed ? undefined : onWSMessage(body, message)),
+					() => (wsClosed ? undefined : onWSMessage(body, message))
+				);
+				return;
+			}
+		}
 		messageProcessing = messageProcessing.then(
 			() => (wsClosed ? undefined : onWSMessage(body)),
 			() => (wsClosed ? undefined : onWSMessage(body))
@@ -782,7 +921,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		return true;
 	}
-	async function onWSMessage(body: Buffer): Promise<void> {
+	async function onWSMessage(body: Buffer, predecodedMessage?: any): Promise<void> {
 		if (!authorizationFinished) {
 			if (authorization?.then) {
 				try {
@@ -807,8 +946,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		try {
 			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
 			if (body[0] > 127) {
-				// not a transaction, special message
-				const message = decode(body);
+				// not a transaction, special message. The ws.on('message') dispatcher already decoded
+				// command frames to check for BLOB_CHUNK; reuse that to avoid decoding twice.
+				const message = predecodedMessage ?? decode(body);
 				const [command, data, tableId] = message;
 				switch (command) {
 					case NODE_NAME: {
@@ -1050,100 +1190,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
 						break;
 					case BLOB_CHUNK: {
-						// this is a blob chunk, we need to write it to the blob store
-						const blobInfo = message[1];
-						const { fileId, size, finished, error } = blobInfo;
-						let stream = blobsInFlight.get(fileId);
-						logger.debug?.(
-							'Received blob',
-							fileId,
-							'has stream',
-							!!stream,
-							'connectedToBlob',
-							!!stream?.connectedToBlob,
-							'length',
-							message[2].length,
-							'finished',
-							finished
-						);
-
-						if (!stream) {
-							stream = new PassThrough();
-							stream.expectedSize = size;
-							blobsInFlight.set(fileId, stream);
-						}
-						stream.lastChunk = Date.now();
-						const blobBody = message[2];
-						recordAction(
-							blobBody.byteLength,
-							'bytes-received',
-							`${remoteNodeName}.${databaseName}`,
-							'replication',
-							'blob'
-						);
-						try {
-							if (finished) {
-								if (error) {
-									stream.on('error', () => {}); // don't treat this as an uncaught error
-									stream.destroy(
-										new Error(
-											'Blob error: ' +
-												error +
-												' for record ' +
-												(stream.recordId ?? 'unknown') +
-												' from ' +
-												remoteNodeName
-										)
-									);
-								} else if (stream.destroyed || stream.writableEnded) {
-									// The stream was torn down mid-blob and intentionally left in blobsInFlight
-									// (see the destroyed branch below) so intervening chunks were dropped rather
-									// than recreating a reader-less stream. Now that the blob is complete it will
-									// never connect to a record — forget it instead of writing to a dead stream.
-									blobsInFlight.delete(fileId);
-								} else stream.end(blobBody);
-								if (stream.connectedToBlob) blobsInFlight.delete(fileId);
-							} else if (stream.destroyed || stream.writableEnded) {
-								// The stream was already torn down before this mid-blob chunk arrived —
-								// typically because saveBlob's pipeline failed (e.g. ENOENT on
-								// createWriteStream) and destroyed the PassThrough source, firing 'close'.
-								// We must NOT fall into the backpressure branch below: writing to a dead
-								// stream returns false, and pausing to wait for a 'drain'/'close' that has
-								// already fired strands the pause reason forever, wedging the entire
-								// receive loop (observed in prod: receiver goes silent, sender stuck
-								// reconnecting, replication never recovers). Drop the orphaned chunk.
-								// Deliberately keep the dead stream in blobsInFlight: deleting it here would
-								// make the next chunk for this fileId recreate a fresh, reader-less PassThrough
-								// that backpressures and re-wedges the WS. Holding the destroyed stream routes
-								// every subsequent chunk back through this branch (dropped), and it is removed
-								// when the final chunk arrives (above) or by the blobsTimer timeout sweep.
-							} else if (!stream.write(blobBody)) {
-								// The PassThrough's internal queue is over its HWM, meaning the downstream
-								// file write (via pipeline in saveBlob) can't keep up. Pause the WS until the
-								// stream drains so blob chunks don't accumulate in memory faster than they
-								// can be flushed to disk.
-								if (stream.destroyed || stream.writableEnded) {
-									// write() itself may have torn the stream down (e.g. a late error). If so,
-									// 'drain'/'close' won't arrive — skip pausing rather than strand the reason.
-									// Keep the dead stream in blobsInFlight for the same reason as above.
-								} else {
-									addPauseReason();
-									const release = () => {
-										stream.off('drain', release);
-										stream.off('close', release);
-										removePauseReason();
-									};
-									stream.on('drain', release);
-									stream.on('close', release);
-								}
-							}
-						} catch (error) {
-							logger.error?.(
-								`Error receiving blob for ${stream.recordId} from ${remoteNodeName} and streaming to storage`,
-								error
-							);
-							blobsInFlight.delete(fileId);
-						}
+						// Normally dispatched off the serialized chain by ws.on('message') so a drain-paused
+						// data frame can't starve blob delivery (see handleBlobChunk). Still handled here for
+						// any BLOB_CHUNK that reaches the switch directly (defensive — keeps the switch total).
+						handleBlobChunk(message);
 						break;
 					}
 					case GET_RECORD: {
@@ -2160,11 +2210,24 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// queue mid-message and the worker heap balloons until it OOMs.
 					const queueLength = tableSubscriptionToReplicator.queue?.length ?? 0;
 					if (queueLength > RECEIVE_EVENT_HIGH_WATER_MARK) {
-						addPauseReason();
+						// Deadlock break (see also ws.on('message') / handleBlobChunk): the apply loop
+						// drains this queue, but its end_txn onCommit blocks on
+						// `Promise.all(outstandingBlobsToFinish)`. Those blobs only finish once their
+						// BLOB_CHUNK frames are applied — and BLOB_CHUNK frames now run OFF the message
+						// chain, so they can be applied while we wait here. BUT `ws.pause()` stops the
+						// underlying socket, so blob chunks that haven't been delivered yet would never
+						// arrive, re-forming the circular wait (onCommit ⇠ blobs ⇠ chunks ⇠ paused socket ⇠
+						// this drain ⇠ onCommit). So when blobs are in flight, throttle the *data-frame*
+						// apply rate by awaiting the queue drain WITHOUT pausing the socket, letting blob
+						// chunks keep flowing to unblock onCommit. The producer is still bounded by the
+						// MAX_OUTSTANDING_COMMITS commit-backlog pause. When no blobs are pending, keep the
+						// original socket pause for full heap-pressure backpressure.
+						const blobsPending = blobsInFlight.size > 0 || outstandingBlobsToFinish.length > 0;
+						if (!blobsPending) addPauseReason();
 						try {
 							await tableSubscriptionToReplicator.waitForDrain();
 						} finally {
-							removePauseReason();
+							if (!blobsPending) removePauseReason();
 						}
 						lastYieldTime = performance.now();
 					} else if (performance.now() - lastYieldTime >= RECEIVE_YIELD_INTERVAL) {
@@ -2556,12 +2619,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					: tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('copyCursor'), nodeId]),
 				tableSubscriptionToReplicator?.dbisDB,
 				nodeId,
-				() =>
-					logger.warn?.(
-						'Discarding malformed copy-resume cursor (no currentTable) for',
-						node.name,
-						databaseName
-					)
+				() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
 			);
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
