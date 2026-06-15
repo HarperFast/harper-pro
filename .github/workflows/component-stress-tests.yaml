@@ -34,10 +34,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # GitHub runs this workflow as a required check on push events even though it has no
-  # push trigger. When triggered that way, all stress jobs are skipped by their `if:`
-  # and GitHub marks the run as failure (0 jobs). This no-op job gives the required-check
-  # gate something to report on push, keeping main green.
+  # On push events (required-check context) the stress tests should not run.
+  # This job passes immediately, satisfying the required-check gate.
   skip:
     if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -50,10 +48,8 @@ jobs:
     # Each k6 leg is ~6 min wall-clock; acl-connect (dialled-down) ~6 min plus JMeter overhead.
     # Generous head-room for cluster boot, npm install, build, and JMeter shutdown.
     timeout-minutes: 60
-    if: >-
-      github.event_name == 'schedule' ||
-      github.event.inputs.component == 'all' ||
-      github.event.inputs.component == matrix.component
+    # matrix.component is not available at job-level if:, so filter per-component at the step level.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -117,6 +113,7 @@ jobs:
           sudo apt-get install -y k6
 
       - name: Run component stress test (${{ matrix.component }})
+        if: github.event_name == 'schedule' || github.event.inputs.component == 'all' || github.event.inputs.component == matrix.component
         run: node stressTests/run-stress.mjs --component=${{ matrix.component }}
 
       - name: Upload Harper server logs
