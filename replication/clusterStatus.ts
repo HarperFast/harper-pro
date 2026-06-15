@@ -13,6 +13,8 @@ import {
 	RECEIVING_STATUS_POSITION,
 	RECEIVING_STATUS_RECEIVING,
 	BACK_PRESSURE_RATIO_POSITION,
+	BLOB_FAILURE_COUNT_POSITION,
+	LAST_BLOB_FAILURE_TIME_POSITION,
 } from './replicationConnection.ts';
 import '../core/server/serverHelpers/serverUtilities.ts';
 
@@ -58,6 +60,11 @@ export async function clusterStatus() {
 			socket.backPressurePercent = replicationSharedStatus[BACK_PRESSURE_RATIO_POSITION] * 100;
 			socket.lastReceivedStatus =
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] === RECEIVING_STATUS_RECEIVING ? 'Receiving' : 'Waiting';
+			// Blob-replication divergence (harper-pro#386): a non-zero count means replicated blobs failed
+			// to save durably on this link. `connected: true` alone can hide that; surface it here so an
+			// operator (or alert) sees the divergence and its recency.
+			socket.blobReplicationFailures = replicationSharedStatus[BLOB_FAILURE_COUNT_POSITION];
+			socket.lastBlobFailure = asDate(replicationSharedStatus[LAST_BLOB_FAILURE_TIME_POSITION]);
 		}
 	}
 

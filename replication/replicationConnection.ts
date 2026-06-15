@@ -104,6 +104,16 @@ export const SENDING_TIME_POSITION = 3;
 export const LATENCY_POSITION = 4;
 export const RECEIVING_STATUS_POSITION = 5;
 export const BACK_PRESSURE_RATIO_POSITION = 6;
+// Blob-replication divergence signals (harper-pro#386). A blob save failure on the receive side means
+// a record committed but its bytes are not durably stored — the resume cursor holds (see `hasBlobGap`)
+// and, on a sustained failing link, the peer can silently diverge to the point of unrecoverable loss.
+// These slots surface that divergence in cluster_status so it is observable (count + recency) rather
+// than visible only as per-blob error spam in the logs.
+export const BLOB_FAILURE_COUNT_POSITION = 7; // cumulative count of blob save failures for this peer/db
+export const LAST_BLOB_FAILURE_TIME_POSITION = 8; // wall-clock time (ms) of the most recent blob failure
+// Per-connection blob save failures before we log one escalation line (above the per-blob errors). A
+// handful of failures on one connection indicates a persistently failing link, not a one-off blip.
+const SUSTAINED_BLOB_FAILURE_THRESHOLD = 5;
 export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
 
@@ -250,6 +260,23 @@ export function refreshBlobStreamsOnResume(blobsInFlight: Map<any, { lastChunk?:
 	for (const stream of blobsInFlight.values()) {
 		if (stream.lastChunk !== undefined) stream.lastChunk += pausedMs;
 	}
+}
+
+/**
+ * Record a blob-replication divergence (a receive-side blob save failure) in the per-peer shared status
+ * so cluster_status can surface it. Bumps the cumulative failure count and stamps the most-recent
+ * failure time, returning the new cumulative count. A blob failure means a record committed without its
+ * bytes being durable — the resume cursor holds (`hasBlobGap`) and a sustained failing link can silently
+ * diverge toward unrecoverable loss (harper-pro#386). Surfacing it as a metric makes that observable
+ * instead of leaving it as per-blob error spam an operator would not notice.
+ *
+ * Exported as a pure helper so the accounting is unit-testable (mirrors `isBlobStreamTimedOut`); the
+ * production caller is the blob-save `.catch` in `receiveBlobs`. `now` is injected for determinism.
+ */
+export function recordBlobReplicationFailure(sharedStatus: Float64Array | undefined, now: number): number {
+	if (!sharedStatus) return 0;
+	sharedStatus[LAST_BLOB_FAILURE_TIME_POSITION] = now;
+	return ++sharedStatus[BLOB_FAILURE_COUNT_POSITION];
 }
 
 /**
@@ -915,6 +942,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let hasBlobGap = false;
 	let lastDurableSequenceId = 0;
 	let committedSequence = 0;
+	// Blob-divergence escalation (harper-pro#386). Each blob save failure already logs at `error`, but a
+	// sustained failing link emits that per-blob spam without a single line naming it as ongoing
+	// divergence. Once this connection crosses SUSTAINED_BLOB_FAILURE_THRESHOLD failures we log one
+	// escalation line pointing the operator at cluster_status, then stay quiet (the per-blob errors and
+	// the metric carry the rest). Connection-scoped so it re-arms on reconnect.
+	let blobFailureCount = 0;
+	let sustainedBlobFailureLogged = false;
 	// The cursor must not advance past a sequence id whose blobs are not yet durable — whether a blob has
 	// already failed (`hasBlobGap`) OR is still in flight and might fail. A sequence-update can arrive while
 	// a slow blob (e.g. one about to hit the stream timeout) is still saving; advancing on it would push the
@@ -2790,6 +2824,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// records keep flowing live and the next reconnect/restart resumes from the clamp and re-saves
 					// the disrupted blob. A transient catch-up fault (e.g. a blob-stream timeout) clears on resume.
 					hasBlobGap = true;
+					// Surface the divergence as an observable metric (cluster_status) and, on a sustained link,
+					// one escalation line — see harper-pro#386.
+					recordBlobReplicationFailure(getSharedStatus(), Date.now());
+					if (++blobFailureCount >= SUSTAINED_BLOB_FAILURE_THRESHOLD && !sustainedBlobFailureLogged) {
+						sustainedBlobFailureLogged = true;
+						logger.error?.(
+							`Sustained blob replication divergence from ${remoteNodeName}: ${blobFailureCount} blob saves have failed on this connection; ` +
+								`replicated blobs are not durably stored and the resume cursor is held. Check cluster_status (blobReplicationFailures/lastBlobFailure).`
+						);
+					}
 				})
 				.finally(() => {
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);

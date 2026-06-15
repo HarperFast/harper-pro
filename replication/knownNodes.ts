@@ -66,10 +66,15 @@ export function getReplicationSharedStatus(
 	node_name: string,
 	callback?: () => void
 ) {
+	// 128 bytes = 16 Float64 slots. Positions 0..6 are the replication status fields and 7..8 the
+	// blob-divergence signals (see the *_POSITION exports in replicationConnection.ts); the rest is
+	// headroom for future metrics. This buffer is process-local shared memory (shared across this
+	// node's threads via getUserSharedBuffer, never persisted or sent across nodes), so growing it is
+	// safe: every caller goes through this function, and a node runs a single version.
 	return new Float64Array(
 		auditStore.getUserSharedBuffer(
 			['replicated', databaseName, node_name],
-			new ArrayBuffer(64),
+			new ArrayBuffer(128),
 			callback && { callback }
 		)
 	);
@@ -161,12 +166,7 @@ export function isGenuineNodeDeletion(eventType: string): boolean {
  * peers with 1008 Unauthorized.
  */
 export function isValidNodeRecord(record: unknown): boolean {
-	return (
-		!!record &&
-		typeof record === 'object' &&
-		!Array.isArray(record) &&
-		typeof (record as any).name === 'string'
-	);
+	return !!record && typeof record === 'object' && !Array.isArray(record) && typeof (record as any).name === 'string';
 }
 
 /**
