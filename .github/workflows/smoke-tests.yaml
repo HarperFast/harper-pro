@@ -5,6 +5,7 @@ name: Smoke Tests
 # keep CI costs down; also runnable on demand. See smokeTests/README.md.
 
 on:
+  push: {} # required-check gate: skip job passes immediately; smoke job if: guards against push runs
   schedule:
     # Nightly at 06:00 UTC. Offset from Sync Core (07:00) so they don't contend.
     - cron: '0 6 * * *'
