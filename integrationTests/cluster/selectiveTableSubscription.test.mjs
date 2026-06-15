@@ -118,8 +118,13 @@ suite('Selective table subscription', { timeout: 120000 }, (ctx) => {
 
 		// Wait for the data-database socket to come up on both sides. The static-route
 		// handshake takes a moment after both processes start.
+		// [sel-window EXPERIMENT] window bumped 20s->60s + connect-time logging to
+		// distinguish "slow handshake under CI load" from "never connects (deadlock)".
 		let connected = false;
-		for (let i = 0; i < 40 && !connected; i++) {
+		const startWait = Date.now();
+		let waitIters = 0;
+		for (let i = 0; i < 120 && !connected; i++) {
+			waitIters = i + 1;
 			await delay(500);
 			const [statusA, statusB] = await Promise.all([
 				sendOperation(nodeA, { operation: 'cluster_status' }).catch(() => null),
@@ -133,6 +138,10 @@ suite('Selective table subscription', { timeout: 120000 }, (ctx) => {
 			);
 			connected = aOk && bOk;
 		}
+		// eslint-disable-next-line no-console
+		console.log(
+			`[sel-window] data-db socket connected=${connected} after ${Date.now() - startWait}ms (${waitIters} polls, window=60s)`
+		);
 		ok(connected, 'both nodes should show a connected data-database socket');
 
 		// Insert a Table1 record on nodeA and wait for it to replicate to nodeB.
