@@ -31,6 +31,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # GitHub runs this workflow as a required check on push events even though it has no
+  # push trigger. When triggered that way, all smoke jobs are skipped by their `if:`
+  # and GitHub marks the run as failure (0 jobs). This no-op job gives the required-check
+  # gate something to report on push, keeping main green.
+  skip:
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Smoke tests run on schedule/dispatch only — skipping."
+
   smoke:
     name: Smoke ${{ matrix.component }}
     runs-on: ubuntu-latest
