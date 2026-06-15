@@ -160,16 +160,19 @@ if (!stressEnabled()) {
 			const peers = [A, C, D];
 			const WARMUP_WRITES = Math.min(KEYSPACE, 60);
 			console.log(`[backlog] warm-up: seeding ${WARMUP_WRITES} writes so B has a resume position before going offline`);
-			for (let i = 0; i < WARMUP_WRITES; i++) {
-				const id = prerenderId(i % KEYSPACE);
-				try {
-					await fetchWithRetry(peers[i % peers.length].httpURL + '/Prerender/' + encodeURIComponent(id), {
+			// Issue the warm-up writes in parallel: they're independent seed writes, so
+			// firing them concurrently keeps setup fast and avoids letting a single slow
+			// peer stretch out the warm-up window.
+			await Promise.all(
+				Array.from({ length: WARMUP_WRITES }, (_, i) => {
+					const id = prerenderId(i % KEYSPACE);
+					return fetchWithRetry(peers[i % peers.length].httpURL + '/Prerender/' + encodeURIComponent(id), {
 						retries: 1,
+					}).catch(() => {
+						// transient errors during warm-up are fine
 					});
-				} catch {
-					// transient errors during warm-up are fine
-				}
-			}
+				})
+			);
 			// Wait until B has actually received (and committed) the warm-up — a positive
 			// record_count is the durable signal that B holds a `data` resume position.
 			const warmupDeadline = Date.now() + 60_000;
