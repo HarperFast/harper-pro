@@ -107,12 +107,19 @@ describe('fetchJWTKeyWithRetry', () => {
 		let calls = 0;
 		let thrown;
 		try {
-			await fetchJWTKeyWithRetry(async () => ({ message: '' }), '.jwtPublic', 2, 1);
+			await fetchJWTKeyWithRetry(
+				async () => {
+					calls++;
+					return { message: '' };
+				},
+				'.jwtPublic',
+				2,
+				1
+			);
 		} catch (err) {
 			thrown = err;
-			calls = 1;
 		}
-		expect(calls).to.equal(1);
+		expect(calls).to.equal(2);
 		expect(thrown).to.be.an('error');
 		expect(thrown.message).to.contain('.jwtPublic');
 		expect(thrown.cause).to.be.an('error');

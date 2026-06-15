@@ -702,6 +702,9 @@ async function cloneJWTKeys(): Promise<void> {
 		'.jwtPass'
 	);
 
+	// Ensure the keys dir exists before writing — a cloned node normally has it from its own install,
+	// but don't assume it (a fresh clone path, or a wiped dir, would otherwise fail with ENOENT).
+	mkdirSync(keysDir, { recursive: true });
 	writeFileSync(join(keysDir, JWT_ENUM.JWT_PUBLIC_KEY_NAME), publicKey);
 	writeFileSync(join(keysDir, JWT_ENUM.JWT_PRIVATE_KEY_NAME), privateKey);
 	writeFileSync(join(keysDir, JWT_ENUM.JWT_PASSPHRASE_NAME), passphrase);
