@@ -218,8 +218,8 @@ if (!stressEnabled()) {
 						available = true;
 						break;
 					}
-					const countRows = await trySendOperation(cloneCtx.harper, { operation: 'sql', sql: 'SELECT COUNT(*) AS c FROM data.large' });
-					const count = countRows?.[0]?.c ?? -1;
+					const countResp = await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large', exact_count: true });
+					const count = countResp?.record_count ?? -1;
 					const remaining = Math.ceil((deadline - Date.now()) / 1000);
 					console.log(
 						`[large-clone] clone progress: count=${count}/${ctx.leaderRecordCount} status=${resp?.status ?? 'unknown'} (${remaining}s remaining)`
@@ -259,13 +259,15 @@ if (!stressEnabled()) {
 			if (anonMb > 0)
 				ok(anonMb < ANON_CAP_MB, `clone peak anon ${anonMb.toFixed(0)} MB exceeded cap ${ANON_CAP_MB} MB`);
 
-			// Verify SQL row count matches after clone completes.
-			// Use COUNT(*) rather than describe_table.record_count — the latter is an
-			// internal storage counter that diverges between nodes during bulk copy.
+			// Verify exact row count matches after clone completes.
+			// Use describe_table with exact_count rather than the default
+			// record_count — the latter is a rounded RocksDB estimate that diverges
+			// between nodes during bulk copy. The exact_count flag forces a full
+			// value scan (no extrapolation short-circuit), giving a precise count.
 			let finalCount = -1;
 			for (let i = 0; i < 30; i++) {
-				const rows = await trySendOperation(cloneCtx.harper, { operation: 'sql', sql: 'SELECT COUNT(*) AS c FROM data.large' });
-				finalCount = rows?.[0]?.c ?? -1;
+				const rows = await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large', exact_count: true });
+				finalCount = rows?.record_count ?? -1;
 				if (finalCount >= ctx.leaderRecordCount) break;
 				await delay(2_000);
 			}
