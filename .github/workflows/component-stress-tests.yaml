@@ -7,7 +7,7 @@ name: Component Stress Tests
 # integrationTests/stress/ and HARPER_RUN_STRESS_TESTS gating). See stressTests/README.md.
 
 on:
-  push: {} # required-check gate: skip job passes immediately; stress job if: guards against push runs
+  push: # required-check gate: skip job passes immediately; stress job if: guards against push runs
   schedule:
     # Weekly, Sundays at 08:00 UTC (after Sync Core 07:00 and the replication Stress 06:11).
     - cron: '0 8 * * 0'
