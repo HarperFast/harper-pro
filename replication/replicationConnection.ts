@@ -276,6 +276,50 @@ export function discardMalformedCopyCursor(copyCursor: any, dbisDB: any, nodeId:
 }
 
 /**
+ * Build the "newest lastTxnTime per source node" map from the dbisDB `seq` entries, tolerating a
+ * `seq` row that fails to decode.
+ *
+ * Each entry's `value` is decoded lazily by the store iterator. During a rolling upgrade a `seq`
+ * row can be encoded against a structure shape this node decodes differently; the decode then
+ * yields `null` (logged as "Error decoding record: Data read, but end of buffer not reached"; see
+ * harper-pro#352). The bare `entry.value.nodes` deref previously threw on that `null`, escaping
+ * `sendSubscriptionRequestUpdate` — so the inbound subscription handshake never completed (1006
+ * reconnect storm) and the node received nothing while still reporting a connected socket. This is
+ * the subscription-setup sibling of the cert-auth fallback #352 already landed for `hdb_nodes`.
+ *
+ * Skipping an undecodable entry is safe: `lastTxnTimes` only ever RAISES a resume start point as an
+ * optimization, so a missing entry falls back to the persisted `seqId` cursor and re-overlaps a
+ * little (replication dedupes incoming records) — it never advances past unseen data. Skipping also
+ * breaks the self-sustaining wedge: once the handshake completes the node resumes, and the next
+ * cursor write rewrites the `seq` row against the current structures, healing it.
+ *
+ * Exported so the decode-tolerance can be exercised in isolation by
+ * `unitTests/replication/collectLastTxnTimes.test.mjs`; production callers go through
+ * `sendSubscriptionRequestUpdate` in `replicateOverWS`.
+ */
+export function collectLastTxnTimes(seqEntries: Iterable<{ value: any }>): Map<any, number> {
+	const lastTxnTimes = new Map();
+	for (const entry of seqEntries) {
+		let value: any;
+		try {
+			value = entry.value;
+		} catch {
+			// A `seq` row that throws on value access (rather than decoding to null) is the same
+			// undecodable case — skip it instead of failing the whole subscription request.
+			continue;
+		}
+		// `value` is null for the observed undecodable row; require a real array before iterating so a
+		// partially-decoded row with a non-array `nodes` can't throw out of the loop either.
+		const nodes = value?.nodes;
+		if (!Array.isArray(nodes)) continue;
+		for (const node of nodes) {
+			if (node.lastTxnTime > (lastTxnTimes.get(node.id) ?? 0)) lastTxnTimes.set(node.id, node.lastTxnTime);
+		}
+	}
+	return lastTxnTimes;
+}
+
+/**
  * Receive-side silence watchdog. Arm with `reset()` whenever incoming activity is observed
  * (peer ping, pong, message). If `intervalMs` elapses with the underlying socket's `bytesRead`
  * unchanged, `onSilence` is invoked exactly once.
@@ -2822,20 +2866,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (!auditStore && tableSubscriptionToReplicator) auditStore = tableSubscriptionToReplicator.auditStore;
 		if (options.connection?.isFinished)
 			throw new Error('Can not make a subscription request on a connection that is already closed');
-		const lastTxnTimes = new Map();
+		let lastTxnTimes = new Map();
 		if (!auditStore)
 			// if it hasn't been set yet, do so now
 			auditStore = tableSubscriptionToReplicator?.auditStore;
-		// iterate through all the sequence entries and find the newest txn time for each node
+		// iterate through all the sequence entries and find the newest txn time for each node.
+		// collectLastTxnTimes tolerates a `seq` row that fails to decode (harper-pro#352) so one
+		// undecodable cursor entry can't crash the subscription handshake.
 		try {
-			for (const entry of tableSubscriptionToReplicator?.dbisDB?.getRange({
+			const seqEntries = tableSubscriptionToReplicator?.dbisDB?.getRange({
 				start: Symbol.for('seq'),
 				end: [Symbol.for('seq'), Buffer.from([0xff])],
-			}) || []) {
-				for (const node of entry.value.nodes || []) {
-					if (node.lastTxnTime > (lastTxnTimes.get(node.id) ?? 0)) lastTxnTimes.set(node.id, node.lastTxnTime);
-				}
-			}
+			});
+			if (seqEntries) lastTxnTimes = collectLastTxnTimes(seqEntries);
 		} catch (error) {
 			// if the database is closed, just proceed (matches multiple error messages)
 			if (!error.message.includes('Can not re')) throw error;
