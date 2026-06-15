@@ -139,11 +139,24 @@ export function start(options) {
 			return next(ws, request, chainCompletion);
 		}
 		ws._socket.unref(); // we don't want the socket to keep the thread alive
-		replicateOverWS(
-			ws,
-			options,
-			chainCompletion.then(() => request?.user)
-		);
+		// if the http middleware below set a reject reason, close the WS with 1008 + that reason
+		// instead of stalling on a generic 'Unauthorized'
+		const authPromise = chainCompletion.then(() => {
+			const rejectReason = (request as any)?._replicationAuthRejectReason;
+			if (!request?.user && rejectReason) {
+				logger.warn(
+					`Replication WS rejected for ${request.peerCertificate?.subjectaltname ?? request.ip}: ${rejectReason}`
+				);
+				try {
+					ws.close(1008, rejectReason);
+				} catch {
+					// best-effort close
+				}
+				return undefined;
+			}
+			return request?.user;
+		});
+		replicateOverWS(ws, options, authPromise);
 		ws.on('error', (error) => {
 			if (error.code !== 'ECONNREFUSED') logger.error('Error in connection to ' + this.url, error.message);
 		});
@@ -218,6 +231,9 @@ export function start(options) {
 					}
 				} else {
 					// technically if there are credentials, we could still allow the connection, but give a warning, because we don't usually do that
+					const certName = hostnames.find((h) => h) ?? '<unknown>';
+					(request as any)._replicationAuthRejectReason =
+						`no hdb_nodes entry for ${certName}; run add_node from this node specifying the peer URL to register it`;
 					logger.warn(
 						`No node found for certificate common name/SANs: ${hostnames}, available nodes are ${Array.from(
 							hdbNodesStore
@@ -226,7 +242,7 @@ export function start(options) {
 								.map(({ key }) => key)
 						).join(', ')} and routes ${Array.from(routeByHostname.keys()).join(
 							', '
-						)}, connection will require credentials.`
+						)}. Run add_node from this node specifying the peer URL to register it.`
 					);
 				}
 			} else if (request.ip) {
@@ -235,10 +251,12 @@ export function start(options) {
 				if (isValidNodeRecord(candidate)) {
 					request.user = candidate;
 				} else if (!authorizationError) {
+					(request as any)._replicationAuthRejectReason =
+						`no hdb_nodes entry for IP ${request.ip}; run add_node from this node specifying the peer URL to register it`;
 					logger.info(
 						`No node found for IP address ${request.ip}, available nodes are ${Array.from(
 							new Set([...hdbNodesStore.getKeys(), ...routeByHostname.keys()])
-						).join(', ')}, connection will require credentials.`
+						).join(', ')}. Run add_node from this node specifying the peer URL to register it.`
 					);
 				}
 			}
