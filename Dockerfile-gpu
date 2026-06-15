@@ -9,7 +9,7 @@ COPY . .
 
 RUN env NO_USE_GIT=true npm run package
 
-FROM nvidia/cuda:13.2.1-cudnn-runtime-ubuntu22.04 AS run
+FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu22.04 AS run
 
 ARG NODE_VERSION=24
 
