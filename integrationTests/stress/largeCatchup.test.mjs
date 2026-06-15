@@ -15,7 +15,7 @@
  *  2. Create a table on A; seed a small baseline so B has a non-zero start.
  *  3. Take B offline (clean teardown).
  *  4. Write TARGET_GB of bulk row data to A while B is offline.
- *  5. Restart B. Time until its row count (exact SQL COUNT(*)) converges with A.
+ *  5. Restart B. Time until its row count (exact describe_table count) converges with A.
  *  6. Assert: convergence within CATCHUP_BUDGET_SECS; no OOM on either node.
  *  7. Emit write throughput and catch-up throughput.
  *
@@ -256,14 +256,17 @@ if (!stressEnabled()) {
 			let lastCount = -1;
 			let convergedAt = null;
 			while (Date.now() < deadline) {
-				// Measure convergence with an exact SQL COUNT(*), not
+				// Measure convergence with an exact count, not the default
 				// describe_table.record_count — the latter is a rounded RocksDB
-				// estimate that diverges between nodes during bulk catch-up.
-				const rows = await trySendOperation(B, {
-					operation: 'sql',
-					sql: 'SELECT COUNT(*) AS c FROM data.large',
+				// estimate that diverges between nodes during bulk catch-up. The
+				// exact_count flag forces a full value scan (no 500ms extrapolation
+				// short-circuit in getRecordCount), giving a precise count.
+				const resp = await trySendOperation(B, {
+					operation: 'describe_table',
+					table: 'large',
+					exact_count: true,
 				});
-				lastCount = rows?.[0]?.c ?? -1;
+				lastCount = resp?.record_count ?? -1;
 				// B replays A's distinct-id upserts, so its row count can only climb up
 				// to the target. A count above it means duplicated/over-replicated rows —
 				// a real catch-up regression — so fail fast rather than waiting out the
