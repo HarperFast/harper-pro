@@ -63,7 +63,8 @@ export async function clusterStatus() {
 			// Blob-replication divergence (harper-pro#386): a non-zero count means replicated blobs failed
 			// to save durably on this link. `connected: true` alone can hide that; surface it here so an
 			// operator (or alert) sees the divergence and its recency.
-			socket.blobReplicationFailures = replicationSharedStatus[BLOB_FAILURE_COUNT_POSITION];
+			// `|| undefined` so a healthy link omits the field entirely (matching lastBlobFailure's asDate(0)).
+			socket.blobReplicationFailures = replicationSharedStatus[BLOB_FAILURE_COUNT_POSITION] || undefined;
 			socket.lastBlobFailure = asDate(replicationSharedStatus[LAST_BLOB_FAILURE_TIME_POSITION]);
 		}
 	}

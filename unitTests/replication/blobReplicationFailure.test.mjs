@@ -16,6 +16,7 @@
 import { expect } from 'chai';
 import {
 	recordBlobReplicationFailure,
+	shouldLogSustainedBlobDivergence,
 	BLOB_FAILURE_COUNT_POSITION,
 	LAST_BLOB_FAILURE_TIME_POSITION,
 	BACK_PRESSURE_RATIO_POSITION,
@@ -56,5 +57,36 @@ describe('recordBlobReplicationFailure — blob divergence metric (#386)', () =>
 		const status = newSharedStatus();
 		expect(status[BLOB_FAILURE_COUNT_POSITION]).to.equal(0);
 		expect(status[LAST_BLOB_FAILURE_TIME_POSITION]).to.equal(0); // asDate(0) === undefined in cluster_status
+	});
+});
+
+describe('shouldLogSustainedBlobDivergence — one-per-connection escalation latch (#386)', () => {
+	const THRESHOLD = 5;
+
+	it('does not escalate below the threshold', () => {
+		for (let count = 1; count < THRESHOLD; count++) {
+			expect(shouldLogSustainedBlobDivergence(count, THRESHOLD, false)).to.equal(false);
+		}
+	});
+
+	it('escalates exactly when the count first reaches the threshold', () => {
+		expect(shouldLogSustainedBlobDivergence(THRESHOLD, THRESHOLD, false)).to.equal(true);
+	});
+
+	it('does not escalate again once already logged, even past the threshold', () => {
+		expect(shouldLogSustainedBlobDivergence(THRESHOLD, THRESHOLD, true)).to.equal(false);
+		expect(shouldLogSustainedBlobDivergence(THRESHOLD + 100, THRESHOLD, true)).to.equal(false);
+	});
+
+	it('models the call-site loop: fires once, on the threshold-crossing failure only', () => {
+		let logged = false;
+		const firedAt = [];
+		for (let count = 1; count <= THRESHOLD + 3; count++) {
+			if (shouldLogSustainedBlobDivergence(count, THRESHOLD, logged)) {
+				logged = true;
+				firedAt.push(count);
+			}
+		}
+		expect(firedAt).to.deep.equal([THRESHOLD]); // single fire, at the crossing
 	});
 });

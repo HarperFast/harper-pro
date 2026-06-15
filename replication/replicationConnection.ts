@@ -258,8 +258,25 @@ export function refreshBlobStreamsOnResume(blobsInFlight: Map<any, { lastChunk?:
  */
 export function recordBlobReplicationFailure(sharedStatus: Float64Array | undefined, now: number): number {
 	if (!sharedStatus) return 0;
+	// Bump the count BEFORE stamping the time: the writes aren't atomic as a pair, so a concurrent
+	// reader should at worst see a fresh count with a slightly-stale time (count is the divergence
+	// signal), never a fresh time alongside a stale/zero count.
+	const count = ++sharedStatus[BLOB_FAILURE_COUNT_POSITION];
 	sharedStatus[LAST_BLOB_FAILURE_TIME_POSITION] = now;
-	return ++sharedStatus[BLOB_FAILURE_COUNT_POSITION];
+	return count;
+}
+
+/**
+ * Decide whether a blob-save failure is the point at which we emit the one-per-connection sustained-
+ * divergence escalation log: the connection-local failure count has reached the threshold and we have
+ * not logged yet. Pure (the latch lives at the call site) so the threshold/latch logic is unit-testable.
+ */
+export function shouldLogSustainedBlobDivergence(
+	failureCount: number,
+	threshold: number,
+	alreadyLogged: boolean
+): boolean {
+	return failureCount >= threshold && !alreadyLogged;
 }
 
 /**
@@ -2622,10 +2639,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// Surface the divergence as an observable metric (cluster_status) and, on a sustained link,
 					// one escalation line — see harper-pro#386.
 					recordBlobReplicationFailure(getSharedStatus(), Date.now());
-					if (++blobFailureCount >= SUSTAINED_BLOB_FAILURE_THRESHOLD && !sustainedBlobFailureLogged) {
+					if (
+						shouldLogSustainedBlobDivergence(
+							++blobFailureCount,
+							SUSTAINED_BLOB_FAILURE_THRESHOLD,
+							sustainedBlobFailureLogged
+						)
+					) {
 						sustainedBlobFailureLogged = true;
 						logger.error?.(
-							`Sustained blob replication divergence from ${remoteNodeName}: ${blobFailureCount} blob saves have failed on this connection; ` +
+							`Sustained blob replication divergence from ${remoteNodeName}: ${blobFailureCount} blob saves have failed on this connection ` +
+								`(cluster_status.blobReplicationFailures reports the cumulative total across connections); ` +
 								`replicated blobs are not durably stored and the resume cursor is held. Check cluster_status (blobReplicationFailures/lastBlobFailure).`
 						);
 					}
