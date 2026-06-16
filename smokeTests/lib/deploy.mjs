@@ -2,7 +2,7 @@
  * Prepare a cloned component directory and deploy it to a running cluster.
  * targz the dir, deploy_component with replicated + restart, then wait for HTTP workers to settle.
  */
-import { existsSync, lstatSync, readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readlinkSync, symlinkSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -63,11 +63,31 @@ export async function deployComponent(
 	// `npm link harperdb` (e.g. from a component's postinstall) will point to a non-existent
 	// global location once packaged and extracted to a temp dir, causing Harper to reject the
 	// deploy with "not a valid symlink". Strip it so Harper can recreate it correctly.
+	// Restore the link afterward so running smoke tests locally doesn't wipe a developer's
+	// `npm link harperdb`.
 	const harperdbLink = join(dir, 'node_modules', 'harperdb');
+	let linkTarget = null;
 	try {
-		if (lstatSync(harperdbLink).isSymbolicLink()) unlinkSync(harperdbLink);
-	} catch { /* not present — nothing to do */ }
-	const payload = await targz(dir);
+		if (lstatSync(harperdbLink).isSymbolicLink()) {
+			linkTarget = readlinkSync(harperdbLink);
+			unlinkSync(harperdbLink);
+		}
+	} catch {
+		/* not present — nothing to do */
+	}
+
+	let payload;
+	try {
+		payload = await targz(dir);
+	} finally {
+		if (linkTarget) {
+			try {
+				symlinkSync(linkTarget, harperdbLink);
+			} catch {
+				/* best-effort restore */
+			}
+		}
+	}
 	const response = await sendOperation(nodes[0], {
 		operation: 'deploy_component',
 		project,
