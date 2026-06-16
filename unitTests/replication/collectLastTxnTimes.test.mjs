@@ -92,4 +92,27 @@ describe('collectLastTxnTimes', () => {
 		}).to.not.throw();
 		expect(map.get(3)).to.equal(7);
 	});
+
+	it('skips malformed node elements (null, non-object, non-numeric lastTxnTime, nullish id) without throwing or polluting the map', () => {
+		const entries = [
+			{
+				value: {
+					nodes: [
+						null,
+						42,
+						{ id: 1, lastTxnTime: 'nope' }, // non-numeric lastTxnTime
+						{ id: null, lastTxnTime: 99 }, // nullish id
+						{ id: 5, lastTxnTime: 500 }, // the only well-formed entry
+					],
+				},
+			},
+		];
+		let map;
+		expect(() => {
+			map = collectLastTxnTimes(entries);
+		}).to.not.throw();
+		expect(map.get(5)).to.equal(500);
+		expect(map.has(null)).to.equal(false);
+		expect(map.size).to.equal(1);
+	});
 });
