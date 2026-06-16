@@ -3039,7 +3039,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				const connectedNodeId = auditStore && getIdOfRemoteNode(connectedNode.name, auditStore);
 				const proxySeqEntry = tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('seq'), connectedNodeId]);
 				for (const seqNode of proxySeqEntry?.nodes || []) {
-					if (seqNode.id === nodeId && seqNode.seqId > 1) {
+					// Guard `nodeId !== undefined` first: if both `nodeId` and a malformed `seqNode.id` were
+					// undefined the `===` would spuriously match an unrelated entry. (Arming is gated on a
+					// defined nodeId downstream too, but match it here so intent is explicit.)
+					if (nodeId !== undefined && seqNode.id === nodeId && seqNode.seqId > 1) {
 						// Arm the leading-duplicate fast-skip from this relayed cursor so the proxy's re-streamed
 						// already-applied tail (the high-volume out-of-order re-delivery in #399) is dropped
 						// cheaply at the receive layer instead of driving the core resequencing walk per record.
@@ -3102,7 +3105,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			//     (possibly newest) versions, so "version <= cursor" is NOT a duplicate signal there.
 			//   - no direct or proxied cursor / a fresh "now - 60s" start → no prior applied tail to dedupe.
 			// Keyed by local node id so a proxied multi-node subscription gets an independent latch.
-			const leadingDupArmCursor = hasPersistedResumeCursor && startTime > 1 ? startTime : proxiedSkipCursor;
+			// Branch on the connection type rather than falling back: a node that previously had a DIRECT
+			// subscription leaves a persisted direct cursor (`hasPersistedResumeCursor`) on disk, so once it
+			// fails over to a PROXIED subscription we must still arm from the live `proxiedSkipCursor` — a
+			// fallback that preferred the stale direct `startTime` would dedupe against an old, narrower window.
+			const leadingDupArmCursor =
+				connectedNode === node
+					? hasPersistedResumeCursor && startTime > 1
+						? startTime
+						: undefined
+					: proxiedSkipCursor;
 			if (nodeId !== undefined && !copyResume && leadingDupArmCursor !== undefined && leadingDupArmCursor > 1) {
 				leadingDupCursorByNode.set(nodeId, leadingDupArmCursor);
 				logger.debug?.(
