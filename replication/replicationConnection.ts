@@ -142,7 +142,7 @@ const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 
 // dispatching it, avoiding the audit-walk cost during catch-up. This is a pure optimization: it only ever
 // suppresses dispatch of a record the apply loop would itself have dropped as an identity tie. Disable
 // (set false) to fall back to dispatching everything to the apply loop. See LeadingDuplicateSkip below.
-const LEADING_DUP_SKIP_ENABLED = env.get('replication_leadingDuplicateSkip') ?? true;
+const LEADING_DUP_SKIP_ENABLED = env.get(CONFIG_PARAMS.REPLICATION_LEADINGDUPLICATESKIP) ?? true;
 // Distinctive log substring tests grep for to confirm the fast-skip path engaged. Keep stable.
 export const LEADING_DUP_SKIP_LOG = 'leading-duplicate fast-skip';
 // Process-wide counter of records suppressed by the fast-skip, for in-process tests/observability.
