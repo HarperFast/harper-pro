@@ -190,7 +190,7 @@ if (!stressEnabled()) {
 			while (Date.now() < warmupDeadline) {
 				const [a, b, c, d] = await Promise.all(
 					[A, B, C, D].map((n) =>
-						sendOperation(n, { operation: 'describe_table', table: 'Prerender' }).catch(() => null)
+						sendOperation(n, { operation: 'describe_table', table: 'Prerender' }, { timeoutMs: 5000 }).catch(() => null)
 					)
 				);
 				warmupCounts = {
@@ -289,7 +289,7 @@ if (!stressEnabled()) {
 			while (Date.now() < catchupDeadline) {
 				const [a, b, c, d] = await Promise.all(
 					[A, B, C, D].map((n) =>
-						sendOperation(n, { operation: 'describe_table', table: 'Prerender' }).catch(() => null)
+						sendOperation(n, { operation: 'describe_table', table: 'Prerender' }, { timeoutMs: 5000 }).catch(() => null)
 					)
 				);
 				counts = {

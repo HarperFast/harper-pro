@@ -89,7 +89,7 @@ const armGraceIfDone = () => {
 // emits `test:complete` when its child hangs (that's the whole failure mode), so counting
 // it would keep enqueued > completed forever and the backstop would never arm. Excluding
 // `name === file` leaves just the genuine tests, whose completes we can balance against.
-const isFileWrapper = (e) => e?.name === e?.file;
+const isFileWrapper = (e) => !!(e?.name && e.name === e.file);
 stream.on('test:enqueue', (e) => {
 	if ((e?.nesting ?? 0) === 0 && !isFileWrapper(e)) {
 		enqueuedTop++;
