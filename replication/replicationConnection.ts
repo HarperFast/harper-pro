@@ -3014,11 +3014,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// A genuine resume = we have a persisted last-received sequence id (>1) for this node. Only then
 			// does the leader re-stream an already-applied tail worth fast-skipping. A fresh subscription
 			// (no persisted seqId, which later falls back to `Date.now() - 60000`) has no such tail, so we
-			// must NOT arm the latch from that synthetic start point. NOTE: this checks the DIRECT sequence
-			// cursor only; a resume that derives its start point from a proxy node's seqId (indirect path
-			// below) is deliberately left un-armed — conservative (we simply forgo the optimization for that
-			// case rather than risk arming from a cursor whose version space we can't cleanly attribute).
+			// must NOT arm the latch from that synthetic start point. This checks the DIRECT sequence cursor;
+			// a proxied/indirect subscription has no direct cursor and instead arms from `proxiedSkipCursor`
+			// (set in the indirect block below).
 			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
+			// For a proxied/indirect subscription: the relayed per-source resume cursor, used ONLY to arm the
+			// leading-duplicate fast-skip (it does not move `startTime` — see the indirect block for why).
+			let proxiedSkipCursor: number | undefined;
 			logger.debug?.(
 				'Starting time recorded in db',
 				node.name,
@@ -3030,14 +3032,34 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				new Date(startTime)
 			);
 			if (connectedNode !== node) {
-				// indirect connection through a proxying node
-				// if there is a last sequence id we received through the proxying node that is newer, we can start from there
+				// Indirect (proxied) subscription: this source node's writes reach us relayed through
+				// `connectedNode`. The relayed per-source resume cursor lives in the proxy connection's seq
+				// node-states, which are keyed by node *id* (see Table.ts `updateRecordedSequenceId`, which
+				// builds `{ id, seqId, lastTxnTime }` and never sets a `name`).
 				const connectedNodeId = auditStore && getIdOfRemoteNode(connectedNode.name, auditStore);
-				const sequenceEntry = tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('seq'), connectedNodeId]) ?? 1;
-				for (const seqNode of sequenceEntry?.nodes || []) {
-					if (seqNode.name === node.name) {
-						startTime = seqNode.seqId;
-						logger.debug?.('Using sequence id from proxy node', connectedNode.name, startTime);
+				const proxySeqEntry = tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('seq'), connectedNodeId]);
+				for (const seqNode of proxySeqEntry?.nodes || []) {
+					// Guard `nodeId !== undefined` first: if both `nodeId` and a malformed `seqNode.id` were
+					// undefined the `===` would spuriously match an unrelated entry. (Arming is gated on a
+					// defined nodeId downstream too, but match it here so intent is explicit.)
+					if (nodeId !== undefined && seqNode.id === nodeId && seqNode.seqId > 1) {
+						// Arm the leading-duplicate fast-skip from this relayed cursor so the proxy's re-streamed
+						// already-applied tail (the high-volume out-of-order re-delivery in #399) is dropped
+						// cheaply at the receive layer instead of driving the core resequencing walk per record.
+						// We deliberately do NOT raise `startTime` from this value: the relayed seqId is the proxy
+						// connection's local time, which for an out-of-order source can sit ahead of what we have
+						// actually applied for this source, so using it as the leader's resume lower bound could
+						// skip un-applied writes. (Tightening the proxied resume start itself is #399 direction 1
+						// and needs the `lastTxnTime` overlap as a data-loss floor.) The skip stays safe regardless
+						// of this cursor's precision — it only ever elides a TRUE identity tie against the stored
+						// record, so an imprecise cursor at worst skips nothing.
+						proxiedSkipCursor = seqNode.seqId;
+						logger.debug?.(
+							'Proxied leading-dup-skip cursor from proxy node',
+							connectedNode.name,
+							node.name,
+							proxiedSkipCursor
+						);
 					}
 				}
 			}
@@ -3073,23 +3095,36 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				);
 			}
 			logger.trace?.(connectionId, 'defining subscription request', node.name, databaseName, new Date(startTime));
-			// Arm the leading-duplicate fast-skip for this source node. The leader will re-stream from
-			// `startTime`, so incoming records from this node with version <= startTime are the
-			// already-applied tail. Only arm for a genuine incremental resume from a real prior cursor:
+			// Arm the leading-duplicate fast-skip for this source node. Incoming records from this node with
+			// version <= the arming cursor are the already-applied tail the leader re-streams on resume.
+			//   - DIRECT resume → arm from `startTime` (the persisted direct cursor we asked to resume from).
+			//   - PROXIED resume → arm from `proxiedSkipCursor` (the relayed per-source cursor; startTime is
+			//     left conservative, so the skip absorbs the re-streamed tail #399 produces).
+			// Only arm for a genuine incremental resume from a real prior cursor:
 			//   - copyResume / startTime === 0  → a bulk copy re-streams in key order carrying original
 			//     (possibly newest) versions, so "version <= cursor" is NOT a duplicate signal there.
-			//   - startTime <= 1 / a fresh "now - 60s" start → no prior applied tail to dedupe.
+			//   - no direct or proxied cursor / a fresh "now - 60s" start → no prior applied tail to dedupe.
 			// Keyed by local node id so a proxied multi-node subscription gets an independent latch.
-			if (nodeId !== undefined && !copyResume && hasPersistedResumeCursor && startTime > 1) {
-				leadingDupCursorByNode.set(nodeId, startTime);
+			// Branch on the connection type rather than falling back: a node that previously had a DIRECT
+			// subscription leaves a persisted direct cursor (`hasPersistedResumeCursor`) on disk, so once it
+			// fails over to a PROXIED subscription we must still arm from the live `proxiedSkipCursor` — a
+			// fallback that preferred the stale direct `startTime` would dedupe against an old, narrower window.
+			const leadingDupArmCursor =
+				connectedNode === node
+					? hasPersistedResumeCursor && startTime > 1
+						? startTime
+						: undefined
+					: proxiedSkipCursor;
+			if (nodeId !== undefined && !copyResume && leadingDupArmCursor !== undefined && leadingDupArmCursor > 1) {
+				leadingDupCursorByNode.set(nodeId, leadingDupArmCursor);
 				logger.debug?.(
 					connectionId,
 					'armed leading-duplicate fast-skip',
 					node.name,
 					nodeId,
 					databaseName,
-					'resume cursor',
-					startTime
+					connectedNode === node ? 'direct resume cursor' : 'proxied resume cursor',
+					leadingDupArmCursor
 				);
 			} else if (nodeId !== undefined) {
 				// Re-subscription without a resumable cursor (or a copy): clear any stale latch so we never
