@@ -166,6 +166,12 @@ suite('Replication receive-side backlog memory bound', { skip: !STRESS, timeout:
 			},
 			env: { HARPER_NO_FLUSH_ON_EXIT: true },
 		});
+		// Re-track the restarted instance so the `after` hook tears down the *live*
+		// process, not the original (already-killed) handle. Without this, the
+		// restarted Harper child is orphaned: teardown targets the dead pid, the new
+		// child outlives the kill, and its open handles keep the test process — and
+		// thus the whole CI job — alive until the 260-minute runner timeout.
+		ctx.nodes[1] = nodeCtxB.harper;
 
 		// Poll record counts directly — unambiguous catch-up signal, no dependency on
 		// the shape of cluster_status's lastReceivedVersion fields.
