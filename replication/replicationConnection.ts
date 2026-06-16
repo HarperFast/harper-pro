@@ -313,7 +313,12 @@ export function collectLastTxnTimes(seqEntries: Iterable<{ value: any }>): Map<a
 		const nodes = value?.nodes;
 		if (!Array.isArray(nodes)) continue;
 		for (const node of nodes) {
-			if (node.lastTxnTime > (lastTxnTimes.get(node.id) ?? 0)) lastTxnTimes.set(node.id, node.lastTxnTime);
+			// Guard each element too: a partially-decoded row can yield null/non-object entries or a
+			// non-numeric lastTxnTime, which would throw out of the loop (defeating the crash-tolerance) or
+			// pollute the map with a nullish key. Only fold in well-formed entries.
+			if (node && typeof node === 'object' && typeof node.lastTxnTime === 'number' && node.id != null) {
+				if (node.lastTxnTime > (lastTxnTimes.get(node.id) ?? 0)) lastTxnTimes.set(node.id, node.lastTxnTime);
+			}
 		}
 	}
 	return lastTxnTimes;
