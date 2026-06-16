@@ -148,9 +148,21 @@ export function start(options) {
 					`Replication WS rejected for ${request.peerCertificate?.subjectaltname ?? request.ip}: ${rejectReason}`
 				);
 				try {
-					ws.close(1008, rejectReason);
+					// RFC 6455 control frames cap the payload at 125 bytes; 2 are reserved for the
+					// status code, so the UTF-8 close reason must be <= 123 bytes or ws.close() throws
+					// synchronously and we'd fall back into the stall this is meant to avoid.
+					let reason = rejectReason;
+					if (Buffer.byteLength(reason) > 123) {
+						reason = Buffer.from(reason).subarray(0, 120).toString('utf8') + '...';
+					}
+					ws.close(1008, reason);
 				} catch {
-					// best-effort close
+					// close failed (e.g. malformed reason); terminate so the peer doesn't stall
+					try {
+						ws.terminate();
+					} catch {
+						// best-effort close
+					}
 				}
 				return undefined;
 			}
