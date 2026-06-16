@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781611888325,
+  "lastUpdate": 1781611891307,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -291,6 +291,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E scan p99",
             "value": 544.12,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "cefb6ceffc74f839117eafa1ae372d9dd5b2f513",
+          "message": "5.1.2",
+          "timestamp": "2026-06-16T05:02:34Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/cefb6ceffc74f839117eafa1ae372d9dd5b2f513"
+        },
+        "date": 1781611891279,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99",
+            "value": 7.15,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99",
+            "value": 102.84,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99",
+            "value": 113.17,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99",
+            "value": 126.56,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99",
+            "value": 139.67,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99",
+            "value": 126.5,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99",
+            "value": 242.9,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99",
+            "value": 310.13,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99",
+            "value": 476.36,
             "unit": "ms"
           }
         ]
