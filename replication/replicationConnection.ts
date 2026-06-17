@@ -2893,6 +2893,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							`Blob ${blobId} for record ${id} is unrecoverable at source ${remoteNodeName} (${errorToString(err)}); ` +
 								`advancing the resume cursor past it — the record's blob stays diverged until backfilled (harper-pro#388).`
 						);
+						// The failed save left a header-only stub on disk (saveBlob writes the size header before the
+						// body, and the non-deleteOnFailure error path keeps a non-empty file). Since we are advancing
+						// past this unrecoverable blob, unlink the stub: a missing file is the unambiguous "needs
+						// backfill" signal for #388, whereas an 8-byte stub masquerades as a real (empty) blob and
+						// accumulates unreclaimed. Transient gaps are NOT cleaned — their reconnect re-stream re-saves
+						// the same fileId, overwriting the stub.
+						deleteBlob(localBlob);
 					} else {
 						logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err);
 						// A local/transient save fault. Mark a blob gap so onCommit and the sequence-update branch
