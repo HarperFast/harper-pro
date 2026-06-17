@@ -160,4 +160,16 @@ describe('createBlobReceiveStream — an orphaned blob stream cannot crash the p
 		await delay(0); // let the would-be unhandled 'error' fire (or not) before asserting
 		expect(stream.destroyed).to.equal(true);
 	});
+
+	it('does not swallow propagation: a later error listener (e.g. saveBlob\'s pipeline) still receives the error', async () => {
+		// Guards the one regression worth ruling out — that the creation-time no-op listener does not stop a
+		// wired consumer's handler from seeing real save errors (#403 classification depends on this).
+		const stream = createBlobReceiveStream();
+		const saveError = new Error('save failed');
+		let received;
+		stream.on('error', (err) => (received = err));
+		stream.destroy(saveError);
+		await delay(0);
+		expect(received).to.equal(saveError);
+	});
 });
