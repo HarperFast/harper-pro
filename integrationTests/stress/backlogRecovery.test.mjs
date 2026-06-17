@@ -173,21 +173,46 @@ if (!stressEnabled()) {
 					});
 				})
 			);
-			// Wait until B has actually received (and committed) the warm-up — a positive
-			// record_count is the durable signal that B holds a `data` resume position.
+			// Wait until the whole mesh has CONVERGED on the warm-up set — every node
+			// reporting the same positive record_count — not merely until B holds *some*
+			// record. The resume position is per-origin: B needs a persisted `data`-db
+			// cursor for each peer it will later have to drain from (A, C and D). A bare
+			// `count > 0` break is satisfied the instant B receives a write from any single
+			// peer, so B could hold a cursor for C/D but none for A, then — per the
+			// explicit-leader design (#254) — restart A's subscription "from scratch"
+			// (startTime === 1 → Date.now() - 60s) and silently skip A's entire share of the
+			// offline backlog. That is exactly the wedge this test exists to catch (B stalls
+			// short of the source: e.g. 554/800). Requiring B to match the peers proves it
+			// committed a write originating on every peer, so it holds a cursor for all three.
 			const warmupDeadline = Date.now() + 60_000;
-			let warmupCount = 0;
+			let warmupCounts = { A: -1, B: -1, C: -1, D: -1 };
+			let warmedUp = false;
 			while (Date.now() < warmupDeadline) {
-				const b = await sendOperation(B, { operation: 'describe_table', table: 'Prerender' }).catch(() => null);
-				warmupCount = b?.record_count ?? 0;
-				if (warmupCount > 0) break;
+				const [a, b, c, d] = await Promise.all(
+					[A, B, C, D].map((n) =>
+						sendOperation(n, { operation: 'describe_table', table: 'Prerender' }, { timeoutMs: 5000 }).catch(() => null)
+					)
+				);
+				warmupCounts = {
+					A: a?.record_count ?? -1,
+					B: b?.record_count ?? -1,
+					C: c?.record_count ?? -1,
+					D: d?.record_count ?? -1,
+				};
+				const vals = Object.values(warmupCounts);
+				if (warmupCounts.B > 0 && vals.every((v) => v === vals[0])) {
+					warmedUp = true;
+					break;
+				}
 				await delay(1000);
 			}
 			ok(
-				warmupCount > 0,
-				`warm-up failed: B never received the seed writes (count=${warmupCount}); cannot establish a data-db resume position, so the offline-backlog drain path can't be exercised`
+				warmedUp,
+				`warm-up failed: mesh did not converge on the seed writes before B went offline ` +
+					`(${JSON.stringify(warmupCounts)}); without a per-origin data-db resume position for every ` +
+					`peer the offline-backlog drain path can't be exercised`
 			);
-			console.log(`[backlog] warm-up done; B holds ${warmupCount} records (resume position established)`);
+			console.log(`[backlog] warm-up done; B holds ${warmupCounts.B} records (per-origin resume position established)`);
 
 			// Sample memory on peers A/C/D for the whole offline window.
 			const peerSamplers = [A, C, D].map((n) => sampleMetrics(n, { intervalMs: 2000 }));
@@ -264,7 +289,7 @@ if (!stressEnabled()) {
 			while (Date.now() < catchupDeadline) {
 				const [a, b, c, d] = await Promise.all(
 					[A, B, C, D].map((n) =>
-						sendOperation(n, { operation: 'describe_table', table: 'Prerender' }).catch(() => null)
+						sendOperation(n, { operation: 'describe_table', table: 'Prerender' }, { timeoutMs: 5000 }).catch(() => null)
 					)
 				);
 				counts = {
