@@ -1,6 +1,5 @@
 import { randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { setTimeout as delay } from 'node:timers/promises';
 export class LocationImage extends tables.Location {
 	static async get(target) {
 		let location = await super.get(target);
@@ -13,10 +12,9 @@ tables.Location.sourcedFrom({
 	get(id) {
 		let image = createBlob(
 			Readable.from(
-				(async function* () {
+				(function* () {
 					for (let i = 0; i < 150; i++) {
 						yield randomBytes(50);
-						await delay(i % 10); // vary it to keep things exciting
 					}
 				})()
 			)
