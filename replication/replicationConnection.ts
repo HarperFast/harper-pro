@@ -336,6 +336,20 @@ export function isPermanentSourceBlobErrorCode(errorCode: unknown): boolean {
 }
 
 /**
+ * Create the PassThrough that receives a blob's bytes on the way to its file store. It carries a no-op
+ * `'error'` listener from creation so that destroying it with an error — most importantly the blobsTimer
+ * sweep tearing down a blob whose save never wired up, leaving the stream orphaned in `blobsInFlight`
+ * after an app/source error (harper-pro#1337) — cannot promote a stream `'error'` into a process-level
+ * uncaughtException. saveBlob's pipeline still observes and reports real errors via its completion
+ * callback; this listener only suppresses the unhandled-error crash, never the handling.
+ */
+export function createBlobReceiveStream(): PassThrough {
+	const stream = new PassThrough();
+	stream.on('error', () => {});
+	return stream;
+}
+
+/**
  * On reconnect the follower reads its persisted copy-resume cursor (`{copyStartTime, currentTable,
  * afterKey}` under `dbisDB[Symbol.for('copyCursor'), nodeId]`) and forwards it to the leader so the
  * bulk copy can resume mid-stream. If the cursor on disk is malformed — specifically `currentTable`
@@ -1425,7 +1439,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						);
 
 						if (!stream) {
-							stream = new PassThrough();
+							stream = createBlobReceiveStream();
 							stream.expectedSize = size;
 							blobsInFlight.set(fileId, stream);
 						}
@@ -1441,7 +1455,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						try {
 							if (finished) {
 								if (error) {
-									stream.on('error', () => {}); // don't treat this as an uncaught error
+									// the stream already carries a no-op 'error' listener from createBlobReceiveStream
 									const blobError = new Error(
 										'Blob error: ' + error + ' for record ' + (stream.recordId ?? 'unknown') + ' from ' + remoteNodeName
 									);
@@ -2854,7 +2868,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				blobsInFlight.delete(blobId);
 			}
 		} else {
-			stream = new PassThrough();
+			stream = createBlobReceiveStream();
 			blobsInFlight.set(blobId, stream);
 		}
 		stream.connectedToBlob = true;
