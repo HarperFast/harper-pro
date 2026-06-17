@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781611891307,
+  "lastUpdate": 1781697071147,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -155,6 +155,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E",
             "value": 970.34,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "harperfastaibot[bot]",
+            "username": "harperfastaibot[bot]",
+            "email": "280766738+harperfastaibot[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "fa16ed40a85d6d09f745ac31dfc847fc3bdfe593",
+          "message": "feat: Sync Core (#407)\n\nCo-authored-by: kriszyp <34054+kriszyp@users.noreply.github.com>",
+          "timestamp": "2026-06-17T11:49:59Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/fa16ed40a85d6d09f745ac31dfc847fc3bdfe593"
+        },
+        "date": 1781697070124,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 11040.41,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C",
+            "value": 22512.59,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B",
+            "value": 21524.37,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A",
+            "value": 4368.58,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F",
+            "value": 4464.64,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E",
+            "value": 1475.55,
             "unit": "ops/sec"
           }
         ]
