@@ -708,6 +708,14 @@ async function cloneJWTKeys(): Promise<void> {
 	writeFileSync(join(keysDir, JWT_ENUM.JWT_PUBLIC_KEY_NAME), publicKey);
 	writeFileSync(join(keysDir, JWT_ENUM.JWT_PRIVATE_KEY_NAME), privateKey);
 	writeFileSync(join(keysDir, JWT_ENUM.JWT_PASSPHRASE_NAME), passphrase);
+
+	// Harper is already running by this point, so the operations API may have served an early Bearer-auth
+	// request and cached the install-generated JWT keys in-process. Those just got overwritten on disk;
+	// drop the cache so the next token verify/sign reads the cloned leader keys instead of finishing the
+	// clone Available while still authing with the pre-clone key set. Dynamically imported to avoid the
+	// module's load-time env.initSync() running before rootPath is initialized.
+	const { clearJWTRSAKeysCache } = await import('../core/security/tokenAuthentication.js');
+	clearJWTRSAKeysCache();
 }
 
 /**
