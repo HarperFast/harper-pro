@@ -297,6 +297,45 @@ export function shouldLogSustainedBlobDivergence(
 }
 
 /**
+ * Mark an error as a *source-reported* blob unavailability: the sender told us (via a BLOB_CHUNK
+ * `error` marker) that it cannot provide this blob — classically `ENOENT` because the blob was
+ * evicted/expired at the origin. Set on the error the receive loop destroys the blob stream with, so
+ * the blob-save `.catch` in `receiveBlobs` can tell it apart from a local/transient save fault.
+ */
+export function markSourceBlobUnavailable(error: Error): Error {
+	(error as { sourceBlobUnavailable?: boolean }).sourceBlobUnavailable = true;
+	return error;
+}
+
+/**
+ * Whether a blob-save failure is unrecoverable *at the source* (see `markSourceBlobUnavailable`).
+ * Such a blob cannot be re-streamed — a reconnect reproduces the identical error — so the receiver
+ * advances the resume cursor past it (recorded loudly) rather than holding `hasBlobGap` forever and
+ * wedging the whole connection. Local/transient save faults (disk full, mid-stream timeout) are NOT
+ * this and still hold so a reconnect can re-save them. See harper-pro#403; the diverged record is
+ * left for proactive blob backfill (harper-pro#388). Pure so the classification is unit-testable.
+ */
+export function isUnrecoverableSourceBlobError(error: unknown): boolean {
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		(error as { sourceBlobUnavailable?: boolean }).sourceBlobUnavailable === true
+	);
+}
+
+/**
+ * Whether a sender-forwarded blob read-error CODE denotes a PERMANENT absence — the blob is gone at the
+ * origin (evicted/expired), so re-streaming on reconnect reproduces the identical error and the receiver
+ * may advance the resume cursor past it. Deliberately narrow: only `ENOENT`. Transient sender faults
+ * (`EIO`, `EMFILE`, timeouts) and a missing code (older sender that doesn't forward one) return false, so
+ * the receiver HOLDS the gap and a reconnect retries — never silently skipping a recoverable blob. See
+ * harper-pro#403.
+ */
+export function isPermanentSourceBlobErrorCode(errorCode: unknown): boolean {
+	return errorCode === 'ENOENT';
+}
+
+/**
  * On reconnect the follower reads its persisted copy-resume cursor (`{copyStartTime, currentTable,
  * afterKey}` under `dbisDB[Symbol.for('copyCursor'), nodeId]`) and forwards it to the leader so the
  * bulk copy can resume mid-stream. If the cursor on disk is malformed — specifically `currentTable`
@@ -1370,7 +1409,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					case BLOB_CHUNK: {
 						// this is a blob chunk, we need to write it to the blob store
 						const blobInfo = message[1];
-						const { fileId, size, finished, error } = blobInfo;
+						const { fileId, size, finished, error, errorCode } = blobInfo;
 						let stream = blobsInFlight.get(fileId);
 						logger.debug?.(
 							'Received blob',
@@ -1403,16 +1442,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							if (finished) {
 								if (error) {
 									stream.on('error', () => {}); // don't treat this as an uncaught error
-									stream.destroy(
-										new Error(
-											'Blob error: ' +
-												error +
-												' for record ' +
-												(stream.recordId ?? 'unknown') +
-												' from ' +
-												remoteNodeName
-										)
+									const blobError = new Error(
+										'Blob error: ' + error + ' for record ' + (stream.recordId ?? 'unknown') + ' from ' + remoteNodeName
 									);
+									// Only a PERMANENT source absence (ENOENT — the blob was evicted/expired at the
+									// origin) is unrecoverable: re-streaming reproduces it, so the save `.catch` advances
+									// the resume cursor past it instead of holding forever (harper-pro#403). A transient
+									// source read fault (EIO, EMFILE, timeout) is left UNMARKED so the receiver holds
+									// the gap and a reconnect retries. An older sender that doesn't send `errorCode`
+									// also stays unmarked — the safe (hold) default for a mixed-version cluster.
+									if (isPermanentSourceBlobErrorCode(errorCode)) markSourceBlobUnavailable(blobError);
+									stream.destroy(blobError);
 								} else if (stream.destroyed || stream.writableEnded) {
 									// The stream was torn down mid-blob and intentionally left in blobsInFlight
 									// (see the destroyed branch below) so intervening chunks were dropped rather
@@ -2781,6 +2821,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			);
 		} catch (error) {
 			logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
+			// Forward the error CODE alongside the message so the receiver can tell a PERMANENT source
+			// absence (ENOENT — the blob was evicted/expired at the origin; re-streaming reproduces it)
+			// from a TRANSIENT read fault (EIO, EMFILE, timeout — a reconnect may succeed). Only the
+			// former lets the receiver advance the resume cursor past the blob; the latter must still
+			// hold so the gap is retried. See harper-pro#403 and receiveBlobs's classification.
 			ws.send(
 				encode([
 					BLOB_CHUNK,
@@ -2788,6 +2833,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						fileId: id,
 						finished: true,
 						error: errorToString(error),
+						errorCode: (error as { code?: string })?.code,
 					},
 					Buffer.alloc(0),
 				])
@@ -2833,16 +2879,31 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// uncaughtException — observed in prod as ~35/sec ENOENT spam during catch-up.
 			const tracked = finished
 				.catch((err) => {
-					logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err);
-					// Mark a blob gap. We deliberately do NOT tear down here: this .catch runs inside the same
-					// microtask chain that onCommit's `await Promise.all(outstandingBlobsToFinish)` is waiting on.
-					// Once set, onCommit and the sequence-update branch clamp the persisted resume cursor at the
-					// last fully-durable transaction (lastDurableSequenceId) instead of advancing over the gap;
-					// records keep flowing live and the next reconnect/restart resumes from the clamp and re-saves
-					// the disrupted blob. A transient catch-up fault (e.g. a blob-stream timeout) clears on resume.
-					hasBlobGap = true;
-					// Surface the divergence as an observable metric (cluster_status) and, on a sustained link,
-					// one escalation line — see harper-pro#386.
+					// This .catch runs inside the same microtask chain that onCommit's
+					// `await Promise.all(outstandingBlobsToFinish)` is waiting on; we deliberately do NOT tear
+					// down here. Classify the failure to decide whether the resume cursor holds or advances.
+					if (isUnrecoverableSourceBlobError(err)) {
+						// The sender reported it cannot provide this blob (BLOB_CHUNK `error` marker — typically
+						// ENOENT because the blob was evicted/expired at the origin). Re-streaming on reconnect
+						// reproduces the identical error, so holding `hasBlobGap` would wedge the connection
+						// forever and block every healthy record behind it (harper-pro#403). Leave `hasBlobGap`
+						// unset so the watermark advances past it; the diverged record is left for proactive
+						// blob backfill (harper-pro#388). Recorded loudly below so the skip is never silent.
+						logger.error?.(
+							`Blob ${blobId} for record ${id} is unrecoverable at source ${remoteNodeName} (${errorToString(err)}); ` +
+								`advancing the resume cursor past it — the record's blob stays diverged until backfilled (harper-pro#388).`
+						);
+					} else {
+						logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err);
+						// A local/transient save fault. Mark a blob gap so onCommit and the sequence-update branch
+						// clamp the persisted resume cursor at the last fully-durable transaction
+						// (lastDurableSequenceId) instead of advancing over the gap; records keep flowing live and
+						// the next reconnect/restart resumes from the clamp and re-saves the disrupted blob. A
+						// transient catch-up fault (e.g. a blob-stream timeout) clears on resume.
+						hasBlobGap = true;
+					}
+					// Either failure is an observable divergence: surface the metric (cluster_status) and, on a
+					// sustained link, one escalation line — see harper-pro#386.
 					recordBlobReplicationFailure(getSharedStatus(), Date.now());
 					if (
 						shouldLogSustainedBlobDivergence(
@@ -2855,7 +2916,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						logger.error?.(
 							`Sustained blob replication divergence from ${remoteNodeName}: ${blobFailureCount} blob saves have failed on this connection ` +
 								`(cluster_status.blobReplicationFailures reports the cumulative total across connections); ` +
-								`replicated blobs are not durably stored and the resume cursor is held. Check cluster_status (blobReplicationFailures/lastBlobFailure).`
+								`transient gaps hold the resume cursor for re-streaming, unrecoverable (source-missing) blobs are skipped past. ` +
+								`Check cluster_status (blobReplicationFailures/lastBlobFailure).`
 						);
 					}
 				})
@@ -2863,11 +2925,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
 					const index = outstandingBlobsToFinish.indexOf(tracked);
 					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
-					// Advance the durable watermark when the LAST in-flight blob drains successfully. The splice
-					// above runs first so the length check sees the post-removal count; a save FAILURE set
-					// `hasBlobGap` in the `.catch` (which runs before this `.finally`), so the `!hasBlobGap` guard
-					// keeps the watermark pinned on a gap. On clean drain the watermark catches up to the highest
-					// committed sequence, which the next end_txn/sequence-update persists as the resume cursor.
+					// Advance the durable watermark when the LAST in-flight blob settles without a held gap. The
+					// splice above runs first so the length check sees the post-removal count. A local/transient
+					// save FAILURE set `hasBlobGap` in the `.catch` (which runs before this `.finally`), so the
+					// `!hasBlobGap` guard keeps the watermark pinned until a reconnect re-streams it. A clean drain
+					// — OR an unrecoverable source-missing blob that was skipped (which intentionally leaves
+					// `hasBlobGap` unset, see the `.catch`) — lets the watermark catch up to the highest committed
+					// sequence, which the next end_txn/sequence-update persists as the resume cursor.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
 				});
 			(tracked as any).blobId = blobId;
