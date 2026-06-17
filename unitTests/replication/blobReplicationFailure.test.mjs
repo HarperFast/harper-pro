@@ -17,6 +17,9 @@ import { expect } from 'chai';
 import {
 	recordBlobReplicationFailure,
 	shouldLogSustainedBlobDivergence,
+	markSourceBlobUnavailable,
+	isUnrecoverableSourceBlobError,
+	isPermanentSourceBlobErrorCode,
 	BLOB_FAILURE_COUNT_POSITION,
 	LAST_BLOB_FAILURE_TIME_POSITION,
 	BACK_PRESSURE_RATIO_POSITION,
@@ -88,5 +91,52 @@ describe('shouldLogSustainedBlobDivergence — one-per-connection escalation lat
 			}
 		}
 		expect(firedAt).to.deep.equal([THRESHOLD]); // single fire, at the crossing
+	});
+});
+
+describe('isUnrecoverableSourceBlobError — source-missing vs local/transient classification (#403)', () => {
+	it('treats an error marked by markSourceBlobUnavailable as unrecoverable', () => {
+		const err = markSourceBlobUnavailable(new Error('Blob error: ENOENT ... from peerA'));
+		expect(isUnrecoverableSourceBlobError(err)).to.equal(true);
+	});
+
+	it('markSourceBlobUnavailable returns the same error instance (so it can wrap a throw/destroy arg)', () => {
+		const err = new Error('boom');
+		expect(markSourceBlobUnavailable(err)).to.equal(err);
+	});
+
+	it('does NOT treat a plain local/transient save error as unrecoverable', () => {
+		// The receiver-side injected ENOENT (fixture-blob-fail-transient / -injector) is a local fault:
+		// it is never marked, so it must keep holding the cursor (hasBlobGap), not advance past.
+		const localEnoent = new Error("ENOENT: no such file or directory, open '/.../blobs/0/0/3e0'");
+		localEnoent.code = 'ENOENT';
+		expect(isUnrecoverableSourceBlobError(localEnoent)).to.equal(false);
+	});
+
+	it('is false for non-error / nullish values', () => {
+		expect(isUnrecoverableSourceBlobError(null)).to.equal(false);
+		expect(isUnrecoverableSourceBlobError(undefined)).to.equal(false);
+		expect(isUnrecoverableSourceBlobError('Blob error: ...')).to.equal(false);
+		expect(isUnrecoverableSourceBlobError({})).to.equal(false);
+		expect(isUnrecoverableSourceBlobError({ sourceBlobUnavailable: false })).to.equal(false);
+	});
+});
+
+describe('isPermanentSourceBlobErrorCode — only ENOENT is a permanent source absence (#403)', () => {
+	it('treats ENOENT (evicted/expired blob) as permanent → advance past', () => {
+		expect(isPermanentSourceBlobErrorCode('ENOENT')).to.equal(true);
+	});
+
+	it('treats transient sender faults as NOT permanent → hold the gap and retry on reconnect', () => {
+		// The crux of the cross-model-review blocker: a transient source read fault must not be skipped.
+		for (const code of ['EIO', 'EMFILE', 'EACCES', 'EBUSY', 'ETIMEDOUT']) {
+			expect(isPermanentSourceBlobErrorCode(code), code).to.equal(false);
+		}
+	});
+
+	it('treats a missing code (older sender that does not forward one) as NOT permanent — safe hold default', () => {
+		expect(isPermanentSourceBlobErrorCode(undefined)).to.equal(false);
+		expect(isPermanentSourceBlobErrorCode(null)).to.equal(false);
+		expect(isPermanentSourceBlobErrorCode('')).to.equal(false);
 	});
 });
