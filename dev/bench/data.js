@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781782943563,
+  "lastUpdate": 1781782946188,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -529,6 +529,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99",
             "value": 107.14,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "bdadb1ecf3587a1cf3f46b239abf449c092ddc9e",
+          "message": "test(fixture): remove artificial async delays from blob generator in cluster test fixture (#408)\n\nThe sourcedFrom blob used 150 async yields with 0–9ms delays (total ~675ms). After\nharper#1341 (fix blob cleanup on skipped replication applies), the replication commit for\na received record now awaits the blob's save promise before committing — intentional, so\nthe record isn't stored before its blob is durable. This pushed the effective commit time\nfor Location/2 on node 1 past the test's 500ms wait, causing `bodyFrom1.random !==\nbodyFrom2.random` because node 1 re-invoked the source's get() independently.\n\nRemove the per-yield delays (they were ornamental). The generator now completes\nsynchronously, the blob saves in one I/O burst, and the 500ms replication window is ample.\n\nFixes the consistent shard 4/4 failure across all Node versions (v22/v24/v26) introduced\nby harper#1341 + hp#405 for the v5.1.4 release.\n\nCo-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>",
+          "timestamp": "2026-06-17T15:12:30Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/bdadb1ecf3587a1cf3f46b239abf449c092ddc9e"
+        },
+        "date": 1781782946171,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99",
+            "value": 6.53,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99",
+            "value": 59.27,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99",
+            "value": 68.43,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99",
+            "value": 30.35,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99",
+            "value": 32.29,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99",
+            "value": 96.68,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99",
+            "value": 179.55,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99",
+            "value": 151.3,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99",
+            "value": 436.35,
             "unit": "ms"
           }
         ]
