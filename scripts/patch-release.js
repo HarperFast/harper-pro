@@ -329,9 +329,26 @@ async function main() {
 	}
 	log(`  Pushing harper-pro ${RELEASE_BRANCH} ${proVersion}...`);
 	execSync(`git -C "${harperProRoot}" push origin "${RELEASE_BRANCH}" "${proVersion}"`, { stdio: 'inherit' });
+	ok('\nTags pushed.');
+
+	// ── Step 6: trigger CM release-to-environments ─────────────────────────────
+	header('Deploy to environments (Central Manager)');
+	const plainVersion = proVersion.replace(/^v/, '');
+	const cmCmd =
+		`gh workflow run release-to-environments.yaml --repo HarperFast/central-manager ` +
+		`-f version=${plainVersion} -f version_name=stable -f update_environments=all`;
+	log(`  Command: ${C.dim}${cmCmd}${C.reset}`);
+	const deploy = await prompt(`\nTrigger CM release-to-environments (version_name=stable)? [Y/n]: `);
+	if (deploy.toLowerCase() !== 'n') {
+		log('\nTriggering CM workflow...');
+		execSync(cmCmd, { stdio: 'inherit' });
+		ok('  ✅ Workflow triggered — https://github.com/HarperFast/central-manager/actions');
+	} else {
+		warn(`  Skipped. Manually trigger release-to-environments with version_name=stable when ready.`);
+	}
 	ok('\n✅ Done.');
 
-	// ── Step 6: offer to return to original branches ───────────────────────────
+	// ── Step 7: offer to return to original branches ───────────────────────────
 	process.chdir(corePath);
 	if (coreOriginalBranch && coreOriginalBranch !== RELEASE_BRANCH) {
 		const back = await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
