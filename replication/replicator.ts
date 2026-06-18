@@ -52,6 +52,7 @@ import { clearThisNodeName } from '../core/server/nodeName';
 // allow this to register operations
 import './setNode.ts';
 import './clusterStatus.ts';
+import './blobRepair.ts';
 import '../security/keyService.ts';
 import '../security/sshKeyOperations.ts';
 
@@ -499,6 +500,28 @@ const connections = new Map<string, Map<string, NodeReplicationConnection>>();
 // and create a fresh one through the normal connect path. See harper-pro#233 / #289.
 export function isReusableConnection(connection?: NodeReplicationConnection): boolean {
 	return !!connection && !connection.isFinished && !connection.intentionallyUnsubscribed;
+}
+
+/**
+ * Returns active subscription connections for the given database, for use by the blob repair sweep.
+ * Uses subscription connections (not retrieval connections) so that tableSubscriptionToReplicator
+ * is valid inside receiveBlobs — retrieval connections created without a subscription would
+ * crash with a TypeError at replicationConnection.ts:receiveBlobs. A side effect is that a
+ * blob-save failure during repair sets hasBlobGap on the subscription connection; this stalls
+ * lastDurableSequenceId advancement until the next reconnect, which is the same recovery path
+ * as any normal blob-save failure (#368).
+ */
+export function getRepairConnectionsForDB(dbName: string): NodeReplicationConnection[] {
+	const result: NodeReplicationConnection[] = [];
+	const seen = new Set<NodeReplicationConnection>();
+	for (const dbConnections of connections.values()) {
+		const conn = dbConnections.get(dbName);
+		if (isReusableConnection(conn) && conn.isConnected && !seen.has(conn)) {
+			seen.add(conn);
+			result.push(conn);
+		}
+	}
+	return result;
 }
 
 /**
