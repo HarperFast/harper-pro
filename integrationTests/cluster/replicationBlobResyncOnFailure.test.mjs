@@ -124,6 +124,7 @@ suite('Receive-side blob resume-cursor clamp on transient save failure', { skip:
 			payload,
 			replicated: true,
 			restart: true,
+			ignore_replication_errors: true,
 		});
 		await delay(35000);
 

@@ -147,6 +147,7 @@ if (!stressEnabled()) {
 				payload,
 				replicated: true,
 				restart: true,
+				ignore_replication_errors: true,
 			});
 			// Restart settle.
 			await delay(40_000);

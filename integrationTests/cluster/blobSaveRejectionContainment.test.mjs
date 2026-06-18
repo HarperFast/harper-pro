@@ -114,6 +114,7 @@ suite('Receive-side blob save rejection containment', { skip: !STRESS, timeout: 
 			payload,
 			replicated: true,
 			restart: true,
+			ignore_replication_errors: true,
 		});
 		equal(deployResp.message, 'Successfully deployed: large-blob-source, restarting Harper');
 		// Give both nodes time to come back up after the restart.
