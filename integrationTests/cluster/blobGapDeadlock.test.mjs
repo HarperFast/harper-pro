@@ -128,6 +128,7 @@ suite('Receive-path blob-gap deadlock', { skip: !STRESS, timeout: 300000 }, (ctx
 			payload,
 			replicated: true,
 			restart: true,
+			ignore_replication_errors: true,
 		});
 		equal(deployResp.message, 'Successfully deployed: blob-gap-deadlock-source, restarting Harper');
 		await delay(35000);

@@ -119,6 +119,7 @@ if (!stressEnabled()) {
 				payload,
 				replicated: true,
 				restart: true,
+				ignore_replication_errors: true,
 			});
 			await delay(40_000);
 			for (let i = 1; i < ctx.nodes.length; i++) {

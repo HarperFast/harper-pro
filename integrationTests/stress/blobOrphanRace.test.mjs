@@ -115,6 +115,7 @@ if (!stressEnabled()) {
 				payload,
 				replicated: true,
 				restart: true,
+				ignore_replication_errors: true,
 			});
 			await delay(40_000);
 			await waitForAllConnected(ctx.nodes[1], { timeoutMs: 90_000 });

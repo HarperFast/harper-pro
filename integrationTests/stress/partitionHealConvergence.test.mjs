@@ -176,6 +176,7 @@ if (!stressEnabled() || process.env.HARPER_STRESS_ALLOW_INSECURE_REPLICATION !==
 				payload,
 				replicated: true,
 				restart: true,
+				ignore_replication_errors: true,
 			});
 			await delay(40_000);
 			await waitForAllConnected(ctx.nodes[1], { timeoutMs: 90_000 });
