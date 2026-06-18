@@ -20,23 +20,22 @@
  *   nodeB — non-source peer.  Requests a cached record; should NOT trigger an
  *            independent origin fetch after the entry has replicated.
  *
- * Assertions
- * ──────────
- *   (a) After a request on nodeB the origin is contacted (exactly once — stampede
- *       prevention still applies across the cluster).
+ * Assertions (what is verified today)
+ * ─────────────────────────────────────
+ *   (a) After a request on nodeB the origin is contacted exactly once (cache-miss
+ *       fetch + stampede prevention applies cluster-wide).  Which node contacts
+ *       the origin is NOT asserted here — replicationSource routing is not yet
+ *       implemented (see harper-pro#416).
  *   (b) The record value is byte-identical on both nodes after replication
  *       converges.
  *   (c) A second request on nodeB is served from the replicated cache without any
  *       additional origin fetch.
+ *   (d) A separate id requested from nodeA also caches and replicates to nodeB.
  *
- * NOTE: Harper's `replicationSource: true` routing (origin fetches only on the
- * designated source node) is the intended semantic but the routing implementation
- * is not yet present in the current codebase (see harper#1189 TODO).  Until it
- * lands, assertion (a) verifies that the origin IS contacted on cache miss
- * (regardless of which node contacts it); assertion (b) / (c) verify that the
- * replicated cache entry is byte-identical and served from cache on the second
- * request.  A TODO comment marks the stricter per-node check so it can be
- * tightened once the routing is implemented.
+ * What is NOT verified (pending harper-pro#416)
+ * ──────────────────────────────────────────────
+ *   • That origin fetches are routed specifically to the `replicationSource: true`
+ *     node (nodeA).  The skipped test below makes this gap explicit in test output.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -217,190 +216,206 @@ async function connectNodes(nodeA, nodeB) {
 
 const FIXTURE = resolve(import.meta.dirname ?? module.path, 'fixture-cache-repl-source');
 
-suite('Cache replicationSource cross-node', { timeout: 180000 }, (ctx) => {
-	/** @type {{ url: string, fetchCounts: () => Promise<Record<string,number>>, totalFetches: () => Promise<number>, reset: () => Promise<void>, close: () => Promise<void> }} */
-	let origin;
+suite(
+	'Cache sourcedFrom cross-node replication (replicationSource fetch routing NOT verified — see harper-pro#416)',
+	{ timeout: 180000 },
+	(ctx) => {
+		/** @type {{ url: string, fetchCounts: () => Promise<Record<string,number>>, totalFetches: () => Promise<number>, reset: () => Promise<void>, close: () => Promise<void> }} */
+		let origin;
 
-	before(async () => {
-		origin = await startMockOrigin();
+		before(async () => {
+			origin = await startMockOrigin();
 
-		const sharedConfig = (hostname) => ({
-			analytics: { aggregatePeriod: -1 },
-			logging: { colors: false, stdStreams: false, console: true },
-			replication: {
-				securePort: hostname + ':9933',
-			},
+			const sharedConfig = (hostname) => ({
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false, stdStreams: false, console: true },
+				replication: {
+					securePort: hostname + ':9933',
+				},
+			});
+
+			// Allocate addresses first, then manually copy the fixture into the dataRootDir
+			// before calling startHarper. This ensures the pre-allocated hostname is what
+			// startHarper actually binds to (startHarper respects ctx.harper.hostname when set),
+			// so the replication securePort in the config matches the actual node address.
+			// Using startHarper directly (vs setupHarperWithFixture) avoids the hostname loss
+			// that occurs when setupHarperWithFixture replaces ctx.harper = { dataRootDir }.
+			const [hostnameA, hostnameB] = await Promise.all([
+				getNextAvailableLoopbackAddress(),
+				getNextAvailableLoopbackAddress(),
+			]);
+
+			const [dataRootDirA, dataRootDirB] = await Promise.all([
+				mkdtemp(join(tmpdir(), 'harper-integration-test-')),
+				mkdtemp(join(tmpdir(), 'harper-integration-test-')),
+			]);
+
+			const fixtureBasename = basename(FIXTURE);
+			await Promise.all([
+				cp(FIXTURE, join(dataRootDirA, 'components', fixtureBasename), { recursive: true, dereference: true }),
+				cp(FIXTURE, join(dataRootDirB, 'components', fixtureBasename), { recursive: true, dereference: true }),
+			]);
+
+			const ctxA = { name: ctx.name, harper: { hostname: hostnameA, dataRootDir: dataRootDirA } };
+			const ctxB = { name: ctx.name, harper: { hostname: hostnameB, dataRootDir: dataRootDirB } };
+
+			await Promise.all([
+				startHarper(ctxA, {
+					config: sharedConfig(hostnameA),
+					env: {
+						HARPER_NO_FLUSH_ON_EXIT: true,
+						HARPER_TEST_ORIGIN_URL: origin.url,
+					},
+				}),
+				startHarper(ctxB, {
+					config: sharedConfig(hostnameB),
+					env: {
+						HARPER_NO_FLUSH_ON_EXIT: true,
+						HARPER_TEST_ORIGIN_URL: origin.url,
+					},
+				}),
+			]);
+
+			ctx.nodeA = ctxA.harper;
+			ctx.nodeB = ctxB.harper;
+
+			console.log('nodeA:', ctx.nodeA.hostname);
+			console.log('nodeB:', ctx.nodeB.hostname);
+
+			await connectNodes(ctx.nodeA, ctx.nodeB);
+			console.log('cluster connected');
 		});
 
-		// Allocate addresses first, then manually copy the fixture into the dataRootDir
-		// before calling startHarper. This ensures the pre-allocated hostname is what
-		// startHarper actually binds to (startHarper respects ctx.harper.hostname when set),
-		// so the replication securePort in the config matches the actual node address.
-		// Using startHarper directly (vs setupHarperWithFixture) avoids the hostname loss
-		// that occurs when setupHarperWithFixture replaces ctx.harper = { dataRootDir }.
-		const [hostnameA, hostnameB] = await Promise.all([
-			getNextAvailableLoopbackAddress(),
-			getNextAvailableLoopbackAddress(),
-		]);
+		after(async () => {
+			await Promise.all([
+				ctx.nodeA && teardownHarper({ harper: ctx.nodeA }),
+				ctx.nodeB && teardownHarper({ harper: ctx.nodeB }),
+			]);
+			await origin.close();
+		});
 
-		const [dataRootDirA, dataRootDirB] = await Promise.all([
-			mkdtemp(join(tmpdir(), 'harper-integration-test-')),
-			mkdtemp(join(tmpdir(), 'harper-integration-test-')),
-		]);
+		test('(a) origin is contacted exactly once on cache miss (which node fetches is not asserted — see harper-pro#416)', async () => {
+			await origin.reset();
 
-		const fixtureBasename = basename(FIXTURE);
-		await Promise.all([
-			cp(FIXTURE, join(dataRootDirA, 'components', fixtureBasename), { recursive: true, dereference: true }),
-			cp(FIXTURE, join(dataRootDirB, 'components', fixtureBasename), { recursive: true, dereference: true }),
-		]);
+			const id = 'item-1';
 
-		const ctxA = { name: ctx.name, harper: { hostname: hostnameA, dataRootDir: dataRootDirA } };
-		const ctxB = { name: ctx.name, harper: { hostname: hostnameB, dataRootDir: dataRootDirB } };
+			// Request from nodeB triggers a cache miss. The sourcedFrom source fetches
+			// from the mock origin. With replicationSource: true, the intent is that
+			// the origin fetch is routed to nodeA; without the routing implementation
+			// it will be executed on nodeB directly — either way the total count is 1.
+			const response = await fetchWithRetry(`${ctx.nodeB.httpURL}/OriginCache/${id}`);
+			equal(response.status, 200, `expected 200 but got ${response.status}`);
+			const body = await response.json();
+			equal(body.id, id, 'record id should match');
+			equal(body.value, `origin-value-${id}`, 'record value should come from origin');
 
-		await Promise.all([
-			startHarper(ctxA, {
-				config: sharedConfig(hostnameA),
-				env: {
-					HARPER_NO_FLUSH_ON_EXIT: true,
-					HARPER_TEST_ORIGIN_URL: origin.url,
-				},
-			}),
-			startHarper(ctxB, {
-				config: sharedConfig(hostnameB),
-				env: {
-					HARPER_NO_FLUSH_ON_EXIT: true,
-					HARPER_TEST_ORIGIN_URL: origin.url,
-				},
-			}),
-		]);
+			const total = await origin.totalFetches();
+			equal(total, 1, `expected exactly 1 origin fetch for the cache miss, got ${total}`);
 
-		ctx.nodeA = ctxA.harper;
-		ctx.nodeB = ctxB.harper;
+			// TODO(harper-pro#416): When replicationSource routing is implemented, tighten
+			// this to assert the fetch happened on nodeA specifically.  Before enabling,
+			// also verify that `ctx.nodeA.hostname` resolves to the real loopback address
+			// (not 'unknown') — the mock origin keys fetch counts by the hostname the
+			// Harper node reports, so an unresolved hostname would silently miss the assertion.
+			//   const counts = await origin.fetchCounts();
+			//   equal(counts[ctx.nodeA.hostname], 1, 'origin fetch should happen on nodeA (replicationSource)');
+			//   ok(!counts[ctx.nodeB.hostname], 'nodeB should not contact origin directly');
+		});
 
-		console.log('nodeA:', ctx.nodeA.hostname);
-		console.log('nodeB:', ctx.nodeB.hostname);
+		// Explicitly skipped: this is the gap harper-pro#416 tracks.  When routing is
+		// implemented, remove the `skip` option and wire up the per-node assertions from
+		// the TODO block above.
+		test(
+			'routes origin fetch to the replicationSource node (nodeA) — blocked on harper-pro#416',
+			{ skip: 'replicationSource routing not yet implemented — see harper-pro#416' },
+			() => {}
+		);
 
-		await connectNodes(ctx.nodeA, ctx.nodeB);
-		console.log('cluster connected');
-	});
+		test('(b) record is byte-identical on both nodes after replication converges', async () => {
+			const id = 'item-1'; // written in test (a)
 
-	after(async () => {
-		await Promise.all([
-			ctx.nodeA && teardownHarper({ harper: ctx.nodeA }),
-			ctx.nodeB && teardownHarper({ harper: ctx.nodeB }),
-		]);
-		await origin.close();
-	});
+			// Wait for the cache entry written during test (a) to replicate to nodeA.
+			let recordOnA = null;
+			for (let i = 0; i < 40 && !recordOnA; i++) {
+				await delay(250);
+				const results = await sendOperation(ctx.nodeA, {
+					operation: 'search_by_id',
+					table: 'OriginCache',
+					ids: [id],
+					get_attributes: ['id', 'value', 'fetchedBy'],
+				});
+				if (results.length) recordOnA = results[0];
+			}
+			ok(recordOnA, `record ${id} did not replicate to nodeA within the wait window`);
 
-	test('(a) origin is contacted exactly once on cache miss from nodeB', async () => {
-		await origin.reset();
-
-		const id = 'item-1';
-
-		// Request from nodeB triggers a cache miss. The sourcedFrom source fetches
-		// from the mock origin. With replicationSource: true, the intent is that
-		// the origin fetch is routed to nodeA; without the routing implementation
-		// it will be executed on nodeB directly — either way the total count is 1.
-		const response = await fetchWithRetry(`${ctx.nodeB.httpURL}/OriginCache/${id}`);
-		equal(response.status, 200, `expected 200 but got ${response.status}`);
-		const body = await response.json();
-		equal(body.id, id, 'record id should match');
-		equal(body.value, `origin-value-${id}`, 'record value should come from origin');
-
-		const total = await origin.totalFetches();
-		equal(total, 1, `expected exactly 1 origin fetch for the cache miss, got ${total}`);
-
-		// TODO(harper#1189): When replicationSource routing is implemented, tighten
-		// this to assert the fetch happened on nodeA specifically:
-		//   const counts = await origin.fetchCounts();
-		//   equal(counts[ctx.nodeA.hostname], 1, 'origin fetch should happen on nodeA (replicationSource)');
-		//   ok(!counts[ctx.nodeB.hostname], 'nodeB should not contact origin directly');
-	});
-
-	test('(b) record is byte-identical on both nodes after replication converges', async () => {
-		const id = 'item-1'; // written in test (a)
-
-		// Wait for the cache entry written during test (a) to replicate to nodeA.
-		let recordOnA = null;
-		for (let i = 0; i < 40 && !recordOnA; i++) {
-			await delay(250);
-			const results = await sendOperation(ctx.nodeA, {
+			const recordOnB = await sendOperation(ctx.nodeB, {
 				operation: 'search_by_id',
 				table: 'OriginCache',
 				ids: [id],
 				get_attributes: ['id', 'value', 'fetchedBy'],
-			});
-			if (results.length) recordOnA = results[0];
-		}
-		ok(recordOnA, `record ${id} did not replicate to nodeA within the wait window`);
+			}).then((r) => r[0]);
 
-		const recordOnB = await sendOperation(ctx.nodeB, {
-			operation: 'search_by_id',
-			table: 'OriginCache',
-			ids: [id],
-			get_attributes: ['id', 'value', 'fetchedBy'],
-		}).then((r) => r[0]);
+			ok(recordOnB, `record ${id} not found on nodeB`);
 
-		ok(recordOnB, `record ${id} not found on nodeB`);
+			// The key values must be identical on both nodes.
+			equal(recordOnA.value, recordOnB.value, 'value must be identical on both nodes');
+			equal(recordOnA.id, recordOnB.id, 'id must be identical on both nodes');
+		});
 
-		// The key values must be identical on both nodes.
-		equal(recordOnA.value, recordOnB.value, 'value must be identical on both nodes');
-		equal(recordOnA.id, recordOnB.id, 'id must be identical on both nodes');
-	});
+		test('(c) second request on nodeB is served from replicated cache without re-fetching origin', async () => {
+			await origin.reset();
 
-	test('(c) second request on nodeB is served from replicated cache without re-fetching origin', async () => {
-		await origin.reset();
+			const id = 'item-1'; // already cached from test (a)/(b)
 
-		const id = 'item-1'; // already cached from test (a)/(b)
+			// A second HTTP GET for the same id on nodeB should be served from the local
+			// replicated cache — no additional origin fetch expected.
+			const response = await fetchWithRetry(`${ctx.nodeB.httpURL}/OriginCache/${id}`);
+			equal(response.status, 200, `expected 200 but got ${response.status}`);
+			const body = await response.json();
+			equal(body.value, `origin-value-${id}`, 'value should still match origin');
 
-		// A second HTTP GET for the same id on nodeB should be served from the local
-		// replicated cache — no additional origin fetch expected.
-		const response = await fetchWithRetry(`${ctx.nodeB.httpURL}/OriginCache/${id}`);
-		equal(response.status, 200, `expected 200 but got ${response.status}`);
-		const body = await response.json();
-		equal(body.value, `origin-value-${id}`, 'value should still match origin');
+			const total = await origin.totalFetches();
+			equal(total, 0, `expected 0 origin fetches on cache hit, got ${total}`);
+		});
 
-		const total = await origin.totalFetches();
-		equal(total, 0, `expected 0 origin fetches on cache hit, got ${total}`);
-	});
+		test('(d) separate id also caches and replicates correctly', async () => {
+			await origin.reset();
 
-	test('(d) separate id also caches and replicates correctly', async () => {
-		await origin.reset();
+			const id = 'item-2';
 
-		const id = 'item-2';
+			// Request from nodeA this time to exercise the source-node path directly.
+			const responseA = await fetchWithRetry(`${ctx.nodeA.httpURL}/OriginCache/${id}`);
+			equal(responseA.status, 200);
+			const bodyA = await responseA.json();
+			equal(bodyA.value, `origin-value-${id}`);
 
-		// Request from nodeA this time to exercise the source-node path directly.
-		const responseA = await fetchWithRetry(`${ctx.nodeA.httpURL}/OriginCache/${id}`);
-		equal(responseA.status, 200);
-		const bodyA = await responseA.json();
-		equal(bodyA.value, `origin-value-${id}`);
+			const fetchesAfterA = await origin.totalFetches();
+			equal(fetchesAfterA, 1, 'exactly one origin fetch for nodeA miss');
 
-		const fetchesAfterA = await origin.totalFetches();
-		equal(fetchesAfterA, 1, 'exactly one origin fetch for nodeA miss');
+			// Wait for replication to nodeB.
+			let recordOnB = null;
+			for (let i = 0; i < 40 && !recordOnB; i++) {
+				await delay(250);
+				const results = await sendOperation(ctx.nodeB, {
+					operation: 'search_by_id',
+					table: 'OriginCache',
+					ids: [id],
+					get_attributes: ['id', 'value'],
+				});
+				if (results.length) recordOnB = results[0];
+			}
+			ok(recordOnB, `record ${id} did not replicate from nodeA to nodeB`);
+			equal(recordOnB.value, bodyA.value, 'replicated value must match origin value');
 
-		// Wait for replication to nodeB.
-		let recordOnB = null;
-		for (let i = 0; i < 40 && !recordOnB; i++) {
-			await delay(250);
-			const results = await sendOperation(ctx.nodeB, {
-				operation: 'search_by_id',
-				table: 'OriginCache',
-				ids: [id],
-				get_attributes: ['id', 'value'],
-			});
-			if (results.length) recordOnB = results[0];
-		}
-		ok(recordOnB, `record ${id} did not replicate from nodeA to nodeB`);
-		equal(recordOnB.value, bodyA.value, 'replicated value must match origin value');
+			// Now request from nodeB — should hit the replicated cache, no further origin fetch.
+			await origin.reset();
+			const responseB = await fetchWithRetry(`${ctx.nodeB.httpURL}/OriginCache/${id}`);
+			equal(responseB.status, 200);
+			const bodyB = await responseB.json();
+			equal(bodyB.value, bodyA.value, 'nodeB cache hit must match nodeA origin value');
 
-		// Now request from nodeB — should hit the replicated cache, no further origin fetch.
-		await origin.reset();
-		const responseB = await fetchWithRetry(`${ctx.nodeB.httpURL}/OriginCache/${id}`);
-		equal(responseB.status, 200);
-		const bodyB = await responseB.json();
-		equal(bodyB.value, bodyA.value, 'nodeB cache hit must match nodeA origin value');
-
-		const fetchesAfterB = await origin.totalFetches();
-		equal(fetchesAfterB, 0, 'no additional origin fetch after replication to nodeB');
-	});
-});
+			const fetchesAfterB = await origin.totalFetches();
+			equal(fetchesAfterB, 0, 'no additional origin fetch after replication to nodeB');
+		});
+	}
+);
