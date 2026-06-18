@@ -3756,12 +3756,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					tableId: request.table.tableId,
 					key: request.id,
 					resolve(entry) {
-						const { table, entry: existingEntry } = request;
+						const { table, entry: existingEntry, blobRepairOnly } = request;
 						// we can immediately resolve this because the data is available.
 						resolve(entry);
 						// However, if we are going to record this locally, we need to record it as a relocation event
-						// and determine new residency information
-						if (entry) return table._recordRelocate(existingEntry, entry);
+						// and determine new residency information. For blob-repair-only fetches we skip relocation
+						// (we only want the blob bytes written by BLOB_CHUNK, not to update the record's residency).
+						if (entry && !blobRepairOnly) return table._recordRelocate(existingEntry, entry);
+						// Return truthy for blob-repair-only so the GET_RECORD_RESPONSE handler does not schedule
+						// the freshly-received blobs for deferred deletion (they are exactly what we came for).
+						return !!blobRepairOnly;
 					},
 					reject,
 				});
