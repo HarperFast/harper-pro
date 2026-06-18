@@ -14,12 +14,15 @@
  */
 
 import { expect } from 'chai';
+import { PassThrough } from 'node:stream';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
 	recordBlobReplicationFailure,
 	shouldLogSustainedBlobDivergence,
 	markSourceBlobUnavailable,
 	isUnrecoverableSourceBlobError,
 	isPermanentSourceBlobErrorCode,
+	createBlobReceiveStream,
 	BLOB_FAILURE_COUNT_POSITION,
 	LAST_BLOB_FAILURE_TIME_POSITION,
 	BACK_PRESSURE_RATIO_POSITION,
@@ -138,5 +141,35 @@ describe('isPermanentSourceBlobErrorCode — only ENOENT is a permanent source a
 		expect(isPermanentSourceBlobErrorCode(undefined)).to.equal(false);
 		expect(isPermanentSourceBlobErrorCode(null)).to.equal(false);
 		expect(isPermanentSourceBlobErrorCode('')).to.equal(false);
+	});
+});
+
+describe('createBlobReceiveStream — an orphaned blob stream cannot crash the process (#1337)', () => {
+	it('returns a PassThrough', () => {
+		expect(createBlobReceiveStream()).to.be.instanceOf(PassThrough);
+	});
+
+	it('absorbs a destroy(error) instead of promoting it to an uncaughtException', async () => {
+		// Models the blobsTimer sweep destroying a blob whose save never wired up a consumer (an app/source
+		// error — e.g. `blob.save is not a function` on a v4→v5 store — left it orphaned in blobsInFlight).
+		// Without the listener attached at creation, this destroy emits an unhandled 'error' and Node would
+		// fail the test via uncaughtException on the next tick.
+		const stream = createBlobReceiveStream();
+		expect(stream.listenerCount('error')).to.be.greaterThan(0);
+		stream.destroy(new Error('Timeout waiting for blob stream in replication'));
+		await delay(0); // let the would-be unhandled 'error' fire (or not) before asserting
+		expect(stream.destroyed).to.equal(true);
+	});
+
+	it('does not swallow propagation: a later error listener (e.g. saveBlob\'s pipeline) still receives the error', async () => {
+		// Guards the one regression worth ruling out — that the creation-time no-op listener does not stop a
+		// wired consumer's handler from seeing real save errors (#403 classification depends on this).
+		const stream = createBlobReceiveStream();
+		const saveError = new Error('save failed');
+		let received;
+		stream.on('error', (err) => (received = err));
+		stream.destroy(saveError);
+		await delay(0);
+		expect(received).to.equal(saveError);
 	});
 });
