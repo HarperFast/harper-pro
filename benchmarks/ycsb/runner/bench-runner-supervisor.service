@@ -1,0 +1,18 @@
+[Unit]
+Description=Harper Bench GH Actions Runner Supervisor (multi-repo, serial JIT)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Host-specific: adjust the path and the repo list to your checkout. REPOS must be
+# quoted (it is space-separated) or systemd rejects the value after the first token.
+Environment=RUNNER_CPUS=16
+Environment="REPOS=HarperFast/harper-pro HarperFast/harper"
+ExecStart=%h/dev/scripts/bench-runner-supervisor.sh
+WorkingDirectory=%h/dev/harper-pro
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
