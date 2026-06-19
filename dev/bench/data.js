@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781869646363,
+  "lastUpdate": 1781869648936,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -766,6 +766,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "C read p99",
             "value": 2.91,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "24818b15a78e5b08f72bdd7ec5d3f999be68b140",
+          "message": "bench-runner: support org-level runner registration (default SCOPE=org)\n\nThe ephemeral bench runner was hard-coded to a repo-scoped registration on\nHarperFast/harper-pro, so only harper-pro workflows could use the harper-bench\nhost. Register at org scope by default (org URL + org registration token) so a\nsingle host loop — and thus a single job at a time, preserving comparable perf\nnumbers — serves every HarperFast repo's bench workflow (e.g. harper's new\nperf-benchmarks-nightly). SCOPE=repo restores the previous single-repo behavior.\n\nRequires the gh token to carry the admin:org scope for org-token minting.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-18T23:59:31Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/24818b15a78e5b08f72bdd7ec5d3f999be68b140"
+        },
+        "date": 1781869648916,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99",
+            "value": 6.31,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99",
+            "value": 7.06,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99",
+            "value": 9.02,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99",
+            "value": 72.38,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99",
+            "value": 80.92,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99",
+            "value": 59.66,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99",
+            "value": 122.65,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99",
+            "value": 258.25,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99",
+            "value": 103.7,
             "unit": "ms"
           }
         ]
