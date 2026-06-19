@@ -296,6 +296,31 @@ export function shouldLogSustainedBlobDivergence(
 	return failureCount >= threshold && !alreadyLogged;
 }
 
+// Test-only fault injection for the harper-pro#420 regression test. When HARPER_TEST_REPLICATION_WEDGE_DB
+// names a database, the FIRST receive (subscription) connection for it is forced into the open-but-idle
+// wedge: the socket is paused (no frames arrive, so nothing re-arms the watchdog) and its terminate/close
+// are neutralized so no 'close' event ever fires. The caller also freezes the watchdog's observed byte
+// count for this connection — `socket.bytesRead` counts OS-buffered bytes (incl. pong frames) even while
+// paused, so without freezing it the watchdog would keep seeing "activity" and never trip. Together these
+// reproduce the field condition where recovery cannot come from the close handler and must come from
+// forceReconnect's close-independent reconnect — so the test stays wedged on the pre-#420 bare-terminate()
+// code and only recovers with the fix. One-shot per worker thread, so the reconnect's fresh socket
+// recovers normally. Never arms in production: the env var is set only by the regression test.
+let replicationWedgeForTestArmed = false;
+export function armReplicationWedgeForTest(connection: any, ws: WebSocket, databaseName?: string): boolean {
+	// Guard the env var first: an unset var is undefined, and `undefined !== undefined` is false, so a
+	// connection with an undefined databaseName would otherwise arm the wedge in production.
+	if (!process.env.HARPER_TEST_REPLICATION_WEDGE_DB) return false;
+	if (!connection || replicationWedgeForTestArmed || process.env.HARPER_TEST_REPLICATION_WEDGE_DB !== databaseName)
+		return false;
+	replicationWedgeForTestArmed = true;
+	logger.warn?.(`[test] forcing open-but-idle replication wedge for db "${databaseName}" (harper-pro#420)`);
+	ws.terminate = () => {};
+	ws.close = () => {};
+	ws._socket?.pause();
+	return true; // tell the watchdog to treat this connection's byte count as frozen
+}
+
 /**
  * Mark an error as a *source-reported* blob unavailability: the sender told us (via a BLOB_CHUNK
  * `error` marker) that it cannot provide this blob — classically `ENOENT` because the blob was
@@ -587,6 +612,9 @@ export class NodeReplicationConnection extends EventEmitter {
 	// which is the post-close terminal marker. Anything else (protocol errors, peer
 	// DISCONNECT, etc.) leaves this false so the close handler schedules a retry.
 	intentionallyUnsubscribed = false;
+	// Set while a reconnect has already been scheduled (by forceReconnect or the close handler) so the
+	// two paths never both arm a connect() for the same drop — see forceReconnect / harper-pro#420.
+	reconnectScheduled = false;
 	nodeSubscriptions?: NodeSubscription[];
 	latency = 0;
 	replicateTablesByDefault: boolean;
@@ -612,7 +640,22 @@ export class NodeReplicationConnection extends EventEmitter {
 		if (this.intentionallyUnsubscribed) return;
 		if (!this.session) this.resetSession();
 		// TODO: Need to do this specifically for each node
-		this.socket = await createWebSocket(this.url, { serverName: this.nodeName, authorization: this.authorization });
+		try {
+			this.socket = await createWebSocket(this.url, {
+				serverName: this.nodeName,
+				authorization: this.authorization,
+			});
+		} finally {
+			// A forceReconnect-scheduled reconnect is now realized (or has failed) — stop suppressing the
+			// close handler's own retry. Clearing this only after this.socket is reassigned (rather than in
+			// the scheduling timer) keeps a late close from the superseded socket from arming a second
+			// connect() during the createWebSocket await window. See forceReconnect / harper-pro#420.
+			this.reconnectScheduled = false;
+		}
+		// Capture this attempt's socket so its close handler can tell whether it is still the live socket:
+		// forceReconnect can schedule a fresh connect() that replaces this.socket before this socket's
+		// (possibly delayed) terminate() finally fires close. See the close handler / harper-pro#420.
+		const socket = this.socket;
 
 		let session;
 		logger.debug?.(`Connecting to ${this.url}, db: ${this.databaseName}, process ${process.pid}`);
@@ -678,6 +721,11 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.sessionReject(error);
 		});
 		this.socket.on('close', (code, reasonBuffer) => {
+			// Ignore a late close from a socket we have already replaced — forceReconnect may have scheduled
+			// a fresh connect() that swapped in a new this.socket before this superseded socket's terminate()
+			// finally propagated its close. Acting on it would wrongly tear down the live connection (mark it
+			// disconnected, drop its subscription listener, reset its session). See harper-pro#420.
+			if (this.socket !== socket) return;
 			// Only treat the close as terminal when something explicitly marked it as a deliberate
 			// teardown (user unsubscribe or the empty-subscription delayed close). Protocol-level
 			// closes — peer DISCONNECT, unauthorized after open, node-name-mismatch, invalid
@@ -713,6 +761,9 @@ export class NodeReplicationConnection extends EventEmitter {
 				);
 			}
 			session = null;
+			// forceReconnect (receive-watchdog path) may have already scheduled the reconnect before
+			// this close fired — don't arm a second connect() for the same drop.
+			if (this.reconnectScheduled) return;
 			this.resetSession();
 			// try to reconnect
 			setTimeout(() => {
@@ -742,6 +793,50 @@ export class NodeReplicationConnection extends EventEmitter {
 	unsubscribe() {
 		this.intentionallyUnsubscribed = true;
 		this.socket?.close(1008, 'No longer subscribed');
+	}
+	// Drive recovery when the receive watchdog detects a silent connection. The normal recovery path is
+	// the close handler's retry, but an open-but-idle socket (copy stalls, no transport close) may never
+	// emit 'close' — and even when terminate() does fire one, the wedge reconciler skips a (peer, db)
+	// whose node entry is still connected:true, and the cached connection is still "reusable" so a
+	// re-subscribe hands back the same dead socket (replicator.isReusableConnection). So drive recovery
+	// here, independent of the close event: notify the main thread the node is disconnected (flipping the
+	// entry to connected:false for the reconciler backstop), tear the socket down, and schedule one fresh
+	// connect. See harper-pro#420.
+	forceReconnect() {
+		if (this.intentionallyUnsubscribed || this.isFinished || this.reconnectScheduled) return;
+		if (this.isConnected) {
+			if (this.nodeSubscriptions) {
+				disconnectedFromNode({
+					name: this.nodeName,
+					database: this.databaseName,
+					url: this.url,
+					finished: false,
+				});
+			}
+			this.isConnected = false;
+		}
+		this.reconnectScheduled = true;
+		// Drop this connection's stale subscription listener before reconnecting. The close handler
+		// normally does this (removeAllListeners), but its socket-identity guard early-returns for a
+		// superseded socket, so an open-but-idle wedge — whose old socket never fires a timely close —
+		// would otherwise leak one 'subscriptions-updated' listener per recovery cycle (eventually a
+		// MaxListenersExceededWarning). The fresh connect re-registers its own. See harper-pro#420.
+		this.removeAllListeners('subscriptions-updated');
+		this.resetSession();
+		const socket = this.socket;
+		// connect() clears reconnectScheduled once the new socket is installed (its finally), which keeps
+		// a late close from the old socket from double-scheduling during the createWebSocket await.
+		setTimeout(() => {
+			this.connect();
+		}, this.retryTime).unref();
+		// Match the close-handler backoff so a repeatedly-wedging peer backs off the same way (#339).
+		this.retryTime = Math.min(this.retryTime << 1, 30_000);
+		// Best-effort teardown of the dead socket; recovery above does not depend on the close it fires.
+		try {
+			socket?.terminate();
+		} catch {
+			// already destroyed — the scheduled connect still runs
+		}
 	}
 
 	getRecord(request) {
@@ -876,9 +971,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// sendPing tick above: if that tick is missed or its ws.terminate() does not propagate a
 	// 'close' event, the watchdog forces the reconnect path. See harper-pro#233 for the failure
 	// modes observed in the field.
+	const wedgedForTest = armReplicationWedgeForTest(options.connection, ws, databaseName);
 	receiveWatchdog = createReceiveWatchdog({
 		intervalMs: RECEIVE_SILENCE_THRESHOLD_MS,
-		getBytesRead: () => ws._socket?.bytesRead ?? 0,
+		getBytesRead: () => (wedgedForTest ? 0 : (ws._socket?.bytesRead ?? 0)),
 		onSilence: () => {
 			// Warn-level: if the active sendPing was healthy this watchdog should not have fired,
 			// so it is a signal that something is wrong upstream (event-loop stall, keepalive timer
@@ -889,7 +985,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.warn?.(
 				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${RECEIVE_SILENCE_THRESHOLD_MS}ms — terminating connection and reconnecting`
 			);
-			ws.terminate();
+			// On the client (subscription) side drive recovery through the connection so it does not depend
+			// on terminate() propagating a 'close' (an open-but-idle socket may never emit one). A
+			// server-accepted connection has no connection object to reconnect — the remote client
+			// reconnects — so just terminate. See harper-pro#420.
+			if (options.connection) options.connection.forceReconnect();
+			else ws.terminate();
 		},
 	});
 	const resetPingTimer = receiveWatchdog.reset;
