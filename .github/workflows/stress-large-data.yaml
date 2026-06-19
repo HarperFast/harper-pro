@@ -33,6 +33,14 @@ on:
     # 06:00 UTC nightly (midnight MDT)
     - cron: '0 6 * * *'
 
+# The `harper-bench` self-hosted box is shared with ycsb-cluster-nightly.yml. GitHub
+# concurrency groups are repo-scoped and matched by name across workflows, so using the
+# same group name in both serializes them on that one box. cancel-in-progress: false so a
+# queued run waits for the in-progress test rather than killing it mid-run.
+concurrency:
+  group: harper-bench-exclusive
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build Harper Pro (Node.js v${{ inputs.node-version || '24' }})

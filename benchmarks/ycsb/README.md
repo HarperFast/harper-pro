@@ -24,6 +24,10 @@ All core flags apply (see the core README). Cluster-specific defaults:
 - `--nodes` (default 3) — cluster size.
 - `--settle-ms` (default 10000) — wait after the load phase for asynchronous
   replication to converge before the read/run phase.
+- `--reps` (default 3) — repetitions per workload; the reported point is the
+  **median rep by throughput**, which keeps a single noisy rep from skewing the
+  nightly trend. Warmup runs once per workload (not per rep). Set `--reps=1` for
+  a quick single-pass run.
 - `--workloads` (default `C,B,A,F,E`) — see the caveat below.
 
 ## Round-robin + asynchronous replication
@@ -36,7 +40,7 @@ account for this:
   C/B/A/F/E run cleanly (their reads/scans target the converged dataset; updates
   replicate asynchronously but a read still returns a valid — possibly slightly
   stale — record, not an error).
-- **Workload D** (read-latest-after-insert) is *excluded by default*. Under
+- **Workload D** (read-latest-after-insert) is _excluded by default_. Under
   round-robin it is dominated by replication lag — its "latest" reads target keys
   just inserted on another node that often have not replicated yet, surfacing as
   read errors. Run it explicitly with `--workloads=D` to observe replication lag,

@@ -149,6 +149,9 @@ function withClusterDefaults(argv: string[]): string[] {
 	const args = [...argv];
 	if (!args.some((a) => a.startsWith('--workloads'))) args.push('--workloads=C,B,A,F,E');
 	if (!args.some((a) => a.startsWith('--settle-ms'))) args.push('--settle-ms=10000');
+	// The cluster bench is noisy, so each reported point is the median of several reps
+	// per workload (see harness.mts). Default to 3; override with --reps.
+	if (!args.some((a) => a.startsWith('--reps'))) args.push('--reps=3');
 	return args;
 }
 
@@ -167,6 +170,19 @@ async function main(): Promise<void> {
 		const baseUrls = nodes.map((n) => n.httpURL);
 		console.log(`Driving load round-robin across ${baseUrls.length} nodes.`);
 		const results = await runBenchmark(baseUrls, options, { topology: 'round-robin', nodeCount });
+
+		// Fail loudly if any requested workload didn't produce a result — a partial run must never
+		// be treated as a clean nightly. (writeResults below would otherwise overwrite the
+		// `latest.json` the convert/publish steps read, polluting the trend with a partial point.)
+		const expected = options.config.workloads;
+		const completed = new Set(results.workloads.map((w) => w.name));
+		const missing = expected.filter((name) => !completed.has(name));
+		if (missing.length > 0) {
+			throw new Error(
+				`incomplete run: ${completed.size}/${expected.length} workloads completed, missing ${missing.join(', ')}`
+			);
+		}
+
 		const file = await writeResults(results, options.out, 'cluster');
 		printReport(results);
 		console.log(`\nResults written to ${file}`);
