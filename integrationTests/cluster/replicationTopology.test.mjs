@@ -250,6 +250,11 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		// would delete `replication.databases: ['data']` and the restarted node would
 		// try to open `db: system` replication to its peers (which they reject).
 		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
+		// A killed node must restart, re-subscribe, and replay the audit log to catch
+		// up — on a loaded CI runner that can take several seconds, so poll generously
+		// (25 * 200ms = 5s) rather than the old ~2.2s, which a slow-but-healthy catchup
+		// could overrun.
+		const MAX_CATCHUP_RETRIES = 25;
 		let retries = 0;
 		// ensure the data gets to the central node
 		do {
@@ -260,7 +265,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 				get_attributes: ['id', 'name'],
 				ids: ['2'],
 			});
-			if (retries++ > 10) {
+			if (retries++ > MAX_CATCHUP_RETRIES) {
 				break;
 			}
 		} while (response.length === 0);
@@ -270,6 +275,14 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		// and the data is passed on to the other node
 		equal(response.length, 1);
 		equal(response[0].name, 'test while disconnected');
+		// Reset the retry budget: this loop polls a *different* node (transitive
+		// catchup to node 2), so it must get its own full poll window. Sharing the
+		// counter with the node-0 loop above let a slow-but-successful node-0
+		// catchup (e.g. a loaded CI runner) exhaust the budget, leaving node 2 a
+		// single ~200ms poll before this assertion fired — a false `0 == 1` even
+		// though the record arrived moments later (node 0/2 catchup is not lost,
+		// just slower under load; passes on faster runners).
+		retries = 0;
 		do {
 			await delay(200);
 			response = await sendOperation(ctx.nodes[2], {
@@ -278,11 +291,11 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 				get_attributes: ['id', 'name'],
 				ids: ['2'],
 			});
-			if (retries++ > 10) {
+			if (retries++ > MAX_CATCHUP_RETRIES) {
 				break;
 			}
 		} while (response.length === 0);
-		equal(response.length, 1);
+		equal(response.length, 1, 'Node 2 did not receive the transitively-replicated record from node 0');
 		equal(response[0].name, 'test while disconnected');
 	});
 	test('replicate per-record expiration so records evict on receivers', async () => {
