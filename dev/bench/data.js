@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781782946188,
+  "lastUpdate": 1781830603235,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -259,6 +259,38 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E",
             "value": 1398.94,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "24818b15a78e5b08f72bdd7ec5d3f999be68b140",
+          "message": "bench-runner: support org-level runner registration (default SCOPE=org)\n\nThe ephemeral bench runner was hard-coded to a repo-scoped registration on\nHarperFast/harper-pro, so only harper-pro workflows could use the harper-bench\nhost. Register at org scope by default (org URL + org registration token) so a\nsingle host loop — and thus a single job at a time, preserving comparable perf\nnumbers — serves every HarperFast repo's bench workflow (e.g. harper's new\nperf-benchmarks-nightly). SCOPE=repo restores the previous single-repo behavior.\n\nRequires the gh token to carry the admin:org scope for org-token minting.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-18T23:59:31Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/24818b15a78e5b08f72bdd7ec5d3f999be68b140"
+        },
+        "date": 1781830601887,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 7328.85,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C",
+            "value": 2196.51,
             "unit": "ops/sec"
           }
         ]
