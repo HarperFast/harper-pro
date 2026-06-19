@@ -71,7 +71,20 @@ jobs:
       - name: Convert results to benchmark format
         run: node core/benchmarks/ycsb/to-benchmark-json.mts core/benchmarks/ycsb/results/ycsb-cluster-latest.json core/benchmarks/ycsb/bench-out
 
+      # A cancelled or early-dispatched run can leave a stale or partial `latest.json` on the
+      # self-hosted runner; publishing it pollutes the trend with low partial points that look
+      # like regressions. Only publish when the converted output carries the FULL expected metric
+      # set: the `load` series plus one `workload <X>` series per requested workload. Series names
+      # carry a description suffix (e.g. "workload A — Update heavy ..."), so this matches the
+      # "workload <X>" prefix, not an exact name. Sets the `publish` output to gate the steps below.
+      - name: Validate complete result set
+        id: validate
+        env:
+          WORKLOADS: ${{ github.event.inputs.workloads || 'C,B,A,F,E' }}
+        run: node benchmarks/ycsb/validate-benchmark-json.mts core/benchmarks/ycsb/bench-out/throughput.json "$WORKLOADS"
+
       - name: Track cluster throughput trend
+        if: success() && steps.validate.outputs.publish == 'true'
         uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         with:
           name: YCSB Cluster Throughput
@@ -85,6 +98,7 @@ jobs:
           alert-comment-cc-users: '@kriszyp'
 
       - name: Track cluster latency (p99) trend
+        if: success() && steps.validate.outputs.publish == 'true'
         uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         with:
           name: YCSB Cluster Latency p99
