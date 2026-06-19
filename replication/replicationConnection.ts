@@ -95,8 +95,14 @@ const COMMITTED_UPDATE = 144;
 const DB_SCHEMA = 145;
 const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
-const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime
+const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime + copy-order version
 const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
+// Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
+// trusts that every table before the cursor's currentTable was already copied — only true if the
+// resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
+// changes so a leader resuming a cursor stamped with a different (or absent) version recopies from
+// scratch instead of silently skipping tables the old order had not yet reached (#421).
+const COPY_ORDER_VERSION = 1;
 export const CONFIRMATION_STATUS_POSITION = 0;
 export const RECEIVED_VERSION_POSITION = 1;
 export const RECEIVED_TIME_POSITION = 2;
@@ -370,6 +376,60 @@ export function discardMalformedCopyCursor(copyCursor: any, dbisDB: any, nodeId:
 	warn?.();
 	if (nodeId !== undefined) dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
 	return undefined;
+}
+
+// Small control-plane tables whose convergence gates cluster operations: hdb_deployment gates
+// deploy_component (awaitDeploymentRow), hdb_nodes gates membership. Copying them first keeps a
+// large, high-churn, largely node-local table (notably hdb_analytics, which by insertion order sorts
+// ahead of them) from gating control-plane convergence during a base copy (#421). Listed order is
+// the copy order within this group.
+export const COPY_PRIORITY_TABLES = ['hdb_deployment', 'hdb_nodes'];
+// High-volume tables copied last so they can never gate the tables above. hdb_analytics is ~node-local
+// telemetry that can reach millions of rows; it must not sit ahead of control-plane tables in the copy.
+export const COPY_DEPRIORITIZED_TABLES = ['hdb_analytics'];
+
+/**
+ * Order a database's table names for a base copy: COPY_PRIORITY_TABLES first (in listed order), then
+ * everything else in its original (insertion) order, then COPY_DEPRIORITIZED_TABLES last. Only the
+ * `system` database contains these names, so user databases are returned in unchanged insertion order.
+ *
+ * The ordering is a pure function of the table-name set, so it is identical on every run for a given
+ * set — which the resume skip-loop relies on (it skips tables "before" the cursor's currentTable). A
+ * resume that runs under a DIFFERENT order than the one that built the cursor is unsafe; that cross-
+ * version case is guarded by COPY_ORDER_VERSION at the loop, not here. Bump COPY_ORDER_VERSION if this
+ * ordering changes.
+ *
+ * Exported for `unitTests/replication/orderTablesForCopy.test.mjs`; production calls it inline below.
+ */
+export function orderTablesForCopy(tableNames: string[]): string[] {
+	const rankOf = (name: string): number => {
+		const priority = COPY_PRIORITY_TABLES.indexOf(name);
+		if (priority !== -1) return priority; // 0..(P-1): copied first, in listed order
+		const deprioritized = COPY_DEPRIORITIZED_TABLES.indexOf(name);
+		// P+1+i for deprioritized so they all rank after every "middle" table (which share rank P).
+		if (deprioritized !== -1) return COPY_PRIORITY_TABLES.length + 1 + deprioritized;
+		return COPY_PRIORITY_TABLES.length; // everything else, keeping insertion order via the index tiebreak
+	};
+	return (
+		tableNames
+			// rank computed once per table here, not inside the comparator (which would re-scan per compare).
+			.map((name, index) => ({ name, index, rank: rankOf(name) }))
+			// Stable sort: equal ranks keep insertion order, so the result is deterministic for a given set.
+			.sort((a, b) => a.rank - b.rank || a.index - b.index)
+			.map((entry) => entry.name)
+	);
+}
+
+/**
+ * Whether a leader may trust a resume cursor's skip-loop: true only when the cursor was built under the
+ * SAME copy order the leader uses now (orderTablesForCopy / COPY_ORDER_VERSION). A cursor from a
+ * pre-versioning leader carries no `copyOrder` — both an absent field and an explicit `undefined` decode
+ * to `undefined` here, which is (correctly) incompatible with any real version, forcing a full recopy
+ * rather than a skip that could omit tables the old order had not yet reached. Exported for
+ * `unitTests/replication/orderTablesForCopy.test.mjs`. (#421)
+ */
+export function isCopyResumeOrderCompatible(copyOrder: number | undefined, orderVersion: number): boolean {
+	return copyOrder === orderVersion;
 }
 
 /**
@@ -793,6 +853,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// (copyStartTime + last committed table/key) so an interrupted copy can resume instead of restarting.
 	let inCopyMode = false;
 	let copyModeStartTime = 0;
+	let copyModeOrderVersion; // copy-order version the leader announced in COPY_START; persisted in the cursor (#421)
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
 	let copyCompleteReceived = false;
 	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
@@ -1389,6 +1450,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
 						inCopyMode = true;
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
+						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
+						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
+						copyModeOrderVersion = message[2];
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
@@ -2076,10 +2140,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							subscriptionToHdbNodes?.end();
 						});
 						// find the earliest start time of the subscriptions
-						let copyResume: { copyStartTime: number; currentTable: string; afterKey: any } | undefined;
+						let copyResume:
+							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
+							| undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
-							// a follower resuming an interrupted bulk copy sends back where it left off
+							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
+							// last cursor if several subscriptions carry one — the single-cursor assumption is load-bearing
+							// for the copy loop below (the order-version guard, skip-loop, and copyStartTime anchor all key
+							// off this one copyResume); per-source resume would need a cursor per source.
 							if (subscription.copyResume) copyResume = subscription.copyResume;
 						}
 
@@ -2192,8 +2261,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// the post-copy resume point stays anchored to when the copy first began (see safety note).
 											const copyStartTime = copyResume?.copyStartTime ?? Date.now();
 											const nodeId = getThisNodeId(auditStore);
-											// Tell the follower a bulk copy is starting and its anchor time, so it tracks a resume cursor.
-											ws.send(encode([COPY_START, copyStartTime]));
+											// Tell the follower a bulk copy is starting, its anchor time, and the copy-order version,
+											// so it tracks a resume cursor that a later leader can validate before trusting the skip.
+											ws.send(encode([COPY_START, copyStartTime, COPY_ORDER_VERSION]));
 											let recordsSinceCheckpoint = 0;
 											// If resuming, the follower already committed every table before currentTable (records commit
 											// in stable iteration order), so skip to currentTable and continue after its last committed key.
@@ -2204,7 +2274,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// `tables` can be undefined on a freshly-joined peer, and a malformed cursor can have an
 											// undefined currentTable (#321); the `?.` makes both fall into the warn-and-recopy branch
 											// instead of throwing, which would bubble to the outer .catch and close the channel (1008).
-											if (copyResume && !tableToTableEntry(tables?.[copyResume.currentTable])) {
+											if (copyResume && !isCopyResumeOrderCompatible(copyResume.copyOrder, COPY_ORDER_VERSION)) {
+												// The cursor was built under a different copy order, or a pre-versioning leader (an absent
+												// or explicit-undefined copyOrder both decode to undefined here). The skip-loop below trusts
+												// that every table before currentTable was already copied, which only holds under the order
+												// that built the cursor — honoring it here could silently skip tables the old order had not yet
+												// reached (e.g. hdb_deployment behind hdb_analytics). Recopy from scratch (idempotent puts;
+												// copyStartTime is captured above, so the resume anchor survives the reset). (#421)
+												logger.warn?.(
+													'Copy-resume order version mismatch, restarting full copy',
+													copyResume.copyOrder,
+													'!=',
+													COPY_ORDER_VERSION
+												);
+												copyResume = undefined;
+												reachedResumeTable = true;
+											} else if (copyResume && !tableToTableEntry(tables?.[copyResume.currentTable])) {
 												// cursor table is gone, unreplicated, or the cursor itself is malformed — the skip loop
 												// would never reach it and would omit every later table, so recopy from scratch
 												// (idempotent puts; copyStartTime is captured above, so the resume anchor survives the reset).
@@ -2217,7 +2302,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											}
 											const resumeCurrentTable = copyResume?.currentTable;
 											const resumeAfterKey = copyResume?.afterKey;
-											for (const tableName in tables) {
+											// Copy control-plane tables before bulk tables so a large table (hdb_analytics) can't gate
+											// convergence of small tables that gate cluster operations (hdb_deployment). Ordering is a
+											// pure function of the table-name set, so it stays stable across runs — which the skip-loop
+											// above (reachedResumeTable) relies on; cross-version cursors are rejected by the guard above. (#421)
+											const orderedTableNames = orderTablesForCopy(tables ? Object.keys(tables) : []);
+											for (const tableName of orderedTableNames) {
 												const table = tables[tableName];
 												if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
 												if (!reachedResumeTable) {
@@ -2695,6 +2785,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							copyStartTime: copyModeStartTime,
 							currentTable: event.table,
 							afterKey: event.id,
+							copyOrder: copyModeOrderVersion, // validated by the leader before it trusts the resume skip (#421)
 						});
 					} else if (isCopyFrame && event && !event.table && copyFromNodeId !== undefined) {
 						logger.warn?.(connectionId, 'copy cursor not advanced: event has no table name', databaseName);
@@ -3174,6 +3265,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					copyStartTime: copyCursor.copyStartTime,
 					currentTable: copyCursor.currentTable,
 					afterKey: copyCursor.afterKey,
+					copyOrder: copyCursor.copyOrder, // leader rejects the resume if this != its current COPY_ORDER_VERSION (#421)
 				};
 				logger.warn?.(
 					`Resuming interrupted copy of database ${databaseName} from ${getNodeURL(node)} at table ${copyCursor.currentTable}`
