@@ -149,6 +149,9 @@ function withClusterDefaults(argv: string[]): string[] {
 	const args = [...argv];
 	if (!args.some((a) => a.startsWith('--workloads'))) args.push('--workloads=C,B,A,F,E');
 	if (!args.some((a) => a.startsWith('--settle-ms'))) args.push('--settle-ms=10000');
+	// The cluster bench is noisy, so each reported point is the median of several reps
+	// per workload (see harness.mts). Default to 3; override with --reps.
+	if (!args.some((a) => a.startsWith('--reps'))) args.push('--reps=3');
 	return args;
 }
 
