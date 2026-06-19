@@ -65,6 +65,7 @@ import {
 	getFileId,
 	findBlobsInObject,
 	getFilePathForBlob,
+	BLOB_INCOMPLETE_ERROR_CODE,
 } from '../core/resources/blob.ts';
 import { promises as fsPromises } from 'node:fs';
 import { PassThrough } from 'node:stream';

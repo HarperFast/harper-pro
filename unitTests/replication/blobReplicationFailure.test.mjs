@@ -27,7 +27,6 @@ import {
 	LAST_BLOB_FAILURE_TIME_POSITION,
 	BACK_PRESSURE_RATIO_POSITION,
 } from '#src/replication/replicationConnection';
-
 // The shared status buffer is 128 bytes = 16 Float64 slots (see getReplicationSharedStatus).
 const newSharedStatus = () => new Float64Array(16);
 
@@ -190,7 +189,7 @@ describe('createBlobReceiveStream — an orphaned blob stream cannot crash the p
 		expect(stream.destroyed).to.equal(true);
 	});
 
-	it('does not swallow propagation: a later error listener (e.g. saveBlob\'s pipeline) still receives the error', async () => {
+	it("does not swallow propagation: a later error listener (e.g. saveBlob's pipeline) still receives the error", async () => {
 		// Guards the one regression worth ruling out — that the creation-time no-op listener does not stop a
 		// wired consumer's handler from seeing real save errors (#403 classification depends on this).
 		const stream = createBlobReceiveStream();
