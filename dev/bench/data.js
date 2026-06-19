@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781846498380,
+  "lastUpdate": 1781869646363,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -323,6 +323,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload C",
             "value": 25764.1,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "24818b15a78e5b08f72bdd7ec5d3f999be68b140",
+          "message": "bench-runner: support org-level runner registration (default SCOPE=org)\n\nThe ephemeral bench runner was hard-coded to a repo-scoped registration on\nHarperFast/harper-pro, so only harper-pro workflows could use the harper-bench\nhost. Register at org scope by default (org URL + org registration token) so a\nsingle host loop — and thus a single job at a time, preserving comparable perf\nnumbers — serves every HarperFast repo's bench workflow (e.g. harper's new\nperf-benchmarks-nightly). SCOPE=repo restores the previous single-repo behavior.\n\nRequires the gh token to carry the admin:org scope for org-token minting.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-06-18T23:59:31Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/24818b15a78e5b08f72bdd7ec5d3f999be68b140"
+        },
+        "date": 1781869645385,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load",
+            "value": 10192.49,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C",
+            "value": 25347.88,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B",
+            "value": 21788.42,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A",
+            "value": 5692.56,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F",
+            "value": 5588.09,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E",
+            "value": 2118.18,
             "unit": "ops/sec"
           }
         ]
