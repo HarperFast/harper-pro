@@ -266,18 +266,15 @@ suite(
 						HARPER_NO_FLUSH_ON_EXIT: true,
 						HARPER_TEST_ORIGIN_URL: origin.url,
 					},
-				}),
+				}).then(() => { ctx.nodeA = ctxA.harper; }),
 				startHarper(ctxB, {
 					config: sharedConfig(hostnameB),
 					env: {
 						HARPER_NO_FLUSH_ON_EXIT: true,
 						HARPER_TEST_ORIGIN_URL: origin.url,
 					},
-				}),
+				}).then(() => { ctx.nodeB = ctxB.harper; }),
 			]);
-
-			ctx.nodeA = ctxA.harper;
-			ctx.nodeB = ctxB.harper;
 
 			console.log('nodeA:', ctx.nodeA.hostname);
 			console.log('nodeB:', ctx.nodeB.hostname);
