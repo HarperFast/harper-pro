@@ -1,0 +1,5 @@
+type OriginCache @table @export {
+	id: String @primaryKey
+	value: String
+	fetchedBy: String
+}
