@@ -42,7 +42,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 const STRESS = process.env.HARPER_RUN_STRESS_TESTS === '1';
 const FIXTURE_PATH = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
-	'fixture-qa177-blob-ttl-copy'
+	'fixture-blob-orphan-full-copy-converges'
 );
 
 const RECORD_COUNT = 20;

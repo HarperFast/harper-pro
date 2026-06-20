@@ -47,7 +47,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 const STRESS = process.env.HARPER_RUN_STRESS_TESTS === '1';
 const FIXTURE_PATH = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
-	'fixture-qa178-struct-dict'
+	'fixture-typed-struct-replication-divergence'
 );
 
 // Number of distinctly-shaped records per node; more shapes → higher collision probability.
