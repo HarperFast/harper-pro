@@ -30,6 +30,7 @@ import {
 	RECEIVING_STATUS_RECEIVING,
 	RECEIVED_TIME_POSITION,
 	RECEIVED_VERSION_POSITION,
+	readConnectionTruth,
 } from './replicationConnection.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import lodash from 'lodash';
@@ -116,6 +117,18 @@ const WEDGE_RECONCILE_THRESHOLD_MS = 30_000;
 const RECEIVE_STALL_THRESHOLD_MS = 15 * 60_000;
 let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
+
+// Resolve an auditStore for a database (any table's will do — the per-(db, peer) shared-memory status
+// buffer is keyed by database, not table) so the main thread can read the authoritative connection truth
+// written by the owning worker. See W1 (harper-pro#431).
+function getAuditStoreForDatabase(databaseName: string): any {
+	const database = getDatabases()[databaseName];
+	if (!database) return;
+	for (const tableName in database) {
+		const auditStore = database[tableName]?.auditStore;
+		if (auditStore) return auditStore;
+	}
+}
 
 // harper-pro#351 defense-in-depth. Pure helper so the fail-loud identity check (and its unit
 // tests) don't need the live subscription machinery. Given this node's resolved name/url and
@@ -912,6 +925,26 @@ export async function startOnMainThread(options) {
 	// can never get stuck.
 	function reconcileWorkers() {
 		const now = Date.now();
+		// Reconcile the inferred `connected` flag against the authoritative shared-memory truth the owning
+		// worker writes: a worker may have wedged or died without delivering a disconnect message, leaving
+		// connected:true for a link it knows is down (#289/#233). Correcting it here feeds the existing wedge
+		// recovery below (findWedgedNodeUrls keys on connected:false + disconnectedAt past the threshold).
+		for (const dbWorkers of connectionReplicationMap.values()) {
+			for (const [databaseName, entry] of dbWorkers) {
+				if (entry.connected === false) continue;
+				const nodeName = entry.nodes?.[0]?.name;
+				if (!nodeName) continue;
+				const auditStore = getAuditStoreForDatabase(databaseName);
+				if (!auditStore) continue;
+				const truth = readConnectionTruth(auditStore, databaseName, nodeName, now);
+				// Only correct a link that has reported liveness at least once (lastLiveness > 0); a
+				// never-yet-connected entry is left to the normal connect/retry path.
+				if (truth && !truth.connected && truth.lastLiveness > 0) {
+					entry.connected = false;
+					if (entry.disconnectedAt == null) entry.disconnectedAt = now;
+				}
+			}
+		}
 		const httpWorkers = workers.filter((worker) => worker.name === 'http');
 		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
 		const wedgedNodeUrls = findWedgedNodeUrls(

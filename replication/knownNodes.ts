@@ -97,9 +97,10 @@ export function getReplicationSharedStatus(
 	node_name: string,
 	callback?: () => void
 ) {
-	// 128 bytes = 16 Float64 slots. Positions 0..6 are the replication status fields and 7..8 the
-	// blob-divergence signals (see the *_POSITION exports in replicationConnection.ts); the rest is
-	// headroom for future metrics. This buffer is process-local shared memory (shared across this
+	// 128 bytes = 16 Float64 slots. Positions 0..6 are the replication status fields, 7..8 the
+	// blob-divergence signals, and 9..12 the W1 connection-truth fields (state/liveness/error-code/
+	// error-time; see the *_POSITION exports in replicationConnection.ts); 13..15 are headroom for
+	// future metrics. This buffer is process-local shared memory (shared across this
 	// node's threads via getUserSharedBuffer, never persisted or sent across nodes), so growing it is
 	// safe: every caller goes through this function, and a node runs a single version.
 	return new Float64Array(
