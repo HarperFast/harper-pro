@@ -29,6 +29,31 @@
 import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
+import { connect as netConnect } from 'node:net';
+
+// Wait until a TCP connect to host:port succeeds — i.e. the replication server has actually bound its
+// secure port. The CSR exchange in add_node connects directly to that port and throws on ECONNREFUSED
+// with no internal retry, so on a host where the replication listener takes a few seconds to bind we
+// must not fire add_node before it is accepting (otherwise setup races and fails).
+async function waitForPort(host, port, timeoutMs = 30000) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const open = await new Promise((resolve) => {
+			const socket = netConnect({ host, port }, () => {
+				socket.destroy();
+				resolve(true);
+			});
+			socket.on('error', () => resolve(false));
+			socket.setTimeout(1000, () => {
+				socket.destroy();
+				resolve(false);
+			});
+		});
+		if (open) return true;
+		await delay(250);
+	}
+	return false;
+}
 import {
 	startHarper,
 	teardownHarper,
@@ -81,6 +106,13 @@ suite('Incomplete (truncated) source blob does not permanently wedge replication
 			env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_BLOB_CHUNKS: BLOB_CHUNKS },
 		});
 		ctx.nodes = [nodeA.harper, nodeB.harper];
+
+		// A's replication server (the secure port add_node connects to for the CSR exchange) can take a
+		// few seconds to bind after startup; wait for it so setup doesn't race into ECONNREFUSED.
+		ok(
+			await waitForPort(nodeA.harper.hostname, 9933),
+			`node A replication server never started listening on ${nodeA.harper.hostname}:9933`
+		);
 
 		// Connect A↔B.
 		const tokenResp = await sendOperation(ctx.nodes[0], {
