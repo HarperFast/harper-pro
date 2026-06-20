@@ -349,15 +349,27 @@ export function isUnrecoverableSourceBlobError(error: unknown): boolean {
 }
 
 /**
- * Whether a sender-forwarded blob read-error CODE denotes a PERMANENT absence — the blob is gone at the
- * origin (evicted/expired), so re-streaming on reconnect reproduces the identical error and the receiver
- * may advance the resume cursor past it. Deliberately narrow: only `ENOENT`. Transient sender faults
- * (`EIO`, `EMFILE`, timeouts) and a missing code (older sender that doesn't forward one) return false, so
- * the receiver HOLDS the gap and a reconnect retries — never silently skipping a recoverable blob. See
- * harper-pro#403.
+ * Whether a sender-forwarded blob read-error denotes a PERMANENT failure at the origin — re-streaming on
+ * reconnect reproduces the identical error, so the receiver may advance the resume cursor past it rather
+ * than holding `hasBlobGap` forever and wedging the whole connection (harper-pro#403/#429). Two signals,
+ * either of which marks permanent:
+ *
+ *   - `errorCode === 'ENOENT'` — the classic case: the blob was evicted/expired at the origin. Kept for
+ *     pre-#1425 senders, whose read paths reject with the raw fs error (it carries `.code`).
+ *   - `errorStatus` 404 or 500 — the HTTP-style status core PR harper#1425 attaches to `BlobReadError`.
+ *     404 = the file is cleanly gone; 500 = confidently corrupt/incomplete (a self-consistent truncation,
+ *     or an incomplete read after the writer finished — harper-pro#429). Both are unrecoverable.
+ *
+ * 503 (write-in-progress / read-timeout) is TRANSIENT and deliberately excluded, as are transient fs
+ * faults (`EIO`, `EMFILE`) and a missing code/status (older sender that forwards neither) — all return
+ * false so the receiver HOLDS the gap and a reconnect retries, never silently skipping a recoverable blob.
+ *
+ * NB once harper#1425 lands, core wraps even ENOENT into a code-less `BlobReadError(404)`, so the
+ * `errorStatus` arm is what preserves the #405 advance-past for a missing source blob — not just the new
+ * #429 incomplete case. The `errorCode` arm remains for senders still running pre-#1425 core.
  */
-export function isPermanentSourceBlobErrorCode(errorCode: unknown): boolean {
-	return errorCode === 'ENOENT';
+export function isPermanentSourceBlobErrorCode(errorCode: unknown, errorStatus?: unknown): boolean {
+	return errorCode === 'ENOENT' || errorStatus === 404 || errorStatus === 500;
 }
 
 /**
@@ -1524,7 +1536,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					case BLOB_CHUNK: {
 						// this is a blob chunk, we need to write it to the blob store
 						const blobInfo = message[1];
-						const { fileId, size, finished, error, errorCode } = blobInfo;
+						const { fileId, size, finished, error, errorCode, errorStatus } = blobInfo;
 						let stream = blobsInFlight.get(fileId);
 						logger.debug?.(
 							'Received blob',
@@ -1560,13 +1572,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									const blobError = new Error(
 										'Blob error: ' + error + ' for record ' + (stream.recordId ?? 'unknown') + ' from ' + remoteNodeName
 									);
-									// Only a PERMANENT source absence (ENOENT — the blob was evicted/expired at the
-									// origin) is unrecoverable: re-streaming reproduces it, so the save `.catch` advances
-									// the resume cursor past it instead of holding forever (harper-pro#403). A transient
-									// source read fault (EIO, EMFILE, timeout) is left UNMARKED so the receiver holds
-									// the gap and a reconnect retries. An older sender that doesn't send `errorCode`
-									// also stays unmarked — the safe (hold) default for a mixed-version cluster.
-									if (isPermanentSourceBlobErrorCode(errorCode)) markSourceBlobUnavailable(blobError);
+									// A PERMANENT source failure — the blob is gone (ENOENT/404) or confidently
+									// corrupt/incomplete (500, harper-pro#429) at the origin — is unrecoverable:
+									// re-streaming reproduces it, so the save `.catch` advances the resume cursor past
+									// it instead of holding forever (harper-pro#403). A transient source read fault
+									// (EIO, EMFILE, timeout, 503 write-in-progress) is left UNMARKED so the receiver
+									// holds the gap and a reconnect retries. An older sender that sends neither
+									// `errorCode` nor `errorStatus` also stays unmarked — the safe (hold) default for a
+									// mixed-version cluster.
+									if (isPermanentSourceBlobErrorCode(errorCode, errorStatus)) markSourceBlobUnavailable(blobError);
 									stream.destroy(blobError);
 								} else if (stream.destroyed || stream.writableEnded) {
 									// The stream was torn down mid-blob and intentionally left in blobsInFlight
@@ -2936,11 +2950,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			);
 		} catch (error) {
 			logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
-			// Forward the error CODE alongside the message so the receiver can tell a PERMANENT source
-			// absence (ENOENT — the blob was evicted/expired at the origin; re-streaming reproduces it)
-			// from a TRANSIENT read fault (EIO, EMFILE, timeout — a reconnect may succeed). Only the
-			// former lets the receiver advance the resume cursor past the blob; the latter must still
-			// hold so the gap is retried. See harper-pro#403 and receiveBlobs's classification.
+			// Forward the error CODE and STATUS alongside the message so the receiver can tell a PERMANENT
+			// source failure — the blob is gone (ENOENT/404) or confidently corrupt/incomplete (500,
+			// harper-pro#429) — from a TRANSIENT read fault (EIO, EMFILE, timeout, 503 write-in-progress —
+			// a reconnect may succeed). Only the former lets the receiver advance the resume cursor past the
+			// blob; the latter must still hold so the gap is retried. `errorCode` is the fs `.code` (set by
+			// pre-#1425 core); `errorStatus` is the HTTP-style status core PR harper#1425 attaches to
+			// `BlobReadError` (its read paths no longer carry a raw fs `.code`). See harper-pro#403 and
+			// receiveBlobs's classification.
 			ws.send(
 				encode([
 					BLOB_CHUNK,
@@ -2949,6 +2966,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						finished: true,
 						error: errorToString(error),
 						errorCode: (error as { code?: string })?.code,
+						errorStatus: (error as { statusCode?: number })?.statusCode,
 					},
 					Buffer.alloc(0),
 				])

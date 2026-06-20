@@ -125,22 +125,51 @@ describe('isUnrecoverableSourceBlobError — source-missing vs local/transient c
 	});
 });
 
-describe('isPermanentSourceBlobErrorCode — only ENOENT is a permanent source absence (#403)', () => {
-	it('treats ENOENT (evicted/expired blob) as permanent → advance past', () => {
+describe('isPermanentSourceBlobErrorCode — permanent (gone/corrupt) vs transient source failure (#403/#429)', () => {
+	it('treats ENOENT (evicted/expired blob, pre-#1425 sender) as permanent → advance past', () => {
 		expect(isPermanentSourceBlobErrorCode('ENOENT')).to.equal(true);
 	});
 
-	it('treats transient sender faults as NOT permanent → hold the gap and retry on reconnect', () => {
+	it('treats transient sender fault codes as NOT permanent → hold the gap and retry on reconnect', () => {
 		// The crux of the cross-model-review blocker: a transient source read fault must not be skipped.
 		for (const code of ['EIO', 'EMFILE', 'EACCES', 'EBUSY', 'ETIMEDOUT']) {
 			expect(isPermanentSourceBlobErrorCode(code), code).to.equal(false);
 		}
 	});
 
-	it('treats a missing code (older sender that does not forward one) as NOT permanent — safe hold default', () => {
+	it('treats a missing code/status (older sender that forwards neither) as NOT permanent — safe hold default', () => {
 		expect(isPermanentSourceBlobErrorCode(undefined)).to.equal(false);
 		expect(isPermanentSourceBlobErrorCode(null)).to.equal(false);
 		expect(isPermanentSourceBlobErrorCode('')).to.equal(false);
+		expect(isPermanentSourceBlobErrorCode(undefined, undefined)).to.equal(false);
+	});
+
+	// harper#1425 wraps blob read errors in a BlobReadError carrying an HTTP-style statusCode (and NO raw
+	// fs `.code`), forwarded by sendBlobs as `errorStatus`. 404 (gone) and 500 (confidently
+	// corrupt/incomplete, #429) are permanent; 503 (write-in-progress / read-timeout) is transient.
+	it('treats statusCode 404 (file cleanly gone) as permanent → advance past', () => {
+		expect(isPermanentSourceBlobErrorCode(undefined, 404)).to.equal(true);
+	});
+
+	it('treats statusCode 500 (corrupt/incomplete source blob, #429) as permanent → advance past', () => {
+		// The #429 wedge: a confidently-incomplete/truncated source blob used to be misclassified as
+		// transient (no `.code`) and pinned the resume cursor forever. The forwarded 500 fixes that.
+		expect(isPermanentSourceBlobErrorCode(undefined, 500)).to.equal(true);
+	});
+
+	it('treats statusCode 503 (write-in-progress / read-timeout) as NOT permanent → hold and retry', () => {
+		expect(isPermanentSourceBlobErrorCode(undefined, 503)).to.equal(false);
+	});
+
+	it('ignores unrelated/successful statuses', () => {
+		for (const status of [200, 0, 400, 502, 504]) {
+			expect(isPermanentSourceBlobErrorCode(undefined, status), String(status)).to.equal(false);
+		}
+	});
+
+	it('either signal alone suffices (code from a pre-#1425 sender, or status from a #1425 sender)', () => {
+		expect(isPermanentSourceBlobErrorCode('ENOENT', 503)).to.equal(true); // code wins even with a transient status
+		expect(isPermanentSourceBlobErrorCode('EIO', 404)).to.equal(true); // status wins even with a transient code
 	});
 });
 
