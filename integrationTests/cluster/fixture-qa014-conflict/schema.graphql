@@ -1,0 +1,10 @@
+# QA-014 — replication conflict resolution determinism
+# Table with audit logging enabled so CRDT addTo cross-node merges work.
+# Plain scalar (score) for LWW characterisation.
+# Integer counter (counter) for addTo CRDT characterisation.
+type ConflictRecord @table(audit: "1d") @export {
+	id: ID @primaryKey
+	score: Int
+	label: String
+	counter: Int
+}
