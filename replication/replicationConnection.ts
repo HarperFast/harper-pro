@@ -1538,8 +1538,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				lastByteActivity = performance.now();
 				// Keep the shared-memory liveness fresh too, so the main thread's connection truth (W1 / #431)
 				// does not falsely flip this healthy-but-paused link to down and trigger a needless reconcile.
+				// LAST_LIVENESS_TIME_POSITION holds a wall-clock timestamp (Date.now()), since the main thread
+				// compares it against Date.now() in deriveConnectionTruth — not performance.now() like
+				// lastByteActivity above (which is the keepalive's own monotonic clock). See gemini review on #445.
 				const pausedStatus = getSharedStatus();
-				if (pausedStatus) pausedStatus[LAST_LIVENESS_TIME_POSITION] = lastByteActivity;
+				if (pausedStatus) pausedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
 			}
 			// Always send the keep-alive ping. ws.pause() only stops reads, not writes, and the accepted
 			// peer relies on our pings to keep its own receive timer alive even when it has no data to send
