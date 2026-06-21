@@ -191,6 +191,17 @@ export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationS
 				entry.worker = undefined;
 				owned = true;
 			}
+			// Also drop the dead worker from per-node refs (entry.nodes[].worker); connectToNextWorker sets
+			// those via Object.defineProperty (configurable, non-writable), so delete (not assign) clears them
+			// and avoids retaining the exited Worker. See gemini review on #446.
+			if (entry.nodes) {
+				for (const node of entry.nodes) {
+					if (node?.worker === worker) {
+						delete node.worker;
+						owned = true;
+					}
+				}
+			}
 		}
 	}
 	return owned;
@@ -1094,6 +1105,9 @@ export async function startOnMainThread(options) {
 				// staggering guarded against before #357 made the reconcile the single reassignment path.
 				const delay = staleReassignCount++ * RECONNECT_STAGGER_MS;
 				setTimeout(() => {
+					// The node may have been removed or replaced during the stagger delay; only re-drive it if it
+					// is still the current entry in nodeMap, so a deleted node isn't resurrected (gemini review).
+					if (nodeMap.get(node.name) !== node) return;
 					try {
 						onNodeUpdate(node);
 					} catch (error) {
