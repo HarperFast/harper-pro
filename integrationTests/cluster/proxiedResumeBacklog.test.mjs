@@ -1,19 +1,26 @@
 /**
  * Proxied resume must not silently skip backlog (harper-pro#426)
  *
- * A follower receiving a source's writes RELAYED through a bridge (a proxied / non-leader
- * subscription) has no top-level resume cursor for that source — the relayed per-source cursor's
- * `lastTxnTime` isn't recorded, so on every reconnect the source resolves to no cursor and the
- * subscription-build falls into the "starting from scratch" branch.
+ * The bug (harper-pro#426): when a source resolves to NO resume cursor on reconnect
+ * (`startTime === 1` — no direct seqId, no recorded `lastTxnTime`), the subscription-build used to
+ * resume a non-leader source from `Date.now() - 60000`, silently claiming "I already hold everything
+ * older than a minute." A follower that is actually BEHIND on records now older than that window never
+ * re-requests them — permanent, silent divergence even though it reconnects cleanly. The fix requests
+ * a full copy (`startTime = 0`) whenever a source resolves cursorless.
  *
- * The bug: that branch used to resume a non-leader source from `Date.now() - 60000`, which silently
- * claims "I already hold everything older than a minute." When the follower is actually BEHIND on
- * records that are now older than that window (it missed them while the bridge was down), they are
- * never re-requested and never delivered — permanent, silent divergence even though the follower
- * reconnects cleanly. The fix requests a full copy when there is no resume cursor.
+ * ⚠️ WHAT THIS TEST ACTUALLY COVERS (read before trusting it as a data-loss guard):
+ * This exercises the cursorless → full-copy resume DECISION and confirms the cluster still converges.
+ * It is NOT a data-loss regression. In this 3-node L→B→M line, M tracks a real DIRECT cursor to its
+ * bridge B (M's cursor is keyed on the connection node B, not on the relayed origin L), so even
+ * pre-fix M re-acquires the aged backlog through that direct B cursor and converges — verified
+ * empirically (convergence passes with the now-60s code; only the resume-decision log line differs).
+ * So here the DISCRIMINATING signal is "M requests a full copy (not a now-60s incremental) when a
+ * source resolves cursorless," not the record count.
  *
- * This test forces exactly that: M misses a batch while bridge B is down, the batch ages past the
- * 60s window, then B returns and M resumes its PROXIED subscription to L. M must still converge.
+ * The genuine #426 data loss needs a node with NO direct cursor to an origin whose writes arrived
+ * only RELAYED (emerges under churn when one node becomes the hub). That reproduction lives in the
+ * 4-node `integrationTests/stress/backlogRecovery.test.mjs`; treat THAT as the data-loss guard and
+ * this as a resume-decision + convergence smoke check.
  *
  * Topology (L = source, B = bridge/proxy + M's leader, M = transitive follower):
  *
@@ -160,8 +167,8 @@ suite('Proxied resume backlog (harper-pro#426)', { timeout: 240000 }, (ctx) => {
 		});
 		ok(await waitForSystemMesh(ctx.nodeB), 'B and M should mesh with a connected system-database socket');
 
-		// Phase 1: a baseline batch on L relays L -> B -> M. M applying these establishes its (proxied)
-		// view of L; the resulting per-source cursor is the one that, on resume, resolves to "no cursor".
+		// Phase 1: a baseline batch on L relays L -> B -> M. M applying these establishes its view of the
+		// data db and its DIRECT cursor to bridge B (which is what lets it converge pre-fix, see header).
 		const PHASE1 = 20;
 		for (let i = 0; i < PHASE1; i++) {
 			await sendOperation(nodeL, {
@@ -200,8 +207,9 @@ suite('Proxied resume backlog (harper-pro#426)', { timeout: 240000 }, (ctx) => {
 		// The bridge itself (direct follower of L) must recover the backlog — sanity that L still has it.
 		await waitForCount(ctx.nodeB, PHASE1 + PHASE2);
 
-		// THE REGRESSION ASSERTION: M must converge to the full set. Pre-fix, M resumes the proxied L
-		// stream from `now - 60000`, never re-requests the aged phase-2 backlog, and stalls at PHASE1.
+		// Convergence (smoke): M must reach the full set. NOTE this passes pre-fix too — M re-acquires the
+		// backlog through its direct B cursor regardless of the now-60s resume (see header). It guards
+		// against a gross regression, but it is NOT what discriminates the fix.
 		const TOTAL = PHASE1 + PHASE2;
 		await waitForCount(ctx.nodeM, TOTAL);
 
@@ -215,12 +223,13 @@ suite('Proxied resume backlog (harper-pro#426)', { timeout: 240000 }, (ctx) => {
 		});
 		equal(sample.length, 1, 'a phase-2 backlog record must be present on the proxied follower');
 
-		// The fix path should have engaged: with no resume cursor, M requests a full copy rather than a
-		// now-60s incremental. (Diagnostic, not the core guard — convergence above is the real assertion.)
+		// THE DISCRIMINATING ASSERTION (in this topology): when a source resolves cursorless, M must
+		// request a full copy rather than a now-60s incremental. This is what actually fails pre-fix;
+		// convergence above does not. (Genuine data-loss coverage lives in backlogRecovery.test.mjs.)
 		const log = await readLog(ctx.nodeM);
 		ok(
 			log.includes('no resume cursor for this source') || log.includes('Requesting full copy'),
-			'M should request a full copy when it has no resume cursor for the proxied source'
+			'M should request a full copy when a source resolves to no resume cursor'
 		);
 	});
 });
