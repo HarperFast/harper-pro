@@ -2926,10 +2926,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						} else if (event && !event.table && copyFromNodeId !== undefined) {
 							logger.warn?.(connectionId, 'copy cursor not advanced: event has no table name', databaseName);
 						}
-						// Persist the staged cursor + maybe finish the copy, but only if the watermark already
-						// covers it (no in-flight blob, no gap); otherwise the blob `.finally` does it on drain.
-						flushDurableCopyCursor();
 					}
+					// Persist any staged copy cursor + (when durable) finish the copy. Called on EVERY commit —
+					// copy frame or not — because the copy can complete on a trailing NON-copy frame: the sender
+					// streams catch-up audit-replay frames right after COPY_COMPLETE, and the commit that finally
+					// drains outstandingCommits to 0 may be one of those (isCopyFrame === false). If only copy
+					// frames re-checked, that trailing frame would leave the clone stuck in copy mode forever
+					// (cursor never cleared, per-record received-version updates suppressed → never Available).
+					// This restores the original unconditional maybeFinishCopy() call; the blob-durability gate
+					// now lives inside flushDurableCopyCursor()/maybeFinishCopy().
+					flushDurableCopyCursor();
 					if (!lastSequenceIdCommitted && sequenceIdReceived) {
 						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
 						setTimeout(() => {
@@ -3186,7 +3192,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// — OR an unrecoverable source-missing blob that was skipped (which intentionally leaves
 					// `hasBlobGap` unset, see the `.catch`) — lets the watermark catch up to the highest committed
 					// sequence, which the next end_txn/sequence-update persists as the resume cursor.
-					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
+					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) {
+						lastDurableSequenceId = committedSequence;
+						// The last in-flight blob is now durable. Any resume-cursor update we sent earlier while it
+						// was outstanding was clamped to the pre-drain watermark (cursorBlockedByBlob() at the
+						// REMOTE_SEQUENCE_UPDATE / SEQUENCE_ID_UPDATE sites). Re-emit an end_txn at the now-durable
+						// received sequence so core persists the advance. Without this, a copy that completes and
+						// then goes quiescent — no later sequence-update to carry the clamp forward — would leave the
+						// persisted resume cursor below copyStartTime and force a needless base copy on restart (#426).
+						// Safe: at drain with no gap, every received record (incl. blobs) through lastSequenceIdReceived
+						// is durable, and core applies this end_txn after the records already enqueued ahead of it, so
+						// the cursor never advances past an uncommitted/undurable point. max() keeps it monotonic.
+						tableSubscriptionToReplicator.send({
+							type: 'end_txn',
+							localTime: Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId),
+							remoteNodeIds: receivingDataFromNodeIds,
+						});
+					}
 					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
 					// durable: persist it (and finish the copy if COPY_COMPLETE already arrived). No-op outside
 					// copy mode or while blobs/gaps remain. This is the copy analog of the watermark advance above.
