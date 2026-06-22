@@ -54,6 +54,7 @@ import {
 	readLog,
 	waitForAllConnected,
 	prerenderId,
+	clusterSnapshot,
 } from './stressShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
@@ -157,9 +158,11 @@ if (!stressEnabled()) {
 			});
 
 			let cycle = 0;
+			let lastVictimIdx = -1;
 			while (Date.now() < endAt) {
 				cycle++;
 				const idx = (cycle - 1) % NODE_COUNT;
+				lastVictimIdx = idx;
 				const victim = ctx.nodes[idx];
 				console.log(
 					`[adversity] cycle ${cycle} t=${Math.round((Date.now() - startedAt) / 1000)}s ` +
@@ -235,16 +238,37 @@ if (!stressEnabled()) {
 				);
 				const max = Math.max(...counts);
 				const min = Math.min(...counts);
+				// Per-iteration progress so a post-mortem can tell a still-climbing
+				// laggard (window too short) from a hard stall (replication wedge).
+				console.log(
+					`[adversity] convergence poll t=${Math.round((Date.now() - deadline + 60_000) / 1000)}s ` +
+						`counts=[${counts.join(',')}] drift=${(max > 0 ? ((max - min) / max) * 100 : 0).toFixed(2)}%`
+				);
 				if (max > 0 && (max - min) / max < 0.01) break;
 				await delay(2000);
 			}
-			console.log(`[adversity] cycles=${cycle} final record_count=${counts.join(', ')}`);
+			console.log(
+				`[adversity] cycles=${cycle} lastVictim=node${lastVictimIdx} ` +
+					`(${ctx.nodes[lastVictimIdx]?.hostname}) final record_count=${counts.join(', ')}`
+			);
 			const max = Math.max(...counts);
 			const min = Math.min(...counts);
 			const drift = max > 0 ? (max - min) / max : 0;
+			// On divergence, dump each node's per-peer subscription state
+			// (connected? lastReceivedVersion / lastCommitConfirmed) so the next
+			// CI failure shows WHICH path stalled and how far behind it sat.
+			if (drift >= 0.01) {
+				for (let i = 0; i < ctx.nodes.length; i++) {
+					const snap = await clusterSnapshot(ctx.nodes[i]).catch((e) => ({ error: String(e) }));
+					console.log(
+						`[adversity] DIVERGENCE snapshot node${i} (${ctx.nodes[i]?.hostname}) count=${counts[i]}: ` +
+							JSON.stringify(snap)
+					);
+				}
+			}
 			ok(
 				drift < 0.01,
-				`record_count diverged > 1% across nodes after ${cycle} kill cycles: ${JSON.stringify(counts)} drift=${(drift * 100).toFixed(2)}%`
+				`record_count diverged > 1% across nodes after ${cycle} kill cycles: ${JSON.stringify(counts)} drift=${(drift * 100).toFixed(2)}% lastVictim=node${lastVictimIdx}`
 			);
 		});
 	});

@@ -3308,7 +3308,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			);
 			// A genuine resume = we have a persisted last-received sequence id (>1) for this node. Only then
 			// does the leader re-stream an already-applied tail worth fast-skipping. A fresh subscription
-			// (no persisted seqId, which later falls back to `Date.now() - 60000`) has no such tail, so we
+			// (no persisted seqId, which later falls back to a full copy, startTime 0) has no such tail, so we
 			// must NOT arm the latch from that synthetic start point. This checks the DIRECT sequence cursor;
 			// a proxied/indirect subscription has no direct cursor and instead arms from `proxiedSkipCursor`
 			// (set in the indirect block below).
@@ -3368,14 +3368,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				logger.debug?.('Updating start time from more recent txn recorded', connectedNode.name, startTime);
 			}
 			if (startTime === 1) {
-				// if we are starting from scratch and we have a leader URL, we directly ask for a copy from that database
+				// We resolved no resume cursor for this source (no direct seqId, no recorded lastTxnTime).
+				// That means we have no proven baseline for it, so we must fully copy: a `Date.now() - 60000`
+				// incremental start would silently claim "I already hold everything older than a minute" and
+				// drop the un-acquired backlog. That assumption breaks when an initial copy never completed
+				// (e.g. interrupted by restart churn) — the node then resumes from now-60s and permanently
+				// loses the gap, even though it never lost the connection (harper-pro#426). A full copy is
+				// idempotent, and the leader collapses redundant requests via the per-connection
+				// min(startTime); the cost of an occasional extra copy is acceptable versus silent data loss.
 				if (node.isLeader) {
 					logger.warn?.(`Requesting full copy of database ${databaseName} from ${getNodeURL(node)}`);
-					startTime = 0; // use this to indicate that we want to fully copy
 				} else {
-					// for all other nodes, start at right now (minus a minute for overlap)
-					startTime = Date.now() - 60000;
+					logger.warn?.(
+						`Requesting full copy of database ${databaseName} from ${getNodeURL(node)} (no resume cursor for this source)`
+					);
 				}
+				startTime = 0; // use this to indicate that we want to fully copy
 			}
 			let copyResume;
 			if (copyCursor) {
