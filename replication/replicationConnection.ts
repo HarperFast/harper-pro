@@ -362,6 +362,23 @@ export function armReplicationWedgeForTest(connection: any, ws: WebSocket, datab
 	return true; // tell the watchdog to treat this connection's byte count as frozen
 }
 
+// Test-only fault injection for harper-pro#453. When HARPER_TEST_COPY_STALL_ONCE_DB names a database,
+// the FIRST outbound base copy for it is stalled mid-flight: right after COPY_START the send loop awaits
+// a promise that never resolves, so no further copy frames (and no COPY_COMPLETE) are sent — but the
+// independent sendPing timer keeps the socket ping-alive. This reproduces the field wedge where the
+// receiver settles connected:true / "Receiving" with the copy frozen: keepalive pings keep its byte-level
+// receive watchdog from firing and the connected:false wedge-reconcile passes it by, so only the
+// copy-progress watchdog recovers it. One-shot per process, so the post-reconnect copy completes normally.
+// Never arms in production: the env var is set only by the regression test.
+let copyStallForTestArmed = false;
+export function maybeStallCopyForTest(databaseName?: string): Promise<void> | undefined {
+	if (!process.env.HARPER_TEST_COPY_STALL_ONCE_DB) return undefined;
+	if (copyStallForTestArmed || process.env.HARPER_TEST_COPY_STALL_ONCE_DB !== databaseName) return undefined;
+	copyStallForTestArmed = true;
+	logger.warn?.(`[test] stalling outbound base copy mid-flight for db "${databaseName}" (harper-pro#453)`);
+	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
+}
+
 /**
  * Mark an error as a *source-reported* blob unavailability: the sender told us (via a BLOB_CHUNK
  * `error` marker) that it cannot provide this blob — classically `ENOENT` because the blob was
@@ -1219,6 +1236,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 			pendingCopyCursor = null;
+			copyProgressWatchdog?.stop(); // copy is done; no longer watching for copy-progress stalls (#453)
 		}
 	}
 	// Persist the staged copy cursor and, if the copy is now fully durable, finish it — but ONLY when the
@@ -1330,6 +1348,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// Companion to receiveWatchdog that guards the back-pressure-paused window the byte watchdog is
 	// blind to (harper-pro#466). Armed on pause, stopped on resume — see addPauseReason/removePauseReason.
 	let pauseStallWatchdog: { reset: () => void; stop: () => void } | undefined;
+	// Copy-progress watchdog (harper-pro#453): keyed on base-copy app-frame progress rather than raw
+	// socket bytes, so keepalive pings (WS control frames, not 'message' events) can't suppress it the way
+	// they do the byte-level receiveWatchdog. `copyProgressFrames` advances on every received 'message'
+	// while in copy mode; if it stalls past the threshold while still `connected`, the copy has wedged.
+	let copyProgressWatchdog: { reset: () => void; stop: () => void } | undefined;
+	let copyProgressFrames = 0;
+	// Count ONLY base-copy frames as progress — COPY_START, the per-batch copy records (isCopyFrame), and
+	// copy BLOB_CHUNKs — not every 'message'. replicateOverWS is bidirectional, so counting arbitrary
+	// frames (schema/subscription updates, reverse-direction traffic) could re-arm the watchdog once per
+	// threshold and mask a genuinely stalled copy. Re-arms the watchdog while copying. (harper-pro#453)
+	const noteCopyProgress = () => {
+		copyProgressFrames++;
+		copyProgressWatchdog?.reset();
+	};
 	let blobsTimer;
 	const DELAY_CLOSE_TIME = 60000; // amount of time to wait before closing the connection if we haven't any activity and there are no subscriptions
 	let delayedClose: NodeJS.Timeout;
@@ -1445,6 +1477,29 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (pauseReasons === 0) receiveWatchdog?.reset();
 	};
 	resetPingTimer();
+	// Copy-progress watchdog: the byte-level receiveWatchdog above can't catch a base copy that stalls
+	// while the socket stays ping-alive — keepalive pings keep `bytesRead` advancing, so it never fires
+	// (a customer's 5.1.7 deploy wedge, harper-pro#453: follower parked connected:true, status "Receiving",
+	// version frozen,
+	// while the connected:false wedge-reconcile and this byte watchdog both pass it by). This watchdog is
+	// keyed on copy app-frame progress instead, so pings can't suppress it. Armed only while in copy mode
+	// (reset on COPY_START and on each in-copy 'message'; stopped on copy finish / pause). On a stall it
+	// forces the same close-independent reconnect, which restarts the copy from the leader. (harper-pro#453)
+	copyProgressWatchdog = createReceiveWatchdog({
+		// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 120000 and is shared with blobsTimer; guard
+		// against a misconfigured 0/negative that would otherwise forceReconnect in a tight loop.
+		intervalMs: blobTimeout > 0 ? blobTimeout : 120000,
+		getBytesRead: () => copyProgressFrames,
+		onSilence: () => {
+			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
+			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+			logger.warn?.(
+				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${blobTimeout}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453)`
+			);
+			if (options.connection) options.connection.forceReconnect();
+			else ws.terminate();
+		},
+	});
 	ws._socket?.setMaxListeners(200); // we should allow a lot of drain listeners for concurrent blob streams
 	let ratioOfBackPressureTime = 0;
 	let lastBackPressureCheck = 0;
@@ -1505,6 +1560,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Hand liveness off to the pause-stall watchdog for the paused window: the byte watchdog is now
 			// blind, but a leg can still die mid-pause, so guard it by consumer progress instead (harper-pro#466).
 			pauseStallWatchdog?.reset();
+			// Same reasoning for the copy-progress watchdog: paused means no 'message' frames arrive, so
+			// `copyProgressFrames` legitimately freezes — don't count backpressure as a copy stall (#453).
+			copyProgressWatchdog?.stop();
 		}
 		pauseReasons++;
 	}
@@ -1518,6 +1576,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// connection for the time it spent paused.
 			pauseStallWatchdog?.stop();
 			receiveWatchdog?.reset();
+			// Restart the copy-progress window too, but only while still copying (#453).
+			if (inCopyMode && !copyCompleteReceived) copyProgressWatchdog?.reset();
 			// Same reasoning for in-flight blob streams: while paused we stop reading the socket, so no
 			// blob chunks are processed and each stream's `lastChunk` clock goes stale even though the
 			// transfer is perfectly healthy. The blobsTimer below would then count the paused interval
@@ -1959,6 +2019,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
 						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)
 						lastCopyFlushTime = performance.now();
+						noteCopyProgress(); // COPY_START is itself copy progress; arm the watchdog (#453)
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
@@ -1970,6 +2031,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
 						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
 						copyCompleteReceived = true;
+						// No more copy frames will arrive, so stop watching for copy-progress stalls now rather
+						// than leaving the timer to wake the event loop until the commit drain finishes (#453).
+						copyProgressWatchdog?.stop();
 						maybeFinishCopy();
 						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
 						break;
@@ -1993,6 +2057,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
 						break;
 					case BLOB_CHUNK: {
+						if (inCopyMode) noteCopyProgress(); // copy blob chunk arriving — the copy is advancing (#453)
 						// this is a blob chunk, we need to write it to the blob store
 						const blobInfo = message[1];
 						const { fileId, size, finished, error, errorCode, errorStatus } = blobInfo;
@@ -2788,6 +2853,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// Tell the follower a bulk copy is starting, its anchor time, and the copy-order version,
 											// so it tracks a resume cursor that a later leader can validate before trusting the skip.
 											ws.send(encode([COPY_START, copyStartTime, COPY_ORDER_VERSION]));
+											// Test-only (#453): one-shot stall here leaves the follower in copy mode with no
+											// further frames while pings keep flowing — the connected:true copy wedge.
+											const copyStallForTest = maybeStallCopyForTest(databaseName);
+											if (copyStallForTest) await copyStallForTest;
 											let recordsSinceCheckpoint = 0;
 											// Paces the flush/yield cadence inside the copy loop below (see
 											// COPY_CHECKPOINT_MAX_INTERVAL_MS). Marked on every in-loop flush/yield.
@@ -3275,7 +3344,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Is this a bulk-copy frame? Only frames received before COPY_COMPLETE are part of the
 			// primary-key copy; later audit-replay frames must not be recorded as the resume cursor.
 			const isCopyFrame = messageIsCopyFrame; // latched above (consistent across the body despite awaits)
-			if (isCopyFrame) copyBytesSinceFlush += body.byteLength; // feed the copy-apply flush cadence (harper-pro#480)
+			if (isCopyFrame) {
+				copyBytesSinceFlush += body.byteLength; // feed the copy-apply flush cadence (harper-pro#480)
+				noteCopyProgress(); // a copy record batch arrived — the copy is advancing (#453)
+			}
 			// Capture the end_txn in a const so onCommit can clamp its `localTime` before the apply loop reads
 			// it: core Table.ts awaits onCommit and only THEN reads `event.localTime` to persist the resume
 			// cursor (same object — onCommit being callable proves the event isn't cloned across send()).
@@ -3414,6 +3486,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		clearInterval(sendPingInterval);
 		receiveWatchdog?.stop();
 		pauseStallWatchdog?.stop();
+		copyProgressWatchdog?.stop();
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
 		if (auditSubscription) auditSubscription.emit('close');
