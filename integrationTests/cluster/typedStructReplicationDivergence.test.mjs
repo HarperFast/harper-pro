@@ -121,7 +121,7 @@ suite('Typed-struct replication divergence resistance (randomAccessFields:true)'
 	before(async () => {
 		ctx.nodes = {};
 
-		const startNode = async (label) => {
+		const startNode = async (_label) => {
 			const hostname = await getNextAvailableLoopbackAddress();
 			const nodeCtx = { name: ctx.name, harper: { hostname } };
 			await startHarper(nodeCtx, {
