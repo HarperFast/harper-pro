@@ -3009,9 +3009,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// `error`, the for-await waits indefinitely, no finishing BLOB_CHUNK is ever sent, and the
 			// receiver's apply consumer wedges at `lastReceivedStatus:"Receiving"` until its own idle
 			// watchdog fires (core/resources/blob.ts) 120s later. With the timeout, the catch below
-			// emits the finishing error frame so the receiver advances cleanly. Off by default;
-			// HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS sets it.
-			const chunkTimeoutMs = Number(process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS) || 0;
+			// emits the finishing error frame so the receiver advances cleanly.
+			// Defaults ON to the replication blob timeout (REPLICATION_BLOBTIMEOUT, 120000 default) so a
+			// stalled send can't silently wedge a base copy out of the box (harper-pro#453). The
+			// HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS env var overrides it; set it to 0 to disable.
+			const chunkTimeoutMs =
+				process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS != null
+					? Number(process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS)
+					: blobTimeout;
 			const iterator = blob.stream()[Symbol.asyncIterator]();
 			while (true) {
 				let result: IteratorResult<any>;
