@@ -963,6 +963,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let copyModeOrderVersion; // copy-order version the leader announced in COPY_START; persisted in the cursor (#421)
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
 	let copyCompleteReceived = false;
+	// Staged key-based copy resume cursor (#426). The copy cursor (`{currentTable, afterKey, ...}` = "fully
+	// copied through this key") is KEY-based and, exactly like the sequence watermark, must only be
+	// PERSISTED once the copied key's blob — and every earlier blob — is durable. We must NOT await blobs in
+	// onCommit to achieve that (the same `ws.pause()` × in-flight-blob circular wait that deadlocked the
+	// non-copy path deadlocks copy mode too). So onCommit stages the most-recent copied key here and the
+	// durable-advance points (onCommit when nothing is in flight, and the blob save `.finally` when the last
+	// blob drains) persist it via flushDurableCopyCursor(). Null when there is nothing pending to persist.
+	let pendingCopyCursor: { copyStartTime: number; currentTable: any; afterKey: any; copyOrder: any } | null = null;
 	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
 	// received AND every copied batch has committed (outstandingCommits drained, which includes the final
 	// end_txn that advances the resume seqId to copyStartTime). We deliberately stay in copy mode until
@@ -971,7 +979,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// and risk a crash that loses both the cursor and the not-yet-durable rows, leaving the next start to
 	// resume from seqId with gaps.
 	function maybeFinishCopy() {
-		if (copyCompleteReceived && outstandingCommits === 0) {
+		// Finishing REMOVES the copy resume cursor and exits copy mode, so it must only happen once the copy
+		// is fully durable: COPY_COMPLETE received, every batch committed (outstandingCommits drained), AND —
+		// since onCommit no longer awaits blobs (#426) — every copied blob durably saved with no held gap.
+		// Removing the cursor while a blob is still in flight or a transient gap is held would let a crash
+		// resume from the post-copy seqId and skip re-streaming the not-yet-durable blob, losing it.
+		if (
+			copyCompleteReceived &&
+			outstandingCommits === 0 &&
+			outstandingBlobsToFinish.length === 0 &&
+			!hasBlobGap
+		) {
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
@@ -980,7 +998,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			inCopyMode = false;
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
+			pendingCopyCursor = null;
 		}
+	}
+	// Persist the staged copy cursor and, if the copy is now fully durable, finish it — but ONLY when the
+	// durable watermark covers the staged key (no in-flight blob, no held gap). This is the copy-mode analog
+	// of the `lastDurableSequenceId` advance: it runs from every durable-advance point (onCommit when nothing
+	// is in flight, and the blob save `.finally` when the last blob drains) so the key-based cursor advances
+	// without the apply loop ever blocking on blobs. A no-op outside copy mode / when blobs are still pending.
+	function flushDurableCopyCursor() {
+		if (outstandingBlobsToFinish.length > 0 || hasBlobGap) return;
+		if (pendingCopyCursor && copyFromNodeId !== undefined) {
+			tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], pendingCopyCursor);
+			pendingCopyCursor = null;
+			logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
+		}
+		maybeFinishCopy();
 	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
@@ -1562,6 +1595,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					case COPY_START:
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
 						inCopyMode = true;
+						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
@@ -2863,50 +2897,39 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// visibility; this is monotonic across batches. The durable watermark below only ever
 					// catches up TO this value, never past it.
 					committedSequence = Math.max(committedSequence, endTxnEvent.localTime ?? 0);
+					// Advance the durable watermark WITHOUT awaiting blobs — for copy AND non-copy frames alike.
+					// COPY MODE used to keep a synchronous `await Promise.all(outstandingBlobsToFinish)` here on
+					// the assumption only the non-copy catch-up path could deadlock. That was wrong (#426): the
+					// receive loop ws.pause()s on apply-queue backpressure, which starves the very BLOB_CHUNK
+					// frames the await waits on — a circular wait that hangs base copies too once a copy is
+					// blob-heavy enough to push the apply queue past the high-water mark mid-blob. So copy mode
+					// now uses the same async watermark: advance immediately only when nothing is in flight and
+					// there is no gap (the common blob-less / already-saved case); otherwise the watermark stays
+					// put and the in-flight blobs' `.finally` advances it once the last one drains. A failed blob
+					// (`hasBlobGap`) holds the watermark until a reconnect re-streams it. Because the watermark
+					// only ever includes durable blobs, the persisted cursor never advances past an unfinished or
+					// failed blob — preserving the no-data-loss guarantee — while the apply loop never blocks.
+					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
+					endTxnEvent.localTime = lastDurableSequenceId;
 					if (isCopyFrame) {
-						// COPY MODE retains the synchronous blob-wait. The copy-cursor put and maybeFinishCopy()
-						// below rely on the copied batch's blobs being durable before the copy cursor advances,
-						// and copy is the lower-frequency initial bulk-copy path (the deadlock was observed in
-						// non-copy catch-up). Awaiting here keeps copy durability exactly as before. The
-						// non-copy catch-up/live path (the deadlock-prone one) uses the async watermark instead
-						// and never blocks the apply loop on blobs.
-						if (outstandingBlobsToFinish.length > 0) await Promise.all(outstandingBlobsToFinish);
-						logger.trace?.('All copy blobs finished');
-						if (hasBlobGap) {
-							// A copy blob save failed; hold the copy cursor at the last fully-durable point so the
-							// next reconnect/restart re-streams and re-saves it rather than advancing over the gap.
-							endTxnEvent.localTime = lastDurableSequenceId;
-						} else {
-							lastDurableSequenceId = Math.max(lastDurableSequenceId, committedSequence);
-							endTxnEvent.localTime = lastDurableSequenceId;
+						// Stage this copied key as the copy resume cursor. It is only PERSISTED once its blob (and
+						// every earlier blob) is durable — by flushDurableCopyCursor() just below when nothing is in
+						// flight, or otherwise from the blob save `.finally`. Same key-based durability guarantee as
+						// before; it just no longer comes from blocking onCommit.
+						if (event?.table && copyFromNodeId !== undefined) {
+							pendingCopyCursor = {
+								copyStartTime: copyModeStartTime,
+								currentTable: event.table,
+								afterKey: event.id,
+								copyOrder: copyModeOrderVersion, // validated by the leader before it trusts the resume skip (#421)
+							};
+						} else if (event && !event.table && copyFromNodeId !== undefined) {
+							logger.warn?.(connectionId, 'copy cursor not advanced: event has no table name', databaseName);
 						}
-					} else {
-						// NON-COPY: do NOT await blobs (that await is what deadlocked). Advance the durable
-						// watermark immediately only when there is nothing in flight and no gap — the common
-						// blob-less or already-saved case advances the cursor normally. Otherwise the watermark
-						// stays where it is and the in-flight blobs' `.finally` will advance it once the last one
-						// drains. A failed blob (`hasBlobGap`) holds the watermark until a reconnect re-streams it.
-						if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
-						// Persist the resume cursor at the durable watermark. Because the watermark only includes
-						// durable blobs, the cursor never advances past an unfinished or failed blob — preserving
-						// the no-data-loss guarantee — while the apply loop no longer blocks on blob saves.
-						endTxnEvent.localTime = lastDurableSequenceId;
+						// Persist the staged cursor + maybe finish the copy, but only if the watermark already
+						// covers it (no in-flight blob, no gap); otherwise the blob `.finally` does it on drain.
+						flushDurableCopyCursor();
 					}
-					// Persist/clear the resume cursor only AFTER this batch's blobs are durable too. The cursor
-					// means "fully copied through this key"; advancing it before blob writes finish would let a
-					// crash skip re-requesting an unfinished blob, leaving the record pointing at missing data.
-					if (isCopyFrame && event?.table && copyFromNodeId !== undefined) {
-						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], {
-							copyStartTime: copyModeStartTime,
-							currentTable: event.table,
-							afterKey: event.id,
-							copyOrder: copyModeOrderVersion, // validated by the leader before it trusts the resume skip (#421)
-						});
-					} else if (isCopyFrame && event && !event.table && copyFromNodeId !== undefined) {
-						logger.warn?.(connectionId, 'copy cursor not advanced: event has no table name', databaseName);
-					}
-					// once the last copied batch (incl. its blobs) is durable, it's safe to drop the cursor
-					maybeFinishCopy();
 					if (!lastSequenceIdCommitted && sequenceIdReceived) {
 						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
 						setTimeout(() => {
@@ -3164,6 +3187,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// `hasBlobGap` unset, see the `.catch`) — lets the watermark catch up to the highest committed
 					// sequence, which the next end_txn/sequence-update persists as the resume cursor.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
+					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
+					// durable: persist it (and finish the copy if COPY_COMPLETE already arrived). No-op outside
+					// copy mode or while blobs/gaps remain. This is the copy analog of the watermark advance above.
+					flushDurableCopyCursor();
 				});
 			(tracked as any).blobId = blobId;
 			outstandingBlobsToFinish.push(tracked);
