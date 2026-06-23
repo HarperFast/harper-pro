@@ -244,6 +244,33 @@ export function resolveNodeForAuth(store: any, name: string, routeRecord?: any):
 }
 
 /**
+ * Reconstruct a minimal node descriptor from an hdb_nodes key whose stored value failed to decode,
+ * for the OUTBOUND subscription path (harper-pro#460). Returns `undefined` when the key is not a
+ * usable peer name (so the caller keeps skipping it).
+ *
+ * Background: `resolveNodeForAuth` recovers a `{ name }` descriptor for the *inbound* auth path so a
+ * cert-validated peer is accepted when its row transiently fails to decode. But that fallback is
+ * never reached by the *outbound* path — `subscribeToNodeUpdates` and the `processNodeUpdateEvent`
+ * put-path simply did `if (!node) continue` / dropped the event, so a follower whose replicated
+ * `hdb_nodes` rows decode to null at subscription-scan time (the state a `deploy_component`
+ * worker-reload leaves them in: the scan re-fires on the already-resolved main-thread module with no
+ * base-copy) built ZERO outbound subscriptions and silently stopped receiving replicated writes.
+ *
+ * The minimal descriptor mirrors `resolveNodeForAuth`'s `{ name }` but additionally sets
+ * `replicates: true`: unlike the auth path (which only needs the identity), the subscription path
+ * gates on `node.replicates` (see `shouldReplicateFromNode` and the early-return in
+ * `subscriptionManager.onNodeUpdate`). Without it the reconstructed node would be filtered out and no
+ * subscription created. `replicates: true` is the cluster default (it is what `ensureThisNode` and
+ * the route defaulting write) and `getNodeURL` already falls back to `wss://<name>:9933`, so the
+ * outbound subscription is re-established from the key alone. This is a recovery descriptor: the next
+ * decodable `hdb_nodes` update replaces it with the full record (carrying url/shard/subscriptions/etc.).
+ */
+export function reconstructNodeFromKey(key: unknown): { name: string; replicates: true } | undefined {
+	if (typeof key !== 'string' || key.length === 0) return undefined;
+	return { name: key, replicates: true };
+}
+
+/**
  * Existence probe for an hdb_nodes key that prefers the RANGE/scan path. A v5-era shared-structure
  * row can transiently misread to `[]`/null through the point lookup (`doesExist`/`get`) at early
  * boot (harper-pro#352), but `getKeys` lists the key reliably because it never decodes the value.
@@ -278,7 +305,14 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		// add any new nodes
 		if (event.value) server.nodes.push(event.value);
 		else {
-			console.error('Invalid node update event', event);
+			// put event with no decodable value — reconstruct a minimal descriptor from the key so
+			// server.nodes (and the outbound subscription fired below) still reflect the peer
+			// (harper-pro#460). A genuine delete is handled separately via isGenuineNodeDeletion.
+			const reconstructed = reconstructNodeFromKey(node_name);
+			// Cast: this is a deliberate partial recovery descriptor (name + replicates), parallel to
+			// the loosely-typed `event.value` push above; the next decodable update supplies url/shard.
+			if (reconstructed) server.nodes.push(reconstructed as any);
+			else console.error('Invalid node update event', event);
 		}
 	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
 		// add_node { isLeader: true } reaches us as a patch event; read the merged
@@ -307,14 +341,27 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			listener(event.value, event.id);
 		} else {
 			// A put/patch with no decodable value is a transient decode failure (e.g. stale
-			// msgpackr shared-structures, harper#1163) — NOT a node removal. Forwarding it here
-			// would make onNodeUpdate treat the nullish value as a deletion and unsubscribe the
-			// peer from every database. Drop it instead; the next decodable event self-heals.
-			logger.warn?.(
-				'hdb_nodes change event for',
-				event.id,
-				'had no decodable value; treating as a transient decode failure (see harper#1163), not a node deletion'
-			);
+			// msgpackr shared-structures, harper#1163) — NOT a node removal. We must NOT forward the
+			// nullish value (onNodeUpdate would treat it as a deletion and unsubscribe the peer from
+			// every database). But dropping it entirely left a put-event-driven peer with no outbound
+			// subscription (harper-pro#460). Reconstruct a minimal descriptor from the key and forward
+			// THAT instead, so the outbound subscription is (re)created; the next decodable event
+			// replaces it with the full record.
+			const reconstructed = reconstructNodeFromKey(event.id);
+			if (reconstructed) {
+				logger.warn?.(
+					'hdb_nodes change event for',
+					event.id,
+					'had no decodable value; subscribing to the peer by name so outbound replication is not lost (see harper-pro#460), treating it as a transient decode failure (see harper#1163), not a node deletion'
+				);
+				listener(reconstructed, event.id);
+			} else {
+				logger.warn?.(
+					'hdb_nodes change event for',
+					event.id,
+					'had no decodable value and no usable key; treating as a transient decode failure (see harper#1163), not a node deletion'
+				);
+			}
 		}
 	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
 		// isLeader patches need to drive subscription bootstrap; pass the merged record.
@@ -322,14 +369,48 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		if (fullRecord) listener(fullRecord, event.id);
 	}
 }
+/**
+ * Resolve the node descriptor to use for one hdb_nodes scan entry on the OUTBOUND subscription path.
+ * Returns the decoded record when valid; otherwise, when the key is range-visible but the value
+ * failed to decode (the state a deploy_component worker-reload leaves a follower's replicated rows
+ * in — see harper-pro#460/#352), reconstructs a minimal descriptor from the key so the outbound
+ * subscription is still created. Returns `undefined` only when there is no usable key (truly skip).
+ *
+ * Pure (store-free) so it can be unit-tested directly; see scanNodesForSubscription for the IO loop.
+ */
+export function resolveScannedNode(value: any, key: unknown): any {
+	if (value) return value;
+	return reconstructNodeFromKey(key);
+}
+
+/**
+ * Iterate the hdb_nodes range and drive `onNode(node, key)` for each peer, reconstructing a minimal
+ * descriptor for any range-visible-but-undecodable row (harper-pro#460). Takes the store explicitly
+ * so it can be unit-tested against a fake/real store without standing up a server. The shard/server
+ * bookkeeping stays in subscribeToNodeUpdates (its concern, and it owns the `server` global).
+ */
+export function scanNodesForSubscription(store: any, onNode: (node: any, key: any) => void) {
+	for (const entry of store.getRange({})) {
+		const { value, key } = entry;
+		const node = resolveScannedNode(value, key);
+		if (!node) continue;
+		if (!value) {
+			logger.warn?.(
+				'hdb_nodes record for',
+				key,
+				'did not decode at the subscription scan but is range-visible; subscribing to the peer by name so outbound replication is not lost (see harper-pro#460). The full record self-heals on the next decodable update.'
+			);
+		}
+		onNode(node, key);
+	}
+}
+
 export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {
 	runNodeUpdateWatcher(listener);
 	server.nodes = [];
 	server.shards = new Map();
 
-	for (let entry of getHDBNodeTable().primaryStore.getRange({})) {
-		const { value: node, key } = entry;
-		if (!node) continue;
+	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key) => {
 		server.nodes.push(node);
 		if (node.shard != undefined) {
 			let nodesForShard = server.shards.get(node.shard);
@@ -339,7 +420,7 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 			nodesForShard.push(node);
 		}
 		listener(node, key);
-	}
+	});
 	logger.debug?.(
 		'Known nodes at startup',
 		server.nodes.map((node) => node.name)
