@@ -3029,6 +3029,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			return;
 		}
 		blobsBeingSent.add(id);
+		const iterator = blob.stream()[Symbol.asyncIterator]();
 		try {
 			let lastBuffer: Buffer;
 			outstandingBlobsBeingSent++;
@@ -3046,7 +3047,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS != null
 					? Number(process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS)
 					: blobTimeout;
-			const iterator = blob.stream()[Symbol.asyncIterator]();
 			while (true) {
 				let result: IteratorResult<any>;
 				if (chunkTimeoutMs > 0) {
@@ -3109,6 +3109,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				])
 			);
 		} catch (error) {
+			try {
+				await iterator.return?.();
+			} catch {}
 			logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
 			// Forward the error CODE and STATUS alongside the message so the receiver can tell a PERMANENT
 			// source failure — the blob is gone (ENOENT/404) or confidently corrupt/incomplete (500,
