@@ -210,7 +210,7 @@ function setVersion(repoLabel, targetVersion) {
 	run(`git add ${toStage.join(' ')}`);
 
 	run(`git commit -m "Release ${newVersion}"`);
-	run(`git tag "${newVersion}"`);
+	run(`git tag -a "${newVersion}" -m "Release ${newVersion}"`);
 	ok(`  Tagged ${newVersion}`);
 	return newVersion;
 }
