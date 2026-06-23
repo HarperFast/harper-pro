@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782219290673,
+  "lastUpdate": 1782219292939,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -1242,6 +1242,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 42.93,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "6bb5289f313591b428a4ec92e43c1be7581df551",
+          "message": "test(cluster): promote QA-campaign cluster regression tests (#442)\n\n* test(cluster): promote QA-campaign cluster regression tests\n\nAdd three cluster regression tests verified passing on main:\n- replicationConflictDeterminism: LWW convergence, no split-brain, addTo CRDT merge\n- typedStructReplicationDivergence: randomAccessFields:true replication across pre-diverged/late-join/restart (#1163 guard)\n- blobOrphanFullCopyConverges: TTL-orphaned blobs don't wedge full-copy (#403/#405/#429 guard)\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n\n* test(cluster): rename QA fixtures to match test names\n\nfixture-qa014-conflict      -> fixture-replication-conflict-determinism\nfixture-qa178-struct-dict   -> fixture-typed-struct-replication-divergence\nfixture-qa177-blob-ttl-copy -> fixture-blob-orphan-full-copy-converges\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* fix(lint): prefix unused label param with underscore\n\n---------\n\nCo-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>",
+          "timestamp": "2026-06-23T00:03:20Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/6bb5289f313591b428a4ec92e43c1be7581df551"
+        },
+        "date": 1782219292912,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 4.65,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 7.08,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 7.97,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 17.21,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 18.08,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 16.16,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 30.84,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 96.02,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 42.32,
             "unit": "ms"
           }
         ]
