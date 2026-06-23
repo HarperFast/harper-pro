@@ -690,6 +690,20 @@ export async function unsubscribeFromNode({ url, nodes, database }) {
 	}
 }
 
+// Force a wedged-but-connected subscription to tear down and reconnect. Unlike unsubscribeFromNode this
+// keeps the cached connection in place (forceReconnect reconnects it), and unlike re-driving via
+// subscribe-to-node it actually recovers a connected:true entry: getSubscriptionConnection hands back a
+// still-`connected` connection unchanged (isReusableConnection is true), so a re-subscribe is a no-op for
+// a connection that is connected but no longer making progress. The main-thread reconcile uses this as a
+// defense-in-depth fallback when a subscription is stuck connected:true / Receiving with no progress and
+// the worker-local copy-progress watchdog (harper-pro#453) did not recover it. The connection-key lookup
+// mirrors unsubscribeFromNode so it resolves the same connection the subscribe path created.
+export function forceReconnectToNode({ url, nodes, database }) {
+	const connectionKey = url + '-' + (nodes?.[0]?.url ?? url);
+	const connection = connections.get(connectionKey)?.get(database);
+	if (connection) connection.forceReconnect();
+}
+
 (server as any).replication = {
 	exportIdMapping,
 	getIdOfRemoteNode,
