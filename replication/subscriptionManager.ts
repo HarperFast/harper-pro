@@ -239,6 +239,12 @@ export async function startOnMainThread(options) {
 	// we need to wait for the threads to start before we can start adding nodes
 	// but don't await this because this start function has to finish before the threads can start
 	whenThreadsStarted.then(async () => {
+		// A deploy_component reload re-invokes startOnMainThread on this same already-resolved module
+		// instance, so this callback re-fires (whenThreadsStarted is already settled). Reset the
+		// module-level route list before repopulating so routes don't accumulate duplicates across
+		// deploys; the node-update watcher started by subscribeToNodeUpdates below is itself idempotent
+		// (it supersedes the prior watcher rather than stacking one — see knownNodes.ts). harper-pro#460.
+		routes.length = 0;
 		const nodes = [];
 		// if we are getting notified of system table updates, hdbNodes could be absent
 		for await (const node of databases.system.hdb_nodes?.search([]) || []) {
@@ -290,7 +296,10 @@ export async function startOnMainThread(options) {
 				console.error(error);
 			}
 		}
-		subscribeToNodeUpdates(onNodeUpdate);
+		// keyed 'subscription-manager' so a deploy_component reload (which re-fires this callback)
+		// supersedes only this watcher, while the CA-monitor and replication-confirmation watchers
+		// keyed elsewhere keep running concurrently (harper-pro#460).
+		subscribeToNodeUpdates(onNodeUpdate, 'subscription-manager');
 	});
 	let isFullyReplicating;
 	/**

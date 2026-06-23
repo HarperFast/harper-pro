@@ -319,6 +319,10 @@ export function start(options) {
 }
 export function monitorNodeCAs(listener: () => void) {
 	let lastCaCount = 0;
+	// keyed 'ca-monitor' so this watcher runs concurrently with the subscription-manager and
+	// replication-confirmation watchers; without a distinct key the subscription-manager's default-key
+	// subscribeToNodeUpdates would supersede (stop) this one and CA additions/rotations would stop
+	// updating the replication TLS contexts (harper-pro#460 review follow-up).
 	subscribeToNodeUpdates((node) => {
 		logger.debug('Adding node CA', node?.ca?.slice(0, 60));
 		if (node?.ca) {
@@ -330,7 +334,7 @@ export function monitorNodeCAs(listener: () => void) {
 				listener?.();
 			}
 		}
-	});
+	}, 'ca-monitor');
 }
 export function disableReplication(disabled = true) {
 	replicationDisabled = disabled;

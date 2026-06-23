@@ -96,38 +96,84 @@ type WatcherOptions = {
 	maxDelayMs?: number;
 	maxRestarts?: number;
 };
-export async function runNodeUpdateWatcher(listener: (node: any, id: string) => void, options: WatcherOptions = {}) {
+
+// Generation tokens guarding against duplicate node-update watchers (harper-pro#460). A
+// `deploy_component` reload re-invokes `replicator.startOnMainThread` on the SAME already-resolved
+// main-thread module instance; its `whenThreadsStarted.then()` fires again and calls
+// `subscribeToNodeUpdates` → `runNodeUpdateWatcher` a second (third, …) time. Each call previously
+// started an independent unbounded watcher loop and an extra forEachReplicatedDatabase chain,
+// accumulating listeners across deploys (the observed `MaxListenersExceededWarning`) and double-
+// processing every hdb_nodes event. We let only the most-recent watcher per logical purpose run:
+// starting a new one for a given key bumps that key's generation, closes the prior iterator, and the
+// older loop exits on its next turn. The key namespaces watchers so the two concurrent legitimate
+// consumers (subscription management vs replication-confirmation tracking) don't supersede each
+// other — only a re-invocation of the SAME consumer does.
+const watcherGenerations = new Map<string, number>();
+const watcherIterators = new Map<string, AsyncIterator<any>>();
+const DEFAULT_WATCHER_KEY = 'default';
+
+/** Stop the currently-running node-update watcher for `key` (if any). Idempotent. */
+export function stopNodeUpdateWatcher(key: string = DEFAULT_WATCHER_KEY) {
+	watcherGenerations.set(key, (watcherGenerations.get(key) ?? 0) + 1);
+	const iterator = watcherIterators.get(key);
+	watcherIterators.delete(key);
+	// Closing the iterator breaks the `for await` the active loop is parked on; the generation bump
+	// makes the loop exit instead of restarting even if the close races the next iteration.
+	iterator?.return?.(undefined);
+}
+
+export async function runNodeUpdateWatcher(
+	listener: (node: any, id: string) => void,
+	options: WatcherOptions & { key?: string } = {}
+) {
 	const subscribe = options.subscribe ?? (() => getHDBNodeTable().subscribe({}));
 	const processEvent = options.processEvent ?? processNodeUpdateEvent;
 	const restartDelayMs = options.restartDelayMs ?? NODE_WATCHER_RESTART_DELAY_MS;
 	const maxDelayMs = options.maxDelayMs ?? NODE_WATCHER_MAX_DELAY_MS;
 	const maxRestarts = options.maxRestarts ?? Infinity;
+	const key = options.key ?? DEFAULT_WATCHER_KEY;
+	// Supersede any watcher already running for this key so a reload doesn't stack a second loop
+	// (harper-pro#460). Distinct keys (subscription vs confirmation) run concurrently and untouched.
+	stopNodeUpdateWatcher(key);
+	const generation = watcherGenerations.get(key) ?? 0;
 	let restarts = 0;
 	let consecutiveFailures = 0;
-	while (restarts < maxRestarts) {
+	const isCurrent = () => generation === (watcherGenerations.get(key) ?? 0);
+	while (restarts < maxRestarts && isCurrent()) {
 		let iteratedSuccessfully = false;
 		try {
 			const events = await subscribe();
+			if (!isCurrent()) break; // superseded while awaiting subscribe
 			iteratedSuccessfully = true; // we got past subscribe — any later throw is a fresh failure
-			for await (const event of events) {
-				try {
-					await processEvent(event, listener);
-				} catch (error) {
-					// Don't let a single bad event tear down the watcher — log and continue.
-					// Optional chaining: this `logger` is the level-conditional one, where
-					// `.error` is undefined when the configured level filters it out, and an
-					// uncaught TypeError here would defeat the whole recovery loop.
-					logger.error?.('Error processing hdb_nodes update event', error);
+			const iterator = events[Symbol.asyncIterator]();
+			watcherIterators.set(key, iterator);
+			try {
+				while (true) {
+					const { value: event, done } = await iterator.next();
+					if (done || !isCurrent()) break;
+					try {
+						await processEvent(event, listener);
+					} catch (error) {
+						// Don't let a single bad event tear down the watcher — log and continue.
+						// Optional chaining: this `logger` is the level-conditional one, where
+						// `.error` is undefined when the configured level filters it out, and an
+						// uncaught TypeError here would defeat the whole recovery loop.
+						logger.error?.('Error processing hdb_nodes update event', error);
+					}
 				}
+			} finally {
+				if (watcherIterators.get(key) === iterator) watcherIterators.delete(key);
 			}
+			if (!isCurrent()) break; // superseded — exit without restarting
 			logger.warn?.('hdb_nodes subscription ended unexpectedly; restarting watcher');
 		} catch (error) {
+			if (!isCurrent()) break; // superseded watcher; iterator.return rejected
 			logger.error?.('hdb_nodes watcher failed; restarting', error);
 		}
 		// Successful subscribe → reset backoff so a fresh failure restarts quickly.
 		consecutiveFailures = iteratedSuccessfully ? 0 : consecutiveFailures + 1;
 		restarts++;
-		if (restarts >= maxRestarts) return;
+		if (restarts >= maxRestarts || !isCurrent()) return;
 		const delay = Math.min(restartDelayMs * Math.pow(2, Math.min(consecutiveFailures, 5)), maxDelayMs);
 		await new Promise((resolve) => setTimeout(resolve, delay));
 	}
@@ -244,6 +290,33 @@ export function resolveNodeForAuth(store: any, name: string, routeRecord?: any):
 }
 
 /**
+ * Reconstruct a minimal node descriptor from an hdb_nodes key whose stored value failed to decode,
+ * for the OUTBOUND subscription path (harper-pro#460). Returns `undefined` when the key is not a
+ * usable peer name (so the caller keeps skipping it).
+ *
+ * Background: `resolveNodeForAuth` recovers a `{ name }` descriptor for the *inbound* auth path so a
+ * cert-validated peer is accepted when its row transiently fails to decode. But that fallback is
+ * never reached by the *outbound* path — `subscribeToNodeUpdates` and the `processNodeUpdateEvent`
+ * put-path simply did `if (!node) continue` / dropped the event, so a follower whose replicated
+ * `hdb_nodes` rows decode to null at subscription-scan time (the state a `deploy_component`
+ * worker-reload leaves them in: the scan re-fires on the already-resolved main-thread module with no
+ * base-copy) built ZERO outbound subscriptions and silently stopped receiving replicated writes.
+ *
+ * The minimal descriptor mirrors `resolveNodeForAuth`'s `{ name }` but additionally sets
+ * `replicates: true`: unlike the auth path (which only needs the identity), the subscription path
+ * gates on `node.replicates` (see `shouldReplicateFromNode` and the early-return in
+ * `subscriptionManager.onNodeUpdate`). Without it the reconstructed node would be filtered out and no
+ * subscription created. `replicates: true` is the cluster default (it is what `ensureThisNode` and
+ * the route defaulting write) and `getNodeURL` already falls back to `wss://<name>:9933`, so the
+ * outbound subscription is re-established from the key alone. This is a recovery descriptor: the next
+ * decodable `hdb_nodes` update replaces it with the full record (carrying url/shard/subscriptions/etc.).
+ */
+export function reconstructNodeFromKey(key: unknown): { name: string; replicates: true } | undefined {
+	if (typeof key !== 'string' || key.length === 0) return undefined;
+	return { name: key, replicates: true };
+}
+
+/**
  * Existence probe for an hdb_nodes key that prefers the RANGE/scan path. A v5-era shared-structure
  * row can transiently misread to `[]`/null through the point lookup (`doesExist`/`get`) at early
  * boot (harper-pro#352), but `getKeys` lists the key reliably because it never decodes the value.
@@ -278,7 +351,14 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		// add any new nodes
 		if (event.value) server.nodes.push(event.value);
 		else {
-			console.error('Invalid node update event', event);
+			// put event with no decodable value — reconstruct a minimal descriptor from the key so
+			// server.nodes (and the outbound subscription fired below) still reflect the peer
+			// (harper-pro#460). A genuine delete is handled separately via isGenuineNodeDeletion.
+			const reconstructed = reconstructNodeFromKey(node_name);
+			// Cast: this is a deliberate partial recovery descriptor (name + replicates), parallel to
+			// the loosely-typed `event.value` push above; the next decodable update supplies url/shard.
+			if (reconstructed) server.nodes.push(reconstructed as any);
+			else console.error('Invalid node update event', event);
 		}
 	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
 		// add_node { isLeader: true } reaches us as a patch event; read the merged
@@ -307,14 +387,27 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			listener(event.value, event.id);
 		} else {
 			// A put/patch with no decodable value is a transient decode failure (e.g. stale
-			// msgpackr shared-structures, harper#1163) — NOT a node removal. Forwarding it here
-			// would make onNodeUpdate treat the nullish value as a deletion and unsubscribe the
-			// peer from every database. Drop it instead; the next decodable event self-heals.
-			logger.warn?.(
-				'hdb_nodes change event for',
-				event.id,
-				'had no decodable value; treating as a transient decode failure (see harper#1163), not a node deletion'
-			);
+			// msgpackr shared-structures, harper#1163) — NOT a node removal. We must NOT forward the
+			// nullish value (onNodeUpdate would treat it as a deletion and unsubscribe the peer from
+			// every database). But dropping it entirely left a put-event-driven peer with no outbound
+			// subscription (harper-pro#460). Reconstruct a minimal descriptor from the key and forward
+			// THAT instead, so the outbound subscription is (re)created; the next decodable event
+			// replaces it with the full record.
+			const reconstructed = reconstructNodeFromKey(event.id);
+			if (reconstructed) {
+				logger.warn?.(
+					'hdb_nodes change event for',
+					event.id,
+					'had no decodable value; subscribing to the peer by name so outbound replication is not lost (see harper-pro#460), treating it as a transient decode failure (see harper#1163), not a node deletion'
+				);
+				listener(reconstructed, event.id);
+			} else {
+				logger.warn?.(
+					'hdb_nodes change event for',
+					event.id,
+					'had no decodable value and no usable key; treating as a transient decode failure (see harper#1163), not a node deletion'
+				);
+			}
 		}
 	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
 		// isLeader patches need to drive subscription bootstrap; pass the merged record.
@@ -322,14 +415,107 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		if (fullRecord) listener(fullRecord, event.id);
 	}
 }
-export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {
-	runNodeUpdateWatcher(listener);
+/**
+ * Distinguish a genuine `remove_node` tombstone from a transient decode failure for a range-visible
+ * hdb_nodes row whose scan value was nullish (harper-pro#460 review). A deleted node leaves a row
+ * whose POINT lookup returns `null` cleanly (the startup path in subscriptionManager already keys off
+ * `primaryStore.get(name) === null` to mean "previously deleted, do not recreate"). A decode failure
+ * instead THROWS from the point lookup (missing shared structure — the #352/#1163 misread) or yields
+ * a present-but-invalid value. So: a clean `null` ⇒ `'deleted'` (skip, must NOT revive a removed
+ * peer); a throw or any non-null point result ⇒ `'decode-failure'` (reconstruct so outbound
+ * replication survives). Returns the point-looked-up record too, so a point lookup that succeeds
+ * where the range value was null can be used directly.
+ */
+export function probeNodeRow(store: any, key: unknown): { outcome: 'deleted' | 'decode-failure'; record?: any } {
+	let record: any;
+	try {
+		record = store.get(key);
+	} catch {
+		// present-but-undecodable row → decode failure, reconstruct.
+		return { outcome: 'decode-failure' };
+	}
+	// A clean null is a genuine tombstone (removed node); undefined means physically absent. Either
+	// way there is no live peer here — do not reconstruct.
+	if (record == null) return { outcome: 'deleted' };
+	// The point lookup returned something present (a valid record, or a misread `[]`/partial). Treat
+	// it as still-present: a valid record is used directly; an invalid-but-present value reconstructs.
+	return { outcome: 'decode-failure', record };
+}
+
+/**
+ * Resolve the node descriptor to use for one hdb_nodes scan entry on the OUTBOUND subscription path.
+ * Returns the decoded record when valid; when the value is nullish, `probe` distinguishes a genuine
+ * tombstone (returns `undefined` → skip, harper-pro#460 review) from a transient decode failure
+ * (reconstructs a minimal descriptor so the outbound subscription is still created — harper-pro#460/
+ * #352). Returns `undefined` when there is no usable key (truly skip).
+ *
+ * `probe` is injected so this stays unit-testable without a live store; scanNodesForSubscription
+ * supplies the store-backed {@link probeNodeRow}.
+ */
+export function resolveScannedNode(
+	value: any,
+	key: unknown,
+	probe?: (key: unknown) => { outcome: 'deleted' | 'decode-failure'; record?: any }
+): any {
+	if (value) return value;
+	// No probe (legacy/pure call): preserve the original reconstruct-on-null behavior.
+	if (!probe) return reconstructNodeFromKey(key);
+	const { outcome, record } = probe(key);
+	if (outcome === 'deleted') return undefined; // genuine tombstone — do not revive a removed node
+	if (record && isValidNodeRecord(record)) return record; // point lookup recovered the real record
+	return reconstructNodeFromKey(key);
+}
+
+/**
+ * Iterate the hdb_nodes range and drive `onNode(node, key)` for each peer, reconstructing a minimal
+ * descriptor for any range-visible-but-undecodable row while skipping genuine tombstones
+ * (harper-pro#460). Takes the store explicitly so it can be unit-tested against a fake/real store
+ * without standing up a server. The shard/server bookkeeping stays in subscribeToNodeUpdates (its
+ * concern, and it owns the `server` global).
+ */
+export function scanNodesForSubscription(store: any, onNode: (node: any, key: any) => void) {
+	// Test-only fault injection for the harper-pro#460 route-less seamless-deploy verification test
+	// (integrationTests/cluster/seamlessDeploy.test.mjs). When HARPER_TEST_HDBNODES_DECODE_FAIL names
+	// one or more hdb_nodes keys (comma-separated peer names), the scan treats those rows as
+	// undecodable — exactly the route-less-peer #352/#1163 misread state — so it exercises the #460
+	// reconstruct-and-warn path for a peer discovered only via mesh propagation. Never arms in
+	// production: the env var is set only by that verification test. Mirrors the wedgedForTest pattern
+	// in replicationConnection.ts.
+	// NOTE (verification finding): this injection does NOT isolate core#1464 (startOnMainThread
+	// once-per-component). The #460 reconstruct warn is dominated by the per-worker CA-monitor scan in
+	// replicator.start() -> monitorNodeCAs(), which re-runs on every worker on every `restart: true`
+	// reload regardless of #1464 (which only dedupes the MAIN-thread startOnMainThread path). See the
+	// header of seamlessDeploy.test.mjs for the full byte-trace.
+	const decodeFailKeys = process.env.HARPER_TEST_HDBNODES_DECODE_FAIL?.split(',').filter(Boolean);
+	for (const entry of store.getRange({})) {
+		const key = entry.key;
+		const injectDecodeFail = !!decodeFailKeys?.includes(String(key));
+		const value = injectDecodeFail ? null : entry.value;
+		const node = injectDecodeFail
+			? resolveScannedNode(null, key, () => ({ outcome: 'decode-failure' }))
+			: resolveScannedNode(value, key, (probeKey) => probeNodeRow(store, probeKey));
+		if (!node) continue;
+		if (!value) {
+			logger.warn?.(
+				'hdb_nodes record for',
+				key,
+				'did not decode to a live record at the subscription scan but is present (not a tombstone); subscribing to the peer so outbound replication is not lost (see harper-pro#460). The full record self-heals on the next decodable update.'
+			);
+		}
+		onNode(node, key);
+	}
+}
+
+export function subscribeToNodeUpdates(listener: (node: any, id: string) => void, watcherKey?: string) {
+	// `watcherKey` namespaces the underlying watcher so a re-invocation of the SAME caller (e.g. a
+	// deploy_component reload re-running startOnMainThread, harper-pro#460) supersedes its prior
+	// watcher instead of stacking one, while the two distinct callers (subscription management vs
+	// replication-confirmation tracking) keep independent concurrent watchers.
+	runNodeUpdateWatcher(listener, { key: watcherKey });
 	server.nodes = [];
 	server.shards = new Map();
 
-	for (let entry of getHDBNodeTable().primaryStore.getRange({})) {
-		const { value: node, key } = entry;
-		if (!node) continue;
+	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key) => {
 		server.nodes.push(node);
 		if (node.shard != undefined) {
 			let nodesForShard = server.shards.get(node.shard);
@@ -339,7 +525,7 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 			nodesForShard.push(node);
 		}
 		listener(node, key);
-	}
+	});
 	logger.debug?.(
 		'Known nodes at startup',
 		server.nodes.map((node) => node.name)
@@ -429,6 +615,8 @@ replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void
 const confirmationWatchersByNode = new Map<string, { remove: () => void }>();
 function startSubscriptionToReplications() {
 	subscribeToNodeUpdates((nodeRecord, nodeId) => {
+		// keyed 'replication-confirmation' so it runs concurrently with the subscription-manager
+		// watcher and supersedes only a prior confirmation watcher on re-invocation (harper-pro#460).
 		// subscribeToNodeUpdates fires the listener for both 'put' and 'delete' events; on delete
 		// the value is undefined but the id (node name) is still passed. Tear down any existing
 		// watcher in both cases so we don't accumulate stale watchers when nodes are removed.
@@ -482,7 +670,7 @@ function startSubscriptionToReplications() {
 			}
 		});
 		confirmationWatchersByNode.set(nodeNameAtUpdate, handle);
-	});
+	}, 'replication-confirmation');
 }
 export type RouteEntry = {
 	target?: string;

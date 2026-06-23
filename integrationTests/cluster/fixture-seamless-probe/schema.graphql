@@ -1,0 +1,7 @@
+# Minimal component deployed to force a deploy_component worker reload on node A.
+# The component itself is incidental — the reload is what we are verifying stays seamless
+# for a route-less replication peer (harper-pro#460 + harper#1464).
+type Probe @table @export {
+	id: ID @primaryKey
+	value: String
+}
