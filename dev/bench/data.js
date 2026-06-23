@@ -24,32 +24,32 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "load",
+            "name": "load — bulk insert",
             "value": 10001.61,
             "unit": "records/sec"
           },
           {
-            "name": "workload C",
+            "name": "workload C — Read only (100% read)",
             "value": 22506.98,
             "unit": "ops/sec"
           },
           {
-            "name": "workload B",
+            "name": "workload B — Read mostly (95% read / 5% update)",
             "value": 8384.77,
             "unit": "ops/sec"
           },
           {
-            "name": "workload A",
+            "name": "workload A — Update heavy (50% read / 50% update)",
             "value": 9546.23,
             "unit": "ops/sec"
           },
           {
-            "name": "workload F",
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
             "value": 4584.27,
             "unit": "ops/sec"
           },
           {
-            "name": "workload E",
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2034.5,
             "unit": "ops/sec"
           }
@@ -76,32 +76,32 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "load",
+            "name": "load — bulk insert",
             "value": 1817.69,
             "unit": "records/sec"
           },
           {
-            "name": "workload C",
+            "name": "workload C — Read only (100% read)",
             "value": 5914.16,
             "unit": "ops/sec"
           },
           {
-            "name": "workload B",
+            "name": "workload B — Read mostly (95% read / 5% update)",
             "value": 4964.76,
             "unit": "ops/sec"
           },
           {
-            "name": "workload A",
+            "name": "workload A — Update heavy (50% read / 50% update)",
             "value": 3500.79,
             "unit": "ops/sec"
           },
           {
-            "name": "workload F",
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
             "value": 1903.74,
             "unit": "ops/sec"
           },
           {
-            "name": "workload E",
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 789.13,
             "unit": "ops/sec"
           }
@@ -128,32 +128,32 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "load",
+            "name": "load — bulk insert",
             "value": 1740.76,
             "unit": "records/sec"
           },
           {
-            "name": "workload C",
+            "name": "workload C — Read only (100% read)",
             "value": 21349.12,
             "unit": "ops/sec"
           },
           {
-            "name": "workload B",
+            "name": "workload B — Read mostly (95% read / 5% update)",
             "value": 3756.52,
             "unit": "ops/sec"
           },
           {
-            "name": "workload A",
+            "name": "workload A — Update heavy (50% read / 50% update)",
             "value": 3604.52,
             "unit": "ops/sec"
           },
           {
-            "name": "workload F",
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
             "value": 2400.38,
             "unit": "ops/sec"
           },
           {
-            "name": "workload E",
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 970.34,
             "unit": "ops/sec"
           }
@@ -180,32 +180,32 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "load",
+            "name": "load — bulk insert",
             "value": 11040.41,
             "unit": "records/sec"
           },
           {
-            "name": "workload C",
+            "name": "workload C — Read only (100% read)",
             "value": 22512.59,
             "unit": "ops/sec"
           },
           {
-            "name": "workload B",
+            "name": "workload B — Read mostly (95% read / 5% update)",
             "value": 21524.37,
             "unit": "ops/sec"
           },
           {
-            "name": "workload A",
+            "name": "workload A — Update heavy (50% read / 50% update)",
             "value": 4368.58,
             "unit": "ops/sec"
           },
           {
-            "name": "workload F",
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
             "value": 4464.64,
             "unit": "ops/sec"
           },
           {
-            "name": "workload E",
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 1475.55,
             "unit": "ops/sec"
           }
@@ -232,97 +232,33 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "load",
+            "name": "load — bulk insert",
             "value": 9836.19,
             "unit": "records/sec"
           },
           {
-            "name": "workload C",
+            "name": "workload C — Read only (100% read)",
             "value": 23703.73,
             "unit": "ops/sec"
           },
           {
-            "name": "workload B",
+            "name": "workload B — Read mostly (95% read / 5% update)",
             "value": 6036.49,
             "unit": "ops/sec"
           },
           {
-            "name": "workload A",
+            "name": "workload A — Update heavy (50% read / 50% update)",
             "value": 8708.69,
             "unit": "ops/sec"
           },
           {
-            "name": "workload F",
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
             "value": 2816.88,
             "unit": "ops/sec"
           },
           {
-            "name": "workload E",
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 1398.94,
-            "unit": "ops/sec"
-          }
-        ]
-      },
-      {
-        "commit": {
-          "author": {
-            "name": "Kris Zyp",
-            "username": "kriszyp",
-            "email": "kriszyp@gmail.com"
-          },
-          "committer": {
-            "name": "Kris Zyp",
-            "username": "kriszyp",
-            "email": "kriszyp@gmail.com"
-          },
-          "id": "24818b15a78e5b08f72bdd7ec5d3f999be68b140",
-          "message": "bench-runner: support org-level runner registration (default SCOPE=org)\n\nThe ephemeral bench runner was hard-coded to a repo-scoped registration on\nHarperFast/harper-pro, so only harper-pro workflows could use the harper-bench\nhost. Register at org scope by default (org URL + org registration token) so a\nsingle host loop — and thus a single job at a time, preserving comparable perf\nnumbers — serves every HarperFast repo's bench workflow (e.g. harper's new\nperf-benchmarks-nightly). SCOPE=repo restores the previous single-repo behavior.\n\nRequires the gh token to carry the admin:org scope for org-token minting.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
-          "timestamp": "2026-06-18T23:59:31Z",
-          "url": "https://github.com/HarperFast/harper-pro/commit/24818b15a78e5b08f72bdd7ec5d3f999be68b140"
-        },
-        "date": 1781830601887,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "load",
-            "value": 7328.85,
-            "unit": "records/sec"
-          },
-          {
-            "name": "workload C",
-            "value": 2196.51,
-            "unit": "ops/sec"
-          }
-        ]
-      },
-      {
-        "commit": {
-          "author": {
-            "name": "Kris Zyp",
-            "username": "kriszyp",
-            "email": "kriszyp@gmail.com"
-          },
-          "committer": {
-            "name": "Kris Zyp",
-            "username": "kriszyp",
-            "email": "kriszyp@gmail.com"
-          },
-          "id": "24818b15a78e5b08f72bdd7ec5d3f999be68b140",
-          "message": "bench-runner: support org-level runner registration (default SCOPE=org)\n\nThe ephemeral bench runner was hard-coded to a repo-scoped registration on\nHarperFast/harper-pro, so only harper-pro workflows could use the harper-bench\nhost. Register at org scope by default (org URL + org registration token) so a\nsingle host loop — and thus a single job at a time, preserving comparable perf\nnumbers — serves every HarperFast repo's bench workflow (e.g. harper's new\nperf-benchmarks-nightly). SCOPE=repo restores the previous single-repo behavior.\n\nRequires the gh token to carry the admin:org scope for org-token minting.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
-          "timestamp": "2026-06-18T23:59:31Z",
-          "url": "https://github.com/HarperFast/harper-pro/commit/24818b15a78e5b08f72bdd7ec5d3f999be68b140"
-        },
-        "date": 1781846495381,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "load",
-            "value": 7742.82,
-            "unit": "records/sec"
-          },
-          {
-            "name": "workload C",
-            "value": 25764.1,
             "unit": "ops/sec"
           }
         ]
@@ -348,32 +284,32 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "load",
+            "name": "load — bulk insert",
             "value": 10192.49,
             "unit": "records/sec"
           },
           {
-            "name": "workload C",
+            "name": "workload C — Read only (100% read)",
             "value": 25347.88,
             "unit": "ops/sec"
           },
           {
-            "name": "workload B",
+            "name": "workload B — Read mostly (95% read / 5% update)",
             "value": 21788.42,
             "unit": "ops/sec"
           },
           {
-            "name": "workload A",
+            "name": "workload A — Update heavy (50% read / 50% update)",
             "value": 5692.56,
             "unit": "ops/sec"
           },
           {
-            "name": "workload F",
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
             "value": 5588.09,
             "unit": "ops/sec"
           },
           {
-            "name": "workload E",
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2118.18,
             "unit": "ops/sec"
           }
@@ -610,47 +546,47 @@ window.BENCHMARK_DATA = {
         "tool": "customSmallerIsBetter",
         "benches": [
           {
-            "name": "C read p99",
+            "name": "C read p99 — read only",
             "value": 7.17,
             "unit": "ms"
           },
           {
-            "name": "B read p99",
+            "name": "B read p99 — read mostly",
             "value": 62.19,
             "unit": "ms"
           },
           {
-            "name": "B update p99",
+            "name": "B update p99 — read mostly",
             "value": 70.41,
             "unit": "ms"
           },
           {
-            "name": "A read p99",
+            "name": "A read p99 — update heavy",
             "value": 19.9,
             "unit": "ms"
           },
           {
-            "name": "A update p99",
+            "name": "A update p99 — update heavy",
             "value": 21.35,
             "unit": "ms"
           },
           {
-            "name": "F read p99",
+            "name": "F read p99 — read-modify-write",
             "value": 71.51,
             "unit": "ms"
           },
           {
-            "name": "F rmw p99",
+            "name": "F rmw p99 — read-modify-write",
             "value": 147.26,
             "unit": "ms"
           },
           {
-            "name": "E scan p99",
+            "name": "E scan p99 — short ranges",
             "value": 247.39,
             "unit": "ms"
           },
           {
-            "name": "E insert p99",
+            "name": "E insert p99 — short ranges",
             "value": 145.48,
             "unit": "ms"
           }
@@ -677,47 +613,47 @@ window.BENCHMARK_DATA = {
         "tool": "customSmallerIsBetter",
         "benches": [
           {
-            "name": "C read p99",
+            "name": "C read p99 — read only",
             "value": 92.72,
             "unit": "ms"
           },
           {
-            "name": "B read p99",
+            "name": "B read p99 — read mostly",
             "value": 90.27,
             "unit": "ms"
           },
           {
-            "name": "B update p99",
+            "name": "B update p99 — read mostly",
             "value": 102.88,
             "unit": "ms"
           },
           {
-            "name": "A read p99",
+            "name": "A read p99 — update heavy",
             "value": 126.83,
             "unit": "ms"
           },
           {
-            "name": "A update p99",
+            "name": "A update p99 — update heavy",
             "value": 138.44,
             "unit": "ms"
           },
           {
-            "name": "F read p99",
+            "name": "F read p99 — read-modify-write",
             "value": 160.98,
             "unit": "ms"
           },
           {
-            "name": "F rmw p99",
+            "name": "F rmw p99 — read-modify-write",
             "value": 313.81,
             "unit": "ms"
           },
           {
-            "name": "E insert p99",
+            "name": "E insert p99 — short ranges",
             "value": 371.94,
             "unit": "ms"
           },
           {
-            "name": "E scan p99",
+            "name": "E scan p99 — short ranges",
             "value": 544.12,
             "unit": "ms"
           }
@@ -744,47 +680,47 @@ window.BENCHMARK_DATA = {
         "tool": "customSmallerIsBetter",
         "benches": [
           {
-            "name": "C read p99",
+            "name": "C read p99 — read only",
             "value": 7.15,
             "unit": "ms"
           },
           {
-            "name": "B read p99",
+            "name": "B read p99 — read mostly",
             "value": 102.84,
             "unit": "ms"
           },
           {
-            "name": "B update p99",
+            "name": "B update p99 — read mostly",
             "value": 113.17,
             "unit": "ms"
           },
           {
-            "name": "A read p99",
+            "name": "A read p99 — update heavy",
             "value": 126.56,
             "unit": "ms"
           },
           {
-            "name": "A update p99",
+            "name": "A update p99 — update heavy",
             "value": 139.67,
             "unit": "ms"
           },
           {
-            "name": "F read p99",
+            "name": "F read p99 — read-modify-write",
             "value": 126.5,
             "unit": "ms"
           },
           {
-            "name": "F rmw p99",
+            "name": "F rmw p99 — read-modify-write",
             "value": 242.9,
             "unit": "ms"
           },
           {
-            "name": "E insert p99",
+            "name": "E insert p99 — short ranges",
             "value": 310.13,
             "unit": "ms"
           },
           {
-            "name": "E scan p99",
+            "name": "E scan p99 — short ranges",
             "value": 476.36,
             "unit": "ms"
           }
@@ -811,47 +747,47 @@ window.BENCHMARK_DATA = {
         "tool": "customSmallerIsBetter",
         "benches": [
           {
-            "name": "C read p99",
+            "name": "C read p99 — read only",
             "value": 6.98,
             "unit": "ms"
           },
           {
-            "name": "B read p99",
+            "name": "B read p99 — read mostly",
             "value": 7.95,
             "unit": "ms"
           },
           {
-            "name": "B update p99",
+            "name": "B update p99 — read mostly",
             "value": 11.55,
             "unit": "ms"
           },
           {
-            "name": "A read p99",
+            "name": "A read p99 — update heavy",
             "value": 90.27,
             "unit": "ms"
           },
           {
-            "name": "A update p99",
+            "name": "A update p99 — update heavy",
             "value": 112.01,
             "unit": "ms"
           },
           {
-            "name": "F read p99",
+            "name": "F read p99 — read-modify-write",
             "value": 67.92,
             "unit": "ms"
           },
           {
-            "name": "F rmw p99",
+            "name": "F rmw p99 — read-modify-write",
             "value": 144.79,
             "unit": "ms"
           },
           {
-            "name": "E scan p99",
+            "name": "E scan p99 — short ranges",
             "value": 385.11,
             "unit": "ms"
           },
           {
-            "name": "E insert p99",
+            "name": "E insert p99 — short ranges",
             "value": 107.14,
             "unit": "ms"
           }
@@ -878,102 +814,48 @@ window.BENCHMARK_DATA = {
         "tool": "customSmallerIsBetter",
         "benches": [
           {
-            "name": "C read p99",
+            "name": "C read p99 — read only",
             "value": 6.53,
             "unit": "ms"
           },
           {
-            "name": "B read p99",
+            "name": "B read p99 — read mostly",
             "value": 59.27,
             "unit": "ms"
           },
           {
-            "name": "B update p99",
+            "name": "B update p99 — read mostly",
             "value": 68.43,
             "unit": "ms"
           },
           {
-            "name": "A read p99",
+            "name": "A read p99 — update heavy",
             "value": 30.35,
             "unit": "ms"
           },
           {
-            "name": "A update p99",
+            "name": "A update p99 — update heavy",
             "value": 32.29,
             "unit": "ms"
           },
           {
-            "name": "F read p99",
+            "name": "F read p99 — read-modify-write",
             "value": 96.68,
             "unit": "ms"
           },
           {
-            "name": "F rmw p99",
+            "name": "F rmw p99 — read-modify-write",
             "value": 179.55,
             "unit": "ms"
           },
           {
-            "name": "E insert p99",
+            "name": "E insert p99 — short ranges",
             "value": 151.3,
             "unit": "ms"
           },
           {
-            "name": "E scan p99",
+            "name": "E scan p99 — short ranges",
             "value": 436.35,
-            "unit": "ms"
-          }
-        ]
-      },
-      {
-        "commit": {
-          "author": {
-            "name": "Kris Zyp",
-            "username": "kriszyp",
-            "email": "kriszyp@gmail.com"
-          },
-          "committer": {
-            "name": "Kris Zyp",
-            "username": "kriszyp",
-            "email": "kriszyp@gmail.com"
-          },
-          "id": "24818b15a78e5b08f72bdd7ec5d3f999be68b140",
-          "message": "bench-runner: support org-level runner registration (default SCOPE=org)\n\nThe ephemeral bench runner was hard-coded to a repo-scoped registration on\nHarperFast/harper-pro, so only harper-pro workflows could use the harper-bench\nhost. Register at org scope by default (org URL + org registration token) so a\nsingle host loop — and thus a single job at a time, preserving comparable perf\nnumbers — serves every HarperFast repo's bench workflow (e.g. harper's new\nperf-benchmarks-nightly). SCOPE=repo restores the previous single-repo behavior.\n\nRequires the gh token to carry the admin:org scope for org-token minting.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
-          "timestamp": "2026-06-18T23:59:31Z",
-          "url": "https://github.com/HarperFast/harper-pro/commit/24818b15a78e5b08f72bdd7ec5d3f999be68b140"
-        },
-        "date": 1781830606999,
-        "tool": "customSmallerIsBetter",
-        "benches": [
-          {
-            "name": "C read p99",
-            "value": 50.89,
-            "unit": "ms"
-          }
-        ]
-      },
-      {
-        "commit": {
-          "author": {
-            "name": "Kris Zyp",
-            "username": "kriszyp",
-            "email": "kriszyp@gmail.com"
-          },
-          "committer": {
-            "name": "Kris Zyp",
-            "username": "kriszyp",
-            "email": "kriszyp@gmail.com"
-          },
-          "id": "24818b15a78e5b08f72bdd7ec5d3f999be68b140",
-          "message": "bench-runner: support org-level runner registration (default SCOPE=org)\n\nThe ephemeral bench runner was hard-coded to a repo-scoped registration on\nHarperFast/harper-pro, so only harper-pro workflows could use the harper-bench\nhost. Register at org scope by default (org URL + org registration token) so a\nsingle host loop — and thus a single job at a time, preserving comparable perf\nnumbers — serves every HarperFast repo's bench workflow (e.g. harper's new\nperf-benchmarks-nightly). SCOPE=repo restores the previous single-repo behavior.\n\nRequires the gh token to carry the admin:org scope for org-token minting.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
-          "timestamp": "2026-06-18T23:59:31Z",
-          "url": "https://github.com/HarperFast/harper-pro/commit/24818b15a78e5b08f72bdd7ec5d3f999be68b140"
-        },
-        "date": 1781846498365,
-        "tool": "customSmallerIsBetter",
-        "benches": [
-          {
-            "name": "C read p99",
-            "value": 2.91,
             "unit": "ms"
           }
         ]
@@ -999,47 +881,47 @@ window.BENCHMARK_DATA = {
         "tool": "customSmallerIsBetter",
         "benches": [
           {
-            "name": "C read p99",
+            "name": "C read p99 — read only",
             "value": 6.31,
             "unit": "ms"
           },
           {
-            "name": "B read p99",
+            "name": "B read p99 — read mostly",
             "value": 7.06,
             "unit": "ms"
           },
           {
-            "name": "B update p99",
+            "name": "B update p99 — read mostly",
             "value": 9.02,
             "unit": "ms"
           },
           {
-            "name": "A read p99",
+            "name": "A read p99 — update heavy",
             "value": 72.38,
             "unit": "ms"
           },
           {
-            "name": "A update p99",
+            "name": "A update p99 — update heavy",
             "value": 80.92,
             "unit": "ms"
           },
           {
-            "name": "F read p99",
+            "name": "F read p99 — read-modify-write",
             "value": 59.66,
             "unit": "ms"
           },
           {
-            "name": "F rmw p99",
+            "name": "F rmw p99 — read-modify-write",
             "value": 122.65,
             "unit": "ms"
           },
           {
-            "name": "E scan p99",
+            "name": "E scan p99 — short ranges",
             "value": 258.25,
             "unit": "ms"
           },
           {
-            "name": "E insert p99",
+            "name": "E insert p99 — short ranges",
             "value": 103.7,
             "unit": "ms"
           }
