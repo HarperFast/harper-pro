@@ -1711,6 +1711,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									// write() itself may have torn the stream down (e.g. a late error). If so,
 									// 'drain'/'close' won't arrive — skip pausing rather than strand the reason.
 									// Keep the dead stream in blobsInFlight for the same reason as above.
+								} else if (!stream.connectedToBlob) {
+									// No consumer is attached yet: the blob's chunks have outrun its record, so
+									// saveBlob — the only thing that drains this PassThrough — has not started
+									// (receiveBlobs sets connectedToBlob when the record is decoded). Pausing here
+									// would block the very record that attaches the consumer behind the pause,
+									// stranding it forever (the same wedge class as the destroyed/ended guard above,
+									// but for a not-yet-connected stream — the base-copy receive deadlock). Let the
+									// chunk buffer instead; saveBlob attaches and drains it once the record arrives.
+									// Exposure is bounded by the sender's in-flight blob cap
+									// (MAX_OUTSTANDING_BLOBS_BEING_SENT) and the blobsTimer reclaims a truly orphaned stream.
 								} else {
 									addPauseReason();
 									const release = () => {
