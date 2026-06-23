@@ -96,38 +96,84 @@ type WatcherOptions = {
 	maxDelayMs?: number;
 	maxRestarts?: number;
 };
-export async function runNodeUpdateWatcher(listener: (node: any, id: string) => void, options: WatcherOptions = {}) {
+
+// Generation tokens guarding against duplicate node-update watchers (harper-pro#460). A
+// `deploy_component` reload re-invokes `replicator.startOnMainThread` on the SAME already-resolved
+// main-thread module instance; its `whenThreadsStarted.then()` fires again and calls
+// `subscribeToNodeUpdates` → `runNodeUpdateWatcher` a second (third, …) time. Each call previously
+// started an independent unbounded watcher loop and an extra forEachReplicatedDatabase chain,
+// accumulating listeners across deploys (the observed `MaxListenersExceededWarning`) and double-
+// processing every hdb_nodes event. We let only the most-recent watcher per logical purpose run:
+// starting a new one for a given key bumps that key's generation, closes the prior iterator, and the
+// older loop exits on its next turn. The key namespaces watchers so the two concurrent legitimate
+// consumers (subscription management vs replication-confirmation tracking) don't supersede each
+// other — only a re-invocation of the SAME consumer does.
+const watcherGenerations = new Map<string, number>();
+const watcherIterators = new Map<string, AsyncIterator<any>>();
+const DEFAULT_WATCHER_KEY = 'default';
+
+/** Stop the currently-running node-update watcher for `key` (if any). Idempotent. */
+export function stopNodeUpdateWatcher(key: string = DEFAULT_WATCHER_KEY) {
+	watcherGenerations.set(key, (watcherGenerations.get(key) ?? 0) + 1);
+	const iterator = watcherIterators.get(key);
+	watcherIterators.delete(key);
+	// Closing the iterator breaks the `for await` the active loop is parked on; the generation bump
+	// makes the loop exit instead of restarting even if the close races the next iteration.
+	iterator?.return?.(undefined);
+}
+
+export async function runNodeUpdateWatcher(
+	listener: (node: any, id: string) => void,
+	options: WatcherOptions & { key?: string } = {}
+) {
 	const subscribe = options.subscribe ?? (() => getHDBNodeTable().subscribe({}));
 	const processEvent = options.processEvent ?? processNodeUpdateEvent;
 	const restartDelayMs = options.restartDelayMs ?? NODE_WATCHER_RESTART_DELAY_MS;
 	const maxDelayMs = options.maxDelayMs ?? NODE_WATCHER_MAX_DELAY_MS;
 	const maxRestarts = options.maxRestarts ?? Infinity;
+	const key = options.key ?? DEFAULT_WATCHER_KEY;
+	// Supersede any watcher already running for this key so a reload doesn't stack a second loop
+	// (harper-pro#460). Distinct keys (subscription vs confirmation) run concurrently and untouched.
+	stopNodeUpdateWatcher(key);
+	const generation = watcherGenerations.get(key) ?? 0;
 	let restarts = 0;
 	let consecutiveFailures = 0;
-	while (restarts < maxRestarts) {
+	const isCurrent = () => generation === (watcherGenerations.get(key) ?? 0);
+	while (restarts < maxRestarts && isCurrent()) {
 		let iteratedSuccessfully = false;
 		try {
 			const events = await subscribe();
+			if (!isCurrent()) break; // superseded while awaiting subscribe
 			iteratedSuccessfully = true; // we got past subscribe — any later throw is a fresh failure
-			for await (const event of events) {
-				try {
-					await processEvent(event, listener);
-				} catch (error) {
-					// Don't let a single bad event tear down the watcher — log and continue.
-					// Optional chaining: this `logger` is the level-conditional one, where
-					// `.error` is undefined when the configured level filters it out, and an
-					// uncaught TypeError here would defeat the whole recovery loop.
-					logger.error?.('Error processing hdb_nodes update event', error);
+			const iterator = events[Symbol.asyncIterator]();
+			watcherIterators.set(key, iterator);
+			try {
+				while (true) {
+					const { value: event, done } = await iterator.next();
+					if (done || !isCurrent()) break;
+					try {
+						await processEvent(event, listener);
+					} catch (error) {
+						// Don't let a single bad event tear down the watcher — log and continue.
+						// Optional chaining: this `logger` is the level-conditional one, where
+						// `.error` is undefined when the configured level filters it out, and an
+						// uncaught TypeError here would defeat the whole recovery loop.
+						logger.error?.('Error processing hdb_nodes update event', error);
+					}
 				}
+			} finally {
+				if (watcherIterators.get(key) === iterator) watcherIterators.delete(key);
 			}
+			if (!isCurrent()) break; // superseded — exit without restarting
 			logger.warn?.('hdb_nodes subscription ended unexpectedly; restarting watcher');
 		} catch (error) {
+			if (!isCurrent()) break; // superseded watcher; iterator.return rejected
 			logger.error?.('hdb_nodes watcher failed; restarting', error);
 		}
 		// Successful subscribe → reset backoff so a fresh failure restarts quickly.
 		consecutiveFailures = iteratedSuccessfully ? 0 : consecutiveFailures + 1;
 		restarts++;
-		if (restarts >= maxRestarts) return;
+		if (restarts >= maxRestarts || !isCurrent()) return;
 		const delay = Math.min(restartDelayMs * Math.pow(2, Math.min(consecutiveFailures, 5)), maxDelayMs);
 		await new Promise((resolve) => setTimeout(resolve, delay));
 	}
@@ -405,8 +451,12 @@ export function scanNodesForSubscription(store: any, onNode: (node: any, key: an
 	}
 }
 
-export function subscribeToNodeUpdates(listener: (node: any, id: string) => void) {
-	runNodeUpdateWatcher(listener);
+export function subscribeToNodeUpdates(listener: (node: any, id: string) => void, watcherKey?: string) {
+	// `watcherKey` namespaces the underlying watcher so a re-invocation of the SAME caller (e.g. a
+	// deploy_component reload re-running startOnMainThread, harper-pro#460) supersedes its prior
+	// watcher instead of stacking one, while the two distinct callers (subscription management vs
+	// replication-confirmation tracking) keep independent concurrent watchers.
+	runNodeUpdateWatcher(listener, { key: watcherKey });
 	server.nodes = [];
 	server.shards = new Map();
 
@@ -510,6 +560,8 @@ replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void
 const confirmationWatchersByNode = new Map<string, { remove: () => void }>();
 function startSubscriptionToReplications() {
 	subscribeToNodeUpdates((nodeRecord, nodeId) => {
+		// keyed 'replication-confirmation' so it runs concurrently with the subscription-manager
+		// watcher and supersedes only a prior confirmation watcher on re-invocation (harper-pro#460).
 		// subscribeToNodeUpdates fires the listener for both 'put' and 'delete' events; on delete
 		// the value is undefined but the id (node name) is still passed. Tear down any existing
 		// watcher in both cases so we don't accumulate stale watchers when nodes are removed.
@@ -563,7 +615,7 @@ function startSubscriptionToReplications() {
 			}
 		});
 		confirmationWatchersByNode.set(nodeNameAtUpdate, handle);
-	});
+	}, 'replication-confirmation');
 }
 export type RouteEntry = {
 	target?: string;

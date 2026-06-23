@@ -23,7 +23,13 @@
  */
 
 import { expect } from 'chai';
-import { reconstructNodeFromKey, resolveScannedNode, scanNodesForSubscription } from '#src/replication/knownNodes';
+import {
+	reconstructNodeFromKey,
+	resolveScannedNode,
+	scanNodesForSubscription,
+	runNodeUpdateWatcher,
+	stopNodeUpdateWatcher,
+} from '#src/replication/knownNodes';
 
 /**
  * Minimal store stub modeling lmdb-js getRange. `rows` maps key -> decoded value (use `null` to
@@ -105,5 +111,146 @@ describe('scanNodesForSubscription end-to-end (harper-pro#460 wedge close)', () 
 		expect(driven).to.have.length(2);
 		expect(driven[0]).to.deep.equal({ node: peerA, key: 'peer-a' }); // full record preserved (url/shard kept)
 		expect(driven[1]).to.deep.equal({ node: { name: 'peer-b', replicates: true }, key: 'peer-b' });
+	});
+});
+
+/**
+ * A controllable hdb_nodes change-subscription stand-in. `next()` resolves once `push()` is called,
+ * so the watcher loop parks on it exactly like the real change stream. `return()` (what
+ * stopNodeUpdateWatcher invokes to cancel a superseded watcher) flips `closed` and unblocks any
+ * pending `next()` with `{ done: true }`, so we can assert that starting a new watcher of the same
+ * key actually closed the prior one.
+ */
+function controllableSubscription() {
+	let pending;
+	const queue = [];
+	const iterator = {
+		closed: false,
+		next() {
+			if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+			if (this.closed) return Promise.resolve({ value: undefined, done: true });
+			return new Promise((resolve) => {
+				pending = resolve;
+			});
+		},
+		return() {
+			this.closed = true;
+			if (pending) {
+				pending({ value: undefined, done: true });
+				pending = undefined;
+			}
+			return Promise.resolve({ value: undefined, done: true });
+		},
+		[Symbol.asyncIterator]() {
+			return this;
+		},
+	};
+	return {
+		iterator,
+		push(event) {
+			if (pending) {
+				pending({ value: event, done: false });
+				pending = undefined;
+			} else {
+				queue.push(event);
+			}
+		},
+	};
+}
+
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+describe('runNodeUpdateWatcher idempotency (harper-pro#460 reload double-registration)', () => {
+	afterEach(() => {
+		// Tear down anything the tests left running so a lingering watcher can't bleed across cases.
+		stopNodeUpdateWatcher('test-key');
+		stopNodeUpdateWatcher('test-key-a');
+		stopNodeUpdateWatcher('test-key-b');
+	});
+
+	it('re-invoking the SAME key supersedes (closes) the prior watcher instead of stacking one', async () => {
+		const first = controllableSubscription();
+		const firstEvents = [];
+		runNodeUpdateWatcher((node) => firstEvents.push(node), {
+			key: 'test-key',
+			subscribe: () => first.iterator,
+			processEvent: (event, listener) => listener(event, event?.name),
+		});
+		await flush();
+		first.push({ name: 'peer-a', replicates: true });
+		await flush();
+		expect(firstEvents).to.have.length(1);
+		expect(first.iterator.closed).to.equal(false);
+
+		// Reload: same key, fresh subscription. The first watcher must be superseded and closed.
+		const second = controllableSubscription();
+		const secondEvents = [];
+		runNodeUpdateWatcher((node) => secondEvents.push(node), {
+			key: 'test-key',
+			subscribe: () => second.iterator,
+			processEvent: (event, listener) => listener(event, event?.name),
+		});
+		await flush();
+		expect(first.iterator.closed).to.equal(true); // prior watcher torn down — no accumulation
+
+		// An event on the superseded subscription must NOT reach the old listener anymore.
+		first.push({ name: 'stale', replicates: true });
+		await flush();
+		expect(firstEvents).to.have.length(1);
+
+		// The new watcher is the only live one.
+		second.push({ name: 'peer-b', replicates: true });
+		await flush();
+		expect(secondEvents).to.have.length(1);
+		expect(secondEvents[0]).to.deep.equal({ name: 'peer-b', replicates: true });
+	});
+
+	it('distinct keys run concurrently and do not supersede each other', async () => {
+		const a = controllableSubscription();
+		const b = controllableSubscription();
+		const aEvents = [];
+		const bEvents = [];
+		runNodeUpdateWatcher((node) => aEvents.push(node), {
+			key: 'test-key-a',
+			subscribe: () => a.iterator,
+			processEvent: (event, listener) => listener(event, event?.name),
+		});
+		runNodeUpdateWatcher((node) => bEvents.push(node), {
+			key: 'test-key-b',
+			subscribe: () => b.iterator,
+			processEvent: (event, listener) => listener(event, event?.name),
+		});
+		await flush();
+		// Neither watcher closed the other (this is the subscription-vs-confirmation coexistence case).
+		expect(a.iterator.closed).to.equal(false);
+		expect(b.iterator.closed).to.equal(false);
+
+		a.push({ name: 'peer-a' });
+		b.push({ name: 'peer-b' });
+		await flush();
+		expect(aEvents).to.deep.equal([{ name: 'peer-a' }]);
+		expect(bEvents).to.deep.equal([{ name: 'peer-b' }]);
+	});
+
+	it('stopNodeUpdateWatcher closes the active watcher and stops further delivery', async () => {
+		const sub = controllableSubscription();
+		const events = [];
+		runNodeUpdateWatcher((node) => events.push(node), {
+			key: 'test-key',
+			subscribe: () => sub.iterator,
+			processEvent: (event, listener) => listener(event, event?.name),
+		});
+		await flush();
+		sub.push({ name: 'peer-a' });
+		await flush();
+		expect(events).to.have.length(1);
+
+		stopNodeUpdateWatcher('test-key');
+		await flush();
+		expect(sub.iterator.closed).to.equal(true);
+
+		sub.push({ name: 'after-stop' });
+		await flush();
+		expect(events).to.have.length(1); // nothing delivered after stop
 	});
 });
