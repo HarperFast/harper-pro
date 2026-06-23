@@ -1,0 +1,3 @@
+rest: true # provides the HTTP REST interface for exported resources
+graphqlSchema: # reads GraphQL schemas to define database/tables/attributes
+  files: '*.graphql'

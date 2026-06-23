@@ -474,9 +474,26 @@ export function resolveScannedNode(
  * concern, and it owns the `server` global).
  */
 export function scanNodesForSubscription(store: any, onNode: (node: any, key: any) => void) {
+	// Test-only fault injection for the harper-pro#460 route-less seamless-deploy verification test
+	// (integrationTests/cluster/seamlessDeploy.test.mjs). When HARPER_TEST_HDBNODES_DECODE_FAIL names
+	// one or more hdb_nodes keys (comma-separated peer names), the scan treats those rows as
+	// undecodable — exactly the route-less-peer #352/#1163 misread state — so it exercises the #460
+	// reconstruct-and-warn path for a peer discovered only via mesh propagation. Never arms in
+	// production: the env var is set only by that verification test. Mirrors the wedgedForTest pattern
+	// in replicationConnection.ts.
+	// NOTE (verification finding): this injection does NOT isolate core#1464 (startOnMainThread
+	// once-per-component). The #460 reconstruct warn is dominated by the per-worker CA-monitor scan in
+	// replicator.start() -> monitorNodeCAs(), which re-runs on every worker on every `restart: true`
+	// reload regardless of #1464 (which only dedupes the MAIN-thread startOnMainThread path). See the
+	// header of seamlessDeploy.test.mjs for the full byte-trace.
+	const decodeFailKeys = process.env.HARPER_TEST_HDBNODES_DECODE_FAIL?.split(',').filter(Boolean);
 	for (const entry of store.getRange({})) {
-		const { value, key } = entry;
-		const node = resolveScannedNode(value, key, (probeKey) => probeNodeRow(store, probeKey));
+		const key = entry.key;
+		const injectDecodeFail = !!decodeFailKeys?.includes(String(key));
+		const value = injectDecodeFail ? null : entry.value;
+		const node = injectDecodeFail
+			? resolveScannedNode(null, key, () => ({ outcome: 'decode-failure' }))
+			: resolveScannedNode(value, key, (probeKey) => probeNodeRow(store, probeKey));
 		if (!node) continue;
 		if (!value) {
 			logger.warn?.(
