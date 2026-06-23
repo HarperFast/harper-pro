@@ -1,0 +1,21 @@
+# Table with randomAccessFields: true (typed structs ON — this is the path
+# described in HarperFast/harper#1163 where per-node structure-id dictionaries
+# can diverge, producing silent empty/partial results on replicas).
+# The 5.1 DEFAULT is false, so we must opt in explicitly.
+type TypedRecord @table(randomAccessFields: true) @export {
+	id: ID @primaryKey
+	f1: String
+	f2: Int
+	f3: Float
+	f4: String
+}
+
+# Control table: no randomAccessFields (plain msgpackr, no typed structs).
+# Should always decode correctly on any replica.
+type PlainRecord @table @export {
+	id: ID @primaryKey
+	f1: String
+	f2: Int
+	f3: Float
+	f4: String
+}

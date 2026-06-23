@@ -1,0 +1,5 @@
+type BlobAsset @table @export {
+	id: Long @primaryKey
+	name: String @indexed
+	data: Blob
+}
