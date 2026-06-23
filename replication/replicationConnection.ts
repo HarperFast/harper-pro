@@ -386,9 +386,15 @@ export function isPermanentSourceBlobErrorCode(errorCode: unknown, errorStatus?:
  * uncaughtException. saveBlob's pipeline still observes and reports real errors via its completion
  * callback; this listener only suppresses the unhandled-error crash, never the handling.
  */
-export function createBlobReceiveStream(): PassThrough {
+export function createBlobReceiveStream(idleTimeoutMs?: number): PassThrough {
 	const stream = new PassThrough();
 	stream.on('error', () => {});
+	// Arm core's source-idle watchdog (harper#1444) on this receive source: a sender that stops mid-blob
+	// without a closing/error BLOB_CHUNK would otherwise leave writeBlobWithStream's pipeline waiting
+	// forever, pinning the per-database apply consumer at lastReceivedStatus="Receiving". The watchdog is
+	// off in core by default — bounding a source's liveness is the owning caller's job — so the replication
+	// receiver, which knows its source is a network-fed PassThrough that can wedge, opts in here.
+	if (idleTimeoutMs && idleTimeoutMs > 0) (stream as { blobStreamIdleTimeoutMs?: number }).blobStreamIdleTimeoutMs = idleTimeoutMs;
 	return stream;
 }
 
@@ -1650,7 +1656,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						);
 
 						if (!stream) {
-							stream = createBlobReceiveStream();
+							stream = createBlobReceiveStream(blobTimeout);
 							stream.expectedSize = size;
 							blobsInFlight.set(fileId, stream);
 						}
@@ -3107,7 +3113,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				blobsInFlight.delete(blobId);
 			}
 		} else {
-			stream = createBlobReceiveStream();
+			stream = createBlobReceiveStream(blobTimeout);
 			blobsInFlight.set(blobId, stream);
 		}
 		stream.connectedToBlob = true;
