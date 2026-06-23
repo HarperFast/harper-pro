@@ -3043,10 +3043,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Defaults ON to the replication blob timeout (REPLICATION_BLOBTIMEOUT, 120000 default) so a
 			// stalled send can't silently wedge a base copy out of the box (harper-pro#453). The
 			// HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS env var overrides it; set it to 0 to disable.
-			const chunkTimeoutMs =
-				process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS != null
-					? Number(process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS)
-					: blobTimeout;
+			const rawEnv = process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS;
+			const chunkTimeoutMs = rawEnv != null && rawEnv !== '' ? Math.max(0, Number(rawEnv) || 0) : blobTimeout;
 			while (true) {
 				let result: IteratorResult<any>;
 				if (chunkTimeoutMs > 0) {
