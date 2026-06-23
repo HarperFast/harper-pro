@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782130987409,
+  "lastUpdate": 1782219290673,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -531,6 +531,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 3364.02,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "6bb5289f313591b428a4ec92e43c1be7581df551",
+          "message": "test(cluster): promote QA-campaign cluster regression tests (#442)\n\n* test(cluster): promote QA-campaign cluster regression tests\n\nAdd three cluster regression tests verified passing on main:\n- replicationConflictDeterminism: LWW convergence, no split-brain, addTo CRDT merge\n- typedStructReplicationDivergence: randomAccessFields:true replication across pre-diverged/late-join/restart (#1163 guard)\n- blobOrphanFullCopyConverges: TTL-orphaned blobs don't wedge full-copy (#403/#405/#429 guard)\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n\n* test(cluster): rename QA fixtures to match test names\n\nfixture-qa014-conflict      -> fixture-replication-conflict-determinism\nfixture-qa178-struct-dict   -> fixture-typed-struct-replication-divergence\nfixture-qa177-blob-ttl-copy -> fixture-blob-orphan-full-copy-converges\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* fix(lint): prefix unused label param with underscore\n\n---------\n\nCo-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>",
+          "timestamp": "2026-06-23T00:03:20Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/6bb5289f313591b428a4ec92e43c1be7581df551"
+        },
+        "date": 1782219289618,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 9898.5,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 29619.4,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 23280.75,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 11475.1,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 8831.65,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 3511.87,
             "unit": "ops/sec"
           }
         ]
