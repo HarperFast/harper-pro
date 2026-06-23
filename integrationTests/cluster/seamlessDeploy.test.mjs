@@ -64,6 +64,21 @@
  * without it). Until that flap is understood, treat (b) as unstable; the value of this file is
  * the topology repro + the CA-monitor finding above, not a green gate. Captured A logs land in
  * ~/dev/tmp/seamlessDeploy-A-*.log (post-deploy snapshot, survives teardown).
+ *
+ * UPDATE (2026-06-23) — the SECOND FINDING's flap was an ENVIRONMENT artifact, now resolved. On
+ * Linux (local dev box AND CI, Node 22/24/26) assertion (b) passes deterministically: the post-deploy
+ * write from the route-less / decode-injected peer C reaches A in ~10s, no widening-backoff spiral.
+ * The 1006 close code still appears on Linux but only TRANSIENTLY during initial mesh subscription
+ * (peer mid-boot, not yet listening) and self-heals in ~0.5–1.5s. The non-recovering spiral that hit
+ * even the routed hub was specific to the macOS loopback self-signed *-replication cert re-handshake.
+ *
+ * THIRD FINDING — the route-less peer's missing `node.ca` is NOT load-bearing here. The outbound peer
+ * connection already runs rejectUnauthorized:true (replicationConnection.createWebSocket), and C's CA
+ * reaches A through the cluster CA-mesh availableCAs channel (replicator.ts secure-context updaters),
+ * independent of the hdb_nodes row the injection strips. enableRootCAs defaults to true, so the suite
+ * is now a matrix over enableRootCAs ∈ {true,false}: true = JJill's literal field shape; false turns
+ * the bundled-root-CA safety net off, the only mode where a missing `node.ca` could surface. (b) passing
+ * under enableRootCAs=false would prove the CA-mesh alone carries C's CA across the decode-strip+deploy.
  * ────────────────────────────────────────────────────────────────────────────────────────
  */
 import { suite, test, before, after } from 'node:test';
@@ -90,25 +105,32 @@ const RECONSTRUCT_WARN = 'subscribing to the peer so outbound replication is not
 const PROMPT_REPLICATION_TIMEOUT_MS = 20000;
 const POLL_INTERVAL_MS = 250;
 
-function nodeStartOptions(hostname, env) {
+function nodeStartOptions(hostname, env, enableRootCAs) {
 	return {
 		config: {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: false, console: true },
-			// Route-less follower config: replicate every database, discover peers via the
-			// hdb_nodes mesh — no `routes`.
+			// Route-less follower config matching the JJill field shape: replicate every database,
+			// discover peers via the hdb_nodes mesh — no `routes`. `enableRootCAs` is parameterized so the
+			// suite runs as a matrix (see defineSeamlessSuite): true = JJill's literal config and the Harper
+			// default ("Verify certificates against Node's bundled CA store: true"); false = the strict probe
+			// with that bundled-root-CA safety net OFF. false is the ONLY mode where the reconstructed
+			// {name,replicates:true} descriptor's missing `node.ca` could matter — with roots off, C's CA must
+			// arrive via the cluster CA-mesh availableCAs channel (replicator.ts), not the hdb_nodes row that
+			// the decode injection strips. The outbound peer connection already runs rejectUnauthorized:true.
 			replication: {
 				securePort: hostname + ':9933',
 				databases: '*',
+				enableRootCAs,
 			},
 		},
 		env: { HARPER_NO_FLUSH_ON_EXIT: true, ...env },
 	};
 }
 
-async function startNode(ctx, env) {
+async function startNode(ctx, env, enableRootCAs) {
 	const nodeCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
-	await startHarper(nodeCtx, nodeStartOptions(nodeCtx.harper.hostname, env));
+	await startHarper(nodeCtx, nodeStartOptions(nodeCtx.harper.hostname, env, enableRootCAs));
 	return nodeCtx.harper;
 }
 
@@ -161,115 +183,129 @@ async function waitForReplicated(receiver, id, timeoutMs) {
 	return false;
 }
 
-suite('Seamless deploy reload for a route-less replication peer (harper-pro#460 + harper#1464)', { timeout: 180000 }, (ctx) => {
-	before(async () => {
-		// Start C first so A can be started with C's hostname as the decode-fail target.
-		ctx.C = await startNode(ctx);
-		// SEAMLESS_NO_INJECT=1 → control run: no decode-miss, A decodes C's real descriptor (with ca/
-		// connection info). Used to classify the 1006 reconnect flap: if the control is stable but the
-		// injected run flaps, the reconstructed {name,replicates:true} descriptor is the cause.
-		ctx.A = await startNode(
-			ctx,
-			process.env.SEAMLESS_NO_INJECT ? {} : { HARPER_TEST_HDBNODES_DECODE_FAIL: ctx.C.hostname }
-		);
-		ctx.B = await startNode(ctx); // hub
-		ctx.nodes = [ctx.A, ctx.B, ctx.C];
-		await Promise.all(ctx.nodes.map((node) => createTestTable(node)));
-	});
+// Run the repro as a matrix over enableRootCAs. true = JJill's literal field shape (and the Harper
+// default); false = strict probe with the bundled-root-CA safety net OFF — the discriminating case for
+// whether the reconstructed descriptor's missing `node.ca` is actually load-bearing. Both variants run
+// the injected decode-miss on CI (HARPER_TEST_HDBNODES_DECODE_FAIL is set by the test); SEAMLESS_NO_INJECT=1
+// flips both to the control. Each variant uses its own 3 nodes (fresh loopback addresses).
+for (const enableRootCAs of [true, false]) defineSeamlessSuite(enableRootCAs);
 
-	after(async () => {
-		if (!ctx.nodes) return;
-		await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node })));
-	});
+function defineSeamlessSuite(enableRootCAs) {
+	suite(
+		`Seamless deploy reload for a route-less replication peer (harper-pro#460, enableRootCAs=${enableRootCAs})`,
+		{ timeout: 180000 },
+		(ctx) => {
+			before(async () => {
+				// Start C first so A can be started with C's hostname as the decode-fail target.
+				ctx.C = await startNode(ctx, undefined, enableRootCAs);
+				// SEAMLESS_NO_INJECT=1 → control run: no decode-miss, A decodes C's real descriptor (with ca/
+				// connection info). Used to classify the 1006 reconnect flap: if the control is stable but the
+				// injected run flaps, the reconstructed {name,replicates:true} descriptor is the cause.
+				ctx.A = await startNode(
+					ctx,
+					process.env.SEAMLESS_NO_INJECT ? {} : { HARPER_TEST_HDBNODES_DECODE_FAIL: ctx.C.hostname },
+					enableRootCAs
+				);
+				ctx.B = await startNode(ctx, undefined, enableRootCAs); // hub
+				ctx.nodes = [ctx.A, ctx.B, ctx.C];
+				await Promise.all(ctx.nodes.map((node) => createTestTable(node)));
+			});
 
-	test('A and C mesh-discover each other through hub B (route-less A<->C)', async () => {
-		// Hub B issues the token; A and C each add_node B. Neither A nor C has a route to the
-		// other — A learns C only via hdb_nodes propagation from B, which is exactly the path the
-		// injected decode miss orphans.
-		const tokenResponse = await sendOperation(ctx.B, {
-			operation: 'create_authentication_tokens',
-			authorization: ctx.B.admin,
-		});
-		const token = tokenResponse.operation_token;
-		await addHub(ctx.A, ctx.B, token);
-		await addHub(ctx.C, ctx.B, token);
+			after(async () => {
+				if (!ctx.nodes) return;
+				await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node })));
+			});
 
-		// Wait until A has a connected database_socket to the route-less peer C. This proves the
-		// reconstruct path (harper-pro#460) built the outbound subscription despite the boot
-		// decode miss — the precondition for the seamless-reload assertions below.
-		const deadline = Date.now() + 60000;
-		let connected = false;
-		while (Date.now() < deadline) {
-			if (await databaseSocketConnectedTo(ctx.A, ctx.C)) {
-				connected = true;
-				break;
-			}
-			await delay(POLL_INTERVAL_MS);
+			test('A and C mesh-discover each other through hub B (route-less A<->C)', async () => {
+				// Hub B issues the token; A and C each add_node B. Neither A nor C has a route to the
+				// other — A learns C only via hdb_nodes propagation from B, which is exactly the path the
+				// injected decode miss orphans.
+				const tokenResponse = await sendOperation(ctx.B, {
+					operation: 'create_authentication_tokens',
+					authorization: ctx.B.admin,
+				});
+				const token = tokenResponse.operation_token;
+				await addHub(ctx.A, ctx.B, token);
+				await addHub(ctx.C, ctx.B, token);
+
+				// Wait until A has a connected database_socket to the route-less peer C. This proves the
+				// reconstruct path (harper-pro#460) built the outbound subscription despite the boot
+				// decode miss — the precondition for the seamless-reload assertions below.
+				const deadline = Date.now() + 60000;
+				let connected = false;
+				while (Date.now() < deadline) {
+					if (await databaseSocketConnectedTo(ctx.A, ctx.C)) {
+						connected = true;
+						break;
+					}
+					await delay(POLL_INTERVAL_MS);
+				}
+				ok(connected, 'A should have a connected database_socket to route-less peer C before the deploy');
+			});
+
+			test('baseline: a write on C replicates to A', async () => {
+				await sendOperation(ctx.C, {
+					operation: 'upsert',
+					table: 'test',
+					records: [{ id: '1', name: 'from-C-pre-deploy' }],
+				});
+				const replicated = await waitForReplicated(ctx.A, '1', PROMPT_REPLICATION_TIMEOUT_MS);
+				ok(replicated, 'baseline write {id:1} on C must replicate to A before the deploy');
+			});
+
+			test('a deploy_component reload of A is SEAMLESS for the route-less peer C', async () => {
+				const logBeforeDeploy = await readLog(ctx.A);
+
+				const project = 'seamless-probe';
+				const payload = await targz(join(import.meta.dirname, 'fixture-seamless-probe'));
+				const deployResponse = await sendOperation(ctx.A, {
+					operation: 'deploy_component',
+					project,
+					payload,
+					restart: true,
+				});
+				ok(
+					/Successfully deployed: seamless-probe/.test(deployResponse.message ?? ''),
+					`deploy should succeed; got ${JSON.stringify(deployResponse)}`
+				);
+
+				// Let the HTTP workers cycle (restart:true) and the fresh worker re-run replicator.start().
+				await delay(10000);
+
+				// Persist A's full log to a stable location BEFORE teardown wipes the temp log dir, so the
+				// scan/warn evidence survives for inspection.
+				const logAfterDeploy = await readLog(ctx.A);
+				await captureLog(ctx.A, logAfterDeploy);
+
+				// DIAGNOSTIC (not a gate): record where the #460 reconstruct warn fired. As documented in the
+				// header, with #460 in place this warn appears after the deploy in BOTH #1464 configs because
+				// the per-worker CA-monitor scan in replicator.start() re-runs on every worker restart and is
+				// not gated by startOnMainThread. The injection does NOT fire at A's boot scan (C is not
+				// mesh-known yet then), so a pre-deploy occurrence would be unexpected — surface it if seen.
+				console.log(
+					`[seamlessDeploy] #460 reconstruct warn — pre-deploy: ${logBeforeDeploy.includes(RECONSTRUCT_WARN)}, ` +
+						`post-deploy: ${logAfterDeploy.includes(RECONSTRUCT_WARN)} (post-deploy true is expected: ` +
+						'per-worker CA-monitor scan re-runs the injection; not a #1464 signal — see header)'
+				);
+
+				// PRIMARY ASSERTION (harper-pro#460): a write on C reaches A promptly after the deploy — the
+				// route-less peer's outbound replication survives the reload because the post-reload scan
+				// reconstructs C's descriptor and re-subscribes. (No ~90s reconcileWorkers gap.)
+				await sendOperation(ctx.C, {
+					operation: 'upsert',
+					table: 'test',
+					records: [{ id: '2', name: 'from-C-post-deploy' }],
+				});
+				const replicatedPromptly = await waitForReplicated(ctx.A, '2', PROMPT_REPLICATION_TIMEOUT_MS);
+				ok(
+					replicatedPromptly,
+					`post-deploy write {id:2} on C must reach A within ${PROMPT_REPLICATION_TIMEOUT_MS}ms (seamless, ` +
+						'no ~90s reconcile gap). It did not — the route-less peer was orphaned after the deploy.'
+				);
+			});
 		}
-		ok(connected, 'A should have a connected database_socket to route-less peer C before the deploy');
-	});
-
-	test('baseline: a write on C replicates to A', async () => {
-		await sendOperation(ctx.C, {
-			operation: 'upsert',
-			table: 'test',
-			records: [{ id: '1', name: 'from-C-pre-deploy' }],
-		});
-		const replicated = await waitForReplicated(ctx.A, '1', PROMPT_REPLICATION_TIMEOUT_MS);
-		ok(replicated, 'baseline write {id:1} on C must replicate to A before the deploy');
-	});
-
-	test('a deploy_component reload of A is SEAMLESS for the route-less peer C', async () => {
-		const logBeforeDeploy = await readLog(ctx.A);
-
-		const project = 'seamless-probe';
-		const payload = await targz(join(import.meta.dirname, 'fixture-seamless-probe'));
-		const deployResponse = await sendOperation(ctx.A, {
-			operation: 'deploy_component',
-			project,
-			payload,
-			restart: true,
-		});
-		ok(
-			/Successfully deployed: seamless-probe/.test(deployResponse.message ?? ''),
-			`deploy should succeed; got ${JSON.stringify(deployResponse)}`
-		);
-
-		// Let the HTTP workers cycle (restart:true) and the fresh worker re-run replicator.start().
-		await delay(10000);
-
-		// Persist A's full log to a stable location BEFORE teardown wipes the temp log dir, so the
-		// scan/warn evidence survives for inspection.
-		const logAfterDeploy = await readLog(ctx.A);
-		await captureLog(ctx.A, logAfterDeploy);
-
-		// DIAGNOSTIC (not a gate): record where the #460 reconstruct warn fired. As documented in the
-		// header, with #460 in place this warn appears after the deploy in BOTH #1464 configs because
-		// the per-worker CA-monitor scan in replicator.start() re-runs on every worker restart and is
-		// not gated by startOnMainThread. The injection does NOT fire at A's boot scan (C is not
-		// mesh-known yet then), so a pre-deploy occurrence would be unexpected — surface it if seen.
-		console.log(
-			`[seamlessDeploy] #460 reconstruct warn — pre-deploy: ${logBeforeDeploy.includes(RECONSTRUCT_WARN)}, ` +
-				`post-deploy: ${logAfterDeploy.includes(RECONSTRUCT_WARN)} (post-deploy true is expected: ` +
-				'per-worker CA-monitor scan re-runs the injection; not a #1464 signal — see header)'
-		);
-
-		// PRIMARY ASSERTION (harper-pro#460): a write on C reaches A promptly after the deploy — the
-		// route-less peer's outbound replication survives the reload because the post-reload scan
-		// reconstructs C's descriptor and re-subscribes. (No ~90s reconcileWorkers gap.)
-		await sendOperation(ctx.C, {
-			operation: 'upsert',
-			table: 'test',
-			records: [{ id: '2', name: 'from-C-post-deploy' }],
-		});
-		const replicatedPromptly = await waitForReplicated(ctx.A, '2', PROMPT_REPLICATION_TIMEOUT_MS);
-		ok(
-			replicatedPromptly,
-			`post-deploy write {id:2} on C must reach A within ${PROMPT_REPLICATION_TIMEOUT_MS}ms (seamless, ` +
-				'no ~90s reconcile gap). It did not — the route-less peer was orphaned after the deploy.'
-		);
-	});
-});
+	);
+}
 
 // Write a copy of A's captured log to ~/dev/tmp/ so the warn evidence survives teardown.
 async function captureLog(node, contents) {
