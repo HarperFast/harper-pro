@@ -83,10 +83,13 @@ suite('Copy-mode blob deadlock (base copy)', { timeout: 240000 }, (ctx) => {
 		});
 		ctx.nodes = [nodeA.harper, nodeB.harper];
 
-		// Seed RECORDS file-backed blobs on A BEFORE B subscribes, so add_node base-copies them.
+		// Seed RECORDS file-backed blobs on A BEFORE B subscribes, so add_node base-copies them. Order
+		// doesn't matter (independent records), so fire them concurrently to speed up setup.
+		const seedPromises = [];
 		for (let id = 1; id <= RECORDS; id++) {
-			await fetchWithRetry(ctx.nodes[0].httpURL + '/Prerender/' + id);
+			seedPromises.push(fetchWithRetry(ctx.nodes[0].httpURL + '/Prerender/' + id));
 		}
+		await Promise.all(seedPromises);
 		const aDesc = await sendOperation(ctx.nodes[0], { operation: 'describe_table', table: 'Prerender' });
 		ok((aDesc.record_count ?? 0) >= RECORDS, `source did not materialize blobs: holds ${aDesc.record_count}/${RECORDS}`);
 	});
