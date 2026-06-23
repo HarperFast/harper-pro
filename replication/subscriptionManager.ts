@@ -296,7 +296,10 @@ export async function startOnMainThread(options) {
 				console.error(error);
 			}
 		}
-		subscribeToNodeUpdates(onNodeUpdate);
+		// keyed 'subscription-manager' so a deploy_component reload (which re-fires this callback)
+		// supersedes only this watcher, while the CA-monitor and replication-confirmation watchers
+		// keyed elsewhere keep running concurrently (harper-pro#460).
+		subscribeToNodeUpdates(onNodeUpdate, 'subscription-manager');
 	});
 	let isFullyReplicating;
 	/**

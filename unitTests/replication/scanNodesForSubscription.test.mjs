@@ -27,22 +27,33 @@ import {
 	reconstructNodeFromKey,
 	resolveScannedNode,
 	scanNodesForSubscription,
+	probeNodeRow,
 	runNodeUpdateWatcher,
 	stopNodeUpdateWatcher,
 } from '#src/replication/knownNodes';
 
+// Sentinel meaning "the POINT lookup throws for this key" — the present-but-undecodable (#352/#1163)
+// state, distinct from a clean null (a genuine remove_node tombstone).
+const DECODE_THROWS = Symbol('decode-throws');
+
 /**
- * Minimal store stub modeling lmdb-js getRange. `rows` maps key -> decoded value (use `null` to
- * model a range-visible-but-undecodable row — the harper-pro#460 follower state). Keys are always
- * range-visible (that is the whole point: the scan path lists keys reliably even when the value
- * fails to decode through the record codec).
+ * Minimal store stub modeling lmdb-js getRange + get. `rows` maps key -> decoded range value (use
+ * `null` to model a range-visible row whose decoded scan value is null — both the decode-miss and
+ * the tombstone present this way in the scan). The point lookup (`get`) is what disambiguates:
+ * `DECODE_THROWS` ⇒ get() throws (decode failure, reconstruct); a `null` row value ⇒ get() returns
+ * null (genuine tombstone, skip); any object ⇒ get() returns it.
  */
 function fakeStore(rows) {
 	return {
 		getRange() {
 			return Object.keys(rows)
 				.sort()
-				.map((key) => ({ key, value: rows[key] }));
+				.map((key) => ({ key, value: rows[key] === DECODE_THROWS ? null : rows[key] }));
+		},
+		get(key) {
+			const row = rows[key];
+			if (row === DECODE_THROWS) throw new Error('missing shared structure');
+			return row ?? null;
 		},
 	};
 }
@@ -64,26 +75,68 @@ describe('reconstructNodeFromKey (harper-pro#460)', () => {
 });
 
 describe('resolveScannedNode (harper-pro#460)', () => {
+	// A probe modeling the store-backed probeNodeRow outcome for tests of the pure resolution logic.
+	const decodeFailure = () => ({ outcome: 'decode-failure' });
+	const tombstone = () => ({ outcome: 'deleted' });
+
 	it('returns the decoded record as-is when present', () => {
 		const decoded = { name: 'peer-a', url: 'wss://peer-a:9933', replicates: true, shard: 2 };
-		expect(resolveScannedNode(decoded, 'peer-a')).to.equal(decoded);
+		expect(resolveScannedNode(decoded, 'peer-a', decodeFailure)).to.equal(decoded);
 	});
 
-	it('reconstructs from the key when the value failed to decode (null) but the key is range-visible', () => {
+	it('reconstructs from the key on a decode failure (probe says decode-failure)', () => {
+		expect(resolveScannedNode(null, 'peer-a', decodeFailure)).to.deep.equal({ name: 'peer-a', replicates: true });
+		expect(resolveScannedNode(undefined, 'peer-a', decodeFailure)).to.deep.equal({ name: 'peer-a', replicates: true });
+	});
+
+	it('does NOT reconstruct a genuine tombstone (probe says deleted) — no reviving removed nodes', () => {
+		// harper-pro#460 review (Codex P1): a remove_node leaves a null tombstone; reviving it would
+		// resubscribe a removed peer.
+		expect(resolveScannedNode(null, 'peer-a', tombstone)).to.equal(undefined);
+	});
+
+	it('without a probe, preserves the original reconstruct-on-null behavior (pure seam)', () => {
 		expect(resolveScannedNode(null, 'peer-a')).to.deep.equal({ name: 'peer-a', replicates: true });
-		expect(resolveScannedNode(undefined, 'peer-a')).to.deep.equal({ name: 'peer-a', replicates: true });
+		expect(resolveScannedNode(null, '')).to.equal(undefined);
 	});
 
 	it('returns undefined when there is neither a value nor a usable key', () => {
-		expect(resolveScannedNode(null, '')).to.equal(undefined);
-		expect(resolveScannedNode(null, undefined)).to.equal(undefined);
+		expect(resolveScannedNode(null, '', decodeFailure)).to.equal(undefined);
+		expect(resolveScannedNode(null, undefined, decodeFailure)).to.equal(undefined);
+	});
+});
+
+describe('probeNodeRow (harper-pro#460 review: tombstone vs decode failure)', () => {
+	it('classifies a point lookup that THROWS as a decode failure', () => {
+		const store = {
+			get: () => {
+				throw new Error('missing shared structure');
+			},
+		};
+		expect(probeNodeRow(store, 'peer-a')).to.deep.equal({ outcome: 'decode-failure' });
+	});
+
+	it('classifies a clean null point lookup as a genuine tombstone (deleted)', () => {
+		const store = { get: () => null };
+		expect(probeNodeRow(store, 'peer-a')).to.deep.equal({ outcome: 'deleted' });
+	});
+
+	it('classifies undefined (physically absent) as deleted', () => {
+		const store = { get: () => undefined };
+		expect(probeNodeRow(store, 'peer-a')).to.deep.equal({ outcome: 'deleted' });
+	});
+
+	it('returns the recovered record when the point lookup succeeds where the range value was null', () => {
+		const rec = { name: 'peer-a', replicates: true };
+		const store = { get: () => rec };
+		expect(probeNodeRow(store, 'peer-a')).to.deep.equal({ outcome: 'decode-failure', record: rec });
 	});
 });
 
 describe('scanNodesForSubscription end-to-end (harper-pro#460 wedge close)', () => {
 	it('THE BUG (old behavior): a follower whose every hdb_nodes peer decodes to null gets ZERO subscriptions', () => {
 		// Reproduce the old `if (!node) continue` skip to show the failure mode the fix closes.
-		const store = fakeStore({ 'peer-a': null, 'peer-b': null, 'peer-c': null });
+		const store = fakeStore({ 'peer-a': DECODE_THROWS, 'peer-b': DECODE_THROWS, 'peer-c': DECODE_THROWS });
 		const subscribed = [];
 		for (const { value, key } of store.getRange({})) {
 			if (!value) continue; // <-- the old skip
@@ -93,7 +146,7 @@ describe('scanNodesForSubscription end-to-end (harper-pro#460 wedge close)', () 
 	});
 
 	it('THE FIX: the same all-undecodable follower drives one subscription per range-visible peer', () => {
-		const store = fakeStore({ 'peer-a': null, 'peer-b': null, 'peer-c': null });
+		const store = fakeStore({ 'peer-a': DECODE_THROWS, 'peer-b': DECODE_THROWS, 'peer-c': DECODE_THROWS });
 		const driven = [];
 		scanNodesForSubscription(store, (node, key) => driven.push({ node, key }));
 		expect(driven).to.deep.equal([
@@ -103,9 +156,18 @@ describe('scanNodesForSubscription end-to-end (harper-pro#460 wedge close)', () 
 		]);
 	});
 
+	it('skips genuine tombstones (deleted nodes) while still reconstructing decode-miss peers (mixed)', () => {
+		// harper-pro#460 review (Codex P1): peer-b is a removed node (clean-null tombstone) and must NOT
+		// be resubscribed; peer-c is a transient decode miss and must be reconstructed.
+		const store = fakeStore({ 'peer-b': null, 'peer-c': DECODE_THROWS });
+		const driven = [];
+		scanNodesForSubscription(store, (node, key) => driven.push({ node, key }));
+		expect(driven).to.deep.equal([{ node: { name: 'peer-c', replicates: true }, key: 'peer-c' }]);
+	});
+
 	it('passes decoded records through unchanged and reconstructs only the undecodable ones (mixed)', () => {
 		const peerA = { name: 'peer-a', url: 'wss://peer-a:9933', replicates: true, shard: 1 };
-		const store = fakeStore({ 'peer-a': peerA, 'peer-b': null });
+		const store = fakeStore({ 'peer-a': peerA, 'peer-b': DECODE_THROWS });
 		const driven = [];
 		scanNodesForSubscription(store, (node, key) => driven.push({ node, key }));
 		expect(driven).to.have.length(2);

@@ -416,35 +416,73 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 	}
 }
 /**
- * Resolve the node descriptor to use for one hdb_nodes scan entry on the OUTBOUND subscription path.
- * Returns the decoded record when valid; otherwise, when the key is range-visible but the value
- * failed to decode (the state a deploy_component worker-reload leaves a follower's replicated rows
- * in — see harper-pro#460/#352), reconstructs a minimal descriptor from the key so the outbound
- * subscription is still created. Returns `undefined` only when there is no usable key (truly skip).
- *
- * Pure (store-free) so it can be unit-tested directly; see scanNodesForSubscription for the IO loop.
+ * Distinguish a genuine `remove_node` tombstone from a transient decode failure for a range-visible
+ * hdb_nodes row whose scan value was nullish (harper-pro#460 review). A deleted node leaves a row
+ * whose POINT lookup returns `null` cleanly (the startup path in subscriptionManager already keys off
+ * `primaryStore.get(name) === null` to mean "previously deleted, do not recreate"). A decode failure
+ * instead THROWS from the point lookup (missing shared structure — the #352/#1163 misread) or yields
+ * a present-but-invalid value. So: a clean `null` ⇒ `'deleted'` (skip, must NOT revive a removed
+ * peer); a throw or any non-null point result ⇒ `'decode-failure'` (reconstruct so outbound
+ * replication survives). Returns the point-looked-up record too, so a point lookup that succeeds
+ * where the range value was null can be used directly.
  */
-export function resolveScannedNode(value: any, key: unknown): any {
+export function probeNodeRow(store: any, key: unknown): { outcome: 'deleted' | 'decode-failure'; record?: any } {
+	let record: any;
+	try {
+		record = store.get(key);
+	} catch {
+		// present-but-undecodable row → decode failure, reconstruct.
+		return { outcome: 'decode-failure' };
+	}
+	// A clean null is a genuine tombstone (removed node); undefined means physically absent. Either
+	// way there is no live peer here — do not reconstruct.
+	if (record == null) return { outcome: 'deleted' };
+	// The point lookup returned something present (a valid record, or a misread `[]`/partial). Treat
+	// it as still-present: a valid record is used directly; an invalid-but-present value reconstructs.
+	return { outcome: 'decode-failure', record };
+}
+
+/**
+ * Resolve the node descriptor to use for one hdb_nodes scan entry on the OUTBOUND subscription path.
+ * Returns the decoded record when valid; when the value is nullish, `probe` distinguishes a genuine
+ * tombstone (returns `undefined` → skip, harper-pro#460 review) from a transient decode failure
+ * (reconstructs a minimal descriptor so the outbound subscription is still created — harper-pro#460/
+ * #352). Returns `undefined` when there is no usable key (truly skip).
+ *
+ * `probe` is injected so this stays unit-testable without a live store; scanNodesForSubscription
+ * supplies the store-backed {@link probeNodeRow}.
+ */
+export function resolveScannedNode(
+	value: any,
+	key: unknown,
+	probe?: (key: unknown) => { outcome: 'deleted' | 'decode-failure'; record?: any }
+): any {
 	if (value) return value;
+	// No probe (legacy/pure call): preserve the original reconstruct-on-null behavior.
+	if (!probe) return reconstructNodeFromKey(key);
+	const { outcome, record } = probe(key);
+	if (outcome === 'deleted') return undefined; // genuine tombstone — do not revive a removed node
+	if (record && isValidNodeRecord(record)) return record; // point lookup recovered the real record
 	return reconstructNodeFromKey(key);
 }
 
 /**
  * Iterate the hdb_nodes range and drive `onNode(node, key)` for each peer, reconstructing a minimal
- * descriptor for any range-visible-but-undecodable row (harper-pro#460). Takes the store explicitly
- * so it can be unit-tested against a fake/real store without standing up a server. The shard/server
- * bookkeeping stays in subscribeToNodeUpdates (its concern, and it owns the `server` global).
+ * descriptor for any range-visible-but-undecodable row while skipping genuine tombstones
+ * (harper-pro#460). Takes the store explicitly so it can be unit-tested against a fake/real store
+ * without standing up a server. The shard/server bookkeeping stays in subscribeToNodeUpdates (its
+ * concern, and it owns the `server` global).
  */
 export function scanNodesForSubscription(store: any, onNode: (node: any, key: any) => void) {
 	for (const entry of store.getRange({})) {
 		const { value, key } = entry;
-		const node = resolveScannedNode(value, key);
+		const node = resolveScannedNode(value, key, (probeKey) => probeNodeRow(store, probeKey));
 		if (!node) continue;
 		if (!value) {
 			logger.warn?.(
 				'hdb_nodes record for',
 				key,
-				'did not decode at the subscription scan but is range-visible; subscribing to the peer by name so outbound replication is not lost (see harper-pro#460). The full record self-heals on the next decodable update.'
+				'did not decode to a live record at the subscription scan but is present (not a tombstone); subscribing to the peer so outbound replication is not lost (see harper-pro#460). The full record self-heals on the next decodable update.'
 			);
 		}
 		onNode(node, key);
