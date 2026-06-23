@@ -3039,10 +3039,48 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			return;
 		}
 		blobsBeingSent.add(id);
+		const iterator = blob.stream()[Symbol.asyncIterator]();
 		try {
 			let lastBuffer: Buffer;
 			outstandingBlobsBeingSent++;
-			for await (const buffer of blob.stream()) {
+			// Per-chunk timeout: races each iterator.next() against a setTimeout reject so a stuck
+			// underlying read can't park the send loop forever. The local blob file may be missing or
+			// confidently corrupt; the read stream then sits without emitting `data`, `end`, or
+			// `error`, the for-await waits indefinitely, no finishing BLOB_CHUNK is ever sent, and the
+			// receiver's apply consumer wedges at `lastReceivedStatus:"Receiving"` until its own idle
+			// watchdog fires (core/resources/blob.ts) 120s later. With the timeout, the catch below
+			// emits the finishing error frame so the receiver advances cleanly.
+			// Defaults ON to the replication blob timeout (REPLICATION_BLOBTIMEOUT, 120000 default) so a
+			// stalled send can't silently wedge a base copy out of the box (harper-pro#453). The
+			// HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS env var overrides it; set it to 0 to disable.
+			const rawEnv = process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS;
+			const chunkTimeoutMs = rawEnv != null && rawEnv !== '' ? Math.max(0, Number(rawEnv) || 0) : blobTimeout;
+			while (true) {
+				let result: IteratorResult<any>;
+				if (chunkTimeoutMs > 0) {
+					let timer: NodeJS.Timeout | undefined;
+					try {
+						result = await Promise.race([
+							iterator.next(),
+							new Promise<never>((_, reject) => {
+								timer = setTimeout(
+									() =>
+										reject(
+											new Error(`Blob send chunk timeout after ${chunkTimeoutMs}ms (fileId=${id})`)
+										),
+									chunkTimeoutMs
+								);
+								timer.unref();
+							}),
+						]);
+					} finally {
+						if (timer) clearTimeout(timer);
+					}
+				} else {
+					result = await iterator.next();
+				}
+				if (result.done) break;
+				const buffer = result.value as Buffer;
 				if (lastBuffer) {
 					logger.debug?.('Sending blob chunk', id, 'length', lastBuffer.length);
 					// do the previous buffer so we know if it is the last one or not
@@ -3057,7 +3095,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						])
 					);
 				}
-				lastBuffer = buffer as Buffer;
+				lastBuffer = buffer;
 				if (ws._socket.writableNeedDrain) {
 					logger.debug?.('draining', id);
 					await new Promise((resolve) => ws._socket.once('drain', resolve));
@@ -3079,6 +3117,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				])
 			);
 		} catch (error) {
+			try {
+				await iterator.return?.();
+			} catch {}
 			logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
 			// Forward the error CODE and STATUS alongside the message so the receiver can tell a PERMANENT
 			// source failure — the blob is gone (ENOENT/404) or confidently corrupt/incomplete (500,
