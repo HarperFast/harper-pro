@@ -209,6 +209,13 @@ const COMMITTED_UPDATE_DELAY = 2;
 const PING_INTERVAL = env.get(CONFIG_PARAMS.REPLICATION_PINGINTERVAL) ?? 30000;
 // Time (ms) without any socket activity before a connection is treated as dead.
 const PING_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_PINGTIMEOUT) ?? PING_INTERVAL * 2;
+// During an initial base copy of a large table the *sender* can be stuck in writableNeedDrain
+// backpressure for a long stretch, so no socket bytes reach the receiver for well over PING_TIMEOUT
+// (default 60s) even though the copy is healthy and will resume. Timing the receiver out on that gap
+// reconnects → resumes the same checkpoint → stalls again, starving the copy (harper-pro#460). So while
+// inCopyMode the byte-level idle watchdog uses this higher copy-phase threshold instead of PING_TIMEOUT;
+// the copy-progress watchdog (#453) still catches a genuinely frozen copy on its own clock.
+const COPY_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_COPYTIMEOUT) ?? 300000;
 // On RocksDB the audit log is keyed by the record version directly (version === the log key), so a
 // record's `version` IS a valid resume-cursor value. On LMDB the log key is a separate local audit time
 // (`localTime`) that differs from `version` (the origin record timestamp) — and the receive side does not
@@ -661,17 +668,21 @@ export function collectLastTxnTimes(seqEntries: Iterable<{ value: any }>): Map<a
  * receiveWatchdog.test.mjs` — production callers go through `replicateOverWS`.
  */
 export function createReceiveWatchdog(opts: {
-	intervalMs: number;
+	// A function lets the threshold change per-arm without rebuilding the watchdog — used so the byte
+	// watchdog can widen the window to COPY_TIMEOUT while inCopyMode and fall back to PING_TIMEOUT after
+	// (harper-pro#460). A plain number is still accepted for the fixed-threshold callers.
+	intervalMs: number | (() => number);
 	getBytesRead: () => number;
 	onSilence: () => void;
 }): { reset: () => void; stop: () => void } {
 	let timer: NodeJS.Timeout | undefined;
 	let bytesReadAtArm = 0;
 	let lastResetAt = 0;
+	const resolveIntervalMs = () => (typeof opts.intervalMs === 'function' ? opts.intervalMs() : opts.intervalMs);
 	// Coalesce rapid reset() calls (e.g. message frames arriving thousands of times per second
 	// during a large copy) so we do not churn setTimeout/clearTimeout per frame. Granularity loss
 	// is small relative to intervalMs — at worst the watchdog fires this much earlier or later.
-	const throttleMs = Math.min(1000, Math.max(100, opts.intervalMs / 30));
+	const throttleMs = Math.min(1000, Math.max(100, resolveIntervalMs() / 30));
 	function check() {
 		const current = opts.getBytesRead();
 		if (current === bytesReadAtArm) {
@@ -685,7 +696,7 @@ export function createReceiveWatchdog(opts: {
 		// watchdog permanently inactive (see PR #234 review).
 		bytesReadAtArm = current;
 		lastResetAt = Date.now();
-		timer = setTimeout(check, opts.intervalMs).unref();
+		timer = setTimeout(check, resolveIntervalMs()).unref();
 	}
 	return {
 		reset() {
@@ -694,7 +705,7 @@ export function createReceiveWatchdog(opts: {
 			lastResetAt = now;
 			if (timer) clearTimeout(timer);
 			bytesReadAtArm = opts.getBytesRead();
-			timer = setTimeout(check, opts.intervalMs).unref();
+			timer = setTimeout(check, resolveIntervalMs()).unref();
 		},
 		stop() {
 			if (timer) {
@@ -1237,6 +1248,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyFromNodeId = undefined;
 			pendingCopyCursor = null;
 			copyProgressWatchdog?.stop(); // copy is done; no longer watching for copy-progress stalls (#453)
+			// Copy is over: narrow the byte watchdog back from COPY_TIMEOUT to PING_TIMEOUT so an idle/dead
+			// connection in normal replication is still detected on the normal timeout. stop()+reset() so the
+			// per-frame throttle can't swallow this transition re-arm (mirrors the COPY_START widen). (#460)
+			receiveWatchdog?.stop();
+			receiveWatchdog?.reset();
 		}
 	}
 	// Persist the staged copy cursor and, if the copy is now fully durable, finish it — but ONLY when the
@@ -1400,12 +1416,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			lastByteActivity = performance.now();
 		}
 	}
+	// The idle-silence window the byte-level liveness checks tolerate. While receiving a base copy the
+	// sender can sit in writableNeedDrain backpressure with no bytes reaching us for far longer than
+	// PING_TIMEOUT even though the copy is healthy, so widen the window to COPY_TIMEOUT during copy and
+	// fall back to the normal ping timeout otherwise (harper-pro#460). Evaluated per check/arm because
+	// inCopyMode flips during the connection's life.
+	const currentReceiveSilenceThresholdMs = () => (inCopyMode ? COPY_TIMEOUT : RECEIVE_SILENCE_THRESHOLD_MS);
 	if (options.url) {
 		const sendPing = () => {
 			// Note any socket activity since the last interval (incoming pong/data or our send buffer
 			// draining as the peer consumes) — either proves the peer is still alive.
 			noteByteActivity();
-			if (shouldTerminateIdlePing(performance.now() - lastByteActivity, PING_TIMEOUT, pauseReasons)) {
+			if (
+				shouldTerminateIdlePing(performance.now() - lastByteActivity, currentReceiveSilenceThresholdMs(), pauseReasons)
+			) {
 				ws.terminate(); // no socket activity within the timeout — peer is gone
 				return;
 			}
@@ -1430,7 +1454,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// modes observed in the field.
 	const wedgedForTest = armReplicationWedgeForTest(options.connection, ws, databaseName);
 	receiveWatchdog = createReceiveWatchdog({
-		intervalMs: RECEIVE_SILENCE_THRESHOLD_MS,
+		intervalMs: currentReceiveSilenceThresholdMs,
 		getBytesRead: () => (wedgedForTest ? 0 : (ws._socket?.bytesRead ?? 0)),
 		onSilence: () => {
 			// Warn-level: if the active sendPing was healthy this watchdog should not have fired,
@@ -1440,7 +1464,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			const direction = options.url ? 'no activity from' : 'no ping from';
 			logger.warn?.(
-				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${RECEIVE_SILENCE_THRESHOLD_MS}ms — terminating connection and reconnecting`
+				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${currentReceiveSilenceThresholdMs()}ms — terminating connection and reconnecting`
 			);
 			// On the client (subscription) side drive recovery through the connection so it does not depend
 			// on terminate() propagating a 'close' (an open-but-idle socket may never emit one). A
@@ -2019,6 +2043,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
 						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)
 						lastCopyFlushTime = performance.now();
+						// The byte watchdog was already (re)armed for THIS frame back in the synchronous
+						// ws.on('message') handler — before inCopyMode flipped — so it is still sized to
+						// PING_TIMEOUT. Re-arm it now that we're in copy mode so it picks up the wider
+						// COPY_TIMEOUT; otherwise a sender that goes silent immediately after COPY_START would
+						// trip the ping timeout and reconnect, the exact starvation loop #460 avoids. stop()
+						// first so the per-frame reset() throttle can't swallow this transition re-arm.
+						receiveWatchdog?.stop();
+						receiveWatchdog?.reset();
 						noteCopyProgress(); // COPY_START is itself copy progress; arm the watchdog (#453)
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the

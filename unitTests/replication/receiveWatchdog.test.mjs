@@ -233,6 +233,34 @@ describe('createReceiveWatchdog', () => {
 		expect(onSilence.callCount).to.equal(1);
 	});
 
+	it('intervalMs as a function is resolved at each arm, so a copy-phase widen takes effect (harper-pro#460)', () => {
+		// The byte watchdog passes a function for intervalMs so it can return PING_TIMEOUT normally and a
+		// wider COPY_TIMEOUT while inCopyMode. Flipping the function's result mid-life must change the
+		// next armed interval rather than being frozen at construction time.
+		const onSilence = sinon.spy();
+		let inCopyMode = false;
+		const watchdog = createReceiveWatchdog({
+			intervalMs: () => (inCopyMode ? 300_000 : 60_000),
+			getBytesRead: () => 0,
+			onSilence,
+		});
+
+		// Normal phase: fires at the 60s ping timeout.
+		watchdog.reset();
+		clock.tick(60_000);
+		expect(onSilence.callCount).to.equal(1);
+
+		// Enter copy mode and re-arm: the same instance now tolerates 60s of silence without firing...
+		inCopyMode = true;
+		watchdog.reset();
+		clock.tick(60_000);
+		expect(onSilence.callCount).to.equal(1);
+
+		// ...and only fires once the wider copy threshold elapses.
+		clock.tick(240_000);
+		expect(onSilence.callCount).to.equal(2);
+	});
+
 	it('regression: silence is still detected when the last activity was a *throttled* reset', () => {
 		// PR #234 review bug shape: external reset() while within the throttle window is dropped
 		// (no clear+reschedule). The in-flight timer eventually fires, observes that bytesRead

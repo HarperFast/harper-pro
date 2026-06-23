@@ -49,6 +49,11 @@ const STALL_DB = 'data';
 const PING_INTERVAL_MS = 1000;
 const PING_TIMEOUT_MS = 3000;
 const COPY_STALL_TIMEOUT_MS = 5000; // REPLICATION_BLOBTIMEOUT → the copy-progress watchdog threshold
+// REPLICATION_COPYTIMEOUT — the byte watchdog's no-activity threshold *while in copy mode* (harper-pro#460).
+// Set comfortably above COPY_STALL_TIMEOUT_MS so the copy-progress watchdog is provably the recovery path
+// and the byte watchdog never fires during the stall (it would at the 3s pingTimeout if copy mode didn't
+// widen it). This also pins the #460 behavior: the byte watchdog tolerates a long copy-phase silence.
+const COPY_TIMEOUT_MS = 30000;
 const RECOVERY_TIMEOUT_MS = 40000;
 const POLL_INTERVAL_MS = 250;
 
@@ -62,6 +67,7 @@ function nodeStartOptions(node, { stall = false } = {}) {
 				databases: [STALL_DB],
 				pingInterval: PING_INTERVAL_MS,
 				pingTimeout: PING_TIMEOUT_MS,
+				copyTimeout: COPY_TIMEOUT_MS,
 				blobTimeout: COPY_STALL_TIMEOUT_MS,
 			},
 		},
