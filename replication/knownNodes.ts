@@ -119,7 +119,11 @@ export function stopNodeUpdateWatcher(key: string = DEFAULT_WATCHER_KEY) {
 	watcherIterators.delete(key);
 	// Closing the iterator breaks the `for await` the active loop is parked on; the generation bump
 	// makes the loop exit instead of restarting even if the close races the next iteration.
-	iterator?.return?.(undefined);
+	// `iterator.return()` can return a rejecting Promise (the underlying subscription may reject on
+	// close); swallow it so superseding a watcher can't surface an unhandled rejection.
+	Promise.resolve(iterator?.return?.(undefined)).catch((error) => {
+		logger.error?.('Error closing node update watcher iterator', error);
+	});
 }
 
 export async function runNodeUpdateWatcher(
@@ -346,6 +350,10 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 	// remove any nodes that have been updated or deleted
 	const node_name = event?.value?.name || event?.id;
 	logger.debug?.('adding node', node_name, 'on  node', getThisNodeName(), ' on process', process.pid);
+	// Capture the prior in-memory node before we drop it, so a transient decode miss can be
+	// reconstructed WITH its connection fields (url/shard/ca/etc.) instead of a bare {name}
+	// (harper-pro#460 review). name + replicates from the reconstruct still win on merge.
+	const oldNode = server.nodes.find((node) => node && node.name !== undefined && node.name === node_name);
 	server.nodes = server.nodes.filter((node) => node && node.name !== node_name);
 	if (event.type === 'put' && node_name !== getThisNodeName()) {
 		// add any new nodes
@@ -354,9 +362,10 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			// put event with no decodable value — reconstruct a minimal descriptor from the key so
 			// server.nodes (and the outbound subscription fired below) still reflect the peer
 			// (harper-pro#460). A genuine delete is handled separately via isGenuineNodeDeletion.
-			const reconstructed = reconstructNodeFromKey(node_name);
-			// Cast: this is a deliberate partial recovery descriptor (name + replicates), parallel to
-			// the loosely-typed `event.value` push above; the next decodable update supplies url/shard.
+			let reconstructed = reconstructNodeFromKey(node_name);
+			if (reconstructed && oldNode) reconstructed = { ...oldNode, ...reconstructed };
+			// Cast: this is a deliberate partial recovery descriptor (name + replicates, plus any
+			// enriched fields from oldNode); the next decodable update supplies the rest.
 			if (reconstructed) server.nodes.push(reconstructed as any);
 			else console.error('Invalid node update event', event);
 		}
@@ -393,7 +402,8 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			// subscription (harper-pro#460). Reconstruct a minimal descriptor from the key and forward
 			// THAT instead, so the outbound subscription is (re)created; the next decodable event
 			// replaces it with the full record.
-			const reconstructed = reconstructNodeFromKey(event.id);
+			let reconstructed = reconstructNodeFromKey(event.id);
+			if (reconstructed && oldNode) reconstructed = { ...oldNode, ...reconstructed };
 			if (reconstructed) {
 				logger.warn?.(
 					'hdb_nodes change event for',
@@ -495,10 +505,21 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 	// watcher instead of stacking one, while the two distinct callers (subscription management vs
 	// replication-confirmation tracking) keep independent concurrent watchers.
 	runNodeUpdateWatcher(listener, { key: watcherKey });
+	// Keep the prior in-memory nodes so a reload's scan can re-enrich a reconstructed decode-miss
+	// descriptor (which has no url/shard) instead of transiently dropping those fields (harper-pro#460
+	// review). Empty on first boot (nothing to enrich from), which is correct.
+	const oldNodes = server.nodes || [];
 	server.nodes = [];
 	server.shards = new Map();
 
 	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key) => {
+		if (!node.url || node.shard === undefined) {
+			const targetName = node.name ?? key;
+			const oldNode =
+				targetName !== undefined ? oldNodes.find((n) => n && n.name !== undefined && n.name === targetName) : undefined;
+			// name + replicates from the reconstruct win; oldNode supplies url/shard/ca/etc.
+			if (oldNode) node = { ...oldNode, ...node };
+		}
 		server.nodes.push(node);
 		if (node.shard != undefined) {
 			let nodesForShard = server.shards.get(node.shard);
