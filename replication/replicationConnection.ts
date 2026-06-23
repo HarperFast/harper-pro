@@ -1544,18 +1544,25 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// replication messages come across in binary format of audit log entries from the source node,
 						// so we need to have the same structure and decoder configuration to decode them. We keep a map
 						// of the table id to the decoder so we can decode the binary data for each table.
+						const decoder = new StructonPackr({
+							useBigIntExtension: true,
+							freezeData: true,
+							typedStructs: data.typedStructs,
+							structures: data.structures,
+						} as any);
 						tableDecoders[tableId] = {
 							name: tableName,
-							decoder: new StructonPackr({
-								useBigIntExtension: true,
-								freezeData: true,
-								typedStructs: data.typedStructs,
-								structures: data.structures,
-							} as any),
+							decoder,
 							getEntry(id) {
 								return table.primaryStore.getEntry(id);
 							},
 							rootStore: table.primaryStore.rootStore,
+							reloadStructures() {
+								// harper#1453: refresh the wire decoder from local durable structures when
+								// a record decode hits a present-but-wrong id.
+								const fresh = (table.primaryStore as any).encoder?.getStructures?.();
+								if (fresh) (decoder as any)._mergeStructures(fresh);
+							},
 						};
 						break;
 					case NODE_NAME_TO_ID_MAP:
@@ -2711,7 +2718,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				const id = auditRecord.recordId;
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
-				try {
+				const runDecode = () =>
 					decodeBlobsWithWrites(
 						() => {
 							event = {
@@ -2735,16 +2742,34 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							return localBlob;
 						}
 					);
+				try {
+					runDecode();
 				} catch (error) {
-					logger.error?.(
-						'Error decoding replication message, record id: ' + id,
-						' typed structures for current decoder' + JSON.stringify(tableDecoder.decoder.typedStructs),
-						' structures for current decoder' + JSON.stringify(tableDecoder.decoder.structures),
-						'encoded message',
-						auditRecord.encoded.subarray(0, 1000),
-						auditRecord,
-						error
-					);
+					// harper#1453 dict-drift retry (mirrors core RecordEncoder.decode).
+					if (/end of buffer not reached|unexpected end of messagepack data/i.test((error as any)?.message)) {
+						try {
+							tableDecoder.reloadStructures?.();
+							event = undefined;
+							receivedBlobs = undefined;
+							runDecode();
+						} catch (retryError) {
+							logger.error?.(
+								'Error decoding replication message after structures reload, record id: ' + id,
+								auditRecord,
+								retryError
+							);
+						}
+					} else {
+						logger.error?.(
+							'Error decoding replication message, record id: ' + id,
+							' typed structures for current decoder' + JSON.stringify(tableDecoder.decoder.typedStructs),
+							' structures for current decoder' + JSON.stringify(tableDecoder.decoder.structures),
+							'encoded message',
+							auditRecord.encoded.subarray(0, 1000),
+							auditRecord,
+							error
+						);
+					}
 				}
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
