@@ -231,6 +231,20 @@ export let connectedToNode; // this is set by thread to handle when a node is co
 const nodeMap = new Map(); // this is a map of all nodes that are available to connect to
 const selfCatchupOfDatabase = new Map<string, number>(); // this is a map of databases that need to catch up to themselves, and the time of the last audit entry (to start from)
 const routes: Route[] = [];
+
+/**
+ * Read a single hdb_nodes row synchronously.
+ *
+ * MUST use getSync, never get: on RocksDB `primaryStore.get()` returns a MaybePromise — the record
+ * synchronously when it is in the block cache / memtable, but a *Promise* on a cache miss. Callers here
+ * consume the row synchronously (`?.replicates`, `!row`, spread), and a Promise is truthy with no fields,
+ * so an un-awaited get() silently disables replication once hdb_nodes grows past the block cache.
+ * Exported for unit coverage (unitTests/replication/readNodeRowSync.test.mjs).
+ */
+export function readNodeRowSync(store, name) {
+	return store.getSync(name);
+}
+
 export async function startOnMainThread(options) {
 	// we do all of the main management of tracking connections and subscriptions on the main thread and delegate
 	// the actual work to the worker threads
@@ -276,7 +290,10 @@ export async function startOnMainThread(options) {
 		reportIdentityMismatchOnce(nodes);
 		function ensureThisNode() {
 			// If it doesn't exist and or needs to be updated.
-			const existing = getHDBNodeTable().primaryStore.get(thisName);
+			// getSync (not get): on RocksDB, get() returns a Promise on a block-cache miss, which is
+			// truthy and has no .url/.shard, so the existence + diff checks below would misfire as
+			// hdb_nodes grows out of cache. This is a tiny system record; a sync point read is fine.
+			const existing = getHDBNodeTable().primaryStore.getSync(thisName);
 			if (existing !== null) {
 				// if this was null it has previously been deleted, and we don't want to recreate nodes for deleted nodes
 				const url = options.url ?? getThisNodeUrl();
@@ -290,7 +307,7 @@ export async function startOnMainThread(options) {
 				}
 			}
 		}
-		if (getHDBNodeTable().primaryStore.get(thisName)) ensureThisNode(); // if this node record already exists, check for config changes
+		if (getHDBNodeTable().primaryStore.getSync(thisName)) ensureThisNode(); // if this node record already exists, check for config changes (getSync: a get() Promise on a cache miss is always truthy)
 		for (const route of iterateRoutes(options) as any) {
 			try {
 				const replicateAll = !route.subscriptions;
@@ -558,10 +575,13 @@ export async function startOnMainThread(options) {
 					node,
 					subscriptions: node.subscriptions,
 					hasDatabase: !!databases[databaseName],
-					thisReplicates: getHDBNodeTable().primaryStore.get(getThisNodeName())?.replicates,
+					thisReplicates: getHDBNodeTable().primaryStore.getSync(getThisNodeName())?.replicates,
 				});
 				const nodeStore = getHDBNodeTable().primaryStore;
-				const selfNodeRow = nodeStore.get(getThisNodeName());
+				// readNodeRowSync (getSync, not get): an un-awaited get() Promise on a block-cache miss has no
+				// .replicates, so `!selfNodeRow?.replicates` would silently disable replication. This is the
+				// authoritative silent-disable gate — it MUST read sync. See readNodeRowSync above.
+				const selfNodeRow = readNodeRowSync(nodeStore, getThisNodeName());
 				if (!selfNodeRow?.replicates) {
 					// if we are not fully replicating because it is turned off, make sure we set this
 					// flag so that we actually turn on subscriptions if full replication is turned on
@@ -578,7 +598,7 @@ export async function startOnMainThread(options) {
 					if (!selfNodeRow) {
 						const registeredNodes = Array.from(nodeStore.getKeys({})).map((name) => ({
 							name,
-							...nodeStore.get(name),
+							...readNodeRowSync(nodeStore, name),
 						}));
 						reportIdentityMismatchOnce(registeredNodes);
 					}
@@ -949,7 +969,10 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 		logger.error('Error parsing replication CA info for hdb_nodes table', err.message);
 	}
 
-	const existing = table.primaryStore.get(name);
+	// getSync (not get): get() returns a Promise on a RocksDB block-cache miss. A truthy Promise here
+	// would drop the existing revoked_certificates merge below (existing.revoked_certificates undefined)
+	// and defeat the sticky LOCAL_ONLY check (existing?.isLeader undefined), re-opening harper-pro#246.
+	const existing = table.primaryStore.getSync(name);
 	logger.debug(`Ensuring node ${name} at ${getNodeURL(node)}, existing record:`, existing, 'new record:', node);
 	if (existing && Array.isArray(node.revoked_certificates)) {
 		const existingRevoked = existing.revoked_certificates || [];

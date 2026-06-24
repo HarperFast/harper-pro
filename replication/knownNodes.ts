@@ -371,8 +371,10 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		}
 	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
 		// add_node { isLeader: true } reaches us as a patch event; read the merged
-		// record from LMDB so server.nodes reflects the full record (including isLeader).
-		const fullRecord = getHDBNodeTable().primaryStore.get(node_name);
+		// record so server.nodes reflects the full record (including isLeader).
+		// getSync (not get): get() returns a Promise on a RocksDB block-cache miss, which would push a
+		// Promise into server.nodes (later read as a node record). The record is tiny; a sync read is fine.
+		const fullRecord = getHDBNodeTable().primaryStore.getSync(node_name);
 		if (fullRecord) server.nodes.push(fullRecord);
 	}
 	const shards = new Map();
@@ -421,7 +423,8 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		}
 	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
 		// isLeader patches need to drive subscription bootstrap; pass the merged record.
-		const fullRecord = getHDBNodeTable().primaryStore.get(event.id);
+		// getSync (not get): a get() Promise on a cache miss would be forwarded to the listener as a node record.
+		const fullRecord = getHDBNodeTable().primaryStore.getSync(event.id);
 		if (fullRecord) listener(fullRecord, event.id);
 	}
 }
