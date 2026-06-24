@@ -597,23 +597,21 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
  * the point lookup decode like the scan path) is the durable root fix; this is the harper-pro-side guard.
  */
 export function selfNodeReplicates(store: any, name: string): any {
-	let record: any;
-	try {
-		record = store.get(name);
-	} catch {
-		// present-but-undecodable self row throws here (missing shared structure) — fall through to scan.
-		record = undefined;
-	}
-	if (isValidNodeRecord(record)) return record.replicates;
-	// Point lookup did not yield a valid descriptor. Try the scan path, which decodes v5-era rows
-	// reliably while the point lookup misreads (harper-pro#352). Use its real `replicates` if recovered.
+	// probeNodeRow distinguishes a genuine tombstone (clean `null` point lookup — a removed node, must NOT
+	// be revived) from a decode failure (throw, or a present-but-invalid value — the harper-pro#352
+	// misread). This is the same tombstone-vs-decode-failure distinction the outbound subscription scan
+	// uses; reusing it keeps the self gate from reviving a removed node.
+	const { outcome, record } = probeNodeRow(store, name);
+	if (record && isValidNodeRecord(record)) return record.replicates; // point lookup recovered the real record
+	if (outcome === 'deleted') return undefined; // clean-null tombstone (removed node) or physically absent — do not revive
+	// Decode failure. Try the scan path, which decodes v5-era rows reliably while the point lookup
+	// misreads (harper-pro#352). Use its real `replicates` if recovered (still honors a genuine `false`).
 	const scanned = scanSelfNodeRecord(store, name);
 	if (isValidNodeRecord(scanned)) return scanned.replicates;
-	// No decodable self descriptor from either path. A range-visible key means the row exists but is
-	// transiently undecodable — default to the add_node-written self default (`replicates: true`) so the
-	// gate does not silently disable replication recovery. Not range-visible at all means the self record
-	// genuinely is not present yet → undefined (falsy), preserving prior behavior.
-	return storeRecordRangeVisible(store, name) ? true : undefined;
+	// Present-but-undecodable from both paths: default to the add_node-written self default
+	// (`replicates: true`, see setNode.ts) so the gate does not silently disable replication recovery. The
+	// `deleted` outcome already returned above, so we never revive a tombstoned node here.
+	return true;
 }
 
 /**
@@ -629,7 +627,7 @@ function scanSelfNodeRecord(store: any, name: string): any {
 			return undefined; // first key past `name` — self key not present in range
 		}
 	} catch {
-		// scan unavailable/failed — caller falls back to the range-visibility default
+		// scan unavailable/failed — caller falls back to the decode-failure default
 	}
 	return undefined;
 }

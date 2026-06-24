@@ -89,14 +89,15 @@ describe('selfNodeReplicates', () => {
 		expect(selfNodeReplicates(store, SELF)).to.equal(true);
 	});
 
-	// Default-when-no-decodable-self-record safety: row is range-visible but neither the point lookup nor
-	// the scan can decode a valid descriptor. add_node always writes the self record with replicates:true,
-	// so the safe recovery default is true (the observed wedge: the self row never decoded on this node).
-	it('defaults to true when the self key is range-visible but nothing decodes anywhere', () => {
+	// Default-when-no-decodable-self-record safety: a present-but-undecodable row (point lookup misreads to
+	// [], a decode failure NOT a clean-null tombstone) that the scan also can't decode. add_node always
+	// writes the self record with replicates:true, so the safe recovery default is true (the observed
+	// wedge: the self row never decoded on this node).
+	it('defaults to true on a present-but-undecodable row (decode failure) that nothing can decode', () => {
 		const store = fakeStore({
-			data: { [SELF]: [] }, // point lookup misreads
+			data: { [SELF]: [] }, // present-but-invalid point lookup == decode failure (not a tombstone)
 			rangeData: { [SELF]: null }, // scan also can't decode a valid descriptor
-			rangeKeys: new Set([SELF]), // but the key is range-visible
+			rangeKeys: new Set([SELF]),
 		});
 		expect(selfNodeReplicates(store, SELF)).to.equal(true);
 	});
@@ -120,6 +121,18 @@ describe('selfNodeReplicates', () => {
 	// record where there is none.
 	it('returns undefined when there is no self-record at all (not range-visible)', () => {
 		const store = fakeStore({ data: {} });
+		expect(selfNodeReplicates(store, SELF)).to.equal(undefined);
+	});
+
+	// Tombstone guard (Codex review): a removed node leaves a CLEAN null at the self key that stays
+	// range-visible. We must NOT revive it with the default-true recovery — a clean-null point lookup is a
+	// tombstone (probeNodeRow 'deleted'), distinct from a present-but-undecodable decode failure.
+	it('returns undefined for a clean-null tombstone even though the key is range-visible (does NOT revive)', () => {
+		const store = fakeStore({
+			data: { [SELF]: null }, // clean null point lookup == removed-node tombstone
+			rangeData: { [SELF]: null },
+			rangeKeys: new Set([SELF]), // tombstone row still listed by range scans
+		});
 		expect(selfNodeReplicates(store, SELF)).to.equal(undefined);
 	});
 });
