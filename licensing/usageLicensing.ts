@@ -99,6 +99,12 @@ async function installUsageLicenseOp(req: InstallLicenseRequest): Promise<string
 	try {
 		await installUsageLicense(license);
 	} catch (cause) {
+		// A license that's already installed is a benign no-op (e.g. a provisioning retry), not a
+		// failure — log at info and report success instead of surfacing a 400 error.
+		if (cause instanceof ExistingLicenseError) {
+			logger.info?.(cause.message);
+			return 'Usage license already installed';
+		}
 		const error = new ClientError('Failed to install usage license; ' + cause.message);
 		error.cause = cause;
 		throw error;
