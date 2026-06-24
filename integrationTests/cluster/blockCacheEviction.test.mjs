@@ -200,14 +200,26 @@ suite(
 			// Remove B's subscription to A, then re-add it. add_node / ensureNode /
 			// getRetrievalConnectionByName all read hdb_nodes via point lookup.
 			await sendOperation(nodeB, { operation: 'remove_node', hostname: nodeA.hostname }).catch(() => {});
-			await delay(2000);
-			await sendOperation(nodeB, {
-				operation: 'add_node',
-				hostname: nodeA.hostname,
-				rejectUnauthorized: false,
-				isLeader: true,
-				authorization: nodeA.admin,
-			});
+			// remove_node can reload/restart the node, so its operations API may briefly refuse connections
+			// (ECONNREFUSED). Wait for B to be reachable again, then re-add with a few retries.
+			await pollHealth(nodeB);
+			let readded = false;
+			for (let attempt = 0; attempt < 5 && !readded; attempt++) {
+				try {
+					await sendOperation(nodeB, {
+						operation: 'add_node',
+						hostname: nodeA.hostname,
+						rejectUnauthorized: false,
+						isLeader: true,
+						authorization: nodeA.admin,
+					});
+					readded = true;
+				} catch {
+					await delay(2000);
+					await pollHealth(nodeB);
+				}
+			}
+			ok(readded, 're-add of node A on node B did not succeed after remove_node');
 
 			// A new write on A after the re-add must reach B (a missed retrieval-connection lookup would
 			// silently never re-establish the subscription).
