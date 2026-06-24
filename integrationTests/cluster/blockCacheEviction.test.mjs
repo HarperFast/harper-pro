@@ -18,7 +18,6 @@
  *   - Every node is RESTARTED, giving a COLD block cache + empty memtable, so the first post-restart read
  *     of each `hdb_nodes` record is a guaranteed cache miss (a Promise from `get()`). The startup
  *     replication paths (ensureThisNode / shouldReplicateFromNode) run exactly in that window.
- *   - We then drive the procedures that depend on those synchronous reads — a rolling restart and a
  *   - We then drive the procedures that depend on those synchronous reads — a rolling restart — and assert replication stays healthy and converges.
  *
  * Pre-fix this fails: a post-restart cache miss makes shouldReplicateFromNode falsy (unsubscribe) and/or
