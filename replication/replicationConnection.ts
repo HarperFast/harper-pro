@@ -229,6 +229,30 @@ export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pau
 }
 
 /**
+ * Decide whether the empty-subscription delayed close inside `replicateOverWS`'s `scheduleClose` should
+ * be classified as INTENTIONAL/finished (mark `isFinished`/`intentionallyUnsubscribed`, emit `'finished'`,
+ * remove the connection from the worker map, never reconnect) vs a transient close that falls through to
+ * `NodeReplicationConnection`'s normal retry path.
+ *
+ * The close fires when the WIRE subscription this connection sent went 0-length and the peer has been idle
+ * for `DELAY_CLOSE_TIME`. That is genuinely terminal only when the peer is no longer DESIRED. A genuine
+ * unsubscribe sets `connection.nodeSubscriptions` to `[]` (replicator.assignReplicationSource's
+ * `subscribe([], false)` on database removal, and unsubscribeFromNode → `unsubscribe()`), so an empty or
+ * absent `nodeSubscriptions` means "no longer wanted" → finish it.
+ *
+ * But a still-desired peer (its `nodeSubscriptions` still populated) can momentarily map to a 0-length
+ * wire subscription during a transient resync — e.g. just after a base-copy resync. Finishing THAT close
+ * sets `isFinished`/`intentionallyUnsubscribed` and emits `'finished'`, deleting the connection and
+ * stranding the still-wanted peer at `connected:false` with no reconnect — the observed permanent
+ * replication wedge on a 4-node preprod cluster. So when the peer is still desired we must NOT finish:
+ * the close handler then takes its retry path and the connection self-heals once the wire subscription
+ * repopulates. Returns `true` (finish) only when the connection is genuinely no longer desired.
+ */
+export function shouldFinishEmptySubscriptionClose(connection: { nodeSubscriptions?: unknown[] } | undefined): boolean {
+	return !((connection?.nodeSubscriptions?.length ?? 0) > 0);
+}
+
+/**
  * Decide whether an in-flight blob stream has genuinely stalled and should be destroyed by the
  * `blobsTimer` sweep. The clock (`lastChunk`) advances every time a chunk is processed, so a healthy
  * transfer never trips this. The subtlety — and the bug this guards (harper-pro#368, the
@@ -3619,7 +3643,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					delayedClose = setTimeout(() => {
 						// if we have not received any messages in a while, we can close the connection
 						if (lastMessageTime <= scheduled)
-							close(1008, 'Connection has no subscriptions and is no longer used', true);
+							// Only finish (no reconnect) when the peer is genuinely no longer desired; a still-desired
+							// peer transiently at a 0-length wire subscription must self-heal. See
+							// shouldFinishEmptySubscriptionClose.
+							close(
+								1008,
+								'Connection has no subscriptions and is no longer used',
+								shouldFinishEmptySubscriptionClose(options.connection)
+							);
 						else scheduleClose();
 					}, DELAY_CLOSE_TIME).unref();
 				};
