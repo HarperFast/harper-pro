@@ -808,6 +808,14 @@ export async function startOnMainThread(options) {
 						type: 'subscribe-to-node',
 						database: databaseName,
 						nodes,
+						// Force a reconnect rather than relying on the re-subscribe alone. subscribeToNode reuses
+						// the cached connection when isReusableConnection is true (not finished, not intentionally
+						// unsubscribed), so a never-connected wedge — connect() rejected with no socket, but the
+						// connection object is still "reusable" — would otherwise just receive subscribe() again
+						// and stay wedged. forceReconnect drives an independent reconnect (and no-ops when a retry
+						// is already pending, via its reconnectScheduled guard), keeping this backstop effective
+						// even if the connection's own retry never armed. See harper-pro#466.
+						forceReconnect: true,
 					};
 					// Stagger reconnects (RECONNECT_STAGGER_MS apart) so opening N TLS connections
 					// simultaneously does not spike memory when there are many databases.

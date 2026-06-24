@@ -623,6 +623,13 @@ export function subscribeToNode(request: any) {
 			}),
 			request.replicateByDefault
 		);
+		// The wedge reconcile (subscriptionManager.findWedgedNodeUrls path) sets forceReconnect so a
+		// re-subscribe to an already-cached, still-"reusable" connection actually drives recovery.
+		// getSubscriptionConnection returns the existing connection when isReusableConnection is true, and
+		// subscribe() alone only re-emits 'subscriptions-updated' — it does not reconnect a wedged socket.
+		// forceReconnect tears the dead socket down and arms a fresh connect, and is a no-op when a retry is
+		// already pending (its reconnectScheduled / isFinished / intentionallyUnsubscribed guards). #466.
+		if (request.forceReconnect) connection.forceReconnect();
 	} catch (error) {
 		logger.error('Error in subscription to node', request.nodes[0]?.url, error);
 	}
