@@ -34,6 +34,12 @@ type ConnectedWorkerStatus = {
 	// Timestamp (ms) of the most recent transition to connected:false, used by the reconcile to
 	// distinguish a connection that is briefly retrying from one that is wedged. Cleared on connect.
 	disconnectedAt?: number;
+	// Timestamp (ms) the entry was created. A never-connected entry (connected still undefined) never
+	// receives a disconnectedAt — disconnectedFromNode only stamps that on a connected->false transition
+	// — so the wedge reconcile uses disconnectedAt ?? createdAt as its "down since" clock. This lets a
+	// connected:false transition that bypasses disconnectedFromNode (e.g. a connect() that never fired
+	// 'open'/'close') still trip the wedge net once it's been down past the threshold. See harper-pro#466.
+	createdAt?: number;
 };
 type ReplicationConnectionStatus = {
 	url?: string;
@@ -169,12 +175,18 @@ export function findWedgedNodeUrls(
 	if (httpWorkers.length === 0) return wedgedNodeUrls;
 	for (const [url, dbReplicationWorkers] of connectionMap) {
 		for (const [database, entry] of dbReplicationWorkers) {
+			// connected !== true (not === false) so a never-connected entry — connected still undefined
+			// because its connect() never fired 'open' — is caught too, not only an entry that flipped
+			// false via disconnectedFromNode. downSince falls back to createdAt for that never-connected
+			// case so the threshold gate still uses a real timestamp and a fresh/mid-initial-connect entry
+			// is never flagged (it clears to connected:true within seconds on a healthy 'open'). See #466.
+			const downSince = entry.disconnectedAt ?? entry.createdAt;
 			if (
-				entry.connected === false &&
+				entry.connected !== true &&
 				entry.worker &&
 				httpWorkers.includes(entry.worker) &&
-				entry.disconnectedAt != null &&
-				now - entry.disconnectedAt >= thresholdMs &&
+				downSince != null &&
+				now - downSince >= thresholdMs &&
 				isDesired(entry.nodes?.[0], database)
 			) {
 				wedgedNodeUrls.add(url);
@@ -482,6 +494,10 @@ export async function startOnMainThread(options) {
 					worker,
 					nodes,
 					url: getNodeURL(node),
+					// "Down since" baseline for the wedge reconcile. A subscription that is created here but
+					// never reaches 'open' (so connectedToNode never clears it and disconnectedFromNode never
+					// stamps disconnectedAt) would otherwise be invisible to findWedgedNodeUrls. See harper-pro#466.
+					createdAt: Date.now(),
 				});
 				worker?.on('exit', () => {
 					// when a worker exits, we need to remove the entry from the map, and then reassign the subscriptions
@@ -776,9 +792,13 @@ export async function startOnMainThread(options) {
 				if (!entries) continue;
 				let reconnectCount = 0;
 				for (const [databaseName, entry] of entries) {
-					if (entry.connected !== false) continue;
+					// Mirror findWedgedNodeUrls: skip only confirmed-connected entries, so a never-connected
+					// entry (connected still undefined) is re-driven too — not just one that flipped false via
+					// disconnectedFromNode. See harper-pro#466.
+					if (entry.connected === true) continue;
 					// Restart the disconnect clock so this entry is not re-driven on every reconcile
-					// tick until it either connects or exceeds the threshold again.
+					// tick until it either connects or exceeds the threshold again. Stamping disconnectedAt
+					// also gives a never-connected entry a real "down since" for subsequent ticks.
 					entry.disconnectedAt = Date.now();
 					const worker = entry.worker;
 					const nodes = entry.nodes;

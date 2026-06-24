@@ -723,13 +723,29 @@ export class NodeReplicationConnection extends EventEmitter {
 				serverName: this.nodeName,
 				authorization: this.authorization,
 			});
-		} finally {
-			// A forceReconnect-scheduled reconnect is now realized (or has failed) — stop suppressing the
-			// close handler's own retry. Clearing this only after this.socket is reassigned (rather than in
-			// the scheduling timer) keeps a late close from the superseded socket from arming a second
-			// connect() during the createWebSocket await window. See forceReconnect / harper-pro#420.
-			this.reconnectScheduled = false;
+		} catch (error) {
+			// createWebSocket can reject before any socket exists or any open/error/close listener is
+			// attached — e.g. no valid replication certificate yet, or SNICallback.initialize() failing
+			// while a freshly-restarted peer rebuilds its TLS secure contexts. This connect() is invoked
+			// from setTimeout(() => this.connect()) in the close handler / forceReconnect with no .catch(),
+			// so without rescheduling here the rejection escapes as an unhandled rejection and the only
+			// pending retry vanishes: no socket, no timer, connected:false forever (harper-pro#466). Funnel
+			// it into the same backoff retry path the close handler uses so the connection self-heals once
+			// the peer's certs settle. scheduleReconnect re-arms reconnectScheduled, so the close-handler
+			// early-return invariant still holds and there is always a pending retry.
+			if (++this.retries % 20 === 1)
+				logger.warn?.(
+					`Failed to create web socket to ${this.url} (db: "${this.databaseName}"), retrying: ${error.message}`
+				);
+			this.scheduleReconnect();
+			return;
 		}
+		// A forceReconnect-scheduled reconnect is now realized — stop suppressing the close handler's own
+		// retry. Clearing this only after this.socket is reassigned (rather than in the scheduling timer)
+		// keeps a late close from the superseded socket from arming a second connect() during the
+		// createWebSocket await window. Only on the success path: a createWebSocket rejection takes the
+		// catch above, which leaves reconnectScheduled true for its own pending retry. See harper-pro#420.
+		this.reconnectScheduled = false;
 		// Capture this attempt's socket so its close handler can tell whether it is still the live socket:
 		// forceReconnect can schedule a fresh connect() that replaces this.socket before this socket's
 		// (possibly delayed) terminate() finally fires close. See the close handler / harper-pro#420.
@@ -842,19 +858,27 @@ export class NodeReplicationConnection extends EventEmitter {
 			// forceReconnect (receive-watchdog path) may have already scheduled the reconnect before
 			// this close fired — don't arm a second connect() for the same drop.
 			if (this.reconnectScheduled) return;
-			this.resetSession();
-			// try to reconnect
-			setTimeout(() => {
-				this.connect();
-			}, this.retryTime).unref();
-			// Double the interval each retry, capped at 30 s. The previous ~0.4%/retry
-			// growth took >1000 retries to reach any meaningful delay, so rapid
-			// reconnects to a dead peer (symphony accepts the TLS handshake then drops
-			// it) would still accumulate unreleased native TLS state faster than V8 can
-			// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
-			// Doubling reaches 30 s in ~6 retries (~62 s total) and resets on success.
-			this.retryTime = Math.min(this.retryTime << 1, 30_000);
+			this.scheduleReconnect();
 		});
+	}
+	// Arm exactly one backoff retry of connect() and mark reconnectScheduled so the close handler's
+	// early-return and forceReconnect's guard don't double-arm a second connect() for the same drop.
+	// connect()'s success path clears reconnectScheduled once the new socket is installed; a
+	// createWebSocket rejection routes back through here, keeping the flag true with a fresh pending
+	// retry. Shared by the close handler, forceReconnect, and the connect()-reject path (harper-pro#466).
+	scheduleReconnect() {
+		this.reconnectScheduled = true;
+		this.resetSession();
+		setTimeout(() => {
+			this.connect();
+		}, this.retryTime).unref();
+		// Double the interval each retry, capped at 30 s. The previous ~0.4%/retry
+		// growth took >1000 retries to reach any meaningful delay, so rapid
+		// reconnects to a dead peer (symphony accepts the TLS handshake then drops
+		// it) would still accumulate unreleased native TLS state faster than V8 can
+		// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
+		// Doubling reaches 30 s in ~6 retries (~62 s total) and resets on success.
+		this.retryTime = Math.min(this.retryTime << 1, 30_000);
 	}
 	resetSession() {
 		this.session = new Promise((resolve, reject) => {
@@ -893,22 +917,17 @@ export class NodeReplicationConnection extends EventEmitter {
 			}
 			this.isConnected = false;
 		}
-		this.reconnectScheduled = true;
 		// Drop this connection's stale subscription listener before reconnecting. The close handler
 		// normally does this (removeAllListeners), but its socket-identity guard early-returns for a
 		// superseded socket, so an open-but-idle wedge — whose old socket never fires a timely close —
 		// would otherwise leak one 'subscriptions-updated' listener per recovery cycle (eventually a
 		// MaxListenersExceededWarning). The fresh connect re-registers its own. See harper-pro#420.
 		this.removeAllListeners('subscriptions-updated');
-		this.resetSession();
 		const socket = this.socket;
-		// connect() clears reconnectScheduled once the new socket is installed (its finally), which keeps
-		// a late close from the old socket from double-scheduling during the createWebSocket await.
-		setTimeout(() => {
-			this.connect();
-		}, this.retryTime).unref();
-		// Match the close-handler backoff so a repeatedly-wedging peer backs off the same way (#339).
-		this.retryTime = Math.min(this.retryTime << 1, 30_000);
+		// Sets reconnectScheduled and arms one backoff retry (matching the close-handler backoff so a
+		// repeatedly-wedging peer backs off the same way, #339). connect() clears reconnectScheduled once
+		// the new socket is installed, which keeps a late close from the old socket from double-scheduling.
+		this.scheduleReconnect();
 		// Best-effort teardown of the dead socket; recovery above does not depend on the close it fires.
 		try {
 			socket?.terminate();
