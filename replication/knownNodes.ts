@@ -268,10 +268,13 @@ export function readNodeForAuth(name: string, routeRecord?: any): any {
 export function resolveNodeForAuth(store: any, name: string, routeRecord?: any): any {
 	let record: any;
 	try {
-		record = store.get(name);
+		// Synchronous point read. RocksDB get() is a MaybePromise (a Promise on a block-cache miss);
+		// an un-awaited get() would return a pending Promise that isValidNodeRecord rejects, stranding
+		// the peer. getSync forces the inline read. See selfNodeReplicates.
+		record = store.getSync(name);
 	} catch {
-		// A present-but-undecodable row throws here (missing shared structure); fall through to
-		// the physical-existence check below rather than treating the peer as unknown.
+		// Defensive: a read error here falls through to the range-visibility check rather than
+		// treating the peer as unknown.
 		record = undefined;
 	}
 	if (isValidNodeRecord(record)) return record;
@@ -286,7 +289,7 @@ export function resolveNodeForAuth(store: any, name: string, routeRecord?: any):
 		logger.warn?.(
 			'hdb_nodes record for',
 			name,
-			'did not decode to a valid node descriptor on the point lookup but is range-visible (likely a v5-era shared-structure row transiently misreading at boot during an in-place upgrade; see harper-pro#352). Authorizing the peer by its certificate-validated name; the full record self-heals on the next decodable update.'
+			'did not resolve to a valid node descriptor on the (synchronous) point lookup but is range-visible. Authorizing the peer by its certificate-validated name (defense-in-depth; the connection is independently TLS-validated). This path should be rare now that the point read is synchronous (see harper-pro#470).'
 		);
 		return { name };
 	}
@@ -371,8 +374,10 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		}
 	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
 		// add_node { isLeader: true } reaches us as a patch event; read the merged
-		// record from LMDB so server.nodes reflects the full record (including isLeader).
-		const fullRecord = getHDBNodeTable().primaryStore.get(node_name);
+		// record so server.nodes reflects the full record (including isLeader). Sync read
+		// (getSync): RocksDB get() is a MaybePromise (Promise on a block-cache miss); an un-awaited
+		// get() here would push a pending Promise into server.nodes. See selfNodeReplicates.
+		const fullRecord = getHDBNodeTable().primaryStore.getSync(node_name);
 		if (fullRecord) server.nodes.push(fullRecord);
 	}
 	const shards = new Map();
@@ -421,7 +426,8 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		}
 	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
 		// isLeader patches need to drive subscription bootstrap; pass the merged record.
-		const fullRecord = getHDBNodeTable().primaryStore.get(event.id);
+		// Sync read (getSync) — RocksDB get() is a MaybePromise; see selfNodeReplicates.
+		const fullRecord = getHDBNodeTable().primaryStore.getSync(event.id);
 		if (fullRecord) listener(fullRecord, event.id);
 	}
 }
@@ -571,66 +577,25 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 }
 
 /**
- * Read this node's own `replicates` flag from its hdb_nodes self-record, resilient to the harper-pro#352
- * shared-structure point-lookup misread. This is the "does THIS node participate in replication at all"
- * gate at the end of {@link shouldReplicateFromNode}; it is consulted by BOTH the wedge backstop
- * (findWedgedNodeUrls → reconcileWorkers) and the onDatabase re-subscribe path, so if it reads falsy a
- * still-desired peer is silently excluded from ALL recovery (the observed 4-node preprod wedge: the self
- * row point-lookup decoded to an empty/undecodable value so `?.replicates` was undefined, leaving no
- * re-drive and no re-subscribe, ever).
+ * Read this node's own `replicates` flag from its hdb_nodes self-record. This is the "does THIS node
+ * participate in replication at all" gate at the end of {@link shouldReplicateFromNode}; it is consulted
+ * by BOTH the wedge backstop (findWedgedNodeUrls -> reconcileWorkers) and the onDatabase re-subscribe
+ * path, in synchronous contexts (the `isDesired` filter, the change-stream listener).
  *
- * Resolution order (prefer the real value, default only on a genuine decode failure):
- *   1. POINT lookup — if it yields a valid node descriptor, use its `replicates` verbatim (the common
- *      path; preserves a genuine `replicates: false`).
- *   2. Clean-`null` tombstone or physically-absent key (probeNodeRow 'deleted') → `undefined` (falsy). A
- *      removed node must NOT be revived, and a node with no self-record yet keeps its prior behavior.
- *   3. Decode failure (the point lookup threw, or returned a present-but-invalid value — the #352
- *      misread): try the RANGE/scan lookup, which decodes v5-era shared-structure rows reliably while the
- *      point lookup misreads (harper-pro#352/#460). If it recovers a valid descriptor, use its real
- *      `replicates` (still honors a genuine `false`).
- *   4. Decode failure that neither path can decode → default to `true`. `add_node` always writes the
- *      self-record with `replicates: true` (setNode.ts), so a node that has peers and is running
- *      replication is configured to participate; defaulting `true` recovers the wedge. A decodable
- *      `replicates: false` from step 1/3 still wins — we do not hardcode `true` unconditionally, and a
- *      tombstone (step 2) is never defaulted.
+ * It MUST use the synchronous point read. The system database is RocksDB, whose `get()` returns a
+ * `MaybePromise`: the value synchronously when the row is in the block cache / memtable, but a `Promise`
+ * on a cache miss that needs a disk read. An un-awaited `get()` therefore works only while `system` is
+ * small enough that this row stays cached; once `system` grows past block-cache size the row is evicted,
+ * `get()` returns a Promise, and `(promise)?.replicates` silently becomes `undefined` — disabling ALL
+ * replication recovery for a still-desired peer (the observed preprod wedge, where the self row read as
+ * an empty object that was actually a pending Promise). `getSync()` forces the synchronous read (doing
+ * the disk read inline on a cache miss), which is what these sync callers require.
  *
- * Store is passed explicitly so it stays unit-testable without standing up a server. harper#1463 (make
- * the point lookup decode like the scan path) is the durable root fix; this is the harper-pro-side guard.
+ * A deleted/absent self-record yields `null`/`undefined` (`?.` -> falsy), which is correct; a genuine
+ * `replicates: false` is preserved. Store is passed explicitly so it stays unit-testable.
  */
 export function selfNodeReplicates(store: any, name: string): any {
-	// probeNodeRow distinguishes a genuine tombstone (clean `null` point lookup — a removed node, must NOT
-	// be revived) from a decode failure (throw, or a present-but-invalid value — the harper-pro#352
-	// misread). This is the same tombstone-vs-decode-failure distinction the outbound subscription scan
-	// uses; reusing it keeps the self gate from reviving a removed node.
-	const { outcome, record } = probeNodeRow(store, name);
-	if (record && isValidNodeRecord(record)) return record.replicates; // point lookup recovered the real record
-	if (outcome === 'deleted') return undefined; // clean-null tombstone (removed node) or physically absent — do not revive
-	// Decode failure. Try the scan path, which decodes v5-era rows reliably while the point lookup
-	// misreads (harper-pro#352). Use its real `replicates` if recovered (still honors a genuine `false`).
-	const scanned = scanSelfNodeRecord(store, name);
-	if (isValidNodeRecord(scanned)) return scanned.replicates;
-	// Present-but-undecodable from both paths: default to the add_node-written self default
-	// (`replicates: true`, see setNode.ts) so the gate does not silently disable replication recovery. The
-	// `deleted` outcome already returned above, so we never revive a tombstoned node here.
-	return true;
-}
-
-/**
- * Read a single hdb_nodes record via the RANGE/scan path (which reliably decodes v5-era shared-structure
- * rows that the point lookup transiently misreads — harper-pro#352). Returns the decoded value for the
- * matching key, or `undefined` if the scan can't recover a decodable value. See {@link selfNodeReplicates}.
- */
-function scanSelfNodeRecord(store: any, name: string): any {
-	if (typeof store.getRange !== 'function') return undefined;
-	try {
-		for (const { key, value } of store.getRange({ start: name, limit: 1 })) {
-			if (key === name) return value;
-			return undefined; // first key past `name` — self key not present in range
-		}
-	} catch {
-		// scan unavailable/failed — caller falls back to the decode-failure default
-	}
-	return undefined;
+	return store.getSync(name)?.replicates;
 }
 
 const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array>>();
