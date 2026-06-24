@@ -43,6 +43,7 @@ import { threadId } from 'worker_threads';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 const { forComponent, errorToString } = harperLogger;
 import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptionManager.ts';
+import { materializeOperationResponse } from './materializeOperationResponse.ts';
 import { EventEmitter } from 'events';
 import { createTLSSelector } from '../core/security/keys.js';
 import * as tls from 'node:tls';
@@ -1507,14 +1508,26 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							const isAuthorizedNode = authorization?.replicates || authorization?.subscribers || authorization?.name;
 							logger.debug?.('Received operation request', data, 'from', remoteNodeName);
 							server.operation(data, { user: authorization }, !isAuthorizedNode).then(
-								(response) => {
-									logger.debug?.('Requested request from finished', remoteNodeName, response);
-									if (Array.isArray(response)) {
-										// convert an array to an object so we can have a top-level requestId properly serialized
-										response = { results: response };
+								async (response) => {
+									try {
+										logger.debug?.('Requested request from finished', remoteNodeName, response);
+										// Drain streaming responses (e.g. get_analytics) into a concrete value so this
+										// single replication message can be encoded — see materializeOperationResponse.
+										response = await materializeOperationResponse(response);
+										response.requestId = data.requestId;
+										ws.send(encode([OPERATION_RESPONSE, response]));
+									} catch (error) {
+										logger.debug?.('Failed encoding operation response for', remoteNodeName, error);
+										ws.send(
+											encode([
+												OPERATION_RESPONSE,
+												{
+													requestId: data.requestId,
+													error: errorToString(error),
+												},
+											])
+										);
 									}
-									response.requestId = data.requestId;
-									ws.send(encode([OPERATION_RESPONSE, response]));
 								},
 								(error) => {
 									logger.debug?.('Failed requested operation from', remoteNodeName, error);
