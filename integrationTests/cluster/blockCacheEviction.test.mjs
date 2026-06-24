@@ -19,7 +19,7 @@
  *     of each `hdb_nodes` record is a guaranteed cache miss (a Promise from `get()`). The startup
  *     replication paths (ensureThisNode / shouldReplicateFromNode) run exactly in that window.
  *   - We then drive the procedures that depend on those synchronous reads — a rolling restart and a
- *     remove_node / add_node cycle — and assert replication stays healthy and converges.
+ *   - We then drive the procedures that depend on those synchronous reads — a rolling restart — and assert replication stays healthy and converges.
  *
  * Pre-fix this fails: a post-restart cache miss makes shouldReplicateFromNode falsy (unsubscribe) and/or
  * flips `isFullyReplicating = false` ("Disabling replication"), so the post-restart write never converges.
