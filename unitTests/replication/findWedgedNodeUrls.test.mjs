@@ -63,9 +63,47 @@ describe('findWedgedNodeUrls', () => {
 		expect(findWedgedNodeUrls(map, [w], NOW, THRESHOLD, isDesired)).to.deep.equal(new Set());
 	});
 
-	it('does not flag an entry with no disconnectedAt recorded', () => {
+	it('does not flag an entry with no down-since timestamp at all (no disconnectedAt and no createdAt)', () => {
 		const w = makeWorker();
-		const map = makeConnectionMap([['ws://a:9933', [['data', entry(w, { disconnectedAt: undefined })]]]]);
+		const map = makeConnectionMap([
+			['ws://a:9933', [['data', entry(w, { disconnectedAt: undefined, createdAt: undefined })]]],
+		]);
+		expect(findWedgedNodeUrls(map, [w], NOW, THRESHOLD, isDesired)).to.deep.equal(new Set());
+	});
+
+	// harper-pro#466 backstop: a connect() that rejects before 'open' (or whose 'open' never fires)
+	// leaves the entry connected:undefined and disconnectedFromNode never stamps disconnectedAt — the
+	// old `connected === false && disconnectedAt != null` predicate never caught it. The entry's
+	// createdAt is the down-since fallback so the wedge net engages once it's been down past threshold.
+	it('flags a never-connected entry (connected undefined) past the threshold via createdAt', () => {
+		const w = makeWorker();
+		const map = makeConnectionMap([
+			[
+				'ws://a:9933',
+				[['data', entry(w, { connected: undefined, disconnectedAt: undefined, createdAt: NOW - THRESHOLD })]],
+			],
+		]);
+		expect(findWedgedNodeUrls(map, [w], NOW, THRESHOLD, isDesired)).to.deep.equal(new Set(['ws://a:9933']));
+	});
+
+	it('does not flag a fresh never-connected entry still within the threshold (mid-initial-connect)', () => {
+		const w = makeWorker();
+		const map = makeConnectionMap([
+			[
+				'ws://a:9933',
+				[['data', entry(w, { connected: undefined, disconnectedAt: undefined, createdAt: NOW - 1_000 })]],
+			],
+		]);
+		expect(findWedgedNodeUrls(map, [w], NOW, THRESHOLD, isDesired)).to.deep.equal(new Set());
+	});
+
+	it('prefers disconnectedAt over createdAt for the down-since clock (a recent disconnect on an old entry is not wedged)', () => {
+		// Entry was created long ago but reconnected and only just dropped again — must not be flagged
+		// off the stale createdAt; the recent disconnectedAt is the authoritative down-since time.
+		const w = makeWorker();
+		const map = makeConnectionMap([
+			['ws://a:9933', [['data', entry(w, { disconnectedAt: NOW - 1_000, createdAt: NOW - 10 * THRESHOLD })]]],
+		]);
 		expect(findWedgedNodeUrls(map, [w], NOW, THRESHOLD, isDesired)).to.deep.equal(new Set());
 	});
 
