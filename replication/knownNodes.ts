@@ -568,7 +568,12 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 							: dbReplication.name === databaseName &&
 									(!dbReplication.sharded || node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD));
 					}))) &&
-			getHDBNodeTable().primaryStore.get(getThisNodeName())?.replicates) ||
+			// getSync (not get): this is the load-bearing self-record gate. shouldReplicateFromNode decides
+			// shouldSubscribe (onDatabase) AND the wedge-reconcile isDesired check; an un-awaited get() Promise
+			// on a RocksDB block-cache miss has no .replicates, so the whole predicate goes falsy and a
+			// still-desired peer is silently unsubscribed/excluded once hdb_nodes grows past the block cache or
+			// right after a cold restart. (PR #474 refactors this to selfNodeReplicates, which must also read sync.)
+			getHDBNodeTable().primaryStore.getSync(getThisNodeName())?.replicates) ||
 		node.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe)
 	);
 }
