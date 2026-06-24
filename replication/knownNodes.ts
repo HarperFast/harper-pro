@@ -579,19 +579,20 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
  * row point-lookup decoded to an empty/undecodable value so `?.replicates` was undefined, leaving no
  * re-drive and no re-subscribe, ever).
  *
- * Resolution order (prefer the real value, default only when nothing decodes):
+ * Resolution order (prefer the real value, default only on a genuine decode failure):
  *   1. POINT lookup — if it yields a valid node descriptor, use its `replicates` verbatim (the common
  *      path; preserves a genuine `replicates: false`).
- *   2. RANGE/scan lookup of the self key — the scan path lists and decodes v5-era shared-structure rows
- *      reliably while the point lookup transiently misreads (harper-pro#352/#460). If it recovers a valid
- *      descriptor, use its real `replicates` (still honors a genuine `false`).
- *   3. Range-visible key but NO decodable descriptor anywhere → default to `true`. `add_node` always
- *      writes the self-record with `replicates: true` (setNode.ts), so a node that has peers and is
- *      running replication is configured to participate; defaulting `true` recovers the wedge without
- *      inventing replication for a node that never had a self-record. A decodable `replicates: false` from
- *      step 1/2 still wins — we do not hardcode `true` unconditionally.
- *   4. No self-record at all (not range-visible) → `undefined` (falsy), preserving prior behavior for a
- *      node whose self-record genuinely does not exist yet.
+ *   2. Clean-`null` tombstone or physically-absent key (probeNodeRow 'deleted') → `undefined` (falsy). A
+ *      removed node must NOT be revived, and a node with no self-record yet keeps its prior behavior.
+ *   3. Decode failure (the point lookup threw, or returned a present-but-invalid value — the #352
+ *      misread): try the RANGE/scan lookup, which decodes v5-era shared-structure rows reliably while the
+ *      point lookup misreads (harper-pro#352/#460). If it recovers a valid descriptor, use its real
+ *      `replicates` (still honors a genuine `false`).
+ *   4. Decode failure that neither path can decode → default to `true`. `add_node` always writes the
+ *      self-record with `replicates: true` (setNode.ts), so a node that has peers and is running
+ *      replication is configured to participate; defaulting `true` recovers the wedge. A decodable
+ *      `replicates: false` from step 1/3 still wins — we do not hardcode `true` unconditionally, and a
+ *      tombstone (step 2) is never defaulted.
  *
  * Store is passed explicitly so it stays unit-testable without standing up a server. harper#1463 (make
  * the point lookup decode like the scan path) is the durable root fix; this is the harper-pro-side guard.
