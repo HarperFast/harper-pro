@@ -12,10 +12,41 @@ import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 
-let hdbNodeTable;
+type MaybePromise<T> = T | Promise<T>;
+
+/**
+ * A row in the system `hdb_nodes` table — the canonical {@link Node} shape plus an index signature for
+ * the incidental extra fields some paths read (e.g. `authorization`). Reusing `Node` keeps it assignable
+ * everywhere a `Node` is expected (`getNodeURL`, `server.nodes`, …).
+ */
+export interface NodeRecord extends Node {
+	[key: string]: any;
+}
+
+/**
+ * Typed view of the `hdb_nodes` primaryStore. It is RocksDB-capable, so `get()` returns a MaybePromise —
+ * the record synchronously on a block-cache / memtable hit, but a *Promise* on a cache miss that needs a
+ * disk read. Typing `get()` this way makes any SYNCHRONOUS consumption (e.g. `store.get(id)?.replicates`)
+ * a compile error: use `getSync(id)` (forces the inline read) or `await` / `when` the result. LMDB is
+ * always synchronous so its Promise arm is never taken at runtime, but the type keeps callers honest on
+ * both engines. Other members fall through the index signature — this intentionally constrains only the
+ * point-read path the MaybePromise hazard affects.
+ */
+export type NodeStore = {
+	get(id: string, options?: any): MaybePromise<NodeRecord | undefined>;
+	getSync(id: string, options?: any): NodeRecord | undefined;
+	[key: string]: any;
+};
+
+interface HdbNodeTable {
+	primaryStore: NodeStore;
+	[key: string]: any;
+}
+
+let hdbNodeTable: HdbNodeTable | undefined;
 server.nodes = [];
 
-export function getHDBNodeTable() {
+export function getHDBNodeTable(): HdbNodeTable {
 	return (
 		hdbNodeTable ||
 		(hdbNodeTable = table({
@@ -57,7 +88,7 @@ export function getHDBNodeTable() {
 					attribute: '__updatedtime__',
 				},
 			],
-		}))
+		}) as unknown as HdbNodeTable)
 	);
 }
 export function getReplicationSharedStatus(
@@ -268,10 +299,13 @@ export function readNodeForAuth(name: string, routeRecord?: any): any {
 export function resolveNodeForAuth(store: any, name: string, routeRecord?: any): any {
 	let record: any;
 	try {
-		record = store.get(name);
+		// Synchronous point read. RocksDB get() is a MaybePromise (a Promise on a block-cache miss);
+		// an un-awaited get() would return a pending Promise that isValidNodeRecord rejects, stranding
+		// the peer. getSync forces the inline read. See selfNodeReplicates.
+		record = store.getSync(name);
 	} catch {
-		// A present-but-undecodable row throws here (missing shared structure); fall through to
-		// the physical-existence check below rather than treating the peer as unknown.
+		// Defensive: a read error here falls through to the range-visibility check rather than
+		// treating the peer as unknown.
 		record = undefined;
 	}
 	if (isValidNodeRecord(record)) return record;
@@ -286,7 +320,7 @@ export function resolveNodeForAuth(store: any, name: string, routeRecord?: any):
 		logger.warn?.(
 			'hdb_nodes record for',
 			name,
-			'did not decode to a valid node descriptor on the point lookup but is range-visible (likely a v5-era shared-structure row transiently misreading at boot during an in-place upgrade; see harper-pro#352). Authorizing the peer by its certificate-validated name; the full record self-heals on the next decodable update.'
+			'did not resolve to a valid node descriptor on the (synchronous) point lookup but is range-visible. Authorizing the peer by its certificate-validated name (defense-in-depth; the connection is independently TLS-validated). This path should be rare now that the point read is synchronous (see harper-pro#470).'
 		);
 		return { name };
 	}
@@ -340,7 +374,9 @@ function storeRecordRangeVisible(store: any, name: string): boolean {
 	if (typeof store.doesExist === 'function' && store.doesExist(name)) return true;
 	if (typeof store.getBinaryFast === 'function' && store.getBinaryFast(name) != null) return true;
 	try {
-		return store.get(name) != null;
+		// Synchronous read: RocksDB get() is a MaybePromise; an un-awaited get() would return a
+		// truthy Promise on a cache miss, making an absent key look present. See selfNodeReplicates.
+		return store.getSync(name) != null;
 	} catch {
 		return true;
 	}
@@ -371,9 +407,11 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		}
 	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
 		// add_node { isLeader: true } reaches us as a patch event; read the merged
-		// record from LMDB so server.nodes reflects the full record (including isLeader).
-		const fullRecord = getHDBNodeTable().primaryStore.get(node_name);
-		if (fullRecord) server.nodes.push(fullRecord);
+		// record so server.nodes reflects the full record (including isLeader). Sync read
+		// (getSync): RocksDB get() is a MaybePromise (Promise on a block-cache miss); an un-awaited
+		// get() here would push a pending Promise into server.nodes. See selfNodeReplicates.
+		const fullRecord = getHDBNodeTable().primaryStore.getSync(node_name);
+		if (fullRecord) server.nodes.push(fullRecord as any);
 	}
 	const shards = new Map();
 	for await (const node of getHDBNodeTable().search({})) {
@@ -421,7 +459,8 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		}
 	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
 		// isLeader patches need to drive subscription bootstrap; pass the merged record.
-		const fullRecord = getHDBNodeTable().primaryStore.get(event.id);
+		// Sync read (getSync) — RocksDB get() is a MaybePromise; see selfNodeReplicates.
+		const fullRecord = getHDBNodeTable().primaryStore.getSync(event.id);
 		if (fullRecord) listener(fullRecord, event.id);
 	}
 }
@@ -439,7 +478,10 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 export function probeNodeRow(store: any, key: unknown): { outcome: 'deleted' | 'decode-failure'; record?: any } {
 	let record: any;
 	try {
-		record = store.get(key);
+		// Synchronous read: RocksDB get() is a MaybePromise. An un-awaited get() returns Promise<null>
+		// for a tombstone on a cache miss, so `record == null` would be false and a removed node would
+		// be misclassified as a decode-failure and revived. getSync forces the inline read. See #470.
+		record = store.getSync(key);
 	} catch {
 		// present-but-undecodable row → decode failure, reconstruct.
 		return { outcome: 'decode-failure' };
@@ -565,9 +607,31 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 							: dbReplication.name === databaseName &&
 									(!dbReplication.sharded || node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD));
 					}))) &&
-			getHDBNodeTable().primaryStore.get(getThisNodeName())?.replicates) ||
+			selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName())) ||
 		node.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe)
 	);
+}
+
+/**
+ * Read this node's own `replicates` flag from its hdb_nodes self-record. This is the "does THIS node
+ * participate in replication at all" gate at the end of {@link shouldReplicateFromNode}; it is consulted
+ * by BOTH the wedge backstop (findWedgedNodeUrls -> reconcileWorkers) and the onDatabase re-subscribe
+ * path, in synchronous contexts (the `isDesired` filter, the change-stream listener).
+ *
+ * It MUST use the synchronous point read. The system database is RocksDB, whose `get()` returns a
+ * `MaybePromise`: the value synchronously when the row is in the block cache / memtable, but a `Promise`
+ * on a cache miss that needs a disk read. An un-awaited `get()` therefore works only while `system` is
+ * small enough that this row stays cached; once `system` grows past block-cache size the row is evicted,
+ * `get()` returns a Promise, and `(promise)?.replicates` silently becomes `undefined` — disabling ALL
+ * replication recovery for a still-desired peer (the observed preprod wedge, where the self row read as
+ * an empty object that was actually a pending Promise). `getSync()` forces the synchronous read (doing
+ * the disk read inline on a cache miss), which is what these sync callers require.
+ *
+ * A deleted/absent self-record yields `null`/`undefined` (`?.` -> falsy), which is correct; a genuine
+ * `replicates: false` is preserved. Store is passed explicitly so it stays unit-testable.
+ */
+export function selfNodeReplicates(store: any, name: string): any {
+	return store.getSync(name)?.replicates;
 }
 
 const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array>>();

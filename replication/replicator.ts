@@ -551,7 +551,9 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 	}
 	let connection = dbConnections.get(dbName);
 	if (isReusableConnection(connection)) return connection;
-	const node = getHDBNodeTable().primaryStore.get(nodeName);
+	// getSync (not get): get() returns a Promise on a RocksDB block-cache miss; `Promise?.url` is undefined,
+	// so the connection would silently never be created (no error) for a node that actually exists.
+	const node = getHDBNodeTable().primaryStore.getSync(nodeName);
 	if (node?.url) {
 		connection = new NodeReplicationConnection(getNodeURL(node), subscription, dbName, nodeName, node.authorization);
 		// cache the connection
