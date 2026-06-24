@@ -565,9 +565,73 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 							: dbReplication.name === databaseName &&
 									(!dbReplication.sharded || node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD));
 					}))) &&
-			getHDBNodeTable().primaryStore.get(getThisNodeName())?.replicates) ||
+			selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName())) ||
 		node.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe)
 	);
+}
+
+/**
+ * Read this node's own `replicates` flag from its hdb_nodes self-record, resilient to the harper-pro#352
+ * shared-structure point-lookup misread. This is the "does THIS node participate in replication at all"
+ * gate at the end of {@link shouldReplicateFromNode}; it is consulted by BOTH the wedge backstop
+ * (findWedgedNodeUrls → reconcileWorkers) and the onDatabase re-subscribe path, so if it reads falsy a
+ * still-desired peer is silently excluded from ALL recovery (the observed 4-node preprod wedge: the self
+ * row point-lookup decoded to an empty/undecodable value so `?.replicates` was undefined, leaving no
+ * re-drive and no re-subscribe, ever).
+ *
+ * Resolution order (prefer the real value, default only when nothing decodes):
+ *   1. POINT lookup — if it yields a valid node descriptor, use its `replicates` verbatim (the common
+ *      path; preserves a genuine `replicates: false`).
+ *   2. RANGE/scan lookup of the self key — the scan path lists and decodes v5-era shared-structure rows
+ *      reliably while the point lookup transiently misreads (harper-pro#352/#460). If it recovers a valid
+ *      descriptor, use its real `replicates` (still honors a genuine `false`).
+ *   3. Range-visible key but NO decodable descriptor anywhere → default to `true`. `add_node` always
+ *      writes the self-record with `replicates: true` (setNode.ts), so a node that has peers and is
+ *      running replication is configured to participate; defaulting `true` recovers the wedge without
+ *      inventing replication for a node that never had a self-record. A decodable `replicates: false` from
+ *      step 1/2 still wins — we do not hardcode `true` unconditionally.
+ *   4. No self-record at all (not range-visible) → `undefined` (falsy), preserving prior behavior for a
+ *      node whose self-record genuinely does not exist yet.
+ *
+ * Store is passed explicitly so it stays unit-testable without standing up a server. harper#1463 (make
+ * the point lookup decode like the scan path) is the durable root fix; this is the harper-pro-side guard.
+ */
+export function selfNodeReplicates(store: any, name: string): any {
+	let record: any;
+	try {
+		record = store.get(name);
+	} catch {
+		// present-but-undecodable self row throws here (missing shared structure) — fall through to scan.
+		record = undefined;
+	}
+	if (isValidNodeRecord(record)) return record.replicates;
+	// Point lookup did not yield a valid descriptor. Try the scan path, which decodes v5-era rows
+	// reliably while the point lookup misreads (harper-pro#352). Use its real `replicates` if recovered.
+	const scanned = scanSelfNodeRecord(store, name);
+	if (isValidNodeRecord(scanned)) return scanned.replicates;
+	// No decodable self descriptor from either path. A range-visible key means the row exists but is
+	// transiently undecodable — default to the add_node-written self default (`replicates: true`) so the
+	// gate does not silently disable replication recovery. Not range-visible at all means the self record
+	// genuinely is not present yet → undefined (falsy), preserving prior behavior.
+	return storeRecordRangeVisible(store, name) ? true : undefined;
+}
+
+/**
+ * Read a single hdb_nodes record via the RANGE/scan path (which reliably decodes v5-era shared-structure
+ * rows that the point lookup transiently misreads — harper-pro#352). Returns the decoded value for the
+ * matching key, or `undefined` if the scan can't recover a decodable value. See {@link selfNodeReplicates}.
+ */
+function scanSelfNodeRecord(store: any, name: string): any {
+	if (typeof store.getRange !== 'function') return undefined;
+	try {
+		for (const { key, value } of store.getRange({ start: name, limit: 1 })) {
+			if (key === name) return value;
+			return undefined; // first key past `name` — self key not present in range
+		}
+	} catch {
+		// scan unavailable/failed — caller falls back to the range-visibility default
+	}
+	return undefined;
 }
 
 const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array>>();
