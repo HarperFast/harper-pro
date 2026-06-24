@@ -513,7 +513,8 @@ function getSubscriptionConnection(
 	subscription: any,
 	dbName: string,
 	nodeName?: string,
-	authorization?: string
+	authorization?: string,
+	status?: { reused: boolean }
 ) {
 	const connectionKey = connectingUrl + '-' + subscriptionUrl;
 	let dbConnections = connections.get(connectionKey);
@@ -522,7 +523,10 @@ function getSubscriptionConnection(
 		connections.set(connectionKey, dbConnections);
 	}
 	let connection = dbConnections.get(dbName);
-	if (isReusableConnection(connection)) return connection;
+	if (isReusableConnection(connection)) {
+		if (status) status.reused = true;
+		return connection;
+	}
 	if (subscription) {
 		dbConnections.set(
 			dbName,
@@ -603,13 +607,15 @@ export function subscribeToNode(request: any) {
 			subscriptionToTable.ready = ready;
 			databaseSubscriptions.set(request.database, subscriptionToTable);
 		}
+		const connectionStatus = { reused: false };
 		const connection = getSubscriptionConnection(
 			request.nodes[0].url,
 			request.url,
 			subscriptionToTable,
 			request.database,
 			request.name,
-			request.nodes[0].authorization
+			request.nodes[0].authorization,
+			connectionStatus
 		);
 		if (request.nodes[0].name === undefined) {
 			// we don't have the node name yet
@@ -624,12 +630,14 @@ export function subscribeToNode(request: any) {
 			request.replicateByDefault
 		);
 		// The wedge reconcile (subscriptionManager.findWedgedNodeUrls path) sets forceReconnect so a
-		// re-subscribe to an already-cached, still-"reusable" connection actually drives recovery.
+		// re-subscribe to an already-cached, still-"reusable" connection actually drives recovery:
 		// getSubscriptionConnection returns the existing connection when isReusableConnection is true, and
 		// subscribe() alone only re-emits 'subscriptions-updated' — it does not reconnect a wedged socket.
-		// forceReconnect tears the dead socket down and arms a fresh connect, and is a no-op when a retry is
-		// already pending (its reconnectScheduled / isFinished / intentionallyUnsubscribed guards). #466.
-		if (request.forceReconnect) connection.forceReconnect();
+		// Only force the REUSED connection: a freshly-created one already called connect() inside
+		// getSubscriptionConnection, and forcing it mid-await (before reconnectScheduled is set) could open a
+		// duplicate socket. forceReconnect is otherwise a no-op when a retry is already pending (its
+		// reconnectScheduled / isFinished / intentionallyUnsubscribed guards). See harper-pro#466.
+		if (request.forceReconnect && connectionStatus.reused) connection.forceReconnect();
 	} catch (error) {
 		logger.error('Error in subscription to node', request.nodes[0]?.url, error);
 	}

@@ -791,15 +791,22 @@ export async function startOnMainThread(options) {
 				const entries = connectionReplicationMap.get(url);
 				if (!entries) continue;
 				let reconnectCount = 0;
+				const reconcileNow = Date.now();
 				for (const [databaseName, entry] of entries) {
-					// Mirror findWedgedNodeUrls: skip only confirmed-connected entries, so a never-connected
-					// entry (connected still undefined) is re-driven too — not just one that flipped false via
-					// disconnectedFromNode. See harper-pro#466.
+					// Apply the SAME wedged predicate findWedgedNodeUrls uses, per database — the URL is in
+					// wedgedNodeUrls because *some* db on this peer is wedged, but a sibling db may be a healthy
+					// connection or one still inside its initial-connect grace period. Re-checking here keeps a
+					// just-created entry (connected undefined, createdAt below threshold) and a not-desired entry
+					// from being force-reconnected and interrupting an in-flight dial. Mirrors findWedgedNodeUrls:
+					// connected !== true, downSince = disconnectedAt ?? createdAt, past threshold, still desired.
 					if (entry.connected === true) continue;
+					const downSince = entry.disconnectedAt ?? entry.createdAt;
+					if (downSince == null || reconcileNow - downSince < WEDGE_RECONCILE_THRESHOLD_MS) continue;
+					if (!shouldReplicateFromNode(entry.nodes?.[0] as any, databaseName)) continue;
 					// Restart the disconnect clock so this entry is not re-driven on every reconcile
 					// tick until it either connects or exceeds the threshold again. Stamping disconnectedAt
 					// also gives a never-connected entry a real "down since" for subsequent ticks.
-					entry.disconnectedAt = Date.now();
+					entry.disconnectedAt = reconcileNow;
 					const worker = entry.worker;
 					const nodes = entry.nodes;
 					if (!worker || !nodes) continue;
