@@ -220,6 +220,29 @@ const STORAGE_IS_ROCKSDB = (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_
 // to 'close', etc.) this timer-based watchdog is the belt-and-suspenders that forces the
 // reconnect — see harper-pro#233.
 const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
+// While the receive socket is paused for back-pressure the byte-silence watchdog above is stopped —
+// `ws.pause()` freezes `bytesRead`, so it can no longer tell a healthy back-pressure pause from a peer
+// that died mid-pause — and the active sendPing is exempt while `pauseReasons > 0`. That left a paused
+// leg with NO liveness check, so a base copy stalled at ~100% back-pressure whose peer restarted could
+// wedge `connected:false` forever (harper-pro#466, the deferred third recovery layer of PR #467). The
+// pause-stall watchdog (createPauseStallWatchdog) covers that window instead, keyed on local consumer
+// progress. This is how long the consumer must make ZERO progress while paused before we conclude the
+// pause can never self-clear and force a reconnect.
+//
+// Threshold sizing (cross-model review): the only consumer-progress signals that advance WHILE paused are
+// whole-batch commits (onCommit) and blob-stream drains — there is no sub-operation hook without a core
+// change. So a single legitimately-slow local operation (a huge transaction applying/committing, or a slow
+// blob write) that produces no commit/drain for the whole window would trip a false positive. We make that
+// vanishingly unlikely by defaulting to TWICE the longest single-operation duration the system already
+// tolerates (`blobTimeout` — the bound after which a stalled blob stream is itself destroyed), floored at
+// `PING_TIMEOUT * 2`. A false positive here is in any case benign-not-lossy: forceReconnect re-streams from
+// the durable resume cursor (re-applying only not-yet-committed work, idempotently), so the worst case is
+// connection churn on an already-pathologically-slow leg, never data loss. A finer-grained drain-progress
+// hook from core's IterableEventQueue would let us tighten this — tracked as a follow-up. Override with
+// `replication_pauseStallTimeout` for clusters with extreme single-transaction sizes.
+const PAUSE_STALL_THRESHOLD_MS =
+	env.get('replication_pauseStallTimeout') ??
+	Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 120000) * 2);
 
 /**
  * Decide whether an idle replication connection should be terminated as dead.
@@ -641,6 +664,46 @@ export function createCopyFlushPacer(
 			lastFlushAt = now;
 		},
 	};
+}
+
+/**
+ * Liveness watchdog for the BACK-PRESSURE-PAUSED state, the companion to `createReceiveWatchdog`.
+ *
+ * While the receive socket is paused (`pauseReasons > 0`) the byte-silence watchdog is stopped:
+ * `ws.pause()` freezes `bytesRead`, so it can no longer distinguish a healthy back-pressure pause
+ * (the receiver intentionally not reading while it drains its own queue) from a peer that died
+ * mid-pause. The active sendPing is exempt for the same reason. That left a paused leg with NO
+ * recovery driver, so a base copy stalled at ~100% back-pressure whose peer restarted could wedge
+ * `connected:false` forever — the receive-watchdog `forceReconnect` path (harper-pro#420/#424) was
+ * removed for exactly the stall it exists to catch. See harper-pro#466 / PR #467.
+ *
+ * This watchdog runs ONLY while paused (armed by `reset()` on pause, `stop()`ed on resume) and keys
+ * off a monotonic local consumer-progress counter instead of socket `bytesRead`. That counter
+ * advances on signals that survive `ws.pause()` — the apply loop committing already-queued records,
+ * and in-flight blob streams draining to disk — so a pause that is legitimately making progress
+ * re-arms every window and never fires. Only a pause with ZERO consumer progress for the full
+ * `thresholdMs` (the consumer can never drain it, so it will never self-clear) trips `onStall`.
+ *
+ * Implemented on top of `createReceiveWatchdog` so the throttled stall-timer is defined and unit
+ * tested in one place; this wrapper only swaps the activity source (`bytesRead` → progress counter)
+ * and the threshold. Like its byte-silence sibling it self-re-arms when progress is observed, so the
+ * caller need not `reset()` on every tick — it only arms on pause and stops on resume. Detection
+ * latency is therefore between `thresholdMs` and `2 × thresholdMs` (progress can arrive just after an
+ * arm), which is fine for an otherwise-permanent wedge and keeps the hot commit path untouched.
+ *
+ * Exported so the pause-stall behavior can be exercised in isolation by
+ * `unitTests/replication/pauseStallWatchdog.test.mjs`.
+ */
+export function createPauseStallWatchdog(opts: {
+	thresholdMs: number;
+	getProgress: () => number;
+	onStall: () => void;
+}): { reset: () => void; stop: () => void } {
+	return createReceiveWatchdog({
+		intervalMs: opts.thresholdMs,
+		getBytesRead: opts.getProgress,
+		onSilence: opts.onStall,
+	});
 }
 let secureContexts: Map<string, tls.SecureContext>;
 /**
@@ -1219,6 +1282,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
+	// Companion to receiveWatchdog that guards the back-pressure-paused window the byte watchdog is
+	// blind to (harper-pro#466). Armed on pause, stopped on resume — see addPauseReason/removePauseReason.
+	let pauseStallWatchdog: { reset: () => void; stop: () => void } | undefined;
 	let blobsTimer;
 	const DELAY_CLOSE_TIME = 60000; // amount of time to wait before closing the connection if we haven't any activity and there are no subscriptions
 	let delayedClose: NodeJS.Timeout;
@@ -1235,6 +1301,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// ahead of another that still wants the WS paused. Declared before the ping setup below because the
 	// immediate sendPing() reads it.
 	let pauseReasons = 0;
+	// Monotonic local-consumer progress tick sampled by pauseStallWatchdog. Unlike socket `bytesRead`
+	// (frozen by `ws.pause()`), this keeps advancing while the receive socket is paused for back-pressure
+	// — bumped when the apply loop commits a queued batch (onCommit) and when an in-flight blob stream
+	// drains to disk — so the watchdog can tell a healthy back-pressure pause (consumer draining) from a
+	// leg that died mid-pause (harper-pro#466). Only meaningful while paused.
+	let consumerProgress = 0;
 	const blobTimeout = env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 120000;
 	const blobsInFlight = new Map();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
@@ -1301,7 +1373,32 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			else ws.terminate();
 		},
 	});
-	const resetPingTimer = receiveWatchdog.reset;
+	// Guards the window the receive watchdog cannot: while the socket is paused for back-pressure the
+	// byte watchdog is stopped (bytesRead frozen) and the sendPing is exempt, so a leg that dies
+	// mid-pause has no recovery driver. This one keys off consumer progress instead and is armed only
+	// while paused (addPauseReason → reset, removePauseReason → stop). Same recovery as above. (harper-pro#466)
+	pauseStallWatchdog = createPauseStallWatchdog({
+		thresholdMs: PAUSE_STALL_THRESHOLD_MS,
+		getProgress: () => consumerProgress,
+		onStall: () => {
+			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+			logger.warn?.(
+				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting`
+			);
+			if (options.connection) options.connection.forceReconnect();
+			else ws.terminate();
+		},
+	});
+	// Re-arm the byte watchdog on observed frame activity — but NOT while the socket is paused for
+	// back-pressure. The 'message'/'ping'/'pong' handlers call this on every frame; without the guard a
+	// frame delivered around a pause boundary could re-arm the byte watchdog after addPauseReason stopped
+	// it, and since `ws.pause()` freezes `bytesRead` it would then spuriously fire `forceReconnect` after
+	// PING_TIMEOUT on a healthy paused leg — breaking the "exactly one of {receiveWatchdog,
+	// pauseStallWatchdog} armed while paused" invariant. While paused the pause-stall watchdog is the
+	// liveness guard; removePauseReason re-arms the byte watchdog on resume. (harper-pro#466 review)
+	const resetPingTimer = () => {
+		if (pauseReasons === 0) receiveWatchdog?.reset();
+	};
 	resetPingTimer();
 	ws._socket?.setMaxListeners(200); // we should allow a lot of drain listeners for concurrent blob streams
 	let ratioOfBackPressureTime = 0;
@@ -1360,6 +1457,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// is frozen by `ws.pause()` so the byte check cannot tell legitimate backpressure
 			// from peer silence, and firing here would terminate a healthy mid-ingest connection.
 			receiveWatchdog?.stop();
+			// Hand liveness off to the pause-stall watchdog for the paused window: the byte watchdog is now
+			// blind, but a leg can still die mid-pause, so guard it by consumer progress instead (harper-pro#466).
+			pauseStallWatchdog?.reset();
 		}
 		pauseReasons++;
 	}
@@ -1368,8 +1468,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		pauseReasons--;
 		if (pauseReasons === 0) {
 			ws.resume();
-			// Restart the silence window from the resume point — we deliberately do not penalize
-			// the connection for the time it spent paused.
+			// Resuming: the byte watchdog can see the socket again, so retire the pause-stall watchdog and
+			// restart the silence window from the resume point — we deliberately do not penalize the
+			// connection for the time it spent paused.
+			pauseStallWatchdog?.stop();
 			receiveWatchdog?.reset();
 			// Same reasoning for in-flight blob streams: while paused we stop reading the socket, so no
 			// blob chunks are processed and each stream's `lastChunk` clock goes stale even though the
@@ -1940,6 +2042,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									const release = () => {
 										stream.off('drain', release);
 										stream.off('close', release);
+										// Consumer-progress tick for pauseStallWatchdog: the blob's buffered bytes drained to
+										// disk — progress that survives the pause even if another reason keeps the socket
+										// paused after this one clears (harper-pro#466).
+										consumerProgress++;
 										removePauseReason();
 									};
 									stream.on('drain', release);
@@ -3149,6 +3255,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						}
 					}
 					outstandingCommits--;
+					// Consumer-progress tick for pauseStallWatchdog: the apply loop committed a queued batch,
+					// which advances even while the receive socket is paused for back-pressure (harper-pro#466).
+					consumerProgress++;
 					if (commitBacklogPaused) {
 						commitBacklogPaused = false;
 						removePauseReason();
@@ -3259,6 +3368,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		wsClosed = true;
 		clearInterval(sendPingInterval);
 		receiveWatchdog?.stop();
+		pauseStallWatchdog?.stop();
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
 		if (auditSubscription) auditSubscription.emit('close');
