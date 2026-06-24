@@ -12,10 +12,41 @@ import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 
-let hdbNodeTable;
+type MaybePromise<T> = T | Promise<T>;
+
+/**
+ * A row in the system `hdb_nodes` table — the canonical {@link Node} shape plus an index signature for
+ * the incidental extra fields some paths read (e.g. `authorization`). Reusing `Node` keeps it assignable
+ * everywhere a `Node` is expected (`getNodeURL`, `server.nodes`, …).
+ */
+export interface NodeRecord extends Node {
+	[key: string]: any;
+}
+
+/**
+ * Typed view of the `hdb_nodes` primaryStore. It is RocksDB-capable, so `get()` returns a MaybePromise —
+ * the record synchronously on a block-cache / memtable hit, but a *Promise* on a cache miss that needs a
+ * disk read. Typing `get()` this way makes any SYNCHRONOUS consumption (e.g. `store.get(id)?.replicates`)
+ * a compile error: use `getSync(id)` (forces the inline read) or `await` / `when` the result. LMDB is
+ * always synchronous so its Promise arm is never taken at runtime, but the type keeps callers honest on
+ * both engines. Other members fall through the index signature — this intentionally constrains only the
+ * point-read path the MaybePromise hazard affects.
+ */
+export type NodeStore = {
+	get(id: string, options?: any): MaybePromise<NodeRecord | undefined>;
+	getSync(id: string, options?: any): NodeRecord | undefined;
+	[key: string]: any;
+};
+
+interface HdbNodeTable {
+	primaryStore: NodeStore;
+	[key: string]: any;
+}
+
+let hdbNodeTable: HdbNodeTable | undefined;
 server.nodes = [];
 
-export function getHDBNodeTable() {
+export function getHDBNodeTable(): HdbNodeTable {
 	return (
 		hdbNodeTable ||
 		(hdbNodeTable = table({
@@ -57,7 +88,7 @@ export function getHDBNodeTable() {
 					attribute: '__updatedtime__',
 				},
 			],
-		}))
+		}) as unknown as HdbNodeTable)
 	);
 }
 export function getReplicationSharedStatus(
@@ -380,7 +411,7 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 		// (getSync): RocksDB get() is a MaybePromise (Promise on a block-cache miss); an un-awaited
 		// get() here would push a pending Promise into server.nodes. See selfNodeReplicates.
 		const fullRecord = getHDBNodeTable().primaryStore.getSync(node_name);
-		if (fullRecord) server.nodes.push(fullRecord);
+		if (fullRecord) server.nodes.push(fullRecord as any);
 	}
 	const shards = new Map();
 	for await (const node of getHDBNodeTable().search({})) {
