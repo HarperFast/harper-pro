@@ -343,7 +343,9 @@ function storeRecordRangeVisible(store: any, name: string): boolean {
 	if (typeof store.doesExist === 'function' && store.doesExist(name)) return true;
 	if (typeof store.getBinaryFast === 'function' && store.getBinaryFast(name) != null) return true;
 	try {
-		return store.get(name) != null;
+		// Synchronous read: RocksDB get() is a MaybePromise; an un-awaited get() would return a
+		// truthy Promise on a cache miss, making an absent key look present. See selfNodeReplicates.
+		return store.getSync(name) != null;
 	} catch {
 		return true;
 	}
@@ -445,7 +447,10 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 export function probeNodeRow(store: any, key: unknown): { outcome: 'deleted' | 'decode-failure'; record?: any } {
 	let record: any;
 	try {
-		record = store.get(key);
+		// Synchronous read: RocksDB get() is a MaybePromise. An un-awaited get() returns Promise<null>
+		// for a tombstone on a cache miss, so `record == null` would be false and a removed node would
+		// be misclassified as a decode-failure and revived. getSync forces the inline read. See #470.
+		record = store.getSync(key);
 	} catch {
 		// present-but-undecodable row → decode failure, reconstruct.
 		return { outcome: 'decode-failure' };
