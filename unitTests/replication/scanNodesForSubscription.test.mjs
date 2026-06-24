@@ -44,17 +44,21 @@ const DECODE_THROWS = Symbol('decode-throws');
  * null (genuine tombstone, skip); any object ⇒ get() returns it.
  */
 function fakeStore(rows) {
+	// probeNodeRow uses the SYNCHRONOUS point read (getSync) because the real system store is RocksDB,
+	// whose get() is a MaybePromise; getSync mirrors the synchronous point lookup here.
+	const pointGet = (key) => {
+		const row = rows[key];
+		if (row === DECODE_THROWS) throw new Error('missing shared structure');
+		return row ?? null;
+	};
 	return {
 		getRange() {
 			return Object.keys(rows)
 				.sort()
 				.map((key) => ({ key, value: rows[key] === DECODE_THROWS ? null : rows[key] }));
 		},
-		get(key) {
-			const row = rows[key];
-			if (row === DECODE_THROWS) throw new Error('missing shared structure');
-			return row ?? null;
-		},
+		get: pointGet,
+		getSync: pointGet,
 	};
 }
 
@@ -107,9 +111,11 @@ describe('resolveScannedNode (harper-pro#460)', () => {
 });
 
 describe('probeNodeRow (harper-pro#460 review: tombstone vs decode failure)', () => {
+	// probeNodeRow reads via getSync (RocksDB get() is a MaybePromise — the synchronous read is required
+	// so a cache-miss tombstone is a clean null, not a truthy Promise<null> misclassified as a decode failure).
 	it('classifies a point lookup that THROWS as a decode failure', () => {
 		const store = {
-			get: () => {
+			getSync: () => {
 				throw new Error('missing shared structure');
 			},
 		};
@@ -117,18 +123,18 @@ describe('probeNodeRow (harper-pro#460 review: tombstone vs decode failure)', ()
 	});
 
 	it('classifies a clean null point lookup as a genuine tombstone (deleted)', () => {
-		const store = { get: () => null };
+		const store = { getSync: () => null };
 		expect(probeNodeRow(store, 'peer-a')).to.deep.equal({ outcome: 'deleted' });
 	});
 
 	it('classifies undefined (physically absent) as deleted', () => {
-		const store = { get: () => undefined };
+		const store = { getSync: () => undefined };
 		expect(probeNodeRow(store, 'peer-a')).to.deep.equal({ outcome: 'deleted' });
 	});
 
 	it('returns the recovered record when the point lookup succeeds where the range value was null', () => {
 		const rec = { name: 'peer-a', replicates: true };
-		const store = { get: () => rec };
+		const store = { getSync: () => rec };
 		expect(probeNodeRow(store, 'peer-a')).to.deep.equal({ outcome: 'decode-failure', record: rec });
 	});
 });
