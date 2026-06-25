@@ -77,7 +77,11 @@ export async function clusterStatus() {
 	const thisNode = getHDBNodeTable().primaryStore.getSync(response.node_name);
 	if (thisNode?.shard) response.shard = thisNode.shard;
 	if (thisNode?.url) response.url = thisNode.url;
-	response.is_enabled = true; // if we have replication, replication is enabled
+	// is_enabled now reports whether this node is an active cluster member (harper-pro#217): a removed node
+	// (or one with no peers) has no connections and reports false, instead of the previous always-true that
+	// hid removal. `connections` is the per-peer list requestClusterStatus assembles from nodeMap; once a
+	// removed node's hdb_nodes delete propagates to onNodeUpdate(null) the peer is dropped and this flips.
+	response.is_enabled = response.connections.length > 0;
 
 	return response;
 }
