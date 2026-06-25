@@ -1008,6 +1008,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let lastCopyFlushTime = 0;
 	const COPY_CURSOR_FLUSH_BYTES = env.get('replication_copyCursorFlushBytes') ?? 64 * 1024 * 1024;
 	const COPY_CURSOR_FLUSH_INTERVAL_MS = Math.max(env.get('replication_copyCursorFlushIntervalMs') ?? 5000, 1);
+	// copyApply (and its WAL-off durability gate) engages only for non-system RocksDB copies. The system DB is
+	// excluded: its tables drive event-based machinery off the audit `aftercommit` stream — hdb_nodes feeds
+	// subscribeToNodeUpdates (peer discovery / connection setup) and hdb_certificate feeds CA install — so
+	// suppressing audit entries there would stop a freshly-copied node from forming its cluster (harper-pro#480;
+	// the system-analytics spin is handled by the retention-horizon dedup guard instead). LMDB is excluded too
+	// (copy rows stay audited/durable via the transaction log). databaseName is read dynamically — a connection
+	// can switch databases via SET_DATABASE.
+	const copyApplyActive = () => STORAGE_IS_ROCKSDB && databaseName !== 'system';
 	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
 	// received AND every copied batch has committed (outstandingCommits drained, which includes the final
 	// end_txn that advances the resume seqId to copyStartTime). We deliberately stay in copy mode until
@@ -1049,9 +1057,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	function flushDurableCopyCursor() {
 		if (outstandingBlobsToFinish.length > 0 || hasBlobGap) return;
 		if (pendingCopyCursor && copyFromNodeId !== undefined) {
-			if (!STORAGE_IS_ROCKSDB) {
-				// LMDB copies stay audited (durable via the transaction log), so the cursor needs no RocksDB flush
-				// gate — persist it directly, exactly as before copyApply. (harper-pro#480)
+			if (!copyApplyActive()) {
+				// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
+				// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
 				tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], pendingCopyCursor);
 				pendingCopyCursor = null;
 				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
@@ -1121,7 +1129,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn exactly as before, so this
 	// adds no per-seq-update overhead and does not alter non-copyApply paths. (harper-pro#480)
 	function seqUpdateEndTxn(localTime: number): any {
-		if (STORAGE_IS_ROCKSDB && inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) {
+		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) {
 			return {
 				type: 'end_txn',
 				localTime,
@@ -2959,7 +2967,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// still need a real audit entry for the redelivery to dedup (a commutative patch would
 					// otherwise double-apply). Rows older than copyStartTime are never redelivered, so the
 					// snapshot is safe and carries no audit. Strict `<` keeps the boundary row audited.
-					event.isCopyApply = messageIsCopyFrame && auditRecord.version < copyModeStartTime;
+					event.isCopyApply = messageIsCopyFrame && copyApplyActive() && auditRecord.version < copyModeStartTime;
 					tableSubscriptionToReplicator.send(event);
 					// Per-record backpressure: a single large WS message can synchronously decode
 					// thousands of records, each holding a decoded value object and a closure over
@@ -3058,7 +3066,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// flush persists the cursor with rows still in the memtable and no copyCursor, and a crash loses
 					// them (resume-from-seq skips pre-copyStartTime rows). core awaits this onCommit, then calls
 					// updateRecordedSequenceId, so awaiting the flush here orders flush-before-seq. (harper-pro#480)
-					if (STORAGE_IS_ROCKSDB && inCopyMode && copyModeStartTime > 0 && lastDurableSequenceId >= copyModeStartTime) {
+					if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && lastDurableSequenceId >= copyModeStartTime) {
 						await flushCopyRowsDurable();
 					}
 					if (isCopyFrame) {
