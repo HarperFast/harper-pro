@@ -143,13 +143,14 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 	const ghRepo = detectGhRepo();
 	info(`  GitHub repo: ${ghRepo}`);
 
+	log('  Fetching from origin...');
+	runSafe('git fetch origin ' + branch);
+	run('git fetch origin --tags');
+
 	if (!hasBranch(branch)) {
 		err(`  Release branch "${branch}" not found.`);
 		process.exit(1);
 	}
-
-	log('  Fetching from origin...');
-	run('git fetch origin --tags');
 
 	const last = getLastRelease(branch);
 	if (last) info(`  Last release: ${last.tag} (${last.date})`);
@@ -363,7 +364,7 @@ async function main() {
 
 	// ── Step 7: offer to return to original branches ───────────────────────────
 	process.chdir(corePath);
-	if (coreOriginalBranch && coreOriginalBranch !== RELEASE_BRANCH) {
+	if (coreOriginalBranch && coreOriginalBranch !== CORE_RELEASE_BRANCH) {
 		const back = await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
 		if (back.toLowerCase() !== 'n') run(`git checkout "${coreOriginalBranch}"`);
 	}
