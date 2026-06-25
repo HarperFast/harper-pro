@@ -591,6 +591,11 @@ export const COPY_PRIORITY_TABLES = ['hdb_deployment', 'hdb_nodes'];
 // High-volume tables copied last so they can never gate the tables above. hdb_analytics is ~node-local
 // telemetry that can reach millions of rows; it must not sit ahead of control-plane tables in the copy.
 export const COPY_DEPRIORITIZED_TABLES = ['hdb_analytics'];
+// System tables whose subscribers drive cluster machinery off the audit `aftercommit` stream and so
+// must be re-read after a copyApply base copy (whose snapshot rows carry no per-row audit events): a
+// whole-table "reload" marker is emitted for each once the system-DB copy is durable. hdb_nodes feeds
+// peer discovery / outbound subscriptions, hdb_certificate feeds CA install. (harper-pro#489)
+export const SYSTEM_RELOAD_TABLES = ['hdb_nodes', 'hdb_certificate'];
 
 /**
  * Order a database's table names for a base copy: COPY_PRIORITY_TABLES first (in listed order), then
@@ -1242,14 +1247,31 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let copyFlushRetryTimer;
 	const COPY_CURSOR_FLUSH_BYTES = env.get('replication_copyCursorFlushBytes') ?? 64 * 1024 * 1024;
 	const COPY_CURSOR_FLUSH_INTERVAL_MS = Math.max(env.get('replication_copyCursorFlushIntervalMs') ?? 5000, 1);
-	// copyApply (and its WAL-off durability gate) engages only for non-system RocksDB copies. The system DB is
-	// excluded: its tables drive event-based machinery off the audit `aftercommit` stream — hdb_nodes feeds
-	// subscribeToNodeUpdates (peer discovery / connection setup) and hdb_certificate feeds CA install — so
-	// suppressing audit entries there would stop a freshly-copied node from forming its cluster (harper-pro#480;
-	// the system-analytics spin is handled by the retention-horizon dedup guard instead). LMDB is excluded too
-	// (copy rows stay audited/durable via the transaction log). databaseName is read dynamically — a connection
-	// can switch databases via SET_DATABASE.
-	const copyApplyActive = () => STORAGE_IS_ROCKSDB && databaseName !== 'system';
+	// copyApply (and its WAL-off durability gate) engages for every RocksDB copy, the system DB included. The
+	// system DB's tables drive event-based machinery off the audit `aftercommit` stream — hdb_nodes feeds
+	// subscribeToNodeUpdates (peer discovery / connection setup) and hdb_certificate feeds CA install — which
+	// copyApply's audit-less snapshot writes would otherwise suppress. A per-table "reload" marker emitted once
+	// the copy is durable (emitSystemReloadMarkers) re-drives those subscribers, so a freshly-copied node still
+	// forms its cluster while copyApply also covers hdb_analytics — retiring the system-DB exclusion and the
+	// #480 system-analytics spin's interim retention-horizon guard. LMDB stays excluded (copy rows stay
+	// audited/durable via the transaction log). (harper-pro#489)
+	const copyApplyActive = () => STORAGE_IS_ROCKSDB;
+	// Emit a whole-table reload marker for each cluster-machinery system table once a copyApply base copy
+	// of the system DB is durable, so subscribers that saw no per-row events (those rows were snapshotted
+	// without audit entries) re-read the table and the freshly-copied node forms its cluster. A no-op for
+	// non-system DBs and for audited (LMDB / non-copyApply) copies, which already delivered per-row events.
+	// Fire-and-forget: each marker is its own tiny transaction, and a failure self-heals on the next
+	// restart's subscription scan, so it must never block or fail copy finalization. (harper-pro#489)
+	function emitSystemReloadMarkers() {
+		if (databaseName !== 'system' || !copyApplyActive()) return;
+		for (const tableName of SYSTEM_RELOAD_TABLES) {
+			const table = (tables as any)?.[tableName];
+			if (typeof table?.writeReloadMarker !== 'function') continue;
+			Promise.resolve(table.writeReloadMarker()).catch((error: unknown) =>
+				logger.warn?.(connectionId, `failed to emit reload marker for system.${tableName}`, error)
+			);
+		}
+	}
 	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
 	// received AND every copied batch has committed (outstandingCommits drained, which includes the final
 	// end_txn that advances the resume seqId to copyStartTime). We deliberately stay in copy mode until
@@ -1287,6 +1309,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// per-frame throttle can't swallow this transition re-arm (mirrors the COPY_START widen). (#460)
 			receiveWatchdog?.stop();
 			receiveWatchdog?.reset();
+			// The copy's rows are now durable; signal the audit-stream subscribers to re-read the
+			// cluster-machinery system tables that copyApply snapshotted without per-row events (harper-pro#489).
+			emitSystemReloadMarkers();
 		}
 	}
 	// Persist the staged copy cursor and, if the copy is now fully durable, finish it — but ONLY when the
