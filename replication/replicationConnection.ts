@@ -1054,6 +1054,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// durable-advance points (onCommit when nothing is in flight, and the blob save `.finally` when the last
 	// blob drains) persist it via flushDurableCopyCursor(). Null when there is nothing pending to persist.
 	let pendingCopyCursor: { copyStartTime: number; currentTable: any; afterKey: any; copyOrder: any } | null = null;
+	// Durability gate for copy-apply rows (harper-pro#480): bulk-copy frames are applied WAL-off with NO
+	// transaction-log entry, so the resume cursor must only advance behind an explicit RocksDB flush
+	// (memtable -> SST). flushDurableCopyCursor() flushes the copied DB on a size/time cadence (or immediately
+	// when finishing) and persists the cursor staged at flush time; a crash before a flush re-copies
+	// idempotently from the last durable cursor. Flushing per batch would be too frequent (write amplification,
+	// tiny SSTs), so we batch by COPY_CURSOR_FLUSH_BYTES / _INTERVAL_MS.
+	let copyBytesSinceFlush = 0;
+	let copyFlushInFlight = false;
+	let lastCopyFlushTime = 0;
+	const COPY_CURSOR_FLUSH_BYTES = env.get('replication_copyCursorFlushBytes') ?? 64 * 1024 * 1024;
+	const COPY_CURSOR_FLUSH_INTERVAL_MS = Math.max(env.get('replication_copyCursorFlushIntervalMs') ?? 5000, 1);
 	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
 	// received AND every copied batch has committed (outstandingCommits drained, which includes the final
 	// end_txn that advances the resume seqId to copyStartTime). We deliberately stay in copy mode until
@@ -1068,6 +1079,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// Removing the cursor while a blob is still in flight or a transient gap is held would let a crash
 		// resume from the post-copy seqId and skip re-streaming the not-yet-durable blob, losing it.
 		if (copyCompleteReceived && outstandingCommits === 0 && outstandingBlobsToFinish.length === 0 && !hasBlobGap) {
+			// copy-apply rows are WAL-off with no transaction-log entry: the last copied rows must be durably
+			// flushed before the cursor is removed, or a crash after removal loses them (resume-from-seqId can't
+			// re-stream base-copy rows). Force the final flush, then finish on its completion. (harper-pro#480)
+			if (pendingCopyCursor != null) {
+				flushDurableCopyCursor(); // copyCompleteReceived forces a flush; re-invokes maybeFinishCopy when durable
+				return;
+			}
+			if (copyFlushInFlight) return; // a flush is persisting the final cursor; finish on its completion
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
@@ -1087,11 +1106,76 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	function flushDurableCopyCursor() {
 		if (outstandingBlobsToFinish.length > 0 || hasBlobGap) return;
 		if (pendingCopyCursor && copyFromNodeId !== undefined) {
-			tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], pendingCopyCursor);
+			// copy-apply rows are WAL-off with no transaction-log entry, so the cursor must sit behind an explicit
+			// RocksDB flush (memtable -> SST). Flush the copied DB on a size/time cadence (or immediately when
+			// finishing) and persist the staged cursor only once the flush resolves; never persist without a
+			// durable flush, or a crash would lose the unflushed rows the cursor claims. If the store isn't
+			// reachable, hold the cursor rather than risk loss. (harper-pro#480)
+			const flushRootStore = copyStoreFlush();
+			const flushNow =
+				copyCompleteReceived ||
+				copyBytesSinceFlush >= COPY_CURSOR_FLUSH_BYTES ||
+				performance.now() - lastCopyFlushTime >= COPY_CURSOR_FLUSH_INTERVAL_MS;
+			if (!flushNow || copyFlushInFlight || !flushRootStore) return;
+			const cursorAtFlush = pendingCopyCursor;
 			pendingCopyCursor = null;
-			logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
+			copyBytesSinceFlush = 0;
+			lastCopyFlushTime = performance.now();
+			copyFlushInFlight = true;
+			Promise.resolve(flushRootStore())
+				.then(() => {
+					// rows up to cursorAtFlush are now durable in SST; dbisDB is WAL-on, so this persist is durable.
+					// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
+					if (copyFromNodeId !== undefined)
+						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
+					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
+				})
+				.catch((error) => {
+					pendingCopyCursor ??= cursorAtFlush; // hold the staged cursor; a later flush retries
+					logger.warn?.(connectionId, 'copy cursor flush failed; holding cursor', error);
+				})
+				.finally(() => {
+					copyFlushInFlight = false;
+					maybeFinishCopy();
+				});
+			return;
 		}
 		maybeFinishCopy();
+	}
+	// Select the copied DB's flush primitive: RocksDB exposes flush() (memtable -> SST); LMDB exposes a
+	// `flushed` promise. Returns undefined if neither is reachable. (replication targets RocksDB; the LMDB
+	// suite exercises this path.)
+	function copyStoreFlush(): (() => Promise<unknown>) | undefined {
+		const rootStore = auditStore?.rootStore;
+		return typeof rootStore?.flush === 'function'
+			? () => rootStore.flush()
+			: rootStore?.flushed !== undefined
+				? () => Promise.resolve(rootStore.flushed)
+				: undefined;
+	}
+	// Force the copied DB durable and await it. Gates [seq] = copyStartTime behind the copyApply rows'
+	// durability: those rows are WAL-off with no transaction-log entry, and core awaits the end_txn onCommit
+	// before persisting [seq] (Table.ts updateRecordedSequenceId), so awaiting here orders flush-before-seq.
+	// A flush rejection propagates out of onCommit, so core skips the seq persist and the copy re-runs rather
+	// than resuming past undurable rows. (harper-pro#480)
+	async function flushCopyRowsDurable(): Promise<void> {
+		const flush = copyStoreFlush();
+		if (flush) await flush();
+	}
+	// Build an empty sequence-update end_txn. In copy mode, when its localTime advances the resume cursor to
+	// copyStartTime, its onCommit flushes the WAL-off copyApply rows durable BEFORE core persists [seq] (core
+	// awaits onCommit, then calls updateRecordedSequenceId). Used for every plain seq-update emit so none can
+	// advance the persisted resume cursor past undurable copy rows; a flush rejection skips the seq persist so
+	// the copy re-runs rather than losing rows. (harper-pro#480)
+	function seqUpdateEndTxn(localTime: number): any {
+		return {
+			type: 'end_txn',
+			localTime,
+			remoteNodeIds: receivingDataFromNodeIds,
+			async onCommit() {
+				if (inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) await flushCopyRowsDurable();
+			},
+		};
 	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
@@ -1686,6 +1770,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
 						inCopyMode = true;
 						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
+						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)
+						lastCopyFlushTime = performance.now();
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
@@ -1703,14 +1789,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					case SEQUENCE_ID_UPDATE:
 						// we need to record the sequence number that the remote node has received
 						lastSequenceIdReceived = data;
-						tableSubscriptionToReplicator.send({
-							type: 'end_txn',
-							// Clamp: a sequence-id update carries no commit/blob-durability gate, so while any blob is
-							// not yet durable it must not push the resume cursor past the last fully-durable point (same
-							// as the inline REMOTE_SEQUENCE_UPDATE branch below).
-							localTime: cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived,
-							remoteNodeIds: receivingDataFromNodeIds,
-						});
+						// Clamp: a sequence-id update carries no commit/blob-durability gate, so while any blob is not
+						// yet durable it must not push the resume cursor past the last fully-durable point (same as the
+						// inline REMOTE_SEQUENCE_UPDATE branch below). seqUpdateEndTxn also gates copy-apply durability.
+						tableSubscriptionToReplicator.send(
+							seqUpdateEndTxn(cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived)
+						);
 						getSharedStatus();
 						replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
 							// ensure monotonicity
@@ -2752,6 +2836,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			let sequenceIdReceived;
 			let maxBatchVersion; // highest record version in this batch (non-copy); end_txn resume cursor when no sequence-update set lastSequenceIdReceived
 			let lastYieldTime = performance.now();
+			// Latch the copy-frame status ONCE for this whole WS message body. The decode loop below awaits
+			// (waitForDrain / setImmediate) and ws does not serialize async message handlers, so a later
+			// COPY_COMPLETE could otherwise flip copyCompleteReceived mid-body and make trailing rows fall back to
+			// the audited/resequencing path — reintroducing the O(n) copy-time work this avoids. (harper-pro#480)
+			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
 			do {
 				getSharedStatus();
 				const eventLength = decoder.readInt();
@@ -2766,13 +2855,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					);
 					replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 					replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
-					tableSubscriptionToReplicator.send({
-						type: 'end_txn',
-						// Clamp: an empty sequence update carries no commit/blob-durability gate, so while any
-						// blob is not yet durable it must not push the resume cursor past the last fully-durable point.
-						localTime: cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived,
-						remoteNodeIds: receivingDataFromNodeIds,
-					});
+					// Clamp: an empty sequence update carries no commit/blob-durability gate, so while any blob is
+					// not yet durable it must not push the resume cursor past the last fully-durable point.
+					// seqUpdateEndTxn also gates copy-apply durability (flush before [seq] = copyStartTime).
+					tableSubscriptionToReplicator.send(
+						seqUpdateEndTxn(cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived)
+					);
 					logger.trace?.('received remote sequence update', lastSequenceIdReceived, databaseName);
 					break;
 				}
@@ -2944,6 +3032,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						'nodeId',
 						event.nodeId
 					);
+					// Mark base-copy frames so core applies them as snapshots: record + indices only, no
+					// audit/transaction-log entry and no out-of-order resequencing/dedup (harper-pro#480).
+					// Only snapshot rows OLDER than copyStartTime: the post-copy audit replay resumes from
+					// copyStartTime and re-delivers every write with version >= copyStartTime, so those rows
+					// still need a real audit entry for the redelivery to dedup (a commutative patch would
+					// otherwise double-apply). Rows older than copyStartTime are never redelivered, so the
+					// snapshot is safe and carries no audit. Strict `<` keeps the boundary row audited.
+					event.isCopyApply = messageIsCopyFrame && auditRecord.version < copyModeStartTime;
 					tableSubscriptionToReplicator.send(event);
 					// Per-record backpressure: a single large WS message can synchronously decode
 					// thousands of records, each holding a decoded value object and a closure over
@@ -2987,7 +3083,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 			// Is this a bulk-copy frame? Only frames received before COPY_COMPLETE are part of the
 			// primary-key copy; later audit-replay frames must not be recorded as the resume cursor.
-			const isCopyFrame = inCopyMode && !copyCompleteReceived;
+			const isCopyFrame = messageIsCopyFrame; // latched above (consistent across the body despite awaits)
+			if (isCopyFrame) copyBytesSinceFlush += body.byteLength; // feed the copy-apply flush cadence (harper-pro#480)
 			// Capture the end_txn in a const so onCommit can clamp its `localTime` before the apply loop reads
 			// it: core Table.ts awaits onCommit and only THEN reads `event.localTime` to persist the resume
 			// cursor (same object — onCommit being callable proves the event isn't cloned across send()).
@@ -3035,6 +3132,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// failed blob — preserving the no-data-loss guarantee — while the apply loop never blocks.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
 					endTxnEvent.localTime = lastDurableSequenceId;
+					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
+					// (version < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
+					// core persists [seq] = copyStartTime. Otherwise a small copy that finished before the cadence
+					// flush persists the cursor with rows still in the memtable and no copyCursor, and a crash loses
+					// them (resume-from-seq skips pre-copyStartTime rows). core awaits this onCommit, then calls
+					// updateRecordedSequenceId, so awaiting the flush here orders flush-before-seq. (harper-pro#480)
+					if (inCopyMode && copyModeStartTime > 0 && lastDurableSequenceId >= copyModeStartTime) {
+						await flushCopyRowsDurable();
+					}
 					if (isCopyFrame) {
 						// Stage this copied key as the copy resume cursor. It is only PERSISTED once its blob (and
 						// every earlier blob) is durable — by flushDurableCopyCursor() just below when nothing is in
@@ -3365,11 +3471,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// Safe: at drain with no gap, every received record (incl. blobs) through lastSequenceIdReceived
 						// is durable, and core applies this end_txn after the records already enqueued ahead of it, so
 						// the cursor never advances past an uncommitted/undurable point. max() keeps it monotonic.
-						tableSubscriptionToReplicator.send({
-							type: 'end_txn',
-							localTime: Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId),
-							remoteNodeIds: receivingDataFromNodeIds,
-						});
+						tableSubscriptionToReplicator.send(
+							seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+						);
 					}
 					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
 					// durable: persist it (and finish the copy if COPY_COMPLETE already arrived). No-op outside
