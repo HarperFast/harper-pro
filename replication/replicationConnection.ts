@@ -1063,6 +1063,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let copyBytesSinceFlush = 0;
 	let copyFlushInFlight = false;
 	let lastCopyFlushTime = 0;
+	// Backoff for a failing copy-cursor flush (e.g. disk-full / I/O error). Without it, the .catch re-stages
+	// the cursor and the .finally re-invokes maybeFinishCopy → flushDurableCopyCursor immediately, busy-looping
+	// at ~100% CPU and flooding logs on a persistent failure. Escalating backoff + a scheduled retry paces it:
+	// transient errors self-heal, a persistent one idles until the operator (or a higher-level watchdog) acts.
+	let copyFlushBackoffUntil = 0;
+	let copyFlushRetryMs = 0;
+	let copyFlushRetryTimer;
 	const COPY_CURSOR_FLUSH_BYTES = env.get('replication_copyCursorFlushBytes') ?? 64 * 1024 * 1024;
 	const COPY_CURSOR_FLUSH_INTERVAL_MS = Math.max(env.get('replication_copyCursorFlushIntervalMs') ?? 5000, 1);
 	// copyApply (and its WAL-off durability gate) engages only for non-system RocksDB copies. The system DB is
@@ -1133,7 +1140,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				copyCompleteReceived ||
 				copyBytesSinceFlush >= COPY_CURSOR_FLUSH_BYTES ||
 				performance.now() - lastCopyFlushTime >= COPY_CURSOR_FLUSH_INTERVAL_MS;
-			if (!flushNow || copyFlushInFlight || !flushRootStore) return;
+			if (!flushNow || copyFlushInFlight || !flushRootStore || performance.now() < copyFlushBackoffUntil) return;
 			const cursorAtFlush = pendingCopyCursor;
 			pendingCopyCursor = null;
 			copyBytesSinceFlush = 0;
@@ -1145,11 +1152,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
 					if (copyFromNodeId !== undefined)
 						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
+					copyFlushBackoffUntil = 0;
+					copyFlushRetryMs = 0; // flush succeeded; reset backoff
 					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
 				})
 				.catch((error) => {
-					pendingCopyCursor ??= cursorAtFlush; // hold the staged cursor; a later flush retries
-					logger.warn?.(connectionId, 'copy cursor flush failed; holding cursor', error);
+					pendingCopyCursor ??= cursorAtFlush; // hold the staged cursor
+					// Escalating backoff (250ms → 30s cap) instead of an immediate re-flush, so a persistent flush
+					// failure idles rather than busy-looping; a scheduled retry drives progress without another event.
+					copyFlushRetryMs = Math.min(copyFlushRetryMs ? copyFlushRetryMs * 2 : 250, 30000);
+					copyFlushBackoffUntil = performance.now() + copyFlushRetryMs;
+					clearTimeout(copyFlushRetryTimer);
+					copyFlushRetryTimer = setTimeout(() => {
+						copyFlushRetryTimer = undefined;
+						flushDurableCopyCursor();
+					}, copyFlushRetryMs);
+					copyFlushRetryTimer.unref?.();
+					logger.warn?.(connectionId, `copy cursor flush failed; backing off ${copyFlushRetryMs}ms`, error);
 				})
 				.finally(() => {
 					copyFlushInFlight = false;
