@@ -583,7 +583,12 @@ function rebuildKnownNodes(listener: (node: any, id: string) => void) {
 			// name + replicates from the reconstruct win; oldNode supplies url/shard/ca/etc.
 			if (oldNode) node = { ...oldNode, ...node };
 		}
-		server.nodes.push(node);
+		// server.nodes holds PEERS, never this node itself — mirror processNodeUpdateEvent's
+		// `node_name !== getThisNodeName()` guard. The per-row event path always excluded self; the scan
+		// path latently did not, which was harmless while it only ran on an empty table at boot. A copyApply
+		// reload now runs it over a populated hdb_nodes (incl. the self row), so without this guard self leaks
+		// into server.nodes and the node treats itself as a replication/deploy peer (harper-pro#489).
+		if (node.name === undefined || node.name !== getThisNodeName()) server.nodes.push(node);
 		if (node.shard != undefined) {
 			let nodesForShard = server.shards.get(node.shard);
 			if (!nodesForShard) {
