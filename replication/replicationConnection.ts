@@ -271,6 +271,35 @@ export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pau
 }
 
 /**
+ * Decide whether the empty-subscription delayed close inside `replicateOverWS`'s `scheduleClose` should
+ * be classified as INTENTIONAL/finished (mark `isFinished`/`intentionallyUnsubscribed`, emit `'finished'`,
+ * remove the connection from the worker map, never reconnect) vs a transient close that falls through to
+ * `NodeReplicationConnection`'s normal retry path so it self-heals.
+ *
+ * The close fires when the WIRE subscription went 0-length and the peer has been idle for
+ * `DELAY_CLOSE_TIME`. The wire subscription is a 1:1 map of `connection.nodeSubscriptions` (it is built by
+ * `.map()`-ing it), so at this point that array is itself empty — keying the decision on
+ * `connection.nodeSubscriptions` would be a no-op: it is empty in BOTH the genuine-unsubscribe and the
+ * spurious-empty cases (a later repopulating `subscribe()` would have cleared `delayedClose` before this
+ * timer fired). The two — and only two — code paths that drive an empty `subscribe([])` are:
+ *   - replicator.assignReplicationSource on DATABASE REMOVAL (`subscribe([], false)` then delete from the
+ *     connection map) — the local database is gone. Genuinely terminal → finish.
+ *   - subscribeToNode's `nodes.filter(shouldReplicateFromNode)` collapsing to `[]` while the database is
+ *     still present — e.g. the harper-pro#470 self-record gate misread emptied the filter for a
+ *     STILL-desired peer. Finishing THAT close strands the still-wanted peer at `connected:false` with no
+ *     reconnect (the observed permanent wedge on a 4-node preprod cluster). Must stay retryable.
+ *
+ * So the real discriminator is durable state, NOT `connection.nodeSubscriptions`: the genuine-terminal
+ * path is exactly "the local database for this connection is gone". `databasePresent` is read at close
+ * time from `getDatabases()` so the predicate stays pure and unit-testable. (The genuine user-unsubscribe
+ * path, `unsubscribe()`, sets `intentionallyUnsubscribed` directly and closes the socket itself — it never
+ * reaches this delayed close, so it is unaffected.)
+ */
+export function shouldFinishEmptySubscriptionClose(databasePresent: boolean): boolean {
+	return !databasePresent;
+}
+
+/**
  * Decide whether an in-flight blob stream has genuinely stalled and should be destroyed by the
  * `blobsTimer` sweep. The clock (`lastChunk`) advances every time a chunk is processed, so a healthy
  * transfer never trips this. The subtlety — and the bug this guards (harper-pro#368, the
@@ -4111,7 +4140,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					delayedClose = setTimeout(() => {
 						// if we have not received any messages in a while, we can close the connection
 						if (lastMessageTime <= scheduled)
-							close(1008, 'Connection has no subscriptions and is no longer used', true);
+							// Only finish (no reconnect) when the local database is genuinely gone; an empty
+							// subscription while the database is still present is spurious (e.g. a #470 filter
+							// misread for a still-desired peer) and must self-heal. See
+							// shouldFinishEmptySubscriptionClose.
+							close(
+								1008,
+								'Connection has no subscriptions and is no longer used',
+								shouldFinishEmptySubscriptionClose(getDatabases()?.[databaseName] != null)
+							);
 						else scheduleClose();
 					}, DELAY_CLOSE_TIME).unref();
 				};
