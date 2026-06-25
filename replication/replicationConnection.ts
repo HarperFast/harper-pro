@@ -1097,9 +1097,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		for (const tableName of SYSTEM_RELOAD_TABLES) {
 			const table = (tables as any)?.[tableName];
 			if (typeof table?.writeReloadMarker !== 'function') continue;
-			Promise.resolve(table.writeReloadMarker()).catch((error: unknown) =>
-				logger.warn?.(connectionId, `failed to emit reload marker for system.${tableName}`, error)
-			);
+			// `.then(() => writeReloadMarker())` rather than `Promise.resolve(writeReloadMarker())` so a
+			// SYNCHRONOUS throw (the marker's transaction commits inline) is also routed to the catch — never
+			// bubbling out of this fire-and-forget call into copy finalization (maybeFinishCopy).
+			Promise.resolve()
+				.then(() => table.writeReloadMarker())
+				.catch((error: unknown) =>
+					logger.warn?.(connectionId, `failed to emit reload marker for system.${tableName}`, error)
+				);
 		}
 	}
 	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
