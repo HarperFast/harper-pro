@@ -141,6 +141,17 @@ const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 10
 // cursor instead of restarting from zero. Larger = less overhead but coarser resume granularity.
 const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 1000;
 
+// Wall-clock ceiling on the gap between socket flushes / event-loop yields during a bulk copy.
+// Reading a large cold table out of RocksDB dominates copy cost (decompress + decode), so a purely
+// count-based checkpoint can let a single batch run longer than the receive watchdog window with no
+// non-ping bytes on the wire: the sender's own idle-ping check then self-terminates and the follower's
+// receive watchdog also fires, churning the connection ~once a window for hours. Flushing + yielding at
+// least this often keeps real bytes moving and the ping timer alive. Stays comfortably under
+// RECEIVE_SILENCE_THRESHOLD_MS (the watchdog timeout). Floored at 1ms: a non-positive misconfig would
+// make the pacer fire on every record (a setImmediate yield per row), throttling the copy to a crawl —
+// the very pathology this bounds — so clamp rather than trust the operator-supplied value.
+const COPY_CHECKPOINT_MAX_INTERVAL_MS = Math.max(env.get('replication_copyCheckpointMaxIntervalMs') ?? 5000, 1);
+
 // Leading-duplicate fast-skip (PR B, stacks on the #368 clamp work). On resume the leader re-streams
 // from the follower's resume cursor, so the first records of a resumed stream are records this follower
 // already applied. Each such record otherwise flows into core Table.ts's apply loop and triggers the
@@ -582,6 +593,29 @@ export function createReceiveWatchdog(opts: {
 				clearTimeout(timer);
 				timer = undefined;
 			}
+		},
+	};
+}
+
+/**
+ * Wall-clock pacer for the bulk-copy send loop. The copy normally flushes to the socket on a
+ * record-count checkpoint, but reading a large cold table dominates copy cost, so a single
+ * count-batch can exceed the receive watchdog window with no bytes on the wire — and the LOCAL_ONLY
+ * skip path bypasses the per-record flush+yield entirely. Either starves the watchdog into killing
+ * the connection mid-copy. This bounds the wall-clock gap between flushes/yields: `due(now)` reports
+ * whether at least `intervalMs` has elapsed since the last one, and callers `mark(now)` after each
+ * flush or yield (whether triggered by this pacer or the count checkpoint) so the window restarts.
+ * Clock is injected via `now` arguments so the cadence is unit-testable.
+ */
+export function createCopyFlushPacer(
+	intervalMs: number,
+	initialNow: number
+): { due: (now: number) => boolean; mark: (now: number) => void } {
+	let lastFlushAt = initialNow;
+	return {
+		due: (now: number) => now - lastFlushAt >= intervalMs,
+		mark: (now: number) => {
+			lastFlushAt = now;
 		},
 	};
 }
@@ -2462,6 +2496,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// so it tracks a resume cursor that a later leader can validate before trusting the skip.
 											ws.send(encode([COPY_START, copyStartTime, COPY_ORDER_VERSION]));
 											let recordsSinceCheckpoint = 0;
+											// Paces the flush/yield cadence inside the copy loop below (see
+											// COPY_CHECKPOINT_MAX_INTERVAL_MS). Marked on every in-loop flush/yield.
+											const copyFlushPacer = createCopyFlushPacer(COPY_CHECKPOINT_MAX_INTERVAL_MS, Date.now());
 											// If resuming, the follower already committed every table before currentTable (records commit
 											// in stable iteration order), so skip to currentTable and continue after its last committed key.
 											let reachedResumeTable = !copyResume;
@@ -2520,6 +2557,26 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												}
 												for (const entry of table.primaryStore.getRange(rangeOptions)) {
 													if (closed) return;
+													// Bound the wall-clock gap between socket flushes and event-loop yields,
+													// independent of record count. The count checkpoint below alone can let a cold
+													// batch run past the watchdog window with no bytes flushed (reads dominate cost),
+													// and the LOCAL_ONLY `continue` below skips the normal per-record flush+yield
+													// entirely — a contiguous skipped run would then never reach the timers phase, so
+													// the ping timer and receive side starve. Flush any pending batch (plain flush, NOT
+													// an end_txn — see the watermark note below) and yield a macrotask on this cadence
+													// so both watchdog variants stay satisfied regardless of which records we walk.
+													const now = Date.now();
+													if (copyFlushPacer.due(now)) {
+														copyFlushPacer.mark(now);
+														if (position - encodingStart > 8) {
+															recordsSinceCheckpoint = 0;
+															sendQueuedData();
+															encodingStart = position;
+															currentTransaction.txnTime = 0;
+														}
+														await new Promise(setImmediate);
+														if (closed) return;
+													}
 													// Local-only records must never be full-copied to a peer. metadataFlags is the
 													// already-available record metadata integer from the range entry — a pure bitmask
 													// test, no record value decode added to this send path.
@@ -2585,6 +2642,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// watermark is only advanced to copyStartTime by the single end_txn after the whole copy.
 													if (++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS && position - encodingStart > 8) {
 														recordsSinceCheckpoint = 0;
+														copyFlushPacer.mark(Date.now());
 														sendQueuedData();
 														encodingStart = position;
 														currentTransaction.txnTime = 0;
