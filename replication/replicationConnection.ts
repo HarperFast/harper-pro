@@ -415,7 +415,15 @@ export function createBlobReceiveStream(idleTimeoutMs?: number): PassThrough {
  * `unitTests/replication/discardMalformedCopyCursor.test.mjs`; production callers go through
  * `replicateOverWS`.
  */
-export function discardMalformedCopyCursor(copyCursor: any, dbisDB: any, nodeId: any, warn?: () => void): any {
+export function discardMalformedCopyCursor(
+	copyCursor: DbisCursor | undefined,
+	dbisDB: DbisStore | undefined,
+	nodeId: any,
+	warn?: () => void
+): DbisCursor | undefined {
+	// copyCursor is DbisCursor | undefined (not any) so the #485 invariant reaches this path too: passing a
+	// raw dbisDB.get() result (a MaybePromise on a RocksDB cache miss) is a tsc error here, not a Promise that
+	// reads as malformed and gets remove()d from disk — i.e. a spurious full-recopy on reconnect (#321).
 	if (!copyCursor || copyCursor.currentTable) return copyCursor;
 	warn?.();
 	if (nodeId !== undefined) dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
