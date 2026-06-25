@@ -394,7 +394,8 @@ export function createBlobReceiveStream(idleTimeoutMs?: number): PassThrough {
 	// forever, pinning the per-database apply consumer at lastReceivedStatus="Receiving". The watchdog is
 	// off in core by default — bounding a source's liveness is the owning caller's job — so the replication
 	// receiver, which knows its source is a network-fed PassThrough that can wedge, opts in here.
-	if (idleTimeoutMs && idleTimeoutMs > 0) (stream as { blobStreamIdleTimeoutMs?: number }).blobStreamIdleTimeoutMs = idleTimeoutMs;
+	if (idleTimeoutMs && idleTimeoutMs > 0)
+		(stream as { blobStreamIdleTimeoutMs?: number }).blobStreamIdleTimeoutMs = idleTimeoutMs;
 	return stream;
 }
 
@@ -419,6 +420,28 @@ export function discardMalformedCopyCursor(copyCursor: any, dbisDB: any, nodeId:
 	warn?.();
 	if (nodeId !== undefined) dbisDB?.remove?.([Symbol.for('copyCursor'), nodeId]);
 	return undefined;
+}
+
+/**
+ * Synchronous point-read of a per-source replication resume cursor (`seq` or `copyCursor`) from the raw
+ * __dbis__ store.
+ *
+ * getSync (not get): __dbis__ is RocksDB, whose get() is a MaybePromise — it returns the value when the
+ * key is in the block cache / memtable, but a *Promise* on a cache miss that needs a disk read. The
+ * subscription handshake runs right after a restart/upgrade, exactly when the cursor key is cold. An
+ * un-awaited get() there returns a Promise: for a `seq` row `Promise?.seqId` is undefined, so startTime
+ * collapses to 1 and the handshake treats a node with a valid persisted cursor as having no resume point
+ * — forcing an unnecessary FULL COPY. This is worse the larger the system database, since more block-cache
+ * pressure makes the seq key likelier to be evicted (the field signature: large-system-DB nodes full-copy
+ * on upgrade while small ones resume incrementally). For a `copyCursor` row the Promise reads as a
+ * malformed/absent cursor and an interrupted-copy resume point is dropped. getSync forces the inline read
+ * regardless of cache state, mirroring the writer (core Table.ts updateRecordedSequenceId, nodeIdMapping.ts).
+ *
+ * Exported for unit coverage (unitTests/replication/readDbisCursorSync.test.mjs); production callers go
+ * through `replicateOverWS`.
+ */
+export function readDbisCursorSync(dbisDB: any, kind: 'seq' | 'copyCursor', id: any): any {
+	return dbisDB?.getSync([Symbol.for(kind), id]);
 }
 
 // Small control-plane tables whose convergence gates cluster operations: hdb_deployment gates
@@ -1009,12 +1032,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// since onCommit no longer awaits blobs (#426) — every copied blob durably saved with no held gap.
 		// Removing the cursor while a blob is still in flight or a transient gap is held would let a crash
 		// resume from the post-copy seqId and skip re-streaming the not-yet-durable blob, losing it.
-		if (
-			copyCompleteReceived &&
-			outstandingCommits === 0 &&
-			outstandingBlobsToFinish.length === 0 &&
-			!hasBlobGap
-		) {
+		if (copyCompleteReceived && outstandingCommits === 0 && outstandingBlobsToFinish.length === 0 && !hasBlobGap) {
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
@@ -3089,10 +3107,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							iterator.next(),
 							new Promise<never>((_, reject) => {
 								timer = setTimeout(
-									() =>
-										reject(
-											new Error(`Blob send chunk timeout after ${chunkTimeoutMs}ms (fileId=${id})`)
-										),
+									() => reject(new Error(`Blob send chunk timeout after ${chunkTimeoutMs}ms (fileId=${id})`)),
 									chunkTimeoutMs
 								);
 								timer.unref();
@@ -3414,14 +3429,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 			auditStore?.ensureLogExists?.(node.name);
-			const sequenceEntry = tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('seq'), nodeId]) ?? 1;
+			const sequenceEntry = readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'seq', nodeId) ?? 1;
 			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
 			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
 			// data predates copyStartTime and would never be delivered by an audit-log resume).
 			const copyCursor = discardMalformedCopyCursor(
 				nodeId === undefined
 					? undefined
-					: tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('copyCursor'), nodeId]),
+					: readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'copyCursor', nodeId),
 				tableSubscriptionToReplicator?.dbisDB,
 				nodeId,
 				() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
@@ -3457,7 +3472,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// node-states, which are keyed by node *id* (see Table.ts `updateRecordedSequenceId`, which
 				// builds `{ id, seqId, lastTxnTime }` and never sets a `name`).
 				const connectedNodeId = auditStore && getIdOfRemoteNode(connectedNode.name, auditStore);
-				const proxySeqEntry = tableSubscriptionToReplicator?.dbisDB?.get([Symbol.for('seq'), connectedNodeId]);
+				// getSync via readDbisCursorSync: a get() Promise on a cache miss has no `.nodes`, silently
+				// disarming the proxied leading-duplicate fast-skip (#399) and forcing the per-record walk.
+				const proxySeqEntry = readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'seq', connectedNodeId);
 				for (const seqNode of proxySeqEntry?.nodes || []) {
 					// Guard `nodeId !== undefined` first: if both `nodeId` and a malformed `seqNode.id` were
 					// undefined the `===` would spuriously match an unrelated entry. (Arming is gated on a
