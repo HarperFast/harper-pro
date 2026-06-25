@@ -434,6 +434,37 @@ export function discardMalformedCopyCursor(copyCursor: any, dbisDB: any, nodeId:
 	return undefined;
 }
 
+type MaybePromise<T> = T | Promise<T>;
+
+/**
+ * A per-source resume cursor as stored in the `__dbis__` store under `[Symbol.for('seq'|'copyCursor'), id]`:
+ * a `seq` row (`{ seqId, nodes, lastTxnTime }`) or a `copyCursor` row (`{ copyStartTime, currentTable, … }`).
+ * All fields optional because the two shapes share one keyspace; consumers read the subset they expect.
+ */
+type DbisCursor = {
+	seqId?: number;
+	nodes?: any[];
+	lastTxnTime?: number;
+	copyStartTime?: number;
+	currentTable?: string;
+	afterKey?: any;
+	copyOrder?: number;
+};
+
+/**
+ * Typed view of the raw `__dbis__` store for the resume-cursor read path. `get()` is honestly a
+ * `MaybePromise` (RocksDB returns a Promise on a block-cache miss), so any *synchronous* consumption of
+ * `get()` — `store.get(k)?.seqId`, truthiness, spread — is a compile error: use `getSync()` (forces the
+ * inline read) or `await`. Everything else (`put`/`remove`/`getRange`/…) falls through the index signature,
+ * so there is no broad retype / blast radius. This makes the #484 fix a compile-time invariant: see
+ * readDbisCursorSync below. (harper-pro#485; mirrors the `NodeStore` typing in knownNodes.ts / #477.)
+ */
+export type DbisStore = {
+	get(key: any): MaybePromise<DbisCursor | undefined>;
+	getSync(key: any): DbisCursor | undefined;
+	[key: string]: any;
+};
+
 /**
  * Synchronous point-read of a per-source replication resume cursor (`seq` or `copyCursor`) from the raw
  * __dbis__ store.
@@ -452,7 +483,13 @@ export function discardMalformedCopyCursor(copyCursor: any, dbisDB: any, nodeId:
  * Exported for unit coverage (unitTests/replication/readDbisCursorSync.test.mjs); production callers go
  * through `replicateOverWS`.
  */
-export function readDbisCursorSync(dbisDB: any, kind: 'seq' | 'copyCursor', id: any): any {
+export function readDbisCursorSync(
+	dbisDB: DbisStore | undefined,
+	kind: 'seq' | 'copyCursor',
+	id: any
+): DbisCursor | undefined {
+	// getSync is load-bearing here: reverting it to get() would return a MaybePromise that no longer
+	// satisfies the DbisCursor | undefined return type — a tsc error, not a silent full-copy regression.
 	return dbisDB?.getSync([Symbol.for(kind), id]);
 }
 
@@ -1026,7 +1063,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
-	let tableSubscriptionToReplicator = options.subscription;
+	let tableSubscriptionToReplicator: { dbisDB?: DbisStore; [key: string]: any } = options.subscription;
 	if (tableSubscriptionToReplicator?.then)
 		tableSubscriptionToReplicator.then((sub) => {
 			tableSubscriptionToReplicator = sub;
@@ -3644,7 +3681,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 			auditStore?.ensureLogExists?.(node.name);
-			const sequenceEntry = readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'seq', nodeId) ?? 1;
+			const sequenceEntry = readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'seq', nodeId);
 			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
 			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
 			// data predates copyStartTime and would never be delivered by an audit-log resume).
