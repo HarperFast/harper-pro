@@ -434,7 +434,11 @@ export function setReplicator(dbName: string, table: any, options: any) {
 			static async load(entry: any) {
 				if (entry) {
 					const residencyId = entry.residencyId;
-					const residency: string[] = entry.residency || table.dbisDB.get([Symbol.for('residency_by_id'), residencyId]);
+					// await the get(): dbisDB is the raw __dbis__ RocksDB store, so get() returns a Promise on a
+					// block-cache miss. Without awaiting, a miss would make `residency` a Promise (truthy) and the
+					// `for...of` below would throw. We're already async here, so await rather than block with getSync.
+					const residency: string[] =
+						entry.residency || (await table.dbisDB.get([Symbol.for('residency_by_id'), residencyId]));
 					if (residency) {
 						let firstError: Error;
 						const attemptedNodes = new Set<string>();
