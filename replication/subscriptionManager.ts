@@ -7,7 +7,13 @@ import { getDatabases } from '../core/resources/databases.ts';
 import { transaction } from '../core/resources/transaction.ts';
 import { workers, onMessageByType, whenThreadsStarted } from '../core/server/threads/manageThreads.js';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
-import { subscribeToNode, urlToNodeName, forEachReplicatedDatabase, unsubscribeFromNode } from './replicator.ts';
+import {
+	subscribeToNode,
+	urlToNodeName,
+	forEachReplicatedDatabase,
+	unsubscribeFromNode,
+	forceReconnectToNode,
+} from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
 import { parentPort } from 'worker_threads';
 import {
@@ -15,9 +21,16 @@ import {
 	getHDBNodeTable,
 	iterateRoutes,
 	shouldReplicateFromNode,
+	getReplicationSharedStatus,
 	type Route,
 	getNodeURL,
 } from './knownNodes.ts';
+import {
+	RECEIVING_STATUS_POSITION,
+	RECEIVING_STATUS_RECEIVING,
+	RECEIVED_TIME_POSITION,
+	RECEIVED_VERSION_POSITION,
+} from './replicationConnection.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import lodash from 'lodash';
 const { cloneDeep } = lodash;
@@ -40,6 +53,11 @@ type ConnectedWorkerStatus = {
 	// connected:false transition that bypasses disconnectedFromNode (e.g. a connect() that never fired
 	// 'open'/'close') still trip the wedge net once it's been down past the threshold. See harper-pro#466.
 	createdAt?: number;
+	// Wall-clock (ms) the reconcile last forced a reconnect for a connected:true / Receiving / no-progress
+	// stall. The entry is re-driven again only once apply progress resumes past this point (lastReceivedTime
+	// advances beyond it) — so a kick that produced no progress (already caught up / not recoverable) is not
+	// re-fired every tick. Mirrors disconnectedAt for the connected:false path. See findStalledReceivingNodeUrls.
+	receiveStallReconnectAt?: number;
 };
 type ReplicationConnectionStatus = {
 	url?: string;
@@ -83,6 +101,19 @@ const RECONCILE_INTERVAL_MS = 5_000;
 // beyond that, so the reconcile targets genuinely wedged connections (e.g. an intentionally-closed
 // connection with no pending retry) rather than churning connections that are mid-reconnect.
 const WEDGE_RECONCILE_THRESHOLD_MS = 30_000;
+// Defense-in-depth fallback threshold for a subscription stuck connected:true / Receiving with no apply
+// progress (the ping-alive base-copy wedge — follower parked connected:true, status "Receiving", version
+// suppressed/frozen — harper-pro#453). The worker-local copy-progress watchdog (harper-pro#454, keyed on
+// copy app-frame progress) is the primary recovery for this; this reconcile-level net only matters if that
+// watchdog itself fails (event-loop block, software bug, misconfiguration). It is deliberately far longer
+// than the worker watchdogs (copy-progress ~120s; byte-idle COPY_TIMEOUT 300s) so they always get first
+// chance, and — most importantly — so it never tears down a healthy slow-but-progressing copy: progress is
+// measured by the per-record RECEIVED_TIME watermark, which advances on every applied copy record, so a
+// copy that is making progress (however slowly) keeps resetting the clock. The residual exposure is a copy
+// legitimately back-pressure-PAUSED with zero applied records for this entire window; at that point a
+// reconnect (resume from the persisted copy cursor, no data loss) is an acceptable trade for guaranteeing
+// the wedge can never be permanent. See findStalledReceivingNodeUrls.
+const RECEIVE_STALL_THRESHOLD_MS = 15 * 60_000;
 let nextWorkerExitReassignAt = 0;
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
 
@@ -195,6 +226,84 @@ export function findWedgedNodeUrls(
 		}
 	}
 	return wedgedNodeUrls;
+}
+// The per-(database, node) replication progress signals the main-thread reconcile reads out of the
+// process-shared status buffer (auditStore.getUserSharedBuffer, written by the worker that owns the
+// connection — see getReplicationSharedStatus / replicationConnection.ts). `lastReceivedTime` is the
+// wall-clock time the last record was applied and `status` is RECEIVING_STATUS_RECEIVING while a batch
+// (including a base copy) is mid-apply.
+type ReceiveStatus = { status: number; lastReceivedTime: number; version: number };
+// A connection is "stalled receiving" when it claims to be actively Receiving but its apply watermark has
+// not advanced for the whole threshold. RECEIVED_TIME and RECEIVING_STATUS=RECEIVING are written together
+// per applied record, so Receiving implies lastReceivedTime was set (>0); the explicit >0 guard also keeps
+// a freshly-zeroed buffer (never received anything) from reading as "stalled since epoch". Typed as a
+// predicate so callers can read status.lastReceivedTime without re-narrowing.
+export function isReceiveStalled(
+	status: ReceiveStatus | undefined,
+	now: number,
+	thresholdMs: number
+): status is ReceiveStatus {
+	return (
+		status != null &&
+		status.status === RECEIVING_STATUS_RECEIVING &&
+		status.lastReceivedTime > 0 &&
+		now - status.lastReceivedTime >= thresholdMs
+	);
+}
+// Defense-in-depth companion to findWedgedNodeUrls for the OTHER wedge shape: a subscription stuck
+// connected:true / Receiving with no apply progress (the ping-alive base-copy stall — harper-pro#453).
+// findWedgedNodeUrls only catches connected:false entries; a copy that parks connected:true with the
+// received-version watermark suppressed (frozen, e.g. 0 on a fresh clone) is invisible to it, and the
+// byte-level receive watchdog can't see it either because keepalive pings keep the socket's bytesRead
+// advancing. The worker-local copy-progress watchdog (harper-pro#454) is the primary recovery; this is the
+// reconcile-level net for when that watchdog itself fails to fire. Returns url -> set of databases whose
+// entry is stalled, so the reconcile re-drives exactly those (a forceReconnect, not a re-subscribe, since a
+// connected:true connection is reused unchanged). `getReceiveStatus` reads the shared status buffer and is
+// injected so this stays a pure, unit-testable helper. `isDesired` mirrors findWedgedNodeUrls so a
+// legitimately-unsubscribed entry is never re-driven.
+export function findStalledReceivingNodeUrls(
+	connectionMap: Map<string, DBReplicationStatusMap>,
+	httpWorkers: any[],
+	now: number,
+	thresholdMs: number,
+	isDesired: (node: any, database: string) => boolean,
+	getReceiveStatus: (database: string, nodeName: string) => ReceiveStatus | undefined
+): Map<string, Set<string>> {
+	const stalledByUrl = new Map<string, Set<string>>();
+	if (httpWorkers.length === 0) return stalledByUrl;
+	for (const [url, dbReplicationWorkers] of connectionMap) {
+		for (const [database, entry] of dbReplicationWorkers) {
+			// connected:false entries are the findWedgedNodeUrls path; only consider live-worker,
+			// still-desired connections that have not reported a disconnect.
+			if (
+				entry.connected === false ||
+				!entry.worker ||
+				!httpWorkers.includes(entry.worker) ||
+				!isDesired(entry.nodes?.[0], database)
+			)
+				continue;
+			const nodeName = entry.nodes?.[0]?.name;
+			if (!nodeName) continue;
+			const status = getReceiveStatus(database, nodeName);
+			// Re-drive only when there has been NO apply progress since the last forced reconnect. A kick that
+			// resumed the copy advances lastReceivedTime past receiveStallReconnectAt, so a fresh re-stall is
+			// still caught; a kick that changed nothing — the peer was already caught up but its shared status
+			// is cosmetically stuck at "Receiving" (e.g. the wedge landed on the end_txn boundary), or the
+			// stall is not reconnect-recoverable — leaves lastReceivedTime behind, and reconnecting a healthy
+			// connection every threshold would just churn it. The first detection (receiveStallReconnectAt
+			// unset) always fires. This also subsumes a time throttle: a kick still settling has not advanced
+			// lastReceivedTime, so it is not re-driven on the next tick.
+			if (
+				isReceiveStalled(status, now, thresholdMs) &&
+				(entry.receiveStallReconnectAt == null || status.lastReceivedTime > entry.receiveStallReconnectAt)
+			) {
+				let databases = stalledByUrl.get(url);
+				if (!databases) stalledByUrl.set(url, (databases = new Set<string>()));
+				databases.add(database);
+			}
+		}
+	}
+	return stalledByUrl;
 }
 // Tear down the failover subscription(s) a restored node left behind on another connection's
 // worker, and prune it from that entry's nodes list. The unsubscribe must mirror the subscribe-time
@@ -765,6 +874,27 @@ export async function startOnMainThread(options) {
 			});
 		} else subscribeToNode({ url: getNodeURL(connectingNode), name: connectingNode.name, database, nodes: [node] });
 	}
+	// Read the per-(database, node) replication progress out of the process-shared status buffer the owning
+	// worker writes (the same buffer cluster_status reports from). Used by findStalledReceivingNodeUrls to
+	// detect a connected:true / Receiving connection whose apply watermark has frozen.
+	function getReceiveStatus(database: string, nodeName: string) {
+		const db = getDatabases()[database];
+		if (!db) return undefined;
+		let auditStore;
+		for (const table of Object.values(db) as any[]) {
+			if (table?.auditStore) {
+				auditStore = table.auditStore;
+				break;
+			}
+		}
+		if (!auditStore) return undefined;
+		const shared = getReplicationSharedStatus(auditStore, database, nodeName);
+		return {
+			status: shared[RECEIVING_STATUS_POSITION],
+			lastReceivedTime: shared[RECEIVED_TIME_POSITION],
+			version: shared[RECEIVED_VERSION_POSITION],
+		};
+	}
 	// Periodic safety net for stale subscription entries. The existing per-database
 	// worker.on('exit') chain reassigns to a healthy worker after a worker dies, but a
 	// single broken link in that chain (identity check failing, setTimeout retry being
@@ -774,16 +904,28 @@ export async function startOnMainThread(options) {
 	// process. This reconciles independently of the chain so the broken-state node
 	// can never get stuck.
 	function reconcileWorkers() {
+		const now = Date.now();
 		const httpWorkers = workers.filter((worker) => worker.name === 'http');
 		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
 		const wedgedNodeUrls = findWedgedNodeUrls(
 			connectionReplicationMap,
 			httpWorkers,
-			Date.now(),
+			now,
 			WEDGE_RECONCILE_THRESHOLD_MS,
 			shouldReplicateFromNode
 		);
-		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0) return;
+		// Defense-in-depth net for the connected:true / Receiving / no-progress copy wedge (harper-pro#453),
+		// recovered primarily by the worker-local copy-progress watchdog (harper-pro#454); this only matters
+		// if that watchdog fails to fire. See findStalledReceivingNodeUrls / RECEIVE_STALL_THRESHOLD_MS.
+		const stalledByUrl = findStalledReceivingNodeUrls(
+			connectionReplicationMap,
+			httpWorkers,
+			now,
+			RECEIVE_STALL_THRESHOLD_MS,
+			shouldReplicateFromNode,
+			getReceiveStatus
+		);
+		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0 && stalledByUrl.size === 0) return;
 		if (staleNodeUrls.size > 0)
 			logger.warn(
 				'Reconciling replication subscriptions for nodes pointing at exited workers:',
@@ -794,10 +936,16 @@ export async function startOnMainThread(options) {
 				'Reconciling replication subscriptions for nodes wedged disconnected on a live worker:',
 				Array.from(wedgedNodeUrls)
 			);
+		if (stalledByUrl.size > 0)
+			logger.warn(
+				'Reconciling replication subscriptions stalled connected:true with no receive progress:',
+				Array.from(stalledByUrl.keys())
+			);
 		for (const node of nodeMap.values()) {
 			const url = getNodeURL(node);
 			const isWedged = wedgedNodeUrls.has(url);
-			if (!staleNodeUrls.has(url) && !isWedged) continue;
+			const stalledDatabases = stalledByUrl.get(url);
+			if (!staleNodeUrls.has(url) && !isWedged && !stalledDatabases) continue;
 			if (isWedged) {
 				// Re-drive ONLY the existing connected:false entries, not the full onNodeUpdate pass.
 				//
@@ -854,7 +1002,37 @@ export async function startOnMainThread(options) {
 					logger.warn(
 						`Reconciling ${reconnectCount} wedged subscription(s) for ${url} (staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms)`
 					);
-			} else {
+			}
+			if (stalledDatabases) {
+				// connected:true but no apply progress — force a reconnect (a re-subscribe is a no-op for a
+				// still-connected connection). Only the specific stalled (database) entries flagged by
+				// findStalledReceivingNodeUrls, staggered like the wedged path to bound concurrent reconnect
+				// setup. forceReconnectToNode on the worker drops + reconnects the existing connection.
+				const entries = connectionReplicationMap.get(url);
+				let reconnectCount = 0;
+				for (const databaseName of stalledDatabases) {
+					const entry = entries?.get(databaseName);
+					const worker = entry?.worker;
+					const nodes = entry?.nodes;
+					if (!entry || !worker || !nodes) continue;
+					// Throttle clock so this entry is not re-kicked until the threshold elapses again.
+					entry.receiveStallReconnectAt = now;
+					const request = {
+						...nodes[0],
+						type: 'force-reconnect-node',
+						database: databaseName,
+						nodes,
+					};
+					const delay = NODE_SUBSCRIBE_DELAY + reconnectCount * RECONNECT_STAGGER_MS;
+					reconnectCount++;
+					setTimeout(() => worker.postMessage(request), delay).unref();
+				}
+				if (reconnectCount > 0)
+					logger.warn(
+						`Reconciling ${reconnectCount} stalled connected:true subscription(s) for ${url} (no receive progress for ${RECEIVE_STALL_THRESHOLD_MS}ms; staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms)`
+					);
+			}
+			if (staleNodeUrls.has(url) && !isWedged) {
 				try {
 					onNodeUpdate(node);
 				} catch (error) {
@@ -945,6 +1123,12 @@ if (parentPort) {
 		// subscribe followed by an unsubscribe must apply in that order (else the deferred subscribe
 		// would run after the unsubscribe and re-open a connection the main thread already removed).
 		whenWorkerComponentsLoaded().then(() => unsubscribeFromNode(message));
+	});
+	onMessageByType('force-reconnect-node', (message) => {
+		// Reconcile-driven recovery for a connected:true / Receiving / no-progress stall. Acts on an
+		// already-established connection (no new subscription state needed), so it runs directly rather
+		// than through the component-load gate; if the connection isn't found it is a no-op.
+		forceReconnectToNode(message);
 	});
 }
 

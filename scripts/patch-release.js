@@ -22,8 +22,9 @@
  *   node scripts/patch-release.js [options]
  *
  * Options:
- *   --branch <name>   Release branch (default: v5.0)
- *   --source <name>   Source branch (default: main)
+ *   --branch <name>        Release branch (default: v5.0)
+ *   --core-branch <name>   Core release branch (default: same as --branch; use when core RC branch has a different name, e.g. rc/X.Y.Z-core)
+ *   --source <name>        Source branch (default: main)
  *   --label <name>    PR label to filter on (default: patch)
  *   --bump <type>     npm version bump: patch|minor|major (default: patch)
  *   --dry-run         Preview without making changes
@@ -39,6 +40,7 @@ const semver = require('semver');
 const argv = process.argv.slice(2);
 const DRY_RUN = argv.includes('--dry-run');
 const RELEASE_BRANCH = getArg('--branch', 'v5.0');
+const CORE_RELEASE_BRANCH = getArg('--core-branch', RELEASE_BRANCH);
 const SOURCE_BRANCH = getArg('--source', 'main');
 const LABEL = getArg('--label', 'patch');
 const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major
@@ -102,8 +104,8 @@ function hasBranch(branch) {
 }
 
 // Most recent semver tag reachable from origin/RELEASE_BRANCH, with its commit date.
-function getLastRelease() {
-	const tagR = runSafe(`git describe --tags --abbrev=0 --match 'v*.*.*' "origin/${RELEASE_BRANCH}"`);
+function getLastRelease(branch = RELEASE_BRANCH) {
+	const tagR = runSafe(`git describe --tags --abbrev=0 --match 'v*.*.*' "origin/${branch}"`);
 	if (tagR.code !== 0 || !tagR.out) return null;
 	const tag = tagR.out;
 	const dateR = runSafe(`git log -1 --format=%aI "${tag}"`);
@@ -121,8 +123,8 @@ function getPatchPRs(ghRepo, sinceDate) {
 	return prs;
 }
 
-function getReleaseBranchCommits(lastTag) {
-	const range = lastTag ? `${lastTag}..origin/${RELEASE_BRANCH}` : `origin/${RELEASE_BRANCH}`;
+function getReleaseBranchCommits(lastTag, branch = RELEASE_BRANCH) {
+	const range = lastTag ? `${lastTag}..origin/${branch}` : `origin/${branch}`;
 	const r = runSafe(`git log ${range} --format='%h%x09%s'`);
 	if (r.code !== 0 || !r.out) return [];
 	return r.out
@@ -135,28 +137,29 @@ function getReleaseBranchCommits(lastTag) {
 }
 
 // ── Per-repo status display ───────────────────────────────────────────────────
-function showRepoStatus({ absPath, name }) {
+function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 	header(name);
 	process.chdir(absPath);
 	const ghRepo = detectGhRepo();
 	info(`  GitHub repo: ${ghRepo}`);
 
-	if (!hasBranch(RELEASE_BRANCH)) {
-		err(`  Release branch "${RELEASE_BRANCH}" not found.`);
+	log('  Fetching from origin...');
+	runSafe('git fetch origin ' + branch);
+	run('git fetch origin --tags');
+
+	if (!hasBranch(branch)) {
+		err(`  Release branch "${branch}" not found.`);
 		process.exit(1);
 	}
 
-	log('  Fetching from origin...');
-	run('git fetch origin --tags');
-
-	const last = getLastRelease();
+	const last = getLastRelease(branch);
 	if (last) info(`  Last release: ${last.tag} (${last.date})`);
-	else warn(`  No prior semver tag on ${RELEASE_BRANCH}.`);
+	else warn(`  No prior semver tag on ${branch}.`);
 
 	const prs = getPatchPRs(ghRepo, last?.date);
 	prs.sort((a, b) => a.number - b.number);
 
-	const commits = getReleaseBranchCommits(last?.tag);
+	const commits = getReleaseBranchCommits(last?.tag, branch);
 
 	log(`\n  ${C.bold}Labeled PRs merged into ${SOURCE_BRANCH} since ${last?.tag ?? 'beginning'}:${C.reset}`);
 	if (prs.length === 0) {
@@ -167,7 +170,7 @@ function showRepoStatus({ absPath, name }) {
 		}
 	}
 
-	log(`\n  ${C.bold}Commits on origin/${RELEASE_BRANCH} since ${last?.tag ?? 'beginning'}:${C.reset}`);
+	log(`\n  ${C.bold}Commits on origin/${branch} since ${last?.tag ?? 'beginning'}:${C.reset}`);
 	if (commits.length === 0) {
 		log(`    ${C.dim}(none)${C.reset}`);
 	} else {
@@ -236,7 +239,7 @@ async function main() {
 	const coreOriginalBranch = run('git branch --show-current');
 
 	// ── Show status for both repos ─────────────────────────────────────────────
-	const coreStatus = showRepoStatus({ absPath: corePath, name: 'harper (core)' });
+	const coreStatus = showRepoStatus({ absPath: corePath, name: 'harper (core)', branch: CORE_RELEASE_BRANCH });
 	showRepoStatus({ absPath: harperProRoot, name: 'harper-pro' });
 
 	log('');
@@ -249,7 +252,7 @@ async function main() {
 	// When both bump, sync to the highest of their natural next versions —
 	// this catches up either repo that fell behind on a prior release.
 	process.chdir(corePath);
-	const coreCurrent = readPackageVersion(`origin/${RELEASE_BRANCH}`);
+	const coreCurrent = readPackageVersion(`origin/${CORE_RELEASE_BRANCH}`);
 	process.chdir(harperProRoot);
 	const proCurrent = readPackageVersion(`origin/${RELEASE_BRANCH}`);
 	const coreBumping = coreStatus.commits.length > 0;
@@ -283,12 +286,12 @@ async function main() {
 
 		// ── Step 1: bump core (if it has new commits) ──────────────────────────
 		process.chdir(corePath);
-		run(`git checkout "${RELEASE_BRANCH}"`);
-		run(`git merge --ff-only "origin/${RELEASE_BRANCH}"`);
+		run(`git checkout "${CORE_RELEASE_BRANCH}"`);
+		run(`git merge --ff-only "origin/${CORE_RELEASE_BRANCH}"`);
 		if (coreBumping) {
 			coreVersion = setVersion('harper (core)', target);
 		} else {
-			info(`  No new commits on core's ${RELEASE_BRANCH} since ${coreStatus.lastTag} — skipping core version bump.`);
+			info(`  No new commits on core's ${CORE_RELEASE_BRANCH} since ${coreStatus.lastTag} — skipping core version bump.`);
 		}
 
 		// ── Step 2: checkout harper-pro release branch ─────────────────────────
@@ -326,8 +329,8 @@ async function main() {
 		// tags), so we name the tag in the refspec list.
 		header('Pushing');
 		if (coreVersion) {
-			log(`  Pushing core ${RELEASE_BRANCH} ${coreVersion}...`);
-			execSync(`git -C "${corePath}" push origin "${RELEASE_BRANCH}" "${coreVersion}"`, { stdio: 'inherit' });
+			log(`  Pushing core ${CORE_RELEASE_BRANCH} ${coreVersion}...`);
+			execSync(`git -C "${corePath}" push origin "${CORE_RELEASE_BRANCH}" "${coreVersion}"`, { stdio: 'inherit' });
 		}
 		log(`  Pushing harper-pro ${RELEASE_BRANCH} ${proVersion}...`);
 		execSync(`git -C "${harperProRoot}" push origin "${RELEASE_BRANCH}" "${proVersion}"`, { stdio: 'inherit' });
@@ -361,7 +364,7 @@ async function main() {
 
 	// ── Step 7: offer to return to original branches ───────────────────────────
 	process.chdir(corePath);
-	if (coreOriginalBranch && coreOriginalBranch !== RELEASE_BRANCH) {
+	if (coreOriginalBranch && coreOriginalBranch !== CORE_RELEASE_BRANCH) {
 		const back = await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
 		if (back.toLowerCase() !== 'n') run(`git checkout "${coreOriginalBranch}"`);
 	}
