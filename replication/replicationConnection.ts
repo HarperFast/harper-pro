@@ -1049,6 +1049,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	function flushDurableCopyCursor() {
 		if (outstandingBlobsToFinish.length > 0 || hasBlobGap) return;
 		if (pendingCopyCursor && copyFromNodeId !== undefined) {
+			if (!STORAGE_IS_ROCKSDB) {
+				// LMDB copies stay audited (durable via the transaction log), so the cursor needs no RocksDB flush
+				// gate — persist it directly, exactly as before copyApply. (harper-pro#480)
+				tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], pendingCopyCursor);
+				pendingCopyCursor = null;
+				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
+				maybeFinishCopy();
+				return;
+			}
 			// copy-apply rows are WAL-off with no transaction-log entry, so the cursor must sit behind an explicit
 			// RocksDB flush (memtable -> SST). Flush the copied DB on a size/time cadence (or immediately when
 			// finishing) and persist the staged cursor only once the flush resolves; never persist without a
@@ -1105,20 +1114,24 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		const flush = copyStoreFlush();
 		if (flush) await flush();
 	}
-	// Build an empty sequence-update end_txn. In copy mode, when its localTime advances the resume cursor to
-	// copyStartTime, its onCommit flushes the WAL-off copyApply rows durable BEFORE core persists [seq] (core
-	// awaits onCommit, then calls updateRecordedSequenceId). Used for every plain seq-update emit so none can
-	// advance the persisted resume cursor past undurable copy rows; a flush rejection skips the seq persist so
-	// the copy re-runs rather than losing rows. (harper-pro#480)
+	// Build an empty sequence-update end_txn. ONLY the RocksDB copy-apply path needs the durability flush gate:
+	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (localTime >=
+	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
+	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
+	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn exactly as before, so this
+	// adds no per-seq-update overhead and does not alter non-copyApply paths. (harper-pro#480)
 	function seqUpdateEndTxn(localTime: number): any {
-		return {
-			type: 'end_txn',
-			localTime,
-			remoteNodeIds: receivingDataFromNodeIds,
-			async onCommit() {
-				if (inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) await flushCopyRowsDurable();
-			},
-		};
+		if (STORAGE_IS_ROCKSDB && inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) {
+			return {
+				type: 'end_txn',
+				localTime,
+				remoteNodeIds: receivingDataFromNodeIds,
+				async onCommit() {
+					await flushCopyRowsDurable();
+				},
+			};
+		}
+		return { type: 'end_txn', localTime, remoteNodeIds: receivingDataFromNodeIds };
 	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
@@ -3045,7 +3058,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// flush persists the cursor with rows still in the memtable and no copyCursor, and a crash loses
 					// them (resume-from-seq skips pre-copyStartTime rows). core awaits this onCommit, then calls
 					// updateRecordedSequenceId, so awaiting the flush here orders flush-before-seq. (harper-pro#480)
-					if (inCopyMode && copyModeStartTime > 0 && lastDurableSequenceId >= copyModeStartTime) {
+					if (STORAGE_IS_ROCKSDB && inCopyMode && copyModeStartTime > 0 && lastDurableSequenceId >= copyModeStartTime) {
 						await flushCopyRowsDurable();
 					}
 					if (isCopyFrame) {
