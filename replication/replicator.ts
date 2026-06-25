@@ -52,6 +52,7 @@ import { clearThisNodeName } from '../core/server/nodeName';
 // allow this to register operations
 import './setNode.ts';
 import './clusterStatus.ts';
+import './blobRepair.ts';
 import '../security/keyService.ts';
 import '../security/sshKeyOperations.ts';
 
@@ -433,7 +434,11 @@ export function setReplicator(dbName: string, table: any, options: any) {
 			static async load(entry: any) {
 				if (entry) {
 					const residencyId = entry.residencyId;
-					const residency: string[] = entry.residency || table.dbisDB.get([Symbol.for('residency_by_id'), residencyId]);
+					// await the get(): dbisDB is the raw __dbis__ RocksDB store, so get() returns a Promise on a
+					// block-cache miss. Without awaiting, a miss would make `residency` a Promise (truthy) and the
+					// `for...of` below would throw. We're already async here, so await rather than block with getSync.
+					const residency: string[] =
+						entry.residency || (await table.dbisDB.get([Symbol.for('residency_by_id'), residencyId]));
 					if (residency) {
 						let firstError: Error;
 						const attemptedNodes = new Set<string>();
@@ -502,6 +507,28 @@ export function isReusableConnection(connection?: NodeReplicationConnection): bo
 }
 
 /**
+ * Returns active subscription connections for the given database, for use by the blob repair sweep.
+ * Uses subscription connections (not retrieval connections) so that tableSubscriptionToReplicator
+ * is valid inside receiveBlobs — retrieval connections created without a subscription would
+ * crash with a TypeError at replicationConnection.ts:receiveBlobs. A side effect is that a
+ * blob-save failure during repair sets hasBlobGap on the subscription connection; this stalls
+ * lastDurableSequenceId advancement until the next reconnect, which is the same recovery path
+ * as any normal blob-save failure (#368).
+ */
+export function getRepairConnectionsForDB(dbName: string): NodeReplicationConnection[] {
+	const result: NodeReplicationConnection[] = [];
+	const seen = new Set<NodeReplicationConnection>();
+	for (const dbConnections of connections.values()) {
+		const conn = dbConnections.get(dbName);
+		if (isReusableConnection(conn) && conn.isConnected && !seen.has(conn)) {
+			seen.add(conn);
+			result.push(conn);
+		}
+	}
+	return result;
+}
+
+/**
  * Get or create a connection to the specified node
  * @param url
  * @param subscription
@@ -551,7 +578,9 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 	}
 	let connection = dbConnections.get(dbName);
 	if (isReusableConnection(connection)) return connection;
-	const node = getHDBNodeTable().primaryStore.get(nodeName);
+	// getSync (not get): get() returns a Promise on a RocksDB block-cache miss; `Promise?.url` is undefined,
+	// so the connection would silently never be created (no error) for a node that actually exists.
+	const node = getHDBNodeTable().primaryStore.getSync(nodeName);
 	if (node?.url) {
 		connection = new NodeReplicationConnection(getNodeURL(node), subscription, dbName, nodeName, node.authorization);
 		// cache the connection

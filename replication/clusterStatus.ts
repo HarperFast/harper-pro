@@ -72,7 +72,9 @@ export async function clusterStatus() {
 	// Add node name and shard/url info for this node
 	response.node_name = getThisNodeName();
 	// If it doesn't exist and or needs to be updated.
-	const thisNode = getHDBNodeTable().primaryStore.get(response.node_name);
+	// getSync (not get): a get() Promise on a cache miss has no .shard/.url, so cluster_status would
+	// silently omit this node's shard/url once hdb_nodes grows past the block cache.
+	const thisNode = getHDBNodeTable().primaryStore.getSync(response.node_name);
 	if (thisNode?.shard) response.shard = thisNode.shard;
 	if (thisNode?.url) response.url = thisNode.url;
 	response.is_enabled = true; // if we have replication, replication is enabled

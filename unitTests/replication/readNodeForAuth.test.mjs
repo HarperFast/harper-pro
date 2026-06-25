@@ -37,11 +37,15 @@ import { resolveNodeForAuth, isValidNodeRecord } from '#src/replication/knownNod
 function fakeStore({ data = {}, present = null, rangeKeys = null, throwOnGet = new Set() } = {}) {
 	const presentSet = present ?? new Set(Object.keys(data));
 	const rangeSet = rangeKeys ?? presentSet;
+	const pointGet = (key) => {
+		if (throwOnGet.has(key)) throw new Error('Record id is not defined for 0');
+		return data[key];
+	};
 	return {
-		get(key) {
-			if (throwOnGet.has(key)) throw new Error('Record id is not defined for 0');
-			return data[key];
-		},
+		get: pointGet,
+		// resolveNodeForAuth uses the SYNCHRONOUS point read (getSync) because the real system store is
+		// RocksDB, whose get() is a MaybePromise. getSync mirrors the synchronous get here.
+		getSync: pointGet,
 		doesExist(key) {
 			return presentSet.has(key);
 		},
@@ -124,7 +128,8 @@ describe('readNodeForAuth precondition (real msgpackr shared-structure decode)',
 
 		// Late-flipped node: the structure table was never persisted on this node, so decode fails.
 		const readerMissing = new Packr({ useRecords: true, maxSharedStructures: 32, getStructures: () => undefined });
-		let decodedMissing, threw = false;
+		let decodedMissing,
+			threw = false;
 		try {
 			decodedMissing = readerMissing.unpack(bytes);
 		} catch {
