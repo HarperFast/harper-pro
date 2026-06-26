@@ -159,6 +159,46 @@ async function waitForAclReady(node) {
 	);
 }
 
+// `waitForAclReady` only proves the `dog` resource is registered locally for
+// subscriptions; it does not prove the node-to-node change-stream is live yet.
+// Right after a fresh cluster connect + component deploy + restart there is a
+// brief window where a subscriber on the receiving node has a granted SUBACK
+// but the cross-node replication path isn't flowing — a publish in that window
+// is dropped, not retroactively delivered. Steady-state delivery is ~90ms, so
+// poll with fresh publishes until one round-trips, then the real assertions run
+// against a warm path. If cross-node delivery is genuinely broken this throws
+// loudly rather than masking it.
+async function waitForCrossNodeDelivery(subNode, pubNode) {
+	const subClient = await connectMqtt(mqttUrlFor(subNode), adminOpts(subNode, 'warmup-sub'));
+	const pubClient = await connectMqtt(mqttUrlFor(pubNode), adminOpts(pubNode, 'warmup-pub'));
+	try {
+		await subscribe(subClient, 'dog/#');
+		const obs = collectMessages(subClient, 'dog/#');
+		const deadline = Date.now() + 60_000;
+		while (Date.now() < deadline) {
+			const marker = `warmup-${randomUUID()}`;
+			const topic = `dog/warmup-${randomUUID().slice(0, 8)}`;
+			// retain:false so warm-up probes leave no retained state behind.
+			await publish(pubClient, topic, JSON.stringify({ marker }), { qos: 1, retain: false });
+			const arrived = await waitFor(
+				() => obs.messages.some((m) => m.topic === topic && tryParse(m.payload)?.marker === marker),
+				{ timeoutMs: 1000, intervalMs: 50 }
+			);
+			if (arrived) {
+				obs.stop();
+				return;
+			}
+		}
+		obs.stop();
+		throw new Error(
+			`cross-node delivery never became live during warm-up (subscriber saw: ${JSON.stringify(obs.messages)})`
+		);
+	} finally {
+		await endQuiet(pubClient);
+		await endQuiet(subClient);
+	}
+}
+
 suite('ACL Connect Cross-Node Delivery', { timeout: 180_000 }, (ctx) => {
 	before(async () => {
 		ctx.nodes = await Promise.all(
@@ -229,6 +269,11 @@ suite('ACL Connect Cross-Node Delivery', { timeout: 180_000 }, (ctx) => {
 		for (const node of ctx.nodes) {
 			await waitForAclReady(node);
 		}
+
+		// Local resource readiness doesn't imply the cross-node change-stream is
+		// flowing yet; warm it before asserting so the first delivery test isn't
+		// racing post-bootstrap replication establishment.
+		await waitForCrossNodeDelivery(ctx.nodes[0], ctx.nodes[1]);
 	});
 
 	after(async () => {
