@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782558087690,
+  "lastUpdate": 1782644899895,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -675,6 +675,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 3598.01,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "harperfastaibot[bot]",
+            "username": "harperfastaibot[bot]",
+            "email": "280766738+harperfastaibot[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "d2abdcd084443dcf8172dc94704ef5fec9637ee1",
+          "message": "feat: Sync Core (#493)\n\nCo-authored-by: kriszyp <34054+kriszyp@users.noreply.github.com>",
+          "timestamp": "2026-06-26T12:36:55Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/d2abdcd084443dcf8172dc94704ef5fec9637ee1"
+        },
+        "date": 1782644898756,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 10319.9,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 26716.35,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 22935.29,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 10606.94,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 7480.74,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 3244,
             "unit": "ops/sec"
           }
         ]
