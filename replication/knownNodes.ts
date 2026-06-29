@@ -587,16 +587,36 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 	// so the subscription can be scheduled and the leader can push records (and schema)
 	// to create the database on this node.
 	const hasLocalDatabase = !!databases[databaseName] || !!node.isLeader;
+	// The *receive* decision ("do we receive from this peer"). Prefer this node's config-route
+	// directionality (`replication.routes[].replicates`), which expresses the edge from our side as
+	// `receives`/`receivesFrom`. Only when no config route is present do we fall back to the peer's
+	// hdb_nodes record, which encodes the same edge from the sender's side as `sends`/`sendsTo` (set
+	// via add_node). The two encodings are NOT interchangeable — we must never read receivesFrom off
+	// an hdb_nodes object — so the config route is carried on a DISTINCT `configRouteReplicates`
+	// field (see subscriptionManager.onDatabase), kept separate from `routeReplicates` (which falls
+	// back to hdb_nodes for table-exclusion). harper-pro#498.
+	// Only the directional OBJECT form ({ sends, receives, sendsTo, receivesFrom }) drives this gate —
+	// that is the controlled-flow config #498 is about. A boolean route (full-replication `true`, or the
+	// `false` that iterateRoutes normalizes a subscriptions-only route to) is left to the existing
+	// hdb_nodes + `node.subscriptions` path below, so selective-subscription routes are unaffected.
+	const configRoute = (node as any).configRouteReplicates;
+	let peerFeedsUs;
+	if (configRoute && typeof configRoute === 'object') {
+		peerFeedsUs = configRoute.receives || routeEntriesIncludePeer(configRoute.receivesFrom, node.name, databaseName);
+	} else {
+		peerFeedsUs =
+			typeof node.replicates === 'object'
+				? node.replicates?.sends ||
+					node.replicates?.sendsTo?.some?.((sendsTo) =>
+						typeof sendsTo === 'object'
+							? (!sendsTo.target || sendsTo.target === getThisNodeName()) &&
+								(!sendsTo.database || sendsTo.database === databaseName)
+							: sendsTo === getThisNodeName()
+					)
+				: node.replicates;
+	}
 	return (
-		((typeof node.replicates === 'object'
-			? node.replicates?.sends ||
-				node.replicates?.sendsTo?.some?.((sendsTo) =>
-					typeof sendsTo === 'object'
-						? (!sendsTo.target || sendsTo.target === getThisNodeName()) &&
-							(!sendsTo.database || sendsTo.database === databaseName)
-						: sendsTo === getThisNodeName()
-				)
-			: node.replicates) &&
+		(peerFeedsUs &&
 			hasLocalDatabase &&
 			(!databaseReplications ||
 				databaseReplications === '*' ||
@@ -807,6 +827,48 @@ export function getExcludedTablesForRouteEntries(
 		}
 	}
 	return excluded;
+}
+
+/**
+ * Returns true when a `sendsTo`/`receivesFrom` route-entry array authorizes the given peer+database
+ * direction. A string entry names the peer directly; an object entry matches by `target`/`source`
+ * (absent = any) and `database` (absent = any). Mirrors getExcludedTablesForRouteEntries' matching
+ * so authorization and table-exclusion agree on what an entry covers. harper-pro#498.
+ */
+export function routeEntriesIncludePeer(
+	entries: (RouteEntry | string)[] | undefined,
+	peerName: string,
+	databaseName: string
+): boolean {
+	if (!Array.isArray(entries)) return false;
+	for (const entry of entries) {
+		if (!entry) continue; // tolerate a malformed null/undefined element
+		if (typeof entry === 'string') {
+			if (entry === peerName) return true;
+			continue;
+		}
+		const entryPeer = entry.target ?? entry.source;
+		if ((!entryPeer || entryPeer === peerName) && (!entry.database || entry.database === databaseName)) return true;
+	}
+	return false;
+}
+
+/**
+ * Look up this node's local `replication.routes[]` config entry for a peer and return its
+ * `replicates` value (boolean | directional object | undefined when no route is configured).
+ *
+ * The receive path reads config-route directionality off the node-subscription payload
+ * (`configRouteReplicates`, attached on the main thread where the route list lives). The server-side
+ * SEND gates run in an http worker reacting to an inbound subscription and have no such payload —
+ * but they DO receive the raw replication `options` (with `routes`), so they resolve the config
+ * route directly here. harper-pro#498.
+ */
+export function getConfigRouteReplicates(options: { routes?: (Route | any)[] } | undefined, peerName: string) {
+	if (!options?.routes) return undefined;
+	for (const route of iterateRoutes(options as { routes: (Route | any)[] })) {
+		if (route.name === peerName) return route.replicates;
+	}
+	return undefined;
 }
 
 export function* iterateRoutes(options: { routes: (Route | any)[] }) {

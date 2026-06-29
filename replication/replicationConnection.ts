@@ -52,6 +52,8 @@ import {
 	getNodeURL,
 	getReplicationSharedStatus,
 	getExcludedTablesForRouteEntries,
+	getConfigRouteReplicates,
+	routeEntriesIncludePeer,
 } from './knownNodes.ts';
 import * as process from 'node:process';
 import { isIP } from 'node:net';
@@ -2430,32 +2432,59 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							tableSubscriptionToReplicator.ready = ready;
 							databaseSubscriptions.set(databaseName, tableSubscriptionToReplicator);
 						}
+						// Local config-route directionality for this peer, resolved once and reused by the send
+						// authority gate below and the send-side excludeTables further down. harper-pro#498.
+						const sendRoute = getConfigRouteReplicates(options, remoteNodeName);
+						const sendRouteDirectional = sendRoute && typeof sendRoute === 'object' ? sendRoute : undefined;
 						if (authorization.name) {
-							whenSubscribedToHdbNodes = getHDBNodeTable().subscribe(authorization.name);
-							whenSubscribedToHdbNodes.then(
-								async (subscription) => {
-									subscriptionToHdbNodes = subscription;
-									for await (const event of subscriptionToHdbNodes) {
-										const node = event.value;
-										if (
-											!(
-												node?.replicates === true ||
-												node?.replicates?.receives ||
-												node?.replicates?.receivesFrom?.some(
-													(sub) => sub.source === getThisNodeName() && sub.database === databaseName
+							// Send authority (do WE send to this subscriber for this database). A directional config
+							// route (the controlled-flow object form) is authoritative — unlike the receive path, the
+							// server-side handler has no subscription payload to read routeReplicates from, but it does
+							// have the raw replication `options` (with routes). A boolean/subscriptions-only route yields
+							// undefined here and keeps the existing dynamic hdb_nodes path. harper-pro#498.
+							const configSendDecision = sendRouteDirectional
+								? !!(
+										sendRouteDirectional.sends ||
+										routeEntriesIncludePeer(sendRouteDirectional.sendsTo, remoteNodeName, databaseName)
+									)
+								: undefined;
+							if (configSendDecision === false) {
+								// Our config route to this peer does not authorize sending to them for this database;
+								// reject up front rather than optimistically wiring up the send path.
+								closed = true;
+								close(1008, `Unauthorized database subscription to ${databaseName}`);
+								return;
+							}
+							// configSendDecision === true → the config route is authoritative (and static until reload),
+							// so skip the hdb_nodes auth watch entirely. Only when there is no directional config route
+							// (undefined) do we watch the subscriber's hdb_nodes record for dynamic (de)authorization.
+							if (configSendDecision === undefined) {
+								whenSubscribedToHdbNodes = getHDBNodeTable().subscribe(authorization.name);
+								whenSubscribedToHdbNodes.then(
+									async (subscription) => {
+										subscriptionToHdbNodes = subscription;
+										for await (const event of subscriptionToHdbNodes) {
+											const node = event.value;
+											if (
+												!(
+													node?.replicates === true ||
+													node?.replicates?.receives ||
+													node?.replicates?.receivesFrom?.some(
+														(sub) => sub.source === getThisNodeName() && sub.database === databaseName
+													)
 												)
-											)
-										) {
-											closed = true;
-											close(1008, `Unauthorized database subscription to ${databaseName}`);
-											return;
+											) {
+												closed = true;
+												close(1008, `Unauthorized database subscription to ${databaseName}`);
+												return;
+											}
 										}
+									},
+									(error) => {
+										logger.error?.(connectionId, 'Error subscribing to HDB nodes', error);
 									}
-								},
-								(error) => {
-									logger.error?.(connectionId, 'Error subscribing to HDB nodes', error);
-								}
-							);
+								);
+							}
 						} else if (!(authorization?.role?.permission?.super_user || authorization.replicates)) {
 							ws.send(encode([DISCONNECT]));
 							close(1008, `Unauthorized database subscription to ${databaseName}`);
@@ -2485,11 +2514,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
-						// Tables excluded from outgoing replication to this peer+database (from sendsTo config)
-						const sendExcludedTables =
-							authorization?.replicates && typeof authorization.replicates === 'object'
-								? getExcludedTablesForRouteEntries(authorization.replicates.sendsTo, remoteNodeName, databaseName)
-								: null;
+						// Tables excluded from outgoing replication to this peer+database. Prefer this node's
+						// config-route sendsTo (the `sendRoute` resolved above), falling back to the peer's hdb_nodes
+						// authorization.replicates.sendsTo for add_node-configured peers. Previously this read only
+						// hdb_nodes, so config-route excludeTables never applied on the send side. harper-pro#498.
+						const sendsToForExclusions = sendRouteDirectional?.sendsTo
+							? sendRouteDirectional.sendsTo
+							: authorization?.replicates && typeof authorization.replicates === 'object'
+								? authorization.replicates.sendsTo
+								: undefined;
+						const sendExcludedTables = getExcludedTablesForRouteEntries(
+							sendsToForExclusions,
+							remoteNodeName,
+							databaseName
+						);
 						const sendAuditRecord = (auditRecord, localTime) => {
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnTime) {
