@@ -15,14 +15,8 @@
  */
 import { join } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import {
-	generateKeyPairSync,
-	privateDecrypt,
-	createDecipheriv,
-	createPublicKey,
-	createHash,
-	constants,
-} from 'node:crypto';
+import { generateKeyPairSync, createPublicKey } from 'node:crypto';
+import { decryptEnvelope, fingerprintOf } from './envSecretCrypto.ts';
 import { server } from '../core/server/Server.ts';
 import { registerEnvSecretDecryptor } from '../core/resources/envSecretDecryptor.js';
 import { ENV_ENCRYPTED_PREFIX } from '../core/utility/envFile.js';
@@ -46,13 +40,6 @@ let keyFingerprint: string | undefined;
 
 function keysDir(): string {
 	return join(getHdbBasePath(), LICENSE_KEY_DIR_NAME);
-}
-
-// Stable identifier for a key = SHA-256 of its DER SPKI public encoding. Lets `kid` in an envelope
-// select the right key during rotation.
-function fingerprintOf(publicPem: string): string {
-	const der = createPublicKey(publicPem).export({ type: 'spki', format: 'der' });
-	return createHash('sha256').update(der).digest('hex');
 }
 
 function cache(privatePem: string, publicPem: string): void {
@@ -91,51 +78,15 @@ function ensureKeypair(): void {
 	cache(privateKey as string, publicKey as string);
 }
 
-interface Envelope {
-	kid?: string;
-	k: string;
-	iv: string;
-	ct: string;
-	tag: string;
-}
-
 /**
- * Decrypt an `enc:v1:` value. Synchronous (Node RSA/AES are sync) so it can plug directly into
- * core's loadEnv path. Throws on a wrong/missing key or a tampered envelope (GCM auth failure).
+ * Decrypt an `enc:v1:` value via the pure envelope crypto. Synchronous (Node RSA/AES are sync) so it
+ * plugs directly into core's loadEnv path. Throws on a wrong/missing key or a tampered envelope.
  */
 function decryptEnvValue(value: string): string {
 	if (!privateKeyPem && !loadKeypair()) {
 		throw new Error('env-secrets keypair is not available on this node');
 	}
-	const body = value.slice(ENV_ENCRYPTED_PREFIX.length);
-	let env: Envelope;
-	try {
-		env = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-	} catch {
-		throw new Error('malformed env-secret envelope');
-	}
-	// Validate the shape before touching it, so a null/array/missing-field envelope yields a clean
-	// error rather than a cryptic TypeError out of Buffer.from / privateDecrypt.
-	if (
-		!env ||
-		typeof env !== 'object' ||
-		typeof env.k !== 'string' ||
-		typeof env.iv !== 'string' ||
-		typeof env.ct !== 'string' ||
-		typeof env.tag !== 'string'
-	) {
-		throw new Error('malformed env-secret envelope');
-	}
-	if (env.kid && env.kid !== keyFingerprint) {
-		throw new Error(`no env-secrets key for kid ${env.kid}`);
-	}
-	const aesKey = privateDecrypt(
-		{ key: privateKeyPem!, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
-		Buffer.from(env.k, 'base64')
-	);
-	const decipher = createDecipheriv('aes-256-gcm', aesKey, Buffer.from(env.iv, 'base64'));
-	decipher.setAuthTag(Buffer.from(env.tag, 'base64'));
-	return Buffer.concat([decipher.update(Buffer.from(env.ct, 'base64')), decipher.final()]).toString('utf8');
+	return decryptEnvelope(value.slice(ENV_ENCRYPTED_PREFIX.length), privateKeyPem!, keyFingerprint!);
 }
 
 interface PublicKeyRequest {
