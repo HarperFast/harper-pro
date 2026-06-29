@@ -114,6 +114,18 @@ function decryptEnvValue(value: string): string {
 	} catch {
 		throw new Error('malformed env-secret envelope');
 	}
+	// Validate the shape before touching it, so a null/array/missing-field envelope yields a clean
+	// error rather than a cryptic TypeError out of Buffer.from / privateDecrypt.
+	if (
+		!env ||
+		typeof env !== 'object' ||
+		typeof env.k !== 'string' ||
+		typeof env.iv !== 'string' ||
+		typeof env.ct !== 'string' ||
+		typeof env.tag !== 'string'
+	) {
+		throw new Error('malformed env-secret envelope');
+	}
 	if (env.kid && env.kid !== keyFingerprint) {
 		throw new Error(`no env-secrets key for kid ${env.kid}`);
 	}

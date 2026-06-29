@@ -703,7 +703,9 @@ async function cloneEnvSecretsKeys(): Promise<void> {
 			name: ENV_SECRETS_PRIVATE_KEY_NAME,
 		});
 		if (result?.message) {
-			writeFileSync(join(rootPath, LICENSE_KEY_DIR_NAME, ENV_SECRETS_PRIVATE_KEY_NAME), result.message);
+			writeFileSync(join(rootPath, LICENSE_KEY_DIR_NAME, ENV_SECRETS_PRIVATE_KEY_NAME), result.message, {
+				mode: 0o600,
+			});
 			log('Cloned env-secrets key');
 		}
 	} catch (err) {
