@@ -1081,29 +1081,42 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// system DB's tables drive event-based machinery off the audit `aftercommit` stream — hdb_nodes feeds
 	// subscribeToNodeUpdates (peer discovery / connection setup) and hdb_certificate feeds CA install — which
 	// copyApply's audit-less snapshot writes would otherwise suppress. A per-table "reload" marker emitted once
-	// the copy is durable (emitSystemReloadMarkers) re-drives those subscribers, so a freshly-copied node still
+	// the copy is durable (emitCopyReloadMarkers) re-drives those subscribers, so a freshly-copied node still
 	// forms its cluster while copyApply also covers hdb_analytics — retiring the system-DB exclusion and the
 	// #480 system-analytics spin's interim retention-horizon guard. LMDB stays excluded (copy rows stay
 	// audited/durable via the transaction log). (harper-pro#489)
 	const copyApplyActive = () => STORAGE_IS_ROCKSDB;
-	// Emit a whole-table reload marker for each cluster-machinery system table once a copyApply base copy
-	// of the system DB is durable, so subscribers that saw no per-row events (those rows were snapshotted
-	// without audit entries) re-read the table and the freshly-copied node forms its cluster. A no-op for
-	// non-system DBs and for audited (LMDB / non-copyApply) copies, which already delivered per-row events.
-	// Fire-and-forget: each marker is its own tiny transaction, and a failure self-heals on the next
-	// restart's subscription scan, so it must never block or fail copy finalization. (harper-pro#489)
-	function emitSystemReloadMarkers() {
-		if (databaseName !== 'system' || !copyApplyActive()) return;
-		for (const tableName of SYSTEM_RELOAD_TABLES) {
+	// Emit a whole-table reload marker for each table whose live subscribers saw no per-row events once a
+	// copyApply base copy is durable (the snapshotted rows carry no audit entries), so those subscribers
+	// re-read the table. For the system DB this re-drives cluster machinery off the cluster-machinery
+	// tables (hdb_nodes peer discovery / hdb_certificate CA install); other system tables (e.g.
+	// hdb_analytics) have no live re-read consumer, so it stays the fixed SYSTEM_RELOAD_TABLES list there.
+	// For a user DB every table's copyApply snapshot is invisible to live subscribers, so a marker is
+	// emitted for each; Table.subscribe re-delivers the current scope on 'reload', so every live
+	// subscriber (MQTT/SSE/WS all funnel through subscribe()) recovers the snapshotted rows (harper-pro#495).
+	// A no-op for
+	// audited (LMDB / non-copyApply) copies, which already delivered per-row events. Fire-and-forget: each
+	// marker is its own tiny transaction, and a failure self-heals on the next restart's subscription scan,
+	// so it must never block or fail copy finalization. (harper-pro#489)
+	function emitCopyReloadMarkers() {
+		if (!copyApplyActive()) return;
+		const isSystem = databaseName === 'system';
+		const tableNames = isSystem ? SYSTEM_RELOAD_TABLES : Object.keys(tables ?? {});
+		for (const tableName of tableNames) {
 			const table = (tables as any)?.[tableName];
 			if (typeof table?.writeReloadMarker !== 'function') continue;
+			// Skip non-replicated user tables: copyApply only copies replicated tables, so a table with
+			// `replicate === false` received no audit-less copy rows and has nothing for subscribers to
+			// recover (mirrors the send path's `replicate !== false` gate). NOT applied to the system DB —
+			// its tables carry `replicate = false` but are listed explicitly and must always emit.
+			if (!isSystem && table.replicate === false) continue;
 			// `.then(() => writeReloadMarker())` rather than `Promise.resolve(writeReloadMarker())` so a
 			// SYNCHRONOUS throw (the marker's transaction commits inline) is also routed to the catch — never
 			// bubbling out of this fire-and-forget call into copy finalization (maybeFinishCopy).
 			Promise.resolve()
 				.then(() => table.writeReloadMarker())
 				.catch((error: unknown) =>
-					logger.warn?.(connectionId, `failed to emit reload marker for system.${tableName}`, error)
+					logger.warn?.(connectionId, `failed to emit reload marker for ${databaseName}.${tableName}`, error)
 				);
 		}
 	}
@@ -1138,9 +1151,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 			pendingCopyCursor = null;
-			// The copy's rows are now durable; signal the audit-stream subscribers to re-read the
-			// cluster-machinery system tables that copyApply snapshotted without per-row events (harper-pro#489).
-			emitSystemReloadMarkers();
+			// The copy's rows are now durable; signal the audit-stream subscribers to re-read the tables
+			// copyApply snapshotted without per-row events — cluster-machinery system tables (harper-pro#489)
+			// and user-DB tables with live MQTT/SSE/WS subscribers (harper-pro#495).
+			emitCopyReloadMarkers();
 		}
 	}
 	// Persist the staged copy cursor and, if the copy is now fully durable, finish it — but ONLY when the
