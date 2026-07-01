@@ -42,16 +42,12 @@ const PUBLIC_KEY_FILE = 'envSecrets.public.pem';
  */
 export class FileKeyCustody implements KeyCustody {
 	readonly #dir: string;
-	readonly #generate: boolean;
 	#privatePem?: string;
 	#publicPem?: string;
 	#fingerprint?: string;
 
-	// `generate` should be true only on the main thread (the leader generates the shared key once);
-	// workers load-only, since generating on a worker would fork a divergent keypair.
-	constructor(dir: string, opts: { generate?: boolean } = {}) {
+	constructor(dir: string) {
 		this.#dir = dir;
-		this.#generate = opts.generate ?? false;
 	}
 
 	/** Whether the key file exists yet (workers use this to decide before touching the key). */
@@ -59,24 +55,37 @@ export class FileKeyCustody implements KeyCustody {
 		return existsSync(join(this.#dir, PRIVATE_KEY_FILE));
 	}
 
+	/**
+	 * Generate the shared keypair if absent, then load it. Idempotent. Generation is EXPLICIT and
+	 * belongs only to the leader / main thread — a worker calling this could fork a divergent keypair,
+	 * so workers must not. Kept separate from the accessors (which are load-only and throw if the key
+	 * is absent) so the leader's create step can't be silently skipped by call ordering.
+	 */
+	ensureKey(): void {
+		if (this.#privatePem || this.hasKey()) {
+			this.#ensureLoaded();
+			return;
+		}
+		const { privateKey, publicKey } = generateKeyPairSync('rsa', {
+			modulusLength: 4096,
+			publicKeyEncoding: { type: 'spki', format: 'pem' },
+			privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+		});
+		mkdirSync(this.#dir, { recursive: true });
+		writeFileSync(join(this.#dir, PRIVATE_KEY_FILE), privateKey as string, { mode: 0o600 });
+		writeFileSync(join(this.#dir, PUBLIC_KEY_FILE), publicKey as string, { mode: 0o644 });
+		this.#privatePem = privateKey as string;
+		this.#publicPem = createPublicKey(this.#privatePem).export({ type: 'spki', format: 'pem' }) as string;
+		this.#fingerprint = fingerprintOf(this.#publicPem);
+	}
+
 	#ensureLoaded(): void {
 		if (this.#privatePem) return;
 		const privatePath = join(this.#dir, PRIVATE_KEY_FILE);
-		if (existsSync(privatePath)) {
-			this.#privatePem = readFileSync(privatePath, 'utf8');
-		} else if (this.#generate) {
-			const { privateKey, publicKey } = generateKeyPairSync('rsa', {
-				modulusLength: 4096,
-				publicKeyEncoding: { type: 'spki', format: 'pem' },
-				privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-			});
-			mkdirSync(this.#dir, { recursive: true });
-			writeFileSync(privatePath, privateKey as string, { mode: 0o600 });
-			writeFileSync(join(this.#dir, PUBLIC_KEY_FILE), publicKey as string, { mode: 0o644 });
-			this.#privatePem = privateKey as string;
-		} else {
+		if (!existsSync(privatePath)) {
 			throw new Error('env-secrets keypair is not available on this node');
 		}
+		this.#privatePem = readFileSync(privatePath, 'utf8');
 		this.#publicPem = createPublicKey(this.#privatePem).export({ type: 'spki', format: 'pem' }) as string;
 		this.#fingerprint = fingerprintOf(this.#publicPem);
 	}
@@ -175,19 +184,20 @@ export class KmsKeyCustody implements KeyCustody {
 export interface KeyCustodyConfig {
 	backend?: 'file' | 'kms';
 	dir?: string;
-	/** file backend only: generate the keypair if absent (main thread / leader only). */
-	generate?: boolean;
 	kms?: { keyArn: string; region?: string };
 }
 
-/** Select the custody backend from config. Defaults to file. */
+/**
+ * Select the custody backend from config. Defaults to file. Key generation is NOT a construction
+ * concern — the leader calls `FileKeyCustody.ensureKey()` explicitly (see envSecrets.startOnMainThread).
+ */
 export function getKeyCustody(config: KeyCustodyConfig): KeyCustody {
 	if (config.backend === 'kms') {
 		if (!config.kms?.keyArn) throw new Error('kms key custody requires kms.keyArn');
 		return new KmsKeyCustody(config.kms);
 	}
 	if (!config.dir) throw new Error('file key custody requires a keys directory');
-	return new FileKeyCustody(config.dir, { generate: config.generate });
+	return new FileKeyCustody(config.dir);
 }
 
 /**

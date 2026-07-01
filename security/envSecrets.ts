@@ -42,18 +42,17 @@ const ALGORITHM = 'RSA-OAEP-SHA256 + AES-256-GCM';
 
 let custody: KeyCustody | undefined;
 
-// `generate` is passed true only from the main-thread entry point (the leader mints the shared key).
-function getCustody(generate = false): KeyCustody {
+function getCustody(): KeyCustody {
 	if (!custody) {
 		// TODO(config): read `envSecrets.keyCustody` (file | kms) + kms settings from Harper config.
-		custody = getKeyCustody({ backend: 'file', dir: join(getHdbBasePath(), LICENSE_KEY_DIR_NAME), generate });
+		custody = getKeyCustody({ backend: 'file', dir: join(getHdbBasePath(), LICENSE_KEY_DIR_NAME) });
 	}
 	return custody;
 }
 
 /** The file backend, when active — the sync loadEnv path and the get_key clone path need it. */
-function fileCustody(generate = false): FileKeyCustody | undefined {
-	const c = getCustody(generate);
+function fileCustody(): FileKeyCustody | undefined {
+	const c = getCustody();
 	return c instanceof FileKeyCustody ? c : undefined;
 }
 
@@ -122,8 +121,9 @@ export function createScopeSecrets(
  * operations API only runs on the main thread (v5.1+), so the operation registers here.
  */
 export function startOnMainThread(): void {
-	const fc = fileCustody(true); // leader mints the shared key if absent
+	const fc = fileCustody();
 	if (fc) {
+		fc.ensureKey(); // the leader mints the shared key if absent (explicit — never via call ordering)
 		// Publish the shared private key so the `get_key` clone path can copy it to new nodes.
 		getPrivateKeys().set(ENV_SECRETS_PRIVATE_KEY_NAME, fc.exportPrivateKeyPemForCloning());
 	}
@@ -140,7 +140,7 @@ export function startOnMainThread(): void {
  * the leader / cloned at bootstrap). Workers never generate the key.
  */
 export function start(): void {
-	const fc = fileCustody(false);
+	const fc = fileCustody();
 	if (fc && fc.hasKey()) {
 		getPrivateKeys().set(ENV_SECRETS_PRIVATE_KEY_NAME, fc.exportPrivateKeyPemForCloning());
 		registerEnvSecretDecryptor(decryptEnvValue);

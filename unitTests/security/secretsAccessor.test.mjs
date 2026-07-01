@@ -111,7 +111,8 @@ describe('createComponentSecrets (store-backed authority)', () => {
 	});
 
 	it('decrypts real ciphertext through custody without exposing the key (end-to-end)', async () => {
-		const custody = new FileKeyCustody(freshDir(), { generate: true });
+		const custody = new FileKeyCustody(freshDir());
+		custody.ensureKey();
 		const publicKey = await custody.publicKey();
 		const kid = await custody.keyId();
 
