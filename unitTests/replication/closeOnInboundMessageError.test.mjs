@@ -74,4 +74,17 @@ describe('closeOnInboundMessageError', () => {
 
 		expect(close.calledOnce).to.equal(true);
 	});
+
+	it('still closes when the logger itself is missing — the log must never prevent the close', () => {
+		const close = sinon.spy();
+
+		closeOnInboundMessageError(new Error('boom'), {
+			connectionId: 7,
+			logger: undefined,
+			markInboundClosed: () => {},
+			close,
+		});
+
+		expect(close.calledOnce).to.equal(true);
+	});
 });
