@@ -6,66 +6,106 @@ import { describe, it } from 'mocha';
 import { encryptEnvelope } from '#src/security/envSecretCrypto';
 import { decryptEnvelopeWithCustody, FileKeyCustody } from '#src/security/keyCustody';
 import { createComponentSecrets } from '#src/security/secretsAccessor';
+import { InMemorySecretsStore, setSecret } from '#src/security/secretsStore';
 
 const freshDir = () => mkdtempSync(join(tmpdir(), 'secrets-'));
 
-describe('createComponentSecrets (per-component accessor)', () => {
-	it('resolves declared secrets and denies undeclared ones', async () => {
-		const secrets = createComponentSecrets({
-			componentName: 'my-app',
-			declarations: [
-				{ name: 'API_KEY', required: true },
-				{ name: 'UNSET_KEY', required: false },
-			],
-			resolve: async (name) => (name === 'API_KEY' ? 'the-value' : undefined),
+// A store whose values are plain strings, with a trivial "decrypt" — lets the accessor's authority
+// logic be tested without crypto. (End-to-end crypto is covered in the last test.)
+async function plainStore(entries) {
+	const store = new InMemorySecretsStore();
+	for (const [name, { value, grants }] of Object.entries(entries)) {
+		await setSecret(store, { name, value, grants });
+	}
+	return store;
+}
+const identity = async (s) => s;
+
+describe('createComponentSecrets (store-backed authority)', () => {
+	it('resolves granted secrets and denies ungranted ones', async () => {
+		const store = await plainStore({
+			API_KEY: { value: 'the-value', grants: ['my-app'] },
+			OTHERS_SECRET: { value: 'nope', grants: ['other-app'] },
 		});
+		const secrets = createComponentSecrets({ componentName: 'my-app', store, decrypt: identity });
 
 		assert.equal(await secrets.get('API_KEY'), 'the-value');
-		assert.deepEqual(secrets.list().sort(), ['API_KEY', 'UNSET_KEY']);
-		assert.equal(secrets.has('API_KEY'), true);
-		assert.equal(secrets.has('OTHER'), false);
+		assert.equal(await secrets.has('API_KEY'), true);
+		assert.deepEqual(await secrets.list(), ['API_KEY']);
 
-		// Undeclared read is refused before resolve is ever consulted (least authority).
-		await assert.rejects(() => secrets.get('OTHER'), /not allowed to read secret "OTHER"/);
-		await assert.rejects(() => secrets.get('UNSET_KEY'), /is not set/);
+		// Not granted to my-app — refused before any decryption, and error points at the operator.
+		assert.equal(await secrets.has('OTHERS_SECRET'), false);
+		await assert.rejects(() => secrets.get('OTHERS_SECRET'), /is not granted secret "OTHERS_SECRET"/);
+		await assert.rejects(() => secrets.get('OTHERS_SECRET'), /a component cannot grant itself/);
+		// Unknown secret is likewise refused.
+		await assert.rejects(() => secrets.get('NOPE'), /is not granted/);
 	});
 
-	it('describe() surfaces declarations (for operator tooling) without values', () => {
+	it('a component cannot widen access via its own manifest', async () => {
+		// Manifest asks for a secret that exists but grants it to someone else.
+		const store = await plainStore({ SECRET: { value: 'v', grants: ['other-app'] } });
 		const secrets = createComponentSecrets({
 			componentName: 'my-app',
-			declarations: [{ name: 'DATABASE_URL', required: true, description: 'Postgres DSN' }],
-			resolve: async () => 'postgres://secret',
+			store,
+			decrypt: identity,
+			manifest: [{ name: 'SECRET', required: true }],
+		});
+		await assert.rejects(() => secrets.get('SECRET'), /is not granted/);
+		assert.deepEqual(await secrets.list(), []); // authoritative list ignores the manifest
+	});
+
+	it('granted-but-unset secret reports distinctly from ungranted', async () => {
+		const store = await plainStore({ NEEDS_VALUE: { grants: ['my-app'] } }); // granted, no value
+		const secrets = createComponentSecrets({ componentName: 'my-app', store, decrypt: identity });
+		await assert.rejects(() => secrets.get('NEEDS_VALUE'), /granted but has no value set/);
+	});
+
+	it('describe() returns the manifest (non-authoritative) without values', async () => {
+		const store = await plainStore({});
+		const secrets = createComponentSecrets({
+			componentName: 'my-app',
+			store,
+			decrypt: identity,
+			manifest: [{ name: 'DATABASE_URL', required: true, description: 'Postgres DSN' }],
 		});
 		assert.deepEqual(secrets.describe(), [{ name: 'DATABASE_URL', required: true, description: 'Postgres DSN' }]);
 	});
 
-	it('ensureRequired() fails loud listing only the missing required secrets', async () => {
-		const present = new Set(['SET_REQUIRED']);
+	it('ensureRequired() distinguishes not-granted from granted-but-unset, ignores optional', async () => {
+		const store = await plainStore({
+			GRANTED_SET: { value: 'v', grants: ['my-app'] },
+			GRANTED_UNSET: { grants: ['my-app'] },
+			GRANTED_OPTIONAL_MISSING: { grants: ['other-app'] },
+		});
 		const secrets = createComponentSecrets({
 			componentName: 'my-app',
-			declarations: [
-				{ name: 'SET_REQUIRED', required: true },
-				{ name: 'MISSING_REQUIRED', required: true },
-				{ name: 'MISSING_OPTIONAL', required: false },
+			store,
+			decrypt: identity,
+			manifest: [
+				{ name: 'GRANTED_SET', required: true },
+				{ name: 'GRANTED_UNSET', required: true },
+				{ name: 'NOT_GRANTED', required: true },
+				{ name: 'GRANTED_OPTIONAL_MISSING', required: false },
 			],
-			resolve: async (name) => (present.has(name) ? 'v' : undefined),
 		});
-		await assert.rejects(() => secrets.ensureRequired(), /missing required secret\(s\): MISSING_REQUIRED/);
-		// The optional missing one is not reported.
 		await assert.rejects(
 			() => secrets.ensureRequired(),
-			(e) => !/MISSING_OPTIONAL/.test(e.message)
+			(e) => /not granted: NOT_GRANTED/.test(e.message) && /granted but unset: GRANTED_UNSET/.test(e.message)
+		);
+		// Optional and satisfied ones are not reported.
+		await assert.rejects(
+			() => secrets.ensureRequired(),
+			(e) => !/GRANTED_SET/.test(e.message) && !/GRANTED_OPTIONAL_MISSING/.test(e.message)
 		);
 	});
 
-	it('ensureRequired() passes when every required secret resolves', async () => {
+	it('ensureRequired() passes when required secrets are granted and set', async () => {
+		const store = await plainStore({ A: { value: 'v', grants: ['my-app'] } });
 		const secrets = createComponentSecrets({
 			componentName: 'my-app',
-			declarations: [
-				{ name: 'A', required: true },
-				{ name: 'B', required: false },
-			],
-			resolve: async (name) => (name === 'A' ? 'v' : undefined),
+			store,
+			decrypt: identity,
+			manifest: [{ name: 'A', required: true }],
 		});
 		await assert.doesNotReject(() => secrets.ensureRequired());
 	});
@@ -74,15 +114,18 @@ describe('createComponentSecrets (per-component accessor)', () => {
 		const custody = new FileKeyCustody(freshDir(), { generate: true });
 		const publicKey = await custody.publicKey();
 		const kid = await custody.keyId();
-		const ciphertext = { DATABASE_URL: encryptEnvelope('postgres://secret', publicKey, kid) };
+
+		const store = new InMemorySecretsStore();
+		await setSecret(store, {
+			name: 'DATABASE_URL',
+			value: encryptEnvelope('postgres://secret', publicKey, kid),
+			grants: ['my-app'],
+		});
 
 		const secrets = createComponentSecrets({
 			componentName: 'my-app',
-			declarations: [{ name: 'DATABASE_URL', required: true }],
-			resolve: async (name) => {
-				const body = ciphertext[name];
-				return body === undefined ? undefined : decryptEnvelopeWithCustody(body, custody);
-			},
+			store,
+			decrypt: (ciphertext) => decryptEnvelopeWithCustody(ciphertext, custody),
 		});
 
 		assert.equal(await secrets.get('DATABASE_URL'), 'postgres://secret');

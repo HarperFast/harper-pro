@@ -1,9 +1,13 @@
 /**
- * The customer-facing secrets declaration — the `secrets:` block a component puts in its
- * `config.yaml`. This is the single surface where a component states which secrets it consumes, and
- * it is *also* the authorization list: the names declared here are exactly the names Harper will let
- * that component read through `scope.secrets` (see secretsAccessor.ts). Declaration is grant; there
- * is no wildcard and nothing ambient.
+ * The component's secrets MANIFEST — the `secrets:` block in its `config.yaml`. This is where a
+ * component states which secrets it *needs*.
+ *
+ * IMPORTANT: this is NON-AUTHORITATIVE. The component (and whoever writes/deploys its config)
+ * controls this file, so it cannot be the thing that grants access — otherwise a component would
+ * authorize itself. Authority lives in the trusted, operator-only secrets store (secretsStore.ts):
+ * a read is allowed only if that store's `grants` for the secret include this component. The manifest
+ * is used only to (a) fail loud at load if a required secret isn't granted/set (`ensureRequired`) and
+ * (b) tell operators what a component wants so they can grant it. It can never widen access.
  *
  * Two forms, both following existing config.yaml conventions (cf. `jsResource: { files: ... }`):
  *

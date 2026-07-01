@@ -32,6 +32,7 @@ import { openEnvelope, parseEnvelope } from './envSecretCrypto.ts';
 import { decryptEnvelopeWithCustody, FileKeyCustody, getKeyCustody, type KeyCustody } from './keyCustody.ts';
 import { type ComponentSecrets, createComponentSecrets } from './secretsAccessor.ts';
 import type { SecretDeclaration } from './secretsConfig.ts';
+import type { SecretsStore } from './secretsStore.ts';
 
 // Also the name under which the private key is registered in core's key store, so the existing
 // `get_key` operation can serve it to a cloning node (file backend only).
@@ -89,36 +90,29 @@ async function getSecretsPublicKey(_req: PublicKeyRequest) {
 }
 
 /**
- * Build the per-component `scope.secrets` accessor. Given the component's declarations (parsed from
- * its `secrets:` config, see secretsConfig.ts) and its stored ciphertext, returns an accessor that
- * decrypts on demand via KeyCustody and enforces the declared allow-list. The private key stays in
- * host scope and never crosses into the component sandbox; the plaintext is never written to
- * `process.env`, so there is nothing ambient for sandboxed code to scrape.
+ * Build the per-component `scope.secrets` accessor. Authority is the trusted `store`
+ * (secretsStore.ts): a read is allowed only if the secret's `grants` include `componentName` (which
+ * Harper's loader asserts). Ciphertext comes from the store and is decrypted on demand via KeyCustody
+ * — the private key stays in host scope, and plaintext is never written to `process.env`, so there is
+ * nothing ambient for sandboxed code to scrape. `manifest` (the component's `secrets:` config) is
+ * non-authoritative; it only drives `ensureRequired()` fail-fast and `describe()`.
  *
- * Two-tier resolution: a cluster-level (operator-managed) secret overrides the component's own `.env`
- * value of the same name; the `.env` is the inner default layer. Both are `enc:v1:` ciphertext.
- *
- * INTEGRATION (core loader): Harper parses the component's `secrets:` config into declarations,
- * builds this accessor, binds it to `scope.secrets` (and `harper`'s `secrets` export), and calls
- * `ensureRequired()` during load so a missing required secret fails the component loudly. Because the
- * accessor is attached to the per-component scope — never to the shared sandbox global or the
- * `harper` module's process-wide singletons — each component sees only its own secrets.
+ * INTEGRATION (core loader): Harper builds this with the loader-asserted `componentName` and the
+ * shared secrets store, binds it to the per-component `scope.secrets` (and `harper`'s `secrets`
+ * export — never the shared sandbox global), passes the parsed `secrets:` manifest, and calls
+ * `ensureRequired()` during load so a missing required secret fails the component loudly.
  */
 export function createScopeSecrets(
 	componentName: string,
-	declarations: SecretDeclaration[],
-	sources: { appEnv?: Record<string, string>; clusterSecrets?: Record<string, string> }
+	store: SecretsStore,
+	opts: { manifest?: SecretDeclaration[] } = {}
 ): ComponentSecrets {
 	const c = getCustody();
-	const { appEnv, clusterSecrets } = sources;
 	return createComponentSecrets({
 		componentName,
-		declarations,
-		resolve: async (name) => {
-			const envelope = clusterSecrets?.[name] ?? appEnv?.[name];
-			if (envelope === undefined) return undefined;
-			return decryptEnvelopeWithCustody(envelope.slice(ENV_ENCRYPTED_PREFIX.length), c);
-		},
+		store,
+		manifest: opts.manifest,
+		decrypt: (ciphertext) => decryptEnvelopeWithCustody(ciphertext.slice(ENV_ENCRYPTED_PREFIX.length), c),
 		onAccess: ({ componentName: cn, name }) => logger.debug?.(`env-secret read: ${cn} -> ${name}`),
 	});
 }
