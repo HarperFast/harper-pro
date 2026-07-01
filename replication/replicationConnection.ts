@@ -361,13 +361,15 @@ export function closeOnInboundMessageError(
 	error: unknown,
 	deps: {
 		connectionId: string | number;
-		logger: { error?: (...args: unknown[]) => void };
+		logger?: { error?: (...args: unknown[]) => void };
 		markInboundClosed: () => void;
 		close: (code: number, reason: string) => void;
 	}
 ): void {
 	deps.markInboundClosed();
-	deps.logger.error?.(
+	// The log must never prevent the close — this handler is the last line of defense, so the
+	// logger access is fully guarded rather than trusted.
+	deps.logger?.error?.(
 		deps.connectionId,
 		'Error handling incoming replication message; closing so replication resumes from the last durable cursor',
 		error
@@ -3639,8 +3641,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// to the outer catch, so the skip-vs-close outcome was decided by accident (#440).
 					logger.error?.(
 						'Error decoding replication message, record id: ' + id,
-						' typed structures for current decoder' + JSON.stringify(tableDecoder?.decoder?.typedStructs),
-						' structures for current decoder' + JSON.stringify(tableDecoder?.decoder?.structures),
+						' typed structures for current decoder: ' +
+							(JSON.stringify(tableDecoder?.decoder?.typedStructs) ?? 'unknown table decoder'),
+						' structures for current decoder: ' +
+							(JSON.stringify(tableDecoder?.decoder?.structures) ?? 'unknown table decoder'),
 						'encoded message',
 						auditRecord.encoded.subarray(0, 1000),
 						auditRecord,
