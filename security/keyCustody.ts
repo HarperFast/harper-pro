@@ -2,18 +2,22 @@
  * KeyCustody — who holds the env-secrets private key, and where the private-key operation runs.
  *
  * The interface exposes only an **unwrap** operation (RSA-OAEP unwrap of a hybrid envelope's AES
- * key), never the private key itself. That's the whole point: a backend can perform the operation
- * without ever surfacing the key to this process. Backends, weakest to strongest:
+ * key), never the private key itself. The custody instance lives in *host scope* — the trusted side
+ * of Harper's module-loader sandbox — and customer code reaches it only through the mediated,
+ * per-component accessor (secretsAccessor.ts). Since Harper runs component/plugin code in `node:vm`
+ * contexts (hardened by SES / frozen intrinsics) and controls what those contexts can reference,
+ * keeping the custody object off the sandbox global / `harper` exports is what isolates the key from
+ * a compromised plugin or an SSR JS-RCE. That is the threat this design targets, and the default
+ * FileKeyCustody handles it — no separate process required.
  *
- *   - FileKeyCustody  — key on disk, loaded into the trusted Harper/Pro process (never into
- *                       customer-sandboxed component/plugin code). Air-gap friendly; the default.
- *   - KmsKeyCustody   — key lives in AWS KMS and NEVER enters this process; `unwrapKey` is a
- *                       KMS.Decrypt call (auditable via CloudTrail, rate-limitable, revocable).
- *   - (future)        — PKCS#11 / TPM for on-prem "local HSM", same interface.
- *
- * Harper controls the sandbox boundary, so the custody instance lives on the trusted side and is
- * reached by customer code only through the mediated, per-component accessor (see secretsAccessor.ts)
- * — customer code can obtain the *values it declared*, but never the key.
+ *   - FileKeyCustody  — RSA-4096 keypair on disk, loaded into the trusted process, held in host
+ *                       scope. The default. Provides a sync unwrap for the legacy loadEnv path.
+ *   - KmsKeyCustody   — OPTIONAL off-box tier: key lives in AWS KMS and never enters the process;
+ *                       `unwrapKey` is a KMS.Decrypt (auditable/rate-limitable/revocable). Only this
+ *                       (or an HSM) additionally resists *host-root* / native-RCE compromise — a
+ *                       higher bar than the JS-compromise threat above — at the cost of a third party.
+ *   - (future)        — PKCS#11 / TPM "local HSM", or cluster threshold key-shares (no single node
+ *                       holds the whole key). Same interface throughout.
  */
 import { createPublicKey, generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';

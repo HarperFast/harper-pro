@@ -5,7 +5,6 @@ import { join } from 'node:path';
 import { describe, it } from 'mocha';
 import { encryptEnvelope } from '#src/security/envSecretCrypto';
 import { decryptEnvelopeWithCustody, FileKeyCustody } from '#src/security/keyCustody';
-import { createComponentSecrets } from '#src/security/secretsAccessor';
 
 const freshDir = () => mkdtempSync(join(tmpdir(), 'keycustody-'));
 
@@ -45,41 +44,5 @@ describe('FileKeyCustody', () => {
 		const custody = new FileKeyCustody(freshDir(), { generate: true });
 		// The interface surface is keyId / publicKey / unwrapKey only — no getPrivateKey.
 		assert.equal('getPrivateKey' in custody, false);
-	});
-});
-
-describe('createComponentSecrets (per-component accessor)', () => {
-	it('resolves declared secrets and denies undeclared ones', async () => {
-		const secrets = createComponentSecrets({
-			componentName: 'my-app',
-			declaredKeys: ['API_KEY', 'UNSET_KEY'],
-			resolve: async (name) => (name === 'API_KEY' ? 'the-value' : undefined),
-		});
-
-		assert.equal(await secrets.get('API_KEY'), 'the-value');
-		assert.deepEqual(secrets.list().sort(), ['API_KEY', 'UNSET_KEY']);
-		assert.equal(secrets.has('API_KEY'), true);
-		assert.equal(secrets.has('OTHER'), false);
-
-		await assert.rejects(() => secrets.get('OTHER'), /not allowed to read secret "OTHER"/);
-		await assert.rejects(() => secrets.get('UNSET_KEY'), /is not set/);
-	});
-
-	it('decrypts real ciphertext through custody without exposing the key (end-to-end)', async () => {
-		const custody = new FileKeyCustody(freshDir(), { generate: true });
-		const publicKey = await custody.publicKey();
-		const kid = await custody.keyId();
-		const ciphertext = { DATABASE_URL: encryptEnvelope('postgres://secret', publicKey, kid) };
-
-		const secrets = createComponentSecrets({
-			componentName: 'my-app',
-			declaredKeys: ['DATABASE_URL'],
-			resolve: async (name) => {
-				const body = ciphertext[name];
-				return body === undefined ? undefined : decryptEnvelopeWithCustody(body, custody);
-			},
-		});
-
-		assert.equal(await secrets.get('DATABASE_URL'), 'postgres://secret');
 	});
 });

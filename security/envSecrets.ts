@@ -1,19 +1,23 @@
 /**
  * Env-secret encryption (Pro). Fills the dormant decrypt hook that Harper core exposes
  * (`core/resources/envSecretDecryptor.ts`) so `.env` values written as `enc:v1:` envelopes are
- * decrypted at runtime. The private key is held by a KeyCustody backend on the trusted side of the
- * sandbox boundary — with the file backend it lives in this (Harper Pro) process, never in
- * customer-sandboxed component/plugin code; with KMS custody it never enters the process at all.
+ * decrypted at runtime. The private key is held by a KeyCustody backend and lives in *host scope* —
+ * the trusted side of Harper's module-loader sandbox — never on a component's global or in the
+ * `harper` module it can import. Harper runs customer code in `node:vm` contexts (hardened by SES /
+ * frozen intrinsics) within the worker, so keeping the key out of that reachable graph is what
+ * isolates it; no separate process is needed for the JS-compromise threat this targets.
  *
  * Two consumption paths:
- *   - loadEnv → `process.env` (legacy compat): synchronous, so it requires the file backend's sync
- *     unwrap. Any code in the worker can read `process.env`.
- *   - `scope.secrets` (preferred): a per-component mediated accessor (see secretsAccessor.ts) that
- *     resolves only the keys a component declared, via KeyCustody — nothing ambient to scrape.
+ *   - loadEnv → `process.env` (legacy compat): synchronous (file backend sync unwrap). NOTE: `process`
+ *     is reachable inside the sandbox, so anything here is ambient — fine for non-secret env, but it
+ *     is the exposure the accessor below exists to avoid for real secrets.
+ *   - `scope.secrets` (preferred / hardened): a per-component mediated accessor (see
+ *     secretsAccessor.ts) that resolves only the keys a component declared in its `secrets:` config
+ *     (secretsConfig.ts), decrypting on the trusted side. Nothing lands in `process.env`, so there's
+ *     nothing ambient to scrape.
  *
- * Key model: a single cluster-shared keypair. For the file backend the leader generates it and it's
- * cloned to new nodes (cloneEnvSecretsKeys → get_key). KMS custody needs no cloning — every node
- * references the same key by ARN.
+ * Key model: a single cluster-shared keypair. The leader generates it and it's cloned to new nodes
+ * (cloneEnvSecretsKeys → get_key).
  */
 import { join } from 'node:path';
 import { server } from '../core/server/Server.ts';
@@ -27,6 +31,7 @@ import logger from '../core/utility/logging/harper_logger.js';
 import { openEnvelope, parseEnvelope } from './envSecretCrypto.ts';
 import { decryptEnvelopeWithCustody, FileKeyCustody, getKeyCustody, type KeyCustody } from './keyCustody.ts';
 import { type ComponentSecrets, createComponentSecrets } from './secretsAccessor.ts';
+import type { SecretDeclaration } from './secretsConfig.ts';
 
 // Also the name under which the private key is registered in core's key store, so the existing
 // `get_key` operation can serve it to a cloning node (file backend only).
@@ -84,25 +89,33 @@ async function getSecretsPublicKey(_req: PublicKeyRequest) {
 }
 
 /**
- * Build the per-component `scope.secrets` accessor. Given the component's declared secret keys and
- * its stored ciphertext map (key -> `enc:v1:` value, e.g. parsed from its `.env`), returns an
- * accessor that decrypts on demand via KeyCustody and enforces the declared allow-list. The private
- * key never crosses into the component sandbox.
+ * Build the per-component `scope.secrets` accessor. Given the component's declarations (parsed from
+ * its `secrets:` config, see secretsConfig.ts) and its stored ciphertext, returns an accessor that
+ * decrypts on demand via KeyCustody and enforces the declared allow-list. The private key stays in
+ * host scope and never crosses into the component sandbox; the plaintext is never written to
+ * `process.env`, so there is nothing ambient for sandboxed code to scrape.
  *
- * INTEGRATION (core/scope): Harper supplies `componentName` + `declaredKeys` (from component config)
- * and the ciphertext map, and binds the returned accessor to `scope.secrets`.
+ * Two-tier resolution: a cluster-level (operator-managed) secret overrides the component's own `.env`
+ * value of the same name; the `.env` is the inner default layer. Both are `enc:v1:` ciphertext.
+ *
+ * INTEGRATION (core loader): Harper parses the component's `secrets:` config into declarations,
+ * builds this accessor, binds it to `scope.secrets` (and `harper`'s `secrets` export), and calls
+ * `ensureRequired()` during load so a missing required secret fails the component loudly. Because the
+ * accessor is attached to the per-component scope — never to the shared sandbox global or the
+ * `harper` module's process-wide singletons — each component sees only its own secrets.
  */
 export function createScopeSecrets(
 	componentName: string,
-	declaredKeys: string[],
-	ciphertext: Record<string, string>
+	declarations: SecretDeclaration[],
+	sources: { appEnv?: Record<string, string>; clusterSecrets?: Record<string, string> }
 ): ComponentSecrets {
 	const c = getCustody();
+	const { appEnv, clusterSecrets } = sources;
 	return createComponentSecrets({
 		componentName,
-		declaredKeys,
+		declarations,
 		resolve: async (name) => {
-			const envelope = ciphertext[name];
+			const envelope = clusterSecrets?.[name] ?? appEnv?.[name];
 			if (envelope === undefined) return undefined;
 			return decryptEnvelopeWithCustody(envelope.slice(ENV_ENCRYPTED_PREFIX.length), c);
 		},
