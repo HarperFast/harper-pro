@@ -273,6 +273,47 @@ export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pau
 }
 
 /**
+ * Handle an error that escaped `onWSMessage` (the inbound handler in `replicateOverWS`).
+ *
+ * Historically this was logged and swallowed. That silently dropped the rest of the failed frame
+ * while later frames kept applying and confirming ever-higher sequence ids — a permanent,
+ * undetected `[error, head]` gap on the receiver (epic harper-pro#430 Theme B; workstream
+ * harper-pro#440). Recovery instead rides the established transient-close path:
+ *
+ *   1. `markInboundClosed` FIRST — frames already queued behind this one on the
+ *      `messageProcessing` chain must not apply (they would commit past the hole), and after
+ *      `ws.close()` the peer can still deliver frames until the close handshake completes.
+ *   2. `close(1011)` (internal error — distinct from the 1008 policy closes) WITHOUT the
+ *      `intentional` flag, so `NodeReplicationConnection`'s normal retry path reconnects with
+ *      backoff and resumes from the last durable cursor, re-streaming everything past it.
+ *      Records applied before the error redeliver idempotently (version dedup).
+ *
+ * A deterministic error (e.g. a genuinely undecodable frame) becomes a visible, backed-off
+ * reconnect loop instead of silent loss; bounding that with an escalation budget is W2
+ * (harper-pro#432) territory.
+ *
+ * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
+ * catch in `onWSMessage`.
+ */
+export function closeOnInboundMessageError(
+	error: unknown,
+	deps: {
+		connectionId: string | number;
+		logger: { error?: (...args: unknown[]) => void };
+		markInboundClosed: () => void;
+		close: (code: number, reason: string) => void;
+	}
+): void {
+	deps.markInboundClosed();
+	deps.logger.error?.(
+		deps.connectionId,
+		'Error handling incoming replication message; closing so replication resumes from the last durable cursor',
+		error
+	);
+	deps.close(1011, 'Error handling incoming replication message');
+}
+
+/**
  * Decide whether the empty-subscription delayed close inside `replicateOverWS`'s `scheduleClose` should
  * be classified as INTENTIONAL/finished (mark `isFinished`/`intentionallyUnsubscribed`, emit `'finished'`,
  * remove the connection from the worker map, never reconnect) vs a transient close that falls through to
@@ -3554,7 +3595,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			};
 			tableSubscriptionToReplicator.send(endTxnEvent);
 		} catch (error) {
-			logger.error?.(connectionId, 'Error handling incoming replication message', error);
+			closeOnInboundMessageError(error, {
+				connectionId,
+				logger,
+				markInboundClosed: () => (wsClosed = true),
+				close,
+			});
 		}
 	}
 	ws.on('ping', resetPingTimer);
