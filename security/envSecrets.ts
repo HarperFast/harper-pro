@@ -1,22 +1,21 @@
 /**
  * Env-secret encryption (Pro). Fills the dormant decrypt hook that Harper core exposes
  * (`core/resources/envSecretDecryptor.ts`) so `.env` values written as `enc:v1:` envelopes are
- * decrypted into `process.env` at runtime. The cryptography and the private key live only here, so
- * the feature is gated by this component's presence — without harper-pro, core stays dormant.
+ * decrypted at runtime. The private key is held by a KeyCustody backend on the trusted side of the
+ * sandbox boundary — with the file backend it lives in this (Harper Pro) process, never in
+ * customer-sandboxed component/plugin code; with KMS custody it never enters the process at all.
  *
- * Key model: a single cluster-shared RSA-4096 "env-secrets" keypair. The leader generates it once
- * (first boot) and persists it to the keys/ dir; the private key is registered in core's key store
- * so the existing `get_key` operation can serve it to a cloning node (see cloneEnvSecretsKeys in
- * cloneNode). Because every node holds the same key, an `enc:v1:` value encrypted once by a client
- * is stored/replicated verbatim and decrypts on any node.
+ * Two consumption paths:
+ *   - loadEnv → `process.env` (legacy compat): synchronous, so it requires the file backend's sync
+ *     unwrap. Any code in the worker can read `process.env`.
+ *   - `scope.secrets` (preferred): a per-component mediated accessor (see secretsAccessor.ts) that
+ *     resolves only the keys a component declared, via KeyCustody — nothing ambient to scrape.
  *
- * Envelope + client flow are documented in core/docs/env-secret-encryption.md. The wire format is
- * hybrid: AES-256-GCM encrypts the value, RSA-OAEP(SHA-256) wraps the AES key.
+ * Key model: a single cluster-shared keypair. For the file backend the leader generates it and it's
+ * cloned to new nodes (cloneEnvSecretsKeys → get_key). KMS custody needs no cloning — every node
+ * references the same key by ARN.
  */
 import { join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { generateKeyPairSync, createPublicKey } from 'node:crypto';
-import { decryptEnvelope, fingerprintOf } from './envSecretCrypto.ts';
 import { server } from '../core/server/Server.ts';
 import { registerEnvSecretDecryptor } from '../core/resources/envSecretDecryptor.js';
 import { ENV_ENCRYPTED_PREFIX } from '../core/utility/envFile.js';
@@ -25,68 +24,49 @@ import { getHdbBasePath } from '../core/utility/environment/environmentManager.j
 import { LICENSE_KEY_DIR_NAME } from '../core/utility/hdbTerms.js';
 import { ClientError } from '../core/utility/errors/hdbError.js';
 import logger from '../core/utility/logging/harper_logger.js';
+import { openEnvelope, parseEnvelope } from './envSecretCrypto.ts';
+import { decryptEnvelopeWithCustody, FileKeyCustody, getKeyCustody, type KeyCustody } from './keyCustody.ts';
+import { type ComponentSecrets, createComponentSecrets } from './secretsAccessor.ts';
 
-// Filename of the shared private key in the keys/ dir. Also the name under which it is registered
-// in core's key store, so `get_key { name: ENV_SECRETS_PRIVATE_KEY_NAME }` serves it to a cloning node.
+// Also the name under which the private key is registered in core's key store, so the existing
+// `get_key` operation can serve it to a cloning node (file backend only).
 export const ENV_SECRETS_PRIVATE_KEY_NAME = 'envSecrets.private.pem';
-const ENV_SECRETS_PUBLIC_KEY_NAME = 'envSecrets.public.pem';
 const SCHEME = 'enc:v1';
 const ALGORITHM = 'RSA-OAEP-SHA256 + AES-256-GCM';
 
-// Per-process cache, populated by ensureKeypair (main) / loadKeypair (workers).
-let privateKeyPem: string | undefined;
-let publicKeyPem: string | undefined;
-let keyFingerprint: string | undefined;
+let custody: KeyCustody | undefined;
 
-function keysDir(): string {
-	return join(getHdbBasePath(), LICENSE_KEY_DIR_NAME);
+// `generate` is passed true only from the main-thread entry point (the leader mints the shared key).
+function getCustody(generate = false): KeyCustody {
+	if (!custody) {
+		// TODO(config): read `envSecrets.keyCustody` (file | kms) + kms settings from Harper config.
+		custody = getKeyCustody({ backend: 'file', dir: join(getHdbBasePath(), LICENSE_KEY_DIR_NAME), generate });
+	}
+	return custody;
 }
 
-function cache(privatePem: string, publicPem: string): void {
-	privateKeyPem = privatePem;
-	publicKeyPem = publicPem;
-	keyFingerprint = fingerprintOf(publicPem);
-	// Expose the private key to the key store so `get_key` can clone it to new nodes.
-	getPrivateKeys().set(ENV_SECRETS_PRIVATE_KEY_NAME, privatePem);
-}
-
-/** Load the keypair from disk into the cache. Returns false if it isn't present yet. */
-function loadKeypair(): boolean {
-	if (privateKeyPem) return true;
-	const privatePath = join(keysDir(), ENV_SECRETS_PRIVATE_KEY_NAME);
-	if (!existsSync(privatePath)) return false;
-	const privatePem = readFileSync(privatePath, 'utf8');
-	// Derive the public key rather than trusting a separate file.
-	const publicPem = createPublicKey(privatePem).export({ type: 'spki', format: 'pem' }) as string;
-	cache(privatePem, publicPem);
-	return true;
-}
-
-/** Ensure the shared keypair exists (generating + persisting on first boot), then cache it. */
-function ensureKeypair(): void {
-	if (loadKeypair()) return;
-	logger.notify?.('Generating cluster env-secrets keypair');
-	const { privateKey, publicKey } = generateKeyPairSync('rsa', {
-		modulusLength: 4096,
-		publicKeyEncoding: { type: 'spki', format: 'pem' },
-		privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-	});
-	const dir = keysDir();
-	mkdirSync(dir, { recursive: true });
-	writeFileSync(join(dir, ENV_SECRETS_PRIVATE_KEY_NAME), privateKey, { mode: 0o600 });
-	writeFileSync(join(dir, ENV_SECRETS_PUBLIC_KEY_NAME), publicKey, { mode: 0o644 });
-	cache(privateKey as string, publicKey as string);
+/** The file backend, when active — the sync loadEnv path and the get_key clone path need it. */
+function fileCustody(generate = false): FileKeyCustody | undefined {
+	const c = getCustody(generate);
+	return c instanceof FileKeyCustody ? c : undefined;
 }
 
 /**
- * Decrypt an `enc:v1:` value via the pure envelope crypto. Synchronous (Node RSA/AES are sync) so it
- * plugs directly into core's loadEnv path. Throws on a wrong/missing key or a tampered envelope.
+ * Synchronous decryptor for the loadEnv → `process.env` compat path. Requires the file backend
+ * (sync unwrap). With KMS custody, `process.env` injection is unavailable — read via `scope.secrets`.
  */
 function decryptEnvValue(value: string): string {
-	if (!privateKeyPem && !loadKeypair()) {
-		throw new Error('env-secrets keypair is not available on this node');
+	const fc = fileCustody();
+	if (!fc) {
+		throw new Error(
+			'process.env injection of encrypted values requires file key custody; with KMS custody, read secrets via scope.secrets'
+		);
 	}
-	return decryptEnvelope(value.slice(ENV_ENCRYPTED_PREFIX.length), privateKeyPem!, keyFingerprint!);
+	const env = parseEnvelope(value.slice(ENV_ENCRYPTED_PREFIX.length));
+	if (env.kid && env.kid !== fc.keyIdSync()) {
+		throw new Error(`no env-secrets key for kid ${env.kid}`);
+	}
+	return openEnvelope(env, fc.unwrapKeySync(env.k));
 }
 
 interface PublicKeyRequest {
@@ -95,23 +75,51 @@ interface PublicKeyRequest {
 
 /** `get_secrets_public_key` — returns only PUBLIC material clients use to encrypt secret values. */
 async function getSecretsPublicKey(_req: PublicKeyRequest) {
-	if (!publicKeyPem && !loadKeypair()) {
+	const c = getCustody();
+	try {
+		return { publicKey: await c.publicKey(), fingerprint: await c.keyId(), scheme: SCHEME, algorithm: ALGORITHM };
+	} catch {
 		throw new ClientError('env-secrets keypair is not initialized');
 	}
-	return {
-		publicKey: publicKeyPem,
-		fingerprint: keyFingerprint,
-		scheme: SCHEME,
-		algorithm: ALGORITHM,
-	};
 }
 
 /**
- * Main-thread entry point: ensure the shared keypair exists and expose the public key. Runs once;
- * the operations API only runs on the main thread (v5.1+), so the operation registers here.
+ * Build the per-component `scope.secrets` accessor. Given the component's declared secret keys and
+ * its stored ciphertext map (key -> `enc:v1:` value, e.g. parsed from its `.env`), returns an
+ * accessor that decrypts on demand via KeyCustody and enforces the declared allow-list. The private
+ * key never crosses into the component sandbox.
+ *
+ * INTEGRATION (core/scope): Harper supplies `componentName` + `declaredKeys` (from component config)
+ * and the ciphertext map, and binds the returned accessor to `scope.secrets`.
+ */
+export function createScopeSecrets(
+	componentName: string,
+	declaredKeys: string[],
+	ciphertext: Record<string, string>
+): ComponentSecrets {
+	const c = getCustody();
+	return createComponentSecrets({
+		componentName,
+		declaredKeys,
+		resolve: async (name) => {
+			const envelope = ciphertext[name];
+			if (envelope === undefined) return undefined;
+			return decryptEnvelopeWithCustody(envelope.slice(ENV_ENCRYPTED_PREFIX.length), c);
+		},
+		onAccess: ({ componentName: cn, name }) => logger.debug?.(`env-secret read: ${cn} -> ${name}`),
+	});
+}
+
+/**
+ * Main-thread entry point: ensure the shared keypair exists and expose the public key. The
+ * operations API only runs on the main thread (v5.1+), so the operation registers here.
  */
 export function startOnMainThread(): void {
-	ensureKeypair();
+	const fc = fileCustody(true); // leader mints the shared key if absent
+	if (fc) {
+		// Publish the shared private key so the `get_key` clone path can copy it to new nodes.
+		getPrivateKeys().set(ENV_SECRETS_PRIVATE_KEY_NAME, fc.exportPrivateKeyPemForCloning());
+	}
 	registerEnvSecretDecryptor(decryptEnvValue);
 	server.registerOperation?.({
 		name: 'get_secrets_public_key',
@@ -121,15 +129,20 @@ export function startOnMainThread(): void {
 }
 
 /**
- * Worker-thread entry point: load the shared key (written by the leader / cloned at bootstrap) and
- * register the decryptor so `.env` files loaded in this worker decrypt `enc:v1:` values.
+ * Worker-thread entry point: register the sync decryptor if the shared key is present (written by
+ * the leader / cloned at bootstrap). Workers never generate the key.
  */
 export function start(): void {
-	if (loadKeypair()) {
+	const fc = fileCustody(false);
+	if (fc && fc.hasKey()) {
+		getPrivateKeys().set(ENV_SECRETS_PRIVATE_KEY_NAME, fc.exportPrivateKeyPemForCloning());
 		registerEnvSecretDecryptor(decryptEnvValue);
-	} else {
+	} else if (fc) {
 		logger.warn?.(
 			'env-secrets keypair not found on this worker; encrypted .env values will not be decrypted until it is present'
 		);
+	} else {
+		// KMS custody: process.env injection is unavailable; components read via scope.secrets.
+		logger.debug?.('env-secrets: non-file key custody active; process.env injection disabled (use scope.secrets)');
 	}
 }

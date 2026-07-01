@@ -51,12 +51,17 @@ export function encryptEnvelope(plaintext: string, publicKeyPem: string, kid: st
 	return Buffer.from(JSON.stringify(envelope)).toString('base64url');
 }
 
-/**
- * Decrypt a base64url envelope body. These are the security guarantees of the feature and throw on:
- * a malformed/incomplete envelope, a `kid` that doesn't match this node's key, or a failed GCM
- * authentication tag (any tampering with `ct`/`tag` makes `decipher.final()` throw).
- */
-export function decryptEnvelope(body: string, privateKeyPem: string, keyFingerprint: string): string {
+/** A decoded envelope: the base64 fields turned into buffers, ready to unwrap + open. */
+export interface ParsedEnvelope {
+	kid?: string;
+	k: Buffer; // RSA-OAEP-wrapped AES key
+	iv: Buffer;
+	ct: Buffer;
+	tag: Buffer;
+}
+
+/** Parse + validate a base64url envelope body. Throws on malformed/incomplete input. */
+export function parseEnvelope(body: string): ParsedEnvelope {
 	let env: EnvelopeFields;
 	try {
 		env = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
@@ -73,14 +78,39 @@ export function decryptEnvelope(body: string, privateKeyPem: string, keyFingerpr
 	) {
 		throw new Error('malformed env-secret envelope');
 	}
+	return {
+		kid: env.kid,
+		k: Buffer.from(env.k, 'base64'),
+		iv: Buffer.from(env.iv, 'base64'),
+		ct: Buffer.from(env.ct, 'base64'),
+		tag: Buffer.from(env.tag, 'base64'),
+	};
+}
+
+/** The RSA-OAEP(SHA-256) private-key operation: unwrap the envelope's wrapped AES key. */
+export function unwrapWithPrivateKey(wrappedKey: Buffer, privateKeyPem: string): Buffer {
+	return privateDecrypt(
+		{ key: privateKeyPem, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
+		wrappedKey
+	);
+}
+
+/** AES-256-GCM decrypt given the unwrapped AES key. Throws on a failed auth tag (tamper). */
+export function openEnvelope(env: ParsedEnvelope, aesKey: Buffer): string {
+	const decipher = createDecipheriv('aes-256-gcm', aesKey, env.iv);
+	decipher.setAuthTag(env.tag);
+	return Buffer.concat([decipher.update(env.ct), decipher.final()]).toString('utf8');
+}
+
+/**
+ * Convenience decrypt with the private key in hand (used by the file-backend fast path and tests).
+ * The custody-agnostic path is `decryptEnvelopeWithCustody` in keyCustody.ts, which keeps the key
+ * inside the custody backend.
+ */
+export function decryptEnvelope(body: string, privateKeyPem: string, keyFingerprint: string): string {
+	const env = parseEnvelope(body);
 	if (env.kid && env.kid !== keyFingerprint) {
 		throw new Error(`no env-secrets key for kid ${env.kid}`);
 	}
-	const aesKey = privateDecrypt(
-		{ key: privateKeyPem, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
-		Buffer.from(env.k, 'base64')
-	);
-	const decipher = createDecipheriv('aes-256-gcm', aesKey, Buffer.from(env.iv, 'base64'));
-	decipher.setAuthTag(Buffer.from(env.tag, 'base64'));
-	return Buffer.concat([decipher.update(Buffer.from(env.ct, 'base64')), decipher.final()]).toString('utf8');
+	return openEnvelope(env, unwrapWithPrivateKey(env.k, privateKeyPem));
 }
