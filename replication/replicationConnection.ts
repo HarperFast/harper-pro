@@ -347,6 +347,12 @@ export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pau
  * reconnect loop instead of silent loss; bounding that with an escalation budget is W2
  * (harper-pro#432) territory.
  *
+ * Coverage boundary: this path handles FRAME-level errors (header/command decode, audit-entry
+ * structure, unexpected rejections from awaited handler work). A per-record VALUE decode failure
+ * is caught earlier by the inner catch around `decodeBlobsWithWrites` and skip-and-logged, and
+ * the batch resume cursor still advances past the skipped record — that residual silent-gap
+ * class is tracked in harper-pro#440 (with W2 #432).
+ *
  * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
  * catch in `onWSMessage`.
  */
@@ -3472,10 +3478,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						}
 					);
 				} catch (error) {
+					// Guarded dereferences: tableDecoder is undefined for an unknown tableId, and an unguarded
+					// log line here used to throw its own TypeError — masking the original error and escaping
+					// to the outer catch, so the skip-vs-close outcome was decided by accident (#440).
 					logger.error?.(
 						'Error decoding replication message, record id: ' + id,
-						' typed structures for current decoder' + JSON.stringify(tableDecoder.decoder.typedStructs),
-						' structures for current decoder' + JSON.stringify(tableDecoder.decoder.structures),
+						' typed structures for current decoder' + JSON.stringify(tableDecoder?.decoder?.typedStructs),
+						' structures for current decoder' + JSON.stringify(tableDecoder?.decoder?.structures),
 						'encoded message',
 						auditRecord.encoded.subarray(0, 1000),
 						auditRecord,
