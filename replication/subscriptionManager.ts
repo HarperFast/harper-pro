@@ -493,6 +493,7 @@ export async function startOnMainThread(options) {
 			!(
 				node.replicates === true ||
 				node.replicates?.sends ||
+				node.replicates?.receives || // a receive-only directional route still needs a connection (harper-pro#498)
 				node.replicates?.sendsTo?.length ||
 				node.replicates?.receivesFrom?.length
 			) &&
@@ -569,7 +570,12 @@ export async function startOnMainThread(options) {
 					: node.replicates && typeof node.replicates === 'object'
 						? node.replicates
 						: null;
-			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node, routeReplicates }];
+			// Config-route directionality kept DISTINCT from routeReplicates: the receive gate
+			// (shouldReplicateFromNode) reads the route's receives/receivesFrom and must NOT fall back
+			// to an hdb_nodes object (whose direction is encoded as sends/sendsTo) the way routeReplicates
+			// does for table-exclusion. undefined when no config route matches this peer. harper-pro#498.
+			const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
+			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node, routeReplicates, configRouteReplicates }];
 			// Self catchup is done in case we have replicated any records that weren't actually written to our storage
 			// before a crash.
 			if (selfCatchupOfDatabase.has(databaseName) && env.get(CONFIG_PARAMS.REPLICATION_FAILOVER)) {
@@ -584,7 +590,8 @@ export async function startOnMainThread(options) {
 				});
 				selfCatchupOfDatabase.delete(databaseName);
 			}
-			const shouldSubscribe = shouldReplicateFromNode(node, databaseName);
+			// Use the enriched payload (nodes[0]) so the receive gate sees configRouteReplicates.
+			const shouldSubscribe = shouldReplicateFromNode(nodes[0] as any, databaseName);
 			const httpWorkers = workers.filter((worker) => worker.name === 'http');
 			// Defensively detect entries that point at a worker no longer in the http pool.
 			// This happens when the worker.on('exit') handler below never fired (hung WebSocket
