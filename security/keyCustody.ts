@@ -156,7 +156,16 @@ export function startOnMainThread(options?: { provider?: string }): void {
 				);
 				return;
 			}
-			const custodyKeys = custodyKeysFromPem(injectedPem);
+			let custodyKeys: CustodyKeys;
+			try {
+				custodyKeys = custodyKeysFromPem(injectedPem);
+			} catch (error) {
+				// never log the material itself — only the parse failure
+				disableCustody(
+					`Injected secrets key material is not a usable private key (${(error as Error).message}); secret custody is disabled`
+				);
+				return;
+			}
 			setWorkerDataProvider(makeWorkerDataProvider(custodyKeys));
 			activate(custodyKeys);
 			return;
@@ -237,7 +246,15 @@ export function start(options?: { provider?: string }): void {
 	// leaving raw key material readable in process.env.
 	const injectedPem = ingestInjectedMaterial();
 	if (injectedPem !== undefined && explicit !== 'file') {
-		activate(custodyKeysFromPem(injectedPem));
+		try {
+			activate(custodyKeysFromPem(injectedPem));
+		} catch (error) {
+			// never log the material itself — only the parse failure; latch so this thread cannot
+			// fall through to a mismatched tier
+			disableCustody(
+				`Injected secrets key material is not a usable private key (${(error as Error).message}); secret custody is disabled`
+			);
+		}
 		return;
 	}
 	if (explicit === 'injected') {

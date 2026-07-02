@@ -717,6 +717,9 @@ async function cloneEnvSecretsKeys(): Promise<void> {
 		});
 		if (result?.message) {
 			const kid = kidOfPrivateKeyPem(result.message);
+			// the keys dir usually exists by now (boot creates it), but a fresh clone must not
+			// depend on that
+			mkdirSync(join(rootPath, LICENSE_KEY_DIR_NAME), { recursive: true });
 			writeFileSync(join(rootPath, LICENSE_KEY_DIR_NAME, privateKeyFileNameFor(kid)), result.message, {
 				mode: 0o600,
 			});

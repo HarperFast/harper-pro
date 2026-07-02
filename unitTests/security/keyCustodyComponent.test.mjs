@@ -188,6 +188,28 @@ describe('keyCustody component', () => {
 		assert.throws(() => fileModule.ensureFileKeys(), /refusing to generate/);
 	});
 
+	it('survives malformed injected material on the main thread: custody disabled, not crashed', () => {
+		process.env[injectedModule.SECRETS_KEY_B64_ENV] = Buffer.from('not a private key at all').toString('base64');
+		custodyModule.startOnMainThread(); // must not throw
+		assert.equal(core.getSecretCustody(), undefined);
+		assert.equal(core.getSecretDecryptor(), undefined);
+		assert.equal(process.env[injectedModule.SECRETS_KEY_B64_ENV], undefined); // still scrubbed
+		// and the disabled state latched (start() in the same process stays dormant)
+		custodyModule.start();
+		assert.equal(core.getSecretCustody(), undefined);
+	});
+
+	it('survives malformed fd-injected material on the worker path: custody disabled, not crashed', async () => {
+		const { openSync } = await import('node:fs');
+		const garbagePath = join(baseDir, 'garbage.pem');
+		writeFileSync(garbagePath, 'garbage bytes, not a PEM');
+		const fd = openSync(garbagePath, 'r');
+		process.env[injectedModule.SECRETS_KEY_FD_ENV] = String(fd);
+		custodyModule.start(); // must not throw
+		assert.equal(core.getSecretCustody(), undefined);
+		assert.equal(process.env[injectedModule.SECRETS_KEY_FD_ENV], undefined);
+	});
+
 	it('explicit provider config resolves the ambiguity', () => {
 		const filePem = makePem();
 		const kid = fileModule.kidOfPrivateKeyPem(filePem);
