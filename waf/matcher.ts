@@ -52,6 +52,12 @@ export interface WafDecision {
 	ruleIds: (string | number)[];
 	/** Accumulated score when the decision came from score rules. */
 	score?: number;
+	/**
+	 * On a block decision: ids of log-action rules that ALSO matched this request. Enforcement
+	 * short-circuits, telemetry must not — the middleware records these even though the request
+	 * is rejected. Absent when no log rules matched (no allocation on that path).
+	 */
+	matchedLogRuleIds?: (string | number)[];
 }
 
 interface CompiledRule {
@@ -781,22 +787,32 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		if (matched === null) return null;
 		if (matched.length > 1) matched.sort((a, b) => a.priority - b.priority);
 
+		// Enforcement short-circuits, telemetry must not: once a block decision is made, no further
+		// score accumulation happens, but log-action rules from the WHOLE matched set are still
+		// collected and surfaced on the decision (matchedLogRuleIds) so the middleware records them.
 		let totalScore = 0;
 		let logIds: (string | number)[] | null = null;
+		let blockDecision: WafDecision | null = null;
 		const scoreIds: (string | number)[] = [];
 		for (const rule of matched) {
-			if (rule.action === 'block') {
-				return { action: 'block', status: rule.blockStatus, ruleIds: [rule.id] };
+			if (rule.action === 'log') {
+				(logIds ??= []).push(rule.id);
+				continue;
 			}
-			if (rule.action === 'score') {
+			if (blockDecision !== null) continue; // enforcement decided; only telemetry collection remains
+			if (rule.action === 'block') {
+				blockDecision = { action: 'block', status: rule.blockStatus, ruleIds: [rule.id] };
+			} else {
 				totalScore += rule.score;
 				scoreIds.push(rule.id);
 				if (totalScore >= scoreThreshold) {
-					return { action: 'block', status: DEFAULT_BLOCK_STATUS, ruleIds: scoreIds, score: totalScore };
+					blockDecision = { action: 'block', status: DEFAULT_BLOCK_STATUS, ruleIds: scoreIds, score: totalScore };
 				}
-			} else {
-				(logIds ??= []).push(rule.id);
 			}
+		}
+		if (blockDecision !== null) {
+			if (logIds !== null) blockDecision.matchedLogRuleIds = logIds;
+			return blockDecision;
 		}
 		if (logIds !== null) {
 			return { action: 'log', status: 0, ruleIds: logIds, score: totalScore > 0 ? totalScore : undefined };

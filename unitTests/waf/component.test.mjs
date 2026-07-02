@@ -151,4 +151,30 @@ describe('WAF component middleware', () => {
 		start({ server, ensureTable: () => makeFakeTable([RULE]) });
 		expect(getCurrentMatcher().ruleCount).to.equal(1);
 	});
+
+	it('block + log rules both matching → 403 AND the log rule is recorded on the decision', () => {
+		const server = makeFakeServer();
+		const logRule = {
+			id: 'watch-admin',
+			enabled: true,
+			priority: 0, // matches before the block rule
+			phase: 'request',
+			action: 'log',
+			match: { path: { prefix: '/admin' } },
+		};
+		start({ server, ensureTable: () => makeFakeTable([RULE, logRule]) });
+		// enforcement: the middleware still blocks
+		const response = server.middleware.listener(makeReq({ url: '/admin/x' }), () => 'pass');
+		expect(response.status).to.equal(403);
+		// telemetry: the decision the middleware logs from carries the matched log rule
+		const decision = getCurrentMatcher().evaluate({
+			ip: '203.0.113.7',
+			method: 'GET',
+			path: '/admin/x',
+			query: undefined,
+			getHeader: () => undefined,
+		});
+		expect(decision.ruleIds).to.deep.equal(['block-admin']);
+		expect(decision.matchedLogRuleIds).to.deep.equal(['watch-admin']);
+	});
 });
