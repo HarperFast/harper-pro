@@ -1435,7 +1435,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	const blobsInFlight = new Map();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
-	let blobSentCallback: (v?: any) => void;
+	const blobSentCallbacks: Array<(v?: any) => void> = [];
 	// Refresh the keep-alive liveness clock from observed socket byte movement. If the underlying
 	// _socket isn't observable (test mocks, pre-connect, or a change in the ws library internals),
 	// bytesRead/bytesWritten read as undefined; we can't measure activity, so treat the connection as
@@ -2800,7 +2800,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								});
 							} else if (outstandingBlobsBeingSent > MAX_OUTSTANDING_BLOBS_BEING_SENT) {
 								return new Promise((resolve) => {
-									blobSentCallback = resolve;
+									blobSentCallbacks.push(resolve);
 								});
 							} else return new Promise(setImmediate); // yield on each turn for fairness and letting other things run
 						};
@@ -3729,7 +3729,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		} finally {
 			blobsBeingSent.delete(id);
 			outstandingBlobsBeingSent--;
-			if (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT) blobSentCallback?.();
+			while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
+				blobSentCallbacks.shift()?.();
+			}
 		}
 	}
 	function receiveBlobs(remoteBlob: Blob, id: string | number) {
