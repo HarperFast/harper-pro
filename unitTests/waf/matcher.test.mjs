@@ -194,6 +194,36 @@ describe('WAF matcher — actions, scoring, priority', () => {
 		]);
 		expect(logFirst.evaluate(makeRequest({ path: '/p/a' })).ruleIds).to.deep.equal(['a', 'b']);
 	});
+	it('records ALL matched log rules on a block decision (enforcement short-circuits, telemetry does not)', () => {
+		const matcher = compileRules([
+			{ ...BASE, id: 'log-before', priority: 1, action: 'log', match: { path: { prefix: '/p/' } } },
+			{ ...BASE, id: 'blocker', priority: 5, match: { path: { prefix: '/p/' } } },
+			{ ...BASE, id: 'log-after', priority: 9, action: 'log', match: { path: { prefix: '/p/' } } },
+		]);
+		const decision = matcher.evaluate(makeRequest({ path: '/p/a' }));
+		expect(decision.action).to.equal('block');
+		expect(decision.status).to.equal(403);
+		expect(decision.ruleIds).to.deep.equal(['blocker']);
+		// log rules both before AND after the block (by priority) are surfaced for recording
+		expect(decision.matchedLogRuleIds).to.deep.equal(['log-before', 'log-after']);
+		// no allocation / no field when no log rules matched
+		const blockOnly = compileRules([{ ...BASE, id: 'only', match: { path: { prefix: '/p/' } } }]);
+		expect(blockOnly.evaluate(makeRequest({ path: '/p/a' }))).to.not.have.property('matchedLogRuleIds');
+	});
+	it('records matched log rules on a score-threshold block too', () => {
+		const matcher = compileRules(
+			[
+				{ ...BASE, id: 'watch', priority: 1, action: 'log', match: { path: { prefix: '/p/' } } },
+				{ ...BASE, id: 's1', priority: 2, action: 'score', score: 6, match: { path: { prefix: '/p/' } } },
+				{ ...BASE, id: 's2', priority: 3, action: 'score', score: 6, match: { method: ['GET'] } },
+			],
+			{ scoreThreshold: 10 }
+		);
+		const decision = matcher.evaluate(makeRequest({ path: '/p/a' }));
+		expect(decision.action).to.equal('block');
+		expect(decision.ruleIds).to.deep.equal(['s1', 's2']);
+		expect(decision.matchedLogRuleIds).to.deep.equal(['watch']);
+	});
 	it('skips disabled and requestBody-phase rules', () => {
 		const matcher = compileRules([
 			{ ...BASE, id: 'off', enabled: false, match: { path: { prefix: '/p/' } } },
