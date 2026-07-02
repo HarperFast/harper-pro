@@ -336,6 +336,8 @@ export async function cloneNode(): Promise<void> {
 
 	await cloneJWTKeys();
 
+	await cloneEnvSecretsKeys();
+
 	await cloneSSHKeys();
 
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
@@ -684,6 +686,44 @@ async function cloneJWTKeys(): Promise<void> {
 		writeFileSync(join(keysDir, JWT_ENUM.JWT_PASSPHRASE_NAME), jwtPass.message);
 	} catch (err) {
 		log(`Error cloning JWT keys: ${err}`, 'error');
+	}
+}
+
+/**
+ * Clones the cluster-shared env-secrets private key (file custody tier) from the leader so this
+ * node can decrypt `enc:v1:` secret values. Fetched under the stable active-key alias, then
+ * persisted under its per-kid filename (the kid is derived from the key material itself).
+ * Best-effort: a leader without file-tier custody has no key to serve. NOTE: the leader serves
+ * custody keys only to node-identity (cert-auth) requests, so a credential/token-auth clone
+ * cannot fetch this key — without it, this node generates its own keypair on first boot and
+ * cannot decrypt secrets encrypted for the cluster.
+ */
+async function cloneEnvSecretsKeys(): Promise<void> {
+	try {
+		// dynamic import: keep module-load side effects (rootPath resolution) out of the install path
+		const { ACTIVE_CUSTODY_KEY_NAME, privateKeyFileNameFor, kidOfPrivateKeyPem } =
+			await import('../security/fileKeyCustody.js');
+		const result: Record<string, any> = await leaderRequest({
+			operation: 'get_key',
+			name: ACTIVE_CUSTODY_KEY_NAME,
+		});
+		if (result?.message) {
+			const kid = kidOfPrivateKeyPem(result.message);
+			writeFileSync(join(rootPath, LICENSE_KEY_DIR_NAME, privateKeyFileNameFor(kid)), result.message, {
+				mode: 0o600,
+			});
+			log('Cloned env-secrets key');
+		}
+	} catch (err) {
+		if (/Key not found/i.test(String(err))) {
+			log('Leader has no env-secrets key to clone');
+		} else {
+			log(
+				`Error cloning env-secrets key: ${err} (custody keys are served to node-identity requests only; ` +
+					'credential/token-auth clones cannot fetch them — use certificate auth or provision the key)',
+				'error'
+			);
+		}
 	}
 }
 
