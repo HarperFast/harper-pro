@@ -26,7 +26,12 @@ import { type WafRule, type WafNamedValueMatch, validateRule, compileRuleRegex }
 export interface WafRequestInfo {
 	ip: string | undefined;
 	method: string;
-	/** Pathname only (no query string). */
+	/**
+	 * Pathname only (no query string). CALLER CONTRACT (M6): matched AS PROVIDED — raw and
+	 * case-sensitive; the matcher does NOT percent-decode or normalize it. A caller wanting
+	 * to defeat encoding-based evasion (e.g. %2e%2e, mixed case) must normalize before calling.
+	 * Deciding whether to match decoded vs raw is a WAF-normalization design choice deferred here.
+	 */
 	path: string;
 	/** Raw query string without the leading '?', or undefined. */
 	query?: string;
@@ -172,10 +177,31 @@ export function parseIpv6(ip: string): bigint | null {
 
 const IPV6_ALL_ONES = (1n << 128n) - 1n;
 
-/** Strips an IPv4-mapped IPv6 form ("::ffff:1.2.3.4") down to the IPv4 literal. */
+/**
+ * Strips an IPv4-mapped IPv6 form ("::ffff:1.2.3.4") down to the IPv4 literal.
+ * Null-safe (M4): a non-string ip yields '' (parses as neither v4 nor v6 → no match).
+ * TODO(M5, when XFF trust lands): only the canonical lowercase "::ffff:" form is stripped;
+ * handle the full ::ffff:0:0/96 range (uppercase hex, "::ffff:0102:0304") once untrusted,
+ * non-canonical client-supplied addresses can reach here.
+ */
 function normalizeIp(ip: string): string {
+	if (typeof ip !== 'string') return '';
 	if (ip.startsWith('::ffff:') && ip.indexOf('.') !== -1) return ip.slice(7);
 	return ip;
+}
+
+/** True when a regex source contains a backreference (\1..\9); such rules can't join the gate (M3). */
+function hasBackreference(source: string): boolean {
+	// \\ escapes a literal backslash; \1..\9 outside a char-class is a backreference. A conservative
+	// scan (treats any \digit not preceded by an escaped backslash as a backreference) is fine here —
+	// over-detection only costs the gate optimization, never correctness.
+	for (let i = 0; i < source.length; i++) {
+		if (source[i] !== '\\') continue;
+		const next = source[i + 1];
+		if (next >= '1' && next <= '9') return true;
+		i++; // skip the escaped character
+	}
+	return false;
 }
 
 function lowerBound(haystack: Float64Array, length: number, needle: number): number {
@@ -222,13 +248,21 @@ type ParsedCidr =
 	| { kind: 'v4'; start: number; end: number }
 	| { kind: 'v6'; value: bigint; mask: bigint; bits: number };
 
-function parseCidr(cidr: string): ParsedCidr | null {
+/** Matches a plain base-10 non-negative integer with no sign, whitespace, or radix prefix. */
+const CANONICAL_BITS = /^[0-9]+$/;
+
+export function parseCidr(cidr: string): ParsedCidr | null {
+	if (typeof cidr !== 'string') return null;
 	let address = cidr;
 	let bits = -1;
 	const slash = cidr.indexOf('/');
 	if (slash !== -1) {
 		address = cidr.slice(0, slash);
-		bits = Number(cidr.slice(slash + 1));
+		const bitsStr = cidr.slice(slash + 1);
+		// Reject '' ('10.0.0.0/' → NaN→0 → /0 "block everything"), whitespace, and the
+		// Number()-coercion leniency ('/0x10', '/1e1'). Require a plain base-10 integer (M2).
+		if (!CANONICAL_BITS.test(bitsStr)) return null;
+		bits = Number(bitsStr);
 		if (!Number.isInteger(bits) || bits < 0) return null;
 	}
 	const v4 = parseIpv4(address);
@@ -278,9 +312,16 @@ function makeHeaderResidual(headers: WafNamedValueMatch[], errors: string[]): Re
 			regex = compileRuleRegex(entry.value!, `match.headers[${entry.name}]`, errors);
 			if (!regex) return undefined;
 		}
-		checks.push({ name: entry.name, check: { op: entry.op, value: entry.value ?? '', regex, ruleIndex: -1 } });
+		// M7: lowercase to match the anchor path (which lowercases). WafRequestInfo.getHeader is
+		// contractually case-insensitive, but lowercasing here keeps multi-header rules correct even
+		// against a case-sensitive getHeader.
+		checks.push({
+			name: entry.name.toLowerCase(),
+			check: { op: entry.op, value: entry.value ?? '', regex, ruleIndex: -1 },
+		});
 	}
 	return (request) => {
+		if (typeof request.getHeader !== 'function') return false; // M4: malformed request → no match
 		for (const { name, check } of checks) {
 			if (!checkHeaderValue(request.getHeader(name), check)) return false;
 		}
@@ -391,13 +432,28 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		const residuals: ResidualCheck[] = [];
 		const ruleIndex = compiled.length;
 
+		// Stage-then-commit (M1): all index insertions are collected into locals here and merged
+		// into the shared structures ONLY after the validity gate below passes. This preserves the
+		// invariant that a rejected rule's ruleIndex (== compiled.length, unchanged since we don't
+		// push to `compiled`) is never aliased by stale entries when the NEXT valid rule reuses it.
+		const staged = {
+			v4: [] as { start: number; end: number }[],
+			v6Exact: [] as bigint[],
+			v6Prefix: [] as { value: bigint; mask: bigint }[],
+			pathExact: undefined as string | undefined,
+			pathPrefix: undefined as string | undefined,
+			pathRegex: undefined as RegExp | undefined,
+			header: undefined as { name: string; check: Omit<HeaderCheck, 'ruleIndex'> } | undefined,
+			query: undefined as { name: string; check: Omit<HeaderCheck, 'ruleIndex'> } | undefined,
+			methods: undefined as string[] | undefined,
+		};
+
 		// Anchor preference: ip > path.exact > path.prefix > path.regex > header > query > method.
 		// The anchor's own condition is baked into its index; everything else goes to residuals.
 		let anchored = false;
 
 		if (match.ip != null) {
 			let allParsed = true;
-			const parsedList: ParsedCidr[] = [];
 			for (const cidr of Array.isArray(match.ip) ? match.ip : [match.ip]) {
 				const parsed = parseCidr(cidr);
 				if (!parsed) {
@@ -405,26 +461,15 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 					errors.push(`match.ip: unparseable address or CIDR ${JSON.stringify(cidr)}`);
 					break;
 				}
-				parsedList.push(parsed);
+				if (parsed.kind === 'v4') staged.v4.push({ start: parsed.start, end: parsed.end });
+				else if (parsed.bits === 128) staged.v6Exact.push(parsed.value);
+				else staged.v6Prefix.push({ value: parsed.value, mask: parsed.mask });
 			}
-			if (allParsed) {
-				for (const parsed of parsedList) {
-					if (parsed.kind === 'v4') v4Intervals.push({ start: parsed.start, end: parsed.end, ruleIndex });
-					else if (parsed.bits === 128) {
-						const key = parsed.value.toString();
-						let list = v6Exact.get(key);
-						if (!list) v6Exact.set(key, (list = []));
-						list.push(ruleIndex);
-					} else v6Prefixes.push({ value: parsed.value, mask: parsed.mask, ruleIndex });
-				}
-				anchored = true;
-			}
+			if (allParsed) anchored = true;
 		}
 		if (!anchored && match.path != null) {
 			if (match.path.exact != null) {
-				let list = pathExact.get(match.path.exact);
-				if (!list) pathExact.set(match.path.exact, (list = []));
-				list.push(ruleIndex);
+				staged.pathExact = match.path.exact;
 				const residualPath = { ...match.path, exact: undefined };
 				if (residualPath.prefix != null || residualPath.regex != null) {
 					const residual = makePathResidual(residualPath, errors);
@@ -432,7 +477,7 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 				}
 				anchored = true;
 			} else if (match.path.prefix != null) {
-				prefixEntries.push({ prefix: match.path.prefix, ruleIndex });
+				staged.pathPrefix = match.path.prefix;
 				if (match.path.regex != null) {
 					const residual = makePathResidual({ regex: match.path.regex }, errors);
 					if (residual) residuals.push(residual);
@@ -441,7 +486,7 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 			} else if (match.path.regex != null) {
 				const regex = compileRuleRegex(match.path.regex, 'match.path.regex', errors);
 				if (regex) {
-					pathRegexes.push({ regex, ruleIndex });
+					staged.pathRegex = regex;
 					anchored = true;
 				}
 			}
@@ -456,10 +501,7 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 			let regex: RegExp | undefined;
 			if (first.op === 'regex') regex = compileRuleRegex(first.value!, `match.headers[${first.name}]`, errors);
 			if (first.op !== 'regex' || regex) {
-				const lowerName = first.name.toLowerCase();
-				let list = headerAnchors.get(lowerName);
-				if (!list) headerAnchors.set(lowerName, (list = []));
-				list.push({ op: first.op, value: first.value ?? '', regex, ruleIndex });
+				staged.header = { name: first.name.toLowerCase(), check: { op: first.op, value: first.value ?? '', regex } };
 				if (rest.length > 0) {
 					const residual = makeHeaderResidual(rest, errors);
 					if (residual) residuals.push(residual);
@@ -478,7 +520,7 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 			let regex: RegExp | undefined;
 			if (first.op === 'regex') regex = compileRuleRegex(first.value!, `match.query[${first.name}]`, errors);
 			if (first.op !== 'regex' || regex) {
-				queryChecks.push({ name: first.name, check: { op: first.op, value: first.value ?? '', regex, ruleIndex } });
+				staged.query = { name: first.name, check: { op: first.op, value: first.value ?? '', regex } };
 				if (rest.length > 0) {
 					const residual = makeQueryResidual(rest, errors);
 					if (residual) residuals.push(residual);
@@ -491,12 +533,7 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		}
 
 		if (!anchored && match.method != null && match.method.length > 0) {
-			for (const method of match.method) {
-				const upper = method.toUpperCase();
-				let list = methodAnchors.get(upper);
-				if (!list) methodAnchors.set(upper, (list = []));
-				list.push(ruleIndex);
-			}
+			staged.methods = match.method.map((m) => m.toUpperCase());
 			anchored = true;
 		} else if (anchored && match.method != null && match.method.length > 0) {
 			residuals.push(makeMethodResidual(match.method));
@@ -506,7 +543,38 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 			const allProblems = errors.length > 0 ? errors : ['no indexable condition'];
 			invalidRules.set(String(rule.id), allProblems);
 			options.onInvalidRule?.(String(rule.id), allProblems);
-			continue;
+			continue; // ruleIndex is NOT consumed — no staged entry was committed
+		}
+
+		// ---- commit: the rule is valid, merge staged index entries under ruleIndex ----
+		for (const range of staged.v4) v4Intervals.push({ start: range.start, end: range.end, ruleIndex });
+		for (const value of staged.v6Exact) {
+			const key = value.toString();
+			let list = v6Exact.get(key);
+			if (!list) v6Exact.set(key, (list = []));
+			list.push(ruleIndex);
+		}
+		for (const prefix of staged.v6Prefix) v6Prefixes.push({ value: prefix.value, mask: prefix.mask, ruleIndex });
+		if (staged.pathExact !== undefined) {
+			let list = pathExact.get(staged.pathExact);
+			if (!list) pathExact.set(staged.pathExact, (list = []));
+			list.push(ruleIndex);
+		}
+		if (staged.pathPrefix !== undefined) prefixEntries.push({ prefix: staged.pathPrefix, ruleIndex });
+		if (staged.pathRegex !== undefined) pathRegexes.push({ regex: staged.pathRegex, ruleIndex });
+		if (staged.header !== undefined) {
+			let list = headerAnchors.get(staged.header.name);
+			if (!list) headerAnchors.set(staged.header.name, (list = []));
+			list.push({ ...staged.header.check, ruleIndex });
+		}
+		if (staged.query !== undefined)
+			queryChecks.push({ name: staged.query.name, check: { ...staged.query.check, ruleIndex } });
+		if (staged.methods !== undefined) {
+			for (const method of staged.methods) {
+				let list = methodAnchors.get(method);
+				if (!list) methodAnchors.set(method, (list = []));
+				list.push(ruleIndex);
+			}
 		}
 
 		compiled.push({
@@ -552,19 +620,30 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		(node.ruleIndexes ??= []).push(ruleIndex);
 	}
 
-	// Combined-alternation pre-gate: one regex test decides whether ANY path-regex rule can match,
-	// so the 99% (non-matching) path costs a single test instead of a scan per regex rule.
-	// TODO(production): with RE2/Hyperscan this becomes a proper multi-pattern set scan.
+	// Combined-alternation pre-gate: one regex test decides whether ANY gate-eligible path-regex
+	// rule can match, so the 99% (non-matching) path costs a single test instead of a scan per
+	// regex rule. TODO(production): with RE2/Hyperscan this becomes a proper multi-pattern set scan.
+	//
+	// Backreference safety (M3): alternation renumbers capture groups, so a pattern containing a
+	// backreference (\1, \2, ...) would bind to the wrong group inside the combined source and the
+	// authoritative gate could produce a FALSE NEGATIVE that disarms a sibling block rule. Such
+	// rules are EXCLUDED from the gate and always evaluated on every request via the per-rule scan.
+	const gateableRegexes: { regex: RegExp; ruleIndex: number }[] = [];
+	const ungatedRegexes: { regex: RegExp; ruleIndex: number }[] = [];
+	for (const entry of pathRegexes) {
+		(hasBackreference(entry.regex.source) ? ungatedRegexes : gateableRegexes).push(entry);
+	}
 	let pathRegexGate: RegExp | null = null;
-	if (pathRegexes.length > 1) {
+	if (gateableRegexes.length > 1) {
 		try {
-			pathRegexGate = new RegExp(pathRegexes.map(({ regex }) => `(?:${regex.source})`).join('|'));
+			pathRegexGate = new RegExp(gateableRegexes.map(({ regex }) => `(?:${regex.source})`).join('|'));
 		} catch {
 			pathRegexGate = null; // e.g. combined source too large — fall back to the linear scan
 		}
 	}
 
 	const hasV6Rules = v6Exact.size > 0 || v6Prefixes.length > 0;
+	const hasPathRules = pathExact.size > 0 || prefixTrieRoot !== null || pathRegexes.length > 0;
 	// With many distinct rule-referenced header names, probing each of them per request is the
 	// dominant cost; walking the request's own (~12) header names instead flips it to O(request).
 	const invertHeaderIteration = headerAnchors.size > 16;
@@ -586,8 +665,10 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		let candidateCount = 0;
 
 		// --- ip anchor ---
+		// M4: treat null / non-string ip the same as absent so evaluate() can never throw on
+		// malformed requestInfo (it runs pre-auth; a throw would 500 all traffic).
 		const rawIp = request.ip;
-		if (rawIp !== undefined && (v4Count > 0 || hasV6Rules)) {
+		if (typeof rawIp === 'string' && (v4Count > 0 || hasV6Rules)) {
 			const ip = normalizeIp(rawIp);
 			const v4value = parseIpv4(ip);
 			if (v4value !== -1) {
@@ -611,29 +692,38 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		}
 
 		// --- path anchors ---
+		// M4: a missing / non-string path skips all path indexes rather than throwing.
 		const path = request.path;
-		if (pathExact.size > 0) {
-			const exactList = pathExact.get(path);
-			if (exactList) for (const ruleIndex of exactList) candidateBuffer[candidateCount++] = ruleIndex;
-		}
-		if (prefixTrieRoot !== null) {
-			let node: PathTrieNode | null = prefixTrieRoot;
-			for (let i = 0; node !== null && i <= path.length; i++) {
-				if (node.ruleIndexes !== null) {
-					for (const ruleIndex of node.ruleIndexes) candidateBuffer[candidateCount++] = ruleIndex;
-				}
-				if (i === path.length || node.children === null) break;
-				node = node.children.get(path.charCodeAt(i)) ?? null;
+		if (typeof path === 'string' && hasPathRules) {
+			if (pathExact.size > 0) {
+				const exactList = pathExact.get(path);
+				if (exactList) for (const ruleIndex of exactList) candidateBuffer[candidateCount++] = ruleIndex;
 			}
-		}
-		if (pathRegexes.length > 0 && (pathRegexGate === null || pathRegexGate.test(path))) {
-			for (let i = 0; i < pathRegexes.length; i++) {
-				if (pathRegexes[i].regex.test(path)) candidateBuffer[candidateCount++] = pathRegexes[i].ruleIndex;
+			if (prefixTrieRoot !== null) {
+				let node: PathTrieNode | null = prefixTrieRoot;
+				for (let i = 0; node !== null && i <= path.length; i++) {
+					if (node.ruleIndexes !== null) {
+						for (const ruleIndex of node.ruleIndexes) candidateBuffer[candidateCount++] = ruleIndex;
+					}
+					if (i === path.length || node.children === null) break;
+					node = node.children.get(path.charCodeAt(i)) ?? null;
+				}
+			}
+			// gate-eligible regexes run only when the combined pre-gate hits (or has none);
+			// ungated (backreference) regexes always scan — see the M3 note at gate construction.
+			if (gateableRegexes.length > 0 && (pathRegexGate === null || pathRegexGate.test(path))) {
+				for (let i = 0; i < gateableRegexes.length; i++) {
+					if (gateableRegexes[i].regex.test(path)) candidateBuffer[candidateCount++] = gateableRegexes[i].ruleIndex;
+				}
+			}
+			for (let i = 0; i < ungatedRegexes.length; i++) {
+				if (ungatedRegexes[i].regex.test(path)) candidateBuffer[candidateCount++] = ungatedRegexes[i].ruleIndex;
 			}
 		}
 
 		// --- header anchors ---
-		if (headerAnchors.size > 0) {
+		// M4 defense-in-depth: a malformed request without a getHeader function must not throw.
+		if (headerAnchors.size > 0 && typeof request.getHeader === 'function') {
 			const requestNames = invertHeaderIteration ? request.headerNames?.() : undefined;
 			if (requestNames !== undefined) {
 				// large anchor map: walk the request's own header names, probe the map per name
