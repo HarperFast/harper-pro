@@ -2,7 +2,7 @@
  * WAF (Web Application Firewall) component — prototype.
  *
  * Registers an HTTP middleware as early as possible in the chain (`before: 'authentication'`)
- * that evaluates request-phase rules from the `data.waf_rule` table against a compiled,
+ * that evaluates request-phase rules from the `system.hdb_waf_rules` table against a compiled,
  * immutable matcher (see matcher.ts). Rule changes are picked up via a real-time table
  * subscription; recompiles are debounced and the matcher reference is swapped atomically.
  *
@@ -23,16 +23,19 @@
  * - phase 'requestBody' rules are not evaluated (future work: needs body access after the
  *   body-parsing point in the chain, without forcing body reads for non-matching requests).
  * - client ip is the socket address (request.ip); X-Forwarded-For trust is future work.
- * - rules live in the default data database so standard CRUD operations/REST manage them and
- *   they replicate cluster-wide; production likely wants a system table plus dedicated
- *   super_user-only operations instead.
+ * - rules live in `system.hdb_waf_rules` (same pattern as replication's hdb_nodes): the system
+ *   schema is excluded from non-super_user permission translation, so only super_user can
+ *   manage rules via the operations API, and system tables replicate cluster-wide by default
+ *   (not in NON_REPLICATING_SYSTEM_TABLES).
  */
 
 import { loggerWithTag } from '../core/utility/logging/harper_logger.js';
 import { compileRules, type WafMatcher, type WafRequestInfo } from './matcher.ts';
+import { makeWafRuleOperations } from './ruleOperations.ts';
 import type { WafRule } from './rules.ts';
 
-export const WAF_RULE_TABLE = 'waf_rule';
+export const WAF_RULE_TABLE = 'hdb_waf_rules';
+export const WAF_RULE_DATABASE = 'system';
 
 const logger = loggerWithTag('waf');
 
@@ -47,7 +50,7 @@ interface WafComponentOptions {
 
 const TABLE_DEFINITION = {
 	table: WAF_RULE_TABLE,
-	database: 'data',
+	database: WAF_RULE_DATABASE,
 	attributes: [
 		{ name: 'id', isPrimaryKey: true },
 		{ name: 'enabled' },
@@ -81,10 +84,20 @@ const requestInfo: WafRequestInfo & {
 	},
 };
 
-/** Main-thread init: define the rule table so the operations API can validate writes to it. */
+/**
+ * Main-thread init: define the rule table and register the dedicated management operations
+ * (the operations API only runs on the main thread in v5.1+). Generic CRUD operations cannot
+ * touch system tables, so add/alter/drop/list_waf_rule(s) are the management surface — see
+ * ruleOperations.ts for the authorization model.
+ */
 export function startOnMainThread(options: WafComponentOptions) {
 	if (options.enabled === false) return;
-	options.ensureTable(TABLE_DEFINITION);
+	const WafRuleTable = options.ensureTable(TABLE_DEFINITION);
+	const operations = makeWafRuleOperations(WafRuleTable);
+	options.server.registerOperation?.({ name: 'add_waf_rule', execute: operations.addWafRule, httpMethod: 'POST' });
+	options.server.registerOperation?.({ name: 'alter_waf_rule', execute: operations.alterWafRule, httpMethod: 'POST' });
+	options.server.registerOperation?.({ name: 'drop_waf_rule', execute: operations.dropWafRule, httpMethod: 'POST' });
+	options.server.registerOperation?.({ name: 'list_waf_rules', execute: operations.listWafRules, httpMethod: 'GET' });
 }
 
 /** Worker init: compile rules, subscribe for changes, and register the request middleware. */

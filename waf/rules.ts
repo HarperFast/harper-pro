@@ -1,7 +1,7 @@
 /**
  * WAF rule document shape and validation.
  *
- * Rules are operator-supplied documents stored in the `data.waf_rule` table. Validation
+ * Rules are operator-supplied documents stored in the `system.hdb_waf_rules` table. Validation
  * runs at compile time (see matcher.ts) so a bad rule is skipped with a log rather than taking
  * down the request path.
  */
