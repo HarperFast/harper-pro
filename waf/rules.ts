@@ -6,6 +6,11 @@
  * down the request path.
  */
 
+// parseCidr lives in matcher.ts (co-located with the parsers it shares); the import creates a
+// benign runtime cycle — both symbols are function declarations only called at runtime, never at
+// module init. Cyclic deps are acceptable per Harper conventions.
+import { parseCidr } from './matcher.ts';
+
 export type WafStringOp = 'equals' | 'contains' | 'prefix' | 'regex' | 'exists';
 
 export interface WafNamedValueMatch {
@@ -80,11 +85,11 @@ function validateNamedValueMatches(list: WafNamedValueMatch[], where: string, er
 			errors.push(`${where}[${entry.name}]: unknown op ${JSON.stringify(entry.op)}`);
 			continue;
 		}
-		if (entry.op !== 'exists' && typeof entry.value !== 'string') {
-			errors.push(`${where}[${entry.name}]: op ${entry.op} requires a string value`);
-		}
-		if (entry.op === 'regex' && typeof entry.value === 'string') {
-			compileRuleRegex(entry.value, `${where}[${entry.name}]`, errors);
+		if (entry.op !== 'exists') {
+			// M9: a non-exists op needs a non-empty value; '' would match every request.
+			if (typeof entry.value !== 'string' || entry.value.length === 0)
+				errors.push(`${where}[${entry.name}]: op ${entry.op} requires a non-empty string value`);
+			else if (entry.op === 'regex') compileRuleRegex(entry.value, `${where}[${entry.name}]`, errors);
 		}
 	}
 }
@@ -97,6 +102,9 @@ export function validateRule(rule: WafRule): string[] {
 	const errors: string[] = [];
 	if (!rule || typeof rule !== 'object') return ['rule is not an object'];
 	if (rule.id == null) errors.push('missing id');
+	// M8: type-check enabled / priority so the "usable" verdict matches the compiler's expectations.
+	if (rule.enabled != null && typeof rule.enabled !== 'boolean') errors.push('enabled must be a boolean');
+	if (rule.priority != null && typeof rule.priority !== 'number') errors.push('priority must be a number');
 	if (!VALID_PHASES.has(rule.phase)) errors.push(`unknown phase ${JSON.stringify(rule.phase)}`);
 	if (!VALID_ACTIONS.has(rule.action)) errors.push(`unknown action ${JSON.stringify(rule.action)}`);
 	if (rule.action === 'score' && typeof rule.score !== 'number') errors.push('action "score" requires a numeric score');
@@ -115,18 +123,29 @@ export function validateRule(rule: WafRule): string[] {
 	if (!hasCondition) errors.push('match must specify at least one condition');
 	if (match.ip != null) {
 		for (const cidr of Array.isArray(match.ip) ? match.ip : [match.ip]) {
-			if (typeof cidr !== 'string' || cidr.length === 0) errors.push(`match.ip: invalid entry ${JSON.stringify(cidr)}`);
+			// M2/M8: validate by actually parsing so validateRule and the compiler agree (rejects
+			// '10.0.0.0/', '/0x10', bad addresses instead of silently compiling to /0 "block all").
+			if (typeof cidr !== 'string' || cidr.length === 0 || parseCidr(cidr) === null)
+				errors.push(`match.ip: invalid address or CIDR ${JSON.stringify(cidr)}`);
 		}
 	}
 	if (match.method != null) {
-		if (!Array.isArray(match.method) || match.method.some((m) => typeof m !== 'string'))
-			errors.push('match.method must be an array of strings');
+		if (!Array.isArray(match.method) || match.method.length === 0 || match.method.some((m) => typeof m !== 'string'))
+			errors.push('match.method must be a non-empty array of strings');
 	}
 	if (match.path != null) {
 		const { prefix, exact, regex } = match.path;
 		if (prefix == null && exact == null && regex == null)
 			errors.push('match.path must specify prefix, exact, or regex');
-		if (regex != null) compileRuleRegex(regex, 'match.path.regex', errors);
+		// M9: reject empty match strings — they would match every request.
+		if (prefix != null && (typeof prefix !== 'string' || prefix.length === 0))
+			errors.push('match.path.prefix must be a non-empty string');
+		if (exact != null && (typeof exact !== 'string' || exact.length === 0))
+			errors.push('match.path.exact must be a non-empty string');
+		if (regex != null) {
+			if (typeof regex !== 'string' || regex.length === 0) errors.push('match.path.regex must be a non-empty string');
+			else compileRuleRegex(regex, 'match.path.regex', errors);
+		}
 	}
 	if (match.headers != null) validateNamedValueMatches(match.headers, 'match.headers', errors);
 	if (match.query != null) validateNamedValueMatches(match.query, 'match.query', errors);
