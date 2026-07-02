@@ -112,10 +112,20 @@ export function loadFileKeys(): CustodyKeys | undefined {
 	return { keys, activeKid };
 }
 
-/** Ensure the shared keypair exists (generating + persisting on first boot), then return it. */
+/**
+ * Ensure the shared keypair exists (generating + persisting on first boot), then return it.
+ * Generation only happens when NO custody key files exist at all: files that exist but cannot be
+ * read (permissions, disk fault) abort instead — silently generating a replacement would split
+ * the cluster key and permanently orphan every existing `enc:v1:` value.
+ */
 export function ensureFileKeys(): CustodyKeys {
 	const existing = loadFileKeys();
 	if (existing) return existing;
+	if (hasFileKeys()) {
+		throw new Error(
+			'env-secrets key files exist under keys/ but none could be read; refusing to generate a replacement keypair — fix permissions or remove the unreadable files'
+		);
+	}
 	logger.notify?.('Generating cluster env-secrets keypair');
 	const { privateKey, publicKey } = generateKeyPairSync('rsa', {
 		modulusLength: 4096,

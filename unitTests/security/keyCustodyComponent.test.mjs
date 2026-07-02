@@ -154,6 +154,38 @@ describe('keyCustody component', () => {
 			() => manageThreads.registerWorkerDataProvider(custodyModule.CUSTODY_WORKER_DATA_KEY, () => undefined),
 			/already in use/
 		);
+		// the refusal latches in-process: single-thread mode runs start() in the same process,
+		// which must NOT fall through to the on-disk key the selection just refused
+		custodyModule.start();
+		assert.equal(core.getSecretCustody(), undefined);
+	});
+
+	it('clone bootstrap: never self-generates while gated; registers the cloned key on activation', async () => {
+		const custodyState = await import('#src/security/custodyState');
+		custodyState.setCloneBootstrapInProgress(true);
+
+		custodyModule.startOnMainThread();
+		assert.equal(core.getSecretCustody(), undefined); // dormant, not a clone-local key
+		assert.equal(fileModule.hasFileKeys(), false); // and nothing was generated onto disk
+
+		// the leader's key arrives (as cloneEnvSecretsKeys persists it), the gate lifts, and
+		// cloneNode registers custody from disk
+		const pem = makePem();
+		const kid = fileModule.kidOfPrivateKeyPem(pem);
+		mkdirSync(join(baseDir, 'keys'), { recursive: true });
+		writeFileSync(join(baseDir, 'keys', fileModule.privateKeyFileNameFor(kid)), pem, { mode: 0o600 });
+		custodyState.setCloneBootstrapInProgress(false);
+		assert.equal(custodyModule.activateFileCustodyFromDisk(), true);
+		assert.equal(core.getSecretCustody().getPublicKey().fingerprint, kid);
+		const { getPrivateKeys } = await import('#src/core/security/keys');
+		assert.equal(getPrivateKeys().get(fileModule.ACTIVE_CUSTODY_KEY_NAME), pem);
+	});
+
+	it('aborts instead of regenerating when key files exist but cannot be read', () => {
+		mkdirSync(join(baseDir, 'keys'), { recursive: true });
+		// unreadable by mode (non-root) and invalid as a PEM (root CI) — both count as unreadable
+		writeFileSync(join(baseDir, 'keys', 'envSecrets.deadbeef.private.pem'), 'not a key', { mode: 0o000 });
+		assert.throws(() => fileModule.ensureFileKeys(), /refusing to generate/);
 	});
 
 	it('explicit provider config resolves the ambiguity', () => {

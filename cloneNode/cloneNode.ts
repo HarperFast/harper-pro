@@ -244,6 +244,14 @@ export async function cloneNode(): Promise<void> {
 		await installHarper();
 	}
 
+	// Custody clone gate (#166): mark the clone bootstrap BEFORE Harper starts so the
+	// secretCustody component does not self-generate a cluster env-secrets keypair — the leader's
+	// key is cloned right after replication is established (cloneEnvSecretsKeys), and a
+	// self-generated key would diverge from the cluster and could encrypt new secrets before the
+	// real key arrives. Custody stays dormant until the cloned key is registered.
+	const { setCloneBootstrapInProgress } = await import('../security/custodyState.js');
+	setCloneBootstrapInProgress(true);
+
 	// Start Harper to prepare for clone operations
 	const { main } = await import('../core/bin/run.js');
 	await main();
@@ -713,7 +721,20 @@ async function cloneEnvSecretsKeys(): Promise<void> {
 				mode: 0o600,
 			});
 			log('Cloned env-secrets key');
+			// Component startup ran custody-dormant under the clone gate; lift it and register the
+			// cloned key now (core's deferred replay then heals any queued .env values on this
+			// thread). Worker threads that started before this point stay dormant until the next
+			// restart — they load the key from disk on boot.
+			const { setCloneBootstrapInProgress } = await import('../security/custodyState.js');
+			setCloneBootstrapInProgress(false);
+			const { activateFileCustodyFromDisk } = await import('../security/keyCustody.js');
+			if (activateFileCustodyFromDisk()) {
+				log('Registered env-secrets custody with the cloned key');
+			}
 		}
+		// no leader key (or fetch refused): the gate stays latched, so this bootstrap session
+		// cannot generate a divergent keypair; a normal (post-clone) boot generates if the cluster
+		// truly has no key
 	} catch (err) {
 		if (/Key not found/i.test(String(err))) {
 			log('Leader has no env-secrets key to clone');

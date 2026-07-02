@@ -40,6 +40,7 @@ import {
 	type CustodyKeys,
 } from './fileKeyCustody.ts';
 import { ingestInjectedMaterial, SECRETS_KEY_FD_ENV, SECRETS_KEY_B64_ENV } from './injectedKeyCustody.ts';
+import { isCloneBootstrapInProgress, setCloneBootstrapInProgress } from './custodyState.ts';
 
 export type { CustodyKeys };
 
@@ -47,8 +48,11 @@ export type { CustodyKeys };
 export const CUSTODY_WORKER_DATA_KEY = 'secretCustody';
 
 // Single-thread mode (threadCount === 0) runs both startOnMainThread and start in one process;
-// this keeps the second call from re-selecting.
+// `activated` keeps the second call from re-selecting, and `disabled` latches a refusal
+// (ambiguous/invalid selection) so the in-process start() cannot fall through to the on-disk key
+// that the selection just refused.
 let activated = false;
+let disabled = false;
 let unregisterWorkerDataProvider: (() => void) | undefined;
 
 function setWorkerDataProvider(provider: (options: { name?: string }) => unknown): void {
@@ -59,6 +63,8 @@ function setWorkerDataProvider(provider: (options: { name?: string }) => unknown
 /** Reset module state (selection + workerData provider). Intended for tests. */
 export function resetKeyCustodyForTests(): void {
 	activated = false;
+	disabled = false;
+	setCloneBootstrapInProgress(false);
 	unregisterWorkerDataProvider?.();
 	unregisterWorkerDataProvider = undefined;
 }
@@ -70,9 +76,10 @@ export function custodyKeysFromPem(privateKeyPem: string): CustodyKeys {
 }
 
 /**
- * Build core's SecretCustody from a kid map: decrypt resolves the key by the envelope's own kid
- * (falling back to the active key for kid-less envelopes — an unknown kid then surfaces the
- * standard mismatch error from decryptEnvelope); getPublicKey exposes the single ACTIVE key.
+ * Build core's SecretCustody from a kid map: decrypt resolves the key by the envelope's own kid;
+ * the active-key fallback applies ONLY to kid-less envelopes — an unknown kid fails fast with a
+ * clear error rather than attempting RSA with the wrong key (which would surface as an opaque
+ * OpenSSL padding error). getPublicKey exposes the single ACTIVE key.
  */
 export function buildCustody({ keys, activeKid }: CustodyKeys): SecretCustody {
 	const publicKey = publicPemOf(keys.get(activeKid)!);
@@ -81,7 +88,10 @@ export function buildCustody({ keys, activeKid }: CustodyKeys): SecretCustody {
 			// core's SecretDecryptor contract passes the full `enc:v1:` value; the marker is stripped here
 			const body = value.startsWith(ENV_ENCRYPTED_PREFIX) ? value.slice(ENV_ENCRYPTED_PREFIX.length) : value;
 			const envelopeKid = parseEnvelopeFields(body).kid;
-			const kid = envelopeKid && keys.has(envelopeKid) ? envelopeKid : activeKid;
+			if (envelopeKid && !keys.has(envelopeKid)) {
+				throw new Error(`no secrets key for kid ${envelopeKid}`);
+			}
+			const kid = envelopeKid || activeKid;
 			return decryptEnvelope(body, keys.get(kid)!, kid);
 		},
 		getPublicKey() {
@@ -114,10 +124,12 @@ function activate(custodyKeys: CustodyKeys): void {
 	activated = true;
 }
 
-// Custody stays off, and workers are told so via the marker — otherwise a worker would silently
-// fall back to the on-disk key and diverge from the main thread's refusal.
+// Custody stays off — latched in-process (single-thread mode runs start() in the same process,
+// which must not fall through to the on-disk key the selection refused) and signalled to worker
+// threads via the marker for the same reason.
 function disableCustody(reason: string): void {
 	logger.error?.(reason);
+	disabled = true;
 	setWorkerDataProvider(() => ({ mode: 'disabled' }));
 }
 
@@ -153,6 +165,14 @@ export function startOnMainThread(options?: { provider?: string }): void {
 			if (injectedPem !== undefined) {
 				logger.warn?.('Ignoring injected secrets-key material because the secretCustody provider is set to file');
 			}
+			// Clone gate (#166): during the clone bootstrap the file tier must not GENERATE a
+			// keypair — the leader's key is cloned right after replication is up (cloneNode calls
+			// activateFileCustodyFromDisk then). Loading an existing on-disk key stays allowed
+			// (re-clone over an existing install).
+			if (isCloneBootstrapInProgress() && !hasFileKeys()) {
+				logger.notify?.('Node clone in progress: env-secrets custody stays dormant until the leader key is cloned');
+				return;
+			}
 			const custodyKeys = ensureFileKeys();
 			registerCustodyKeysInKeyStore(custodyKeys);
 			activate(custodyKeys);
@@ -161,8 +181,26 @@ export function startOnMainThread(options?: { provider?: string }): void {
 	}
 }
 
+/**
+ * Load the file-tier key(s) from disk and register custody — called by cloneNode after the
+ * leader's key has been cloned, when component startup ran custody-dormant under the clone gate.
+ * No-op (returns false) if custody is already active in this process: an already-active tier is
+ * never silently replaced; a newly cloned key file becomes part of the map on the next boot.
+ */
+export function activateFileCustodyFromDisk(): boolean {
+	if (activated || disabled) return false;
+	const fileKeys = loadFileKeys();
+	if (!fileKeys) return false;
+	registerCustodyKeysInKeyStore(fileKeys);
+	activate(fileKeys);
+	return true;
+}
+
 export function start(options?: { provider?: string }): void {
-	if (activated) return; // single-thread mode: startOnMainThread already ran in this process
+	// single-thread mode: startOnMainThread already ran in this process — honor both its
+	// activation and its refusal latch (falling through to loadFileKeys here would activate the
+	// very key an ambiguous selection just refused)
+	if (activated || disabled) return;
 	const explicit = options?.provider;
 	if (explicit !== undefined && explicit !== 'file' && explicit !== 'injected') {
 		logger.error?.(
@@ -170,7 +208,10 @@ export function start(options?: { provider?: string }): void {
 		);
 		return;
 	}
-	const ambient = workerData as Record<string, unknown> | null;
+	// workerData can be null (main thread) or any structured-cloneable value, including a
+	// primitive — guard the `in` check, which throws on non-objects
+	const ambient =
+		typeof workerData === 'object' && workerData !== null ? (workerData as Record<string, unknown>) : undefined;
 	const delivered = ambient?.[CUSTODY_WORKER_DATA_KEY] as
 		| { mode: string; keys?: Record<string, string>; activeKid?: string }
 		| undefined;
@@ -211,6 +252,12 @@ export function start(options?: { provider?: string }): void {
 		// so the key store must be populated here too — same as #505's worker-side cache()
 		registerCustodyKeysInKeyStore(fileKeys);
 		activate(fileKeys);
+		return;
+	}
+	if (hasFileKeys()) {
+		// files exist but none could be read (loadFileKeys logged each) — surface loudly rather
+		// than running silently dormant on what is likely a permission/disk fault
+		logger.error?.('env-secrets key files exist under keys/ but none could be read on this thread');
 		return;
 	}
 	logger.debug?.(
