@@ -68,6 +68,8 @@ import {
 	getFileId,
 	findBlobsInObject,
 	getFilePathForBlob,
+	registerBlobReceiveInFlight,
+	unregisterBlobReceiveInFlight,
 } from '../core/resources/blob.ts';
 import { promises as fsPromises } from 'node:fs';
 import { PassThrough } from 'node:stream';
@@ -2142,6 +2144,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							stream = createBlobReceiveStream(blobTimeout);
 							stream.expectedSize = size;
 							blobsInFlight.set(fileId, stream);
+							registerBlobReceiveInFlight(fileId, auditStore?.rootStore);
 						}
 						stream.lastChunk = Date.now();
 						const blobBody = message[2];
@@ -2175,6 +2178,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									// than recreating a reader-less stream. Now that the blob is complete it will
 									// never connect to a record — forget it instead of writing to a dead stream.
 									blobsInFlight.delete(fileId);
+									unregisterBlobReceiveInFlight(fileId, auditStore?.rootStore);
 								} else stream.end(blobBody);
 								if (stream.connectedToBlob) blobsInFlight.delete(fileId);
 							} else if (stream.destroyed || stream.writableEnded) {
@@ -2231,6 +2235,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								error
 							);
 							blobsInFlight.delete(fileId);
+							if (!stream.connectedToBlob) unregisterBlobReceiveInFlight(fileId, auditStore?.rootStore);
 						}
 						break;
 					}
@@ -3740,12 +3745,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		let stream = blobsInFlight.get(blobId);
 		logger.debug?.('Received transaction with blob', blobId, 'has stream', !!stream, 'ended', !!stream?.writableEnded);
 		if (stream) {
-			if (stream.writableEnded) {
-				blobsInFlight.delete(blobId);
-			}
+			if (stream.writableEnded) blobsInFlight.delete(blobId);
 		} else {
 			stream = createBlobReceiveStream(blobTimeout);
 			blobsInFlight.set(blobId, stream);
+			registerBlobReceiveInFlight(blobId, auditStore?.rootStore);
 		}
 		stream.connectedToBlob = true;
 		stream.lastChunk = Date.now();
@@ -3820,6 +3824,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				})
 				.finally(() => {
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
+					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
 					const index = outstandingBlobsToFinish.indexOf(tracked);
 					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
 					// Advance the durable watermark when the LAST in-flight blob settles without a held gap. The
@@ -4297,6 +4302,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
 				);
 				blobsInFlight.delete(blobId);
+				unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
 				stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
 			}
 		}
