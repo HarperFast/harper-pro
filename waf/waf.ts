@@ -307,6 +307,17 @@ export function start(options: WafComponentOptions) {
 					logger.info?.(
 						`WAF blocked ${request.method} ${requestInfo.path} from ${request.ip} (rules: ${decision.ruleIds.join(', ')}${decision.score !== undefined ? `, score ${decision.score}` : ''})`
 					);
+				// Enforcement short-circuits, telemetry must not: log-action rules that also matched
+				// this request are still recorded (rate-limited) even though the request is blocked.
+				const logRuleIds = decision.matchedLogRuleIds;
+				if (logRuleIds !== undefined) {
+					const logGate = rateLimiter.consume(logRuleIds[0], now);
+					if (logGate.summary) logger.warn?.(logGate.summary);
+					if (logGate.allow)
+						logger.warn?.(
+							`WAF rule match (log) ${request.method} ${requestInfo.path} from ${request.ip} (rules: ${logRuleIds.join(', ')}) [request blocked by ${decision.ruleIds.join(', ')}]`
+						);
+				}
 				// O4: opaque body (no ruleIds to the client — server log only), correct reason
 				// phrase for the status, explicit JSON content type. Never touches request.body.
 				const status = decision.status;
