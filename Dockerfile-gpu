@@ -9,7 +9,13 @@ COPY . .
 
 RUN env NO_USE_GIT=true npm run package
 
-FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu22.04 AS run
+# Runtime base. CUDA 13.x supports Turing (SM 7.5 / T4) — Turing is the minimum
+# architecture in the 13.x line (Maxwell/Pascal/Volta were dropped). The 13.x
+# runtime requires an R580+ host driver; on hosts pinned to an older driver
+# branch, override with a CUDA 12.x cudnn-runtime base, e.g.:
+#   --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.3.0-cudnn-runtime-ubuntu22.04
+FROM ${CUDA_RUNTIME_IMAGE} AS run
 
 ARG NODE_VERSION=24
 
