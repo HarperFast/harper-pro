@@ -336,6 +336,8 @@ export async function cloneNode(): Promise<void> {
 
 	await cloneJWTKeys();
 
+	await cloneEnvSecretsKeys();
+
 	await cloneSSHKeys();
 
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
@@ -684,6 +686,30 @@ async function cloneJWTKeys(): Promise<void> {
 		writeFileSync(join(keysDir, JWT_ENUM.JWT_PASSPHRASE_NAME), jwtPass.message);
 	} catch (err) {
 		log(`Error cloning JWT keys: ${err}`, 'error');
+	}
+}
+
+/**
+ * Clones the cluster-shared env-secrets private key from the leader so this node can decrypt
+ * `enc:v1:` .env values. Without it the node would generate its own keypair and be unable to
+ * decrypt secrets encrypted for the cluster. Best-effort: a leader without the env-secrets
+ * component simply has no key to serve.
+ */
+async function cloneEnvSecretsKeys(): Promise<void> {
+	try {
+		const { ENV_SECRETS_PRIVATE_KEY_NAME } = await import('../security/envSecrets.js');
+		const result: Record<string, any> = await leaderRequest({
+			operation: 'get_key',
+			name: ENV_SECRETS_PRIVATE_KEY_NAME,
+		});
+		if (result?.message) {
+			writeFileSync(join(rootPath, LICENSE_KEY_DIR_NAME, ENV_SECRETS_PRIVATE_KEY_NAME), result.message, {
+				mode: 0o600,
+			});
+			log('Cloned env-secrets key');
+		}
+	} catch (err) {
+		log(`Error cloning env-secrets key: ${err}`, 'error');
 	}
 }
 
