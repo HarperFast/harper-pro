@@ -15,6 +15,7 @@ import {
 	BACK_PRESSURE_RATIO_POSITION,
 	BLOB_FAILURE_COUNT_POSITION,
 	LAST_BLOB_FAILURE_TIME_POSITION,
+	readConnectionTruth,
 } from './replicationConnection.ts';
 import '../core/server/serverHelpers/serverUtilities.ts';
 
@@ -66,6 +67,16 @@ export async function clusterStatus() {
 			// `|| undefined` so a healthy link omits the field entirely (matching lastBlobFailure's asDate(0)).
 			socket.blobReplicationFailures = replicationSharedStatus[BLOB_FAILURE_COUNT_POSITION] || undefined;
 			socket.lastBlobFailure = asDate(replicationSharedStatus[LAST_BLOB_FAILURE_TIME_POSITION]);
+			// W1 (harper-pro#431): the shared-memory connection truth is authoritative over the edge-triggered
+			// map mirror in requestClusterStatus, which can still read connected:true for an open-but-idle
+			// wedge that never delivered a disconnect (#289/#233). Also surface the last disconnect (#214).
+			const truth = readConnectionTruth(auditStore, databaseName, remoteNodeName);
+			if (truth) {
+				socket.connected = truth.connected;
+				if (truth.errorCode != null) {
+					socket.lastConnectionError = { code: truth.errorCode, time: asDate(truth.errorTime) };
+				}
+			}
 		}
 	}
 
