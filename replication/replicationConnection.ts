@@ -306,7 +306,7 @@ const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
 // `replication_pauseStallTimeout` for clusters with extreme single-transaction sizes.
 const PAUSE_STALL_THRESHOLD_MS =
 	env.get('replication_pauseStallTimeout') ??
-	Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 120000) * 2);
+	Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000) * 2);
 
 /**
  * Decide whether an idle replication connection should be terminated as dead.
@@ -1529,7 +1529,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// drains to disk — so the watchdog can tell a healthy back-pressure pause (consumer draining) from a
 	// leg that died mid-pause (harper-pro#466). Only meaningful while paused.
 	let consumerProgress = 0;
-	const blobTimeout = env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 120000;
+	// Default 15min: a 120s cap dropped ~4,500 blobs to permanent divergence when a rolling
+	// upgrade + concurrent writes had blob transfers routinely stalling past the timeout, the
+	// receive watchdog then killed the subscription, and the audit cursor advanced past the
+	// missing blob. 900000 lets in-flight transfers complete across a peer restart window.
+	const blobTimeout = env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000;
 	const blobsInFlight = new Map();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
@@ -1648,9 +1652,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// (reset on COPY_START and on each in-copy 'message'; stopped on copy finish / pause). On a stall it
 	// forces the same close-independent reconnect, which restarts the copy from the leader. (harper-pro#453)
 	copyProgressWatchdog = createReceiveWatchdog({
-		// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 120000 and is shared with blobsTimer; guard
+		// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 900000 and is shared with blobsTimer; guard
 		// against a misconfigured 0/negative that would otherwise forceReconnect in a tight loop.
-		intervalMs: blobTimeout > 0 ? blobTimeout : 120000,
+		intervalMs: blobTimeout > 0 ? blobTimeout : 900000,
 		getBytesRead: () => copyProgressFrames,
 		onSilence: () => {
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
@@ -3767,7 +3771,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// receiver's apply consumer wedges at `lastReceivedStatus:"Receiving"` until its own idle
 			// watchdog fires (core/resources/blob.ts) 120s later. With the timeout, the catch below
 			// emits the finishing error frame so the receiver advances cleanly.
-			// Defaults ON to the replication blob timeout (REPLICATION_BLOBTIMEOUT, 120000 default) so a
+			// Defaults ON to the replication blob timeout (REPLICATION_BLOBTIMEOUT, 900000 default) so a
 			// stalled send can't silently wedge a base copy out of the box (harper-pro#453). The
 			// HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS env var overrides it; set it to 0 to disable.
 			const rawEnv = process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS;
