@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783077277152,
+  "lastUpdate": 1783077279241,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -2314,6 +2314,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E scan p99 — short ranges",
             "value": 170.04,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "f379f162996d6f7562c945dd26be9b639d4a142d",
+          "message": "Make replication connection state authoritative via shared memory (W1, #431) (#445)\n\n* Make replication connection state authoritative via shared memory (W1, #431)\n\nThe main thread infers each outbound (db,peer) subscription's connected\nstate from edge-triggered worker->main messages, which desync when a\nterminal/idle state is reached without a 'close' (open-but-idle wedge,\ninto the existing per-(db,peer) shared-memory Float64Array (slots 9-12:\nstate/liveness/error-code/error-time). The main thread reads it as truth:\ncluster_status reports the accurate connected plus a new lastConnectionError\n(#214), and reconcileWorkers corrects the inferred flag against it, feeding\nthe existing wedge recovery.\n\nconnected = CONNECTED state AND fresh liveness, so a worker that died or\nwedged without writing DOWN still reads down once liveness goes stale.\nLiveness is written at the NODE_NAME handshake, on pong, and on received\ndata; a backpressure pause refreshes it (matching shouldTerminateIdlePing's\npauseReasons exemption). LIVENESS_STALE_MS derives from PING_TIMEOUT.\n\nFirst of two PRs for W1 (#431); this is the state-truth data plane.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n* Write wall-clock Date.now() to liveness slot in the backpressure-pause refresh\n\nLAST_LIVENESS_TIME_POSITION holds a wall-clock timestamp that the main thread\ncompares against Date.now() in deriveConnectionTruth. The backpressure-pause\nrefresh in sendPing was writing lastByteActivity (performance.now(), a monotonic\nclock relative to process start), so the slot would read as far in the past and\na healthy-but-paused link would be marked stale/down — the opposite of the\nrefresh's intent. Write Date.now() instead, matching every other liveness write.\n\nAddresses the gemini-code-assist critical review finding on #445.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-07-02T15:52:45Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/f379f162996d6f7562c945dd26be9b639d4a142d"
+        },
+        "date": 1783077279214,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 4.99,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 6.82,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 8.49,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 25.17,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 27.51,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 22.47,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 47.59,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 102.25,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 41.15,
             "unit": "ms"
           }
         ]
