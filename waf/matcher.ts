@@ -27,10 +27,13 @@ export interface WafRequestInfo {
 	ip: string | undefined;
 	method: string;
 	/**
-	 * Pathname only (no query string). CALLER CONTRACT (M6): matched AS PROVIDED — raw and
-	 * case-sensitive; the matcher does NOT percent-decode or normalize it. A caller wanting
-	 * to defeat encoding-based evasion (e.g. %2e%2e, mixed case) must normalize before calling.
-	 * Deciding whether to match decoded vs raw is a WAF-normalization design choice deferred here.
+	 * Pathname only (no query string). CALLER CONTRACT (M6): the caller passes the path already
+	 * run through canonicalizePath() — percent-decoded (bounded), dot-segment-resolved, and with
+	 * duplicate slashes collapsed — so encoding-based evasion (%2e%2e, //, /./, /../, double-
+	 * encoding) is defeated before matching. It is NOT case-folded (case-sensitive paths are
+	 * legitimate app semantics). Rule path.exact/path.prefix literals are canonicalized at compile
+	 * time so rules and requests share one normalized space; path.regex patterns are authored
+	 * against this canonicalized form (a regex cannot be canonicalized).
 	 */
 	path: string;
 	/** Raw query string without the leading '?', or undefined. */
@@ -98,6 +101,58 @@ export interface WafMatcher {
 }
 
 const DEFAULT_BLOCK_STATUS = 403;
+
+/**
+ * RFC 3986 §5.2.4 remove_dot_segments: resolves `.` and `..` in a path so /a/./b→/a/b and
+ * /a/b/../c→/a/c, without touching the network. Operates on the whole path (no scheme/authority).
+ */
+function removeDotSegments(path: string): string {
+	const output: string[] = [];
+	const segments = path.split('/');
+	for (const segment of segments) {
+		if (segment === '.') continue;
+		if (segment === '..') {
+			// pop the previous real segment, but never past the (empty) leading-slash marker
+			if (output.length > 1) output.pop();
+			continue;
+		}
+		output.push(segment);
+	}
+	return output.join('/');
+}
+
+/**
+ * Canonicalizes a request/rule path into one normalized matching space so encoding- and
+ * traversal-based evasions (/admin%2F, /./admin, //admin, /admin/../admin, double-encoding) can't
+ * slip past a path rule. Steps, in order:
+ *   1. bounded iterative percent-decoding — up to 2 decodeURIComponent passes, or until the string
+ *      stops changing; a malformed-escape throw stops decoding and keeps the last good value.
+ *   2. RFC 3986 §5.2.4 remove_dot_segments (resolve `.` and `..`).
+ *   3. collapse runs of `/` into a single `/`.
+ * A leading `/` is preserved. Deliberately NOT case-folded: case-sensitive paths are legitimate
+ * app semantics and lowercasing would cause false matches. A future per-rule case-insensitive
+ * option is the extension point for callers that want case-folded matching.
+ */
+export function canonicalizePath(path: string): string {
+	// 1. bounded iterative percent-decoding
+	let decoded = path;
+	for (let pass = 0; pass < 2; pass++) {
+		if (decoded.indexOf('%') === -1) break;
+		let next: string;
+		try {
+			next = decodeURIComponent(decoded);
+		} catch {
+			break; // malformed escape: keep the last successfully-decoded value, never throw out
+		}
+		if (next === decoded) break;
+		decoded = next;
+	}
+	// 2. resolve dot segments
+	let result = removeDotSegments(decoded);
+	// 3. collapse duplicate slashes, preserving a single leading slash
+	result = result.replace(/\/{2,}/g, '/');
+	return result;
+}
 
 /** Parses a dotted-quad IPv4 address to an unsigned 32-bit integer, or -1 when not IPv4. */
 export function parseIpv4(ip: string): number {
@@ -288,7 +343,11 @@ export function parseCidr(cidr: string): ParsedCidr | null {
 }
 
 function makePathResidual(path: NonNullable<WafRule['match']['path']>, errors: string[]): ResidualCheck | undefined {
-	const { exact, prefix } = path;
+	// Canonicalize authored literals so rule and (already-canonicalized) request paths share one
+	// normalized space; path.regex is authored against the canonical form (a regex can't be
+	// canonicalized) — see WafRequestInfo.path (M6).
+	const exact = path.exact == null ? undefined : canonicalizePath(path.exact);
+	const prefix = path.prefix == null ? undefined : canonicalizePath(path.prefix);
 	let regex: RegExp | undefined;
 	if (path.regex != null) {
 		regex = compileRuleRegex(path.regex, 'match.path.regex', errors);
@@ -475,7 +534,8 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		}
 		if (!anchored && match.path != null) {
 			if (match.path.exact != null) {
-				staged.pathExact = match.path.exact;
+				// canonicalize the authored literal so it shares the request path's normalized space (M6)
+				staged.pathExact = canonicalizePath(match.path.exact);
 				const residualPath = { ...match.path, exact: undefined };
 				if (residualPath.prefix != null || residualPath.regex != null) {
 					const residual = makePathResidual(residualPath, errors);
@@ -483,7 +543,7 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 				}
 				anchored = true;
 			} else if (match.path.prefix != null) {
-				staged.pathPrefix = match.path.prefix;
+				staged.pathPrefix = canonicalizePath(match.path.prefix);
 				if (match.path.regex != null) {
 					const residual = makePathResidual({ regex: match.path.regex }, errors);
 					if (residual) residuals.push(residual);

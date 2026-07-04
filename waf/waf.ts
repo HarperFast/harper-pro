@@ -37,15 +37,17 @@
  *   so socket-ip rules are correct there today; explicit XFF trust is the future-work case (O6).
  * - the WAF middleware registers only in the worker `start` hook, so it covers worker HTTP/REST/
  *   app ports, NOT the main-thread operations-API port (that surface is governed by role perms).
- * - request path is matched raw/case-sensitive (no percent-decode/normalize) — a normalization
- *   design decision; see WafRequestInfo.path in matcher.ts (M6).
+ * - request path is canonicalized before matching (bounded percent-decode, dot-segment
+ *   resolution, duplicate-slash collapse) so encoding/traversal evasions are defeated; it is NOT
+ *   case-folded (case-sensitive paths are legitimate app semantics). See canonicalizePath and
+ *   WafRequestInfo.path in matcher.ts (M6).
  * - rules live in `system.hdb_waf_rules` (same pattern as replication's hdb_nodes): generic CRUD
  *   on system tables is forbidden by core, so management goes through dedicated super_user-only
  *   operations (ruleOperations.ts); system tables replicate cluster-wide by default.
  */
 
 import { loggerWithTag } from '../core/utility/logging/harper_logger.js';
-import { compileRules, type WafMatcher, type WafRequestInfo } from './matcher.ts';
+import { canonicalizePath, compileRules, type WafMatcher, type WafRequestInfo } from './matcher.ts';
 import { makeWafRuleOperations } from './ruleOperations.ts';
 import type { WafRule } from './rules.ts';
 
@@ -285,7 +287,7 @@ export function start(options: WafComponentOptions) {
 				const queryStart = url.indexOf('?');
 				requestInfo.ip = request.ip;
 				requestInfo.method = request.method;
-				requestInfo.path = queryStart === -1 ? url : url.slice(0, queryStart);
+				requestInfo.path = canonicalizePath(queryStart === -1 ? url : url.slice(0, queryStart));
 				requestInfo.query = queryStart === -1 ? undefined : url.slice(queryStart + 1);
 				requestInfo.headers = request.headers;
 				decision = matcher.evaluate(requestInfo);
