@@ -92,6 +92,31 @@ describe('WAF global mode', () => {
 		expect(compileRules(rules).evaluate(makeRequest()).action).to.equal('block');
 	});
 
+	it("mode 'monitor' still emits log-action output (log is orthogonal to shadow)", () => {
+		const matcher = compileRules(
+			[
+				{ ...BASE, id: 'blocker', priority: 2, match: { path: { exact: '/x' } } },
+				{ ...BASE, id: 'watcher', priority: 1, action: 'log', match: { path: { exact: '/x' } } },
+			],
+			{ mode: 'monitor' }
+		);
+		const decision = matcher.evaluate(makeRequest());
+		// block is downgraded to a would-block preview; the log rule is still logged (not suppressed)
+		expect(decision.action).to.equal('log');
+		expect(decision.ruleIds).to.deep.equal(['watcher']);
+		expect(decision.shadowRuleIds).to.deep.equal(['blocker']);
+	});
+
+	it('a shadow:true log rule is still logged (log never suppressed by shadow)', () => {
+		const matcher = compileRules([
+			{ ...BASE, id: 'sl', action: 'log', shadow: true, match: { path: { exact: '/x' } } },
+		]);
+		const decision = matcher.evaluate(makeRequest());
+		expect(decision.action).to.equal('log');
+		expect(decision.ruleIds).to.deep.equal(['sl']);
+		expect(decision).to.not.have.property('shadowRuleIds'); // a log rule produces no would-block
+	});
+
 	it("mode 'off' still classifies invalid/deferred rules for the summary log", () => {
 		const matcher = compileRules(
 			[
