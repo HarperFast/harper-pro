@@ -8,7 +8,7 @@
  */
 
 import { expect } from 'chai';
-import { compileRules, parseIpv4, parseIpv6 } from '#src/waf/matcher';
+import { canonicalizePath, compileRules, parseIpv4, parseIpv6 } from '#src/waf/matcher';
 import { validateRule } from '#src/waf/rules';
 
 const BASE = { enabled: true, priority: 0, phase: 'request', action: 'block' };
@@ -108,6 +108,44 @@ describe('WAF matcher — path rules', () => {
 	it('matches path regexes', () => {
 		expect(matcher.evaluate(makeRequest({ path: '/legacy/index.php' })).ruleIds).to.deep.equal(['regex']);
 		expect(matcher.evaluate(makeRequest({ path: '/legacy/index.html' }))).to.equal(null);
+	});
+});
+
+describe('WAF matcher — path canonicalization (bypass defense)', () => {
+	// The middleware canonicalizes the request path before evaluate() (see waf.ts); mirror that
+	// here so these tests exercise the same normalized-space contract end-to-end.
+	const matcher = compileRules([
+		{ ...BASE, id: 'exact', match: { path: { exact: '/admin' } } },
+		{ ...BASE, id: 'prefix', action: 'log', match: { path: { prefix: '/api' } } },
+	]);
+	const evalPath = (rawPath) => matcher.evaluate(makeRequest({ path: canonicalizePath(rawPath) }));
+
+	it('still matches the plain canonical path', () => {
+		expect(evalPath('/admin').ruleIds).to.deep.equal(['exact']);
+		expect(evalPath('/api/products').ruleIds).to.deep.equal(['prefix']);
+	});
+	it('closes encoded-slash / dot-segment / duplicate-slash bypasses of an exact rule', () => {
+		// %2F decodes to '/', so encoded-slash traversal resolves back to the rule path
+		expect(evalPath('/admin%2F..%2Fadmin').ruleIds).to.deep.equal(['exact']);
+		expect(evalPath('/./admin').ruleIds).to.deep.equal(['exact']);
+		expect(evalPath('//admin').ruleIds).to.deep.equal(['exact']);
+		expect(evalPath('/admin/../admin').ruleIds).to.deep.equal(['exact']);
+	});
+	it('closes double-encoding bypasses (%2561 -> a)', () => {
+		expect(evalPath('/%2561dmin').ruleIds).to.deep.equal(['exact']);
+	});
+	it('closes bypasses of a prefix rule', () => {
+		expect(evalPath('/%61pi/x').ruleIds).to.deep.equal(['prefix']); // %61 -> 'a'
+		expect(evalPath('//api//x').ruleIds).to.deep.equal(['prefix']);
+		expect(evalPath('/x/../api/y').ruleIds).to.deep.equal(['prefix']);
+	});
+	it('canonicalizes authored rule literals too (encoded/dotted rule path)', () => {
+		const m = compileRules([
+			{ ...BASE, id: 'enc-exact', match: { path: { exact: '/adm%69n' } } }, // %69 -> 'i' -> '/admin'
+			{ ...BASE, id: 'dot-prefix', action: 'log', match: { path: { prefix: '/a/../b/' } } }, // -> '/b/'
+		]);
+		expect(m.evaluate(makeRequest({ path: canonicalizePath('/admin') })).ruleIds).to.deep.equal(['enc-exact']);
+		expect(m.evaluate(makeRequest({ path: canonicalizePath('/b/thing') })).ruleIds).to.deep.equal(['dot-prefix']);
 	});
 });
 
