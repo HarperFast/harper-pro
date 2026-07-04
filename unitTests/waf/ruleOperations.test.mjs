@@ -15,6 +15,9 @@ function makeFakeTable() {
 	return {
 		map,
 		calls,
+		// NOTE: this fake returns the PLAIN object it was given, so its keys are OWN + enumerable and
+		// object-spread copies them. That does NOT reproduce a real TrackedObject, whose attributes are
+		// inherited getters (own-enumerable keys are empty) — see the trackedGet test below for that path.
 		get: (id) => map.get(id),
 		put: (id, record, context) => {
 			calls.put.push({ id, context });
@@ -24,6 +27,34 @@ function makeFakeTable() {
 			calls.delete.push({ id, context });
 			return map.delete(id);
 		},
+		primaryStore: { getRange: () => Array.from(map, ([key, value]) => ({ key, value })) },
+	};
+}
+
+// Wraps a stored plain record so its fields are exposed as INHERITED GETTERS with NO own enumerable
+// keys — the shape of a real Harper TrackedObject (core/resources/tracked.ts assignTrackedAccessors).
+// Object-spread ({...tracked}) copies nothing off this; individual property reads (tracked.action)
+// still work through the getters. Used to prove alter_waf_rule preserves un-patched fields.
+function makeTrackedTable() {
+	const map = new Map();
+	function toTracked(record) {
+		const prototype = {};
+		for (const key of Object.keys(record)) {
+			Object.defineProperty(prototype, key, {
+				get() {
+					return record[key];
+				},
+				enumerable: true,
+				configurable: true,
+			});
+		}
+		return Object.create(prototype); // own enumerable keys: none
+	}
+	return {
+		map,
+		get: (id) => (map.has(id) ? toTracked(map.get(id)) : undefined),
+		put: (id, record) => map.set(id, record),
+		delete: (id) => map.delete(id),
 		primaryStore: { getRange: () => Array.from(map, ([key, value]) => ({ key, value })) },
 	};
 }
@@ -156,6 +187,22 @@ describe('WAF rule operations', () => {
 		expect(stored.activation).to.deep.equal({ nodes: ['n1'] });
 		expect(stored.scope).to.deep.equal({ tenants: ['t'] });
 		expect(stored.rateLimit).to.deep.equal({ key: ['ip'], limit: 5 });
+	});
+
+	it('preserves un-patched fields when get() returns a TrackedObject (inherited getters, no own keys)', async () => {
+		const table = makeTrackedTable();
+		const operations = makeWafRuleOperations(table);
+		// seed a full rule directly (bypass add so the stored record is exactly RULE)
+		table.map.set('r1', { ...RULE, priority: 7 });
+		// single-field patch: object-spread of the TrackedObject would drop action/match/priority and
+		// the stored rule would fail re-validation; the explicit allowlist copy keeps them.
+		await operations.alterWafRule({ hdb_user: SUPER_USER, id: 'r1', enabled: false });
+		const stored = table.map.get('r1');
+		expect(stored.enabled).to.equal(false); // the patch applied
+		expect(stored.action).to.equal('block'); // un-patched field preserved through the getter
+		expect(stored.priority).to.equal(7);
+		expect(stored.match).to.deep.equal({ path: { prefix: '/blocked/' } });
+		expect(stored.id).to.equal('r1');
 	});
 
 	describe('set_waf_mode + control-row sentinel guards', () => {

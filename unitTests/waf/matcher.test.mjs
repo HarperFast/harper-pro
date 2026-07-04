@@ -8,7 +8,7 @@
  */
 
 import { expect } from 'chai';
-import { canonicalizePath, compileRules, parseIpv4, parseIpv6 } from '#src/waf/matcher';
+import { canonicalizePath, compileRules, parseCidr, parseIpv4, parseIpv6, parseQueryString } from '#src/waf/matcher';
 import { validateRule } from '#src/waf/rules';
 
 const BASE = { enabled: true, priority: 0, phase: 'request', action: 'block' };
@@ -44,6 +44,16 @@ describe('WAF ip parsing', () => {
 		expect(parseIpv4('a.b.c.d')).to.equal(-1);
 		expect(parseIpv4('1.2.3.4.5')).to.equal(-1);
 	});
+	it('rejects IPv4 octets with leading zeros (parse-ambiguity / SSRF bypass)', () => {
+		expect(parseIpv4('010.0.0.1')).to.equal(-1);
+		expect(parseIpv4('00.0.0.0')).to.equal(-1);
+		expect(parseIpv4('1.2.3.01')).to.equal(-1);
+		expect(parseCidr('010.0.0.1')).to.equal(null);
+		// a lone '0' octet is still valid — the guard only fires on a 2nd digit after a leading 0
+		expect(parseIpv4('10.0.0.1')).to.equal((10 << 24) + 1);
+		expect(parseIpv4('0.0.0.0')).to.equal(0);
+		expect(parseIpv4('127.0.0.1')).to.equal((127 << 24) + 1);
+	});
 	it('parses IPv6 including compressed and IPv4-mapped forms', () => {
 		expect(parseIpv6('::1')).to.equal(1n);
 		expect(parseIpv6('::')).to.equal(0n);
@@ -51,6 +61,21 @@ describe('WAF ip parsing', () => {
 		expect(parseIpv6('::ffff:1.2.3.4')).to.equal((0xffffn << 32n) | 0x01020304n);
 		expect(parseIpv6('not-an-ip')).to.equal(null);
 		expect(parseIpv6('1:2:3:4:5:6:7:8:9')).to.equal(null);
+	});
+	it('rejects IPv6 groups with non-hex garbage (parseInt trailing-garbage guard)', () => {
+		expect(parseIpv6('2001:db8::12g4')).to.equal(null);
+		expect(parseCidr('2001:db8::12g4')).to.equal(null);
+	});
+});
+
+describe('WAF query-string parsing', () => {
+	it('decodes name and value independently so one bad escape does not corrupt the other', () => {
+		// bad VALUE escape: name still decodes, value stays raw (never throws)
+		const a = parseQueryString('a%20b=%ZZ');
+		expect(a.get('a b')).to.equal('%ZZ');
+		// bad NAME escape: value still decodes, name stays raw (never throws)
+		const b = parseQueryString('%ZZ=b%20c');
+		expect(b.get('%ZZ')).to.equal('b c');
 	});
 });
 
@@ -310,5 +335,10 @@ describe('WAF rule validation', () => {
 		expect(validateRule({ ...BASE, id: 'x', match: { headers: [{ name: 'h', op: 'nope' }] } })).to.not.be.empty;
 		expect(validateRule({ ...BASE, id: 'x', blockStatus: 99, match: { ip: '10.0.0.1' } })).to.not.be.empty;
 		expect(validateRule({ ...BASE, id: 'x', action: 'score', match: { ip: '10.0.0.1' } })).to.not.be.empty;
+	});
+	it('rejects empty match arrays (anchored-yet-dead rules that never match)', () => {
+		expect(validateRule({ ...BASE, id: 'x', match: { ip: [] } })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', match: { headers: [] } })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', match: { query: [] } })).to.not.be.empty;
 	});
 });

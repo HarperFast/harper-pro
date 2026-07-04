@@ -102,9 +102,16 @@ export function makeWafRuleOperations(table: WafRuleStore) {
 				throw new ClientError(`${WAF_CONTROL_ID} is reserved; use set_waf_mode to control the global mode`);
 			const existing = await table.get(String(id));
 			if (!existing) throw new ClientError(`WAF rule ${id} does not exist`, 404);
-			// explicit allowlist: the operations server attaches metadata (hdb_user, transport
-			// objects, ...) to the request body, which must not leak into the stored rule
-			const updated = { ...existing, id: existing.id } as WafRule;
+			// table.get() returns a TrackedObject whose attributes are inherited getters (see
+			// core/resources/tracked.ts assignTrackedAccessors), so object-spread — which copies only
+			// OWN enumerable keys — would drop every field. Copy explicitly through the getters via the
+			// PATCHABLE_FIELDS allowlist (also excludes the request metadata hdb_user/transport attaches),
+			// then overlay the patch. id stays immutable.
+			const updated: WafRule = { id: existing.id } as WafRule;
+			for (const field of PATCHABLE_FIELDS) {
+				const value = (existing as any)[field];
+				if (value !== undefined) (updated as any)[field] = value;
+			}
 			for (const field of PATCHABLE_FIELDS) {
 				if (field in request) (updated as any)[field] = request[field];
 			}

@@ -256,12 +256,16 @@ export function validateRule(rule: WafRule): string[] {
 		match.agent != null;
 	if (!hasCondition) errors.push('match must specify at least one condition');
 	if (match.ip != null) {
-		for (const cidr of Array.isArray(match.ip) ? match.ip : [match.ip]) {
-			// M2/M8: validate by actually parsing so validateRule and the compiler agree (rejects
-			// '10.0.0.0/', '/0x10', bad addresses instead of silently compiling to /0 "block all").
-			if (typeof cidr !== 'string' || cidr.length === 0 || parseCidr(cidr) === null)
-				errors.push(`match.ip: invalid address or CIDR ${JSON.stringify(cidr)}`);
-		}
+		// An empty array anchors the rule yet can never match — compile to a dead rule that silently
+		// never fires; reject it instead of letting the zero-iteration loop pass it.
+		if (Array.isArray(match.ip) && match.ip.length === 0) errors.push('match.ip: cannot be an empty array');
+		else
+			for (const cidr of Array.isArray(match.ip) ? match.ip : [match.ip]) {
+				// M2/M8: validate by actually parsing so validateRule and the compiler agree (rejects
+				// '10.0.0.0/', '/0x10', bad addresses instead of silently compiling to /0 "block all").
+				if (typeof cidr !== 'string' || cidr.length === 0 || parseCidr(cidr) === null)
+					errors.push(`match.ip: invalid address or CIDR ${JSON.stringify(cidr)}`);
+			}
 	}
 	if (match.method != null) {
 		if (!Array.isArray(match.method) || match.method.length === 0 || match.method.some((m) => typeof m !== 'string'))
@@ -281,8 +285,16 @@ export function validateRule(rule: WafRule): string[] {
 			else compileRuleRegex(regex, 'match.path.regex', errors);
 		}
 	}
-	if (match.headers != null) validateNamedValueMatches(match.headers, 'match.headers', errors);
-	if (match.query != null) validateNamedValueMatches(match.query, 'match.query', errors);
+	// Empty headers/query arrays anchor a rule that never matches (like empty ip above); reject them.
+	if (match.headers != null) {
+		if (Array.isArray(match.headers) && match.headers.length === 0)
+			errors.push('match.headers: cannot be an empty array');
+		else validateNamedValueMatches(match.headers, 'match.headers', errors);
+	}
+	if (match.query != null) {
+		if (Array.isArray(match.query) && match.query.length === 0) errors.push('match.query: cannot be an empty array');
+		else validateNamedValueMatches(match.query, 'match.query', errors);
+	}
 	validateReservedMatch(match, errors);
 	validateReservedRule(rule, errors);
 	return errors;
