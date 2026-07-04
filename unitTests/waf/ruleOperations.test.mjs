@@ -11,13 +11,19 @@ import { makeWafRuleOperations } from '#src/waf/ruleOperations';
 
 function makeFakeTable() {
 	const map = new Map();
+	const calls = { put: [], delete: [] };
 	return {
 		map,
+		calls,
 		get: (id) => map.get(id),
-		put: (id, record) => {
+		put: (id, record, context) => {
+			calls.put.push({ id, context });
 			map.set(id, record);
 		},
-		delete: (id) => map.delete(id),
+		delete: (id, context) => {
+			calls.delete.push({ id, context });
+			return map.delete(id);
+		},
 		primaryStore: { getRange: () => Array.from(map, ([key, value]) => ({ key, value })) },
 	};
 }
@@ -59,6 +65,21 @@ describe('WAF rule operations', () => {
 
 		await operations.dropWafRule({ operation: 'drop_waf_rule', hdb_user: SUPER_USER, id: 'r1' });
 		expect(table.map.size).to.equal(0);
+	});
+
+	it('threads the authenticated user as explicit write context on put and delete (harper#1592)', async () => {
+		const table = makeFakeTable();
+		const operations = makeWafRuleOperations(table);
+		await operations.addWafRule({ hdb_user: SUPER_USER, rule: RULE });
+		await operations.alterWafRule({ hdb_user: SUPER_USER, id: 'r1', enabled: false });
+		await operations.dropWafRule({ hdb_user: SUPER_USER, id: 'r1' });
+
+		// add + alter each call put with the request's hdb_user in the context
+		expect(table.calls.put).to.have.length(2);
+		for (const call of table.calls.put) expect(call.context).to.deep.equal({ user: SUPER_USER });
+		// drop calls delete with the same explicit context
+		expect(table.calls.delete).to.have.length(1);
+		expect(table.calls.delete[0].context).to.deep.equal({ user: SUPER_USER });
 	});
 
 	it('rejects non-super_user for every operation, even with full data CRUD permissions', async () => {

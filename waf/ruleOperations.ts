@@ -23,8 +23,8 @@ import { type WafRule, validateRule } from './rules.ts';
 /** The subset of the rule table the operations need (kept narrow for unit-testing). */
 export interface WafRuleStore {
 	get(id: string): any;
-	put(id: string, record: WafRule): any;
-	delete(id: string): any;
+	put(id: string, record: WafRule, context?: object): any;
+	delete(id: string, context?: object): any;
 	primaryStore: { getRange(options: object): Iterable<{ key: unknown; value: any }> };
 }
 
@@ -54,7 +54,10 @@ export function makeWafRuleOperations(table: WafRuleStore) {
 			if (await table.get(String(rule.id))) {
 				throw new ClientError(`WAF rule ${rule.id} already exists; use alter_waf_rule to modify it`, 409);
 			}
-			await table.put(String(rule.id), rule);
+			// Pass the authenticated user explicitly so the audit record is attributed even if this
+			// ships before core's ambient-context fix (harper#1592); explicit context takes precedence
+			// over ambient, so this is harmless once #1592 lands and decouples us from its merge order.
+			await table.put(String(rule.id), rule, { user: request.hdb_user });
 			return { message: `Added WAF rule ${rule.id}` };
 		},
 
@@ -71,7 +74,7 @@ export function makeWafRuleOperations(table: WafRuleStore) {
 				if (field in request) (updated as any)[field] = request[field];
 			}
 			validateOrThrow(updated);
-			await table.put(String(id), updated);
+			await table.put(String(id), updated, { user: request.hdb_user }); // explicit audit user (harper#1592)
 			return { message: `Updated WAF rule ${id}` };
 		},
 
@@ -80,7 +83,7 @@ export function makeWafRuleOperations(table: WafRuleStore) {
 			const id = request.id;
 			if (id == null) throw new ClientError('drop_waf_rule requires an id');
 			if (!(await table.get(String(id)))) throw new ClientError(`WAF rule ${id} does not exist`, 404);
-			await table.delete(String(id));
+			await table.delete(String(id), { user: request.hdb_user }); // explicit audit user (harper#1592)
 			return { message: `Dropped WAF rule ${id}` };
 		},
 
