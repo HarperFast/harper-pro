@@ -238,6 +238,9 @@ export function parseIpv4(ip: string): number {
 			dots++;
 			if (dots > 3) return -1;
 		} else if (code >= 48 && code <= 57) {
+			// reject leading zeros (010.0.0.1) — parse ambiguity/SSRF-bypass; net.isIPv4 rejects them too.
+			// A lone '0' octet still parses; the guard only fires on a 2nd digit after a leading 0.
+			if (digits === 1 && octet === 0) return -1;
 			octet = octet * 10 + (code - 48);
 			if (octet > 255 || ++digits > 3) return -1;
 		} else {
@@ -287,7 +290,8 @@ export function parseIpv6(ip: string): bigint | null {
 			}
 		}
 		const part = parts[i];
-		if (part.length === 0 || part.length > 4) return null;
+		// parseInt(part, 16) tolerates trailing garbage ('123g' → 0x123); require strictly hex digits.
+		if (part.length === 0 || part.length > 4 || !/^[0-9a-fA-F]+$/.test(part)) return null;
 		const group = parseInt(part, 16);
 		if (Number.isNaN(group) || group < 0 || group > 0xffff) return null;
 		result = (result << 16n) | BigInt(group);
@@ -477,11 +481,17 @@ export function parseQueryString(query: string): Map<string, string | string[]> 
 			name = pair.slice(0, eq);
 			value = pair.slice(eq + 1);
 		}
+		// Decode name and value independently: a malformed escape in one must not leave the other in a
+		// mixed decoded/raw state. Each keeps its raw form on failure.
 		try {
 			name = decodeURIComponent(name.replaceAll('+', ' '));
+		} catch {
+			// keep the raw name when percent-decoding fails
+		}
+		try {
 			value = decodeURIComponent(value.replaceAll('+', ' '));
 		} catch {
-			// keep the raw form when percent-decoding fails
+			// keep the raw value when percent-decoding fails
 		}
 		const existing = result.get(name);
 		if (existing === undefined) result.set(name, value);

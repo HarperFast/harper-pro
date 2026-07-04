@@ -301,7 +301,7 @@ export function start(options: WafComponentOptions) {
 			}
 			if (!stopped) await new Promise((resolve) => setTimeout(resolve, 1000).unref?.());
 		}
-	})();
+	})().catch((error) => logger.error?.('WAF subscription loop exited unexpectedly', error));
 
 	// O2: the initial compile must not throw out of start() (that would skip middleware
 	// registration and silently pass ALL traffic on this worker with no retry). On failure keep
