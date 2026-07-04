@@ -347,11 +347,14 @@ export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pau
  * reconnect loop instead of silent loss; bounding that with an escalation budget is W2
  * (harper-pro#432) territory.
  *
- * Coverage boundary: this path handles FRAME-level errors (header/command decode, audit-entry
- * structure, unexpected rejections from awaited handler work). A per-record VALUE decode failure
- * is caught earlier by the inner catch around `decodeBlobsWithWrites` and skip-and-logged, and
- * the batch resume cursor still advances past the skipped record — that residual silent-gap
- * class is tracked in harper-pro#440 (with W2 #432).
+ * Coverage: FRAME-level errors (header/command decode, audit-entry structure, unexpected rejections
+ * from awaited handler work) reach the outer catch directly. A per-record VALUE decode failure is
+ * caught first by the inner catch around `decodeBlobsWithWrites` — which logs the decoder's structures
+ * and the offending bytes for diagnosis, then RE-THROWS (only when the table decoder resolved) so it
+ * rides this same close path instead of skip-and-logging while the resume cursor advances past the
+ * hole. That closes the #1163/#1453 structure-fork silent-gap class: the reconnect rebuilds the table
+ * decoder from the peer's re-sent structures, healing the fork on resume. An unknown tableId (decoder
+ * unresolved — a transient schema-propagation case, not a fork) stays skip-and-log.
  *
  * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
  * catch in `onWSMessage`.
@@ -374,6 +377,30 @@ export function closeOnInboundMessageError(
 		error
 	);
 	deps.close(1011, 'Error handling incoming replication message');
+}
+
+/**
+ * Classify how a per-record value-decode failure inside `onWSMessage` should recover — the one decision
+ * that keeps a decode error from silently, permanently dropping a record.
+ *
+ * A RESOLVED table decoder means the offending bytes are a genuine record for a known table whose decoder
+ * structures forked from the sender's (#1163/#1453 — e.g. an "end of buffer" structon throw). The batch's
+ * resume cursor (`maxBatchVersion` → end_txn → sender `COMMITTED_UPDATE`) advances regardless of whether the
+ * record decoded, so skip-and-logging moves the cursor past the hole forever. We `'close'` instead: the
+ * transient 1011 reconnect rebuilds this table's decoder from the peer's re-sent typedStructs/structures
+ * (the SET_TABLE handshake) and re-streams from the durable cursor, healing the fork on resume.
+ *
+ * An UNRESOLVED decoder is an unknown tableId — a transient schema-propagation case, not a structure fork;
+ * a reconnect wouldn't supply the missing table def, so closing would only churn. It stays `'skip'`.
+ *
+ * (harper-pro#440, epic #430 Theme B. A bounded-retry escalation budget for a deterministically un-healable
+ * frame — so a genuinely corrupt record can't wedge the link forever — is W2 / harper-pro#432.)
+ *
+ * Exported for unit tests (`recordDecodeErrorRecovery.test.mjs`); the production caller is the inner
+ * value-decode catch in `onWSMessage`.
+ */
+export function classifyRecordDecodeError(hasTableDecoder: boolean): 'close' | 'skip' {
+	return hasTableDecoder ? 'close' : 'skip';
 }
 
 /**
@@ -3455,6 +3482,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				const id = auditRecord.recordId;
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
+				// Boxed (not the bare error) so the re-throw below can't be defeated by a falsy thrown value.
+				let decodeFailure: { error: unknown } | undefined;
 				try {
 					decodeBlobsWithWrites(
 						() => {
@@ -3480,9 +3509,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						}
 					);
 				} catch (error) {
-					// Guarded dereferences: tableDecoder is undefined for an unknown tableId, and an unguarded
-					// log line here used to throw its own TypeError — masking the original error and escaping
-					// to the outer catch, so the skip-vs-close outcome was decided by accident (#440).
+					// Guarded dereferences: tableDecoder is undefined for an unknown tableId. An unguarded log
+					// line here used to throw its own TypeError, masking the original error and escaping to the
+					// outer catch — closing by accident. The guard keeps the unknown-tableId case skip-and-log;
+					// the deliberate close for a resolved-decoder value-decode failure is the re-throw below (#440).
 					logger.error?.(
 						'Error decoding replication message, record id: ' + id,
 						' typed structures for current decoder: ' +
@@ -3494,12 +3524,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						auditRecord,
 						error
 					);
+					// A resolved-decoder value-decode failure must close, not skip: `maxBatchVersion` (and the
+					// end_txn resume cursor) advance below regardless of `event`, so skipping loses the record
+					// permanently. Latch it to re-throw onto the outer close path. See classifyRecordDecodeError.
+					if (classifyRecordDecodeError(!!tableDecoder) === 'close') decodeFailure = { error };
 				}
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
 					// a window to complete, then unlink the files. (mirrors the pattern at the relocate path above.)
 					setTimeout(() => receivedBlobs.forEach(deleteBlob), 60000).unref();
 				}
+				if (decodeFailure) throw decodeFailure.error; // re-throw after blob cleanup, before the resume cursor advances past this record
 				// During a bulk copy, do NOT advance the received-version watermark per copied record:
 				// records arrive in primary-key order carrying their original (possibly newest) versions, so a
 				// single record at the leader's latest timestamp would otherwise let checkSyncStatus mark the
