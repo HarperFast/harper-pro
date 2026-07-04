@@ -91,6 +91,12 @@ interface PathTrieNode {
 	ruleIndexes: number[] | null;
 }
 
+export interface WafRuleStat {
+	hitCount: number;
+	/** Date.now() of the most recent match, or 0 if never matched. */
+	lastMatched: number;
+}
+
 export interface WafMatcher {
 	/** True when there are no compiled request-phase rules; callers can skip evaluate(). */
 	isEmpty: boolean;
@@ -98,6 +104,26 @@ export interface WafMatcher {
 	/** Rules that failed validation, for reporting. Keyed by rule id (stringified). */
 	invalidRules: Map<string, string[]>;
 	evaluate(request: WafRequestInfo): WafDecision | null;
+	/** Per-rule hit telemetry (same map as getRuleStats), for convenience off the matcher. */
+	getStats(): ReadonlyMap<string, WafRuleStat>;
+}
+
+/**
+ * Per-rule hit telemetry, keyed by String(rule.id). Module-level so it PERSISTS across recompiles:
+ * the matcher object is swapped on every rule change (see waf.ts), but a rule's counters must
+ * survive the swap and keep climbing by id. These are per-worker, process-lifetime counters;
+ * cross-worker aggregation / main-thread surfacing rides on the #518 analytics work (out of scope).
+ */
+const ruleStats = new Map<string, WafRuleStat>();
+
+/** Per-rule hit telemetry (read-only), keyed by String(rule.id). Persists across recompiles. */
+export function getRuleStats(): ReadonlyMap<string, WafRuleStat> {
+	return ruleStats;
+}
+
+/** Clears all per-rule telemetry (test hook). */
+export function resetRuleStats(): void {
+	ruleStats.clear();
 }
 
 const DEFAULT_BLOCK_STATUS = 403;
@@ -847,6 +873,22 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		if (matched === null) return null;
 		if (matched.length > 1) matched.sort((a, b) => a.priority - b.priority);
 
+		// Per-rule telemetry: every rule in the final matched set counts as a hit regardless of
+		// action (block/log/score). Only reached when matched !== null, so the 99% no-candidate path
+		// stays allocation-free. Entries are created lazily, keyed by String(rule.id).
+		// TODO: per-rule latency attribution would need a hot-path timestamp diff; skipped as not
+		// free — hitCount + lastMatched are the telemetry contract here.
+		const hitTime = Date.now();
+		for (const rule of matched) {
+			const key = String(rule.id);
+			const stat = ruleStats.get(key);
+			if (stat === undefined) ruleStats.set(key, { hitCount: 1, lastMatched: hitTime });
+			else {
+				stat.hitCount++;
+				stat.lastMatched = hitTime;
+			}
+		}
+
 		// Enforcement short-circuits, telemetry must not: once a block decision is made, no further
 		// score accumulation happens, but log-action rules from the WHOLE matched set are still
 		// collected and surfaced on the decision (matchedLogRuleIds) so the middleware records them.
@@ -880,5 +922,5 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		return null; // only sub-threshold score rules matched
 	}
 
-	return { isEmpty, ruleCount, invalidRules, evaluate };
+	return { isEmpty, ruleCount, invalidRules, evaluate, getStats: getRuleStats };
 }
