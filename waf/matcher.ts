@@ -153,20 +153,39 @@ const DEFAULT_BLOCK_STATUS = 403;
 /**
  * RFC 3986 §5.2.4 remove_dot_segments: resolves `.` and `..` in a path so /a/./b→/a/b and
  * /a/b/../c→/a/c, without touching the network. Operates on the whole path (no scheme/authority).
+ *
+ * A trailing `.`/`..` segment preserves the boundary slash (the RFC "complete path segment" rule):
+ * /admin/.→/admin/, /admin/x/..→/admin/, /admin/..→/, /a/b/.→/a/b/. This matters because a rule
+ * literal /admin/ has no dot segment to resolve, so dropping the trailing slash here would make
+ * /admin/. never match it. Interior dots are unaffected (/a/./b→/a/b, /a/b/../c→/a/c). The
+ * duplicate-slash collapse is folded in (empty interior segments are skipped) so callers need no
+ * separate pass; the single leading-slash marker is preserved.
  */
 function removeDotSegments(path: string): string {
-	const output: string[] = [];
+	const output: string[] = [''];
 	const segments = path.split('/');
-	for (const segment of segments) {
-		if (segment === '.') continue;
-		if (segment === '..') {
-			// pop the previous real segment, but never past the (empty) leading-slash marker
-			if (output.length > 1) output.pop();
+	for (let i = 0; i < segments.length; i++) {
+		const segment = segments[i];
+		const isLast = i === segments.length - 1;
+		if (segment === '.') {
+			// a trailing '.' resolves to the current directory: keep the boundary slash
+			if (isLast) output.push('');
 			continue;
 		}
+		if (segment === '..') {
+			// pop the previous real segment, but never past the leading-slash marker
+			if (output.length > 1) output.pop();
+			// a trailing '..' leaves us at the parent directory: keep the boundary slash
+			if (isLast) output.push('');
+			continue;
+		}
+		// skip empty interior segments (collapses duplicate slashes) but keep the leading marker (index
+		// 0) and a genuine trailing slash (the last segment, empty because the path ended in '/')
+		if (segment === '' && !isLast) continue;
 		output.push(segment);
 	}
-	return output.join('/');
+	// output[0] is the leading-slash marker; join reintroduces every '/'
+	return output.join('/') || '/';
 }
 
 /**
@@ -175,13 +194,17 @@ function removeDotSegments(path: string): string {
  * slip past a path rule. Steps, in order:
  *   1. bounded iterative percent-decoding — up to 2 decodeURIComponent passes, or until the string
  *      stops changing; a malformed-escape throw stops decoding and keeps the last good value.
- *   2. RFC 3986 §5.2.4 remove_dot_segments (resolve `.` and `..`).
- *   3. collapse runs of `/` into a single `/`.
+ *   2. RFC 3986 §5.2.4 remove_dot_segments (resolve `.` and `..`, folding in duplicate-slash collapse).
  * A leading `/` is preserved. Deliberately NOT case-folded: case-sensitive paths are legitimate
  * app semantics and lowercasing would cause false matches. A future per-rule case-insensitive
  * option is the extension point for callers that want case-folded matching.
  */
 export function canonicalizePath(path: string): string {
+	// Fast path: a path with no percent-escape, no duplicate slash, and no dot segment is already
+	// canonical, so return it with zero allocation — this is the 99% case and it preserves the
+	// matcher's allocation-free non-candidate path. A legit segment containing '/.' (e.g.
+	// '/.well-known') harmlessly takes the slow path and still canonicalizes to itself.
+	if (path.indexOf('%') === -1 && path.indexOf('//') === -1 && path.indexOf('/.') === -1) return path;
 	// 1. bounded iterative percent-decoding
 	let decoded = path;
 	for (let pass = 0; pass < 2; pass++) {
@@ -195,11 +218,8 @@ export function canonicalizePath(path: string): string {
 		if (next === decoded) break;
 		decoded = next;
 	}
-	// 2. resolve dot segments
-	let result = removeDotSegments(decoded);
-	// 3. collapse duplicate slashes, preserving a single leading slash
-	result = result.replace(/\/{2,}/g, '/');
-	return result;
+	// 2. resolve dot segments (duplicate-slash collapse is folded into this single pass)
+	return removeDotSegments(decoded);
 }
 
 /** Parses a dotted-quad IPv4 address to an unsigned 32-bit integer, or -1 when not IPv4. */
@@ -1005,8 +1025,10 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		if (matched.length > 1) matched.sort((a, b) => a.priority - b.priority);
 
 		// Per-rule telemetry: every rule in the final matched set counts as a hit regardless of
-		// action (block/log/score). Only reached when matched !== null, so the 99% no-candidate path
-		// stays allocation-free. Entries are created lazily, keyed by String(rule.id).
+		// action (block/log/score). Shadow rules and monitor-mode matches count too: hitCount is a
+		// MATCH counter, not a block counter (intended — a shadow/monitor "would-block" is still a
+		// match). Only reached when matched !== null, so the 99% no-candidate path stays allocation-
+		// free. Entries are created lazily, keyed by String(rule.id).
 		// TODO: per-rule latency attribution would need a hot-path timestamp diff; skipped as not
 		// free — hitCount + lastMatched are the telemetry contract here.
 		const hitTime = Date.now();
@@ -1020,13 +1042,16 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 			}
 		}
 
-		// Resolution splits the matched set into a REAL track (non-shadow rules — today's exact logic:
-		// first block wins, score accumulates to threshold, log passes through) and a SHADOW track
-		// (rules with shadow:true, which in monitor mode is EVERY rule — see the compile step). The
-		// shadow track mirrors the block/score resolution but produces ONLY a would-block preview id
-		// list; shadow rules never contribute to the real score and can never cause a real block.
-		// Enforcement short-circuits, telemetry must not: log-action rules from the WHOLE matched set
-		// are still collected and surfaced (matchedLogRuleIds) even after a block wins.
+		// Resolution. `log` is orthogonal to shadow — a log rule NEVER enforces, so shadow/monitor
+		// must not suppress it: every matched log rule is collected into the real logIds regardless of
+		// the shadow flag (handled first, below). Only ENFORCING actions (block/score) go through the
+		// REAL-vs-SHADOW split: the REAL track is today's exact logic (first block wins, score
+		// accumulates to threshold); the SHADOW track (rules with shadow:true, which in monitor mode is
+		// EVERY block/score rule — see the compile step) mirrors that resolution but produces ONLY a
+		// would-block preview id list, never contributing to the real score or causing a real block.
+		// Net for monitor mode: would-block previews for block/score PLUS normal log output — the
+		// intended visibility-adding dry-run. Enforcement short-circuits, telemetry does not: log rules
+		// from the WHOLE matched set are surfaced (matchedLogRuleIds) even after a block wins.
 		let totalScore = 0;
 		let logIds: (string | number)[] | null = null;
 		let blockDecision: WafDecision | null = null;
@@ -1036,24 +1061,24 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		let shadowBlockIds: (string | number)[] | null = null; // would-block preview (first shadow block wins)
 		const shadowScoreIds: (string | number)[] = [];
 		for (const rule of matched) {
+			// log is orthogonal to shadow/monitor — always collect it (never suppressed, never a block)
+			if (rule.action === 'log') {
+				(logIds ??= []).push(rule.id);
+				continue;
+			}
 			if (rule.shadow) {
 				// SHADOW track: mirror block/score resolution into a would-block list only.
 				if (shadowBlockIds !== null) continue; // shadow would-block already decided
 				if (rule.action === 'block') {
 					shadowBlockIds = [rule.id];
-				} else if (rule.action === 'score') {
+				} else {
 					shadowScore += rule.score;
 					shadowScoreIds.push(rule.id);
 					if (shadowScore >= scoreThreshold) shadowBlockIds = shadowScoreIds.slice();
 				}
-				// shadow log rules produce no would-block; the request would pass either way, so skip.
 				continue;
 			}
 			// REAL track (unchanged logic)
-			if (rule.action === 'log') {
-				(logIds ??= []).push(rule.id);
-				continue;
-			}
 			if (blockDecision !== null) continue; // enforcement decided; only telemetry collection remains
 			if (rule.action === 'block') {
 				blockDecision = { action: 'block', status: rule.blockStatus, ruleIds: [rule.id] };

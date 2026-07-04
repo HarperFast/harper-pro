@@ -70,6 +70,19 @@ describe('WAF per-rule telemetry', () => {
 		expect(getRuleStats().get('dup').hitCount).to.equal(2);
 	});
 
+	it('counts a shadow (would-block) match as a hit — hitCount is a match counter, not a block counter', () => {
+		const matcher = compileRules([{ ...BASE, id: 'sh', shadow: true, match: { path: { exact: '/admin' } } }]);
+		// shadow rule never enforces, but the match still counts
+		matcher.evaluate(makeRequest({ path: '/admin' }));
+		expect(getRuleStats().get('sh').hitCount).to.equal(1);
+	});
+
+	it('counts a monitor-mode match as a hit', () => {
+		const matcher = compileRules([{ ...BASE, id: 'mon', match: { path: { exact: '/admin' } } }], { mode: 'monitor' });
+		matcher.evaluate(makeRequest({ path: '/admin' }));
+		expect(getRuleStats().get('mon').hitCount).to.equal(1);
+	});
+
 	it('exposes the same stats map via matcher.getStats()', () => {
 		const matcher = compileRules([{ ...BASE, id: 'g', match: { path: { exact: '/admin' } } }]);
 		matcher.evaluate(makeRequest({ path: '/admin' }));

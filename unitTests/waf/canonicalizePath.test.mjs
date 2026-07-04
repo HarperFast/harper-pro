@@ -7,7 +7,9 @@
  */
 
 import { expect } from 'chai';
-import { canonicalizePath } from '#src/waf/matcher';
+import { canonicalizePath, compileRules } from '#src/waf/matcher';
+
+const BASE = { enabled: true, priority: 0, phase: 'request', action: 'block' };
 
 describe('WAF canonicalizePath', () => {
 	it('percent-decodes a single pass', () => {
@@ -56,5 +58,29 @@ describe('WAF canonicalizePath', () => {
 	});
 	it('leaves an already-canonical path unchanged', () => {
 		expect(canonicalizePath('/api/products/42')).to.equal('/api/products/42');
+	});
+	it('preserves the boundary trailing slash on a final dot segment (RFC 3986 §5.2.4)', () => {
+		expect(canonicalizePath('/admin/.')).to.equal('/admin/');
+		expect(canonicalizePath('/admin/x/..')).to.equal('/admin/');
+		expect(canonicalizePath('/admin/..')).to.equal('/');
+		expect(canonicalizePath('/a/b/.')).to.equal('/a/b/');
+	});
+	it('takes the slow path for a legit /. segment but still canonicalizes to itself', () => {
+		expect(canonicalizePath('/.well-known/x')).to.equal('/.well-known/x');
+	});
+});
+
+describe('WAF canonicalizePath — trailing-slash rule matching (regression)', () => {
+	// Before FIX 1, /admin/. canonicalized to /admin (dropped slash) while a rule literal /admin/
+	// canonicalized to /admin/ (no dot segment) — so they never matched. Now both land on /admin/.
+	it('a path.exact:/admin/ rule matches request /admin/.', () => {
+		const matcher = compileRules([{ ...BASE, id: 'trailing', match: { path: { exact: '/admin/' } } }]);
+		const request = { ip: '1.1.1.1', method: 'GET', path: canonicalizePath('/admin/.'), getHeader: () => undefined };
+		expect(matcher.evaluate(request).ruleIds).to.deep.equal(['trailing']);
+	});
+	it('a path.prefix:/admin/ rule matches request /admin/x/..', () => {
+		const matcher = compileRules([{ ...BASE, id: 'tp', action: 'log', match: { path: { prefix: '/admin/' } } }]);
+		const request = { ip: '1.1.1.1', method: 'GET', path: canonicalizePath('/admin/x/..'), getHeader: () => undefined };
+		expect(matcher.evaluate(request).ruleIds).to.deep.equal(['tp']);
 	});
 });
