@@ -61,14 +61,25 @@ export interface WafDecision {
 	 * is rejected. Absent when no log rules matched (no allocation on that path).
 	 */
 	matchedLogRuleIds?: (string | number)[];
+	/**
+	 * "Would-block" preview ids from the SHADOW track (wave 2): rules with shadow:true that matched
+	 * (or, in monitor mode, every rule that would have blocked). Shadow rules never enforce; these
+	 * are surfaced for telemetry/preview only. On a real block they ride along; when only shadow
+	 * would-block exists the decision is a pass-through (action 'log', status 0) carrying these.
+	 * Absent when no shadow would-block exists (no allocation on that path).
+	 */
+	shadowRuleIds?: (string | number)[];
 }
 
 interface CompiledRule {
 	id: string | number;
 	priority: number;
+	// only enforceable actions reach compilation; challenge/serve/drop are deferred (see compileRules).
 	action: 'block' | 'log' | 'score';
 	score: number;
 	blockStatus: number;
+	/** When true this rule never enforces — it only produces a would-block preview (wave 2 shadow). */
+	shadow: boolean;
 	/** Conditions not covered by the anchor index; null when the anchor is the whole rule. */
 	residual: ((request: WafRequestInfo) => boolean) | null;
 }
@@ -98,11 +109,22 @@ export interface WafRuleStat {
 }
 
 export interface WafMatcher {
-	/** True when there are no compiled request-phase rules; callers can skip evaluate(). */
+	/**
+	 * True when the matcher can never produce a decision; callers can skip evaluate(). Set when
+	 * there are no compiled rules OR the global mode is 'off' (kill switch, pass-through).
+	 */
 	isEmpty: boolean;
 	ruleCount: number;
-	/** Rules that failed validation, for reporting. Keyed by rule id (stringified). */
+	/** Rules that failed validation (malformed shape), for reporting. Keyed by rule id (stringified). */
 	invalidRules: Map<string, string[]>;
+	/**
+	 * Rules that are VALID (shape ok) but use a feature the v1 engine cannot honor (challenge/serve/
+	 * drop action, a ja4/ja4h/model/agent match, or rateLimit). Compiled OUT and reported here as
+	 * DEFERRED — kept DISTINCT from invalidRules so a "deferred" count never masquerades as a
+	 * malformed-rule count (decision a: skip-with-warning, never silently under-enforce). Keyed by
+	 * rule id (stringified) → reasons.
+	 */
+	unsupportedRules: Map<string, string[]>;
 	evaluate(request: WafRequestInfo): WafDecision | null;
 	/** Per-rule hit telemetry (same map as getRuleStats), for convenience off the matcher. */
 	getStats(): ReadonlyMap<string, WafRuleStat>;
@@ -483,18 +505,113 @@ function combineResiduals(residuals: ResidualCheck[]): ResidualCheck | null {
 export interface CompileOptions {
 	/** Total accumulated score at which score-action rules produce a block. */
 	scoreThreshold?: number;
-	/** Called once per skipped rule with a reason (defaults to silent). */
+	/** Called once per malformed (invalid) rule with a reason (defaults to silent). */
 	onInvalidRule?(ruleId: string, problems: string[]): void;
+	/**
+	 * Called once per VALID-but-DEFERRED rule (wave 2): a rule whose shape is fine but that uses a
+	 * feature this engine cannot honor, so it is compiled OUT rather than partially enforced. Kept
+	 * separate from onInvalidRule so callers can report the two counts distinctly.
+	 */
+	onUnsupportedRule?(ruleId: string, reasons: string[]): void;
+	/**
+	 * Global enforcement mode (wave 2, decision b): 'enforce' = normal; 'monitor' = compile normally
+	 * but treat EVERY rule as shadow (nothing enforces, would-blocks are surfaced); 'off' = return a
+	 * pass-through matcher (kill switch). Defaults to 'enforce'.
+	 */
+	mode?: 'enforce' | 'monitor' | 'off';
+	/**
+	 * This node's identity for activation gating (wave 2, decision c). A rule with an `activation`
+	 * selector compiles into the matcher only when this identity satisfies it. Absent identity means
+	 * only rules WITHOUT node/region/tag constraints they can't meet are armed (see isArmedOnNode).
+	 */
+	nodeIdentity?: { name?: string; region?: string; tags?: string[] };
+}
+
+const DEFERRED_ACTIONS = new Set<string>(['challenge', 'serve', 'drop']);
+
+/**
+ * Reasons a VALID rule is DEFERRED (compiled out, not enforced) by the v1 engine — see decision a.
+ * Returns an empty array when the rule uses only v1-enforceable features. A deferred rule is never
+ * partially enforced: any single deferred feature removes the whole rule from the matcher.
+ * NOTE: scope and provenance are reserved METADATA in v1 — validated + persisted, NOT enforced, and
+ * deliberately do NOT cause deferral (a rule with scope/provenance still compiles and enforces).
+ */
+function deferralReasons(rule: WafRule): string[] {
+	const reasons: string[] = [];
+	if (DEFERRED_ACTIONS.has(rule.action)) reasons.push(`action '${rule.action}' is not enforced in this version`);
+	const match = rule.match;
+	if (match) {
+		if (match.ja4 != null) reasons.push('match.ja4 is not enforced in this version');
+		if (match.ja4h != null) reasons.push('match.ja4h is not enforced in this version');
+		if (match.model != null) reasons.push('match.model is not enforced in this version');
+		if (match.agent != null) reasons.push('match.agent is not enforced in this version');
+	}
+	if (rule.rateLimit != null) reasons.push('rateLimit is not enforced in this version');
+	return reasons;
 }
 
 /**
- * Compiles the full rule list into an immutable matcher. Disabled, non-request-phase, and
- * invalid rules are excluded (invalid ones are reported via options.onInvalidRule and the
- * matcher's invalidRules map).
+ * Activation gating (wave 2, decision c): a rule is ARMED on this node iff, for each present
+ * selector, the node identity matches — nodes by name, regions by region, tags by intersection.
+ * Absent activation → armed everywhere. A present selector the node can't satisfy (e.g. an
+ * activation.nodes list when this node has no name) leaves the rule NOT armed here.
+ */
+function isArmedOnNode(rule: WafRule, identity: NonNullable<CompileOptions['nodeIdentity']>): boolean {
+	const activation = rule.activation;
+	if (activation == null) return true;
+	if (activation.nodes != null && (identity.name == null || !activation.nodes.includes(identity.name))) return false;
+	if (activation.regions != null && (identity.region == null || !activation.regions.includes(identity.region)))
+		return false;
+	if (activation.tags != null) {
+		const nodeTags = identity.tags;
+		if (nodeTags == null || !activation.tags.some((tag) => nodeTags.includes(tag))) return false;
+	}
+	return true;
+}
+
+/**
+ * Compiles the full rule list into an immutable matcher. Disabled, non-request-phase, and invalid
+ * (malformed) rules are excluded (invalid ones reported via options.onInvalidRule + invalidRules).
+ * VALID-but-DEFERRED rules (reserved/unimplemented features) are also excluded but reported
+ * separately via options.onUnsupportedRule + unsupportedRules (decision a). Rules gated OUT by
+ * activation on this node are silently omitted (not counted as invalid or unsupported).
+ * When options.mode is 'off' a pass-through (isEmpty) matcher is returned immediately (kill switch).
  */
 export function compileRules(rules: WafRule[], options: CompileOptions = {}): WafMatcher {
 	const scoreThreshold = options.scoreThreshold ?? 10;
+	const mode = options.mode ?? 'enforce';
+	const monitorMode = mode === 'monitor';
+	const nodeIdentity = options.nodeIdentity ?? {};
 	const invalidRules = new Map<string, string[]>();
+	const unsupportedRules = new Map<string, string[]>();
+
+	// mode 'off' is the kill switch: return a pass-through matcher so evaluate() short-circuits. We
+	// still classify rules for the logging summary (which reads invalid/unsupported counts) but skip
+	// all index building, since nothing is ever evaluated.
+	if (mode === 'off') {
+		for (const rule of rules) {
+			if (!rule || rule.enabled === false || rule.phase !== 'request') continue;
+			const problems = validateRule(rule);
+			if (problems.length > 0) {
+				invalidRules.set(String(rule.id), problems);
+				options.onInvalidRule?.(String(rule.id), problems);
+				continue;
+			}
+			const reasons = deferralReasons(rule);
+			if (reasons.length > 0) {
+				unsupportedRules.set(String(rule.id), reasons);
+				options.onUnsupportedRule?.(String(rule.id), reasons);
+			}
+		}
+		return {
+			isEmpty: true,
+			ruleCount: 0,
+			invalidRules,
+			unsupportedRules,
+			evaluate: () => null,
+			getStats: getRuleStats,
+		};
+	}
 
 	const compiled: CompiledRule[] = [];
 
@@ -518,6 +635,17 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 			options.onInvalidRule?.(String(rule.id), problems);
 			continue;
 		}
+		// DEFERRED (decision a): the rule is valid but uses a feature the v1 engine can't honor.
+		// Compile it OUT and report it as unsupported — distinct from invalid — never partially enforce.
+		const deferred = deferralReasons(rule);
+		if (deferred.length > 0) {
+			unsupportedRules.set(String(rule.id), deferred);
+			options.onUnsupportedRule?.(String(rule.id), deferred);
+			continue;
+		}
+		// Activation gating (decision c): a rule not armed on THIS node is compiled out silently —
+		// it's simply not-for-this-node, so it is neither invalid nor unsupported here.
+		if (!isArmedOnNode(rule, nodeIdentity)) continue;
 		const match = rule.match;
 		const errors: string[] = [];
 		const residuals: ResidualCheck[] = [];
@@ -672,9 +800,12 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		compiled.push({
 			id: rule.id,
 			priority: rule.priority ?? 0,
-			action: rule.action,
+			// deferred actions (challenge/serve/drop) were filtered above, so only enforceable actions remain
+			action: rule.action as CompiledRule['action'],
 			score: rule.score ?? 0,
 			blockStatus: rule.blockStatus ?? DEFAULT_BLOCK_STATUS,
+			// monitor mode makes EVERY rule behave as shadow (decision b); otherwise honor per-rule shadow.
+			shadow: monitorMode || rule.shadow === true,
 			residual: combineResiduals(residuals),
 		});
 	}
@@ -889,14 +1020,36 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 			}
 		}
 
-		// Enforcement short-circuits, telemetry must not: once a block decision is made, no further
-		// score accumulation happens, but log-action rules from the WHOLE matched set are still
-		// collected and surfaced on the decision (matchedLogRuleIds) so the middleware records them.
+		// Resolution splits the matched set into a REAL track (non-shadow rules — today's exact logic:
+		// first block wins, score accumulates to threshold, log passes through) and a SHADOW track
+		// (rules with shadow:true, which in monitor mode is EVERY rule — see the compile step). The
+		// shadow track mirrors the block/score resolution but produces ONLY a would-block preview id
+		// list; shadow rules never contribute to the real score and can never cause a real block.
+		// Enforcement short-circuits, telemetry must not: log-action rules from the WHOLE matched set
+		// are still collected and surfaced (matchedLogRuleIds) even after a block wins.
 		let totalScore = 0;
 		let logIds: (string | number)[] | null = null;
 		let blockDecision: WafDecision | null = null;
 		const scoreIds: (string | number)[] = [];
+		// shadow-track accumulators (mirror the real ones)
+		let shadowScore = 0;
+		let shadowBlockIds: (string | number)[] | null = null; // would-block preview (first shadow block wins)
+		const shadowScoreIds: (string | number)[] = [];
 		for (const rule of matched) {
+			if (rule.shadow) {
+				// SHADOW track: mirror block/score resolution into a would-block list only.
+				if (shadowBlockIds !== null) continue; // shadow would-block already decided
+				if (rule.action === 'block') {
+					shadowBlockIds = [rule.id];
+				} else if (rule.action === 'score') {
+					shadowScore += rule.score;
+					shadowScoreIds.push(rule.id);
+					if (shadowScore >= scoreThreshold) shadowBlockIds = shadowScoreIds.slice();
+				}
+				// shadow log rules produce no would-block; the request would pass either way, so skip.
+				continue;
+			}
+			// REAL track (unchanged logic)
 			if (rule.action === 'log') {
 				(logIds ??= []).push(rule.id);
 				continue;
@@ -914,13 +1067,26 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		}
 		if (blockDecision !== null) {
 			if (logIds !== null) blockDecision.matchedLogRuleIds = logIds;
+			if (shadowBlockIds !== null) blockDecision.shadowRuleIds = shadowBlockIds;
 			return blockDecision;
+		}
+		// No real block. If a shadow would-block exists, return a pass-through (action 'log', status 0)
+		// carrying the preview so the middleware logs the would-block without enforcing.
+		if (shadowBlockIds !== null) {
+			const decision: WafDecision = {
+				action: 'log',
+				status: 0,
+				ruleIds: logIds ?? [],
+				shadowRuleIds: shadowBlockIds,
+			};
+			if (totalScore > 0) decision.score = totalScore;
+			return decision;
 		}
 		if (logIds !== null) {
 			return { action: 'log', status: 0, ruleIds: logIds, score: totalScore > 0 ? totalScore : undefined };
 		}
-		return null; // only sub-threshold score rules matched
+		return null; // only sub-threshold (real and shadow) score rules matched
 	}
 
-	return { isEmpty, ruleCount, invalidRules, evaluate, getStats: getRuleStats };
+	return { isEmpty, ruleCount, invalidRules, unsupportedRules, evaluate, getStats: getRuleStats };
 }
