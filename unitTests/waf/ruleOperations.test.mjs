@@ -7,7 +7,7 @@
  */
 
 import { expect } from 'chai';
-import { makeWafRuleOperations } from '#src/waf/ruleOperations';
+import { makeWafRuleOperations, WAF_CONTROL_ID } from '#src/waf/ruleOperations';
 
 function makeFakeTable() {
 	const map = new Map();
@@ -123,6 +123,98 @@ describe('WAF rule operations', () => {
 			expect(error.statusCode).to.equal(400);
 		}
 		expect(table.map.get('r1').action).to.equal('block');
+	});
+
+	it('defaults provenance to human-authored on add', async () => {
+		const table = makeFakeTable();
+		const operations = makeWafRuleOperations(table);
+		// fresh rule objects — addWafRule assigns the default provenance onto the passed rule
+		await operations.addWafRule({ hdb_user: { ...SUPER_USER, username: 'kris' }, rule: { ...RULE } });
+		expect(table.map.get('r1').provenance).to.deep.equal({ origin: 'human', approver: 'kris' });
+		// an explicit provenance is preserved
+		await operations.addWafRule({
+			hdb_user: SUPER_USER,
+			rule: { ...RULE, id: 'r2', provenance: { origin: 'managed-feed', source: 'feed' } },
+		});
+		expect(table.map.get('r2').provenance).to.deep.equal({ origin: 'managed-feed', source: 'feed' });
+	});
+
+	it('patches the wave-2 reserved top-level fields on alter', async () => {
+		const table = makeFakeTable();
+		const operations = makeWafRuleOperations(table);
+		await operations.addWafRule({ hdb_user: SUPER_USER, rule: RULE });
+		await operations.alterWafRule({
+			hdb_user: SUPER_USER,
+			id: 'r1',
+			shadow: true,
+			activation: { nodes: ['n1'] },
+			scope: { tenants: ['t'] },
+			rateLimit: { key: ['ip'], limit: 5 },
+		});
+		const stored = table.map.get('r1');
+		expect(stored.shadow).to.equal(true);
+		expect(stored.activation).to.deep.equal({ nodes: ['n1'] });
+		expect(stored.scope).to.deep.equal({ tenants: ['t'] });
+		expect(stored.rateLimit).to.deep.equal({ key: ['ip'], limit: 5 });
+	});
+
+	describe('set_waf_mode + control-row sentinel guards', () => {
+		it('set_waf_mode upserts the control row (super_user only, validated)', async () => {
+			const table = makeFakeTable();
+			const operations = makeWafRuleOperations(table);
+			await operations.setWafMode({ hdb_user: SUPER_USER, mode: 'monitor' });
+			expect(table.map.get(WAF_CONTROL_ID)).to.deep.equal({ id: WAF_CONTROL_ID, mode: 'monitor' });
+			// upsert (not duplicate-rejected)
+			await operations.setWafMode({ hdb_user: SUPER_USER, mode: 'off' });
+			expect(table.map.get(WAF_CONTROL_ID).mode).to.equal('off');
+			expect(table.calls.put.every((c) => c.context.user === SUPER_USER)).to.equal(true);
+		});
+
+		it('set_waf_mode rejects an invalid mode and non-super_user', async () => {
+			const table = makeFakeTable();
+			const operations = makeWafRuleOperations(table);
+			try {
+				await operations.setWafMode({ hdb_user: SUPER_USER, mode: 'paranoid' });
+				expect.fail('expected rejection');
+			} catch (error) {
+				expect(error.statusCode).to.equal(400);
+			}
+			try {
+				await operations.setWafMode({ hdb_user: DATA_ADMIN, mode: 'off' });
+				expect.fail('expected rejection');
+			} catch (error) {
+				expect(error.statusCode).to.equal(403);
+			}
+			expect(table.map.size).to.equal(0);
+		});
+
+		it('add/alter reject the reserved control-row id', async () => {
+			const table = makeFakeTable();
+			const operations = makeWafRuleOperations(table);
+			try {
+				await operations.addWafRule({ hdb_user: SUPER_USER, rule: { ...RULE, id: WAF_CONTROL_ID } });
+				expect.fail('expected rejection');
+			} catch (error) {
+				expect(error.message).to.include('reserved');
+			}
+			try {
+				await operations.alterWafRule({ hdb_user: SUPER_USER, id: WAF_CONTROL_ID, enabled: false });
+				expect.fail('expected rejection');
+			} catch (error) {
+				expect(error.message).to.include('reserved');
+			}
+			expect(table.map.has(WAF_CONTROL_ID)).to.equal(false);
+		});
+
+		it('list_waf_rules excludes the control row', async () => {
+			const table = makeFakeTable();
+			const operations = makeWafRuleOperations(table);
+			await operations.addWafRule({ hdb_user: SUPER_USER, rule: RULE });
+			await operations.setWafMode({ hdb_user: SUPER_USER, mode: 'enforce' });
+			const listed = await operations.listWafRules({ hdb_user: SUPER_USER });
+			expect(listed).to.have.length(1);
+			expect(listed[0].id).to.equal('r1');
+		});
 	});
 
 	it('rejects duplicate adds and missing-id alters/drops', async () => {

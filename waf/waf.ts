@@ -47,8 +47,9 @@
  */
 
 import { loggerWithTag } from '../core/utility/logging/harper_logger.js';
+import { getThisNodeName } from '../core/server/nodeName.ts';
 import { canonicalizePath, compileRules, type WafMatcher, type WafRequestInfo } from './matcher.ts';
-import { makeWafRuleOperations } from './ruleOperations.ts';
+import { makeWafRuleOperations, WAF_CONTROL_ID } from './ruleOperations.ts';
 import type { WafRule } from './rules.ts';
 
 export const WAF_RULE_TABLE = 'hdb_waf_rules';
@@ -66,7 +67,26 @@ interface WafComponentOptions {
 	logRateLimit?: number;
 	/** Log rate-limit window in ms (default 60000). */
 	logRateIntervalMs?: number;
+	/**
+	 * Config-level global enforcement mode fallback (wave 2). The replicated control row overrides
+	 * this; this is the value used when no control row exists. Defaults to 'enforce'.
+	 */
+	mode?: 'enforce' | 'monitor' | 'off';
+	/** This node's region for activation gating (wave 2). */
+	region?: string;
+	/** This node's tags for activation gating (wave 2, default []). */
+	nodeTags?: string[];
 	[key: string]: any;
+}
+
+/**
+ * Replicated WAF control row (wave 2, decision b): a single sentinel row in the rule table carrying
+ * the global mode. Pulled OUT of the rule list before compilation — it is never compiled/validated
+ * as a rule. Persists + replicates cluster-wide like every other row in the table.
+ */
+interface WafControlRow {
+	id: string;
+	mode?: 'enforce' | 'monitor' | 'off';
 }
 
 /** Minimal status → reason-phrase map for the opaque block response (O4). */
@@ -129,6 +149,14 @@ const TABLE_DEFINITION = {
 		{ name: 'action' },
 		{ name: 'score' },
 		{ name: 'blockStatus' },
+		// wave 2 reserved top-level slots (match sub-fields live inside the `match` object)
+		{ name: 'shadow' },
+		{ name: 'activation' },
+		{ name: 'scope' },
+		{ name: 'provenance' },
+		{ name: 'rateLimit' },
+		// the replicated control row (id '__waf_control__') stores the global mode here too
+		{ name: 'mode' },
 	],
 };
 
@@ -166,6 +194,7 @@ export function startOnMainThread(options: WafComponentOptions) {
 	options.server.registerOperation?.({ name: 'alter_waf_rule', execute: operations.alterWafRule, httpMethod: 'POST' });
 	options.server.registerOperation?.({ name: 'drop_waf_rule', execute: operations.dropWafRule, httpMethod: 'POST' });
 	options.server.registerOperation?.({ name: 'list_waf_rules', execute: operations.listWafRules, httpMethod: 'GET' });
+	options.server.registerOperation?.({ name: 'set_waf_mode', execute: operations.setWafMode, httpMethod: 'POST' });
 }
 
 /** Per-worker teardown state, cleared by stop() (O8). */
@@ -188,26 +217,48 @@ export function start(options: WafComponentOptions) {
 	const rateLimiter = new LogRateLimiter(options.logRateLimit ?? 100, options.logRateIntervalMs ?? 60_000);
 	const WafRuleTable = options.ensureTable(TABLE_DEFINITION);
 
+	// Node identity for activation gating (wave 2, decision c): name from the standard node-hostname
+	// config accessor (the same getThisNodeName replication uses); region/tags from waf config.
+	const nodeIdentity = { name: getThisNodeName(), region: options.region, tags: options.nodeTags ?? [] };
+
+	// readAllRules pulls the replicated control row OUT of the returned rule list so it is never
+	// compiled/validated as a rule; the discovered mode is stashed for recompile() to read.
+	let controlMode: WafControlRow['mode'];
 	function readAllRules(): WafRule[] {
 		// primaryStore.getRange is the established pattern for a full scan outside a request
 		// context (see replication/knownNodes.ts); undecodable rows are skipped.
 		const rules: WafRule[] = [];
+		controlMode = undefined;
 		for (const { value } of WafRuleTable.primaryStore.getRange({})) {
-			if (value) rules.push(value as WafRule);
+			if (!value) continue;
+			if ((value as WafControlRow).id === WAF_CONTROL_ID) {
+				controlMode = (value as WafControlRow).mode;
+				continue; // sentinel control row: not a rule
+			}
+			rules.push(value as WafRule);
 		}
 		return rules;
 	}
 
 	function recompile() {
 		const rules = readAllRules();
+		// mode precedence: replicated control row > config fallback > 'enforce'.
+		const mode = controlMode ?? options.mode ?? 'enforce';
 		const matcher = compileRules(rules, {
 			scoreThreshold,
+			mode,
+			nodeIdentity,
 			onInvalidRule(ruleId, problems) {
 				logger.warn?.(`WAF rule ${ruleId} skipped: ${problems.join('; ')}`);
 			},
+			onUnsupportedRule(ruleId, reasons) {
+				logger.info?.(`WAF rule ${ruleId} deferred: ${reasons.join('; ')}`);
+			},
 		});
 		currentMatcher = matcher; // atomic reference swap; in-flight evaluations keep the old one
-		logger.debug?.(`WAF compiled ${matcher.ruleCount} rules (${matcher.invalidRules.size} invalid)`);
+		logger.debug?.(
+			`WAF compiled ${matcher.ruleCount} rules (${matcher.invalidRules.size} invalid, ${matcher.unsupportedRules.size} deferred, mode ${mode})`
+		);
 	}
 
 	// --- lifecycle flags/timers (O8: cleared by stop) ---
@@ -272,6 +323,21 @@ export function start(options: WafComponentOptions) {
 	};
 	initialCompileWithRetry(0);
 
+	/**
+	 * Shadow would-block preview log (wave 2): a shadow rule (or, in monitor mode, any rule) that
+	 * matched WOULD have blocked but does not enforce. Rate-limited like every other WAF log line
+	 * (keyed on the first would-block rule id) and never returns a block response.
+	 */
+	function logWouldBlock(shadowRuleIds: (string | number)[] | undefined, request: any, now: number) {
+		if (shadowRuleIds === undefined || shadowRuleIds.length === 0) return;
+		const { allow, summary } = rateLimiter.consume(shadowRuleIds[0], now);
+		if (summary) logger.info?.(summary);
+		if (allow)
+			logger.info?.(
+				`WAF would block ${request.method} ${requestInfo.path} from ${request.ip} (shadow rules: ${shadowRuleIds.join(', ')})`
+			);
+	}
+
 	// --- request-phase middleware, as early in the chain as possible ---
 	// `before: 'authentication'` orders it ahead of the core auth middleware (named after its
 	// component, see TRUSTED_RESOURCE_PLUGINS); runFirst additionally front-loads it among
@@ -320,6 +386,8 @@ export function start(options: WafComponentOptions) {
 							`WAF rule match (log) ${request.method} ${requestInfo.path} from ${request.ip} (rules: ${logRuleIds.join(', ')}) [request blocked by ${decision.ruleIds.join(', ')}]`
 						);
 				}
+				// Shadow would-block preview alongside a real block (rate-limited).
+				logWouldBlock(decision.shadowRuleIds, request, now);
 				// O4: opaque body (no ruleIds to the client — server log only), correct reason
 				// phrase for the status, explicit JSON content type. Never touches request.body.
 				const status = decision.status;
@@ -329,13 +397,18 @@ export function start(options: WafComponentOptions) {
 					body: JSON.stringify({ error: STATUS_TEXT[status] ?? 'Forbidden' }),
 				};
 			}
-			// action 'log': record and continue (rate-limited per rule)
-			const { allow, summary } = rateLimiter.consume(decision.ruleIds[0], now);
-			if (summary) logger.warn?.(summary);
-			if (allow)
-				logger.warn?.(
-					`WAF rule match (log) ${request.method} ${requestInfo.path} from ${request.ip} (rules: ${decision.ruleIds.join(', ')})`
-				);
+			// action 'log' (pass-through): record any real log-rule matches and any shadow would-block
+			// preview, then continue. Both are rate-limited per rule; a shadow-only decision carries an
+			// empty ruleIds list, so only emit the log line when there is a real log match to record.
+			if (decision.ruleIds.length > 0) {
+				const { allow, summary } = rateLimiter.consume(decision.ruleIds[0], now);
+				if (summary) logger.warn?.(summary);
+				if (allow)
+					logger.warn?.(
+						`WAF rule match (log) ${request.method} ${requestInfo.path} from ${request.ip} (rules: ${decision.ruleIds.join(', ')})`
+					);
+			}
+			logWouldBlock(decision.shadowRuleIds, request, now);
 			return nextHandler(request);
 		},
 		{ name: 'waf', before: 'authentication', runFirst: true }
