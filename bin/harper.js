@@ -15,6 +15,14 @@ const { values } = parseArgs({
 	},
 	strict: false, // Allow other args to be passed through
 });
+// harper-pro#530: read + close the injected secrets-key fd as the first thing in boot, before
+// cloneNode/harper() spawn any worker thread or subprocess. The entrypoint opens fd 3 without
+// close-on-exec, so until we close it every descendant that shares the fd table could read the
+// cluster private key off /proc/self/fd/3. custodyState is dependency-free (node:fs only), so this
+// pulls in nothing that reads config before the base path is set. The read is idempotent — the
+// secretCustody component later retrieves the same cached PEM.
+require('../security/custodyState.js').consumeInjectedKeyMaterial();
+
 const HDB_LEADER_URL = values['leader-url'] || process.env.HDB_LEADER_URL || values['HDB_LEADER_URL'];
 
 // Check to see if extra args are passed to harper, this could be the case with api-ops through the CLI

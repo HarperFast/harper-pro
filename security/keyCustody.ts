@@ -40,7 +40,11 @@ import {
 	type CustodyKeys,
 } from './fileKeyCustody.ts';
 import { ingestInjectedMaterial, SECRETS_KEY_FD_ENV, SECRETS_KEY_B64_ENV } from './injectedKeyCustody.ts';
-import { isCloneBootstrapInProgress, setCloneBootstrapInProgress } from './custodyState.ts';
+import {
+	isCloneBootstrapInProgress,
+	setCloneBootstrapInProgress,
+	resetInjectedIngestionForTests,
+} from './custodyState.ts';
 
 export type { CustodyKeys };
 
@@ -65,6 +69,7 @@ export function resetKeyCustodyForTests(): void {
 	activated = false;
 	disabled = false;
 	setCloneBootstrapInProgress(false);
+	resetInjectedIngestionForTests();
 	unregisterWorkerDataProvider?.();
 	unregisterWorkerDataProvider = undefined;
 }
