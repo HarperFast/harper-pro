@@ -73,6 +73,10 @@ export async function clusterStatus() {
 			const truth = readConnectionTruth(auditStore, databaseName, remoteNodeName);
 			if (truth) {
 				socket.connected = truth.connected;
+				// Surface the last proof-of-life (handshake/pong/receive stamp) so an operator — and the
+				// watchdog-demotion soak (#431) — can see how fresh the truth behind `connected` is, and
+				// distinguish "connected, actively alive" from "connected, liveness nearing the stale window".
+				socket.lastLiveness = asDate(truth.lastLiveness);
 				if (truth.errorCode != null) {
 					socket.lastConnectionError = { code: truth.errorCode, time: asDate(truth.errorTime) };
 				}
