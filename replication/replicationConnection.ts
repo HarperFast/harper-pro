@@ -1585,8 +1585,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// LAST_LIVENESS_TIME_POSITION holds a wall-clock timestamp (Date.now()), since the main thread
 				// compares it against Date.now() in deriveConnectionTruth — not performance.now() like
 				// lastByteActivity above (which is the keepalive's own monotonic clock). See gemini review on #445.
+				// Only the owning subscription may refresh the (db, peer) truth (connectionOwnsTruth); a paused
+				// inbound/retrieval connection sharing the buffer must not keep a dead subscription's link alive.
 				const pausedStatus = getSharedStatus();
-				if (pausedStatus) pausedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
+				if (pausedStatus && connectionOwnsTruth(options.connection))
+					pausedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
 			}
 			// Always send the keep-alive ping. ws.pause() only stops reads, not writes, and the accepted
 			// peer relies on our pings to keep its own receive timer alive even when it has no data to send
