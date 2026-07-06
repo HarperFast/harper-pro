@@ -31,6 +31,7 @@ import {
 	RECEIVED_TIME_POSITION,
 	RECEIVED_VERSION_POSITION,
 	readConnectionTruth,
+	type ConnectionTruth,
 } from './replicationConnection.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import lodash from 'lodash';
@@ -239,6 +240,36 @@ export function findWedgedNodeUrls(
 		}
 	}
 	return wedgedNodeUrls;
+}
+// W1 (harper-pro#431): reconcile the main thread's edge-triggered `connected` bit against the
+// authoritative shared-memory truth the owning worker writes (readConnectionTruth). Corrections:
+// - DOWN (entry true/undefined, truth not connected): the worker wedged/died or the disconnect edge
+//   was lost (#289/#233); flip to false and stamp disconnectedAt so the wedge re-drive threshold
+//   starts counting from the correction.
+// - UP (entry false, truth CONNECTED with fresh liveness): the connect edge was lost or never
+//   processed (#289); flip to true in place — without this, findWedgedNodeUrls force-reconnects a
+//   perfectly healthy link once the 30s threshold lapses. Deliberately NOT applied to a
+//   never-connected (undefined) entry: that is mid-connect and owned by the connect/retry path.
+// Truth must have reported liveness at least once (lastLiveness > 0) for either correction; a
+// never-yet-written buffer says nothing about the link. Mutates the entry (mirroring what the
+// connectedToNode/disconnectedFromNode edges would have set) and returns which correction was
+// applied — or undefined on agreement — so the reconcile loop owns the telemetry.
+export function reconcileEntryWithTruth(
+	entry: { connected?: boolean; disconnectedAt?: number },
+	truth: ConnectionTruth | undefined,
+	now: number
+): 'down' | 'up' | undefined {
+	if (!truth || truth.lastLiveness <= 0) return;
+	if (entry.connected !== false && !truth.connected) {
+		entry.connected = false;
+		if (entry.disconnectedAt == null) entry.disconnectedAt = now;
+		return 'down';
+	}
+	if (entry.connected === false && truth.connected) {
+		entry.connected = true;
+		entry.disconnectedAt = undefined;
+		return 'up';
+	}
 }
 // The per-(database, node) replication progress signals the main-thread reconcile reads out of the
 // process-shared status buffer (auditStore.getUserSharedBuffer, written by the worker that owns the
@@ -926,23 +957,25 @@ export async function startOnMainThread(options) {
 	function reconcileWorkers() {
 		const now = Date.now();
 		// Reconcile the inferred `connected` flag against the authoritative shared-memory truth the owning
-		// worker writes: a worker may have wedged or died without delivering a disconnect message, leaving
-		// connected:true for a link it knows is down (#289/#233). Correcting it here feeds the existing wedge
-		// recovery below (findWedgedNodeUrls keys on connected:false + disconnectedAt past the threshold).
+		// worker writes, in BOTH directions (see reconcileEntryWithTruth): down-corrections feed the wedge
+		// recovery below (findWedgedNodeUrls keys on connected:false + disconnectedAt past the threshold);
+		// up-corrections stop that same recovery from force-reconnecting a healthy link whose connect edge
+		// was lost. Each correction is logged — the edge bit and the truth disagreeing is exactly the
+		// desync class W1 exists to retire, so its frequency in production should be observable.
 		for (const dbWorkers of connectionReplicationMap.values()) {
 			for (const [databaseName, entry] of dbWorkers) {
-				if (entry.connected === false) continue;
 				const nodeName = entry.nodes?.[0]?.name;
 				if (!nodeName) continue;
 				const auditStore = getAuditStoreForDatabase(databaseName);
 				if (!auditStore) continue;
 				const truth = readConnectionTruth(auditStore, databaseName, nodeName, now);
-				// Only correct a link that has reported liveness at least once (lastLiveness > 0); a
-				// never-yet-connected entry is left to the normal connect/retry path.
-				if (truth && !truth.connected && truth.lastLiveness > 0) {
-					entry.connected = false;
-					if (entry.disconnectedAt == null) entry.disconnectedAt = now;
-				}
+				const correction = reconcileEntryWithTruth(entry, truth, now);
+				if (correction && truth)
+					logger.warn(
+						`Corrected replication connection state (${correction === 'down' ? 'connected -> down' : 'disconnected -> up'}) ` +
+							`from shared-memory truth for ${databaseName} from ${nodeName}: state=${truth.state}, ` +
+							`liveness ${now - truth.lastLiveness}ms ago${truth.errorCode ? `, last close code ${truth.errorCode}` : ''}`
+					);
 			}
 		}
 		const httpWorkers = workers.filter((worker) => worker.name === 'http');
