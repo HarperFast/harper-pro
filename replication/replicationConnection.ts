@@ -428,7 +428,7 @@ export function abortInFlightBlobsOnClose(
 		blobsInFlight.delete(blobId);
 		onAbort?.(blobId);
 		const error = new Error(
-			`Replication connection to ${remoteNodeName} closed before blob ${blobId} finished; will re-request on reconnect`
+			`Replication connection to ${remoteNodeName || 'unknown'} closed before blob ${blobId} finished; will re-request on reconnect`
 		) as Error & { replicationConnectionClosed?: boolean };
 		// Mark it so receiveBlobs's .catch treats it as a routine, self-healing interruption (clamp +
 		// re-request) rather than logging an error and bumping the divergence metric on every restart.
@@ -3979,7 +3979,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// lifecycle). Clamp like any transient gap so the reconnect re-requests it, but skip the
 						// error log and the divergence metric below — this is routine and self-healing, and would
 						// otherwise spam logs / inflate cluster_status.blobReplicationFailures on every deploy.
-						logger.debug?.(`Blob ${blobId} receive interrupted by connection close; will re-request on reconnect`);
+						logger.debug?.(
+							connectionId,
+							`Blob ${blobId} receive interrupted by connection close; will re-request on reconnect`
+						);
 						hasBlobGap = true;
 						return;
 					}
