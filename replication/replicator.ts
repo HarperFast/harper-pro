@@ -27,6 +27,8 @@ import {
 	LATENCY_POSITION,
 } from './replicationConnection.ts';
 import { redactOperationForLog } from './logRedaction.ts';
+import { registerShutdownDrain } from '../core/components/shutdownDrain.ts';
+import { hasProgressingBlobSends, drainBlobSends } from './blobSendDrain.ts';
 import { server } from '../core/server/Server.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -715,6 +717,15 @@ export function forceReconnectToNode({ url, nodes, database }) {
 	exportIdMapping,
 	getIdOfRemoteNode,
 };
+
+// Gracefully drain in-flight replication blob sends before this worker shuts down during a restart,
+// so a deploy reload doesn't tear a transfer down mid-stream and leave the peer's copy diverged
+// (harper-pro#527 covers the receiver side). Only sends still making progress are waited on, bounded
+// by an absolute deadline core supplies; see blobSendDrain.ts.
+registerShutdownDrain({
+	hasWork: () => hasProgressingBlobSends(),
+	drain: (deadlineMs: number) => drainBlobSends(deadlineMs),
+});
 export function urlToNodeName(nodeUrl) {
 	if (nodeUrl) return new URL(nodeUrl).hostname; // this the part of the URL that is the node name, as we want it to match common name in the certificate
 }

@@ -36,6 +36,7 @@ import { redactOperationForLog } from './logRedaction.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import { registerBlobSend, noteBlobSendProgress, endBlobSend, isDrainingBlobSends } from './blobSendDrain.ts';
 import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
@@ -3759,8 +3760,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.debug?.('Blob already being sent', id);
 			return;
 		}
+		if (isDrainingBlobSends()) {
+			// The worker is draining for shutdown; don't start a new send that we'd only tear down (or
+			// hold the drain open for). The peer re-requests this blob on reconnect (harper-pro#527).
+			logger.debug?.('Worker draining, not starting new blob send', id);
+			return;
+		}
 		blobsBeingSent.add(id);
 		const iterator = blob.stream()[Symbol.asyncIterator]();
+		// Track this send so a worker restart can gracefully drain it (finish it if it's still making
+		// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
+		const drainToken = registerBlobSend();
 		try {
 			let lastBuffer: Buffer;
 			outstandingBlobsBeingSent++;
@@ -3814,12 +3824,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					);
 				}
 				lastBuffer = buffer;
-				if (ws._socket.writableNeedDrain) {
+				// Optional-chain the guard: the connection can close during an await, leaving `_socket` null.
+				if (ws._socket?.writableNeedDrain) {
 					logger.debug?.('draining', id);
+					// Waiting on the socket to flush IS progress — mark it so a shutdown drain doesn't misread a
+					// slow-but-alive peer (a large chunk taking longer than the stall window to flush) as stalled.
+					noteBlobSendProgress(drainToken);
 					await new Promise((resolve) => ws._socket.once('drain', resolve));
 					logger.debug?.('drained', id);
 				}
 				recordAction(buffer.length, 'bytes-sent', `${remoteNodeName}.${databaseName}`, 'replication', 'blob');
+				noteBlobSendProgress(drainToken);
 			}
 			logger.debug?.('Sending final blob chunk', id, 'length', lastBuffer.length);
 			if (checkExcessMessageSize(lastBuffer.length)) throw new Error('Blob chunk too large');
@@ -3834,6 +3849,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					lastBuffer,
 				])
 			);
+			noteBlobSendProgress(drainToken);
+			// Keep this send "in flight" until the terminal frame has actually flushed to the socket, so a
+			// concurrent shutdown drain waits for the `finished:true` frame rather than exiting with it still
+			// buffered (which would leave the peer's blob diverged until it re-requests). Only waits under
+			// backpressure; if the peer stops reading, the drain's stall detection abandons it after the
+			// stall window and the receiver re-requests (harper-pro#527).
+			if (ws._socket?.writableNeedDrain) {
+				await new Promise((resolve) => ws._socket.once('drain', resolve));
+				noteBlobSendProgress(drainToken);
+			}
 		} catch (error) {
 			try {
 				await iterator.return?.();
@@ -3861,6 +3886,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				])
 			);
 		} finally {
+			endBlobSend(drainToken);
 			blobsBeingSent.delete(id);
 			outstandingBlobsBeingSent--;
 			while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
