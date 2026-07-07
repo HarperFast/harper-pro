@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783423239531,
+  "lastUpdate": 1783423241735,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -2790,6 +2790,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 44.52,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "795d5cd24012feba06300ff535a1f0b63a9b0307",
+          "message": "feat(replication): expose connection-truth liveness age in cluster_status (#431)\n\ncluster_status already reports the shared-memory connection truth (connected\noverride + lastConnectionError, from #445). Add the missing piece: lastLiveness,\nthe wall-clock of the link's last proof-of-life (handshake/pong/receive stamp).\nOperators — and the W1 watchdog-demotion soak — need to see how fresh the truth\nbehind `connected` is, distinguishing an actively-alive link from one nearing\nthe staleness window.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-07-06T04:17:25Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/795d5cd24012feba06300ff535a1f0b63a9b0307"
+        },
+        "date": 1783423241708,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 4.53,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 6.58,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 8.56,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 16.23,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 17.61,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 15.13,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 27.89,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 103.66,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 33.73,
             "unit": "ms"
           }
         ]
