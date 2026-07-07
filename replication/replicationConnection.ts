@@ -2270,7 +2270,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										const localTable = tables?.[tableName];
 										if (!localTable?.getRecordCount) continue;
 										if (!('evictionMS' in localTable) || localTable.expirationMS || localTable.evictionMS) continue;
-										const localCount = (await localTable.getRecordCount({ timeLimit: 2000 }))?.recordCount ?? -1;
+										let localCount = -1;
+										try {
+											localCount = (await localTable.getRecordCount({ timeLimit: 2000 }))?.recordCount ?? -1;
+										} catch (countError) {
+											logger.warn?.(connectionId, `failed to count ${tableName} for copy verification`, countError);
+										}
 										if (localCount < 0) continue;
 										const shortfall = senderCount - localCount;
 										if (shortfall > Math.max(100, senderCount * 0.1)) {
@@ -3356,6 +3361,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											for (const tableName of orderedTableNames) {
 												const verifyTable = tables[tableName];
 												if (!tableToTableEntry(verifyTable)) continue;
+												if (!verifyTable?.getRecordCount) continue;
 												if (!('evictionMS' in verifyTable) || verifyTable.expirationMS || verifyTable.evictionMS)
 													continue;
 												try {
