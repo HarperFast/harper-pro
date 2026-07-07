@@ -2249,6 +2249,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
 						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
 						copyCompleteReceived = true;
+						// Snapshot before maybeFinishCopy: the zero-rows-copied case (a poisoned cursor that
+						// claimed the whole range) satisfies every finish condition, so it clears copyFromNodeId
+						// synchronously right here, and the closure below must not read the live variable either
+						// (an async finish during a count await would corrupt the remove/put key).
+						const copySourceNodeId = copyFromNodeId;
 						// No more copy frames will arrive, so stop watching for copy-progress stalls now rather
 						// than leaving the timer to wake the event loop until the commit drain finishes (#453).
 						copyProgressWatchdog?.stop();
@@ -2262,7 +2267,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// connect takes the no-resume-cursor full-copy path, then force that reconnect.
 						// Tolerance absorbs count-estimate error; runs detached so a slow count scan
 						// cannot stall the receive loop.
-						if (data && typeof data === 'object' && copyFromNodeId !== undefined && !copyCountMismatchHandled) {
+						if (data && typeof data === 'object' && copySourceNodeId !== undefined && !copyCountMismatchHandled) {
 							void (async () => {
 								try {
 									for (const [tableName, senderCount] of Object.entries(data as Record<string, number>)) {
@@ -2284,8 +2289,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												`Copy verification failed for ${databaseName}.${tableName} from ${remoteNodeName}: sender has ~${senderCount} rows, local has ~${localCount}. ` +
 													`Clearing the resume cursor and seq for this source and reconnecting to force a fresh full copy.`
 											);
-											tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
-											tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('seq'), copyFromNodeId], { seqId: 1 });
+											tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copySourceNodeId]);
+											tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('seq'), copySourceNodeId], { seqId: 1 });
 											options.connection?.forceReconnect();
 											return;
 										}
