@@ -36,7 +36,13 @@ import { redactOperationForLog } from './logRedaction.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
+import {
+	HAS_STRUCTURE_UPDATE,
+	isMissingStructureError,
+	lastMetadata,
+	lastValueEncoding,
+	METADATA,
+} from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
 import { WebSocket } from 'ws';
@@ -691,6 +697,37 @@ export function orderTablesForCopy(tableNames: string[]): string[] {
  */
 export function isCopyResumeOrderCompatible(copyOrder: number | undefined, orderVersion: number): boolean {
 	return copyOrder === orderVersion;
+}
+
+// Metric fired when a received replication record can't be decoded because its shared structure is
+// genuinely absent on this node. Mirrors core RecordEncoder's `MISSING_STRUCTURE_METRIC` (that const
+// is not exported; kept in sync by name) so the copy/audit-apply drop is surfaced through the same
+// `decode-missing-structure` counter as the local-read drop. (harper#1163)
+export const DECODE_MISSING_STRUCTURE_METRIC = 'decode-missing-structure';
+
+/**
+ * Classify a decode error thrown while applying a received copy/audit record, choosing how loudly to
+ * surface the skip. (harper-pro#537)
+ *
+ * Both verdicts SKIP the record and let the resume cursor advance — a decode error reaching this
+ * catch is treated as permanent. Transient conditions are already handled upstream (blob-gap `hold`,
+ * apply-queue backpressure), and every known source of a decode failure has been root-caused, so one
+ * that still reaches here is almost certainly unrecoverable old-version/corrupt data that no re-copy
+ * can heal (re-fetching re-ships the same undecodable bytes). Holding the leg would only wedge it, so
+ * we drop the record and keep the copy moving; the verdicts differ only in observability:
+ *
+ * - `skip-missing-structure`: the record references a shared structure genuinely absent on this node
+ *   (`isMissingStructureError` — structon/msgpackr already reloaded structures from durable storage
+ *   and retried before throwing; harper#1163). Surfaced through the same `decode-missing-structure`
+ *   metric core's local-read path fires, so it is alertable rather than laundered as emptiness.
+ * - `skip`: any other decode failure — unexpected post-root-cause, so it is logged loudly at error
+ *   level for investigation.
+ *
+ * Exported so the policy can be exercised in isolation by
+ * `unitTests/replication/classifyReplicationDecodeError.test.mjs`.
+ */
+export function classifyReplicationDecodeError(error: unknown): 'skip-missing-structure' | 'skip' {
+	return isMissingStructureError(error) ? 'skip-missing-structure' : 'skip';
 }
 
 /**
@@ -3377,7 +3414,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				const auditRecord = readAuditEntry(body, start, start + eventLength);
 				const tableDecoder = tableDecoders[auditRecord.tableId];
 				if (!tableDecoder) {
-					logger.error?.(`No table found with an id of ${auditRecord.tableId}`);
+					// No structure/decoder for this table id yet. tableDecoders is populated only by a
+					// TABLE_FIXED_STRUCTURE message, which the sender always emits BEFORE the first record of a
+					// table (see the length-gated send at ~2882) over an ordered WS — so reaching here means the
+					// structure sync was missed (a reset/edge case) or the table's schema has not propagated to
+					// this node yet (#1497 family). Both are TRANSIENT/recoverable — categorically unlike an
+					// undecodable record (handled as permanent below). So HOLD rather than skip-and-advance: skipping
+					// would seal a still-deliverable record under the resume cursor, and falling through would crash
+					// (the decode throws on `tableDecoder.name`, then the catch's `tableDecoder.decoder` deref throws
+					// again and escapes the catch — a wedge). Close so the leg reconnects and resumes from the durable
+					// cursor, which re-sends TABLE_FIXED_STRUCTURE and lets the record decode. The cursor is not
+					// advanced (we return before this record applies), so nothing is lost.
+					logger.error?.(
+						connectionId,
+						`No decoder for table id ${auditRecord.tableId} in ${databaseName}; holding and reconnecting to resync table structures`
+					);
+					close(1011, 'missing table structure; reconnecting to resync');
+					return;
 				}
 				// Lazily compute receive-side exclusions once remoteNodeName is known.
 				// Prefer routeReplicates from the subscriber-side connection; fall back to
@@ -3457,15 +3510,41 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						}
 					);
 				} catch (error) {
-					logger.error?.(
-						'Error decoding replication message, record id: ' + id,
-						' typed structures for current decoder' + JSON.stringify(tableDecoder.decoder.typedStructs),
-						' structures for current decoder' + JSON.stringify(tableDecoder.decoder.structures),
-						'encoded message',
-						auditRecord.encoded.subarray(0, 1000),
-						auditRecord,
-						error
-					);
+					// A decode failure here is treated as permanent: skip the record and let the cursor advance
+					// (harper-pro#537). The old bare catch already skipped, but silently — it never distinguished
+					// or metricized the genuinely-unrecoverable missing-structure case. classifyReplicationDecodeError
+					// only chooses how loudly to surface the drop.
+					if (classifyReplicationDecodeError(error) === 'skip-missing-structure') {
+						// Missing shared structure (harper#1163): genuinely absent on this node, re-copy re-ships the
+						// same undecodable bytes. Surface it through the same metric core's local-read path fires so
+						// the drop is alertable rather than laundered as emptiness. Kept concise: this is the #537
+						// flood path (an interrupted copy can replay thousands of these), so we do NOT stringify the
+						// decoder's full struct dictionaries per record — the metric carries the volume and `error`
+						// already names the specific missing structure.
+						recordAction(true, DECODE_MISSING_STRUCTURE_METRIC, databaseName + '.' + tableDecoder.name);
+						logger.warn?.(
+							connectionId,
+							`Skipping replication record referencing a shared structure missing on this node (permanent; see harper#1163), table: ${tableDecoder.name}, record id: ${id}`,
+							error
+						);
+					} else {
+						// Unexpected post-root-cause decode failure — log loudly for investigation. Still skipped (the
+						// record is undecodable on this node); the cursor advances past it below. Pass the decoder
+						// dictionaries as objects (not eager JSON.stringify) so the formatting cost is paid only when
+						// the log actually emits, not on every dropped record.
+						logger.error?.(
+							connectionId,
+							'Error decoding replication message, record id: ' + id,
+							'typed structures for current decoder',
+							tableDecoder.decoder.typedStructs,
+							'structures for current decoder',
+							tableDecoder.decoder.structures,
+							'encoded message',
+							auditRecord.encoded.subarray(0, 1000),
+							auditRecord,
+							error
+						);
+					}
 				}
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
