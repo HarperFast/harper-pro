@@ -478,6 +478,30 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
 }
 
+// Test-only fault injection for harper-pro#537 symptom characterization. When
+// HARPER_TEST_INJECT_COPY_CURSOR_JSON is set on the RECEIVER node, the subscription handshake
+// overrides the copyCursor with the JSON-parsed value — as if a prior interrupted copy had left a
+// poisoned resume cursor in the __dbis__ store. This lets integration tests demonstrate the
+// cursor-trust behavior (leader resumes at afterKey, skipping all earlier rows) without filesystem
+// manipulation or a real interrupted copy. One-shot via env-clear so the post-test reconnect uses the
+// real (absent) cursor.  Never arms in production: the env var is set only by the regression test.
+export function maybeInjectCopyCursorForTest(existingCursor: any, databaseName?: string): any {
+	if (!process.env.HARPER_TEST_INJECT_COPY_CURSOR_JSON) return existingCursor;
+	if (existingCursor) return existingCursor; // never override a real cursor
+	let injected: any;
+	try {
+		injected = JSON.parse(process.env.HARPER_TEST_INJECT_COPY_CURSOR_JSON);
+	} catch {
+		return existingCursor;
+	}
+	// Only fire for the named db (the JSON encodes { db, cursor }), so a two-database node doesn't
+	// inject on the wrong database leg.
+	if (injected.db && injected.db !== databaseName) return existingCursor;
+	process.env.HARPER_TEST_INJECT_COPY_CURSOR_JSON = ''; // one-shot: clear so reconnect uses real cursor
+	logger.warn?.(`[test] injecting synthetic copyCursor for cursor-trust characterization (harper-pro#537), db ${databaseName}`);
+	return injected.cursor;
+}
+
 /**
  * Mark an error as a *source-reported* blob unavailability: the sender told us (via a BLOB_CHUNK
  * `error` marker) that it cannot provide this blob — classically `ENOENT` because the blob was
@@ -4239,13 +4263,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
 			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
 			// data predates copyStartTime and would never be delivered by an audit-log resume).
-			const copyCursor = discardMalformedCopyCursor(
-				nodeId === undefined
-					? undefined
-					: readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'copyCursor', nodeId),
-				tableSubscriptionToReplicator?.dbisDB,
-				nodeId,
-				() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
+			const copyCursor = maybeInjectCopyCursorForTest(
+				discardMalformedCopyCursor(
+					nodeId === undefined
+						? undefined
+						: readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'copyCursor', nodeId),
+					tableSubscriptionToReplicator?.dbisDB,
+					nodeId,
+					() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
+				),
+				databaseName
 			);
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
