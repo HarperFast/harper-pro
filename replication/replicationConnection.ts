@@ -1313,6 +1313,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let copyModeOrderVersion; // copy-order version the leader announced in COPY_START; persisted in the cursor (#421)
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
 	let copyCompleteReceived = false;
+	// One-shot latch for copy verification: a detected shortfall reconnects the whole leg, so
+	// re-checking further tables (or a re-entrant COPY_COMPLETE) must not stack reconnects.
+	let copyCountMismatchHandled = false;
 	// Staged key-based copy resume cursor (#426). The copy cursor (`{currentTable, afterKey, ...}` = "fully
 	// copied through this key") is KEY-based and, exactly like the sequence watermark, must only be
 	// PERSISTED once the copied key's blob — and every earlier blob — is durable. We must NOT await blobs in
@@ -2251,6 +2254,42 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						copyProgressWatchdog?.stop();
 						maybeFinishCopy();
 						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
+						// Verify the copy actually delivered the sender's tables (payload absent from old
+						// senders). A resume cursor asserts everything before afterKey landed in an earlier
+						// run; an interrupted copy can persist a cursor over a never-delivered range, and
+						// every later resume then skips to the tail and re-seals the hole. Compare row
+						// counts and, on a large shortfall, clear this source's cursor and seq so the next
+						// connect takes the no-resume-cursor full-copy path, then force that reconnect.
+						// Tolerance absorbs count-estimate error; runs detached so a slow count scan
+						// cannot stall the receive loop.
+						if (data && typeof data === 'object' && copyFromNodeId !== undefined && !copyCountMismatchHandled) {
+							void (async () => {
+								try {
+									for (const [tableName, senderCount] of Object.entries(data as Record<string, number>)) {
+										if (typeof senderCount !== 'number' || senderCount < 0) continue;
+										const localTable = tables?.[tableName];
+										if (!localTable?.getRecordCount) continue;
+										if (!('evictionMS' in localTable) || localTable.expirationMS || localTable.evictionMS) continue;
+										const localCount = (await localTable.getRecordCount({ timeLimit: 2000 }))?.recordCount ?? -1;
+										if (localCount < 0) continue;
+										const shortfall = senderCount - localCount;
+										if (shortfall > Math.max(100, senderCount * 0.1)) {
+											copyCountMismatchHandled = true;
+											logger.error?.(
+												`Copy verification failed for ${databaseName}.${tableName} from ${remoteNodeName}: sender has ~${senderCount} rows, local has ~${localCount}. ` +
+													`Clearing the resume cursor and seq for this source and reconnecting to force a fresh full copy.`
+											);
+											tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+											tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('seq'), copyFromNodeId], { seqId: 1 });
+											options.connection?.forceReconnect();
+											return;
+										}
+									}
+								} catch (error) {
+									logger.warn?.(connectionId, 'copy verification check failed', error);
+								}
+							})();
+						}
 						break;
 					case SEQUENCE_ID_UPDATE:
 						// we need to record the sequence number that the remote node has received
@@ -3306,7 +3345,27 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											);
 											// The full copy is done — tell the follower to clear its resume cursor and fall back to
 											// normal audit-log replication from the persisted seqId (which is copyStartTime).
-											ws.send(encode([COPY_COMPLETE]));
+											// Include this side's per-table row counts so the follower can detect a poisoned
+											// resume cursor: a resume trusts that everything before afterKey was delivered, but
+											// an interrupted copy can persist a cursor whose skipped range never landed. The
+											// follower compares counts and forces a fresh full copy on a large shortfall.
+											// Evicting/expiring tables are excluded: they reclaim rows lazily and per-node, so
+											// raw counts legitimately diverge. The 'evictionMS in' check keeps this safe against
+											// a core that predates the getter (skip rather than false-positive).
+											const copyVerification: Record<string, number> = {};
+											for (const tableName of orderedTableNames) {
+												const verifyTable = tables[tableName];
+												if (!tableToTableEntry(verifyTable)) continue;
+												if (!('evictionMS' in verifyTable) || verifyTable.expirationMS || verifyTable.evictionMS)
+													continue;
+												try {
+													copyVerification[tableName] =
+														(await verifyTable.getRecordCount({ timeLimit: 2000 }))?.recordCount ?? -1;
+												} catch {
+													copyVerification[tableName] = -1;
+												}
+											}
+											ws.send(encode([COPY_COMPLETE, copyVerification]));
 											getSharedStatus()[SENDING_TIME_POSITION] = 0;
 											currentSequenceId = copyStartTime;
 										}
