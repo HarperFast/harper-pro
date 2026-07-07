@@ -2920,17 +2920,27 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									logger.debug?.(
 										`Waiting for remote node ${remoteNodeName} to allow more commits ${ws._socket.writableNeedDrain ? 'due to network backlog' : 'due to requested flow directive'}`
 									);
-									ws._socket.once('drain', () => {
+									const onDrain = () => {
+										ws.off('close', onClose);
 										isPausedForBackPressure = false;
 										updateBackPressureRatio();
 										// Also wait out blob saturation before admitting the next record; as an
 										// else-if this check was unreachable while the socket stayed congested.
-										if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+										// The !wsClosed guard matters: a drain queued behind the close event would
+										// otherwise push onto an already-flushed callback list and park forever.
+										if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT && !wsClosed) {
 											blobSentCallbacks.push(resolve);
 										} else resolve();
-									});
+									};
+									const onClose = () => {
+										// a closed socket never drains; resolve so the loop can observe closed and exit
+										ws._socket?.off('drain', onDrain);
+										resolve();
+									};
+									ws._socket.once('drain', onDrain);
+									ws.once('close', onClose);
 								});
-							} else if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+							} else if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT && !wsClosed) {
 								return new Promise((resolve) => {
 									blobSentCallbacks.push(resolve);
 								});
@@ -3767,6 +3777,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.debug?.('Blob already being sent', id);
 			return;
 		}
+		if (wsClosed) return;
 		blobsBeingSent.add(id);
 		// Acquire a send slot before opening the blob stream. Enforcing the cap only at the audit
 		// writer's backpressure check didn't bound concurrency: there it sat in an else-if behind the
@@ -4469,7 +4480,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Sweep more often than the idle threshold: with the interval coupled to blobTimeout (900s
 			// default), an orphaned stream could hold its buffered chunks for up to 2x blobTimeout.
 		},
-		Math.min(blobTimeout > 0 ? blobTimeout : 900000, 60000)
+		Math.max(Math.min(blobTimeout > 0 ? blobTimeout : 900000, 60000), 1000)
 	).unref();
 
 	let nextId = 1;
