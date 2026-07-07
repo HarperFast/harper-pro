@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783338713522,
+  "lastUpdate": 1783423239531,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -1195,6 +1195,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 3614.64,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "795d5cd24012feba06300ff535a1f0b63a9b0307",
+          "message": "feat(replication): expose connection-truth liveness age in cluster_status (#431)\n\ncluster_status already reports the shared-memory connection truth (connected\noverride + lastConnectionError, from #445). Add the missing piece: lastLiveness,\nthe wall-clock of the link's last proof-of-life (handshake/pong/receive stamp).\nOperators — and the W1 watchdog-demotion soak — need to see how fresh the truth\nbehind `connected` is, distinguishing an actively-alive link from one nearing\nthe staleness window.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-07-06T04:17:25Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/795d5cd24012feba06300ff535a1f0b63a9b0307"
+        },
+        "date": 1783423238414,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 9991.75,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 28862.66,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 24619.17,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 12901.47,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 10085.42,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 3740.34,
             "unit": "ops/sec"
           }
         ]
