@@ -2921,12 +2921,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										`Waiting for remote node ${remoteNodeName} to allow more commits ${ws._socket.writableNeedDrain ? 'due to network backlog' : 'due to requested flow directive'}`
 									);
 									ws._socket.once('drain', () => {
-										resolve();
 										isPausedForBackPressure = false;
 										updateBackPressureRatio();
+										// Also wait out blob saturation before admitting the next record; as an
+										// else-if this check was unreachable while the socket stayed congested.
+										if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+											blobSentCallbacks.push(resolve);
+										} else resolve();
 									});
 								});
-							} else if (outstandingBlobsBeingSent > MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+							} else if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
 								return new Promise((resolve) => {
 									blobSentCallbacks.push(resolve);
 								});
@@ -3725,6 +3729,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
 		if (hdbNodesSubscription) hdbNodesSubscription.end();
+		// Wake queued blob senders and writer waits so they observe wsClosed instead of parking forever
+		while (blobSentCallbacks.length > 0) blobSentCallbacks.shift()?.();
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
@@ -3752,6 +3758,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// The same blobs can't be sent concurrently of the packets will get mixed up. The receiving
 	// end should handle aggregated the results of the same blob for separate record requests.
 	const blobsBeingSent = new Set();
+	let blobSendErrorsSuppressed = 0;
+	let lastBlobSendErrorLog = 0;
 	async function sendBlobs(blob: Blob, recordId: any) {
 		// found a blob, start sending it
 		const id = getFileId(blob);
@@ -3760,6 +3768,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			return;
 		}
 		blobsBeingSent.add(id);
+		// Acquire a send slot before opening the blob stream. Enforcing the cap only at the audit
+		// writer's backpressure check didn't bound concurrency: there it sat in an else-if behind the
+		// drain wait (unreachable while the socket stayed congested) and the GET_RECORD path never
+		// checked it at all, so concurrent sends grew by one per drain event (200+ drain listeners
+		// on one TLSSocket observed in the field).
+		while (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+			await new Promise((resolve) => blobSentCallbacks.push(resolve));
+			if (wsClosed) {
+				blobsBeingSent.delete(id);
+				return;
+			}
+		}
 		const iterator = blob.stream()[Symbol.asyncIterator]();
 		try {
 			let lastBuffer: Buffer;
@@ -3838,7 +3858,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			try {
 				await iterator.return?.();
 			} catch {}
-			logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
+			// Throttle the warn (a peer backfilling thousands of already-deleted blobs makes this fire
+			// at kHz); the error frame below is unconditional
+			const errorLogTime = Date.now();
+			if (errorLogTime - lastBlobSendErrorLog >= 5000) {
+				if (blobSendErrorsSuppressed > 0) {
+					logger.warn?.(`Suppressed ${blobSendErrorsSuppressed} additional blob send errors in the last 5s`);
+				}
+				blobSendErrorsSuppressed = 0;
+				lastBlobSendErrorLog = errorLogTime;
+				logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
+			} else blobSendErrorsSuppressed++;
 			// Forward the error CODE and STATUS alongside the message so the receiver can tell a PERMANENT
 			// source failure — the blob is gone (ENOENT/404) or confidently corrupt/incomplete (500,
 			// harper-pro#429) — from a TRANSIENT read fault (EIO, EMFILE, timeout, 503 write-in-progress —
@@ -4417,25 +4447,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 		ws.send(encode([DB_SCHEMA, tables, databaseName]));
 	}
-	blobsTimer = setInterval(() => {
-		const now = Date.now();
-		// Discount the time spent in the *current* (not-yet-ended) back-pressure pause: a pause can outlast
-		// blobTimeout, and this sweep fires independently of the pause, so without crediting the ongoing
-		// pause it would destroy a healthy stream mid-pause before `removePauseReason` ever runs (harper-pro
-		// #368). Shifting `lastChunk` forward by the ongoing pause duration here mirrors the permanent shift
-		// `removePauseReason` applies on resume.
-		const ongoingPauseMs = pauseReasons > 0 ? now - pauseStartTime : 0;
-		for (const [blobId, stream] of blobsInFlight) {
-			if (isBlobStreamTimedOut(stream.lastChunk + ongoingPauseMs, blobTimeout, now)) {
-				logger.warn?.(
-					`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
-				);
-				blobsInFlight.delete(blobId);
-				unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
-				stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
+	blobsTimer = setInterval(
+		() => {
+			const now = Date.now();
+			// Discount the time spent in the *current* (not-yet-ended) back-pressure pause: a pause can outlast
+			// blobTimeout, and this sweep fires independently of the pause, so without crediting the ongoing
+			// pause it would destroy a healthy stream mid-pause before `removePauseReason` ever runs (harper-pro
+			// #368). Shifting `lastChunk` forward by the ongoing pause duration here mirrors the permanent shift
+			// `removePauseReason` applies on resume.
+			const ongoingPauseMs = pauseReasons > 0 ? now - pauseStartTime : 0;
+			for (const [blobId, stream] of blobsInFlight) {
+				if (isBlobStreamTimedOut(stream.lastChunk + ongoingPauseMs, blobTimeout, now)) {
+					logger.warn?.(
+						`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
+					);
+					blobsInFlight.delete(blobId);
+					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
+					stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
+				}
 			}
-		}
-	}, blobTimeout).unref();
+			// Sweep more often than the idle threshold: with the interval coupled to blobTimeout (900s
+			// default), an orphaned stream could hold its buffered chunks for up to 2x blobTimeout.
+		},
+		Math.min(blobTimeout > 0 ? blobTimeout : 900000, 60000)
+	).unref();
 
 	let nextId = 1;
 	const sentTableNames = [];
