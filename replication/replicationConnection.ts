@@ -2688,7 +2688,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							if (!tableEntry) {
 								tableEntry = tableById[tableId] = tableToTableEntry(tableSubscriptionToReplicator.tableById[tableId]);
 								if (!tableEntry) {
-									return logger.debug?.('Not subscribed to table', tableId);
+									// Must yield like every other skip path: a contiguous run of entries for a
+									// table this peer doesn't subscribe to (or a dropped table, or corrupt-entry
+									// sentinels with tableId undefined) otherwise iterates with await undefined,
+									// which never leaves the microtask queue. Timers, I/O, and watchdogs starve
+									// for the whole run, and the periodic sequence updates skipAuditRecord sends
+									// never go out, so the peer's cursor can't advance past the run and every
+									// reconnect rescans it from the start.
+									logger.debug?.('Not subscribed to table', tableId);
+									return skipAuditRecord();
 								}
 							}
 							const table = tableEntry.table;
