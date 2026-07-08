@@ -888,9 +888,10 @@ let replicationSecureContext: tls.SecureContext & { caCount?: number; derivedFro
 /**
  * Build the trusted-CA list for a replication TLS connection: the replication CA set (root CAs plus
  * every peer's hdb_nodes.ca, kept current by monitorNodeCAs) combined with the secure context's own
- * CAs. `nodeCA` explicitly adds a specific peer's CA — used for transient operation connections
- * (replicateOperation → sendOperationToNode) that run outside the subscription context where the
- * replication CA set is kept populated, and so cannot rely on it already containing that peer's CA.
+ * CAs. `nodeCA` explicitly adds a specific peer's CA — used for replicated operations
+ * (replicateOperation → sendOperationToNode), which run on the main thread. monitorNodeCAs populates
+ * replicationCertificateAuthorities only on the replication worker threads, so on the main thread that
+ * set holds just the root CAs — it never contains peer CAs, hence the explicit per-peer CA here.
  */
 export function mergeReplicationCAs(availableCAs?: Iterable<string>, nodeCA?: string): string[] {
 	const cas = [...replicationCertificateAuthorities, ...(availableCAs ?? [])];
@@ -954,12 +955,12 @@ export async function createWebSocket(
 	};
 	if (secureContext) {
 		if (nodeCA) {
-			// Replicated operations (replicateOperation → sendOperationToNode) open a transient
-			// connection that does not run in the subscription context where monitorNodeCAs keeps
-			// replicationCertificateAuthorities populated, so that set may not yet include the target
-			// peer's CA. Trust the peer's specific CA (its hdb_nodes.ca) explicitly — the same per-node
-			// CA the subscription path relies on. Built fresh rather than reusing replicationSecureContext:
-			// the CA is per-target and this is a cold path (deploy/cert/add_node), not the hot subscription path.
+			// Replicated operations (replicateOperation → sendOperationToNode) run on the main thread.
+			// monitorNodeCAs populates replicationCertificateAuthorities only on the replication worker
+			// threads, so on the main thread it holds just the root CAs and never the peers' CAs. Trust
+			// this peer's specific CA (its hdb_nodes.ca) explicitly — the same per-node CA the worker
+			// subscription path trusts. Built fresh rather than reusing replicationSecureContext: the CA is
+			// per-target and this is a cold path (deploy/cert/add_node), not the hot subscription path.
 			wsOptions.secureContext = tls.createSecureContext({
 				...secureContext.options,
 				ca: mergeReplicationCAs(secureContext.options.availableCAs?.values(), nodeCA),

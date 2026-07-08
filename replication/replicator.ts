@@ -595,9 +595,10 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 export async function sendOperationToNode(node, operation, options?) {
 	if (!options) options = {};
 	options.serverName = node.name;
-	// Trust the target peer's specific CA (hdb_nodes.ca) for this transient connection, matching how
-	// the subscription path trusts each node's CA. Bootstrap callers (add_node/clone) pass a bare
-	// { url } node with no ca and are unaffected.
+	// This runs on the main thread (operations API), which never populates replicationCertificateAuthorities
+	// with peer CAs (monitorNodeCAs runs only on the replication worker threads). Pass the target peer's
+	// specific CA (hdb_nodes.ca) so createWebSocket trusts it, matching how the worker subscription path
+	// trusts each node's CA. Bootstrap callers (add_node/clone) pass a bare { url } node with no ca and are unaffected.
 	if (node.ca) options.nodeCA = node.ca;
 	const socket = await createWebSocket(getNodeURL(node), options);
 	const session = replicateOverWS(socket, {}, {});
