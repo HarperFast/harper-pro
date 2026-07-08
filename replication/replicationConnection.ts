@@ -128,6 +128,51 @@ export const LAST_BLOB_FAILURE_TIME_POSITION = 8; // wall-clock time (ms) of the
 const SUSTAINED_BLOB_FAILURE_THRESHOLD = 5;
 export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
+// W1 (harper-pro#431): authoritative connection-health slots, written by the worker thread that owns the
+// outbound (db, peer) subscription socket and read by the main thread as the source of truth for link
+// state — rather than relying solely on the edge-triggered worker→main postMessage mirror, which desyncs
+// when a terminal state is reached without a 'close' (open-but-idle wedge, #289/#233). State is paired with
+// a liveness timestamp so a worker that died/wedged without writing DOWN cannot leave a stale CONNECTED.
+export const CONNECTION_STATE_POSITION = 9;
+export const LAST_LIVENESS_TIME_POSITION = 10; // wall-clock ms of last confirmed liveness (pong or received message)
+export const LAST_ERROR_CODE_POSITION = 11; // close code of the most recent disconnect
+export const LAST_ERROR_TIME_POSITION = 12; // wall-clock ms of the most recent disconnect
+export const CONNECTION_STATE_DOWN = 0;
+export const CONNECTION_STATE_CONNECTED = 2;
+// LIVENESS_STALE_MS is defined below, after PING_TIMEOUT, so it can be derived from the configured
+// keepalive window rather than a fixed default.
+export type ConnectionTruth = {
+	connected: boolean;
+	state: number;
+	lastLiveness: number;
+	errorCode?: number;
+	errorTime?: number;
+};
+// Pure derivation of connection truth from a status buffer, separated from the buffer fetch so it can be
+// unit-tested without a live auditStore. `connected` requires the CONNECTED state AND fresh liveness, so a
+// worker that died/wedged without writing DOWN reads as not-connected once its liveness goes stale.
+export function deriveConnectionTruth(status: Float64Array, now: number = Date.now()): ConnectionTruth {
+	const state = status[CONNECTION_STATE_POSITION];
+	const lastLiveness = status[LAST_LIVENESS_TIME_POSITION];
+	const connected = state === CONNECTION_STATE_CONNECTED && lastLiveness > 0 && now - lastLiveness < LIVENESS_STALE_MS;
+	return {
+		connected,
+		state,
+		lastLiveness,
+		errorCode: status[LAST_ERROR_CODE_POSITION] || undefined,
+		errorTime: status[LAST_ERROR_TIME_POSITION] || undefined,
+	};
+}
+// Read the authoritative connection truth for an outbound (db, peer) subscription from shared memory.
+export function readConnectionTruth(
+	auditStore: any,
+	databaseName: string,
+	nodeName: string,
+	now: number = Date.now()
+): ConnectionTruth | undefined {
+	if (!auditStore || !databaseName || !nodeName) return;
+	return deriveConnectionTruth(getReplicationSharedStatus(auditStore, databaseName, nodeName), now);
+}
 
 const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
 // When receiving a replication message, we apply per-record backpressure to keep a single
@@ -221,6 +266,13 @@ const PING_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_PINGTIMEOUT) ?? PING_INTE
 // inCopyMode the byte-level idle watchdog uses this higher copy-phase threshold instead of PING_TIMEOUT;
 // the copy-progress watchdog (#453) still catches a genuinely frozen copy on its own clock.
 const COPY_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_COPYTIMEOUT) ?? 300000;
+// W1 (harper-pro#431): safety net behind the explicit DOWN write — a link whose last liveness is older
+// than this reads as down even if still marked CONNECTED, so a worker that died/wedged without writing
+// DOWN can't pin a stale CONNECTED. Derived from the configured keepalive (not a fixed default) so a
+// raised replication.pingInterval/pingTimeout doesn't falsely mark a healthy idle link down before its
+// next ping; floored at 120s for the default 30s/60s case. A backpressure pause refreshes liveness in
+// sendPing so a legitimate local stall is exempt, matching shouldTerminateIdlePing's pauseReasons guard.
+export const LIVENESS_STALE_MS = Math.max(120_000, PING_TIMEOUT * 2);
 // On RocksDB the audit log is keyed by the record version directly (version === the log key), so a
 // record's `version` IS a valid resume-cursor value. On LMDB the log key is a separate local audit time
 // (`localTime`) that differs from `version` (the origin record timestamp) — and the receive side does not
@@ -254,7 +306,7 @@ const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
 // `replication_pauseStallTimeout` for clusters with extreme single-transaction sizes.
 const PAUSE_STALL_THRESHOLD_MS =
 	env.get('replication_pauseStallTimeout') ??
-	Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 120000) * 2);
+	Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000) * 2);
 
 /**
  * Decide whether an idle replication connection should be terminated as dead.
@@ -591,6 +643,11 @@ export const COPY_PRIORITY_TABLES = ['hdb_deployment', 'hdb_nodes'];
 // High-volume tables copied last so they can never gate the tables above. hdb_analytics is ~node-local
 // telemetry that can reach millions of rows; it must not sit ahead of control-plane tables in the copy.
 export const COPY_DEPRIORITIZED_TABLES = ['hdb_analytics'];
+// System tables whose subscribers drive cluster machinery off the audit `aftercommit` stream and so
+// must be re-read after a copyApply base copy (whose snapshot rows carry no per-row audit events): a
+// whole-table "reload" marker is emitted for each once the system-DB copy is durable. hdb_nodes feeds
+// peer discovery / outbound subscriptions, hdb_certificate feeds CA install. (harper-pro#489)
+export const SYSTEM_RELOAD_TABLES = ['hdb_nodes', 'hdb_certificate'];
 
 /**
  * Order a database's table names for a base copy: COPY_PRIORITY_TABLES first (in listed order), then
@@ -933,6 +990,9 @@ export class NodeReplicationConnection extends EventEmitter {
 	nodeName?: string;
 	authorization?: string;
 	tentativeNode?: any;
+	// Shared-memory connection-health buffer for this outbound (db, peer) link, stashed by replicateOverWS
+	// once resolved so close()/forceReconnect() can record DOWN/error without re-resolving auditStore (W1).
+	sharedStatus?: Float64Array;
 	constructor(url: string, subscription: any, databaseName: string, nodeName?: string, authorization?: string) {
 		super();
 		this.url = url;
@@ -1065,6 +1125,14 @@ export class NodeReplicationConnection extends EventEmitter {
 					});
 				}
 				this.isConnected = false;
+				// Record the disconnect in shared memory so the main thread sees the link is down even if the
+				// disconnect message is never processed (W1 / harper-pro#431). The reconcile staleness net
+				// covers the case where even this doesn't run (worker died).
+				if (this.sharedStatus) {
+					this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+					this.sharedStatus[LAST_ERROR_CODE_POSITION] = code ?? 0;
+					this.sharedStatus[LAST_ERROR_TIME_POSITION] = Date.now();
+				}
 			}
 			this.removeAllListeners('subscriptions-updated');
 
@@ -1144,6 +1212,8 @@ export class NodeReplicationConnection extends EventEmitter {
 				});
 			}
 			this.isConnected = false;
+			// Watchdog-forced teardown of a wedged link: mark down in shared memory (W1 / harper-pro#431).
+			if (this.sharedStatus) this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
 		}
 		// Drop this connection's stale subscription listener before reconnecting. The close handler
 		// normally does this (removeAllListeners), but its socket-identity guard early-returns for a
@@ -1242,14 +1312,36 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let copyFlushRetryTimer;
 	const COPY_CURSOR_FLUSH_BYTES = env.get('replication_copyCursorFlushBytes') ?? 64 * 1024 * 1024;
 	const COPY_CURSOR_FLUSH_INTERVAL_MS = Math.max(env.get('replication_copyCursorFlushIntervalMs') ?? 5000, 1);
-	// copyApply (and its WAL-off durability gate) engages only for non-system RocksDB copies. The system DB is
-	// excluded: its tables drive event-based machinery off the audit `aftercommit` stream — hdb_nodes feeds
-	// subscribeToNodeUpdates (peer discovery / connection setup) and hdb_certificate feeds CA install — so
-	// suppressing audit entries there would stop a freshly-copied node from forming its cluster (harper-pro#480;
-	// the system-analytics spin is handled by the retention-horizon dedup guard instead). LMDB is excluded too
-	// (copy rows stay audited/durable via the transaction log). databaseName is read dynamically — a connection
-	// can switch databases via SET_DATABASE.
-	const copyApplyActive = () => STORAGE_IS_ROCKSDB && databaseName !== 'system';
+	// copyApply (and its WAL-off durability gate) engages for every RocksDB copy, the system DB included. The
+	// system DB's tables drive event-based machinery off the audit `aftercommit` stream — hdb_nodes feeds
+	// subscribeToNodeUpdates (peer discovery / connection setup) and hdb_certificate feeds CA install — which
+	// copyApply's audit-less snapshot writes would otherwise suppress. A per-table "reload" marker emitted once
+	// the copy is durable (emitSystemReloadMarkers) re-drives those subscribers, so a freshly-copied node still
+	// forms its cluster while copyApply also covers hdb_analytics — retiring the system-DB exclusion and the
+	// #480 system-analytics spin's interim retention-horizon guard. LMDB stays excluded (copy rows stay
+	// audited/durable via the transaction log). (harper-pro#489)
+	const copyApplyActive = () => STORAGE_IS_ROCKSDB;
+	// Emit a whole-table reload marker for each cluster-machinery system table once a copyApply base copy
+	// of the system DB is durable, so subscribers that saw no per-row events (those rows were snapshotted
+	// without audit entries) re-read the table and the freshly-copied node forms its cluster. A no-op for
+	// non-system DBs and for audited (LMDB / non-copyApply) copies, which already delivered per-row events.
+	// Fire-and-forget: each marker is its own tiny transaction, and a failure self-heals on the next
+	// restart's subscription scan, so it must never block or fail copy finalization. (harper-pro#489)
+	function emitSystemReloadMarkers() {
+		if (databaseName !== 'system' || !copyApplyActive()) return;
+		for (const tableName of SYSTEM_RELOAD_TABLES) {
+			const table = (tables as any)?.[tableName];
+			if (typeof table?.writeReloadMarker !== 'function') continue;
+			// `.then(() => writeReloadMarker())` rather than `Promise.resolve(writeReloadMarker())` so a
+			// SYNCHRONOUS throw (the marker's transaction commits inline) is also routed to the catch — never
+			// bubbling out of this fire-and-forget call into copy finalization (maybeFinishCopy).
+			Promise.resolve()
+				.then(() => table.writeReloadMarker())
+				.catch((error: unknown) =>
+					logger.warn?.(connectionId, `failed to emit reload marker for system.${tableName}`, error)
+				);
+		}
+	}
 	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
 	// received AND every copied batch has committed (outstandingCommits drained, which includes the final
 	// end_txn that advances the resume seqId to copyStartTime). We deliberately stay in copy mode until
@@ -1287,6 +1379,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// per-frame throttle can't swallow this transition re-arm (mirrors the COPY_START widen). (#460)
 			receiveWatchdog?.stop();
 			receiveWatchdog?.reset();
+			// The copy's rows are now durable; signal the audit-stream subscribers to re-read the
+			// cluster-machinery system tables that copyApply snapshotted without per-row events (harper-pro#489).
+			emitSystemReloadMarkers();
 		}
 	}
 	// Persist the staged copy cursor and, if the copy is now fully durable, finish it — but ONLY when the
@@ -1434,7 +1529,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// drains to disk — so the watchdog can tell a healthy back-pressure pause (consumer draining) from a
 	// leg that died mid-pause (harper-pro#466). Only meaningful while paused.
 	let consumerProgress = 0;
-	const blobTimeout = env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 120000;
+	// Default 15min: a 120s cap dropped ~4,500 blobs to permanent divergence when a rolling
+	// upgrade + concurrent writes had blob transfers routinely stalling past the timeout, the
+	// receive watchdog then killed the subscription, and the audit cursor advanced past the
+	// missing blob. 900000 lets in-flight transfers complete across a peer restart window.
+	const blobTimeout = env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000;
 	const blobsInFlight = new Map();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
@@ -1469,7 +1568,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 			// While paused for receiver backpressure, keep our own liveness fresh: the stall is local and
 			// self-clearing (it doesn't depend on the peer), so we must not time the peer out for it.
-			if (pauseReasons > 0) lastByteActivity = performance.now();
+			if (pauseReasons > 0) {
+				lastByteActivity = performance.now();
+				// Keep the shared-memory liveness fresh too, so the main thread's connection truth (W1 / #431)
+				// does not falsely flip this healthy-but-paused link to down and trigger a needless reconcile.
+				// LAST_LIVENESS_TIME_POSITION holds a wall-clock timestamp (Date.now()), since the main thread
+				// compares it against Date.now() in deriveConnectionTruth — not performance.now() like
+				// lastByteActivity above (which is the keepalive's own monotonic clock). See gemini review on #445.
+				const pausedStatus = getSharedStatus();
+				if (pausedStatus) pausedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
+			}
 			// Always send the keep-alive ping. ws.pause() only stops reads, not writes, and the accepted
 			// peer relies on our pings to keep its own receive timer alive even when it has no data to send
 			// us. Record byte counts AFTER the ping so the ping's own bytes aren't later mistaken for peer
@@ -1544,9 +1652,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// (reset on COPY_START and on each in-copy 'message'; stopped on copy finish / pause). On a stall it
 	// forces the same close-independent reconnect, which restarts the copy from the leader. (harper-pro#453)
 	copyProgressWatchdog = createReceiveWatchdog({
-		// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 120000 and is shared with blobsTimer; guard
+		// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 900000 and is shared with blobsTimer; guard
 		// against a misconfigured 0/negative that would otherwise forceReconnect in a tight loop.
-		intervalMs: blobTimeout > 0 ? blobTimeout : 120000,
+		intervalMs: blobTimeout > 0 ? blobTimeout : 900000,
 		getBytesRead: () => copyProgressFrames,
 		onSilence: () => {
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
@@ -1583,6 +1691,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		if (!replicationSharedStatus) {
 			replicationSharedStatus = getReplicationSharedStatus(auditStore, databaseName, remoteNodeName);
+			// Make the buffer available to the connection's lifecycle methods (close/forceReconnect) so they
+			// can record DOWN/error without re-resolving auditStore. See W1 (harper-pro#431).
+			if (options.connection) options.connection.sharedStatus = replicationSharedStatus;
 		}
 		return replicationSharedStatus;
 	}
@@ -1877,6 +1988,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								}
 							}
 							if (options.connection) options.connection.nodeName = remoteNodeName;
+							// Mark the link connected as soon as the handshake identifies the peer, so the main thread's
+							// connection truth (W1 / #431) reflects an established-but-idle link immediately rather than
+							// waiting for the first post-handshake pong up to a ping interval later — otherwise a
+							// reconnected idle link reads as connected:false until then (replicationReconnect tests).
+							const handshakeStatus = getSharedStatus();
+							if (handshakeStatus) {
+								handshakeStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+								handshakeStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
+							}
 							//const url = message[3] ?? thisNodeUrl;
 							logger.debug?.(connectionId, 'received node name:', remoteNodeName, 'db:', databaseName ?? message[2]);
 							if (!databaseName) {
@@ -2568,7 +2688,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							if (!tableEntry) {
 								tableEntry = tableById[tableId] = tableToTableEntry(tableSubscriptionToReplicator.tableById[tableId]);
 								if (!tableEntry) {
-									return logger.debug?.('Not subscribed to table', tableId);
+									// Must yield like every other skip path: a contiguous run of entries for a
+									// table this peer doesn't subscribe to (or a dropped table, or corrupt-entry
+									// sentinels with tableId undefined) otherwise iterates with await undefined,
+									// which never leaves the microtask queue. Timers, I/O, and watchdogs starve
+									// for the whole run, and the periodic sequence updates skipAuditRecord sends
+									// never go out, so the peer's cursor can't advance past the run and every
+									// reconnect rescans it from the start.
+									logger.debug?.('Not subscribed to table', tableId);
+									return skipAuditRecord();
 								}
 							}
 							const table = tableEntry.table;
@@ -2800,13 +2928,27 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									logger.debug?.(
 										`Waiting for remote node ${remoteNodeName} to allow more commits ${ws._socket.writableNeedDrain ? 'due to network backlog' : 'due to requested flow directive'}`
 									);
-									ws._socket.once('drain', () => {
-										resolve();
+									const onDrain = () => {
+										ws.off('close', onClose);
 										isPausedForBackPressure = false;
 										updateBackPressureRatio();
-									});
+										// Also wait out blob saturation before admitting the next record; as an
+										// else-if this check was unreachable while the socket stayed congested.
+										// The !wsClosed guard matters: a drain queued behind the close event would
+										// otherwise push onto an already-flushed callback list and park forever.
+										if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT && !wsClosed) {
+											blobSentCallbacks.push(resolve);
+										} else resolve();
+									};
+									const onClose = () => {
+										// a closed socket never drains; resolve so the loop can observe closed and exit
+										ws._socket?.off('drain', onDrain);
+										resolve();
+									};
+									ws._socket.once('drain', onDrain);
+									ws.once('close', onClose);
 								});
-							} else if (outstandingBlobsBeingSent > MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+							} else if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT && !wsClosed) {
 								return new Promise((resolve) => {
 									blobSentCallbacks.push(resolve);
 								});
@@ -3349,6 +3491,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					maxBatchVersion = auditRecord.version;
 				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
+				// Received data is a liveness signal for the authoritative connection state (W1 / #431).
+				replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+				replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = replicationSharedStatus[RECEIVED_TIME_POSITION];
 
 				if (event) {
 					// Leading-duplicate fast-skip: on a resumed stream the first records re-streamed from the
@@ -3574,6 +3719,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			options.connection.latency = latency;
 			if (getSharedStatus()) {
 				replicationSharedStatus[LATENCY_POSITION] = latency;
+				// A pong confirms the link is alive in both directions; record it as the authoritative state.
+				replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+				replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
 			}
 			// update the manager with latest connection information
 			if (options.isSubscriptionConnection) {
@@ -3599,6 +3747,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
 		if (hdbNodesSubscription) hdbNodesSubscription.end();
+		// Wake queued blob senders and writer waits so they observe wsClosed instead of parking forever
+		while (blobSentCallbacks.length > 0) blobSentCallbacks.shift()?.();
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
@@ -3626,6 +3776,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// The same blobs can't be sent concurrently of the packets will get mixed up. The receiving
 	// end should handle aggregated the results of the same blob for separate record requests.
 	const blobsBeingSent = new Set();
+	let blobSendErrorsSuppressed = 0;
+	let lastBlobSendErrorLog = 0;
 	async function sendBlobs(blob: Blob, recordId: any) {
 		// found a blob, start sending it
 		const id = getFileId(blob);
@@ -3633,7 +3785,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.debug?.('Blob already being sent', id);
 			return;
 		}
+		if (wsClosed) return;
 		blobsBeingSent.add(id);
+		// Acquire a send slot before opening the blob stream. Enforcing the cap only at the audit
+		// writer's backpressure check didn't bound concurrency: there it sat in an else-if behind the
+		// drain wait (unreachable while the socket stayed congested) and the GET_RECORD path never
+		// checked it at all, so concurrent sends grew by one per drain event (200+ drain listeners
+		// on one TLSSocket observed in the field).
+		while (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+			await new Promise((resolve) => blobSentCallbacks.push(resolve));
+			if (wsClosed) {
+				blobsBeingSent.delete(id);
+				return;
+			}
+		}
 		const iterator = blob.stream()[Symbol.asyncIterator]();
 		try {
 			let lastBuffer: Buffer;
@@ -3645,7 +3810,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// receiver's apply consumer wedges at `lastReceivedStatus:"Receiving"` until its own idle
 			// watchdog fires (core/resources/blob.ts) 120s later. With the timeout, the catch below
 			// emits the finishing error frame so the receiver advances cleanly.
-			// Defaults ON to the replication blob timeout (REPLICATION_BLOBTIMEOUT, 120000 default) so a
+			// Defaults ON to the replication blob timeout (REPLICATION_BLOBTIMEOUT, 900000 default) so a
 			// stalled send can't silently wedge a base copy out of the box (harper-pro#453). The
 			// HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS env var overrides it; set it to 0 to disable.
 			const rawEnv = process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS;
@@ -3712,7 +3877,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			try {
 				await iterator.return?.();
 			} catch {}
-			logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
+			// Throttle the warn (a peer backfilling thousands of already-deleted blobs makes this fire
+			// at kHz); the error frame below is unconditional
+			const errorLogTime = Date.now();
+			if (errorLogTime - lastBlobSendErrorLog >= 5000) {
+				if (blobSendErrorsSuppressed > 0) {
+					logger.warn?.(`Suppressed ${blobSendErrorsSuppressed} additional blob send errors in the last 5s`);
+				}
+				blobSendErrorsSuppressed = 0;
+				lastBlobSendErrorLog = errorLogTime;
+				logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
+			} else blobSendErrorsSuppressed++;
 			// Forward the error CODE and STATUS alongside the message so the receiver can tell a PERMANENT
 			// source failure — the blob is gone (ENOENT/404) or confidently corrupt/incomplete (500,
 			// harper-pro#429) — from a TRANSIENT read fault (EIO, EMFILE, timeout, 503 write-in-progress —
@@ -4291,25 +4466,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 		ws.send(encode([DB_SCHEMA, tables, databaseName]));
 	}
-	blobsTimer = setInterval(() => {
-		const now = Date.now();
-		// Discount the time spent in the *current* (not-yet-ended) back-pressure pause: a pause can outlast
-		// blobTimeout, and this sweep fires independently of the pause, so without crediting the ongoing
-		// pause it would destroy a healthy stream mid-pause before `removePauseReason` ever runs (harper-pro
-		// #368). Shifting `lastChunk` forward by the ongoing pause duration here mirrors the permanent shift
-		// `removePauseReason` applies on resume.
-		const ongoingPauseMs = pauseReasons > 0 ? now - pauseStartTime : 0;
-		for (const [blobId, stream] of blobsInFlight) {
-			if (isBlobStreamTimedOut(stream.lastChunk + ongoingPauseMs, blobTimeout, now)) {
-				logger.warn?.(
-					`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
-				);
-				blobsInFlight.delete(blobId);
-				unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
-				stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
+	blobsTimer = setInterval(
+		() => {
+			const now = Date.now();
+			// Discount the time spent in the *current* (not-yet-ended) back-pressure pause: a pause can outlast
+			// blobTimeout, and this sweep fires independently of the pause, so without crediting the ongoing
+			// pause it would destroy a healthy stream mid-pause before `removePauseReason` ever runs (harper-pro
+			// #368). Shifting `lastChunk` forward by the ongoing pause duration here mirrors the permanent shift
+			// `removePauseReason` applies on resume.
+			const ongoingPauseMs = pauseReasons > 0 ? now - pauseStartTime : 0;
+			for (const [blobId, stream] of blobsInFlight) {
+				if (isBlobStreamTimedOut(stream.lastChunk + ongoingPauseMs, blobTimeout, now)) {
+					logger.warn?.(
+						`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
+					);
+					blobsInFlight.delete(blobId);
+					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
+					stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
+				}
 			}
-		}
-	}, blobTimeout).unref();
+			// Sweep more often than the idle threshold: with the interval coupled to blobTimeout (900s
+			// default), an orphaned stream could hold its buffered chunks for up to 2x blobTimeout.
+		},
+		Math.max(Math.min(blobTimeout > 0 ? blobTimeout : 900000, 60000), 1000)
+	).unref();
 
 	let nextId = 1;
 	const sentTableNames = [];
