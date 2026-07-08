@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783508446494,
+  "lastUpdate": 1783508448641,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -2909,6 +2909,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 33.73,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lavinia",
+            "username": "ldt1996",
+            "email": "lavinia@harperdb.io"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "9af593e81ed571b369635fcdc71bd5e273d8a84b",
+          "message": "fix(replication): bound the blob send path under backpressure (#534)\n\n* fix(replication): bound blob-send concurrency and sweep orphan blob streams every 60s\n\n* fix(replication): resolve writer drain wait on close, guard callback pushes with wsClosed, floor the sweep interval (review)",
+          "timestamp": "2026-07-07T18:06:48Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/9af593e81ed571b369635fcdc71bd5e273d8a84b"
+        },
+        "date": 1783508448617,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 4.9,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 5.78,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 6.55,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 16.47,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 22.19,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 15.07,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 29.95,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 34.64,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 119.88,
             "unit": "ms"
           }
         ]
