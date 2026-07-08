@@ -344,6 +344,80 @@ export function refreshBlobStreamsOnResume(blobsInFlight: Map<any, { lastChunk?:
 }
 
 /**
+ * Abort each still-receiving blob when the replication connection closes, rather than leaving the
+ * half-written stream for core's source-idle watchdog to reap `blobTimeout` (REPLICATION_BLOBTIMEOUT,
+ * up to 15 min) later. A worker restart on the sender — routine in the deploy_component lifecycle —
+ * closes the WS mid-blob; without this the receiver holds the stream until that watchdog fires, only
+ * then stamping a PENDING stub, so the diverged blob lingers for the whole timeout before the reconnect
+ * can re-request it. Destroying with a plain Error is classified TRANSIENT by `receiveBlobs`'s `.catch`
+ * (not `sourceBlobUnavailable`, not a permanent source error), which sets `hasBlobGap` → the resume
+ * cursor clamps at the last durable transaction → the reconnect re-streams the blob promptly. Each
+ * abort's `.finally` in `receiveBlobs` unregisters its in-flight marker, so `onAbort` (the sweep's
+ * explicit unregister) is redundant but harmless and keeps parity with the `blobsTimer` sweep.
+ *
+ * A COMPLETED-but-unconnected stream (`writableEnded`, its chunks arrived ahead of its record) is
+ * skipped: its bytes are fully buffered and an in-flight message handler that was paused when the close
+ * fired can still attach to it via `receiveBlobs` and save it — destroying it would discard received
+ * data and force an unnecessary re-request. Left in the map, it is either attached during teardown or
+ * discarded with the connection's `blobsInFlight` on reconnect (re-streamed from the resume cursor).
+ *
+ * That stream's core-level receive-in-flight marker (`registerBlobReceiveInFlight`, taken by the chunk
+ * handler when the stream was created) is released here too, via `onAbort`, even though the stream
+ * itself is preserved. If its record never arrives, nothing else ever releases that marker: `blobsTimer`
+ * is already cleared above, and `receiveBlobs`'s `.finally` — the normal release site — never runs for a
+ * stream it never touched. Left unreleased, `isBlobReceiveInFlight` for this fileId would stay true for
+ * the process lifetime, permanently 503-ing reads of that blob (harper-pro#527 review). This trades a
+ * brief window — an in-flight handler on THIS closing connection could still attach and save the stream
+ * after its marker is gone — for closing a leak that otherwise never heals; that window is bounded to
+ * this one connection's already-queued work, and `unregisterBlobReceiveInFlight` is idempotent (guarded
+ * on absent state), so `receiveBlobs`'s own later release for the same stream, if it does still run, is a
+ * safe no-op rather than a double-release.
+ *
+ * Exported so the teardown can be unit-tested in isolation; the production caller is the ws `'close'`
+ * handler in `replicateOverWS`. Deleting the current entry mid-iteration is safe for a Map.
+ */
+export function abortInFlightBlobsOnClose(
+	blobsInFlight: Map<any, { destroy?: (error: Error) => void; writableEnded?: boolean }>,
+	remoteNodeName: string,
+	onAbort?: (blobId: any) => void
+): number {
+	let aborted = 0;
+	for (const [blobId, stream] of blobsInFlight) {
+		if (stream.writableEnded) {
+			// Fully received, waiting for its record — preserve its bytes, but release its marker (see above).
+			onAbort?.(blobId);
+			continue;
+		}
+		blobsInFlight.delete(blobId);
+		onAbort?.(blobId);
+		const error = new Error(
+			`Replication connection to ${remoteNodeName || 'unknown'} closed before blob ${blobId} finished; will re-request on reconnect`
+		) as Error & { replicationConnectionClosed?: boolean };
+		// Mark it so receiveBlobs's .catch treats it as a routine, self-healing interruption (clamp +
+		// re-request) rather than logging an error and bumping the divergence metric on every restart.
+		error.replicationConnectionClosed = true;
+		stream.destroy?.(error);
+		aborted++;
+	}
+	return aborted;
+}
+
+/**
+ * Whether a blob-save rejection came from {@link abortInFlightBlobsOnClose} — i.e. the replication
+ * connection closed mid-blob (e.g. a peer worker restart in the deploy_component lifecycle). This is a
+ * TRANSIENT, self-healing interruption: `receiveBlobs` clamps the resume cursor and the reconnect
+ * re-requests the blob, so it should NOT be logged as an error or counted as a divergence
+ * (cluster_status.blobReplicationFailures) — that would spam logs and inflate the metric on every deploy.
+ */
+export function isReplicationConnectionClosedError(error: unknown): boolean {
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		(error as { replicationConnectionClosed?: boolean }).replicationConnectionClosed === true
+	);
+}
+
+/**
  * Record a blob-replication divergence (a receive-side blob save failure) in the per-peer shared status
  * so cluster_status can surface it. Bumps the cumulative failure count and stamps the most-recent
  * failure time, returning the new cumulative count. A blob failure means a record committed without its
@@ -3643,6 +3717,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		copyProgressWatchdog?.stop();
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
+		// The blobsTimer that would otherwise reap stalled receives is now cleared, and the connection is
+		// gone, so abort any in-flight blob receives immediately instead of waiting up to blobTimeout for
+		// core's source-idle watchdog. This clamps the resume cursor (transient failure) so the reconnect
+		// re-requests them promptly — a worker restart on the sender (deploy_component lifecycle) closes the
+		// WS mid-blob, and holding the stream for the full timeout is what leaves the blob diverged.
+		if (blobsInFlight.size > 0) {
+			const aborted = abortInFlightBlobsOnClose(blobsInFlight, remoteNodeName, (blobId) =>
+				unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore)
+			);
+			logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`);
+		}
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
 		if (hdbNodesSubscription) hdbNodesSubscription.end();
@@ -3853,6 +3938,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// This .catch runs inside the same microtask chain that onCommit's
 					// `await Promise.all(outstandingBlobsToFinish)` is waiting on; we deliberately do NOT tear
 					// down here. Classify the failure to decide whether the resume cursor holds or advances.
+					if (isReplicationConnectionClosedError(err)) {
+						// The connection closed mid-blob (e.g. a peer worker restart in the deploy_component
+						// lifecycle). Clamp like any transient gap so the reconnect re-requests it, but skip the
+						// error log and the divergence metric below — this is routine and self-healing, and would
+						// otherwise spam logs / inflate cluster_status.blobReplicationFailures on every deploy.
+						logger.debug?.(
+							connectionId,
+							`Blob ${blobId} receive interrupted by connection close; will re-request on reconnect`
+						);
+						hasBlobGap = true;
+						return;
+					}
 					if (isUnrecoverableSourceBlobError(err)) {
 						// The sender reported it cannot provide this blob (BLOB_CHUNK `error` marker — typically
 						// ENOENT because the blob was evicted/expired at the origin). Re-streaming on reconnect
