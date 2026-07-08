@@ -28,6 +28,7 @@ import {
 	LICENSE_KEY_DIR_NAME,
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
+import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 
 /**
  * Environment Variables:
@@ -342,7 +343,26 @@ export async function cloneNode(): Promise<void> {
 	const setNodeResponse = await setNode(setNodeRequest);
 	log(`Response from set node: ${setNodeResponse}`);
 
-	await cloneJWTKeys();
+	try {
+		await cloneJWTKeys();
+	} catch (err) {
+		// A node without the leader's JWT signing keys cannot issue or validate tokens, so the clone is
+		// not viable. Mirror the unconfirmed-sync handling below: keep Harper running so get_status stays
+		// queryable, publish Unavailable, clear the cloned flag so a subsequent start retries the clone,
+		// and stop before finalizing.
+		const { set: setStatus } = await import('../core/server/status/index.js');
+		try {
+			await setStatus({ id: 'availability', status: 'Unavailable' });
+		} catch (statusErr) {
+			log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
+		}
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		log(
+			`Clone from leader node ${leaderURL} failed to obtain JWT signing keys (${err}); node is running but Unavailable and not marked as cloned`,
+			'error'
+		);
+		return;
+	}
 
 	await cloneEnvSecretsKeys();
 
@@ -671,30 +691,41 @@ async function cloneSSHKeys() {
 async function cloneJWTKeys(): Promise<void> {
 	if (skipJWTKeys) return;
 
-	try {
-		log('Cloning JWT keys');
-		const keysDir = join(rootPath, LICENSE_KEY_DIR_NAME);
+	log('Cloning JWT keys');
+	const keysDir = join(rootPath, LICENSE_KEY_DIR_NAME);
 
-		const jwtPublic: Record<string, any> = await leaderRequest({
-			operation: 'get_key',
-			name: '.jwtPublic',
-		});
-		writeFileSync(join(keysDir, JWT_ENUM.JWT_PUBLIC_KEY_NAME), jwtPublic.message);
+	// Fetch all three keys before writing any. A partial write — say the private key lands but the
+	// passphrase fetch fails — leaves the node unable to read its key set at all (getJWTRSAKeys needs
+	// all three), which is harder to diagnose than a clean failure. fetchJWTKeyWithRetry rides out
+	// transient leader hiccups and throws if a key can't be obtained, so the caller can contain a
+	// non-viable clone rather than finalizing it.
+	const publicKey = await fetchJWTKeyWithRetry(
+		() => leaderRequest({ operation: 'get_key', name: '.jwtPublic' }),
+		'.jwtPublic'
+	);
+	const privateKey = await fetchJWTKeyWithRetry(
+		() => leaderRequest({ operation: 'get_key', name: '.jwtPrivate' }),
+		'.jwtPrivate'
+	);
+	const passphrase = await fetchJWTKeyWithRetry(
+		() => leaderRequest({ operation: 'get_key', name: '.jwtPass' }),
+		'.jwtPass'
+	);
 
-		const jwtPrivate: Record<string, any> = await leaderRequest({
-			operation: 'get_key',
-			name: '.jwtPrivate',
-		});
-		writeFileSync(join(keysDir, JWT_ENUM.JWT_PRIVATE_KEY_NAME), jwtPrivate.message);
+	// Ensure the keys dir exists before writing — a cloned node normally has it from its own install,
+	// but don't assume it (a fresh clone path, or a wiped dir, would otherwise fail with ENOENT).
+	mkdirSync(keysDir, { recursive: true });
+	writeFileSync(join(keysDir, JWT_ENUM.JWT_PUBLIC_KEY_NAME), publicKey);
+	writeFileSync(join(keysDir, JWT_ENUM.JWT_PRIVATE_KEY_NAME), privateKey);
+	writeFileSync(join(keysDir, JWT_ENUM.JWT_PASSPHRASE_NAME), passphrase);
 
-		const jwtPass: Record<string, any> = await leaderRequest({
-			operation: 'get_key',
-			name: '.jwtPass',
-		});
-		writeFileSync(join(keysDir, JWT_ENUM.JWT_PASSPHRASE_NAME), jwtPass.message);
-	} catch (err) {
-		log(`Error cloning JWT keys: ${err}`, 'error');
-	}
+	// Harper is already running by this point, so the operations API may have served an early Bearer-auth
+	// request and cached the install-generated JWT keys in-process. Those just got overwritten on disk;
+	// drop the cache so the next token verify/sign reads the cloned leader keys instead of finishing the
+	// clone Available while still authing with the pre-clone key set. Dynamically imported to avoid the
+	// module's load-time env.initSync() running before rootPath is initialized.
+	const { clearJWTRSAKeysCache } = await import('../core/security/tokenAuthentication.js');
+	clearJWTRSAKeysCache();
 }
 
 /**

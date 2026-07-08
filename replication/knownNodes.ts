@@ -97,9 +97,10 @@ export function getReplicationSharedStatus(
 	node_name: string,
 	callback?: () => void
 ) {
-	// 128 bytes = 16 Float64 slots. Positions 0..6 are the replication status fields and 7..8 the
-	// blob-divergence signals (see the *_POSITION exports in replicationConnection.ts); the rest is
-	// headroom for future metrics. This buffer is process-local shared memory (shared across this
+	// 128 bytes = 16 Float64 slots. Positions 0..6 are the replication status fields, 7..8 the
+	// blob-divergence signals, and 9..12 the W1 connection-truth fields (state/liveness/error-code/
+	// error-time; see the *_POSITION exports in replicationConnection.ts); 13..15 are headroom for
+	// future metrics. This buffer is process-local shared memory (shared across this
 	// node's threads via getUserSharedBuffer, never persisted or sent across nodes), so growing it is
 	// safe: every caller goes through this function, and a node runs a single version.
 	return new Float64Array(
@@ -383,6 +384,14 @@ function storeRecordRangeVisible(store: any, name: string): boolean {
 }
 
 async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
+	if (event.type === 'reload') {
+		// A copyApply base copy back-filled hdb_nodes as snapshots with no per-row change events
+		// (harper-pro#489). Re-scan the whole table and fire the listener for every node so outbound
+		// replication connections are (re)established to the peers that arrived via the bulk copy.
+		logger.debug?.('hdb_nodes reload marker received; rescanning known nodes');
+		rebuildKnownNodes(listener);
+		return;
+	}
 	// remove any nodes that have been updated or deleted
 	const node_name = event?.value?.name || event?.id;
 	logger.debug?.('adding node', node_name, 'on  node', getThisNodeName(), ' on process', process.pid);
@@ -547,9 +556,22 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 	// watcher instead of stacking one, while the two distinct callers (subscription management vs
 	// replication-confirmation tracking) keep independent concurrent watchers.
 	runNodeUpdateWatcher(listener, { key: watcherKey });
-	// Keep the prior in-memory nodes so a reload's scan can re-enrich a reconstructed decode-miss
-	// descriptor (which has no url/shard) instead of transiently dropping those fields (harper-pro#460
-	// review). Empty on first boot (nothing to enrich from), which is correct.
+	rebuildKnownNodes(listener);
+	logger.debug?.(
+		'Known nodes at startup',
+		server.nodes.map((node) => node.name)
+	);
+}
+
+/**
+ * Rebuild server.nodes / server.shards from a full hdb_nodes scan, firing `listener` for every node.
+ * Drives the initial subscription scan and the reaction to a table-reload marker after a copyApply
+ * base copy of the system DB, whose per-row snapshot writes carry no change events (harper-pro#489).
+ * Prior in-memory nodes are kept so a reconstructed decode-miss descriptor (which has no url/shard) is
+ * re-enriched instead of transiently dropping those fields (harper-pro#460). Empty on first boot
+ * (nothing to enrich from), which is correct.
+ */
+function rebuildKnownNodes(listener: (node: any, id: string) => void) {
 	const oldNodes = server.nodes || [];
 	server.nodes = [];
 	server.shards = new Map();
@@ -562,7 +584,12 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 			// name + replicates from the reconstruct win; oldNode supplies url/shard/ca/etc.
 			if (oldNode) node = { ...oldNode, ...node };
 		}
-		server.nodes.push(node);
+		// server.nodes holds PEERS, never this node itself — mirror processNodeUpdateEvent's
+		// `node_name !== getThisNodeName()` guard. The per-row event path always excluded self; the scan
+		// path latently did not, which was harmless while it only ran on an empty table at boot. A copyApply
+		// reload now runs it over a populated hdb_nodes (incl. the self row), so without this guard self leaks
+		// into server.nodes and the node treats itself as a replication/deploy peer (harper-pro#489).
+		if (node.name === undefined || node.name !== getThisNodeName()) server.nodes.push(node);
 		if (node.shard != undefined) {
 			let nodesForShard = server.shards.get(node.shard);
 			if (!nodesForShard) {
@@ -572,10 +599,6 @@ export function subscribeToNodeUpdates(listener: (node: any, id: string) => void
 		}
 		listener(node, key);
 	});
-	logger.debug?.(
-		'Known nodes at startup',
-		server.nodes.map((node) => node.name)
-	);
 }
 
 export function shouldReplicateFromNode(node: Node, databaseName: string) {

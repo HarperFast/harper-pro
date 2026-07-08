@@ -26,6 +26,7 @@ import {
 	tableUpdateListeners,
 	LATENCY_POSITION,
 } from './replicationConnection.ts';
+import { redactOperationForLog } from './logRedaction.ts';
 import { server } from '../core/server/Server.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -598,7 +599,13 @@ export async function sendOperationToNode(node, operation, options?) {
 	const session = replicateOverWS(socket, {}, {});
 	return new Promise((resolve, reject) => {
 		socket.on('open', () => {
-			logger.debug('Sending operation connection to ' + getNodeURL(node) + ' opened', operation);
+			// operation may carry a secret (registry token / ssh key / password); redact before
+			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
+			if (logger.logsAtLevel('debug'))
+				logger.debug(
+					'Sending operation connection to ' + getNodeURL(node) + ' opened',
+					redactOperationForLog(operation)
+				);
 			resolve(session.sendOperation(operation));
 		});
 		socket.on('error', (error) => {
