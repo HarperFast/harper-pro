@@ -244,6 +244,28 @@ export function shouldForceBaseCopyForRetention(
 	return requestedStartTime < Math.max(oldestRetainedTime ?? 0, retentionCutoffTime);
 }
 
+/**
+ * Compare the sender's per-table sent counts (carried on COPY_COMPLETE) against the records this
+ * receiver actually decoded from the copy stream. Both sides count the same stream for the same
+ * session, so the comparison is exact: it is immune to concurrent writes, eviction/expiration, and
+ * resume (a resumed copy counts only its own tail on both ends). A deficit means records were lost
+ * in flight or dropped undecodable on this end — loss the receive path otherwise silently skips
+ * past. A malformed sent count is ignored; an extra received table (sender predates the payload,
+ * or names diverge) is not an error. Pure so the comparison is unit-testable.
+ */
+export function computeCopyDeliveryShortfall(
+	sent: Record<string, number>,
+	received: Record<string, number>
+): Array<{ table: string; sent: number; received: number }> {
+	const shortfalls: Array<{ table: string; sent: number; received: number }> = [];
+	for (const [table, sentCount] of Object.entries(sent)) {
+		if (typeof sentCount !== 'number' || !(sentCount >= 0)) continue;
+		const receivedCount = received[table] ?? 0;
+		if (receivedCount < sentCount) shortfalls.push({ table, sent: sentCount, received: receivedCount });
+	}
+	return shortfalls;
+}
+
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
 // when we receive messages from other nodes, we then forward them on to as a notification on these subscriptions
@@ -1313,9 +1335,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let copyModeOrderVersion; // copy-order version the leader announced in COPY_START; persisted in the cursor (#421)
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
 	let copyCompleteReceived = false;
-	// One-shot latch for copy verification: a detected shortfall reconnects the whole leg, so
-	// re-checking further tables (or a re-entrant COPY_COMPLETE) must not stack reconnects.
-	let copyCountMismatchHandled = false;
+	// Per-table count of copy records this session delivered intact (decoded, or intentionally
+	// dropped by policy). Compared at COPY_COMPLETE against the sender's sent counts; see
+	// computeCopyDeliveryShortfall.
+	let copyReceivedCounts: Record<string, number> = {};
 	// Staged key-based copy resume cursor (#426). The copy cursor (`{currentTable, afterKey, ...}` = "fully
 	// copied through this key") is KEY-based and, exactly like the sequence watermark, must only be
 	// PERSISTED once the copied key's blob — and every earlier blob — is durable. We must NOT await blobs in
@@ -2227,6 +2250,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
 						inCopyMode = true;
 						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
+						copyReceivedCounts = {}; // fresh delivery tally for this copy session
 						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)
 						lastCopyFlushTime = performance.now();
 						// The byte watchdog was already (re)armed for THIS frame back in the synchronous
@@ -2245,62 +2269,44 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
-					case COPY_COMPLETE:
+					case COPY_COMPLETE: {
 						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
 						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
 						copyCompleteReceived = true;
-						// Snapshot before maybeFinishCopy: the zero-rows-copied case (a poisoned cursor that
-						// claimed the whole range) satisfies every finish condition, so it clears copyFromNodeId
-						// synchronously right here, and the closure below must not read the live variable either
-						// (an async finish during a count await would corrupt the remove/put key).
-						const copySourceNodeId = copyFromNodeId;
 						// No more copy frames will arrive, so stop watching for copy-progress stalls now rather
 						// than leaving the timer to wake the event loop until the commit drain finishes (#453).
 						copyProgressWatchdog?.stop();
 						maybeFinishCopy();
 						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
-						// Verify the copy actually delivered the sender's tables (payload absent from old
-						// senders). A resume cursor asserts everything before afterKey landed in an earlier
-						// run; an interrupted copy can persist a cursor over a never-delivered range, and
-						// every later resume then skips to the tail and re-seals the hole. Compare row
-						// counts and, on a large shortfall, clear this source's cursor and seq so the next
-						// connect takes the no-resume-cursor full-copy path, then force that reconnect.
-						// Tolerance absorbs count-estimate error; runs detached so a slow count scan
-						// cannot stall the receive loop.
-						if (data && typeof data === 'object' && copySourceNodeId !== undefined && !copyCountMismatchHandled) {
-							void (async () => {
-								try {
-									for (const [tableName, senderCount] of Object.entries(data as Record<string, number>)) {
-										if (typeof senderCount !== 'number' || senderCount < 0) continue;
-										const localTable = tables?.[tableName];
-										if (!localTable?.getRecordCount) continue;
-										if (!('evictionMS' in localTable) || localTable.expirationMS || localTable.evictionMS) continue;
-										let localCount = -1;
-										try {
-											localCount = (await localTable.getRecordCount({ timeLimit: 2000 }))?.recordCount ?? -1;
-										} catch (countError) {
-											logger.warn?.(connectionId, `failed to count ${tableName} for copy verification`, countError);
-										}
-										if (localCount < 0) continue;
-										const shortfall = senderCount - localCount;
-										if (shortfall > Math.max(100, senderCount * 0.1)) {
-											copyCountMismatchHandled = true;
-											logger.error?.(
-												`Copy verification failed for ${databaseName}.${tableName} from ${remoteNodeName}: sender has ~${senderCount} rows, local has ~${localCount}. ` +
-													`Clearing the resume cursor and seq for this source and reconnecting to force a fresh full copy.`
-											);
-											tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copySourceNodeId]);
-											tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('seq'), copySourceNodeId], { seqId: 1 });
-											options.connection?.forceReconnect();
-											return;
-										}
-									}
-								} catch (error) {
-									logger.warn?.(connectionId, 'copy verification check failed', error);
+						// Alert-only delivery verification: the payload (absent from old senders) carries how
+						// many records the sender actually sent per table in this copy session, and
+						// copyReceivedCounts tallied what arrived intact. Both sides count the same stream, so
+						// any deficit is real loss — records dropped in transit or skipped undecodable on this
+						// end, which the decode path otherwise silently advances past. Deliberately no
+						// corrective action: a forced re-copy would loop forever against permanently
+						// undecodable records, and at-rest completeness belongs to a range-checksum check, not
+						// a delivery tally.
+						if (data && typeof data === 'object') {
+							const shortfalls = computeCopyDeliveryShortfall(data as Record<string, number>, copyReceivedCounts);
+							if (shortfalls.length > 0) {
+								logger.error?.(
+									`Copy delivery verification failed for database ${databaseName} from ${remoteNodeName}: ` +
+										shortfalls.map((s) => `${s.table} sent=${s.sent} received=${s.received}`).join(', ') +
+										'. The missing records were lost in transit or dropped as undecodable (see any decode errors above); not forcing a re-copy.'
+								);
+								if (options.connection) {
+									// surfaced for inspection/monitoring alongside the connection's other state
+									options.connection.copyDeliveryShortfall = {
+										time: Date.now(),
+										database: databaseName,
+										from: remoteNodeName,
+										shortfalls,
+									};
 								}
-							})();
+							}
 						}
 						break;
+					}
 					case SEQUENCE_ID_UPDATE:
 						// we need to record the sequence number that the remote node has received
 						lastSequenceIdReceived = data;
@@ -2669,13 +2675,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										subscriptionToHdbNodes = subscription;
 										for await (const event of subscriptionToHdbNodes) {
 											const node = event.value;
-											if (!(
-												node?.replicates === true ||
-												node?.replicates?.receives ||
-												node?.replicates?.receivesFrom?.some(
-													(sub) => sub.source === getThisNodeName() && sub.database === databaseName
+											if (
+												!(
+													node?.replicates === true ||
+													node?.replicates?.receives ||
+													node?.replicates?.receivesFrom?.some(
+														(sub) => sub.source === getThisNodeName() && sub.database === databaseName
+													)
 												)
-											)) {
+											) {
 												closed = true;
 												close(1008, `Unauthorized database subscription to ${databaseName}`);
 												return;
@@ -3053,7 +3061,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
+							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
+							| undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -3183,6 +3192,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// Paces the flush/yield cadence inside the copy loop below (see
 											// COPY_CHECKPOINT_MAX_INTERVAL_MS). Marked on every in-loop flush/yield.
 											const copyFlushPacer = createCopyFlushPacer(COPY_CHECKPOINT_MAX_INTERVAL_MS, Date.now());
+											// Per-table tally of records actually sent in THIS copy session, shipped on
+											// COPY_COMPLETE so the follower can verify delivery (computeCopyDeliveryShortfall).
+											// Counting the stream keeps the comparison exact: no table scan, no race with
+											// concurrent writes or eviction, and a resumed copy counts only its own tail.
+											const copySentCounts: Record<string, number> = {};
 											// If resuming, the follower already committed every table before currentTable (records commit
 											// in stable iteration order), so skip to currentTable and continue after its last committed key.
 											let reachedResumeTable = !copyResume;
@@ -3310,6 +3324,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														},
 														entry.localTime
 													);
+													copySentCounts[tableName] = (copySentCounts[tableName] ?? 0) + 1;
 													logger.debug?.(
 														'sent record from table',
 														entry.key,
@@ -3355,28 +3370,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											);
 											// The full copy is done — tell the follower to clear its resume cursor and fall back to
 											// normal audit-log replication from the persisted seqId (which is copyStartTime).
-											// Include this side's per-table row counts so the follower can detect a poisoned
-											// resume cursor: a resume trusts that everything before afterKey was delivered, but
-											// an interrupted copy can persist a cursor whose skipped range never landed. The
-											// follower compares counts and forces a fresh full copy on a large shortfall.
-											// Evicting/expiring tables are excluded: they reclaim rows lazily and per-node, so
-											// raw counts legitimately diverge. The 'evictionMS in' check keeps this safe against
-											// a core that predates the getter (skip rather than false-positive).
-											const copyVerification: Record<string, number> = {};
-											for (const tableName of orderedTableNames) {
-												const verifyTable = tables[tableName];
-												if (!tableToTableEntry(verifyTable)) continue;
-												if (!verifyTable?.getRecordCount) continue;
-												if (!('evictionMS' in verifyTable) || verifyTable.expirationMS || verifyTable.evictionMS)
-													continue;
-												try {
-													copyVerification[tableName] =
-														(await verifyTable.getRecordCount({ timeLimit: 2000 }))?.recordCount ?? -1;
-												} catch {
-													copyVerification[tableName] = -1;
-												}
-											}
-											ws.send(encode([COPY_COMPLETE, copyVerification]));
+											// The per-table sent tally rides along so the follower can verify every record it
+											// was sent arrived intact (computeCopyDeliveryShortfall); the record frames all
+											// precede this message on the socket, so the follower's tally is settled by the
+											// time it compares.
+											ws.send(encode([COPY_COMPLETE, copySentCounts]));
 											getSharedStatus()[SENDING_TIME_POSITION] = 0;
 											currentSequenceId = copyStartTime;
 										}
@@ -3494,6 +3492,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						'from',
 						remoteNodeName
 					);
+					// a policy drop still counts as delivered for the copy tally: the record arrived intact
+					if (messageIsCopyFrame)
+						copyReceivedCounts[tableDecoder.name] = (copyReceivedCounts[tableDecoder.name] ?? 0) + 1;
 					decoder.position = start + eventLength;
 					continue;
 				}
@@ -3509,6 +3510,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						'from',
 						remoteNodeName
 					);
+					// a policy drop still counts as delivered for the copy tally: the record arrived intact
+					if (messageIsCopyFrame && tableDecoder)
+						copyReceivedCounts[tableDecoder.name] = (copyReceivedCounts[tableDecoder.name] ?? 0) + 1;
 					decoder.position = start + eventLength;
 					continue;
 				}
@@ -3646,6 +3650,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// otherwise double-apply). Rows older than copyStartTime are never redelivered, so the
 					// snapshot is safe and carries no audit. Strict `<` keeps the boundary row audited.
 					event.isCopyApply = messageIsCopyFrame && copyApplyActive() && auditRecord.version < copyModeStartTime;
+					// Count only records that decoded successfully: a decode failure leaves `event` unset and
+					// falls through above, so its absence here is exactly the deficit the COPY_COMPLETE
+					// delivery verification reports.
+					if (messageIsCopyFrame) copyReceivedCounts[event.table] = (copyReceivedCounts[event.table] ?? 0) + 1;
 					tableSubscriptionToReplicator.send(event);
 					// Per-record backpressure: a single large WS message can synchronously decode
 					// thousands of records, each holding a decoded value object and a closure over
