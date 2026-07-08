@@ -108,6 +108,25 @@ describe('abortInFlightBlobsOnClose — re-request in-flight blobs on connection
 		expect(blobsInFlight.has('receiving')).to.equal(false);
 	});
 
+	it('releases the in-flight marker for a preserved writableEnded stream without destroying or dropping it (cb1kenobi review, harper-pro#527)', () => {
+		// If the preserved stream's record never arrives, nothing else ever unregisters its
+		// registerBlobReceiveInFlight marker (receiveBlobs's .finally never runs for a stream it never
+		// touched, and blobsTimer is already cleared on close) — a permanent leak that pins
+		// isBlobReceiveInFlight true (503-forever reads of that blob) until process restart. onAbort must
+		// still fire for it even though it is not counted as "aborted" and stays in the map.
+		const unregistered = [];
+		const completed = makeStream();
+		completed.writableEnded = true;
+		const blobsInFlight = new Map([['done', completed]]);
+
+		const aborted = abortInFlightBlobsOnClose(blobsInFlight, 'peer-node', (id) => unregistered.push(id));
+
+		expect(aborted).to.equal(0); // preserved, not counted as an abort
+		expect(completed.destroyedWith).to.equal(undefined); // still preserved
+		expect(blobsInFlight.has('done')).to.equal(true); // still preserved
+		expect(unregistered).to.have.members(['done']); // but its marker was released
+	});
+
 	it('is a no-op (returns 0) when nothing is in flight', () => {
 		const blobsInFlight = new Map();
 		expect(abortInFlightBlobsOnClose(blobsInFlight, 'peer-node')).to.equal(0);

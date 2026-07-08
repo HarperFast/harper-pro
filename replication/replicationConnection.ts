@@ -414,6 +414,18 @@ export function refreshBlobStreamsOnResume(blobsInFlight: Map<any, { lastChunk?:
  * data and force an unnecessary re-request. Left in the map, it is either attached during teardown or
  * discarded with the connection's `blobsInFlight` on reconnect (re-streamed from the resume cursor).
  *
+ * That stream's core-level receive-in-flight marker (`registerBlobReceiveInFlight`, taken by the chunk
+ * handler when the stream was created) is released here too, via `onAbort`, even though the stream
+ * itself is preserved. If its record never arrives, nothing else ever releases that marker: `blobsTimer`
+ * is already cleared above, and `receiveBlobs`'s `.finally` — the normal release site — never runs for a
+ * stream it never touched. Left unreleased, `isBlobReceiveInFlight` for this fileId would stay true for
+ * the process lifetime, permanently 503-ing reads of that blob (harper-pro#527 review). This trades a
+ * brief window — an in-flight handler on THIS closing connection could still attach and save the stream
+ * after its marker is gone — for closing a leak that otherwise never heals; that window is bounded to
+ * this one connection's already-queued work, and `unregisterBlobReceiveInFlight` is idempotent (guarded
+ * on absent state), so `receiveBlobs`'s own later release for the same stream, if it does still run, is a
+ * safe no-op rather than a double-release.
+ *
  * Exported so the teardown can be unit-tested in isolation; the production caller is the ws `'close'`
  * handler in `replicateOverWS`. Deleting the current entry mid-iteration is safe for a Map.
  */
@@ -424,7 +436,11 @@ export function abortInFlightBlobsOnClose(
 ): number {
 	let aborted = 0;
 	for (const [blobId, stream] of blobsInFlight) {
-		if (stream.writableEnded) continue; // fully received, waiting for its record — preserve its bytes
+		if (stream.writableEnded) {
+			// Fully received, waiting for its record — preserve its bytes, but release its marker (see above).
+			onAbort?.(blobId);
+			continue;
+		}
 		blobsInFlight.delete(blobId);
 		onAbort?.(blobId);
 		const error = new Error(
