@@ -97,10 +97,13 @@ suite('Copy-mode blob deadlock (base copy)', { timeout: 240000 }, (ctx) => {
 		// on) commits in the background afterward. So Promise.all(seedPromises) resolving does NOT
 		// guarantee all RECORDS commits have landed yet — poll describe_table for the actual
 		// condition instead of asserting on it immediately.
+		const seedDeadline = Date.now() + SEED_CONVERGE_TIMEOUT_MS;
 		let aRecordCount = -1;
-		for (let i = 0; i < SEED_CONVERGE_TIMEOUT_MS / POLL_MS; i++) {
-			const aDesc = await sendOperation(ctx.nodes[0], { operation: 'describe_table', table: 'Prerender' });
-			aRecordCount = aDesc.record_count ?? 0;
+		while (Date.now() < seedDeadline) {
+			const aDesc = await sendOperation(ctx.nodes[0], { operation: 'describe_table', table: 'Prerender' }).catch(
+				() => null
+			);
+			aRecordCount = aDesc?.record_count ?? 0;
 			if (aRecordCount >= RECORDS) break;
 			await delay(POLL_MS);
 		}
