@@ -885,11 +885,24 @@ type NodeSubscription = {
 
 let replicationSecureContext: tls.SecureContext & { caCount?: number; derivedFromContext?: tls.SecureContext };
 
+/**
+ * Build the trusted-CA list for a replication TLS connection: the replication CA set (root CAs plus
+ * every peer's hdb_nodes.ca, kept current by monitorNodeCAs) combined with the secure context's own
+ * CAs. `nodeCA` explicitly adds a specific peer's CA — used for transient operation connections
+ * (replicateOperation → sendOperationToNode) that run outside the subscription context where the
+ * replication CA set is kept populated, and so cannot rely on it already containing that peer's CA.
+ */
+export function mergeReplicationCAs(availableCAs: Iterable<string>, nodeCA?: string): string[] {
+	const cas = [...replicationCertificateAuthorities, ...availableCAs];
+	if (nodeCA) cas.push(nodeCA);
+	return cas;
+}
+
 export async function createWebSocket(
 	url: string,
-	options: { authorization?: string; rejectUnauthorized?: boolean; serverName?: string }
+	options: { authorization?: string; rejectUnauthorized?: boolean; serverName?: string; nodeCA?: string }
 ) {
-	const { authorization, rejectUnauthorized } = options || {};
+	const { authorization, rejectUnauthorized, nodeCA } = options || {};
 
 	const node_name = getThisNodeName();
 	let secureContext;
@@ -940,20 +953,33 @@ export async function createWebSocket(
 		secureContext: undefined,
 	};
 	if (secureContext) {
-		// check to see if our cached secure context is still valid
-		if (
-			replicationSecureContext?.caCount !== replicationCertificateAuthorities.size ||
-			replicationSecureContext?.derivedFromContext !== secureContext
-		) {
-			// create a secure context and cache by the number of replication CAs (if that changes, we need to create a new secure context)
-			replicationSecureContext = tls.createSecureContext({
+		if (nodeCA) {
+			// Replicated operations (replicateOperation → sendOperationToNode) open a transient
+			// connection that does not run in the subscription context where monitorNodeCAs keeps
+			// replicationCertificateAuthorities populated, so that set may not yet include the target
+			// peer's CA. Trust the peer's specific CA (its hdb_nodes.ca) explicitly — the same per-node
+			// CA the subscription path relies on. Built fresh rather than reusing replicationSecureContext:
+			// the CA is per-target and this is a cold path (deploy/cert/add_node), not the hot subscription path.
+			wsOptions.secureContext = tls.createSecureContext({
 				...secureContext.options,
-				ca: [...replicationCertificateAuthorities, ...secureContext.options.availableCAs.values()], // add CA if secure context had one
+				ca: mergeReplicationCAs(secureContext.options.availableCAs.values(), nodeCA),
 			});
-			replicationSecureContext.caCount = replicationCertificateAuthorities.size;
-			replicationSecureContext.derivedFromContext = secureContext;
+		} else {
+			// check to see if our cached secure context is still valid
+			if (
+				replicationSecureContext?.caCount !== replicationCertificateAuthorities.size ||
+				replicationSecureContext?.derivedFromContext !== secureContext
+			) {
+				// create a secure context and cache by the number of replication CAs (if that changes, we need to create a new secure context)
+				replicationSecureContext = tls.createSecureContext({
+					...secureContext.options,
+					ca: mergeReplicationCAs(secureContext.options.availableCAs.values()), // add CA if secure context had one
+				});
+				replicationSecureContext.caCount = replicationCertificateAuthorities.size;
+				replicationSecureContext.derivedFromContext = secureContext;
+			}
+			wsOptions.secureContext = replicationSecureContext;
 		}
-		wsOptions.secureContext = replicationSecureContext;
 	}
 	return new WebSocket(url, 'harperdb-replication-v1', wsOptions);
 }
@@ -2593,15 +2619,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										subscriptionToHdbNodes = subscription;
 										for await (const event of subscriptionToHdbNodes) {
 											const node = event.value;
-											if (
-												!(
-													node?.replicates === true ||
-													node?.replicates?.receives ||
-													node?.replicates?.receivesFrom?.some(
-														(sub) => sub.source === getThisNodeName() && sub.database === databaseName
-													)
+											if (!(
+												node?.replicates === true ||
+												node?.replicates?.receives ||
+												node?.replicates?.receivesFrom?.some(
+													(sub) => sub.source === getThisNodeName() && sub.database === databaseName
 												)
-											) {
+											)) {
 												closed = true;
 												close(1008, `Unauthorized database subscription to ${databaseName}`);
 												return;
@@ -2979,8 +3003,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
-							| undefined;
+							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
