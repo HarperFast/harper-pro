@@ -892,8 +892,8 @@ let replicationSecureContext: tls.SecureContext & { caCount?: number; derivedFro
  * (replicateOperation → sendOperationToNode) that run outside the subscription context where the
  * replication CA set is kept populated, and so cannot rely on it already containing that peer's CA.
  */
-export function mergeReplicationCAs(availableCAs: Iterable<string>, nodeCA?: string): string[] {
-	const cas = [...replicationCertificateAuthorities, ...availableCAs];
+export function mergeReplicationCAs(availableCAs?: Iterable<string>, nodeCA?: string): string[] {
+	const cas = [...replicationCertificateAuthorities, ...(availableCAs ?? [])];
 	if (nodeCA) cas.push(nodeCA);
 	return cas;
 }
@@ -962,7 +962,7 @@ export async function createWebSocket(
 			// the CA is per-target and this is a cold path (deploy/cert/add_node), not the hot subscription path.
 			wsOptions.secureContext = tls.createSecureContext({
 				...secureContext.options,
-				ca: mergeReplicationCAs(secureContext.options.availableCAs.values(), nodeCA),
+				ca: mergeReplicationCAs(secureContext.options.availableCAs?.values(), nodeCA),
 			});
 		} else {
 			// check to see if our cached secure context is still valid
@@ -973,7 +973,7 @@ export async function createWebSocket(
 				// create a secure context and cache by the number of replication CAs (if that changes, we need to create a new secure context)
 				replicationSecureContext = tls.createSecureContext({
 					...secureContext.options,
-					ca: mergeReplicationCAs(secureContext.options.availableCAs.values()), // add CA if secure context had one
+					ca: mergeReplicationCAs(secureContext.options.availableCAs?.values()), // add CA if secure context had one
 				});
 				replicationSecureContext.caCount = replicationCertificateAuthorities.size;
 				replicationSecureContext.derivedFromContext = secureContext;

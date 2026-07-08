@@ -42,4 +42,11 @@ describe('mergeReplicationCAs — replicated-operation per-node CA trust', () =>
 		mergeReplicationCAs([STATIC_CA], NODE_CA);
 		expect(replicationCertificateAuthorities.size).to.equal(sizeBefore);
 	});
+
+	it('tolerates an absent availableCAs (secure context without availableCAs)', () => {
+		expect(() => mergeReplicationCAs(undefined)).to.not.throw();
+		const result = mergeReplicationCAs(undefined, NODE_CA);
+		expect(result).to.include(REPL_CA);
+		expect(result).to.include(NODE_CA);
+	});
 });
