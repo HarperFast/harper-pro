@@ -73,7 +73,7 @@ export const servers = [];
 // This is the set of acceptable root certificates for replication, which includes the publicly trusted CAs if enabled
 // and any CAs that have been replicated across the cluster
 export const replicationCertificateAuthorities =
-	env.get(CONFIG_PARAMS.REPLICATION_ENABLEROOTCAS) !== false ? new Set(tls.rootCertificates) : new Set();
+	env.get(CONFIG_PARAMS.REPLICATION_ENABLEROOTCAS) !== false ? new Set(tls.rootCertificates) : new Set<string>();
 
 /**
  * Build mTLS configuration for replication server with certificate verification support
@@ -597,6 +597,11 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 export async function sendOperationToNode(node, operation, options?) {
 	if (!options) options = {};
 	options.serverName = node.name;
+	// This runs on the main thread (operations API), which never populates replicationCertificateAuthorities
+	// with peer CAs (monitorNodeCAs runs only on the replication worker threads). Pass the target peer's
+	// specific CA (hdb_nodes.ca) so createWebSocket trusts it, matching how the worker subscription path
+	// trusts each node's CA. Bootstrap callers (add_node/clone) pass a bare { url } node with no ca and are unaffected.
+	if (node.ca) options.nodeCA = node.ca;
 	const socket = await createWebSocket(getNodeURL(node), options);
 	const session = replicateOverWS(socket, {}, {});
 	return new Promise((resolve, reject) => {
