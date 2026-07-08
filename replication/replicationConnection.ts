@@ -378,6 +378,37 @@ export function isBlobStreamTimedOut(lastChunk: number, blobTimeout: number, now
 }
 
 /**
+ * Race a backpressure `drain` wait against the connection going away, so a mid-flush peer disconnect
+ * always lets the waiter settle instead of parking forever on a `drain` that will never fire.
+ *
+ * `sendBlobs` awaits this whenever `ws._socket.writableNeedDrain` is true (both the mid-loop wait and
+ * the terminal-frame flush wait have this exact shape). Without racing `close`/`error`, a peer that
+ * closes the connection while backpressured leaves the await unsettled, so `sendBlobs`'s `finally`
+ * never runs: `endBlobSend` is skipped and the drain token leaks in `blobSendDrain`'s module-global
+ * `activeSends` for the rest of the worker's life (harper-pro#529 review, cb1kenobi). Listening on both
+ * the raw socket (`drain`/`close`/`error`) and the WebSocket wrapper (`close`) covers a close that
+ * surfaces on either emitter; all listeners are removed once one fires, so nothing is left registered
+ * after the promise settles.
+ *
+ * Exported so the race itself is unit-testable with plain EventEmitters standing in for the socket/ws.
+ */
+export function waitForDrainOrSocketEnd(socket: EventEmitter, ws: EventEmitter): Promise<void> {
+	return new Promise<void>((resolve) => {
+		const done = () => {
+			socket.off('drain', done);
+			socket.off('close', done);
+			socket.off('error', done);
+			ws.off('close', done);
+			resolve();
+		};
+		socket.once('drain', done);
+		socket.once('close', done);
+		socket.once('error', done);
+		ws.once('close', done);
+	});
+}
+
+/**
  * Credit the back-pressure pause back to every in-flight blob stream at the moment the receiver resumes
  * (the point where the pause-reason refcount drops to zero). Because reads are suspended while paused,
  * these streams processed no chunks during the pause and their `lastChunk` would otherwise make
@@ -3900,7 +3931,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// Waiting on the socket to flush IS progress — mark it so a shutdown drain doesn't misread a
 					// slow-but-alive peer (a large chunk taking longer than the stall window to flush) as stalled.
 					noteBlobSendProgress(drainToken);
-					await new Promise((resolve) => ws._socket.once('drain', resolve));
+					// Races against close/error so a mid-flush disconnect still lets `finally` below run
+					// (endBlobSend/outstandingBlobsBeingSent cleanup) instead of hanging on a `drain` that
+					// will never fire (harper-pro#529 review, cb1kenobi).
+					await waitForDrainOrSocketEnd(ws._socket, ws);
 					logger.debug?.('drained', id);
 				}
 				recordAction(buffer.length, 'bytes-sent', `${remoteNodeName}.${databaseName}`, 'replication', 'blob');
@@ -3926,7 +3960,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// backpressure; if the peer stops reading, the drain's stall detection abandons it after the
 			// stall window and the receiver re-requests (harper-pro#527).
 			if (ws._socket?.writableNeedDrain) {
-				await new Promise((resolve) => ws._socket.once('drain', resolve));
+				// Same close/error race as the mid-loop wait above — otherwise a peer that disconnects
+				// while this terminal-frame flush is parked on backpressure never lets `finally` run.
+				await waitForDrainOrSocketEnd(ws._socket, ws);
 				noteBlobSendProgress(drainToken);
 			}
 		} catch (error) {
