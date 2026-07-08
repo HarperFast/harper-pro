@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783423241735,
+  "lastUpdate": 1783508446494,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -1247,6 +1247,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 3740.34,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lavinia",
+            "username": "ldt1996",
+            "email": "lavinia@harperdb.io"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "9af593e81ed571b369635fcdc71bd5e273d8a84b",
+          "message": "fix(replication): bound the blob send path under backpressure (#534)\n\n* fix(replication): bound blob-send concurrency and sweep orphan blob streams every 60s\n\n* fix(replication): resolve writer drain wait on close, guard callback pushes with wsClosed, floor the sweep interval (review)",
+          "timestamp": "2026-07-07T18:06:48Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/9af593e81ed571b369635fcdc71bd5e273d8a84b"
+        },
+        "date": 1783508445368,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 10694.13,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 27917.47,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 24284.43,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 12699.15,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 9524.61,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 3718.64,
             "unit": "ops/sec"
           }
         ]
