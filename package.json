@@ -97,6 +97,7 @@
 	"scripts": {
 		"build": "tsc --project tsconfig.json",
 		"build:watch": "npm run build -- --watch --incremental",
+		"typecheck:fast": "tsgo --noEmit --project tsconfig.json",
 		"core:sync": "./build-tools/sync-core.sh",
 		"core:set-branch": "./build-tools/set-core-branch.sh",
 		"package": "./build-tools/build-pro.sh",
@@ -220,6 +221,7 @@
 		"@types/sinon": "^21.0.0",
 		"@types/tar-fs": "^2.0.4",
 		"@typescript-eslint/parser": "^8.48.1",
+		"@typescript/native-preview": "7.0.0-dev.20260707.2",
 		"axios": "1.18.1",
 		"chai": "^6.2.0",
 		"chai-as-promised": "^8.0.2",
