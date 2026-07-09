@@ -31,6 +31,7 @@ on:
 
 permissions:
   contents: write # github-action-benchmark pushes trend history to the gh-pages branch
+  pull-requests: write # github-action-benchmark posts alert comments on PRs
 
 jobs:
   ycsb-single-node:
@@ -51,13 +52,22 @@ jobs:
           package-manager-cache: false
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build
         run: npm run build || true # repo currently has type errors; ignore per integration-tests.yaml
 
       - name: Verify build output
         run: test -f dist/bin/harper.js || { echo "dist/bin/harper.js missing — build failed"; exit 1; }
+
+      # The YCSB script lives in core and resolves the Harper binary relative to
+      # itself at core/dist/bin/harper.js. harper-pro's build compiles core into
+      # dist/core (its production runtime), so point core/dist at that built
+      # output rather than rebuilding core standalone.
+      - name: Expose core build output for benchmark
+        run: |
+          ln -sfn "$GITHUB_WORKSPACE/dist/core" core/dist
+          test -f core/dist/bin/harper.js || { echo "core/dist/bin/harper.js missing — core build output not found"; exit 1; }
 
       # Discard any lockfile churn from npm install so the gh-pages checkout
       # that github-action-benchmark does below succeeds on a clean working tree.
