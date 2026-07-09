@@ -251,21 +251,41 @@ export function shouldForceBaseCopyForRetention(
 
 // Bounds for the resume-range checksum scans: cap how many keys a single table contributes (both
 // sides cap identically over the same key order, so capped checksums stay comparable; the sender's
-// cap rides the wire so a retuned constant cannot desynchronize versions), pace scans on wall
-// clock so a slow storage chunk cannot starve pings past a watchdog window, and clamp a
-// wire-received cap so a bad payload cannot demand an unbounded scan.
+// cap rides the wire so a retuned constant stays comparable across versions UP TO the receiver
+// clamp, which is the real cross-version ceiling), pace scans on wall clock so a slow storage
+// chunk cannot starve pings past a watchdog window, clamp a wire-received cap so a bad payload
+// cannot demand an unbounded scan, and bound the sender's whole scan pass so a huge claimed range
+// degrades to skipped verification rather than holding up the copy into watchdog territory.
 export const RANGE_CHECKSUM_MAX_KEYS = 1_000_000;
 const RANGE_CHECKSUM_MAX_KEYS_CLAMP = 10_000_000;
 const RANGE_CHECKSUM_YIELD_MS = 25;
+const RANGE_CHECKSUM_MAX_SCAN_MS = 60_000;
 
 export type RangeChecksum = { count: number; h1: number; h2: number; capped: boolean };
+
+// Canonical text form of a primary key for checksumming: deterministic across nodes, type-tagged
+// (string '1', number 1, and BigInt 1n stay distinct), and independent of JSON.stringify — Harper
+// globally overrides BigInt.prototype.toJSON to throw, and toJSON runs before any replacer, so
+// JSON cannot serialize the BigInt keys ordered-binary yields for integers past 2^53. Composite
+// (array) keys tag their length and separate elements so boundary shifts cannot alias.
+function canonicalKeyText(key: unknown): string {
+	if (typeof key === 'string') return 's' + key;
+	if (typeof key === 'number') return 'd' + key;
+	if (typeof key === 'bigint') return 'n' + key.toString();
+	if (typeof key === 'boolean') return 'b' + key;
+	if (key === null || key === undefined) return 'u';
+	if (Array.isArray(key)) return 'a' + key.length + ':' + key.map(canonicalKeyText).join('\u001f');
+	if (key instanceof Uint8Array) return 'x' + Buffer.from(key).toString('hex');
+	if (key instanceof Date) return 't' + key.getTime();
+	return 'o' + String(key);
+}
 
 /**
  * Rolling checksum over an ordered stream of primary keys, plus an exact key count (the count is
  * the primary signal; the hash is a non-cryptographic content tripwire for equal-count drift, kept
  * as two mixed FNV-1a-based 32-bit lanes because 2^64 exceeds float precision). Keys canonicalize
- * through a type-tagged string (so string '1', number 1, and BigInt 1n stay distinct; ordered-binary
- * yields BigInt for integer keys past 2^53) with the key length mixed in before its characters, so
+ * through a type-tagged canonical string (see canonicalKeyText) with the key length mixed in
+ * before its characters, so
  * boundary shifts like ['ab', 'c'] vs ['a', 'bc'] differ even when a key contains the terminator.
  * The per-character xor-shift feeds high state bits back down, breaking FNV's low-bit locality
  * (without it, keys differing only in high code-unit bits collide at ~2^-34 jointly). add() returns
@@ -284,12 +304,7 @@ export function createRangeChecksum(maxKeys: number = RANGE_CHECKSUM_MAX_KEYS) {
 				capped = true;
 				return false;
 			}
-			const text =
-				typeof key === 'string'
-					? 's' + key
-					: typeof key === 'bigint'
-						? 'n' + key.toString()
-						: 'j' + JSON.stringify(key);
+			const text = canonicalKeyText(key);
 			h1 = Math.imul(h1 ^ text.length, 0x01000193) >>> 0;
 			h2 = Math.imul(h2 ^ text.length, 0x01000193) >>> 0;
 			for (let i = 0; i < text.length; i++) {
@@ -1533,13 +1548,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				if (!table?.primaryStore?.getRange) continue;
 				ensureReceiveExcludedTables();
 				if (receiveExcludedTables?.has(tableName)) continue;
-				const checksum = await checksumTableRange(table.primaryStore, {
-					end: tableName === claim.currentTable ? claim.afterKey : undefined,
-					maxKeys,
-					isClosed: () => wsClosed,
-				});
+				try {
+					const checksum = await checksumTableRange(table.primaryStore, {
+						end: tableName === claim.currentTable ? claim.afterKey : undefined,
+						maxKeys,
+						isClosed: () => wsClosed,
+					});
+					if (checksum) localChecksums[tableName] = checksum;
+				} catch (tableError) {
+					// an unreadable table only loses its own comparison
+					logger.warn?.(connectionId, 'skipping resume-range verification for', tableName, tableError);
+				}
 				if (wsClosed) return;
-				if (checksum) localChecksums[tableName] = checksum;
 			}
 			const mismatches = compareRangeChecksums(sentChecksums, localChecksums);
 			if (mismatches.length > 0) {
@@ -2445,6 +2465,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// The sender checksummed the range our resume cursor claimed was already delivered,
 						// with the exact bounds it honored. Verify against our own tables, detached so the
 						// scan never blocks the receive loop.
+						noteCopyProgress(); // arrives inside the copy; keep the copy-progress watchdog fed (#453)
 						if (data && typeof data === 'object') {
 							void verifyResumeRangeChecksums(data);
 						}
@@ -3399,29 +3420,48 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											if (copyResume) {
 												try {
 													const rangeChecksums: Record<string, RangeChecksum> = {};
+													const scanDeadline = Date.now() + RANGE_CHECKSUM_MAX_SCAN_MS;
+													let scanTimedOut = false;
 													for (const tableName of orderedTableNames) {
 														const table = tables[tableName];
 														if (!tableToTableEntry(table)) continue;
+														// tables this route never sends have no delivery claim to verify
+														if (sendExcludedTables?.has(tableName)) continue;
 														const isResumeTable = tableName === resumeCurrentTable;
-														const checksum = await checksumTableRange(table.primaryStore, {
-															end: isResumeTable ? resumeAfterKey : undefined,
-															isClosed: () => closed,
-														});
+														try {
+															const checksum = await checksumTableRange(table.primaryStore, {
+																end: isResumeTable ? resumeAfterKey : undefined,
+																isClosed: () => closed || (scanTimedOut = Date.now() > scanDeadline),
+															});
+															if (checksum) rangeChecksums[tableName] = checksum;
+														} catch (tableError) {
+															// an unreadable table only loses its own claim
+															logger.warn?.(connectionId, 'skipping resume-range checksum for', tableName, tableError);
+														}
 														if (closed) return;
-														if (checksum) rangeChecksums[tableName] = checksum;
+														if (scanTimedOut) break;
 														if (isResumeTable) break;
 													}
-													ws.send(
-														encode([
-															COPY_RANGE_CHECKSUM,
-															{
-																currentTable: resumeCurrentTable,
-																afterKey: resumeAfterKey,
-																maxKeys: RANGE_CHECKSUM_MAX_KEYS,
-																tables: rangeChecksums,
-															},
-														])
-													);
+													if (scanTimedOut) {
+														// degrade to no verification rather than holding up the copy into the
+														// follower's copy-progress watchdog window
+														logger.warn?.(
+															connectionId,
+															'resume-range checksum scan exceeded its time budget; skipping verification'
+														);
+													} else {
+														ws.send(
+															encode([
+																COPY_RANGE_CHECKSUM,
+																{
+																	currentTable: resumeCurrentTable,
+																	afterKey: resumeAfterKey,
+																	maxKeys: RANGE_CHECKSUM_MAX_KEYS,
+																	tables: rangeChecksums,
+																},
+															])
+														);
+													}
 												} catch (checksumError) {
 													logger.warn?.(connectionId, 'skipping resume-range checksum', checksumError);
 												}

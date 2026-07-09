@@ -73,6 +73,19 @@ describe('createRangeChecksum', () => {
 	it('exposes a sane default cap', () => {
 		expect(RANGE_CHECKSUM_MAX_KEYS).to.be.greaterThan(0);
 	});
+
+	it('matches the golden vector (sender and receiver must compute identical hashes across versions)', () => {
+		// Pins the exact wire values: any change to the canonical key form, the length mix, either
+		// lane's seed/prime/shift, or the terminator changes these numbers and breaks mixed-version
+		// comparability. If this test fails, the checksum algorithm changed; that requires a new
+		// message id (or a version field), not just new constants.
+		expect(checksumOf(['alpha', 42, ['tenant', 7n], 'omega'])).to.deep.equal({
+			count: 4,
+			h1: 2319132405,
+			h2: 719383003,
+			capped: false,
+		});
+	});
 });
 
 describe('compareRangeChecksums', () => {
