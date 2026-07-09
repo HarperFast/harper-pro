@@ -148,6 +148,18 @@ export function resetRuleStats(): void {
 	ruleStats.clear();
 }
 
+/**
+ * Prunes telemetry for rule ids no longer present in the rule set (called after each successful
+ * recompile — see waf.ts). Without this the module-level map grows for the process lifetime as ids
+ * churn, and a dropped-then-readded id would inherit the old rule's counters (false telemetry).
+ * `liveIds` holds String(rule.id) for every currently-persisted rule.
+ */
+export function pruneRuleStats(liveIds: ReadonlySet<string>): void {
+	for (const key of ruleStats.keys()) {
+		if (!liveIds.has(key)) ruleStats.delete(key);
+	}
+}
+
 const DEFAULT_BLOCK_STATUS = 403;
 
 /**
@@ -378,8 +390,7 @@ function checkHeaderValue(value: string | string[] | undefined, check: HeaderChe
 type ResidualCheck = (request: WafRequestInfo) => boolean;
 
 type ParsedCidr =
-	| { kind: 'v4'; start: number; end: number }
-	| { kind: 'v6'; value: bigint; mask: bigint; bits: number };
+	{ kind: 'v4'; start: number; end: number } | { kind: 'v6'; value: bigint; mask: bigint; bits: number };
 
 /** Matches a plain base-10 non-negative integer with no sign, whitespace, or radix prefix. */
 const CANONICAL_BITS = /^[0-9]+$/;

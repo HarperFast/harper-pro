@@ -6,7 +6,7 @@
  */
 
 import { expect } from 'chai';
-import { compileRules, getRuleStats, resetRuleStats } from '#src/waf/matcher';
+import { compileRules, getRuleStats, resetRuleStats, pruneRuleStats } from '#src/waf/matcher';
 
 const BASE = { enabled: true, priority: 0, phase: 'request', action: 'block' };
 
@@ -81,6 +81,22 @@ describe('WAF per-rule telemetry', () => {
 		const matcher = compileRules([{ ...BASE, id: 'mon', match: { path: { exact: '/admin' } } }], { mode: 'monitor' });
 		matcher.evaluate(makeRequest({ path: '/admin' }));
 		expect(getRuleStats().get('mon').hitCount).to.equal(1);
+	});
+
+	it('pruneRuleStats drops telemetry for ids no longer in the rule set (dropped rule + id reuse)', () => {
+		const matcher = compileRules([
+			{ ...BASE, id: 'keep', match: { path: { exact: '/admin' } } },
+			{ ...BASE, id: 'gone', match: { path: { exact: '/gone' } } },
+		]);
+		matcher.evaluate(makeRequest({ path: '/admin' }));
+		matcher.evaluate(makeRequest({ path: '/gone' }));
+		expect(getRuleStats().get('keep').hitCount).to.equal(1);
+		expect(getRuleStats().get('gone').hitCount).to.equal(1);
+
+		// operator drops 'gone': the next recompile's live-id set no longer contains it
+		pruneRuleStats(new Set(['keep']));
+		expect(getRuleStats().has('gone')).to.equal(false); // stale counter removed
+		expect(getRuleStats().get('keep').hitCount).to.equal(1); // surviving rule untouched
 	});
 
 	it('exposes the same stats map via matcher.getStats()', () => {

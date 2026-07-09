@@ -124,6 +124,10 @@ export function makeWafRuleOperations(table: WafRuleStore) {
 			requireSuperUser(request);
 			const id = request.id;
 			if (id == null) throw new ClientError('drop_waf_rule requires an id');
+			// The control row is not a rule; dropping it would silently revert the cluster to the config
+			// mode fallback (potentially 'off'), outside the set_waf_mode path — same guard as add/alter.
+			if (String(id) === WAF_CONTROL_ID)
+				throw new ClientError(`${WAF_CONTROL_ID} is reserved; use set_waf_mode to control the global mode`);
 			if (!(await table.get(String(id)))) throw new ClientError(`WAF rule ${id} does not exist`, 404);
 			await table.delete(String(id), { user: request.hdb_user }); // explicit audit user (harper#1592)
 			return { message: `Dropped WAF rule ${id}` };
