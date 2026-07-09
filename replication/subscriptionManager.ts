@@ -480,7 +480,11 @@ export async function startOnMainThread(options) {
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
 	 */
-	function onNodeUpdate(node, hostname = node?.name, forceResubscribe = false) {
+	// `subscribeStagger` (when provided) spaces this call's per-database subscribe scheduling
+	// RECONNECT_STAGGER_MS apart via a shared running counter, so a reassignment sweep that re-drives
+	// many databases doesn't open all their catchup connections in one tick. Only the stale-worker
+	// reconcile passes it; normal node updates leave it undefined and keep the flat NODE_SUBSCRIBE_DELAY.
+	function onNodeUpdate(node, hostname = node?.name, forceResubscribe = false, subscribeStagger?: { count: number }) {
 		const isSelf =
 			(getThisNodeName() && hostname === getThisNodeName()) || (getThisNodeUrl() && node?.url === getThisNodeUrl());
 		if (isSelf) {
@@ -699,6 +703,11 @@ export async function startOnMainThread(options) {
 				// from the "first other node in hdb_nodes" fallback — that's just a guess.
 				nodes[0].isLeader = nodes[0].isLeader || !leaderName || (hasExplicitLeader && nodeName === leaderName);
 				nodes[0].url ??= getNodeURL(nodes[0]);
+				// Stagger the subscribe when reassigning (subscribeStagger set) so N databases on one peer
+				// don't dial N catchup connections simultaneously; otherwise use the flat delay. See #446.
+				const subscribeDelay = subscribeStagger
+					? NODE_SUBSCRIBE_DELAY + subscribeStagger.count++ * RECONNECT_STAGGER_MS
+					: NODE_SUBSCRIBE_DELAY;
 				setTimeout(() => {
 					const request = {
 						...nodes[0],
@@ -709,7 +718,7 @@ export async function startOnMainThread(options) {
 					if (worker) {
 						worker.postMessage(request);
 					} else subscribeToNode(request);
-				}, NODE_SUBSCRIBE_DELAY);
+				}, subscribeDelay);
 			} else {
 				logger.info('Node no longer should be used, unsubscribing from node', {
 					replicates: node.replicates,
@@ -1005,7 +1014,7 @@ export async function startOnMainThread(options) {
 				'Reconciling replication subscriptions stalled connected:true with no receive progress:',
 				Array.from(stalledByUrl.keys())
 			);
-		let staleReassignCount = 0; // stagger budget for stale-entry reassignments (see the stale-entry branch)
+		const staleNodesToReassign: any[] = []; // reassigned after the loop so onNodeUpdate doesn't mutate nodeMap mid-iteration
 		for (const node of nodeMap.values()) {
 			const url = getNodeURL(node);
 			const isWedged = wedgedNodeUrls.has(url);
@@ -1097,22 +1106,25 @@ export async function startOnMainThread(options) {
 						`Reconciling ${reconnectCount} stalled connected:true subscription(s) for ${url} (no receive progress for ${RECEIVE_STALL_THRESHOLD_MS}ms; staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms)`
 					);
 			}
-			if (staleNodeUrls.has(url) && !isWedged) {
-				// Stagger stale-entry reassignments the same way the wedge path above does. A dead worker can
-				// own subscriptions across many nodes, and re-driving them all in one tick opens a burst of
-				// catchup WebSocket/TLS handshakes that can spike memory — the OOM the per-(db,node) worker-exit
-				// staggering guarded against before #357 made the reconcile the single reassignment path.
-				const delay = staleReassignCount++ * RECONNECT_STAGGER_MS;
-				setTimeout(() => {
-					// The node may have been removed or replaced during the stagger delay; only re-drive it if it
-					// is still the current entry in nodeMap, so a deleted node isn't resurrected (gemini review).
-					if (nodeMap.get(node.name) !== node) return;
-					try {
-						onNodeUpdate(node);
-					} catch (error) {
-						logger.error('Error reconciling node', node?.name, error);
-					}
-				}, delay).unref();
+			if (staleNodeUrls.has(url) && !isWedged) staleNodesToReassign.push(node);
+		}
+		if (staleNodesToReassign.length > 0) {
+			// A dead worker can own subscriptions across many nodes, and onNodeUpdate re-drives EVERY
+			// replicated database for a node in one tick. Re-driving them all opens a burst of catchup
+			// WebSocket/TLS handshakes that can spike memory — the OOM the per-(db,node) worker-exit
+			// staggering guarded against before #357 made the reconcile the single reassignment path. A
+			// per-node stagger alone left the per-database burst (a peer with N databases dialed N at once),
+			// so stagger per DATABASE across the whole sweep like the wedge path does. See cb1kenobi review on #446.
+			const subscribeStagger = { count: 0 };
+			for (const node of staleNodesToReassign) {
+				// The node may have been removed or replaced since we flagged it; only re-drive it if it is
+				// still the current entry in nodeMap, so a deleted node isn't resurrected (gemini review).
+				if (nodeMap.get(node.name) !== node) continue;
+				try {
+					onNodeUpdate(node, node.name, false, subscribeStagger);
+				} catch (error) {
+					logger.error('Error reconciling node', node?.name, error);
+				}
 			}
 		}
 	}
