@@ -253,6 +253,19 @@ describe('WAF rule operations', () => {
 			expect(table.map.has(WAF_CONTROL_ID)).to.equal(false);
 		});
 
+		it('drop rejects the reserved control-row id (cannot delete the global-mode row)', async () => {
+			const table = makeFakeTable();
+			const operations = makeWafRuleOperations(table);
+			await operations.setWafMode({ hdb_user: SUPER_USER, mode: 'off' });
+			try {
+				await operations.dropWafRule({ hdb_user: SUPER_USER, id: WAF_CONTROL_ID });
+				expect.fail('expected rejection');
+			} catch (error) {
+				expect(error.message).to.include('reserved');
+			}
+			expect(table.map.has(WAF_CONTROL_ID)).to.equal(true); // the control row is untouched
+		});
+
 		it('list_waf_rules excludes the control row', async () => {
 			const table = makeFakeTable();
 			const operations = makeWafRuleOperations(table);

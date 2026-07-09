@@ -48,7 +48,7 @@
 
 import { loggerWithTag } from '../core/utility/logging/harper_logger.js';
 import { getThisNodeName } from '../core/server/nodeName.ts';
-import { canonicalizePath, compileRules, type WafMatcher, type WafRequestInfo } from './matcher.ts';
+import { canonicalizePath, compileRules, pruneRuleStats, type WafMatcher, type WafRequestInfo } from './matcher.ts';
 import { makeWafRuleOperations, WAF_CONTROL_ID } from './ruleOperations.ts';
 import type { WafRule } from './rules.ts';
 
@@ -134,6 +134,19 @@ class LogRateLimiter {
 		window.suppressed++;
 		return { allow: false };
 	}
+
+	/**
+	 * Drops rate-limit windows for rule ids no longer present (called after each successful recompile).
+	 * Without this the map grows for the process lifetime as ids churn, and a dropped-then-readded id
+	 * would inherit the old rule's suppression window. The '__internal__' pseudo-rule (WAF-error log
+	 * gate) is not a real id and is always retained. Keys may be numbers, so compare stringified.
+	 */
+	prune(liveIds: ReadonlySet<string>): void {
+		for (const key of this.#windows.keys()) {
+			if (key === '__internal__') continue;
+			if (!liveIds.has(String(key))) this.#windows.delete(key);
+		}
+	}
 }
 
 const TABLE_DEFINITION = {
@@ -217,9 +230,15 @@ export function start(options: WafComponentOptions) {
 	const rateLimiter = new LogRateLimiter(options.logRateLimit ?? 100, options.logRateIntervalMs ?? 60_000);
 	const WafRuleTable = options.ensureTable(TABLE_DEFINITION);
 
-	// Node identity for activation gating (wave 2, decision c): name from the standard node-hostname
-	// config accessor (the same getThisNodeName replication uses); region/tags from waf config.
-	const nodeIdentity = { name: getThisNodeName(), region: options.region, tags: options.nodeTags ?? [] };
+	// Node identity for activation gating (wave 2, decision c): region/tags from waf config; name
+	// (from the standard node-hostname accessor replication uses) is resolved lazily inside recompile
+	// so a getThisNodeName() throw is caught by the O2 fail-open/retry guard rather than escaping
+	// start() and skipping middleware registration (node identity may not be resolvable at start).
+	const nodeIdentity: { name?: string; region?: string; tags?: string[] } = {
+		name: undefined,
+		region: options.region,
+		tags: options.nodeTags ?? [],
+	};
 
 	// readAllRules pulls the replicated control row OUT of the returned rule list so it is never
 	// compiled/validated as a rule; the discovered mode is stashed for recompile() to read.
@@ -242,6 +261,8 @@ export function start(options: WafComponentOptions) {
 
 	function recompile() {
 		const rules = readAllRules();
+		// Resolve node name inside the try so a throw fails open + retries (O2), not out of start().
+		nodeIdentity.name = getThisNodeName();
 		// mode precedence: replicated control row > config fallback > 'enforce'.
 		const mode = controlMode ?? options.mode ?? 'enforce';
 		const matcher = compileRules(rules, {
@@ -256,6 +277,11 @@ export function start(options: WafComponentOptions) {
 			},
 		});
 		currentMatcher = matcher; // atomic reference swap; in-flight evaluations keep the old one
+		// Prune telemetry + rate-limit windows for ids no longer in the rule set so the module-level
+		// maps don't grow unbounded across recompiles and a reused id can't inherit stale counters.
+		const liveIds = new Set(rules.map((rule) => String(rule.id)));
+		pruneRuleStats(liveIds);
+		rateLimiter.prune(liveIds);
 		logger.debug?.(
 			`WAF compiled ${matcher.ruleCount} rules (${matcher.invalidRules.size} invalid, ${matcher.unsupportedRules.size} deferred, mode ${mode})`
 		);
@@ -352,7 +378,10 @@ export function start(options: WafComponentOptions) {
 				const url: string = request.url;
 				const queryStart = url.indexOf('?');
 				requestInfo.ip = request.ip;
-				requestInfo.method = request.method;
+				// Upper-case to match the compiler (rule methods are upper-cased): a lowercase/mixed verb
+				// (raw servers pass the method as-received; WHATWG Request only normalizes a fixed set)
+				// must still hit the method anchor, or a case-insensitive downstream router lets it through.
+				requestInfo.method = request.method?.toUpperCase() ?? '';
 				requestInfo.path = canonicalizePath(queryStart === -1 ? url : url.slice(0, queryStart));
 				requestInfo.query = queryStart === -1 ? undefined : url.slice(queryStart + 1);
 				requestInfo.headers = request.headers;
@@ -391,10 +420,15 @@ export function start(options: WafComponentOptions) {
 				// O4: opaque body (no ruleIds to the client — server log only), correct reason
 				// phrase for the status, explicit JSON content type. Never touches request.body.
 				const status = decision.status;
+				// Reason phrase: known statuses map exactly; otherwise fall back BY CLASS (5xx →
+				// "Internal Server Error", 4xx → "Forbidden") so an uncommon status (418/451) doesn't
+				// emit a 5xx body labeled "Forbidden". blockStatus is validated to 4xx/5xx upstream.
 				return {
 					status,
 					headers: new Headers({ 'Content-Type': 'application/json' }),
-					body: JSON.stringify({ error: STATUS_TEXT[status] ?? 'Forbidden' }),
+					body: JSON.stringify({
+						error: STATUS_TEXT[status] ?? (status >= 500 ? 'Internal Server Error' : 'Forbidden'),
+					}),
 				};
 			}
 			// action 'log' (pass-through): record any real log-rule matches and any shadow would-block

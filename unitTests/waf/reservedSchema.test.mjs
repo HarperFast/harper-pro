@@ -85,6 +85,31 @@ describe('WAF reserved schema — validation', () => {
 		expect(validateRule({ ...BASE, id: 'x', rateLimit: { key: ['country'] }, match: IP_MATCH })).to.not.be.empty; // bad key
 		expect(validateRule({ ...BASE, id: 'x', rateLimit: { limit: 'ten' }, match: IP_MATCH })).to.not.be.empty; // bad type
 	});
+
+	it('rejects an empty activation selector array (would silently disable the rule on every node)', () => {
+		// activation GATES compilation: an empty nodes/regions/tags can never be satisfied, so the rule
+		// would be a silent cluster-wide no-op — reject at validation instead (like match.ip/headers/query).
+		expect(validateRule({ ...BASE, id: 'x', activation: { nodes: [] }, match: IP_MATCH })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', activation: { regions: [] }, match: IP_MATCH })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', activation: { tags: [] }, match: IP_MATCH })).to.not.be.empty;
+		// scope is descriptive-only (does not gate), so an empty scope array stays allowed
+		expect(validateRule({ ...BASE, id: 'ok', scope: { clusters: [] }, match: IP_MATCH })).to.deep.equal([]);
+	});
+
+	it('rejects non-finite / non-positive reserved numeric fields', () => {
+		expect(validateRule({ ...BASE, id: 'x', rateLimit: { limit: NaN }, match: IP_MATCH })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', rateLimit: { limit: 0 }, match: IP_MATCH })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', rateLimit: { windowMs: -1 }, match: IP_MATCH })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', rateLimit: { windowMs: Infinity }, match: IP_MATCH })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', match: { model: { threshold: Infinity } } })).to.not.be.empty;
+	});
+
+	it('rejects a blockStatus outside the 4xx/5xx range (a block must not read as success)', () => {
+		expect(validateRule({ ...BASE, id: 'x', blockStatus: 200, match: IP_MATCH })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', blockStatus: 302, match: IP_MATCH })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', blockStatus: 600, match: IP_MATCH })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'ok', blockStatus: 503, match: IP_MATCH })).to.deep.equal([]);
+	});
 });
 
 describe('WAF reserved schema — compiler deferral (decision a)', () => {

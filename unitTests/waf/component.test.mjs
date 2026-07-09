@@ -1,10 +1,15 @@
 /**
  * Component-level coverage for waf/waf.ts start()/middleware robustness (harper-pro#517 review).
- * Drives start() with a fake server/table so no Harper runtime is needed. Finding ids: O1–O4.
+ * Drives start() with a fake server/table so no Harper runtime is needed. Finding ids: O1–O4, plus
+ * the control-row → global-mode seam (sentinel stripped, monitor downgrade, off kill switch) and the
+ * block short-circuit contract (a block returns a response and never reaches the downstream handler).
+ * The block-reaches-app / pre-auth-ordering guarantee against the REAL middleware runner needs a
+ * built-runtime integration test (follow-up; a fake server can't validate runner semantics).
  */
 
 import { expect } from 'chai';
 import { start, stop, getCurrentMatcher } from '#src/waf/waf';
+import { WAF_CONTROL_ID } from '#src/waf/ruleOperations';
 
 const RULE = {
 	id: 'block-admin',
@@ -150,6 +155,83 @@ describe('WAF component middleware', () => {
 		const server = makeFakeServer();
 		start({ server, ensureTable: () => makeFakeTable([RULE]) });
 		expect(getCurrentMatcher().ruleCount).to.equal(1);
+	});
+
+	it('upper-cases the incoming method so a lowercase verb still hits a method-anchored rule', () => {
+		const server = makeFakeServer();
+		const methodRule = {
+			id: 'block-delete',
+			enabled: true,
+			priority: 1,
+			phase: 'request',
+			action: 'block',
+			match: { method: ['DELETE'] },
+		};
+		start({ server, ensureTable: () => makeFakeTable([methodRule]) });
+		let reached = false;
+		// raw servers can pass a non-canonical verb as-received; the WAF must fold case before matching
+		const response = server.middleware.listener(makeReq({ url: '/x', method: 'delete' }), () => (reached = true));
+		expect(reached).to.equal(false);
+		expect(response.status).to.equal(403);
+	});
+
+	it('block short-circuit: a block returns a response and never reaches the downstream handler', () => {
+		const server = makeFakeServer();
+		start({ server, ensureTable: () => makeFakeTable([RULE]) });
+		let reached = false;
+		const response = server.middleware.listener(makeReq({ url: '/admin/x' }), () => {
+			reached = true;
+			return 'downstream';
+		});
+		expect(reached).to.equal(false); // downstream handler must be skipped (pre-auth short-circuit)
+		expect(response).to.include({ status: 403 });
+		expect(response.body).to.be.a('string');
+	});
+
+	it('control row → global mode: a __waf_control__ row is stripped from the rule list, not compiled', () => {
+		const server = makeFakeServer();
+		const control = { id: WAF_CONTROL_ID, mode: 'enforce' };
+		start({ server, ensureTable: () => makeFakeTable([RULE, control]) });
+		// the sentinel is pulled out before compile — it must NOT count as a rule
+		expect(getCurrentMatcher().ruleCount).to.equal(1);
+		// and enforcement still works with the (enforce) control row present
+		let reached = false;
+		const response = server.middleware.listener(makeReq({ url: '/admin/x' }), () => (reached = true));
+		expect(reached).to.equal(false);
+		expect(response.status).to.equal(403);
+	});
+
+	it("control row mode 'monitor' downgrades an enforcing rule to a would-block (pass-through)", () => {
+		const server = makeFakeServer();
+		const control = { id: WAF_CONTROL_ID, mode: 'monitor' };
+		start({ server, ensureTable: () => makeFakeTable([RULE, control]) });
+		expect(getCurrentMatcher().ruleCount).to.equal(1); // sentinel excluded
+		let passed = false;
+		const result = server.middleware.listener(makeReq({ url: '/admin/x' }), () => {
+			passed = true;
+			return 'ok';
+		});
+		expect(passed).to.equal(true); // monitor mode: the block is downgraded to a would-block, not enforced
+		expect(result).to.equal('ok');
+		// the matcher still surfaces the match as a shadow would-block for telemetry
+		const decision = getCurrentMatcher().evaluate({
+			ip: '203.0.113.7',
+			method: 'GET',
+			path: '/admin/x',
+			query: undefined,
+			getHeader: () => undefined,
+		});
+		expect(decision.shadowRuleIds).to.deep.equal(['block-admin']);
+	});
+
+	it("control row mode 'off' is a kill switch: matcher is empty and all traffic passes", () => {
+		const server = makeFakeServer();
+		const control = { id: WAF_CONTROL_ID, mode: 'off' };
+		start({ server, ensureTable: () => makeFakeTable([RULE, control]) });
+		expect(getCurrentMatcher().isEmpty).to.equal(true);
+		let passed = false;
+		server.middleware.listener(makeReq({ url: '/admin/x' }), () => (passed = true));
+		expect(passed).to.equal(true);
 	});
 
 	it('block + log rules both matching → 403 AND the log rule is recorded on the decision', () => {

@@ -141,8 +141,15 @@ function validateStringOrArray(value: unknown, where: string, errors: string[]) 
 	}
 }
 
-/** Validates an activation/scope-style slot: an object whose present sub-fields are string arrays. */
-function validateStringArrayObject(value: unknown, where: string, fields: string[], errors: string[]) {
+/**
+ * Validates an activation/scope-style slot: an object whose present sub-fields are string arrays.
+ * `emptyOk` controls whether a present-but-empty sub-array is allowed. It must be false for GATING
+ * selectors (activation): a present-but-empty `activation.nodes`/`regions`/`tags` can never be
+ * satisfied in isArmedOnNode, so the rule is silently skipped on every node with no invalid/
+ * unsupported report — the same dead-rule footgun rejected for match.ip/headers/query. Descriptive-
+ * only slots (scope) do not gate, so an empty array there is harmless and allowed.
+ */
+function validateStringArrayObject(value: unknown, where: string, fields: string[], errors: string[], emptyOk = true) {
 	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
 		errors.push(`${where}: must be an object`);
 		return;
@@ -152,6 +159,7 @@ function validateStringArrayObject(value: unknown, where: string, fields: string
 		if (sub == null) continue;
 		if (!Array.isArray(sub) || sub.some((entry) => typeof entry !== 'string'))
 			errors.push(`${where}.${field}: must be an array of strings`);
+		else if (!emptyOk && sub.length === 0) errors.push(`${where}.${field}: cannot be an empty array`);
 	}
 }
 
@@ -164,8 +172,8 @@ function validateReservedMatch(match: WafRuleMatch, errors: string[]) {
 		else {
 			if (match.model.name != null && typeof match.model.name !== 'string')
 				errors.push('match.model.name: must be a string');
-			if (match.model.threshold != null && typeof match.model.threshold !== 'number')
-				errors.push('match.model.threshold: must be a number');
+			if (match.model.threshold != null && !Number.isFinite(match.model.threshold))
+				errors.push('match.model.threshold: must be a finite number');
 		}
 	}
 	if (match.agent != null) {
@@ -182,7 +190,7 @@ function validateReservedMatch(match: WafRuleMatch, errors: string[]) {
 function validateReservedRule(rule: WafRule, errors: string[]) {
 	if (rule.shadow != null && typeof rule.shadow !== 'boolean') errors.push('shadow: must be a boolean');
 	if (rule.activation != null)
-		validateStringArrayObject(rule.activation, 'activation', ['nodes', 'regions', 'tags'], errors);
+		validateStringArrayObject(rule.activation, 'activation', ['nodes', 'regions', 'tags'], errors, false);
 	if (rule.scope != null)
 		validateStringArrayObject(rule.scope, 'scope', ['clusters', 'applications', 'tenants'], errors);
 	if (rule.provenance != null) {
@@ -205,10 +213,10 @@ function validateReservedRule(rule: WafRule, errors: string[]) {
 				if (!Array.isArray(rule.rateLimit.key) || rule.rateLimit.key.some((k) => !VALID_RATELIMIT_KEYS.has(k)))
 					errors.push('rateLimit.key: must be an array of ip/ja4/session/agent/user');
 			}
-			if (rule.rateLimit.limit != null && typeof rule.rateLimit.limit !== 'number')
-				errors.push('rateLimit.limit: must be a number');
-			if (rule.rateLimit.windowMs != null && typeof rule.rateLimit.windowMs !== 'number')
-				errors.push('rateLimit.windowMs: must be a number');
+			if (rule.rateLimit.limit != null && !(Number.isFinite(rule.rateLimit.limit) && rule.rateLimit.limit > 0))
+				errors.push('rateLimit.limit: must be a positive number');
+			if (rule.rateLimit.windowMs != null && !(Number.isFinite(rule.rateLimit.windowMs) && rule.rateLimit.windowMs > 0))
+				errors.push('rateLimit.windowMs: must be a positive number');
 		}
 	}
 }
@@ -232,11 +240,13 @@ export function validateRule(rule: WafRule): string[] {
 	if (!VALID_PHASES.has(rule.phase)) errors.push(`unknown phase ${JSON.stringify(rule.phase)}`);
 	if (!VALID_ACTIONS.has(rule.action)) errors.push(`unknown action ${JSON.stringify(rule.action)}`);
 	if (rule.action === 'score' && typeof rule.score !== 'number') errors.push('action "score" requires a numeric score');
+	// A "block" must read as a rejection: constrain to error statuses (4xx/5xx) so a rule can't
+	// suppress nextHandler yet return 2xx/3xx (a block that looks like success).
 	if (
 		rule.blockStatus != null &&
-		(typeof rule.blockStatus !== 'number' || rule.blockStatus < 100 || rule.blockStatus > 599)
+		(typeof rule.blockStatus !== 'number' || rule.blockStatus < 400 || rule.blockStatus > 599)
 	)
-		errors.push('blockStatus must be a valid HTTP status');
+		errors.push('blockStatus must be a 4xx or 5xx HTTP status');
 	const match = rule.match;
 	if (!match || typeof match !== 'object') {
 		errors.push('missing match');
