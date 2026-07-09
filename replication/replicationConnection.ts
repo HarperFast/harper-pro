@@ -137,6 +137,12 @@ export const CONNECTION_STATE_POSITION = 9;
 export const LAST_LIVENESS_TIME_POSITION = 10; // wall-clock ms of last confirmed liveness (pong or received message)
 export const LAST_ERROR_CODE_POSITION = 11; // close code of the most recent disconnect
 export const LAST_ERROR_TIME_POSITION = 12; // wall-clock ms of the most recent disconnect
+// Copy delivery shortfall (alert-only verification at COPY_COMPLETE): cumulative count of records
+// the sender reported sent but this receiver never counted as delivered, and when it last grew.
+// Non-zero means silent in-flight loss or undecodable drops occurred on this link; per-table detail
+// is in the error log and on the connection's copyDeliveryShortfall marker.
+export const COPY_SHORTFALL_COUNT_POSITION = 13;
+export const LAST_COPY_SHORTFALL_TIME_POSITION = 14;
 export const CONNECTION_STATE_DOWN = 0;
 export const CONNECTION_STATE_CONNECTED = 2;
 // LIVENESS_STALE_MS is defined below, after PING_TIMEOUT, so it can be derived from the configured
@@ -2302,6 +2308,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										from: remoteNodeName,
 										shortfalls,
 									};
+								}
+								// cluster_status tripwire (mirrors the blob-failure slots, harper-pro#386)
+								const sharedStatus = getSharedStatus();
+								if (sharedStatus) {
+									sharedStatus[COPY_SHORTFALL_COUNT_POSITION] += shortfalls.reduce(
+										(total, shortfall) => total + (shortfall.sent - shortfall.received),
+										0
+									);
+									sharedStatus[LAST_COPY_SHORTFALL_TIME_POSITION] = Date.now();
 								}
 							}
 						}

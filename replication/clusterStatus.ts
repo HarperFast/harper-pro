@@ -16,6 +16,8 @@ import {
 	BLOB_FAILURE_COUNT_POSITION,
 	LAST_BLOB_FAILURE_TIME_POSITION,
 	readConnectionTruth,
+	COPY_SHORTFALL_COUNT_POSITION,
+	LAST_COPY_SHORTFALL_TIME_POSITION,
 } from './replicationConnection.ts';
 import '../core/server/serverHelpers/serverUtilities.ts';
 
@@ -67,6 +69,10 @@ export async function clusterStatus() {
 			// `|| undefined` so a healthy link omits the field entirely (matching lastBlobFailure's asDate(0)).
 			socket.blobReplicationFailures = replicationSharedStatus[BLOB_FAILURE_COUNT_POSITION] || undefined;
 			socket.lastBlobFailure = asDate(replicationSharedStatus[LAST_BLOB_FAILURE_TIME_POSITION]);
+			// Copy delivery shortfall tripwire: records the sender reported sent that never arrived intact
+			// on this link (alert-only verification at COPY_COMPLETE). Omitted entirely when healthy.
+			socket.copyDeliveryShortfall = replicationSharedStatus[COPY_SHORTFALL_COUNT_POSITION] || undefined;
+			socket.lastCopyShortfall = asDate(replicationSharedStatus[LAST_COPY_SHORTFALL_TIME_POSITION]);
 			// W1 (harper-pro#431): the shared-memory connection truth is authoritative over the edge-triggered
 			// map mirror in requestClusterStatus, which can still read connected:true for an open-but-idle
 			// wedge that never delivered a disconnect (#289/#233). Also surface the last disconnect (#214).
