@@ -109,7 +109,6 @@ const WEDGE_RECONCILE_THRESHOLD_MS = 30_000;
 // reconnect (resume from the persisted copy cursor, no data loss) is an acceptable trade for guaranteeing
 // the wedge can never be permanent. See findStalledReceivingNodeUrls.
 const RECEIVE_STALL_THRESHOLD_MS = 15 * 60_000;
-let nextWorkerExitReassignAt = 0;
 // One 'exit' listener per worker (tracked here), not one per (database, node) subscription — the old
 // per-subscription registration accumulated D×P listeners on the shared worker objects and tripped
 // MaxListenersExceededWarning past ~10 databases (harper-pro#357).
