@@ -354,7 +354,8 @@ export async function checksumTableRange(
 			if (options.isClosed?.()) return undefined;
 			lastYield = performance.now();
 		}
-		if ((entry.metadataFlags as number) & LOCAL_ONLY) continue;
+		if (!entry) continue;
+		if ((entry.metadataFlags ?? 0) & LOCAL_ONLY) continue;
 		if (!checksum.add(entry.key)) break;
 	}
 	return checksum.result();
@@ -371,6 +372,7 @@ export function compareRangeChecksums(
 	local: Record<string, RangeChecksum>
 ): Array<{ table: string; sent: RangeChecksum; local: RangeChecksum }> {
 	const mismatches: Array<{ table: string; sent: RangeChecksum; local: RangeChecksum }> = [];
+	if (!sent || !local) return mismatches;
 	for (const [table, sentSum] of Object.entries(sent)) {
 		if (!sentSum || typeof sentSum !== 'object' || typeof sentSum.count !== 'number') continue;
 		const localSum = local[table];
