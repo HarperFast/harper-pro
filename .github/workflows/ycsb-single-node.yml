@@ -106,6 +106,10 @@ jobs:
           tool: customSmallerIsBetter
           output-file-path: core/benchmarks/ycsb/bench-out/latency.json
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # The throughput step above already fetched gh-pages into a local ref in
+          # this same job/workspace. A second fetch of the same ref fails with a
+          # non-fast-forward rejection, so reuse the already-fetched local ref.
+          skip-fetch-gh-pages: true
           auto-push: ${{ github.ref == 'refs/heads/main' }}
           comment-on-alert: true
           fail-on-alert: false
