@@ -97,6 +97,8 @@
 	"scripts": {
 		"build": "tsc --project tsconfig.json",
 		"build:watch": "npm run build -- --watch --incremental",
+		"typecheck": "tsc --noEmit --project tsconfig.json",
+		"typecheck:fast": "npx -y -p @typescript/native-preview@7.0.0-dev.20260707.2 tsgo --noEmit --project tsconfig.json",
 		"core:sync": "./build-tools/sync-core.sh",
 		"core:set-branch": "./build-tools/set-core-branch.sh",
 		"package": "./build-tools/build-pro.sh",

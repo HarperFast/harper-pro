@@ -4,6 +4,7 @@ import { ClientError } from '../core/utility/errors/hdbError.js';
 import { getPrivateKeys } from '../core/security/keys.js';
 import { getJWTRSAKeys } from '../core/security/tokenAuthentication.ts';
 import { server } from '../core/server/Server.ts';
+import { isCustodyKeyName } from './fileKeyCustody.ts';
 
 type JwtKeyField = 'privateKey' | 'publicKey' | 'passphrase';
 
@@ -57,6 +58,13 @@ async function keyResolver(req: KeyResolverRequest): Promise<string> {
 	const privateKeys = getPrivateKeys();
 	const privateKey = privateKeys.get(name);
 	if (privateKey) {
+		// Cluster secret-custody keys are served only to internal callers and node-identity
+		// requests (replication cert-auth executes operations with bypass_auth; external HTTP
+		// requests have it stripped) — otherwise one super-user API call could exfiltrate the
+		// cluster's secrets key (#166). Credential/token-auth cloning therefore cannot fetch these.
+		if (isCustodyKeyName(name) && req.bypass_auth !== true) {
+			throw new ClientError('This key is restricted to node-identity requests', 403);
+		}
 		return privateKey;
 	}
 

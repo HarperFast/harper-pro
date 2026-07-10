@@ -245,6 +245,14 @@ export async function cloneNode(): Promise<void> {
 		await installHarper();
 	}
 
+	// Custody clone gate (#166): mark the clone bootstrap BEFORE Harper starts so the
+	// secretCustody component does not self-generate a cluster env-secrets keypair — the leader's
+	// key is cloned right after replication is established (cloneEnvSecretsKeys), and a
+	// self-generated key would diverge from the cluster and could encrypt new secrets before the
+	// real key arrives. Custody stays dormant until the cloned key is registered.
+	const { setCloneBootstrapInProgress } = await import('../security/custodyState.js');
+	setCloneBootstrapInProgress(true);
+
 	// Start Harper to prepare for clone operations
 	const { main } = await import('../core/bin/run.js');
 	await main();
@@ -355,6 +363,8 @@ export async function cloneNode(): Promise<void> {
 		);
 		return;
 	}
+
+	await cloneEnvSecretsKeys();
 
 	await cloneSSHKeys();
 
@@ -716,6 +726,60 @@ async function cloneJWTKeys(): Promise<void> {
 	// module's load-time env.initSync() running before rootPath is initialized.
 	const { clearJWTRSAKeysCache } = await import('../core/security/tokenAuthentication.js');
 	clearJWTRSAKeysCache();
+}
+
+/**
+ * Clones the cluster-shared env-secrets private key (file custody tier) from the leader so this
+ * node can decrypt `enc:v1:` secret values. Fetched under the stable active-key alias, then
+ * persisted under its per-kid filename (the kid is derived from the key material itself).
+ * Best-effort: a leader without file-tier custody has no key to serve. NOTE: the leader serves
+ * custody keys only to node-identity (cert-auth) requests, so a credential/token-auth clone
+ * cannot fetch this key — without it, this node generates its own keypair on first boot and
+ * cannot decrypt secrets encrypted for the cluster.
+ */
+async function cloneEnvSecretsKeys(): Promise<void> {
+	try {
+		// dynamic import: keep module-load side effects (rootPath resolution) out of the install path
+		const { ACTIVE_CUSTODY_KEY_NAME, privateKeyFileNameFor, kidOfPrivateKeyPem } =
+			await import('../security/fileKeyCustody.js');
+		const result: Record<string, any> = await leaderRequest({
+			operation: 'get_key',
+			name: ACTIVE_CUSTODY_KEY_NAME,
+		});
+		if (result?.message) {
+			const kid = kidOfPrivateKeyPem(result.message);
+			// the keys dir usually exists by now (boot creates it), but a fresh clone must not
+			// depend on that
+			mkdirSync(join(rootPath, LICENSE_KEY_DIR_NAME), { recursive: true });
+			writeFileSync(join(rootPath, LICENSE_KEY_DIR_NAME, privateKeyFileNameFor(kid)), result.message, {
+				mode: 0o600,
+			});
+			log('Cloned env-secrets key');
+			// Component startup ran custody-dormant under the clone gate; lift it and register the
+			// cloned key now (core's deferred replay then heals any queued .env values on this
+			// thread). Worker threads that started before this point stay dormant until the next
+			// restart — they load the key from disk on boot.
+			const { setCloneBootstrapInProgress } = await import('../security/custodyState.js');
+			setCloneBootstrapInProgress(false);
+			const { activateFileCustodyFromDisk } = await import('../security/keyCustody.js');
+			if (activateFileCustodyFromDisk()) {
+				log('Registered env-secrets custody with the cloned key');
+			}
+		}
+		// no leader key (or fetch refused): the gate stays latched, so this bootstrap session
+		// cannot generate a divergent keypair; a normal (post-clone) boot generates if the cluster
+		// truly has no key
+	} catch (err) {
+		if (/Key not found/i.test(String(err))) {
+			log('Leader has no env-secrets key to clone');
+		} else {
+			log(
+				`Error cloning env-secrets key: ${err} (custody keys are served to node-identity requests only; ` +
+					'credential/token-auth clones cannot fetch them — use certificate auth or provision the key)',
+				'error'
+			);
+		}
+	}
 }
 
 /**

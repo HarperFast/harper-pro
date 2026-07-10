@@ -1214,19 +1214,41 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 	// explicit demotion, which is allowed to clear it.
 	const alreadyLocalOnly = existing?.isLeader === true && node.isLeader !== false;
 
+	// Use an explicit, isolated context for this write instead of relying on ambient fallback
+	// (contextStorage.getStore()). This is internal node-registry bookkeeping, not a user-authored
+	// write: ensureNode() runs both for genuine admin-initiated add_node calls AND for internal
+	// inter-node bookkeeping (addNodeBack, received over the replication socket, whose "hdb_user" is
+	// just the resolved auth principal of the peer connection) — neither should be stamped onto a
+	// system table row as if a user directly wrote it (see core's registerLiveSubscriptionForContext:
+	// "Internal watchers, replication and local-bypass have no user principal").
+	//
+	// This was also, until harper#1720, a correctness bug, not just an attribution one:
+	// processLocalTransaction (core#1591/#1592) wraps an entire operation handler invocation in one
+	// contextStorage.run(...) call, installing a single, long-lived, mutable context object as the
+	// ambient store for the whole handler. Because setNode()/addNodeBack() each call ensureNode()
+	// twice in sequence (once for this node's own record, once for the peer's), the second call could
+	// see the first call's already-completed transaction still attached to the shared context and
+	// wrongly join it instead of starting its own — silently dropping one of the two writes (verified
+	// via instrumented harper-pro integrationTests/cluster/replicationTopology.test.mjs against core
+	// commit af646222d: a peer's `ca` field failed to persist into hdb_nodes, producing
+	// SELF_SIGNED_CERT_IN_CHAIN on subsequent mesh connections). harper#1720 fixes that generally at
+	// the core level. Passing a fresh context per call here restores the pre-#1591 behavior (every
+	// internal static Resource API call always got its own throwaway `{}` context) as defense in
+	// depth, and fixes the attribution issue regardless of the core fix.
+	const writeContext: any = {};
 	if (options?.localOnly || alreadyLocalOnly) {
 		// Persist the node row with the LOCAL_ONLY metadata bit so it never replicates to peers
 		// (e.g. a v4 bridge peer that must stay invisible to the rest of the v5 mesh — harper-pro #246).
 		// The public patch() API has no per-write option slot, so write through the resource's internal
 		// _writeUpdate, which threads { localOnly } down to the record encoder. Wrapped in a transaction
 		// to mirror the transactional() boundary that the public patch()/put() path provides.
-		await transaction(async (txn) => {
+		await transaction(writeContext, async (txn) => {
 			const context = (txn as any).getContext();
 			const resource: any = await table.getResource(name, context, { async: true });
 			await resource._writeUpdate(name, node, false, { localOnly: true });
 			await resource.save?.();
 		});
 	} else {
-		await table.patch(node);
+		await table.patch(node, writeContext);
 	}
 }

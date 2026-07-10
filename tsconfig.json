@@ -28,6 +28,9 @@
 		"outDir": "dist",
 		"esModuleInterop": true,
 		"noImplicitAny": false,
+		// Codebase is not strict-clean yet; pin explicitly so a compiler upgrade
+		// that flips this default (e.g. TypeScript 7) doesn't silently change results
+		"strict": false,
 		"target": "ES2022",
 		"moduleResolution": "NodeNext",
 		"module": "NodeNext",
@@ -45,7 +48,8 @@
 		// Required: third-party type declarations (alasql, mathjs, msgpackr) have incompatible type errors
 		"skipLibCheck": true,
 
-		"baseUrl": ".",
+		// TS7 removes baseUrl; paths are already relative to this file so this
+		// resolves identically without it (verified: 0 resolution changes)
 		"paths": {
 			// Provide convenient path alias for compiled output
 			// Change this to ./* once we're fully in TypeStrip land
