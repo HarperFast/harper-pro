@@ -83,3 +83,10 @@ node:
   hostname: null
 license:
   region: null
+# Empty (not omitted): the component loader only loads a root component whose config key is
+# truthy (`for (const componentName in config) { if (!config[componentName]) continue; }` in
+# componentLoader.ts), so an absent key means startOnMainThread never runs and secret custody
+# silently never activates, even when a valid key was delivered via HARPER_SECRETS_KEY_FD/
+# HARPER_SECRETS_PRIVATE_KEY_B64. Leave this key-less so provider selection stays automatic
+# (see keyCustody.ts chooseProvider) -- do not add a `provider:` field here.
+secretCustody: {}
