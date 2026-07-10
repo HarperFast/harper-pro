@@ -389,6 +389,25 @@ export function compareRangeChecksums(
 	return mismatches;
 }
 
+/**
+ * Whether any write landed in this database's audit logs (any origin) at or after `sinceTime`.
+ * Gates resume-range verification: the claimed-delivered range is only invariant if nothing has
+ * written to the database since the copy began (the receiver's copy of the range is frozen while
+ * the copy is incomplete, so sender-side key churn since copyStartTime — inserts or deletes landing
+ * inside the already-delivered range — would drift the comparison without any delivery fault).
+ * Copy-apply rows are snapshot writes with no audit entry, so a receiver that has only applied copy
+ * frames still reads as quiescent. One bounded seek per log; take-first.
+ */
+export function hasAuditWritesSince(
+	auditStore: { getRange: (options: any) => Iterable<unknown> },
+	sinceTime: number
+): boolean {
+	for (const _entry of auditStore.getRange({ start: sinceTime })) {
+		return true;
+	}
+	return false;
+}
+
 export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
 // when we receive messages from other nodes, we then forward them on to as a notification on these subscriptions
@@ -1628,18 +1647,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// resume from seqId with gaps.
 	// Verify the sender's checksums of the range our resume cursor claimed was already delivered
 	// (COPY_RANGE_CHECKSUM, sent right after COPY_START on resumes) against this node's actual table
-	// content. The payload echoes the exact bounds and cap the sender honored, so both sides scan the
-	// identical range even when the persisted cursor has since advanced, been removed, or belongs to
-	// a different source in a proxied failover. Alert-only: a mismatch is logged with exact per-table
-	// numbers and stashed on the connection for inspection, never acted on — the range can drift
-	// benignly (rows inserted/deleted on the sender since the copy began, live deliveries from other
-	// sources, local writes), and a mismatch caused by receiver-side undecodable drops would only
-	// loop a forced re-copy. A poisoned cursor shows up as a massive one-sided gap. Detached and
-	// wall-clock-paced so the scan never blocks the receive loop; skipped for tables this receiver
-	// drops by policy or cannot read.
+	// content. The payload echoes the exact bounds, cap, and copyStartTime the sender honored, so both
+	// sides scan the identical range even when the persisted cursor has since advanced, been removed,
+	// or belongs to a different source in a proxied failover. The sender only sends this when ITS
+	// database has been quiescent since the copy began; this side must hold the same precondition
+	// (checked before and after the scan), because local writes or live deliveries from other sources
+	// since copyStartTime would drift the range without any delivery fault. Under the precondition the
+	// comparison is exact: a mismatch means the claimed range provably was not delivered. Alert-only:
+	// logged with per-table key counts and stashed on the connection; no re-copy (receiver-side
+	// undecodable drops would loop one forever) and no cursor surgery. Detached and wall-clock-paced
+	// so the scan never blocks the receive loop; skipped for tables this receiver drops by policy.
 	async function verifyResumeRangeChecksums(claim: {
 		currentTable?: string;
 		afterKey?: unknown;
+		copyStartTime?: number;
 		maxKeys?: number;
 		tables?: Record<string, RangeChecksum>;
 	}): Promise<void> {
@@ -1650,6 +1671,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				typeof claim.maxKeys === 'number' && claim.maxKeys > 0 ? claim.maxKeys : RANGE_CHECKSUM_MAX_KEYS,
 				RANGE_CHECKSUM_MAX_KEYS_CLAMP
 			);
+			if (typeof claim.copyStartTime === 'number' && hasAuditWritesSince(auditStore, claim.copyStartTime)) {
+				logger.debug?.(connectionId, 'not quiescent since copy start; skipping resume-range verification');
+				return;
+			}
 			const localChecksums: Record<string, RangeChecksum> = {};
 			for (const tableName of Object.keys(sentChecksums)) {
 				const table = tables?.[tableName];
@@ -1669,13 +1694,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				}
 				if (wsClosed) return;
 			}
+			// re-check after the scan: a write landing mid-scan drifts the range benignly
+			if (typeof claim.copyStartTime === 'number' && hasAuditWritesSince(auditStore, claim.copyStartTime)) {
+				logger.debug?.(connectionId, 'writes landed during resume-range verification; skipping');
+				return;
+			}
 			const mismatches = compareRangeChecksums(sentChecksums, localChecksums);
 			if (mismatches.length > 0) {
 				logger.error?.(
 					`Resume-range verification mismatch for database ${databaseName} from ${remoteNodeName}: ` +
 						mismatches.map((m) => `${m.table} sender=${m.sent.count} keys local=${m.local.count} keys`).join(', ') +
-						'. The resume cursor claims this range was delivered; a large one-sided gap means it was not ' +
-						'(small drift can be benign churn since the copy began). Not forcing a re-copy.'
+						'. The database has been quiescent since the copy began, so the claimed-delivered range should be ' +
+						'identical on both sides: these records provably were not delivered. Not forcing a re-copy.'
 				);
 				if (options.connection) {
 					options.connection.copyResumeRangeMismatch = {
@@ -3530,7 +3560,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													const rangeChecksums: Record<string, RangeChecksum> = {};
 													const scanDeadline = Date.now() + RANGE_CHECKSUM_MAX_SCAN_MS;
 													let scanTimedOut = false;
+													let skipReason: string | undefined;
+													if (hasAuditWritesSince(auditStore, copyStartTime)) {
+														skipReason = 'not quiescent since copy start';
+													}
 													for (const tableName of orderedTableNames) {
+														if (skipReason) break;
 														const table = tables[tableName];
 														if (!tableToTableEntry(table)) continue;
 														// tables this route never sends have no delivery claim to verify
@@ -3550,13 +3585,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														if (scanTimedOut) break;
 														if (isResumeTable) break;
 													}
-													if (scanTimedOut) {
-														// degrade to no verification rather than holding up the copy into the
-														// follower's copy-progress watchdog window
-														logger.warn?.(
-															connectionId,
-															'resume-range checksum scan exceeded its time budget; skipping verification'
-														);
+													if (scanTimedOut) skipReason = 'scan exceeded its time budget';
+													// re-check after the scan: a write landing mid-scan means the checksums no longer
+													// describe an invariant range
+													if (!skipReason && hasAuditWritesSince(auditStore, copyStartTime))
+														skipReason = 'writes landed during the scan';
+													if (skipReason) {
+														// degrade to no verification rather than false-alarming (or, for the time budget,
+														// holding up the copy into the follower's watchdog window)
+														logger.debug?.(connectionId, 'skipping resume-range verification:', skipReason);
 													} else {
 														ws.send(
 															encode([
@@ -3564,6 +3601,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 																{
 																	currentTable: resumeCurrentTable,
 																	afterKey: resumeAfterKey,
+																	copyStartTime,
 																	maxKeys: RANGE_CHECKSUM_MAX_KEYS,
 																	tables: rangeChecksums,
 																},

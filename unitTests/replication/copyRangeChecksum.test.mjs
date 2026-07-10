@@ -12,6 +12,7 @@ import {
 	createRangeChecksum,
 	compareRangeChecksums,
 	checksumTableRange,
+	hasAuditWritesSince,
 	RANGE_CHECKSUM_MAX_KEYS,
 } from '#src/replication/replicationConnection';
 
@@ -189,5 +190,29 @@ describe('checksumTableRange', () => {
 			},
 		};
 		expect(await checksumTableRange(store, { isClosed: () => seen >= 2 })).to.equal(undefined);
+	});
+});
+
+describe('hasAuditWritesSince', () => {
+	// Gates resume-range verification: exact-or-silent. The claimed range is only invariant when
+	// nothing wrote to the database since the copy began.
+	function auditStoreOf(entryTimes) {
+		return {
+			getRange(options) {
+				return entryTimes.filter((t) => t >= options.start).map((t) => ({ localTime: t }));
+			},
+		};
+	}
+
+	it('reports quiescent when no entry is at or after the copy start', () => {
+		expect(hasAuditWritesSince(auditStoreOf([100, 200]), 300)).to.equal(false);
+	});
+
+	it('reports writes when any entry is at or after the copy start', () => {
+		expect(hasAuditWritesSince(auditStoreOf([100, 350]), 300)).to.equal(true);
+	});
+
+	it('an empty log is quiescent', () => {
+		expect(hasAuditWritesSince(auditStoreOf([]), 1)).to.equal(false);
 	});
 });
