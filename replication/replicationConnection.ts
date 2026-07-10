@@ -76,6 +76,7 @@ import {
 import { promises as fsPromises } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
+import { FrameWriter } from './frameWriter.ts';
 const logger = forComponent('replication').conditional as Logger;
 
 // msgpackr v2 removed the built-in `randomAccessStructure` option; that random-access
@@ -1436,10 +1437,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		' ' +
 		Math.random().toString().slice(2, 3);
 	logger.debug?.(connectionId, 'Initializing replication connection', authorization);
-	let encodingStart = 0;
-	let encodingBuffer = Buffer.allocUnsafeSlow(1024);
-	let position = 0;
-	let dataView = new DataView(encodingBuffer.buffer, 0, 1024);
+	const frame = new FrameWriter();
 	let databaseName = options.database;
 	const dbSubscriptions = options.databaseSubscriptions || databaseSubscriptions;
 	let auditStore: any;
@@ -2839,20 +2837,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						const sendAuditRecord = (auditRecord, localTime) => {
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnTime) {
-									if (encodingBuffer[encodingStart] !== 66) {
+									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
 										logger.error?.(
 											new Error('Invalid encoding of message to'),
 											remoteNodeName,
 											databaseName,
-											encodingBuffer
+											frame.encodingBuffer
 										);
 									}
-									writeInt(9); // replication message of nine bytes long
-									writeInt(REMOTE_SEQUENCE_UPDATE); // action id
-									writeFloat64((sentSequenceId = localTime)); // send the local time so we know what sequence number to start from next time.
+									frame.writeInt(9); // replication message of nine bytes long
+									frame.writeInt(REMOTE_SEQUENCE_UPDATE); // action id
+									frame.writeFloat64((sentSequenceId = localTime)); // send the local time so we know what sequence number to start from next time.
 									sendQueuedData();
 								}
-								encodingStart = position;
+								frame.encodingStart = frame.position;
 								currentTransaction.txnTime = 0;
 								return; // end of transaction, nothing more to do
 							}
@@ -3058,14 +3056,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								if (currentTransaction.txnTime) {
 									if (DEBUG_MODE)
 										logger.trace?.(connectionId, 'new txn time, sending queued txn', currentTransaction.txnTime);
-									if (encodingBuffer[encodingStart] !== 66) {
+									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
 										logger.error?.('Invalid encoding of message');
 									}
 									sendQueuedData();
 								}
 								currentTransaction.txnTime = txnTime;
-								encodingStart = position;
-								writeFloat64(txnTime);
+								frame.encodingStart = frame.position;
+								frame.writeFloat64(txnTime);
 							}
 
 							/*
@@ -3073,8 +3071,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							and username from subsequent audit entries in multiple entry transactions*/
 							if (invalidationEntry) {
 								// if we have an invalidation entry to send, do that now
-								writeInt(invalidationEntry.length);
-								writeBytes(invalidationEntry);
+								frame.writeInt(invalidationEntry.length);
+								frame.writeBytes(invalidationEntry);
 							} else {
 								// directly write the audit record.
 								const encoded = auditRecord.encoded;
@@ -3088,8 +3086,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								}
 								// If it starts with the previous local time, we omit that
 								const start = encoded[0] === 66 ? 8 : 0;
-								writeInt(encoded.length - start);
-								writeBytes(encoded, start);
+								frame.writeInt(encoded.length - start);
+								frame.writeBytes(encoded, start);
 								logger.debug?.(
 									'wrote record',
 									auditRecord.recordId,
@@ -3135,14 +3133,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							} else return new Promise(setImmediate); // yield on each turn for fairness and letting other things run
 						};
 						const sendQueuedData = () => {
-							if (position - encodingStart > 8) {
+							if (frame.position - frame.encodingStart > 8) {
 								// if we have more than just a txn time, send it
-								if (checkExcessMessageSize(position - encodingStart)) return;
-								ws.send(encodingBuffer.subarray(encodingStart, position));
-								logger.debug?.(connectionId, 'Sent message, size:', position - encodingStart);
+								if (checkExcessMessageSize(frame.position - frame.encodingStart)) return;
+								ws.send(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
+								logger.debug?.(connectionId, 'Sent message, size:', frame.position - frame.encodingStart);
 								if (databaseName !== 'system') {
 									recordAction(
-										position - encodingStart,
+										frame.position - frame.encodingStart,
 										'bytes-sent',
 										`${remoteNodeName}.${databaseName}`,
 										'replication',
@@ -3358,10 +3356,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													const now = Date.now();
 													if (copyFlushPacer.due(now)) {
 														copyFlushPacer.mark(now);
-														if (position - encodingStart > 8) {
+														if (frame.position - frame.encodingStart > 8) {
 															recordsSinceCheckpoint = 0;
 															sendQueuedData();
-															encodingStart = position;
+															frame.encodingStart = frame.position;
 															currentTransaction.txnTime = 0;
 														}
 														await new Promise(setImmediate);
@@ -3430,11 +3428,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// Available/cloned with rows still uncopied. (Records with differing versions already flush
 													// naturally above; this also bounds same-version bulk data into committable batches.) The
 													// watermark is only advanced to copyStartTime by the single end_txn after the whole copy.
-													if (++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS && position - encodingStart > 8) {
+													if (
+														++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS &&
+														frame.position - frame.encodingStart > 8
+													) {
 														recordsSinceCheckpoint = 0;
 														copyFlushPacer.mark(Date.now());
 														sendQueuedData();
-														encodingStart = position;
+														frame.encodingStart = frame.position;
 														currentTransaction.txnTime = 0;
 													}
 												}
@@ -3445,8 +3446,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												// no records pending (none sent, or the last batch landed on a checkpoint flush):
 												// force a txn so the end_txn below still carries the sequence update
 												currentTransaction.txnTime = copyStartTime;
-												encodingStart = position;
-												writeFloat64(copyStartTime);
+												frame.encodingStart = frame.position;
+												frame.writeFloat64(copyStartTime);
 											}
 											// ALWAYS emit the final end_txn at copyStartTime. It carries the REMOTE_SEQUENCE_UPDATE
 											// that advances the follower's seqId and received-version watermark to copyStartTime —
@@ -3494,7 +3495,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										await sendAuditRecord(auditRecord, key);
 										auditSubscription.startTime = key; // update so don't double send
 									}
-									if (position - encodingStart > 8) {
+									if (frame.position - frame.encodingStart > 8) {
 										sendAuditRecord(
 											{
 												type: 'end_txn',
@@ -4791,48 +4792,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			});
 		},
 	};
-
-	// write an integer to the current buffer
-	function writeInt(number) {
-		checkRoom(5);
-		if (number < 128) {
-			encodingBuffer[position++] = number;
-		} else if (number < 0x4000) {
-			dataView.setUint16(position, number | 0x8000);
-			position += 2;
-		} else if (number < 0x3f000000) {
-			dataView.setUint32(position, number | 0xc0000000);
-			position += 4;
-		} else {
-			encodingBuffer[position] = 0xff;
-			dataView.setUint32(position + 1, number);
-			position += 5;
-		}
-	}
-
-	// write raw binary/bytes to the current buffer
-	function writeBytes(src, start = 0, end = src.length) {
-		const length = end - start;
-		checkRoom(length);
-		src.copy(encodingBuffer, position, start, end);
-		position += length;
-	}
-
-	function writeFloat64(number) {
-		checkRoom(8);
-		dataView.setFloat64(position, number);
-		position += 8;
-	}
-	function checkRoom(length) {
-		if (length + 16 > encodingBuffer.length - position) {
-			const newBuffer = Buffer.allocUnsafeSlow(((position + length - encodingStart + 0x10000) >> 10) << 11);
-			encodingBuffer.copy(newBuffer, 0, encodingStart, position);
-			position = position - encodingStart;
-			encodingStart = 0;
-			encodingBuffer = newBuffer;
-			dataView = new DataView(encodingBuffer.buffer, 0, encodingBuffer.length);
-		}
-	}
 
 	function checkExcessMessageSize(messageSize) {
 		if (messageSize > MAX_PAYLOAD) {
