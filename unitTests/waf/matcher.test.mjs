@@ -349,6 +349,17 @@ describe('WAF rule validation', () => {
 		expect(validateRule({ ...BASE, id: 'x', blockStatus: 99, match: { ip: '10.0.0.1' } })).to.not.be.empty;
 		expect(validateRule({ ...BASE, id: 'x', action: 'score', match: { ip: '10.0.0.1' } })).to.not.be.empty;
 	});
+	it('rejects non-finite numeric fields (NaN/Infinity poison scoring and sort order)', () => {
+		// score: NaN would make totalScore NaN, so `NaN >= scoreThreshold` never blocks
+		expect(validateRule({ ...BASE, id: 'x', action: 'score', score: NaN, match: { ip: '10.0.0.1' } })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', action: 'score', score: Infinity, match: { ip: '10.0.0.1' } })).to.not.be
+			.empty;
+		expect(validateRule({ ...BASE, id: 'x', action: 'score', score: '5', match: { ip: '10.0.0.1' } })).to.not.be.empty;
+		// priority: NaN makes the sort comparator return NaN, leaving enforcement order unspecified
+		expect(validateRule({ ...BASE, id: 'x', priority: NaN, match: { ip: '10.0.0.1' } })).to.not.be.empty;
+		// finite values still validate
+		expect(validateRule({ ...BASE, id: 'x', action: 'score', score: 5, match: { ip: '10.0.0.1' } })).to.deep.equal([]);
+	});
 	it('rejects empty match arrays (anchored-yet-dead rules that never match)', () => {
 		expect(validateRule({ ...BASE, id: 'x', match: { ip: [] } })).to.not.be.empty;
 		expect(validateRule({ ...BASE, id: 'x', match: { headers: [] } })).to.not.be.empty;

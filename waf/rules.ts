@@ -232,11 +232,15 @@ export function validateRule(rule: WafRule): string[] {
 	if (!rule || typeof rule !== 'object') return ['rule is not an object'];
 	if (rule.id == null) errors.push('missing id');
 	// M8: type-check enabled / priority so the "usable" verdict matches the compiler's expectations.
+	// Numeric fields require Number.isFinite: NaN/Infinity pass a typeof check but poison their
+	// consumers (a NaN score makes totalScore NaN, so `NaN >= scoreThreshold` never blocks; a NaN
+	// priority makes the sort comparator return NaN, leaving enforcement order unspecified).
 	if (rule.enabled != null && typeof rule.enabled !== 'boolean') errors.push('enabled must be a boolean');
-	if (rule.priority != null && typeof rule.priority !== 'number') errors.push('priority must be a number');
+	if (rule.priority != null && !Number.isFinite(rule.priority)) errors.push('priority must be a finite number');
 	if (!VALID_PHASES.has(rule.phase)) errors.push(`unknown phase ${JSON.stringify(rule.phase)}`);
 	if (!VALID_ACTIONS.has(rule.action)) errors.push(`unknown action ${JSON.stringify(rule.action)}`);
-	if (rule.action === 'score' && typeof rule.score !== 'number') errors.push('action "score" requires a numeric score');
+	if (rule.action === 'score' && !Number.isFinite(rule.score))
+		errors.push('action "score" requires a finite numeric score');
 	// A "block" must read as a rejection: constrain to error statuses (4xx/5xx) so a rule can't
 	// suppress nextHandler yet return 2xx/3xx (a block that looks like success).
 	if (
