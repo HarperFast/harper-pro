@@ -105,6 +105,10 @@ jobs:
           name: harper-large-stress-build-${{ inputs.node-version || '24' }}
       - name: Relink bin scripts
         run: npm install --ignore-scripts
+      # re2 downloads its native binary from a post-install script (unlike lmdb/msgpackr/rocksdb,
+      # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
+      - name: Build re2 native binary
+        run: npm rebuild re2
       - name: Run ${{ matrix.test.name }}
         env:
           HARPER_RUN_STRESS_TESTS: '1'
