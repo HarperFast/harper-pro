@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783682529635,
+  "lastUpdate": 1783766754213,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -1351,6 +1351,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 3593.28,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "c5850bde98a0fbb66ae55a8734761e7f5b49cd1f",
+          "message": "test: guard every HARPER_BUILTIN_COMPONENTS entry has a defaultConfig.yaml key\n\nPer PR #560 review: nothing previously enforced that a built-in\ncomponent registered in bin/harper.js actually has a matching key in\nstatic/defaultConfig.yaml, so componentLoader.ts's\n`if (!config[componentName]) continue;` can silently skip loading any\nfuture built-in the same way it did secretCustody. Verified this test\nfails with the pre-fix defaultConfig.yaml (missing secretCustody key)\nand passes with it restored.",
+          "timestamp": "2026-07-10T20:42:20Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/c5850bde98a0fbb66ae55a8734761e7f5b49cd1f"
+        },
+        "date": 1783766753131,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 10923.9,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 28269.19,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 23815.58,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 11814.33,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 8682.34,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 3879.32,
             "unit": "ops/sec"
           }
         ]
