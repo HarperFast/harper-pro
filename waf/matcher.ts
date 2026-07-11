@@ -335,20 +335,6 @@ function normalizeIp(ip: string): string {
 	return ip;
 }
 
-/** True when a regex source contains a backreference (\1..\9); such rules can't join the gate (M3). */
-function hasBackreference(source: string): boolean {
-	// \\ escapes a literal backslash; \1..\9 outside a char-class is a backreference. A conservative
-	// scan (treats any \digit not preceded by an escaped backslash as a backreference) is fine here —
-	// over-detection only costs the gate optimization, never correctness.
-	for (let i = 0; i < source.length; i++) {
-		if (source[i] !== '\\') continue;
-		const next = source[i + 1];
-		if (next >= '1' && next <= '9') return true;
-		i++; // skip the escaped character
-	}
-	return false;
-}
-
 function lowerBound(haystack: Float64Array, length: number, needle: number): number {
 	let low = 0;
 	let high = length;
@@ -884,28 +870,12 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 		(node.ruleIndexes ??= []).push(ruleIndex);
 	}
 
-	// Combined-alternation pre-gate: one regex test decides whether ANY gate-eligible path-regex
-	// rule can match, so the 99% (non-matching) path costs a single test instead of a scan per
-	// regex rule. TODO(production): with RE2/Hyperscan this becomes a proper multi-pattern set scan.
-	//
-	// Backreference safety (M3): alternation renumbers capture groups, so a pattern containing a
-	// backreference (\1, \2, ...) would bind to the wrong group inside the combined source and the
-	// authoritative gate could produce a FALSE NEGATIVE that disarms a sibling block rule. Such
-	// rules are EXCLUDED from the gate and always evaluated on every request via the per-rule scan.
-	const gateableRegexes: { regex: RegExp; ruleIndex: number }[] = [];
-	const ungatedRegexes: { regex: RegExp; ruleIndex: number }[] = [];
-	for (const entry of pathRegexes) {
-		(hasBackreference(entry.regex.source) ? ungatedRegexes : gateableRegexes).push(entry);
-	}
-	let pathRegexGate: RegExp | null = null;
-	if (gateableRegexes.length > 1) {
-		try {
-			pathRegexGate = new RegExp(gateableRegexes.map(({ regex }) => `(?:${regex.source})`).join('|'));
-		} catch {
-			pathRegexGate = null; // e.g. combined source too large — fall back to the linear scan
-		}
-	}
-
+	// Path-regex rules are matched by a plain linear scan (see evaluate). Every pattern is an RE2
+	// (compileRuleRegex), so each `.test()` is linear-time and cannot backtrack — a per-request scan
+	// over the handful of path-regex rules in a realistic (super_user-authored) rule set is
+	// negligible, and it stays allocation-free on the no-match path. If path-regex volume ever
+	// dominates, `RE2.Set` (a native multi-pattern scan whose `.test()` gates the set in one call)
+	// is the drop-in replacement — no capture-group renumbering, so no per-pattern exclusions.
 	const hasV6Rules = v6Exact.size > 0 || v6Prefixes.length > 0;
 	const hasPathRules = pathExact.size > 0 || prefixTrieRoot !== null || pathRegexes.length > 0;
 	// With many distinct rule-referenced header names, probing each of them per request is the
@@ -973,15 +943,9 @@ export function compileRules(rules: WafRule[], options: CompileOptions = {}): Wa
 					node = node.children.get(path.charCodeAt(i)) ?? null;
 				}
 			}
-			// gate-eligible regexes run only when the combined pre-gate hits (or has none);
-			// ungated (backreference) regexes always scan — see the M3 note at gate construction.
-			if (gateableRegexes.length > 0 && (pathRegexGate === null || pathRegexGate.test(path))) {
-				for (let i = 0; i < gateableRegexes.length; i++) {
-					if (gateableRegexes[i].regex.test(path)) candidateBuffer[candidateCount++] = gateableRegexes[i].ruleIndex;
-				}
-			}
-			for (let i = 0; i < ungatedRegexes.length; i++) {
-				if (ungatedRegexes[i].regex.test(path)) candidateBuffer[candidateCount++] = ungatedRegexes[i].ruleIndex;
+			// Linear scan of the path-regex rules; each pattern is a linear-time RE2 (no backtracking).
+			for (let i = 0; i < pathRegexes.length; i++) {
+				if (pathRegexes[i].regex.test(path)) candidateBuffer[candidateCount++] = pathRegexes[i].ruleIndex;
 			}
 		}
 

@@ -10,6 +10,7 @@
 // benign runtime cycle — both symbols are function declarations only called at runtime, never at
 // module init. Cyclic deps are acceptable per Harper conventions.
 import { parseCidr } from './matcher.ts';
+import { compileSafeRegex } from '../security/safeRegex.ts';
 
 export type WafStringOp = 'equals' | 'contains' | 'prefix' | 'regex' | 'exists';
 
@@ -96,18 +97,14 @@ const VALID_RATELIMIT_KEYS = new Set<string>(['ip', 'ja4', 'session', 'agent', '
 const VALID_WEBBOTAUTH = new Set<string>(['verified', 'unverified', 'any']);
 
 /**
- * Compile a rule-supplied regex source, returning undefined (with an error pushed) when invalid.
- * TODO(production): operator-supplied patterns must be compiled with RE2 (linear-time) instead of
- * JS RegExp to prevent ReDoS — a hostile pattern like (a+)+$ here can stall the event loop.
+ * Compile a rule-supplied regex source, returning undefined (with an error pushed) when the pattern
+ * is invalid or unsupported. Rule sources are operator-influenceable, so this delegates to the
+ * RE2-backed {@link compileSafeRegex}: RE2's linear-time guarantee removes the ReDoS vector that
+ * `new RegExp(...)` would leave open (a pattern like `(a+)+$` cannot stall the event loop). The
+ * trade-off — backreferences and lookaround are rejected at compile time — is acceptable here: a
+ * rule using an unsupported feature is skipped with an error, exactly like an invalid one.
  */
-export function compileRuleRegex(source: string, where: string, errors: string[]): RegExp | undefined {
-	try {
-		return new RegExp(source);
-	} catch (error) {
-		errors.push(`${where}: invalid regex ${JSON.stringify(source)}: ${(error as Error).message}`);
-		return undefined;
-	}
-}
+export const compileRuleRegex = compileSafeRegex;
 
 function validateNamedValueMatches(list: WafNamedValueMatch[], where: string, errors: string[]) {
 	if (!Array.isArray(list)) {

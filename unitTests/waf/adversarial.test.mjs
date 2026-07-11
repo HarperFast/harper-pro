@@ -53,23 +53,43 @@ describe('M2 — trailing-slash / non-canonical CIDR must be rejected, not compi
 	});
 });
 
-describe('M3 — backreference regex must not disarm a sibling block rule via the gate', () => {
-	it('a backref rule does not create a false-negative bypass of a block rule', () => {
-		const matcher = compileRules([
-			{ ...BASE, id: 'benign', action: 'log', match: { path: { regex: '^/(x)\\1' } } },
-			{ ...BASE, id: 'blockdup', action: 'block', match: { path: { regex: '/(a)(b)\\2' } } },
-		]);
-		// /abb matches blockdup's backreference; the combined gate must NOT suppress it
-		expect(matcher.evaluate(makeRequest({ path: '/abb' })).ruleIds).to.deep.equal(['blockdup']);
+describe('M3 — RE2-unsupported regex (backreference/lookaround) is rejected, not silently matched', () => {
+	// path.regex compiles through the RE2-backed compileRuleRegex, whose linear-time guarantee is
+	// what removes the ReDoS surface here (a hostile `(a+)+$` cannot stall the event loop). The
+	// price of that guarantee is that RE2 cannot evaluate backreferences or lookaround, so a rule
+	// using them is rejected as invalid — the same treatment as malformed syntax. This replaces the
+	// old JS-RegExp combined-alternation gate (and its backreference-safety carve-out), which no
+	// longer exists: every path-regex is a linear-time RE2 matched by a plain scan.
+	it('a backreference path.regex is rejected as invalid and never matches', () => {
+		const matcher = compileRules([{ ...BASE, id: 'backref', action: 'block', match: { path: { regex: '/(z)\\1' } } }]);
+		expect(matcher.ruleCount).to.equal(0);
+		expect(matcher.invalidRules.has('backref')).to.equal(true);
+		expect(matcher.evaluate(makeRequest({ path: '/zz' }))).to.equal(null);
 	});
-	it('gate-excluded backref rules still evaluate on every request', () => {
+	it('a lookaround path.regex is rejected as invalid', () => {
 		const matcher = compileRules([
-			{ ...BASE, id: 'r1', action: 'log', match: { path: { regex: '^/aa' } } },
-			{ ...BASE, id: 'r2', action: 'log', match: { path: { regex: '^/bb' } } },
-			{ ...BASE, id: 'backref', action: 'block', match: { path: { regex: '/(z)\\1' } } },
+			{ ...BASE, id: 'lookahead', action: 'block', match: { path: { regex: '/admin(?=/)' } } },
 		]);
-		expect(matcher.evaluate(makeRequest({ path: '/zz' })).ruleIds).to.deep.equal(['backref']);
-		expect(matcher.evaluate(makeRequest({ path: '/aa' })).ruleIds).to.deep.equal(['r1']);
+		expect(matcher.ruleCount).to.equal(0);
+		expect(matcher.invalidRules.has('lookahead')).to.equal(true);
+	});
+	it('rejecting an unsupported-regex rule does not disarm a sibling valid rule', () => {
+		const matcher = compileRules([
+			{ ...BASE, id: 'backref', action: 'log', match: { path: { regex: '/(z)\\1' } } },
+			{ ...BASE, id: 'goodblock', action: 'block', match: { path: { regex: '\\.(php|asp)$' } } },
+		]);
+		expect(matcher.ruleCount).to.equal(1);
+		expect(matcher.invalidRules.has('backref')).to.equal(true);
+		expect(matcher.evaluate(makeRequest({ path: '/legacy/index.php' })).ruleIds).to.deep.equal(['goodblock']);
+	});
+	it('is immune to catastrophic backtracking on a hostile path.regex (ReDoS)', () => {
+		const matcher = compileRules([{ ...BASE, id: 'evil', action: 'block', match: { path: { regex: '(a+)+$' } } }]);
+		expect(matcher.ruleCount).to.equal(1);
+		const start = process.hrtime.bigint();
+		const decision = matcher.evaluate(makeRequest({ path: '/' + 'a'.repeat(50_000) + '!' }));
+		const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+		expect(decision).to.equal(null); // trailing '!' → no match; RE2 returns in linear time
+		expect(elapsedMs).to.be.lessThan(250);
 	});
 });
 
