@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783766754213,
+  "lastUpdate": 1783766756200,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -3147,6 +3147,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E scan p99 — short ranges",
             "value": 96.88,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "c5850bde98a0fbb66ae55a8734761e7f5b49cd1f",
+          "message": "test: guard every HARPER_BUILTIN_COMPONENTS entry has a defaultConfig.yaml key\n\nPer PR #560 review: nothing previously enforced that a built-in\ncomponent registered in bin/harper.js actually has a matching key in\nstatic/defaultConfig.yaml, so componentLoader.ts's\n`if (!config[componentName]) continue;` can silently skip loading any\nfuture built-in the same way it did secretCustody. Verified this test\nfails with the pre-fix defaultConfig.yaml (missing secretCustody key)\nand passes with it restored.",
+          "timestamp": "2026-07-10T20:42:20Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/c5850bde98a0fbb66ae55a8734761e7f5b49cd1f"
+        },
+        "date": 1783766756179,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 4.96,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 6.76,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 7.99,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 16.84,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 17.63,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 15.3,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 29.35,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 82.86,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 34.85,
             "unit": "ms"
           }
         ]
