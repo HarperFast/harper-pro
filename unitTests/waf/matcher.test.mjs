@@ -134,6 +134,19 @@ describe('WAF matcher — path rules', () => {
 		expect(matcher.evaluate(makeRequest({ path: '/legacy/index.php' })).ruleIds).to.deep.equal(['regex']);
 		expect(matcher.evaluate(makeRequest({ path: '/legacy/index.html' }))).to.equal(null);
 	});
+	it('attributes exactly the right rules through the combined regex pre-gate (>1 regex rule)', () => {
+		// 3 regex rules arm the combined-alternation pre-gate; attribution must stay per-rule
+		const gated = compileRules([
+			{ ...BASE, id: 'php', match: { path: { regex: '\\.php$' } } },
+			{ ...BASE, id: 'legacy', action: 'log', match: { path: { regex: '^/legacy/' } } },
+			{ ...BASE, id: 'trace', match: { path: { regex: '/trace/[0-9]+$' } } },
+		]);
+		const both = gated.evaluate(makeRequest({ path: '/legacy/index.php' }));
+		expect(both.ruleIds).to.deep.equal(['php']);
+		expect(both.matchedLogRuleIds).to.deep.equal(['legacy']);
+		expect(gated.evaluate(makeRequest({ path: '/app/trace/42' })).ruleIds).to.deep.equal(['trace']);
+		expect(gated.evaluate(makeRequest({ path: '/app/safe' }))).to.equal(null);
+	});
 });
 
 describe('WAF matcher — path canonicalization (bypass defense)', () => {
