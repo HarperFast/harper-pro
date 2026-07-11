@@ -14,7 +14,8 @@
  * Root-config enablement (harperdb-config.yaml):
  *   waf:
  *     enabled: true          # default true when the waf block is present
- *     scoreThreshold: 10     # accumulated score at which score-action rules block
+ *     scoreThreshold: 10     # accumulated score at which score-action rules block (fallback —
+ *                            # the replicated control row set via set_waf_mode overrides it)
  *     debounceMs: 100        # recompile debounce for rule-change bursts
  *     logRateLimit: 100      # max match log lines per rule per interval (O3)
  *     logRateIntervalMs: 60000
@@ -81,12 +82,15 @@ interface WafComponentOptions {
 
 /**
  * Replicated WAF control row (wave 2, decision b): a single sentinel row in the rule table carrying
- * the global mode. Pulled OUT of the rule list before compilation — it is never compiled/validated
- * as a rule. Persists + replicates cluster-wide like every other row in the table.
+ * the global mode and score threshold. Pulled OUT of the rule list before compilation — it is never
+ * compiled/validated as a rule. Persists + replicates cluster-wide like every other row in the
+ * table, so score rules block at the same threshold on every node (a per-node config threshold
+ * would let the same request block on one node and pass on another).
  */
 interface WafControlRow {
 	id: string;
 	mode?: 'enforce' | 'monitor' | 'off';
+	scoreThreshold?: number;
 }
 
 /** Minimal status → reason-phrase map for the opaque block response (O4). */
@@ -241,17 +245,23 @@ export function start(options: WafComponentOptions) {
 	};
 
 	// readAllRules pulls the replicated control row OUT of the returned rule list so it is never
-	// compiled/validated as a rule; the discovered mode is stashed for recompile() to read.
+	// compiled/validated as a rule; the discovered mode/threshold are stashed for recompile().
 	let controlMode: WafControlRow['mode'];
+	let controlScoreThreshold: number | undefined;
 	function readAllRules(): WafRule[] {
 		// primaryStore.getRange is the established pattern for a full scan outside a request
 		// context (see replication/knownNodes.ts); undecodable rows are skipped.
 		const rules: WafRule[] = [];
 		controlMode = undefined;
+		controlScoreThreshold = undefined;
 		for (const { value } of WafRuleTable.primaryStore.getRange({})) {
 			if (!value) continue;
 			if ((value as WafControlRow).id === WAF_CONTROL_ID) {
 				controlMode = (value as WafControlRow).mode;
+				// Finite-guard the replicated value: a NaN threshold would make `totalScore >=
+				// threshold` always false, silently disabling score blocking cluster-wide.
+				const rowThreshold = (value as WafControlRow).scoreThreshold;
+				controlScoreThreshold = Number.isFinite(rowThreshold) && rowThreshold! > 0 ? rowThreshold : undefined;
 				continue; // sentinel control row: not a rule
 			}
 			rules.push(value as WafRule);
@@ -263,10 +273,11 @@ export function start(options: WafComponentOptions) {
 		const rules = readAllRules();
 		// Resolve node name inside the try so a throw fails open + retries (O2), not out of start().
 		nodeIdentity.name = getThisNodeName();
-		// mode precedence: replicated control row > config fallback > 'enforce'.
+		// control precedence (mode and scoreThreshold alike): replicated control row > config
+		// fallback > default — so both enforcement knobs are cluster-consistent once set via ops.
 		const mode = controlMode ?? options.mode ?? 'enforce';
 		const matcher = compileRules(rules, {
-			scoreThreshold,
+			scoreThreshold: controlScoreThreshold ?? scoreThreshold,
 			mode,
 			nodeIdentity,
 			onInvalidRule(ruleId, problems) {

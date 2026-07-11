@@ -15,7 +15,8 @@
  * - alter_waf_rule  { id, ...patch } — merges the patch into an existing rule and re-validates
  * - drop_waf_rule   { id }
  * - list_waf_rules  {}
- * - set_waf_mode    { mode }         — upserts the replicated control row (wave 2, decision b)
+ * - set_waf_mode    { mode?, scoreThreshold? } — upserts the replicated control row (wave 2,
+ *                    decision b); unspecified fields are preserved from the existing row
  */
 
 import { ClientError } from '../core/utility/errors/hdbError.ts';
@@ -33,7 +34,7 @@ const VALID_MODES = new Set<string>(['enforce', 'monitor', 'off']);
 /** The subset of the rule table the operations need (kept narrow for unit-testing). */
 export interface WafRuleStore {
 	get(id: string): any;
-	put(id: string, record: WafRule | { id: string; mode: string }, context?: object): any;
+	put(id: string, record: WafRule | { id: string; mode?: string; scoreThreshold?: number }, context?: object): any;
 	delete(id: string, context?: object): any;
 	primaryStore: { getRange(options: object): Iterable<{ key: unknown; value: any }> };
 }
@@ -144,17 +145,41 @@ export function makeWafRuleOperations(table: WafRuleStore) {
 		},
 
 		/**
-		 * Upserts the replicated control row that carries the global WAF mode (wave 2, decision b):
-		 * 'enforce' (normal), 'monitor' (everything runs as shadow), or 'off' (kill switch). The row
-		 * replicates cluster-wide like any other table row; each node's component reads it on recompile.
+		 * Upserts the replicated control row that carries the global WAF mode (wave 2, decision b) —
+		 * 'enforce' (normal), 'monitor' (everything runs as shadow), 'off' (kill switch) — and the
+		 * cluster-wide scoreThreshold (a per-node config threshold would let the same score rules
+		 * block on one node and pass on another). Unspecified fields are preserved from the existing
+		 * row, so setting one knob never clears the other. The row replicates cluster-wide like any
+		 * other table row; each node's component reads it on recompile.
 		 */
 		async setWafMode(request: any) {
 			requireSuperUser(request);
-			const mode = request.mode;
-			if (!VALID_MODES.has(mode))
+			const { mode, scoreThreshold } = request;
+			if (mode === undefined && scoreThreshold === undefined)
+				throw new ClientError('set_waf_mode requires mode and/or scoreThreshold');
+			if (mode !== undefined && !VALID_MODES.has(mode))
 				throw new ClientError(`set_waf_mode requires mode to be one of: enforce, monitor, off`);
-			await table.put(WAF_CONTROL_ID, { id: WAF_CONTROL_ID, mode }, { user: request.hdb_user });
-			return { message: `WAF mode set to ${mode}` };
+			// Reject non-finite/non-positive up front — recompile finite-guards too (defense in
+			// depth), but a bad value should fail the operation, not silently fall back.
+			if (scoreThreshold !== undefined && (!Number.isFinite(scoreThreshold) || scoreThreshold <= 0))
+				throw new ClientError('set_waf_mode requires scoreThreshold to be a finite positive number');
+			// Merge with the existing row via explicit field reads — a TrackedObject serves fields
+			// through inherited getters, so spread would copy nothing (see alterWafRule). Unset
+			// fields are omitted (not stored as undefined).
+			const existing = await table.get(WAF_CONTROL_ID);
+			const row: { id: string; mode?: string; scoreThreshold?: number } = { id: WAF_CONTROL_ID };
+			const mergedMode = mode ?? existing?.mode;
+			if (mergedMode !== undefined) row.mode = mergedMode;
+			const mergedThreshold = scoreThreshold ?? existing?.scoreThreshold;
+			if (mergedThreshold !== undefined) row.scoreThreshold = mergedThreshold;
+			await table.put(WAF_CONTROL_ID, row, { user: request.hdb_user });
+			const changed = [
+				mode !== undefined ? `mode set to ${mode}` : null,
+				scoreThreshold !== undefined ? `scoreThreshold set to ${scoreThreshold}` : null,
+			]
+				.filter(Boolean)
+				.join(', ');
+			return { message: `WAF ${changed}` };
 		},
 	};
 }

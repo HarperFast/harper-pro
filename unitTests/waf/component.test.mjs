@@ -224,6 +224,84 @@ describe('WAF component middleware', () => {
 		expect(decision.shadowRuleIds).to.deep.equal(['block-admin']);
 	});
 
+	it('control row scoreThreshold overrides the config threshold (cluster-consistent blocking)', () => {
+		const scoreRules = [
+			{
+				id: 's1',
+				enabled: true,
+				priority: 1,
+				phase: 'request',
+				action: 'score',
+				score: 3,
+				match: { path: { prefix: '/admin' } },
+			},
+			{
+				id: 's2',
+				enabled: true,
+				priority: 2,
+				phase: 'request',
+				action: 'score',
+				score: 3,
+				match: { path: { prefix: '/adm' } },
+			},
+		];
+		// config threshold 5 would block (3+3=6 >= 5); the replicated row raises it to 10 → pass
+		let server = makeFakeServer();
+		start({
+			server,
+			scoreThreshold: 5,
+			ensureTable: () => makeFakeTable([...scoreRules, { id: WAF_CONTROL_ID, scoreThreshold: 10 }]),
+		});
+		let reached = false;
+		server.middleware.listener(makeReq({ url: '/admin/x' }), () => (reached = true));
+		expect(reached).to.equal(true);
+		stop();
+		// the replicated row lowers it below the accumulated score → block despite a high config value
+		server = makeFakeServer();
+		start({
+			server,
+			scoreThreshold: 100,
+			ensureTable: () => makeFakeTable([...scoreRules, { id: WAF_CONTROL_ID, scoreThreshold: 6 }]),
+		});
+		reached = false;
+		const blocked = server.middleware.listener(makeReq({ url: '/admin/x' }), () => (reached = true));
+		expect(reached).to.equal(false);
+		expect(blocked.status).to.equal(403);
+	});
+
+	it('a non-finite control-row scoreThreshold is ignored (falls back to config, never poisons)', () => {
+		const scoreRules = [
+			{
+				id: 's1',
+				enabled: true,
+				priority: 1,
+				phase: 'request',
+				action: 'score',
+				score: 3,
+				match: { path: { prefix: '/admin' } },
+			},
+			{
+				id: 's2',
+				enabled: true,
+				priority: 2,
+				phase: 'request',
+				action: 'score',
+				score: 3,
+				match: { path: { prefix: '/adm' } },
+			},
+		];
+		const server = makeFakeServer();
+		start({
+			server,
+			scoreThreshold: 5,
+			ensureTable: () => makeFakeTable([...scoreRules, { id: WAF_CONTROL_ID, scoreThreshold: NaN }]),
+		});
+		let reached = false;
+		const blocked = server.middleware.listener(makeReq({ url: '/admin/x' }), () => (reached = true));
+		expect(reached).to.equal(false); // config threshold 5 still applies: 6 >= 5 blocks
+		expect(blocked.status).to.equal(403);
+	});
+
 	it("control row mode 'off' is a kill switch: matcher is empty and all traffic passes", () => {
 		const server = makeFakeServer();
 		const control = { id: WAF_CONTROL_ID, mode: 'off' };

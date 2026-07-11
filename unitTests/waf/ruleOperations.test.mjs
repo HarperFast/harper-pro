@@ -217,6 +217,47 @@ describe('WAF rule operations', () => {
 			expect(table.calls.put.every((c) => c.context.user === SUPER_USER)).to.equal(true);
 		});
 
+		it('set_waf_mode carries scoreThreshold and preserves the other knob on partial updates', async () => {
+			const table = makeFakeTable();
+			const operations = makeWafRuleOperations(table);
+			await operations.setWafMode({ hdb_user: SUPER_USER, scoreThreshold: 25 });
+			expect(table.map.get(WAF_CONTROL_ID)).to.deep.equal({ id: WAF_CONTROL_ID, scoreThreshold: 25 });
+			// mode-only update preserves the threshold
+			await operations.setWafMode({ hdb_user: SUPER_USER, mode: 'monitor' });
+			expect(table.map.get(WAF_CONTROL_ID)).to.deep.equal({
+				id: WAF_CONTROL_ID,
+				mode: 'monitor',
+				scoreThreshold: 25,
+			});
+			// threshold-only update preserves the mode
+			await operations.setWafMode({ hdb_user: SUPER_USER, scoreThreshold: 40 });
+			expect(table.map.get(WAF_CONTROL_ID)).to.deep.equal({
+				id: WAF_CONTROL_ID,
+				mode: 'monitor',
+				scoreThreshold: 40,
+			});
+		});
+
+		it('set_waf_mode rejects a non-finite/non-positive scoreThreshold and an empty request', async () => {
+			const table = makeFakeTable();
+			const operations = makeWafRuleOperations(table);
+			for (const bad of [NaN, Infinity, 0, -5, '10']) {
+				try {
+					await operations.setWafMode({ hdb_user: SUPER_USER, scoreThreshold: bad });
+					expect.fail(`expected rejection for scoreThreshold ${bad}`);
+				} catch (error) {
+					expect(error.statusCode, `scoreThreshold ${bad}`).to.equal(400);
+				}
+			}
+			try {
+				await operations.setWafMode({ hdb_user: SUPER_USER });
+				expect.fail('expected rejection for empty request');
+			} catch (error) {
+				expect(error.statusCode).to.equal(400);
+			}
+			expect(table.map.size).to.equal(0);
+		});
+
 		it('set_waf_mode rejects an invalid mode and non-super_user', async () => {
 			const table = makeFakeTable();
 			const operations = makeWafRuleOperations(table);
