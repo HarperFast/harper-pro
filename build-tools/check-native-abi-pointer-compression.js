@@ -31,6 +31,15 @@ if (process.config.variables.v8_enable_pointer_compression !== 1) {
 }
 
 const root = process.argv[2] || '.';
+
+// The per-file nm failures below are tolerated (non-ELF files), so a missing nm
+// binary must fail loudly here — otherwise the scan would silently check nothing.
+try {
+	execFileSync('nm', ['--version'], { stdio: 'ignore' });
+} catch {
+	console.error('nm (binutils) is required for the pointer-compression ABI check but was not found');
+	process.exit(1);
+}
 const platform = process.platform; // linux
 const arch = process.arch; // x64 | arm64
 const abi = process.versions.modules; // e.g. 137
