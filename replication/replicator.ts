@@ -27,6 +27,8 @@ import {
 	LATENCY_POSITION,
 } from './replicationConnection.ts';
 import { redactOperationForLog } from './logRedaction.ts';
+import { registerShutdownDrain } from '../core/components/shutdownDrain.ts';
+import { hasProgressingBlobSends, drainBlobSends } from './blobSendDrain.ts';
 import { server } from '../core/server/Server.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -71,7 +73,7 @@ export const servers = [];
 // This is the set of acceptable root certificates for replication, which includes the publicly trusted CAs if enabled
 // and any CAs that have been replicated across the cluster
 export const replicationCertificateAuthorities =
-	env.get(CONFIG_PARAMS.REPLICATION_ENABLEROOTCAS) !== false ? new Set(tls.rootCertificates) : new Set();
+	env.get(CONFIG_PARAMS.REPLICATION_ENABLEROOTCAS) !== false ? new Set(tls.rootCertificates) : new Set<string>();
 
 /**
  * Build mTLS configuration for replication server with certificate verification support
@@ -595,6 +597,11 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 export async function sendOperationToNode(node, operation, options?) {
 	if (!options) options = {};
 	options.serverName = node.name;
+	// This runs on the main thread (operations API), which never populates replicationCertificateAuthorities
+	// with peer CAs (monitorNodeCAs runs only on the replication worker threads). Pass the target peer's
+	// specific CA (hdb_nodes.ca) so createWebSocket trusts it, matching how the worker subscription path
+	// trusts each node's CA. Bootstrap callers (add_node/clone) pass a bare { url } node with no ca and are unaffected.
+	if (node.ca) options.nodeCA = node.ca;
 	const socket = await createWebSocket(getNodeURL(node), options);
 	const session = replicateOverWS(socket, {}, {});
 	return new Promise((resolve, reject) => {
@@ -715,6 +722,15 @@ export function forceReconnectToNode({ url, nodes, database }) {
 	exportIdMapping,
 	getIdOfRemoteNode,
 };
+
+// Gracefully drain in-flight replication blob sends before this worker shuts down during a restart,
+// so a deploy reload doesn't tear a transfer down mid-stream and leave the peer's copy diverged
+// (harper-pro#527 covers the receiver side). Only sends still making progress are waited on, bounded
+// by an absolute deadline core supplies; see blobSendDrain.ts.
+registerShutdownDrain({
+	hasWork: () => hasProgressingBlobSends(),
+	drain: (deadlineMs: number) => drainBlobSends(deadlineMs),
+});
 export function urlToNodeName(nodeUrl) {
 	if (nodeUrl) return new URL(nodeUrl).hostname; // this the part of the URL that is the node name, as we want it to match common name in the certificate
 }

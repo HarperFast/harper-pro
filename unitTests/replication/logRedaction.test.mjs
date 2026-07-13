@@ -41,6 +41,32 @@ describe('redactOperationForLog', () => {
 		expect(out.package).to.equal('npm:@myorg/app@1.0.0');
 	});
 
+	it('leaves reference-form registryAuth un-redacted (a secret name is a pointer, not a credential)', () => {
+		// Core's hdb_secret-backed registry auth replicates references, not tokens. A reference has no
+		// `token` field, so nothing is masked — and the whole operation returns by identity (no copy).
+		const input = {
+			operation: 'deploy_component',
+			project: 'my_app',
+			registryAuth: [{ registry: 'https://npm.pkg.github.com', secret: 'deploy.my_app.npm.pkg.github.com', scope: '@myorg' }],
+		};
+		const out = redactOperationForLog(input);
+		expect(out).to.equal(input);
+		expect(out.registryAuth[0].secret).to.equal('deploy.my_app.npm.pkg.github.com');
+	});
+
+	it('masks only the token-bearing entries in a mixed reference/token registryAuth array', () => {
+		const out = redactOperationForLog({
+			operation: 'deploy_component',
+			registryAuth: [
+				{ registry: 'https://npm.pkg.github.com', secret: 'deploy.app.gh', scope: '@myorg' },
+				{ registry: 'registry.example.com', token: 'stray_secret' },
+			],
+		});
+		expect(out.registryAuth[0].secret).to.equal('deploy.app.gh');
+		expect(out.registryAuth[0]).to.not.have.property('token');
+		expect(out.registryAuth[1].token).to.equal('[redacted]');
+	});
+
 	it('returns the same object reference when no sensitive field is present (no allocation)', () => {
 		const input = { operation: 'insert', records: [{ id: 1 }] };
 		expect(redactOperationForLog(input)).to.equal(input);
