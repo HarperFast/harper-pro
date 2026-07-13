@@ -43,6 +43,9 @@ perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/insta
 echo -e "\n📦 Building project"
 npm run build || true
 
+echo -e "\n📦 Pruning devDependencies"
+npm prune --omit=dev
+
 echo -e "\n📦 Creating shrinkwrap"
 npm shrinkwrap
 
