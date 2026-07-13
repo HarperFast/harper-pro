@@ -5,8 +5,10 @@
 import { recordAction } from '../core/resources/analytics/write.ts';
 import { getHdbBasePath } from '../core/utility/environment/environmentManager.js';
 import { PACKAGE_ROOT } from '../core/utility/packageUtils.js';
-import { realpathSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, realpathSync, readFileSync, readdirSync } from 'node:fs';
 import { execFile } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -24,6 +26,26 @@ if (process.env.RUN_HDB_APP) userCodeFolders.push(realpathSync(process.env.RUN_H
 
 let profilerTimer: NodeJS.Timeout | undefined;
 let profilerStarted = false;
+// @datadog/pprof prebuilds link the raw V8 ABI and segfault under V8 pointer compression. The
+// pointer-compression Docker image swaps in a binary rebuilt for that ABI and marks the package
+// with .pointer-compression-build; without the marker, skip profiling instead of crashing.
+const profilerSupported = (() => {
+	if ((process.config?.variables as { v8_enable_pointer_compression?: number })?.v8_enable_pointer_compression !== 1)
+		return true;
+	try {
+		const pprofDir = dirname(createRequire(__filename).resolve('@datadog/pprof/package.json'));
+		return existsSync(join(pprofDir, '.pointer-compression-build'));
+	} catch {
+		return false;
+	}
+})();
+function profilerUnavailable(): boolean {
+	if (profilerSupported) return false;
+	log.warn?.(
+		'Profiling disabled: @datadog/pprof is not built for this pointer-compression Node runtime (its prebuilds target the standard V8 ABI and would crash)'
+	);
+	return true;
+}
 const SAMPLING_INTERVAL_IN_MICROSECONDS = 50000;
 // Running this on the thread itself can be a problematic because the profiler snapshots are somewhat expensive
 //  (calling timeProfiler.stop and getting the large block of JSON and parsing it). This can take a 5ms or more
@@ -36,6 +58,7 @@ export function handleApplication({ options }: Scope) {
 			log.info?.('Profiling disabled by configuration');
 			return;
 		}
+		if (profilerUnavailable()) return;
 		// start the profiler
 		if (!profilerStarted) {
 			profilerStarted = true;
@@ -54,6 +77,7 @@ let gpuAvailable = true;
 
 export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) * 1000): Promise<void> {
 	clearTimeout(profilerTimer);
+	if (profilerUnavailable()) return;
 	if (!profilerStarted) {
 		profilerStarted = true;
 		timeProfiler.start({ intervalMicros: SAMPLING_INTERVAL_IN_MICROSECONDS });
