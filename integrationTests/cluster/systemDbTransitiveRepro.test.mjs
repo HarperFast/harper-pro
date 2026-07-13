@@ -16,6 +16,7 @@
  *   node --test integrationTests/cluster/systemDbTransitiveRepro.test.mjs
  */
 import { suite, test, before, after } from 'node:test';
+import { ok } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
@@ -66,14 +67,6 @@ async function waitForRecord(node, id, { timeoutMs = 60000, pollMs = 300 } = {})
 async function clusterStatus(node) {
 	return sendOperation(node, { operation: 'cluster_status' }).catch((e) => ({ error: String(e) }));
 }
-function summarizeConnections(label, status, names) {
-	const conns = status?.connections || status?.[0]?.connections || [];
-	const rows = (Array.isArray(conns) ? conns : []).map((c) => {
-		const nm = names[c.url] || c.node_name || c.name || c.url;
-		return `${nm}${c.connected ? '' : '(down)'}`;
-	});
-	return `${label} sees peers: [${rows.join(', ')}]  (node_name=${status?.node_name})  raw=${JSON.stringify(conns).slice(0, 400)}`;
-}
 
 suite('REPRO: system-db replication vs directional topology', { timeout: 180000 }, (ctx) => {
 	before(async () => {
@@ -94,7 +87,10 @@ suite('REPRO: system-db replication vs directional topology', { timeout: 180000 
 
 		await Promise.all([
 			// Core receives from Middle only
-			startHarper(ctxC, optionsFor(C, [{ hostname: M, port: 9933, replicates: { sends: false, receives: true } }], DBS)),
+			startHarper(
+				ctxC,
+				optionsFor(C, [{ hostname: M, port: 9933, replicates: { sends: false, receives: true } }], DBS)
+			),
 			// Middle sends up to Core, receives from Roadside
 			startHarper(
 				ctxM,
@@ -108,7 +104,10 @@ suite('REPRO: system-db replication vs directional topology', { timeout: 180000 
 				)
 			),
 			// Roadside sends up to Middle only (NO route to Core)
-			startHarper(ctxR, optionsFor(R, [{ hostname: M, port: 9933, replicates: { sends: true, receives: false } }], DBS)),
+			startHarper(
+				ctxR,
+				optionsFor(R, [{ hostname: M, port: 9933, replicates: { sends: true, receives: false } }], DBS)
+			),
 		]);
 
 		ctx.nodeC = ctxC.harper;
@@ -148,8 +147,8 @@ suite('REPRO: system-db replication vs directional topology', { timeout: 180000 
 		// (1) transitive upstream: roadside write should reach core via middle
 		const rec = 'up-' + Date.now();
 		await insertRecord(nodeR, rec);
-		const reachedM = await waitForRecord(nodeM, rec, { timeoutMs: 90000 });
-		const reachedC = await waitForRecord(nodeC, rec, { timeoutMs: 90000 });
+		const reachedM = await waitForRecord(nodeM, rec, { timeoutMs: 60000 });
+		const reachedC = await waitForRecord(nodeC, rec, { timeoutMs: 60000 });
 		console.log(`\n[DATAFLOW transitive R->M->C] reached Middle=${reachedM} Core=${reachedC}`);
 
 		// (2) direct upstream edge: a MIDDLE write should reach core (M sends, C receives)
@@ -219,7 +218,9 @@ suite('REPRO: system-db replication vs directional topology', { timeout: 180000 
 		// If Core never learns R => mesh averted only by non-propagation (weaker; central visibility lost).
 		const rName = ctx.R;
 		let coreKnowsRoadside = false;
-		for (let i = 0; i < 120; i++) {
+		// Diagnostic only (central visibility of a far leaf is NOT guaranteed — the hdb_nodes registry
+		// relay differs from data relay), so keep this probe short.
+		for (let i = 0; i < 24; i++) {
 			const rows = await sendOperation(nodeC, {
 				operation: 'search_by_id',
 				database: 'system',
@@ -235,7 +236,7 @@ suite('REPRO: system-db replication vs directional topology', { timeout: 180000 
 			await delay(500);
 		}
 		if (!coreKnowsRoadside) console.log('[PROBE] Core NEVER learned Roadside in 60s (hdb_nodes relay did not deliver)');
-		await delay(6000); // give any (buggy) mesh connection time to establish after discovery
+		await delay(3000); // give any (buggy) mesh connection time to establish after discovery
 		const ipName = (u = '') => (u.match(/127\.0\.0\.\d+/) || [u])[0];
 		const scAfter = await clusterStatus(nodeC);
 		console.log('[PROBE] Core connections AFTER discovery + settle:');
@@ -264,5 +265,12 @@ suite('REPRO: system-db replication vs directional topology', { timeout: 180000 
 				? '[VERDICT] MESH REFORMED: a direct Core<->Roadside socket exists (system propagation defeats tight topology)'
 				: '[VERDICT] TOPOLOGY HELD: no direct Core<->Roadside socket (chain preserved)'
 		);
+
+		// Assertions — the durable invariants (the role/discovery probes above stay diagnostics: central
+		// visibility of every far leaf is intentionally NOT guaranteed, and the hdb_nodes relay is racy).
+		ok(reachedM, 'roadside data write should reach middle');
+		ok(reachedC, 'roadside data write should reach core transitively (R->M->C)');
+		ok(midReachedC, 'middle data write should reach core (direct up edge)');
+		ok(!coreTouchesRoadside, 'no direct Core<->Roadside replication socket should form even with `system` replicated');
 	});
 });
