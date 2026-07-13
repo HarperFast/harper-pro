@@ -433,6 +433,46 @@ export async function startOnMainThread(options) {
 		// nodes → brand-new-node case); the authoritative check is at the unsubscribe decision
 		// point in onDatabase below, which has the loaded hdb_nodes rows in hand (harper-pro#351).
 		reportIdentityMismatchOnce(nodes);
+		// Derive a DIRECTIONAL self-record from this node's config routes instead of a blanket
+		// `replicates: true`. When the system database is replicated for node discovery, this
+		// self-record propagates through the cluster, and the existing controlled-flow gates
+		// (shouldReplicateFromNode / the send-side authority gate — harper-pro#498) then keep a
+		// discovered (non-neighbor) peer from opening a direct connection: they consult this peer's
+		// advertised sendsTo/receivesFrom rather than falling back to a permissive boolean. This is
+		// what lets `system` replicate (so users/roles/schema propagate everywhere) while user
+		// databases stay on the configured roadside→middle→core topology. A node with no directional
+		// routes keeps the legacy `replicates: true` (full-mesh) behavior.
+		function computeSelfReplicates(): true | { sendsTo: any[]; receivesFrom: any[] } {
+			const sendsTo: any[] = [];
+			const receivesFrom: any[] = [];
+			for (const route of iterateRoutes(options) as any) {
+				const rep = route.replicates;
+				const peer = route.name;
+				if (rep && typeof rep === 'object') {
+					if (rep.sends) sendsTo.push({ target: peer });
+					if (rep.receives) receivesFrom.push({ source: peer });
+					// A route-level sendsTo/receivesFrom entry may scope by `database` while leaving the peer
+					// implicit (it's this route's peer). Default target/source to the route peer so the
+					// propagated self-record is fully qualified (peer + database) for the discovered-peer gates.
+					for (const e of rep.sendsTo || []) {
+						const entry = typeof e === 'string' ? { target: e } : { ...e };
+						if (!entry.target) entry.target = peer;
+						sendsTo.push(entry);
+					}
+					for (const e of rep.receivesFrom || []) {
+						const entry = typeof e === 'string' ? { source: e } : { ...e };
+						if (!entry.source) entry.source = peer;
+						receivesFrom.push(entry);
+					}
+				} else if (rep === true || rep == undefined) {
+					// full-replication neighbor: advertise both directions to it
+					sendsTo.push({ target: peer });
+					receivesFrom.push({ source: peer });
+				}
+			}
+			if (sendsTo.length === 0 && receivesFrom.length === 0) return true;
+			return { sendsTo, receivesFrom };
+		}
 		function ensureThisNode() {
 			// If it doesn't exist and or needs to be updated.
 			// getSync (not get): on RocksDB, get() returns a Promise on a block-cache miss, which is
@@ -447,7 +487,7 @@ export async function startOnMainThread(options) {
 						name: thisName,
 						url,
 						shard: options.shard,
-						replicates: true,
+						replicates: computeSelfReplicates(),
 					});
 				}
 			}
