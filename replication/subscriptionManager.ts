@@ -78,12 +78,6 @@ type ReplicationConnectionStatus = {
 type DBReplicationStatusMap = Map<string, ReplicationConnectionStatus> & { iterator?: any };
 
 const NODE_SUBSCRIBE_DELAY = 200; // delay before sending node subscribe to other nodes, so operations can complete first
-// When a worker dies it may have been holding subscriptions for many (database, node) pairs.
-// All of those pairs fire onDatabase reassignments in the same tick, which would otherwise
-// slam a fresh worker with a burst of catchup connections and is the kind of pressure that
-// caused the OOM in the first place. We stagger the re-subscriptions in time so the new
-// worker(s) absorb them gradually.
-const WORKER_EXIT_REASSIGN_STAGGER_MS = 100;
 // When the wedge reconcile re-drives disconnected subscriptions, each one opens a new WebSocket
 // (and for TLS, a full TLS handshake). Firing hundreds simultaneously can spike memory (each
 // replicateOverWS instance + TLS buffer). Stagger them so at most ~1 new connection starts
@@ -115,7 +109,10 @@ const WEDGE_RECONCILE_THRESHOLD_MS = 30_000;
 // reconnect (resume from the persisted copy cursor, no data loss) is an acceptable trade for guaranteeing
 // the wedge can never be permanent. See findStalledReceivingNodeUrls.
 const RECEIVE_STALL_THRESHOLD_MS = 15 * 60_000;
-let nextWorkerExitReassignAt = 0;
+// One 'exit' listener per worker (tracked here), not one per (database, node) subscription — the old
+// per-subscription registration accumulated D×P listeners on the shared worker objects and tripped
+// MaxListenersExceededWarning past ~10 databases (harper-pro#357).
+const workersWithExitHandler = new WeakSet<any>();
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
 
 // Resolve an auditStore for a database (any table's will do — the per-(db, peer) shared-memory status
@@ -182,6 +179,32 @@ function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string }
 // `worker: undefined` when httpWorkers is empty, and without this the entry would never
 // get reassigned once workers came back. Pure helper so the reconcile pass below — and its
 // unit tests — can verify the broken-chain detection without spinning up real workers.
+// Clear a dead worker from every subscription entry it owned, so findStaleNodeUrls re-binds those
+// entries on a live worker. Pure helper (like findStaleNodeUrls) so its behavior is unit-testable without
+// real worker threads. Returns whether the worker owned any entries. See harper-pro#357.
+export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationStatusMap>, worker: any): boolean {
+	let owned = false;
+	for (const dbReplicationWorkers of connectionMap.values()) {
+		for (const entry of dbReplicationWorkers.values()) {
+			if (entry.worker === worker) {
+				entry.worker = undefined;
+				owned = true;
+			}
+			// Also drop the dead worker from per-node refs (entry.nodes[].worker); connectToNextWorker sets
+			// those via Object.defineProperty (configurable, non-writable), so delete (not assign) clears them
+			// and avoids retaining the exited Worker. See gemini review on #446.
+			if (entry.nodes) {
+				for (const node of entry.nodes) {
+					if (node?.worker === worker) {
+						delete node.worker;
+						owned = true;
+					}
+				}
+			}
+		}
+	}
+	return owned;
+}
 export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatusMap>, httpWorkers: any[]): Set<string> {
 	const staleNodeUrls = new Set<string>();
 	// No live workers to reassign to — flagging here would cause endless no-op reassignments.
@@ -457,7 +480,11 @@ export async function startOnMainThread(options) {
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
 	 */
-	function onNodeUpdate(node, hostname = node?.name, forceResubscribe = false) {
+	// `subscribeStagger` (when provided) spaces this call's per-database subscribe scheduling
+	// RECONNECT_STAGGER_MS apart via a shared running counter, so a reassignment sweep that re-drives
+	// many databases doesn't open all their catchup connections in one tick. Only the stale-worker
+	// reconcile passes it; normal node updates leave it undefined and keep the flat NODE_SUBSCRIBE_DELAY.
+	function onNodeUpdate(node, hostname = node?.name, forceResubscribe = false, subscribeStagger?: { count: number }) {
 		const isSelf =
 			(getThisNodeName() && hostname === getThisNodeName()) || (getThisNodeUrl() && node?.url === getThisNodeUrl());
 		if (isSelf) {
@@ -645,17 +672,7 @@ export async function startOnMainThread(options) {
 					// stamps disconnectedAt) would otherwise be invisible to findWedgedNodeUrls. See harper-pro#466.
 					createdAt: Date.now(),
 				});
-				worker?.on('exit', () => {
-					// when a worker exits, we need to remove the entry from the map, and then reassign the subscriptions
-					if (dbReplicationWorkers.get(databaseName)?.worker === worker) {
-						// first verify it is still the worker
-						dbReplicationWorkers.delete(databaseName);
-						const now = Date.now();
-						nextWorkerExitReassignAt = Math.max(now, nextWorkerExitReassignAt) + WORKER_EXIT_REASSIGN_STAGGER_MS;
-						const delay = nextWorkerExitReassignAt - now;
-						setTimeout(() => onDatabase(databaseName, tablesReplicateByDefault), delay).unref();
-					}
-				});
+				ensureWorkerExitHandler(worker);
 			}
 			if (shouldSubscribe) {
 				let leaderUrl: string =
@@ -686,6 +703,11 @@ export async function startOnMainThread(options) {
 				// from the "first other node in hdb_nodes" fallback — that's just a guess.
 				nodes[0].isLeader = nodes[0].isLeader || !leaderName || (hasExplicitLeader && nodeName === leaderName);
 				nodes[0].url ??= getNodeURL(nodes[0]);
+				// Stagger the subscribe when reassigning (subscribeStagger set) so N databases on one peer
+				// don't dial N catchup connections simultaneously; otherwise use the flat delay. See #446.
+				const subscribeDelay = subscribeStagger
+					? NODE_SUBSCRIBE_DELAY + subscribeStagger.count++ * RECONNECT_STAGGER_MS
+					: NODE_SUBSCRIBE_DELAY;
 				setTimeout(() => {
 					const request = {
 						...nodes[0],
@@ -696,7 +718,7 @@ export async function startOnMainThread(options) {
 					if (worker) {
 						worker.postMessage(request);
 					} else subscribeToNode(request);
-				}, NODE_SUBSCRIBE_DELAY);
+				}, subscribeDelay);
 			} else {
 				logger.info('Node no longer should be used, unsubscribing from node', {
 					replicates: node.replicates,
@@ -923,6 +945,17 @@ export async function startOnMainThread(options) {
 	// an exited worker, silently breaking outbound replication for the lifetime of the
 	// process. This reconciles independently of the chain so the broken-state node
 	// can never get stuck.
+	// One 'exit' handler per worker (harper-pro#357). When a worker dies, clear it from any subscriptions it
+	// owned so findStaleNodeUrls re-binds them, then run the reconcile immediately (fast path) instead of
+	// waiting up to RECONCILE_INTERVAL_MS. Registered at most once per worker via workersWithExitHandler; the
+	// 5s reconcile remains the backstop if a worker exit never fires (hung refs).
+	function ensureWorkerExitHandler(worker) {
+		if (!worker || workersWithExitHandler.has(worker)) return;
+		workersWithExitHandler.add(worker);
+		worker.once('exit', () => {
+			if (clearWorkerFromEntries(connectionReplicationMap, worker)) reconcileWorkers();
+		});
+	}
 	function reconcileWorkers() {
 		const now = Date.now();
 		// Reconcile the inferred `connected` flag against the authoritative shared-memory truth the owning
@@ -981,6 +1014,7 @@ export async function startOnMainThread(options) {
 				'Reconciling replication subscriptions stalled connected:true with no receive progress:',
 				Array.from(stalledByUrl.keys())
 			);
+		const staleNodesToReassign: any[] = []; // reassigned after the loop so onNodeUpdate doesn't mutate nodeMap mid-iteration
 		for (const node of nodeMap.values()) {
 			const url = getNodeURL(node);
 			const isWedged = wedgedNodeUrls.has(url);
@@ -1072,9 +1106,22 @@ export async function startOnMainThread(options) {
 						`Reconciling ${reconnectCount} stalled connected:true subscription(s) for ${url} (no receive progress for ${RECEIVE_STALL_THRESHOLD_MS}ms; staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms)`
 					);
 			}
-			if (staleNodeUrls.has(url) && !isWedged) {
+			if (staleNodeUrls.has(url) && !isWedged) staleNodesToReassign.push(node);
+		}
+		if (staleNodesToReassign.length > 0) {
+			// A dead worker can own subscriptions across many nodes, and onNodeUpdate re-drives EVERY
+			// replicated database for a node in one tick. Re-driving them all opens a burst of catchup
+			// WebSocket/TLS handshakes that can spike memory — the OOM the per-(db,node) worker-exit
+			// staggering guarded against before #357 made the reconcile the single reassignment path. A
+			// per-node stagger alone left the per-database burst (a peer with N databases dialed N at once),
+			// so stagger per DATABASE across the whole sweep like the wedge path does. See cb1kenobi review on #446.
+			const subscribeStagger = { count: 0 };
+			for (const node of staleNodesToReassign) {
+				// The node may have been removed or replaced since we flagged it; only re-drive it if it is
+				// still the current entry in nodeMap, so a deleted node isn't resurrected (gemini review).
+				if (nodeMap.get(node.name) !== node) continue;
 				try {
-					onNodeUpdate(node);
+					onNodeUpdate(node, node.name, false, subscribeStagger);
 				} catch (error) {
 					logger.error('Error reconciling node', node?.name, error);
 				}
@@ -1214,19 +1261,41 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 	// explicit demotion, which is allowed to clear it.
 	const alreadyLocalOnly = existing?.isLeader === true && node.isLeader !== false;
 
+	// Use an explicit, isolated context for this write instead of relying on ambient fallback
+	// (contextStorage.getStore()). This is internal node-registry bookkeeping, not a user-authored
+	// write: ensureNode() runs both for genuine admin-initiated add_node calls AND for internal
+	// inter-node bookkeeping (addNodeBack, received over the replication socket, whose "hdb_user" is
+	// just the resolved auth principal of the peer connection) — neither should be stamped onto a
+	// system table row as if a user directly wrote it (see core's registerLiveSubscriptionForContext:
+	// "Internal watchers, replication and local-bypass have no user principal").
+	//
+	// This was also, until harper#1720, a correctness bug, not just an attribution one:
+	// processLocalTransaction (core#1591/#1592) wraps an entire operation handler invocation in one
+	// contextStorage.run(...) call, installing a single, long-lived, mutable context object as the
+	// ambient store for the whole handler. Because setNode()/addNodeBack() each call ensureNode()
+	// twice in sequence (once for this node's own record, once for the peer's), the second call could
+	// see the first call's already-completed transaction still attached to the shared context and
+	// wrongly join it instead of starting its own — silently dropping one of the two writes (verified
+	// via instrumented harper-pro integrationTests/cluster/replicationTopology.test.mjs against core
+	// commit af646222d: a peer's `ca` field failed to persist into hdb_nodes, producing
+	// SELF_SIGNED_CERT_IN_CHAIN on subsequent mesh connections). harper#1720 fixes that generally at
+	// the core level. Passing a fresh context per call here restores the pre-#1591 behavior (every
+	// internal static Resource API call always got its own throwaway `{}` context) as defense in
+	// depth, and fixes the attribution issue regardless of the core fix.
+	const writeContext: any = {};
 	if (options?.localOnly || alreadyLocalOnly) {
 		// Persist the node row with the LOCAL_ONLY metadata bit so it never replicates to peers
 		// (e.g. a v4 bridge peer that must stay invisible to the rest of the v5 mesh — harper-pro #246).
 		// The public patch() API has no per-write option slot, so write through the resource's internal
 		// _writeUpdate, which threads { localOnly } down to the record encoder. Wrapped in a transaction
 		// to mirror the transactional() boundary that the public patch()/put() path provides.
-		await transaction(async (txn) => {
+		await transaction(writeContext, async (txn) => {
 			const context = (txn as any).getContext();
 			const resource: any = await table.getResource(name, context, { async: true });
 			await resource._writeUpdate(name, node, false, { localOnly: true });
 			await resource.save?.();
 		});
 	} else {
-		await table.patch(node);
+		await table.patch(node, writeContext);
 	}
 }

@@ -55,6 +55,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 const RECORDS = 80; // file-backed blobs seeded on the source, base-copied to the subscriber
 const BLOB_CHUNKS = process.env.HARPER_TEST_BLOB_CHUNKS || '128'; // 128 * 4096 = 512 KB/blob -> many BLOB_CHUNK frames
 const CONVERGE_TIMEOUT_MS = 60000;
+const SEED_CONVERGE_TIMEOUT_MS = 20000; // single-node local writes; no cross-node replication involved yet
 const POLL_MS = 500;
 const FIXTURE = join(import.meta.dirname ?? module.path, 'fixture-blob-gap-deadlock-source');
 
@@ -90,8 +91,23 @@ suite('Copy-mode blob deadlock (base copy)', { timeout: 240000 }, (ctx) => {
 			seedPromises.push(fetchWithRetry(ctx.nodes[0].httpURL + '/Prerender/' + id));
 		}
 		await Promise.all(seedPromises);
-		const aDesc = await sendOperation(ctx.nodes[0], { operation: 'describe_table', table: 'Prerender' });
-		ok((aDesc.record_count ?? 0) >= RECORDS, `source did not materialize blobs: holds ${aDesc.record_count}/${RECORDS}`);
+
+		// A sourcedFrom GET resolves the HTTP response as soon as the source's get() returns; the
+		// cache-populating write (and, since harper#1641, the blob's durability fsync it now gates
+		// on) commits in the background afterward. So Promise.all(seedPromises) resolving does NOT
+		// guarantee all RECORDS commits have landed yet — poll describe_table for the actual
+		// condition instead of asserting on it immediately.
+		const seedDeadline = Date.now() + SEED_CONVERGE_TIMEOUT_MS;
+		let aRecordCount = -1;
+		while (Date.now() < seedDeadline) {
+			const aDesc = await sendOperation(ctx.nodes[0], { operation: 'describe_table', table: 'Prerender' }).catch(
+				() => null
+			);
+			aRecordCount = aDesc?.record_count ?? 0;
+			if (aRecordCount >= RECORDS) break;
+			await delay(POLL_MS);
+		}
+		ok(aRecordCount >= RECORDS, `source did not materialize blobs: holds ${aRecordCount}/${RECORDS}`);
 	});
 
 	after(async () => {

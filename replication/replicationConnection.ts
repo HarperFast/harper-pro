@@ -36,6 +36,7 @@ import { redactOperationForLog } from './logRedaction.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import { registerBlobSend, noteBlobSendProgress, endBlobSend, isDrainingBlobSends } from './blobSendDrain.ts';
 import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
@@ -75,6 +76,7 @@ import {
 import { promises as fsPromises } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
+import { FrameWriter } from './frameWriter.ts';
 const logger = forComponent('replication').conditional as Logger;
 
 // msgpackr v2 removed the built-in `randomAccessStructure` option; that random-access
@@ -306,7 +308,7 @@ const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
 // `replication_pauseStallTimeout` for clusters with extreme single-transaction sizes.
 const PAUSE_STALL_THRESHOLD_MS =
 	env.get('replication_pauseStallTimeout') ??
-	Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 120000) * 2);
+	Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000) * 2);
 
 /**
  * Decide whether an idle replication connection should be terminated as dead.
@@ -325,6 +327,55 @@ const PAUSE_STALL_THRESHOLD_MS =
  */
 export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pauseReasons: number): boolean {
 	return pauseReasons === 0 && idleMs >= pingTimeout;
+}
+
+/**
+ * Handle an error that escaped `onWSMessage` (the inbound handler in `replicateOverWS`).
+ *
+ * Historically this was logged and swallowed. That silently dropped the rest of the failed frame
+ * while later frames kept applying and confirming ever-higher sequence ids — a permanent,
+ * undetected `[error, head]` gap on the receiver (epic harper-pro#430 Theme B; workstream
+ * harper-pro#440). Recovery instead rides the established transient-close path:
+ *
+ *   1. `markInboundClosed` FIRST — frames already queued behind this one on the
+ *      `messageProcessing` chain must not apply (they would commit past the hole), and after
+ *      `ws.close()` the peer can still deliver frames until the close handshake completes.
+ *   2. `close(1011)` (internal error — distinct from the 1008 policy closes) WITHOUT the
+ *      `intentional` flag, so `NodeReplicationConnection`'s normal retry path reconnects with
+ *      backoff and resumes from the last durable cursor, re-streaming everything past it.
+ *      Records applied before the error redeliver idempotently (version dedup).
+ *
+ * A deterministic error (e.g. a genuinely undecodable frame) becomes a visible, backed-off
+ * reconnect loop instead of silent loss; bounding that with an escalation budget is W2
+ * (harper-pro#432) territory.
+ *
+ * Coverage boundary: this path handles FRAME-level errors (header/command decode, audit-entry
+ * structure, unexpected rejections from awaited handler work). A per-record VALUE decode failure
+ * is caught earlier by the inner catch around `decodeBlobsWithWrites` and skip-and-logged, and
+ * the batch resume cursor still advances past the skipped record — that residual silent-gap
+ * class is tracked in harper-pro#440 (with W2 #432).
+ *
+ * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
+ * catch in `onWSMessage`.
+ */
+export function closeOnInboundMessageError(
+	error: unknown,
+	deps: {
+		connectionId: string | number;
+		logger?: { error?: (...args: unknown[]) => void };
+		markInboundClosed: () => void;
+		close: (code: number, reason: string) => void;
+	}
+): void {
+	deps.markInboundClosed();
+	// The log must never prevent the close — this handler is the last line of defense, so the
+	// logger access is fully guarded rather than trusted.
+	deps.logger?.error?.(
+		deps.connectionId,
+		'Error handling incoming replication message; closing so replication resumes from the last durable cursor',
+		error
+	);
+	deps.close(1011, 'Error handling incoming replication message');
 }
 
 /**
@@ -377,6 +428,37 @@ export function isBlobStreamTimedOut(lastChunk: number, blobTimeout: number, now
 }
 
 /**
+ * Race a backpressure `drain` wait against the connection going away, so a mid-flush peer disconnect
+ * always lets the waiter settle instead of parking forever on a `drain` that will never fire.
+ *
+ * `sendBlobs` awaits this whenever `ws._socket.writableNeedDrain` is true (both the mid-loop wait and
+ * the terminal-frame flush wait have this exact shape). Without racing `close`/`error`, a peer that
+ * closes the connection while backpressured leaves the await unsettled, so `sendBlobs`'s `finally`
+ * never runs: `endBlobSend` is skipped and the drain token leaks in `blobSendDrain`'s module-global
+ * `activeSends` for the rest of the worker's life (harper-pro#529 review, cb1kenobi). Listening on both
+ * the raw socket (`drain`/`close`/`error`) and the WebSocket wrapper (`close`) covers a close that
+ * surfaces on either emitter; all listeners are removed once one fires, so nothing is left registered
+ * after the promise settles.
+ *
+ * Exported so the race itself is unit-testable with plain EventEmitters standing in for the socket/ws.
+ */
+export function waitForDrainOrSocketEnd(socket: EventEmitter, ws: EventEmitter): Promise<void> {
+	return new Promise<void>((resolve) => {
+		const done = () => {
+			socket.off('drain', done);
+			socket.off('close', done);
+			socket.off('error', done);
+			ws.off('close', done);
+			resolve();
+		};
+		socket.once('drain', done);
+		socket.once('close', done);
+		socket.once('error', done);
+		ws.once('close', done);
+	});
+}
+
+/**
  * Credit the back-pressure pause back to every in-flight blob stream at the moment the receiver resumes
  * (the point where the pause-reason refcount drops to zero). Because reads are suspended while paused,
  * these streams processed no chunks during the pause and their `lastChunk` would otherwise make
@@ -394,6 +476,80 @@ export function refreshBlobStreamsOnResume(blobsInFlight: Map<any, { lastChunk?:
 	for (const stream of blobsInFlight.values()) {
 		if (stream.lastChunk !== undefined) stream.lastChunk += pausedMs;
 	}
+}
+
+/**
+ * Abort each still-receiving blob when the replication connection closes, rather than leaving the
+ * half-written stream for core's source-idle watchdog to reap `blobTimeout` (REPLICATION_BLOBTIMEOUT,
+ * up to 15 min) later. A worker restart on the sender — routine in the deploy_component lifecycle —
+ * closes the WS mid-blob; without this the receiver holds the stream until that watchdog fires, only
+ * then stamping a PENDING stub, so the diverged blob lingers for the whole timeout before the reconnect
+ * can re-request it. Destroying with a plain Error is classified TRANSIENT by `receiveBlobs`'s `.catch`
+ * (not `sourceBlobUnavailable`, not a permanent source error), which sets `hasBlobGap` → the resume
+ * cursor clamps at the last durable transaction → the reconnect re-streams the blob promptly. Each
+ * abort's `.finally` in `receiveBlobs` unregisters its in-flight marker, so `onAbort` (the sweep's
+ * explicit unregister) is redundant but harmless and keeps parity with the `blobsTimer` sweep.
+ *
+ * A COMPLETED-but-unconnected stream (`writableEnded`, its chunks arrived ahead of its record) is
+ * skipped: its bytes are fully buffered and an in-flight message handler that was paused when the close
+ * fired can still attach to it via `receiveBlobs` and save it — destroying it would discard received
+ * data and force an unnecessary re-request. Left in the map, it is either attached during teardown or
+ * discarded with the connection's `blobsInFlight` on reconnect (re-streamed from the resume cursor).
+ *
+ * That stream's core-level receive-in-flight marker (`registerBlobReceiveInFlight`, taken by the chunk
+ * handler when the stream was created) is released here too, via `onAbort`, even though the stream
+ * itself is preserved. If its record never arrives, nothing else ever releases that marker: `blobsTimer`
+ * is already cleared above, and `receiveBlobs`'s `.finally` — the normal release site — never runs for a
+ * stream it never touched. Left unreleased, `isBlobReceiveInFlight` for this fileId would stay true for
+ * the process lifetime, permanently 503-ing reads of that blob (harper-pro#527 review). This trades a
+ * brief window — an in-flight handler on THIS closing connection could still attach and save the stream
+ * after its marker is gone — for closing a leak that otherwise never heals; that window is bounded to
+ * this one connection's already-queued work, and `unregisterBlobReceiveInFlight` is idempotent (guarded
+ * on absent state), so `receiveBlobs`'s own later release for the same stream, if it does still run, is a
+ * safe no-op rather than a double-release.
+ *
+ * Exported so the teardown can be unit-tested in isolation; the production caller is the ws `'close'`
+ * handler in `replicateOverWS`. Deleting the current entry mid-iteration is safe for a Map.
+ */
+export function abortInFlightBlobsOnClose(
+	blobsInFlight: Map<any, { destroy?: (error: Error) => void; writableEnded?: boolean }>,
+	remoteNodeName: string,
+	onAbort?: (blobId: any) => void
+): number {
+	let aborted = 0;
+	for (const [blobId, stream] of blobsInFlight) {
+		if (stream.writableEnded) {
+			// Fully received, waiting for its record — preserve its bytes, but release its marker (see above).
+			onAbort?.(blobId);
+			continue;
+		}
+		blobsInFlight.delete(blobId);
+		onAbort?.(blobId);
+		const error = new Error(
+			`Replication connection to ${remoteNodeName || 'unknown'} closed before blob ${blobId} finished; will re-request on reconnect`
+		) as Error & { replicationConnectionClosed?: boolean };
+		// Mark it so receiveBlobs's .catch treats it as a routine, self-healing interruption (clamp +
+		// re-request) rather than logging an error and bumping the divergence metric on every restart.
+		error.replicationConnectionClosed = true;
+		stream.destroy?.(error);
+		aborted++;
+	}
+	return aborted;
+}
+
+/**
+ * Whether a blob-save rejection came from {@link abortInFlightBlobsOnClose} — i.e. the replication
+ * connection closed mid-blob (e.g. a peer worker restart in the deploy_component lifecycle). This is a
+ * TRANSIENT, self-healing interruption: `receiveBlobs` clamps the resume cursor and the reconnect
+ * re-requests the blob, so it should NOT be logged as an error or counted as a divergence
+ * (cluster_status.blobReplicationFailures) — that would spam logs and inflate the metric on every deploy.
+ */
+export function isReplicationConnectionClosedError(error: unknown): boolean {
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		(error as { replicationConnectionClosed?: boolean }).replicationConnectionClosed === true
+	);
 }
 
 /**
@@ -912,11 +1068,25 @@ type NodeSubscription = {
 
 let replicationSecureContext: tls.SecureContext & { caCount?: number; derivedFromContext?: tls.SecureContext };
 
+/**
+ * Build the trusted-CA list for a replication TLS connection: the replication CA set (root CAs plus
+ * every peer's hdb_nodes.ca, kept current by monitorNodeCAs) combined with the secure context's own
+ * CAs. `nodeCA` explicitly adds a specific peer's CA — used for replicated operations
+ * (replicateOperation → sendOperationToNode), which run on the main thread. monitorNodeCAs populates
+ * replicationCertificateAuthorities only on the replication worker threads, so on the main thread that
+ * set holds just the root CAs — it never contains peer CAs, hence the explicit per-peer CA here.
+ */
+export function mergeReplicationCAs(availableCAs?: Iterable<string>, nodeCA?: string): string[] {
+	const cas = [...replicationCertificateAuthorities, ...(availableCAs ?? [])];
+	if (nodeCA) cas.push(nodeCA);
+	return cas;
+}
+
 export async function createWebSocket(
 	url: string,
-	options: { authorization?: string; rejectUnauthorized?: boolean; serverName?: string }
+	options: { authorization?: string; rejectUnauthorized?: boolean; serverName?: string; nodeCA?: string }
 ) {
-	const { authorization, rejectUnauthorized } = options || {};
+	const { authorization, rejectUnauthorized, nodeCA } = options || {};
 
 	const node_name = getThisNodeName();
 	let secureContext;
@@ -967,20 +1137,33 @@ export async function createWebSocket(
 		secureContext: undefined,
 	};
 	if (secureContext) {
-		// check to see if our cached secure context is still valid
-		if (
-			replicationSecureContext?.caCount !== replicationCertificateAuthorities.size ||
-			replicationSecureContext?.derivedFromContext !== secureContext
-		) {
-			// create a secure context and cache by the number of replication CAs (if that changes, we need to create a new secure context)
-			replicationSecureContext = tls.createSecureContext({
+		if (nodeCA) {
+			// Replicated operations (replicateOperation → sendOperationToNode) run on the main thread.
+			// monitorNodeCAs populates replicationCertificateAuthorities only on the replication worker
+			// threads, so on the main thread it holds just the root CAs and never the peers' CAs. Trust
+			// this peer's specific CA (its hdb_nodes.ca) explicitly — the same per-node CA the worker
+			// subscription path trusts. Built fresh rather than reusing replicationSecureContext: the CA is
+			// per-target and this is a cold path (deploy/cert/add_node), not the hot subscription path.
+			wsOptions.secureContext = tls.createSecureContext({
 				...secureContext.options,
-				ca: [...replicationCertificateAuthorities, ...secureContext.options.availableCAs.values()], // add CA if secure context had one
+				ca: mergeReplicationCAs(secureContext.options.availableCAs?.values(), nodeCA),
 			});
-			replicationSecureContext.caCount = replicationCertificateAuthorities.size;
-			replicationSecureContext.derivedFromContext = secureContext;
+		} else {
+			// check to see if our cached secure context is still valid
+			if (
+				replicationSecureContext?.caCount !== replicationCertificateAuthorities.size ||
+				replicationSecureContext?.derivedFromContext !== secureContext
+			) {
+				// create a secure context and cache by the number of replication CAs (if that changes, we need to create a new secure context)
+				replicationSecureContext = tls.createSecureContext({
+					...secureContext.options,
+					ca: mergeReplicationCAs(secureContext.options.availableCAs?.values()), // add CA if secure context had one
+				});
+				replicationSecureContext.caCount = replicationCertificateAuthorities.size;
+				replicationSecureContext.derivedFromContext = secureContext;
+			}
+			wsOptions.secureContext = replicationSecureContext;
 		}
-		wsOptions.secureContext = replicationSecureContext;
 	}
 	return new WebSocket(url, 'harperdb-replication-v1', wsOptions);
 }
@@ -1281,10 +1464,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		' ' +
 		Math.random().toString().slice(2, 3);
 	logger.debug?.(connectionId, 'Initializing replication connection', authorization);
-	let encodingStart = 0;
-	let encodingBuffer = Buffer.allocUnsafeSlow(1024);
-	let position = 0;
-	let dataView = new DataView(encodingBuffer.buffer, 0, 1024);
+	const frame = new FrameWriter();
 	let databaseName = options.database;
 	const dbSubscriptions = options.databaseSubscriptions || databaseSubscriptions;
 	let auditStore: any;
@@ -1573,7 +1753,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// drains to disk — so the watchdog can tell a healthy back-pressure pause (consumer draining) from a
 	// leg that died mid-pause (harper-pro#466). Only meaningful while paused.
 	let consumerProgress = 0;
-	const blobTimeout = env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 120000;
+	// Default 15min: a 120s cap dropped ~4,500 blobs to permanent divergence when a rolling
+	// upgrade + concurrent writes had blob transfers routinely stalling past the timeout, the
+	// receive watchdog then killed the subscription, and the audit cursor advanced past the
+	// missing blob. 900000 lets in-flight transfers complete across a peer restart window.
+	const blobTimeout = env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000;
 	const blobsInFlight = new Map();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
@@ -1692,9 +1876,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// (reset on COPY_START and on each in-copy 'message'; stopped on copy finish / pause). On a stall it
 	// forces the same close-independent reconnect, which restarts the copy from the leader. (harper-pro#453)
 	copyProgressWatchdog = createReceiveWatchdog({
-		// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 120000 and is shared with blobsTimer; guard
+		// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 900000 and is shared with blobsTimer; guard
 		// against a misconfigured 0/negative that would otherwise forceReconnect in a tight loop.
-		intervalMs: blobTimeout > 0 ? blobTimeout : 120000,
+		intervalMs: blobTimeout > 0 ? blobTimeout : 900000,
 		getBytesRead: () => copyProgressFrames,
 		onSilence: () => {
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
@@ -2634,15 +2818,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										subscriptionToHdbNodes = subscription;
 										for await (const event of subscriptionToHdbNodes) {
 											const node = event.value;
-											if (
-												!(
-													node?.replicates === true ||
-													node?.replicates?.receives ||
-													node?.replicates?.receivesFrom?.some(
-														(sub) => sub.source === getThisNodeName() && sub.database === databaseName
-													)
+											if (!(
+												node?.replicates === true ||
+												node?.replicates?.receives ||
+												node?.replicates?.receivesFrom?.some(
+													(sub) => sub.source === getThisNodeName() && sub.database === databaseName
 												)
-											) {
+											)) {
 												closed = true;
 												close(1008, `Unauthorized database subscription to ${databaseName}`);
 												return;
@@ -2700,20 +2882,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						const sendAuditRecord = (auditRecord, localTime) => {
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnTime) {
-									if (encodingBuffer[encodingStart] !== 66) {
+									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
 										logger.error?.(
 											new Error('Invalid encoding of message to'),
 											remoteNodeName,
 											databaseName,
-											encodingBuffer
+											frame.encodingBuffer
 										);
 									}
-									writeInt(9); // replication message of nine bytes long
-									writeInt(REMOTE_SEQUENCE_UPDATE); // action id
-									writeFloat64((sentSequenceId = localTime)); // send the local time so we know what sequence number to start from next time.
+									frame.writeInt(9); // replication message of nine bytes long
+									frame.writeInt(REMOTE_SEQUENCE_UPDATE); // action id
+									frame.writeFloat64((sentSequenceId = localTime)); // send the local time so we know what sequence number to start from next time.
 									sendQueuedData();
 								}
-								encodingStart = position;
+								frame.encodingStart = frame.position;
 								currentTransaction.txnTime = 0;
 								return; // end of transaction, nothing more to do
 							}
@@ -2729,7 +2911,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							if (!tableEntry) {
 								tableEntry = tableById[tableId] = tableToTableEntry(tableSubscriptionToReplicator.tableById[tableId]);
 								if (!tableEntry) {
-									return logger.debug?.('Not subscribed to table', tableId);
+									// Must yield like every other skip path: a contiguous run of entries for a
+									// table this peer doesn't subscribe to (or a dropped table, or corrupt-entry
+									// sentinels with tableId undefined) otherwise iterates with await undefined,
+									// which never leaves the microtask queue. Timers, I/O, and watchdogs starve
+									// for the whole run, and the periodic sequence updates skipAuditRecord sends
+									// never go out, so the peer's cursor can't advance past the run and every
+									// reconnect rescans it from the start.
+									logger.debug?.('Not subscribed to table', tableId);
+									return skipAuditRecord();
 								}
 							}
 							const table = tableEntry.table;
@@ -2911,14 +3101,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								if (currentTransaction.txnTime) {
 									if (DEBUG_MODE)
 										logger.trace?.(connectionId, 'new txn time, sending queued txn', currentTransaction.txnTime);
-									if (encodingBuffer[encodingStart] !== 66) {
+									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
 										logger.error?.('Invalid encoding of message');
 									}
 									sendQueuedData();
 								}
 								currentTransaction.txnTime = txnTime;
-								encodingStart = position;
-								writeFloat64(txnTime);
+								frame.encodingStart = frame.position;
+								frame.writeFloat64(txnTime);
 							}
 
 							/*
@@ -2926,8 +3116,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							and username from subsequent audit entries in multiple entry transactions*/
 							if (invalidationEntry) {
 								// if we have an invalidation entry to send, do that now
-								writeInt(invalidationEntry.length);
-								writeBytes(invalidationEntry);
+								frame.writeInt(invalidationEntry.length);
+								frame.writeBytes(invalidationEntry);
 							} else {
 								// directly write the audit record.
 								const encoded = auditRecord.encoded;
@@ -2941,8 +3131,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								}
 								// If it starts with the previous local time, we omit that
 								const start = encoded[0] === 66 ? 8 : 0;
-								writeInt(encoded.length - start);
-								writeBytes(encoded, start);
+								frame.writeInt(encoded.length - start);
+								frame.writeBytes(encoded, start);
 								logger.debug?.(
 									'wrote record',
 									auditRecord.recordId,
@@ -2961,27 +3151,41 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									logger.debug?.(
 										`Waiting for remote node ${remoteNodeName} to allow more commits ${ws._socket.writableNeedDrain ? 'due to network backlog' : 'due to requested flow directive'}`
 									);
-									ws._socket.once('drain', () => {
-										resolve();
+									const onDrain = () => {
+										ws.off('close', onClose);
 										isPausedForBackPressure = false;
 										updateBackPressureRatio();
-									});
+										// Also wait out blob saturation before admitting the next record; as an
+										// else-if this check was unreachable while the socket stayed congested.
+										// The !wsClosed guard matters: a drain queued behind the close event would
+										// otherwise push onto an already-flushed callback list and park forever.
+										if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT && !wsClosed) {
+											blobSentCallbacks.push(resolve);
+										} else resolve();
+									};
+									const onClose = () => {
+										// a closed socket never drains; resolve so the loop can observe closed and exit
+										ws._socket?.off('drain', onDrain);
+										resolve();
+									};
+									ws._socket.once('drain', onDrain);
+									ws.once('close', onClose);
 								});
-							} else if (outstandingBlobsBeingSent > MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+							} else if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT && !wsClosed) {
 								return new Promise((resolve) => {
 									blobSentCallbacks.push(resolve);
 								});
 							} else return new Promise(setImmediate); // yield on each turn for fairness and letting other things run
 						};
 						const sendQueuedData = () => {
-							if (position - encodingStart > 8) {
+							if (frame.position - frame.encodingStart > 8) {
 								// if we have more than just a txn time, send it
-								if (checkExcessMessageSize(position - encodingStart)) return;
-								ws.send(encodingBuffer.subarray(encodingStart, position));
-								logger.debug?.(connectionId, 'Sent message, size:', position - encodingStart);
+								if (checkExcessMessageSize(frame.position - frame.encodingStart)) return;
+								ws.send(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
+								logger.debug?.(connectionId, 'Sent message, size:', frame.position - frame.encodingStart);
 								if (databaseName !== 'system') {
 									recordAction(
-										position - encodingStart,
+										frame.position - frame.encodingStart,
 										'bytes-sent',
 										`${remoteNodeName}.${databaseName}`,
 										'replication',
@@ -2998,8 +3202,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
-							| undefined;
+							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -3198,10 +3401,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													const now = Date.now();
 													if (copyFlushPacer.due(now)) {
 														copyFlushPacer.mark(now);
-														if (position - encodingStart > 8) {
+														if (frame.position - frame.encodingStart > 8) {
 															recordsSinceCheckpoint = 0;
 															sendQueuedData();
-															encodingStart = position;
+															frame.encodingStart = frame.position;
 															currentTransaction.txnTime = 0;
 														}
 														await new Promise(setImmediate);
@@ -3270,11 +3473,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// Available/cloned with rows still uncopied. (Records with differing versions already flush
 													// naturally above; this also bounds same-version bulk data into committable batches.) The
 													// watermark is only advanced to copyStartTime by the single end_txn after the whole copy.
-													if (++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS && position - encodingStart > 8) {
+													if (
+														++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS &&
+														frame.position - frame.encodingStart > 8
+													) {
 														recordsSinceCheckpoint = 0;
 														copyFlushPacer.mark(Date.now());
 														sendQueuedData();
-														encodingStart = position;
+														frame.encodingStart = frame.position;
 														currentTransaction.txnTime = 0;
 													}
 												}
@@ -3285,8 +3491,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												// no records pending (none sent, or the last batch landed on a checkpoint flush):
 												// force a txn so the end_txn below still carries the sequence update
 												currentTransaction.txnTime = copyStartTime;
-												encodingStart = position;
-												writeFloat64(copyStartTime);
+												frame.encodingStart = frame.position;
+												frame.writeFloat64(copyStartTime);
 											}
 											// ALWAYS emit the final end_txn at copyStartTime. It carries the REMOTE_SEQUENCE_UPDATE
 											// that advances the follower's seqId and received-version watermark to copyStartTime —
@@ -3334,7 +3540,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										await sendAuditRecord(auditRecord, key);
 										auditSubscription.startTime = key; // update so don't double send
 									}
-									if (position - encodingStart > 8) {
+									if (frame.position - frame.encodingStart > 8) {
 										sendAuditRecord(
 											{
 												type: 'end_txn',
@@ -3476,10 +3682,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						}
 					);
 				} catch (error) {
+					// Guarded dereferences: tableDecoder is undefined for an unknown tableId, and an unguarded
+					// log line here used to throw its own TypeError — masking the original error and escaping
+					// to the outer catch, so the skip-vs-close outcome was decided by accident (#440).
 					logger.error?.(
 						'Error decoding replication message, record id: ' + id,
-						' typed structures for current decoder' + JSON.stringify(tableDecoder.decoder.typedStructs),
-						' structures for current decoder' + JSON.stringify(tableDecoder.decoder.structures),
+						' typed structures for current decoder: ' +
+							(JSON.stringify(tableDecoder?.decoder?.typedStructs) ?? 'unknown table decoder'),
+						' structures for current decoder: ' +
+							(JSON.stringify(tableDecoder?.decoder?.structures) ?? 'unknown table decoder'),
 						'encoded message',
 						auditRecord.encoded.subarray(0, 1000),
 						auditRecord,
@@ -3731,7 +3942,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			};
 			tableSubscriptionToReplicator.send(endTxnEvent);
 		} catch (error) {
-			logger.error?.(connectionId, 'Error handling incoming replication message', error);
+			closeOnInboundMessageError(error, {
+				connectionId,
+				logger,
+				markInboundClosed: () => (wsClosed = true),
+				close,
+			});
 		}
 	}
 	ws.on('ping', resetPingTimer);
@@ -3768,9 +3984,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		copyProgressWatchdog?.stop();
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
+		// The blobsTimer that would otherwise reap stalled receives is now cleared, and the connection is
+		// gone, so abort any in-flight blob receives immediately instead of waiting up to blobTimeout for
+		// core's source-idle watchdog. This clamps the resume cursor (transient failure) so the reconnect
+		// re-requests them promptly — a worker restart on the sender (deploy_component lifecycle) closes the
+		// WS mid-blob, and holding the stream for the full timeout is what leaves the blob diverged.
+		if (blobsInFlight.size > 0) {
+			const aborted = abortInFlightBlobsOnClose(blobsInFlight, remoteNodeName, (blobId) =>
+				unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore)
+			);
+			logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`);
+		}
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
 		if (hdbNodesSubscription) hdbNodesSubscription.end();
+		// Wake queued blob senders and writer waits so they observe wsClosed instead of parking forever
+		while (blobSentCallbacks.length > 0) blobSentCallbacks.shift()?.();
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
@@ -3798,6 +4027,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// The same blobs can't be sent concurrently of the packets will get mixed up. The receiving
 	// end should handle aggregated the results of the same blob for separate record requests.
 	const blobsBeingSent = new Set();
+	let blobSendErrorsSuppressed = 0;
+	let lastBlobSendErrorLog = 0;
 	async function sendBlobs(blob: Blob, recordId: any) {
 		// found a blob, start sending it
 		const id = getFileId(blob);
@@ -3805,8 +4036,37 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.debug?.('Blob already being sent', id);
 			return;
 		}
+		if (wsClosed) return;
+		if (isDrainingBlobSends()) {
+			// The worker is draining for shutdown; don't start a new send that we'd only tear down (or
+			// hold the drain open for). The peer re-requests this blob on reconnect (harper-pro#527).
+			logger.debug?.('Worker draining, not starting new blob send', id);
+			return;
+		}
 		blobsBeingSent.add(id);
+		// Acquire a send slot before opening the blob stream. Enforcing the cap only at the audit
+		// writer's backpressure check didn't bound concurrency: there it sat in an else-if behind the
+		// drain wait (unreachable while the socket stayed congested) and the GET_RECORD path never
+		// checked it at all, so concurrent sends grew by one per drain event (200+ drain listeners
+		// on one TLSSocket observed in the field).
+		while (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+			await new Promise((resolve) => blobSentCallbacks.push(resolve));
+			if (wsClosed) {
+				blobsBeingSent.delete(id);
+				return;
+			}
+			if (isDrainingBlobSends()) {
+				// A shutdown drain can start while this send was queued behind the concurrency cap;
+				// don't let a freshly-dequeued send start after that point (same reasoning as the
+				// pre-queue check above).
+				blobsBeingSent.delete(id);
+				return;
+			}
+		}
 		const iterator = blob.stream()[Symbol.asyncIterator]();
+		// Track this send so a worker restart can gracefully drain it (finish it if it's still making
+		// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
+		const drainToken = registerBlobSend();
 		try {
 			let lastBuffer: Buffer;
 			outstandingBlobsBeingSent++;
@@ -3817,7 +4077,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// receiver's apply consumer wedges at `lastReceivedStatus:"Receiving"` until its own idle
 			// watchdog fires (core/resources/blob.ts) 120s later. With the timeout, the catch below
 			// emits the finishing error frame so the receiver advances cleanly.
-			// Defaults ON to the replication blob timeout (REPLICATION_BLOBTIMEOUT, 120000 default) so a
+			// Defaults ON to the replication blob timeout (REPLICATION_BLOBTIMEOUT, 900000 default) so a
 			// stalled send can't silently wedge a base copy out of the box (harper-pro#453). The
 			// HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS env var overrides it; set it to 0 to disable.
 			const rawEnv = process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS;
@@ -3860,12 +4120,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					);
 				}
 				lastBuffer = buffer;
-				if (ws._socket.writableNeedDrain) {
+				// Optional-chain the guard: the connection can close during an await, leaving `_socket` null.
+				if (ws._socket?.writableNeedDrain) {
 					logger.debug?.('draining', id);
-					await new Promise((resolve) => ws._socket.once('drain', resolve));
+					// Waiting on the socket to flush IS progress — mark it so a shutdown drain doesn't misread a
+					// slow-but-alive peer (a large chunk taking longer than the stall window to flush) as stalled.
+					noteBlobSendProgress(drainToken);
+					// Races against close/error so a mid-flush disconnect still lets `finally` below run
+					// (endBlobSend/outstandingBlobsBeingSent cleanup) instead of hanging on a `drain` that
+					// will never fire (harper-pro#529 review, cb1kenobi).
+					await waitForDrainOrSocketEnd(ws._socket, ws);
 					logger.debug?.('drained', id);
 				}
 				recordAction(buffer.length, 'bytes-sent', `${remoteNodeName}.${databaseName}`, 'replication', 'blob');
+				noteBlobSendProgress(drainToken);
 			}
 			logger.debug?.('Sending final blob chunk', id, 'length', lastBuffer.length);
 			if (checkExcessMessageSize(lastBuffer.length)) throw new Error('Blob chunk too large');
@@ -3880,11 +4148,33 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					lastBuffer,
 				])
 			);
+			noteBlobSendProgress(drainToken);
+			// Keep this send "in flight" until the terminal frame has actually flushed to the socket, so a
+			// concurrent shutdown drain waits for the `finished:true` frame rather than exiting with it still
+			// buffered (which would leave the peer's blob diverged until it re-requests). Only waits under
+			// backpressure; if the peer stops reading, the drain's stall detection abandons it after the
+			// stall window and the receiver re-requests (harper-pro#527).
+			if (ws._socket?.writableNeedDrain) {
+				// Same close/error race as the mid-loop wait above — otherwise a peer that disconnects
+				// while this terminal-frame flush is parked on backpressure never lets `finally` run.
+				await waitForDrainOrSocketEnd(ws._socket, ws);
+				noteBlobSendProgress(drainToken);
+			}
 		} catch (error) {
 			try {
 				await iterator.return?.();
 			} catch {}
-			logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
+			// Throttle the warn (a peer backfilling thousands of already-deleted blobs makes this fire
+			// at kHz); the error frame below is unconditional
+			const errorLogTime = Date.now();
+			if (errorLogTime - lastBlobSendErrorLog >= 5000) {
+				if (blobSendErrorsSuppressed > 0) {
+					logger.warn?.(`Suppressed ${blobSendErrorsSuppressed} additional blob send errors in the last 5s`);
+				}
+				blobSendErrorsSuppressed = 0;
+				lastBlobSendErrorLog = errorLogTime;
+				logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
+			} else blobSendErrorsSuppressed++;
 			// Forward the error CODE and STATUS alongside the message so the receiver can tell a PERMANENT
 			// source failure — the blob is gone (ENOENT/404) or confidently corrupt/incomplete (500,
 			// harper-pro#429) — from a TRANSIENT read fault (EIO, EMFILE, timeout, 503 write-in-progress —
@@ -3907,6 +4197,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				])
 			);
 		} finally {
+			endBlobSend(drainToken);
 			blobsBeingSent.delete(id);
 			outstandingBlobsBeingSent--;
 			while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
@@ -3951,6 +4242,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// This .catch runs inside the same microtask chain that onCommit's
 					// `await Promise.all(outstandingBlobsToFinish)` is waiting on; we deliberately do NOT tear
 					// down here. Classify the failure to decide whether the resume cursor holds or advances.
+					if (isReplicationConnectionClosedError(err)) {
+						// The connection closed mid-blob (e.g. a peer worker restart in the deploy_component
+						// lifecycle). Clamp like any transient gap so the reconnect re-requests it, but skip the
+						// error log and the divergence metric below — this is routine and self-healing, and would
+						// otherwise spam logs / inflate cluster_status.blobReplicationFailures on every deploy.
+						logger.debug?.(
+							connectionId,
+							`Blob ${blobId} receive interrupted by connection close; will re-request on reconnect`
+						);
+						hasBlobGap = true;
+						return;
+					}
 					if (isUnrecoverableSourceBlobError(err)) {
 						// The sender reported it cannot provide this blob (BLOB_CHUNK `error` marker — typically
 						// ENOENT because the blob was evicted/expired at the origin). Re-streaming on reconnect
@@ -4463,25 +4766,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 		ws.send(encode([DB_SCHEMA, tables, databaseName]));
 	}
-	blobsTimer = setInterval(() => {
-		const now = Date.now();
-		// Discount the time spent in the *current* (not-yet-ended) back-pressure pause: a pause can outlast
-		// blobTimeout, and this sweep fires independently of the pause, so without crediting the ongoing
-		// pause it would destroy a healthy stream mid-pause before `removePauseReason` ever runs (harper-pro
-		// #368). Shifting `lastChunk` forward by the ongoing pause duration here mirrors the permanent shift
-		// `removePauseReason` applies on resume.
-		const ongoingPauseMs = pauseReasons > 0 ? now - pauseStartTime : 0;
-		for (const [blobId, stream] of blobsInFlight) {
-			if (isBlobStreamTimedOut(stream.lastChunk + ongoingPauseMs, blobTimeout, now)) {
-				logger.warn?.(
-					`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
-				);
-				blobsInFlight.delete(blobId);
-				unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
-				stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
+	blobsTimer = setInterval(
+		() => {
+			const now = Date.now();
+			// Discount the time spent in the *current* (not-yet-ended) back-pressure pause: a pause can outlast
+			// blobTimeout, and this sweep fires independently of the pause, so without crediting the ongoing
+			// pause it would destroy a healthy stream mid-pause before `removePauseReason` ever runs (harper-pro
+			// #368). Shifting `lastChunk` forward by the ongoing pause duration here mirrors the permanent shift
+			// `removePauseReason` applies on resume.
+			const ongoingPauseMs = pauseReasons > 0 ? now - pauseStartTime : 0;
+			for (const [blobId, stream] of blobsInFlight) {
+				if (isBlobStreamTimedOut(stream.lastChunk + ongoingPauseMs, blobTimeout, now)) {
+					logger.warn?.(
+						`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
+					);
+					blobsInFlight.delete(blobId);
+					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
+					stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
+				}
 			}
-		}
-	}, blobTimeout).unref();
+			// Sweep more often than the idle threshold: with the interval coupled to blobTimeout (900s
+			// default), an orphaned stream could hold its buffered chunks for up to 2x blobTimeout.
+		},
+		Math.max(Math.min(blobTimeout > 0 ? blobTimeout : 900000, 60000), 1000)
+	).unref();
 
 	let nextId = 1;
 	const sentTableNames = [];
@@ -4534,48 +4842,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			});
 		},
 	};
-
-	// write an integer to the current buffer
-	function writeInt(number) {
-		checkRoom(5);
-		if (number < 128) {
-			encodingBuffer[position++] = number;
-		} else if (number < 0x4000) {
-			dataView.setUint16(position, number | 0x8000);
-			position += 2;
-		} else if (number < 0x3f000000) {
-			dataView.setUint32(position, number | 0xc0000000);
-			position += 4;
-		} else {
-			encodingBuffer[position] = 0xff;
-			dataView.setUint32(position + 1, number);
-			position += 5;
-		}
-	}
-
-	// write raw binary/bytes to the current buffer
-	function writeBytes(src, start = 0, end = src.length) {
-		const length = end - start;
-		checkRoom(length);
-		src.copy(encodingBuffer, position, start, end);
-		position += length;
-	}
-
-	function writeFloat64(number) {
-		checkRoom(8);
-		dataView.setFloat64(position, number);
-		position += 8;
-	}
-	function checkRoom(length) {
-		if (length + 16 > encodingBuffer.length - position) {
-			const newBuffer = Buffer.allocUnsafeSlow(((position + length - encodingStart + 0x10000) >> 10) << 11);
-			encodingBuffer.copy(newBuffer, 0, encodingStart, position);
-			position = position - encodingStart;
-			encodingStart = 0;
-			encodingBuffer = newBuffer;
-			dataView = new DataView(encodingBuffer.buffer, 0, encodingBuffer.length);
-		}
-	}
 
 	function checkExcessMessageSize(messageSize) {
 		if (messageSize > MAX_PAYLOAD) {
