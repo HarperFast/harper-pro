@@ -16,4 +16,17 @@ if [ "$#" -ne 3 ]; then
 	exit 2
 fi
 
-printf 'node=%s;uws=%s;pprof=%s' "$1" "$2" "$3" | sha256sum | cut -c1-16
+# sha256sum on Linux (the CI runners); fall back to shasum so the script also runs
+# locally on macOS. Both print "<hash>  <file>", so cut -c1-16 takes the hash prefix.
+sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum
+	elif command -v shasum >/dev/null 2>&1; then
+		shasum -a 256
+	else
+		echo "error: neither sha256sum nor shasum found" >&2
+		exit 1
+	fi
+}
+
+printf 'node=%s;uws=%s;pprof=%s' "$1" "$2" "$3" | sha256 | cut -c1-16
