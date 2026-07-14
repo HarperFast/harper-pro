@@ -74,6 +74,14 @@ describe('computeSelfReplicates', () => {
 		expect(result).to.deep.equal({ sendsTo: [{ target: 'X' }], receivesFrom: [{ source: 'Y' }] });
 	});
 
+	it('tolerates a misconfigured non-array sendsTo/receivesFrom instead of throwing', () => {
+		// Route config comes from YAML and isn't schema-validated; a typo'd object or string in place of
+		// an array must not crash boot.
+		expect(
+			computeSelfReplicates([{ name: 'M', replicates: { sendsTo: { target: 'M' }, receivesFrom: 'oops' } }])
+		).to.deep.equal({ sendsTo: [], receivesFrom: [] });
+	});
+
 	it('returns an EMPTY directional record (not true) for an explicit "replicate nothing" route', () => {
 		// A directional object that authorizes nothing must not silently re-advertise a full mesh.
 		expect(computeSelfReplicates([{ name: 'M', replicates: { sends: false, receives: false } }])).to.deep.equal({

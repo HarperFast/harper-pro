@@ -137,7 +137,7 @@ suite('REPRO(b): per-database opposite directions + system on', { timeout: 24000
 	});
 
 	test('cardata flows up, config flows down, no direct core<->roadside socket', async () => {
-		const { nodeC, nodeM, nodeR } = ctx;
+		const { nodeC, nodeR } = ctx;
 
 		const up = 'up-' + Date.now();
 		await insert(nodeR, UP, up);

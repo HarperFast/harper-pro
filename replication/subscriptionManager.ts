@@ -429,12 +429,15 @@ export function computeSelfReplicates(routeList: Iterable<any>): true | { sendsT
 			sawDirectional = true;
 			if (rep.sends) sendsTo.push({ target: peer });
 			if (rep.receives) receivesFrom.push({ source: peer });
-			for (const e of rep.sendsTo || []) {
+			// Array.isArray (not `|| []`): route config comes from YAML and isn't schema-validated, so a
+			// misconfigured non-array sendsTo/receivesFrom (object or string) must not crash boot in a
+			// `for...of`. Matches the same guard in routeEntriesIncludePeer.
+			for (const e of Array.isArray(rep.sendsTo) ? rep.sendsTo : []) {
 				const entry = typeof e === 'string' ? { target: e } : { ...e };
 				if (!entry.target) entry.target = peer;
 				sendsTo.push(entry);
 			}
-			for (const e of rep.receivesFrom || []) {
+			for (const e of Array.isArray(rep.receivesFrom) ? rep.receivesFrom : []) {
 				const entry = typeof e === 'string' ? { source: e } : { ...e };
 				if (!entry.source) entry.source = peer;
 				receivesFrom.push(entry);
