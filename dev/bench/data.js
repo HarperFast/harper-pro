@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783941830700,
+  "lastUpdate": 1784026732613,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -1507,6 +1507,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 3259.92,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "3215f3357c9325eaf3062096eb39853452f4027d",
+          "message": "fix: tighten engines.node to match re2's install-time requirement\n\nre2 (and its node-gyp source-build fallback) requires\n^22.22.2 || ^24.15.0 || >=26.0.0, narrower than the root package.json's\n^22.18.0 || >=24.0.0. Node 22.18.0-22.22.1 and 24.0.0-24.14.x satisfy\nthe old range but not re2's, so an install on one of those patch\nversions would warn/fail. Tighten the declared range to match.",
+          "timestamp": "2026-07-14T01:24:10Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/3215f3357c9325eaf3062096eb39853452f4027d"
+        },
+        "date": 1784026731483,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 9499.55,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 25030.03,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 19539.35,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 7709.29,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 5852.38,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2471.22,
             "unit": "ops/sec"
           }
         ]
