@@ -31,10 +31,10 @@ jobs:
         # build-pc job so its dispatch-only base image can never block this
         # standard release image (see build-pc / the PUBLISH_PC_VARIANT gate).
         include:
-          - { node-version: 24, platform: linux/amd64, runner: ubuntu-latest, variant: standard }
-          - { node-version: 24, platform: linux/arm64, runner: ubuntu-24.04-arm, variant: standard }
-          - { node-version: 25, platform: linux/amd64, runner: ubuntu-latest, variant: standard }
-          - { node-version: 25, platform: linux/arm64, runner: ubuntu-24.04-arm, variant: standard }
+          - { node-version: 24, platform: linux/amd64, runner: ubuntu-latest }
+          - { node-version: 24, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { node-version: 25, platform: linux/amd64, runner: ubuntu-latest }
+          - { node-version: 25, platform: linux/arm64, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -62,7 +62,6 @@ jobs:
           build-args: |
             NODE_BUILD_VERSION=${{ matrix.node-version }}-trixie
             NODE_VERSION=${{ matrix.node-version }}-trixie
-            ${{ matrix.variant == 'pc' && format('RUN_IMAGE=harperfast/node-pointer-compression:{0}', matrix.node-version) || '' }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=harperfast/harper-pro,push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
@@ -73,7 +72,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digest-${{ matrix.variant == 'pc' && 'pc-' || '' }}node${{ matrix.node-version }}-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          name: digest-node${{ matrix.node-version }}-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -559,6 +558,22 @@ jobs:
     needs: [build, merge, build-pc, merge-pc]
     runs-on: ubuntu-latest
     steps:
+      - name: Compose status
+        id: status
+        # Distinguish a standard-image failure from a pc-only failure: when the
+        # standard `merge` succeeded the image did publish, and only the (opt-in)
+        # pc variant failed — don't report a healthy standard release as failed.
+        env:
+          MERGE_RESULT: ${{ needs.merge.result }}
+        run: |
+          #!/usr/bin/env bash
+          if [ "${MERGE_RESULT}" = "success" ]; then
+            echo "text=Harper Pro v${{ needs.merge.outputs.docker-image-tag }}: standard image published, pc variant failed" >> "$GITHUB_OUTPUT"
+            echo "status_line=:warning: Standard image published to :docker_logo:; pc variant build failed" >> "$GITHUB_OUTPUT"
+          else
+            echo "text=Harper Pro v${{ needs.merge.outputs.docker-image-tag }} Docker publish failed" >> "$GITHUB_OUTPUT"
+            echo "status_line=:x: Failed to publish to :docker_logo:" >> "$GITHUB_OUTPUT"
+          fi
       - uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
         with:
           method: chat.postMessage
@@ -566,7 +581,7 @@ jobs:
           payload: |
             {
               "channel": "#development-ci",
-              "text": "Harper Pro v${{ needs.merge.outputs.docker-image-tag }} Docker publish failed",
+              "text": "${{ steps.status.outputs.text }}",
               "blocks": [
                 {
                   "type": "header",
@@ -584,7 +599,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": ":x: Failed to publish to :docker_logo:"
+                      "text": "${{ steps.status.outputs.status_line }}"
                     },
                     {
                       "type": "mrkdwn",
