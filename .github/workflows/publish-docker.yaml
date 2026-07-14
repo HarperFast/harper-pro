@@ -505,10 +505,12 @@ jobs:
             --submit >> "${GITHUB_STEP_SUMMARY}"
 
   send-slack-message-on-success:
-    # Standard image is the release gate; pc is opt-in, so success is keyed on merge
-    # and only suppressed if the pc leg actually failed (skipped/success both fine).
-    if: ${{ !cancelled() && needs.merge.result == 'success' && needs.merge-pc.result != 'failure' }}
-    needs: [merge, merge-pc]
+    # Standard image is the release gate; pc is opt-in. Fire only when the standard
+    # image published (merge succeeded, which implies build did) and the pc legs did
+    # not fail. A pc failure surfaces at build-pc (which skips merge-pc), so check
+    # build-pc too — skipped (pc off) is fine, only failure suppresses success.
+    if: ${{ !cancelled() && needs.merge.result == 'success' && needs.build-pc.result != 'failure' && needs.merge-pc.result != 'failure' }}
+    needs: [merge, build-pc, merge-pc]
     runs-on: ubuntu-latest
     steps:
       - name: Send Slack published notification
@@ -549,10 +551,12 @@ jobs:
             }
 
   send-slack-message-on-failure:
-    # Alert if either the standard or the pc merge failed (pc failure no longer
-    # blocks the standard image, but we still surface it).
-    if: ${{ !cancelled() && (needs.merge.result == 'failure' || needs.merge-pc.result == 'failure') }}
-    needs: [merge, merge-pc]
+    # Alert if any standard or pc leg that ran failed. A failed build skips its merge
+    # (result 'skipped', not 'failure'), so check the build jobs too or a build-stage
+    # failure would be swallowed. pc failure no longer blocks the standard image, but
+    # we still surface it.
+    if: ${{ !cancelled() && (needs.build.result == 'failure' || needs.merge.result == 'failure' || needs.build-pc.result == 'failure' || needs.merge-pc.result == 'failure') }}
+    needs: [build, merge, build-pc, merge-pc]
     runs-on: ubuntu-latest
     steps:
       - uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
