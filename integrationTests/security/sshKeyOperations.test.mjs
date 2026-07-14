@@ -59,7 +59,13 @@ suite('SSH Key Operations', (ctx) => {
 
 		({ status, data } = await sendOperation(ctx.harper, { operation: 'get_ssh_key', name: 'testkey1' }));
 		equal(status, 200);
-		deepEqual(data, { name: 'testkey1', host: 'testkey1.gitlab.com', hostname: 'gitlab.com', key: 'random\nstring' });
+		equal(data.name, 'testkey1');
+		equal(data.host, 'testkey1.gitlab.com');
+		equal(data.hostname, 'gitlab.com');
+		// Keys are sealed at rest (harper-pro#581) and get_ssh_key returns the envelope as-is —
+		// the only consumer is cloneSSHKeys, which never needs the plaintext.
+		ok(data.key.startsWith('enc:v1:'), 'expected key to be returned as an enc:v1: envelope');
+		ok(!data.key.includes('random\nstring'), 'expected key to not be returned in plaintext');
 
 		// cleanup
 		await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey1' });
