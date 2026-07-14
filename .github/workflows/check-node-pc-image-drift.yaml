@@ -62,9 +62,8 @@ jobs:
           if [ -z "$uws_archive" ]; then
             echo "::error::could not parse uWebSockets.js archive commit from package.json ('${uws_url}')"; exit 1
           fi
-          uws_commit=$(curl -fsSL "https://raw.githubusercontent.com/uNetworking/uWebSockets.js/${uws_archive}/source_commit" | tr -d '[:space:]')
-          if [ -z "$uws_commit" ]; then
-            echo "::error::empty source_commit for uWebSockets.js archive ${uws_archive}"; exit 1
+          if ! uws_commit=$(curl -fsSL "https://raw.githubusercontent.com/uNetworking/uWebSockets.js/${uws_archive}/source_commit" | tr -d '[:space:]') || [ -z "$uws_commit" ]; then
+            echo "::error::could not fetch source_commit for uWebSockets.js archive ${uws_archive}"; exit 1
           fi
 
           # @datadog/pprof version from the lockfile.
@@ -105,9 +104,13 @@ jobs:
           set -euo pipefail
           # publish-node-pc-image cancels in-progress runs per node-version, so
           # dispatching while one runs would kill it. Skip if one is queued/running.
+          # Conservative: gh run list can't filter by the node-version input, so with
+          # multiple majors this may skip a major's rebuild for a day when a different
+          # major is mid-build — it self-heals on the next daily run and never causes
+          # a bad rebuild. (Single major today, so no effect yet.)
           active=$(gh run list --workflow=publish-node-pc-image.yaml \
             --repo "${{ github.repository }}" \
-            --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length')
+            --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length' || echo 0)
           echo "active publish-node-pc-image runs: ${active}"
           if [ "${active}" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -116,33 +119,20 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Dispatch rebuild
-        id: dispatch
         if: steps.drift.outputs.up-to-date == 'false' && steps.inflight.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           echo "dispatching publish-node-pc-image: node=${MAJOR} uws=${{ steps.drift.outputs.uws_commit }} pprof=${{ steps.drift.outputs.pprof_version }}"
+          # workflow_dispatch/repository_dispatch are the documented exceptions to
+          # GITHUB_TOKEN recursion prevention, so this triggers the run (needs the
+          # actions:write permission above). `gh workflow run` exits non-zero if the
+          # API rejects it (e.g. missing rights) — under set -e that fails the job
+          # loudly rather than silently skipping a needed rebuild.
           gh workflow run publish-node-pc-image.yaml \
             --repo "${{ github.repository }}" \
             --ref "${{ github.ref_name }}" \
             -f node-version="${MAJOR}" \
             -f uws-source-commit="${{ steps.drift.outputs.uws_commit }}" \
             -f pprof-version="${{ steps.drift.outputs.pprof_version }}"
-      - name: Verify the rebuild actually started
-        if: steps.dispatch.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # A workflow_dispatch via GITHUB_TOKEN normally starts a run; fail loud if
-          # it silently didn't (e.g. token policy) rather than skip a needed rebuild.
-          for _ in $(seq 1 12); do
-            active=$(gh run list --workflow=publish-node-pc-image.yaml \
-              --repo "${{ github.repository }}" \
-              --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length')
-            if [ "${active}" -gt 0 ]; then echo "rebuild run is active"; exit 0; fi
-            sleep 5
-          done
-          echo "::error::dispatched publish-node-pc-image but no run appeared within 60s — GITHUB_TOKEN may lack workflow_dispatch rights; switch to a PAT"
-          exit 1
