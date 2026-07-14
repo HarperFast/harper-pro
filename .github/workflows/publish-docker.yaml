@@ -27,20 +27,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Explicit legs (not a node-version × platform product) so the pc
-        # (V8 pointer compression, harper#919) variant only builds for the
-        # default Node version. The pc legs run on a Node binary compiled with
-        # pointer compression (~40% lower JS heap memory, 4 GB heap cap per
-        # isolate) plus a uWS addon rebuilt for that ABI; their base image is
-        # published by the publish-node-pc-image workflow — dispatch that first
-        # when the Node version or the uWS pin bumps.
+        # The pc (V8 pointer compression, harper#919) variant builds in its own
+        # build-pc job so its dispatch-only base image can never block this
+        # standard release image (see build-pc / the PUBLISH_PC_VARIANT gate).
         include:
           - { node-version: 24, platform: linux/amd64, runner: ubuntu-latest, variant: standard }
           - { node-version: 24, platform: linux/arm64, runner: ubuntu-24.04-arm, variant: standard }
           - { node-version: 25, platform: linux/amd64, runner: ubuntu-latest, variant: standard }
           - { node-version: 25, platform: linux/arm64, runner: ubuntu-24.04-arm, variant: standard }
-          - { node-version: 24, platform: linux/amd64, runner: ubuntu-latest, variant: pc }
-          - { node-version: 24, platform: linux/arm64, runner: ubuntu-24.04-arm, variant: pc }
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -136,10 +130,74 @@ jobs:
         run: |
           docker buildx imagetools inspect harperfast/harper-pro:${{ steps.meta.outputs.version }}
 
+  # V8 pointer-compression variant (harper#919), isolated from the standard build
+  # so it can never block the standard release image. The pc legs build FROM
+  # harperfast/node-pointer-compression:<major>, published by the dispatch-only
+  # publish-node-pc-image workflow (compiling Node from source takes 1-2+ h/arch).
+  # Gated on the PUBLISH_PC_VARIANT repo variable: set it to 'true' once that base
+  # image exists for the current Node version; leave it unset to skip pc entirely.
+  build-pc:
+    if: >-
+      vars.PUBLISH_PC_VARIANT == 'true' &&
+      (github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'standard')
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # pc only builds for the default Node version (the base image is expensive
+        # to compile); both arches.
+        include:
+          - { node-version: 24, platform: linux/amd64, runner: ubuntu-latest }
+          - { node-version: 24, platform: linux/arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: 'recursive'
+      - name: Setup Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: harperfast/harper-pro
+      - name: Login to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # -trixie: the runtime requires Debian trixie's glibc (see Dockerfile);
+          # matrix.node-version stays the bare major for tag naming and the base image.
+          build-args: |
+            NODE_BUILD_VERSION=${{ matrix.node-version }}-trixie
+            NODE_VERSION=${{ matrix.node-version }}-trixie
+            RUN_IMAGE=harperfast/node-pointer-compression:${{ matrix.node-version }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=harperfast/harper-pro,push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-pc-node${{ matrix.node-version }}-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
   merge-pc:
-    if: github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'standard'
+    if: >-
+      vars.PUBLISH_PC_VARIANT == 'true' &&
+      (github.event_name == 'release' || inputs.image == 'all' || inputs.image == 'standard')
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [build-pc]
     steps:
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -447,7 +505,9 @@ jobs:
             --submit >> "${GITHUB_STEP_SUMMARY}"
 
   send-slack-message-on-success:
-    if: success() && !cancelled()
+    # Standard image is the release gate; pc is opt-in, so success is keyed on merge
+    # and only suppressed if the pc leg actually failed (skipped/success both fine).
+    if: ${{ !cancelled() && needs.merge.result == 'success' && needs.merge-pc.result != 'failure' }}
     needs: [merge, merge-pc]
     runs-on: ubuntu-latest
     steps:
@@ -489,7 +549,9 @@ jobs:
             }
 
   send-slack-message-on-failure:
-    if: failure() && !cancelled()
+    # Alert if either the standard or the pc merge failed (pc failure no longer
+    # blocks the standard image, but we still surface it).
+    if: ${{ !cancelled() && (needs.merge.result == 'failure' || needs.merge-pc.result == 'failure') }}
     needs: [merge, merge-pc]
     runs-on: ubuntu-latest
     steps:
