@@ -593,15 +593,22 @@ function rebuildKnownNodes(listener: (node: any, id: string) => void) {
 	server.shards = new Map();
 
 	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key) => {
-		if (!node.url || node.shard === undefined) {
+		// Only a decode-miss RECONSTRUCT descriptor (reconstructNodeFromKey → no url) needs enrichment;
+		// gate strictly on `!node.url`, NOT `node.shard === undefined`. On an unsharded cluster every real,
+		// fully-decoded record has `shard === undefined`, so the looser guard would run mergeReconstructedNode
+		// over REAL records and revert their freshly-decoded `replicates` to a stale in-memory value during a
+		// copyApply base-copy reload (harper-pro#489) — dropping user-database records for a peer that just
+		// widened, or over-connecting to one that narrowed. A real record always has a url, so it skips this
+		// branch and its fresh `replicates` is honored. (PR #572 review — Chris Barber.)
+		if (!node.url) {
 			const targetName = node.name ?? key;
 			const oldNode =
 				targetName !== undefined ? oldNodes.find((n) => n && n.name !== undefined && n.name === targetName) : undefined;
 			// name from the reconstruct wins and oldNode supplies url/shard/ca/etc., but a directional
 			// `replicates` from oldNode is preserved (mergeReconstructedNode) rather than clobbered by the
-			// reconstruct's `true` — otherwise a transient decode miss during this scan (e.g. a copyApply
-			// base-copy reload of the system DB) would widen a constrained peer back to full mesh. Same
-			// treatment as the two processNodeUpdateEvent reconstruct sites. systemdb-routing / harper-pro#489.
+			// reconstruct's `true` — otherwise a transient decode miss during this scan would widen a
+			// constrained peer back to full mesh. Same treatment as the two processNodeUpdateEvent reconstruct
+			// sites. systemdb-routing / harper-pro#489.
 			if (oldNode) node = mergeReconstructedNode(node, oldNode);
 		}
 		// server.nodes holds PEERS, never this node itself — mirror processNodeUpdateEvent's
