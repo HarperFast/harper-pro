@@ -55,7 +55,7 @@ function sealSSHKey(name: string, key: string): string {
 		} catch (error) {
 			throw new ClientError(`Invalid SSH key envelope: ${(error as Error).message}`);
 		}
-		const fingerprint = custody?.getPublicKey().fingerprint;
+		const fingerprint = custody?.getPublicKey()?.fingerprint;
 		if (fingerprint && kid && kid !== fingerprint) {
 			throw new ClientError(
 				`SSH key envelope kid '${kid}' does not match this cluster's secrets key (expected '${fingerprint}')`
