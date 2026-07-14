@@ -105,6 +105,11 @@ const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
 const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime + copy-order version
 const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
+// leader -> follower, right after COPY_START on a resume: checksums of the key range the honored
+// resume cursor claims was already delivered, plus the exact bounds and cap the sender used, so the
+// follower verifies the claim over the identical range. Older receivers ignore the unknown id
+// (the command switch has no default case).
+const COPY_RANGE_CHECKSUM = 150;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -244,6 +249,164 @@ export function shouldForceBaseCopyForRetention(
 	// 0 means a base copy was already requested; guard against non-positive/NaN starts too.
 	if (!(requestedStartTime > 0)) return false;
 	return requestedStartTime < Math.max(oldestRetainedTime ?? 0, retentionCutoffTime);
+}
+
+// Bounds for the resume-range checksum scans: cap how many keys a single table contributes (both
+// sides cap identically over the same key order, so capped checksums stay comparable; the sender's
+// cap rides the wire so a retuned constant stays comparable across versions UP TO the receiver
+// clamp, which is the real cross-version ceiling), pace scans on wall clock so a slow storage
+// chunk cannot starve pings past a watchdog window, clamp a wire-received cap so a bad payload
+// cannot demand an unbounded scan, and bound the sender's whole scan pass so a huge claimed range
+// degrades to skipped verification rather than holding up the copy into watchdog territory.
+export const RANGE_CHECKSUM_MAX_KEYS = 1_000_000;
+const RANGE_CHECKSUM_MAX_KEYS_CLAMP = 10_000_000;
+const RANGE_CHECKSUM_YIELD_MS = 25;
+const RANGE_CHECKSUM_MAX_SCAN_MS = 60_000;
+
+export type RangeChecksum = { count: number; h1: number; h2: number; capped: boolean };
+
+// Canonical text form of a primary key for checksumming: deterministic across nodes, type-tagged
+// (string '1', number 1, and BigInt 1n stay distinct), and independent of JSON.stringify — Harper
+// globally overrides BigInt.prototype.toJSON to throw, and toJSON runs before any replacer, so
+// JSON cannot serialize the BigInt keys ordered-binary yields for integers past 2^53. Composite
+// (array) keys tag their length and separate elements so boundary shifts cannot alias.
+function canonicalKeyText(key: unknown): string {
+	if (typeof key === 'string') return 's' + key;
+	if (typeof key === 'number') return 'd' + key;
+	if (typeof key === 'bigint') return 'n' + key.toString();
+	if (typeof key === 'boolean') return 'b' + key;
+	if (key === null || key === undefined) return 'u';
+	if (Array.isArray(key)) return 'a' + key.length + ':' + key.map(canonicalKeyText).join('\u001f');
+	if (key instanceof Uint8Array) return 'x' + Buffer.from(key).toString('hex');
+	if (key instanceof Date) return 't' + key.getTime();
+	return 'o' + String(key);
+}
+
+/**
+ * Rolling checksum over an ordered stream of primary keys, plus an exact key count (the count is
+ * the primary signal; the hash is a non-cryptographic content tripwire for equal-count drift, kept
+ * as two mixed FNV-1a-based 32-bit lanes because 2^64 exceeds float precision). Keys canonicalize
+ * through a type-tagged canonical string (see canonicalKeyText) with the key length mixed in
+ * before its characters, so
+ * boundary shifts like ['ab', 'c'] vs ['a', 'bc'] differ even when a key contains the terminator.
+ * The per-character xor-shift feeds high state bits back down, breaking FNV's low-bit locality
+ * (without it, keys differing only in high code-unit bits collide at ~2^-34 jointly). add() returns
+ * false once the cap is reached (the key is not counted); a capped checksum still compares
+ * meaningfully because both sides cap at the same count over the same ordered range. Pure so it is
+ * unit-testable.
+ */
+export function createRangeChecksum(maxKeys: number = RANGE_CHECKSUM_MAX_KEYS) {
+	let h1 = 0x811c9dc5;
+	let h2 = 0x0538d02f; // arbitrary distinct seed for the second lane
+	let count = 0;
+	let capped = false;
+	return {
+		add(key: unknown): boolean {
+			if (count >= maxKeys) {
+				capped = true;
+				return false;
+			}
+			const text = canonicalKeyText(key);
+			h1 = Math.imul(h1 ^ text.length, 0x01000193) >>> 0;
+			h2 = Math.imul(h2 ^ text.length, 0x01000193) >>> 0;
+			for (let i = 0; i < text.length; i++) {
+				const code = text.charCodeAt(i);
+				h1 = Math.imul(h1 ^ code, 0x01000193);
+				h1 = (h1 ^ (h1 >>> 15)) >>> 0;
+				h2 = Math.imul(h2 ^ code, 0x01000193);
+				h2 = (h2 ^ (h2 >>> 13)) >>> 0;
+			}
+			h1 = Math.imul(h1 ^ 0x1f, 0x01000193) >>> 0;
+			h2 = Math.imul(h2 ^ 0x1f, 0x01000193) >>> 0;
+			count++;
+			return true;
+		},
+		result(): RangeChecksum {
+			return { count, h1, h2, capped };
+		},
+	};
+}
+
+/**
+ * Checksum one table's key range for resume verification: primary-key order, local-only records
+ * excluded (the copy never sends them), optionally bounded through `end` inclusive (the resume
+ * table's afterKey; other tables scan whole). Pacing is wall-clock, not key-count: a slow storage
+ * chunk or a contiguous local-only run must still yield the event loop inside a watchdog window
+ * (the copy loop's pacer exists for the same field-proven reason). isClosed() aborts the scan when
+ * the connection dies; an aborted scan returns undefined so the caller skips the table rather than
+ * comparing a partial checksum. Store-agnostic (anything with getRange yielding {key, metadataFlags})
+ * so it is unit-testable with a mock store.
+ */
+export async function checksumTableRange(
+	store: { getRange: (options: any) => Iterable<{ key: unknown; metadataFlags?: number }> },
+	options: { end?: unknown; maxKeys?: number; isClosed?: () => boolean }
+): Promise<RangeChecksum | undefined> {
+	const checksum = createRangeChecksum(options.maxKeys);
+	const rangeOptions: any = { snapshot: false, versions: true };
+	if (options.end !== undefined) {
+		rangeOptions.end = options.end;
+		rangeOptions.inclusiveEnd = true;
+	}
+	let lastYield = performance.now();
+	for (const entry of store.getRange(rangeOptions)) {
+		if (options.isClosed?.()) return undefined;
+		if (performance.now() - lastYield >= RANGE_CHECKSUM_YIELD_MS) {
+			await new Promise(setImmediate);
+			if (options.isClosed?.()) return undefined;
+			lastYield = performance.now();
+		}
+		if (!entry) continue;
+		if ((entry.metadataFlags ?? 0) & LOCAL_ONLY) continue;
+		if (!checksum.add(entry.key)) break;
+	}
+	return checksum.result();
+}
+
+/**
+ * Compare the sender's per-table resume-range checksums against this receiver's. Any field
+ * difference is a mismatch: the claimed-delivered range does not hold the same keys on both sides.
+ * Tables the receiver did not (or could not) compute are skipped, not flagged. Pure so the
+ * comparison is unit-testable.
+ */
+export function compareRangeChecksums(
+	sent: Record<string, RangeChecksum>,
+	local: Record<string, RangeChecksum>
+): Array<{ table: string; sent: RangeChecksum; local: RangeChecksum }> {
+	const mismatches: Array<{ table: string; sent: RangeChecksum; local: RangeChecksum }> = [];
+	if (!sent || !local) return mismatches;
+	for (const [table, sentSum] of Object.entries(sent)) {
+		if (!sentSum || typeof sentSum !== 'object' || typeof sentSum.count !== 'number') continue;
+		const localSum = local[table];
+		if (!localSum) continue;
+		if (
+			localSum.count !== sentSum.count ||
+			localSum.h1 !== sentSum.h1 ||
+			localSum.h2 !== sentSum.h2 ||
+			localSum.capped !== !!sentSum.capped
+		) {
+			mismatches.push({ table, sent: sentSum, local: localSum });
+		}
+	}
+	return mismatches;
+}
+
+/**
+ * Whether any write landed in this database's audit logs (any origin) at or after `sinceTime`.
+ * Gates resume-range verification: the claimed-delivered range is only invariant if nothing has
+ * written to the database since the copy began (the receiver's copy of the range is frozen while
+ * the copy is incomplete, so sender-side key churn since copyStartTime — inserts or deletes landing
+ * inside the already-delivered range — would drift the comparison without any delivery fault).
+ * Copy-apply rows are snapshot writes with no audit entry, so a receiver that has only applied copy
+ * frames still reads as quiescent. One bounded seek per log; take-first.
+ */
+export function hasAuditWritesSince(
+	auditStore: { getRange: (options: any) => Iterable<unknown> },
+	sinceTime: number
+): boolean {
+	for (const _entry of auditStore.getRange({ start: sinceTime })) {
+		return true;
+	}
+	return false;
 }
 
 export const tableUpdateListeners = new Map();
@@ -1529,6 +1692,81 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// synchronously when COPY_COMPLETE is decoded while batches are still queued — would freeze the cursor
 	// and risk a crash that loses both the cursor and the not-yet-durable rows, leaving the next start to
 	// resume from seqId with gaps.
+	// Verify the sender's checksums of the range our resume cursor claimed was already delivered
+	// (COPY_RANGE_CHECKSUM, sent right after COPY_START on resumes) against this node's actual table
+	// content. The payload echoes the exact bounds, cap, and copyStartTime the sender honored, so both
+	// sides scan the identical range even when the persisted cursor has since advanced, been removed,
+	// or belongs to a different source in a proxied failover. The sender only sends this when ITS
+	// database has been quiescent since the copy began; this side must hold the same precondition
+	// (checked before and after the scan), because local writes or live deliveries from other sources
+	// since copyStartTime would drift the range without any delivery fault. Under the precondition the
+	// comparison is exact: a mismatch means the claimed range provably was not delivered. Alert-only:
+	// logged with per-table key counts and stashed on the connection; no re-copy (receiver-side
+	// undecodable drops would loop one forever) and no cursor surgery. Detached and wall-clock-paced
+	// so the scan never blocks the receive loop; skipped for tables this receiver drops by policy.
+	async function verifyResumeRangeChecksums(claim: {
+		currentTable?: string;
+		afterKey?: unknown;
+		copyStartTime?: number;
+		maxKeys?: number;
+		tables?: Record<string, RangeChecksum>;
+	}): Promise<void> {
+		try {
+			const sentChecksums = claim.tables;
+			if (!sentChecksums || typeof sentChecksums !== 'object') return;
+			const maxKeys = Math.min(
+				typeof claim.maxKeys === 'number' && claim.maxKeys > 0 ? claim.maxKeys : RANGE_CHECKSUM_MAX_KEYS,
+				RANGE_CHECKSUM_MAX_KEYS_CLAMP
+			);
+			if (typeof claim.copyStartTime === 'number' && hasAuditWritesSince(auditStore, claim.copyStartTime)) {
+				logger.debug?.(connectionId, 'not quiescent since copy start; skipping resume-range verification');
+				return;
+			}
+			const localChecksums: Record<string, RangeChecksum> = {};
+			for (const tableName of Object.keys(sentChecksums)) {
+				const table = tables?.[tableName];
+				if (!table?.primaryStore?.getRange) continue;
+				ensureReceiveExcludedTables();
+				if (receiveExcludedTables?.has(tableName)) continue;
+				try {
+					const checksum = await checksumTableRange(table.primaryStore, {
+						end: tableName === claim.currentTable ? claim.afterKey : undefined,
+						maxKeys,
+						isClosed: () => wsClosed,
+					});
+					if (checksum) localChecksums[tableName] = checksum;
+				} catch (tableError) {
+					// an unreadable table only loses its own comparison
+					logger.warn?.(connectionId, 'skipping resume-range verification for', tableName, tableError);
+				}
+				if (wsClosed) return;
+			}
+			// re-check after the scan: a write landing mid-scan drifts the range benignly
+			if (typeof claim.copyStartTime === 'number' && hasAuditWritesSince(auditStore, claim.copyStartTime)) {
+				logger.debug?.(connectionId, 'writes landed during resume-range verification; skipping');
+				return;
+			}
+			const mismatches = compareRangeChecksums(sentChecksums, localChecksums);
+			if (mismatches.length > 0) {
+				logger.error?.(
+					`Resume-range verification mismatch for database ${databaseName} from ${remoteNodeName}: ` +
+						mismatches.map((m) => `${m.table} sender=${m.sent.count} keys local=${m.local.count} keys`).join(', ') +
+						'. The database has been quiescent since the copy began, so the claimed-delivered range should be ' +
+						'identical on both sides: these records provably were not delivered. Not forcing a re-copy.'
+				);
+				if (options.connection) {
+					options.connection.copyResumeRangeMismatch = {
+						time: Date.now(),
+						database: databaseName,
+						from: remoteNodeName,
+						mismatches,
+					};
+				}
+			}
+		} catch (error) {
+			logger.warn?.(connectionId, 'resume-range verification failed', error);
+		}
+	}
 	function maybeFinishCopy() {
 		// Finishing REMOVES the copy resume cursor and exits copy mode, so it must only happen once the copy
 		// is fully durable: COPY_COMPLETE received, every batch committed (outstandingCommits drained), AND —
@@ -1945,6 +2183,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	// undefined = not yet computed; null = computed, no exclusions; Set = tables to drop on receive
 	let receiveExcludedTables: Set<string> | null | undefined;
+	// Lazily compute receive-side exclusions once remoteNodeName is known. Prefer routeReplicates
+	// from the subscriber-side connection; fall back to authorization.replicates when this is the
+	// server-side handler. Shared by the record decode path and the resume-range verification.
+	function ensureReceiveExcludedTables(): void {
+		if (receiveExcludedTables !== undefined) return;
+		const firstNode = options.connection?.nodeSubscriptions?.[0];
+		const receivesFromEntries =
+			firstNode?.routeReplicates?.receivesFrom ??
+			(authorization?.replicates && typeof authorization.replicates === 'object'
+				? authorization.replicates.receivesFrom
+				: undefined);
+		receiveExcludedTables = getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName) ?? null;
+	}
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
 	// Serialize message handling so that async backpressure inside onWSMessage doesn't allow
@@ -2395,6 +2646,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
+					case COPY_RANGE_CHECKSUM:
+						// The sender checksummed the range our resume cursor claimed was already delivered,
+						// with the exact bounds it honored. Verify against our own tables, detached so the
+						// scan never blocks the receive loop.
+						noteCopyProgress(); // arrives inside the copy; keep the copy-progress watchdog fed (#453)
+						if (data && typeof data === 'object') {
+							void verifyResumeRangeChecksums(data);
+						}
+						break;
 					case COPY_COMPLETE:
 						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
 						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
@@ -2773,13 +3033,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										subscriptionToHdbNodes = subscription;
 										for await (const event of subscriptionToHdbNodes) {
 											const node = event.value;
-											if (!(
-												node?.replicates === true ||
-												node?.replicates?.receives ||
-												node?.replicates?.receivesFrom?.some(
-													(sub) => sub.source === getThisNodeName() && sub.database === databaseName
+											if (
+												!(
+													node?.replicates === true ||
+													node?.replicates?.receives ||
+													node?.replicates?.receivesFrom?.some(
+														(sub) => sub.source === getThisNodeName() && sub.database === databaseName
+													)
 												)
-											)) {
+											) {
 												closed = true;
 												close(1008, `Unauthorized database subscription to ${databaseName}`);
 												return;
@@ -3157,7 +3419,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
+							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
+							| undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -3276,13 +3539,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// the post-copy resume point stays anchored to when the copy first began (see safety note).
 											const copyStartTime = copyResume?.copyStartTime ?? Date.now();
 											const nodeId = getThisNodeId(auditStore);
-											// Tell the follower a bulk copy is starting, its anchor time, and the copy-order version,
-											// so it tracks a resume cursor that a later leader can validate before trusting the skip.
-											ws.send(encode([COPY_START, copyStartTime, COPY_ORDER_VERSION]));
-											// Test-only (#453): one-shot stall here leaves the follower in copy mode with no
-											// further frames while pings keep flowing — the connected:true copy wedge.
-											const copyStallForTest = maybeStallCopyForTest(databaseName);
-											if (copyStallForTest) await copyStallForTest;
 											let recordsSinceCheckpoint = 0;
 											// Paces the flush/yield cadence inside the copy loop below (see
 											// COPY_CHECKPOINT_MAX_INTERVAL_MS). Marked on every in-loop flush/yield.
@@ -3329,6 +3585,80 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// pure function of the table-name set, so it stays stable across runs — which the skip-loop
 											// above (reachedResumeTable) relies on; cross-version cursors are rejected by the guard above. (#421)
 											const orderedTableNames = orderTablesForCopy(tables ? Object.keys(tables) : []);
+											// Tell the follower a bulk copy is starting, its anchor time, and the copy-order version,
+											// so it tracks a resume cursor that a later leader can validate before trusting the skip.
+											// Sent BEFORE the resume-range scan below so both sides are already in copy mode (wide
+											// watchdog windows) while the scan runs.
+											ws.send(encode([COPY_START, copyStartTime, COPY_ORDER_VERSION]));
+											// Test-only (#453): one-shot stall here leaves the follower in copy mode with no
+											// further frames while pings keep flowing — the connected:true copy wedge.
+											const copyStallForTest = maybeStallCopyForTest(databaseName);
+											if (copyStallForTest) await copyStallForTest;
+											// For an honored resume cursor, checksum the range it claims was already delivered
+											// (every prior table in copy order, plus the resume table through afterKey inclusive)
+											// and send it with the exact bounds and cap used, so the follower can verify the
+											// claim over the identical range instead of trusting it blind — a cursor that outran
+											// delivery re-seals its hole on every resume otherwise (#537). Wall-clock-paced and
+											// capped; any scan failure skips verification rather than disturbing the copy (a
+											// throw here would close the channel and wedge every subsequent resume the same way).
+											// Fresh copies skip all of this (nothing is claimed).
+											if (copyResume) {
+												try {
+													const rangeChecksums: Record<string, RangeChecksum> = {};
+													const scanDeadline = Date.now() + RANGE_CHECKSUM_MAX_SCAN_MS;
+													let scanTimedOut = false;
+													let skipReason: string | undefined;
+													if (hasAuditWritesSince(auditStore, copyStartTime)) {
+														skipReason = 'not quiescent since copy start';
+													}
+													for (const tableName of orderedTableNames) {
+														if (skipReason) break;
+														const table = tables[tableName];
+														if (!tableToTableEntry(table)) continue;
+														// tables this route never sends have no delivery claim to verify
+														if (sendExcludedTables?.has(tableName)) continue;
+														const isResumeTable = tableName === resumeCurrentTable;
+														try {
+															const checksum = await checksumTableRange(table.primaryStore, {
+																end: isResumeTable ? resumeAfterKey : undefined,
+																isClosed: () => closed || (scanTimedOut = Date.now() > scanDeadline),
+															});
+															if (checksum) rangeChecksums[tableName] = checksum;
+														} catch (tableError) {
+															// an unreadable table only loses its own claim
+															logger.warn?.(connectionId, 'skipping resume-range checksum for', tableName, tableError);
+														}
+														if (closed) return;
+														if (scanTimedOut) break;
+														if (isResumeTable) break;
+													}
+													if (scanTimedOut) skipReason = 'scan exceeded its time budget';
+													// re-check after the scan: a write landing mid-scan means the checksums no longer
+													// describe an invariant range
+													if (!skipReason && hasAuditWritesSince(auditStore, copyStartTime))
+														skipReason = 'writes landed during the scan';
+													if (skipReason) {
+														// degrade to no verification rather than false-alarming (or, for the time budget,
+														// holding up the copy into the follower's watchdog window)
+														logger.debug?.(connectionId, 'skipping resume-range verification:', skipReason);
+													} else {
+														ws.send(
+															encode([
+																COPY_RANGE_CHECKSUM,
+																{
+																	currentTable: resumeCurrentTable,
+																	afterKey: resumeAfterKey,
+																	copyStartTime,
+																	maxKeys: RANGE_CHECKSUM_MAX_KEYS,
+																	tables: rangeChecksums,
+																},
+															])
+														);
+													}
+												} catch (checksumError) {
+													logger.warn?.(connectionId, 'skipping resume-range checksum', checksumError);
+												}
+											}
 											for (const tableName of orderedTableNames) {
 												const table = tables[tableName];
 												if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
@@ -3559,19 +3889,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				if (!tableDecoder) {
 					logger.error?.(`No table found with an id of ${auditRecord.tableId}`);
 				}
-				// Lazily compute receive-side exclusions once remoteNodeName is known.
-				// Prefer routeReplicates from the subscriber-side connection; fall back to
-				// authorization.replicates when this is the server-side handler.
-				if (receiveExcludedTables === undefined) {
-					const firstNode = options.connection?.nodeSubscriptions?.[0];
-					const receivesFromEntries =
-						firstNode?.routeReplicates?.receivesFrom ??
-						(authorization?.replicates && typeof authorization.replicates === 'object'
-							? authorization.replicates.receivesFrom
-							: undefined);
-					receiveExcludedTables =
-						getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName) ?? null;
-				}
+				ensureReceiveExcludedTables();
 				if (tableDecoder && receiveExcludedTables?.has(tableDecoder.name)) {
 					logger.trace?.(
 						connectionId,
