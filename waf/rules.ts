@@ -245,7 +245,7 @@ export function validateRule(rule: WafRule): string[] {
 	// suppress nextHandler yet return 2xx/3xx (a block that looks like success).
 	if (
 		rule.blockStatus != null &&
-		(typeof rule.blockStatus !== 'number' || rule.blockStatus < 400 || rule.blockStatus > 599)
+		(!Number.isFinite(rule.blockStatus) || rule.blockStatus < 400 || rule.blockStatus > 599)
 	)
 		errors.push('blockStatus must be a 4xx or 5xx HTTP status');
 	const match = rule.match;

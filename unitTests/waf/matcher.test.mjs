@@ -357,6 +357,10 @@ describe('WAF rule validation', () => {
 		expect(validateRule({ ...BASE, id: 'x', action: 'score', score: '5', match: { ip: '10.0.0.1' } })).to.not.be.empty;
 		// priority: NaN makes the sort comparator return NaN, leaving enforcement order unspecified
 		expect(validateRule({ ...BASE, id: 'x', priority: NaN, match: { ip: '10.0.0.1' } })).to.not.be.empty;
+		// blockStatus: NaN comparisons are always false, so the old `< 400 || > 599` range check
+		// silently let it through; Infinity was already caught by `> 599`, kept here for parity
+		expect(validateRule({ ...BASE, id: 'x', blockStatus: NaN, match: { ip: '10.0.0.1' } })).to.not.be.empty;
+		expect(validateRule({ ...BASE, id: 'x', blockStatus: Infinity, match: { ip: '10.0.0.1' } })).to.not.be.empty;
 		// finite values still validate
 		expect(validateRule({ ...BASE, id: 'x', action: 'score', score: 5, match: { ip: '10.0.0.1' } })).to.deep.equal([]);
 	});
