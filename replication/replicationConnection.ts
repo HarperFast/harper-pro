@@ -1622,8 +1622,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// at the moment a worker-local watchdog decided to act (see formatTruthSnapshot for how the
 	// demotion soak reads this).
 	const truthSnapshotForLog = () => {
-		const status = getSharedStatus();
-		return formatTruthSnapshot(status && deriveConnectionTruth(status));
+		// This telemetry feeds the watchdog fire logs, emitted from the onSilence/onStall recovery
+		// callbacks immediately before forceReconnect()/ws.terminate(). getSharedStatus() and
+		// deriveConnectionTruth() read shared memory / the auditStore and can throw if that state is
+		// unexpected; an unhandled throw here would abort the recovery callback and leave the connection
+		// permanently wedged — the opposite of what a recovery net is for. Swallow (trace-log) so a
+		// telemetry failure degrades the log line to a marker and recovery always proceeds. (harper-pro#431)
+		try {
+			const status = getSharedStatus();
+			return formatTruthSnapshot(status && deriveConnectionTruth(status));
+		} catch (error) {
+			logger.trace?.(connectionId, 'failed to build connection-truth snapshot for watchdog fire log', error);
+			return 'truth=error';
+		}
 	};
 	receiveWatchdog = createReceiveWatchdog({
 		intervalMs: currentReceiveSilenceThresholdMs,
