@@ -184,13 +184,15 @@ suite(
 
 			// Sustained concurrent writes on A drive B's apply queue with wire-carried saveBeforeCommit
 			// blobs while B is also mid-catch-up from the full copy.
+			const EXPECTED = PRE_EXISTING + RECORDS;
 			let nextId = PRE_EXISTING + 1000; // clear of the pre-existing id range
-			let loadDone = false;
-			const load = concurrent(() => fetchWithRetry(A.httpURL + '/SeedSbcLocation/' + nextId++), CONCURRENCY);
+			const load = concurrent(async () => {
+				const resp = await fetchWithRetry(A.httpURL + '/SeedSbcLocation/' + nextId++);
+				if (!resp.ok) throw new Error(`SeedSbcLocation write failed: HTTP ${resp.status}`);
+			}, CONCURRENCY);
 			const loadPromise = (async () => {
 				for (let i = 0; i < RECORDS; i++) await load.execute();
 				await load.finish();
-				loadDone = true;
 			})();
 
 			// Restart B mid-load. Gotcha: a restart MUST re-pass the original config or replication
@@ -217,17 +219,22 @@ suite(
 
 			await loadPromise;
 
-			// Poll for full convergence. A timeout here is the deadlock signature: on unfixed code the
-			// apply loop wedges permanently and B plateaus short of A no matter how long we wait.
+			// A's writes are direct (no sourcedFrom caching to mask an under-delivery), so once the
+			// live load drains, A must already hold the full expected total — assert this absolutely
+			// rather than trusting whatever count B ends up chasing.
+			const aCount = (await sendOperation(A, { operation: 'describe_table', table: 'SbcLocation' })).record_count;
+			equal(aCount, EXPECTED, `origin A did not reach the expected total after live load: A=${aCount}/${EXPECTED}`);
+
+			// Poll for full convergence to that absolute total. A timeout here is the deadlock
+			// signature: on unfixed code the apply loop wedges permanently and B plateaus short of
+			// EXPECTED no matter how long we wait.
 			const deadline = Date.now() + CONVERGE_TIMEOUT_MS;
-			let aCount = 0,
-				bCount = 0,
+			let bCount = 0,
 				lastB = -1,
 				stalledSamples = 0;
 			while (Date.now() < deadline) {
-				aCount = (await sendOperation(A, { operation: 'describe_table', table: 'SbcLocation' })).record_count;
 				bCount = (await sendOperation(B, { operation: 'describe_table', table: 'SbcLocation' })).record_count;
-				if (loadDone && bCount >= aCount && aCount > 0) break;
+				if (bCount >= EXPECTED) break;
 				if (bCount === lastB) stalledSamples++;
 				else stalledSamples = 0;
 				lastB = bCount;
@@ -237,7 +244,7 @@ suite(
 			const aFiles = countBlobFiles(A.dataRootDir);
 			const bFiles = countBlobFiles(B.dataRootDir);
 
-			if (bCount < aCount) {
+			if (bCount < EXPECTED) {
 				const [statusA, statusB] = await Promise.all(
 					[A, B].map((n) => sendOperation(n, { operation: 'cluster_status' }).catch((e) => String(e)))
 				);
@@ -253,8 +260,8 @@ suite(
 			);
 
 			ok(
-				bCount >= aCount,
-				`receiver never converged: B=${bCount}/${aCount} after ${CONVERGE_TIMEOUT_MS}ms (stalled ~${stalledSamples}s) — ` +
+				bCount >= EXPECTED,
+				`receiver never converged: B=${bCount}/${EXPECTED} after ${CONVERGE_TIMEOUT_MS}ms (stalled ~${stalledSamples}s) — ` +
 					`apply-loop wedge on wire-carried saveBeforeCommit (harper#1640).`
 			);
 			ok(
