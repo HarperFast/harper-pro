@@ -382,30 +382,6 @@ export function closeOnInboundMessageError(
 }
 
 /**
- * Classify how a per-record value-decode failure inside `onWSMessage` should recover — the one decision
- * that keeps a decode error from silently, permanently dropping a record.
- *
- * A RESOLVED table decoder means the offending bytes are a genuine record for a known table whose decoder
- * structures forked from the sender's (#1163/#1453 — e.g. an "end of buffer" structon throw). The batch's
- * resume cursor (`maxBatchVersion` → end_txn → sender `COMMITTED_UPDATE`) advances regardless of whether the
- * record decoded, so skip-and-logging moves the cursor past the hole forever. We `'close'` instead: the
- * transient 1011 reconnect rebuilds this table's decoder from the peer's re-sent typedStructs/structures
- * (the SET_TABLE handshake) and re-streams from the durable cursor, healing the fork on resume.
- *
- * An UNRESOLVED decoder is an unknown tableId — a transient schema-propagation case, not a structure fork;
- * a reconnect wouldn't supply the missing table def, so closing would only churn. It stays `'skip'`.
- *
- * (harper-pro#440, epic #430 Theme B. A bounded-retry escalation budget for a deterministically un-healable
- * frame — so a genuinely corrupt record can't wedge the link forever — is W2 / harper-pro#432.)
- *
- * Exported for unit tests (`recordDecodeErrorRecovery.test.mjs`); the production caller is the inner
- * value-decode catch in `onWSMessage`.
- */
-export function classifyRecordDecodeError(hasTableDecoder: boolean): 'close' | 'skip' {
-	return hasTableDecoder ? 'close' : 'skip';
-}
-
-/**
  * Decide whether the empty-subscription delayed close inside `replicateOverWS`'s `scheduleClose` should
  * be classified as INTENTIONAL/finished (mark `isFinished`/`intentionallyUnsubscribed`, emit `'finished'`,
  * remove the connection from the worker map, never reconnect) vs a transient close that falls through to
@@ -3681,10 +3657,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						auditRecord,
 						error
 					);
-					// A resolved-decoder value-decode failure must close, not skip: `maxBatchVersion` (and the
-					// end_txn resume cursor) advance below regardless of `event`, so skipping loses the record
-					// permanently. Latch it to re-throw onto the outer close path. See classifyRecordDecodeError.
-					if (classifyRecordDecodeError(!!tableDecoder) === 'close') decodeFailure = { error };
+					// A resolved decoder (tableDecoder set) means these bytes are a real record whose structures
+					// forked from the sender's (#1163/#1453); the resume cursor (maxBatchVersion -> end_txn)
+					// advances below regardless of `event`, so skipping loses the record permanently. Latch the
+					// error to re-throw onto the outer close path — the reconnect rebuilds this table's decoder
+					// from the peer's re-sent structures, healing the fork on resume. An unresolved decoder
+					// (unknown tableId) is transient schema propagation, not a fork, so it still skips.
+					if (tableDecoder) decodeFailure = { error };
 				}
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
