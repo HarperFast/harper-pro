@@ -3,10 +3,11 @@
  * thread's edge-triggered `connected` bit from the shared-memory truth the owning worker writes. The
  * rules these tests pin: no correction without truth or without at-least-once liveness; a down
  * correction flips true/undefined entries to false and stamps disconnectedAt only if absent (so the
- * wedge re-drive clock is not restarted by repeated ticks); an up correction applies ONLY to an
- * explicit connected:false entry (a lost connect edge, #289) — never to a never-connected undefined
- * entry, which is mid-connect and owned by the connect/retry path; agreement in either direction is a
- * no-op returning undefined.
+ * wedge re-drive clock is not restarted by repeated ticks); an up correction is signalled (detection
+ * only — the restore is routed through connectedToNode by the caller, so the entry is NOT mutated here)
+ * ONLY for an explicit connected:false entry (a lost connect edge, #289) — never for a never-connected
+ * undefined entry, which is mid-connect and owned by the connect/retry path; agreement in either
+ * direction is a no-op returning undefined.
  */
 
 import { expect } from 'chai';
@@ -49,11 +50,12 @@ describe('reconcileEntryWithTruth', () => {
 		expect(entry.disconnectedAt).to.equal(NOW - 60_000);
 	});
 
-	it('corrects a connected:false entry up and clears disconnectedAt', () => {
+	it('signals an up correction for a connected:false entry without mutating it (restore is routed through connectedToNode)', () => {
 		const entry = { connected: false, disconnectedAt: NOW - 60_000 };
 		expect(reconcileEntryWithTruth(entry, up, NOW)).to.equal('up');
-		expect(entry.connected).to.equal(true);
-		expect(entry.disconnectedAt).to.equal(undefined);
+		// Detection only: connectedToNode owns the bit/latency/failover restore, so the entry is untouched here.
+		expect(entry.connected).to.equal(false);
+		expect(entry.disconnectedAt).to.equal(NOW - 60_000);
 	});
 
 	it('does NOT up-correct a never-connected (undefined) entry', () => {

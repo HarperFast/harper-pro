@@ -247,13 +247,17 @@ export function findWedgedNodeUrls(
 //   was lost (#289/#233); flip to false and stamp disconnectedAt so the wedge re-drive threshold
 //   starts counting from the correction.
 // - UP (entry false, truth CONNECTED with fresh liveness): the connect edge was lost or never
-//   processed (#289); flip to true in place — without this, findWedgedNodeUrls force-reconnects a
-//   perfectly healthy link once the 30s threshold lapses. Deliberately NOT applied to a
+//   processed (#289); without a correction, findWedgedNodeUrls force-reconnects a perfectly healthy
+//   link once the 30s threshold lapses. This is detection ONLY — the caller routes the restore
+//   through connectedToNode (the same path the connect edge uses) so `latency` and, under
+//   REPLICATION_FAILOVER, the failover-restore block (consolidating migrated subscriptions back off
+//   the failover peer) run too, rather than a partial bit-only mirror. Deliberately NOT applied to a
 //   never-connected (undefined) entry: that is mid-connect and owned by the connect/retry path.
 // Truth must have reported liveness at least once (lastLiveness > 0) for either correction; a
-// never-yet-written buffer says nothing about the link. Mutates the entry (mirroring what the
-// connectedToNode/disconnectedFromNode edges would have set) and returns which correction was
-// applied — or undefined on agreement — so the reconcile loop owns the telemetry.
+// never-yet-written buffer says nothing about the link. Applies the DOWN bit-correction in place
+// (it is self-contained — the wedge re-drive keys off connected:false + disconnectedAt) and returns
+// which correction is needed — or undefined on agreement — so the reconcile loop owns the UP restore
+// (via connectedToNode) and the telemetry.
 export function reconcileEntryWithTruth(
 	entry: { connected?: boolean; disconnectedAt?: number },
 	truth: ConnectionTruth | undefined,
@@ -265,11 +269,7 @@ export function reconcileEntryWithTruth(
 		if (entry.disconnectedAt == null) entry.disconnectedAt = now;
 		return 'down';
 	}
-	if (entry.connected === false && truth.connected) {
-		entry.connected = true;
-		entry.disconnectedAt = undefined;
-		return 'up';
-	}
+	if (entry.connected === false && truth.connected) return 'up';
 	return undefined;
 }
 // The per-(database, node) replication progress signals the main-thread reconcile reads out of the
@@ -963,7 +963,8 @@ export async function startOnMainThread(options) {
 		// up-corrections stop that same recovery from force-reconnecting a healthy link whose connect edge
 		// was lost. Each correction is logged — the edge bit and the truth disagreeing is exactly the
 		// desync class W1 exists to retire, so its frequency in production should be observable.
-		for (const dbWorkers of connectionReplicationMap.values()) {
+		let upCorrections;
+		for (const [url, dbWorkers] of connectionReplicationMap) {
 			for (const [databaseName, entry] of dbWorkers) {
 				const nodeName = entry.nodes?.[0]?.name;
 				if (!nodeName) continue;
@@ -977,8 +978,16 @@ export async function startOnMainThread(options) {
 							`from shared-memory truth for ${databaseName} from ${nodeName}: state=${truth.state}, ` +
 							`liveness ${now - truth.lastLiveness}ms ago${truth.errorCode ? `, last close code ${truth.errorCode}` : ''}`
 					);
+				// Defer the up-correction restore until after this read pass: connectedToNode mutates
+				// connectionReplicationMap (the failover-restore block), which must not run while we iterate it.
+				if (correction === 'up') (upCorrections ??= []).push({ url, database: databaseName, latency: entry.latency });
 			}
 		}
+		// Route each up-correction through the SAME restore path the connect edge uses (connectedToNode)
+		// rather than a partial bit-only mirror, so latency and — under REPLICATION_FAILOVER — the
+		// failover-restore block (pull migrated subscriptions back off the failover peer) run. Passing the
+		// entry's current latency avoids clobbering it, since the shared-memory truth carries none.
+		if (upCorrections) for (const connection of upCorrections) connectedToNode(connection);
 		const httpWorkers = workers.filter((worker) => worker.name === 'http');
 		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
 		const wedgedNodeUrls = findWedgedNodeUrls(
