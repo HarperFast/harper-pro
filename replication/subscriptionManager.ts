@@ -270,6 +270,7 @@ export function reconcileEntryWithTruth(
 		entry.disconnectedAt = undefined;
 		return 'up';
 	}
+	return undefined;
 }
 // The per-(database, node) replication progress signals the main-thread reconcile reads out of the
 // process-shared status buffer (auditStore.getUserSharedBuffer, written by the worker that owns the
