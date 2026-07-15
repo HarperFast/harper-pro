@@ -90,3 +90,7 @@ license:
 # HARPER_SECRETS_PRIVATE_KEY_B64. Leave this key-less so provider selection stays automatic
 # (see keyCustody.ts chooseProvider) -- do not add a `provider:` field here.
 secretCustody: {}
+# Empty (not omitted): same componentLoader.ts guard as secretCustody above -- an absent key
+# means startOnMainThread never runs and the WAF middleware never registers. `enabled` defaults
+# to true (waf.ts) when this block is present, so leave it key-less to activate with defaults.
+waf: {}
