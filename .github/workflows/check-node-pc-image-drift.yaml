@@ -122,9 +122,11 @@ jobs:
         if: steps.drift.outputs.up-to-date == 'false' && steps.inflight.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UWS_COMMIT: ${{ steps.drift.outputs.uws_commit }}
+          PPROF_VERSION: ${{ steps.drift.outputs.pprof_version }}
         run: |
           set -euo pipefail
-          echo "dispatching publish-node-pc-image: node=${MAJOR} uws=${{ steps.drift.outputs.uws_commit }} pprof=${{ steps.drift.outputs.pprof_version }}"
+          echo "dispatching publish-node-pc-image: node=${MAJOR} uws=${UWS_COMMIT} pprof=${PPROF_VERSION}"
           # workflow_dispatch/repository_dispatch are the documented exceptions to
           # GITHUB_TOKEN recursion prevention, so this triggers the run (needs the
           # actions:write permission above). `gh workflow run` exits non-zero if the
@@ -134,5 +136,5 @@ jobs:
             --repo "${{ github.repository }}" \
             --ref "${{ github.ref_name }}" \
             -f node-version="${MAJOR}" \
-            -f uws-source-commit="${{ steps.drift.outputs.uws_commit }}" \
-            -f pprof-version="${{ steps.drift.outputs.pprof_version }}"
+            -f uws-source-commit="${UWS_COMMIT}" \
+            -f pprof-version="${PPROF_VERSION}"
