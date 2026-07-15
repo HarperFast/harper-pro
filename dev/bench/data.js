@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784112959910,
+  "lastUpdate": 1784112962344,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -3623,6 +3623,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E scan p99 — short ranges",
             "value": 188.52,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "0b49587f56d4bf6fb55703c0818b47ee2af610cf",
+          "message": "Constrain replication mesh when the system database is replicated (#572)\n\n* spike: directional hdb_nodes self-record to constrain mesh under system replication\n\nDerive a directional replicates object (sendsTo/receivesFrom, per-database) for a\nnode's own hdb_nodes record from its config routes instead of a blanket replicates:true.\nLets the system db replicate for discovery/config propagation while user-db connections\nstay on the configured topology, enforced by the existing #498 gates.\n\nIncludes two integration repros (3-tier chain; per-database opposite directions).\nValidated by hot-patching dist; see repro output in session.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n\n* Constrain replication mesh when the system database is replicated\n\nDerive a directional hdb_nodes self-record from a node's config routes\n(computeSelfReplicates) instead of a blanket replicates:true, so `system`\ncan replicate for discovery/config propagation without every aggregation\nnode opening direct connections to every discovered peer. The existing\n#498 gates consult the propagated directional record; opt-in, so nodes\nwith no directional routes keep legacy full-mesh.\n\n- computeSelfReplicates + getConfiguredRoutes extracted/module-scoped; opt-in\n  (only when >=1 directional route), explicit-none yields empty (not true).\n- ensureThisNode compares replicates structurally so config/deploy reloads refresh it.\n- setNode/addNodeBack derive the self-record the same way and drop the blanket\n  sends:true on directional peer records (was short-circuiting the allow-list).\n- mergeReconstructedNode preserves a peer's last-known directional replicates\n  through a transient decode miss (no topology widening).\n- Unit tests (computeSelfReplicates/mergeReconstructedNode); integration tests\n  for transitive 3-tier, per-db opposite directions, and excluded-peer churn.\n- DESIGN.md documents the mechanism and its boundaries.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* fix: guard non-array sendsTo/receivesFrom, fix lint\n\n- computeSelfReplicates: Array.isArray guard on rep.sendsTo/receivesFrom\n  instead of `|| []` — route config comes from YAML and isn't schema-\n  validated, so a misconfigured non-array value would throw in the\n  for...of and crash boot. Matches the existing guard in\n  routeEntriesIncludePeer. Per gemini-code-assist review on PR #572.\n- systemDbPerDbDirectionRepro.test.mjs: remove unused nodeM destructure\n  (lint failure).\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n* fix: address PR #572 review (Chris Barber)\n\nTwo directional-routing regressions found in review:\n\n- knownNodes.ts scanNodesForSubscription: the reconstruct-merge guard was\n  `!node.url || node.shard === undefined`, but on an UNSHARDED cluster every\n  real decoded record has shard === undefined, so mergeReconstructedNode ran\n  over real records and reverted a freshly-decoded `replicates` to a stale\n  in-memory value during a copyApply base-copy reload (harper-pro#489) —\n  dropping user-db records for a peer that widened, over-connecting to one\n  that narrowed. Gate strictly on `!node.url`: a real record always has a\n  url, so only true reconstruct descriptors are merged.\n\n- replicationConnection.ts dynamic send-authority gate: used a strict\n  `sub.source === thisNode && sub.database === databaseName`. A\n  full-replication neighbor's directional self-record advertises\n  `receivesFrom: [{ source }]` with NO database (wildcard), so once a node\n  was opted-in, its full-replication neighbors' per-database subscriptions\n  were rejected (close 1008) whenever the sender fell to the dynamic gate.\n  Delegate to routeEntriesIncludePeer (absent source/database = wildcard),\n  matching the receive-side gate.\n\n- Adds an integration test driving an opted-in full-replication neighbor\n  through the dynamic send path.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: KrAIs <kris@harperdb.io>\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-07-15T02:01:17Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/0b49587f56d4bf6fb55703c0818b47ee2af610cf"
+        },
+        "date": 1784112962320,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 5.41,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 6.79,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 7.64,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 17.79,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 18.77,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 26.94,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 57.85,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 128.53,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 53.08,
             "unit": "ms"
           }
         ]
