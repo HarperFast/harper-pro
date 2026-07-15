@@ -284,13 +284,17 @@ export function reconcileEntryWithTruth(
 // answers "was this net the sole detector, or was recovery already underway?" without correlating
 // timestamps across log lines by hand. Returns 'prior=none' when nothing has acted on the entry.
 export function describePriorSignals(
-	entry: { lastRecovery?: { mechanism: string; at: number }; lastTruthCorrection?: { direction: string; at: number } },
+	entry:
+		| { lastRecovery?: { mechanism: string; at: number }; lastTruthCorrection?: { direction: string; at: number } }
+		| null
+		| undefined,
 	now: number
 ): string {
+	if (!entry) return 'prior=none';
 	const parts: string[] = [];
-	if (entry.lastRecovery)
+	if (entry.lastRecovery && typeof entry.lastRecovery.at === 'number')
 		parts.push(`${entry.lastRecovery.mechanism} ${Math.round((now - entry.lastRecovery.at) / 1000)}s ago`);
-	if (entry.lastTruthCorrection)
+	if (entry.lastTruthCorrection && typeof entry.lastTruthCorrection.at === 'number')
 		parts.push(
 			`truth-corrected-${entry.lastTruthCorrection.direction} ${Math.round((now - entry.lastTruthCorrection.at) / 1000)}s ago`
 		);

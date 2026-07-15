@@ -65,4 +65,18 @@ describe('describePriorSignals', () => {
 			)
 		).to.equal('prior={receive-stall-net 60s ago; truth-corrected-up 10s ago}');
 	});
+
+	it('reads prior=none for a null or undefined entry', () => {
+		expect(describePriorSignals(null, NOW)).to.equal('prior=none');
+		expect(describePriorSignals(undefined, NOW)).to.equal('prior=none');
+	});
+
+	it('omits signals whose `at` is not a number rather than logging NaN', () => {
+		expect(describePriorSignals({ lastRecovery: { mechanism: 'wedge-reconcile', at: undefined } }, NOW)).to.equal(
+			'prior=none'
+		);
+		expect(describePriorSignals({ lastTruthCorrection: { direction: 'down', at: 'oops' } }, NOW)).to.equal(
+			'prior=none'
+		);
+	});
 });
