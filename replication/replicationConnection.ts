@@ -382,6 +382,21 @@ export function closeOnInboundMessageError(
 }
 
 /**
+ * The close-vs-skip decision for a per-record value-decode failure inside `onWSMessage`'s inner
+ * catch (around `decodeBlobsWithWrites`): a resolved `tableDecoder` means the offending bytes are a
+ * real record whose structures forked from the sender's (#1163/#1453), so the caller latches the
+ * error to re-throw onto `closeOnInboundMessageError`'s close-and-reconnect path instead of skipping
+ * past it — see the inline comment at the call site for the full reasoning. An unresolved decoder
+ * (unknown tableId) is transient schema propagation, not a fork, and still skips.
+ *
+ * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
+ * inner value-decode catch in `onWSMessage`.
+ */
+export function shouldCloseOnRecordDecodeFailure(tableDecoder: unknown): boolean {
+	return !!tableDecoder;
+}
+
+/**
  * Decide whether the empty-subscription delayed close inside `replicateOverWS`'s `scheduleClose` should
  * be classified as INTENTIONAL/finished (mark `isFinished`/`intentionallyUnsubscribed`, emit `'finished'`,
  * remove the connection from the worker map, never reconnect) vs a transient close that falls through to
@@ -3663,7 +3678,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// error to re-throw onto the outer close path — the reconnect rebuilds this table's decoder
 					// from the peer's re-sent structures, healing the fork on resume. An unresolved decoder
 					// (unknown tableId) is transient schema propagation, not a fork, so it still skips.
-					if (tableDecoder) decodeFailure = { error };
+					if (shouldCloseOnRecordDecodeFailure(tableDecoder)) decodeFailure = { error };
 				}
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads

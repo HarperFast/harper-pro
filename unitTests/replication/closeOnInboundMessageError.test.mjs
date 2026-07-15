@@ -12,7 +12,7 @@
 
 import { expect } from 'chai';
 import sinon from 'sinon';
-import { closeOnInboundMessageError } from '#src/replication/replicationConnection';
+import { closeOnInboundMessageError, shouldCloseOnRecordDecodeFailure } from '#src/replication/replicationConnection';
 
 describe('closeOnInboundMessageError', () => {
 	it('latches inbound processing off before closing the socket', () => {
@@ -86,5 +86,21 @@ describe('closeOnInboundMessageError', () => {
 		});
 
 		expect(close.calledOnce).to.equal(true);
+	});
+});
+
+describe('shouldCloseOnRecordDecodeFailure', () => {
+	// Pins the close-vs-skip disposition for a per-record value-decode failure (harper-pro#440):
+	// a resolved tableDecoder means the bytes are a real record whose structures forked from the
+	// sender's, so the inner catch in onWSMessage latches the error to re-throw onto
+	// closeOnInboundMessageError's close-and-reconnect path instead of skipping past it.
+	it('a resolved tableDecoder latches for close (structure-fork class — must not skip past it)', () => {
+		const tableDecoder = { name: 'dog', decoder: {} };
+
+		expect(shouldCloseOnRecordDecodeFailure(tableDecoder)).to.equal(true);
+	});
+
+	it('an unresolved tableDecoder (unknown tableId) skips — transient schema propagation, not a fork', () => {
+		expect(shouldCloseOnRecordDecodeFailure(undefined)).to.equal(false);
 	});
 });
