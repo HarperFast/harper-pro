@@ -43,7 +43,7 @@ import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { existsSync, readdirSync } from 'node:fs';
-import { mkdtemp, cp } from 'node:fs/promises';
+import { mkdir, mkdtemp, cp } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -87,6 +87,7 @@ function sharedConfig(host) {
 // trap). Doing the copy + startHarper directly avoids it.
 async function startFixtureNode(hostname, name, options) {
 	const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
+	await mkdir(join(dataRootDir, 'components'), { recursive: true });
 	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
 	const nodeCtx = { name, harper: { hostname, dataRootDir } };
 	await startHarper(nodeCtx, options);
