@@ -2794,9 +2794,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											if (!(
 												node?.replicates === true ||
 												node?.replicates?.receives ||
-												node?.replicates?.receivesFrom?.some(
-													(sub) => sub.source === getThisNodeName() && sub.database === databaseName
-												)
+												// routeEntriesIncludePeer (not a strict source+database match): a self-record
+												// entry may omit `database` (a wildcard for all databases — what a full-replication
+												// neighbor's directional self-record advertises), and absent source means any peer.
+												// A strict `sub.database === databaseName` here would reject a full-replication
+												// neighbor's per-database subscription once this node is opted-in to directional
+												// routing, silently stopping replication and reconnect-churning. (PR #572 review — Chris Barber.)
+												routeEntriesIncludePeer(node?.replicates?.receivesFrom, getThisNodeName(), databaseName)
 											)) {
 												closed = true;
 												close(1008, `Unauthorized database subscription to ${databaseName}`);

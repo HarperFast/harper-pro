@@ -356,6 +356,22 @@ export function reconstructNodeFromKey(key: unknown): { name: string; replicates
 }
 
 /**
+ * Merge a decode-recovery descriptor (from reconstructNodeFromKey — key + `replicates: true`) with the
+ * last-known in-memory node record. The reconstruct only knows the key, so it defaults `replicates:
+ * true` (full mesh). When we still hold the peer's last decoded DIRECTIONAL `replicates` object, that
+ * is authoritative — otherwise a transient decode miss of a constrained peer's row would briefly widen
+ * the topology back to a full mesh (the peer's directional record says "don't connect me to everyone",
+ * but the reconstruct would re-advertise `true` until the next decodable event). A legacy boolean
+ * `replicates` on the old record is left to the reconstruct's `true`. systemdb-routing / harper-pro#460.
+ */
+export function mergeReconstructedNode(reconstructed: any, oldNode: any): any {
+	if (!oldNode) return reconstructed;
+	const merged = { ...oldNode, ...reconstructed };
+	if (oldNode.replicates && typeof oldNode.replicates === 'object') merged.replicates = oldNode.replicates;
+	return merged;
+}
+
+/**
  * Existence probe for an hdb_nodes key that prefers the RANGE/scan path. A v5-era shared-structure
  * row can transiently misread to `[]`/null through the point lookup (`doesExist`/`get`) at early
  * boot (harper-pro#352), but `getKeys` lists the key reliably because it never decodes the value.
@@ -408,7 +424,7 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			// server.nodes (and the outbound subscription fired below) still reflect the peer
 			// (harper-pro#460). A genuine delete is handled separately via isGenuineNodeDeletion.
 			let reconstructed = reconstructNodeFromKey(node_name);
-			if (reconstructed && oldNode) reconstructed = { ...oldNode, ...reconstructed };
+			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
 			// Cast: this is a deliberate partial recovery descriptor (name + replicates, plus any
 			// enriched fields from oldNode); the next decodable update supplies the rest.
 			if (reconstructed) server.nodes.push(reconstructed as any);
@@ -450,7 +466,7 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			// THAT instead, so the outbound subscription is (re)created; the next decodable event
 			// replaces it with the full record.
 			let reconstructed = reconstructNodeFromKey(event.id);
-			if (reconstructed && oldNode) reconstructed = { ...oldNode, ...reconstructed };
+			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
 			if (reconstructed) {
 				logger.warn?.(
 					'hdb_nodes change event for',
@@ -577,12 +593,23 @@ function rebuildKnownNodes(listener: (node: any, id: string) => void) {
 	server.shards = new Map();
 
 	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key) => {
-		if (!node.url || node.shard === undefined) {
+		// Only a decode-miss RECONSTRUCT descriptor (reconstructNodeFromKey → no url) needs enrichment;
+		// gate strictly on `!node.url`, NOT `node.shard === undefined`. On an unsharded cluster every real,
+		// fully-decoded record has `shard === undefined`, so the looser guard would run mergeReconstructedNode
+		// over REAL records and revert their freshly-decoded `replicates` to a stale in-memory value during a
+		// copyApply base-copy reload (harper-pro#489) — dropping user-database records for a peer that just
+		// widened, or over-connecting to one that narrowed. A real record always has a url, so it skips this
+		// branch and its fresh `replicates` is honored. (PR #572 review — Chris Barber.)
+		if (!node.url) {
 			const targetName = node.name ?? key;
 			const oldNode =
 				targetName !== undefined ? oldNodes.find((n) => n && n.name !== undefined && n.name === targetName) : undefined;
-			// name + replicates from the reconstruct win; oldNode supplies url/shard/ca/etc.
-			if (oldNode) node = { ...oldNode, ...node };
+			// name from the reconstruct wins and oldNode supplies url/shard/ca/etc., but a directional
+			// `replicates` from oldNode is preserved (mergeReconstructedNode) rather than clobbered by the
+			// reconstruct's `true` — otherwise a transient decode miss during this scan would widen a
+			// constrained peer back to full mesh. Same treatment as the two processNodeUpdateEvent reconstruct
+			// sites. systemdb-routing / harper-pro#489.
+			if (oldNode) node = mergeReconstructedNode(node, oldNode);
 		}
 		// server.nodes holds PEERS, never this node itself — mirror processNodeUpdateEvent's
 		// `node_name !== getThisNodeName()` guard. The per-row event path always excluded self; the scan

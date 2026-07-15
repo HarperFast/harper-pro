@@ -390,6 +390,81 @@ export function readNodeRowSync(store, name) {
 	return store.getSync(name);
 }
 
+/** The normalized route list this node was started with (populated by startOnMainThread). Exposed so
+ * the registry-set path (setNode/addNodeBack) can derive the same directional self-record as the
+ * config-route path instead of re-deriving from a replication `options` it doesn't have in scope. */
+export function getConfiguredRoutes(): Route[] {
+	return routes;
+}
+
+/**
+ * Derive a node's OWN hdb_nodes `replicates` record from its config routes. Instead of a blanket
+ * `replicates: true` (which advertises a full mesh), produce a DIRECTIONAL record so that when the
+ * `system` database is replicated for discovery the record propagates cluster-wide and the existing
+ * controlled-flow gates (shouldReplicateFromNode / the send-side authority gate — harper-pro#498)
+ * keep a discovered non-neighbor peer from opening a direct connection: they consult this node's
+ * advertised sendsTo/receivesFrom rather than a permissive boolean. This is what lets `system`
+ * replicate (users/roles/schema propagate everywhere) while user databases stay on the configured
+ * roadside→middle→core topology.
+ *
+ * The directional record is OPT-IN: it is produced only when the node has at least one DIRECTIONAL
+ * route (a `replicates` object — the controlled-flow form, whether `{sends/receives}` booleans or
+ * `{sendsTo/receivesFrom}` entries). A node with no routes, or only non-directional routes
+ * (full-replication `true` or subscriptions-only), keeps the legacy `replicates: true` (full mesh), so
+ * existing clusters — including seed-based transitive auto-mesh — are unaffected. Once a directional
+ * route exists, full-replication neighbors on the SAME node still contribute both-direction entries
+ * (they are fully replicated), while everyone else is constrained. Entry target/source default to the
+ * route's peer so the propagated record is fully qualified (peer + database) for the discovered-peer
+ * gates. A directional route that authorizes nothing yields an empty record (NOT `true`), so a node
+ * configured to replicate nothing does not silently re-advertise a full mesh.
+ */
+export function computeSelfReplicates(routeList: Iterable<any>): true | { sendsTo: any[]; receivesFrom: any[] } {
+	const sendsTo: any[] = [];
+	const receivesFrom: any[] = [];
+	let sawDirectional = false;
+	for (const route of routeList) {
+		const rep = route.replicates;
+		const peer = route.name;
+		if (rep && typeof rep === 'object') {
+			sawDirectional = true;
+			if (rep.sends) sendsTo.push({ target: peer });
+			if (rep.receives) receivesFrom.push({ source: peer });
+			// Array.isArray (not `|| []`): route config comes from YAML and isn't schema-validated, so a
+			// misconfigured non-array sendsTo/receivesFrom (object or string) must not crash boot in a
+			// `for...of`. Matches the same guard in routeEntriesIncludePeer.
+			for (const e of Array.isArray(rep.sendsTo) ? rep.sendsTo : []) {
+				const entry = typeof e === 'string' ? { target: e } : { ...e };
+				if (!entry.target) entry.target = peer;
+				sendsTo.push(entry);
+			}
+			for (const e of Array.isArray(rep.receivesFrom) ? rep.receivesFrom : []) {
+				const entry = typeof e === 'string' ? { source: e } : { ...e };
+				if (!entry.source) entry.source = peer;
+				receivesFrom.push(entry);
+			}
+		} else if (rep === true || rep == undefined) {
+			// full-replication neighbor: advertise both directions to it (only matters once this node has
+			// at least one directional route, i.e. sawDirectional — otherwise we return legacy `true` below).
+			sendsTo.push({ target: peer });
+			receivesFrom.push({ source: peer });
+		}
+		// rep === false is a subscriptions-only route; it contributes nothing to the directional
+		// record and is not itself a directional declaration (handled by the node.subscriptions path).
+	}
+	// Opt-in: no directional route → preserve the legacy full-mesh self-record.
+	if (!sawDirectional) return true;
+	return { sendsTo, receivesFrom };
+}
+
+/** Structural equality for a self-record `replicates` value, used to decide whether a config change
+ * requires rewriting this node's hdb_nodes row. Both operands are produced by computeSelfReplicates
+ * (deterministic entry order) or are the legacy boolean, so a stable JSON compare is sufficient. */
+function replicatesEqual(a: unknown, b: unknown): boolean {
+	if (a === b) return true;
+	if (typeof a !== typeof b) return false;
+	return JSON.stringify(a) === JSON.stringify(b);
+}
+
 export async function startOnMainThread(options) {
 	// we do all of the main management of tracking connections and subscriptions on the main thread and delegate
 	// the actual work to the worker threads
@@ -442,12 +517,24 @@ export async function startOnMainThread(options) {
 			if (existing !== null) {
 				// if this was null it has previously been deleted, and we don't want to recreate nodes for deleted nodes
 				const url = options.url ?? getThisNodeUrl();
-				if (existing === undefined || existing.url !== url || existing.shard !== options.shard) {
+				// Recompute the DIRECTIONAL self-record from the current config routes and compare it
+				// structurally, not just url/shard: a topology change (e.g. legacy `true` → directional, or a
+				// changed route direction) leaves url/shard untouched, so without this the existing row would
+				// keep a stale record forever. startOnMainThread runs once per process (componentLoader's
+				// `mainThreadInitialized`, harper-pro#460), and replication routes are process config, so a
+				// route change takes effect on the next restart — where this rewrite fires.
+				const selfReplicates = computeSelfReplicates(iterateRoutes(options));
+				if (
+					existing === undefined ||
+					existing.url !== url ||
+					existing.shard !== options.shard ||
+					!replicatesEqual(existing.replicates, selfReplicates)
+				) {
 					return ensureNode(thisName, {
 						name: thisName,
 						url,
 						shard: options.shard,
-						replicates: true,
+						replicates: selfReplicates,
 					});
 				}
 			}
