@@ -14,7 +14,9 @@
  */
 
 /** A parked send warns once it has waited this long without acquiring a send slot. */
-export const PARK_WARN_MS = Math.max(0, Number(process.env.HARPER_BLOB_SEND_PARK_WARN_MS) || 0) || 5000;
+const parkWarnMs = Number(process.env.HARPER_BLOB_SEND_PARK_WARN_MS);
+export const PARK_WARN_MS =
+	process.env.HARPER_BLOB_SEND_PARK_WARN_MS != null && !Number.isNaN(parkWarnMs) ? Math.max(0, parkWarnMs) : 5000;
 
 /** Minimum gap between throttled warn lines of the same kind. */
 export const WARN_THROTTLE_MS = 5000;
