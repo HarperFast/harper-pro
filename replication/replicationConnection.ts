@@ -37,6 +37,13 @@ import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { registerBlobSend, noteBlobSendProgress, endBlobSend, isDrainingBlobSends } from './blobSendDrain.ts';
+import {
+	PARK_WARN_MS,
+	WARN_THROTTLE_MS,
+	createThrottleState,
+	decideThrottledWarn,
+	type ThrottleState,
+} from './blobSendWarnThrottle.ts';
 import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
@@ -4012,6 +4019,27 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	const blobsBeingSent = new Set();
 	let blobSendErrorsSuppressed = 0;
 	let lastBlobSendErrorLog = 0;
+	// Throttle state for the blob-send visibility warnings below (park-on-cap, unpark, declined).
+	// Each bucket is throttled independently so a burst under one cause can't drown the others.
+	const parkWarnThrottle = createThrottleState();
+	const unparkWarnThrottle = createThrottleState();
+	const declineWarnThrottle = createThrottleState();
+	function warnThrottled(state: ThrottleState, message: string, details: Record<string, unknown>) {
+		const { emit, suppressedCount } = decideThrottledWarn(state, Date.now());
+		if (!emit) return;
+		if (suppressedCount > 0) {
+			logger.warn?.(`Suppressed ${suppressedCount} additional "${message}" warnings in the last ${WARN_THROTTLE_MS}ms`);
+		}
+		logger.warn?.(message, details);
+	}
+	function warnBlobSendDeclined(id, reason: string) {
+		warnThrottled(declineWarnThrottle, 'Not sending blob; peer will rely on re-request to converge', {
+			fileId: id,
+			database: databaseName,
+			node: remoteNodeName,
+			reason,
+		});
+	}
 	async function sendBlobs(blob: Blob, recordId: any) {
 		// found a blob, start sending it
 		const id = getFileId(blob);
@@ -4019,11 +4047,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.debug?.('Blob already being sent', id);
 			return;
 		}
-		if (wsClosed) return;
+		if (wsClosed) {
+			warnBlobSendDeclined(id, 'connection closed');
+			return;
+		}
 		if (isDrainingBlobSends()) {
 			// The worker is draining for shutdown; don't start a new send that we'd only tear down (or
 			// hold the drain open for). The peer re-requests this blob on reconnect (harper-pro#527).
-			logger.debug?.('Worker draining, not starting new blob send', id);
+			warnBlobSendDeclined(id, 'worker draining for shutdown');
 			return;
 		}
 		blobsBeingSent.add(id);
@@ -4032,9 +4063,29 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// drain wait (unreachable while the socket stayed congested) and the GET_RECORD path never
 		// checked it at all, so concurrent sends grew by one per drain event (200+ drain listeners
 		// on one TLSSocket observed in the field).
+		let parkWarned = false;
+		let parkStartedAt = 0;
+		let parkWarnTimer: NodeJS.Timeout | undefined;
+		if (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+			parkStartedAt = Date.now();
+			// Only fires if still parked once PARK_WARN_MS elapses; cleared below the moment we unpark
+			// or bail out, so a send that acquires a slot quickly never logs anything.
+			parkWarnTimer = setTimeout(() => {
+				parkWarned = true;
+				warnThrottled(parkWarnThrottle, 'Blob send parked on the outstanding-sends cap', {
+					fileId: id,
+					database: databaseName,
+					node: remoteNodeName,
+					outstandingBlobsBeingSent,
+					waitedMs: Date.now() - parkStartedAt,
+				});
+			}, PARK_WARN_MS);
+			parkWarnTimer.unref?.();
+		}
 		while (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
 			await new Promise((resolve) => blobSentCallbacks.push(resolve));
 			if (wsClosed) {
+				clearTimeout(parkWarnTimer);
 				blobsBeingSent.delete(id);
 				return;
 			}
@@ -4042,9 +4093,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// A shutdown drain can start while this send was queued behind the concurrency cap;
 				// don't let a freshly-dequeued send start after that point (same reasoning as the
 				// pre-queue check above).
+				clearTimeout(parkWarnTimer);
+				warnBlobSendDeclined(id, 'worker draining for shutdown (while parked on the outstanding-sends cap)');
 				blobsBeingSent.delete(id);
 				return;
 			}
+		}
+		clearTimeout(parkWarnTimer);
+		if (parkWarned) {
+			warnThrottled(unparkWarnThrottle, 'Blob send unparked after waiting on the outstanding-sends cap', {
+				fileId: id,
+				database: databaseName,
+				node: remoteNodeName,
+				waitedMs: Date.now() - parkStartedAt,
+			});
 		}
 		const iterator = blob.stream()[Symbol.asyncIterator]();
 		// Track this send so a worker restart can gracefully drain it (finish it if it's still making
