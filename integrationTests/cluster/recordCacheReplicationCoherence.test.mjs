@@ -53,12 +53,16 @@ const DATABASE = 'data';
 
 /** Raw operations POST that doesn't assert status, for connect-retry loops. */
 async function rawOperation(node, operation) {
-	const response = await fetch(node.operationsAPIURL, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(operation),
-	});
-	return { status: response.status, body: await response.json() };
+	try {
+		const response = await fetch(node.operationsAPIURL, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(operation),
+		});
+		return { status: response.status, body: await response.json() };
+	} catch (error) {
+		return { status: 500, body: { error: error.message } };
+	}
 }
 
 /** Bidirectionally connect nodeB to nodeA, waiting for live database sockets both ways. */

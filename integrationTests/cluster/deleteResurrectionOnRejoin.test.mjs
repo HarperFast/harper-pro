@@ -40,7 +40,7 @@ import {
 import { sendOperation } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
+	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'..',
 	'..',
 	'dist',
@@ -132,10 +132,14 @@ suite('delete-resurrection on rejoin + delete-vs-update LWW', { timeout: 300000 
 		const ctxA = { name: ctx.name, harper: { hostname: hostnameA } };
 		const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
 
-		await Promise.all([startHarper(ctxA, nodeConfig(hostnameA)), startHarper(ctxB, nodeConfig(hostnameB))]);
-
-		ctx.nodeA = ctxA.harper;
-		ctx.nodeB = ctxB.harper;
+		await Promise.all([
+			startHarper(ctxA, nodeConfig(hostnameA)).then(() => {
+				ctx.nodeA = ctxA.harper;
+			}),
+			startHarper(ctxB, nodeConfig(hostnameB)).then(() => {
+				ctx.nodeB = ctxB.harper;
+			}),
+		]);
 
 		// Create the table on both nodes.
 		for (const node of [ctx.nodeA, ctx.nodeB]) {
