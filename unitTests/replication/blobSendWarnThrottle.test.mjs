@@ -5,10 +5,45 @@
  * without spamming logs when a burst of sends hits the same condition at once.
  */
 
+import { execFileSync } from 'node:child_process';
 import { expect } from 'chai';
 import { createThrottleState, decideThrottledWarn, WARN_THROTTLE_MS } from '#src/replication/blobSendWarnThrottle';
 
+const parkWarnEnvName = 'HARPER_BLOB_SEND_PARK_WARN_MS';
+
+function readParkWarnMs(value) {
+	const env = { ...process.env };
+	if (value == null) delete env[parkWarnEnvName];
+	else env[parkWarnEnvName] = value;
+	return Number(
+		execFileSync(
+			process.execPath,
+			[
+				'--input-type=module',
+				'--eval',
+				"import { PARK_WARN_MS } from '#src/replication/blobSendWarnThrottle'; process.stdout.write(String(PARK_WARN_MS));",
+			],
+			{ cwd: new URL('../..', import.meta.url), encoding: 'utf8', env }
+		)
+	);
+}
+
 describe('blobSendWarnThrottle', () => {
+	describe('PARK_WARN_MS', () => {
+		it('allows an immediate warning', () => {
+			expect(readParkWarnMs('0')).to.equal(0);
+		});
+
+		it('defaults when the environment variable is unset or invalid', () => {
+			expect(readParkWarnMs(undefined)).to.equal(5000);
+			expect(readParkWarnMs('invalid')).to.equal(5000);
+		});
+
+		it('clamps negative values to zero', () => {
+			expect(readParkWarnMs('-1')).to.equal(0);
+		});
+	});
+
 	describe('createThrottleState', () => {
 		it('starts fresh so the very first decision always emits', () => {
 			const state = createThrottleState();
