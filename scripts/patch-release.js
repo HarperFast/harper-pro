@@ -269,8 +269,10 @@ async function main() {
 			err(`--set-version "${SET_VERSION}" is not a valid semver`);
 			process.exit(1);
 		}
-		if (semver.compare(SET_VERSION, coreCurrent) < 0 || semver.compare(SET_VERSION, proCurrent) < 0) {
-			err(`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`);
+		if (semver.compare(SET_VERSION, coreCurrent) <= 0 || semver.compare(SET_VERSION, proCurrent) <= 0) {
+			err(
+				`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`
+			);
 			process.exit(1);
 		}
 		target = SET_VERSION;
@@ -306,7 +308,9 @@ async function main() {
 		if (coreBumping) {
 			coreVersion = setVersion('harper (core)', target);
 		} else {
-			info(`  No new commits on core's ${CORE_RELEASE_BRANCH} since ${coreStatus.lastTag} — skipping core version bump.`);
+			info(
+				`  No new commits on core's ${CORE_RELEASE_BRANCH} since ${coreStatus.lastTag} — skipping core version bump.`
+			);
 		}
 
 		// ── Step 2: checkout harper-pro release branch ─────────────────────────
