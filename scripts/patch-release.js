@@ -43,7 +43,11 @@ const RELEASE_BRANCH = getArg('--branch', 'v5.0');
 const CORE_RELEASE_BRANCH = getArg('--core-branch', RELEASE_BRANCH);
 const SOURCE_BRANCH = getArg('--source', 'main');
 const LABEL = getArg('--label', 'patch');
-const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major
+const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major | prerelease
+// Explicit target version (without leading 'v'), overriding the --bump computation.
+// Needed for prerelease-line transitions semver.inc can't express in one step, e.g.
+// alpha.N → beta.1 (`--set-version 5.2.0-beta.1`).
+const SET_VERSION = getArg('--set-version', null);
 
 function getArg(flag, def) {
 	const i = argv.indexOf(flag);
@@ -259,7 +263,18 @@ async function main() {
 	const coreNext = semver.inc(coreCurrent, VERSION_BUMP);
 	const proNext = semver.inc(proCurrent, VERSION_BUMP);
 	const effectiveCore = coreBumping ? coreNext : coreCurrent;
-	const target = semver.compare(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
+	let target = semver.compare(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
+	if (SET_VERSION) {
+		if (!semver.valid(SET_VERSION)) {
+			err(`--set-version "${SET_VERSION}" is not a valid semver`);
+			process.exit(1);
+		}
+		if (semver.compare(SET_VERSION, coreCurrent) < 0 || semver.compare(SET_VERSION, proCurrent) < 0) {
+			err(`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`);
+			process.exit(1);
+		}
+		target = SET_VERSION;
+	}
 
 	info(`\n  Current:  core=v${coreCurrent}  harper-pro=v${proCurrent}`);
 	info(`  Target:   v${target}`);
