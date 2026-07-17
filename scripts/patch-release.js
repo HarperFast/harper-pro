@@ -276,7 +276,10 @@ async function main() {
 			);
 			process.exit(1);
 		}
-		if (runSafe(`git rev-parse -q --verify "refs/tags/v${target}"`).code === 0) {
+		if (
+			runSafe(`git rev-parse -q --verify "refs/tags/v${target}"`).code === 0 ||
+			runSafe(`git -C "${corePath}" rev-parse -q --verify "refs/tags/v${target}"`).code === 0
+		) {
 			err(`--set-version "${SET_VERSION}": tag v${target} already exists`);
 			process.exit(1);
 		}
