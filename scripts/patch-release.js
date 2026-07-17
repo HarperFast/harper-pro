@@ -269,13 +269,17 @@ async function main() {
 			err(`--set-version "${SET_VERSION}" is not a valid semver`);
 			process.exit(1);
 		}
-		if (semver.compare(SET_VERSION, coreCurrent) <= 0 || semver.compare(SET_VERSION, proCurrent) <= 0) {
+		target = semver.valid(SET_VERSION);
+		if (semver.compare(target, coreCurrent) <= 0 || semver.compare(target, proCurrent) <= 0) {
 			err(
 				`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`
 			);
 			process.exit(1);
 		}
-		target = SET_VERSION;
+		if (runSafe(`git rev-parse -q --verify "refs/tags/v${target}"`).code === 0) {
+			err(`--set-version "${SET_VERSION}": tag v${target} already exists`);
+			process.exit(1);
+		}
 	}
 
 	info(`\n  Current:  core=v${coreCurrent}  harper-pro=v${proCurrent}`);
