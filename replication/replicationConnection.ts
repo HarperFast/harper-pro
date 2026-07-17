@@ -184,6 +184,18 @@ export function readConnectionTruth(
 // retrieval connection (it only connect()s) or an inbound connection (no options.connection at all).
 // Checked at write time, not via the open-time `isSubscriptionConnection` snapshot, so it holds
 // regardless of subscribe()/open ordering.
+// W1 T1 (harper-pro#431): one-line truth snapshot appended to every watchdog / reconcile-net fire log,
+// so the watchdog-demotion soak can grep fires and see what the authoritative connection truth said at
+// that moment. A fire while truth reads connected with fresh liveness is an invariant-violation
+// candidate (the watchdog saw something truth did not); a fire while truth already reads down means the
+// truth-driven recovery path had — or should have — taken over. Pure formatter so it is unit-testable
+// and never throws into a recovery path.
+export function formatTruthSnapshot(truth: ConnectionTruth | undefined, now: number = Date.now()): string {
+	if (!truth) return 'truth=unavailable';
+	const liveness = truth.lastLiveness > 0 ? `${Math.round((now - truth.lastLiveness) / 1000)}s ago` : 'never';
+	const closeCode = truth.errorCode ? `, lastCloseCode: ${truth.errorCode}` : '';
+	return `truth={connected: ${truth.connected}, state: ${truth.state}, liveness: ${liveness}${closeCode}}`;
+}
 
 const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
 // When receiving a replication message, we apply per-record backpressure to keep a single
@@ -1606,6 +1618,24 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// 'close' event, the watchdog forces the reconnect path. See harper-pro#233 for the failure
 	// modes observed in the field.
 	const wedgedForTest = armReplicationWedgeForTest(options.connection, ws, databaseName);
+	// W1 T1 (#431): truth snapshot for watchdog fire logs — what the shared-memory connection truth said
+	// at the moment a worker-local watchdog decided to act (see formatTruthSnapshot for how the
+	// demotion soak reads this).
+	const truthSnapshotForLog = () => {
+		// This telemetry feeds the watchdog fire logs, emitted from the onSilence/onStall recovery
+		// callbacks immediately before forceReconnect()/ws.terminate(). getSharedStatus() and
+		// deriveConnectionTruth() read shared memory / the auditStore and can throw if that state is
+		// unexpected; an unhandled throw here would abort the recovery callback and leave the connection
+		// permanently wedged — the opposite of what a recovery net is for. Swallow (trace-log) so a
+		// telemetry failure degrades the log line to a marker and recovery always proceeds. (harper-pro#431)
+		try {
+			const status = getSharedStatus();
+			return formatTruthSnapshot(status && deriveConnectionTruth(status));
+		} catch (error) {
+			logger.trace?.(connectionId, 'failed to build connection-truth snapshot for watchdog fire log', error);
+			return 'truth=error';
+		}
+	};
 	receiveWatchdog = createReceiveWatchdog({
 		intervalMs: currentReceiveSilenceThresholdMs,
 		getBytesRead: () => (wedgedForTest ? 0 : (ws._socket?.bytesRead ?? 0)),
@@ -1617,7 +1647,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			const direction = options.url ? 'no activity from' : 'no ping from';
 			logger.warn?.(
-				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${currentReceiveSilenceThresholdMs()}ms — terminating connection and reconnecting`
+				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${currentReceiveSilenceThresholdMs()}ms — terminating connection and reconnecting — ${truthSnapshotForLog()}`
 			);
 			// On the client (subscription) side drive recovery through the connection so it does not depend
 			// on terminate() propagating a 'close' (an open-but-idle socket may never emit one). A
@@ -1637,7 +1667,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		onStall: () => {
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting`
+				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -1671,7 +1701,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${blobTimeout}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453)`
+				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${blobTimeout}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
