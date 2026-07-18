@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784371823758,
+  "lastUpdate": 1784371825870,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -3980,6 +3980,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 34.69,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "57047faf6419b0073d8d2149017e046a87191286",
+          "message": "fix: rename replication log redaction from registryAuth to credentials (#583)\n\nCore PR harper#1797 reshapes deploy_component's credential field from\nregistryAuth to credentials. logRedaction.ts masked tokens by keying on\noperation.registryAuth, so after that rename the mask would silently stop\nmatching anything.\n\nCo-authored-by: Claude Sonnet <noreply@anthropic.com>",
+          "timestamp": "2026-07-17T20:08:31Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/57047faf6419b0073d8d2149017e046a87191286"
+        },
+        "date": 1784371825851,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 5.33,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 6.87,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 7.98,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 17.65,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 18.64,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 19.65,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 42.78,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 128.55,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 44.1,
             "unit": "ms"
           }
         ]
