@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784371825870,
+  "lastUpdate": 1784458267249,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -1767,6 +1767,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 3168.58,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "57047faf6419b0073d8d2149017e046a87191286",
+          "message": "fix: rename replication log redaction from registryAuth to credentials (#583)\n\nCore PR harper#1797 reshapes deploy_component's credential field from\nregistryAuth to credentials. logRedaction.ts masked tokens by keying on\noperation.registryAuth, so after that rename the mask would silently stop\nmatching anything.\n\nCo-authored-by: Claude Sonnet <noreply@anthropic.com>",
+          "timestamp": "2026-07-17T20:08:31Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/57047faf6419b0073d8d2149017e046a87191286"
+        },
+        "date": 1784458265711,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 10495.26,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 26839.74,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 22635.53,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 10265.68,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 8156.07,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 3216.41,
             "unit": "ops/sec"
           }
         ]
