@@ -71,6 +71,54 @@ suite('SSH Key Operations', (ctx) => {
 		await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey1' });
 	});
 
+	test('add_ssh_key generate=true mints a keypair and returns the public key', async () => {
+		let { status, data } = await sendOperation(ctx.harper, {
+			operation: 'add_ssh_key',
+			name: 'testkey-generated',
+			generate: true,
+			host: 'testkey-generated.gitlab.com',
+			hostname: 'gitlab.com',
+		});
+		equal(status, 200);
+		equal(data.message, 'Added ssh key: testkey-generated');
+		ok(
+			typeof data.public_key === 'string' && data.public_key.startsWith('ssh-ed25519 '),
+			'expected an ed25519 public key in the response'
+		);
+
+		// the minted private key is stored (sealed at rest) and retrievable as an envelope
+		({ status, data } = await sendOperation(ctx.harper, { operation: 'get_ssh_key', name: 'testkey-generated' }));
+		equal(status, 200);
+		ok(data.key.startsWith('enc:v1:'), 'expected the minted key to be sealed at rest');
+
+		// cleanup
+		await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey-generated' });
+	});
+
+	test('add_ssh_key rejects generate=true together with an explicit key', async () => {
+		const { status, data } = await sendOperation(ctx.harper, {
+			operation: 'add_ssh_key',
+			name: 'testkey-both',
+			generate: true,
+			key: 'random\nstring',
+			host: 'testkey-both.gitlab.com',
+			hostname: 'gitlab.com',
+		});
+		ok(status >= 400, `expected a client error, got ${status}`);
+		equal(data.error, 'Provide either `key` or `generate: true`, not both.');
+	});
+
+	test('add_ssh_key with neither key nor generate returns a client error', async () => {
+		const { status, data } = await sendOperation(ctx.harper, {
+			operation: 'add_ssh_key',
+			name: 'testkey-neither',
+			host: 'testkey-neither.gitlab.com',
+			hostname: 'gitlab.com',
+		});
+		ok(status >= 400, `expected a client error, got ${status}`);
+		equal(data.error, 'add_ssh_key requires `key`, or `generate: true` to mint one');
+	});
+
 	test('set_ssh_known_hosts and get_ssh_known_hosts reflect updated known hosts', async () => {
 		let { status, data } = await sendOperation(ctx.harper, {
 			operation: 'set_ssh_known_hosts',
