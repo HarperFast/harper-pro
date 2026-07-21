@@ -520,6 +520,50 @@ export function probeNodeRow(store: any, key: unknown): { outcome: 'deleted' | '
 }
 
 /**
+ * Sentinel returned by {@link resolveNodeForSendAuth} for an hdb_nodes event that carries no
+ * authorization decision — the watcher must leave the connection alone rather than tear it down.
+ */
+export const SEND_AUTH_UNCHANGED = Symbol('send-auth-unchanged');
+
+/**
+ * Resolve the hdb_nodes record that the dynamic send-authorization watch (replicationConnection's
+ * per-subscriber `getHDBNodeTable().subscribe(name)` loop) should evaluate for one change event.
+ *
+ * The decision must NEVER be keyed off `event.value`, because several event shapes legitimately carry
+ * no `replicates` field for a peer that is replicating perfectly well:
+ *   - a whole-table `reload` marker (emitted when a copyApply base copy back-fills hdb_nodes) is fanned
+ *     out to EVERY subscriber on the table with a null id and no value — see transactionBroadcast's
+ *     reload branch. Every node joining/cloning into a cluster base-copies the system database, so this
+ *     fired mid-formation and closed every live connection with a spurious
+ *     `1008 Unauthorized database subscription` roughly 1ms after the marker landed;
+ *   - a `patch` carries only the patched fields (`add_node`'s `{ isLeader: true }`), never `replicates`;
+ *   - a transient decode failure yields a nullish value for a row that is still present
+ *     (harper#1163 / harper-pro#352).
+ * This is the same invariant {@link processNodeUpdateEvent} already enforces on the subscription path:
+ * an event with no decodable value is not a node removal.
+ *
+ * So read the authoritative row instead: a clean tombstone (`probe` outcome `'deleted'`) de-authorizes
+ * (returns `undefined`), a present-and-valid row is evaluated as usual, and a present-but-undecodable
+ * row returns {@link SEND_AUTH_UNCHANGED} so a decode blip cannot knock a peer offline. `probe` is
+ * injected so this stays unit-testable without a live store.
+ *
+ * A genuine `delete` event is NOT resolved here — the caller short-circuits it via
+ * {@link isGenuineNodeDeletion}, because a point read can be served from a snapshot that predates the
+ * delete commit (harper#1163) and would hand back the still-authorizing row. Nor does
+ * SEND_AUTH_UNCHANGED mean "authorized forever": the caller re-probes for a bounded grace period and
+ * then fails closed, so a revocation carried by an undecodable write cannot be missed indefinitely.
+ */
+export function resolveNodeForSendAuth(
+	name: string,
+	probe: (key: unknown) => { outcome: 'deleted' | 'decode-failure'; record?: any } = (key) =>
+		probeNodeRow(getHDBNodeTable().primaryStore, key)
+): any | typeof SEND_AUTH_UNCHANGED {
+	const { outcome, record } = probe(name);
+	if (outcome === 'deleted') return undefined;
+	return isValidNodeRecord(record) ? record : SEND_AUTH_UNCHANGED;
+}
+
+/**
  * Resolve the node descriptor to use for one hdb_nodes scan entry on the OUTBOUND subscription path.
  * Returns the decoded record when valid; when the value is nullish, `probe` distinguishes a genuine
  * tombstone (returns `undefined` → skip, harper-pro#460 review) from a transient decode failure
