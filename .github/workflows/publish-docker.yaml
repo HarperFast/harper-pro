@@ -513,7 +513,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Send Slack published notification
-        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -574,7 +574,7 @@ jobs:
             echo "text=Harper Pro v${{ needs.merge.outputs.docker-image-tag }} Docker publish failed" >> "$GITHUB_OUTPUT"
             echo "status_line=:x: Failed to publish to :docker_logo:" >> "$GITHUB_OUTPUT"
           fi
-      - uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+      - uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -616,7 +616,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Send Slack GPU published notification
-        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -657,7 +657,7 @@ jobs:
     needs: [merge-gpu]
     runs-on: ubuntu-latest
     steps:
-      - uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+      - uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -732,7 +732,7 @@ jobs:
             echo "cert_line=${cert_line}"
           } >> "${GITHUB_OUTPUT}"
       - name: Send Slack OpenShift notification
-        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
