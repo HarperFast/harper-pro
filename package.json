@@ -112,6 +112,8 @@
 		"test:unit": "mocha --require unitTests/unitTestSetup.cjs 'unitTests/**/*.test.mjs'",
 		"test:integration": "HARPER_INTEGRATION_TEST_INSTALL_SCRIPT=dist/bin/harper.js harper-integration-test-run",
 		"test:integration:all": "npm run test:integration -- integrationTests/**/*.test.*s",
+		"test:integration:cluster": "npm run test:integration -- 'integrationTests/cluster/**/*.test.*s'",
+		"test:integration:non-cluster": "npm run test:integration -- 'integrationTests/!(cluster)/**/*.test.*s'",
 		"test:smoke": "node smokeTests/run-smoke.mjs",
 		"test:stress:components": "node stressTests/run-stress.mjs",
 		"cluster:ip:local": "pushd utility/dev && docker compose -f docker-compose.ip.yml --project-directory ../.. build && docker compose -f docker-compose.ip.yml --project-directory ../.. up; popd",
