@@ -127,6 +127,19 @@ jobs:
           mkdir -p /tmp/harperdb-legacy
           npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
 
+      # A zero-match glob makes node:test's run() silently collect no tests and exit 0
+      # (a false green). Fail loudly instead if the extglob exclusion ever stops expanding.
+      - name: Guard against empty non-cluster test glob
+        env:
+          PATTERN: 'integrationTests/!(cluster)/**/*.test.*s'
+        run: |
+          count=$(node -e "console.log(require('node:fs').globSync(process.env.PATTERN).length)")
+          echo "non-cluster test files matched: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::non-cluster glob '$PATTERN' matched 0 files on $(node --version) — the extglob exclusion is not expanding, so this job would run no tests."
+            exit 1
+          fi
+
       - name: Run Integration Test Shard ${{ matrix.shard }}
         env:
           HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
@@ -189,6 +202,17 @@ jobs:
         run: |
           mkdir -p /tmp/harperdb-legacy
           npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+
+      - name: Guard against empty cluster test glob
+        env:
+          PATTERN: 'integrationTests/cluster/**/*.test.*s'
+        run: |
+          count=$(node -e "console.log(require('node:fs').globSync(process.env.PATTERN).length)")
+          echo "cluster test files matched: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::cluster glob '$PATTERN' matched 0 files on $(node --version) — this job would run no tests."
+            exit 1
+          fi
 
       - name: Run Cluster Integration Test Shard ${{ matrix.shard }}
         env:
