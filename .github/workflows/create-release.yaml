@@ -46,7 +46,7 @@ jobs:
           echo "Package.json version: v${{ steps.package-version.outputs.packageVersion }}"
           test "${{ steps.tag-version.outputs.tagVersion }}" == "v${{ steps.package-version.outputs.packageVersion }}"
       - name: Notify release in progress in Slack
-        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -106,7 +106,7 @@ jobs:
           version: ${{ steps.tag-version.outputs.tagVersion }}
       - name: Create Release
         id: create-release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           name: ${{ steps.tag-version.outputs.tagVersion }}
           tag_name: ${{ steps.tag-version.outputs.tagVersion }}
@@ -122,7 +122,7 @@ jobs:
     needs: [create-release]
     runs-on: ubuntu-latest
     steps:
-      - uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+      - uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -163,7 +163,7 @@ jobs:
     needs: [create-release]
     runs-on: ubuntu-latest
     steps:
-      - uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+      - uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
         with:
           method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
