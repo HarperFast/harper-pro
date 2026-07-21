@@ -63,6 +63,9 @@ import {
 	getExcludedTablesForRouteEntries,
 	getConfigRouteReplicates,
 	routeEntriesIncludePeer,
+	resolveNodeForSendAuth,
+	isGenuineNodeDeletion,
+	SEND_AUTH_UNCHANGED,
 } from './knownNodes.ts';
 import * as process from 'node:process';
 import { isIP } from 'node:net';
@@ -339,6 +342,14 @@ const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
 const PAUSE_STALL_THRESHOLD_MS =
 	env.get('replication_pauseStallTimeout') ??
 	Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000) * 2);
+
+// Grace the dynamic send-authorization watch gives a present-but-undecodable hdb_nodes row before it
+// fails closed. Sized well past the seconds-scale self-heal the #352/#1163 misread window takes (the
+// base-copy resync re-encodes the row against local structures), so a decode blip never de-authorizes
+// a healthy peer, while still bounding how long a revocation carried by an undecodable write can go
+// unenforced. Only reached on a genuine decode failure — a decodable row is evaluated on the first probe.
+const SEND_AUTH_REPROBE_INTERVAL_MS = 500;
+const SEND_AUTH_REPROBE_ATTEMPTS = 60;
 
 /**
  * Decide whether an idle replication connection should be terminated as dead.
@@ -2887,7 +2898,40 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									async (subscription) => {
 										subscriptionToHdbNodes = subscription;
 										for await (const event of subscriptionToHdbNodes) {
-											const node = event.value;
+											// Evaluate the authoritative hdb_nodes row, not the event payload: a whole-table
+											// `reload` marker (system-DB base copy — every joining/cloning node emits one) is
+											// delivered to every subscriber with no value, a `patch` carries only the patched
+											// fields, and a decode blip yields a nullish value. Treating any of those as
+											// de-authorization closed every live connection with a spurious 1008 mid-cluster-
+											// formation.
+											//
+											// A genuine tombstone is the one case the event decides, not the row read: a point
+											// read can be served from a snapshot that predates the delete commit (harper#1163),
+											// which would hand back the still-authorizing row and leave a removed peer receiving.
+											let node = isGenuineNodeDeletion(event.type)
+												? undefined
+												: resolveNodeForSendAuth(authorization.name);
+											// A present-but-undecodable row carries no verdict. Neither answer is safe on its
+											// own — closing lets a decode blip knock a healthy peer offline (harper#1163 /
+											// harper-pro#352, which heals within seconds), and continuing forever would let a
+											// revocation carried by that same undecodable write never take effect. So re-probe
+											// for a bounded grace period, then fail closed.
+											for (
+												let attempt = 0;
+												node === SEND_AUTH_UNCHANGED && attempt < SEND_AUTH_REPROBE_ATTEMPTS && !closed;
+												attempt++
+											) {
+												await new Promise((resolve) => setTimeout(resolve, SEND_AUTH_REPROBE_INTERVAL_MS).unref());
+												node = resolveNodeForSendAuth(authorization.name);
+											}
+											if (node === SEND_AUTH_UNCHANGED) {
+												if (closed) return;
+												logger.warn?.(
+													connectionId,
+													`hdb_nodes row for ${authorization.name} did not decode within ${SEND_AUTH_REPROBE_ATTEMPTS * SEND_AUTH_REPROBE_INTERVAL_MS}ms; failing closed so a revocation carried by an undecodable write cannot be missed`
+												);
+												node = undefined;
+											}
 											if (!(
 												node?.replicates === true ||
 												node?.replicates?.receives ||
@@ -2899,6 +2943,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												// routing, silently stopping replication and reconnect-churning. (PR #572 review — Chris Barber.)
 												routeEntriesIncludePeer(node?.replicates?.receivesFrom, getThisNodeName(), databaseName)
 											)) {
+												logger.warn?.(
+													connectionId,
+													`hdb_nodes no longer authorizes ${authorization.name} to receive ${databaseName}; closing the subscription`
+												);
 												closed = true;
 												close(1008, `Unauthorized database subscription to ${databaseName}`);
 												return;
