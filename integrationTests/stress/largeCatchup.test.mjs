@@ -284,9 +284,14 @@ if (!stressEnabled()) {
 						table: 'large',
 						exact_count: true,
 					});
-					const prevCount = lastCount;
-					lastCount = resp?.record_count ?? -1;
-					if (lastCount > prevCount) lastProgressAt = Date.now();
+					// A failed poll (B briefly unreachable) is not progress, but it is also not
+					// evidence of regression — keep the last known good count so the stall clock,
+					// the over-replication guard and the final throughput report all stay honest.
+					if (resp?.record_count !== undefined) {
+						const prevCount = lastCount;
+						lastCount = resp.record_count;
+						if (lastCount > prevCount) lastProgressAt = Date.now();
+					}
 					stalledFor = (Date.now() - lastProgressAt) / 1000;
 					ok(
 						stalledFor < STALL_SECS,
