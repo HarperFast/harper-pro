@@ -182,6 +182,29 @@ export function readConnectionTruth(
 	if (!auditStore || !databaseName || !nodeName) return;
 	return deriveConnectionTruth(getReplicationSharedStatus(auditStore, databaseName, nodeName), now);
 }
+// W1 (harper-pro#431): the connection-truth slots (CONNECTION_STATE / LAST_LIVENESS / LAST_ERROR)
+// describe the OUTBOUND SUBSCRIPTION for a (db, peer) and are read by the main-thread reconcile as the
+// source of truth for that entry. The shared buffer is keyed ONLY by (db, peer), so an inbound server
+// connection or a cache-miss retrieval connection to the same peer resolves the same buffer — and would
+// otherwise stamp these slots for a link the truth is not about, masking a dead subscription (the
+// reconcile up-corrects it to connected) or spuriously downing a healthy one. Only the connection that
+// owns the subscription may write them, checked inline below as `connection?.nodeSubscriptions !==
+// undefined`: it's the reliable marker, set by subscribe() and never cleared, and never set on a
+// retrieval connection (it only connect()s) or an inbound connection (no options.connection at all).
+// Checked at write time, not via the open-time `isSubscriptionConnection` snapshot, so it holds
+// regardless of subscribe()/open ordering.
+// W1 T1 (harper-pro#431): one-line truth snapshot appended to every watchdog / reconcile-net fire log,
+// so the watchdog-demotion soak can grep fires and see what the authoritative connection truth said at
+// that moment. A fire while truth reads connected with fresh liveness is an invariant-violation
+// candidate (the watchdog saw something truth did not); a fire while truth already reads down means the
+// truth-driven recovery path had — or should have — taken over. Pure formatter so it is unit-testable
+// and never throws into a recovery path.
+export function formatTruthSnapshot(truth: ConnectionTruth | undefined, now: number = Date.now()): string {
+	if (!truth) return 'truth=unavailable';
+	const liveness = truth.lastLiveness > 0 ? `${Math.round((now - truth.lastLiveness) / 1000)}s ago` : 'never';
+	const closeCode = truth.errorCode ? `, lastCloseCode: ${truth.errorCode}` : '';
+	return `truth={connected: ${truth.connected}, state: ${truth.state}, liveness: ${liveness}${closeCode}}`;
+}
 
 const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
 // When receiving a replication message, we apply per-record backpressure to keep a single
@@ -1363,7 +1386,7 @@ export class NodeReplicationConnection extends EventEmitter {
 				// Record the disconnect in shared memory so the main thread sees the link is down even if the
 				// disconnect message is never processed (W1 / harper-pro#431). The reconcile staleness net
 				// covers the case where even this doesn't run (worker died).
-				if (this.sharedStatus) {
+				if (this.sharedStatus && this.nodeSubscriptions !== undefined) {
 					this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
 					this.sharedStatus[LAST_ERROR_CODE_POSITION] = code ?? 0;
 					this.sharedStatus[LAST_ERROR_TIME_POSITION] = Date.now();
@@ -1448,7 +1471,8 @@ export class NodeReplicationConnection extends EventEmitter {
 			}
 			this.isConnected = false;
 			// Watchdog-forced teardown of a wedged link: mark down in shared memory (W1 / harper-pro#431).
-			if (this.sharedStatus) this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+			if (this.sharedStatus && this.nodeSubscriptions !== undefined)
+				this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
 		}
 		// Drop this connection's stale subscription listener before reconnecting. The close handler
 		// normally does this (removeAllListeners), but its socket-identity guard early-returns for a
@@ -1824,8 +1848,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// LAST_LIVENESS_TIME_POSITION holds a wall-clock timestamp (Date.now()), since the main thread
 				// compares it against Date.now() in deriveConnectionTruth — not performance.now() like
 				// lastByteActivity above (which is the keepalive's own monotonic clock). See gemini review on #445.
+				// Only the owning subscription may refresh the (db, peer) truth; a paused inbound/retrieval
+				// connection sharing the buffer must not keep a dead subscription's link alive.
 				const pausedStatus = getSharedStatus();
-				if (pausedStatus) pausedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
+				if (pausedStatus && options.connection?.nodeSubscriptions !== undefined)
+					pausedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
 			}
 			// Always send the keep-alive ping. ws.pause() only stops reads, not writes, and the accepted
 			// peer relies on our pings to keep its own receive timer alive even when it has no data to send
@@ -1844,6 +1871,24 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// 'close' event, the watchdog forces the reconnect path. See harper-pro#233 for the failure
 	// modes observed in the field.
 	const wedgedForTest = armReplicationWedgeForTest(options.connection, ws, databaseName);
+	// W1 T1 (#431): truth snapshot for watchdog fire logs — what the shared-memory connection truth said
+	// at the moment a worker-local watchdog decided to act (see formatTruthSnapshot for how the
+	// demotion soak reads this).
+	const truthSnapshotForLog = () => {
+		// This telemetry feeds the watchdog fire logs, emitted from the onSilence/onStall recovery
+		// callbacks immediately before forceReconnect()/ws.terminate(). getSharedStatus() and
+		// deriveConnectionTruth() read shared memory / the auditStore and can throw if that state is
+		// unexpected; an unhandled throw here would abort the recovery callback and leave the connection
+		// permanently wedged — the opposite of what a recovery net is for. Swallow (trace-log) so a
+		// telemetry failure degrades the log line to a marker and recovery always proceeds. (harper-pro#431)
+		try {
+			const status = getSharedStatus();
+			return formatTruthSnapshot(status && deriveConnectionTruth(status));
+		} catch (error) {
+			logger.trace?.(connectionId, 'failed to build connection-truth snapshot for watchdog fire log', error);
+			return 'truth=error';
+		}
+	};
 	receiveWatchdog = createReceiveWatchdog({
 		intervalMs: currentReceiveSilenceThresholdMs,
 		getBytesRead: () => (wedgedForTest ? 0 : (ws._socket?.bytesRead ?? 0)),
@@ -1855,7 +1900,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			const direction = options.url ? 'no activity from' : 'no ping from';
 			logger.warn?.(
-				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${currentReceiveSilenceThresholdMs()}ms — terminating connection and reconnecting`
+				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${currentReceiveSilenceThresholdMs()}ms — terminating connection and reconnecting — ${truthSnapshotForLog()}`
 			);
 			// On the client (subscription) side drive recovery through the connection so it does not depend
 			// on terminate() propagating a 'close' (an open-but-idle socket may never emit one). A
@@ -1875,7 +1920,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		onStall: () => {
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting`
+				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -1909,7 +1954,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${blobTimeout}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453)`
+				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${blobTimeout}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -2242,7 +2287,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							// waiting for the first post-handshake pong up to a ping interval later — otherwise a
 							// reconnected idle link reads as connected:false until then (replicationReconnect tests).
 							const handshakeStatus = getSharedStatus();
-							if (handshakeStatus) {
+							if (handshakeStatus && options.connection?.nodeSubscriptions !== undefined) {
 								handshakeStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
 								handshakeStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
 							}
@@ -3761,9 +3806,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					maxBatchVersion = auditRecord.version;
 				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
-				// Received data is a liveness signal for the authoritative connection state (W1 / #431).
-				replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
-				replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = replicationSharedStatus[RECEIVED_TIME_POSITION];
+				// Received data is a liveness signal for the authoritative connection state (W1 / #431) — but
+				// only when this connection OWNS the (db, peer) subscription the truth represents; an inbound
+				// or retrieval connection sharing the buffer must not refresh liveness for a link it is not.
+				if (options.connection?.nodeSubscriptions !== undefined) {
+					replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+					replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = replicationSharedStatus[RECEIVED_TIME_POSITION];
+				}
 
 				if (event) {
 					// Leading-duplicate fast-skip: on a resumed stream the first records re-streamed from the
@@ -3999,9 +4048,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			options.connection.latency = latency;
 			if (getSharedStatus()) {
 				replicationSharedStatus[LATENCY_POSITION] = latency;
-				// A pong confirms the link is alive in both directions; record it as the authoritative state.
-				replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
-				replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
+				// A pong confirms the link is alive in both directions; record it as the authoritative state —
+				// but only from the connection that owns the (db, peer) subscription truth (an inbound or
+				// cache-miss retrieval connection shares the buffer key and must not stamp CONNECTED for it).
+				if (options.connection?.nodeSubscriptions !== undefined) {
+					replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+					replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
+				}
 			}
 			// update the manager with latest connection information
 			if (options.isSubscriptionConnection) {
