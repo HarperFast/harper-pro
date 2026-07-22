@@ -31,6 +31,8 @@ import {
 	RECEIVED_TIME_POSITION,
 	RECEIVED_VERSION_POSITION,
 	readConnectionTruth,
+	formatTruthSnapshot,
+	type ConnectionTruth,
 } from './replicationConnection.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import lodash from 'lodash';
@@ -59,6 +61,12 @@ type ConnectedWorkerStatus = {
 	// advances beyond it) — so a kick that produced no progress (already caught up / not recoverable) is not
 	// re-fired every tick. Mirrors disconnectedAt for the connected:false path. See findStalledReceivingNodeUrls.
 	receiveStallReconnectAt?: number;
+	// W1 T1 (#431) fire telemetry: the last main-thread recovery net that acted on this entry, and the
+	// last shared-memory truth correction applied to it. Logged with each subsequent fire so the
+	// watchdog-demotion soak can tell "sole detector" fires from ones where another layer (or the
+	// truth-driven path) had already engaged. Telemetry only — never consulted for recovery decisions.
+	lastRecovery?: { mechanism: string; at: number };
+	lastTruthCorrection?: { direction: 'down' | 'up'; at: number };
 };
 type ReplicationConnectionStatus = {
 	url?: string;
@@ -262,6 +270,58 @@ export function findWedgedNodeUrls(
 		}
 	}
 	return wedgedNodeUrls;
+}
+// W1 (harper-pro#431): reconcile the main thread's edge-triggered `connected` bit against the
+// authoritative shared-memory truth the owning worker writes (readConnectionTruth). Corrections:
+// - DOWN (entry true/undefined, truth not connected): the worker wedged/died or the disconnect edge
+//   was lost (#289/#233); flip to false and stamp disconnectedAt so the wedge re-drive threshold
+//   starts counting from the correction.
+// - UP (entry false, truth CONNECTED with fresh liveness): the connect edge was lost or never
+//   processed (#289); without a correction, findWedgedNodeUrls force-reconnects a perfectly healthy
+//   link once the 30s threshold lapses. This is detection ONLY — the caller routes the restore
+//   through connectedToNode (the same path the connect edge uses) so `latency` and, under
+//   REPLICATION_FAILOVER, the failover-restore block (consolidating migrated subscriptions back off
+//   the failover peer) run too, rather than a partial bit-only mirror. Deliberately NOT applied to a
+//   never-connected (undefined) entry: that is mid-connect and owned by the connect/retry path.
+// Truth must have reported liveness at least once (lastLiveness > 0) for either correction; a
+// never-yet-written buffer says nothing about the link. Applies the DOWN bit-correction in place
+// (it is self-contained — the wedge re-drive keys off connected:false + disconnectedAt) and returns
+// which correction is needed — or undefined on agreement — so the reconcile loop owns the UP restore
+// (via connectedToNode) and the telemetry.
+export function reconcileEntryWithTruth(
+	entry: { connected?: boolean; disconnectedAt?: number },
+	truth: ConnectionTruth | undefined,
+	now: number
+): 'down' | 'up' | undefined {
+	if (!truth || truth.lastLiveness <= 0) return;
+	if (entry.connected !== false && !truth.connected) {
+		entry.connected = false;
+		if (entry.disconnectedAt == null) entry.disconnectedAt = now;
+		return 'down';
+	}
+	if (entry.connected === false && truth.connected) return 'up';
+	return undefined;
+}
+// W1 T1 (#431) fire telemetry: describe what already engaged on this entry before the current net
+// fired — the last recovery mechanism and/or the last truth correction, with ages — so a fire log
+// answers "was this net the sole detector, or was recovery already underway?" without correlating
+// timestamps across log lines by hand. Returns 'prior=none' when nothing has acted on the entry.
+export function describePriorSignals(
+	entry:
+		| { lastRecovery?: { mechanism: string; at: number }; lastTruthCorrection?: { direction: string; at: number } }
+		| null
+		| undefined,
+	now: number
+): string {
+	if (!entry) return 'prior=none';
+	const parts: string[] = [];
+	if (entry.lastRecovery && typeof entry.lastRecovery.at === 'number')
+		parts.push(`${entry.lastRecovery.mechanism} ${Math.round((now - entry.lastRecovery.at) / 1000)}s ago`);
+	if (entry.lastTruthCorrection && typeof entry.lastTruthCorrection.at === 'number')
+		parts.push(
+			`truth-corrected-${entry.lastTruthCorrection.direction} ${Math.round((now - entry.lastTruthCorrection.at) / 1000)}s ago`
+		);
+	return parts.length ? `prior={${parts.join('; ')}}` : 'prior=none';
 }
 // The per-(database, node) replication progress signals the main-thread reconcile reads out of the
 // process-shared status buffer (auditStore.getUserSharedBuffer, written by the worker that owns the
@@ -1046,25 +1106,37 @@ export async function startOnMainThread(options) {
 	function reconcileWorkers() {
 		const now = Date.now();
 		// Reconcile the inferred `connected` flag against the authoritative shared-memory truth the owning
-		// worker writes: a worker may have wedged or died without delivering a disconnect message, leaving
-		// connected:true for a link it knows is down (#289/#233). Correcting it here feeds the existing wedge
-		// recovery below (findWedgedNodeUrls keys on connected:false + disconnectedAt past the threshold).
-		for (const dbWorkers of connectionReplicationMap.values()) {
+		// worker writes, in BOTH directions (see reconcileEntryWithTruth): down-corrections feed the wedge
+		// recovery below (findWedgedNodeUrls keys on connected:false + disconnectedAt past the threshold);
+		// up-corrections stop that same recovery from force-reconnecting a healthy link whose connect edge
+		// was lost. Each correction is logged — the edge bit and the truth disagreeing is exactly the
+		// desync class W1 exists to retire, so its frequency in production should be observable.
+		let upCorrections;
+		for (const [url, dbWorkers] of connectionReplicationMap) {
 			for (const [databaseName, entry] of dbWorkers) {
-				if (entry.connected === false) continue;
 				const nodeName = entry.nodes?.[0]?.name;
 				if (!nodeName) continue;
 				const auditStore = getAuditStoreForDatabase(databaseName);
 				if (!auditStore) continue;
 				const truth = readConnectionTruth(auditStore, databaseName, nodeName, now);
-				// Only correct a link that has reported liveness at least once (lastLiveness > 0); a
-				// never-yet-connected entry is left to the normal connect/retry path.
-				if (truth && !truth.connected && truth.lastLiveness > 0) {
-					entry.connected = false;
-					if (entry.disconnectedAt == null) entry.disconnectedAt = now;
-				}
+				const correction = reconcileEntryWithTruth(entry, truth, now);
+				if (correction) entry.lastTruthCorrection = { direction: correction, at: now };
+				if (correction && truth)
+					logger.warn(
+						`Corrected replication connection state (${correction === 'down' ? 'connected -> down' : 'disconnected -> up'}) ` +
+							`from shared-memory truth for ${databaseName} from ${nodeName}: state=${truth.state}, ` +
+							`liveness ${now - truth.lastLiveness}ms ago${truth.errorCode ? `, last close code ${truth.errorCode}` : ''}`
+					);
+				// Defer the up-correction restore until after this read pass: connectedToNode mutates
+				// connectionReplicationMap (the failover-restore block), which must not run while we iterate it.
+				if (correction === 'up') (upCorrections ??= []).push({ url, database: databaseName, latency: entry.latency });
 			}
 		}
+		// Route each up-correction through the SAME restore path the connect edge uses (connectedToNode)
+		// rather than a partial bit-only mirror, so latency and — under REPLICATION_FAILOVER — the
+		// failover-restore block (pull migrated subscriptions back off the failover peer) run. Passing the
+		// entry's current latency avoids clobbering it, since the shared-memory truth carries none.
+		if (upCorrections) for (const connection of upCorrections) connectedToNode(connection);
 		const httpWorkers = workers.filter((worker) => worker.name === 'http');
 		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
 		const wedgedNodeUrls = findWedgedNodeUrls(
@@ -1121,6 +1193,7 @@ export async function startOnMainThread(options) {
 				if (!entries) continue;
 				let reconnectCount = 0;
 				const reconcileNow = Date.now();
+				const fireDetails: string[] = []; // W1 T1 (#431): per-entry truth snapshot + prior signals
 				for (const [databaseName, entry] of entries) {
 					// Apply the SAME wedged predicate findWedgedNodeUrls uses, per database — the URL is in
 					// wedgedNodeUrls because *some* db on this peer is wedged, but a sibling db may be a healthy
@@ -1153,6 +1226,15 @@ export async function startOnMainThread(options) {
 						// even if the connection's own retry never armed. See harper-pro#466.
 						forceReconnect: true,
 					};
+					// W1 T1 (#431): record the fire and what the truth + earlier layers said at this moment.
+					const nodeName = entry.nodes?.[0]?.name;
+					fireDetails.push(
+						`${databaseName}: ${formatTruthSnapshot(
+							readConnectionTruth(getAuditStoreForDatabase(databaseName), databaseName, nodeName, reconcileNow),
+							reconcileNow
+						)} ${describePriorSignals(entry, reconcileNow)}`
+					);
+					entry.lastRecovery = { mechanism: 'wedge-reconcile', at: reconcileNow };
 					// Stagger reconnects (RECONNECT_STAGGER_MS apart) so opening N TLS connections
 					// simultaneously does not spike memory when there are many databases.
 					const delay = NODE_SUBSCRIBE_DELAY + reconnectCount * RECONNECT_STAGGER_MS;
@@ -1161,7 +1243,7 @@ export async function startOnMainThread(options) {
 				}
 				if (reconnectCount > 0)
 					logger.warn(
-						`Reconciling ${reconnectCount} wedged subscription(s) for ${url} (staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms)`
+						`Reconciling ${reconnectCount} wedged subscription(s) for ${url} (staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms) [${fireDetails.join(' | ')}]`
 					);
 			}
 			if (stalledDatabases) {
@@ -1171,11 +1253,20 @@ export async function startOnMainThread(options) {
 				// setup. forceReconnectToNode on the worker drops + reconnects the existing connection.
 				const entries = connectionReplicationMap.get(url);
 				let reconnectCount = 0;
+				const fireDetails: string[] = []; // W1 T1 (#431): per-entry truth snapshot + prior signals
 				for (const databaseName of stalledDatabases) {
 					const entry = entries?.get(databaseName);
 					const worker = entry?.worker;
 					const nodes = entry?.nodes;
 					if (!entry || !worker || !nodes) continue;
+					// W1 T1 (#431): record the fire and what the truth + earlier layers said at this moment.
+					fireDetails.push(
+						`${databaseName}: ${formatTruthSnapshot(
+							readConnectionTruth(getAuditStoreForDatabase(databaseName), databaseName, nodes[0]?.name, now),
+							now
+						)} ${describePriorSignals(entry, now)}`
+					);
+					entry.lastRecovery = { mechanism: 'receive-stall-net', at: now };
 					// Throttle clock so this entry is not re-kicked until the threshold elapses again.
 					entry.receiveStallReconnectAt = now;
 					const request = {
@@ -1190,7 +1281,7 @@ export async function startOnMainThread(options) {
 				}
 				if (reconnectCount > 0)
 					logger.warn(
-						`Reconciling ${reconnectCount} stalled connected:true subscription(s) for ${url} (no receive progress for ${RECEIVE_STALL_THRESHOLD_MS}ms; staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms)`
+						`Reconciling ${reconnectCount} stalled connected:true subscription(s) for ${url} (no receive progress for ${RECEIVE_STALL_THRESHOLD_MS}ms; staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms) [${fireDetails.join(' | ')}]`
 					);
 			}
 			if (staleNodeUrls.has(url) && !isWedged) staleNodesToReassign.push(node);
