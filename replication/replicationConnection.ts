@@ -352,6 +352,74 @@ const SEND_AUTH_REPROBE_INTERVAL_MS = 500;
 const SEND_AUTH_REPROBE_ATTEMPTS = 60;
 
 /**
+ * Decide whether the dynamic send-authorization watch (the per-subscriber `getHDBNodeTable().subscribe`
+ * loop in the SUBSCRIPTION_REQUEST handler) should close a replication connection in response to one
+ * hdb_nodes change event.
+ *
+ * Evaluates the authoritative hdb_nodes row, not the event payload: a whole-table `reload` marker
+ * (system-DB base copy — every joining/cloning node emits one) is delivered to every subscriber with no
+ * value, a `patch` carries only the patched fields, and a decode blip yields a nullish value. Treating
+ * any of those as de-authorization closed every live connection with a spurious 1008 mid-cluster-
+ * formation.
+ *
+ * A genuine tombstone is the one case the event decides, not the row read: a point read can be served
+ * from a snapshot that predates the delete commit (harper#1163), which would hand back the
+ * still-authorizing row and leave a removed peer receiving.
+ *
+ * A present-but-undecodable row carries no verdict. Neither answer is safe on its own — closing lets a
+ * decode blip knock a healthy peer offline (harper#1163 / harper-pro#352, which heals within seconds),
+ * and continuing forever would let a revocation carried by that same undecodable write never take
+ * effect. So re-probe for a bounded grace period, then fail closed.
+ *
+ * The reprobe loop awaits between checks, so the connection can close while it's suspended; `isClosed`
+ * is re-checked before acting on a stale resolution so a decode blip that outlives the connection
+ * doesn't trigger a redundant close/warn.
+ *
+ * Returns true iff the connection should be closed as no longer authorized; false means no action —
+ * either the peer is still authorized, or the connection already closed while this resolution was
+ * pending. `resolve`/`sleep` are injected so this stays unit-testable without a live store or real timers.
+ */
+export async function shouldCloseSendAuthWatch(
+	event: { type: string },
+	name: string,
+	databaseName: string,
+	deps: {
+		isClosed: () => boolean;
+		onReprobeTimeout?: () => void;
+		resolve?: (name: string) => any;
+		sleep?: () => Promise<void>;
+		reprobeAttempts?: number;
+	}
+): Promise<boolean> {
+	const resolve = deps.resolve ?? resolveNodeForSendAuth;
+	const sleep = deps.sleep ?? (() => new Promise<void>((r) => setTimeout(r, SEND_AUTH_REPROBE_INTERVAL_MS).unref()));
+	const reprobeAttempts = deps.reprobeAttempts ?? SEND_AUTH_REPROBE_ATTEMPTS;
+
+	let node = isGenuineNodeDeletion(event.type) ? undefined : resolve(name);
+	for (let attempt = 0; node === SEND_AUTH_UNCHANGED && attempt < reprobeAttempts && !deps.isClosed(); attempt++) {
+		await sleep();
+		node = resolve(name);
+	}
+	if (node === SEND_AUTH_UNCHANGED) {
+		if (deps.isClosed()) return false;
+		deps.onReprobeTimeout?.();
+		node = undefined;
+	}
+	if (deps.isClosed()) return false;
+	return !(
+		node?.replicates === true ||
+		node?.replicates?.receives ||
+		// routeEntriesIncludePeer (not a strict source+database match): a self-record entry may omit
+		// `database` (a wildcard for all databases — what a full-replication neighbor's directional
+		// self-record advertises), and absent source means any peer. A strict `sub.database ===
+		// databaseName` here would reject a full-replication neighbor's per-database subscription once
+		// this node is opted-in to directional routing, silently stopping replication and
+		// reconnect-churning. (PR #572 review — Chris Barber.)
+		routeEntriesIncludePeer(node?.replicates?.receivesFrom, getThisNodeName(), databaseName)
+	);
+}
+
+/**
  * Decide whether an idle replication connection should be terminated as dead.
  *
  * Liveness is measured from the last observed socket byte movement (in either direction), not from a
@@ -2898,51 +2966,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									async (subscription) => {
 										subscriptionToHdbNodes = subscription;
 										for await (const event of subscriptionToHdbNodes) {
-											// Evaluate the authoritative hdb_nodes row, not the event payload: a whole-table
-											// `reload` marker (system-DB base copy — every joining/cloning node emits one) is
-											// delivered to every subscriber with no value, a `patch` carries only the patched
-											// fields, and a decode blip yields a nullish value. Treating any of those as
-											// de-authorization closed every live connection with a spurious 1008 mid-cluster-
-											// formation.
-											//
-											// A genuine tombstone is the one case the event decides, not the row read: a point
-											// read can be served from a snapshot that predates the delete commit (harper#1163),
-											// which would hand back the still-authorizing row and leave a removed peer receiving.
-											let node = isGenuineNodeDeletion(event.type)
-												? undefined
-												: resolveNodeForSendAuth(authorization.name);
-											// A present-but-undecodable row carries no verdict. Neither answer is safe on its
-											// own — closing lets a decode blip knock a healthy peer offline (harper#1163 /
-											// harper-pro#352, which heals within seconds), and continuing forever would let a
-											// revocation carried by that same undecodable write never take effect. So re-probe
-											// for a bounded grace period, then fail closed.
-											for (
-												let attempt = 0;
-												node === SEND_AUTH_UNCHANGED && attempt < SEND_AUTH_REPROBE_ATTEMPTS && !closed;
-												attempt++
-											) {
-												await new Promise((resolve) => setTimeout(resolve, SEND_AUTH_REPROBE_INTERVAL_MS).unref());
-												node = resolveNodeForSendAuth(authorization.name);
-											}
-											if (node === SEND_AUTH_UNCHANGED) {
-												if (closed) return;
-												logger.warn?.(
-													connectionId,
-													`hdb_nodes row for ${authorization.name} did not decode within ${SEND_AUTH_REPROBE_ATTEMPTS * SEND_AUTH_REPROBE_INTERVAL_MS}ms; failing closed so a revocation carried by an undecodable write cannot be missed`
-												);
-												node = undefined;
-											}
-											if (!(
-												node?.replicates === true ||
-												node?.replicates?.receives ||
-												// routeEntriesIncludePeer (not a strict source+database match): a self-record
-												// entry may omit `database` (a wildcard for all databases — what a full-replication
-												// neighbor's directional self-record advertises), and absent source means any peer.
-												// A strict `sub.database === databaseName` here would reject a full-replication
-												// neighbor's per-database subscription once this node is opted-in to directional
-												// routing, silently stopping replication and reconnect-churning. (PR #572 review — Chris Barber.)
-												routeEntriesIncludePeer(node?.replicates?.receivesFrom, getThisNodeName(), databaseName)
-											)) {
+											const shouldClose = await shouldCloseSendAuthWatch(event, authorization.name, databaseName, {
+												isClosed: () => closed,
+												onReprobeTimeout: () =>
+													logger.warn?.(
+														connectionId,
+														`hdb_nodes row for ${authorization.name} did not decode within ${SEND_AUTH_REPROBE_ATTEMPTS * SEND_AUTH_REPROBE_INTERVAL_MS}ms; failing closed so a revocation carried by an undecodable write cannot be missed`
+													),
+											});
+											if (shouldClose) {
 												logger.warn?.(
 													connectionId,
 													`hdb_nodes no longer authorizes ${authorization.name} to receive ${databaseName}; closing the subscription`
