@@ -265,11 +265,11 @@ async function main() {
 	const effectiveCore = coreBumping ? coreNext : coreCurrent;
 	let target = semver.compare(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
 	if (SET_VERSION) {
-		if (!semver.valid(SET_VERSION)) {
+		target = semver.valid(SET_VERSION);
+		if (!target) {
 			err(`--set-version "${SET_VERSION}" is not a valid semver`);
 			process.exit(1);
 		}
-		target = semver.valid(SET_VERSION);
 		if (semver.compare(target, coreCurrent) <= 0 || semver.compare(target, proCurrent) <= 0) {
 			err(
 				`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`
