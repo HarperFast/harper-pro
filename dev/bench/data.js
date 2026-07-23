@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784718218735,
+  "lastUpdate": 1784804905218,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -1975,6 +1975,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 3290.39,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "64439476c7cc3e6c73ab612f04c0f0b820be4a91",
+          "message": "build(core): pick up the replication resume-cursor blocking-write fix\n\nPoints the core submodule at the fix for the apply loop's resume-cursor\nwrite, which blocked the worker event loop for up to 101s under RocksDB\nwrite stall and got the subscription torn down by the sender's receive\nwatchdog.\n\nRefs #603\n\nCo-Authored-By: Claude Opus <noreply@anthropic.com>",
+          "timestamp": "2026-07-21T17:37:19Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/64439476c7cc3e6c73ab612f04c0f0b820be4a91"
+        },
+        "date": 1784804903473,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 12968.01,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 26673.45,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 21857.47,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 10740.21,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 7278.8,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2353.84,
             "unit": "ops/sec"
           }
         ]
