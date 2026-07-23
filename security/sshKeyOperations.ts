@@ -1,6 +1,21 @@
 import Joi from 'joi';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { tmpdir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
-import { constants, access, readFile, writeFile, unlink, chmod, appendFile, mkdir, readdir } from 'node:fs/promises';
+import {
+	constants,
+	access,
+	readFile,
+	writeFile,
+	unlink,
+	chmod,
+	appendFile,
+	mkdir,
+	mkdtemp,
+	readdir,
+	rm,
+} from 'node:fs/promises';
 
 import { validateBySchema } from '../core/validation/validationWrapper.js';
 import harperLogger from '../core/utility/logging/harper_logger.js';
@@ -76,9 +91,37 @@ function sealSSHKey(name: string, key: string): string {
 	return ENV_ENCRYPTED_PREFIX + encryptEnvelope(key, publicKey, fingerprint);
 }
 
+const execFileAsync = promisify(execFile);
+
+// Mint an ed25519 keypair on this node (via ssh-keygen) for `add_ssh_key generate=true`, so the
+// private key is created on the cluster and never travels from the client. Async (never blocks the
+// event loop); temp material is removed before returning. The minted private key then flows through
+// the same seal-at-rest + replicate path (sealSSHKey) as a client-supplied key.
+async function generateEd25519KeyPair(comment: string): Promise<{ privateKey: string; publicKey: string }> {
+	const dir = await mkdtemp(join(tmpdir(), 'hdb-ssh-'));
+	const keyFile = join(dir, 'id');
+	try {
+		try {
+			await execFileAsync('ssh-keygen', ['-t', 'ed25519', '-N', '', '-C', comment, '-f', keyFile]);
+		} catch (error) {
+			// ssh-keygen couldn't run (e.g. not on PATH) — surface an actionable ClientError, never key
+			// material (ssh-keygen writes the key to `keyFile`, not to stderr).
+			throw new ClientError(`SSH key generation failed: ssh-keygen could not run (${(error as Error).message})`);
+		}
+		const privateKey = await readFile(keyFile, 'utf8');
+		const publicKey = (await readFile(`${keyFile}.pub`, 'utf8')).trim();
+		return { privateKey, publicKey };
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+}
+
 const addValidationSchema = Joi.object({
 	name: Joi.string().pattern(SSH_KEY_NAME_REGEX).required().messages({ 'string.pattern.base': SSH_KEY_NAME_ERROR_MSG }),
-	key: Joi.string().required(),
+	// `key` is optional so it can be omitted with `generate: true` (the server mints it); the
+	// "key xor generate" invariant is enforced in addSSHKey for a precise error.
+	generate: Joi.boolean().optional(),
+	key: Joi.string().optional(),
 	host: Joi.string().required(),
 	hostname: Joi.string().required(),
 	known_hosts: Joi.string().optional(),
@@ -118,7 +161,8 @@ function getSSHPaths(keyName: string | undefined): {
 
 interface AddSSHKeyRequest {
 	name: string;
-	key: string;
+	key?: string; // optional when `generate` is true (the server mints the keypair)
+	generate?: boolean;
 	host: string;
 	hostname: string;
 	known_hosts?: string;
@@ -141,11 +185,32 @@ interface AddSSHKeyRequest {
  * @param req.known_hosts - Optional known_hosts entries to append to the known_hosts file.
  * @returns An object containing a success message and optional replication results.
  */
-export async function addSSHKey(req: AddSSHKeyRequest): Promise<{ message: string; replicated?: unknown[] }> {
+export async function addSSHKey(
+	req: AddSSHKeyRequest
+): Promise<{ message: string; replicated?: unknown[]; public_key?: string }> {
 	const validation = validateBySchema(req, addValidationSchema);
 	if (validation) throw new ClientError(validation.message);
 
+	// `generate` and `key` are mutually exclusive: reject both up front. (The origin strips `generate`
+	// before replicating — below — so a peer never receives both and this guard never trips on the
+	// replicated op.)
+	if (req.generate && req.key) {
+		throw new ClientError('Provide either `key` or `generate: true`, not both.');
+	}
+
+	// With `generate: true`, mint the keypair here so the private key never leaves the cluster; the
+	// public half is returned for the caller to register (e.g. a GitHub deploy key). The minted key
+	// then flows through the same seal-at-rest + replicate path (sealSSHKey) as a supplied one.
+	let publicKey: string | undefined;
+	if (req.generate) {
+		const generated = await generateEd25519KeyPair(`harper:${req.name}`);
+		req.key = generated.privateKey;
+		publicKey = generated.publicKey;
+		delete req.generate; // peers receive a plain (then sealed) key add and must not re-generate
+	}
+
 	const { name, key, host, hostname, known_hosts } = req;
+	if (!key) throw new ClientError('add_ssh_key requires `key`, or `generate: true` to mint one');
 	harperLogger?.trace('adding ssh key', name);
 
 	const { filePath, configFile, knownHostsFile } = getSSHPaths(name);
@@ -210,8 +275,11 @@ Host ${host}
 	if (known_hosts) {
 		await appendFile(knownHostsFile, known_hosts);
 	}
-	let response = await replicateOperation(req);
+	const response = await replicateOperation(req);
 	response.message = `Added ssh key: ${name}${additionalMessage}`;
+	// `replicateOperation` returns `{ message, replicated? }`; attach `public_key` via Object.assign so
+	// the extra field doesn't trip the compiler on that narrower return type.
+	if (publicKey) Object.assign(response, { public_key: publicKey });
 
 	return response;
 }
