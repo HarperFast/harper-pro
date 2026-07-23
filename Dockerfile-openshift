@@ -71,6 +71,9 @@ RUN <<-EOF
     chmod -R g=u /home/harperdb
 EOF
 
+# uWS is opt-in for npm consumers but remains bundled in official images.
+COPY --from=build --chown=1001:0 /usr/src/harper-pro/node_modules/uWebSockets.js /home/harperdb/.npm-global/lib/node_modules/@harperfast/harper-pro/node_modules/uWebSockets.js
+
 # Red Hat Container Certification (RHCC) requires license files under /licenses.
 COPY LICENSE.md /licenses/LICENSE.md
 

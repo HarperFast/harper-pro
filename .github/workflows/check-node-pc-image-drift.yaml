@@ -57,7 +57,7 @@ jobs:
 
           # uWebSockets.js source_commit: the archive commit pinned in package.json,
           # then the source_commit file at the root of that archive.
-          uws_url=$(jq -r '.dependencies["uWebSockets.js"] // .optionalDependencies["uWebSockets.js"] // empty' package.json)
+          uws_url=$(jq -r '.dependencies["uWebSockets.js"] // .devDependencies["uWebSockets.js"] // .optionalDependencies["uWebSockets.js"] // empty' package.json)
           uws_archive=$(printf '%s' "$uws_url" | sed -nE 's#.*/archive/([0-9a-f]{40})\.tar\.gz#\1#p')
           if [ -z "$uws_archive" ]; then
             echo "::error::could not parse uWebSockets.js archive commit from package.json ('${uws_url}')"; exit 1

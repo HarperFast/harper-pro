@@ -47,7 +47,7 @@ RUN out/Release/node -e 'if (process.config.variables.v8_enable_pointer_compress
 # pointers, per-isolate cages, 31-bit smis, external code space).
 FROM docker.io/node:${NODE_VERSION} AS uws
 
-# Keep in sync with the uWebSockets.js pin in package.json optionalDependencies:
+# Keep in sync with the uWebSockets.js pin in package.json devDependencies:
 # UWS_SOURCE_COMMIT is the `source_commit` file inside the pinned binaries tarball.
 ARG UWS_SOURCE_COMMIT=fbdac03ee398031f304ddeb6764358d2eaa6fe29
 
