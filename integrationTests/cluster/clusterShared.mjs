@@ -87,6 +87,109 @@ export async function readLog(node) {
 }
 
 /**
+ * Read the pid of a node's main Harper process from its pid file.
+ *
+ * Harper writes `{rootPath}/hdb.pid` from the main process only (bin/run.ts), and the
+ * integration harness always starts nodes with `--ROOTPATH={dataRootDir}`, so this is the
+ * node's process identity. Returns `undefined` while the file is absent — the restart path
+ * unlinks it before relaunching.
+ *
+ * @param {Object} node
+ * @returns {Promise<number|undefined>}
+ */
+export async function readNodePid(node) {
+	const { readFile } = await import('node:fs/promises');
+	const { join } = await import('node:path');
+	if (!node.dataRootDir) throw new Error('node has no dataRootDir; cannot locate its pid file');
+	let contents;
+	try {
+		contents = await readFile(join(node.dataRootDir, 'hdb.pid'), 'utf8');
+	} catch (err) {
+		if (err.code === 'ENOENT') return undefined;
+		throw err;
+	}
+	const pid = Number.parseInt(contents.trim(), 10);
+	return Number.isInteger(pid) ? pid : undefined;
+}
+
+/**
+ * Issue a `restart` operation and wait until the node is genuinely a NEW process.
+ *
+ * `restart` responds immediately and then tears the node down on a timer, so the main
+ * thread keeps answering the operations socket for a moment afterwards. A test that only
+ * polls for health after issuing a restart is therefore answered by the OUTGOING process
+ * and sails straight through a restart that has not happened yet — which both makes the
+ * test vacuous (no cold cache, no reconnect) and lets subsequent writes land in the
+ * shutdown window, where they can be acknowledged and then lost.
+ *
+ * The pid file is the authoritative signal: the restart path unlinks it and the new main
+ * process writes its own pid back. Callers should still poll for readiness afterwards —
+ * the pid appears before the servers are listening.
+ *
+ * @param {Object} node
+ * @param {Object} [opts]
+ * @param {number} [opts.timeoutMs=60000]
+ * @param {number} [opts.pollMs=250]
+ * @returns {Promise<number>} the new main-process pid
+ */
+export async function restartNode(node, { timeoutMs = 60000, pollMs = 250 } = {}) {
+	const previousPid = await readNodePid(node);
+	if (previousPid === undefined) {
+		throw new Error(`node ${node.hostname} has no pid file before restart — it is not running`);
+	}
+	// The response can be lost if the socket closes first; the pid check below is what we trust.
+	await sendOperation(node, { operation: 'restart' }).catch(() => {});
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		await delay(pollMs);
+		const pid = await readNodePid(node);
+		if (pid !== undefined && pid !== previousPid) return pid;
+	}
+	throw new Error(`node ${node.hostname} did not restart within ${timeoutMs}ms (still pid ${previousPid})`);
+}
+
+/**
+ * Terminate whichever Harper process a node is running RIGHT NOW, by pid file.
+ *
+ * `teardownHarper` kills the child handle it spawned, but a node that has been through a
+ * `restart` is a different, detached process — the original handle has already exited, so
+ * teardown finds nothing to kill and the restarted node survives the suite. Any test that
+ * restarts a node must call this before `teardownHarper`, or it leaks a live Harper (and its
+ * ports) into the rest of the CI job.
+ *
+ * @param {Object} node
+ * @param {Object} [opts]
+ * @param {number} [opts.timeoutMs=15000]
+ */
+export async function stopNodeProcess(node, { timeoutMs = 15000 } = {}) {
+	const pid = await readNodePid(node);
+	if (pid === undefined) return; // no pid file: already stopped
+	const isRunning = () => {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	try {
+		process.kill(pid, 'SIGTERM');
+	} catch {
+		return; // already gone
+	}
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isRunning()) return;
+		await delay(100);
+	}
+	try {
+		process.kill(pid, 'SIGKILL');
+	} catch {
+		/* raced with its own exit */
+	}
+}
+
+/**
  * Poll `cluster_status` on `receiver` until it reports a `lastReceivedVersion` for
  * `source` greater than the version captured *now* on `source` itself. Returns the
  * final receiver-side version when caught up, throws on timeout.
