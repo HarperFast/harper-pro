@@ -66,7 +66,7 @@ RUN <<-EOF
 EOF
 
 # uWS is opt-in for npm consumers but remains bundled in official images.
-COPY --from=build --chown=harperdb:harperdb /usr/src/harper-pro/node_modules/uWebSockets.js /home/harperdb/.npm-global/lib/node_modules/@harperfast/harper-pro/node_modules/uWebSockets.js
+COPY --from=build --chown=harperdb:harperdb /usr/src/harper-pro/node_modules/uWebSockets.js /home/harperdb/.npm-global/lib/node_modules/@harperfast/harper-pro/node_modules/uWebSockets.js/
 
 VOLUME /home/harperdb/harper
 
