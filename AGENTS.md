@@ -24,6 +24,7 @@ When that setting is absent, git treats the git data dir as its own work tree; t
 git operations for every agent until manually repaired.
 
 If `.git/modules/core/config` is ever recreated from scratch it **must** contain:
+
 ```
 [core]
     worktree = ../../../core
@@ -101,6 +102,7 @@ When a feature spans both, prefer landing as much as possible in `core/` and glu
 
 - **`integrationTests/`** — end-to-end, runs full Harper instances. `run.mjs` is the custom test harness with shard support. Subdirs mirror source (`analytics/`, `cloneNode/`, `cluster/`, `licensing/`, `security/`).
 - **`unitTests/`** — mocha unit tests (`npm run test:unit`). `testUtils.js` (mock helpers, db reset), `setupTestApp.mjs` (in-memory app scaffold), `unitTestSetup.cjs` (env bootstrap required before ESM module load).
+- **Restarting a node in an integration test**: never `restart` + poll for health. The operation returns immediately and the outgoing process keeps answering the operations socket while it tears down, so a health poll is satisfied by the node you just asked to die — the test then runs against a node that never restarted, and its writes can land in the shutdown window. Use `restartNode()` from `integrationTests/cluster/clusterShared.mjs`, which waits for the pid file to change, and pair it with `stopNodeProcess()` before `teardownHarper` (teardown only kills the child handle it spawned, which a restarted node no longer is).
 
 ### Pro non-source
 

@@ -29,7 +29,7 @@ import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog } from './clusterShared.mjs';
+import { sendOperation, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -80,6 +80,29 @@ async function waitForRecord(node, id, { retries = 90, intervalMs = 1000 } = {})
 		await delay(intervalMs);
 	}
 	return null;
+}
+
+/**
+ * Compact cluster_status summary appended to a convergence failure so CI reports say WHY the
+ * record never arrived (peer subscribed but idle vs. peer missing entirely) without needing the
+ * uploaded server logs.
+ */
+async function describeReplication(node) {
+	try {
+		const status = await sendOperation(node, { operation: 'cluster_status' });
+		const connections = (status.connections ?? []).map((connection) => {
+			const sockets = (connection.database_sockets ?? [])
+				.map(
+					(socket) =>
+						`${socket.database}(connected=${socket.connected}, ${socket.lastReceivedStatus}, lastReceived=${socket.lastReceivedVersion ?? 'none'})`
+				)
+				.join(' ');
+			return `${connection.name ?? connection.url}[${sockets || 'no sockets'}]`;
+		});
+		return ` — ${node.hostname} cluster_status: node_name=${status.node_name}, connections: ${connections.join(' ') || 'none'}`;
+	} catch (err) {
+		return ` — cluster_status on ${node.hostname} failed: ${err.message}`;
+	}
 }
 
 suite(
@@ -146,10 +169,14 @@ suite(
 		});
 
 		after(async () => {
-			await Promise.all([
-				ctx.nodeA && teardownHarper({ harper: ctx.nodeA }),
-				ctx.nodeB && teardownHarper({ harper: ctx.nodeB }),
-			]);
+			// Both nodes are restarted by the test, so teardownHarper's spawned-child handle is stale;
+			// stop the process each node is actually running first or it outlives the suite.
+			await Promise.all(
+				[ctx.nodeA, ctx.nodeB].filter(Boolean).map(async (node) => {
+					await stopNodeProcess(node);
+					await teardownHarper({ harper: node });
+				})
+			);
 		});
 
 		test('cold-cache restart does not silently disable replication; cluster reconverges', async () => {
@@ -158,8 +185,13 @@ suite(
 			// Rolling restart -> COLD block cache on each node. The startup replication paths
 			// (ensureThisNode / shouldReplicateFromNode / cluster bootstrap) now read hdb_nodes from a cold
 			// cache, which is the exact get()->Promise condition this test guards.
+			//
+			// restartNode waits for a genuinely new process (pid change) rather than for health alone:
+			// `restart` keeps answering the operations socket from the OUTGOING process for a moment, so
+			// polling health only would let every step below run against a node that never restarted —
+			// no cold cache, and the post-restart write landing in the shutdown window instead.
 			for (const node of [nodeA, nodeB]) {
-				await sendOperation(node, { operation: 'restart' }).catch(() => {});
+				await restartNode(node);
 				await pollHealth(node);
 			}
 
@@ -188,8 +220,18 @@ suite(
 				table: 'cache_evict_test',
 				records: [{ id: 'post-restart-1', value: 'after-cold-cache', pad: PADDING }],
 			});
+			// The write must be readable on its own node first, so a convergence failure below is
+			// unambiguously a replication failure and not a write that never landed on A.
+			const onA = await waitForRecord(nodeA, 'post-restart-1', { retries: 10 });
+			ok(onA, 'post-restart write is not readable on node A itself — the write, not replication, was lost');
+
 			const found = await waitForRecord(nodeB, 'post-restart-1');
-			ok(found, 'post-restart write did not converge to node B (replication silently disabled?)');
+			if (!found) {
+				ok(
+					false,
+					`post-restart write did not converge to node B (replication silently disabled?)${await describeReplication(nodeB)}`
+				);
+			}
 			equal(found.value, 'after-cold-cache', 'wrong value converged to node B');
 		});
 
