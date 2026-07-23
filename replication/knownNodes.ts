@@ -356,6 +356,22 @@ export function reconstructNodeFromKey(key: unknown): { name: string; replicates
 }
 
 /**
+ * Merge a decode-recovery descriptor (from reconstructNodeFromKey — key + `replicates: true`) with the
+ * last-known in-memory node record. The reconstruct only knows the key, so it defaults `replicates:
+ * true` (full mesh). When we still hold the peer's last decoded DIRECTIONAL `replicates` object, that
+ * is authoritative — otherwise a transient decode miss of a constrained peer's row would briefly widen
+ * the topology back to a full mesh (the peer's directional record says "don't connect me to everyone",
+ * but the reconstruct would re-advertise `true` until the next decodable event). A legacy boolean
+ * `replicates` on the old record is left to the reconstruct's `true`. systemdb-routing / harper-pro#460.
+ */
+export function mergeReconstructedNode(reconstructed: any, oldNode: any): any {
+	if (!oldNode) return reconstructed;
+	const merged = { ...oldNode, ...reconstructed };
+	if (oldNode.replicates && typeof oldNode.replicates === 'object') merged.replicates = oldNode.replicates;
+	return merged;
+}
+
+/**
  * Existence probe for an hdb_nodes key that prefers the RANGE/scan path. A v5-era shared-structure
  * row can transiently misread to `[]`/null through the point lookup (`doesExist`/`get`) at early
  * boot (harper-pro#352), but `getKeys` lists the key reliably because it never decodes the value.
@@ -408,7 +424,7 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			// server.nodes (and the outbound subscription fired below) still reflect the peer
 			// (harper-pro#460). A genuine delete is handled separately via isGenuineNodeDeletion.
 			let reconstructed = reconstructNodeFromKey(node_name);
-			if (reconstructed && oldNode) reconstructed = { ...oldNode, ...reconstructed };
+			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
 			// Cast: this is a deliberate partial recovery descriptor (name + replicates, plus any
 			// enriched fields from oldNode); the next decodable update supplies the rest.
 			if (reconstructed) server.nodes.push(reconstructed as any);
@@ -450,7 +466,7 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			// THAT instead, so the outbound subscription is (re)created; the next decodable event
 			// replaces it with the full record.
 			let reconstructed = reconstructNodeFromKey(event.id);
-			if (reconstructed && oldNode) reconstructed = { ...oldNode, ...reconstructed };
+			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
 			if (reconstructed) {
 				logger.warn?.(
 					'hdb_nodes change event for',
@@ -501,6 +517,50 @@ export function probeNodeRow(store: any, key: unknown): { outcome: 'deleted' | '
 	// The point lookup returned something present (a valid record, or a misread `[]`/partial). Treat
 	// it as still-present: a valid record is used directly; an invalid-but-present value reconstructs.
 	return { outcome: 'decode-failure', record };
+}
+
+/**
+ * Sentinel returned by {@link resolveNodeForSendAuth} for an hdb_nodes event that carries no
+ * authorization decision — the watcher must leave the connection alone rather than tear it down.
+ */
+export const SEND_AUTH_UNCHANGED = Symbol('send-auth-unchanged');
+
+/**
+ * Resolve the hdb_nodes record that the dynamic send-authorization watch (replicationConnection's
+ * per-subscriber `getHDBNodeTable().subscribe(name)` loop) should evaluate for one change event.
+ *
+ * The decision must NEVER be keyed off `event.value`, because several event shapes legitimately carry
+ * no `replicates` field for a peer that is replicating perfectly well:
+ *   - a whole-table `reload` marker (emitted when a copyApply base copy back-fills hdb_nodes) is fanned
+ *     out to EVERY subscriber on the table with a null id and no value — see transactionBroadcast's
+ *     reload branch. Every node joining/cloning into a cluster base-copies the system database, so this
+ *     fired mid-formation and closed every live connection with a spurious
+ *     `1008 Unauthorized database subscription` roughly 1ms after the marker landed;
+ *   - a `patch` carries only the patched fields (`add_node`'s `{ isLeader: true }`), never `replicates`;
+ *   - a transient decode failure yields a nullish value for a row that is still present
+ *     (harper#1163 / harper-pro#352).
+ * This is the same invariant {@link processNodeUpdateEvent} already enforces on the subscription path:
+ * an event with no decodable value is not a node removal.
+ *
+ * So read the authoritative row instead: a clean tombstone (`probe` outcome `'deleted'`) de-authorizes
+ * (returns `undefined`), a present-and-valid row is evaluated as usual, and a present-but-undecodable
+ * row returns {@link SEND_AUTH_UNCHANGED} so a decode blip cannot knock a peer offline. `probe` is
+ * injected so this stays unit-testable without a live store.
+ *
+ * A genuine `delete` event is NOT resolved here — the caller short-circuits it via
+ * {@link isGenuineNodeDeletion}, because a point read can be served from a snapshot that predates the
+ * delete commit (harper#1163) and would hand back the still-authorizing row. Nor does
+ * SEND_AUTH_UNCHANGED mean "authorized forever": the caller re-probes for a bounded grace period and
+ * then fails closed, so a revocation carried by an undecodable write cannot be missed indefinitely.
+ */
+export function resolveNodeForSendAuth(
+	name: string,
+	probe: (key: unknown) => { outcome: 'deleted' | 'decode-failure'; record?: any } = (key) =>
+		probeNodeRow(getHDBNodeTable().primaryStore, key)
+): any | typeof SEND_AUTH_UNCHANGED {
+	const { outcome, record } = probe(name);
+	if (outcome === 'deleted') return undefined;
+	return isValidNodeRecord(record) ? record : SEND_AUTH_UNCHANGED;
 }
 
 /**
@@ -577,12 +637,23 @@ function rebuildKnownNodes(listener: (node: any, id: string) => void) {
 	server.shards = new Map();
 
 	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key) => {
-		if (!node.url || node.shard === undefined) {
+		// Only a decode-miss RECONSTRUCT descriptor (reconstructNodeFromKey → no url) needs enrichment;
+		// gate strictly on `!node.url`, NOT `node.shard === undefined`. On an unsharded cluster every real,
+		// fully-decoded record has `shard === undefined`, so the looser guard would run mergeReconstructedNode
+		// over REAL records and revert their freshly-decoded `replicates` to a stale in-memory value during a
+		// copyApply base-copy reload (harper-pro#489) — dropping user-database records for a peer that just
+		// widened, or over-connecting to one that narrowed. A real record always has a url, so it skips this
+		// branch and its fresh `replicates` is honored. (PR #572 review — Chris Barber.)
+		if (!node.url) {
 			const targetName = node.name ?? key;
 			const oldNode =
 				targetName !== undefined ? oldNodes.find((n) => n && n.name !== undefined && n.name === targetName) : undefined;
-			// name + replicates from the reconstruct win; oldNode supplies url/shard/ca/etc.
-			if (oldNode) node = { ...oldNode, ...node };
+			// name from the reconstruct wins and oldNode supplies url/shard/ca/etc., but a directional
+			// `replicates` from oldNode is preserved (mergeReconstructedNode) rather than clobbered by the
+			// reconstruct's `true` — otherwise a transient decode miss during this scan would widen a
+			// constrained peer back to full mesh. Same treatment as the two processNodeUpdateEvent reconstruct
+			// sites. systemdb-routing / harper-pro#489.
+			if (oldNode) node = mergeReconstructedNode(node, oldNode);
 		}
 		// server.nodes holds PEERS, never this node itself — mirror processNodeUpdateEvent's
 		// `node_name !== getThisNodeName()` guard. The per-row event path always excluded self; the scan

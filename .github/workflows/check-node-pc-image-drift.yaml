@@ -1,0 +1,140 @@
+name: Check Node Pointer-Compression Image Drift
+
+# Daily check that the published harperfast/node-pointer-compression:<major> base
+# image still matches the repo's pins. It recomputes the build-input signature —
+# the exact Node patch of the pinned major, the uWebSockets.js source_commit, and
+# the @datadog/pprof version — and probes Docker Hub for the sig-<hash> tag that
+# publish-node-pc-image records. If that tag is absent (a pin changed, or a new
+# patch of the pinned Node major shipped) it dispatches publish-node-pc-image to
+# rebuild; otherwise it is a no-op, so running daily is cheap. Only the majors the
+# pc variant targets are checked — not "latest Node".
+
+on:
+  schedule:
+    - cron: '17 7 * * *' # 07:17 UTC daily; off the top of the hour (GH delays busy times)
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write # dispatch publish-node-pc-image
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Node majors the pc variant targets — keep in sync with the pc legs in
+        # publish-docker.yaml.
+        node-major: ['24']
+    env:
+      IMAGE: harperfast/node-pointer-compression
+      MAJOR: ${{ matrix.node-major }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: |
+            build-tools/pc-image-signature.sh
+            package.json
+            package-lock.json
+          sparse-checkout-cone-mode: false
+      - name: Login to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Resolve desired build inputs and check for drift
+        id: drift
+        run: |
+          set -euo pipefail
+
+          # Exact Node patch for the pinned major — what a rebuild would bake in.
+          node_exact=$(docker run --rm "node:${MAJOR}" node -p 'process.versions.node')
+
+          # uWebSockets.js source_commit: the archive commit pinned in package.json,
+          # then the source_commit file at the root of that archive.
+          uws_url=$(jq -r '.dependencies["uWebSockets.js"] // .optionalDependencies["uWebSockets.js"] // empty' package.json)
+          uws_archive=$(printf '%s' "$uws_url" | sed -nE 's#.*/archive/([0-9a-f]{40})\.tar\.gz#\1#p')
+          if [ -z "$uws_archive" ]; then
+            echo "::error::could not parse uWebSockets.js archive commit from package.json ('${uws_url}')"; exit 1
+          fi
+          if ! uws_commit=$(curl -fsSL "https://raw.githubusercontent.com/uNetworking/uWebSockets.js/${uws_archive}/source_commit" | tr -d '[:space:]') || [ -z "$uws_commit" ]; then
+            echo "::error::could not fetch source_commit for uWebSockets.js archive ${uws_archive}"; exit 1
+          fi
+
+          # @datadog/pprof version from the lockfile.
+          pprof_version=$(jq -r '.packages["node_modules/@datadog/pprof"].version // empty' package-lock.json)
+          if [ -z "$pprof_version" ]; then
+            echo "::error::could not read @datadog/pprof version from package-lock.json"; exit 1
+          fi
+
+          sig=$(build-tools/pc-image-signature.sh "$node_exact" "$uws_commit" "$pprof_version")
+          echo "desired: node=${node_exact} uws=${uws_commit} pprof=${pprof_version} sig=${sig}"
+
+          # Probe Docker Hub for the sig tag (public repo — the read needs no auth).
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${IMAGE}/tags/sig-${sig}")
+          echo "sig-${sig} probe -> HTTP ${code}"
+
+          {
+            echo "uws_commit=${uws_commit}"
+            echo "pprof_version=${pprof_version}"
+            echo "sig=${sig}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$code" = "200" ]; then
+            echo "up-to-date=true" >> "$GITHUB_OUTPUT"
+            echo "✅ node ${MAJOR} base image is current (sig-${sig} exists) — no rebuild"
+          elif [ "$code" = "404" ]; then
+            echo "up-to-date=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ node ${MAJOR} base image is stale (sig-${sig} missing) — rebuild needed"
+          else
+            echo "::error::unexpected HTTP ${code} probing sig-${sig}; treating as inconclusive"; exit 1
+          fi
+      - name: Skip if a build is already in flight
+        id: inflight
+        if: steps.drift.outputs.up-to-date == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # publish-node-pc-image cancels in-progress runs per node-version, so
+          # dispatching while one runs would kill it. Skip if one is queued/running.
+          # Conservative: gh run list can't filter by the node-version input, so with
+          # multiple majors this may skip a major's rebuild for a day when a different
+          # major is mid-build — it self-heals on the next daily run and never causes
+          # a bad rebuild. (Single major today, so no effect yet.)
+          active=$(gh run list --workflow=publish-node-pc-image.yaml \
+            --repo "${{ github.repository }}" \
+            --json status --jq '[.[] | select(.status=="in_progress" or .status=="queued")] | length' || echo 0)
+          echo "active publish-node-pc-image runs: ${active}"
+          if [ "${active}" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "a publish-node-pc-image run is already active — not dispatching"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Dispatch rebuild
+        if: steps.drift.outputs.up-to-date == 'false' && steps.inflight.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UWS_COMMIT: ${{ steps.drift.outputs.uws_commit }}
+          PPROF_VERSION: ${{ steps.drift.outputs.pprof_version }}
+        run: |
+          set -euo pipefail
+          echo "dispatching publish-node-pc-image: node=${MAJOR} uws=${UWS_COMMIT} pprof=${PPROF_VERSION}"
+          # workflow_dispatch/repository_dispatch are the documented exceptions to
+          # GITHUB_TOKEN recursion prevention, so this triggers the run (needs the
+          # actions:write permission above). `gh workflow run` exits non-zero if the
+          # API rejects it (e.g. missing rights) — under set -e that fails the job
+          # loudly rather than silently skipping a needed rebuild.
+          gh workflow run publish-node-pc-image.yaml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            -f node-version="${MAJOR}" \
+            -f uws-source-commit="${UWS_COMMIT}" \
+            -f pprof-version="${PPROF_VERSION}"

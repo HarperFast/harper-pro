@@ -5,7 +5,7 @@ import Joi from 'joi';
 const { pki } = require('node-forge');
 import { get } from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import { ensureNode } from './subscriptionManager.ts';
+import { ensureNode, computeSelfReplicates, getConfiguredRoutes } from './subscriptionManager.ts';
 import { getHDBNodeTable } from './knownNodes.ts';
 import { sendOperationToNode, urlToNodeName } from './replicator.ts';
 import { getThisNodeName, hostnameToUrl, getThisNodeUrl } from '../core/server/nodeName.ts';
@@ -25,6 +25,19 @@ const validationSchema = Joi.object({
 	shard: Joi.number(),
 	isLeader: Joi.boolean(),
 });
+
+/**
+ * Resolve the `replicates` value to write for THIS node's own hdb_nodes row from add_node/set_node.
+ * Preserve an existing directional record (authored from config routes by startOnMainThread on the main
+ * thread) so a registry-set operation running on any worker does not clobber a constrained topology back
+ * to full mesh; only derive from config routes (→ `true` when there are no directional routes) when no
+ * self-record exists yet. getSync forces the synchronous point read (never a Promise). systemdb-routing.
+ */
+function selfReplicatesForNodeWrite(): any {
+	const existingSelf = getHDBNodeTable().primaryStore.getSync(getThisNodeName());
+	if (existingSelf && typeof existingSelf.replicates === 'object') return existingSelf.replicates;
+	return computeSelfReplicates(getConfiguredRoutes());
+}
 
 /**
  * Can add, update or remove a node from replication
@@ -181,7 +194,11 @@ export async function setNode(req: any) {
 	if (req.hostname) nodeRecord.name = req.hostname;
 	if (req.subscriptions) nodeRecord.subscriptions = req.subscriptions;
 	else if (req.sendsTo || req.receivesFrom)
-		nodeRecord.replicates = { sends: true, sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
+		// Directional peer record. NO blanket `sends: true`: that short-circuits shouldReplicateFromNode's
+		// else-branch to "feeds every database", defeating the sendsTo allow-list. Carry sendsTo/receivesFrom
+		// through unmodified so the receive/send gates restrict by database (and target), matching the
+		// config-route shape iterateRoutes produces. harper-pro#498 / systemdb-routing.
+		nodeRecord.replicates = { sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
 	else nodeRecord.replicates = true;
 	if (req.start_time) {
 		nodeRecord.start_time = typeof req.start_time === 'string' ? new Date(req.start_time).getTime() : req.start_time;
@@ -205,7 +222,13 @@ export async function setNode(req: any) {
 		const thisNode: any = {
 			url: thisUrl,
 			ca: cert_auth,
-			replicates: true,
+			// Don't clobber a constrained (directional) self-record back to full-mesh just because
+			// add_node/set_node ran. The directional self-record is written from config routes by
+			// startOnMainThread (main thread); an operation handler may run on any worker, where the
+			// route list isn't populated, so PRESERVE an existing directional record and only derive/
+			// default (→ `true` for a node with no directional routes) when none exists yet. getSync
+			// forces the synchronous point read (never a Promise). systemdb-routing.
+			replicates: selfReplicatesForNodeWrite(),
 			subscriptions: null,
 		};
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
@@ -256,7 +279,9 @@ export async function addNodeBack(req) {
 	const nodeRecord: any = { url: req.url, ca: originCa };
 	if (req.subscriptions) nodeRecord.subscriptions = req.subscriptions;
 	else if (req.sendsTo || req.receivesFrom) {
-		nodeRecord.replicates = { sends: true, sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
+		// Mirror setNode: no blanket `sends: true` (see the note there) so the directional entries actually
+		// gate. systemdb-routing.
+		nodeRecord.replicates = { sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
 		nodeRecord.subscriptions = null;
 	} else {
 		nodeRecord.replicates = true;
@@ -272,7 +297,9 @@ export async function addNodeBack(req) {
 		const thisNode: any = {
 			url: getThisNodeUrl(),
 			ca: repCa?.certificate,
-			replicates: true,
+			// Preserve a directional self-record, not a forced `true` — mirror setNode so the responder side
+			// of the handshake also keeps a constrained topology. systemdb-routing.
+			replicates: selfReplicatesForNodeWrite(),
 			subscriptions: null,
 		};
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) {

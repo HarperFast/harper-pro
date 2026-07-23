@@ -50,7 +50,9 @@ npm run lint:required      # quiet — for CI
 # Tests
 npm run test:unit                  # mocha unit tests (fast, no server — build first)
 npm run test:integration
-npm run test:integration:all   # all *.test.ts in integrationTests/
+npm run test:integration:all           # all *.test.ts in integrationTests/
+npm run test:integration:cluster       # only integrationTests/cluster/ (heaviest, multi-node)
+npm run test:integration:non-cluster   # everything except integrationTests/cluster/
 
 # Submodule
 npm run core:sync              # sync core submodule to its pinned commit

@@ -43,7 +43,11 @@ const RELEASE_BRANCH = getArg('--branch', 'v5.0');
 const CORE_RELEASE_BRANCH = getArg('--core-branch', RELEASE_BRANCH);
 const SOURCE_BRANCH = getArg('--source', 'main');
 const LABEL = getArg('--label', 'patch');
-const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major
+const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major | prerelease
+// Explicit target version (without leading 'v'), overriding the --bump computation.
+// Needed for prerelease-line transitions semver.inc can't express in one step, e.g.
+// alpha.N → beta.1 (`--set-version 5.2.0-beta.1`).
+const SET_VERSION = getArg('--set-version', null);
 
 function getArg(flag, def) {
 	const i = argv.indexOf(flag);
@@ -259,7 +263,27 @@ async function main() {
 	const coreNext = semver.inc(coreCurrent, VERSION_BUMP);
 	const proNext = semver.inc(proCurrent, VERSION_BUMP);
 	const effectiveCore = coreBumping ? coreNext : coreCurrent;
-	const target = semver.compare(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
+	let target = semver.compare(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
+	if (SET_VERSION) {
+		target = semver.valid(SET_VERSION);
+		if (!target) {
+			err(`--set-version "${SET_VERSION}" is not a valid semver`);
+			process.exit(1);
+		}
+		if (semver.compare(target, coreCurrent) <= 0 || semver.compare(target, proCurrent) <= 0) {
+			err(
+				`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`
+			);
+			process.exit(1);
+		}
+		if (
+			runSafe(`git rev-parse -q --verify "refs/tags/v${target}"`).code === 0 ||
+			runSafe(`git -C "${corePath}" rev-parse -q --verify "refs/tags/v${target}"`).code === 0
+		) {
+			err(`--set-version "${SET_VERSION}": tag v${target} already exists`);
+			process.exit(1);
+		}
+	}
 
 	info(`\n  Current:  core=v${coreCurrent}  harper-pro=v${proCurrent}`);
 	info(`  Target:   v${target}`);
@@ -291,7 +315,9 @@ async function main() {
 		if (coreBumping) {
 			coreVersion = setVersion('harper (core)', target);
 		} else {
-			info(`  No new commits on core's ${CORE_RELEASE_BRANCH} since ${coreStatus.lastTag} — skipping core version bump.`);
+			info(
+				`  No new commits on core's ${CORE_RELEASE_BRANCH} since ${coreStatus.lastTag} — skipping core version bump.`
+			);
 		}
 
 		// ── Step 2: checkout harper-pro release branch ─────────────────────────

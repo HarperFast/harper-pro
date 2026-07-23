@@ -7,6 +7,9 @@ import harperLogger from '../core/utility/logging/harper_logger.js';
 import { ClientError } from '../core/utility/errors/hdbError.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
+import { getSecretCustody } from '../core/resources/secretDecryptor.ts';
+import { encryptEnvelope, parseEnvelopeFields } from '../core/utility/secretEnvelope.ts';
+import { ENV_ENCRYPTED_PREFIX } from '../core/utility/envFile.ts';
 import { replicateOperation } from '../replication/replicator.ts';
 
 // SSH key name can only be alphanumeric, dash and underscores
@@ -20,9 +23,57 @@ const exists = async (path: string): Promise<boolean> =>
 		.catch(() => false);
 
 // Helper function to write a file ensuring the directory exists
-async function writeFileEnsureDir(filePath: string, data: string) {
+async function writeFileEnsureDir(filePath: string, data: string, mode?: number) {
 	await mkdir(dirname(filePath), { recursive: true });
-	await writeFile(filePath, data);
+	await writeFile(filePath, data, mode === undefined ? undefined : { mode });
+}
+
+/**
+ * Seal a private key for storage and replication. The `enc:v1:` envelope is what lands on disk and
+ * what goes into the replicated operation body, so the plaintext key reaches neither a peer's disk
+ * nor the wire.
+ *
+ * A key that arrives already sealed — replicated from a peer, or fetched from the leader by
+ * `cloneSSHKeys` — is stored verbatim and never decrypted here, so forwarding a key never requires
+ * holding its plaintext. Its `kid` is checked against this node's custody exactly the way
+ * `set_secret` vets an ingested envelope.
+ *
+ * Degraded mode: with no custody registered there is no key to seal against, so the key is stored
+ * as plaintext — today's behavior — and a WARN says so plainly. This follows the precedent set by
+ * core's `ingestRegistryAuth`, which likewise passes a literal credential through rather than
+ * failing the operation when custody is absent: SSH keys predate custody and must keep working on
+ * a node that has none. Custody is present by default (the file tier generates a cluster keypair on
+ * first boot), so this is the exception rather than the path.
+ */
+function sealSSHKey(name: string, key: string): string {
+	const custody = getSecretCustody();
+
+	if (key.startsWith(ENV_ENCRYPTED_PREFIX)) {
+		let kid: string | undefined;
+		try {
+			kid = parseEnvelopeFields(key.slice(ENV_ENCRYPTED_PREFIX.length)).kid;
+		} catch (error) {
+			throw new ClientError(`Invalid SSH key envelope: ${(error as Error).message}`);
+		}
+		const fingerprint = custody?.getPublicKey()?.fingerprint;
+		if (fingerprint && kid && kid !== fingerprint) {
+			throw new ClientError(
+				`SSH key envelope kid '${kid}' does not match this cluster's secrets key (expected '${fingerprint}')`
+			);
+		}
+		return key;
+	}
+
+	if (!custody) {
+		harperLogger?.warn(
+			`SSH key '${name}' is being stored and replicated in PLAINTEXT: no secret custody is registered on this node. ` +
+				'Configure secret custody (`secretCustody` in the Harper config) so deploy keys are encrypted at rest.'
+		);
+		return key;
+	}
+
+	const { publicKey, fingerprint } = custody.getPublicKey();
+	return ENV_ENCRYPTED_PREFIX + encryptEnvelope(key, publicKey, fingerprint);
 }
 
 const addValidationSchema = Joi.object({
@@ -78,9 +129,13 @@ interface AddSSHKeyRequest {
  * known_hosts entries. If the hostname is `github.com`, GitHub's public SSH
  * keys are automatically fetched and added to the known_hosts file.
  *
+ * The private key is sealed (`sealSSHKey`) before it reaches disk or the replicated operation
+ * body; core decrypts it to a transient file only for the lifetime of a git invocation
+ * (`materializeGitSSH`).
+ *
  * @param req - The request object containing the SSH key details.
  * @param req.name - The name of the SSH key to add.
- * @param req.key - The SSH key contents to write to disk.
+ * @param req.key - The SSH key contents, either plaintext or an `enc:v1:` envelope.
  * @param req.host - The Host alias to use in the SSH config block.
  * @param req.hostname - The HostName (real hostname) to use in the SSH config block.
  * @param req.known_hosts - Optional known_hosts entries to append to the known_hosts file.
@@ -100,8 +155,13 @@ export async function addSSHKey(req: AddSSHKeyRequest): Promise<{ message: strin
 		throw new ClientError('Key already exists. Use update_ssh_key or delete_ssh_key and then add_ssh_key');
 	}
 
+	// Seal before anything durable or replicated happens, and replicate the envelope rather than
+	// the plaintext the caller supplied.
+	const storedKey = sealSSHKey(name, key);
+	req.key = storedKey;
+
 	// Create the key file
-	await writeFileEnsureDir(filePath, key);
+	await writeFileEnsureDir(filePath, storedKey, 0o600);
 	await chmod(filePath, 0o600);
 
 	// Build the config block string
@@ -160,12 +220,17 @@ Host ${host}
  * Retrieves an SSH key by name, along with any associated Host and HostName
  * configuration from the SSH config file.
  *
+ * `key` is returned exactly as stored — an `enc:v1:` envelope on a node with secret custody, or
+ * plaintext on one without (see `sealSSHKey`). It is deliberately NOT decrypted: the only consumer
+ * is `cloneSSHKeys`, which feeds it straight back into `add_ssh_key` on the cloning node, and
+ * returning the envelope keeps the private key off the clone's wire as well as off its disk.
+ *
  * @param req - The request object containing the key name.
  * @param req.name - The name of the SSH key to retrieve.
- * @returns An object containing the key name, the key contents, and optionally
- * the Host and HostName from the SSH config file.
+ * @returns An object containing the key name, the stored key (sealed envelope or plaintext), and
+ * optionally the Host and HostName from the SSH config file.
  */
-async function getSSHKey(req: {
+export async function getSSHKey(req: {
 	name: string;
 }): Promise<{ name: string; key: string; host?: string; hostname?: string }> {
 	const validation = validateBySchema(req, getSSHKeyValidationSchema);
@@ -194,14 +259,18 @@ async function getSSHKey(req: {
 }
 
 /**
- * Updates an existing SSH key by overwriting the key file with new contents.
+ * Updates an existing SSH key by overwriting the key file with new contents. Rotation semantics are
+ * unchanged; only the stored representation is sealed (see `sealSSHKey`).
  *
  * @param req - The request object containing the updated key details.
  * @param req.name - The name of the SSH key to update.
- * @param req.key - The new SSH key contents to write to disk.
+ * @param req.key - The new SSH key contents, either plaintext or an `enc:v1:` envelope.
  * @returns An object containing a success message and optional replication results.
  */
-async function updateSSHKey(req: { name: string; key: string }): Promise<{ message: string; replicated?: unknown[] }> {
+export async function updateSSHKey(req: {
+	name: string;
+	key: string;
+}): Promise<{ message: string; replicated?: unknown[] }> {
 	const validation = validateBySchema(req, updateSSHKeyValidationSchema);
 	if (validation) throw new ClientError(validation.message);
 
@@ -213,7 +282,10 @@ async function updateSSHKey(req: { name: string; key: string }): Promise<{ messa
 		throw new ClientError(`SSH key '${name}' does not exist. Use add_ssh_key to create it.`);
 	}
 
-	await writeFileEnsureDir(filePath, key);
+	const storedKey = sealSSHKey(name, key);
+	req.key = storedKey;
+
+	await writeFileEnsureDir(filePath, storedKey, 0o600);
 	await chmod(filePath, 0o600);
 
 	const response = await replicateOperation(req);
@@ -262,7 +334,7 @@ async function deleteSSHKey(req: { name: string }): Promise<{ message: string; r
  * @returns An array of objects containing the key name and optionally
  * the Host and HostName from the SSH config file.
  */
-async function listSSHKeys(): Promise<{ name: string; host?: string; hostname?: string }[]> {
+export async function listSSHKeys(): Promise<{ name: string; host?: string; hostname?: string }[]> {
 	const { sshDir, configFile } = getSSHPaths(undefined);
 	if (!(await exists(sshDir))) return [];
 
