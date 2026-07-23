@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1784804905218,
+  "lastUpdate": 1784804908147,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -4575,6 +4575,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 47.61,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "64439476c7cc3e6c73ab612f04c0f0b820be4a91",
+          "message": "build(core): pick up the replication resume-cursor blocking-write fix\n\nPoints the core submodule at the fix for the apply loop's resume-cursor\nwrite, which blocked the worker event loop for up to 101s under RocksDB\nwrite stall and got the subscription torn down by the sender's receive\nwatchdog.\n\nRefs #603\n\nCo-Authored-By: Claude Opus <noreply@anthropic.com>",
+          "timestamp": "2026-07-21T17:37:19Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/64439476c7cc3e6c73ab612f04c0f0b820be4a91"
+        },
+        "date": 1784804908119,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 5.33,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 7.93,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 10.31,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 18.13,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 18.86,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 33.4,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 68.52,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 182.07,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 60.1,
             "unit": "ms"
           }
         ]
