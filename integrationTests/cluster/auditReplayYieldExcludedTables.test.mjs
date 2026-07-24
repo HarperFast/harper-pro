@@ -45,7 +45,12 @@ import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
-import { startHarper, killHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import {
+	startHarper,
+	killHarper,
+	teardownHarper,
+	getNextAvailableLoopbackAddress,
+} from '@harperfast/integration-testing';
 import { sendOperation } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
@@ -154,54 +159,65 @@ function nodeConfig(hostname, peerHostname, { singleThread = false } = {}) {
 	return { config };
 }
 
-suite('QA-690: audit replay loop yields on excludeTables skip run (harper-pro#535/#536)', { timeout: 600000 }, (ctx) => {
-	before(async () => {
-		const hostnameA = await getNextAvailableLoopbackAddress();
-		const hostnameB = await getNextAvailableLoopbackAddress();
-		ctx.hostnameA = hostnameA;
-		ctx.hostnameB = hostnameB;
+suite(
+	'QA-690: audit replay loop yields on excludeTables skip run (harper-pro#535/#536)',
+	{ timeout: 600000 },
+	(ctx) => {
+		before(async () => {
+			const hostnameA = await getNextAvailableLoopbackAddress();
+			const hostnameB = await getNextAvailableLoopbackAddress();
+			ctx.hostnameA = hostnameA;
+			ctx.hostnameB = hostnameB;
 
-		const ctxA = { name: ctx.name, harper: { hostname: hostnameA } };
-		const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
+			const ctxA = { name: ctx.name, harper: { hostname: hostnameA } };
+			const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
 
-		await Promise.all([
-			startHarper(ctxA, nodeConfig(hostnameA, hostnameB, { singleThread: true })),
-			startHarper(ctxB, nodeConfig(hostnameB, hostnameA)),
-		]);
+			await Promise.all([
+				startHarper(ctxA, nodeConfig(hostnameA, hostnameB, { singleThread: true })),
+				startHarper(ctxB, nodeConfig(hostnameB, hostnameA)),
+			]);
 
-		ctx.nodeA = ctxA.harper;
-		ctx.nodeB = ctxB.harper;
+			ctx.nodeA = ctxA.harper;
+			ctx.nodeB = ctxB.harper;
 
-		// excludeTables affects schema propagation too — create both tables independently
-		// on both nodes so 'excluded' isn't silently missing on one side.
-		for (const node of [ctx.nodeA, ctx.nodeB]) {
-			await sendOperation(node, { operation: 'create_table', database: DB, table: EXCLUDED_TABLE, primary_key: 'id' });
-			await sendOperation(node, { operation: 'create_table', database: DB, table: KEEP_TABLE, primary_key: 'id' });
-		}
+			// excludeTables affects schema propagation too — create both tables independently
+			// on both nodes so 'excluded' isn't silently missing on one side.
+			for (const node of [ctx.nodeA, ctx.nodeB]) {
+				await sendOperation(node, {
+					operation: 'create_table',
+					database: DB,
+					table: EXCLUDED_TABLE,
+					primary_key: 'id',
+				});
+				await sendOperation(node, { operation: 'create_table', database: DB, table: KEEP_TABLE, primary_key: 'id' });
+			}
 
-		const connected = await waitForConnected(ctx.nodeB);
-		ok(connected, 'B did not form a connected route to A');
-		console.log('Cluster up — A:', ctx.nodeA.hostname, '(threads:1) B:', ctx.nodeB.hostname);
-	});
+			const connected = await waitForConnected(ctx.nodeB);
+			ok(connected, 'B did not form a connected route to A');
+			console.log('Cluster up — A:', ctx.nodeA.hostname, '(threads:1) B:', ctx.nodeB.hostname);
+		});
 
-	after(async () => {
-		await Promise.all([
-			ctx.nodeA && teardownHarper({ harper: ctx.nodeA }).catch(() => {}),
-			ctx.nodeB && teardownHarper({ harper: ctx.nodeB }).catch(() => {}),
-		]);
-	});
+		after(async () => {
+			await Promise.all([
+				ctx.nodeA && teardownHarper({ harper: ctx.nodeA }).catch(() => {}),
+				ctx.nodeB && teardownHarper({ harper: ctx.nodeB }).catch(() => {}),
+			]);
+		});
 
-	test('sanity: keep-table replication is live before the excluded-table burst', async () => {
-		const id = 'sanity-' + Date.now();
-		await sendOperation(ctx.nodeA, { operation: 'upsert', database: DB, table: KEEP_TABLE, records: [{ id, value: 'v1' }] });
-		const missing = await waitForIds(ctx.nodeB, KEEP_TABLE, [id], 20000);
-		equal(missing.length, 0, 'keep-table record did not replicate A->B — route is not actually live');
-		console.log('Sanity: keep-table replication confirmed live (A->B) over the excludeTables route');
-	});
+		test('sanity: keep-table replication is live before the excluded-table burst', async () => {
+			const id = 'sanity-' + Date.now();
+			await sendOperation(ctx.nodeA, {
+				operation: 'upsert',
+				database: DB,
+				table: KEEP_TABLE,
+				records: [{ id, value: 'v1' }],
+			});
+			const missing = await waitForIds(ctx.nodeB, KEEP_TABLE, [id], 20000);
+			equal(missing.length, 0, 'keep-table record did not replicate A->B — route is not actually live');
+			console.log('Sanity: keep-table replication confirmed live (A->B) over the excludeTables route');
+		});
 
-	test(
-		'A stays responsive and keep-table rows behind two long excluded-table skip runs still arrive at B',
-		async () => {
+		test('A stays responsive and keep-table rows behind two long excluded-table skip runs still arrive at B', async () => {
 			// 1. Take B offline. Its persisted resume cursor is captured BEFORE any of the
 			//    excluded/keep burst below exists, so on reconnect A's sender must walk
 			//    forward through both skip runs to catch it up.
@@ -215,7 +231,10 @@ suite('QA-690: audit replay loop yields on excludeTables skip run (harper-pro#53
 			//    long not-subscribed-table skip runs.
 			const makeExcludedChunk = (prefix, n) =>
 				Array.from({ length: n }, (_, i) => ({ id: `${prefix}-${i}`, payload: 'x'.repeat(32) }));
-			const keepInterleaved = Array.from({ length: 5 }, (_, i) => ({ id: `keep-interleaved-${i}`, value: 'behind-run-1' }));
+			const keepInterleaved = Array.from({ length: 5 }, (_, i) => ({
+				id: `keep-interleaved-${i}`,
+				value: 'behind-run-1',
+			}));
 			const keepAfter = Array.from({ length: 5 }, (_, i) => ({ id: `keep-after-${i}`, value: 'behind-run-2' }));
 
 			const writeStart = Date.now();
@@ -225,7 +244,12 @@ suite('QA-690: audit replay loop yields on excludeTables skip run (harper-pro#53
 				table: EXCLUDED_TABLE,
 				records: makeExcludedChunk('run1', CHUNK_SIZE),
 			});
-			await sendOperation(ctx.nodeA, { operation: 'upsert', database: DB, table: KEEP_TABLE, records: keepInterleaved });
+			await sendOperation(ctx.nodeA, {
+				operation: 'upsert',
+				database: DB,
+				table: KEEP_TABLE,
+				records: keepInterleaved,
+			});
 			await sendOperation(ctx.nodeA, {
 				operation: 'upsert',
 				database: DB,
@@ -239,7 +263,11 @@ suite('QA-690: audit replay loop yields on excludeTables skip run (harper-pro#53
 			);
 
 			const excludedOnASoFar = await countRows(ctx.nodeA, EXCLUDED_TABLE);
-			equal(excludedOnASoFar, 2 * CHUNK_SIZE, 'sender A should locally have both excluded-table bursts before B reconnects');
+			equal(
+				excludedOnASoFar,
+				2 * CHUNK_SIZE,
+				'sender A should locally have both excluded-table bursts before B reconnects'
+			);
 
 			// 3. Start the responsiveness probe, THEN restart B so its reconnect (and A's replay
 			//    of the two excluded skip runs) happens while we're already sampling.
@@ -274,7 +302,11 @@ suite('QA-690: audit replay loop yields on excludeTables skip run (harper-pro#53
 			const excludedOnB = await countRows(ctx.nodeB, EXCLUDED_TABLE);
 			console.log(`Precondition check: excluded-table rows — A=${excludedOnA}, B=${excludedOnB}`);
 			equal(excludedOnA, 2 * CHUNK_SIZE, `PRECONDITION FAILED: source A should have ${2 * CHUNK_SIZE} excluded rows`);
-			equal(excludedOnB, 0, 'PRECONDITION FAILED: excluded-table rows leaked to B — excludeTables route is not excluding');
+			equal(
+				excludedOnB,
+				0,
+				'PRECONDITION FAILED: excluded-table rows leaked to B — excludeTables route is not excluding'
+			);
 
 			// --- Assertion 1: subscribed-table rows behind both excluded runs arrived at B ---
 			equal(
@@ -292,14 +324,23 @@ suite('QA-690: audit replay loop yields on excludeTables skip run (harper-pro#53
 					`replaying two ${CHUNK_SIZE}-row not-subscribed-table (excludeTables) skip runs to B — the send loop ` +
 					`is not yielding to the event loop as expected from #536's fix`
 			);
-		}
-	);
+		});
 
-	test('keep-table replication still works cleanly after the excluded-table burst (no wedge)', async () => {
-		const id = 'post-burst-' + Date.now();
-		await sendOperation(ctx.nodeA, { operation: 'upsert', database: DB, table: KEEP_TABLE, records: [{ id, value: 'after-burst' }] });
-		const missing = await waitForIds(ctx.nodeB, KEEP_TABLE, [id], 20000);
-		equal(missing.length, 0, 'post-burst keep-table write did not replicate — connection may be wedged after the skip-run');
-		console.log('Post-burst sanity: keep-table replication still live — no wedge');
-	});
-});
+		test('keep-table replication still works cleanly after the excluded-table burst (no wedge)', async () => {
+			const id = 'post-burst-' + Date.now();
+			await sendOperation(ctx.nodeA, {
+				operation: 'upsert',
+				database: DB,
+				table: KEEP_TABLE,
+				records: [{ id, value: 'after-burst' }],
+			});
+			const missing = await waitForIds(ctx.nodeB, KEEP_TABLE, [id], 20000);
+			equal(
+				missing.length,
+				0,
+				'post-burst keep-table write did not replicate — connection may be wedged after the skip-run'
+			);
+			console.log('Post-burst sanity: keep-table replication still live — no wedge');
+		});
+	}
+);
