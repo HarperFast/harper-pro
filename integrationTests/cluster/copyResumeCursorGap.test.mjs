@@ -132,10 +132,7 @@ suite('QA-689: interrupted bulk copy resume cursor vs. an undelivered range', { 
 		const source = { name: ctx.name, harper: { hostname: hostnameA } };
 		const receiver = { name: ctx.name, harper: { hostname: hostnameB } };
 
-		await Promise.all([
-			startHarper(source, nodeOptions(hostnameA)),
-			startHarper(receiver, nodeOptions(hostnameB)),
-		]);
+		await Promise.all([startHarper(source, nodeOptions(hostnameA)), startHarper(receiver, nodeOptions(hostnameB))]);
 		ctx.source = source.harper;
 		ctx.receiver = receiver.harper;
 
@@ -166,9 +163,10 @@ suite('QA-689: interrupted bulk copy resume cursor vs. an undelivered range', { 
 
 	after(async () => {
 		await Promise.all(
-			[ctx.source && teardownHarper({ harper: ctx.source }), ctx.receiver && teardownHarper({ harper: ctx.receiver })].filter(
-				Boolean
-			)
+			[
+				ctx.source && teardownHarper({ harper: ctx.source }),
+				ctx.receiver && teardownHarper({ harper: ctx.receiver }),
+			].filter(Boolean)
 		);
 	});
 
@@ -193,7 +191,9 @@ suite('QA-689: interrupted bulk copy resume cursor vs. an undelivered range', { 
 				await delay(POLL_MS);
 			}
 			if (count >= TOTAL_RECORDS) {
-				console.log(`[qa689] checkpoint frac=${frac}: copy already reached ${count}/${TOTAL_RECORDS}; stopping interruption loop`);
+				console.log(
+					`[qa689] checkpoint frac=${frac}: copy already reached ${count}/${TOTAL_RECORDS}; stopping interruption loop`
+				);
 				break;
 			}
 			// Hard precondition: the copy must be GENUINELY interrupted mid-range, not before start
@@ -208,7 +208,10 @@ suite('QA-689: interrupted bulk copy resume cursor vs. an undelivered range', { 
 			ctx.receiver = (await startHarper({ harper: ctx.receiver }, nodeOptions(ctx.receiver.hostname))).harper;
 		}
 
-		ok(interruptions.length > 0, 'precondition never armed: never observed a genuine mid-copy interruption (harness/timing issue)');
+		ok(
+			interruptions.length > 0,
+			'precondition never armed: never observed a genuine mid-copy interruption (harness/timing issue)'
+		);
 
 		// Let the (possibly resumed, possibly restarted-from-persisted-cursor) copy run to
 		// completion without further interruption, or until it visibly stagnates.
@@ -229,7 +232,9 @@ suite('QA-689: interrupted bulk copy resume cursor vs. an undelivered range', { 
 			}
 			await delay(250);
 		}
-		console.log(`[qa689] final receiver record_count=${finalCount}/${TOTAL_RECORDS} after ${interruptions.length} interruption(s): ${JSON.stringify(interruptions)}`);
+		console.log(
+			`[qa689] final receiver record_count=${finalCount}/${TOTAL_RECORDS} after ${interruptions.length} interruption(s): ${JSON.stringify(interruptions)}`
+		);
 
 		// A little extra settle time before the oracle scan, in case the last commit is still
 		// draining (blob/durability watermark) even though the count already reads TOTAL_RECORDS.
