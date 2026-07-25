@@ -1,0 +1,9 @@
+# QA-578 — regression anchor: live-subscriber delivery of copy-applied rows
+# (harper-pro#495 / PR #507 "emit reload markers for user-DB tables so live
+# subscribers recover copy-applied rows"). Plain @export table so the REST
+# collection endpoint (/CopyRow/) supports both ordinary GET and a live
+# Server-Sent-Events subscription (Accept: text/event-stream).
+type CopyRow @table @export {
+	id: ID @primaryKey
+	val: String
+}
