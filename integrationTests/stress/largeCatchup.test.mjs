@@ -80,7 +80,12 @@ if (!stressEnabled()) {
 	// allocations + RocksDB block cache/memtables). This is the real OOM-risk signal,
 	// robust to the reclaimable file cache that inflates RSS. Observed ~2.4–3.6 GB.
 	const ANON_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_ANON_CAP_MB ?? 5120);
-	// Budget: longer offline = larger backlog = more catch-up time needed.
+	// Budget: longer offline = larger backlog = more catch-up time needed. 180 s/GB is NOT marginal —
+	// at the 10 GB CI scale it allows 1800 s against a typical converged time of 600–1100 s (9–17 MB/s),
+	// roughly 2x headroom. Resist raising it to absorb a timeout: the observed timeouts (2026-07-19,
+	// 2026-07-25) are not runs that just missed, they are runs where B never escaped the write-stall
+	// trough and was still 13–35% short while decelerating. Raising the budget would hide a 4–5x
+	// throughput degradation, which is the thing worth knowing. See the rate profile below.
 	const CATCHUP_BUDGET_SECS = Number(
 		process.env.HARPER_STRESS_LARGE_CATCHUP_BUDGET_SECS ?? Math.max(600, TARGET_GB * 180)
 	);
@@ -97,6 +102,53 @@ if (!stressEnabled()) {
 
 	// Build payload once; reused across all records to avoid per-record allocation.
 	const PAYLOAD = 'x'.repeat(PAYLOAD_SIZE);
+
+	// Pace B must sustain, on average, to finish inside the budget. Used to report how much of the
+	// run was spent below the pace that can actually finish — see summariseCatchupRate.
+	const REQUIRED_MBPS = (TARGET_GB * 1024) / CATCHUP_BUDGET_SECS;
+	const RATE_WINDOW_SECS = 180;
+
+	/**
+	 * Catch-up throughput is strongly BIMODAL, so a single averaged MB/s is not a diagnosis.
+	 * Every observed run replays fast for ~3 min (10–13 MB/s), drops into a RocksDB write-stall
+	 * trough (1.5–3 MB/s), and then either climbs back out and finishes in 600–1100 s, or never
+	 * does and grinds out the whole budget. Those are different failures with different causes,
+	 * but the averaged number reports both as "slow replay" — the 2026-07-25 nightly timeout
+	 * averaged 4.9 MB/s while its per-window rate ranged 1.5–11.1 MB/s.
+	 *
+	 * Summarise the rate over fixed windows so a timeout carries its own phase profile: whether B
+	 * was uniformly slow, or stall-bound and never recovered.
+	 */
+	function summariseCatchupRate(progress, windowSecs = RATE_WINDOW_SECS) {
+		const windows = [];
+		if (progress.length < 2) return { windows, peakMBps: 0, slowSecs: 0 };
+		const toMBps = (records, secs) => (records * PAYLOAD_SIZE) / 1024 / 1024 / secs;
+		let anchor = progress[0];
+		for (const sample of progress) {
+			const secs = (sample.t - anchor.t) / 1000;
+			if (secs < windowSecs) continue;
+			// Labelled by the elapsed time at the END of the window it summarises.
+			windows.push({
+				toSecs: (sample.t - progress[0].t) / 1000,
+				mbps: toMBps(sample.count - anchor.count, secs),
+				secs,
+			});
+			anchor = sample;
+		}
+		const peakMBps = windows.reduce((max, w) => Math.max(max, w.mbps), 0);
+		// Wall-clock spent below the pace that can finish in budget — the "stall-bound" measure.
+		const slowSecs = windows.reduce((sum, w) => sum + (w.mbps < REQUIRED_MBPS ? w.secs : 0), 0);
+		return { windows, peakMBps, slowSecs };
+	}
+
+	function formatRateProfile({ windows, peakMBps, slowSecs }) {
+		if (!windows.length) return 'no rate windows (catch-up ended before one window elapsed)';
+		const profile = windows.map((w) => `${w.toSecs.toFixed(0)}s:${w.mbps.toFixed(1)}`).join(' ');
+		return (
+			`per-${RATE_WINDOW_SECS}s MB/s [${profile}] peak=${peakMBps.toFixed(1)} ` +
+			`below-required-pace(${REQUIRED_MBPS.toFixed(1)} MB/s)=${slowSecs.toFixed(0)}s`
+		);
+	}
 
 	suite(`Large catch-up — ${TARGET_GB} GB`, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		before(async () => {
@@ -273,6 +325,8 @@ if (!stressEnabled()) {
 				// fact — track the last forward step and fail with a distinct message on a wedge.
 				let lastProgressAt = Date.now();
 				let stalledFor = 0;
+				// (time, count) samples behind the rate profile reported below.
+				const progress = [{ t: catchupStart, count: 0 }];
 				while (Date.now() < deadline) {
 					// Measure convergence with an exact count, not the default
 					// describe_table.record_count — the latter is a rounded RocksDB
@@ -291,6 +345,7 @@ if (!stressEnabled()) {
 						const prevCount = lastCount;
 						lastCount = resp.record_count;
 						if (lastCount > prevCount) lastProgressAt = Date.now();
+						progress.push({ t: Date.now(), count: Math.max(lastCount - seedRecords.length, 0) });
 					}
 					stalledFor = (Date.now() - lastProgressAt) / 1000;
 					ok(
@@ -325,6 +380,7 @@ if (!stressEnabled()) {
 				// replaying steadily the whole time — the single most misleading number in this job.
 				const appliedRecords = Math.max(lastCount - seedRecords.length, 0);
 				const catchupMBps = (appliedRecords * PAYLOAD_SIZE) / 1024 / 1024 / catchupSecs;
+				const rateProfile = summariseCatchupRate(progress);
 
 				console.log(
 					`[large-catchup] result: catchup=${convergedAt ? catchupSecs.toFixed(1) + 's' : `TIMEOUT after ${catchupSecs.toFixed(1)}s`} ` +
@@ -332,6 +388,9 @@ if (!stressEnabled()) {
 						`throughput=${catchupMBps.toFixed(1)} MB/s ` +
 						`A_peakRSS=${mb(aSummary.peakRss)} B_peakRSS=${mb(bSummary.peakRss)}`
 				);
+				// Phase profile — the averaged throughput above cannot distinguish uniformly-slow replay
+				// from a stall-bound run that never recovered. See summariseCatchupRate.
+				console.log(`[large-catchup] rate profile: ${formatRateProfile(rateProfile)}`);
 				// Container-level cgroup breakdown (whole job container = both nodes + runner).
 				// anon = genuine/unreclaimable; file = reclaimable page cache (incl. mmap'd txn
 				// log read during catchup); dirty = pending writeback (vm.dirty_ratio concern).
@@ -348,8 +407,11 @@ if (!stressEnabled()) {
 				ok(
 					convergedAt !== null,
 					`B did not converge within ${CATCHUP_BUDGET_SECS}s; last count=${lastCount}/${targetCount} ` +
-						`(applied ${appliedRecords} records at ${catchupMBps.toFixed(1)} MB/s — slow replay, not a wedge; ` +
-						`a wedge would have tripped the ${STALL_SECS}s no-progress guard)`
+						`(applied ${appliedRecords} records at ${catchupMBps.toFixed(1)} MB/s avg — slow replay, not a wedge; ` +
+						`a wedge would have tripped the ${STALL_SECS}s no-progress guard). ` +
+						`Rate profile: ${formatRateProfile(rateProfile)}. ` +
+						`A peak well above the required pace with most of the run below it means B was ` +
+						`stall-bound and never recovered (harper-pro#430 / #435), NOT that the budget is too tight.`
 				);
 				for (const [name, summary, log] of [
 					['A', aSummary, logA],

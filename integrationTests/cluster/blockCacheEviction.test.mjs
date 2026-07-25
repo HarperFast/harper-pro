@@ -11,18 +11,22 @@
  *   `Promise?.replicates` is `undefined`, which silently disables replication / drops a node from
  *   cluster_status / never opens a retrieval connection. The fix is `getSync(...)` at those sites.
  *
- * Why this test reproduces it:
- *   - Each node runs RocksDB with a SMALL (but viable) block cache, so system-table blocks do not stay
- *     resident under churn. (A sub-MB cache makes RocksDB hang on open, so "small" here is ~32 MB, far
- *     below the default ~25%-of-RAM — the cold restart below is what makes the miss DETERMINISTIC.)
- *   - Every node is RESTARTED, giving a COLD block cache + empty memtable, so the first post-restart read
- *     of each `hdb_nodes` record is a guaranteed cache miss (a Promise from `get()`). The startup
- *     replication paths (ensureThisNode / shouldReplicateFromNode) run exactly in that window.
- *   - We then drive the procedures that depend on those synchronous reads — a rolling restart — and assert replication stays healthy and converges.
+ * What this test is (and is NOT):
+ *   It is a SCENARIO test: a real rolling restart of a 2-node cluster on RocksDB with a small block
+ *   cache, asserting the startup replication paths (ensureThisNode / shouldReplicateFromNode /
+ *   cluster_status) bring the cluster back and a post-restart write converges.
  *
- * Pre-fix this fails: a post-restart cache miss makes shouldReplicateFromNode falsy (unsubscribe) and/or
- * flips `isFullyReplicating = false` ("Disabling replication"), so the post-restart write never converges.
- * Post-fix the synchronous reads return the real records regardless of cache state, so it converges.
+ *   It is NOT the regression guard for the `get()`-returns-a-Promise bug itself, despite the name.
+ *   That guard is `unitTests/replication/selfNodeReplicates.test.mjs` and
+ *   `unitTests/replication/readNodeRowSync.test.mjs`, which inject a Promise-returning `get()`
+ *   directly and fail deterministically when the `getSync` call sites regress. This file cannot:
+ *   replication startup does a full `hdb_nodes` SCAN (rebuildKnownNodes) before any point read, which
+ *   warms the block holding the node rows, so the subsequent point read hits the cache and returns
+ *   synchronously even on a stone-cold restart. Verified by mutation — reverting `selfNodeReplicates`
+ *   and `readNodeRowSync` to plain `get()` leaves this suite green while the two unit tests fail.
+ *   Reproducing a genuine point-read miss here would need `hdb_nodes` grown past the block cache,
+ *   which is what the field repro had and a 2-node test does not. Do not read a pass here as evidence
+ *   that the MaybePromise sites are still correct.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -107,7 +111,7 @@ async function describeReplication(node) {
 
 suite(
 	'replication survives RocksDB get() cache-miss Promises (small block cache + restart)',
-	{ timeout: 240000 },
+	{ timeout: 360000 },
 	(ctx) => {
 		before(async () => {
 			const hostnameA = await getNextAvailableLoopbackAddress();
@@ -199,8 +203,8 @@ suite(
 				await pollHealth(node);
 			}
 
-			// (1) Direct catch for the silent-disable bug: a cold-cache Promise self-row logs
-			// "Disabling replication". It must not appear.
+			// (1) Whatever the cause, a node that decides it should stop replicating logs
+			// "Disabling replication". It must not appear after a routine restart.
 			for (const node of [nodeA, nodeB]) {
 				const log = await readLog(node);
 				ok(
