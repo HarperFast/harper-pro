@@ -9,7 +9,7 @@
 
 import { equal } from 'node:assert';
 import { readFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -34,6 +34,223 @@ export function readCgroupMem() {
 		return { current, anon: field('anon'), file: field('file'), fileDirty: field('file_dirty') };
 	} catch {
 		return null;
+	}
+}
+
+/**
+ * Read the counters that expose *host* pressure from inside the job container.
+ * `/proc/stat`, `/proc/diskstats`, `/proc/loadavg`, `/proc/pressure/*` and
+ * `/proc/meminfo` are not namespaced by Docker, so a container reads the whole
+ * machine through them — which is exactly the signal cgroup memory stats cannot
+ * see. Without this, a stress run that was slow because a neighbouring workload
+ * saturated the box is indistinguishable from a genuine replication regression.
+ * Returns null for any source the platform lacks (PSI is kernel-config gated,
+ * and none of it exists off Linux).
+ */
+export function readHostCounters() {
+	const readOrNull = (path) => {
+		try {
+			return readFileSync(path, 'utf8');
+		} catch {
+			return null;
+		}
+	};
+	const stat = readOrNull('/proc/stat');
+	const loadavg = readOrNull('/proc/loadavg');
+	if (!stat || !loadavg) return null;
+
+	// cpu aggregate line: user nice system idle iowait irq softirq steal ...
+	const cpu =
+		stat
+			.match(/^cpu\s+(.*)$/m)?.[1]
+			.trim()
+			.split(/\s+/)
+			.map(Number) ?? [];
+	const [, , , idle = 0, iowait = 0, , , steal = 0] = cpu;
+	const cpuTotal = cpu.reduce((sum, v) => sum + v, 0);
+
+	// Sum every whole block device (skip partitions/loopbacks/dm) so one line
+	// covers whatever the runner's storage happens to be called.
+	let readSectors = 0;
+	let writeSectors = 0;
+	for (const line of (readOrNull('/proc/diskstats') ?? '').split('\n')) {
+		const f = line.trim().split(/\s+/);
+		if (f.length < 10) continue;
+		const name = f[2];
+		if (!/^(sd[a-z]+|nvme\d+n\d+|vd[a-z]+|xvd[a-z]+)$/.test(name)) continue;
+		readSectors += Number(f[5]);
+		writeSectors += Number(f[9]);
+	}
+
+	// PSI "some" totals are microseconds of stall since boot — the single best
+	// contention signal, because it counts time tasks *waited* rather than a rate.
+	const psiTotal = (path) => {
+		const m = readOrNull(path)?.match(/^some .*total=(\d+)/m);
+		return m ? Number(m[1]) : null;
+	};
+
+	const memAvailableKb = Number(readOrNull('/proc/meminfo')?.match(/^MemAvailable:\s+(\d+)/m)?.[1] ?? 0);
+
+	const [load1, load5] = loadavg.trim().split(/\s+/).map(Number);
+	return {
+		t: Date.now(),
+		load1,
+		load5,
+		cpuTotal,
+		cpuIdle: idle,
+		cpuIowait: iowait,
+		cpuSteal: steal,
+		readSectors,
+		writeSectors,
+		psiCpu: psiTotal('/proc/pressure/cpu'),
+		psiIo: psiTotal('/proc/pressure/io'),
+		psiMem: psiTotal('/proc/pressure/memory'),
+		memAvailableKb,
+	};
+}
+
+/**
+ * Turn two readHostCounters() readings into rates over the interval between
+ * them: CPU time percentages, host block-device MB/s, and PSI stall percentage
+ * (share of wall-clock in which at least one task was stalled). Returns null if
+ * either reading is missing or the interval is degenerate.
+ */
+export function hostCounterDelta(before, after) {
+	if (!before || !after) return null;
+	const elapsedMs = after.t - before.t;
+	if (elapsedMs <= 0) return null;
+	const cpuTicks = after.cpuTotal - before.cpuTotal;
+	const pct = (delta) => (cpuTicks > 0 ? (delta / cpuTicks) * 100 : 0);
+	const stallPct = (key) =>
+		before[key] == null || after[key] == null ? null : ((after[key] - before[key]) / 1000 / elapsedMs) * 100;
+	// diskstats sectors are always 512 bytes regardless of the device's real sector size.
+	const mbPerSec = (sectors) => (sectors * 512) / MB / (elapsedMs / 1000);
+	return {
+		elapsedSecs: elapsedMs / 1000,
+		load1: after.load1,
+		idlePct: pct(after.cpuIdle - before.cpuIdle),
+		iowaitPct: pct(after.cpuIowait - before.cpuIowait),
+		stealPct: pct(after.cpuSteal - before.cpuSteal),
+		readMBps: mbPerSec(after.readSectors - before.readSectors),
+		writeMBps: mbPerSec(after.writeSectors - before.writeSectors),
+		psiCpuPct: stallPct('psiCpu'),
+		psiIoPct: stallPct('psiIo'),
+		psiMemPct: stallPct('psiMem'),
+		memAvailableKb: after.memAvailableKb,
+	};
+}
+
+/**
+ * Sample host counters at a fixed interval. Unlike sampleMetrics this needs no
+ * Harper node — it reads /proc directly — so it keeps running across node
+ * restarts. `window()` returns the rates since the previous window() call (or
+ * since start), which is what a poll loop wants to print alongside its progress.
+ */
+export function sampleHostCounters(opts = {}) {
+	const interval = opts.intervalMs ?? 5000;
+	const first = readHostCounters();
+	const samples = first ? [first] : [];
+	let windowStart = first;
+	const timer = setInterval(() => {
+		const sample = readHostCounters();
+		if (sample) samples.push(sample);
+	}, interval);
+	timer.unref?.();
+	return {
+		samples,
+		/** Rates since the previous window() call; null when /proc is unavailable. */
+		window() {
+			const now = readHostCounters();
+			if (!now) return null;
+			samples.push(now);
+			const delta = hostCounterDelta(windowStart, now);
+			windowStart = now;
+			return delta;
+		},
+		stop() {
+			clearInterval(timer);
+			// Take a final reading so the summary always spans right up to stop(), rather
+			// than ending at whenever the last interval happened to land.
+			const last = readHostCounters();
+			if (last) samples.push(last);
+			return samples;
+		},
+	};
+}
+
+/**
+ * Summarise host-counter samples over the whole run: rates across the full
+ * span, plus the worst individual interval, so a short contention burst that
+ * averages away is still visible.
+ */
+export function summariseHostSamples(samples) {
+	if (!samples || samples.length < 2) return null;
+	const overall = hostCounterDelta(samples[0], samples[samples.length - 1]);
+	if (!overall) return null;
+	let peakLoad1 = 0;
+	let peakIowaitPct = 0;
+	let peakPsiIoPct = 0;
+	let peakPsiCpuPct = 0;
+	let minMemAvailableKb = Infinity;
+	for (let i = 1; i < samples.length; i++) {
+		const d = hostCounterDelta(samples[i - 1], samples[i]);
+		if (!d) continue;
+		if (d.load1 > peakLoad1) peakLoad1 = d.load1;
+		if (d.iowaitPct > peakIowaitPct) peakIowaitPct = d.iowaitPct;
+		if ((d.psiIoPct ?? 0) > peakPsiIoPct) peakPsiIoPct = d.psiIoPct;
+		if ((d.psiCpuPct ?? 0) > peakPsiCpuPct) peakPsiCpuPct = d.psiCpuPct;
+		if (d.memAvailableKb < minMemAvailableKb) minMemAvailableKb = d.memAvailableKb;
+	}
+	return {
+		...overall,
+		peakLoad1,
+		peakIowaitPct,
+		peakPsiIoPct,
+		peakPsiCpuPct,
+		minMemAvailableKb: minMemAvailableKb === Infinity ? 0 : minMemAvailableKb,
+		sampleCount: samples.length,
+	};
+}
+
+/** One-line rendering of a hostCounterDelta/summariseHostSamples result. */
+export function formatHostCounters(d) {
+	if (!d) return 'host: unavailable';
+	const pct = (v) => (v == null ? 'n/a' : v.toFixed(0) + '%');
+	return (
+		`load=${d.load1.toFixed(2)} iowait=${pct(d.iowaitPct)} steal=${pct(d.stealPct)} ` +
+		`psi(cpu/io/mem)=${pct(d.psiCpuPct)}/${pct(d.psiIoPct)}/${pct(d.psiMemPct)} ` +
+		`hostIO=${d.readMBps.toFixed(0)}r/${d.writeMBps.toFixed(0)}w MB/s ` +
+		`memAvail=${(d.memAvailableKb / 1024).toFixed(0)} MB`
+	);
+}
+
+/**
+ * Persist a stress run's metrics as JSON under HARPER_INTEGRATION_TEST_LOG_DIR —
+ * the directory CI uploads as the run's log artifact — so throughput and host
+ * pressure can be compared night to night without scraping console output.
+ * No-ops when the env var is unset (local runs). Returns the path written.
+ */
+export function writeStressMetrics(name, metrics) {
+	const dir = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;
+	if (!dir) return null;
+	const path = join(dir, `${name}-metrics.json`);
+	try {
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(path, JSON.stringify(metrics, null, 2) + '\n');
+		return path;
+	} catch {
+		return null;
+	}
+}
+
+/** Append a markdown block to the GitHub Actions job summary, when running under one. */
+export function writeJobSummary(markdown) {
+	const path = process.env.GITHUB_STEP_SUMMARY;
+	if (!path) return;
+	try {
+		appendFileSync(path, markdown.endsWith('\n') ? markdown : markdown + '\n');
+	} catch {
+		// A missing/unwritable summary file must never fail the test.
 	}
 }
 
