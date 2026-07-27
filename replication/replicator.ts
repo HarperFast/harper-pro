@@ -22,6 +22,7 @@ import {
 	NodeReplicationConnection,
 	createWebSocket,
 	replicateOverWS,
+	createPendingDatabaseSubscription,
 	databaseSubscriptions,
 	tableUpdateListeners,
 	LATENCY_POSITION,
@@ -635,13 +636,8 @@ export function subscribeToNode(request: any) {
 		let subscriptionToTable = databaseSubscriptions.get(request.database);
 		if (!subscriptionToTable) {
 			// Wait for it to be created
-			let ready;
-			subscriptionToTable = new Promise((resolve) => {
-				logger.info('Waiting for subscription to database ' + request.database);
-				ready = resolve;
-			});
-			subscriptionToTable.ready = ready;
-			databaseSubscriptions.set(request.database, subscriptionToTable);
+			logger.info('Waiting for subscription to database ' + request.database);
+			subscriptionToTable = createPendingDatabaseSubscription(request.database);
 		}
 		const connectionStatus = { reused: false };
 		const connection = getSubscriptionConnection(
