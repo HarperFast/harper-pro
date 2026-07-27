@@ -636,7 +636,11 @@ export function subscribeToNode(request: any) {
 		let subscriptionToTable = databaseSubscriptions.get(request.database);
 		if (!subscriptionToTable) {
 			// Wait for it to be created
+<<<<<<< HEAD
 			logger.info(`Waiting for subscription to database ${request.database}`);
+=======
+			logger.info('Waiting for subscription to database ' + request.database);
+>>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)
 			subscriptionToTable = createPendingDatabaseSubscription(request.database);
 		}
 		const connectionStatus = { reused: false };

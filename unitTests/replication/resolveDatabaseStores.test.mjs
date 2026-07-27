@@ -24,7 +24,10 @@ import {
 	resolveDatabaseStores,
 	createPendingDatabaseSubscription,
 	awaitPendingSubscription,
+<<<<<<< HEAD
 	positiveMsOr,
+=======
+>>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)
 } from '#src/replication/replicationConnection';
 
 const auditStoreA = { name: 'auditStore' };
@@ -178,6 +181,7 @@ describe('awaitPendingSubscription', () => {
 		});
 	});
 });
+<<<<<<< HEAD
 
 /**
  * A NaN timeout fails silently in BOTH directions, which is why these config reads are coerced rather
@@ -200,3 +204,5 @@ describe('positiveMsOr', () => {
 		}
 	});
 });
+=======
+>>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)

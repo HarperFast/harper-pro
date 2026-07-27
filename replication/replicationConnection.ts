@@ -174,7 +174,11 @@ const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 
 // Waiting unbounded there would silently wedge the serialized message chain with no watchdog to catch it
 // — the receive watchdog keeps being reset by the very frames we are not processing — so we close instead
 // and let reconnect backoff retry, which costs one log line per attempt rather than one per message.
+<<<<<<< HEAD
 const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000);
+=======
+const SUBSCRIPTION_RESOLVE_TIMEOUT = env.get('replication_subscriptionResolveTimeout') ?? 60000;
+>>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)
 
 // Wall-clock ceiling on the gap between socket flushes / event-loop yields during a bulk copy.
 // Reading a large cold table out of RocksDB dominates copy cost (decompress + decode), so a purely
@@ -286,6 +290,7 @@ const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
 // Floored at SUBSCRIPTION_RESOLVE_TIMEOUT so an operator who lowers the override can't make this watchdog
 // fire during a legitimate subscription-resolve wait (which pauses intake with zero consumer progress by
 // construction — see awaitPendingSubscription). That would only churn the connection, not lose data, but
+<<<<<<< HEAD
 // the two bounds are ordered by intent, so enforce it rather than document it. positiveMsOr guards the
 // whole expression, not each input: a NaN from ANY of the three config reads would leave this watchdog
 // permanently disarmed (every `elapsed >= NaN` is false), so nothing non-numeric may escape here.
@@ -296,6 +301,90 @@ const PAUSE_STALL_THRESHOLD_MS = Math.max(
 	),
 	SUBSCRIPTION_RESOLVE_TIMEOUT
 );
+=======
+// the two bounds are ordered by intent, so enforce it rather than document it.
+const PAUSE_STALL_THRESHOLD_MS = Math.max(
+	env.get('replication_pauseStallTimeout') ??
+		Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000) * 2),
+	SUBSCRIPTION_RESOLVE_TIMEOUT
+);
+
+// Grace the dynamic send-authorization watch gives a present-but-undecodable hdb_nodes row before it
+// fails closed. Sized well past the seconds-scale self-heal the #352/#1163 misread window takes (the
+// base-copy resync re-encodes the row against local structures), so a decode blip never de-authorizes
+// a healthy peer, while still bounding how long a revocation carried by an undecodable write can go
+// unenforced. Only reached on a genuine decode failure — a decodable row is evaluated on the first probe.
+const SEND_AUTH_REPROBE_INTERVAL_MS = 500;
+const SEND_AUTH_REPROBE_ATTEMPTS = 60;
+
+/**
+ * Decide whether the dynamic send-authorization watch (the per-subscriber `getHDBNodeTable().subscribe`
+ * loop in the SUBSCRIPTION_REQUEST handler) should close a replication connection in response to one
+ * hdb_nodes change event.
+ *
+ * Evaluates the authoritative hdb_nodes row, not the event payload: a whole-table `reload` marker
+ * (system-DB base copy — every joining/cloning node emits one) is delivered to every subscriber with no
+ * value, a `patch` carries only the patched fields, and a decode blip yields a nullish value. Treating
+ * any of those as de-authorization closed every live connection with a spurious 1008 mid-cluster-
+ * formation.
+ *
+ * A genuine tombstone is the one case the event decides, not the row read: a point read can be served
+ * from a snapshot that predates the delete commit (harper#1163), which would hand back the
+ * still-authorizing row and leave a removed peer receiving.
+ *
+ * A present-but-undecodable row carries no verdict. Neither answer is safe on its own — closing lets a
+ * decode blip knock a healthy peer offline (harper#1163 / harper-pro#352, which heals within seconds),
+ * and continuing forever would let a revocation carried by that same undecodable write never take
+ * effect. So re-probe for a bounded grace period, then fail closed.
+ *
+ * The reprobe loop awaits between checks, so the connection can close while it's suspended; `isClosed`
+ * is re-checked before acting on a stale resolution so a decode blip that outlives the connection
+ * doesn't trigger a redundant close/warn.
+ *
+ * Returns true iff the connection should be closed as no longer authorized; false means no action —
+ * either the peer is still authorized, or the connection already closed while this resolution was
+ * pending. `resolve`/`sleep` are injected so this stays unit-testable without a live store or real timers.
+ */
+export async function shouldCloseSendAuthWatch(
+	event: { type: string },
+	name: string,
+	databaseName: string,
+	deps: {
+		isClosed: () => boolean;
+		onReprobeTimeout?: () => void;
+		resolve?: (name: string) => any;
+		sleep?: () => Promise<void>;
+		reprobeAttempts?: number;
+	}
+): Promise<boolean> {
+	const resolve = deps.resolve ?? resolveNodeForSendAuth;
+	const sleep = deps.sleep ?? (() => new Promise<void>((r) => setTimeout(r, SEND_AUTH_REPROBE_INTERVAL_MS).unref()));
+	const reprobeAttempts = deps.reprobeAttempts ?? SEND_AUTH_REPROBE_ATTEMPTS;
+
+	let node = isGenuineNodeDeletion(event.type) ? undefined : resolve(name);
+	for (let attempt = 0; node === SEND_AUTH_UNCHANGED && attempt < reprobeAttempts && !deps.isClosed(); attempt++) {
+		await sleep();
+		node = resolve(name);
+	}
+	if (node === SEND_AUTH_UNCHANGED) {
+		if (deps.isClosed()) return false;
+		deps.onReprobeTimeout?.();
+		node = undefined;
+	}
+	if (deps.isClosed()) return false;
+	return !(
+		node?.replicates === true ||
+		node?.replicates?.receives ||
+		// routeEntriesIncludePeer (not a strict source+database match): a self-record entry may omit
+		// `database` (a wildcard for all databases — what a full-replication neighbor's directional
+		// self-record advertises), and absent source means any peer. A strict `sub.database ===
+		// databaseName` here would reject a full-replication neighbor's per-database subscription once
+		// this node is opted-in to directional routing, silently stopping replication and
+		// reconnect-churning. (PR #572 review — Chris Barber.)
+		routeEntriesIncludePeer(node?.replicates?.receivesFrom, getThisNodeName(), databaseName)
+	);
+}
+>>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)
 
 /**
  * Decide whether an idle replication connection should be terminated as dead.
@@ -1481,6 +1570,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let subscribed = false;
 	let tableSubscriptionToReplicator: DatabaseSubscription = options.subscription;
 	if (tableSubscriptionToReplicator?.then)
+<<<<<<< HEAD
 		(tableSubscriptionToReplicator as Promise<any>)
 			.then((sub) => {
 				tableSubscriptionToReplicator = sub;
@@ -1492,6 +1582,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// the receive path's bounded wait already recovers a subscription that never resolves, so log and
 			// let that close-and-reconnect handle it instead of crashing the worker.
 			.catch((error) => logger.warn?.(connectionId, 'Subscription to database failed to resolve', error));
+=======
+		(tableSubscriptionToReplicator as Promise<any>).then((sub) => {
+			tableSubscriptionToReplicator = sub;
+			if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
+		});
+>>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)
 	let tables = options.tables || (databaseName && getDatabases()[databaseName]);
 	/**
 	 * This database's audit + `__dbis__` stores. Goes through resolveDatabaseStores so they stay readable
