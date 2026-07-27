@@ -500,6 +500,12 @@ suite(
 				`DEFECT SIGNATURE (layer 3b - orphaned blob file): ${bOrphanFiles.length} on-disk blob file(s) on the receiver match NO seeded ` +
 					`id's content (orphan/corrupt): ${JSON.stringify(bOrphanFiles.slice(0, 10))}`
 			);
+			equal(
+				bStructurallyBad.length,
+				0,
+				`DEFECT SIGNATURE (layer 3c - structurally bad blob file): ${bStructurallyBad.length} on-disk blob file(s) on the receiver are ` +
+					`truncated/error-stub/pending-stub/unreadable: ${JSON.stringify(bStructurallyBad.slice(0, 10))}`
+			);
 		});
 	}
 );
