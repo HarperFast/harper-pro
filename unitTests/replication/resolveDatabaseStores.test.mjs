@@ -25,9 +25,13 @@ import {
 	createPendingDatabaseSubscription,
 	awaitPendingSubscription,
 <<<<<<< HEAD
+<<<<<<< HEAD
 	positiveMsOr,
 =======
 >>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)
+=======
+	positiveMsOr,
+>>>>>>> c6c1d8e (fix(replication): guard config-supplied timeouts and the detached subscription handler)
 } from '#src/replication/replicationConnection';
 
 const auditStoreA = { name: 'auditStore' };
@@ -182,6 +186,9 @@ describe('awaitPendingSubscription', () => {
 	});
 });
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> c6c1d8e (fix(replication): guard config-supplied timeouts and the detached subscription handler)
 
 /**
  * A NaN timeout fails silently in BOTH directions, which is why these config reads are coerced rather
@@ -204,5 +211,8 @@ describe('positiveMsOr', () => {
 		}
 	});
 });
+<<<<<<< HEAD
 =======
 >>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)
+=======
+>>>>>>> c6c1d8e (fix(replication): guard config-supplied timeouts and the detached subscription handler)

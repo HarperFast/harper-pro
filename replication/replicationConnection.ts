@@ -150,6 +150,20 @@ export function positiveMsOr(value: unknown, defaultMs: number): number {
 	return ms > 0 ? ms : defaultMs;
 }
 
+/**
+ * Read a millisecond timeout from config, falling back to `defaultMs` for anything that isn't a positive
+ * number. An operator-supplied non-numeric value would otherwise reach a timer as `NaN`, and a `NaN`
+ * timeout fails SILENTLY in both directions: `setTimeout` coerces it to ~0 (the bound fires immediately)
+ * while every `elapsed >= threshold` watchdog comparison against it is false (the watchdog never fires at
+ * all). Same defensive shape as COPY_CHECKPOINT_MAX_INTERVAL_MS's floor below.
+ *
+ * Exported for unit coverage (unitTests/replication/resolveDatabaseStores.test.mjs).
+ */
+export function positiveMsOr(value: unknown, defaultMs: number): number {
+	const ms = Number(value);
+	return ms > 0 ? ms : defaultMs;
+}
+
 const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
 // When receiving a replication message, we apply per-record backpressure to keep a single
 // large batch from synchronously decoding thousands of records and ballooning the worker
@@ -175,10 +189,14 @@ const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 
 // — the receive watchdog keeps being reset by the very frames we are not processing — so we close instead
 // and let reconnect backoff retry, which costs one log line per attempt rather than one per message.
 <<<<<<< HEAD
+<<<<<<< HEAD
 const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000);
 =======
 const SUBSCRIPTION_RESOLVE_TIMEOUT = env.get('replication_subscriptionResolveTimeout') ?? 60000;
 >>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)
+=======
+const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000);
+>>>>>>> c6c1d8e (fix(replication): guard config-supplied timeouts and the detached subscription handler)
 
 // Wall-clock ceiling on the gap between socket flushes / event-loop yields during a bulk copy.
 // Reading a large cold table out of RocksDB dominates copy cost (decompress + decode), so a purely
@@ -291,6 +309,7 @@ const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
 // fire during a legitimate subscription-resolve wait (which pauses intake with zero consumer progress by
 // construction — see awaitPendingSubscription). That would only churn the connection, not lose data, but
 <<<<<<< HEAD
+<<<<<<< HEAD
 // the two bounds are ordered by intent, so enforce it rather than document it. positiveMsOr guards the
 // whole expression, not each input: a NaN from ANY of the three config reads would leave this watchdog
 // permanently disarmed (every `elapsed >= NaN` is false), so nothing non-numeric may escape here.
@@ -303,9 +322,16 @@ const PAUSE_STALL_THRESHOLD_MS = Math.max(
 );
 =======
 // the two bounds are ordered by intent, so enforce it rather than document it.
+=======
+// the two bounds are ordered by intent, so enforce it rather than document it. positiveMsOr guards the
+// whole expression, not each input: a NaN from ANY of the three config reads would leave this watchdog
+// permanently disarmed (every `elapsed >= NaN` is false), so nothing non-numeric may escape here.
+>>>>>>> c6c1d8e (fix(replication): guard config-supplied timeouts and the detached subscription handler)
 const PAUSE_STALL_THRESHOLD_MS = Math.max(
-	env.get('replication_pauseStallTimeout') ??
-		Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000) * 2),
+	positiveMsOr(
+		env.get('replication_pauseStallTimeout'),
+		Math.max(PING_TIMEOUT * 2, positiveMsOr(env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT), 900000) * 2)
+	),
 	SUBSCRIPTION_RESOLVE_TIMEOUT
 );
 
@@ -1571,6 +1597,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let tableSubscriptionToReplicator: DatabaseSubscription = options.subscription;
 	if (tableSubscriptionToReplicator?.then)
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> c6c1d8e (fix(replication): guard config-supplied timeouts and the detached subscription handler)
 		(tableSubscriptionToReplicator as Promise<any>)
 			.then((sub) => {
 				tableSubscriptionToReplicator = sub;
@@ -1582,12 +1611,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// the receive path's bounded wait already recovers a subscription that never resolves, so log and
 			// let that close-and-reconnect handle it instead of crashing the worker.
 			.catch((error) => logger.warn?.(connectionId, 'Subscription to database failed to resolve', error));
+<<<<<<< HEAD
 =======
 		(tableSubscriptionToReplicator as Promise<any>).then((sub) => {
 			tableSubscriptionToReplicator = sub;
 			if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
 		});
 >>>>>>> 65dbf7b (fix(replication): don't treat an unresolved subscription placeholder as a resolved subscription)
+=======
+>>>>>>> c6c1d8e (fix(replication): guard config-supplied timeouts and the detached subscription handler)
 	let tables = options.tables || (databaseName && getDatabases()[databaseName]);
 	/**
 	 * This database's audit + `__dbis__` stores. Goes through resolveDatabaseStores so they stay readable
