@@ -24,6 +24,7 @@ import {
 	resolveDatabaseStores,
 	createPendingDatabaseSubscription,
 	awaitPendingSubscription,
+	positiveMsOr,
 } from '#src/replication/replicationConnection';
 
 const auditStoreA = { name: 'auditStore' };
@@ -175,5 +176,27 @@ describe('awaitPendingSubscription', () => {
 			await awaitPendingSubscription(undefined, 5000, bp);
 			expect(bp.calls).to.deep.equal([]);
 		});
+	});
+});
+
+/**
+ * A NaN timeout fails silently in BOTH directions, which is why these config reads are coerced rather
+ * than trusted: `setTimeout` coerces NaN to ~0 (the subscription-resolve bound would fire immediately and
+ * close every raced connection), while a watchdog's `elapsed >= NaN` is always false (PAUSE_STALL_THRESHOLD_MS
+ * would leave the paused-liveness watchdog permanently disarmed).
+ */
+describe('positiveMsOr', () => {
+	it('passes through a positive number', () => {
+		expect(positiveMsOr(5000, 60000)).to.equal(5000);
+	});
+
+	it('accepts a numeric string (env-var overrides arrive as strings)', () => {
+		expect(positiveMsOr('5000', 60000)).to.equal(5000);
+	});
+
+	it('falls back to the default for anything that is not a positive number', () => {
+		for (const bad of [undefined, null, '', 'abc', NaN, 0, -1, '-1', {}, []]) {
+			expect(positiveMsOr(bad, 60000), `input ${JSON.stringify(bad) ?? String(bad)}`).to.equal(60000);
+		}
 	});
 });
