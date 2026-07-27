@@ -130,6 +130,18 @@ const RECONCILE_INTERVAL_MS = 5000; // subscriptionManager.ts RECONCILE_INTERVAL
 // margin was ~1-4s and a late stamp pushed the first qualifying tick past the restart. Budget the
 // threshold + detection lag + two full sweep ticks.
 const WEDGE_TRIGGER_WAIT_MS = WEDGE_RECONCILE_THRESHOLD_MS + 5000 + 2 * RECONCILE_INTERVAL_MS + 3000; // 48s
+// Generous convergence window used by the long-outage cycle below (observed ~27.5s in a
+// diagnostic run). Hoisted here (rather than a local const in the test) so the test's own
+// timeout can be derived from the same budget it polls against, instead of a hand-picked
+// number that can silently fall out of sync.
+const GENEROUS_CONVERGENCE_TIMEOUT_MS = 90000;
+// Worst case: the full outage wait, then the full convergence window, then a sequential
+// post-recovery data-flow probe per database -- each of those phases can legitimately consume
+// its entire budget before the assertion that would fail fires. Without summing them the test's
+// own { timeout } can (and did) fire first, so the run reports a timeout instead of the
+// intended false-green/wedge assertion.
+const LONG_OUTAGE_TEST_TIMEOUT_MS =
+	WEDGE_TRIGGER_WAIT_MS + GENEROUS_CONVERGENCE_TIMEOUT_MS + DB_NAMES.length * DATA_FLOW_TIMEOUT_MS + 20000;
 
 function nodeStartOptions(node) {
 	return {
@@ -439,7 +451,7 @@ suite(
 
 		test(
 			'long outage: holding the leader down past the 30s wedge threshold still recovers (best-effort race hunt)',
-			{ timeout: 150000 },
+			{ timeout: LONG_OUTAGE_TEST_TIMEOUT_MS },
 			async () => {
 				// The fast cycles above (KILL_CYCLES) confirm the general "never wedges, no false
 				// green, genuine SIGKILL" guarantees via the connection's own fast retry -- which
@@ -496,7 +508,6 @@ suite(
 				ctx.leader = (await startHarper({ harper: ctx.leader }, nodeStartOptions(ctx.leader))).harper;
 				const restartedAt = Date.now();
 
-				const GENEROUS_CONVERGENCE_TIMEOUT_MS = 90000; // observed ~27.5s in a diagnostic run; generous margin
 				let convergedAt = null;
 				while (Date.now() < restartedAt + GENEROUS_CONVERGENCE_TIMEOUT_MS) {
 					const status = await sendOperation(ctx.follower, { operation: 'cluster_status' }).catch(() => null);

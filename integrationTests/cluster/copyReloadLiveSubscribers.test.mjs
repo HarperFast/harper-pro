@@ -399,6 +399,12 @@ suite('QA-578 live subscriber delivery of copy-applied rows (#495 / PR #507)', {
 				`[qa578][ordering-b] SSE attached mid-copy: attachCount=${attachCount}, confirm=${attachCountConfirm}, total=${totalOnA} ` +
 					`(${attachCountConfirm < totalOnA ? 'genuinely mid-copy' : 'copy completed before attach landed -- see log'})`
 			);
+			ok(
+				attachCountConfirm > 0 && attachCountConfirm < totalOnA,
+				`ordering-b precondition failed: SSE subscribe must land genuinely mid-copy (0 < attachCountConfirm < totalOnA), ` +
+					`got attachCountConfirm=${attachCountConfirm} totalOnA=${totalOnA} -- otherwise this test cannot distinguish the ` +
+					`reload re-snapshot from the subscriber's ordinary initial current-state scan`
+			);
 
 			// 3) NON-BLINDNESS continued: keep polling to confirm the copy actually finishes (0/partial -> N)
 			// on this independent channel.
