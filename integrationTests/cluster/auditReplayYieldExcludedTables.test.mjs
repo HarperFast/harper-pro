@@ -54,7 +54,7 @@ import {
 import { sendOperation } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
+	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'..',
 	'..',
 	'dist',
@@ -173,12 +173,13 @@ suite(
 			const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
 
 			await Promise.all([
-				startHarper(ctxA, nodeConfig(hostnameA, hostnameB, { singleThread: true })),
-				startHarper(ctxB, nodeConfig(hostnameB, hostnameA)),
+				startHarper(ctxA, nodeConfig(hostnameA, hostnameB, { singleThread: true })).then(() => {
+					ctx.nodeA = ctxA.harper;
+				}),
+				startHarper(ctxB, nodeConfig(hostnameB, hostnameA)).then(() => {
+					ctx.nodeB = ctxB.harper;
+				}),
 			]);
-
-			ctx.nodeA = ctxA.harper;
-			ctx.nodeB = ctxB.harper;
 
 			// excludeTables affects schema propagation too — create both tables independently
 			// on both nodes so 'excluded' isn't silently missing on one side.
