@@ -36,7 +36,7 @@ import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@h
 import { join } from 'node:path';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
+	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'..',
 	'..',
 	'dist',
@@ -132,9 +132,14 @@ suite('QA-689: interrupted bulk copy resume cursor vs. an undelivered range', { 
 		const source = { name: ctx.name, harper: { hostname: hostnameA } };
 		const receiver = { name: ctx.name, harper: { hostname: hostnameB } };
 
-		await Promise.all([startHarper(source, nodeOptions(hostnameA)), startHarper(receiver, nodeOptions(hostnameB))]);
-		ctx.source = source.harper;
-		ctx.receiver = receiver.harper;
+		await Promise.all([
+			startHarper(source, nodeOptions(hostnameA)).then(() => {
+				ctx.source = source.harper;
+			}),
+			startHarper(receiver, nodeOptions(hostnameB)).then(() => {
+				ctx.receiver = receiver.harper;
+			}),
+		]);
 
 		await op(ctx.source, {
 			operation: 'create_table',

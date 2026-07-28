@@ -593,7 +593,7 @@ suite(
 			ok(lo.dataFlowed, 'long outage: recovered connection did not carry real data');
 			ok(
 				lo.wedgeReconcileFiredDuringOutage,
-				'long outage: the disruptive wedge-reconcile net never fired despite a 34s outage -- WEDGE_RECONCILE_THRESHOLD_MS behavior may have changed'
+				`long outage: the disruptive wedge-reconcile net never fired despite a ${WEDGE_TRIGGER_WAIT_MS / 1000}s outage -- WEDGE_RECONCILE_THRESHOLD_MS behavior may have changed`
 			);
 
 			console.log(`[qa587] up-correction log lines observed: ${correctionLines.length}`);
@@ -617,7 +617,7 @@ suite(
 					'[qa587] the exact internal edge-vs-truth desync (harper-pro#289, the specific race #431 fixes) was not observed this run -- ' +
 						'the stress recipe (multi-db fan-out SIGKILL, write/admin load, and deliberately crossing the 30s wedge ' +
 						'threshold to force the disruptive forceResubscribe path) did not hit the sub-millisecond IPC-vs-shared-memory ' +
-						'race window. General fix guarantees (no wedge, no false green, genuine fault every cycle including a 34s ' +
+						`race window. General fix guarantees (no wedge, no false green, genuine fault every cycle including a ${WEDGE_TRIGGER_WAIT_MS / 1000}s ` +
 						'outage past the wedge threshold) are still confirmed above.'
 				);
 			}
