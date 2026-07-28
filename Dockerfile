@@ -55,6 +55,9 @@ RUN <<-EOF
   chown harperdb:harperdb /home/harperdb/harper
 EOF
 
+# uWS is opt-in for npm consumers but remains bundled in official images.
+COPY --from=build --chown=harperdb:harperdb /usr/src/harper-pro/node_modules/uWebSockets.js /home/harperdb/.npm-global/lib/node_modules/@harperfast/harper-pro/node_modules/uWebSockets.js/
+
 # On a pointer-compression base (RUN_IMAGE=harperfast/node-pointer-compression),
 # make the native-module tree safe for the pointer-compression V8 ABI — raw-V8-ABI
 # prebuilds (uWS, @datadog/pprof) load cleanly but segfault on first use there:
