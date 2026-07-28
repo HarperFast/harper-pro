@@ -173,7 +173,11 @@ suite(
 			// stop the process each node is actually running first or it outlives the suite.
 			await Promise.all(
 				[ctx.nodeA, ctx.nodeB].filter(Boolean).map(async (node) => {
-					await stopNodeProcess(node);
+					try {
+						await stopNodeProcess(node);
+					} catch (err) {
+						console.error(`Failed to stop node process for ${node.hostname}:`, err);
+					}
 					await teardownHarper({ harper: node });
 				})
 			);
