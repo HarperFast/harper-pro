@@ -35,7 +35,7 @@ import { join } from 'node:path';
 import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
+	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'..',
 	'..',
 	'dist',
