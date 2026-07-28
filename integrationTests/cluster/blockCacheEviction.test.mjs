@@ -11,18 +11,25 @@
  *   `Promise?.replicates` is `undefined`, which silently disables replication / drops a node from
  *   cluster_status / never opens a retrieval connection. The fix is `getSync(...)` at those sites.
  *
- * Why this test reproduces it:
+ * Why this test is here:
  *   - Each node runs RocksDB with a SMALL (but viable) block cache, so system-table blocks do not stay
  *     resident under churn. (A sub-MB cache makes RocksDB hang on open, so "small" here is ~32 MB, far
- *     below the default ~25%-of-RAM — the cold restart below is what makes the miss DETERMINISTIC.)
- *   - Every node is RESTARTED, giving a COLD block cache + empty memtable, so the first post-restart read
- *     of each `hdb_nodes` record is a guaranteed cache miss (a Promise from `get()`). The startup
- *     replication paths (ensureThisNode / shouldReplicateFromNode) run exactly in that window.
+ *     below the default ~25%-of-RAM.)
+ *   - Every node is RESTARTED, giving a COLD block cache + empty memtable, which is the condition under
+ *     which the startup replication paths (ensureThisNode / shouldReplicateFromNode) can observe a
+ *     `get()` Promise instead of a synchronous value. This is valuable end-to-end rolling-restart
+ *     coverage, but NOT a deterministic reproduction of the miss: startup scans the two-row `hdb_nodes`
+ *     table before these point reads run, which can warm the rows into the cache first. The precise,
+ *     deterministic regression guard for the exact miss is the focused unit tests
+ *     (`selfNodeReplicates`, `readNodeRowSync`), which inject the Promise-returning `get()` path
+ *     directly — this suite is a real-world check that a cold-cache rolling restart doesn't silently
+ *     break replication, on top of that.
  *   - We then drive the procedures that depend on those synchronous reads — a rolling restart — and assert replication stays healthy and converges.
  *
- * Pre-fix this fails: a post-restart cache miss makes shouldReplicateFromNode falsy (unsubscribe) and/or
- * flips `isFullyReplicating = false` ("Disabling replication"), so the post-restart write never converges.
- * Post-fix the synchronous reads return the real records regardless of cache state, so it converges.
+ * Pre-fix this can fail: a post-restart cache miss makes shouldReplicateFromNode falsy (unsubscribe)
+ * and/or flips `isFullyReplicating = false` ("Disabling replication"), so the post-restart write never
+ * converges. Post-fix the synchronous reads return the real records regardless of cache state, so it
+ * converges.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -32,7 +39,7 @@ import { join } from 'node:path';
 import { sendOperation, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
+	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'..',
 	'..',
 	'dist',
@@ -41,10 +48,9 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 // Small but viable RocksDB block cache: far below the default (~25% of RAM) so blocks are evicted under
-// churn, yet large enough that opening Harper's databases does not hang (a sub-MB cache does). The cold
-// restart is what makes the cache-miss deterministic; this keeps misses from being papered over by a
-// warm cache. We deliberately do NOT shrink the WriteBufferManager — a tiny WBM with allowStall stalls
-// the schema writes during startup.
+// churn, and the cold restart below has a real chance at reproducing a get()->Promise miss instead of
+// it being papered over by a warm cache. We deliberately do NOT shrink the WriteBufferManager — a tiny
+// WBM with allowStall stalls the schema writes during startup.
 const SMALL_ROCKS = { blockCacheSize: 32 * 1024 * 1024 };
 
 // Some padded records so the data table spans multiple SST blocks (cache pressure). Convergence is
@@ -129,9 +135,17 @@ suite(
 
 			const ctxA = makeNodeCtx(hostnameA);
 			const ctxB = makeNodeCtx(hostnameB);
-			await Promise.all([startHarper(ctxA, nodeConfig(hostnameA)), startHarper(ctxB, nodeConfig(hostnameB))]);
-			ctx.nodeA = ctxA.harper;
-			ctx.nodeB = ctxB.harper;
+			// Record each node as soon as its own start resolves (rather than after Promise.all settles) so
+			// that if one start fails, the other's already-running process is still recorded and gets torn
+			// down instead of leaked.
+			await Promise.all([
+				startHarper(ctxA, nodeConfig(hostnameA)).then(() => {
+					ctx.nodeA = ctxA.harper;
+				}),
+				startHarper(ctxB, nodeConfig(hostnameB)).then(() => {
+					ctx.nodeB = ctxB.harper;
+				}),
+			]);
 
 			// Seed table + data on A, ending with a sentinel we can wait on.
 			await sendOperation(ctx.nodeA, {

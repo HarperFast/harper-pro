@@ -26,10 +26,10 @@ import { ok } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
+	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'..',
 	'..',
 	'dist',
@@ -68,6 +68,17 @@ async function waitStablyHealthy(node, { stableFor = 5, intervalMs = 500, retrie
 	throw new Error(`node ${node.hostname} never became stably healthy`);
 }
 
+async function waitUntilOffline(node, { retries = 60, intervalMs = 500 } = {}) {
+	for (let i = 0; i < retries; i++) {
+		const healthy = await sendOperation(node, { operation: 'cluster_status' })
+			.then((status) => Boolean(status?.node_name))
+			.catch(() => false);
+		if (!healthy) return;
+		await delay(intervalMs);
+	}
+	throw new Error(`node ${node.hostname} never went offline`);
+}
+
 suite(
 	'writes in the pre-crash window still replicate',
 	{ timeout: 600000, skip: process.env.HARPER_TEST_CRASH_WINDOW ? false : 'set HARPER_TEST_CRASH_WINDOW=1 to run' },
@@ -89,9 +100,17 @@ suite(
 
 			const ctxA = makeNodeCtx(hostnameA);
 			const ctxB = makeNodeCtx(hostnameB);
-			await Promise.all([startHarper(ctxA, nodeConfig(hostnameA)), startHarper(ctxB, nodeConfig(hostnameB))]);
-			ctx.nodeA = ctxA.harper;
-			ctx.nodeB = ctxB.harper;
+			// Record each node as soon as its own start resolves (rather than after Promise.all settles) so
+			// that if one start fails, the other's already-running process is still recorded and gets torn
+			// down instead of leaked.
+			await Promise.all([
+				startHarper(ctxA, nodeConfig(hostnameA)).then(() => {
+					ctx.nodeA = ctxA.harper;
+				}),
+				startHarper(ctxB, nodeConfig(hostnameB)).then(() => {
+					ctx.nodeB = ctxB.harper;
+				}),
+			]);
 
 			await sendOperation(ctx.nodeA, {
 				operation: 'create_table',
@@ -128,19 +147,35 @@ suite(
 		});
 
 		after(async () => {
-			await Promise.all([
-				ctx.nodeA && teardownHarper({ harper: ctx.nodeA }),
-				ctx.nodeB && teardownHarper({ harper: ctx.nodeB }),
-			]);
+			// Both nodes are restarted by the test, so teardownHarper's spawned-child handle is stale;
+			// stop the process each node is actually running first or it outlives the suite.
+			await Promise.all(
+				[ctx.nodeA, ctx.nodeB].filter(Boolean).map(async (node) => {
+					try {
+						await stopNodeProcess(node);
+					} catch (err) {
+						console.error(`Failed to stop node process for ${node.hostname}:`, err);
+					}
+					await teardownHarper({ harper: node });
+				})
+			);
 		});
 
 		test('records that survive an unclean restart on A converge to B', async () => {
 			const { nodeA, nodeB } = ctx;
 
-			// Restart both without waiting, then write to A until it stops answering. Restarting B too keeps
-			// it from applying the tail live, which is what leaves A's transaction log the only path to B.
-			await sendOperation(nodeA, { operation: 'restart' }).catch(() => {});
+			// Take B fully offline BEFORE any crash-window write lands on A. `restart` only schedules
+			// shutdown ~50ms after being acknowledged, so if B is restarted at the same time as A (as
+			// this test used to do), there is a window where B is still live and can receive A's
+			// in-window writes as ordinary push replication. That lets the assertion below pass without
+			// ever exercising A's post-crash resume-replay path, which is the thing this test pins.
 			await sendOperation(nodeB, { operation: 'restart' }).catch(() => {});
+			await waitUntilOffline(nodeB);
+
+			// Now crash A: restart it, then keep writing until it stops answering. B is confirmed offline
+			// for the whole window, so none of these writes can reach it live; B can only see them, if at
+			// all, via resume replay once it reconnects to A after both come back up.
+			await sendOperation(nodeA, { operation: 'restart' }).catch(() => {});
 
 			const accepted = [];
 			const deadline = Date.now() + WRITE_WINDOW_MS;
@@ -161,11 +196,16 @@ suite(
 			ok(accepted.length > 0, 'no writes were accepted before A shut down; the window closed too fast');
 
 			await waitStablyHealthy(nodeA);
+			// B was already mid-restart from the step above; wait for it too before checking convergence.
 			await waitStablyHealthy(nodeB);
 			await delay(20000);
 
 			const durableOnA = [];
 			for (const id of accepted) if (await hasRecord(nodeA, id)) durableOnA.push(id);
+			ok(
+				durableOnA.length > 0,
+				`none of the ${accepted.length} accepted writes survived A's unclean restart; the crash-recovery scenario did not set up correctly`
+			);
 			const missingOnB = [];
 			for (const id of durableOnA) if (!(await hasRecord(nodeB, id))) missingOnB.push(id);
 
