@@ -63,7 +63,18 @@ jobs:
           node-version: ${{ inputs.node-version || '24' }}
           package-manager-cache: false
       - name: Install dependencies
-        run: npm install
+        run: |
+          n=0
+          until npm install; do
+            n=$((n + 1))
+            if [ "$n" -ge 4 ]; then
+              echo "::error::npm install failed after $n attempts"
+              exit 1
+            fi
+            delay=$((n * 30))
+            echo "npm install failed (attempt $n/4); retrying in ${delay}s..."
+            sleep "$delay"
+          done
       - name: Build
         run: npm run build || true # tolerate the same pre-existing TS errors as the regular integration workflow
       - name: Upload build artifacts
@@ -146,12 +157,26 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: harper-stress-build-${{ inputs.node-version || '24' }}
+      # The artifact-restored node_modules/ already has everything resolved; this only needs to
+      # recreate node_modules/.bin symlinks, so --offline keeps it off the registry entirely.
       - name: Relink bin scripts
-        run: npm install --ignore-scripts
+        run: npm rebuild --ignore-scripts --offline
       # re2 downloads its native binary from a post-install script (unlike lmdb/msgpackr/rocksdb,
       # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
+      # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
       - name: Build re2 native binary
-        run: npm rebuild re2
+        run: |
+          n=0
+          until npm rebuild re2; do
+            n=$((n + 1))
+            if [ "$n" -ge 4 ]; then
+              echo "::error::npm rebuild re2 failed after $n attempts"
+              exit 1
+            fi
+            delay=$((n * 30))
+            echo "npm rebuild re2 failed (attempt $n/4); retrying in ${delay}s..."
+            sleep "$delay"
+          done
       - name: Run ${{ matrix.test.name }}
         env:
           HARPER_RUN_STRESS_TESTS: '1'

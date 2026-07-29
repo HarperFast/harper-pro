@@ -84,7 +84,18 @@ jobs:
           check-latest: ${{ matrix.node-version == '26' }}
 
       - name: Install dependencies
-        run: npm install
+        run: |
+          n=0
+          until npm install; do
+            n=$((n + 1))
+            if [ "$n" -ge 4 ]; then
+              echo "::error::npm install failed after $n attempts"
+              exit 1
+            fi
+            delay=$((n * 30))
+            echo "npm install failed (attempt $n/4); retrying in ${delay}s..."
+            sleep "$delay"
+          done
 
       - name: Build
         run: npm run build || true # we currently have type errors so just ignore that
@@ -135,18 +146,42 @@ jobs:
         with:
           name: harper-build-artifacts-node-${{ matrix.node-version }}
 
+      # The artifact-restored node_modules/ already has everything resolved; this only needs to
+      # recreate node_modules/.bin symlinks, so --offline keeps it off the registry entirely.
       - name: Relink bin scripts
-        run: npm install --ignore-scripts
+        run: npm rebuild --ignore-scripts --offline
 
       # re2 downloads its native binary from a post-install script (unlike lmdb/msgpackr/rocksdb,
       # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
+      # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
       - name: Build re2 native binary
-        run: npm rebuild re2
+        run: |
+          n=0
+          until npm rebuild re2; do
+            n=$((n + 1))
+            if [ "$n" -ge 4 ]; then
+              echo "::error::npm rebuild re2 failed after $n attempts"
+              exit 1
+            fi
+            delay=$((n * 30))
+            echo "npm rebuild re2 failed (attempt $n/4); retrying in ${delay}s..."
+            sleep "$delay"
+          done
 
       - name: Install harperdb@4 for legacy tests
         run: |
           mkdir -p /tmp/harperdb-legacy
-          npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+          n=0
+          until npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4; do
+            n=$((n + 1))
+            if [ "$n" -ge 4 ]; then
+              echo "::error::npm install harperdb@4 failed after $n attempts"
+              exit 1
+            fi
+            delay=$((n * 30))
+            echo "npm install harperdb@4 failed (attempt $n/4); retrying in ${delay}s..."
+            sleep "$delay"
+          done
 
       # A zero-match glob makes node:test's run() silently collect no tests and exit 0
       # (a false green). Fail loudly instead if the extglob exclusion ever stops expanding.
@@ -216,18 +251,42 @@ jobs:
         with:
           name: harper-build-artifacts-node-${{ matrix.node-version }}
 
+      # The artifact-restored node_modules/ already has everything resolved; this only needs to
+      # recreate node_modules/.bin symlinks, so --offline keeps it off the registry entirely.
       - name: Relink bin scripts
-        run: npm install --ignore-scripts
+        run: npm rebuild --ignore-scripts --offline
 
       # re2 downloads its native binary from a post-install script (unlike lmdb/msgpackr/rocksdb,
       # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
+      # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
       - name: Build re2 native binary
-        run: npm rebuild re2
+        run: |
+          n=0
+          until npm rebuild re2; do
+            n=$((n + 1))
+            if [ "$n" -ge 4 ]; then
+              echo "::error::npm rebuild re2 failed after $n attempts"
+              exit 1
+            fi
+            delay=$((n * 30))
+            echo "npm rebuild re2 failed (attempt $n/4); retrying in ${delay}s..."
+            sleep "$delay"
+          done
 
       - name: Install harperdb@4 for legacy tests
         run: |
           mkdir -p /tmp/harperdb-legacy
-          npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+          n=0
+          until npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4; do
+            n=$((n + 1))
+            if [ "$n" -ge 4 ]; then
+              echo "::error::npm install harperdb@4 failed after $n attempts"
+              exit 1
+            fi
+            delay=$((n * 30))
+            echo "npm install harperdb@4 failed (attempt $n/4); retrying in ${delay}s..."
+            sleep "$delay"
+          done
 
       - name: Guard against empty cluster test glob
         env:
