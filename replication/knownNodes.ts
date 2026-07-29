@@ -768,6 +768,21 @@ export let commitsAwaitingReplication: Map<string, AwaitingReplication[]>;
 const REPLICATION_CONFIRMATION_TIMEOUT_MS = env.get('replication_confirmationTimeout') ?? 60000;
 
 /**
+ * Fire `onConfirm()` for every waiter in `awaiting` whose `txnTime` falls in `(lastTime, updatedTime]`.
+ * Snapshots `awaiting` before iterating: each `onConfirm()` (via createConfirmationWaiter's `settle`)
+ * splices its own entry out of this SAME array as it resolves, and a plain `for...of` over the live
+ * array would skip whichever entry shifts into a just-spliced index — silently dropping other waiters
+ * confirmable in this same batch (a fresh regression the pre-push review on harper-pro#213 caught).
+ */
+export function notifyConfirmedWaiters(awaiting: AwaitingReplication[], lastTime: number, updatedTime: number): void {
+	for (const { txnTime, onConfirm } of [...awaiting]) {
+		if (txnTime > lastTime && txnTime <= updatedTime) {
+			onConfirm();
+		}
+	}
+}
+
+/**
  * Build the promise a `replicatedConfirmation` write awaits, and register its waiter entry in
  * `awaiting`. Extracted from the `replicationConfirmation(...)` registration below so the
  * settle/timeout/cleanup behavior is unit-testable directly, without going through a real commit.
@@ -888,11 +903,7 @@ function startSubscriptionToReplications() {
 					() => {
 						const updatedTime = replicatedTime[0];
 						const lastTime = replicatedTime.lastTime;
-						for (const { txnTime, onConfirm } of commitsAwaitingReplication.get(databaseName) || []) {
-							if (txnTime > lastTime && txnTime <= updatedTime) {
-								onConfirm();
-							}
-						}
+						notifyConfirmedWaiters(commitsAwaitingReplication.get(databaseName) || [], lastTime, updatedTime);
 						replicatedTime.lastTime = updatedTime;
 					}
 				);

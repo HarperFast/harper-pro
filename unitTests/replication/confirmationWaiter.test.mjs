@@ -14,7 +14,7 @@
  */
 
 import { expect } from 'chai';
-import { createConfirmationWaiter } from '#src/replication/knownNodes';
+import { createConfirmationWaiter, notifyConfirmedWaiters } from '#src/replication/knownNodes';
 
 describe('createConfirmationWaiter', () => {
 	it('resolves once confirmationCount onConfirm() calls land, and removes its entry from awaiting', async () => {
@@ -75,5 +75,47 @@ describe('createConfirmationWaiter', () => {
 		const awaiting = [];
 		await createConfirmationWaiter(awaiting, 'data', 100, 5, 10).catch(() => {});
 		expect(awaiting).to.have.lengthOf(0);
+	});
+
+	// Regression for the pre-push review finding on this change: notifyConfirmedWaiters (called from
+	// the node-update watcher on every replicated-time crossing) fans one update out to every pending
+	// waiter for a database, and each onConfirm() splices its own entry out of that SAME `awaiting`
+	// array as it settles. A naive for-of over the live array would skip whichever entry shifts into a
+	// just-spliced index, silently dropping other waiters confirmable in the same batch. This drives
+	// several single-confirmation waiters sharing one `awaiting` array through the real production
+	// helper and asserts every one of them settles — not just every other one.
+	it('notifyConfirmedWaiters settles every waiter confirmable in one batch, not just every other one', async () => {
+		const awaiting = [];
+		const promises = [
+			createConfirmationWaiter(awaiting, 'data', 100, 1, 5000),
+			createConfirmationWaiter(awaiting, 'data', 100, 1, 5000),
+			createConfirmationWaiter(awaiting, 'data', 100, 1, 5000),
+		];
+		expect(awaiting).to.have.lengthOf(3);
+		notifyConfirmedWaiters(awaiting, 0, 200);
+		await Promise.all(promises);
+		expect(awaiting).to.have.lengthOf(0);
+	});
+
+	it('notifyConfirmedWaiters only confirms waiters whose txnTime falls in (lastTime, updatedTime]', async () => {
+		const awaiting = [];
+		const before = createConfirmationWaiter(awaiting, 'data', 50, 1, 20); // at/before lastTime: excluded, times out
+		const inRange = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000);
+		const after = createConfirmationWaiter(awaiting, 'data', 200, 1, 20); // past updatedTime: excluded, times out
+		notifyConfirmedWaiters(awaiting, 50, 150);
+		await inRange;
+		expect(awaiting).to.have.lengthOf(2); // before + after were not confirmed by this call
+		const [beforeError, afterError] = await Promise.all([
+			before.then(
+				() => undefined,
+				(err) => err
+			),
+			after.then(
+				() => undefined,
+				(err) => err
+			),
+		]);
+		expect(beforeError).to.be.an('error');
+		expect(afterError).to.be.an('error');
 	});
 });
