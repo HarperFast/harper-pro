@@ -93,7 +93,7 @@
 		"email": "support@harperdb.io"
 	},
 	"license": "Elastic-2.0",
-	"prettier": "@harperdb/code-guidelines/prettier",
+	"prettier": "@harperfast/code-guidelines/prettier",
 	"scripts": {
 		"build": "tsc --project tsconfig.json",
 		"build:watch": "npm run build -- --watch --incremental",
@@ -212,7 +212,7 @@
 		"yaml": "2.9.0"
 	},
 	"devDependencies": {
-		"@harperdb/code-guidelines": "^0.0.6",
+		"@harperfast/code-guidelines": "^0.1.1",
 		"@harperfast/integration-testing": "^0.6.2",
 		"@modelcontextprotocol/sdk": "^1.29.0",
 		"@types/busboy": "^1.5.4",
