@@ -1,6 +1,17 @@
 ARG NODE_BUILD_VERSION=24
 ARG NODE_VERSION=24
 
+# Runtime base. CUDA 13.x supports Turing (SM 7.5 / T4) — Turing is the minimum
+# architecture in the 13.x line (Maxwell/Pascal/Volta were dropped). The 13.x
+# runtime requires an R580+ host driver; on hosts pinned to an older driver
+# branch, override with a CUDA 12.x cudnn-runtime base, e.g.:
+#   --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+#
+# Must stay above the first FROM: an ARG referenced by a FROM has to be declared
+# in the global scope, before any stage. Declared after a FROM it belongs to that
+# stage, and the later FROM expands it to an empty base name.
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.3.0-cudnn-runtime-ubuntu22.04
+
 FROM docker.io/node:${NODE_BUILD_VERSION} AS build
 
 WORKDIR /usr/src/harper-pro
@@ -9,12 +20,6 @@ COPY . .
 
 RUN env NO_USE_GIT=true npm run package
 
-# Runtime base. CUDA 13.x supports Turing (SM 7.5 / T4) — Turing is the minimum
-# architecture in the 13.x line (Maxwell/Pascal/Volta were dropped). The 13.x
-# runtime requires an R580+ host driver; on hosts pinned to an older driver
-# branch, override with a CUDA 12.x cudnn-runtime base, e.g.:
-#   --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.3.0-cudnn-runtime-ubuntu22.04
 FROM ${CUDA_RUNTIME_IMAGE} AS run
 
 ARG NODE_VERSION=24
