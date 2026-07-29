@@ -10,20 +10,23 @@
  *
  * These tests exercise the extracted waiter directly (no real cluster/commit needed): it must
  * resolve once `confirmationCount` distinct onConfirm() calls land, reject with a clear, bounded
- * error if they never arrive, and always remove its own entry from `awaiting` when it settles.
+ * error if they never arrive, and always end up removed from `awaiting` once it settles. In
+ * production `onConfirm()` is only ever invoked by notifyConfirmedWaiters (never called directly),
+ * so these tests drive confirmations the same way — through notifyConfirmedWaiters — except where a
+ * test is specifically about the raw entry/timer contract (the late-onConfirm no-op case).
  */
 
 import { expect } from 'chai';
 import { createConfirmationWaiter, notifyConfirmedWaiters } from '#src/replication/knownNodes';
 
 describe('createConfirmationWaiter', () => {
-	it('resolves once confirmationCount onConfirm() calls land, and removes its entry from awaiting', async () => {
+	it('resolves once confirmationCount confirmations land, and ends up removed from awaiting', async () => {
 		const awaiting = [];
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 2, 5000);
 		expect(awaiting).to.have.lengthOf(1);
-		const { onConfirm } = awaiting[0];
-		onConfirm();
-		onConfirm();
+		notifyConfirmedWaiters(awaiting, 0, 200); // 1st peer acks — not yet at confirmationCount
+		expect(awaiting).to.have.lengthOf(1);
+		notifyConfirmedWaiters(awaiting, 0, 200); // 2nd peer acks — reaches confirmationCount
 		await promise;
 		expect(awaiting).to.have.lengthOf(0);
 	});
@@ -47,7 +50,7 @@ describe('createConfirmationWaiter', () => {
 	it('rejects after timeout even if only a partial count of confirmations arrived', async () => {
 		const awaiting = [];
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 3, 20);
-		awaiting[0].onConfirm();
+		notifyConfirmedWaiters(awaiting, 0, 200);
 		let error;
 		try {
 			await promise;
@@ -117,5 +120,20 @@ describe('createConfirmationWaiter', () => {
 		]);
 		expect(beforeError).to.be.an('error');
 		expect(afterError).to.be.an('error');
+	});
+
+	// notifyConfirmedWaiters must only drop entries that actually settled during (or before) this call
+	// — a partially-confirmed multi-peer waiter sitting alongside fully-settled ones in the same
+	// `awaiting` array must survive the batch's compaction pass untouched.
+	it('compacts only the settled entries out of a mixed batch, leaving the still-pending one', async () => {
+		const awaiting = [];
+		const single = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000); // settles this call
+		const needsTwo = createConfirmationWaiter(awaiting, 'data', 100, 2, 5000); // needs a 2nd notify
+		notifyConfirmedWaiters(awaiting, 0, 200);
+		await single;
+		expect(awaiting).to.have.lengthOf(1); // needsTwo survives, still counting
+		notifyConfirmedWaiters(awaiting, 0, 200);
+		await needsTwo;
+		expect(awaiting).to.have.lengthOf(0);
 	});
 });
