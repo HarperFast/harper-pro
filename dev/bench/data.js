@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785323851527,
+  "lastUpdate": 1785323854230,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -5289,6 +5289,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 49.52,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "e01bc06e4eb4e91d4911d03d32d4821f38410bbd",
+          "message": "fix(test): address review feedback on static redeploy regression anchor\n\n- ESM-safe fallback for import.meta.dirname (was CJS-only module.path)\n- Assign started cluster nodes by index (not push) so origin/replica\n  identity survives even if the two startHarper calls resolve out of\n  order, while still recording partially-started nodes for teardown\n- Guard test 3 against test 2 having failed before setting ctx.snapshots\n- Assert the replica's redeployed pages are actually 200 after its\n  restart, not just fetched and logged (restart:true test previously\n  proved nothing about the routes it claims to fix)\n- Move the suite to the top of the file, utility functions below\n  (function declarations hoist) per review feedback\n- Raise hook/test timeouts to clear the worst-case retry/poll budgets\n  used inside them, so a legitimately-slow cluster fails with the\n  helper's own descriptive error instead of a generic node:test timeout\n\nAddresses gemini-code-assist, claude, dawsontoth, and the pending\nself-review's feedback on #614.\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-28T11:38:53Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/e01bc06e4eb4e91d4911d03d32d4821f38410bbd"
+        },
+        "date": 1785323854206,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 6.97,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 13.99,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 16.3,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 41.84,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 44.54,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 37.59,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 76.46,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 56.23,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 143.7,
             "unit": "ms"
           }
         ]
