@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785237131276,
+  "lastUpdate": 1785323851527,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -2287,6 +2287,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2834.55,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "e01bc06e4eb4e91d4911d03d32d4821f38410bbd",
+          "message": "fix(test): address review feedback on static redeploy regression anchor\n\n- ESM-safe fallback for import.meta.dirname (was CJS-only module.path)\n- Assign started cluster nodes by index (not push) so origin/replica\n  identity survives even if the two startHarper calls resolve out of\n  order, while still recording partially-started nodes for teardown\n- Guard test 3 against test 2 having failed before setting ctx.snapshots\n- Assert the replica's redeployed pages are actually 200 after its\n  restart, not just fetched and logged (restart:true test previously\n  proved nothing about the routes it claims to fix)\n- Move the suite to the top of the file, utility functions below\n  (function declarations hoist) per review feedback\n- Raise hook/test timeouts to clear the worst-case retry/poll budgets\n  used inside them, so a legitimately-slow cluster fails with the\n  helper's own descriptive error instead of a generic node:test timeout\n\nAddresses gemini-code-assist, claude, dawsontoth, and the pending\nself-review's feedback on #614.\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-28T11:38:53Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/e01bc06e4eb4e91d4911d03d32d4821f38410bbd"
+        },
+        "date": 1785323849883,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 10588.1,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 21734.57,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 16863.08,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 7648.43,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 4924.14,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2726.64,
             "unit": "ops/sec"
           }
         ]
