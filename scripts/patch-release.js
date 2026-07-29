@@ -26,7 +26,10 @@
  *   --core-branch <name>   Core release branch (default: same as --branch; use when core RC branch has a different name, e.g. rc/X.Y.Z-core)
  *   --source <name>        Source branch (default: main)
  *   --label <name>    PR label to filter on (default: patch)
- *   --bump <type>     npm version bump: patch|minor|major (default: patch)
+ *   --bump <type>     npm version bump: patch|minor|major|prerelease (default: patch)
+ *   --version-name <slot>  CM version slot: stable|next. Defaults to `next` for a
+ *                     prerelease target and `stable` otherwise — only pass this to
+ *                     force a deliberate mismatch.
  *   --dry-run         Preview without making changes
  *   --yes             Non-interactive: auto-confirm all prompts. CM deploy (prompt 2) defaults to
  *                     NO in this mode — pass --cm-trigger to opt in. This is intentional: in
@@ -65,6 +68,10 @@ const SET_VERSION = getArg('--set-version', null);
 const YES_MODE = argv.includes('--yes');
 const CM_TRIGGER = argv.includes('--cm-trigger');
 const JSON_OUTPUT = argv.includes('--json');
+// CM version slot. Derived from the target version when unset — a prerelease goes
+// to `next`, a stable release to `stable`. Set explicitly only to force a
+// deliberate mismatch.
+const VERSION_NAME = getArg('--version-name', null);
 
 function getArg(flag, def) {
 	const i = argv.indexOf(flag);
@@ -422,10 +429,21 @@ async function main() {
 	// ── Step 6: trigger CM release-to-environments ─────────────────────────────
 	header('Deploy to environments (Central Manager)');
 	const plainVersion = proVersion.replace(/^v/, '');
+	// The CM slot must follow the version. `stable` is what GA clusters consume, so
+	// sending a prerelease there would put a beta in front of production traffic;
+	// prereleases belong in `next`. Derive it rather than hardcode, and let
+	// --version-name override for the rare deliberate mismatch.
+	const versionName = VERSION_NAME ?? (semver.prerelease(plainVersion) ? 'next' : 'stable');
 	const cmCmd =
 		`gh workflow run release-to-environments.yaml --repo HarperFast/central-manager ` +
-		`-f version=${plainVersion} -f version_name=stable -f update_environments=all`;
+		`-f version=${plainVersion} -f version_name=${versionName} -f update_environments=all`;
 	log(`  Command: ${C.dim}${cmCmd}${C.reset}`);
+	if (VERSION_NAME) {
+		warn(
+			`  version_name forced to "${VERSION_NAME}" via --version-name (derived would be ` +
+				`"${semver.prerelease(plainVersion) ? 'next' : 'stable'}").`
+		);
+	}
 	// In --yes mode CM deploy is opt-in (pass --cm-trigger); interactive default-YES on EOF was a deploy footgun.
 	const autoDeploy = resolveDeployAnswer({ cmTrigger: CM_TRIGGER, yesMode: YES_MODE });
 	let deploy;
@@ -433,8 +451,8 @@ async function main() {
 		deploy = autoDeploy;
 	} else {
 		const promptText = CM_TRIGGER
-			? `\n--cm-trigger requested — trigger CM release-to-environments (version_name=stable)? [Y/n]: `
-			: `\nTrigger CM release-to-environments (version_name=stable)? [Y/n]: `;
+			? `\n--cm-trigger requested — trigger CM release-to-environments (version_name=${versionName})? [Y/n]: `
+			: `\nTrigger CM release-to-environments (version_name=${versionName})? [Y/n]: `;
 		deploy = await prompt(promptText);
 	}
 	// Captured rather than thrown immediately: a requested-and-failed CM dispatch must still be
@@ -462,7 +480,7 @@ async function main() {
 			}
 		}
 	} else {
-		warn('  Skipped. Manually trigger release-to-environments with version_name=stable when ready.');
+		warn(`  Skipped. Manually trigger release-to-environments with version_name=${versionName} when ready.`);
 	}
 	if (!cmFailure) ok('\n✅ Done.');
 
