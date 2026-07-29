@@ -5,12 +5,18 @@ ARG NODE_VERSION=24
 # architecture in the 13.x line (Maxwell/Pascal/Volta were dropped). The 13.x
 # runtime requires an R580+ host driver; on hosts pinned to an older driver
 # branch, override with a CUDA 12.x cudnn-runtime base, e.g.:
-#   --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+#   --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+#
+# Keep the ubuntu24.04 variant (glibc 2.39) whichever CUDA line you pick. This
+# image bundles uWebSockets.js (copied from the build stage below), whose
+# prebuilt Linux binaries link against GLIBC_2.38 — ubuntu22.04 ships glibc 2.35
+# and the addon fails to load there, the same failure that put the standard
+# image on Debian trixie. See the note at the top of ./Dockerfile.
 #
 # Must stay above the first FROM: an ARG referenced by a FROM has to be declared
 # in the global scope, before any stage. Declared after a FROM it belongs to that
 # stage, and the later FROM expands it to an empty base name.
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.3.0-cudnn-runtime-ubuntu22.04
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04
 
 FROM docker.io/node:${NODE_BUILD_VERSION} AS build
 
