@@ -14,6 +14,12 @@
  * production `onConfirm()` is only ever invoked by notifyConfirmedWaiters (never called directly),
  * so these tests drive confirmations the same way — through notifyConfirmedWaiters — except where a
  * test is specifically about the raw entry/timer contract (the late-onConfirm no-op case).
+ *
+ * A timeout only marks its entry `settled` — it does NOT splice `awaiting` itself (a second pre-push
+ * review finding: doing so per-entry makes mass expiry during an outage O(n²)). Actual removal is
+ * deferred to the next notifyConfirmedWaiters compaction pass, so a rejected waiter's entry is still
+ * present (harmlessly, `settled: true`) in `awaiting` until that next call — several tests below
+ * exercise that intermediate state explicitly rather than assuming immediate removal.
  */
 
 import { expect } from 'chai';
@@ -43,8 +49,9 @@ describe('createConfirmationWaiter', () => {
 		expect(error).to.be.an('error');
 		expect(error.message).to.match(/Timed out.*replication confirmation.*1 node.*"data"/);
 		expect(error.statusCode).to.equal(504);
-		// the whole point: the entry must not be left behind to leak/keep firing after timeout
-		expect(awaiting).to.have.lengthOf(0);
+		// The entry is marked settled but not yet compacted out — that's the next section's job.
+		expect(awaiting).to.have.lengthOf(1);
+		expect(awaiting[0].settled).to.equal(true);
 	});
 
 	it('rejects after timeout even if only a partial count of confirmations arrived', async () => {
@@ -58,7 +65,6 @@ describe('createConfirmationWaiter', () => {
 			error = err;
 		}
 		expect(error.message).to.include('received 1');
-		expect(awaiting).to.have.lengthOf(0);
 	});
 
 	it('ignores late onConfirm() calls that arrive after the waiter already timed out', async () => {
@@ -74,9 +80,15 @@ describe('createConfirmationWaiter', () => {
 		expect(() => entry.onConfirm()).to.not.throw();
 	});
 
-	it('does not leak an entry for a request that never gets a single confirmation', async () => {
+	// The whole point of harper-pro#213: a request that never gets confirmed must not leak its entry
+	// forever. A timeout doesn't remove itself immediately (see the file doc comment), so this asserts
+	// the FULL lifecycle: settled-but-present right after timeout, gone after the next compaction pass
+	// — never an unbounded, permanently-retained entry.
+	it('a never-confirmed waiter is gone from awaiting after the next notifyConfirmedWaiters compaction', async () => {
 		const awaiting = [];
 		await createConfirmationWaiter(awaiting, 'data', 100, 5, 10).catch(() => {});
+		expect(awaiting).to.have.lengthOf(1);
+		notifyConfirmedWaiters(awaiting, 0, 0); // any unrelated call for this database compacts it
 		expect(awaiting).to.have.lengthOf(0);
 	});
 

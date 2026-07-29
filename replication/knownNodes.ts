@@ -763,29 +763,30 @@ export let commitsAwaitingReplication: Map<string, AwaitingReplication[]>;
 // giving up. Without a bound, a confirmation that never arrives (e.g. `replicateTo` naming a peer
 // that never applies this specific write, a peer that drops its connection mid-wait, or any other
 // gap between the requested count and what actually gets acked) hangs the request forever — the
-// promise below had no reject path at all (harper-pro#213). `replication_confirmationTimeout`
-// follows the existing `replication_<x>Timeout` config convention (see e.g. `replication_copyTimeout`,
-// `replication_blobTimeout` in replicationConnection.ts).
+// promise below had no reject path at all (harper-pro#213).
 //
 // Floored at the configured blob timeout (default 900000ms, see REPLICATION_BLOBTIMEOUT in
 // replicationConnection.ts): a confirmation can legitimately be waiting on a large blob that is still
 // within its own supported transfer window, and a shorter default would reject that healthy, merely-
-// slow write as if it had failed.
-const REPLICATION_CONFIRMATION_TIMEOUT_MS =
-	env.get('replication_confirmationTimeout') ??
-	Math.max(60000, env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000);
+// slow write as if it had failed. Not independently user-configurable yet — that needs a dedicated
+// CONFIG_PARAMS entry in core (getConfigValue only resolves keys registered in CONFIG_PARAM_MAP), left
+// as a follow-up; see the dispatch Findings for this fix.
+const REPLICATION_CONFIRMATION_TIMEOUT_MS = Math.max(60000, env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000);
 
 /**
  * Fire `onConfirm()` for every unsettled waiter in `awaiting` whose `txnTime` falls in
- * `(lastTime, updatedTime]`, then drop every now-settled entry in one pass.
+ * `(lastTime, updatedTime]`, then drop every settled entry (confirmed just now, or already marked by
+ * an earlier timeout — see createConfirmationWaiter) in a single in-place compaction pass.
  *
- * onConfirm() only marks an entry `settled`; it does not remove it from `awaiting` (see
- * createConfirmationWaiter). Removing it here, once, after the whole batch has run, keeps a
- * replicated-time crossing that satisfies many waiters at once O(n) instead of O(n²) — the naive
- * version spliced `awaiting` (an O(n) shift) inside each of the n onConfirm() calls in the batch.
- * A plain `for...of` over the live array without this two-pass split would also skip whichever
- * entry shifts into a just-spliced index mid-iteration (the regression the pre-push review on
- * harper-pro#213 caught in an earlier revision of this fix).
+ * Two things this deliberately avoids, both found by pre-push review on earlier revisions of this fix:
+ * - Splicing `awaiting` inside the loop (once per settling entry) is an O(n) shift each time, making a
+ *   replicated-time crossing that satisfies many waiters at once O(n²); a plain for-of over the live
+ *   array while it's being spliced also skips whichever entry shifts into the just-vacated index.
+ * - Compacting via `awaiting.length = 0; awaiting.push(...remaining)` empties the live array before the
+ *   spread executes, and `push(...bigArray)` throws `RangeError: Maximum call stack size exceeded`
+ *   somewhere in the tens-of-thousands of elements — which would have thrown AFTER already discarding
+ *   every still-pending waiter's tracking. The read/write two-pointer compaction below never observes
+ *   (or risks emptying) the array in an inconsistent state and never spreads its contents.
  */
 export function notifyConfirmedWaiters(awaiting: AwaitingReplication[], lastTime: number, updatedTime: number): void {
 	for (const waiter of awaiting) {
@@ -793,11 +794,11 @@ export function notifyConfirmedWaiters(awaiting: AwaitingReplication[], lastTime
 			waiter.onConfirm();
 		}
 	}
-	if (awaiting.some((waiter) => waiter.settled)) {
-		const remaining = awaiting.filter((waiter) => !waiter.settled);
-		awaiting.length = 0;
-		awaiting.push(...remaining);
+	let writeIndex = 0;
+	for (let readIndex = 0; readIndex < awaiting.length; readIndex++) {
+		if (!awaiting[readIndex].settled) awaiting[writeIndex++] = awaiting[readIndex];
 	}
+	awaiting.length = writeIndex;
 }
 
 /**
@@ -830,13 +831,16 @@ export function createConfirmationWaiter(
 		};
 		const timer = setTimeout(() => {
 			if (entry.settled) return;
+			// Only mark settled here — do NOT splice `awaiting` directly. During a real outage many
+			// waiters can time out around the same moment; giving each its own O(n) indexOf+splice would
+			// make mass expiry O(n²) at exactly the worst time (a pre-push review finding on an earlier
+			// revision of this fix, verified against a 50k-entry timing probe). The next
+			// notifyConfirmedWaiters call for this database compacts every settled entry — confirmed or
+			// timed-out alike — in one O(n) pass (see its docs). A fully idle database (no replication
+			// traffic at all after the timeout) leaves a settled, harmless, non-growing placeholder until
+			// that next call; that is a bounded, one-time cost per timed-out write, not the unbounded
+			// per-write leak this fix closes.
 			entry.settled = true;
-			// The timeout path settles independently of any batch, so removing our one entry here
-			// (rather than waiting for a future notifyConfirmedWaiters call that may never come, e.g.
-			// on an otherwise-idle database) is what actually prevents the leak — this array otherwise
-			// lived forever with no entry ever spliced out, on success OR failure.
-			const index = awaiting.indexOf(entry);
-			if (index > -1) awaiting.splice(index, 1);
 			reject(
 				new ServerError(
 					`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${count})`,
