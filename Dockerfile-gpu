@@ -49,8 +49,23 @@ RUN <<-EOF
         | tee /etc/apt/sources.list.d/nodesource.list
     apt-get update
     apt-get install -y nodejs
-    groupadd --gid 1000 harperdb
-    useradd --uid 1000 --gid 1000 --home-dir /home/harperdb --shell /bin/bash --no-create-home harperdb
+    # harperdb must own uid/gid 1000 — existing deployments' data volumes are
+    # chowned to it — so reclaim the id from any incumbent rather than moving
+    # harperdb. Ubuntu 24.04 bases ship a default `ubuntu` user at 1000; 22.04
+    # bases ship none, and CUDA_RUNTIME_IMAGE is overridable, so handle both.
+    # Renaming (as ./Dockerfile does for node:*'s `node` user) keeps the id stable.
+    EXISTING_USER="$(getent passwd 1000 | cut -d: -f1)" || true
+    if [ -n "$EXISTING_USER" ]; then
+        EXISTING_GROUP="$(getent group 1000 | cut -d: -f1)" || true
+        usermod -d /home/harperdb -l harperdb "$EXISTING_USER"
+        if [ -n "$EXISTING_GROUP" ]; then
+            groupmod -n harperdb "$EXISTING_GROUP"
+        fi
+        rm -rf "/home/$EXISTING_USER"
+    else
+        groupadd --gid 1000 harperdb
+        useradd --uid 1000 --gid 1000 --home-dir /home/harperdb --shell /bin/bash --no-create-home harperdb
+    fi
     mkdir -p /home/harperdb
     chown harperdb:harperdb /home/harperdb
     rm -rf /var/lib/apt/lists/*
