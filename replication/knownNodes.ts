@@ -7,7 +7,7 @@ import { forEachReplicatedDatabase } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
 import { isMainThread } from 'worker_threads';
-import { ClientError } from '../core/utility/errors/hdbError.js';
+import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
@@ -758,6 +758,63 @@ type AwaitingReplication = {
 };
 export let commitsAwaitingReplication: Map<string, AwaitingReplication[]>;
 
+// How long a `replicatedConfirmation` write waits for the requested number of peer acks before
+// giving up. Without a bound, a confirmation that never arrives (e.g. `replicateTo` naming a peer
+// that never applies this specific write, a peer that drops its connection mid-wait, or any other
+// gap between the requested count and what actually gets acked) hangs the request forever — the
+// promise below had no reject path at all (harper-pro#213). `replication_confirmationTimeout`
+// follows the existing `replication_<x>Timeout` config convention (see e.g. `replication_copyTimeout`,
+// `replication_blobTimeout` in replicationConnection.ts).
+const REPLICATION_CONFIRMATION_TIMEOUT_MS = env.get('replication_confirmationTimeout') ?? 60000;
+
+/**
+ * Build the promise a `replicatedConfirmation` write awaits, and register its waiter entry in
+ * `awaiting`. Extracted from the `replicationConfirmation(...)` registration below so the
+ * settle/timeout/cleanup behavior is unit-testable directly, without going through a real commit.
+ */
+export function createConfirmationWaiter(
+	awaiting: AwaitingReplication[],
+	databaseName: string,
+	txnTime: number,
+	confirmationCount: number,
+	timeoutMs: number = REPLICATION_CONFIRMATION_TIMEOUT_MS
+): Promise<void> {
+	return new Promise((resolve, reject) => {
+		let count = 0;
+		let settled = false;
+		const entry: AwaitingReplication = {
+			txnTime,
+			onConfirm: () => {
+				if (settled) return; // a peer that acks after we've already timed out is a no-op, not a double-resolve
+				if (++count === confirmationCount) settle(() => resolve());
+			},
+		};
+		function settle(action: () => void) {
+			settled = true;
+			clearTimeout(timer);
+			// Entries are pushed once per confirmation request and otherwise live forever (nothing
+			// else in this module ever spliced them out, on success OR failure) — every confirmed
+			// write left a permanent, ever-growing entry that every future replicated-time update on
+			// this database iterated over. Remove ours as soon as it settles, whichever way.
+			const index = awaiting.indexOf(entry);
+			if (index > -1) awaiting.splice(index, 1);
+			action();
+		}
+		const timer = setTimeout(() => {
+			settle(() =>
+				reject(
+					new ServerError(
+						`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${count})`,
+						504
+					)
+				)
+			);
+		}, timeoutMs);
+		timer.unref?.();
+		awaiting.push(entry);
+	});
+}
+
 replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void> => {
 	if (confirmationCount > server.nodes.length) {
 		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
@@ -774,15 +831,7 @@ replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void
 		awaiting = [];
 		commitsAwaitingReplication.set(databaseName, awaiting);
 	}
-	return new Promise((resolve) => {
-		let count = 0;
-		awaiting.push({
-			txnTime,
-			onConfirm: () => {
-				if (++count === confirmationCount) resolve();
-			},
-		});
-	});
+	return createConfirmationWaiter(awaiting, databaseName, txnTime, confirmationCount);
 });
 // Per-node confirmation watchers. Previously the per-node-update callback below called
 // forEachReplicatedDatabase and discarded the returned remove handle, so every hdb_nodes
