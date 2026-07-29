@@ -757,7 +757,15 @@ type AwaitingReplication = {
 	onConfirm: () => void;
 	settled: boolean;
 };
-export let commitsAwaitingReplication: Map<string, AwaitingReplication[]>;
+// A Set, not an array: both settle paths (confirmed, and timed out — see createConfirmationWaiter)
+// remove their own entry the instant they settle, via `.delete(entry)`. That's an O(1) operation on a
+// Set regardless of how many other waiters are pending, unlike an array (indexOf+splice is O(n), and
+// doing that from inside a for-of over the same array is unsafe — see harper-pro#213's review history
+// below). It also means every entry's lifetime is bounded by its own settlement, never by whether some
+// unrelated later event happens to sweep it up — the earlier revisions of this fix that deferred
+// timeout cleanup to "whenever the next confirmation notification arrives" could still leak entries
+// forever against a peer that never sends another update.
+export let commitsAwaitingReplication: Map<string, Set<AwaitingReplication>>;
 
 // How long a `replicatedConfirmation` write waits for the requested number of peer acks before
 // giving up. Without a bound, a confirmation that never arrives (e.g. `replicateTo` naming a peer
@@ -774,31 +782,22 @@ export let commitsAwaitingReplication: Map<string, AwaitingReplication[]>;
 const REPLICATION_CONFIRMATION_TIMEOUT_MS = Math.max(60000, env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000);
 
 /**
- * Fire `onConfirm()` for every unsettled waiter in `awaiting` whose `txnTime` falls in
- * `(lastTime, updatedTime]`, then drop every settled entry (confirmed just now, or already marked by
- * an earlier timeout — see createConfirmationWaiter) in a single in-place compaction pass.
- *
- * Two things this deliberately avoids, both found by pre-push review on earlier revisions of this fix:
- * - Splicing `awaiting` inside the loop (once per settling entry) is an O(n) shift each time, making a
- *   replicated-time crossing that satisfies many waiters at once O(n²); a plain for-of over the live
- *   array while it's being spliced also skips whichever entry shifts into the just-vacated index.
- * - Compacting via `awaiting.length = 0; awaiting.push(...remaining)` empties the live array before the
- *   spread executes, and `push(...bigArray)` throws `RangeError: Maximum call stack size exceeded`
- *   somewhere in the tens-of-thousands of elements — which would have thrown AFTER already discarding
- *   every still-pending waiter's tracking. The read/write two-pointer compaction below never observes
- *   (or risks emptying) the array in an inconsistent state and never spreads its contents.
+ * Fire `onConfirm()` for every waiter in `awaiting` whose `txnTime` falls in `(lastTime, updatedTime]`.
+ * Each waiter removes itself from `awaiting` (via `Set.delete`) the moment it fully settles — see
+ * createConfirmationWaiter — so nothing here needs to compact, snapshot, or otherwise guard against
+ * mutation during iteration: deleting the *current* item mid-for-of over a Set is well-defined and
+ * safe (unlike an array, where the equivalent splice shifts later indices and skips entries).
  */
-export function notifyConfirmedWaiters(awaiting: AwaitingReplication[], lastTime: number, updatedTime: number): void {
+export function notifyConfirmedWaiters(
+	awaiting: Set<AwaitingReplication>,
+	lastTime: number,
+	updatedTime: number
+): void {
 	for (const waiter of awaiting) {
-		if (!waiter.settled && waiter.txnTime > lastTime && waiter.txnTime <= updatedTime) {
+		if (waiter.txnTime > lastTime && waiter.txnTime <= updatedTime) {
 			waiter.onConfirm();
 		}
 	}
-	let writeIndex = 0;
-	for (let readIndex = 0; readIndex < awaiting.length; readIndex++) {
-		if (!awaiting[readIndex].settled) awaiting[writeIndex++] = awaiting[readIndex];
-	}
-	awaiting.length = writeIndex;
 }
 
 /**
@@ -807,7 +806,7 @@ export function notifyConfirmedWaiters(awaiting: AwaitingReplication[], lastTime
  * settle/timeout/cleanup behavior is unit-testable directly, without going through a real commit.
  */
 export function createConfirmationWaiter(
-	awaiting: AwaitingReplication[],
+	awaiting: Set<AwaitingReplication>,
 	databaseName: string,
 	txnTime: number,
 	confirmationCount: number,
@@ -821,26 +820,19 @@ export function createConfirmationWaiter(
 			onConfirm: () => {
 				if (entry.settled) return; // a peer that acks after we've already timed out is a no-op, not a double-resolve
 				if (++count === confirmationCount) {
-					// Only mark settled + clear the timer here — notifyConfirmedWaiters removes settled
-					// entries from `awaiting` itself, in one pass over the whole batch (see its docs).
 					entry.settled = true;
 					clearTimeout(timer);
+					awaiting.delete(entry);
 					resolve();
 				}
 			},
 		};
 		const timer = setTimeout(() => {
 			if (entry.settled) return;
-			// Only mark settled here — do NOT splice `awaiting` directly. During a real outage many
-			// waiters can time out around the same moment; giving each its own O(n) indexOf+splice would
-			// make mass expiry O(n²) at exactly the worst time (a pre-push review finding on an earlier
-			// revision of this fix, verified against a 50k-entry timing probe). The next
-			// notifyConfirmedWaiters call for this database compacts every settled entry — confirmed or
-			// timed-out alike — in one O(n) pass (see its docs). A fully idle database (no replication
-			// traffic at all after the timeout) leaves a settled, harmless, non-growing placeholder until
-			// that next call; that is a bounded, one-time cost per timed-out write, not the unbounded
-			// per-write leak this fix closes.
 			entry.settled = true;
+			// O(1) regardless of how many other waiters are pending or expiring in this same tick — an
+			// outage that times out many waiters at once costs O(n) total here, not O(n²).
+			awaiting.delete(entry);
 			reject(
 				new ServerError(
 					`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${count})`,
@@ -849,7 +841,7 @@ export function createConfirmationWaiter(
 			);
 		}, timeoutMs);
 		timer.unref?.();
-		awaiting.push(entry);
+		awaiting.add(entry);
 	});
 }
 
@@ -864,9 +856,9 @@ replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void
 		commitsAwaitingReplication = new Map();
 		startSubscriptionToReplications();
 	}
-	let awaiting: AwaitingReplication[] = commitsAwaitingReplication.get(databaseName);
+	let awaiting: Set<AwaitingReplication> = commitsAwaitingReplication.get(databaseName);
 	if (!awaiting) {
-		awaiting = [];
+		awaiting = new Set();
 		commitsAwaitingReplication.set(databaseName, awaiting);
 	}
 	return createConfirmationWaiter(awaiting, databaseName, txnTime, confirmationCount);
@@ -926,7 +918,7 @@ function startSubscriptionToReplications() {
 					() => {
 						const updatedTime = replicatedTime[0];
 						const lastTime = replicatedTime.lastTime;
-						notifyConfirmedWaiters(commitsAwaitingReplication.get(databaseName) || [], lastTime, updatedTime);
+						notifyConfirmedWaiters(commitsAwaitingReplication.get(databaseName) || new Set(), lastTime, updatedTime);
 						replicatedTime.lastTime = updatedTime;
 					}
 				);
