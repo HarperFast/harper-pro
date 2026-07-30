@@ -156,11 +156,18 @@ if (!stressEnabled()) {
 	 */
 	function summariseCatchupRate(progress, windowSecs = RATE_WINDOW_SECS) {
 		const windows = [];
-		// Skip the leading zero-count samples: they measure B reconnecting (bounded by
-		// CATCHUP_GRACE_SECS), not replay throughput. Left in, they charge that ramp-up
-		// time against window 1 and understate its rate.
+		// Skip the leading zero-count samples: they measure B reconnecting, not replay
+		// throughput, and left in they charge that ramp-up time against window 1. Capped at
+		// CATCHUP_GRACE_SECS (the assumed reconnect budget) and anchored on the LAST zero
+		// sample rather than the first non-zero one, so a stall that starts at zero and never
+		// leaves it is still measured as a real (slow) window instead of being discarded.
 		let start = 0;
-		while (start < progress.length - 1 && progress[start].count === 0) start++;
+		while (
+			start < progress.length - 1 &&
+			progress[start].count === 0 &&
+			progress[start + 1].t - progress[0].t <= CATCHUP_GRACE_SECS * 1000
+		)
+			start++;
 		const active = progress.slice(start);
 		if (active.length < 2) return { windows, peakMBps: 0, slowSecs: 0 };
 		const toMBps = (records, secs) => (records * PAYLOAD_SIZE) / 1024 / 1024 / secs;
@@ -173,6 +180,7 @@ if (!stressEnabled()) {
 				toSecs: (sample.t - active[0].t) / 1000,
 				mbps: toMBps(sample.count - anchor.count, secs),
 				secs,
+				partial: false,
 			});
 			anchor = sample;
 		}
@@ -186,13 +194,17 @@ if (!stressEnabled()) {
 					toSecs: (lastSample.t - active[0].t) / 1000,
 					mbps: toMBps(lastSample.count - anchor.count, secs),
 					secs,
+					partial: true,
 				});
 			}
 		}
 		// Peak is measured over full windows only — a short trailing window's rate isn't
 		// comparable to a sustained 180s pace (a brief flush can read far higher) and would
-		// otherwise mislabel that burst as the run's peak.
-		const peakMBps = windows.reduce((max, w) => (w.secs === windowSecs ? Math.max(max, w.mbps) : max), 0);
+		// otherwise mislabel that burst as the run's peak. `partial` is tagged explicitly at
+		// push time above rather than re-derived by comparing `secs` to `windowSecs`: real
+		// windows close at poll granularity (~181-196s at the 15s poll interval), never at
+		// exactly 180.0, so a float equality check here always misses every full window.
+		const peakMBps = windows.reduce((max, w) => (w.partial ? max : Math.max(max, w.mbps)), 0);
 		// Wall-clock spent below the pace that can finish in budget — the "stall-bound" measure.
 		const slowSecs = windows.reduce((sum, w) => sum + (w.mbps < ENFORCED_FLOOR_MBPS ? w.secs : 0), 0);
 		return { windows, peakMBps, slowSecs };
@@ -200,13 +212,8 @@ if (!stressEnabled()) {
 
 	function formatRateProfile({ windows, peakMBps, slowSecs }) {
 		if (!windows.length) return 'no rate windows (catch-up ended before one window elapsed)';
-		// A window with secs !== RATE_WINDOW_SECS is partial (the trailing remainder); tag its
-		// actual duration so it isn't read as a sustained per-180s rate.
 		const profile = windows
-			.map(
-				(w) =>
-					`${w.toSecs.toFixed(0)}s:${w.mbps.toFixed(1)}${w.secs !== RATE_WINDOW_SECS ? `(${w.secs.toFixed(0)}s)` : ''}`
-			)
+			.map((w) => `${w.toSecs.toFixed(0)}s:${w.mbps.toFixed(1)}${w.partial ? `(${w.secs.toFixed(0)}s)` : ''}`)
 			.join(' ');
 		return (
 			`per-${RATE_WINDOW_SECS}s MB/s [${profile}] peak=${peakMBps.toFixed(1)} ` +
@@ -430,7 +437,8 @@ if (!stressEnabled()) {
 					ok(
 						stalledFor < STALL_SECS,
 						`B made no catch-up progress for ${stalledFor.toFixed(0)}s (stuck at ${lastCount}/${targetCount}) — ` +
-							`replication is wedged, not merely slow`
+							`replication is wedged, not merely slow. Rate profile up to the wedge: ` +
+							`${formatRateProfile(summariseCatchupRate(progress))}`
 					);
 					// B replays A's distinct-id upserts, so its row count can only climb up
 					// to the target. A count above it means duplicated/over-replicated rows —
@@ -513,6 +521,11 @@ if (!stressEnabled()) {
 					enforcedFloorMBps: Number(ENFORCED_FLOOR_MBPS.toFixed(2)),
 					baselineMBps: CATCHUP_BASELINE_MBPS,
 					stallSecs: STALL_SECS,
+					rateProfile: {
+						windows: rateProfile.windows,
+						peakMBps: Number(rateProfile.peakMBps.toFixed(2)),
+						slowSecs: rateProfile.slowSecs,
+					},
 					peakRss: { A: aSummary.peakRss, B: bSummary.peakRss },
 					cgroupPeaks: {
 						current: aSummary.peakCgroupCurrent,
