@@ -16,18 +16,17 @@
  *   cache, asserting the startup replication paths (ensureThisNode / shouldReplicateFromNode /
  *   cluster_status) bring the cluster back and a post-restart write converges.
  *
- *   It is NOT the regression guard for the `get()`-returns-a-Promise bug itself, despite the name.
- *   That guard is `unitTests/replication/selfNodeReplicates.test.mjs` and
- *   `unitTests/replication/readNodeRowSync.test.mjs`, which inject a Promise-returning `get()`
- *   directly and fail deterministically when the `getSync` call sites regress. This file cannot:
- *   replication startup does a full `hdb_nodes` SCAN (`databases.system.hdb_nodes.search([])` in
- *   `startOnMainThread`, `replication/subscriptionManager.ts`) before any point read, which warms the
- *   block holding the node rows, so the subsequent point read hits the cache and returns
- *   synchronously even on a stone-cold restart. Verified by mutation — reverting `selfNodeReplicates`
+ *   It is NOT a deterministic regression guard for the `get()`-returns-a-Promise bug itself, despite
+ *   the name. That guard is `unitTests/replication/selfNodeReplicates.test.mjs` and
+ *   `unitTests/replication/readNodeRowSync.test.mjs`, which inject a Promise-returning `get()` directly
+ *   and fail deterministically when the `getSync` call sites regress. This file cannot reliably
+ *   reproduce the miss: replication startup scans the `hdb_nodes` table before these point reads run,
+ *   which can warm the rows into the cache first. Verified by mutation — reverting `selfNodeReplicates`
  *   and `readNodeRowSync` to plain `get()` leaves this suite green while the two unit tests fail.
- *   Reproducing a genuine point-read miss here would need `hdb_nodes` grown past the block cache,
- *   which is what the field repro had and a 2-node test does not. Do not read a pass here as evidence
- *   that the MaybePromise sites are still correct.
+ *   Reproducing a genuine point-read miss here would need `hdb_nodes` grown past the block cache, which
+ *   is what the field repro had and a 2-node test does not. Do not read a pass here as evidence that the
+ *   MaybePromise sites are still correct — this suite is a real-world rolling-restart check on top of,
+ *   not instead of, the unit tests above.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -37,7 +36,7 @@ import { join } from 'node:path';
 import { sendOperation, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
+	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'..',
 	'..',
 	'dist',
@@ -46,10 +45,9 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 // Small but viable RocksDB block cache: far below the default (~25% of RAM) so blocks are evicted under
-// churn, yet large enough that opening Harper's databases does not hang (a sub-MB cache does). The cold
-// restart is what makes the cache-miss deterministic; this keeps misses from being papered over by a
-// warm cache. We deliberately do NOT shrink the WriteBufferManager — a tiny WBM with allowStall stalls
-// the schema writes during startup.
+// churn, and the cold restart below has a real chance at reproducing a get()->Promise miss instead of
+// it being papered over by a warm cache. We deliberately do NOT shrink the WriteBufferManager — a tiny
+// WBM with allowStall stalls the schema writes during startup.
 const SMALL_ROCKS = { blockCacheSize: 32 * 1024 * 1024 };
 
 // Some padded records so the data table spans multiple SST blocks (cache pressure). Convergence is
@@ -147,9 +145,17 @@ suite(
 
 			const ctxA = makeNodeCtx(hostnameA);
 			const ctxB = makeNodeCtx(hostnameB);
-			await Promise.all([startHarper(ctxA, nodeConfig(hostnameA)), startHarper(ctxB, nodeConfig(hostnameB))]);
-			ctx.nodeA = ctxA.harper;
-			ctx.nodeB = ctxB.harper;
+			// Record each node as soon as its own start resolves (rather than after Promise.all settles) so
+			// that if one start fails, the other's already-running process is still recorded and gets torn
+			// down instead of leaked.
+			await Promise.all([
+				startHarper(ctxA, nodeConfig(hostnameA)).then(() => {
+					ctx.nodeA = ctxA.harper;
+				}),
+				startHarper(ctxB, nodeConfig(hostnameB)).then(() => {
+					ctx.nodeB = ctxB.harper;
+				}),
+			]);
 
 			// Seed table + data on A, ending with a sentinel we can wait on.
 			await sendOperation(ctx.nodeA, {
