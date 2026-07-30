@@ -56,6 +56,7 @@ import {
 	summariseHostSamples,
 	formatHostCounters,
 	writeStressMetrics,
+	clearStressMetrics,
 	writeJobSummary,
 	fabricRocksConfig,
 	mb,
@@ -119,6 +120,13 @@ if (!stressEnabled()) {
 	// worker is blocked inside a RocksDB write stall — see harper-pro#603), so only a genuine
 	// wedge trips it.
 	const STALL_SECS = Number(process.env.HARPER_STRESS_LARGE_STALL_SECS ?? 300);
+	// The convergence poll's exact_count forces a full value scan of B's table (see the
+	// comment at the poll site), and that scan grows with B's row count and competes with
+	// replication replay for the same RocksDB I/O/CPU it's trying to measure — a 5s cadence
+	// means dozens of full-table scans self-contaminate the very throughput being gated.
+	// Widening the interval cuts scan overhead roughly proportionally; STALL_SECS (300s) and
+	// the metrics/log cadence stay coarse-poll-friendly at this interval.
+	const CATCHUP_POLL_SECS = Number(process.env.HARPER_STRESS_LARGE_CATCHUP_POLL_SECS ?? 15);
 	// Generous write budget: 5 min per GB plus 10 min fixed overhead.
 	const WRITE_BUDGET_SECS = TARGET_GB * 300 + 600;
 	const SUITE_TIMEOUT_MS = (WRITE_BUDGET_SECS + CATCHUP_BUDGET_SECS + 600) * 1000;
@@ -130,6 +138,7 @@ if (!stressEnabled()) {
 
 	suite(`Large catch-up — ${TARGET_GB} GB`, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		before(async () => {
+			clearStressMetrics('large-catchup');
 			const rocks = fabricRocksConfig();
 			// Catch-up throughput is gated by the WriteBufferManager budget: once B's memtables
 			// exhaust it, RocksDB stalls writers and replay collapses (see harper-pro#603). Log the
@@ -357,7 +366,7 @@ if (!stressEnabled()) {
 						`[large-catchup] catchup poll: B=${lastCount}/${targetCount} (${remaining}s remaining, ` +
 							`stalled ${stalledFor.toFixed(0)}s) ${formatHostCounters(hostSampler.window())}`
 					);
-					await delay(5_000);
+					await delay(CATCHUP_POLL_SECS * 1000);
 				}
 
 				const aSummary = summariseSamples(aSampler.stop());
@@ -444,13 +453,19 @@ if (!stressEnabled()) {
 				const uncaughtRe = /\[error\]: uncaughtException/g;
 				const [logA, logB] = await Promise.all([readLog(A), readLog(B)]);
 
-				// Missing the deadline means the run averaged below CATCHUP_FLOOR_MBPS, because the
-				// deadline is derived from that floor — so this reads as a throughput regression, not
-				// as "the clock ran out". Ordinary slow-mode nights (~5 MB/s at 10 GB) stay green.
+				// Gate on the measured rate itself, not on "did it converge before the deadline".
+				// The deadline is grace-padded (CATCHUP_GRACE_SECS added on top of the floor-implied
+				// time) so B has room to reconnect before the first batch lands, but a run that
+				// consumes that whole padded window to converge posts a catchupMBps below
+				// ENFORCED_FLOOR_MBPS despite convergedAt being non-null — convergedAt!==null alone
+				// let that pass. Checking the rate directly closes that gap and still fails an
+				// outright timeout for free (partial progress over the full budget is always < the
+				// rate needed to finish it).
 				ok(
-					convergedAt !== null,
+					catchupMBps >= ENFORCED_FLOOR_MBPS,
 					`B averaged ${catchupMBps.toFixed(1)} MB/s, under the ${ENFORCED_FLOOR_MBPS.toFixed(1)} MB/s catch-up floor ` +
-						`(${appliedRecords}/${targetCount - seedRecords.length} records in ${CATCHUP_BUDGET_SECS}s) — ` +
+						`(${appliedRecords}/${targetCount - seedRecords.length} records in ${catchupSecs.toFixed(1)}s` +
+						`${convergedAt ? '' : ', TIMED OUT'}) — ` +
 						`slow replay, not a wedge; a wedge would have tripped the ${STALL_SECS}s no-progress guard. ` +
 						`Host during catch-up: ${formatHostCounters(hostSummary)}`
 				);
