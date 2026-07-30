@@ -213,6 +213,17 @@ describe('createConfirmationWaiter', () => {
 			await promise;
 		});
 	});
+
+	// PR #633 review (gemini-code-assist): a zero/negative confirmationCount (e.g. a misconfigured or
+	// unresolved `replicatedConfirmation`) would previously never reach the target count via onConfirm
+	// and would hang until timeout. The `alreadyConfirmedCount >= confirmationCount` guard above resolves
+	// this too, since alreadyConfirmedCount (always >= 0) already meets or exceeds any non-positive count.
+	it('resolves immediately for a zero or negative confirmationCount instead of hanging until timeout', async () => {
+		const awaiting = new Set();
+		await createConfirmationWaiter(awaiting, 'data', 100, 0, 5000);
+		await createConfirmationWaiter(awaiting, 'data', 100, -1, 5000);
+		expect(awaiting.size).to.equal(0);
+	});
 });
 
 describe('countAlreadyConfirmedPeers', () => {
