@@ -45,8 +45,10 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 // Small but viable RocksDB block cache: far below the default (~25% of RAM) so blocks are evicted under
-// churn, and the cold restart below has a real chance at reproducing a get()->Promise miss instead of
-// it being papered over by a warm cache. We deliberately do NOT shrink the WriteBufferManager — a tiny
+// churn rather than staying resident regardless of restart. Per the header above, the startup
+// `hdb_nodes` scan can still warm the rows before the point reads in this suite run, so this does not
+// guarantee a cache-miss Promise — it's sized this way anyway so a warm cache from a stale prior run
+// isn't what's papering over a real miss. We deliberately do NOT shrink the WriteBufferManager — a tiny
 // WBM with allowStall stalls the schema writes during startup.
 const SMALL_ROCKS = { blockCacheSize: 32 * 1024 * 1024 };
 

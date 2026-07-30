@@ -201,13 +201,18 @@ if (!stressEnabled()) {
 				});
 			}
 		}
-		// Peak is measured over full windows only — a short trailing window's rate isn't
-		// comparable to a sustained 180s pace (a brief flush can read far higher) and would
-		// otherwise mislabel that burst as the run's peak. `partial` is tagged explicitly at
-		// push time above rather than re-derived by comparing `secs` to `windowSecs`: real
-		// windows close at poll granularity (~181-196s at the 15s poll interval), never at
-		// exactly 180.0, so a float equality check here always misses every full window.
-		const peakMBps = windows.reduce((max, w) => (w.partial ? max : Math.max(max, w.mbps)), 0);
+		// Peak prefers full windows only — a short trailing window's rate isn't comparable to a
+		// sustained 180s pace (a brief flush can read far higher) and would otherwise mislabel
+		// that burst as the run's peak. `partial` is tagged explicitly at push time above rather
+		// than re-derived by comparing `secs` to `windowSecs`: real windows close at poll
+		// granularity (~181-196s at the 15s poll interval), never at exactly 180.0, so a float
+		// equality check here always misses every full window. But when the run ends before a
+		// single full window elapses, every window IS partial — falling back to 0 there would
+		// report zero peak for a run that measurably moved data, so fall back to the partial
+		// windows' own max instead of lying about there being no throughput at all.
+		const fullWindows = windows.filter((w) => !w.partial);
+		const peakSource = fullWindows.length ? fullWindows : windows;
+		const peakMBps = peakSource.reduce((max, w) => Math.max(max, w.mbps), 0);
 		// Wall-clock spent below the pace that can finish in budget — the "stall-bound" measure.
 		const slowSecs = windows.reduce((sum, w) => sum + (w.mbps < ENFORCED_FLOOR_MBPS ? w.secs : 0), 0);
 		return { windows, peakMBps, slowSecs };
