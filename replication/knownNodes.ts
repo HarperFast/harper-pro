@@ -754,7 +754,7 @@ const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array
 
 type AwaitingReplication = {
 	txnTime: number;
-	onConfirm: () => void;
+	onConfirm: (nodeName: string) => void;
 	settled: boolean;
 };
 // A Set, not an array: both settle paths (confirmed, and timed out — see createConfirmationWaiter)
@@ -768,26 +768,33 @@ type AwaitingReplication = {
 export let commitsAwaitingReplication: Map<string, Set<AwaitingReplication>>;
 
 /**
- * Count peers that, per their last-known replicated-time shared status, have already applied
- * `txnTime` for `databaseName` — i.e. confirmations that landed before a waiter for this write
- * registered. `notifyConfirmedWaiters` only fires on the NEXT status update for a peer, so a
- * peer that already crossed `txnTime` before we start waiting will never re-cross it — its ack
+ * The names of peers that, per their last-known replicated-time shared status, have already
+ * applied `txnTime` for `databaseName` — i.e. confirmations that landed before a waiter for this
+ * write registered. `notifyConfirmedWaiters` only fires on the NEXT status update for a peer, so
+ * a peer that already crossed `txnTime` before we start waiting will never re-cross it — its ack
  * would otherwise be silently missed and a fully-replicated write would time out anyway
- * (see `createConfirmationWaiter`, called with this as `alreadyConfirmedCount`). Takes the map
- * explicitly (mirrors `notifyConfirmedWaiters` taking `awaiting`) so it's unit-testable without
- * the module's live `replicationConfirmationFloat64s` state.
+ * (see `createConfirmationWaiter`, called with this as `alreadyConfirmedPeers`).
+ *
+ * Returns names, not a count (harper-pro#633 review): the seed and `notifyConfirmedWaiters` both
+ * feed the same per-peer `Set` on the waiter entry, so a peer whose watcher callback fires *after*
+ * this seed already counted it — a real race, since the shared-buffer write and the JS watcher
+ * callback that reacts to it are not atomic — contributes the same name twice and is naturally
+ * deduplicated by `Set.add`, instead of incrementing a bare counter twice for one peer.
+ *
+ * Takes the map explicitly (mirrors `notifyConfirmedWaiters` taking `awaiting`) so it's
+ * unit-testable without the module's live `replicationConfirmationFloat64s` state.
  */
 export function countAlreadyConfirmedPeers(
 	confirmationsByNode: Map<string, Map<string, Float64Array>>,
 	databaseName: string,
 	txnTime: number
-): number {
-	let count = 0;
-	for (const confirmationsForNode of confirmationsByNode.values()) {
+): Set<string> {
+	const confirmedPeers = new Set<string>();
+	for (const [nodeName, confirmationsForNode] of confirmationsByNode) {
 		const replicatedTime = confirmationsForNode.get(databaseName);
-		if (replicatedTime && replicatedTime[0] >= txnTime) count++;
+		if (replicatedTime && replicatedTime[0] >= txnTime) confirmedPeers.add(nodeName);
 	}
-	return count;
+	return confirmedPeers;
 }
 
 // How long a `replicatedConfirmation` write waits for the requested number of peer acks before
@@ -812,20 +819,27 @@ const REPLICATION_CONFIRMATION_TIMEOUT_MS = Math.max(
 );
 
 /**
- * Fire `onConfirm()` for every waiter in `awaiting` whose `txnTime` falls in `(lastTime, updatedTime]`.
- * Each waiter removes itself from `awaiting` (via `Set.delete`) the moment it fully settles — see
- * createConfirmationWaiter — so nothing here needs to compact, snapshot, or otherwise guard against
- * mutation during iteration: deleting the *current* item mid-for-of over a Set is well-defined and
- * safe (unlike an array, where the equivalent splice shifts later indices and skips entries).
+ * Fire `onConfirm(nodeName)` for every waiter in `awaiting` whose `txnTime` falls in
+ * `(lastTime, updatedTime]`. Each waiter removes itself from `awaiting` (via `Set.delete`) the
+ * moment it fully settles — see createConfirmationWaiter — so nothing here needs to compact,
+ * snapshot, or otherwise guard against mutation during iteration: deleting the *current* item
+ * mid-for-of over a Set is well-defined and safe (unlike an array, where the equivalent splice
+ * shifts later indices and skips entries).
+ *
+ * `nodeName` identifies which peer's status update this crossing came from — required so the
+ * waiter can track confirmations by peer identity rather than a bare count (harper-pro#633
+ * review: the same peer could otherwise be counted once via `alreadyConfirmedPeers` and again
+ * here for that peer's own first post-registration update, producing a false confirmation).
  */
 export function notifyConfirmedWaiters(
 	awaiting: Set<AwaitingReplication>,
+	nodeName: string,
 	lastTime: number,
 	updatedTime: number
 ): void {
 	for (const waiter of awaiting) {
 		if (waiter.txnTime > lastTime && waiter.txnTime <= updatedTime) {
-			waiter.onConfirm();
+			waiter.onConfirm(nodeName);
 		}
 	}
 }
@@ -841,21 +855,28 @@ export function createConfirmationWaiter(
 	txnTime: number,
 	confirmationCount: number,
 	timeoutMs: number = REPLICATION_CONFIRMATION_TIMEOUT_MS,
-	alreadyConfirmedCount: number = 0
+	alreadyConfirmedPeers: Set<string> = new Set()
 ): Promise<void> {
 	// Seeded (not just checked-and-early-returned) so the count-up-to-confirmationCount math below
-	// stays in one place. Computing alreadyConfirmedCount and adding `entry` to `awaiting` both happen
+	// stays in one place. Computing alreadyConfirmedPeers and adding `entry` to `awaiting` both happen
 	// synchronously in the caller's turn — with nothing awaited between them — so no peer ack can land
 	// in the gap; this is what closes the race, not just an optimization.
-	if (alreadyConfirmedCount >= confirmationCount) return Promise.resolve();
+	if (alreadyConfirmedPeers.size >= confirmationCount) return Promise.resolve();
 	return new Promise((resolve, reject) => {
-		let count = alreadyConfirmedCount;
+		// Confirmations are tracked by peer identity, not a bare counter: the same peer's status
+		// update can otherwise be credited twice — once via the `alreadyConfirmedPeers` seed and
+		// again via its own first post-registration notifyConfirmedWaiters crossing, since the
+		// shared-buffer write and the JS watcher callback that reacts to it are not atomic
+		// (harper-pro#633 review). `Set.add` on the same name is a no-op, so a peer contributes at
+		// most once regardless of how many times it's reported confirmed.
+		const confirmed = new Set(alreadyConfirmedPeers);
 		const entry: AwaitingReplication = {
 			txnTime,
 			settled: false,
-			onConfirm: () => {
+			onConfirm: (nodeName) => {
 				if (entry.settled) return; // a peer that acks after we've already timed out is a no-op, not a double-resolve
-				if (++count === confirmationCount) {
+				confirmed.add(nodeName);
+				if (confirmed.size === confirmationCount) {
 					entry.settled = true;
 					clearTimeout(timer);
 					awaiting.delete(entry);
@@ -871,7 +892,7 @@ export function createConfirmationWaiter(
 			awaiting.delete(entry);
 			reject(
 				new ServerError(
-					`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${count})`,
+					`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${confirmed.size})`,
 					504
 				)
 			);
@@ -989,7 +1010,12 @@ function startSubscriptionToReplications() {
 					() => {
 						const updatedTime = replicatedTime[0];
 						const lastTime = replicatedTime.lastTime;
-						notifyConfirmedWaiters(commitsAwaitingReplication.get(databaseName) || new Set(), lastTime, updatedTime);
+						notifyConfirmedWaiters(
+							commitsAwaitingReplication.get(databaseName) || new Set(),
+							nodeNameAtUpdate,
+							lastTime,
+							updatedTime
+						);
 						replicatedTime.lastTime = updatedTime;
 					}
 				);
