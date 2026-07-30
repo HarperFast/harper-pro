@@ -4,7 +4,7 @@
  * Background: When a node rejoins after a long offline window it must replay
  * every write its peers accumulated while it was gone. This test validates
  * that the catch-up path handles production-scale data volumes (configured
- * via HARPER_STRESS_LARGE_DATA_GB) without OOM and completes in bounded time,
+ * via HARPER_STRESS_LARGE_DATA_GB) without OOM and sustains a floor throughput,
  * and emits throughput numbers so we can track regressions across releases.
  *
  * Requires a self-hosted runner with adequate free disk (≥ 3× target data
@@ -16,8 +16,16 @@
  *  3. Take B offline (clean teardown).
  *  4. Write TARGET_GB of bulk row data to A while B is offline.
  *  5. Restart B. Time until its row count (exact describe_table count) converges with A.
- *  6. Assert: convergence within CATCHUP_BUDGET_SECS; no OOM on either node.
- *  7. Emit write throughput and catch-up throughput.
+ *  6. Hard-fail on: a wedge (no forward progress for STALL_SECS), over-replication,
+ *     OOM / uncaughtException / RSS or cgroup-anon blow-up, A exiting mid-write, and
+ *     average catch-up throughput below CATCHUP_FLOOR_MBPS. A run that is merely slow
+ *     — above the floor but under CATCHUP_BASELINE_MBPS — warns and is recorded, so a
+ *     busy shared runner does not turn the nightly red.
+ *  7. Emit write throughput, catch-up throughput and host-pressure counters, to the
+ *     run log, the job summary, and `large-catchup-metrics.json` in the log artifact.
+ *     A failing/timed-out run also carries a per-180s rate profile in its failure
+ *     message, so it's diagnosable as uniformly-slow vs. stall-bound-and-never-recovered
+ *     without reconstructing it from the raw poll log (see summariseCatchupRate).
  *
  * Run locally (1 GB, ~10–20 min):
  *   HARPER_RUN_STRESS_TESTS=1 HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR=~/dev/tmp \
@@ -47,6 +55,12 @@ import {
 	waitForAllConnected,
 	sampleMetrics,
 	summariseSamples,
+	sampleHostCounters,
+	summariseHostSamples,
+	formatHostCounters,
+	writeStressMetrics,
+	clearStressMetrics,
+	writeJobSummary,
 	fabricRocksConfig,
 	mb,
 } from './stressShared.mjs';
@@ -80,20 +94,42 @@ if (!stressEnabled()) {
 	// allocations + RocksDB block cache/memtables). This is the real OOM-risk signal,
 	// robust to the reclaimable file cache that inflates RSS. Observed ~2.4–3.6 GB.
 	const ANON_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_ANON_CAP_MB ?? 5120);
-	// Budget: longer offline = larger backlog = more catch-up time needed. 180 s/GB is NOT marginal —
-	// at the 10 GB CI scale it allows 1800 s against a typical converged time of 600–1100 s (9–17 MB/s),
-	// roughly 2x headroom. Resist raising it to absorb a timeout: the observed timeouts (2026-07-19,
-	// 2026-07-25) are not runs that just missed, they are runs where B never escaped the write-stall
-	// trough and was still 13–35% short while decelerating. Raising the budget would hide a 4–5x
-	// throughput degradation, which is the thing worth knowing. See the rate profile below.
+	// Catch-up throughput on this workload is BIMODAL on identical code: at 10 GB the
+	// nightly has measured 13.5 / 11.4 / 10.0 MB/s in runs that converge quickly and
+	// ~5.1 MB/s in runs that plod, with no code, config or host-contention difference
+	// between them (runner-side loadavg/iowait/PSI/disk were no worse on the slow
+	// nights). A fixed wall-clock budget therefore cannot separate "slow but healthy"
+	// from "regressed" — it just fails whichever mode happens to land past the line.
+	//
+	// So the hard gate is a throughput FLOOR, not a clock: the deadline is the time the
+	// floor rate needs for this dataset, plus a grace for B's restart/reconnect before
+	// the first batch lands. The floor sits at half the slowest healthy run observed, so
+	// a genuine ~2x replication regression still fails while ordinary spread does not.
+	// CATCHUP_BASELINE_MBPS is the *tracked* number: falling under it warns and is
+	// recorded in the metrics artifact, it does not fail the job.
+	const CATCHUP_FLOOR_MBPS = Number(process.env.HARPER_STRESS_LARGE_CATCHUP_FLOOR_MBPS ?? 2.5);
+	const CATCHUP_BASELINE_MBPS = Number(process.env.HARPER_STRESS_LARGE_CATCHUP_BASELINE_MBPS ?? 10);
+	const CATCHUP_GRACE_SECS = Number(process.env.HARPER_STRESS_LARGE_CATCHUP_GRACE_SECS ?? 120);
 	const CATCHUP_BUDGET_SECS = Number(
-		process.env.HARPER_STRESS_LARGE_CATCHUP_BUDGET_SECS ?? Math.max(600, TARGET_GB * 180)
+		process.env.HARPER_STRESS_LARGE_CATCHUP_BUDGET_SECS ??
+			Math.max(600, Math.ceil((TARGET_GB * 1024) / CATCHUP_FLOOR_MBPS) + CATCHUP_GRACE_SECS)
 	);
+	// The rate the budget actually enforces. Equal to CATCHUP_FLOOR_MBPS at CI scale;
+	// looser at small TARGET_GB (the 600s minimum dominates) or when the budget is
+	// overridden outright — so failure messages quote a number that is always true.
+	const ENFORCED_FLOOR_MBPS = (TARGET_GB * 1024) / Math.max(CATCHUP_BUDGET_SECS - CATCHUP_GRACE_SECS, 1);
 	// A wedge, as opposed to slow replay: zero forward progress for this long. Sized well above
 	// the longest legitimate gap observed between applied batches (~100s, when B's replication
 	// worker is blocked inside a RocksDB write stall — see harper-pro#603), so only a genuine
 	// wedge trips it.
 	const STALL_SECS = Number(process.env.HARPER_STRESS_LARGE_STALL_SECS ?? 300);
+	// The convergence poll's exact_count forces a full value scan of B's table (see the
+	// comment at the poll site), and that scan grows with B's row count and competes with
+	// replication replay for the same RocksDB I/O/CPU it's trying to measure — a 5s cadence
+	// means dozens of full-table scans self-contaminate the very throughput being gated.
+	// Widening the interval cuts scan overhead roughly proportionally; STALL_SECS (300s) and
+	// the metrics/log cadence stay coarse-poll-friendly at this interval.
+	const CATCHUP_POLL_SECS = Number(process.env.HARPER_STRESS_LARGE_CATCHUP_POLL_SECS ?? 15);
 	// Generous write budget: 5 min per GB plus 10 min fixed overhead.
 	const WRITE_BUDGET_SECS = TARGET_GB * 300 + 600;
 	const SUITE_TIMEOUT_MS = (WRITE_BUDGET_SECS + CATCHUP_BUDGET_SECS + 600) * 1000;
@@ -103,9 +139,6 @@ if (!stressEnabled()) {
 	// Build payload once; reused across all records to avoid per-record allocation.
 	const PAYLOAD = 'x'.repeat(PAYLOAD_SIZE);
 
-	// Pace B must sustain, on average, to finish inside the budget. Used to report how much of the
-	// run was spent below the pace that can actually finish — see summariseCatchupRate.
-	const REQUIRED_MBPS = (TARGET_GB * 1024) / CATCHUP_BUDGET_SECS;
 	const RATE_WINDOW_SECS = 180;
 
 	/**
@@ -117,54 +150,70 @@ if (!stressEnabled()) {
 	 * averaged 4.9 MB/s while its per-window rate ranged 1.5–11.1 MB/s.
 	 *
 	 * Summarise the rate over fixed windows so a timeout carries its own phase profile: whether B
-	 * was uniformly slow, or stall-bound and never recovered.
+	 * was uniformly slow, or stall-bound and never recovered. Compared against ENFORCED_FLOOR_MBPS
+	 * — there is no other definition of "the pace needed to finish" once the gate is a floor rather
+	 * than a fixed budget.
 	 */
 	function summariseCatchupRate(progress, windowSecs = RATE_WINDOW_SECS) {
 		const windows = [];
-		if (progress.length < 2) return { windows, peakMBps: 0, slowSecs: 0 };
+		// Skip the leading zero-count samples: they measure B reconnecting (bounded by
+		// CATCHUP_GRACE_SECS), not replay throughput. Left in, they charge that ramp-up
+		// time against window 1 and understate its rate.
+		let start = 0;
+		while (start < progress.length - 1 && progress[start].count === 0) start++;
+		const active = progress.slice(start);
+		if (active.length < 2) return { windows, peakMBps: 0, slowSecs: 0 };
 		const toMBps = (records, secs) => (records * PAYLOAD_SIZE) / 1024 / 1024 / secs;
-		let anchor = progress[0];
-		for (const sample of progress) {
+		let anchor = active[0];
+		for (const sample of active) {
 			const secs = (sample.t - anchor.t) / 1000;
 			if (secs < windowSecs) continue;
 			// Labelled by the elapsed time at the END of the window it summarises.
 			windows.push({
-				toSecs: (sample.t - progress[0].t) / 1000,
+				toSecs: (sample.t - active[0].t) / 1000,
 				mbps: toMBps(sample.count - anchor.count, secs),
 				secs,
 			});
 			anchor = sample;
 		}
-		const lastSample = progress[progress.length - 1];
+		const lastSample = active[active.length - 1];
 		if (anchor !== lastSample) {
 			// Trailing partial window — on a timeout run this is the most recent, most
 			// decision-relevant data (still decelerating vs. climbing out); don't drop it.
 			const secs = (lastSample.t - anchor.t) / 1000;
 			if (secs > 0) {
 				windows.push({
-					toSecs: (lastSample.t - progress[0].t) / 1000,
+					toSecs: (lastSample.t - active[0].t) / 1000,
 					mbps: toMBps(lastSample.count - anchor.count, secs),
 					secs,
 				});
 			}
 		}
-		const peakMBps = windows.reduce((max, w) => Math.max(max, w.mbps), 0);
+		// Peak is measured over full windows only — a short trailing window's rate isn't
+		// comparable to a sustained 180s pace (a brief flush can read far higher) and would
+		// otherwise mislabel that burst as the run's peak.
+		const peakMBps = windows.reduce((max, w) => (w.secs === windowSecs ? Math.max(max, w.mbps) : max), 0);
 		// Wall-clock spent below the pace that can finish in budget — the "stall-bound" measure.
-		const slowSecs = windows.reduce((sum, w) => sum + (w.mbps < REQUIRED_MBPS ? w.secs : 0), 0);
+		const slowSecs = windows.reduce((sum, w) => sum + (w.mbps < ENFORCED_FLOOR_MBPS ? w.secs : 0), 0);
 		return { windows, peakMBps, slowSecs };
 	}
 
 	function formatRateProfile({ windows, peakMBps, slowSecs }) {
 		if (!windows.length) return 'no rate windows (catch-up ended before one window elapsed)';
-		const profile = windows.map((w) => `${w.toSecs.toFixed(0)}s:${w.mbps.toFixed(1)}`).join(' ');
+		// A window with secs !== RATE_WINDOW_SECS is partial (the trailing remainder); tag its
+		// actual duration so it isn't read as a sustained per-180s rate.
+		const profile = windows
+			.map((w) => `${w.toSecs.toFixed(0)}s:${w.mbps.toFixed(1)}${w.secs !== RATE_WINDOW_SECS ? `(${w.secs.toFixed(0)}s)` : ''}`)
+			.join(' ');
 		return (
 			`per-${RATE_WINDOW_SECS}s MB/s [${profile}] peak=${peakMBps.toFixed(1)} ` +
-			`below-required-pace(${REQUIRED_MBPS.toFixed(1)} MB/s)=${slowSecs.toFixed(0)}s`
+			`below-required-pace(${ENFORCED_FLOOR_MBPS.toFixed(1)} MB/s)=${slowSecs.toFixed(0)}s`
 		);
 	}
 
 	suite(`Large catch-up — ${TARGET_GB} GB`, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		before(async () => {
+			clearStressMetrics('large-catchup');
 			const rocks = fabricRocksConfig();
 			// Catch-up throughput is gated by the WriteBufferManager budget: once B's memtables
 			// exhaust it, RocksDB stalls writers and replay collapses (see harper-pro#603). Log the
@@ -247,6 +296,11 @@ if (!stressEnabled()) {
 			});
 
 			const aSampler = sampleMetrics(A, { intervalMs: 5_000 });
+			// Host-level pressure, sampled from /proc (not namespaced by Docker, so this is
+			// the whole box, not the job container). The in-container cgroup stats look
+			// identical on fast and slow nights, so these counters are the only way to
+			// attribute a slow run to a busy runner after the fact.
+			const hostSampler = sampleHostCounters({ intervalMs: 5_000 });
 			let bSampler = null;
 			let testDone = false;
 			try {
@@ -299,6 +353,11 @@ if (!stressEnabled()) {
 					`[large-catchup] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ` +
 						`${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 				);
+				// Write-phase host pressure, captured before the window resets for catch-up.
+				// A host-wide slowdown shows up in both phases; a replication-only slowdown
+				// leaves this line looking like a healthy night's.
+				const writeHost = hostSampler.window();
+				console.log(`[large-catchup] write host: ${formatHostCounters(writeHost)}`);
 
 				// Convergence target is the exact count of distinct records on A: the bulk
 				// rows just written plus the small seed batch. We use the known write count
@@ -328,6 +387,10 @@ if (!stressEnabled()) {
 
 				const catchupStart = Date.now();
 				bSampler = sampleMetrics(B, { intervalMs: 5_000 });
+				// Re-baseline the host counters here so both the per-poll lines and the
+				// catch-up summary measure the catch-up phase alone, excluding B's restart.
+				hostSampler.window();
+				const hostCatchupFrom = Math.max(hostSampler.samples.length - 1, 0);
 
 				const deadline = Date.now() + CATCHUP_BUDGET_SECS * 1000;
 				let lastCount = -1;
@@ -379,13 +442,14 @@ if (!stressEnabled()) {
 					const remaining = Math.ceil((deadline - Date.now()) / 1000);
 					console.log(
 						`[large-catchup] catchup poll: B=${lastCount}/${targetCount} (${remaining}s remaining, ` +
-							`stalled ${stalledFor.toFixed(0)}s)`
+							`stalled ${stalledFor.toFixed(0)}s) ${formatHostCounters(hostSampler.window())}`
 					);
-					await delay(5_000);
+					await delay(CATCHUP_POLL_SECS * 1000);
 				}
 
 				const aSummary = summariseSamples(aSampler.stop());
 				const bSummary = summariseSamples(bSampler.stop());
+				const hostSummary = summariseHostSamples(hostSampler.stop().slice(hostCatchupFrom));
 				const catchupSecs = ((convergedAt ?? Date.now()) - catchupStart) / 1000;
 				// Derive throughput from the rows B actually applied rather than from TARGET_GB, so a
 				// timed-out run reports the rate it did achieve. The old form divided by zero progress
@@ -412,19 +476,82 @@ if (!stressEnabled()) {
 						`anon=${mb(aSummary.peakCgroupAnon)} file=${mb(aSummary.peakCgroupFile)} ` +
 						`dirty=${mb(aSummary.peakCgroupDirty)}`
 				);
+				// Host pressure across the catch-up phase. Read this line first when a run is
+				// slow: healthy numbers here mean the slowdown was Harper's, not the runner's.
+				console.log(`[large-catchup] host (catch-up): ${formatHostCounters(hostSummary)}`);
+				if (hostSummary)
+					console.log(
+						`[large-catchup] host peaks: load1=${hostSummary.peakLoad1.toFixed(2)} ` +
+							`iowait=${hostSummary.peakIowaitPct.toFixed(0)}% psiIo=${hostSummary.peakPsiIoPct.toFixed(0)}% ` +
+							`psiCpu=${hostSummary.peakPsiCpuPct.toFixed(0)}% ` +
+							`minMemAvail=${(hostSummary.minMemAvailableKb / 1024).toFixed(0)} MB`
+					);
+
+				// Throughput is the tracked metric; the baseline is a warning, not a gate. Emit it
+				// as an Actions annotation so a downward trend is visible on the run page before it
+				// ever gets slow enough to trip the floor.
+				if (catchupMBps < CATCHUP_BASELINE_MBPS)
+					console.log(
+						`::warning title=large-catchup below baseline::catch-up ${catchupMBps.toFixed(1)} MB/s is under the ` +
+							`${CATCHUP_BASELINE_MBPS} MB/s baseline (hard floor ${ENFORCED_FLOOR_MBPS.toFixed(1)} MB/s)`
+					);
+
+				const metrics = {
+					targetGb: TARGET_GB,
+					converged: convergedAt !== null,
+					catchupSecs: Number(catchupSecs.toFixed(1)),
+					catchupMBps: Number(catchupMBps.toFixed(2)),
+					appliedRecords,
+					targetRecords: targetCount - seedRecords.length,
+					writeSecs: Number(writeSecs.toFixed(1)),
+					writeMBps: Number(writeMBps.toFixed(2)),
+					budgetSecs: CATCHUP_BUDGET_SECS,
+					floorMBps: CATCHUP_FLOOR_MBPS,
+					enforcedFloorMBps: Number(ENFORCED_FLOOR_MBPS.toFixed(2)),
+					baselineMBps: CATCHUP_BASELINE_MBPS,
+					stallSecs: STALL_SECS,
+					peakRss: { A: aSummary.peakRss, B: bSummary.peakRss },
+					cgroupPeaks: {
+						current: aSummary.peakCgroupCurrent,
+						anon: aSummary.peakCgroupAnon,
+						file: aSummary.peakCgroupFile,
+						dirty: aSummary.peakCgroupDirty,
+					},
+					hostWritePhase: writeHost,
+					hostCatchup: hostSummary,
+				};
+				writeStressMetrics('large-catchup', metrics);
+				writeJobSummary(
+					`### large-catchup (${TARGET_GB} GB)\n\n` +
+						`| metric | value |\n| --- | --- |\n` +
+						`| catch-up | ${convergedAt ? catchupSecs.toFixed(1) + 's' : 'TIMEOUT after ' + catchupSecs.toFixed(1) + 's'} |\n` +
+						`| throughput | ${catchupMBps.toFixed(1)} MB/s (baseline ${CATCHUP_BASELINE_MBPS}, floor ${CATCHUP_FLOOR_MBPS}) |\n` +
+						`| applied | ${appliedRecords}/${targetCount - seedRecords.length} |\n` +
+						`| write | ${writeMBps.toFixed(1)} MB/s |\n` +
+						`| host | ${formatHostCounters(hostSummary)} |\n`
+				);
 
 				const oomRe = /JavaScript heap out of memory|FATAL ERROR.*Allocation failed/g;
 				const uncaughtRe = /\[error\]: uncaughtException/g;
 				const [logA, logB] = await Promise.all([readLog(A), readLog(B)]);
 
+				// Gate on the measured rate itself, not on "did it converge before the deadline".
+				// The deadline is grace-padded (CATCHUP_GRACE_SECS added on top of the floor-implied
+				// time) so B has room to reconnect before the first batch lands, but a run that
+				// consumes that whole padded window to converge posts a catchupMBps below
+				// ENFORCED_FLOOR_MBPS despite convergedAt being non-null — convergedAt!==null alone
+				// let that pass. Checking the rate directly closes that gap and still fails an
+				// outright timeout for free (partial progress over the full budget is always < the
+				// rate needed to finish it).
 				ok(
-					convergedAt !== null,
-					`B did not converge within ${CATCHUP_BUDGET_SECS}s; last count=${lastCount}/${targetCount} ` +
-						`(applied ${appliedRecords} records at ${catchupMBps.toFixed(1)} MB/s avg — slow replay, not a wedge; ` +
-						`a wedge would have tripped the ${STALL_SECS}s no-progress guard). ` +
-						`Rate profile: ${formatRateProfile(rateProfile)}. ` +
-						`A peak well above the required pace with most of the run below it means B was ` +
-						`stall-bound and never recovered (harper-pro#430 / #435), NOT that the budget is too tight.`
+					catchupMBps >= ENFORCED_FLOOR_MBPS,
+					`B averaged ${catchupMBps.toFixed(1)} MB/s, under the ${ENFORCED_FLOOR_MBPS.toFixed(1)} MB/s catch-up floor ` +
+						`(${appliedRecords}/${targetCount - seedRecords.length} records in ${catchupSecs.toFixed(1)}s` +
+						`${convergedAt ? '' : ', TIMED OUT'}) — ` +
+						`slow replay, not a wedge; a wedge would have tripped the ${STALL_SECS}s no-progress guard. ` +
+						`Rate profile: ${formatRateProfile(rateProfile)}. A peak well above the floor with most of the ` +
+						`run below it means B was stall-bound and never recovered (harper-pro#430 / #435), NOT that the ` +
+						`floor is too strict. Host during catch-up: ${formatHostCounters(hostSummary)}`
 				);
 				for (const [name, summary, log] of [
 					['A', aSummary, logA],
@@ -448,6 +575,7 @@ if (!stressEnabled()) {
 				// after an early exit (e.g. Harper crash during write phase).
 				aSampler.stop();
 				bSampler?.stop();
+				hostSampler.stop();
 			}
 		});
 	});

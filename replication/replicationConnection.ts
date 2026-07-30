@@ -209,6 +209,20 @@ export function formatTruthSnapshot(truth: ConnectionTruth | undefined, now: num
 	return `truth={connected: ${truth.connected}, state: ${truth.state}, liveness: ${liveness}${closeCode}}`;
 }
 
+/**
+ * Read a millisecond timeout from config, falling back to `defaultMs` for anything that isn't a positive
+ * number. An operator-supplied non-numeric value would otherwise reach a timer as `NaN`, and a `NaN`
+ * timeout fails SILENTLY in both directions: `setTimeout` coerces it to ~0 (the bound fires immediately)
+ * while every `elapsed >= threshold` watchdog comparison against it is false (the watchdog never fires at
+ * all). Same defensive shape as COPY_CHECKPOINT_MAX_INTERVAL_MS's floor below.
+ *
+ * Exported for unit coverage (unitTests/replication/resolveDatabaseStores.test.mjs).
+ */
+export function positiveMsOr(value: unknown, defaultMs: number): number {
+	const ms = Number(value);
+	return ms > 0 ? ms : defaultMs;
+}
+
 const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
 // When receiving a replication message, we apply per-record backpressure to keep a single
 // large batch from synchronously decoding thousands of records and ballooning the worker
@@ -225,6 +239,15 @@ const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 10
 // follower commits incrementally and persists a resume cursor. On reconnect the copy resumes from that
 // cursor instead of restarting from zero. Larger = less overhead but coarser resume granularity.
 const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 1000;
+// How long the receive path waits for this database's local subscription queue to be registered before
+// giving up on the connection. Inbound records can only be delivered to the resolved queue, and the
+// registration normally lands within milliseconds of the connection (harper-pro#622), so this bound only
+// covers the pathological case: a database we subscribed to that never gets registered locally at all
+// (e.g. a non-`data` database the peer streams but whose schema we drop because it does not exist here).
+// Waiting unbounded there would silently wedge the serialized message chain with no watchdog to catch it
+// — the receive watchdog keeps being reset by the very frames we are not processing — so we close instead
+// and let reconnect backoff retry, which costs one log line per attempt rather than one per message.
+const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000);
 
 // Wall-clock ceiling on the gap between socket flushes / event-loop yields during a bulk copy.
 // Reading a large cold table out of RocksDB dominates copy cost (decompress + decode), so a purely
@@ -339,9 +362,20 @@ const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
 // connection churn on an already-pathologically-slow leg, never data loss. A finer-grained drain-progress
 // hook from core's IterableEventQueue would let us tighten this — tracked as a follow-up. Override with
 // `replication_pauseStallTimeout` for clusters with extreme single-transaction sizes.
-const PAUSE_STALL_THRESHOLD_MS =
-	env.get('replication_pauseStallTimeout') ??
-	Math.max(PING_TIMEOUT * 2, (env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000) * 2);
+//
+// Floored at SUBSCRIPTION_RESOLVE_TIMEOUT so an operator who lowers the override can't make this watchdog
+// fire during a legitimate subscription-resolve wait (which pauses intake with zero consumer progress by
+// construction — see awaitPendingSubscription). That would only churn the connection, not lose data, but
+// the two bounds are ordered by intent, so enforce it rather than document it. positiveMsOr guards the
+// whole expression, not each input: a NaN from ANY of the three config reads would leave this watchdog
+// permanently disarmed (every `elapsed >= NaN` is false), so nothing non-numeric may escape here.
+const PAUSE_STALL_THRESHOLD_MS = Math.max(
+	positiveMsOr(
+		env.get('replication_pauseStallTimeout'),
+		Math.max(PING_TIMEOUT * 2, positiveMsOr(env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT), 900000) * 2)
+	),
+	SUBSCRIPTION_RESOLVE_TIMEOUT
+);
 
 // Grace the dynamic send-authorization watch gives a present-but-undecodable hdb_nodes row before it
 // fails closed. Sized well past the seconds-scale self-heal the #352/#1163 misread window takes (the
@@ -915,6 +949,116 @@ export function readDbisCursorSync(
 	// getSync is load-bearing here: reverting it to get() would return a MaybePromise that no longer
 	// satisfies the DbisCursor | undefined return type — a tsc error, not a silent full-copy regression.
 	return dbisDB?.getSync([Symbol.for(kind), id]);
+}
+
+/**
+ * A database's local subscription: either the resolved `IterableEventQueue` that `Replicator.subscribe()`
+ * registers, or the still-unresolved placeholder Promise a connection is handed before that registration
+ * happens (see createPendingDatabaseSubscription).
+ */
+export type DatabaseSubscription = {
+	then?: unknown; // present only on the unresolved placeholder
+	auditStore?: any;
+	dbisDB?: DbisStore;
+	[key: string]: any;
+};
+
+/**
+ * The audit + `__dbis__` stores for a database, resolved without requiring its local subscription to
+ * have been registered yet. Both stores are per-DATABASE (`rootStore.auditStore` / `rootStore.dbisDb`,
+ * surfaced on every table of the database); the subscription queue is only a carrier that
+ * `Replicator.subscribe()` copies them onto from the first table that registers.
+ *
+ * That distinction is load-bearing. Until the registration happens, a connection's subscription is an
+ * unresolved placeholder Promise whose `auditStore`/`dbisDB` are `undefined`. Reading them off it made
+ * "this thread has not registered the subscription yet" indistinguishable from "this source has no
+ * resume cursor": `nodeId` came back undefined, no `seq` cursor resolved, `startTime` collapsed to 1
+ * and the handshake requested a FULL DATABASE COPY while a current cursor sat on disk — on every
+ * restart, for every database that lost the race (harper-pro#622). Same failure shape as the
+ * MaybePromise read in readDbisCursorSync above, a different source of `undefined`.
+ *
+ * Returns empty stores only when the database has no local tables at all — an empty node bootstrapping
+ * from its leader, which is the case a full copy genuinely exists for.
+ *
+ * Exported for unit coverage (unitTests/replication/resolveDatabaseStores.test.mjs).
+ */
+export function resolveDatabaseStores(
+	subscription: DatabaseSubscription | undefined,
+	tables: Record<string, any> | undefined
+): { auditStore?: any; dbisDB?: DbisStore } {
+	// Never read the stores off an unresolved placeholder; it carries neither.
+	const resolved = subscription?.then ? undefined : subscription;
+	let auditStore = resolved?.auditStore;
+	let dbisDB = resolved?.dbisDB;
+	if (!auditStore || !dbisDB) {
+		for (const tableName in tables) {
+			const table = tables[tableName];
+			auditStore ??= table?.auditStore;
+			dbisDB ??= table?.dbisDB;
+			if (auditStore && dbisDB) break;
+		}
+	}
+	return { auditStore, dbisDB };
+}
+
+/**
+ * Await a database subscription that may still be the pending placeholder, bounded by `timeout` ms.
+ * Resolves to the registered `IterableEventQueue`, or to `undefined` if the registration did not land in
+ * time. A subscription that is already resolved (or absent) is returned as-is without yielding.
+ *
+ * The timer is unref'd and always cleared, so neither outcome holds the event loop open.
+ *
+ * `backpressure` (the receive path's `addPauseReason`/`removePauseReason`) is applied around the wait and
+ * ONLY around a wait that actually happens. It is load-bearing rather than defensive: the receive path
+ * awaits this from inside the serialized `messageProcessing` chain, but blocking that chain does not stop
+ * `ws.on('message')` from appending closures that each retain a whole inbound `body` — so without pausing
+ * the socket, a peer mid-copy queues a full timeout's worth of large frames and exhausts the worker heap
+ * before the timeout can close the connection. Paired in a `finally` so the pause is balanced on every
+ * outcome, including a rejection.
+ *
+ * Exported for unit coverage; the production caller is `whenSubscriptionResolved` in `replicateOverWS`.
+ */
+export async function awaitPendingSubscription(
+	subscription: DatabaseSubscription | undefined,
+	timeout: number,
+	backpressure?: { pause: () => void; resume: () => void }
+): Promise<DatabaseSubscription | undefined> {
+	if (!subscription?.then) return subscription;
+	let timer: NodeJS.Timeout;
+	backpressure?.pause();
+	try {
+		return await Promise.race([
+			subscription as Promise<DatabaseSubscription>,
+			new Promise<undefined>((resolve) => {
+				timer = setTimeout(() => resolve(undefined), timeout);
+				timer.unref();
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+		backpressure?.resume();
+	}
+}
+
+/**
+ * Create (and register) the placeholder used for a database whose local subscription queue does not
+ * exist yet: `Replicator.subscribe()` runs when the first table of the database is set up on this
+ * thread, which can happen after a replication connection is accepted or an outbound subscription is
+ * requested. It resolves to the real `IterableEventQueue` when `Replicator.subscribe()` calls `.ready`.
+ *
+ * Consumers must treat a subscription with a `.then` as unresolved and never read `send`/`auditStore`/
+ * `dbisDB` off it — see resolveDatabaseStores and harper-pro#622.
+ */
+export function createPendingDatabaseSubscription(
+	databaseName: string,
+	subscriptions: Map<string, any> = databaseSubscriptions
+): DatabaseSubscription {
+	let ready: (subscription: any) => void;
+	const pending: DatabaseSubscription = new Promise((resolve) => (ready = resolve)) as any;
+	pending.ready = ready;
+	// Register in the same map the resolver reads, so Replicator.subscribe() finds and resolves this one.
+	subscriptions.set(databaseName, pending);
+	return pending;
 }
 
 // Small control-plane tables whose convergence gates cluster operations: hdb_deployment gates
@@ -1601,13 +1745,32 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
-	let tableSubscriptionToReplicator: { dbisDB?: DbisStore; [key: string]: any } = options.subscription;
+	let tableSubscriptionToReplicator: DatabaseSubscription = options.subscription;
 	if (tableSubscriptionToReplicator?.then)
-		tableSubscriptionToReplicator.then((sub) => {
-			tableSubscriptionToReplicator = sub;
-			if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
-		});
+		(tableSubscriptionToReplicator as Promise<any>)
+			.then((sub) => {
+				tableSubscriptionToReplicator = sub;
+				if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
+			})
+			// This handler is detached — nothing awaits it — so a rejection here would surface as a
+			// process-level unhandled rejection rather than a connection error (the DESIGN item-12 /
+			// harper-pro#466 trap). The placeholder has no reject path today (only `.ready` resolves it), but
+			// the receive path's bounded wait already recovers a subscription that never resolves, so log and
+			// let that close-and-reconnect handle it instead of crashing the worker.
+			.catch((error) => logger.warn?.(connectionId, 'Subscription to database failed to resolve', error));
 	let tables = options.tables || (databaseName && getDatabases()[databaseName]);
+	/**
+	 * This database's audit + `__dbis__` stores. Goes through resolveDatabaseStores so they stay readable
+	 * while the local subscription is still the unresolved placeholder (harper-pro#622). `tables` is
+	 * captured above at construction and is undefined for a database that only came into existence
+	 * afterwards, so re-read the database when it is unset.
+	 */
+	function getDatabaseStores() {
+		return resolveDatabaseStores(
+			tableSubscriptionToReplicator,
+			tables || (databaseName ? getDatabases()?.[databaseName] : undefined)
+		);
+	}
 	let remoteNodeName: string;
 	const awaitingResponse = new Map();
 	let receivingDataFromNodeIds = [];
@@ -1718,8 +1881,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
-			if (copyFromNodeId !== undefined)
-				tableSubscriptionToReplicator?.dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
@@ -1747,7 +1909,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (!copyApplyActive()) {
 				// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
 				// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
-				tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], pendingCopyCursor);
+				getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], pendingCopyCursor);
 				pendingCopyCursor = null;
 				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
 				maybeFinishCopy();
@@ -1774,7 +1936,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// rows up to cursorAtFlush are now durable in SST; dbisDB is WAL-on, so this persist is durable.
 					// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
 					if (copyFromNodeId !== undefined)
-						tableSubscriptionToReplicator?.dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
+						getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
 					copyFlushBackoffUntil = 0;
 					copyFlushRetryMs = 0; // flush succeeded; reset backoff
 					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
@@ -2308,6 +2470,42 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		return true;
 	}
+	/**
+	 * Resolve `tableSubscriptionToReplicator` before the receive path delivers to it. Until
+	 * `Replicator.subscribe()` registers this database's queue on this thread, it is the unresolved
+	 * placeholder Promise, and `.send()` on a Promise throws `<x>.send is not a function` — which the outer
+	 * catch logged once per inbound message while dropping every record in it (harper-pro#622).
+	 *
+	 * Awaiting here is safe and order-preserving: ws messages are serialized through `messageProcessing`.
+	 * It must NOT be awaited ahead of the handshake commands, though — NODE_NAME/DB_SCHEMA are what create
+	 * the tables whose registration resolves the placeholder, so blocking them would deadlock a bootstrap.
+	 *
+	 * Returns false (after closing for a backoff retry) if the subscription never resolved; the caller must
+	 * then abandon the message rather than fall through to a `.send()`.
+	 */
+	async function whenSubscriptionResolved(): Promise<boolean> {
+		if (!tableSubscriptionToReplicator?.then) return true;
+		// Socket intake is paused for the duration of the wait — see awaitPendingSubscription. Liveness while
+		// paused belongs to the pause-stall watchdog, whose threshold is floored above
+		// SUBSCRIPTION_RESOLVE_TIMEOUT so it can never pre-empt this wait.
+		const resolved = await awaitPendingSubscription(tableSubscriptionToReplicator, SUBSCRIPTION_RESOLVE_TIMEOUT, {
+			pause: addPauseReason,
+			resume: removePauseReason,
+		});
+		if (!resolved?.send) {
+			logger.error?.(
+				connectionId,
+				`No local subscription registered for database ${databaseName} after ${SUBSCRIPTION_RESOLVE_TIMEOUT}ms; closing so replication resumes from the last durable cursor`
+			);
+			// 1011 (internal error), no `finish`: same transient-close semantics as an inbound message error,
+			// so the normal retry path reconnects with backoff and re-streams from the durable cursor.
+			close(1011, `No local subscription registered for database ${databaseName}`);
+			return false;
+		}
+		tableSubscriptionToReplicator = resolved;
+		auditStore ??= resolved.auditStore;
+		return true;
+	}
 	async function onWSMessage(body: Buffer): Promise<void> {
 		if (!authorizationFinished) {
 			if (authorization?.then) {
@@ -2602,6 +2800,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					case SEQUENCE_ID_UPDATE:
 						// we need to record the sequence number that the remote node has received
 						lastSequenceIdReceived = data;
+						// The resume cursor is persisted by the subscription queue, so this needs the resolved
+						// subscription just like the record path below (harper-pro#622).
+						if (!(await whenSubscriptionResolved())) return;
 						// Clamp: a sequence-id update carries no commit/blob-durability gate, so while any blob is not
 						// yet durable it must not push the resume cursor past the last fully-durable point (same as the
 						// inline REMOTE_SEQUENCE_UPDATE branch below). seqUpdateEndTxn also gates copy-apply durability.
@@ -2925,14 +3126,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						} else tableSubscriptionToReplicator = dbSubscriptions.get(databaseName);
 						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
 						if (!tableSubscriptionToReplicator) {
-							// Wait for it to be created
-							let ready;
-							tableSubscriptionToReplicator = new Promise((resolve) => {
-								logger.debug?.('Waiting for subscription to database ' + databaseName);
-								ready = resolve;
-							});
-							tableSubscriptionToReplicator.ready = ready;
-							databaseSubscriptions.set(databaseName, tableSubscriptionToReplicator);
+							// Wait for it to be created. Registered in dbSubscriptions (not the module-level map
+							// unconditionally): that is the map Replicator.subscribe() resolves from for this
+							// connection, so writing anywhere else would leave the placeholder pending forever.
+							logger.debug?.('Waiting for subscription to database ' + databaseName);
+							tableSubscriptionToReplicator = createPendingDatabaseSubscription(databaseName, dbSubscriptions);
 						}
 						// Local config-route directionality for this peer, resolved once and reused by the send
 						// authority gate below and the send-side excludeTables further down. harper-pro#498.
@@ -3356,7 +3554,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
+							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
+							| undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -3718,6 +3917,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 			/* If we are past the commands, we are now handling an incoming replication message, the next block
 			 * handles parsing and transacting these replication messages */
+			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
+			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
+			if (!(await whenSubscriptionResolved())) return;
 			decoder.position = 8;
 			let beginTxn = true;
 			let event; // could also get txnTime from decoder.getFloat64(0);
@@ -4626,18 +4828,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					});
 			}
 		}
-		if (!auditStore && tableSubscriptionToReplicator) auditStore = tableSubscriptionToReplicator.auditStore;
 		if (options.connection?.isFinished)
 			throw new Error('Can not make a subscription request on a connection that is already closed');
 		let lastTxnTimes = new Map();
-		if (!auditStore)
-			// if it hasn't been set yet, do so now
-			auditStore = tableSubscriptionToReplicator?.auditStore;
+		// Resolve the audit/__dbis__ stores from the database itself, so a subscription that is still the
+		// unresolved placeholder can't make a database with a current resume cursor on disk look like one with
+		// no baseline and trigger a full copy (harper-pro#622).
+		const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
+		// if it hasn't been set yet, do so now
+		if (!auditStore) auditStore = databaseAuditStore;
 		// iterate through all the sequence entries and find the newest txn time for each node.
 		// collectLastTxnTimes tolerates a `seq` row that fails to decode (harper-pro#352) so one
 		// undecodable cursor entry can't crash the subscription handshake.
 		try {
-			const seqEntries = tableSubscriptionToReplicator?.dbisDB?.getRange({
+			const seqEntries = dbisDB?.getRange({
 				start: Symbol.for('seq'),
 				end: [Symbol.for('seq'), Buffer.from([0xff])],
 			});
@@ -4684,15 +4888,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 			auditStore?.ensureLogExists?.(node.name);
-			const sequenceEntry = readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'seq', nodeId);
+			const sequenceEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
 			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
 			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
 			// data predates copyStartTime and would never be delivered by an audit-log resume).
 			const copyCursor = discardMalformedCopyCursor(
-				nodeId === undefined
-					? undefined
-					: readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'copyCursor', nodeId),
-				tableSubscriptionToReplicator?.dbisDB,
+				nodeId === undefined ? undefined : readDbisCursorSync(dbisDB, 'copyCursor', nodeId),
+				dbisDB,
 				nodeId,
 				() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
 			);
@@ -4729,7 +4931,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				const connectedNodeId = auditStore && getIdOfRemoteNode(connectedNode.name, auditStore);
 				// getSync via readDbisCursorSync: a get() Promise on a cache miss has no `.nodes`, silently
 				// disarming the proxied leading-duplicate fast-skip (#399) and forcing the per-record walk.
-				const proxySeqEntry = readDbisCursorSync(tableSubscriptionToReplicator?.dbisDB, 'seq', connectedNodeId);
+				const proxySeqEntry = readDbisCursorSync(dbisDB, 'seq', connectedNodeId);
 				for (const seqNode of proxySeqEntry?.nodes || []) {
 					// Guard `nodeId !== undefined` first: if both `nodeId` and a malformed `seqNode.id` were
 					// undefined the `===` would spuriously match an unrelated entry. (Arming is gated on a
@@ -4872,12 +5074,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 
 		if (nodeSubscriptions) {
-			logger.debug?.(
-				connectionId,
-				'sending subscription request',
-				nodeSubscriptions,
-				tableSubscriptionToReplicator?.dbisDB?.path
-			);
+			logger.debug?.(connectionId, 'sending subscription request', nodeSubscriptions, dbisDB?.path);
 			clearTimeout(delayedClose);
 			if (nodeSubscriptions.length > 0) {
 				ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded]));
