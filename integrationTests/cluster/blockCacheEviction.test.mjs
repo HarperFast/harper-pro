@@ -1,5 +1,5 @@
 /**
- * Integration test: replication must survive RocksDB `store.get()` returning a Promise.
+ * Integration test: replication recovers from a rolling restart (small RocksDB block cache).
  *
  * Background — the bug class this guards against:
  *   On RocksDB, `store.get(id)` returns a `MaybePromise`: the record SYNCHRONOUSLY when it is in the
@@ -112,16 +112,19 @@ async function describeReplication(node) {
 
 suite(
 	'replication recovers from a rolling restart (small block cache, cold-cache reconnect)',
-	// Sized above the AGGREGATE of the test body's own retry budgets, not just its typical
-	// runtime (~5s). If those budgets sum to more than this, a genuinely slow-but-working CI
-	// runner hits the suite timeout before any individual helper's own (more specific) timeout
-	// message fires — and node:test abandons the body in place rather than aborting it, so
-	// `after()` runs concurrently with an in-flight restartNode/pollHealth and can miss killing
-	// the process that comes up after it reads the (stale) pid file, leaking a live Harper and
-	// its ports into the rest of the CI job. Worst case here: before() ~120s (add_node +
-	// waitForRecord) + body ~700s (2x restartNode 60s + pollHealth 120s, then 2x pollHealth
-	// 120s, then waitForRecord 10s + 90s) + after() ~60s (stopNodeProcess + teardownHarper) —
-	// comfortably under 1200s.
+	// Sized above the test BODY's own aggregate retry budget (node:test charges only the body
+	// against this, not before()/after()), not just its typical runtime (~5s): 2x restartNode
+	// 60s + pollHealth 120s, then 2x pollHealth 120s, then waitForRecord 10s + 90s — ~700s if
+	// every retry loop actually exhausts its count. If that sum exceeds this timeout, a
+	// genuinely slow-but-working CI runner hits the suite timeout before any individual
+	// helper's own (more specific) message fires — and node:test abandons the body in place
+	// rather than aborting it, so `after()` runs concurrently with an in-flight
+	// restartNode/pollHealth and can miss killing the process that comes up after it reads a
+	// (momentarily absent) pid file, leaking a live Harper and its ports into later CI jobs.
+	// NOTE: the ~700s figure assumes each retry fails fast — `sendOperation` has no per-request
+	// timeout, so a node that accepts a connection but never answers stretches a single retry
+	// to undici's own (much longer) timeout instead of this suite's. This value reduces the
+	// race's probability; it does not close it.
 	{ timeout: 1200000 },
 	(ctx) => {
 		before(async () => {
@@ -203,7 +206,8 @@ suite(
 
 			// Rolling restart -> COLD block cache on each node. The startup replication paths
 			// (ensureThisNode / shouldReplicateFromNode / cluster bootstrap) now read hdb_nodes from a cold
-			// cache, which is the exact get()->Promise condition this test guards.
+			// cache — though per the header above, the preceding hdb_nodes scan warms it before these
+			// point reads run, so this does not reproduce a genuine cache-miss Promise.
 			//
 			// restartNode waits for a genuinely new process (pid change) rather than for health alone:
 			// `restart` keeps answering the operations socket from the OUTGOING process for a moment, so
@@ -224,8 +228,7 @@ suite(
 				);
 			}
 
-			// (2) cluster_status must still report this node's own record after the cold restart
-			// (clusterStatus reads hdb_nodes for the self record; a Promise there omits node_name).
+			// (2) cluster_status must still report this node's own record after the cold restart.
 			for (const node of [nodeA, nodeB]) {
 				const status = await pollHealth(node);
 				ok(status.node_name, `cluster_status on ${node.hostname} is missing node_name after restart`);
@@ -256,9 +259,9 @@ suite(
 
 		// NOTE: a dedicated remove_node→add_node cycle test was dropped here. Removing a node's *leader*
 		// leaves it with a null self-record so it (correctly) disables replication and does not re-converge
-		// within the window — a remove_node re-subscription behavior orthogonal to the get() MaybePromise
-		// fix this suite guards (the cold-restart test above already exercises ensureThisNode /
-		// shouldReplicateFromNode / cluster_status on a cold cache). add_node itself is covered by the
-		// `before` hook and by replicationReconnect.test.mjs / replicationTopology.test.mjs.
+		// within the window — a remove_node re-subscription behavior orthogonal to the rolling-restart
+		// scenario this suite exercises (ensureThisNode / shouldReplicateFromNode / cluster_status on a
+		// cold cache). add_node itself is covered by the `before` hook and by
+		// replicationReconnect.test.mjs / replicationTopology.test.mjs.
 	}
 );
