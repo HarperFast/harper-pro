@@ -63,7 +63,7 @@ export function readHostCounters() {
 	const cpu =
 		stat
 			.match(/^cpu\s+(.*)$/m)?.[1]
-			.trim()
+			?.trim()
 			.split(/\s+/)
 			.map(Number) ?? [];
 	const [, , , idle = 0, iowait = 0, , , steal = 0] = cpu;
