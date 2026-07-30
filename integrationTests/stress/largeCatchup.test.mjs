@@ -203,7 +203,10 @@ if (!stressEnabled()) {
 		// A window with secs !== RATE_WINDOW_SECS is partial (the trailing remainder); tag its
 		// actual duration so it isn't read as a sustained per-180s rate.
 		const profile = windows
-			.map((w) => `${w.toSecs.toFixed(0)}s:${w.mbps.toFixed(1)}${w.secs !== RATE_WINDOW_SECS ? `(${w.secs.toFixed(0)}s)` : ''}`)
+			.map(
+				(w) =>
+					`${w.toSecs.toFixed(0)}s:${w.mbps.toFixed(1)}${w.secs !== RATE_WINDOW_SECS ? `(${w.secs.toFixed(0)}s)` : ''}`
+			)
 			.join(' ');
 		return (
 			`per-${RATE_WINDOW_SECS}s MB/s [${profile}] peak=${peakMBps.toFixed(1)} ` +
