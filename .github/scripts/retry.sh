@@ -5,6 +5,10 @@
 # Usage: retry.sh <label-for-log-lines> -- <command> [args...]
 set -euo pipefail
 
+if [ "$#" -eq 0 ]; then
+  echo "::error::retry.sh: usage: retry.sh <label> [--] <command> [args...]"
+  exit 1
+fi
 label=$1
 shift
 if [ "${1:-}" = '--' ]; then
