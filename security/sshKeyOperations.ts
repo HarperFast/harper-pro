@@ -198,6 +198,14 @@ export async function addSSHKey(
 		throw new ClientError('Provide either `key` or `generate: true`, not both.');
 	}
 
+	// Reject a duplicate name BEFORE minting anything. With `generate: true` a taken name means the add
+	// is already doomed, so generating first would spawn ssh-keygen and write throwaway private-key
+	// material to a temp file for a request guaranteed to throw below.
+	const { filePath, configFile, knownHostsFile } = getSSHPaths(req.name);
+	if (await exists(filePath)) {
+		throw new ClientError('Key already exists. Use update_ssh_key or delete_ssh_key and then add_ssh_key');
+	}
+
 	// With `generate: true`, mint the keypair here so the private key never leaves the cluster; the
 	// public half is returned for the caller to register (e.g. a GitHub deploy key). The minted key
 	// then flows through the same seal-at-rest + replicate path (sealSSHKey) as a supplied one.
@@ -212,13 +220,6 @@ export async function addSSHKey(
 	const { name, key, host, hostname, known_hosts } = req;
 	if (!key) throw new ClientError('add_ssh_key requires `key`, or `generate: true` to mint one');
 	harperLogger?.trace('adding ssh key', name);
-
-	const { filePath, configFile, knownHostsFile } = getSSHPaths(name);
-
-	// Check if the key already exists
-	if (await exists(filePath)) {
-		throw new ClientError('Key already exists. Use update_ssh_key or delete_ssh_key and then add_ssh_key');
-	}
 
 	// Seal before anything durable or replicated happens, and replicate the envelope rather than
 	// the plaintext the caller supplied.
