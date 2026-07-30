@@ -643,7 +643,7 @@ export function subscribeToNode(request: any) {
 		let subscriptionToTable = databaseSubscriptions.get(request.database);
 		if (!subscriptionToTable) {
 			// Wait for it to be created
-			logger.info('Waiting for subscription to database ' + request.database);
+			logger.info(`Waiting for subscription to database ${request.database}`);
 			subscriptionToTable = createPendingDatabaseSubscription(request.database);
 		}
 		const connectionStatus = { reused: false };
