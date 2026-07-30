@@ -767,19 +767,49 @@ type AwaitingReplication = {
 // forever against a peer that never sends another update.
 export let commitsAwaitingReplication: Map<string, Set<AwaitingReplication>>;
 
+/**
+ * Count peers that, per their last-known replicated-time shared status, have already applied
+ * `txnTime` for `databaseName` — i.e. confirmations that landed before a waiter for this write
+ * registered. `notifyConfirmedWaiters` only fires on the NEXT status update for a peer, so a
+ * peer that already crossed `txnTime` before we start waiting will never re-cross it — its ack
+ * would otherwise be silently missed and a fully-replicated write would time out anyway
+ * (see `createConfirmationWaiter`, called with this as `alreadyConfirmedCount`). Takes the map
+ * explicitly (mirrors `notifyConfirmedWaiters` taking `awaiting`) so it's unit-testable without
+ * the module's live `replicationConfirmationFloat64s` state.
+ */
+export function countAlreadyConfirmedPeers(
+	confirmationsByNode: Map<string, Map<string, Float64Array>>,
+	databaseName: string,
+	txnTime: number
+): number {
+	let count = 0;
+	for (const confirmationsForNode of confirmationsByNode.values()) {
+		const replicatedTime = confirmationsForNode.get(databaseName);
+		if (replicatedTime && replicatedTime[0] >= txnTime) count++;
+	}
+	return count;
+}
+
 // How long a `replicatedConfirmation` write waits for the requested number of peer acks before
 // giving up. Without a bound, a confirmation that never arrives (e.g. `replicateTo` naming a peer
 // that never applies this specific write, a peer that drops its connection mid-wait, or any other
 // gap between the requested count and what actually gets acked) hangs the request forever — the
 // promise below had no reject path at all (harper-pro#213).
 //
-// Floored at the configured blob timeout (default 900000ms, see REPLICATION_BLOBTIMEOUT in
-// replicationConnection.ts): a confirmation can legitimately be waiting on a large blob that is still
-// within its own supported transfer window, and a shorter default would reject that healthy, merely-
-// slow write as if it had failed. Not independently user-configurable yet — that needs a dedicated
-// CONFIG_PARAMS entry in core (getConfigValue only resolves keys registered in CONFIG_PARAM_MAP), left
-// as a follow-up; see the dispatch Findings for this fix.
-const REPLICATION_CONFIRMATION_TIMEOUT_MS = Math.max(60000, env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000);
+// Own default (900000ms), independent of REPLICATION_BLOBTIMEOUT: confirmation and blob transfer are
+// unrelated concerns, and this must not shrink just because an operator tunes blob timeout down for
+// reasons that have nothing to do with confirmation (e.g. failing fast on stalled blob transfers).
+// Not independently user-configurable yet — that needs a dedicated CONFIG_PARAMS entry in core
+// (getConfigValue only resolves keys registered in CONFIG_PARAM_MAP), left as a follow-up; see the
+// dispatch Findings for this fix.
+const REPLICATION_CONFIRMATION_DEFAULT_TIMEOUT_MS = 900000;
+// Still raised (never lowered) to at least the configured blob timeout: a confirmation can legitimately
+// be waiting on a large blob that is still within its own supported transfer window, and rejecting
+// sooner than that would fail a healthy, merely-slow write as if it had timed out.
+const REPLICATION_CONFIRMATION_TIMEOUT_MS = Math.max(
+	REPLICATION_CONFIRMATION_DEFAULT_TIMEOUT_MS,
+	env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 0
+);
 
 /**
  * Fire `onConfirm()` for every waiter in `awaiting` whose `txnTime` falls in `(lastTime, updatedTime]`.
@@ -810,10 +840,16 @@ export function createConfirmationWaiter(
 	databaseName: string,
 	txnTime: number,
 	confirmationCount: number,
-	timeoutMs: number = REPLICATION_CONFIRMATION_TIMEOUT_MS
+	timeoutMs: number = REPLICATION_CONFIRMATION_TIMEOUT_MS,
+	alreadyConfirmedCount: number = 0
 ): Promise<void> {
+	// Seeded (not just checked-and-early-returned) so the count-up-to-confirmationCount math below
+	// stays in one place. Computing alreadyConfirmedCount and adding `entry` to `awaiting` both happen
+	// synchronously in the caller's turn — with nothing awaited between them — so no peer ack can land
+	// in the gap; this is what closes the race, not just an optimization.
+	if (alreadyConfirmedCount >= confirmationCount) return Promise.resolve();
 	return new Promise((resolve, reject) => {
-		let count = 0;
+		let count = alreadyConfirmedCount;
 		const entry: AwaitingReplication = {
 			txnTime,
 			settled: false,
@@ -845,11 +881,39 @@ export function createConfirmationWaiter(
 	});
 }
 
+/**
+ * Filter `nodes` down to peers this node's own self-record actually replicates `databaseName` to —
+ * the pure core of `getReplicationRecipients`, extracted (mirroring `createConfirmationWaiter`'s
+ * extraction from its registration call below) so it's unit-testable without a live server/hdb_nodes.
+ * `nodes` typed `any[]` because `server.nodes` is typed against Server.ts's own (unexported) `Node`,
+ * distinct from this module's `Node` — the same cross-module friction other replication/ call sites
+ * already route around with `as any` (see `shouldReplicateFromNode` callers).
+ */
+export function filterReplicationRecipients(nodes: any[], selfReplicates: any, databaseName: string): any[] {
+	if (selfReplicates == null || selfReplicates === true) return nodes;
+	return nodes.filter((node) => routeEntriesIncludePeer(selfReplicates.sendsTo, node.name, databaseName));
+}
+
+/**
+ * The peers this node actually replicates `databaseName` to — used to bound `replicatedConfirmation`
+ * counts to what's actually reachable, rather than every node known to the cluster. Under a directional
+ * or sharded topology, `server.nodes` can include peers this node never sends `databaseName` to at all;
+ * a confirmationCount that fits within the full node count but exceeds this node's real recipient set
+ * is guaranteed to time out (harper-pro#633 review). Falls back to the full `server.nodes` list for the
+ * legacy full-mesh self-record (`true`, or an absent/unset one) — the common, non-directional case this
+ * previously handled correctly.
+ */
+function getReplicationRecipients(databaseName: string) {
+	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
+	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
+}
+
 replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void> => {
-	if (confirmationCount > server.nodes.length) {
+	const recipients = getReplicationRecipients(databaseName);
+	if (confirmationCount > recipients.length) {
 		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
 		throw new ClientError(
-			`Cannot confirm replication to more nodes (${confirmationCount}) than are in the network (${server.nodes.length} nodes: ${server.nodes.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
+			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
 		);
 	}
 	if (!commitsAwaitingReplication) {
@@ -861,7 +925,14 @@ replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void
 		awaiting = new Set();
 		commitsAwaitingReplication.set(databaseName, awaiting);
 	}
-	return createConfirmationWaiter(awaiting, databaseName, txnTime, confirmationCount);
+	return createConfirmationWaiter(
+		awaiting,
+		databaseName,
+		txnTime,
+		confirmationCount,
+		undefined,
+		countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime)
+	);
 });
 // Per-node confirmation watchers. Previously the per-node-update callback below called
 // forEachReplicatedDatabase and discarded the returned remove handle, so every hdb_nodes

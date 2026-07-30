@@ -27,7 +27,12 @@
  */
 
 import { expect } from 'chai';
-import { createConfirmationWaiter, notifyConfirmedWaiters } from '#src/replication/knownNodes';
+import {
+	createConfirmationWaiter,
+	notifyConfirmedWaiters,
+	countAlreadyConfirmedPeers,
+	filterReplicationRecipients,
+} from '#src/replication/knownNodes';
 
 describe('createConfirmationWaiter', () => {
 	it('resolves once confirmationCount confirmations land, and is immediately removed from awaiting', async () => {
@@ -159,5 +164,95 @@ describe('createConfirmationWaiter', () => {
 			await createConfirmationWaiter(awaiting, 'data', 100 + i, 1, 10).catch(() => {});
 		}
 		expect(awaiting.size).to.equal(0);
+	});
+
+	// harper-pro#633 review: a peer can ack (advance its shared replicated-time position) before the
+	// waiter for that write registers — notifyConfirmedWaiters only fires on a peer's NEXT status
+	// update, so an ack that already landed would otherwise never be credited, and a fully-replicated
+	// write would time out anyway. alreadyConfirmedCount seeds the waiter with confirmations that were
+	// already visible at registration time, closing that gap.
+	describe('alreadyConfirmedCount (pre-registration confirmations)', () => {
+		it('resolves immediately without registering an entry when already fully confirmed', async () => {
+			const awaiting = new Set();
+			await createConfirmationWaiter(awaiting, 'data', 100, 2, 5000, 2);
+			expect(awaiting.size).to.equal(0);
+		});
+
+		it('resolves immediately when already-confirmed count exceeds what was requested', async () => {
+			const awaiting = new Set();
+			await createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, 3);
+			expect(awaiting.size).to.equal(0);
+		});
+
+		it('seeds the count so only the remaining confirmations are needed', async () => {
+			const awaiting = new Set();
+			const promise = createConfirmationWaiter(awaiting, 'data', 100, 3, 5000, 2);
+			expect(awaiting.size).to.equal(1);
+			notifyConfirmedWaiters(awaiting, 0, 200); // the one remaining peer acks
+			await promise;
+			expect(awaiting.size).to.equal(0);
+		});
+
+		it('reflects the seeded count in the timeout error message if the rest never arrive', async () => {
+			const awaiting = new Set();
+			const promise = createConfirmationWaiter(awaiting, 'data', 100, 3, 20, 2);
+			let error;
+			try {
+				await promise;
+			} catch (err) {
+				error = err;
+			}
+			expect(error.message).to.include('received 2');
+		});
+
+		it('defaults to 0 (no behavior change) when not provided', async () => {
+			const awaiting = new Set();
+			const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000);
+			expect(awaiting.size).to.equal(1);
+			notifyConfirmedWaiters(awaiting, 0, 200);
+			await promise;
+		});
+	});
+});
+
+describe('countAlreadyConfirmedPeers', () => {
+	it('counts peers whose last-known replicated position already reached txnTime', () => {
+		const confirmationsByNode = new Map([
+			['peer1', new Map([['data', Float64Array.of(150)]])],
+			['peer2', new Map([['data', Float64Array.of(100)]])],
+			['peer3', new Map([['data', Float64Array.of(50)]])],
+		]);
+		expect(countAlreadyConfirmedPeers(confirmationsByNode, 'data', 100)).to.equal(2); // peer1, peer2 (>=)
+	});
+
+	it('ignores peers with no tracked status for this database', () => {
+		const confirmationsByNode = new Map([['peer1', new Map([['other-db', Float64Array.of(150)]])]]);
+		expect(countAlreadyConfirmedPeers(confirmationsByNode, 'data', 100)).to.equal(0);
+	});
+
+	it('returns 0 when nothing is tracked yet', () => {
+		expect(countAlreadyConfirmedPeers(new Map(), 'data', 100)).to.equal(0);
+	});
+});
+
+describe('filterReplicationRecipients', () => {
+	const nodes = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
+
+	it('returns every node for the legacy full-mesh self-record (true)', () => {
+		expect(filterReplicationRecipients(nodes, true, 'data')).to.deep.equal(nodes);
+	});
+
+	it('returns every node when there is no self-record at all', () => {
+		expect(filterReplicationRecipients(nodes, undefined, 'data')).to.deep.equal(nodes);
+	});
+
+	it('restricts to peers named in a directional sendsTo list', () => {
+		const selfReplicates = { sendsTo: [{ target: 'a' }, { target: 'c' }] };
+		expect(filterReplicationRecipients(nodes, selfReplicates, 'data')).to.deep.equal([nodes[0], nodes[2]]);
+	});
+
+	it('honors a database-scoped sendsTo entry', () => {
+		const selfReplicates = { sendsTo: [{ target: 'a', database: 'other-db' }] };
+		expect(filterReplicationRecipients(nodes, selfReplicates, 'data')).to.deep.equal([]);
 	});
 });
