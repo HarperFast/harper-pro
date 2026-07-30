@@ -135,6 +135,19 @@ if (!stressEnabled()) {
 			});
 			anchor = sample;
 		}
+		const lastSample = progress[progress.length - 1];
+		if (anchor !== lastSample) {
+			// Trailing partial window — on a timeout run this is the most recent, most
+			// decision-relevant data (still decelerating vs. climbing out); don't drop it.
+			const secs = (lastSample.t - anchor.t) / 1000;
+			if (secs > 0) {
+				windows.push({
+					toSecs: (lastSample.t - progress[0].t) / 1000,
+					mbps: toMBps(lastSample.count - anchor.count, secs),
+					secs,
+				});
+			}
+		}
 		const peakMBps = windows.reduce((max, w) => Math.max(max, w.mbps), 0);
 		// Wall-clock spent below the pace that can finish in budget — the "stall-bound" measure.
 		const slowSecs = windows.reduce((sum, w) => sum + (w.mbps < REQUIRED_MBPS ? w.secs : 0), 0);

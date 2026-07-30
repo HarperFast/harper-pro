@@ -20,8 +20,9 @@
  *   That guard is `unitTests/replication/selfNodeReplicates.test.mjs` and
  *   `unitTests/replication/readNodeRowSync.test.mjs`, which inject a Promise-returning `get()`
  *   directly and fail deterministically when the `getSync` call sites regress. This file cannot:
- *   replication startup does a full `hdb_nodes` SCAN (rebuildKnownNodes) before any point read, which
- *   warms the block holding the node rows, so the subsequent point read hits the cache and returns
+ *   replication startup does a full `hdb_nodes` SCAN (`subscribeToNodeUpdates()` -> `scanNodesForSubscription()`,
+ *   `replication/knownNodes.ts:528`) before any point read, which warms the block holding the node rows,
+ *   so the subsequent point read hits the cache and returns
  *   synchronously even on a stone-cold restart. Verified by mutation — reverting `selfNodeReplicates`
  *   and `readNodeRowSync` to plain `get()` leaves this suite green while the two unit tests fail.
  *   Reproducing a genuine point-read miss here would need `hdb_nodes` grown past the block cache,
