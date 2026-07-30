@@ -9,7 +9,7 @@
 
 import { equal } from 'node:assert';
 import { readFile } from 'node:fs/promises';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -145,6 +145,13 @@ export function hostCounterDelta(before, after) {
  * Harper node — it reads /proc directly — so it keeps running across node
  * restarts. `window()` returns the rates since the previous window() call (or
  * since start), which is what a poll loop wants to print alongside its progress.
+ *
+ * `window()` reads its own on-demand sample rather than pushing into `samples` —
+ * `samples` is the timer's uniformly-spaced series that summariseHostSamples()
+ * walks pairwise to find peaks; interleaving an on-demand reading (called from a
+ * poll loop running close to, but not synchronized with, the same interval) can
+ * land two entries milliseconds apart, and dividing a real counter delta by that
+ * near-zero elapsed time manufactures a spurious peak rate.
  */
 export function sampleHostCounters(opts = {}) {
 	const interval = opts.intervalMs ?? 5000;
@@ -162,7 +169,6 @@ export function sampleHostCounters(opts = {}) {
 		window() {
 			const now = readHostCounters();
 			if (!now) return null;
-			samples.push(now);
 			const delta = hostCounterDelta(windowStart, now);
 			windowStart = now;
 			return delta;
@@ -240,6 +246,25 @@ export function writeStressMetrics(name, metrics) {
 		return path;
 	} catch {
 		return null;
+	}
+}
+
+/**
+ * Remove any previously-written metrics file for `name` before a run starts. Self-hosted
+ * runners reuse the same workspace across runs (unlike ephemeral GH-hosted ones), so the
+ * fixed path in writeStressMetrics() persists between them: a run that crashes before
+ * reaching writeStressMetrics — e.g. during setup, or an early OOM/wedge — would otherwise
+ * leave the *previous* run's metrics file in place, and CI uploads it as if it were this
+ * run's data. Call this at the start of a suite so an early failure uploads no file rather
+ * than a stale one that reads as a fresh success.
+ */
+export function clearStressMetrics(name) {
+	const dir = process.env.HARPER_INTEGRATION_TEST_LOG_DIR;
+	if (!dir) return;
+	try {
+		rmSync(join(dir, `${name}-metrics.json`), { force: true });
+	} catch {
+		// Best effort — a failure here must never fail the test.
 	}
 }
 
