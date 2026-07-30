@@ -161,10 +161,13 @@ if (!stressEnabled()) {
 		// CATCHUP_GRACE_SECS (the assumed reconnect budget) and anchored on the LAST zero
 		// sample rather than the first non-zero one, so a stall that starts at zero and never
 		// leaves it is still measured as a real (slow) window instead of being discarded.
+		// Look ahead (progress[start + 1]), not at the current sample: stopping on
+		// progress[start].count === 0 would land ON the first non-zero sample (one past the
+		// last zero), making it the anchor and subtracting that whole burst out of window 1.
 		let start = 0;
 		while (
 			start < progress.length - 1 &&
-			progress[start].count === 0 &&
+			progress[start + 1].count === 0 &&
 			progress[start + 1].t - progress[0].t <= CATCHUP_GRACE_SECS * 1000
 		)
 			start++;

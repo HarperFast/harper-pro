@@ -111,8 +111,18 @@ async function describeReplication(node) {
 }
 
 suite(
-	'replication survives RocksDB get() cache-miss Promises (small block cache + restart)',
-	{ timeout: 360000 },
+	'replication recovers from a rolling restart (small block cache, cold-cache reconnect)',
+	// Sized above the AGGREGATE of the test body's own retry budgets, not just its typical
+	// runtime (~5s). If those budgets sum to more than this, a genuinely slow-but-working CI
+	// runner hits the suite timeout before any individual helper's own (more specific) timeout
+	// message fires — and node:test abandons the body in place rather than aborting it, so
+	// `after()` runs concurrently with an in-flight restartNode/pollHealth and can miss killing
+	// the process that comes up after it reads the (stale) pid file, leaking a live Harper and
+	// its ports into the rest of the CI job. Worst case here: before() ~120s (add_node +
+	// waitForRecord) + body ~700s (2x restartNode 60s + pollHealth 120s, then 2x pollHealth
+	// 120s, then waitForRecord 10s + 90s) + after() ~60s (stopNodeProcess + teardownHarper) —
+	// comfortably under 1200s.
+	{ timeout: 1200000 },
 	(ctx) => {
 		before(async () => {
 			const hostnameA = await getNextAvailableLoopbackAddress();
@@ -210,7 +220,7 @@ suite(
 				const log = await readLog(node);
 				ok(
 					!/Disabling replication/.test(log),
-					`node ${node.hostname} logged "Disabling replication" after a cold-cache restart (get() Promise self-row)`
+					`node ${node.hostname} logged "Disabling replication" after a routine cold-cache restart`
 				);
 			}
 
@@ -221,8 +231,8 @@ suite(
 				ok(status.node_name, `cluster_status on ${node.hostname} is missing node_name after restart`);
 			}
 
-			// (3) A write made AFTER the cold restart must converge to B. If a cold-cache get() Promise
-			// silently disabled replication / unsubscribed the peer, this never arrives.
+			// (3) A write made AFTER the cold restart must converge to B. If the restart left
+			// replication silently disabled / the peer unsubscribed, this never arrives.
 			await sendOperation(nodeA, {
 				operation: 'upsert',
 				database: 'data',
