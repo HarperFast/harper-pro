@@ -10,6 +10,10 @@ shift
 if [ "${1:-}" = '--' ]; then
   shift
 fi
+if [ "$#" -eq 0 ]; then
+  echo "::error::retry.sh: no command given for '${label}'"
+  exit 1
+fi
 
 n=0
 until "$@"; do
