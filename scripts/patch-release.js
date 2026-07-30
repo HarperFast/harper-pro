@@ -136,6 +136,12 @@ function buildCmFailureResult({ pushed, coreVersion, proVersion, error }) {
 	};
 }
 
+// ── Validate args ─────────────────────────────────────────────────────────────
+if (VERSION_NAME && VERSION_NAME !== 'stable' && VERSION_NAME !== 'next') {
+	err(`\n  Error: --version-name "${VERSION_NAME}" is invalid. Expected "stable" or "next".`);
+	process.exit(1);
+}
+
 // ── Shell helpers ─────────────────────────────────────────────────────────────
 function run(cmd, opts = {}) {
 	return execSync(cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...opts }).trim();
@@ -433,16 +439,14 @@ async function main() {
 	// sending a prerelease there would put a beta in front of production traffic;
 	// prereleases belong in `next`. Derive it rather than hardcode, and let
 	// --version-name override for the rare deliberate mismatch.
-	const versionName = VERSION_NAME ?? (semver.prerelease(plainVersion) ? 'next' : 'stable');
+	const derivedVersionName = semver.prerelease(plainVersion) ? 'next' : 'stable';
+	const versionName = VERSION_NAME ?? derivedVersionName;
 	const cmCmd =
 		`gh workflow run release-to-environments.yaml --repo HarperFast/central-manager ` +
 		`-f version=${plainVersion} -f version_name=${versionName} -f update_environments=all`;
 	log(`  Command: ${C.dim}${cmCmd}${C.reset}`);
-	if (VERSION_NAME) {
-		warn(
-			`  version_name forced to "${VERSION_NAME}" via --version-name (derived would be ` +
-				`"${semver.prerelease(plainVersion) ? 'next' : 'stable'}").`
-		);
+	if (VERSION_NAME && VERSION_NAME !== derivedVersionName) {
+		warn(`  version_name forced to "${VERSION_NAME}" via --version-name (derived would be "${derivedVersionName}").`);
 	}
 	// In --yes mode CM deploy is opt-in (pass --cm-trigger); interactive default-YES on EOF was a deploy footgun.
 	const autoDeploy = resolveDeployAnswer({ cmTrigger: CM_TRIGGER, yesMode: YES_MODE });
