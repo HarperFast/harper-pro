@@ -57,18 +57,7 @@ jobs:
           node-version: ${{ inputs.node-version || '24' }}
           package-manager-cache: false
       - name: Install dependencies
-        run: |
-          n=0
-          until npm install; do
-            n=$((n + 1))
-            if [ "$n" -ge 4 ]; then
-              echo "::error::npm install failed after $n attempts"
-              exit 1
-            fi
-            delay=$((n * 30))
-            echo "npm install failed (attempt $n/4); retrying in ${delay}s..."
-            sleep "$delay"
-          done
+        run: .github/scripts/retry.sh "npm install" -- npm install
       - name: Build
         run: npm run build || true
       - name: Upload build artifacts
@@ -123,18 +112,7 @@ jobs:
       # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
       # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
       - name: Build re2 native binary
-        run: |
-          n=0
-          until npm rebuild re2; do
-            n=$((n + 1))
-            if [ "$n" -ge 4 ]; then
-              echo "::error::npm rebuild re2 failed after $n attempts"
-              exit 1
-            fi
-            delay=$((n * 30))
-            echo "npm rebuild re2 failed (attempt $n/4); retrying in ${delay}s..."
-            sleep "$delay"
-          done
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
       - name: Run ${{ matrix.test.name }}
         env:
           HARPER_RUN_STRESS_TESTS: '1'

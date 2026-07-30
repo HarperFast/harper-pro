@@ -68,18 +68,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install dependencies
-        run: |
-          n=0
-          until npm install; do
-            n=$((n + 1))
-            if [ "$n" -ge 4 ]; then
-              echo "::error::npm install failed after $n attempts"
-              exit 1
-            fi
-            delay=$((n * 30))
-            echo "npm install failed (attempt $n/4); retrying in ${delay}s..."
-            sleep "$delay"
-          done
+        run: .github/scripts/retry.sh "npm install" -- npm install
 
       - name: Build
         run: npm run build || true # we currently have type errors so just ignore that
@@ -134,33 +123,12 @@ jobs:
       # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
       # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
       - name: Build re2 native binary
-        run: |
-          n=0
-          until npm rebuild re2; do
-            n=$((n + 1))
-            if [ "$n" -ge 4 ]; then
-              echo "::error::npm rebuild re2 failed after $n attempts"
-              exit 1
-            fi
-            delay=$((n * 30))
-            echo "npm rebuild re2 failed (attempt $n/4); retrying in ${delay}s..."
-            sleep "$delay"
-          done
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
 
       - name: Install harperdb@4 for legacy tests
         run: |
           mkdir -p /tmp/harperdb-legacy
-          n=0
-          until npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4; do
-            n=$((n + 1))
-            if [ "$n" -ge 4 ]; then
-              echo "::error::npm install harperdb@4 failed after $n attempts"
-              exit 1
-            fi
-            delay=$((n * 30))
-            echo "npm install harperdb@4 failed (attempt $n/4); retrying in ${delay}s..."
-            sleep "$delay"
-          done
+          .github/scripts/retry.sh "npm install harperdb@4" -- npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
 
       # A zero-match glob makes node:test's run() silently collect no tests and exit 0
       # (a false green). Fail loudly instead if the extglob exclusion ever stops expanding.
@@ -234,33 +202,12 @@ jobs:
       # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
       # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
       - name: Build re2 native binary
-        run: |
-          n=0
-          until npm rebuild re2; do
-            n=$((n + 1))
-            if [ "$n" -ge 4 ]; then
-              echo "::error::npm rebuild re2 failed after $n attempts"
-              exit 1
-            fi
-            delay=$((n * 30))
-            echo "npm rebuild re2 failed (attempt $n/4); retrying in ${delay}s..."
-            sleep "$delay"
-          done
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
 
       - name: Install harperdb@4 for legacy tests
         run: |
           mkdir -p /tmp/harperdb-legacy
-          n=0
-          until npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4; do
-            n=$((n + 1))
-            if [ "$n" -ge 4 ]; then
-              echo "::error::npm install harperdb@4 failed after $n attempts"
-              exit 1
-            fi
-            delay=$((n * 30))
-            echo "npm install harperdb@4 failed (attempt $n/4); retrying in ${delay}s..."
-            sleep "$delay"
-          done
+          .github/scripts/retry.sh "npm install harperdb@4" -- npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
 
       - name: Guard against empty cluster test glob
         env:
