@@ -28,6 +28,14 @@
  *   --label <name>    PR label to filter on (default: patch)
  *   --bump <type>     npm version bump: patch|minor|major (default: patch)
  *   --dry-run         Preview without making changes
+ *   --yes             Non-interactive: auto-confirm all prompts. CM deploy (prompt 2) defaults to
+ *                     NO in this mode — pass --cm-trigger to opt in. This is intentional: in
+ *                     interactive mode prompt 2 defaults YES on EOF, which would silently deploy;
+ *                     non-interactive mode inverts that default to be safe.
+ *   --cm-trigger      Trigger CM release-to-environments. With --yes: opt-in deploy. Without --yes:
+ *                     skips prompt 2 and forces yes.
+ *   --json            Print a final "RESULT: {...}" JSON line for machine parsing. Also emits on
+ *                     fatal error paths: RESULT: {"ok":false,"error":"..."}.
  */
 
 const { execSync, spawnSync } = require('child_process');
@@ -48,6 +56,9 @@ const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major | prere
 // Needed for prerelease-line transitions semver.inc can't express in one step, e.g.
 // alpha.N → beta.1 (`--set-version 5.2.0-beta.1`).
 const SET_VERSION = getArg('--set-version', null);
+const YES_MODE = argv.includes('--yes');
+const CM_TRIGGER = argv.includes('--cm-trigger');
+const JSON_OUTPUT = argv.includes('--json');
 
 function getArg(flag, def) {
 	const i = argv.indexOf(flag);
@@ -70,6 +81,12 @@ const warn = (m) => console.warn(C.yellow + m + C.reset);
 const err = (m) => console.error(C.red + m + C.reset);
 const info = (m) => console.log(C.cyan + m + C.reset);
 const header = (m) => log(`\n${C.bold}${C.cyan}${'━'.repeat(60)}\n  ${m}\n${'━'.repeat(60)}${C.reset}`);
+
+function die(message, code = 1) {
+	err(message);
+	if (JSON_OUTPUT) process.stdout.write('RESULT: ' + JSON.stringify({ok: false, error: message}) + '\n');
+	process.exit(code);
+}
 
 // ── Shell helpers ─────────────────────────────────────────────────────────────
 function run(cmd, opts = {}) {
@@ -152,8 +169,7 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 	run('git fetch origin --tags');
 
 	if (!hasBranch(branch)) {
-		err(`  Release branch "${branch}" not found.`);
-		process.exit(1);
+		die(`  Release branch "${branch}" not found.`);
 	}
 
 	const last = getLastRelease(branch);
@@ -227,8 +243,7 @@ async function main() {
 	try {
 		run('gh --version');
 	} catch {
-		err('gh CLI not found (https://cli.github.com)');
-		process.exit(1);
+		die('gh CLI not found (https://cli.github.com)');
 	}
 
 	const harperProRoot = path.resolve(__dirname, '..');
@@ -267,21 +282,16 @@ async function main() {
 	if (SET_VERSION) {
 		target = semver.valid(SET_VERSION);
 		if (!target) {
-			err(`--set-version "${SET_VERSION}" is not a valid semver`);
-			process.exit(1);
+			die(`--set-version "${SET_VERSION}" is not a valid semver`);
 		}
 		if (semver.compare(target, coreCurrent) <= 0 || semver.compare(target, proCurrent) <= 0) {
-			err(
-				`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`
-			);
-			process.exit(1);
+			die(`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`);
 		}
 		if (
 			runSafe(`git rev-parse -q --verify "refs/tags/v${target}"`).code === 0 ||
 			runSafe(`git -C "${corePath}" rev-parse -q --verify "refs/tags/v${target}"`).code === 0
 		) {
-			err(`--set-version "${SET_VERSION}": tag v${target} already exists`);
-			process.exit(1);
+			die(`--set-version "${SET_VERSION}": tag v${target} already exists`);
 		}
 	}
 
@@ -297,12 +307,14 @@ async function main() {
 	// ── Steps 1–5: version bump, sync, tag, push (skipped in dry-run) ────────────
 	let proVersion;
 	let coreVersion = null;
+	let pushed = false;
+	let cmTriggered = false;
 	if (DRY_RUN) {
 		warn('\n[dry-run] Skipping version bump, sync, and push.');
 		// Use a placeholder so Step 6 can still show the CM command it would run.
 		proVersion = `v${target}`;
 	} else {
-		const confirm = await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
+		const confirm = YES_MODE ? 'y' : await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
 		if (confirm.toLowerCase() !== 'y') {
 			warn('Aborted.');
 			return;
@@ -336,8 +348,7 @@ async function main() {
 				env: { ...process.env, NO_USE_GIT: 'true', IGNORE_PACKAGE_JSON_DIFF: 'true' },
 			});
 		} catch (e) {
-			err(`sync-core.sh failed (exit ${e.status})`);
-			process.exit(e.status ?? 1);
+			die(`sync-core.sh failed (exit ${e.status})`, e.status ?? 1);
 		}
 
 		// Stage core submodule ref + synced deps so they roll into the release commit
@@ -361,6 +372,7 @@ async function main() {
 		log(`  Pushing harper-pro ${RELEASE_BRANCH} ${proVersion}...`);
 		execSync(`git -C "${harperProRoot}" push origin "${RELEASE_BRANCH}" "${proVersion}"`, { stdio: 'inherit' });
 		ok('\nTags pushed.');
+		pushed = true;
 	}
 
 	// ── Step 6: trigger CM release-to-environments ─────────────────────────────
@@ -370,7 +382,15 @@ async function main() {
 		`gh workflow run release-to-environments.yaml --repo HarperFast/central-manager ` +
 		`-f version=${plainVersion} -f version_name=stable -f update_environments=all`;
 	log(`  Command: ${C.dim}${cmCmd}${C.reset}`);
-	const deploy = await prompt(`\nTrigger CM release-to-environments (version_name=stable)? [Y/n]: `);
+	// In --yes mode CM deploy is opt-in (pass --cm-trigger); interactive default-YES on EOF was a deploy footgun.
+	let deploy;
+	if (CM_TRIGGER) {
+		deploy = 'y';
+	} else if (YES_MODE) {
+		deploy = 'n';
+	} else {
+		deploy = await prompt(`\nTrigger CM release-to-environments (version_name=stable)? [Y/n]: `);
+	}
 	if (deploy.toLowerCase() !== 'n') {
 		log('\nTriggering CM workflow...');
 		if (DRY_RUN) {
@@ -378,6 +398,7 @@ async function main() {
 		} else {
 			try {
 				execSync(cmCmd, { stdio: 'inherit' });
+				cmTriggered = true;
 				ok('  ✅ Workflow triggered — https://github.com/HarperFast/central-manager/actions');
 			} catch (e) {
 				err('  ❌ Failed to trigger workflow: ' + e.message);
@@ -391,17 +412,29 @@ async function main() {
 	// ── Step 7: offer to return to original branches ───────────────────────────
 	process.chdir(corePath);
 	if (coreOriginalBranch && coreOriginalBranch !== CORE_RELEASE_BRANCH) {
-		const back = await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
+		const back = YES_MODE ? 'y' : await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
 		if (back.toLowerCase() !== 'n') run(`git checkout "${coreOriginalBranch}"`);
 	}
 	process.chdir(harperProRoot);
 	if (harperProOriginalBranch && harperProOriginalBranch !== RELEASE_BRANCH) {
-		const back = await prompt(`Return harper-pro to "${harperProOriginalBranch}"? [Y/n]: `);
+		const back = YES_MODE ? 'y' : await prompt(`Return harper-pro to "${harperProOriginalBranch}"? [Y/n]: `);
 		if (back.toLowerCase() !== 'n') run(`git checkout "${harperProOriginalBranch}"`);
+	}
+
+	if (JSON_OUTPUT) {
+		process.stdout.write('RESULT: ' + JSON.stringify({
+			ok: true,
+			target: proVersion,
+			coreVersion: coreVersion ?? null,
+			proVersion,
+			coreBumped: coreVersion !== null,
+			pushed,
+			cmTriggered,
+			dryRun: DRY_RUN,
+		}) + '\n');
 	}
 }
 
 main().catch((e) => {
-	err('Fatal: ' + e.message);
-	process.exit(1);
+	die('Fatal: ' + e.message);
 });
