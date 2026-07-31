@@ -76,7 +76,12 @@ WORKDIR /home/harperdb
 USER harperdb
 
 # Install pnpm
-RUN wget -qO- https://get.pnpm.io/install.sh | ENV="$HOME/.bashrc" SHELL="$(which bash)" bash -
+RUN <<EOF
+  set -e
+  wget -qO /tmp/install-pnpm.sh https://get.pnpm.io/install.sh
+  ENV="$HOME/.bashrc" SHELL="$(which bash)" bash /tmp/install-pnpm.sh
+  rm /tmp/install-pnpm.sh
+EOF
 
 COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 
