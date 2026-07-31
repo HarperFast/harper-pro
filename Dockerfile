@@ -24,6 +24,7 @@ FROM ${RUN_IMAGE} AS run
 
 # Change node user to harper
 RUN <<-EOF
+  set -e
   mkdir -p /home/harperdb
   usermod -d /home/harperdb -l harperdb node
   groupmod -n harperdb node
@@ -39,7 +40,12 @@ WORKDIR /home/harperdb
 USER harperdb
 
 # Install pnpm
-RUN wget -qO- https://get.pnpm.io/install.sh | ENV="$HOME/.bashrc" SHELL="$(which bash)" bash -
+RUN <<EOF
+  set -e
+  wget -qO /tmp/install-pnpm.sh https://get.pnpm.io/install.sh
+  ENV="$HOME/.bashrc" SHELL="$(which bash)" bash /tmp/install-pnpm.sh
+  rm /tmp/install-pnpm.sh
+EOF
 
 COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 
@@ -47,9 +53,14 @@ COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 ENV NPM_CONFIG_PREFIX=/home/harperdb/.npm-global
 ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 
-# Install Harper Pro globally
+# Install Harper Pro globally. Without `set -e` a failed install is masked by the
+# exit status of the cleanup commands that follow it, and `harper version` asserts
+# the installed bin actually resolves and runs: v5.2.0-beta.4 published an image
+# with no harper in it off a green build when npm install hit a transient ETARGET.
 RUN <<-EOF
+  set -e
   npm install --global harperfast-harper-pro-*.tgz
+  harper version
   rm harperfast-harper-pro-*.tgz
   mkdir -p /home/harperdb/harper
   chown harperdb:harperdb /home/harperdb/harper

@@ -1,6 +1,23 @@
 ARG NODE_BUILD_VERSION=24
 ARG NODE_VERSION=24
 
+# Runtime base. CUDA 13.x supports Turing (SM 7.5 / T4) — Turing is the minimum
+# architecture in the 13.x line (Maxwell/Pascal/Volta were dropped). The 13.x
+# runtime requires an R580+ host driver; on hosts pinned to an older driver
+# branch, override with a CUDA 12.x cudnn-runtime base, e.g.:
+#   --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+#
+# Keep the ubuntu24.04 variant (glibc 2.39) whichever CUDA line you pick. This
+# image bundles uWebSockets.js (copied from the build stage below), whose
+# prebuilt Linux binaries link against GLIBC_2.38 — ubuntu22.04 ships glibc 2.35
+# and the addon fails to load there, the same failure that put the standard
+# image on Debian trixie. See the note at the top of ./Dockerfile.
+#
+# Must stay above the first FROM: an ARG referenced by a FROM has to be declared
+# in the global scope, before any stage. Declared after a FROM it belongs to that
+# stage, and the later FROM expands it to an empty base name.
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04
+
 FROM docker.io/node:${NODE_BUILD_VERSION} AS build
 
 WORKDIR /usr/src/harper-pro
@@ -9,12 +26,6 @@ COPY . .
 
 RUN env NO_USE_GIT=true npm run package
 
-# Runtime base. CUDA 13.x supports Turing (SM 7.5 / T4) — Turing is the minimum
-# architecture in the 13.x line (Maxwell/Pascal/Volta were dropped). The 13.x
-# runtime requires an R580+ host driver; on hosts pinned to an older driver
-# branch, override with a CUDA 12.x cudnn-runtime base, e.g.:
-#   --build-arg CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:13.3.0-cudnn-runtime-ubuntu22.04
 FROM ${CUDA_RUNTIME_IMAGE} AS run
 
 ARG NODE_VERSION=24
@@ -27,6 +38,7 @@ USER root
 
 # Install Node.js via NodeSource plus required utilities
 RUN <<-EOF
+    set -e
     apt-get update
     apt-get install -y --no-install-recommends ca-certificates curl git gnupg libatomic1 wget zstd
     mkdir -p /etc/apt/keyrings
@@ -37,8 +49,23 @@ RUN <<-EOF
         | tee /etc/apt/sources.list.d/nodesource.list
     apt-get update
     apt-get install -y nodejs
-    groupadd --gid 1000 harperdb
-    useradd --uid 1000 --gid 1000 --home-dir /home/harperdb --shell /bin/bash --no-create-home harperdb
+    # harperdb must own uid/gid 1000 — existing deployments' data volumes are
+    # chowned to it — so reclaim the id from any incumbent rather than moving
+    # harperdb. Ubuntu 24.04 bases ship a default `ubuntu` user at 1000; 22.04
+    # bases ship none, and CUDA_RUNTIME_IMAGE is overridable, so handle both.
+    # Renaming (as ./Dockerfile does for node:*'s `node` user) keeps the id stable.
+    EXISTING_USER="$(getent passwd 1000 | cut -d: -f1)" || true
+    if [ -n "$EXISTING_USER" ]; then
+        EXISTING_GROUP="$(getent group 1000 | cut -d: -f1)" || true
+        usermod -d /home/harperdb -l harperdb "$EXISTING_USER"
+        if [ -n "$EXISTING_GROUP" ]; then
+            groupmod -n harperdb "$EXISTING_GROUP"
+        fi
+        rm -rf "/home/$EXISTING_USER"
+    else
+        groupadd --gid 1000 harperdb
+        useradd --uid 1000 --gid 1000 --home-dir /home/harperdb --shell /bin/bash --no-create-home harperdb
+    fi
     mkdir -p /home/harperdb
     chown harperdb:harperdb /home/harperdb
     rm -rf /var/lib/apt/lists/*
@@ -49,7 +76,12 @@ WORKDIR /home/harperdb
 USER harperdb
 
 # Install pnpm
-RUN wget -qO- https://get.pnpm.io/install.sh | ENV="$HOME/.bashrc" SHELL="$(which bash)" bash -
+RUN <<EOF
+  set -e
+  wget -qO /tmp/install-pnpm.sh https://get.pnpm.io/install.sh
+  ENV="$HOME/.bashrc" SHELL="$(which bash)" bash /tmp/install-pnpm.sh
+  rm /tmp/install-pnpm.sh
+EOF
 
 COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 
@@ -57,9 +89,12 @@ COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
 ENV NPM_CONFIG_PREFIX=/home/harperdb/.npm-global
 ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 
-# Install Harper Pro globally
+# Install Harper Pro globally. See Dockerfile for why `set -e` and the assertion
+# are load-bearing here.
 RUN <<-EOF
+  set -e
   npm install --global harperfast-harper-pro-*.tgz
+  harper version
   rm harperfast-harper-pro-*.tgz
   mkdir -p /home/harperdb/harper
   chown harperdb:harperdb /home/harperdb/harper
