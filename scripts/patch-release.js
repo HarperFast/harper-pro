@@ -88,15 +88,20 @@ const err = (m) => console.error(C.red + m + C.reset);
 const info = (m) => console.log(C.cyan + m + C.reset);
 const header = (m) => log(`\n${C.bold}${C.cyan}${'━'.repeat(60)}\n  ${m}\n${'━'.repeat(60)}${C.reset}`);
 
+// A plain process.stdout.write() races process.exit(): when stdout is a pipe (the standard
+// --json/dispatch setup), the write is async and exit() can tear the process down before it
+// flushes, dropping the RESULT line. A raw fd write via fs.writeSync is synchronous, so it's
+// guaranteed to land first. `fd` is overridable so tests can assert on the exact bytes written
+// without redirecting real stdout.
+function writeResult(result, fd = 1) {
+	writeSync(fd, 'RESULT: ' + JSON.stringify(result) + '\n');
+}
+
 function die(message, code = 1, extra = {}) {
 	err(message);
 	if (JSON_OUTPUT) {
-		// A plain process.stdout.write() here races process.exit(): when stdout is a
-		// pipe (the standard --json/dispatch setup), the write is async and exit() can
-		// tear the process down before it flushes, dropping the RESULT line. A raw fd
-		// write via fs.writeSync is synchronous, so it's guaranteed to land first.
 		const cleanMessage = typeof message === 'string' ? message.trim() : message;
-		writeSync(1, 'RESULT: ' + JSON.stringify({ ok: false, error: cleanMessage, ...extra }) + '\n');
+		writeResult({ ok: false, error: cleanMessage, ...extra });
 	}
 	process.exit(code);
 }
@@ -355,7 +360,7 @@ async function main() {
 			warn('Aborted.');
 			// Exit 0 (a human/--yes declined, nothing failed) but still emit a RESULT line
 			// under --json — otherwise a caller parsing stdout for completion gets nothing.
-			if (JSON_OUTPUT) writeSync(1, 'RESULT: ' + JSON.stringify(buildAbortedResult()) + '\n');
+			if (JSON_OUTPUT) writeResult(buildAbortedResult());
 			return;
 		}
 
@@ -432,6 +437,10 @@ async function main() {
 			: `\nTrigger CM release-to-environments (version_name=stable)? [Y/n]: `;
 		deploy = await prompt(promptText);
 	}
+	// Captured rather than thrown immediately: a requested-and-failed CM dispatch must still be
+	// terminal (see below), but dying here would skip Step 7's branch restore, leaving a reused
+	// dispatch worktree stuck on the release branch. die() is deferred until after Step 7.
+	let cmFailure = null;
 	if (deploy.toLowerCase() !== 'n') {
 		log('\nTriggering CM workflow...');
 		if (DRY_RUN) {
@@ -448,22 +457,18 @@ async function main() {
 				// and a dispatch caller can't distinguish "deploy skipped" from "deploy attempted
 				// and failed" — it would mark a requested deployment successful when it never started.
 				if (CM_TRIGGER) {
-					const { message, extra } = buildCmFailureResult({
-						pushed,
-						coreVersion,
-						proVersion,
-						error: e.message,
-					});
-					die(message, 1, extra);
+					cmFailure = buildCmFailureResult({ pushed, coreVersion, proVersion, error: e.message });
 				}
 			}
 		}
 	} else {
 		warn('  Skipped. Manually trigger release-to-environments with version_name=stable when ready.');
 	}
-	ok('\n✅ Done.');
+	if (!cmFailure) ok('\n✅ Done.');
 
 	// ── Step 7: offer to return to original branches ───────────────────────────
+	// Always runs, even after a requested CM-trigger failure above, so a reused dispatch
+	// worktree isn't left checked out on the release branch.
 	process.chdir(corePath);
 	if (coreOriginalBranch && coreOriginalBranch !== CORE_RELEASE_BRANCH) {
 		const back = YES_MODE ? 'y' : await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
@@ -475,22 +480,21 @@ async function main() {
 		if (back.toLowerCase() !== 'n') run(`git checkout "${harperProOriginalBranch}"`);
 	}
 
+	if (cmFailure) {
+		die(cmFailure.message, 1, cmFailure.extra);
+	}
+
 	if (JSON_OUTPUT) {
-		writeSync(
-			1,
-			'RESULT: ' +
-				JSON.stringify({
-					ok: true,
-					target: proVersion,
-					coreVersion: coreVersion ?? null,
-					proVersion,
-					coreBumped: coreVersion !== null,
-					pushed,
-					cmTriggered,
-					dryRun: DRY_RUN,
-				}) +
-				'\n'
-		);
+		writeResult({
+			ok: true,
+			target: proVersion,
+			coreVersion: coreVersion ?? null,
+			proVersion,
+			coreBumped: coreVersion !== null,
+			pushed,
+			cmTriggered,
+			dryRun: DRY_RUN,
+		});
 	}
 }
 
@@ -500,4 +504,4 @@ if (require.main === module) {
 	});
 }
 
-module.exports = { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult };
+module.exports = { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult, writeResult };
