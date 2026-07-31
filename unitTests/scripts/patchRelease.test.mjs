@@ -9,13 +9,15 @@
  * main() drives real git/gh state with no seams to stub.
  */
 import assert from 'node:assert/strict';
+import { closeSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 
 const require = createRequire(import.meta.url);
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
-const { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult } = require(
+const { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult, writeResult } = require(
 	join(root, 'scripts/patch-release.js')
 );
 
@@ -77,6 +79,31 @@ describe('patch-release.js non-interactive contract', function () {
 				error: 'network error',
 			});
 			assert.equal(extra.coreVersion, null);
+		});
+	});
+
+	describe('writeResult', function () {
+		// die()/the abort path/the success path all funnel through this one synchronous fd
+		// write to avoid the process.exit() truncation race on a piped stdout — exercise the
+		// actual write (via a real fd), not just the object it serializes.
+		let filePath;
+		let fd;
+
+		beforeEach(function () {
+			filePath = join(tmpdir(), `patch-release-result-${process.pid}-${Math.random().toString(36).slice(2)}.txt`);
+			fd = openSync(filePath, 'w');
+		});
+
+		afterEach(function () {
+			closeSync(fd);
+			rmSync(filePath, { force: true });
+		});
+
+		it('writes a single parsable "RESULT: {...}" line synchronously', function () {
+			writeResult({ ok: true, pushed: true }, fd);
+			const written = readFileSync(filePath, 'utf8');
+			assert.equal(written, 'RESULT: ' + JSON.stringify({ ok: true, pushed: true }) + '\n');
+			assert.deepEqual(JSON.parse(written.replace(/^RESULT: /, '')), { ok: true, pushed: true });
 		});
 	});
 });

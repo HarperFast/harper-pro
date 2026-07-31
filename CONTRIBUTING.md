@@ -45,6 +45,9 @@ node scripts/patch-release.js
 | `--label <name>` | `patch` | PR label to filter on |
 | `--bump <type>` | `patch` | npm version bump type: `patch`, `minor`, or `major` |
 | `--dry-run` | — | Preview all actions without making changes |
+| `--yes` | — | Non-interactive: auto-confirm all prompts. CM deploy defaults to skipped in this mode — pass `--cm-trigger` to opt in |
+| `--cm-trigger` | — | Request CM release-to-environments. With `--yes`, auto-confirms; without it, still prompts interactively |
+| `--json` | — | Print a final `RESULT: {...}` JSON line on stdout for machine parsing (success, abort, or fatal error) |
 
 **Example — preview what would be applied:**
 ```bash
