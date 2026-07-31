@@ -32,14 +32,20 @@
  *                     NO in this mode — pass --cm-trigger to opt in. This is intentional: in
  *                     interactive mode prompt 2 defaults YES on EOF, which would silently deploy;
  *                     non-interactive mode inverts that default to be safe.
- *   --cm-trigger      Trigger CM release-to-environments. With --yes: opt-in deploy. Without --yes:
- *                     skips prompt 2 and forces yes.
+ *   --cm-trigger      Request CM release-to-environments. Combined with --yes, auto-confirms prompt
+ *                     2 (non-interactive opt-in). Without --yes, still prompts interactively — it
+ *                     only changes the prompt's wording, never bypasses confirmation. When the
+ *                     trigger itself fails after being explicitly requested, that's a terminal
+ *                     error (nonzero exit, RESULT ok:false) even though the release itself may
+ *                     already be pushed.
  *   --json            Print a final "RESULT: {...}" JSON line for machine parsing. Also emits on
- *                     fatal error paths: RESULT: {"ok":false,"error":"..."}.
+ *                     fatal error paths (RESULT: {"ok":false,"error":"..."}, nonzero exit) and on
+ *                     an aborted confirmation prompt (RESULT: {"ok":false,"error":"aborted",
+ *                     "aborted":true}, exit 0 — the user declined, nothing failed).
  */
 
 const { execSync, spawnSync } = require('child_process');
-const { existsSync } = require('fs');
+const { existsSync, writeSync } = require('fs');
 const path = require('path');
 const readline = require('readline');
 const semver = require('semver');
@@ -82,10 +88,40 @@ const err = (m) => console.error(C.red + m + C.reset);
 const info = (m) => console.log(C.cyan + m + C.reset);
 const header = (m) => log(`\n${C.bold}${C.cyan}${'━'.repeat(60)}\n  ${m}\n${'━'.repeat(60)}${C.reset}`);
 
-function die(message, code = 1) {
+function die(message, code = 1, extra = {}) {
 	err(message);
-	if (JSON_OUTPUT) process.stdout.write('RESULT: ' + JSON.stringify({ok: false, error: message}) + '\n');
+	if (JSON_OUTPUT) {
+		// A plain process.stdout.write() here races process.exit(): when stdout is a
+		// pipe (the standard --json/dispatch setup), the write is async and exit() can
+		// tear the process down before it flushes, dropping the RESULT line. A raw fd
+		// write via fs.writeSync is synchronous, so it's guaranteed to land first.
+		const cleanMessage = typeof message === 'string' ? message.trim() : message;
+		writeSync(1, 'RESULT: ' + JSON.stringify({ ok: false, error: cleanMessage, ...extra }) + '\n');
+	}
 	process.exit(code);
+}
+
+// Decides the CM-deploy prompt answer from flags: 'y'/'n' to auto-answer non-interactively,
+// or null to fall through to an interactive prompt. --cm-trigger alone (no --yes) always falls
+// through — it must never bypass confirmation for a human running the script by hand.
+function resolveDeployAnswer({ cmTrigger, yesMode }) {
+	if (cmTrigger && yesMode) return 'y';
+	if (!cmTrigger && yesMode) return 'n';
+	return null;
+}
+
+function buildAbortedResult() {
+	return { ok: false, error: 'aborted', aborted: true, pushed: false, cmTriggered: false };
+}
+
+// Builds the die() args for a CM-trigger failure that was explicitly requested via
+// --cm-trigger — preserves whatever state the run had already reached (e.g. pushed: true)
+// so a machine caller can tell "release pushed, deploy trigger failed" from "nothing happened".
+function buildCmFailureResult({ pushed, coreVersion, proVersion, error }) {
+	return {
+		message: `CM release-to-environments trigger failed: ${error}`,
+		extra: { pushed, cmTriggered: false, coreVersion: coreVersion ?? null, proVersion },
+	};
 }
 
 // ── Shell helpers ─────────────────────────────────────────────────────────────
@@ -317,6 +353,9 @@ async function main() {
 		const confirm = YES_MODE ? 'y' : await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
 		if (confirm.toLowerCase() !== 'y') {
 			warn('Aborted.');
+			// Exit 0 (a human/--yes declined, nothing failed) but still emit a RESULT line
+			// under --json — otherwise a caller parsing stdout for completion gets nothing.
+			if (JSON_OUTPUT) writeSync(1, 'RESULT: ' + JSON.stringify(buildAbortedResult()) + '\n');
 			return;
 		}
 
@@ -383,13 +422,15 @@ async function main() {
 		`-f version=${plainVersion} -f version_name=stable -f update_environments=all`;
 	log(`  Command: ${C.dim}${cmCmd}${C.reset}`);
 	// In --yes mode CM deploy is opt-in (pass --cm-trigger); interactive default-YES on EOF was a deploy footgun.
+	const autoDeploy = resolveDeployAnswer({ cmTrigger: CM_TRIGGER, yesMode: YES_MODE });
 	let deploy;
-	if (CM_TRIGGER) {
-		deploy = 'y';
-	} else if (YES_MODE) {
-		deploy = 'n';
+	if (autoDeploy !== null) {
+		deploy = autoDeploy;
 	} else {
-		deploy = await prompt(`\nTrigger CM release-to-environments (version_name=stable)? [Y/n]: `);
+		const promptText = CM_TRIGGER
+			? `\n--cm-trigger requested — trigger CM release-to-environments (version_name=stable)? [Y/n]: `
+			: `\nTrigger CM release-to-environments (version_name=stable)? [Y/n]: `;
+		deploy = await prompt(promptText);
 	}
 	if (deploy.toLowerCase() !== 'n') {
 		log('\nTriggering CM workflow...');
@@ -402,6 +443,19 @@ async function main() {
 				ok('  ✅ Workflow triggered — https://github.com/HarperFast/central-manager/actions');
 			} catch (e) {
 				err('  ❌ Failed to trigger workflow: ' + e.message);
+				// A requested-but-failed dispatch must be terminal in the machine contract:
+				// otherwise `--yes --cm-trigger --json` reports ok:true with cmTriggered:false,
+				// and a dispatch caller can't distinguish "deploy skipped" from "deploy attempted
+				// and failed" — it would mark a requested deployment successful when it never started.
+				if (CM_TRIGGER) {
+					const { message, extra } = buildCmFailureResult({
+						pushed,
+						coreVersion,
+						proVersion,
+						error: e.message,
+					});
+					die(message, 1, extra);
+				}
 			}
 		}
 	} else {
@@ -422,19 +476,28 @@ async function main() {
 	}
 
 	if (JSON_OUTPUT) {
-		process.stdout.write('RESULT: ' + JSON.stringify({
-			ok: true,
-			target: proVersion,
-			coreVersion: coreVersion ?? null,
-			proVersion,
-			coreBumped: coreVersion !== null,
-			pushed,
-			cmTriggered,
-			dryRun: DRY_RUN,
-		}) + '\n');
+		writeSync(
+			1,
+			'RESULT: ' +
+				JSON.stringify({
+					ok: true,
+					target: proVersion,
+					coreVersion: coreVersion ?? null,
+					proVersion,
+					coreBumped: coreVersion !== null,
+					pushed,
+					cmTriggered,
+					dryRun: DRY_RUN,
+				}) +
+				'\n'
+		);
 	}
 }
 
-main().catch((e) => {
-	die('Fatal: ' + e.message);
-});
+if (require.main === module) {
+	main().catch((e) => {
+		die('Fatal: ' + (e?.message ?? String(e)));
+	});
+}
+
+module.exports = { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult };
