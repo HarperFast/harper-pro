@@ -23,6 +23,9 @@
  *     busy shared runner does not turn the nightly red.
  *  7. Emit write throughput, catch-up throughput and host-pressure counters, to the
  *     run log, the job summary, and `large-catchup-metrics.json` in the log artifact.
+ *     A failing/timed-out run also carries a per-180s rate profile in its failure
+ *     message, so it's diagnosable as uniformly-slow vs. stall-bound-and-never-recovered
+ *     without reconstructing it from the raw poll log (see summariseCatchupRate).
  *
  * Run locally (1 GB, ~10–20 min):
  *   HARPER_RUN_STRESS_TESTS=1 HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR=~/dev/tmp \
@@ -135,6 +138,96 @@ if (!stressEnabled()) {
 
 	// Build payload once; reused across all records to avoid per-record allocation.
 	const PAYLOAD = 'x'.repeat(PAYLOAD_SIZE);
+
+	const RATE_WINDOW_SECS = 180;
+
+	/**
+	 * Catch-up throughput is strongly BIMODAL, so a single averaged MB/s is not a diagnosis.
+	 * Every observed run replays fast for ~3 min (10–13 MB/s), drops into a RocksDB write-stall
+	 * trough (1.5–3 MB/s), and then either climbs back out and finishes in 600–1100 s, or never
+	 * does and grinds out the whole budget. Those are different failures with different causes,
+	 * but the averaged number reports both as "slow replay" — the 2026-07-25 nightly timeout
+	 * averaged 4.9 MB/s while its per-window rate ranged 1.5–11.1 MB/s.
+	 *
+	 * Summarise the rate over fixed windows so a timeout carries its own phase profile: whether B
+	 * was uniformly slow, or stall-bound and never recovered. Compared against ENFORCED_FLOOR_MBPS
+	 * — there is no other definition of "the pace needed to finish" once the gate is a floor rather
+	 * than a fixed budget.
+	 */
+	function summariseCatchupRate(progress, windowSecs = RATE_WINDOW_SECS) {
+		const windows = [];
+		// Skip the leading zero-count samples: they measure B reconnecting, not replay
+		// throughput, and left in they charge that ramp-up time against window 1. Capped at
+		// CATCHUP_GRACE_SECS (the assumed reconnect budget) and anchored on the LAST zero
+		// sample rather than the first non-zero one, so a stall that starts at zero and never
+		// leaves it is still measured as a real (slow) window instead of being discarded.
+		// Look ahead (progress[start + 1]), not at the current sample: stopping on
+		// progress[start].count === 0 would land ON the first non-zero sample (one past the
+		// last zero), making it the anchor and subtracting that whole burst out of window 1.
+		let start = 0;
+		while (
+			start < progress.length - 1 &&
+			progress[start + 1].count === 0 &&
+			progress[start + 1].t - progress[0].t <= CATCHUP_GRACE_SECS * 1000
+		)
+			start++;
+		const active = progress.slice(start);
+		if (active.length < 2) return { windows, peakMBps: 0, slowSecs: 0 };
+		const toMBps = (records, secs) => (records * PAYLOAD_SIZE) / 1024 / 1024 / secs;
+		let anchor = active[0];
+		for (const sample of active) {
+			const secs = (sample.t - anchor.t) / 1000;
+			if (secs < windowSecs) continue;
+			// Labelled by the elapsed time at the END of the window it summarises.
+			windows.push({
+				toSecs: (sample.t - active[0].t) / 1000,
+				mbps: toMBps(sample.count - anchor.count, secs),
+				secs,
+				partial: false,
+			});
+			anchor = sample;
+		}
+		const lastSample = active[active.length - 1];
+		if (anchor !== lastSample) {
+			// Trailing partial window — on a timeout run this is the most recent, most
+			// decision-relevant data (still decelerating vs. climbing out); don't drop it.
+			const secs = (lastSample.t - anchor.t) / 1000;
+			if (secs > 0) {
+				windows.push({
+					toSecs: (lastSample.t - active[0].t) / 1000,
+					mbps: toMBps(lastSample.count - anchor.count, secs),
+					secs,
+					partial: true,
+				});
+			}
+		}
+		// Peak prefers full windows only — a short trailing window's rate isn't comparable to a
+		// sustained 180s pace (a brief flush can read far higher) and would otherwise mislabel
+		// that burst as the run's peak. `partial` is tagged explicitly at push time above rather
+		// than re-derived by comparing `secs` to `windowSecs`: real windows close at poll
+		// granularity (~181-196s at the 15s poll interval), never at exactly 180.0, so a float
+		// equality check here always misses every full window. But when the run ends before a
+		// single full window elapses, every window IS partial — falling back to 0 there would
+		// report zero peak for a run that measurably moved data, so fall back to the partial
+		// windows' own max instead of lying about there being no throughput at all.
+		const fullWindows = windows.filter((w) => !w.partial);
+		const peakSource = fullWindows.length ? fullWindows : windows;
+		const peakMBps = peakSource.reduce((max, w) => Math.max(max, w.mbps), 0);
+		// Wall-clock spent below the pace that can finish in budget — the "stall-bound" measure.
+		const slowSecs = windows.reduce((sum, w) => sum + (w.mbps < ENFORCED_FLOOR_MBPS ? w.secs : 0), 0);
+		return { windows, peakMBps, slowSecs };
+	}
+
+	function formatRateProfile({ windows, peakMBps, slowSecs }) {
+		if (!windows.length) return 'no rate windows (catch-up ended before one window elapsed)';
+		const profile = windows
+			.map((w) => `${w.toSecs.toFixed(0)}s:${w.mbps.toFixed(1)}${w.partial ? `(${w.secs.toFixed(0)}s)` : ''}`)
+			.join(' ');
+		return (
+			`per-${RATE_WINDOW_SECS}s MB/s [${profile}] peak=${peakMBps.toFixed(1)} ` +
+			`below-required-pace(${ENFORCED_FLOOR_MBPS.toFixed(1)} MB/s)=${slowSecs.toFixed(0)}s`
+		);
+	}
 
 	suite(`Large catch-up — ${TARGET_GB} GB`, { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 		before(async () => {
@@ -326,6 +419,8 @@ if (!stressEnabled()) {
 				// fact — track the last forward step and fail with a distinct message on a wedge.
 				let lastProgressAt = Date.now();
 				let stalledFor = 0;
+				// (time, count) samples behind the rate profile reported below.
+				const progress = [{ t: catchupStart, count: 0 }];
 				while (Date.now() < deadline) {
 					// Measure convergence with an exact count, not the default
 					// describe_table.record_count — the latter is a rounded RocksDB
@@ -344,12 +439,14 @@ if (!stressEnabled()) {
 						const prevCount = lastCount;
 						lastCount = resp.record_count;
 						if (lastCount > prevCount) lastProgressAt = Date.now();
+						progress.push({ t: Date.now(), count: Math.max(lastCount - seedRecords.length, 0) });
 					}
 					stalledFor = (Date.now() - lastProgressAt) / 1000;
 					ok(
 						stalledFor < STALL_SECS,
 						`B made no catch-up progress for ${stalledFor.toFixed(0)}s (stuck at ${lastCount}/${targetCount}) — ` +
-							`replication is wedged, not merely slow`
+							`replication is wedged, not merely slow. Rate profile up to the wedge: ` +
+							`${formatRateProfile(summariseCatchupRate(progress))}`
 					);
 					// B replays A's distinct-id upserts, so its row count can only climb up
 					// to the target. A count above it means duplicated/over-replicated rows —
@@ -379,6 +476,7 @@ if (!stressEnabled()) {
 				// replaying steadily the whole time — the single most misleading number in this job.
 				const appliedRecords = Math.max(lastCount - seedRecords.length, 0);
 				const catchupMBps = (appliedRecords * PAYLOAD_SIZE) / 1024 / 1024 / catchupSecs;
+				const rateProfile = summariseCatchupRate(progress);
 
 				console.log(
 					`[large-catchup] result: catchup=${convergedAt ? catchupSecs.toFixed(1) + 's' : `TIMEOUT after ${catchupSecs.toFixed(1)}s`} ` +
@@ -386,6 +484,9 @@ if (!stressEnabled()) {
 						`throughput=${catchupMBps.toFixed(1)} MB/s ` +
 						`A_peakRSS=${mb(aSummary.peakRss)} B_peakRSS=${mb(bSummary.peakRss)}`
 				);
+				// Phase profile — the averaged throughput above cannot distinguish uniformly-slow replay
+				// from a stall-bound run that never recovered. See summariseCatchupRate.
+				console.log(`[large-catchup] rate profile: ${formatRateProfile(rateProfile)}`);
 				// Container-level cgroup breakdown (whole job container = both nodes + runner).
 				// anon = genuine/unreclaimable; file = reclaimable page cache (incl. mmap'd txn
 				// log read during catchup); dirty = pending writeback (vm.dirty_ratio concern).
@@ -428,6 +529,11 @@ if (!stressEnabled()) {
 					enforcedFloorMBps: Number(ENFORCED_FLOOR_MBPS.toFixed(2)),
 					baselineMBps: CATCHUP_BASELINE_MBPS,
 					stallSecs: STALL_SECS,
+					rateProfile: {
+						windows: rateProfile.windows,
+						peakMBps: Number(rateProfile.peakMBps.toFixed(2)),
+						slowSecs: rateProfile.slowSecs,
+					},
 					peakRss: { A: aSummary.peakRss, B: bSummary.peakRss },
 					cgroupPeaks: {
 						current: aSummary.peakCgroupCurrent,
@@ -467,7 +573,9 @@ if (!stressEnabled()) {
 						`(${appliedRecords}/${targetCount - seedRecords.length} records in ${catchupSecs.toFixed(1)}s` +
 						`${convergedAt ? '' : ', TIMED OUT'}) — ` +
 						`slow replay, not a wedge; a wedge would have tripped the ${STALL_SECS}s no-progress guard. ` +
-						`Host during catch-up: ${formatHostCounters(hostSummary)}`
+						`Rate profile: ${formatRateProfile(rateProfile)}. A peak well above the floor with most of the ` +
+						`run below it means B was stall-bound and never recovered (harper-pro#430 / #435), NOT that the ` +
+						`floor is too strict. Host during catch-up: ${formatHostCounters(hostSummary)}`
 				);
 				for (const [name, summary, log] of [
 					['A', aSummary, logA],
