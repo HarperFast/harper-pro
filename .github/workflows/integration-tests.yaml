@@ -40,7 +40,15 @@ jobs:
             # the full 22/24/26 matrix runs on push to main/release and on the nightly schedule.
             echo "node-versions=[24]" >> $GITHUB_OUTPUT
           elif [ "${{ github.event.inputs.node-version }}" == "all" ] || [ -z "${{ github.event.inputs.node-version }}" ]; then
-            echo "node-versions=[22, 24, 26]" >> $GITHUB_OUTPUT
+            # TEMPORARY: pinned to 26.5.0 instead of floating "26" — 26.5.1's llhttp/undici bump
+            # (deps: llhttp 9.4.2->9.4.3, undici 8.7.0->8.9.0) breaks analytics.test.mjs,
+            # addNodeLeaderNoMeshLeak.test.mjs, and the Cluster 6/6 shard on Node 26 only. The
+            # harper-side counterpart (a TTL-reset-on-write race made visible by the same bump,
+            # confirmed via a curl-based discriminator that rules out an undici-client artifact)
+            # is documented on harper#2025; harper-pro's own root cause was not traced to the same
+            # depth in this pass. Remove this pin once the underlying issue is fixed — see
+            # harper#2025, which stays open until then.
+            echo "node-versions=[22, 24, \"26.5.0\"]" >> $GITHUB_OUTPUT
           else
             echo "node-versions=[${{ github.event.inputs.node-version }}]" >> $GITHUB_OUTPUT
           fi
