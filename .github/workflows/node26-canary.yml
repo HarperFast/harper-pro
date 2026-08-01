@@ -44,7 +44,7 @@ jobs:
   canary-node26-latest:
     name: Canary — Node 26 latest (harper#2025, non-blocking)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
