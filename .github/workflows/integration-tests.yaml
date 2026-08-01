@@ -260,17 +260,26 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
-  # Non-blocking nightly canary for the pin above (harper#2025): the default matrix no longer
-  # exercises Node >=26.5.1 at all, so this keeps a signal alive on whatever the latest 26.x
-  # release is, without reddening the required checks. Only the test step below is
-  # continue-on-error — a setup/install/build/guard failure fails the job for real, so the
-  # canary can still report "I am broken" instead of going permanently green. Targets the exact
-  # files containing the tests harper#2025 names by name (verified via grep, not a guess at
-  # shard-6 membership — `replicationTopology.test.mjs` contains all three of "replicate
-  # per-record expiration...", "Replicate larger v4 dataset...", and "Bridge teardown: remove_
-  # node..."); the full matrix would cost more than this canary is worth, but that means it does
-  # NOT cover the rest of the replication/broker surface that sits on the same llhttp/undici
-  # stack — see harper#2025 for that residual risk when planning the unpin.
+  # Non-blocking-of-required-checks nightly canary for the pin above (harper#2025): the default
+  # matrix no longer exercises Node >=26.5.1 at all, so this keeps a signal alive on whatever the
+  # latest 26.x release is. "Non-blocking" refers only to the `if:` gate (schedule/dispatch-26,
+  # never pull_request, never in any other job's `needs`) — verified against this repo's actual
+  # branch-protection ruleset, this job cannot appear as or block a required check, so there is
+  # no continue-on-error anywhere in it: a reproduction fails the job for real and shows as a
+  # plain red X, which is a more honest signal than a green run with a buried warning. Targets
+  # the exact files AND case names harper#2025 names (verified via grep, not a guess at shard-6
+  # membership — `replicationTopology.test.mjs` contains all three of "replicate per-record
+  # expiration...", "Replicate larger v4 dataset...", and "Bridge teardown: remove_node...").
+  #
+  # Known residual risk, recorded here rather than fixed by this job (see harper#2025):
+  #   - Two of the three harper-pro failures are on the legacy-v4 replication bridge, a data
+  #     path this pass did not trace to the same depth as the harper-side TTL-reset defect —
+  #     unlike that defect, it has NOT been confirmed as production-vs-test-only here.
+  #   - harper#2025 itself reports the Cluster 6/6 shard failing "3 of last 4 runs" — roughly a
+  #     25% per-run false-negative rate on these exact cases. One green nightly run is a sample,
+  #     not proof the regression cleared; don't unpin off a single green.
+  #   - This canary covers only these three files, not the rest of the replication/broker/
+  #     operations-API surface that sits on the same llhttp/undici stack.
   canary-node26-latest:
     name: Canary — Node 26 latest (harper#2025, non-blocking)
     if: github.event_name == 'schedule' || github.event.inputs.node-version == '26'
@@ -329,10 +338,24 @@ jobs:
               exit 1
             fi
           done
+          # A file surviving a rename doesn't mean the specific harper#2025 cases inside it
+          # do — checking file existence alone would still pass if these were renamed/dropped.
+          for name in "Replicate larger v4 dataset across multiple tables" \
+                      "Bridge teardown: remove_node disconnects legacy v4 node cleanly" \
+                      "replicate per-record expiration so records evict on receivers"; do
+            if ! grep -qF "$name" "integrationTests/cluster/replicationTopology.test.mjs"; then
+              echo "::error::canary target case missing: '$name' no longer found in replicationTopology.test.mjs — the file still exists, but this specific harper#2025 case does not."
+              exit 1
+            fi
+          done
 
+      # This job is gated to schedule/workflow_dispatch only (never pull_request, never in any
+      # other job's `needs`), so it cannot appear as or block a required check — verified against
+      # the repo's actual branch-protection ruleset, not assumed. There is therefore nothing for
+      # continue-on-error to protect here, and using it would only invert this job's signal: a
+      # real harper#2025 reproduction would show as a green ✅ with a warning buried inside, which
+      # is worse than the plain red ✗ a canary should show. Let it fail naturally.
       - name: Run harper#2025 canary tests
-        id: canary-tests
-        continue-on-error: true
         env:
           HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
           HARPER_LEGACY_VERSION_PATH: /tmp/harperdb-legacy/node_modules/harperdb
@@ -347,32 +370,8 @@ jobs:
             "integrationTests/cluster/addNodeLeaderNoMeshLeak.test.mjs" \
             "integrationTests/cluster/replicationTopology.test.mjs"
 
-      - name: Report canary result to step summary
-        if: always()
-        run: |
-          case "${{ steps.canary-tests.outcome }}" in
-            success)
-              echo "harper#2025 canary: passed on Node $(node --version)." | tee -a "$GITHUB_STEP_SUMMARY"
-              ;;
-            failure)
-              echo "::warning::harper#2025 canary reproduced a failure on Node $(node --version) — see the uploaded server logs and the Run harper#2025 canary tests step output above."
-              echo "**harper#2025 canary: FAILED on Node $(node --version)** — see step logs and uploaded server logs." | tee -a "$GITHUB_STEP_SUMMARY"
-              ;;
-            *)
-              # skipped (an earlier setup/install/build/guard step failed) or cancelled (hit
-              # timeout-minutes): the canary did NOT run to completion either way, so it must
-              # not be read as a pass — that misreading is how a genuine 26.5.1+ regression
-              # goes unnoticed indefinitely.
-              echo "::warning::harper#2025 canary did not run to completion on Node $(node --version) (outcome: ${{ steps.canary-tests.outcome }}) — inconclusive, not a pass. Check the job's other step logs."
-              echo "**harper#2025 canary: INCONCLUSIVE on Node $(node --version)** (outcome: ${{ steps.canary-tests.outcome }}) — did not run to completion; check earlier step logs." | tee -a "$GITHUB_STEP_SUMMARY"
-              ;;
-          esac
-
-      # Not gated on failure(): continue-on-error above makes the step (and job) conclusion
-      # "success" even when the canary reproduces harper#2025, so failure() would never see it.
-      # outcome != 'success' also catches skipped/cancelled, so partial-run logs aren't lost.
       - name: Upload Harper server logs
-        if: always() && steps.canary-tests.outcome != 'success'
+        if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: harper-server-logs-canary-node26-latest
