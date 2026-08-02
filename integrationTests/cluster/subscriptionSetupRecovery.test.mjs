@@ -27,7 +27,7 @@ function optionsFor(node, env) {
 			threads: { count: 1 },
 			replication: {
 				securePort: node.hostname + ':9933',
-				databases: [DB],
+				databases: [DB, 'system'],
 				pingInterval: 1000,
 				pingTimeout: 3000,
 			},
@@ -66,17 +66,36 @@ async function waitForLog(node, pattern, timeoutMs = RECOVERY_TIMEOUT_MS) {
 	return '';
 }
 
-function countSetupWatchdogWarnings(log) {
+function countSetupWatchdogWarnings(log, database = DB) {
 	return log
 		.split('\n')
-		.filter((line) => line.includes('Subscription-setup watchdog:') && line.includes(`(db: "${DB}")`)).length;
+		.filter((line) => line.includes('Subscription-setup watchdog:') && line.includes(`(db: "${database}")`)).length;
 }
 
-async function dataSocketConnected(node) {
+async function socketConnected(node, database) {
 	const status = await sendOperation(node, { operation: 'cluster_status' });
 	return status.connections.some((connection) =>
-		connection.database_sockets?.some((socket) => socket.database === DB && socket.connected === true)
+		connection.database_sockets?.some((socket) => socket.database === database && socket.connected === true)
 	);
+}
+
+async function waitForSocket(node, database, timeoutMs = RECOVERY_TIMEOUT_MS) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await socketConnected(node, database).catch(() => false)) return true;
+		await delay(250);
+	}
+	return false;
+}
+
+async function waitForRole(node, role, timeoutMs = RECOVERY_TIMEOUT_MS) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const roles = await sendOperation(node, { operation: 'list_roles' }).catch(() => null);
+		if (Array.isArray(roles) && roles.some((entry) => entry?.role === role)) return true;
+		await delay(250);
+	}
+	return false;
 }
 
 suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
@@ -139,7 +158,7 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			true,
 			'a record written after the setup hang must arrive over the recovered subscription'
 		);
-		assert.equal(await dataSocketConnected(ctx.receiver), true, 'the recovered data socket must be connected');
+		assert.equal(await socketConnected(ctx.receiver, DB), true, 'the recovered data socket must be connected');
 
 		const warningsBeforeIdle = countSetupWatchdogWarnings(await readLog(ctx.receiver));
 		assert.equal(warningsBeforeIdle, 1, 'exactly one setup-watchdog recovery should have occurred');
@@ -222,6 +241,52 @@ suite('sender subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			await readLog(ctx.receiver),
 			/Subscription-setup watchdog:.*\(db: "data"\)/,
 			'the receiver data watchdog must remain quiet after sender-driven convergence'
+		);
+	});
+});
+
+suite('system subscription setup recovery', { timeout: 120000 }, (ctx) => {
+	before(async () => {
+		const sourceCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		const receiverCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		await Promise.all([
+			startHarper(sourceCtx, optionsFor(sourceCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_STALL_ONCE_DB: 'system' })),
+			startHarper(receiverCtx, optionsFor(receiverCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS: '3000' })),
+		]);
+		ctx.source = sourceCtx.harper;
+		ctx.receiver = receiverCtx.harper;
+	});
+
+	after(async () => {
+		await Promise.all([ctx.source, ctx.receiver].filter(Boolean).map((node) => teardownHarper({ harper: node })));
+	});
+
+	test('an unsolicited handshake schema cannot acknowledge the stalled system request', async () => {
+		await sendOperation(ctx.receiver, {
+			operation: 'add_node',
+			rejectUnauthorized: false,
+			hostname: ctx.source.hostname,
+			authorization: ctx.receiver.admin,
+		});
+
+		assert.match(
+			await waitForLog(ctx.source, /\[test\] stalling subscription setup before DB_SCHEMA for db "system"/),
+			/\[test\] stalling subscription setup before DB_SCHEMA for db "system"/
+		);
+		assert.match(
+			await waitForLog(ctx.receiver, /Subscription-setup watchdog:.*\(db: "system"\)/),
+			/Subscription-setup watchdog:.*\(db: "system"\)/,
+			'the unsolicited handshake schema must not retire the correlated system request'
+		);
+		assert.equal(await waitForSocket(ctx.receiver, 'system'), true, 'the replacement system socket must connect');
+
+		const role = `after-system-setup-watchdog-${Date.now()}`;
+		await sendOperation(ctx.source, { operation: 'add_role', role, permission: { super_user: false } });
+		assert.equal(await waitForRole(ctx.receiver, role), true, 'system-table replication must converge after recovery');
+		assert.equal(
+			countSetupWatchdogWarnings(await readLog(ctx.receiver), 'system'),
+			1,
+			'the correlated system request should recover exactly once'
 		);
 	});
 });
