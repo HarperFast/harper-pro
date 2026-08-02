@@ -352,10 +352,12 @@ const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
 // loop (harper-pro#642). Keep this strictly behind both sequential sender subscription-resolution bounds
 // so the sender gets first chance to identify the exact gate and close/retry, with the receiver-side
 // watchdog as the independent net. The extra ping interval prevents equal-deadline timer races.
+const TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS = Number(process.env.HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS);
 const SUBSCRIPTION_SETUP_TIMEOUT_MS = positiveMsOr(
-	process.env.HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS,
+	TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS,
 	Math.max(PING_TIMEOUT * 2, SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL)
 );
+const SEND_SUBSCRIPTION_SETUP_BUDGET_MS = SEND_SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL;
 // While the receive socket is paused for back-pressure the byte-silence watchdog above is stopped —
 // `ws.pause()` freezes `bytesRead`, so it can no longer tell a healthy back-pressure pause from a peer
 // that died mid-pause — and the active sendPing is exempt while `pauseReasons > 0`. That left a paused
@@ -1029,24 +1031,34 @@ export function resolveDatabaseStores(
 	return { auditStore, dbisDB };
 }
 
-/** Await a promise-like setup dependency without letting a never-settling promise wedge the connection. */
-export async function awaitWithTimeout<T>(
+const SETUP_TIMED_OUT = Symbol('setup timed out');
+
+async function awaitWithTimeoutOutcome<T>(
 	value: T | PromiseLike<T> | undefined,
 	timeout: number
-): Promise<T | undefined> {
+): Promise<T | undefined | typeof SETUP_TIMED_OUT> {
 	if (!value || typeof (value as any).then !== 'function') return value as T | undefined;
 	let timer: NodeJS.Timeout | undefined;
 	try {
 		return await Promise.race([
 			value,
-			new Promise<undefined>((resolve) => {
-				timer = setTimeout(() => resolve(undefined), timeout);
+			new Promise<typeof SETUP_TIMED_OUT>((resolve) => {
+				timer = setTimeout(() => resolve(SETUP_TIMED_OUT), timeout);
 				timer.unref();
 			}),
 		]);
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
+}
+
+/** Await a promise-like setup dependency without letting a never-settling promise wedge the connection. */
+export async function awaitWithTimeout<T>(
+	value: T | PromiseLike<T> | undefined,
+	timeout: number
+): Promise<T | undefined> {
+	const outcome = await awaitWithTimeoutOutcome(value, timeout);
+	return outcome === SETUP_TIMED_OUT ? undefined : outcome;
 }
 
 /**
@@ -1058,15 +1070,18 @@ export async function resolveSendSubscriptionSetup<TAuthorization, TDatabase>(
 	authorizationSubscription: TAuthorization | PromiseLike<TAuthorization> | undefined,
 	databaseSubscription: TDatabase | PromiseLike<TDatabase> | undefined,
 	timeout: number,
-	onTimeout: (gate: 'authorization' | 'database') => void
+	onFailure: (gate: 'authorization' | 'database', reason: 'timeout' | 'unavailable') => void
 ): Promise<TDatabase | undefined> {
-	if (authorizationSubscription && !(await awaitWithTimeout(authorizationSubscription, timeout))) {
-		onTimeout('authorization');
-		return;
+	if (authorizationSubscription) {
+		const resolvedAuthorizationSubscription = await awaitWithTimeoutOutcome(authorizationSubscription, timeout);
+		if (resolvedAuthorizationSubscription === SETUP_TIMED_OUT || !resolvedAuthorizationSubscription) {
+			onFailure('authorization', resolvedAuthorizationSubscription === SETUP_TIMED_OUT ? 'timeout' : 'unavailable');
+			return;
+		}
 	}
-	const resolvedDatabaseSubscription = await awaitWithTimeout(databaseSubscription, timeout);
-	if (!resolvedDatabaseSubscription) {
-		onTimeout('database');
+	const resolvedDatabaseSubscription = await awaitWithTimeoutOutcome(databaseSubscription, timeout);
+	if (resolvedDatabaseSubscription === SETUP_TIMED_OUT || !resolvedDatabaseSubscription) {
+		onFailure('database', resolvedDatabaseSubscription === SETUP_TIMED_OUT ? 'timeout' : 'unavailable');
 		return;
 	}
 	return resolvedDatabaseSubscription;
@@ -1115,8 +1130,24 @@ export function isSubscriptionSetupProgressFrame(
 	);
 }
 
+export function resolveSubscriptionSetupCapability(
+	capabilities: any,
+	localTimeoutMs: number,
+	usePeerBudget = true
+): { supported: boolean; timeoutMs: number } {
+	const supported = capabilities?.subscriptionSetupAck >= SUBSCRIPTION_SETUP_ACK_CAPABILITY;
+	const peerSetupBudgetMs = capabilities?.subscriptionSetupBudgetMs;
+	return {
+		supported,
+		timeoutMs:
+			usePeerBudget && supported && Number.isFinite(peerSetupBudgetMs) && peerSetupBudgetMs > 0
+				? Math.max(localTimeoutMs, peerSetupBudgetMs)
+				: localTimeoutMs,
+	};
+}
+
 /** One-shot timer for the request -> first application-level subscription response window. */
-export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number; onTimeout: () => void }): {
+export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() => number); onTimeout: () => void }): {
 	arm: () => void;
 	complete: () => void;
 	pause: () => void;
@@ -1135,11 +1166,12 @@ export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number; onTim
 	const schedule = () => {
 		clearTimer();
 		if (!pending || paused) return;
+		const timeoutMs = typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs;
 		timer = setTimeout(() => {
 			timer = undefined;
 			pending = false;
 			opts.onTimeout();
-		}, opts.timeoutMs).unref();
+		}, timeoutMs).unref();
 	};
 	return {
 		arm() {
@@ -2134,6 +2166,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let peerSupportsSubscriptionSetupAck = false;
 	let nextSubscriptionSetupRequestId = 0;
 	let pendingSubscriptionSetupRequestId: number | undefined;
+	let subscriptionSetupTimeoutMs = SUBSCRIPTION_SETUP_TIMEOUT_MS;
 	// Outbound-only application setup guard (harper-pro#642). Unlike receiveWatchdog it deliberately
 	// ignores ping/pong bytes: those prove the socket is alive, not that the peer entered its replay loop.
 	let subscriptionSetupWatchdog:
@@ -2343,13 +2376,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		},
 	});
 	subscriptionSetupWatchdog = createSubscriptionSetupWatchdog({
-		timeoutMs: SUBSCRIPTION_SETUP_TIMEOUT_MS,
+		timeoutMs: () => subscriptionSetupTimeoutMs,
 		onTimeout: () => {
 			if (wsClosed) return;
 			pendingSubscriptionSetupRequestId = undefined;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Subscription-setup watchdog: no application response from ${remoteNodeName}${dbContext} for ${SUBSCRIPTION_SETUP_TIMEOUT_MS}ms while transport remained connected — reconnecting from the durable cursor (harper-pro#642) — ${truthSnapshotForLog()}`
+				`Subscription-setup watchdog: no application response from ${remoteNodeName}${dbContext} for ${subscriptionSetupTimeoutMs}ms while transport remained connected — reconnecting from the durable cursor (harper-pro#642) — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -2705,7 +2738,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				switch (command) {
 					case NODE_NAME: {
 						if (data) {
-							peerSupportsSubscriptionSetupAck = message[4]?.subscriptionSetupAck === SUBSCRIPTION_SETUP_ACK_CAPABILITY;
+							const setupCapability = resolveSubscriptionSetupCapability(
+								message[4],
+								SUBSCRIPTION_SETUP_TIMEOUT_MS,
+								!(TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS > 0)
+							);
+							peerSupportsSubscriptionSetupAck = setupCapability.supported;
+							subscriptionSetupTimeoutMs = setupCapability.timeoutMs;
 							// this is the node name
 							if (remoteNodeName) {
 								if (remoteNodeName !== data) {
@@ -3754,16 +3793,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									whenSubscribedToHdbNodes,
 									tableSubscriptionToReplicator,
 									SEND_SUBSCRIPTION_RESOLVE_TIMEOUT,
-									(gate) => {
+									(gate, reason) => {
 										if (closed || wsClosed) return;
 										closed = true;
 										const databaseHint =
 											gate === 'database' ? '; this can also mean this node does not host the database' : '';
+										const failure =
+											reason === 'timeout'
+												? `Timed out waiting for ${gate} subscription setup`
+												: `${gate} subscription setup resolved without a subscription`;
 										logger.error?.(
 											connectionId,
-											`Timed out waiting for ${gate} subscription setup for ${databaseName}${databaseHint}; closing so the subscriber retries from its durable cursor (harper-pro#642)`
+											`${failure} for ${databaseName}${databaseHint}; closing so the subscriber retries from its durable cursor (harper-pro#642)`
 										);
-										close(1011, `Replication ${gate} setup timed out`);
+										close(1011, `Replication ${gate} setup ${reason === 'timeout' ? 'timed out' : 'unavailable'}`);
 									}
 								);
 								if (!resolvedDatabaseSubscription) return;
@@ -5384,7 +5427,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				thisNodeName,
 				databaseName,
 				tables,
-				{ subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY },
+				{
+					subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
+					subscriptionSetupBudgetMs: SEND_SUBSCRIPTION_SETUP_BUDGET_MS,
+				},
 			])
 		);
 	}
