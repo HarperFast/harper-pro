@@ -10,6 +10,7 @@ import {
 	awaitWithTimeout,
 	createSubscriptionSetupWatchdog,
 	isSubscriptionSetupProgressFrame,
+	resolveSubscriptionSetupCapability,
 	resolveSendSubscriptionSetup,
 } from '#src/replication/replicationConnection';
 
@@ -54,7 +55,7 @@ describe('resolveSendSubscriptionSetup', () => {
 			await resolveSendSubscriptionSetup(new Promise(() => {}), Promise.resolve({}), 5, timedOut),
 			undefined
 		);
-		assert.deepEqual(timedOut.args, [['authorization']]);
+		assert.deepEqual(timedOut.args, [['authorization', 'timeout']]);
 	});
 
 	it('identifies a database gate that never settles', async () => {
@@ -63,7 +64,33 @@ describe('resolveSendSubscriptionSetup', () => {
 			await resolveSendSubscriptionSetup(Promise.resolve({ end() {} }), new Promise(() => {}), 5, timedOut),
 			undefined
 		);
-		assert.deepEqual(timedOut.args, [['database']]);
+		assert.deepEqual(timedOut.args, [['database', 'timeout']]);
+	});
+
+	it('distinguishes a settled-but-unavailable gate from a timeout', async () => {
+		const failed = sinon.spy();
+		assert.equal(await resolveSendSubscriptionSetup(Promise.resolve(null), Promise.resolve({}), 5, failed), undefined);
+		assert.deepEqual(failed.args, [['authorization', 'unavailable']]);
+	});
+});
+
+describe('resolveSubscriptionSetupCapability', () => {
+	it('accepts newer additive versions and honors a longer sender budget', () => {
+		assert.deepEqual(
+			resolveSubscriptionSetupCapability({ subscriptionSetupAck: 2, subscriptionSetupBudgetMs: 300 }, 150),
+			{
+				supported: true,
+				timeoutMs: 300,
+			}
+		);
+	});
+
+	it('keeps the local timeout for an old peer or an explicit test override', () => {
+		assert.deepEqual(resolveSubscriptionSetupCapability(undefined, 150), { supported: false, timeoutMs: 150 });
+		assert.deepEqual(
+			resolveSubscriptionSetupCapability({ subscriptionSetupAck: 1, subscriptionSetupBudgetMs: 300 }, 25, false),
+			{ supported: true, timeoutMs: 25 }
+		);
 	});
 });
 
@@ -150,6 +177,19 @@ describe('createSubscriptionSetupWatchdog', () => {
 		clock.tick(30_000);
 		assert.equal(onTimeout.callCount, 0);
 		clock.tick(30_000);
+		assert.equal(onTimeout.callCount, 1);
+	});
+
+	it('uses the peer-adjusted timeout when a request is armed', () => {
+		const onTimeout = sinon.spy();
+		let timeoutMs = 60_000;
+		const watchdog = createSubscriptionSetupWatchdog({ timeoutMs: () => timeoutMs, onTimeout });
+
+		timeoutMs = 120_000;
+		watchdog.arm();
+		clock.tick(60_000);
+		assert.equal(onTimeout.callCount, 0);
+		clock.tick(60_000);
 		assert.equal(onTimeout.callCount, 1);
 	});
 

@@ -19,7 +19,7 @@ const TABLE = 'setup_recovery';
 const SETUP_TIMEOUT_MS = 3000;
 const RECOVERY_TIMEOUT_MS = 30000;
 
-function optionsFor(node, env) {
+function optionsFor(node, env, databases = [DB, 'system']) {
 	return {
 		config: {
 			analytics: { aggregatePeriod: -1 },
@@ -27,7 +27,7 @@ function optionsFor(node, env) {
 			threads: { count: 1 },
 			replication: {
 				securePort: node.hostname + ':9933',
-				databases: [DB, 'system'],
+				databases,
 				pingInterval: 1000,
 				pingTimeout: 3000,
 			},
@@ -250,8 +250,14 @@ suite('system subscription setup recovery', { timeout: 120000 }, (ctx) => {
 		const sourceCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		const receiverCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		await Promise.all([
-			startHarper(sourceCtx, optionsFor(sourceCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_STALL_ONCE_DB: 'system' })),
-			startHarper(receiverCtx, optionsFor(receiverCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS: '3000' })),
+			startHarper(
+				sourceCtx,
+				optionsFor(sourceCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_STALL_ONCE_DB: 'system' }, ['system'])
+			),
+			startHarper(
+				receiverCtx,
+				optionsFor(receiverCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS: '3000' }, ['system'])
+			),
 		]);
 		ctx.source = sourceCtx.harper;
 		ctx.receiver = receiverCtx.harper;
