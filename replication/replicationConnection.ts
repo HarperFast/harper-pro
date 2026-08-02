@@ -247,7 +247,10 @@ const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 
 // Waiting unbounded there would silently wedge the serialized message chain with no watchdog to catch it
 // — the receive watchdog keeps being reset by the very frames we are not processing — so we close instead
 // and let reconnect backoff retry, which costs one log line per attempt rather than one per message.
-const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000);
+const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(
+	process.env.HARPER_TEST_SUBSCRIPTION_RESOLVE_TIMEOUT_MS,
+	positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000)
+);
 
 // Wall-clock ceiling on the gap between socket flushes / event-loop yields during a bulk copy.
 // Reading a large cold table out of RocksDB dominates copy cost (decompress + decode), so a purely
@@ -1121,25 +1124,51 @@ export function isSubscriptionSetupProgressFrame(
 export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number; onTimeout: () => void }): {
 	arm: () => void;
 	complete: () => void;
+	pause: () => void;
+	resume: () => void;
 	stop: () => void;
 } {
 	let timer: NodeJS.Timeout | undefined;
-	const stop = () => {
+	let pending = false;
+	let paused = false;
+	const clearTimer = () => {
 		if (timer) {
 			clearTimeout(timer);
 			timer = undefined;
 		}
 	};
+	const schedule = () => {
+		clearTimer();
+		if (!pending || paused) return;
+		timer = setTimeout(() => {
+			timer = undefined;
+			pending = false;
+			opts.onTimeout();
+		}, opts.timeoutMs).unref();
+	};
 	return {
 		arm() {
-			stop();
-			timer = setTimeout(() => {
-				timer = undefined;
-				opts.onTimeout();
-			}, opts.timeoutMs).unref();
+			pending = true;
+			schedule();
 		},
-		complete: stop,
-		stop,
+		complete() {
+			pending = false;
+			clearTimer();
+		},
+		pause() {
+			paused = true;
+			clearTimer();
+		},
+		resume() {
+			if (!paused) return;
+			paused = false;
+			schedule();
+		},
+		stop() {
+			pending = false;
+			paused = false;
+			clearTimer();
+		},
 	};
 }
 
@@ -2109,7 +2138,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	// Outbound-only application setup guard (harper-pro#642). Unlike receiveWatchdog it deliberately
 	// ignores ping/pong bytes: those prove the socket is alive, not that the peer entered its replay loop.
-	let subscriptionSetupWatchdog: { arm: () => void; complete: () => void; stop: () => void } | undefined;
+	let subscriptionSetupWatchdog:
+		| {
+				arm: () => void;
+				complete: () => void;
+				pause: () => void;
+				resume: () => void;
+				stop: () => void;
+		  }
+		| undefined;
 	// Companion to receiveWatchdog that guards the back-pressure-paused window the byte watchdog is
 	// blind to (harper-pro#466). Armed on pause, stopped on resume — see addPauseReason/removePauseReason.
 	let pauseStallWatchdog: { reset: () => void; stop: () => void } | undefined;
@@ -2374,6 +2411,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (pauseReasons === 0) {
 			ws.pause();
 			pauseStartTime = Date.now();
+			subscriptionSetupWatchdog?.pause();
 			// Suspend the receive watchdog while the socket is intentionally paused — `bytesRead`
 			// is frozen by `ws.pause()` so the byte check cannot tell legitimate backpressure
 			// from peer silence, and firing here would terminate a healthy mid-ingest connection.
@@ -2392,6 +2430,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		pauseReasons--;
 		if (pauseReasons === 0) {
 			ws.resume();
+			subscriptionSetupWatchdog?.resume();
 			// Resuming: the byte watchdog can see the socket again, so retire the pause-stall watchdog and
 			// restart the silence window from the resume point — we deliberately do not penalize the
 			// connection for the time it spent paused.
@@ -3704,6 +3743,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									tableSubscriptionToReplicator,
 									SUBSCRIPTION_RESOLVE_TIMEOUT,
 									(gate) => {
+										if (closed || wsClosed) return;
 										closed = true;
 										logger.error?.(
 											connectionId,
@@ -4065,7 +4105,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			 * handles parsing and transacting these replication messages */
 			// Any binary transaction (record batch or REMOTE_SEQUENCE_UPDATE) proves the peer entered the
 			// subscription data path. Retire the setup-only watchdog before async apply work begins.
-			if (isSubscriptionSetupProgressFrame(undefined, databaseName)) subscriptionSetupWatchdog?.complete();
+			subscriptionSetupWatchdog?.complete();
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
 			if (!(await whenSubscriptionResolved())) return;
