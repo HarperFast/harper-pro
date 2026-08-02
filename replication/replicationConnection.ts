@@ -115,6 +115,7 @@ const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
 const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime + copy-order version
 const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
+const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -1098,26 +1099,19 @@ export async function awaitPendingSubscription(
 	}
 }
 
-/**
- * Classify frames that prove an outbound subscription progressed past its setup gates. Ping/pong are WS
- * control frames and never reach this helper; NODE_NAME is transport/identity setup only. DB_SCHEMA is
- * load-bearing for harper-pro#642: the sender emits it only after both unbounded setup candidates have
- * resolved and immediately before entering the replay loop. A schema for a sibling database on the system
- * connection does not acknowledge the requested database.
- *
- * `command === undefined` means a binary replication transaction (including REMOTE_SEQUENCE_UPDATE),
- * which is direct application progress.
- */
+/** Match the DB_SCHEMA acknowledgement emitted after the peer resolves this exact subscription request. */
 export function isSubscriptionSetupProgressFrame(
 	command: number | undefined,
 	requestedDatabase: string | undefined,
-	frameDatabase?: string
+	frameDatabase: string | undefined,
+	requestId: number | undefined,
+	frameRequestId: number | undefined
 ): boolean {
-	if (command === undefined) return true;
 	return (
-		command === COPY_START ||
-		command === SEQUENCE_ID_UPDATE ||
-		(command === DB_SCHEMA && frameDatabase === requestedDatabase)
+		command === DB_SCHEMA &&
+		requestId !== undefined &&
+		frameDatabase === requestedDatabase &&
+		frameRequestId === requestId
 	);
 }
 
@@ -2137,6 +2131,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
+	let peerSupportsSubscriptionSetupAck = false;
+	let nextSubscriptionSetupRequestId = 0;
+	let pendingSubscriptionSetupRequestId: number | undefined;
 	// Outbound-only application setup guard (harper-pro#642). Unlike receiveWatchdog it deliberately
 	// ignores ping/pong bytes: those prove the socket is alive, not that the peer entered its replay loop.
 	let subscriptionSetupWatchdog:
@@ -2349,6 +2346,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		timeoutMs: SUBSCRIPTION_SETUP_TIMEOUT_MS,
 		onTimeout: () => {
 			if (wsClosed) return;
+			pendingSubscriptionSetupRequestId = undefined;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
 				`Subscription-setup watchdog: no application response from ${remoteNodeName}${dbContext} for ${SUBSCRIPTION_SETUP_TIMEOUT_MS}ms while transport remained connected — reconnecting from the durable cursor (harper-pro#642) — ${truthSnapshotForLog()}`
@@ -2692,10 +2690,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// not a transaction, special message
 				const message = decode(body);
 				const [command, data, tableId] = message;
-				if (isSubscriptionSetupProgressFrame(command, databaseName, message[2])) subscriptionSetupWatchdog?.complete();
+				if (
+					isSubscriptionSetupProgressFrame(
+						command,
+						databaseName,
+						message[2],
+						pendingSubscriptionSetupRequestId,
+						message[3]
+					)
+				) {
+					pendingSubscriptionSetupRequestId = undefined;
+					subscriptionSetupWatchdog?.complete();
+				}
 				switch (command) {
 					case NODE_NAME: {
 						if (data) {
+							peerSupportsSubscriptionSetupAck = message[4]?.subscriptionSetupAck === SUBSCRIPTION_SETUP_ACK_CAPABILITY;
 							// this is the node name
 							if (remoteNodeName) {
 								if (remoteNodeName !== data) {
@@ -3268,6 +3278,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					case SUBSCRIPTION_REQUEST: {
 						nodeSubscriptions = data;
 						excludedNodes = message[2]; // use the third argument for exclusion list
+						const subscriptionSetupRequestId = message[3];
 						// permission check to make sure that this node is allowed to subscribe to this database, that is that
 						// we have publish permission for this node/database
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
@@ -3320,8 +3331,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							if (configSendDecision === undefined) {
 								whenSubscribedToHdbNodes =
 									maybeStallSubscriptionSetupForTest(databaseName) ?? getHDBNodeTable().subscribe(authorization.name);
-								whenSubscribedToHdbNodes.then(
-									async (subscription) => {
+								whenSubscribedToHdbNodes
+									.then(async (subscription) => {
 										subscriptionToHdbNodes = subscription;
 										// The setup wait below is bounded. If it timed out and closed this socket before the
 										// subscription promise eventually resolved, retire the late subscription immediately
@@ -3329,7 +3340,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										if (closed || wsClosed) {
 											const lateSubscription = subscriptionToHdbNodes;
 											subscriptionToHdbNodes = undefined;
-											lateSubscription.end();
+											lateSubscription?.end();
 											return;
 										}
 										for await (const event of subscriptionToHdbNodes) {
@@ -3351,11 +3362,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												return;
 											}
 										}
-									},
-									(error) => {
+									})
+									.catch((error) => {
 										logger.error?.(connectionId, 'Error subscribing to HDB nodes', error);
-									}
-								);
+									});
 							}
 						} else if (!(authorization?.role?.permission?.super_user || authorization.replicates)) {
 							ws.send(encode([DISCONNECT]));
@@ -3776,7 +3786,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									subscribedNodeName = name;
 								}
 
-								sendDBSchema(databaseName);
+								sendDBSchema(databaseName, subscriptionSetupRequestId);
 								if (!schemaUpdateListener) {
 									schemaUpdateListener = onUpdatedTable((table) => {
 										if (table.databaseName === databaseName) {
@@ -4107,9 +4117,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 			/* If we are past the commands, we are now handling an incoming replication message, the next block
 			 * handles parsing and transacting these replication messages */
-			// Any binary transaction (record batch or REMOTE_SEQUENCE_UPDATE) proves the peer entered the
-			// subscription data path. Retire the setup-only watchdog before async apply work begins.
-			subscriptionSetupWatchdog?.complete();
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
 			if (!(await whenSubscriptionResolved())) return;
@@ -4546,6 +4553,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	ws.on('close', (code, reasonBuffer) => {
 		// cleanup
 		wsClosed = true;
+		pendingSubscriptionSetupRequestId = undefined;
 		clearInterval(sendPingInterval);
 		receiveWatchdog?.stop();
 		subscriptionSetupWatchdog?.stop();
@@ -5271,13 +5279,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.debug?.(connectionId, 'sending subscription request', nodeSubscriptions, dbisDB?.path);
 			clearTimeout(delayedClose);
 			if (nodeSubscriptions.length > 0) {
-				ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded]));
+				const requestId = peerSupportsSubscriptionSetupAck ? ++nextSubscriptionSetupRequestId : undefined;
+				ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded, requestId]));
 				// Start a fresh request -> first application-response window on every non-empty request. This is
 				// intentionally after send(): a synchronous send failure must not leave an orphaned timer.
-				subscriptionSetupWatchdog?.arm();
+				if (requestId === undefined) {
+					pendingSubscriptionSetupRequestId = undefined;
+					subscriptionSetupWatchdog?.stop();
+				} else {
+					pendingSubscriptionSetupRequestId = requestId;
+					subscriptionSetupWatchdog?.arm();
+				}
 				// Track the excluded list we just sent
 				lastSentExcludedNodes = excluded ? [...excluded] : [];
 			} else {
+				pendingSubscriptionSetupRequestId = undefined;
 				subscriptionSetupWatchdog?.stop();
 				// no nodes means we are unsubscribing/disconnecting
 				// don't immediately close the connection, but wait a bit to see if we get any messages, since opening new connections is a bit expensive
@@ -5362,9 +5378,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			});
 		}
 		logger.trace?.('Sending database info for node', thisNodeName, 'database name', databaseName);
-		ws.send(encode([NODE_NAME, thisNodeName, databaseName, tables]));
+		ws.send(
+			encode([
+				NODE_NAME,
+				thisNodeName,
+				databaseName,
+				tables,
+				{ subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY },
+			])
+		);
 	}
-	function sendDBSchema(databaseName) {
+	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
 		const database = getDatabases()?.[databaseName];
 		const tables = [];
 		for (const tableName in database) {
@@ -5387,7 +5411,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			});
 		}
 
-		ws.send(encode([DB_SCHEMA, tables, databaseName]));
+		ws.send(encode([DB_SCHEMA, tables, databaseName, subscriptionSetupRequestId]));
 	}
 	blobsTimer = setInterval(
 		() => {

@@ -68,22 +68,27 @@ describe('resolveSendSubscriptionSetup', () => {
 });
 
 describe('isSubscriptionSetupProgressFrame', () => {
-	it('accepts the requested database schema', () => {
-		assert.equal(isSubscriptionSetupProgressFrame(DB_SCHEMA, 'flair', 'flair'), true);
+	it('accepts the requested database schema with the matching request id', () => {
+		assert.equal(isSubscriptionSetupProgressFrame(DB_SCHEMA, 'flair', 'flair', 7, 7), true);
 	});
 
 	it('rejects schema traffic for a sibling database', () => {
-		assert.equal(isSubscriptionSetupProgressFrame(DB_SCHEMA, 'flair', 'data'), false);
+		assert.equal(isSubscriptionSetupProgressFrame(DB_SCHEMA, 'flair', 'data', 7, 7), false);
 	});
 
-	it('accepts copy, sequence, and replication-data progress', () => {
-		assert.equal(isSubscriptionSetupProgressFrame(COPY_START, 'flair'), true);
-		assert.equal(isSubscriptionSetupProgressFrame(SEQUENCE_ID_UPDATE, 'flair'), true);
-		assert.equal(isSubscriptionSetupProgressFrame(undefined, 'flair'), true);
+	it('rejects an unsolicited handshake schema and a stale response', () => {
+		assert.equal(isSubscriptionSetupProgressFrame(DB_SCHEMA, 'flair', 'flair', 7, undefined), false);
+		assert.equal(isSubscriptionSetupProgressFrame(DB_SCHEMA, 'flair', 'flair', 7, 6), false);
+	});
+
+	it('does not let uncorrelated copy, sequence, or replication data retire setup', () => {
+		assert.equal(isSubscriptionSetupProgressFrame(COPY_START, 'flair', undefined, 7, undefined), false);
+		assert.equal(isSubscriptionSetupProgressFrame(SEQUENCE_ID_UPDATE, 'flair', undefined, 7, undefined), false);
+		assert.equal(isSubscriptionSetupProgressFrame(undefined, 'flair', undefined, 7, undefined), false);
 	});
 
 	it('does not accept transport/identity handshake traffic', () => {
-		assert.equal(isSubscriptionSetupProgressFrame(NODE_NAME, 'flair'), false);
+		assert.equal(isSubscriptionSetupProgressFrame(NODE_NAME, 'flair', undefined, 7, undefined), false);
 	});
 });
 
