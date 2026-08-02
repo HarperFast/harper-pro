@@ -147,4 +147,48 @@ describe('createSubscriptionSetupWatchdog', () => {
 		clock.tick(30_000);
 		assert.equal(onTimeout.callCount, 1);
 	});
+
+	it('does not count a back-pressure pause against a pending setup window', () => {
+		const onTimeout = sinon.spy();
+		const watchdog = createSubscriptionSetupWatchdog({ timeoutMs: 60_000, onTimeout });
+
+		watchdog.arm();
+		clock.tick(30_000);
+		watchdog.pause();
+		clock.tick(120_000);
+		assert.equal(onTimeout.callCount, 0);
+
+		watchdog.resume();
+		clock.tick(59_999);
+		assert.equal(onTimeout.callCount, 0);
+		clock.tick(1);
+		assert.equal(onTimeout.callCount, 1);
+	});
+
+	it('does not rearm on resume after setup completed while paused', () => {
+		const onTimeout = sinon.spy();
+		const watchdog = createSubscriptionSetupWatchdog({ timeoutMs: 60_000, onTimeout });
+
+		watchdog.arm();
+		watchdog.pause();
+		watchdog.complete();
+		watchdog.resume();
+		clock.tick(60_000);
+
+		assert.equal(onTimeout.callCount, 0);
+	});
+
+	it('defers a request armed during back pressure until the socket resumes', () => {
+		const onTimeout = sinon.spy();
+		const watchdog = createSubscriptionSetupWatchdog({ timeoutMs: 60_000, onTimeout });
+
+		watchdog.pause();
+		watchdog.arm();
+		clock.tick(120_000);
+		assert.equal(onTimeout.callCount, 0);
+
+		watchdog.resume();
+		clock.tick(60_000);
+		assert.equal(onTimeout.callCount, 1);
+	});
 });

@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, readLog } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -24,6 +24,7 @@ function optionsFor(node, env) {
 		config: {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
+			threads: { count: 1 },
 			replication: {
 				securePort: node.hostname + ':9933',
 				databases: [DB],
@@ -55,6 +56,20 @@ async function waitForRecord(node, id, timeoutMs = RECOVERY_TIMEOUT_MS) {
 	return false;
 }
 
+async function waitForLog(node, pattern, timeoutMs = RECOVERY_TIMEOUT_MS) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const log = await readLog(node);
+		if (pattern.test(log)) return log;
+		await delay(250);
+	}
+	return '';
+}
+
+function countSetupWatchdogWarnings(log) {
+	return log.split('Subscription-setup watchdog:').length - 1;
+}
+
 async function dataSocketConnected(node) {
 	const status = await sendOperation(node, { operation: 'cluster_status' });
 	return status.connections.some((connection) =>
@@ -70,9 +85,7 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			startHarper(sourceCtx, optionsFor(sourceCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_STALL_ONCE_DB: DB })),
 			startHarper(
 				receiverCtx,
-				optionsFor(receiverCtx.harper, {
-					HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS: String(SETUP_TIMEOUT_MS),
-				})
+				optionsFor(receiverCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS: String(SETUP_TIMEOUT_MS) })
 			),
 		]);
 		ctx.source = sourceCtx.harper;
@@ -103,9 +116,10 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			authorization: ctx.receiver.admin,
 		});
 
-		// The first request is parked before DB_SCHEMA. Wait past the test-only setup bound and reconnect
-		// backoff so the write below can only arrive over the replacement subscription.
-		await delay(SETUP_TIMEOUT_MS + 5000);
+		const sourceStallLog = await waitForLog(ctx.source, /\[test\] stalling subscription setup before DB_SCHEMA/);
+		assert.match(sourceStallLog, /\[test\] stalling subscription setup before DB_SCHEMA/);
+		const recoveryLog = await waitForLog(ctx.receiver, /Subscription-setup watchdog:/);
+		assert.match(recoveryLog, /Subscription-setup watchdog:/, 'the receiver watchdog must drive recovery');
 
 		const first = `after-setup-watchdog-${Date.now()}`;
 		await sendOperation(ctx.source, {
@@ -121,8 +135,8 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 		);
 		assert.equal(await dataSocketConnected(ctx.receiver), true, 'the recovered data socket must be connected');
 
-		// Once DB_SCHEMA completed the one-shot watchdog is retired. A caught-up idle connection can stay
-		// quiet for several setup windows without reconnect churn, then deliver the next write normally.
+		const warningsBeforeIdle = countSetupWatchdogWarnings(await readLog(ctx.receiver));
+		assert.equal(warningsBeforeIdle, 1, 'exactly one setup-watchdog recovery should have occurred');
 		await delay(SETUP_TIMEOUT_MS * 3);
 		const second = `after-idle-${Date.now()}`;
 		await sendOperation(ctx.source, {
@@ -132,5 +146,71 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			records: [{ id: second }],
 		});
 		assert.equal(await waitForRecord(ctx.receiver, second), true, 'healthy idle must not rearm setup recovery');
+		assert.equal(
+			countSetupWatchdogWarnings(await readLog(ctx.receiver)),
+			warningsBeforeIdle,
+			'healthy idle must not cause setup-watchdog reconnect churn'
+		);
+	});
+});
+
+suite('sender subscription setup recovery', { timeout: 120000 }, (ctx) => {
+	before(async () => {
+		const sourceCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		const receiverCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		await Promise.all([
+			startHarper(
+				sourceCtx,
+				optionsFor(sourceCtx.harper, {
+					HARPER_TEST_SUBSCRIPTION_SETUP_STALL_ONCE_DB: DB,
+					HARPER_TEST_SUBSCRIPTION_RESOLVE_TIMEOUT_MS: '2000',
+				})
+			),
+			startHarper(receiverCtx, optionsFor(receiverCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS: '10000' })),
+		]);
+		ctx.source = sourceCtx.harper;
+		ctx.receiver = receiverCtx.harper;
+
+		await Promise.all(
+			[ctx.source, ctx.receiver].map((node) =>
+				sendOperation(node, {
+					operation: 'create_table',
+					database: DB,
+					table: TABLE,
+					primary_key: 'id',
+					attributes: [{ name: 'id', type: 'ID' }],
+				})
+			)
+		);
+	});
+
+	after(async () => {
+		await Promise.all([ctx.source, ctx.receiver].filter(Boolean).map((node) => teardownHarper({ harper: node })));
+	});
+
+	test('the bounded sender gate closes first and the replacement subscription converges', async () => {
+		await sendOperation(ctx.receiver, {
+			operation: 'add_node',
+			rejectUnauthorized: false,
+			hostname: ctx.source.hostname,
+			authorization: ctx.receiver.admin,
+		});
+
+		const timeoutLog = await waitForLog(ctx.source, /Timed out waiting for authorization subscription setup/);
+		assert.match(timeoutLog, /Timed out waiting for authorization subscription setup/);
+		assert.doesNotMatch(
+			await readLog(ctx.receiver),
+			/Subscription-setup watchdog:/,
+			'the longer receiver backstop must not race the sender gate timeout'
+		);
+
+		const id = `after-sender-timeout-${Date.now()}`;
+		await sendOperation(ctx.source, {
+			operation: 'insert',
+			database: DB,
+			table: TABLE,
+			records: [{ id }],
+		});
+		assert.equal(await waitForRecord(ctx.receiver, id), true, 'the sender-timeout retry must converge');
 	});
 });
