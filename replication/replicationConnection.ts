@@ -247,9 +247,10 @@ const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 
 // Waiting unbounded there would silently wedge the serialized message chain with no watchdog to catch it
 // — the receive watchdog keeps being reset by the very frames we are not processing — so we close instead
 // and let reconnect backoff retry, which costs one log line per attempt rather than one per message.
-const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(
-	process.env.HARPER_TEST_SUBSCRIPTION_RESOLVE_TIMEOUT_MS,
-	positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000)
+const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000);
+const SEND_SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(
+	process.env.HARPER_TEST_SEND_SUBSCRIPTION_RESOLVE_TIMEOUT_MS,
+	SUBSCRIPTION_RESOLVE_TIMEOUT
 );
 
 // Wall-clock ceiling on the gap between socket flushes / event-loop yields during a bulk copy.
@@ -2347,6 +2348,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	subscriptionSetupWatchdog = createSubscriptionSetupWatchdog({
 		timeoutMs: SUBSCRIPTION_SETUP_TIMEOUT_MS,
 		onTimeout: () => {
+			if (wsClosed) return;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
 				`Subscription-setup watchdog: no application response from ${remoteNodeName}${dbContext} for ${SUBSCRIPTION_SETUP_TIMEOUT_MS}ms while transport remained connected — reconnecting from the durable cursor (harper-pro#642) — ${truthSnapshotForLog()}`
@@ -3741,13 +3743,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								const resolvedDatabaseSubscription = await resolveSendSubscriptionSetup(
 									whenSubscribedToHdbNodes,
 									tableSubscriptionToReplicator,
-									SUBSCRIPTION_RESOLVE_TIMEOUT,
+									SEND_SUBSCRIPTION_RESOLVE_TIMEOUT,
 									(gate) => {
 										if (closed || wsClosed) return;
 										closed = true;
+										const databaseHint =
+											gate === 'database' ? '; this can also mean this node does not host the database' : '';
 										logger.error?.(
 											connectionId,
-											`Timed out waiting for ${gate} subscription setup for ${databaseName}; closing so the subscriber retries from its durable cursor (harper-pro#642)`
+											`Timed out waiting for ${gate} subscription setup for ${databaseName}${databaseHint}; closing so the subscriber retries from its durable cursor (harper-pro#642)`
 										);
 										close(1011, `Replication ${gate} setup timed out`);
 									}

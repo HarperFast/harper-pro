@@ -67,7 +67,9 @@ async function waitForLog(node, pattern, timeoutMs = RECOVERY_TIMEOUT_MS) {
 }
 
 function countSetupWatchdogWarnings(log) {
-	return log.split('Subscription-setup watchdog:').length - 1;
+	return log
+		.split('\n')
+		.filter((line) => line.includes('Subscription-setup watchdog:') && line.includes(`(db: "${DB}")`)).length;
 }
 
 async function dataSocketConnected(node) {
@@ -118,8 +120,12 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 
 		const sourceStallLog = await waitForLog(ctx.source, /\[test\] stalling subscription setup before DB_SCHEMA/);
 		assert.match(sourceStallLog, /\[test\] stalling subscription setup before DB_SCHEMA/);
-		const recoveryLog = await waitForLog(ctx.receiver, /Subscription-setup watchdog:/);
-		assert.match(recoveryLog, /Subscription-setup watchdog:/, 'the receiver watchdog must drive recovery');
+		const recoveryLog = await waitForLog(ctx.receiver, /Subscription-setup watchdog:.*\(db: "data"\)/);
+		assert.match(
+			recoveryLog,
+			/Subscription-setup watchdog:.*\(db: "data"\)/,
+			'the receiver data watchdog must drive recovery'
+		);
 
 		const first = `after-setup-watchdog-${Date.now()}`;
 		await sendOperation(ctx.source, {
@@ -163,10 +169,10 @@ suite('sender subscription setup recovery', { timeout: 120000 }, (ctx) => {
 				sourceCtx,
 				optionsFor(sourceCtx.harper, {
 					HARPER_TEST_SUBSCRIPTION_SETUP_STALL_ONCE_DB: DB,
-					HARPER_TEST_SUBSCRIPTION_RESOLVE_TIMEOUT_MS: '2000',
+					HARPER_TEST_SEND_SUBSCRIPTION_RESOLVE_TIMEOUT_MS: '2000',
 				})
 			),
-			startHarper(receiverCtx, optionsFor(receiverCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS: '10000' })),
+			startHarper(receiverCtx, optionsFor(receiverCtx.harper, { HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS: '20000' })),
 		]);
 		ctx.source = sourceCtx.harper;
 		ctx.receiver = receiverCtx.harper;
@@ -200,7 +206,7 @@ suite('sender subscription setup recovery', { timeout: 120000 }, (ctx) => {
 		assert.match(timeoutLog, /Timed out waiting for authorization subscription setup/);
 		assert.doesNotMatch(
 			await readLog(ctx.receiver),
-			/Subscription-setup watchdog:/,
+			/Subscription-setup watchdog:.*\(db: "data"\)/,
 			'the longer receiver backstop must not race the sender gate timeout'
 		);
 
@@ -212,5 +218,10 @@ suite('sender subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			records: [{ id }],
 		});
 		assert.equal(await waitForRecord(ctx.receiver, id), true, 'the sender-timeout retry must converge');
+		assert.doesNotMatch(
+			await readLog(ctx.receiver),
+			/Subscription-setup watchdog:.*\(db: "data"\)/,
+			'the receiver data watchdog must remain quiet after sender-driven convergence'
+		);
 	});
 });
