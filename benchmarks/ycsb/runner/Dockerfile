@@ -4,7 +4,7 @@
 # (run-bench-runner.sh) mints a fresh token and starts one container per job.
 FROM ubuntu:26.04
 
-ARG RUNNER_VERSION=2.334.0
+ARG RUNNER_VERSION=2.336.0
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Toolchain for harper-pro's native deps (rocksdb-js / lmdb prebuilds + gyp fallback) + node 24.
