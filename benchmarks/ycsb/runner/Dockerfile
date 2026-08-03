@@ -2,7 +2,7 @@
 # benchmark. Runs as a non-root user (the Actions runner refuses to run as root).
 # The registration token is supplied at runtime (never baked in); the host loop
 # (run-bench-runner.sh) mints a fresh token and starts one container per job.
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ARG RUNNER_VERSION=2.334.0
 ENV DEBIAN_FRONTEND=noninteractive
