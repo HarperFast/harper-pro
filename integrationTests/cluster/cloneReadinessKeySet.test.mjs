@@ -77,7 +77,9 @@ import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@h
 import { join } from 'node:path';
 import { sendOperation } from './clusterShared.mjs';
 
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
+process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT =
+	process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT ||
+	join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
 const DATABASE = 'data';
 const TABLE = 'qa762_bigitems';
