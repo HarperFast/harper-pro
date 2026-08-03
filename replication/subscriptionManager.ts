@@ -651,29 +651,37 @@ export async function startOnMainThread(options) {
 		logger.info('Setting up node replication for', node);
 		if (!node) {
 			// deleted node
+			const removedNode = nodeMap.get(hostname);
 			nodeMap.delete(hostname);
-			for (const [url, dbReplicationWorkers] of connectionReplicationMap) {
-				let foundNode;
-				for (const [_database, { nodes }] of dbReplicationWorkers) {
-					const node = nodes[0];
-					if (!node) continue;
-					if (node.name == hostname) {
-						foundNode = true;
-						for (const [database, { worker }] of dbReplicationWorkers) {
-							dbReplicationWorkers.delete(database);
-							logger.warn('Node was deleted, unsubscribing from node', hostname, database, url);
-							worker?.postMessage({ type: 'unsubscribe-from-node', node: hostname, nodes, database, url });
+			let url = removedNode ? getNodeURL(removedNode) : undefined;
+			let dbReplicationWorkers = url && connectionReplicationMap.get(url);
+
+			// Fall back to the entry scan for legacy/incomplete nodeMap state. Normally the URL is
+			// resolved above, which keeps cleanup working even when worker reassignment emptied the map.
+			if (!dbReplicationWorkers) {
+				for (const [candidateUrl, entries] of connectionReplicationMap) {
+					let foundNode = false;
+					for (const { nodes } of entries.values()) {
+						if (nodes[0]?.name === hostname) {
+							foundNode = true;
+							break;
 						}
+					}
+					if (foundNode) {
+						url = candidateUrl;
+						dbReplicationWorkers = entries;
 						break;
 					}
 				}
-				if (foundNode) {
-					const dbReplicationWorkers = connectionReplicationMap.get(url);
-					dbReplicationWorkers.iterator.remove();
-					connectionReplicationMap.delete(url);
-					return;
-				}
 			}
+			if (!dbReplicationWorkers || !url) return;
+			for (const [database, { worker, nodes }] of dbReplicationWorkers) {
+				dbReplicationWorkers.delete(database);
+				logger.warn('Node was deleted, unsubscribing from node', hostname, database, url);
+				worker?.postMessage({ type: 'unsubscribe-from-node', node: hostname, nodes, database, url });
+			}
+			dbReplicationWorkers.iterator?.remove();
+			connectionReplicationMap.delete(url);
 			return;
 		}
 		if (isSelf) return;
@@ -811,7 +819,11 @@ export async function startOnMainThread(options) {
 				) {
 					return;
 				}
-				if (shouldSubscribe) existingEntry.unsubscribed = false;
+				if (shouldSubscribe && existingEntry.unsubscribed) {
+					existingEntry.unsubscribed = false;
+					existingEntry.disconnectedAt = undefined;
+					existingEntry.createdAt = Date.now();
+				}
 			} else if (shouldSubscribe) {
 				nextWorkerIndex = nextWorkerIndex % httpWorkers.length; // wrap around as necessary
 				worker = httpWorkers[nextWorkerIndex++];
@@ -958,13 +970,15 @@ export async function startOnMainThread(options) {
 				return;
 			}
 			const mainNode: any = existingWorkerEntry.nodes[0];
-			if (!(
-				mainNode.replicates === true ||
-				mainNode.replicates?.sends ||
-				mainNode.replicates?.sendsTo?.length ||
-				mainNode.replicates?.receivesFrom?.length ||
-				mainNode.subscriptions?.length
-			)) {
+			if (
+				!(
+					mainNode.replicates === true ||
+					mainNode.replicates?.sends ||
+					mainNode.replicates?.sendsTo?.length ||
+					mainNode.replicates?.receivesFrom?.length ||
+					mainNode.subscriptions?.length
+				)
+			) {
 				// no replication, so just return
 				return;
 			}

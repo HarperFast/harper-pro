@@ -61,11 +61,6 @@
  *  - POSITIVE CONTROL: `remove_node` still genuinely de-authorizes -- proves the gate is armed,
  *    not disabled.
  *
- * Run:
- *   cd /home/kzyp/dev/harper-pro
- *   timeout 900 npm run test:integration -- \
- *     "integrationTests/cluster/hdbNodesReloadSendAuth.test.mjs" \
- *     > /home/kzyp/dev/tmp/qa756.log 2>&1; tail -80 /home/kzyp/dev/tmp/qa756.log
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert';

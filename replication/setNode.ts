@@ -326,6 +326,10 @@ export async function addNodeBack(req) {
  */
 export async function removeNodeBack(req) {
 	hdbLogger.trace('removeNodeBack received request:', req);
+	const callerName = req.hdb_user?.name;
+	if (!callerName || (req.name !== callerName && req.name !== getThisNodeName())) {
+		throw new ClientError(`remove_node_back may only remove the authenticated peer or this node, not '${req.name}'`);
+	}
 	const hdbNodes = getHDBNodeTable();
 	//  delete the record
 	await hdbNodes.delete(req.name);
