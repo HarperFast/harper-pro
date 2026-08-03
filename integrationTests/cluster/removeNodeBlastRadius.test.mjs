@@ -1,39 +1,20 @@
 /**
- * QA-758: blast radius of the `remove_node_back` stray-semicolon bug (F-225).
+ * QA-758: reciprocal remove_node and authenticated rejoin lifecycle.
  *
- * F-225 established that the reciprocal remove-node operation is registered as the
- * literal string 'remove_node_back;' (core-repo `replication/setNode.ts`), so it can
- * never match an incoming `operation: 'remove_node_back'` request. Consequence: when
- * A calls remove_node(B), A deletes its own hdb_nodes row for B and best-effort-sends
- * `remove_node_back` to B — which B can never handle — so B's local hdb_nodes record
- * for A, and B's live replication connection to A, are untouched.
+ * In a full-replication topology, A's remove_node(B) deletes A's peer row for B and sends
+ * remove_node_back naming B. B must handle that reciprocal operation by deleting its own
+ * self row, which is the local "replication enabled" authority.
  *
- * This test asks two questions left open by F-225:
+ * The regression has three production pieces:
  *
- * (a) Is the removal durable on the REMOVER across a restart of A? hdb_nodes is a
- *     persisted system-database table (system.hdb_nodes), not in-memory, so A must not
- *     resurrect B on a fresh process. That is asserted.
- *
- *     What B does after being removed is deliberately only LOGGED, never asserted. On a
- *     build where the reciprocal removal does not reach B, B keeps its row for A and keeps
- *     replicating; on a build where it does, B goes quiet. Asserting either direction would
- *     pin build-specific behavior — and asserting today's would pin a bug, turning this
- *     anchor red the moment it is fixed. The observations are printed so a reader of a CI
- *     run can still see which way the build behaved.
- *
- * (b) Re-join after removal: once B has no local record of A at all, does an explicit,
- *     authenticated `add_node` from B restore a live replicating connection? This is the
- *     operator-recovery path ("I removed the wrong node, put it back"), and it is expected
- *     to work — an authenticated add_node is a deliberate re-join, not a bypass. It is
- *     pinned here because the arms above delete membership state on both sides and nothing
- *     else in this suite asserts that re-joining from that state recovers.
- *     Deliberately NOT asserted: any claim about whether SUBSCRIPTION_REQUEST performs a
- *     synchronous membership check. This arm cannot distinguish "no such check exists"
- *     from "an authenticated add_node legitimately satisfies it", so concluding the former
- *     here would over-read the evidence.
+ * - remove_node_back must be registered under the exact operation name (no trailing semicolon);
+ * - reciprocal removal must persist on B, including across restart;
+ * - add_node must recreate B's self row and turn its subscriptions back on. The subscription
+ *   manager must discard explicitly-disabled entries so restored membership schedules a fresh
+ *   subscribe-to-node instead of returning early through a stale existing entry.
  */
 import { suite, test, before, after } from 'node:test';
-import { equal, ok } from 'node:assert/strict';
+import { equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
 	startHarper,
@@ -46,7 +27,7 @@ import { sendOperation } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT =
 	process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT ||
-	join(import.meta.dirname ?? module.path, '..', '..', 'dist', 'bin', 'harper.js');
+	join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
 // Re-passed on every restart — see the "CRITICAL" note in the QA-758 brief: omitting
 // options.config on restart wipes replication.databases and silently breaks the test.
@@ -98,11 +79,13 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		const ctxA = { name: ctx.name, harper: { hostname: hostnameA } };
 		const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
 		await Promise.all([
-			startHarper(ctxA, nodeStartOptions(ctxA.harper)),
-			startHarper(ctxB, nodeStartOptions(ctxB.harper)),
+			startHarper(ctxA, nodeStartOptions(ctxA.harper)).then(() => {
+				ctx.nodeA = ctxA.harper;
+			}),
+			startHarper(ctxB, nodeStartOptions(ctxB.harper)).then(() => {
+				ctx.nodeB = ctxB.harper;
+			}),
 		]);
-		ctx.nodeA = ctxA.harper;
-		ctx.nodeB = ctxB.harper;
 
 		// Create the table on BOTH nodes before add_node. Diagnosed empirically: if only A
 		// has the table pre-created (the addNodeFullCopy.test.mjs pattern, which tests
@@ -136,7 +119,7 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		await sendOperation(ctx.nodeB, {
 			operation: 'add_node',
 			hostname: ctx.nodeA.hostname,
-			authorization: ctx.nodeB.admin,
+			authorization: ctx.nodeA.admin,
 			rejectUnauthorized: false,
 		});
 		await waitUntil(() => connected(ctx.nodeB, ctx.hostnameA), { label: 'B connected to A' });
@@ -165,12 +148,9 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		equal(seeded[0].value, 'before-removal');
 	});
 
-	test('(a) A removes B: the remover drops B, and B is restarted for the arms below', async () => {
+	test('(a) A removes B on both sides, and reciprocal removal survives B restart', async () => {
 		await sendOperation(ctx.nodeA, { operation: 'remove_node', hostname: ctx.hostnameB });
 
-		// ASSERTED: A's own side reflects the removal promptly. A's half of remove_node is
-		// unconditional — it deletes its local hdb_nodes row regardless of whether the
-		// best-effort remove_node_back reached B — so this holds on any build.
 		await waitUntil(async () => !(await connected(ctx.nodeA, ctx.hostnameB)) || undefined, {
 			label: 'A to report B disconnected',
 		});
@@ -184,65 +164,28 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		});
 		ok(!hdbNodesOnA.some((r) => r.name === ctx.hostnameB), 'A must not have B in hdb_nodes after remove_node');
 
-		// OBSERVATIONAL, NOT ASSERTED: whether B stops receiving writes. On builds where
-		// the reciprocal removal does not reach B, B keeps its own hdb_nodes row for A and
-		// keeps replicating; on a build where it does reach B, B should go quiet. Both are
-		// logged rather than asserted, because asserting either direction would pin a
-		// build-specific behavior and turn this anchor red the moment that changes.
-		await sendOperation(ctx.nodeA, {
-			operation: 'upsert',
-			database: 'data',
-			table: 'qa758',
-			records: [{ id: 'post-removal-1', value: 'while-still-connected' }],
+		const hdbNodesOnB = await sendOperation(ctx.nodeB, {
+			operation: 'search_by_value',
+			database: 'system',
+			table: 'hdb_nodes',
+			search_attribute: 'name',
+			search_value: ctx.hostnameB,
+			get_attributes: ['name'],
 		});
-		const stillFlowing = await waitUntil(
-			async () => {
-				const r = await sendOperation(ctx.nodeB, {
-					operation: 'search_by_id',
-					database: 'data',
-					table: 'qa758',
-					ids: ['post-removal-1'],
-					get_attributes: ['id', 'value'],
-				}).catch(() => []);
-				return r.length ? r : null;
-			},
-			{ timeoutMs: 10000, label: 'B receiving a post-removal write from A (observational)' }
-		).catch(() => null);
-		console.log(
-			`[observational] B ${stillFlowing ? 'STILL RECEIVED' : 'did not receive'} a post-removal write from A before restart`
-		);
+		equal(hdbNodesOnB.length, 0, 'remove_node_back must delete B self row in a full-replication topology');
 
-		// Restart B, re-passing its ORIGINAL config (per the hard rule — omitting
-		// options.config wipes replication.databases and would falsely look like "fixed").
-		// killHarper first — starting over a still-live process throws "Harper is already
-		// running" (this is a genuine restart, not an in-place reconfigure).
 		await killHarper({ harper: ctx.nodeB });
 		ctx.nodeB = (await startHarper({ harper: ctx.nodeB }, nodeStartOptions(ctx.nodeB))).harper;
 
-		await sendOperation(ctx.nodeA, {
-			operation: 'upsert',
-			database: 'data',
-			table: 'qa758',
-			records: [{ id: 'post-restart-1', value: 'after-B-restart' }],
+		const hdbNodesOnRestartedB = await sendOperation(ctx.nodeB, {
+			operation: 'search_by_value',
+			database: 'system',
+			table: 'hdb_nodes',
+			search_attribute: 'name',
+			search_value: ctx.hostnameB,
+			get_attributes: ['name'],
 		});
-		const afterRestart = await waitUntil(
-			async () => {
-				const r = await sendOperation(ctx.nodeB, {
-					operation: 'search_by_id',
-					database: 'data',
-					table: 'qa758',
-					ids: ['post-restart-1'],
-					get_attributes: ['id', 'value'],
-				}).catch(() => []);
-				return r.length ? r : null;
-			},
-			{ timeoutMs: 15000, label: 'B (post-restart) receiving writes from A (observational)' }
-		).catch(() => null);
-		console.log(
-			`[observational] after restarting with its ORIGINAL config, B ${
-				afterRestart ? 'RESUMED replication from A (stale peer state is durable on disk)' : 'stayed quiet'
-			}`
-		);
+		equal(hdbNodesOnRestartedB.length, 0, 'B self-row removal must remain durable across restart');
 	});
 
 	test('(a, mirror) the removal itself is durable across a restart of A (the remover)', async () => {
@@ -270,57 +213,38 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		);
 	});
 
-	test('(b) an authenticated add_node re-join restores replication after B has no record of A', async () => {
-		// Put B into the fully-removed end-state by deleting its hdb_nodes record for A —
-		// the exact row remove_node_back would have deleted, had the operation name
-		// matched. From there, an operator re-join is the documented recovery path.
-		const bNodesForA = await sendOperation(ctx.nodeB, {
+	test('(b) an authenticated add_node re-join restores replication after B has no self row', async () => {
+		const bSelfRows = await sendOperation(ctx.nodeB, {
 			operation: 'search_by_value',
 			database: 'system',
 			table: 'hdb_nodes',
 			search_attribute: 'name',
-			search_value: ctx.hostnameA,
+			search_value: ctx.hostnameB,
 			get_attributes: ['name'],
 		});
-		// Normalize to the fully-removed end state without asserting which state we started
-		// from: on a build where the reciprocal removal reaches B the row is already gone,
-		// on one where it does not we delete it here. Either way the arm below starts from
-		// "B has no record of A", so it is agnostic to that behavior.
-		console.log(`[observational] B ${bNodesForA.length > 0 ? 'still has' : 'no longer has'} an hdb_nodes row for A`);
-		if (bNodesForA.length > 0) {
-			await sendOperation(ctx.nodeB, {
-				operation: 'delete',
-				database: 'system',
-				table: 'hdb_nodes',
-				ids: [ctx.hostnameA],
-			});
-		}
-		const afterDelete = await sendOperation(ctx.nodeB, {
-			operation: 'search_by_value',
-			database: 'system',
-			table: 'hdb_nodes',
-			search_attribute: 'name',
-			search_value: ctx.hostnameA,
-			get_attributes: ['name'],
-		});
-		equal(afterDelete.length, 0, 'B hdb_nodes row for A deleted (simulating the fixed removeNodeBack outcome)');
+		equal(bSelfRows.length, 0, 'B must begin rejoin in the real reciprocal-removal state');
 
 		// B re-joins A with an explicit, authenticated add_node. This is an operator
-		// action carrying B's own admin credential, so acceptance is the expected and
+		// action carrying A's admin credential, so acceptance is the expected and
 		// desired outcome; the invariant being pinned is that recovery from a full
 		// removal works, not anything about how A authorizes the subscription.
 		await sendOperation(ctx.nodeB, {
 			operation: 'add_node',
 			hostname: ctx.hostnameA,
-			authorization: ctx.nodeB.admin,
+			authorization: ctx.nodeA.admin,
 			rejectUnauthorized: false,
 		});
 
-		const reconnected = await waitUntil(() => connected(ctx.nodeB, ctx.hostnameA), {
-			timeoutMs: 20000,
-			label: 'B reconnecting to A after re-subscribing with no local record of A',
+		const restoredSelfRows = await sendOperation(ctx.nodeB, {
+			operation: 'search_by_value',
+			database: 'system',
+			table: 'hdb_nodes',
+			search_attribute: 'name',
+			search_value: ctx.hostnameB,
+			get_attributes: ['name', 'replicates'],
 		});
-		ok(reconnected, 'B successfully re-established a connected replication socket to A');
+		equal(restoredSelfRows.length, 1, "add_node must recreate B's hdb_nodes self row");
+		equal(restoredSelfRows[0].replicates, true, 'restored B self row must advertise full replication');
 
 		await sendOperation(ctx.nodeA, {
 			operation: 'upsert',

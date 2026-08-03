@@ -55,47 +55,35 @@
  * sound check or just relocate the same defect onto real numbers.
  *
  * Method: qa711's real-bootstrap bring-up (HDB_LEADER_TOKEN/HDB_LEADER_URL), both nodes on
- * storage.engine:'lmdb', a larger dataset than qa711 (LMDB replication proved fast enough in an
- * initial run of this suite that a 40k/48MB set converged in under 2s -- scaled up here to
- * keep the copy open past cloneNode's pre-copy bootstrap steps and production's own 3s sync-
- * check cadence). Poll production get_status(availability) tightly; at the FIRST Available
- * tick, immediately take a real bidirectional key-set diff (never a count, never
- * cluster_status alone) between leader and clone. A side-channel verbatim port of
- * checkSyncStatus (from qa739) is also polled against the same cluster_status responses purely
- * as a diagnostic cross-check -- it is not what any assertion depends on.
+ * storage.engine:'lmdb', with the clone-resume suite's checkpoint and receive throttles to make
+ * the copy window deterministic. The test first requires a readable partial key set while
+ * production reports Unavailable, then at the FIRST Available tick takes a real bidirectional
+ * key-set diff (never a count, never cluster_status alone) between leader and clone. A side-channel
+ * verbatim port of checkSyncStatus (from qa739) is also polled against the same cluster_status
+ * responses purely as a diagnostic cross-check -- it is not what any assertion depends on.
  *
  * ORACLE ARMED: `selfTestComparator()` runs first and feeds the diff function a deliberately
  * truncated set with an injected extra key, asserting it reports exactly that gap -- so a
  * clean 0/0 result later is a proven-working comparator, not a broken one.
  *
- * DELIBERATELY DIAGNOSTIC, NOT ASSERTED: the non-zero `targetTimestamps` watermark is logged
- * rather than asserted. It was genuinely non-zero on this LMDB path when the scenario ran, but a
- * snapshot taken close to table creation could plausibly race it, and a flaky assertion here would
- * be worse than none. The invariant above does not depend on it. Whether a mid-copy window is
- * observed at all is likewise logged, not asserted -- on a fast runner the copy may complete before
- * the first poll, which makes the observation weaker but never makes the assertion wrong.
+ * The target watermark remains diagnostic because the production outcome is the authoritative
+ * signal. The mid-copy window is hard-asserted: a green run must observe a partial readable set while
+ * Unavailable before it can accept a complete first-Available snapshot.
  */
 import { suite, test, before, after } from 'node:test';
-import { strictEqual as equal, ok } from 'node:assert/strict';
+import { strictEqual as equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
 import { sendOperation } from './clusterShared.mjs';
 
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
-	'..',
-	'..',
-	'dist',
-	'bin',
-	'harper.js'
-);
+process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
 const DATABASE = 'data';
 const TABLE = 'qa762_bigitems';
-const RECORD_COUNT = 250000;
-const BATCH_SIZE = 5000;
-const PAYLOAD_BYTES = 1200; // ~300MB total -- scaled up from qa711/qa739 (40k/48MB converged in <2s on LMDB)
+const RECORD_COUNT = 4000;
+const BATCH_SIZE = 500;
+const PAYLOAD_BYTES = 2048;
 const POLL_WINDOW_MS = 150000;
 const FETCH_TIMEOUT_MS = 10000;
 
@@ -180,6 +168,33 @@ async function getIdSet(node) {
 	}
 }
 
+async function getBoundaryPresence(node) {
+	const firstId = 'item-0000000';
+	const lastId = `item-${String(RECORD_COUNT - 1).padStart(7, '0')}`;
+	try {
+		const rows = await op(node, {
+			operation: 'search_by_id',
+			database: DATABASE,
+			table: TABLE,
+			ids: [firstId, lastId],
+			get_attributes: ['id'],
+		});
+		const found = new Set(rows.map((row) => row.id));
+		return { first: found.has(firstId), last: found.has(lastId) };
+	} catch (err) {
+		return { first: false, last: false, error: err.message };
+	}
+}
+
+async function getAvailability(node) {
+	try {
+		const response = await op(node, { operation: 'get_status', id: 'availability' });
+		return response?.status ?? 'unknown';
+	} catch (err) {
+		return `error:${err.message}`;
+	}
+}
+
 /** The oracle: a real bidirectional key-set diff -- never a count. */
 function diffKeySets(sourceIds, cloneIds) {
 	let missing = 0;
@@ -221,7 +236,10 @@ suite('QA-762 clone checkSyncStatus / availability on LMDB leader', { timeout: 3
 					replication: { port: hostnameA + ':9933', securePort: null, databases: [DATABASE] },
 					storage: { engine: 'lmdb' },
 				},
-				env: { HARPER_NO_FLUSH_ON_EXIT: true },
+				env: {
+					HARPER_NO_FLUSH_ON_EXIT: true,
+					REPLICATION_COPYCHECKPOINTRECORDS: 25,
+				},
 			});
 			ctx.nodeA = nodeCtxA.harper;
 			ctx.nodes.push(ctx.nodeA);
@@ -261,6 +279,13 @@ suite('QA-762 clone checkSyncStatus / availability on LMDB leader', { timeout: 3
 		'real cloneNode bootstrap: availability vs bidirectional key-set oracle (LMDB leader)',
 		async () => {
 			const { nodeA, sourceIds } = ctx;
+			let targetTimestamps = null;
+			try {
+				targetTimestamps = await getTargetTimestamps(nodeA);
+				console.log(`[qa762] diagnostic targetTimestamps=${JSON.stringify(targetTimestamps)}`);
+			} catch (err) {
+				console.log(`[qa762] diagnostic targetTimestamps fetch failed (non-fatal): ${err.message}`);
+			}
 
 			const tokenResponse = await op(nodeA, {
 				operation: 'create_authentication_tokens',
@@ -283,22 +308,28 @@ suite('QA-762 clone checkSyncStatus / availability on LMDB leader', { timeout: 3
 					HDB_LEADER_TOKEN: tokenResponse.operation_token,
 					ALLOW_SELF_SIGNED: true,
 					HARPER_NO_FLUSH_ON_EXIT: true,
+					REPLICATION_RECEIVEEVENTHIGHWATERMARK: 1,
+					REPLICATION_RECEIVEYIELDINTERVAL: 0,
 				},
 			});
 			const nodeB = nodeCtxB.harper;
 			ctx.nodes.push(nodeB);
 			console.log(`[qa762] clone server reachable ${Date.now() - cloneStart}ms after start; beginning poll`);
 
-			// Diagnostic-only targetTimestamps snapshot (not asserted on) -- confirms whether this run
-			// reached the previously-unexercised LMDB code path (non-zero target) or is vacuous like qa739's
-			// RocksDB finding (0).
-			let targetTimestamps = null;
-			try {
-				targetTimestamps = await getTargetTimestamps(nodeA);
-				console.log(`[qa762] diagnostic targetTimestamps=${JSON.stringify(targetTimestamps)}`);
-			} catch (err) {
-				console.log(`[qa762] diagnostic targetTimestamps fetch failed (non-fatal): ${err.message}`);
+			const partialDeadline = Date.now() + 60000;
+			let partialWhileUnavailable = null;
+			while (Date.now() < partialDeadline) {
+				const tRel = Date.now() - cloneStart;
+				const [availability, boundary] = await Promise.all([getAvailability(nodeB), getBoundaryPresence(nodeB)]);
+				if (availability === 'Unavailable' && boundary.first && !boundary.last) {
+					partialWhileUnavailable = { tRel, ...boundary };
+					console.log('[qa762] deterministic mid-copy sample: Unavailable with first key readable and last key absent');
+					break;
+				}
+				if (availability === 'Available') break;
+				await delay(25);
 			}
+			ok(partialWhileUnavailable, 'test must observe a readable partial key set while production reports Unavailable');
 
 			const deadline = Date.now() + POLL_WINDOW_MS;
 			let becameAvailableAt = null;
@@ -310,13 +341,7 @@ suite('QA-762 clone checkSyncStatus / availability on LMDB leader', { timeout: 3
 
 			while (Date.now() < deadline) {
 				const tRel = Date.now() - cloneStart;
-				let availability = 'unknown';
-				try {
-					const statusResp = await op(nodeB, { operation: 'get_status', id: 'availability' });
-					availability = statusResp?.status ?? 'unknown';
-				} catch (err) {
-					availability = `error:${err.message}`;
-				}
+				const availability = await getAvailability(nodeB);
 
 				// Diagnostic-only predicate cross-check against the same cluster_status the real
 				// checkSyncStatus would see -- logged, not asserted on.
@@ -340,7 +365,6 @@ suite('QA-762 clone checkSyncStatus / availability on LMDB leader', { timeout: 3
 					({ missing, extra } = diffKeySets(sourceIds, cloneIds));
 				}
 				if (extra > 0) sawExtra = true;
-
 				lastSample = { tRel, availability, cloneCount: cloneIds ? cloneIds.size : null, cloneIdsError, missing, extra };
 				console.log(
 					`[qa762] t=${tRel}ms availability=${availability} cloneKeys=${cloneIds ? cloneIds.size : `ERROR(${cloneIdsError})`}/${sourceIds.size} missing=${missing} extra=${extra}`
@@ -376,7 +400,8 @@ suite('QA-762 clone checkSyncStatus / availability on LMDB leader', { timeout: 3
 
 			console.log(
 				`[qa762] SUMMARY becameAvailableAt=${becameAvailableAt} availableSnapshot=${JSON.stringify(availableSnapshot)} ` +
-					`predicateFirstSyncedAt=${predicateFirstSyncedAt} convergedAt=${convergedAt} sawExtra=${sawExtra} lastSample=${JSON.stringify(lastSample)}`
+					`partialWhileUnavailable=${JSON.stringify(partialWhileUnavailable)} predicateFirstSyncedAt=${predicateFirstSyncedAt} ` +
+					`convergedAt=${convergedAt} sawExtra=${sawExtra} lastSample=${JSON.stringify(lastSample)}`
 			);
 
 			ok(becameAvailableAt !== null, `clone never reported Available within ${POLL_WINDOW_MS}ms poll window`);
