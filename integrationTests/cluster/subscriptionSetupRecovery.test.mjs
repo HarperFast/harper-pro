@@ -1,9 +1,5 @@
-/**
- * harper-pro#642 end-to-end regression: the sender's dynamic authorization setup never settles for the
- * first data subscription, so DB_SCHEMA/replay never start while ping/pong keeps the WebSocket alive.
- * The receiver's application-level setup watchdog must reconnect from the durable cursor; the one-shot
- * sender fault then clears and replication converges without a process restart.
- */
+// harper-pro#642 end-to-end regression: a stuck sender-side setup gate must not leave the connection
+// ping-alive forever; the receiver's watchdog must reconnect from the durable cursor and converge.
 
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';

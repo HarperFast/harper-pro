@@ -1,8 +1,4 @@
-/**
- * Regression coverage for harper-pro#642: an outbound subscription can remain transport-live forever
- * while the sender is stuck before DB_SCHEMA/replay setup. Ping/pong must not count as application setup;
- * the one-shot watchdog retires only when the requested database's subscription path responds.
- */
+// harper-pro#642: ping/pong must not count as application setup progress.
 
 import assert from 'node:assert/strict';
 import sinon from 'sinon';
@@ -200,7 +196,7 @@ describe('createSubscriptionSetupWatchdog', () => {
 		assert.equal(onTimeout.callCount, 1);
 	});
 
-	it('does not count a back-pressure pause against a pending setup window', () => {
+	it('does not count paused time against a pending setup window, but preserves unpaused progress', () => {
 		const onTimeout = sinon.spy();
 		const watchdog = createSubscriptionSetupWatchdog({ timeoutMs: 60_000, onTimeout });
 
@@ -210,8 +206,29 @@ describe('createSubscriptionSetupWatchdog', () => {
 		clock.tick(120_000);
 		assert.equal(onTimeout.callCount, 0);
 
+		// 30s already elapsed before the pause; only the remaining 30s should be left after resume —
+		// recurring pause/resume must not keep re-granting a full window forever (harper-pro#642 review).
 		watchdog.resume();
-		clock.tick(59_999);
+		clock.tick(29_999);
+		assert.equal(onTimeout.callCount, 0);
+		clock.tick(1);
+		assert.equal(onTimeout.callCount, 1);
+	});
+
+	it('recurring short pause/resume cycles still consume down to firing, never re-granting a full window', () => {
+		const onTimeout = sinon.spy();
+		const watchdog = createSubscriptionSetupWatchdog({ timeoutMs: 60_000, onTimeout });
+
+		watchdog.arm();
+		for (let i = 0; i < 5; i++) {
+			clock.tick(10_000); // active progress
+			watchdog.pause();
+			clock.tick(5_000); // paused; must not count
+			watchdog.resume();
+		}
+		// 5 * 10s active progress consumed of the 60s budget; 10s remains.
+		assert.equal(onTimeout.callCount, 0);
+		clock.tick(9_999);
 		assert.equal(onTimeout.callCount, 0);
 		clock.tick(1);
 		assert.equal(onTimeout.callCount, 1);
