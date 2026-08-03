@@ -354,7 +354,7 @@ server.registerOperation?.({
 	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],
 });
 server.registerOperation?.({
-	name: 'remove_node_back;',
+	name: 'remove_node_back',
 	execute: removeNodeBack,
 	httpMethod: 'DELETE',
 });

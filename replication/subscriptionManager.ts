@@ -901,6 +901,12 @@ export async function startOnMainThread(options) {
 						reportIdentityMismatchOnce(registeredNodes);
 					}
 				}
+				// The entry represents an active or retrying subscription. Once we explicitly unsubscribe,
+				// it must no longer be reusable: if this node's self membership is later restored,
+				// onNodeUpdate re-evaluates the peer with shouldSubscribe=true. Leaving the disabled entry
+				// in the map makes the existingEntry fast path return without posting subscribe-to-node,
+				// permanently wedging full-replication rejoin until process restart.
+				dbReplicationWorkers.delete(databaseName);
 				const request = {
 					type: 'unsubscribe-from-node',
 					database: databaseName,

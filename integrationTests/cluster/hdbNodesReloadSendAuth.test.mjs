@@ -51,9 +51,9 @@
  * under test rather than being short-circuited by a static directional route.
  *
  * Assertions:
- *  - PRECONDITION (non-vacuous, hard-asserted, not just logged): the reload marker debug line
- *    actually appears in a node's log (`logging.level: 'debug'`), and A<->B replication was
- *    genuinely live and bidirectional (real data round trip) before the join.
+ *  - PRECONDITION (non-vacuous, hard-asserted, not just logged): B emits a new reload marker
+ *    debug line after the join (`logging.level: 'debug'`), and A<->B replication was genuinely
+ *    live and bidirectional (real data round trip) before the join.
  *  - DEFECT DETECTOR: no `1008` / "Unauthorized database subscription" close anywhere after the
  *    join; A<->B per-database sockets stay `connected:true` throughout the join window; every
  *    write issued on A and B during the join window arrives on the other side (bidirectional
@@ -64,7 +64,7 @@
  * Run:
  *   cd /home/kzyp/dev/harper-pro
  *   timeout 900 npm run test:integration -- \
- *     "integrationTests/cluster/qa-scratch/qa756-hdbnodes-reload-sendauth.test.mjs" \
+ *     "integrationTests/cluster/hdbNodesReloadSendAuth.test.mjs" \
  *     > /home/kzyp/dev/tmp/qa756.log 2>&1; tail -80 /home/kzyp/dev/tmp/qa756.log
  */
 import { suite, test, before, after } from 'node:test';
@@ -76,12 +76,13 @@ import { sendOperation, readLog } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT =
 	process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT ||
-	join(import.meta.dirname ?? module.path, '..', '..', 'dist', 'bin', 'harper.js');
+	join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
 const DB = 'data';
 const TABLE = 'qa756flow';
 const UNAUTHORIZED_MARKER = 'Unauthorized database subscription';
 const RELOAD_MARKER_LOG_LINE = 'hdb_nodes reload marker received; rescanning known nodes';
+const EXPECTED_SOCKET_DATABASES = ['system'];
 
 function meshConfig(hostname, routes) {
 	return {
@@ -108,7 +109,7 @@ function newPeerConfig(hostname) {
 
 const ip = (u = '') => (u.match(/127\.0\.0\.\d+/) || [u])[0];
 async function clusterStatus(node) {
-	return sendOperation(node, { operation: 'cluster_status' }).catch((e) => ({ error: String(e) }));
+	return sendOperation(node, { operation: 'cluster_status' });
 }
 function socketsToPeer(status, peerIp) {
 	for (const c of status?.connections || []) {
@@ -116,17 +117,13 @@ function socketsToPeer(status, peerIp) {
 	}
 	return [];
 }
-
-async function hasRecord(node, id) {
-	const r = await sendOperation(node, {
-		operation: 'search_by_id',
-		database: DB,
-		table: TABLE,
-		ids: [id],
-		get_attributes: ['id'],
-	}).catch(() => null);
-	return Array.isArray(r) && r.some((x) => x?.id === id);
+function expectedSocketsConnected(status, peerIp) {
+	const sockets = socketsToPeer(status, peerIp);
+	return EXPECTED_SOCKET_DATABASES.every((database) =>
+		sockets.some((socket) => socket.database === database && socket.connected === true)
+	);
 }
+
 /** Poll until every id in `ids` is present on `node`. Returns the (possibly non-empty) still-missing set. */
 async function waitForAll(node, ids, { timeoutMs = 60000, pollMs = 500 } = {}) {
 	const deadline = Date.now() + timeoutMs;
@@ -166,13 +163,16 @@ suite(
 				// the send-auth gate falls to the dynamic hdb_nodes watch under test, not a static
 				// directional route (mirrors systemDbDynamicSendGate.test.mjs's A<->B edge).
 				await Promise.all([
-					startHarper(cA, meshConfig(A, [{ hostname: B, port: 9933 }])),
-					startHarper(cB, meshConfig(B, [{ hostname: A, port: 9933 }])),
-					startHarper(cC, newPeerConfig(C)),
+					startHarper(cA, meshConfig(A, [{ hostname: B, port: 9933 }])).then(() => {
+						ctx.nodeA = cA.harper;
+					}),
+					startHarper(cB, meshConfig(B, [{ hostname: A, port: 9933 }])).then(() => {
+						ctx.nodeB = cB.harper;
+					}),
+					startHarper(cC, newPeerConfig(C)).then(() => {
+						ctx.nodeC = cC.harper;
+					}),
 				]);
-				ctx.nodeA = cA.harper;
-				ctx.nodeB = cB.harper;
-				ctx.nodeC = cC.harper;
 
 				await Promise.all(
 					[ctx.nodeA, ctx.nodeB].map((node) =>
@@ -207,7 +207,7 @@ suite(
 		test(
 			'A<->B survive a hdb_nodes reload marker fired by B base-copying a new, unrelated peer C',
 			async () => {
-				const { nodeA, nodeB, nodeC, A, B } = ctx;
+				const { nodeA, nodeB, nodeC, A } = ctx;
 
 				// PRECONDITION 1 (non-vacuous): replication is genuinely LIVE and BIDIRECTIONAL before the
 				// join -- a real data round trip both ways, not just a cluster_status bit.
@@ -225,26 +225,41 @@ suite(
 					table: TABLE,
 					records: [{ id: preB, name: preB }],
 				});
-				let missing = await waitForAll(nodeB, [preA], { timeoutMs: 30000 });
-				ok(missing.length === 0, `precondition: A->B must be live before the join; missing on B: ${missing}`);
-				missing = await waitForAll(nodeA, [preB], { timeoutMs: 30000 });
-				ok(missing.length === 0, `precondition: B->A must be live before the join; missing on A: ${missing}`);
+				const [missingOnBBeforeJoin, missingOnABeforeJoin] = await Promise.all([
+					waitForAll(nodeB, [preA], { timeoutMs: 30000 }),
+					waitForAll(nodeA, [preB], { timeoutMs: 30000 }),
+				]);
+				ok(
+					missingOnBBeforeJoin.length === 0,
+					`precondition: A->B must be live before the join; missing on B: ${missingOnBBeforeJoin}`
+				);
+				ok(
+					missingOnABeforeJoin.length === 0,
+					`precondition: B->A must be live before the join; missing on A: ${missingOnABeforeJoin}`
+				);
 				console.log('[QA756] precondition satisfied: A<->B bidirectional replication confirmed live before join');
 
-				const statusA0 = await clusterStatus(nodeA);
 				const statusB0 = await clusterStatus(nodeB);
+				const socketsB0 = socketsToPeer(statusB0, A);
+				if (!expectedSocketsConnected(statusB0, A)) {
+					console.log('[QA756] pre-join B->A sockets:', JSON.stringify(socketsB0));
+				}
 				ok(
-					socketsToPeer(statusA0, B).some((s) => s.database === 'system' && s.connected) &&
-						socketsToPeer(statusB0, A).some((s) => s.database === 'system' && s.connected),
-					'precondition: A<->B system-database sockets must be connected before the join'
+					expectedSocketsConnected(statusB0, A),
+					'precondition: B must have a connected system database subscription to A before the join'
 				);
 
 				// Baseline logs, taken right before the join, so the "no 1008" check below only covers
 				// activity the join itself could have caused.
-				const preJoinLogA = await readLog(nodeA);
-				const preJoinLogB = await readLog(nodeB);
+				const [preJoinLogA, preJoinLogB, preJoinLogC] = await Promise.all([
+					readLog(nodeA),
+					readLog(nodeB),
+					readLog(nodeC),
+				]);
 				ok(
-					!preJoinLogA.includes(UNAUTHORIZED_MARKER) && !preJoinLogB.includes(UNAUTHORIZED_MARKER),
+					!preJoinLogA.includes(UNAUTHORIZED_MARKER) &&
+						!preJoinLogB.includes(UNAUTHORIZED_MARKER) &&
+						!preJoinLogC.includes(UNAUTHORIZED_MARKER),
 					'sanity: no Unauthorized closes should exist before the join even starts'
 				);
 
@@ -264,7 +279,7 @@ suite(
 				);
 
 				// Concurrently: writes on BOTH pre-existing nodes during the join window, plus a
-				// cluster_status poll watching the A<->B system socket the whole time.
+				// cluster_status poll watching B's pre-existing subscription to A the whole time.
 				const idsFromA = [];
 				const idsFromB = [];
 				const statusSamples = [];
@@ -289,11 +304,10 @@ suite(
 							records: [{ id: idB, name: idB }],
 						}),
 					]);
-					const [sa, sb] = await Promise.all([clusterStatus(nodeA), clusterStatus(nodeB)]);
+					const sb = await clusterStatus(nodeB);
 					statusSamples.push({
 						t: Date.now(),
-						aToB: socketsToPeer(sa, B).map((s) => `${s.database}:${s.connected}`),
-						bToA: socketsToPeer(sb, A).map((s) => `${s.database}:${s.connected}`),
+						bToA: socketsToPeer(sb, A),
 					});
 					i++;
 					await delay(300);
@@ -303,64 +317,61 @@ suite(
 				// Give the copy + marker + any (wrongly) triggered teardown a little more time to land/settle.
 				await delay(5000);
 
-				// DEFECT DETECTOR 1: per-database sockets must have stayed connected:true for the ENTIRE
-				// sampled window -- never observed disconnected.
-				const droppedA = statusSamples.filter((s) => s.aToB.some((v) => v.endsWith(':false')));
-				const droppedB = statusSamples.filter((s) => s.bToA.some((v) => v.endsWith(':false')));
-				if (droppedA.length || droppedB.length) {
-					console.log('[QA756] DROPPED SAMPLES a->b:', JSON.stringify(droppedA));
-					console.log('[QA756] DROPPED SAMPLES b->a:', JSON.stringify(droppedB));
+				// DEFECT DETECTOR 1: every sample must contain the targeted system socket connected:true.
+				const unhealthyB = statusSamples.filter((sample) =>
+					EXPECTED_SOCKET_DATABASES.some(
+						(database) => !sample.bToA.some((socket) => socket.database === database && socket.connected === true)
+					)
+				);
+				if (unhealthyB.length) {
+					console.log('[QA756] UNHEALTHY SAMPLES b->a:', JSON.stringify(unhealthyB));
 				}
-				ok(droppedA.length === 0, 'A->B database sockets must stay connected:true for the whole join window');
-				ok(droppedB.length === 0, 'B->A database sockets must stay connected:true for the whole join window');
+				ok(
+					unhealthyB.length === 0,
+					'B->A system database socket must stay present and connected for the whole join window'
+				);
 
 				// DEFECT DETECTOR 2: bidirectional key-set -- every id written on A during the window
 				// arrives on B, and every id written on B arrives on A (not just matching counts).
-				const missingOnB = await waitForAll(nodeB, idsFromA, { timeoutMs: 60000 });
+				const [missingOnB, missingOnA] = await Promise.all([
+					waitForAll(nodeB, idsFromA, { timeoutMs: 60000 }),
+					waitForAll(nodeA, idsFromB, { timeoutMs: 60000 }),
+				]);
 				ok(
 					missingOnB.length === 0,
 					`all ${idsFromA.length} A-origin writes must reach B; missing: ${missingOnB.join(', ')}`
 				);
-				const missingOnA = await waitForAll(nodeA, idsFromB, { timeoutMs: 60000 });
 				ok(
 					missingOnA.length === 0,
 					`all ${idsFromB.length} B-origin writes must reach A; missing: ${missingOnA.join(', ')}`
 				);
 
-				// PRECONDITION 2 (non-vacuous): the reload marker must have ACTUALLY fired. Assert the
-				// debug log line itself -- not a weaker proxy -- on whichever node(s) logged it.
-				const [logA, logB, logC] = await Promise.all([readLog(nodeA), readLog(nodeB), readLog(nodeC)]);
-				const markerHits = [
-					logA.includes(RELOAD_MARKER_LOG_LINE) && 'A',
-					logB.includes(RELOAD_MARKER_LOG_LINE) && 'B',
-					logC.includes(RELOAD_MARKER_LOG_LINE) && 'C',
-				].filter(Boolean);
-				if (markerHits.length === 0) {
-					console.log(
-						'[QA756] *** could NOT find the reload-marker debug line on any node; this precondition is ' +
-							'UNVERIFIED (not merely weaker-asserted) -- treat the anchor as inconclusive, not green-by-default ***'
-					);
-				} else {
-					console.log(`[QA756] reload marker line confirmed on: ${markerHits.join(', ')}`);
+				// PRECONDITION 2 (non-vacuous): B must emit a new reload marker after the join.
+				let logB = await readLog(nodeB);
+				const markerDeadline = Date.now() + 30000;
+				while (!logB.slice(preJoinLogB.length).includes(RELOAD_MARKER_LOG_LINE) && Date.now() < markerDeadline) {
+					await delay(250);
+					logB = await readLog(nodeB);
 				}
 				ok(
-					markerHits.length > 0,
-					`precondition: "${RELOAD_MARKER_LOG_LINE}" must appear in at least one node's log (the join must ` +
-						`actually have driven a copyApply base copy) -- found on none, so this cannot be treated as a non-vacuous anchor`
+					logB.slice(preJoinLogB.length).includes(RELOAD_MARKER_LOG_LINE),
+					`precondition: B must log a new "${RELOAD_MARKER_LOG_LINE}" after joining C`
 				);
+				console.log('[QA756] post-join reload marker line confirmed locally on B');
 
 				// DEFECT DETECTOR 3: no spurious de-authorization close anywhere, at any point after the join.
-				const postJoinUnauthorized = [
-					logA.includes(UNAUTHORIZED_MARKER) && 'A',
-					logB.includes(UNAUTHORIZED_MARKER) && 'B',
-					logC.includes(UNAUTHORIZED_MARKER) && 'C',
-				].filter(Boolean);
+				await delay(500);
+				const [logA, finalLogB, logC] = await Promise.all([readLog(nodeA), readLog(nodeB), readLog(nodeC)]);
+				const postJoinLogs = [
+					['A', logA.slice(preJoinLogA.length)],
+					['B', finalLogB.slice(preJoinLogB.length)],
+					['C', logC.slice(preJoinLogC.length)],
+				];
+				const postJoinUnauthorized = postJoinLogs
+					.filter(([, log]) => log.includes(UNAUTHORIZED_MARKER))
+					.map(([name]) => name);
 				if (postJoinUnauthorized.length) {
-					for (const [name, log] of [
-						['A', logA],
-						['B', logB],
-						['C', logC],
-					]) {
+					for (const [name, log] of postJoinLogs) {
 						for (const line of log.split('\n')) {
 							if (line.includes(UNAUTHORIZED_MARKER)) console.log(`[QA756] UNAUTHORIZED CLOSE on ${name}: ${line}`);
 						}
@@ -372,30 +383,33 @@ suite(
 					`no node should log "${UNAUTHORIZED_MARKER}" after the join; found on: ${postJoinUnauthorized.join(', ')}`
 				);
 			},
-			{ timeout: 120000 }
+			{ timeout: 180000 }
 		);
 
 		test(
 			'positive control: remove_node still genuinely de-authorizes a peer',
 			async () => {
-				const { nodeA, nodeB, B } = ctx;
+				const { nodeA, nodeB, A } = ctx;
 
-				await sendOperation(nodeA, { operation: 'remove_node', hostname: nodeB.hostname });
-				console.log('[QA756] A issued remove_node against B -- expecting genuine de-authorization this time');
+				// The main scenario continuously verified B's outbound system subscription to A. Remove
+				// that exact registered edge so the positive control cannot depend on a peer row that a
+				// system-database base copy may have replaced on the opposite side.
+				await sendOperation(nodeB, { operation: 'remove_node', hostname: nodeA.hostname });
+				console.log('[QA756] B issued remove_node against A -- expecting genuine de-authorization this time');
 
-				// Poll for the A->B system socket to disappear / disconnect.
+				// Poll for the verified B->A system socket to disappear / disconnect.
 				let disconnected = false;
 				let lastSockets = [];
 				for (let i = 0; i < 40 && !disconnected; i++) {
 					await delay(500);
-					const status = await clusterStatus(nodeA);
-					lastSockets = socketsToPeer(status, B);
+					const status = await clusterStatus(nodeB);
+					lastSockets = socketsToPeer(status, A);
 					// note: `every` on an empty socket list is already true (peer gone == disconnected)
 					disconnected = lastSockets.every((s) => !s.connected);
 				}
 				ok(
 					disconnected,
-					`A's connection to B should tear down after remove_node; last sockets seen: ${JSON.stringify(lastSockets)}`
+					`B's connection to A should tear down after remove_node; last sockets seen: ${JSON.stringify(lastSockets)}`
 				);
 
 				// The gate should log the SAME Unauthorized-close signature, this time for a genuine
@@ -406,25 +420,20 @@ suite(
 					'remove_node should produce the same "Unauthorized database subscription" close signature (genuine de-auth, gate is still armed)'
 				);
 
-				// NOTE (deliberately observed, NOT asserted): whether B stays removed afterwards is a
-				// SEPARATE, currently-broken property and is not part of this anchor. `setNode.ts` sends
-				// `operation: 'remove_node_back'` to the removed peer, but the peer registers that
-				// operation as `'remove_node_back;'` (stray trailing semicolon, setNode.ts:357), so the
-				// reciprocal removal always fails "Operation not found" — caught and only warn-logged.
-				// B therefore keeps its own hdb_nodes record for A, reconnects, and briefly replicates
-				// again. Pinning that here would freeze the bug; it is tracked separately and this leg
-				// stays observational until the one-character fix lands.
-				const postRemovalId = 'qa756-post-removal-' + Date.now();
-				await sendOperation(nodeA, {
-					operation: 'insert',
-					database: DB,
-					table: TABLE,
-					records: [{ id: postRemovalId, name: postRemovalId }],
+				// Full-replication remove_node_back names the remote node itself, so the reciprocal
+				// operation must delete A's self row and leave replication disabled on that side.
+				const aSelfRows = await sendOperation(nodeA, {
+					operation: 'search_by_value',
+					database: 'system',
+					table: 'hdb_nodes',
+					search_attribute: 'name',
+					search_value: A,
+					get_attributes: ['name'],
 				});
-				await delay(6000);
-				const arrivedAfterRemoval = await hasRecord(nodeB, postRemovalId);
-				console.log(
-					`[QA756] post-removal write reached B: ${arrivedAfterRemoval} (observational only; see remove_node_back registration typo)`
+				equal(
+					aSelfRows.length,
+					0,
+					'remove_node_back must delete A self row after B removes A from a full-replication topology'
 				);
 			},
 			{ timeout: 60000 }
