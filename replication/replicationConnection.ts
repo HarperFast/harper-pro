@@ -1137,11 +1137,12 @@ export function resolveSubscriptionSetupCapability(
 ): { supported: boolean; timeoutMs: number } {
 	const supported = capabilities?.subscriptionSetupAck >= SUBSCRIPTION_SETUP_ACK_CAPABILITY;
 	const peerSetupBudgetMs = capabilities?.subscriptionSetupBudgetMs;
+	const maxPeerSetupBudgetMs = Math.max(localTimeoutMs * 4, 10 * 60_000);
 	return {
 		supported,
 		timeoutMs:
 			usePeerBudget && supported && Number.isFinite(peerSetupBudgetMs) && peerSetupBudgetMs > 0
-				? Math.max(localTimeoutMs, peerSetupBudgetMs)
+				? Math.max(localTimeoutMs, Math.min(peerSetupBudgetMs, maxPeerSetupBudgetMs))
 				: localTimeoutMs,
 	};
 }

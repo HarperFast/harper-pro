@@ -92,6 +92,13 @@ describe('resolveSubscriptionSetupCapability', () => {
 			{ supported: true, timeoutMs: 25 }
 		);
 	});
+
+	it('caps a peer budget that would disable the local recovery net', () => {
+		assert.deepEqual(
+			resolveSubscriptionSetupCapability({ subscriptionSetupAck: 1, subscriptionSetupBudgetMs: 86_400_000 }, 150_000),
+			{ supported: true, timeoutMs: 600_000 }
+		);
+	});
 });
 
 describe('isSubscriptionSetupProgressFrame', () => {
