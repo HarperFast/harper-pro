@@ -1,19 +1,19 @@
 import assert from 'node:assert';
-import { removeNodeBack } from '#src/replication/setNode';
+import { removeNodeBack, removeNodeBackFromTable } from '#src/replication/setNode';
 
 describe('removeNodeBack authorization', () => {
 	it('allows the authenticated peer to remove its own record', async () => {
 		let deletedName;
-		await removeNodeBack(
+		await removeNodeBackFromTable(
 			{
 				name: 'authenticated-peer',
 				hdb_user: { name: 'authenticated-peer' },
 			},
-			() => ({
+			{
 				delete: async (name) => {
 					deletedName = name;
 				},
-			})
+			}
 		);
 
 		assert.equal(deletedName, 'authenticated-peer');
