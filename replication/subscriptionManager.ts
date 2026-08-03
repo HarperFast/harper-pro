@@ -70,6 +70,9 @@ type ConnectedWorkerStatus = {
 };
 type ReplicationConnectionStatus = {
 	url?: string;
+	// Explicit unsubscribe keeps the entry alive for iterator/URL cleanup, but it is no longer
+	// an active subscription and must not take the existing-entry reuse fast path.
+	unsubscribed?: boolean;
 	nodes: ({
 		name: string;
 		url: string;
@@ -801,9 +804,14 @@ export async function startOnMainThread(options) {
 				// still-retrying connection or builds a fresh one — replicator.isReusableConnection). We
 				// deliberately do NOT re-subscribe every connected:false entry on an ordinary onNodeUpdate —
 				// doing so disrupts in-flight replication (e.g. an active legacy-node base copy).
-				if (shouldSubscribe && !(forceResubscribe && existingEntry.connected === false)) {
+				if (
+					shouldSubscribe &&
+					!existingEntry.unsubscribed &&
+					!(forceResubscribe && existingEntry.connected === false)
+				) {
 					return;
 				}
+				if (shouldSubscribe) existingEntry.unsubscribed = false;
 			} else if (shouldSubscribe) {
 				nextWorkerIndex = nextWorkerIndex % httpWorkers.length; // wrap around as necessary
 				worker = httpWorkers[nextWorkerIndex++];
@@ -901,12 +909,9 @@ export async function startOnMainThread(options) {
 						reportIdentityMismatchOnce(registeredNodes);
 					}
 				}
-				// The entry represents an active or retrying subscription. Once we explicitly unsubscribe,
-				// it must no longer be reusable: if this node's self membership is later restored,
-				// onNodeUpdate re-evaluates the peer with shouldSubscribe=true. Leaving the disabled entry
-				// in the map makes the existingEntry fast path return without posting subscribe-to-node,
-				// permanently wedging full-replication rejoin until process restart.
-				dbReplicationWorkers.delete(databaseName);
+				// Keep the entry for URL/iterator cleanup, but bypass the reuse fast path after an
+				// explicit unsubscribe so restoring membership can schedule subscribe-to-node again.
+				if (existingEntry) existingEntry.unsubscribed = true;
 				const request = {
 					type: 'unsubscribe-from-node',
 					database: databaseName,
@@ -953,15 +958,13 @@ export async function startOnMainThread(options) {
 				return;
 			}
 			const mainNode: any = existingWorkerEntry.nodes[0];
-			if (
-				!(
-					mainNode.replicates === true ||
-					mainNode.replicates?.sends ||
-					mainNode.replicates?.sendsTo?.length ||
-					mainNode.replicates?.receivesFrom?.length ||
-					mainNode.subscriptions?.length
-				)
-			) {
+			if (!(
+				mainNode.replicates === true ||
+				mainNode.replicates?.sends ||
+				mainNode.replicates?.sendsTo?.length ||
+				mainNode.replicates?.receivesFrom?.length ||
+				mainNode.subscriptions?.length
+			)) {
 				// no replication, so just return
 				return;
 			}
