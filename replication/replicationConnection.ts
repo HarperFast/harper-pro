@@ -1176,7 +1176,7 @@ export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() 
 	const schedule = () => {
 		clearTimer();
 		if (!pending || paused) return;
-		scheduledAt = Date.now();
+		scheduledAt = performance.now(); // monotonic — immune to wall-clock adjustments
 		timer = setTimeout(fire, remainingMs).unref();
 	};
 	return {
@@ -1191,7 +1191,7 @@ export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() 
 		},
 		pause() {
 			if (paused) return;
-			if (pending && timer) remainingMs = Math.max(0, remainingMs - (Date.now() - scheduledAt));
+			if (pending && timer) remainingMs = Math.max(0, remainingMs - (performance.now() - scheduledAt));
 			paused = true;
 			clearTimer();
 		},
