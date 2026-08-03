@@ -65,7 +65,7 @@ export async function setNode(req: any) {
 			// we delete record and req that other node also deletes record (or mark itself as non-replicating)
 			// we do not wait for the other node to respond, it may not even be online anymore
 			await sendOperationToNode(
-				{ url: record.url },
+				record,
 				{
 					operation: 'remove_node_back',
 					name:
@@ -324,13 +324,13 @@ export async function addNodeBack(req) {
  * Is called by other node when remove_node is requested and
  * system tables are not replicating
  */
-export async function removeNodeBack(req) {
+export async function removeNodeBack(req, getNodeTable = getHDBNodeTable) {
 	hdbLogger.trace('removeNodeBack received request:', req);
 	const callerName = req.hdb_user?.name;
 	if (!callerName || (req.name !== callerName && req.name !== getThisNodeName())) {
 		throw new ClientError(`remove_node_back may only remove the authenticated peer or this node, not '${req.name}'`);
 	}
-	const hdbNodes = getHDBNodeTable();
+	const hdbNodes = getNodeTable();
 	//  delete the record
 	await hdbNodes.delete(req.name);
 }
