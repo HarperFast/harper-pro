@@ -1114,7 +1114,6 @@ export async function awaitPendingSubscription(
 	}
 }
 
-/** Match the DB_SCHEMA acknowledgement emitted after the peer resolves this exact subscription request. */
 export function isSubscriptionSetupProgressFrame(
 	command: number | undefined,
 	requestedDatabase: string | undefined,
@@ -1147,7 +1146,6 @@ export function resolveSubscriptionSetupCapability(
 	};
 }
 
-/** One-shot timer for the request -> first application-level subscription response window. */
 export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() => number); onTimeout: () => void }): {
 	arm: () => void;
 	complete: () => void;
@@ -1158,25 +1156,33 @@ export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() 
 	let timer: NodeJS.Timeout | undefined;
 	let pending = false;
 	let paused = false;
+	// Remaining budget (ms) for the current pending window, consumed as time elapses. Only `arm()`
+	// resets it to a full window (a superseding request); `pause()`/`resume()` preserve whatever was
+	// left, so a link with recurring, short back-pressure pauses can't keep re-granting a full window
+	// forever and never trip this independent recovery net.
+	let remainingMs = 0;
+	let scheduledAt = 0;
 	const clearTimer = () => {
 		if (timer) {
 			clearTimeout(timer);
 			timer = undefined;
 		}
 	};
+	const fire = () => {
+		timer = undefined;
+		pending = false;
+		opts.onTimeout();
+	};
 	const schedule = () => {
 		clearTimer();
 		if (!pending || paused) return;
-		const timeoutMs = typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs;
-		timer = setTimeout(() => {
-			timer = undefined;
-			pending = false;
-			opts.onTimeout();
-		}, timeoutMs).unref();
+		scheduledAt = Date.now();
+		timer = setTimeout(fire, remainingMs).unref();
 	};
 	return {
 		arm() {
 			pending = true;
+			remainingMs = typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs;
 			schedule();
 		},
 		complete() {
@@ -1184,6 +1190,8 @@ export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() 
 			clearTimer();
 		},
 		pause() {
+			if (paused) return;
+			if (pending && timer) remainingMs = Math.max(0, remainingMs - (Date.now() - scheduledAt));
 			paused = true;
 			clearTimer();
 		},
@@ -3783,11 +3791,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							if (subscription.copyResume) copyResume = subscription.copyResume;
 						}
 
-						// Both setup promises precede DB_SCHEMA and the replay loop. They used to be unbounded:
-						// a promise that never settled left this WS ping-alive forever while the receiver saw no
-						// application frames and made no cursor progress (harper-pro#642). Bound each separately
-						// so the log identifies which gate stuck, then close transiently so the peer retries from
-						// its last durable cursor.
+						// A promise that never settles here would leave this WS ping-alive forever with the
+						// receiver seeing no application frames and no cursor progress (harper-pro#642). Bound
+						// each gate separately so the log identifies which one stuck, then close transiently so
+						// the peer retries from its last durable cursor.
 						Promise.resolve()
 							.then(async () => {
 								const resolvedDatabaseSubscription = await resolveSendSubscriptionSetup(
