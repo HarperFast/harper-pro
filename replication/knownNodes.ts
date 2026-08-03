@@ -399,32 +399,6 @@ function storeRecordRangeVisible(store: any, name: string): boolean {
 	}
 }
 
-/**
- * Resolve the complete hdb_nodes row for a patch event before refreshing subscriptions.
- *
- * hdb_nodes writes made through ensureNode() use patch(), and the resulting event contains only the
- * changed fields. Subscription decisions need the complete row (url, subscriptions, replicates,
- * isLeader, and so on), so forwarding the partial event is unsafe. Previously only an isLeader patch
- * was resolved and forwarded. In particular, remove_node_back deletes a full-replication node's self
- * row; a later add_node_back recreates it with a replicates patch, but the ignored patch left the
- * subscription manager's isFullyReplicating state false and the node never subscribed to its peers
- * again.
- *
- * Read synchronously because RocksDB get() is a MaybePromise on a block-cache miss. Invalid or
- * transiently undecodable rows are ignored; a later decodable event or watcher rebuild will recover
- * them without treating the patch as a deletion.
- */
-export function resolveNodePatchForSubscription(event: any, store: any): any {
-	if (event?.type !== 'patch' || typeof event.id !== 'string' || event.id.length === 0) return undefined;
-	let record;
-	try {
-		record = store.getSync(event.id);
-	} catch {
-		return undefined;
-	}
-	return isValidNodeRecord(record) ? record : undefined;
-}
-
 async function processNodeUpdateEvent(event: any, listener: (node: any, id: string) => void) {
 	if (event.type === 'reload') {
 		// A copyApply base copy back-filled hdb_nodes as snapshots with no per-row change events
@@ -440,7 +414,6 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 	// Capture the prior in-memory node before we drop it, so a transient decode miss can be
 	// reconstructed WITH its connection fields (url/shard/ca/etc.) instead of a bare {name}
 	// (harper-pro#460 review). name + replicates from the reconstruct still win on merge.
-	const patchedNode = resolveNodePatchForSubscription(event, getHDBNodeTable().primaryStore);
 	const oldNode = server.nodes.find((node) => node && node.name !== undefined && node.name === node_name);
 	server.nodes = server.nodes.filter((node) => node && node.name !== node_name);
 	if (event.type === 'put' && node_name !== getThisNodeName()) {
@@ -457,9 +430,13 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			if (reconstructed) server.nodes.push(reconstructed as any);
 			else console.error('Invalid node update event', event);
 		}
-	} else if (patchedNode && node_name !== getThisNodeName()) {
-		// patch events contain only changed fields; retain the complete peer descriptor in server.nodes.
-		server.nodes.push(patchedNode as any);
+	} else if (event.type === 'patch' && node_name !== getThisNodeName() && event.value?.isLeader !== undefined) {
+		// add_node { isLeader: true } reaches us as a patch event; read the merged
+		// record so server.nodes reflects the full record (including isLeader). Sync read
+		// (getSync): RocksDB get() is a MaybePromise (Promise on a block-cache miss); an un-awaited
+		// get() here would push a pending Promise into server.nodes. See selfNodeReplicates.
+		const fullRecord = getHDBNodeTable().primaryStore.getSync(node_name);
+		if (fullRecord) server.nodes.push(fullRecord as any);
 	}
 	const shards = new Map();
 	for await (const node of getHDBNodeTable().search({})) {
@@ -505,10 +482,11 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 				);
 			}
 		}
-	} else if (patchedNode) {
-		// Every decodable patch can affect connection or authorization state. This includes the self-row
-		// replicates:false -> true transition used to rejoin after a reciprocal full-replication removal.
-		listener(patchedNode, event.id);
+	} else if (event.type === 'patch' && event.value?.isLeader !== undefined) {
+		// isLeader patches need to drive subscription bootstrap; pass the merged record.
+		// Sync read (getSync) — RocksDB get() is a MaybePromise; see selfNodeReplicates.
+		const fullRecord = getHDBNodeTable().primaryStore.getSync(event.id);
+		if (fullRecord) listener(fullRecord, event.id);
 	}
 }
 /**

@@ -1,17 +1,18 @@
 /**
  * QA-758: reciprocal remove_node and authenticated rejoin lifecycle.
  *
- * In a full-replication topology, A's remove_node(B) deletes A's peer row for B and sends
+ * In a three-node full-replication topology, A's remove_node(B) deletes A's peer row for B and sends
  * remove_node_back naming B. B must handle that reciprocal operation by deleting its own
- * self row, which is the local "replication enabled" authority.
+ * self row, which is the local "replication enabled" authority and therefore disconnects B
+ * from every peer, not only A.
  *
  * The regression has three production pieces:
  *
  * - remove_node_back must be registered under the exact operation name (no trailing semicolon);
  * - reciprocal removal must persist on B, including across restart;
- * - add_node must recreate B's self row and turn its subscriptions back on. The subscription
- *   manager must discard explicitly-disabled entries so restored membership schedules a fresh
- *   subscribe-to-node instead of returning early through a stale existing entry.
+ * - add_node must recreate B's self row and turn its subscriptions back on without restarting.
+ *   Explicitly-disabled subscription entries retain their cleanup iterator but must not take the
+ *   active-entry fast path when restored membership schedules a fresh subscribe-to-node.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
@@ -73,17 +74,23 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 	before(async () => {
 		const hostnameA = await getNextAvailableLoopbackAddress();
 		const hostnameB = await getNextAvailableLoopbackAddress();
+		const hostnameC = await getNextAvailableLoopbackAddress();
 		ctx.hostnameA = hostnameA;
 		ctx.hostnameB = hostnameB;
+		ctx.hostnameC = hostnameC;
 
 		const ctxA = { name: ctx.name, harper: { hostname: hostnameA } };
 		const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
+		const ctxC = { name: ctx.name, harper: { hostname: hostnameC } };
 		await Promise.all([
 			startHarper(ctxA, nodeStartOptions(ctxA.harper)).then(() => {
 				ctx.nodeA = ctxA.harper;
 			}),
 			startHarper(ctxB, nodeStartOptions(ctxB.harper)).then(() => {
 				ctx.nodeB = ctxB.harper;
+			}),
+			startHarper(ctxC, nodeStartOptions(ctxC.harper)).then(() => {
+				ctx.nodeC = ctxC.harper;
 			}),
 		]);
 
@@ -107,23 +114,43 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 			table: 'qa758',
 			primary_key: 'id',
 		});
+		await sendOperation(ctx.nodeC, {
+			operation: 'create_table',
+			database: 'data',
+			table: 'qa758',
+			primary_key: 'id',
+		});
 	});
 
 	after(async () => {
 		// Never do fallible work before teardown; tear down whatever exists.
-		const nodes = [ctx.nodeA, ctx.nodeB].filter(Boolean);
+		const nodes = [ctx.nodeA, ctx.nodeB, ctx.nodeC].filter(Boolean);
 		await Promise.all(nodes.map((n) => teardownHarper({ harper: n }).catch(() => {})));
 	});
 
-	test('B joins A and replication works both ways it needs to (B follows A)', async () => {
+	test('B joins A and C in a three-node topology', async () => {
 		await sendOperation(ctx.nodeB, {
 			operation: 'add_node',
 			hostname: ctx.nodeA.hostname,
 			authorization: ctx.nodeA.admin,
 			rejectUnauthorized: false,
 		});
+		await sendOperation(ctx.nodeC, {
+			operation: 'add_node',
+			hostname: ctx.nodeA.hostname,
+			authorization: ctx.nodeA.admin,
+			rejectUnauthorized: false,
+		});
+		await sendOperation(ctx.nodeB, {
+			operation: 'add_node',
+			hostname: ctx.nodeC.hostname,
+			authorization: ctx.nodeC.admin,
+			rejectUnauthorized: false,
+		});
 		await waitUntil(() => connected(ctx.nodeB, ctx.hostnameA), { label: 'B connected to A' });
 		await waitUntil(() => connected(ctx.nodeA, ctx.hostnameB), { label: 'A connected to B' });
+		await waitUntil(() => connected(ctx.nodeB, ctx.hostnameC), { label: 'B connected to C' });
+		await waitUntil(() => connected(ctx.nodeC, ctx.hostnameB), { label: 'C connected to B' });
 
 		await sendOperation(ctx.nodeA, {
 			operation: 'upsert',
@@ -148,11 +175,14 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		equal(seeded[0].value, 'before-removal');
 	});
 
-	test('(a) A removes B on both sides, and reciprocal removal survives B restart', async () => {
+	test('(a) A removes B from the three-node cluster without restarting any process', async () => {
 		await sendOperation(ctx.nodeA, { operation: 'remove_node', hostname: ctx.hostnameB });
 
 		await waitUntil(async () => !(await connected(ctx.nodeA, ctx.hostnameB)) || undefined, {
 			label: 'A to report B disconnected',
+		});
+		await waitUntil(async () => !(await connected(ctx.nodeB, ctx.hostnameC)) || undefined, {
+			label: 'B to disconnect from C when its full-replication self row is removed',
 		});
 		const hdbNodesOnA = await sendOperation(ctx.nodeA, {
 			operation: 'search_by_value',
@@ -173,19 +203,6 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 			get_attributes: ['name'],
 		});
 		equal(hdbNodesOnB.length, 0, 'remove_node_back must delete B self row in a full-replication topology');
-
-		await killHarper({ harper: ctx.nodeB });
-		ctx.nodeB = (await startHarper({ harper: ctx.nodeB }, nodeStartOptions(ctx.nodeB))).harper;
-
-		const hdbNodesOnRestartedB = await sendOperation(ctx.nodeB, {
-			operation: 'search_by_value',
-			database: 'system',
-			table: 'hdb_nodes',
-			search_attribute: 'name',
-			search_value: ctx.hostnameB,
-			get_attributes: ['name'],
-		});
-		equal(hdbNodesOnRestartedB.length, 0, 'B self-row removal must remain durable across restart');
 	});
 
 	test('(a, mirror) the removal itself is durable across a restart of A (the remover)', async () => {
@@ -245,6 +262,8 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		});
 		equal(restoredSelfRows.length, 1, "add_node must recreate B's hdb_nodes self row");
 		equal(restoredSelfRows[0].replicates, true, 'restored B self row must advertise full replication');
+		await waitUntil(() => connected(ctx.nodeB, ctx.hostnameA), { label: 'B reconnected to A without a restart' });
+		await waitUntil(() => connected(ctx.nodeB, ctx.hostnameC), { label: 'B reconnected to C without a restart' });
 
 		await sendOperation(ctx.nodeA, {
 			operation: 'upsert',
@@ -270,5 +289,57 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 			'A-still-accepts-B',
 			'after an authenticated add_node re-join, a fresh write on A must replicate to B'
 		);
+
+		await sendOperation(ctx.nodeC, {
+			operation: 'upsert',
+			database: 'data',
+			table: 'qa758',
+			records: [{ id: 'post-resubscribe-c', value: 'C-restored-too' }],
+		});
+		const resumedFromC = await waitUntil(
+			async () => {
+				const r = await sendOperation(ctx.nodeB, {
+					operation: 'search_by_id',
+					database: 'data',
+					table: 'qa758',
+					ids: ['post-resubscribe-c'],
+					get_attributes: ['id', 'value'],
+				}).catch(() => []);
+				return r.length ? r : null;
+			},
+			{ timeoutMs: 20000, label: 'B receiving a fresh write from C after re-subscribe' }
+		);
+		equal(resumedFromC[0].value, 'C-restored-too', 'restoring B membership must re-enable every peer subscription');
+	});
+
+	test('(c) reciprocal removal of B remains durable across B restart', async () => {
+		await sendOperation(ctx.nodeA, { operation: 'remove_node', hostname: ctx.hostnameB });
+		await waitUntil(
+			async () => {
+				const rows = await sendOperation(ctx.nodeB, {
+					operation: 'search_by_value',
+					database: 'system',
+					table: 'hdb_nodes',
+					search_attribute: 'name',
+					search_value: ctx.hostnameB,
+					get_attributes: ['name'],
+				});
+				return rows.length === 0;
+			},
+			{ label: 'B self row removed before restart' }
+		);
+
+		await killHarper({ harper: ctx.nodeB });
+		ctx.nodeB = (await startHarper({ harper: ctx.nodeB }, nodeStartOptions(ctx.nodeB))).harper;
+
+		const hdbNodesOnRestartedB = await sendOperation(ctx.nodeB, {
+			operation: 'search_by_value',
+			database: 'system',
+			table: 'hdb_nodes',
+			search_attribute: 'name',
+			search_value: ctx.hostnameB,
+			get_attributes: ['name'],
+		});
+		equal(hdbNodesOnRestartedB.length, 0, 'B self-row removal must remain durable across restart');
 	});
 });

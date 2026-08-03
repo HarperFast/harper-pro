@@ -416,6 +416,10 @@ suite('QA-762 clone checkSyncStatus / availability on LMDB leader', { timeout: 3
 				);
 			}
 
+			ok(
+				availableSnapshot?.queryConfirmed,
+				`could not query the clone key set when availability first reported Available: ${availableSnapshot?.cloneIdsError}`
+			);
 			// The defect-detecting assertion: if this fails, the REAL production availability flag
 			// (cloneNode.ts's monitorSync -> checkSyncStatus -> setStatus) reported Available while the
 			// bidirectional oracle still shows missing keys on the clone -- exactly QA-762/#611's shape,

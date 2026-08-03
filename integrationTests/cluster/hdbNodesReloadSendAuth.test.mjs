@@ -239,7 +239,14 @@ suite(
 				);
 				console.log('[QA756] precondition satisfied: A<->B bidirectional replication confirmed live before join');
 
-				const statusB0 = await clusterStatus(nodeB);
+				let statusB0;
+				const socketsReadyDeadline = Date.now() + 30000;
+				do {
+					statusB0 = await clusterStatus(nodeB);
+					if (expectedSocketsConnected(statusB0, A)) break;
+					await delay(250);
+				} while (Date.now() < socketsReadyDeadline);
+
 				const socketsB0 = socketsToPeer(statusB0, A);
 				if (!expectedSocketsConnected(statusB0, A)) {
 					console.log('[QA756] pre-join B->A sockets:', JSON.stringify(socketsB0));
