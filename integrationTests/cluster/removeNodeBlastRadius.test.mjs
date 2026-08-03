@@ -53,9 +53,13 @@ function nodeStartOptions(node) {
 	};
 }
 
+const ip = (value = '') => (value.match(/127\.0\.0\.\d+/) || [value])[0];
+
 async function connected(node, peerHostname) {
 	const status = await sendOperation(node, { operation: 'cluster_status' });
-	const conn = (status.connections ?? []).find((c) => (c.name ?? c.url ?? '').includes(peerHostname));
+	const conn = (status.connections ?? []).find(
+		(connection) => connection.name === peerHostname || ip(connection.url) === peerHostname
+	);
 	return !!conn && (conn.database_sockets ?? []).some((s) => s.connected);
 }
 
