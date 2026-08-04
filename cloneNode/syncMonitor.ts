@@ -112,12 +112,28 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 
 	while (now() - lastProgressAt < options.stallTimeoutMs) {
 		try {
-			const { syncComplete, latestReceivedMs } = await checkSyncStatus(
+			// Bound each status check by the poll interval: clusterStatus's worker path resolves only
+			// when a cluster-status reply message arrives, so an unbounded await would hang this loop
+			// past its own deadline (e.g. a wedged main thread). A timed-out check counts as no
+			// progress and any late reply is ignored; the no-op catch keeps a late rejection of the
+			// discarded promise away from the process-level unhandledRejection handler.
+			const checkPromise = checkSyncStatus(
 				options.targetTimestamps,
 				options.clusterStatus,
 				options.leaderReplicationURL,
 				options.log
 			);
+			checkPromise.catch(() => {});
+			const result = await Promise.race([
+				checkPromise,
+				delay(options.checkIntervalMs).then(() => 'timed-out' as const),
+			]);
+			if (result === 'timed-out') {
+				options.log(`Cluster status check did not respond within ${options.checkIntervalMs}ms`);
+				await delay(options.checkIntervalMs);
+				continue;
+			}
+			const { syncComplete, latestReceivedMs } = result;
 
 			if (syncComplete) return 'synced';
 
