@@ -30,13 +30,21 @@ function startBarrierOrigin() {
 	const trials = new Map();
 	const server = createServer((req, res) => {
 		let body = '';
+		req.on('error', () => {});
+		res.on('error', () => {});
 		req.on('data', (chunk) => (body += chunk));
 		req.on('end', () => {
 			if (req.method !== 'POST' || req.url !== '/resolve') {
 				res.writeHead(404).end();
 				return;
 			}
-			const call = JSON.parse(body);
+			let call;
+			try {
+				call = JSON.parse(body);
+			} catch {
+				if (!res.destroyed) res.writeHead(400).end();
+				return;
+			}
 			const state = trials.get(call.id) ?? { calls: [], timer: null, timedOut: false, released: false };
 			trials.set(call.id, state);
 			const token = `${call.id}:${call.node}:${call.threadId}:${state.calls.length}`;
@@ -45,6 +53,7 @@ function startBarrierOrigin() {
 			const respond = (pending) => {
 				if (pending.answered) return;
 				pending.answered = true;
+				if (pending.res.destroyed || pending.res.writableEnded) return;
 				pending.res.writeHead(200, { 'Content-Type': 'application/json' });
 				pending.res.end(JSON.stringify({ token: pending.token }));
 			};
@@ -57,7 +66,7 @@ function startBarrierOrigin() {
 			};
 			if (state.released) respond(pending);
 			else if (state.calls.length >= 2) release(false);
-			else state.timer = setTimeout(() => release(true), 2000);
+			else state.timer = setTimeout(() => release(true), 10000);
 		});
 	});
 
@@ -67,7 +76,11 @@ function startBarrierOrigin() {
 			resolve({
 				url: `http://127.0.0.1:${port}`,
 				trial: (id) => trials.get(id),
-				close: () => new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+				close: () =>
+					new Promise((resolve, reject) => {
+						server.close((error) => (error ? reject(error) : resolve()));
+						server.closeAllConnections();
+					}),
 			});
 		});
 	});
@@ -132,15 +145,22 @@ function requestJson(url, agent, options = {}) {
 			(res) => {
 				let responseBody = '';
 				res.setEncoding('utf8');
+				res.on('error', reject);
 				res.on('data', (chunk) => (responseBody += chunk));
 				res.on('end', () => {
 					if (![200, 201, 204].includes(res.statusCode))
 						reject(new Error(url + ' returned ' + res.statusCode + ': ' + responseBody));
-					else resolve(responseBody ? JSON.parse(responseBody) : null);
+					else {
+						try {
+							resolve(responseBody ? JSON.parse(responseBody) : null);
+						} catch (error) {
+							reject(error);
+						}
+					}
 				});
 			}
 		);
-		req.setTimeout(5000, () => req.destroy(new Error(`Timed out requesting ${url}`)));
+		req.setTimeout(20000, () => req.destroy(new Error(`Timed out requesting ${url}`)));
 		req.on('error', reject);
 		req.end(requestBody);
 	});
@@ -219,7 +239,7 @@ async function waitForAllWorkers(nodes, id, agentsByNode, probeResource) {
 				if (signature !== stableSignature) {
 					stableSignature = signature;
 					stableSince = Date.now();
-				} else if (Date.now() - stableSince >= 1000) {
+				} else if (Date.now() - stableSince >= 3000) {
 					return probes;
 				}
 			} else {
@@ -258,9 +278,10 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 			{ name: ctx.name, harper: { hostname: hostnameA, dataRootDir: dataRootDirA } },
 			{ name: ctx.name, harper: { hostname: hostnameB, dataRootDir: dataRootDirB } },
 		];
+		ctx.nodes = [];
 		await Promise.all(
-			contexts.map((nodeCtx) =>
-				startHarper(nodeCtx, {
+			contexts.map(async (nodeCtx, index) => {
+				await startHarper(nodeCtx, {
 					config: {
 						analytics: { aggregatePeriod: -1 },
 						logging: { colors: false, stdStreams: false, console: true },
@@ -268,18 +289,27 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 						threads: { count: WORKERS },
 					},
 					env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_ORIGIN_URL: ctx.origin.url },
-				})
-			)
+				});
+				ctx.nodes[index] = nodeCtx.harper;
+			})
 		);
-		ctx.nodes = contexts.map((nodeCtx) => nodeCtx.harper);
 		await connectNodes(...ctx.nodes);
 		ctx.agentsByNode = await Promise.all(ctx.nodes.map(pinWorkers));
 	});
 
 	after(async () => {
-		for (const agents of ctx.agentsByNode ?? []) for (const agent of agents.values()) agent.destroy();
-		await Promise.all((ctx.nodes ?? []).map((node) => teardownHarper({ harper: node })));
-		await ctx.origin?.close();
+		for (const agents of ctx.agentsByNode ?? []) {
+			for (const agent of agents.values()) {
+				try {
+					agent.destroy();
+				} catch {}
+			}
+		}
+		try {
+			await Promise.allSettled((ctx.nodes ?? []).filter(Boolean).map((node) => teardownHarper({ harper: node })));
+		} finally {
+			await ctx.origin?.close();
+		}
 	});
 
 	test(`${TRIALS} two-node cache-fill races settle each record and blob from one write on every worker`, async () => {
@@ -290,10 +320,12 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 				ctx.nodes.map((node, index) => requestJson(`${node.httpURL}/PairRecord/${id}`, fillAgents[index]))
 			);
 			const originTrial = ctx.origin.trial(id);
+			ok(originTrial, `${id} performed no source fills`);
 			equal(originTrial.calls.length, 2, `${id} must perform exactly two independent source fills`);
 			equal(originTrial.timedOut, false, `${id} barrier timed out, so this trial is inconclusive`);
 			notEqual(fills[0].token, fills[1].token, `${id} source fills must be distinguishable`);
 
+			await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 			await waitForAllWorkers(ctx.nodes, id, ctx.agentsByNode, 'PairPointProbe');
 			const scans = await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 			deepEqual(scans[0].record, scans[1].record, `${id} raw stores must converge`);
@@ -323,6 +355,7 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 					equal(probe.record.payloadToken, probe.record.token, `${id} blob/metadata split on worker ${threadId}`);
 				}
 			}
+			equal(ctx.origin.trial(id).calls.length, 2, `${id} performed extra source fills during probing`);
 		}
 	});
 });

@@ -31,7 +31,7 @@ tables.PairRecord.sourcedFrom({
 });
 
 function describeRecord(record) {
-	if (!record) return null;
+	if (!record?.payload) return null;
 	return record.payload.bytes().then((bytes) => ({
 		id: record.id,
 		token: record.token,
