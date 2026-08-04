@@ -24,7 +24,7 @@ export async function checkSyncStatus(
 	log: SyncMonitorLog
 ): Promise<SyncCheckResult> {
 	const clusterResponse = await clusterStatus();
-	log(`clone sync check cluster status response: ${clusterResponse}`, 'debug');
+	log(`clone sync check cluster status response: ${JSON.stringify(clusterResponse)}`, 'debug');
 
 	if (!clusterResponse) {
 		log('No cluster status response received for clone, will wait and retry');
