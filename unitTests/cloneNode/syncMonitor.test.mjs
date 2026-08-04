@@ -1,11 +1,9 @@
 /**
- * Coverage for the clone sync monitor (harper-pro). The monitor decides when a clone is complete
- * (every database's received version reaches the leader's target timestamp) and when it has failed.
- * Failure is stall-based: the bulk copy keeps the version watermark frozen for its whole duration,
- * so a total-elapsed-time cap would fail any clone larger than the timeout allows. The loop's
- * deadline instead slides forward whenever replication data arrives (parsed from the formatted
- * lastReceivedLocalTime field cluster_status already exposes), so a
- * healthy clone of any size completes and only a genuinely silent link times out.
+ * Coverage for the clone sync monitor. Completion = every database's received version reaches the
+ * leader's target. Failure is stall-based (the copy freezes the version watermark, so a total-time
+ * cap would fail any clone larger than the timeout allows): the deadline slides forward only on
+ * arrivals for databases still below target, so neither a synced-but-busy database nor an
+ * untracked one can mask a wedged copy.
  */
 import assert from 'node:assert/strict';
 import { checkSyncStatus, monitorSyncLoop } from '#src/cloneNode/syncMonitor';
@@ -13,8 +11,7 @@ import { checkSyncStatus, monitorSyncLoop } from '#src/cloneNode/syncMonitor';
 const LEADER_URL = 'wss://leader:9933';
 const noopLog = () => {};
 
-// cluster_status formats arrival stamps via asDate(): a UTC string (1s precision), absent until
-// data has arrived. Fixtures use the same shape the real operation emits.
+// The same shape cluster_status emits: asDate() formats arrival stamps as UTC strings.
 const utc = (ms) => new Date(ms).toUTCString();
 
 function statusResponse(sockets) {
@@ -35,7 +32,7 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 7000 });
+		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0 });
 	});
 
 	it('reports incomplete when any database is behind its target', async () => {
@@ -66,7 +63,7 @@ describe('checkSyncStatus', () => {
 		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 9000 });
 	});
 
-	it('counts arrivals on sockets without a target timestamp as progress', async () => {
+	it('ignores arrivals on sockets without a target timestamp', async () => {
 		const result = await checkSyncStatus(
 			{ system: 1000 },
 			async () =>
@@ -77,7 +74,21 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 8000 });
+		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 1000 });
+	});
+
+	it('ignores arrivals on already-synced databases (wedged-copy regression)', async () => {
+		const result = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: undefined },
+					{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(9000) },
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 0 });
 	});
 
 	it('ignores non-date sentinel strings in the arrival field', async () => {
@@ -192,6 +203,25 @@ describe('monitorSyncLoop', () => {
 		});
 		assert.equal(outcome, 'stalled');
 		assert.ok(clock.now() >= 16000, 'deadline must have slid to last-arrival + window');
+	});
+
+	it('stalls out when a pending database is silent while a synced one keeps receiving', async () => {
+		const clock = fakeClock();
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000, data: 2000 },
+			clusterStatus: async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: undefined },
+					{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(clock.now()) },
+				]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'stalled');
+		assert.equal(clock.now(), 12000);
 	});
 
 	it('does not treat status-check errors as progress', async () => {

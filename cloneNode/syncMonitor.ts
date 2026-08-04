@@ -4,13 +4,13 @@ export type SyncMonitorLog = (message: string, level?: string) => void;
 
 export type SyncCheckResult = {
 	syncComplete: boolean;
-	/** Most recent raw arrival stamp (ms epoch) across the leader connection's database sockets; 0 if none. */
+	/** Most recent arrival stamp (ms epoch) among databases still below their target; 0 if none. */
 	latestReceivedMs: number;
 };
 
 /**
  * Check whether every database with a target timestamp has caught up, and report the freshest
- * arrival stamp seen on the leader connection.
+ * arrival stamp among the databases that have not.
  *
  * Completion and liveness are deliberately separate signals: `lastReceivedVersion` is frozen for the
  * whole bulk copy (it jumps to copyStartTime only on the post-copy end_txn), so it can only answer
@@ -51,14 +51,6 @@ export async function checkSyncStatus(
 	let syncComplete = true;
 	let latestReceivedMs = 0;
 	for (const socket of leaderConnection.database_sockets) {
-		// Arrival stamps count as progress on every socket — including ones the target check below
-		// skips — because any record arriving from the leader is proof the link is moving.
-		// cluster_status formats the arrival stamp as a UTC string (absent until data arrives), so
-		// parse it back to ms; second-level precision is ample for a stall window measured in
-		// minutes. Number.isFinite also drops non-date strings (asDate's 'Copying' sentinel shape).
-		const receivedAt = socket.lastReceivedLocalTime ? Date.parse(socket.lastReceivedLocalTime) : NaN;
-		if (Number.isFinite(receivedAt) && receivedAt > latestReceivedMs) latestReceivedMs = receivedAt;
-
 		const dbName = socket.database;
 		const targetTime = targetTimestamps[dbName];
 		if (!targetTime) {
@@ -69,21 +61,27 @@ export async function checkSyncStatus(
 		// Raw version (high-precision float64) preserves the sub-millisecond precision needed for
 		// an accurate comparison against the leader's last_updated_record targets.
 		const receivedVersion = socket.lastReceivedVersion;
-		if (!receivedVersion) {
-			log(`No lastReceivedVersion data received yet for database ${dbName}`, 'debug');
-			syncComplete = false;
+		if (receivedVersion && receivedVersion >= targetTime) {
+			log(`Database ${dbName}: Synchronized`, 'debug');
 			continue;
 		}
 
-		if (receivedVersion < targetTime) {
+		syncComplete = false;
+		if (receivedVersion) {
 			log(
 				`Database ${dbName}: Not yet synchronized (received: ${receivedVersion}, target: ${targetTime}, gap: ${targetTime - receivedVersion}ms)`
 			);
-			syncComplete = false;
-			continue;
+		} else {
+			log(`No lastReceivedVersion data received yet for database ${dbName}`, 'debug');
 		}
 
-		log(`Database ${dbName}: Synchronized`, 'debug');
+		// Only databases still below target slide the stall deadline — arrivals on synced or
+		// untracked sockets must not mask a wedged copy on a pending one. cluster_status formats
+		// the arrival stamp as a UTC string (absent until data arrives); second precision is ample
+		// for a minutes-scale window, and Number.isFinite drops non-date strings (asDate's
+		// 'Copying' sentinel shape).
+		const receivedAt = socket.lastReceivedLocalTime ? Date.parse(socket.lastReceivedLocalTime) : NaN;
+		if (Number.isFinite(receivedAt) && receivedAt > latestReceivedMs) latestReceivedMs = receivedAt;
 	}
 
 	return { syncComplete, latestReceivedMs };
