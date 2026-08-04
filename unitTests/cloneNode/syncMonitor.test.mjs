@@ -224,6 +224,21 @@ describe('monitorSyncLoop', () => {
 		assert.equal(clock.now(), 12000);
 	});
 
+	it('stalls out when the cluster status check never settles', async () => {
+		const clock = fakeClock();
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: () => new Promise(() => {}),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'stalled');
+		assert.ok(clock.now() >= 10000, 'must fail via the stall window, not hang');
+	});
+
 	it('does not treat status-check errors as progress', async () => {
 		const clock = fakeClock();
 		const outcome = await monitorSyncLoop({
