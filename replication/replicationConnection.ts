@@ -1983,24 +1983,28 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		const flush = copyStoreFlush();
 		if (flush) await flush();
 	}
-	// Build an empty sequence-update end_txn. ONLY the RocksDB copy-apply path needs the durability flush gate:
-	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (localTime >=
-	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
-	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
-	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn exactly as before, so this
-	// adds no per-seq-update overhead and does not alter non-copyApply paths. (harper-pro#480)
+	// Build an empty sequence-update end_txn. The post-commit callback publishes the received watermark only
+	// after the apply transaction is visible; clone availability must not race ahead of its final copied rows.
+	// The RocksDB copy-apply path additionally flushes its WAL-off snapshot rows before publishing the watermark
+	// or allowing core to persist [seq] (core awaits onCommit, then updateRecordedSequenceId). (harper-pro#480)
 	function seqUpdateEndTxn(localTime: number): any {
-		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) {
-			return {
-				type: 'end_txn',
-				localTime,
-				remoteNodeIds: receivingDataFromNodeIds,
-				async onCommit() {
+		return {
+			type: 'end_txn',
+			localTime,
+			remoteNodeIds: receivingDataFromNodeIds,
+			async onCommit() {
+				if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) {
 					await flushCopyRowsDurable();
-				},
-			};
-		}
-		return { type: 'end_txn', localTime, remoteNodeIds: receivingDataFromNodeIds };
+				}
+				getSharedStatus();
+				replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+					localTime,
+					replicationSharedStatus[RECEIVED_VERSION_POSITION]
+				);
+				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
+				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
+			},
+		};
 	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
@@ -2809,15 +2813,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						tableSubscriptionToReplicator.send(
 							seqUpdateEndTxn(cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived)
 						);
-						getSharedStatus();
-						replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
-							// ensure monotonicity
-							lastSequenceIdReceived,
-							replicationSharedStatus[RECEIVED_VERSION_POSITION]
-						);
-
-						replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
-						replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
 						break;
 					case BLOB_CHUNK: {
 						if (inCopyMode) noteCopyProgress(); // copy blob chunk arriving — the copy is advancing (#453)
@@ -3554,8 +3549,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
-							| undefined;
+							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -3938,13 +3932,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// this is an empty txn ending, but need to record the timestamps
 					decoder.position++;
 					lastSequenceIdReceived = sequenceIdReceived = decoder.readFloat64();
-					replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
-						// ensure monotonicity
-						lastSequenceIdReceived,
-						replicationSharedStatus[RECEIVED_VERSION_POSITION]
-					);
-					replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
-					replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
 					// Clamp: an empty sequence update carries no commit/blob-durability gate, so while any blob is
 					// not yet durable it must not push the resume cursor past the last fully-durable point.
 					// seqUpdateEndTxn also gates copy-apply durability (flush before [seq] = copyStartTime).

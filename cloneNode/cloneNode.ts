@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { accessSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { accessSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -30,6 +30,12 @@ import {
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
+import {
+	CLONE_SYNC_BASELINE_VERSION,
+	deriveCloneTargets,
+	isReplicatedDatabase,
+	validateCloneSyncBaseline,
+} from './syncStatus.ts';
 
 /**
  * Environment Variables:
@@ -83,6 +89,7 @@ import { monitorSyncLoop } from './syncMonitor.ts';
 const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
 const DEFAULT_REPLICATION_PORT = '9933';
+const CLONE_SYNC_BASELINE_FILE = '.cloneSyncBaseline.json';
 
 const CONFIG_TO_EXCLUDE_FROM_CLONE = {
 	clustering_nodename: true,
@@ -236,6 +243,7 @@ export async function cloneNode(): Promise<void> {
 		const { main } = await import('../core/bin/run.js');
 		return main();
 	}
+	if (hdbConfig?.cloned && forceClone) removeCloneSyncBaseline();
 
 	if (!usingCertAuth) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
@@ -301,6 +309,31 @@ export async function cloneNode(): Promise<void> {
 	// environment that has the cluster CA chain).
 	if (!usingCertAuth) {
 		await cloneSchemas();
+	}
+	let syncTargetResult;
+	if (!skipSyncMonitor) {
+		try {
+			syncTargetResult = await getCloneSyncTargets();
+		} catch (err) {
+			syncTargetResult = {
+				targets: Object.create(null),
+				errors: [`Failed to obtain clone synchronization targets: ${err}`],
+			};
+		}
+	}
+	if (syncTargetResult?.errors.length) {
+		const { set: setStatus } = await import('../core/server/status/index.js');
+		try {
+			await setStatus({ id: 'availability', status: 'Unavailable' });
+		} catch (statusErr) {
+			log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
+		}
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		log(
+			`Invalid clone synchronization targets: ${syncTargetResult.errors.join('; ')}; clone was not joined and remains Unavailable`,
+			'error'
+		);
+		return;
 	}
 
 	// Base set node request
@@ -376,7 +409,7 @@ export async function cloneNode(): Promise<void> {
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
 	// once sync is confirmed and availability has been published as Available — a timeout or failure
 	// must not be treated as success.
-	const syncOutcome = await monitorSync();
+	const syncOutcome = await monitorSync(syncTargetResult);
 	if (syncOutcome === 'failed') {
 		// Leave Harper running so get_status stays queryable for the control plane (availability is
 		// now Unavailable). Throwing here would propagate to bin/harper.js and exit the already-started
@@ -432,6 +465,7 @@ export async function cloneNode(): Promise<void> {
 
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
+	removeCloneSyncBaseline();
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
@@ -456,7 +490,7 @@ type SyncOutcome = 'synced' | 'skipped' | 'failed';
  * Polls at regular intervals until sync completes, failing only on a stall — the deadline slides
  * forward whenever replication data arrives, so a large clone is never timed out while healthy.
  */
-async function monitorSync(): Promise<SyncOutcome> {
+async function monitorSync(targetResult?: { targets: Record<string, number>; errors: string[] }): Promise<SyncOutcome> {
 	const { set: setStatus } = await import('../core/server/status/index.js');
 
 	if (skipSyncMonitor) {
@@ -494,10 +528,15 @@ async function monitorSync(): Promise<SyncOutcome> {
 		return 'failed';
 	}
 
-	// Get last updated record timestamps for all DB and write to file
-	// These values can be used for checking when the clone replication has caught up with the leader
-	const targetTimestamps = await getLastUpdatedRecord();
-	if (!targetTimestamps || Object.keys(targetTimestamps).length === 0) {
+	if (!targetResult || targetResult.errors.length > 0) {
+		log(
+			`Invalid clone synchronization targets: ${targetResult?.errors.join('; ') || 'none available'}; leaving availability Unavailable`,
+			'error'
+		);
+		return 'failed';
+	}
+	const targetTimestamps = targetResult.targets;
+	if (Object.keys(targetTimestamps).length === 0) {
 		log('No target timestamps available to check synchronization status; leaving availability Unavailable', 'error');
 		return 'failed';
 	}
@@ -544,48 +583,75 @@ async function monitorSync(): Promise<SyncOutcome> {
 	return 'failed';
 }
 
-/**
- * Will loop through a system describe and a describeAll to compare the last updated record for each table
- * and record the most recent timestamp for each database in a JSON file.
- * @returns {Promise<void>}
- */
-async function getLastUpdatedRecord(): Promise<Record<string, number>> {
-	log('Getting last updated record timestamp for all database', 'debug');
-	const lastUpdated: Record<string, number> = {};
+async function getCloneSyncTargets() {
+	log('Getting leader baseline for clone synchronization', 'debug');
+	const databaseDescriptions = Object.create(null) as Record<string, unknown>;
 	const systemDb: Record<string, any> = await leaderRequest({ operation: 'describe_database', database: 'system' });
-	lastUpdated['system'] = findMostRecentTimestamp(systemDb);
+	databaseDescriptions.system = systemDb;
 
 	const allDb: Record<string, any> = await leaderRequest({ operation: 'describe_all' });
 	for (const db in allDb) {
-		// requestId is part of the describe response so we ignore it
-		if (typeof allDb[db] !== 'object') continue;
-		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
+		if (allDb[db] && typeof allDb[db] === 'object') databaseDescriptions[db] = allDb[db];
 	}
+	let leaderBaseline = readCloneSyncBaseline();
+	const isResuming = leaderBaseline !== undefined;
+	if (isResuming) {
+		log(`Reusing persisted clone synchronization baseline ${leaderBaseline}`, 'debug');
+	} else {
+		const timeResponse = await leaderRequest({ operation: 'system_information', attributes: ['time'] });
+		leaderBaseline = timeResponse?.time?.current;
+	}
+	const result = deriveCloneTargets(
+		databaseDescriptions,
+		envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES),
+		leaderBaseline
+	);
 
-	const lastUpdatedFilePath: string = join(rootPath, 'tmp', 'lastUpdated.json');
-	log(`Writing last updated database timestamps to: ${lastUpdatedFilePath}`, 'debug');
-	writeJsonSync(lastUpdatedFilePath, lastUpdated);
+	if (result.errors.length === 0 && !isResuming) writeCloneSyncBaseline(leaderBaseline!);
 
-	return lastUpdated;
+	return result;
 }
 
-/**
- * Find the most recent last_updated_record timestamp across all tables in a database
- * @param {Object} dbObj - Database object or describe response containing tables
- * @returns {number} - Most recent timestamp, or 0 if none found
- */
-function findMostRecentTimestamp(dbObj: Record<string, any>): number {
-	let mostRecent = 0;
-	for (const table in dbObj) {
-		const tableObj = dbObj[table];
-		// requestId is part of the describe response so we ignore it
-		if (typeof tableObj !== 'object' || tableObj == null) continue;
-		if (tableObj.last_updated_record > mostRecent) {
-			mostRecent = tableObj.last_updated_record;
-		}
-	}
+function cloneSyncBaselinePath(): string {
+	return join(rootPath, CLONE_SYNC_BASELINE_FILE);
+}
 
-	return mostRecent;
+function readCloneSyncBaseline(): number | undefined {
+	const path = cloneSyncBaselinePath();
+	if (!pathExists(path)) return undefined;
+
+	let persisted: any;
+	try {
+		persisted = JSON.parse(readFileSync(path, 'utf8'));
+	} catch (err) {
+		throw new Error(`Invalid persisted clone synchronization baseline at ${path}: ${err}`);
+	}
+	try {
+		return validateCloneSyncBaseline(persisted, leaderURL);
+	} catch (err) {
+		throw new Error(`${err} at ${path}`);
+	}
+}
+
+function writeCloneSyncBaseline(leaderBaseline: number): void {
+	const path = cloneSyncBaselinePath();
+	const temporaryPath = `${path}.${process.pid}.tmp`;
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(
+		temporaryPath,
+		JSON.stringify({ version: CLONE_SYNC_BASELINE_VERSION, leaderURL, leaderBaseline }, null, 2),
+		'utf8'
+	);
+	renameSync(temporaryPath, path);
+	log(`Persisted clone synchronization baseline to: ${path}`, 'debug');
+}
+
+function removeCloneSyncBaseline(): void {
+	try {
+		unlinkSync(cloneSyncBaselinePath());
+	} catch (err: any) {
+		if (err?.code !== 'ENOENT') log(`Failed to remove clone synchronization baseline: ${err}`, 'error');
+	}
 }
 
 /**
@@ -917,18 +983,11 @@ async function cloneSchemas(): Promise<void> {
 	// `replication/knownNodes.ts`: `undefined` or `'*'` accept everything; an array accepts only
 	// the names it lists (objects with `.name` are sharded-database entries).
 	const databaseReplications = envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES);
-	const isReplicatedDatabase = (dbName: string): boolean => {
-		if (!databaseReplications || databaseReplications === '*') return true;
-		if (!Array.isArray(databaseReplications)) return true;
-		return databaseReplications.some((entry: any) =>
-			typeof entry === 'string' ? entry === dbName : entry?.name === dbName
-		);
-	};
 
 	for (const dbName of Object.keys(allDb)) {
 		const dbDescribe = allDb[dbName];
 		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;
-		if (!isReplicatedDatabase(dbName)) {
+		if (!isReplicatedDatabase(databaseReplications, dbName)) {
 			log(`Skipping schema pre-create for '${dbName}' (not in replication.databases)`, 'debug');
 			continue;
 		}
@@ -1121,21 +1180,6 @@ function pathExists(path: string): boolean {
 		return true;
 	} catch {
 		return false;
-	}
-}
-
-/**
- * Write the given data as JSON to a file at the specified path
- * @param path
- * @param data
- */
-function writeJsonSync(path: string, data: any): void {
-	try {
-		// Create directory if it doesn't exist
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, JSON.stringify(data, null, 2), 'utf8');
-	} catch (err) {
-		log(`Error writing JSON to ${path}: ${err}`, 'error');
 	}
 }
 
