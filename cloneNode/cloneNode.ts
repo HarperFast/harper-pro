@@ -270,6 +270,16 @@ export async function cloneNode(): Promise<void> {
 	// Start Harper to prepare for clone operations
 	const { main } = await import('../core/bin/run.js');
 	await main();
+	if (!skipSyncMonitor) {
+		const { set: setStatus } = await import('../core/server/status/index.js');
+		try {
+			await setStatus({ id: 'availability', status: 'Unavailable' });
+		} catch (statusErr) {
+			updateConfigValue(CONFIG_PARAMS.CLONED, false);
+			log(`Failed to publish Unavailable before clone initialization: ${statusErr}`, 'error');
+			return;
+		}
+	}
 
 	logger.initLogSettings();
 	harperLogger = logger.loggerWithTag('cloneNode');
@@ -320,16 +330,6 @@ export async function cloneNode(): Promise<void> {
 				targets: Object.create(null),
 				errors: [`Failed to obtain clone synchronization targets: ${err}`],
 			};
-		}
-	}
-	if (!skipSyncMonitor) {
-		const { set: setStatus } = await import('../core/server/status/index.js');
-		try {
-			await setStatus({ id: 'availability', status: 'Unavailable' });
-		} catch (statusErr) {
-			updateConfigValue(CONFIG_PARAMS.CLONED, false);
-			log(`Failed to publish Unavailable before clone replication started: ${statusErr}`, 'error');
-			return;
 		}
 	}
 	if (syncTargetResult?.errors.length) {
@@ -478,7 +478,7 @@ export async function cloneNode(): Promise<void> {
 /**
  * Result of monitoring clone synchronization.
  * - `synced`: sync was confirmed and `availability` was published as Available.
- * - `skipped`: sync monitoring was disabled (skip-sync-monitor); `availability` is left untouched.
+ * - `skipped`: sync monitoring was disabled (skip-sync-monitor); `availability` is published as Available.
  * - `failed`: sync was not confirmed (stall timeout, missing targets, or a failed status write);
  *   `availability` is left Unavailable and the node must not be marked as cloned.
  */

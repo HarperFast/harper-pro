@@ -139,6 +139,22 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		// Restart on the SAME data dir: cloneNode re-enters the clone flow (cloned flag isn't set yet)
 		// and the persisted copy cursor must resume the copy rather than restart it from zero.
 		await startHarper(cloneCtx, cloneOptions);
+		let observedResumeUnavailable = false;
+		const resumeStatusDeadline = Date.now() + 5000;
+		while (Date.now() < resumeStatusDeadline) {
+			let availability;
+			try {
+				availability = await sendOperation(cloneCtx.harper, { operation: 'get_status', id: 'availability' });
+			} catch {}
+			const count = await countRows(cloneCtx.harper);
+			if (count < RECORD_COUNT) {
+				ok(availability?.status !== 'Available', 'A resumed clone must stay Unavailable while rows are still missing');
+				if (availability?.status === 'Unavailable') observedResumeUnavailable = true;
+			}
+			if (count === RECORD_COUNT) break;
+			await sleep(50);
+		}
+		ok(observedResumeUnavailable, 'A resumed clone should publish Unavailable before continuing its copy');
 		await waitForAvailableStatus(cloneCtx.harper);
 		ok(!existsSync(baselinePath), 'the persisted synchronization baseline should be removed after clone completion');
 

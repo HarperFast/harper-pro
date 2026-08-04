@@ -71,12 +71,6 @@ export function checkCloneSyncStatus(
 	if (!clusterResponse?.connections?.length) return { synced: false, reason: 'No replication connections found' };
 	const leaderConnection = clusterResponse.connections.find((connection) => connection.url === leaderReplicationURL);
 	if (!leaderConnection) return { synced: false, reason: 'No connection found for the clone leader' };
-	for (const socket of leaderConnection.database_sockets ?? []) {
-		if (!(socket.database in targets)) {
-			return { synced: false, reason: `No clone target found for leader database ${socket.database}` };
-		}
-	}
-
 	for (const [databaseName, target] of Object.entries(targets)) {
 		const socket = leaderConnection.database_sockets?.find((candidate) => candidate.database === databaseName);
 		if (!socket) return { synced: false, reason: `No leader socket found for database ${databaseName}` };

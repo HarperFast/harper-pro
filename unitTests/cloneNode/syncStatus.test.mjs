@@ -101,7 +101,7 @@ describe('checkCloneSyncStatus', () => {
 		assert.deepStrictEqual(result, { synced: false, reason: 'No leader socket found for database data' });
 	});
 
-	it('does not synchronize when the leader exposes a socket without a target', () => {
+	it('ignores leader sockets outside the configured clone targets', () => {
 		const result = checkCloneSyncStatus(
 			{ system: 50 },
 			{
@@ -117,7 +117,7 @@ describe('checkCloneSyncStatus', () => {
 			},
 			leaderURL
 		);
-		assert.deepStrictEqual(result, { synced: false, reason: 'No clone target found for leader database data' });
+		assert.deepStrictEqual(result, { synced: true });
 	});
 
 	it('does not synchronize against a disconnected socket with a stale watermark', () => {
