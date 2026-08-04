@@ -2,6 +2,7 @@ import { Readable } from 'node:stream';
 import { threadId } from 'node:worker_threads';
 
 const originUrl = process.env.HARPER_TEST_ORIGIN_URL;
+// Keep payloads above core's 8 KiB inline-storage threshold.
 const payloadSize = 16 * 1024;
 
 function payloadFor(token) {
