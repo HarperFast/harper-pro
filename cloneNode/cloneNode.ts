@@ -190,6 +190,7 @@ let harperLogger: any;
 let leaderReplicationURL: string;
 let hdbConfig: Record<string, any> = {};
 let freshClone: boolean = false;
+let cloneDatabaseReplications: unknown;
 
 export async function cloneNode(): Promise<void> {
 	// Clone using websockets with certificate-based auth, or with credential/token auth if provided
@@ -321,13 +322,17 @@ export async function cloneNode(): Promise<void> {
 			};
 		}
 	}
-	if (syncTargetResult?.errors.length) {
+	if (!skipSyncMonitor) {
 		const { set: setStatus } = await import('../core/server/status/index.js');
 		try {
 			await setStatus({ id: 'availability', status: 'Unavailable' });
 		} catch (statusErr) {
-			log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
+			updateConfigValue(CONFIG_PARAMS.CLONED, false);
+			log(`Failed to publish Unavailable before clone replication started: ${statusErr}`, 'error');
+			return;
 		}
+	}
+	if (syncTargetResult?.errors.length) {
 		updateConfigValue(CONFIG_PARAMS.CLONED, false);
 		log(
 			`Invalid clone synchronization targets: ${syncTargetResult.errors.join('; ')}; clone was not joined and remains Unavailable`,
@@ -601,11 +606,7 @@ async function getCloneSyncTargets() {
 		const timeResponse = await leaderRequest({ operation: 'system_information', attributes: ['time'] });
 		leaderBaseline = timeResponse?.time?.current;
 	}
-	const result = deriveCloneTargets(
-		databaseDescriptions,
-		envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES),
-		leaderBaseline
-	);
+	const result = deriveCloneTargets(databaseDescriptions, cloneDatabaseReplications, leaderBaseline);
 
 	if (result.errors.length === 0 && !isResuming) writeCloneSyncBaseline(leaderBaseline!);
 
@@ -625,6 +626,10 @@ function readCloneSyncBaseline(): number | undefined {
 		persisted = JSON.parse(readFileSync(path, 'utf8'));
 	} catch (err) {
 		throw new Error(`Invalid persisted clone synchronization baseline at ${path}: ${err}`);
+	}
+	if (forceClone && persisted?.leaderURL !== leaderURL) {
+		removeCloneSyncBaseline();
+		return undefined;
 	}
 	try {
 		return validateCloneSyncBaseline(persisted, leaderURL);
@@ -889,6 +894,7 @@ async function cloneConfig(): Promise<Record<string, any>> {
 	// Apply command-line and environment variable overrides
 	const cliArgs = assignCMDENVVariables(Object.keys(CONFIG_PARAM_MAP), true);
 	Object.assign(configData, cliArgs);
+	cloneDatabaseReplications = configData[CONFIG_PARAMS.REPLICATION_DATABASES];
 
 	// Write final configuration to file
 	createConfigFile(configData, true);
@@ -982,8 +988,7 @@ async function cloneSchemas(): Promise<void> {
 	// clone isn't even subscribing to. Matches the gating used by `shouldReplicateFromNode` in
 	// `replication/knownNodes.ts`: `undefined` or `'*'` accept everything; an array accepts only
 	// the names it lists (objects with `.name` are sharded-database entries).
-	const databaseReplications = envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES);
-
+	const databaseReplications = cloneDatabaseReplications;
 	for (const dbName of Object.keys(allDb)) {
 		const dbDescribe = allDb[dbName];
 		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;

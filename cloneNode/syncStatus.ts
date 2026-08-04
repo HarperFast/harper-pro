@@ -80,6 +80,9 @@ export function checkCloneSyncStatus(
 	for (const [databaseName, target] of Object.entries(targets)) {
 		const socket = leaderConnection.database_sockets?.find((candidate) => candidate.database === databaseName);
 		if (!socket) return { synced: false, reason: `No leader socket found for database ${databaseName}` };
+		if (socket.connected !== true) {
+			return { synced: false, reason: `Leader socket for database ${databaseName} is not connected` };
+		}
 		if (socket.lastReceivedStatus !== 'Waiting') {
 			return { synced: false, reason: `Database ${databaseName} is still receiving its base copy` };
 		}

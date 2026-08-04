@@ -79,7 +79,9 @@ describe('checkCloneSyncStatus', () => {
 				connections: [
 					{
 						url: leaderURL,
-						database_sockets: [{ database: 'system', lastReceivedStatus: 'Waiting', lastReceivedVersion: 50 }],
+						database_sockets: [
+							{ database: 'system', connected: true, lastReceivedStatus: 'Waiting', lastReceivedVersion: 50 },
+						],
 					},
 				],
 			},
@@ -96,8 +98,8 @@ describe('checkCloneSyncStatus', () => {
 					{
 						url: leaderURL,
 						database_sockets: [
-							{ database: 'system', lastReceivedStatus: 'Waiting', lastReceivedVersion: 50 },
-							{ database: 'data', lastReceivedStatus: 'Waiting', lastReceivedVersion: 100 },
+							{ database: 'system', connected: true, lastReceivedStatus: 'Waiting', lastReceivedVersion: 50 },
+							{ database: 'data', connected: true, lastReceivedStatus: 'Waiting', lastReceivedVersion: 100 },
 						],
 					},
 				],
@@ -107,6 +109,27 @@ describe('checkCloneSyncStatus', () => {
 		expect(result).to.deep.equal({ synced: false, reason: 'No clone target found for leader database data' });
 	});
 
+	it('does not synchronize against a disconnected socket with a stale watermark', () => {
+		const result = checkCloneSyncStatus(
+			{ data: 100 },
+			{
+				connections: [
+					{
+						url: leaderURL,
+						database_sockets: [
+							{ database: 'data', connected: false, lastReceivedStatus: 'Waiting', lastReceivedVersion: 100 },
+						],
+					},
+				],
+			},
+			leaderURL
+		);
+		expect(result).to.deep.equal({
+			synced: false,
+			reason: 'Leader socket for database data is not connected',
+		});
+	});
+
 	it('does not synchronize while a base-copy transaction is still open', () => {
 		const result = checkCloneSyncStatus(
 			{ data: 100 },
@@ -114,7 +137,9 @@ describe('checkCloneSyncStatus', () => {
 				connections: [
 					{
 						url: leaderURL,
-						database_sockets: [{ database: 'data', lastReceivedStatus: 'Receiving', lastReceivedVersion: 100 }],
+						database_sockets: [
+							{ database: 'data', connected: true, lastReceivedStatus: 'Receiving', lastReceivedVersion: 100 },
+						],
 					},
 				],
 			},
@@ -130,7 +155,9 @@ describe('checkCloneSyncStatus', () => {
 				connections: [
 					{
 						url: leaderURL,
-						database_sockets: [{ database: 'data', lastReceivedStatus: 'Waiting', lastReceivedVersion: 99 }],
+						database_sockets: [
+							{ database: 'data', connected: true, lastReceivedStatus: 'Waiting', lastReceivedVersion: 99 },
+						],
 					},
 				],
 			},
@@ -147,8 +174,8 @@ describe('checkCloneSyncStatus', () => {
 					{
 						url: leaderURL,
 						database_sockets: [
-							{ database: 'data', lastReceivedStatus: 'Waiting', lastReceivedVersion: 100 },
-							{ database: 'system', lastReceivedStatus: 'Waiting', lastReceivedVersion: 51 },
+							{ database: 'data', connected: true, lastReceivedStatus: 'Waiting', lastReceivedVersion: 100 },
+							{ database: 'system', connected: true, lastReceivedStatus: 'Waiting', lastReceivedVersion: 51 },
 						],
 					},
 				],
