@@ -242,7 +242,14 @@ export async function cloneNode(): Promise<void> {
 		log('Skipping clone, instance already marked as cloned. Starting Harper.');
 		envMgr.initSync();
 		const { main } = await import('../core/bin/run.js');
-		return main();
+		await main();
+		if (pathExists(cloneSyncBaselinePath())) {
+			const { set: setStatus } = await import('../core/server/status/index.js');
+			await setStatus({ id: 'availability', status: 'Available' });
+			removeCloneSyncBaseline();
+			log('Completed interrupted clone availability finalization');
+		}
+		return;
 	}
 	if (hdbConfig?.cloned && forceClone) removeCloneSyncBaseline();
 
@@ -277,7 +284,7 @@ export async function cloneNode(): Promise<void> {
 		} catch (statusErr) {
 			updateConfigValue(CONFIG_PARAMS.CLONED, false);
 			log(`Failed to publish Unavailable before clone initialization: ${statusErr}`, 'error');
-			return;
+			throw statusErr;
 		}
 	}
 
@@ -468,16 +475,26 @@ export async function cloneNode(): Promise<void> {
 		}
 	}
 
-	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
+	// Persist clone completion before publishing availability. The baseline remains as a recovery
+	// marker until both writes succeed, so a crash in between can finish availability on restart.
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
-	removeCloneSyncBaseline();
+	if (syncOutcome === 'synced') {
+		const { set: setStatus } = await import('../core/server/status/index.js');
+		try {
+			await setStatus({ id: 'availability', status: 'Available' });
+		} catch (err) {
+			log(`Synchronized but failed to set availability to Available: ${err}; leaving recovery marker`, 'error');
+			return;
+		}
+		removeCloneSyncBaseline();
+	}
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
 
 /**
  * Result of monitoring clone synchronization.
- * - `synced`: sync was confirmed and `availability` was published as Available.
+ * - `synced`: sync was confirmed; the caller still must finalize config and publish Available.
  * - `skipped`: sync monitoring was disabled (skip-sync-monitor); `availability` is published as Available.
  * - `failed`: sync was not confirmed (stall timeout, missing targets, or a failed status write);
  *   `availability` is left Unavailable and the node must not be marked as cloned.
@@ -485,20 +502,19 @@ export async function cloneNode(): Promise<void> {
 type SyncOutcome = 'synced' | 'skipped' | 'failed';
 
 /**
- * Monitors database synchronization after cloning and drives this node's `availability` status.
+ * Monitors database synchronization after cloning.
  *
  * `availability` is a cooperative, multi-writer status whose contract is owned by core; this is the
  * clone producer upholding it. It is published as Unavailable up front so `get_status` always
- * carries a definite signal for the control plane — never an absent field — and is only flipped to
- * Available once sync is confirmed and that write succeeds. On any failure it is left Unavailable.
+ * carries a definite signal for the control plane — never an absent field. This function only
+ * confirms sync; the caller publishes Available after durably marking the clone complete.
  *
  * Polls at regular intervals until sync completes, failing only on a stall — the deadline slides
  * forward whenever replication data arrives, so a large clone is never timed out while healthy.
  */
 async function monitorSync(targetResult?: { targets: Record<string, number>; errors: string[] }): Promise<SyncOutcome> {
-	const { set: setStatus } = await import('../core/server/status/index.js');
-
 	if (skipSyncMonitor) {
+		const { set: setStatus } = await import('../core/server/status/index.js');
 		// The operator opted out of the sync gate, so the clone is declared ready. Publish Available
 		// (best-effort) — this also clears any Unavailable persisted by a prior failed attempt, since
 		// hdb_status is not replicated and survives restarts — keeping availability consistent with the
@@ -513,16 +529,6 @@ async function monitorSync(targetResult?: { targets: Record<string, number>; err
 	}
 
 	const { clusterStatus } = await import('../replication/clusterStatus.js');
-
-	// The node is not ready to serve traffic until the clone has caught up with the leader. Publish
-	// Unavailable up front so get_status always carries a definite availability signal for the whole
-	// sync wait. Best-effort: a failed write here must not abort the clone (the loop still runs and
-	// publishes Available on success).
-	try {
-		await setStatus({ id: 'availability', status: 'Unavailable' });
-	} catch (err) {
-		log(`Failed to set availability status to Unavailable: ${err}`, 'error');
-	}
 
 	// Test/diagnostic hook (not a user-facing option): deterministically exercise the
 	// unconfirmed-sync failure path. Loopback replication is too fast and bidirectional to force a
@@ -567,17 +573,6 @@ async function monitorSync(targetResult?: { targets: Record<string, number>; err
 
 	if (outcome === 'synced') {
 		log('All databases synchronized');
-
-		// Only report Available — and let the caller finalize the clone — once the status
-		// write itself succeeds. A failed write must not be treated as a successful sync,
-		// otherwise the node would be marked cloned without a readiness signal.
-		try {
-			await setStatus({ id: 'availability', status: 'Available' });
-		} catch (err) {
-			log(`Synchronized but failed to set availability to Available: ${err}; leaving Unavailable`, 'error');
-			return 'failed';
-		}
-
 		return 'synced';
 	}
 
