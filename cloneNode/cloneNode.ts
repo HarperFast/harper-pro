@@ -29,6 +29,7 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
+import { monitorSyncLoop } from './syncMonitor.ts';
 
 /**
  * Environment Variables:
@@ -49,7 +50,8 @@ import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
  * - CLONE_SSH_KEYS: Clone SSH keys from leader (default: true)
  * - CLONE_JWT_KEYS: Clone JWT keys from leader (default: true)
  * - ALLOW_SELF_SIGNED: Allow self-signed certificates to be used for authentication (default: false)
- * - CLONE_SYNC_TIMEOUT: Sync timeout in milliseconds (default: 300000)
+ * - CLONE_SYNC_TIMEOUT: Sync stall timeout in milliseconds — the clone fails only if no replication
+ *   data arrives for this long, not on total elapsed time (default: max(300000, 2 x replication.copyTimeout))
  * - REPLICATION_PORT: Port for replication
  * - FORCE_CLONE: Force clone even if node exists (default: false)
  * - ROOTPATH: Harper installation root path
@@ -68,7 +70,8 @@ import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
  * --node-hostname: Hostname for this node
  * --replication-port: Port for replication
  * --skip-sync-monitor: Skip monitoring sync status (default: false)
- * --sync-timeout: Sync timeout in milliseconds (default: 300000)
+ * --sync-timeout: Sync stall timeout in milliseconds — the clone fails only if no replication
+ *   data arrives for this long, not on total elapsed time (default: max(300000, 2 x replication.copyTimeout))
  * --skip-ssh-keys: Skip cloning SSH keys (default: false)
  * --skip-jwt-keys: Skip cloning JWT keys (default: false)
  * --force-clone: Force clone even if node exists (default: false)
@@ -150,10 +153,10 @@ const leaderUsername: string = values['leader-username'] || process.env.HDB_LEAD
 const leaderPassword: string = values['leader-password'] || process.env.HDB_LEADER_PASSWORD;
 const leaderToken: string = values['leader-token'] || process.env.HDB_LEADER_TOKEN;
 const skipSyncMonitor: boolean = values['skip-sync-monitor'] ?? process.env.CLONE_SKIP_SYNC_MONITOR === 'true';
-const syncTimeoutMs: number = Math.max(
-	1,
-	parseInt(values['sync-timeout'] || process.env.CLONE_SYNC_TIMEOUT, 10) || DEFAULT_SYNC_TIMEOUT_MS
-);
+// undefined (absent or unparseable) means "not explicitly configured": monitorSync then floors the
+// default stall window at 2x the replication copy timeout.
+const parsedSyncTimeout: number = parseInt(values['sync-timeout'] || process.env.CLONE_SYNC_TIMEOUT, 10);
+const explicitSyncTimeoutMs: number | undefined = parsedSyncTimeout > 0 ? parsedSyncTimeout : undefined;
 // `replication.port` in HARPER_SET_CONFIG / HARPER_DEFAULT_CONFIG accepts both a numeric port
 // and a `host:port` string; cloneNode treats `replicationPort` as a port number (substituted
 // into the leader URL and written to REPLICATION_PORT), so strip any leading `host:`.
@@ -402,7 +405,7 @@ export async function cloneNode(): Promise<void> {
 			if (existing) {
 				// Wait until at least one non-clone-temp-admin user is present (replicated from leader)
 				// before deleting, so the node still has a super_user available for local-auth.
-				const waitDeadline = Date.now() + syncTimeoutMs;
+				const waitDeadline = Date.now() + (explicitSyncTimeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS);
 				while (Date.now() < waitDeadline) {
 					let foundReplicatedUser = false;
 					try {
@@ -435,7 +438,7 @@ export async function cloneNode(): Promise<void> {
  * Result of monitoring clone synchronization.
  * - `synced`: sync was confirmed and `availability` was published as Available.
  * - `skipped`: sync monitoring was disabled (skip-sync-monitor); `availability` is left untouched.
- * - `failed`: sync was not confirmed (timeout, missing targets, or a failed status write);
+ * - `failed`: sync was not confirmed (stall timeout, missing targets, or a failed status write);
  *   `availability` is left Unavailable and the node must not be marked as cloned.
  */
 type SyncOutcome = 'synced' | 'skipped' | 'failed';
@@ -448,7 +451,8 @@ type SyncOutcome = 'synced' | 'skipped' | 'failed';
  * carries a definite signal for the control plane — never an absent field — and is only flipped to
  * Available once sync is confirmed and that write succeeds. On any failure it is left Unavailable.
  *
- * Polls at regular intervals until sync completes or the timeout is reached.
+ * Polls at regular intervals until sync completes, failing only on a stall — the deadline slides
+ * forward whenever replication data arrives, so a large clone is never timed out while healthy.
  */
 async function monitorSync(): Promise<SyncOutcome> {
 	const { set: setStatus } = await import('../core/server/status/index.js');
@@ -496,121 +500,46 @@ async function monitorSync(): Promise<SyncOutcome> {
 		return 'failed';
 	}
 
+	// The default window must outlast the copy layer's own abort+resume recovery cycle; 300000 is
+	// COPY_TIMEOUT's own default in replicationConnection.ts.
+	const stallTimeoutMs: number =
+		explicitSyncTimeoutMs ??
+		Math.max(DEFAULT_SYNC_TIMEOUT_MS, 2 * (envMgr.get(CONFIG_PARAMS.REPLICATION_COPYTIMEOUT) ?? 300000));
+
 	log(
-		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms for up to ${Math.round(syncTimeoutMs / 60000)} minutes`
+		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 60000)} minutes`
 	);
 
-	const timeoutAt: number = Date.now() + syncTimeoutMs;
-	let loopCount: number = 0;
+	const outcome = await monitorSyncLoop({
+		targetTimestamps,
+		clusterStatus,
+		leaderReplicationURL,
+		stallTimeoutMs,
+		checkIntervalMs: DEFAULT_SYNC_CHECK_INTERVAL_MS,
+		log,
+	});
 
-	while (Date.now() < timeoutAt) {
+	if (outcome === 'synced') {
+		log('All databases synchronized');
+
+		// Only report Available — and let the caller finalize the clone — once the status
+		// write itself succeeds. A failed write must not be treated as a successful sync,
+		// otherwise the node would be marked cloned without a readiness signal.
 		try {
-			const syncComplete = await checkSyncStatus(targetTimestamps, clusterStatus);
-
-			if (syncComplete) {
-				log('All databases synchronized');
-
-				// Only report Available — and let the caller finalize the clone — once the status
-				// write itself succeeds. A failed write must not be treated as a successful sync,
-				// otherwise the node would be marked cloned without a readiness signal.
-				try {
-					await setStatus({ id: 'availability', status: 'Available' });
-				} catch (err) {
-					log(`Synchronized but failed to set availability to Available: ${err}; leaving Unavailable`, 'error');
-					return 'failed';
-				}
-
-				return 'synced';
-			}
-
-			// Log every other iteration to reduce noise
-			if (loopCount % 2 === 0) {
-				log(`Sync incomplete, retrying in ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms`);
-			}
-
-			loopCount++;
-			await sleep(DEFAULT_SYNC_CHECK_INTERVAL_MS);
+			await setStatus({ id: 'availability', status: 'Available' });
 		} catch (err) {
-			log(`Error checking sync status: ${err}`, 'error');
-			await sleep(DEFAULT_SYNC_CHECK_INTERVAL_MS); // Still wait on error
+			log(`Synchronized but failed to set availability to Available: ${err}; leaving Unavailable`, 'error');
+			return 'failed';
 		}
+
+		return 'synced';
 	}
 
 	log(
-		`Databases did not synchronize within ${Math.round(syncTimeoutMs / 60000)} minutes; leaving availability Unavailable and not marking node as cloned`,
+		`No replication data received for ${Math.round(stallTimeoutMs / 60000)} minutes; sync is stalled — leaving availability Unavailable and not marking node as cloned`,
 		'error'
 	);
 	return 'failed';
-}
-
-/**
- * Check if all databases are synchronized by comparing timestamps
- * Compares the most recent timestamp in each local database against the target timestamps from the leader
- * @param {Object} targetTimestamps - Target timestamps to check against
- * @param clusterStatus - Function to get the current cluster status, which includes replication status and timestamps for each database connection
- * @returns {Promise<boolean>} - True if all databases are synchronized
- */
-async function checkSyncStatus(
-	targetTimestamps: Record<string, number>,
-	clusterStatus: () => Promise<any>
-): Promise<boolean> {
-	const clusterResponse = await clusterStatus();
-	log(`clone sync check cluster status response: ${clusterResponse}`, 'debug');
-
-	if (!clusterResponse) {
-		log('No cluster status response received for clone, will wait and retry');
-		return false;
-	}
-
-	if (!clusterResponse.connections?.length) {
-		log('No connections found in cluster status response for clone, will wait and retry');
-		return false;
-	}
-
-	// Find the leader replication connection
-	const leaderConnection = clusterResponse.connections.find((conn) => conn.url === leaderReplicationURL);
-
-	if (!leaderConnection) {
-		log('No connection found matching leader replication URL, will wait and retry');
-		return false;
-	}
-
-	if (!leaderConnection.database_sockets?.length) {
-		log(`No database sockets found for connection leader ${leaderConnection.name}`, 'debug');
-		return false;
-	}
-
-	// Check sync status for each database socket
-	for (const socket of leaderConnection.database_sockets) {
-		const dbName = socket.database;
-		const targetTime = targetTimestamps[dbName];
-
-		// Skip if no target time for this database
-		if (!targetTime) {
-			log(`Database ${dbName}: No target timestamp, skipping sync check`, 'debug');
-			continue;
-		}
-
-		// Raw version timestamp from RECEIVED_VERSION_POSITION (high-precision float64)
-		// This preserves sub-millisecond precision needed for accurate sync comparison
-		const receivedVersion = socket.lastReceivedVersion;
-
-		if (!receivedVersion) {
-			log(`No lastReceivedVersion data received yet for database ${dbName}`, 'debug');
-			return false;
-		}
-
-		if (receivedVersion < targetTime) {
-			log(
-				`Database ${dbName}: Not yet synchronized (received: ${receivedVersion}, target: ${targetTime}, gap: ${targetTime - receivedVersion}ms)`
-			);
-			return false;
-		}
-
-		log(`Database ${dbName}: Synchronized`, 'debug');
-	}
-
-	return true;
 }
 
 /**
