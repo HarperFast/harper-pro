@@ -5,8 +5,7 @@
 
 import { suite, test, before, after } from 'node:test';
 import { deepEqual, equal, notEqual, ok } from 'node:assert/strict';
-import { Agent, request } from 'node:http';
-import { createServer } from 'node:http';
+import { Agent, createServer, request } from 'node:http';
 import { cp, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
@@ -38,20 +37,27 @@ function startBarrierOrigin() {
 				return;
 			}
 			const call = JSON.parse(body);
-			const state = trials.get(call.id) ?? { calls: [], timer: null, timedOut: false };
+			const state = trials.get(call.id) ?? { calls: [], timer: null, timedOut: false, released: false };
 			trials.set(call.id, state);
 			const token = `${call.id}:${call.node}:${call.threadId}:${state.calls.length}`;
-			state.calls.push({ ...call, token, res });
+			const pending = { ...call, token, res, answered: false };
+			state.calls.push(pending);
+			const respond = (pending) => {
+				if (pending.answered) return;
+				pending.answered = true;
+				pending.res.writeHead(200, { 'Content-Type': 'application/json' });
+				pending.res.end(JSON.stringify({ token: pending.token }));
+			};
 			const release = (timedOut) => {
 				if (state.timer) clearTimeout(state.timer);
-				state.timedOut = timedOut;
-				for (const pending of state.calls) {
-					pending.res.writeHead(200, { 'Content-Type': 'application/json' });
-					pending.res.end(JSON.stringify({ token: pending.token }));
-				}
+				state.timer = null;
+				state.released = true;
+				state.timedOut ||= timedOut;
+				for (const pending of state.calls) respond(pending);
 			};
-			if (state.calls.length === 2) release(false);
-			else if (state.calls.length === 1) state.timer = setTimeout(() => release(true), 2000);
+			if (state.released) respond(pending);
+			else if (state.calls.length >= 2) release(false);
+			else state.timer = setTimeout(() => release(true), 2000);
 		});
 	});
 
@@ -154,67 +160,82 @@ async function pinWorkers(node) {
 
 async function waitForConvergence(nodes, id, agentsByNode) {
 	const deadline = Date.now() + 30000;
-	let scans;
+	let scans, lastError;
 	while (Date.now() < deadline) {
-		scans = await Promise.all(
-			nodes.map((node, index) =>
-				requestJson(`${node.httpURL}/PairScanProbe/${id}`, agentsByNode[index].values().next().value)
-			)
-		);
-		if (
-			scans.every((scan) => scan.record) &&
-			scans.every((scan) => scan.version === scans[0].version && scan.record.token === scans[0].record.token)
-		) {
-			return scans;
+		try {
+			scans = await Promise.all(
+				nodes.map((node, index) =>
+					requestJson(`${node.httpURL}/PairScanProbe/${id}`, agentsByNode[index].values().next().value)
+				)
+			);
+			if (
+				scans.every((scan) => scan.record) &&
+				scans.every((scan) => scan.version === scans[0].version && scan.record.token === scans[0].record.token)
+			) {
+				return scans;
+			}
+		} catch (error) {
+			lastError = error;
 		}
 		await delay(100);
 	}
-	throw new Error(`Timed out waiting for ${id} convergence: ${JSON.stringify(scans)}`);
+	throw new Error(
+		`Timed out waiting for ${id} convergence: ${JSON.stringify(scans)}${lastError ? `; last error: ${lastError.message}` : ''}`
+	);
 }
 
 async function waitForAllWorkers(nodes, id, agentsByNode, probeResource) {
 	const deadline = Date.now() + 30000;
-	let probes;
+	let probes, lastError;
 	let stableSignature;
 	let stableSince = 0;
 	while (Date.now() < deadline) {
-		probes = (
-			await Promise.all(
-				nodes.map((node, nodeIndex) =>
-					Promise.all(
-						Array.from(agentsByNode[nodeIndex], async ([threadId, agent]) => ({
-							nodeIndex,
-							threadId,
-							probe: await requestJson(`${node.httpURL}/${probeResource}/${id}`, agent),
-						}))
+		try {
+			probes = (
+				await Promise.all(
+					nodes.map((node, nodeIndex) =>
+						Promise.all(
+							Array.from(agentsByNode[nodeIndex], async ([threadId, agent]) => ({
+								nodeIndex,
+								threadId,
+								probe: await requestJson(`${node.httpURL}/${probeResource}/${id}`, agent),
+							}))
+						)
 					)
 				)
-			)
-		).flat();
-		const winner = probes[0]?.probe.raw;
-		if (
-			winner?.record &&
-			probes.every(
-				({ probe }) =>
-					probe.raw?.version === winner.version &&
-					probe.raw.record.token === winner.record.token &&
-					probe.record?.token === winner.record.token
-			)
-		) {
-			const signature = `${winner.version}:${winner.record.token}`;
-			if (signature !== stableSignature) {
-				stableSignature = signature;
-				stableSince = Date.now();
-			} else if (Date.now() - stableSince >= 1000) {
-				return probes;
+			).flat();
+			const winner = probes[0]?.probe.raw;
+			if (
+				winner?.record &&
+				probes.every(
+					({ probe }) =>
+						probe.raw?.record &&
+						probe.raw.version === winner.version &&
+						probe.raw.record.token === winner.record.token &&
+						probe.record?.token === winner.record.token
+				)
+			) {
+				const signature = `${winner.version}:${winner.record.token}`;
+				if (signature !== stableSignature) {
+					stableSignature = signature;
+					stableSince = Date.now();
+				} else if (Date.now() - stableSince >= 1000) {
+					return probes;
+				}
+			} else {
+				stableSignature = undefined;
+				stableSince = 0;
 			}
-		} else {
+		} catch (error) {
+			lastError = error;
 			stableSignature = undefined;
 			stableSince = 0;
 		}
 		await delay(100);
 	}
-	throw new Error(`Timed out waiting for ${id} on every worker: ${JSON.stringify(probes)}`);
+	throw new Error(
+		`Timed out waiting for ${id} on every worker: ${JSON.stringify(probes)}${lastError ? `; last error: ${lastError.message}` : ''}`
+	);
 }
 
 suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout: 300000 }, (ctx) => {
@@ -283,8 +304,9 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 					const probe = await requestJson(`${ctx.nodes[nodeIndex].httpURL}/PairPointProbe/${id}`, agent);
 					equal(probe.threadId, threadId, `${id} connection moved between workers`);
 					ok(probe.record, `${id} missing on node ${nodeIndex}, worker ${threadId}`);
+					ok(probe.raw?.record, `${id} missing raw record on node ${nodeIndex}, worker ${threadId}`);
 					equal(
-						probe.raw?.record.token,
+						probe.raw.record.token,
 						scans[0].record.token,
 						`${id} raw store differs on ${probe.node} worker ${threadId}: ${JSON.stringify(probe)}`
 					);
@@ -292,6 +314,11 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 						probe.record.token,
 						scans[0].record.token,
 						`${id} stale point read on ${probe.node} worker ${threadId}: ${JSON.stringify(probe)}`
+					);
+					equal(
+						probe.raw.record.payloadToken,
+						probe.raw.record.token,
+						`${id} raw blob/metadata split on worker ${threadId}`
 					);
 					equal(probe.record.payloadToken, probe.record.token, `${id} blob/metadata split on worker ${threadId}`);
 				}
