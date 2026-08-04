@@ -78,8 +78,7 @@ export async function checkSyncStatus(
 		// Only databases still below target slide the stall deadline — arrivals on synced or
 		// untracked sockets must not mask a wedged copy on a pending one. cluster_status formats
 		// the arrival stamp as a UTC string (absent until data arrives); second precision is ample
-		// for a minutes-scale window, and Number.isFinite drops non-date strings (asDate's
-		// 'Copying' sentinel shape).
+		// for a minutes-scale window, and Number.isFinite drops undefined/unparseable values.
 		const receivedAt = socket.lastReceivedLocalTime ? Date.parse(socket.lastReceivedLocalTime) : NaN;
 		if (Number.isFinite(receivedAt) && receivedAt > latestReceivedMs) latestReceivedMs = receivedAt;
 	}

@@ -51,7 +51,8 @@ import { monitorSyncLoop } from './syncMonitor.ts';
  * - CLONE_JWT_KEYS: Clone JWT keys from leader (default: true)
  * - ALLOW_SELF_SIGNED: Allow self-signed certificates to be used for authentication (default: false)
  * - CLONE_SYNC_TIMEOUT: Sync stall timeout in milliseconds — the clone fails only if no replication
- *   data arrives for this long, not on total elapsed time (default: max(300000, 2 x replication.copyTimeout))
+ *   data arrives for this long, not on total elapsed time. Intended for minutes-scale values;
+ *   arrival stamps have second precision (default: max(300000, 2 x replication.copyTimeout))
  * - REPLICATION_PORT: Port for replication
  * - FORCE_CLONE: Force clone even if node exists (default: false)
  * - ROOTPATH: Harper installation root path
@@ -71,7 +72,8 @@ import { monitorSyncLoop } from './syncMonitor.ts';
  * --replication-port: Port for replication
  * --skip-sync-monitor: Skip monitoring sync status (default: false)
  * --sync-timeout: Sync stall timeout in milliseconds — the clone fails only if no replication
- *   data arrives for this long, not on total elapsed time (default: max(300000, 2 x replication.copyTimeout))
+ *   data arrives for this long, not on total elapsed time. Intended for minutes-scale values;
+ *   arrival stamps have second precision (default: max(300000, 2 x replication.copyTimeout))
  * --skip-ssh-keys: Skip cloning SSH keys (default: false)
  * --skip-jwt-keys: Skip cloning JWT keys (default: false)
  * --force-clone: Force clone even if node exists (default: false)
@@ -507,7 +509,7 @@ async function monitorSync(): Promise<SyncOutcome> {
 		Math.max(DEFAULT_SYNC_TIMEOUT_MS, 2 * (envMgr.get(CONFIG_PARAMS.REPLICATION_COPYTIMEOUT) ?? 300000));
 
 	log(
-		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 60000)} minutes`
+		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s`
 	);
 
 	const outcome = await monitorSyncLoop({
@@ -536,7 +538,7 @@ async function monitorSync(): Promise<SyncOutcome> {
 	}
 
 	log(
-		`No replication data received for ${Math.round(stallTimeoutMs / 60000)} minutes; sync is stalled — leaving availability Unavailable and not marking node as cloned`,
+		`No replication data received for ${Math.round(stallTimeoutMs / 1000)}s; sync is stalled — leaving availability Unavailable and not marking node as cloned`,
 		'error'
 	);
 	return 'failed';
