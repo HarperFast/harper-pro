@@ -1,4 +1,4 @@
-import { expect } from 'chai';
+import assert from 'node:assert';
 import {
 	checkCloneSyncStatus,
 	CLONE_SYNC_BASELINE_VERSION,
@@ -16,34 +16,42 @@ describe('clone sync targets', () => {
 			leaderURL: 'https://leader:9925',
 			leaderBaseline: copyStartTime - 1,
 		};
-		expect(validateCloneSyncBaseline(persisted, 'https://leader:9925')).to.equal(copyStartTime - 1);
-		expect(validateCloneSyncBaseline(persisted, 'https://leader:9925')).to.be.lessThan(resumedAt);
+		assert.equal(validateCloneSyncBaseline(persisted, 'https://leader:9925'), copyStartTime - 1);
+		assert.ok(validateCloneSyncBaseline(persisted, 'https://leader:9925') < resumedAt);
 	});
 
 	it('rejects a persisted baseline from another clone attempt', () => {
-		expect(() =>
-			validateCloneSyncBaseline(
-				{
-					version: CLONE_SYNC_BASELINE_VERSION,
-					leaderURL: 'https://old-leader:9925',
-					leaderBaseline: 1730000000000,
-				},
-				'https://leader:9925'
-			)
-		).to.throw('does not match this clone attempt');
+		assert.throws(
+			() =>
+				validateCloneSyncBaseline(
+					{
+						version: CLONE_SYNC_BASELINE_VERSION,
+						leaderURL: 'https://old-leader:9925',
+						leaderBaseline: 1730000000000,
+					},
+					'https://leader:9925'
+				),
+			/does not match this clone attempt/
+		);
 	});
 
 	it('uses one pre-copy leader baseline for every replicated database', () => {
 		const result = deriveCloneTargets({ system: {}, data: { items: {} } }, '*', 1730000000100);
-		expect(result).to.deep.equal({
-			targets: { system: 1730000000100, data: 1730000000100 },
-			errors: [],
-		});
+		assert.deepStrictEqual(
+			{ ...result, targets: { ...result.targets } },
+			{
+				targets: { system: 1730000000100, data: 1730000000100 },
+				errors: [],
+			}
+		);
 	});
 
 	it('fails closed when the leader clock is unavailable', () => {
 		const result = deriveCloneTargets({}, '*', undefined);
-		expect(result).to.deep.equal({ targets: {}, errors: ['Leader did not return a valid current time'] });
+		assert.deepStrictEqual(
+			{ ...result, targets: { ...result.targets } },
+			{ targets: {}, errors: ['Leader did not return a valid current time'] }
+		);
 	});
 
 	it('omits databases outside replication.databases', () => {
@@ -55,17 +63,20 @@ describe('clone sync targets', () => {
 			['data'],
 			1000
 		);
-		expect(result).to.deep.equal({ targets: { data: 1000 }, errors: [] });
-		expect(isReplicatedDatabase([{ name: 'data' }], 'data')).to.equal(true);
-		expect(isReplicatedDatabase([{ name: 'data' }], 'staging')).to.equal(false);
+		assert.deepStrictEqual({ ...result, targets: { ...result.targets } }, { targets: { data: 1000 }, errors: [] });
+		assert.equal(isReplicatedDatabase([{ name: 'data' }], 'data'), true);
+		assert.equal(isReplicatedDatabase([{ name: 'data' }], 'staging'), false);
 	});
 
 	it('fails closed when an explicitly configured database is omitted', () => {
 		const result = deriveCloneTargets({ system: {} }, ['system', 'data'], 1000);
-		expect(result).to.deep.equal({
-			targets: { system: 1000 },
-			errors: ['Leader description omitted configured database data'],
-		});
+		assert.deepStrictEqual(
+			{ ...result, targets: { ...result.targets } },
+			{
+				targets: { system: 1000 },
+				errors: ['Leader description omitted configured database data'],
+			}
+		);
 	});
 });
 
@@ -87,7 +98,7 @@ describe('checkCloneSyncStatus', () => {
 			},
 			leaderURL
 		);
-		expect(result).to.deep.equal({ synced: false, reason: 'No leader socket found for database data' });
+		assert.deepStrictEqual(result, { synced: false, reason: 'No leader socket found for database data' });
 	});
 
 	it('does not synchronize when the leader exposes a socket without a target', () => {
@@ -106,7 +117,7 @@ describe('checkCloneSyncStatus', () => {
 			},
 			leaderURL
 		);
-		expect(result).to.deep.equal({ synced: false, reason: 'No clone target found for leader database data' });
+		assert.deepStrictEqual(result, { synced: false, reason: 'No clone target found for leader database data' });
 	});
 
 	it('does not synchronize against a disconnected socket with a stale watermark', () => {
@@ -124,7 +135,7 @@ describe('checkCloneSyncStatus', () => {
 			},
 			leaderURL
 		);
-		expect(result).to.deep.equal({
+		assert.deepStrictEqual(result, {
 			synced: false,
 			reason: 'Leader socket for database data is not connected',
 		});
@@ -145,7 +156,7 @@ describe('checkCloneSyncStatus', () => {
 			},
 			leaderURL
 		);
-		expect(result).to.deep.equal({ synced: false, reason: 'Database data is still receiving its base copy' });
+		assert.deepStrictEqual(result, { synced: false, reason: 'Database data is still receiving its base copy' });
 	});
 
 	it('does not synchronize below a target watermark', () => {
@@ -163,7 +174,7 @@ describe('checkCloneSyncStatus', () => {
 			},
 			leaderURL
 		);
-		expect(result.synced).to.equal(false);
+		assert.equal(result.synced, false);
 	});
 
 	it('requires every target watermark', () => {
@@ -182,6 +193,6 @@ describe('checkCloneSyncStatus', () => {
 			},
 			leaderURL
 		);
-		expect(result).to.deep.equal({ synced: true });
+		assert.deepStrictEqual(result, { synced: true });
 	});
 });
