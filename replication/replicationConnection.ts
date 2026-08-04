@@ -4897,6 +4897,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// a proxied/indirect subscription has no direct cursor and instead arms from `proxiedSkipCursor`
 			// (set in the indirect block below).
 			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
+			// The status buffer is worker-local, while the sequence cursor is durable. Seed the
+			// receive watermark after a worker restart so a completed copy does not look incomplete
+			// until the leader happens to send another record. An outstanding copy cursor remains
+			// authoritative and must not be promoted this way.
+			if (connectedNode === node && !copyCursor && hasPersistedResumeCursor) {
+				const sharedStatus = getSharedStatus();
+				if (sharedStatus) {
+					sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+						sharedStatus[RECEIVED_VERSION_POSITION],
+						sequenceEntry.seqId!
+					);
+				}
+			}
 			// For a proxied/indirect subscription: the relayed per-source resume cursor, used ONLY to arm the
 			// leading-duplicate fast-skip (it does not move `startTime` — see the indirect block for why).
 			let proxiedSkipCursor: number | undefined;
