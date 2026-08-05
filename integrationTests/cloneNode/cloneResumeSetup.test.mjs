@@ -5,7 +5,7 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
@@ -154,11 +154,22 @@ suite('Clone Node - restart after sync starts skips setup', (ctx) => {
 		// A resume monitors the URL recorded here; checkSyncStatus matches it exactly.
 		const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
 		equal(marker.leaderReplicationURL, `ws://${ctx.leader.hostname}:9933`);
+		equal(marker.leaderURL, `http://${ctx.leader.hostname}:9925`);
+		ok(marker.startedAt > 0, 'the marker must record when the wait began');
 
 		await killHarper(cloneCtx);
+		// cloneConfig rewrites harper-config.yaml on every full setup; an untouched mtime after the
+		// restart is what proves the resume actually skipped setup rather than redoing it.
+		const configPath = join(cloneCtx.harper.dataRootDir, 'harper-config.yaml');
+		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
 		await startHarper(cloneCtx, options);
 
 		ok(await waitForAvailable(cloneCtx.harper), 'a resumed clone must still reach Available');
+		equal(
+			statSync(configPath).mtimeMs,
+			configMtimeBeforeRestart,
+			'resume must not rewrite the config — setup was supposed to be skipped'
+		);
 		equal(await waitForRowCount(cloneCtx.harper, RECORD_COUNT), RECORD_COUNT, 'all records must be present');
 		equal(existsSync(markerPath), false, 'finalizing the clone must clear the marker');
 	});
@@ -173,8 +184,14 @@ suite('Clone Node - restart after sync starts skips setup', (ctx) => {
 		ok(existsSync(markerPath), 'the marker must be present for this to test the forceClone override');
 
 		// FORCE_CLONE must discard the marker and re-run setup, then still converge.
+		const configPath = join(cloneCtx.harper.dataRootDir, 'harper-config.yaml');
+		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
 		await startHarper(cloneCtx, cloneOptionsFor(cloneCtx, ctx.leader, await leaderToken(), { FORCE_CLONE: true }));
 		ok(await waitForAvailable(cloneCtx.harper), 'a forced reclone must still reach Available');
+		ok(
+			statSync(configPath).mtimeMs > configMtimeBeforeRestart,
+			'forceClone must re-run setup, which rewrites the config'
+		);
 		equal(await waitForRowCount(cloneCtx.harper, RECORD_COUNT), RECORD_COUNT, 'all records must be present');
 	});
 });

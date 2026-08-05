@@ -54,7 +54,7 @@ import { monitorSyncLoop } from './syncMonitor.ts';
  *   data arrives for this long, not on total elapsed time. Intended for minutes-scale values;
  *   arrival stamps have second precision (default: max(300000, 2 x replication.copyTimeout))
  * - CLONE_MAX_DURATION: Absolute ceiling in milliseconds on the sync wait (default: derived from
- *   the size the leader reports, floored at one hour)
+ *   the size the leader reports, floored at one hour; 24h when no size is reported)
  * - REPLICATION_PORT: Port for replication
  * - FORCE_CLONE: Force clone even if node exists (default: false)
  * - ROOTPATH: Harper installation root path
@@ -245,9 +245,15 @@ export async function cloneNode(): Promise<void> {
 	}
 
 	// A marker means a previous start completed setup and began the sync wait; setup must not be
-	// repeated (full app re-install, worker restart under resumed replication). forceClone overrides.
+	// repeated (full app re-install, worker restart under resumed replication). forceClone overrides,
+	// and a marker written against a different leader is discarded rather than resumed.
 	if (forceClone) clearSyncStartedMarker();
-	const resumeMarker = forceClone ? undefined : readSyncStartedMarker();
+	let resumeMarker = forceClone ? undefined : readSyncStartedMarker();
+	if (resumeMarker && resumeMarker.leaderURL !== leaderURL) {
+		log(`Clone sync marker was for leader ${resumeMarker.leaderURL}; running full clone setup for ${leaderURL}`);
+		clearSyncStartedMarker();
+		resumeMarker = undefined;
+	}
 
 	if (!usingCertAuth && !resumeMarker) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
@@ -284,12 +290,15 @@ export async function cloneNode(): Promise<void> {
 		log(`Clone sync already in progress; skipping clone setup and monitoring sync on ${leaderReplicationURL}`);
 	} else if (!(await establishCloneSetup())) return;
 
-	writeSyncStartedMarker();
+	// The wait's start survives restarts via the marker, so the absolute ceiling bounds the clone's
+	// total wall time rather than granting every restart a fresh budget.
+	const syncStartedAt: number = resumeMarker?.startedAt ?? Date.now();
+	if (!resumeMarker) writeSyncStartedMarker(syncStartedAt);
 
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
 	// once sync is confirmed and availability has been published as Available — a timeout or failure
 	// must not be treated as success.
-	const syncOutcome = await monitorSync();
+	const syncOutcome = await monitorSync(syncStartedAt);
 	if (syncOutcome === 'failed') {
 		// Leave Harper running so get_status stays queryable for the control plane (availability is
 		// now Unavailable). Throwing here would propagate to bin/harper.js and exit the already-started
@@ -475,16 +484,14 @@ function syncStartedMarkerPath(): string {
 	return join(rootPath, 'tmp', 'clone-sync-started.json');
 }
 
-function writeSyncStartedMarker(): void {
-	try {
-		writeJsonSync(syncStartedMarkerPath(), { leaderReplicationURL });
-	} catch (err) {
-		// Losing the marker only costs a future restart the full setup path.
-		log(`Could not record clone sync marker: ${err}`, 'error');
-	}
+// writeJsonSync logs and swallows write failures; losing the marker only costs a future restart
+// the full setup path.
+function writeSyncStartedMarker(startedAt: number): void {
+	writeJsonSync(syncStartedMarkerPath(), { leaderURL, leaderReplicationURL, startedAt });
 }
 
-function readSyncStartedMarker(): { leaderReplicationURL?: string } | undefined {
+function readSyncStartedMarker():
+	{ leaderURL?: string; leaderReplicationURL?: string; startedAt?: number } | undefined {
 	try {
 		return JSON.parse(readFileSync(syncStartedMarkerPath(), 'utf8'));
 	} catch {
@@ -518,9 +525,10 @@ type SyncOutcome = 'synced' | 'skipped' | 'failed';
  * Available once sync is confirmed and that write succeeds. On any failure it is left Unavailable.
  *
  * Polls at regular intervals until sync completes, failing only on a stall — the deadline slides
- * forward whenever replication data arrives, so a large clone is never timed out while healthy.
+ * forward whenever replication data arrives — plus an absolute ceiling sized from the leader's
+ * reported bytes, so a copy that keeps receiving without converging still reaches a verdict.
  */
-async function monitorSync(): Promise<SyncOutcome> {
+async function monitorSync(syncStartedAt: number): Promise<SyncOutcome> {
 	const { set: setStatus } = await import('../core/server/status/index.js');
 
 	if (skipSyncMonitor) {
@@ -571,9 +579,14 @@ async function monitorSync(): Promise<SyncOutcome> {
 	const stallTimeoutMs: number =
 		explicitSyncTimeoutMs ??
 		Math.max(DEFAULT_SYNC_TIMEOUT_MS, 2 * (envMgr.get(CONFIG_PARAMS.REPLICATION_COPYTIMEOUT) ?? 300000));
-	// Sized from what the leader holds, assuming a deliberately pessimistic ~350KB/s sustained.
-	const maxDurationMs: number =
-		explicitMaxCloneDurationMs ?? Math.max(MIN_MAX_CLONE_DURATION_MS, Math.ceil((totalBytes / 350_000) * 1000));
+	// Sized from what the leader holds, assuming a deliberately pessimistic ~350KB/s sustained. A
+	// leader reporting no usable sizes gets a generous fixed ceiling instead of the floor — absent
+	// data must not shrink the budget. The elapsed subtraction charges time already spent by earlier
+	// attempts (syncStartedAt survives restarts via the marker), so restarts cannot renew the budget.
+	const ceilingMs: number =
+		explicitMaxCloneDurationMs ??
+		(totalBytes > 0 ? Math.max(MIN_MAX_CLONE_DURATION_MS, Math.ceil((totalBytes / 350_000) * 1000)) : 86400000);
+	const maxDurationMs: number = Math.max(0, ceilingMs - Math.max(0, Date.now() - syncStartedAt));
 
 	log(
 		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s, or if ${Math.round(totalBytes / 1024 / 1024)}MB has not converged within ${Math.round(maxDurationMs / 1000)}s`
