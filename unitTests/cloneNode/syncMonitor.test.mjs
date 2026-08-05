@@ -34,7 +34,7 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0 });
+		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0, socketDatabases: new Set(['system', 'data']) });
 	});
 
 	it('reports incomplete when any database is behind its target', async () => {
@@ -48,7 +48,11 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 7000 });
+		assert.deepEqual(result, {
+			syncComplete: false,
+			latestReceivedMs: 7000,
+			socketDatabases: new Set(['system', 'data']),
+		});
 	});
 
 	it('scans every socket for arrival stamps instead of returning on the first laggard', async () => {
@@ -62,7 +66,11 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 9000 });
+		assert.deepEqual(result, {
+			syncComplete: false,
+			latestReceivedMs: 9000,
+			socketDatabases: new Set(['system', 'data']),
+		});
 	});
 
 	it('treats a socket without a target as pending until its watermark is positive', async () => {
@@ -78,7 +86,11 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 8000 });
+		assert.deepEqual(result, {
+			syncComplete: false,
+			latestReceivedMs: 8000,
+			socketDatabases: new Set(['system', 'untracked']),
+		});
 	});
 
 	it('does not pass vacuously when every target is missing (#655 regression)', async () => {
@@ -110,7 +122,7 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0 });
+		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0, socketDatabases: new Set(['system', 'data']) });
 	});
 
 	it('holds completion while a target database has no socket yet', async () => {
@@ -135,7 +147,7 @@ describe('checkSyncStatus', () => {
 			noopLog,
 			['data']
 		);
-		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0 });
+		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0, socketDatabases: new Set(['data']) });
 	});
 
 	it('still verifies a non-required database whenever its socket exists', async () => {
@@ -164,7 +176,11 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 0 });
+		assert.deepEqual(result, {
+			syncComplete: false,
+			latestReceivedMs: 0,
+			socketDatabases: new Set(['system', 'data']),
+		});
 	});
 
 	it('ignores non-date sentinel strings in the arrival field', async () => {
@@ -174,7 +190,7 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 0 });
+		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set(['system']) });
 	});
 
 	it('reports no progress when the leader connection has not appeared yet', async () => {
@@ -185,7 +201,7 @@ describe('checkSyncStatus', () => {
 			{ connections: [{ name: 'leader', url: LEADER_URL, database_sockets: [] }] },
 		]) {
 			const result = await checkSyncStatus({ system: 1000 }, async () => response, LEADER_URL, noopLog);
-			assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 0 });
+			assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set() });
 		}
 	});
 });
@@ -214,6 +230,30 @@ describe('monitorSyncLoop', () => {
 			...clock,
 		});
 		assert.equal(outcome, 'synced');
+	});
+
+	it('ratchets a seen socket into the required set so its loss cannot complete the clone', async () => {
+		const clock = fakeClock();
+		// The system DB is optional (v4 leaders never replicate it) — but once its socket has been
+		// seen on a v5 leader, it must be verified: dropping the socket mid-clone (here after the
+		// first poll, with data synced) must hold completion, not complete around it.
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000, data: 2000 },
+			clusterStatus: async () =>
+				clock.now() === 0
+					? statusResponse([
+							{ database: 'system', lastReceivedVersion: undefined },
+							{ database: 'data', lastReceivedVersion: undefined, lastReceivedLocalTime: utc(0) },
+						])
+					: statusResponse([{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(1000) }]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			checkIntervalMs: 1000,
+			log: noopLog,
+			requiredSocketDatabases: ['data'],
+			...clock,
+		});
+		assert.equal(outcome, 'stalled');
 	});
 
 	it('honors requiredSocketDatabases so a socketless system DB cannot wedge a v4-leader clone', async () => {

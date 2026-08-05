@@ -6,6 +6,8 @@ export type SyncCheckResult = {
 	syncComplete: boolean;
 	/** Most recent arrival stamp (ms epoch) among databases still below their target; 0 if none. */
 	latestReceivedMs: number;
+	/** Databases that had a replication socket to the leader in this check. */
+	socketDatabases: Set<string>;
 };
 
 /**
@@ -29,24 +31,24 @@ export async function checkSyncStatus(
 
 	if (!clusterResponse) {
 		log('No cluster status response received for clone, will wait and retry');
-		return { syncComplete: false, latestReceivedMs: 0 };
+		return { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set() };
 	}
 
 	if (!clusterResponse.connections?.length) {
 		log('No connections found in cluster status response for clone, will wait and retry');
-		return { syncComplete: false, latestReceivedMs: 0 };
+		return { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set() };
 	}
 
 	const leaderConnection = clusterResponse.connections.find((conn) => conn.url === leaderReplicationURL);
 
 	if (!leaderConnection) {
 		log('No connection found matching leader replication URL, will wait and retry');
-		return { syncComplete: false, latestReceivedMs: 0 };
+		return { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set() };
 	}
 
 	if (!leaderConnection.database_sockets?.length) {
 		log(`No database sockets found for connection leader ${leaderConnection.name}`, 'debug');
-		return { syncComplete: false, latestReceivedMs: 0 };
+		return { syncComplete: false, latestReceivedMs: 0, socketDatabases: new Set() };
 	}
 
 	let syncComplete = true;
@@ -101,7 +103,7 @@ export async function checkSyncStatus(
 		}
 	}
 
-	return { syncComplete, latestReceivedMs };
+	return { syncComplete, latestReceivedMs, socketDatabases };
 }
 
 export type MonitorSyncLoopOptions = {
@@ -129,6 +131,12 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 	const delay = options.delay ?? sleep;
 	let lastProgressAt = now();
 	let loopCount = 0;
+	const baseRequired = options.requiredSocketDatabases ?? Object.keys(options.targetTimestamps);
+	// Ratchet: a target database whose socket has been seen once stays required even if the socket
+	// later drops, and a non-required one (e.g. `system`, optional because v4 leaders never
+	// replicate it) becomes required as soon as its socket appears — so on a v5 leader a small user
+	// database finishing first cannot complete the clone while the system copy is still pending.
+	const seenTargetSockets = new Set<string>();
 
 	while (now() - lastProgressAt < options.stallTimeoutMs) {
 		try {
@@ -142,7 +150,7 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 				options.clusterStatus,
 				options.leaderReplicationURL,
 				options.log,
-				options.requiredSocketDatabases ?? Object.keys(options.targetTimestamps)
+				[...new Set([...baseRequired, ...seenTargetSockets])]
 			);
 			checkPromise.catch(() => {});
 			const result = await Promise.race([
@@ -154,7 +162,10 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 				await delay(options.checkIntervalMs);
 				continue;
 			}
-			const { syncComplete, latestReceivedMs } = result;
+			const { syncComplete, latestReceivedMs, socketDatabases } = result;
+			for (const dbName of socketDatabases) {
+				if (dbName in options.targetTimestamps) seenTargetSockets.add(dbName);
+			}
 
 			if (syncComplete) return 'synced';
 
