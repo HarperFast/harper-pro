@@ -1230,6 +1230,23 @@ export function createPendingDatabaseSubscription(
 	return pending;
 }
 
+/** A retired placeholder must never be used, nor shadow a real registration that landed after it. */
+export function activeDatabaseSubscription(subscription?: DatabaseSubscription): DatabaseSubscription | undefined {
+	return subscription?.retired ? undefined : subscription;
+}
+
+/**
+ * The database subscription a connection or subscription request should use: the registered one, or a
+ * fresh placeholder. Never a retired placeholder, and — because `createPendingDatabaseSubscription`
+ * registers unconditionally — never creating one over a registration that landed in the meantime.
+ */
+export function subscriptionForDatabase(databaseName: string, subscriptions: Map<string, any>): DatabaseSubscription {
+	return (
+		activeDatabaseSubscription(subscriptions.get(databaseName)) ??
+		createPendingDatabaseSubscription(databaseName, subscriptions)
+	);
+}
+
 /**
  * Settle and unregister a database-subscription placeholder that is still pending, returning whether it
  * did so.
@@ -1252,23 +1269,6 @@ export function createPendingDatabaseSubscription(
  * `Replicator.subscribe()` registers the real queue. Every consumer must treat a retired placeholder as
  * absent and re-derive from the map.
  */
-/** A retired placeholder must never be used, nor shadow a real registration that landed after it. */
-export function activeDatabaseSubscription(subscription?: DatabaseSubscription): DatabaseSubscription | undefined {
-	return subscription?.retired ? undefined : subscription;
-}
-
-/**
- * The database subscription a connection or subscription request should use: the registered one, or a
- * fresh placeholder. Never a retired placeholder, and — because `createPendingDatabaseSubscription`
- * registers unconditionally — never creating one over a registration that landed in the meantime.
- */
-export function subscriptionForDatabase(databaseName: string, subscriptions: Map<string, any>): DatabaseSubscription {
-	return (
-		activeDatabaseSubscription(subscriptions.get(databaseName)) ??
-		createPendingDatabaseSubscription(databaseName, subscriptions)
-	);
-}
-
 export function expirePendingDatabaseSubscription(
 	databaseName: string,
 	subscription: DatabaseSubscription | undefined,
@@ -3397,27 +3397,29 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
 						let sentNodeIds = new Set<number>();
 						let closed = false;
-						// Filter a retired placeholder BEFORE deciding whether to consult the map: it is truthy, so
-						// carrying it into the branch below would skip the lookup and then register a new
-						// placeholder over a real subscription that landed in the meantime.
+						// A retired placeholder is truthy, so it must be filtered before anything reads it or decides
+						// whether to consult the map — carrying it forward would skip the lookup below.
 						tableSubscriptionToReplicator = activeDatabaseSubscription(tableSubscriptionToReplicator);
-						if (tableSubscriptionToReplicator) {
-							if (databaseName !== tableSubscriptionToReplicator.databaseName && !tableSubscriptionToReplicator.then) {
-								logger.error?.(
-									'Subscription request for wrong database',
-									databaseName,
-									tableSubscriptionToReplicator.databaseName
-								);
-								return;
-							}
-						} else {
+						if (
+							tableSubscriptionToReplicator &&
+							!tableSubscriptionToReplicator.then &&
+							databaseName !== tableSubscriptionToReplicator.databaseName
+						) {
+							logger.error?.(
+								'Subscription request for wrong database',
+								databaseName,
+								tableSubscriptionToReplicator.databaseName
+							);
+							return;
+						}
+						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
+						if (!tableSubscriptionToReplicator) {
 							// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
 							// from for this connection, so writing anywhere else would leave a placeholder pending forever.
 							tableSubscriptionToReplicator = subscriptionForDatabase(databaseName, dbSubscriptions);
 							if (tableSubscriptionToReplicator.then)
 								logger.debug?.('Waiting for subscription to database ' + databaseName);
 						}
-						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
 						// Local config-route directionality for this peer, resolved once and reused by the send
 						// authority gate below and the send-side excludeTables further down. harper-pro#498.
 						const sendRoute = getConfigRouteReplicates(options, remoteNodeName);
