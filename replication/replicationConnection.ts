@@ -1257,6 +1257,18 @@ export function activeDatabaseSubscription(subscription?: DatabaseSubscription):
 	return subscription?.retired ? undefined : subscription;
 }
 
+/**
+ * The database subscription a connection or subscription request should use: the registered one, or a
+ * fresh placeholder. Never a retired placeholder, and — because `createPendingDatabaseSubscription`
+ * registers unconditionally — never creating one over a registration that landed in the meantime.
+ */
+export function subscriptionForDatabase(databaseName: string, subscriptions: Map<string, any>): DatabaseSubscription {
+	return (
+		activeDatabaseSubscription(subscriptions.get(databaseName)) ??
+		createPendingDatabaseSubscription(databaseName, subscriptions)
+	);
+}
+
 export function expirePendingDatabaseSubscription(
 	databaseName: string,
 	subscription: DatabaseSubscription | undefined,
@@ -1960,14 +1972,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// no-subscription close — and a late Replicator.subscribe() can still resolve it.
 	let tableSubscriptionToReplicator: DatabaseSubscription = activeDatabaseSubscription(options.subscription);
 	if (options.subscription && !tableSubscriptionToReplicator)
-		tableSubscriptionToReplicator =
-			dbSubscriptions.get(databaseName) ?? createPendingDatabaseSubscription(databaseName, dbSubscriptions);
+		tableSubscriptionToReplicator = subscriptionForDatabase(databaseName, dbSubscriptions);
 	if (tableSubscriptionToReplicator?.then)
 		(tableSubscriptionToReplicator as Promise<any>)
 			.then((sub) => {
-				// A retired placeholder settles to undefined (expirePendingDatabaseSubscription): leave the
-				// local reference as the promise so the request path re-derives from dbSubscriptions rather
-				// than treating a resolved `undefined` as a usable subscription.
+				// A retired placeholder settles to undefined; leave the local reference as the promise so the
+				// request path re-derives rather than treating it as a usable subscription.
 				if (!sub) return;
 				tableSubscriptionToReplicator = sub;
 				if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
@@ -3387,6 +3397,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
 						let sentNodeIds = new Set<number>();
 						let closed = false;
+						// Filter a retired placeholder BEFORE deciding whether to consult the map: it is truthy, so
+						// carrying it into the branch below would skip the lookup and then register a new
+						// placeholder over a real subscription that landed in the meantime.
+						tableSubscriptionToReplicator = activeDatabaseSubscription(tableSubscriptionToReplicator);
 						if (tableSubscriptionToReplicator) {
 							if (databaseName !== tableSubscriptionToReplicator.databaseName && !tableSubscriptionToReplicator.then) {
 								logger.error?.(
@@ -3396,16 +3410,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								);
 								return;
 							}
-						} else tableSubscriptionToReplicator = dbSubscriptions.get(databaseName);
-						tableSubscriptionToReplicator = activeDatabaseSubscription(tableSubscriptionToReplicator);
-						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
-						if (!tableSubscriptionToReplicator) {
-							// Wait for it to be created. Registered in dbSubscriptions (not the module-level map
-							// unconditionally): that is the map Replicator.subscribe() resolves from for this
-							// connection, so writing anywhere else would leave the placeholder pending forever.
-							logger.debug?.('Waiting for subscription to database ' + databaseName);
-							tableSubscriptionToReplicator = createPendingDatabaseSubscription(databaseName, dbSubscriptions);
+						} else {
+							// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
+							// from for this connection, so writing anywhere else would leave a placeholder pending forever.
+							tableSubscriptionToReplicator = subscriptionForDatabase(databaseName, dbSubscriptions);
+							if (tableSubscriptionToReplicator.then)
+								logger.debug?.('Waiting for subscription to database ' + databaseName);
 						}
+						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
 						// Local config-route directionality for this peer, resolved once and reused by the send
 						// authority gate below and the send-side excludeTables further down. harper-pro#498.
 						const sendRoute = getConfigRouteReplicates(options, remoteNodeName);
@@ -3467,6 +3479,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									})
 									.catch((error) => {
 										logger.error?.(connectionId, 'Error subscribing to HDB nodes', error);
+										// This catch also receives a throw from the watch loop itself, after the subscription
+										// resolved. Logging alone would leave the replay loop running with no live
+										// authorization watcher, so a later revocation would go unobserved: fail closed and
+										// let the retry rebuild the watch.
+										if (!closed && !wsClosed) {
+											closed = true;
+											close(1011, `Replication authorization watch failed for ${databaseName}`);
+										}
 									});
 							}
 						} else if (!(authorization?.role?.permission?.super_user || authorization.replicates)) {
