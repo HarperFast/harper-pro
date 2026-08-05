@@ -516,15 +516,21 @@ async function monitorSync(): Promise<SyncOutcome> {
 	// (v4) leader never replicates the system database, so requiring its socket would wedge the
 	// clone, while on a v5+ leader it must be required up front — otherwise a small user database
 	// completing before the system subscription registers could finish the clone with the system
-	// copy unverified. registration_info is the lightweight version probe present on every leader
-	// version (see core/bin/cliOperations.ts). An unreadable version leaves system optional; the
-	// seen-socket ratchet in monitorSyncLoop still verifies it once its socket appears.
-	let systemSocketRequired = false;
-	try {
-		const registration: any = await leaderRequest({ operation: 'registration_info' });
-		systemSocketRequired = parseInt(String(registration?.version ?? ''), 10) >= 5;
-	} catch (err) {
-		log(`Could not read leader version (${err}); not requiring a system replication socket`);
+	// copy unverified. registration_info is the version probe present on every leader version
+	// (see core/bin/cliOperations.ts). Fail CLOSED: only a positively-read legacy major version
+	// exempts system; a missing/unparseable version or a persistently failing probe requires it,
+	// so a transient probe error against a v5 leader cannot reopen the premature-Available race.
+	let systemSocketRequired = true;
+	for (let attempt = 1; attempt <= 3; attempt++) {
+		try {
+			const registration: any = await leaderRequest({ operation: 'registration_info' });
+			const leaderMajorVersion = parseInt(String(registration?.version ?? ''), 10);
+			systemSocketRequired = !(leaderMajorVersion >= 1 && leaderMajorVersion < 5);
+			break;
+		} catch (err) {
+			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
+			if (attempt < 3) await sleep(1000);
+		}
 	}
 
 	const outcome = await monitorSyncLoop({
@@ -569,16 +575,18 @@ async function monitorSync(): Promise<SyncOutcome> {
  */
 // Filter by this node's `replication.databases` — a database the clone doesn't subscribe to must
 // not be pre-created (cloneSchemas) or become a sync target (getLastUpdatedRecord: its socket
-// never exists and its data never arrives, so a target would wedge the sync monitor). Matches the
-// gating used by `shouldReplicateFromNode` in `replication/knownNodes.ts`: `undefined` or `'*'`
-// accept everything; an array accepts only the names it lists (objects with `.name` are
-// sharded-database entries).
-function isReplicatedDatabase(dbName: string): boolean {
+// never exists and its data never arrives, so a target would wedge the sync monitor). Name-based
+// subset of the gating in `shouldReplicateFromNode` (`replication/knownNodes.ts`): `undefined` or
+// `'*'` accept everything; an array accepts only the names it lists. A sharded entry replicates
+// only from same-shard peers — a predicate that needs the leader's shard, unknown at this point —
+// so `excludeSharded` callers (sync targets) treat it as not replicated: when it does replicate,
+// its socket exists and the watermark rule plus the seen-socket ratchet still verify it.
+function isReplicatedDatabase(dbName: string, options?: { excludeSharded?: boolean }): boolean {
 	const databaseReplications = envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES);
 	if (!databaseReplications || databaseReplications === '*') return true;
 	if (!Array.isArray(databaseReplications)) return true;
 	return databaseReplications.some((entry: any) =>
-		typeof entry === 'string' ? entry === dbName : entry?.name === dbName
+		typeof entry === 'string' ? entry === dbName : entry?.name === dbName && !(options?.excludeSharded && entry.sharded)
 	);
 }
 
@@ -592,7 +600,7 @@ async function getLastUpdatedRecord(): Promise<Record<string, number>> {
 	for (const db in allDb) {
 		// requestId is part of the describe response so we ignore it
 		if (typeof allDb[db] !== 'object') continue;
-		if (!isReplicatedDatabase(db)) continue;
+		if (!isReplicatedDatabase(db, { excludeSharded: true })) continue;
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
 	}
 
