@@ -525,7 +525,8 @@ async function monitorSync(): Promise<SyncOutcome> {
 	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
 			const registration: any = await leaderRequest({ operation: 'registration_info' });
-			const leaderMajorVersion = parseInt(String(registration?.version ?? ''), 10);
+			// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
+			const leaderMajorVersion = Number(String(registration?.version ?? '').match(/\d+/)?.[0] ?? NaN);
 			systemSocketRequired = !(leaderMajorVersion >= 1 && leaderMajorVersion < 5);
 			break;
 		} catch (err) {
