@@ -227,6 +227,27 @@ describe('monitorSyncLoop', () => {
 		assert.equal(clock.now(), 12000);
 	});
 
+	it('gives up at the maximum duration when data keeps arriving but sync never converges', async () => {
+		const clock = fakeClock();
+		// The non-converging shape: records keep being applied (arrivals track the clock, so the stall
+		// deadline never expires) while the version watermark never reaches target.
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: undefined, lastReceivedLocalTime: utc(clock.now()) },
+				]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			maxDurationMs: 60000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'unconverged');
+		assert.ok(clock.now() >= 60000, 'must run to the maximum duration, not stall early');
+	});
+
 	it('stalls out when the cluster status check never settles', async () => {
 		const clock = fakeClock();
 		const outcome = await monitorSyncLoop({

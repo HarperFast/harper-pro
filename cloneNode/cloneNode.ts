@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { accessSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { accessSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -53,6 +53,8 @@ import { monitorSyncLoop } from './syncMonitor.ts';
  * - CLONE_SYNC_TIMEOUT: Sync stall timeout in milliseconds — the clone fails only if no replication
  *   data arrives for this long, not on total elapsed time. Intended for minutes-scale values;
  *   arrival stamps have second precision (default: max(300000, 2 x replication.copyTimeout))
+ * - CLONE_MAX_DURATION: Absolute ceiling in milliseconds on the sync wait (default: derived from
+ *   the size the leader reports, floored at one hour)
  * - REPLICATION_PORT: Port for replication
  * - FORCE_CLONE: Force clone even if node exists (default: false)
  * - ROOTPATH: Harper installation root path
@@ -82,6 +84,9 @@ import { monitorSyncLoop } from './syncMonitor.ts';
 
 const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
+// Floor for the size-derived sync-wait ceiling, which guarantees the wait terminates even when data
+// keeps arriving without ever converging (arrivals slide the stall deadline).
+const MIN_MAX_CLONE_DURATION_MS = 3600000;
 const DEFAULT_REPLICATION_PORT = '9933';
 
 const CONFIG_TO_EXCLUDE_FROM_CLONE = {
@@ -159,6 +164,8 @@ const skipSyncMonitor: boolean = values['skip-sync-monitor'] ?? process.env.CLON
 // default stall window at 2x the replication copy timeout.
 const parsedSyncTimeout: number = parseInt(values['sync-timeout'] || process.env.CLONE_SYNC_TIMEOUT, 10);
 const explicitSyncTimeoutMs: number | undefined = parsedSyncTimeout > 0 ? parsedSyncTimeout : undefined;
+const parsedMaxDuration: number = parseInt(process.env.CLONE_MAX_DURATION, 10);
+const explicitMaxCloneDurationMs: number | undefined = parsedMaxDuration > 0 ? parsedMaxDuration : undefined;
 // `replication.port` in HARPER_SET_CONFIG / HARPER_DEFAULT_CONFIG accepts both a numeric port
 // and a `host:port` string; cloneNode treats `replicationPort` as a port number (substituted
 // into the leader URL and written to REPLICATION_PORT), so strip any leading `host:`.
@@ -237,7 +244,12 @@ export async function cloneNode(): Promise<void> {
 		return main();
 	}
 
-	if (!usingCertAuth) {
+	// A marker means a previous start completed setup and began the sync wait; setup must not be
+	// repeated (full app re-install, worker restart under resumed replication). forceClone overrides.
+	if (forceClone) clearSyncStartedMarker();
+	const resumeMarker = forceClone ? undefined : readSyncStartedMarker();
+
+	if (!usingCertAuth && !resumeMarker) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
 		// Cannot check if cloning with WS - module initialization order prevents access to required variables
 		await leaderRequest({ operation: OPERATIONS_ENUM.GET_STATUS });
@@ -265,6 +277,84 @@ export async function cloneNode(): Promise<void> {
 	logger.initLogSettings();
 	harperLogger = logger.loggerWithTag('cloneNode');
 
+	if (resumeMarker) {
+		// Only the marker holds the URL replication was established on, and checkSyncStatus matches it
+		// exactly — the heuristic URL this would otherwise keep is wrong for a TLS-only leader.
+		leaderReplicationURL = resumeMarker.leaderReplicationURL ?? leaderReplicationURL;
+		log(`Clone sync already in progress; skipping clone setup and monitoring sync on ${leaderReplicationURL}`);
+	} else if (!(await establishCloneSetup())) return;
+
+	writeSyncStartedMarker();
+
+	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
+	// once sync is confirmed and availability has been published as Available — a timeout or failure
+	// must not be treated as success.
+	const syncOutcome = await monitorSync();
+	if (syncOutcome === 'failed') {
+		// Leave Harper running so get_status stays queryable for the control plane (availability is
+		// now Unavailable). Throwing here would propagate to bin/harper.js and exit the already-started
+		// process. Explicitly clear the cloned flag rather than just skipping the write: on a forced
+		// reclone, cloneConfig() has already carried the previous `cloned: true` into the rewritten
+		// config, so a bare return would leave it set and the next non-forced start would skip cloning
+		// despite the unconfirmed sync. Clearing it ensures a subsequent start retries the clone.
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		log(
+			`Clone from leader node ${leaderURL} did not complete synchronization; node is running but Unavailable and not marked as cloned`,
+			'error'
+		);
+		return;
+	}
+
+	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
+	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
+	// node with no users during setNode(), which prevents replication from being established.
+	// Runs on retry too (when systemExists but cloned not yet set) via !hdbConfig?.cloned.
+	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
+		try {
+			const { databases } = await import('../core/resources/databases.js');
+			// Only delete clone-temp-admin if it actually exists. If install used CLI/env args
+			// that supplied a real admin username (e.g. integration tests pass
+			// --HDB_ADMIN_USERNAME=admin), `clone-temp-admin` was never created and there is
+			// nothing to clean up — skip the delete entirely.
+			const existing = await databases.system.hdb_user.get('clone-temp-admin');
+			if (existing) {
+				// Wait until at least one non-clone-temp-admin user is present (replicated from leader)
+				// before deleting, so the node still has a super_user available for local-auth.
+				const waitDeadline = Date.now() + (explicitSyncTimeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS);
+				while (Date.now() < waitDeadline) {
+					let foundReplicatedUser = false;
+					try {
+						for await (const user of databases.system.hdb_user.search([])) {
+							if (user?.username && user.username !== 'clone-temp-admin') {
+								foundReplicatedUser = true;
+								break;
+							}
+						}
+					} catch (err) {
+						log(`Error scanning hdb_user while waiting for replicated user: ${err}`, 'error');
+					}
+					if (foundReplicatedUser) break;
+					await sleep(200);
+				}
+				await databases.system.hdb_user.delete('clone-temp-admin');
+			}
+		} catch (err) {
+			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
+		}
+	}
+
+	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
+	updateConfigValue(CONFIG_PARAMS.CLONED, true);
+	clearSyncStartedMarker();
+
+	log(`Clone from leader node ${leaderURL} complete`);
+}
+
+/**
+ * One-time clone setup — everything that must not be repeated once the sync wait has begun. Returns
+ * false when the clone is not viable (Harper keeps running, Unavailable and not marked cloned).
+ */
+async function establishCloneSetup(): Promise<boolean> {
 	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
 	const leaderConfigData = await cloneConfig();
 
@@ -366,74 +456,48 @@ export async function cloneNode(): Promise<void> {
 			`Clone from leader node ${leaderURL} failed to obtain JWT signing keys (${err}); node is running but Unavailable and not marked as cloned`,
 			'error'
 		);
-		return;
+		return false;
 	}
 
 	await cloneEnvSecretsKeys();
 
 	await cloneSSHKeys();
 
-	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
-	// once sync is confirmed and availability has been published as Available — a timeout or failure
-	// must not be treated as success.
-	const syncOutcome = await monitorSync();
-	if (syncOutcome === 'failed') {
-		// Leave Harper running so get_status stays queryable for the control plane (availability is
-		// now Unavailable). Throwing here would propagate to bin/harper.js and exit the already-started
-		// process. Explicitly clear the cloned flag rather than just skipping the write: on a forced
-		// reclone, cloneConfig() has already carried the previous `cloned: true` into the rewritten
-		// config, so a bare return would leave it set and the next non-forced start would skip cloning
-		// despite the unconfirmed sync. Clearing it ensures a subsequent start retries the clone.
-		updateConfigValue(CONFIG_PARAMS.CLONED, false);
-		log(
-			`Clone from leader node ${leaderURL} did not complete synchronization; node is running but Unavailable and not marked as cloned`,
-			'error'
-		);
-		return;
+	return true;
+}
+
+/**
+ * Marker written when the sync wait begins, so a restart resumes the wait instead of redoing setup.
+ * It carries the replication URL because that is refined from the leader's own config (v4 leaders
+ * are TLS-only) and checkSyncStatus matches it exactly against cluster_status.
+ */
+function syncStartedMarkerPath(): string {
+	return join(rootPath, 'tmp', 'clone-sync-started.json');
+}
+
+function writeSyncStartedMarker(): void {
+	try {
+		writeJsonSync(syncStartedMarkerPath(), { leaderReplicationURL });
+	} catch (err) {
+		// Losing the marker only costs a future restart the full setup path.
+		log(`Could not record clone sync marker: ${err}`, 'error');
 	}
+}
 
-	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
-	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
-	// node with no users during setNode(), which prevents replication from being established.
-	// Runs on retry too (when systemExists but cloned not yet set) via !hdbConfig?.cloned.
-	if ((usingCertAuth || leaderToken) && (!systemExists || !hdbConfig?.cloned)) {
-		try {
-			const { databases } = await import('../core/resources/databases.js');
-			// Only delete clone-temp-admin if it actually exists. If install used CLI/env args
-			// that supplied a real admin username (e.g. integration tests pass
-			// --HDB_ADMIN_USERNAME=admin), `clone-temp-admin` was never created and there is
-			// nothing to clean up — skip the delete entirely.
-			const existing = await databases.system.hdb_user.get('clone-temp-admin');
-			if (existing) {
-				// Wait until at least one non-clone-temp-admin user is present (replicated from leader)
-				// before deleting, so the node still has a super_user available for local-auth.
-				const waitDeadline = Date.now() + (explicitSyncTimeoutMs ?? DEFAULT_SYNC_TIMEOUT_MS);
-				while (Date.now() < waitDeadline) {
-					let foundReplicatedUser = false;
-					try {
-						for await (const user of databases.system.hdb_user.search([])) {
-							if (user?.username && user.username !== 'clone-temp-admin') {
-								foundReplicatedUser = true;
-								break;
-							}
-						}
-					} catch (err) {
-						log(`Error scanning hdb_user while waiting for replicated user: ${err}`, 'error');
-					}
-					if (foundReplicatedUser) break;
-					await sleep(200);
-				}
-				await databases.system.hdb_user.delete('clone-temp-admin');
-			}
-		} catch (err) {
-			log(`Warning: failed to delete clone-temp-admin: ${err}`, 'error');
-		}
+function readSyncStartedMarker(): { leaderReplicationURL?: string } | undefined {
+	try {
+		return JSON.parse(readFileSync(syncStartedMarkerPath(), 'utf8'));
+	} catch {
+		return undefined;
 	}
+}
 
-	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
-	updateConfigValue(CONFIG_PARAMS.CLONED, true);
-
-	log(`Clone from leader node ${leaderURL} complete`);
+function clearSyncStartedMarker(): void {
+	try {
+		rmSync(syncStartedMarkerPath(), { force: true });
+	} catch (err) {
+		log(`Could not clear clone sync marker: ${err}`, 'error');
+	}
 }
 
 /**
@@ -496,7 +560,7 @@ async function monitorSync(): Promise<SyncOutcome> {
 
 	// Get last updated record timestamps for all DB and write to file
 	// These values can be used for checking when the clone replication has caught up with the leader
-	const targetTimestamps = await getLastUpdatedRecord();
+	const { targetTimestamps, totalBytes } = await getLastUpdatedRecord();
 	if (!targetTimestamps || Object.keys(targetTimestamps).length === 0) {
 		log('No target timestamps available to check synchronization status; leaving availability Unavailable', 'error');
 		return 'failed';
@@ -507,9 +571,12 @@ async function monitorSync(): Promise<SyncOutcome> {
 	const stallTimeoutMs: number =
 		explicitSyncTimeoutMs ??
 		Math.max(DEFAULT_SYNC_TIMEOUT_MS, 2 * (envMgr.get(CONFIG_PARAMS.REPLICATION_COPYTIMEOUT) ?? 300000));
+	// Sized from what the leader holds, assuming a deliberately pessimistic ~350KB/s sustained.
+	const maxDurationMs: number =
+		explicitMaxCloneDurationMs ?? Math.max(MIN_MAX_CLONE_DURATION_MS, Math.ceil((totalBytes / 350_000) * 1000));
 
 	log(
-		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s`
+		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s, or if ${Math.round(totalBytes / 1024 / 1024)}MB has not converged within ${Math.round(maxDurationMs / 1000)}s`
 	);
 
 	const outcome = await monitorSyncLoop({
@@ -517,6 +584,7 @@ async function monitorSync(): Promise<SyncOutcome> {
 		clusterStatus,
 		leaderReplicationURL,
 		stallTimeoutMs,
+		maxDurationMs,
 		checkIntervalMs: DEFAULT_SYNC_CHECK_INTERVAL_MS,
 		log,
 	});
@@ -537,6 +605,14 @@ async function monitorSync(): Promise<SyncOutcome> {
 		return 'synced';
 	}
 
+	if (outcome === 'unconverged') {
+		log(
+			`Replication data is still arriving after ${Math.round(maxDurationMs / 1000)}s but one or more databases never reached the leader's targets; giving up — leaving availability Unavailable and not marking node as cloned`,
+			'error'
+		);
+		return 'failed';
+	}
+
 	log(
 		`No replication data received for ${Math.round(stallTimeoutMs / 1000)}s; sync is stalled — leaving availability Unavailable and not marking node as cloned`,
 		'error'
@@ -549,24 +625,28 @@ async function monitorSync(): Promise<SyncOutcome> {
  * and record the most recent timestamp for each database in a JSON file.
  * @returns {Promise<void>}
  */
-async function getLastUpdatedRecord(): Promise<Record<string, number>> {
+async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string, number>; totalBytes: number }> {
 	log('Getting last updated record timestamp for all database', 'debug');
 	const lastUpdated: Record<string, number> = {};
+	// The same describe responses carry the leader's on-disk sizes, which size the wait's ceiling.
+	let totalBytes = 0;
 	const systemDb: Record<string, any> = await leaderRequest({ operation: 'describe_database', database: 'system' });
 	lastUpdated['system'] = findMostRecentTimestamp(systemDb);
+	totalBytes += sumTableSizes(systemDb);
 
 	const allDb: Record<string, any> = await leaderRequest({ operation: 'describe_all' });
 	for (const db in allDb) {
 		// requestId is part of the describe response so we ignore it
 		if (typeof allDb[db] !== 'object') continue;
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
+		totalBytes += sumTableSizes(allDb[db]);
 	}
 
 	const lastUpdatedFilePath: string = join(rootPath, 'tmp', 'lastUpdated.json');
 	log(`Writing last updated database timestamps to: ${lastUpdatedFilePath}`, 'debug');
 	writeJsonSync(lastUpdatedFilePath, lastUpdated);
 
-	return lastUpdated;
+	return { targetTimestamps: lastUpdated, totalBytes };
 }
 
 /**
@@ -586,6 +666,18 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 	}
 
 	return mostRecent;
+}
+
+/** Sum the on-disk table sizes in one describe response, for sizing the sync wait's ceiling. */
+function sumTableSizes(dbObj: Record<string, any>): number {
+	let total = 0;
+	for (const table in dbObj) {
+		const tableObj = dbObj[table];
+		if (typeof tableObj !== 'object' || tableObj == null) continue;
+		const size = tableObj.db_size ?? tableObj.table_size;
+		if (typeof size === 'number' && size > 0) total += size;
+	}
+	return total;
 }
 
 /**

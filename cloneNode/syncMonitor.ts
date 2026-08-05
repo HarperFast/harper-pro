@@ -92,6 +92,9 @@ export type MonitorSyncLoopOptions = {
 	leaderReplicationURL: string;
 	stallTimeoutMs: number;
 	checkIntervalMs: number;
+	/** Ceiling on the whole wait: arrivals slide the stall deadline, so a copy that applies records
+	 *  without ever converging would otherwise poll forever instead of reaching a verdict. */
+	maxDurationMs?: number;
 	log: SyncMonitorLog;
 	/** Test hooks: injectable clock and delay. */
 	now?: () => number;
@@ -99,18 +102,20 @@ export type MonitorSyncLoopOptions = {
 };
 
 /**
- * Poll sync status until every database reaches its target, failing only on a stall: the deadline
- * slides forward whenever replication data arrives, so a healthy clone is never timed out for being
- * large. Errors from the status check do not count as progress, so a wedged status pipeline still
- * stalls out.
+ * Poll sync status until every database reaches its target, failing on a stall (no arrivals for
+ * `stallTimeoutMs`, so a healthy clone is never timed out for being large) or on exceeding
+ * `maxDurationMs`. Errors from the status check do not count as progress, so a wedged status
+ * pipeline still stalls out.
  */
-export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<'synced' | 'stalled'> {
+export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<'synced' | 'stalled' | 'unconverged'> {
 	const now = options.now ?? Date.now;
 	const delay = options.delay ?? sleep;
-	let lastProgressAt = now();
+	const maxDurationMs = options.maxDurationMs ?? Number.POSITIVE_INFINITY;
+	const startedAt = now();
+	let lastProgressAt = startedAt;
 	let loopCount = 0;
 
-	while (now() - lastProgressAt < options.stallTimeoutMs) {
+	while (now() - lastProgressAt < options.stallTimeoutMs && now() - startedAt < maxDurationMs) {
 		try {
 			// Bound each status check by the poll interval: clusterStatus's worker path resolves only
 			// when a cluster-status reply message arrives, so an unbounded await would hang this loop
@@ -154,5 +159,5 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 		await delay(options.checkIntervalMs);
 	}
 
-	return 'stalled';
+	return now() - startedAt >= maxDurationMs ? 'unconverged' : 'stalled';
 }
