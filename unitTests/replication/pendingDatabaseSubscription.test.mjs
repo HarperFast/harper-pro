@@ -2,6 +2,7 @@
 
 import assert from 'node:assert';
 import {
+	activeDatabaseSubscription,
 	createPendingDatabaseSubscription,
 	expirePendingDatabaseSubscription,
 	resolveSendSubscriptionSetup,
@@ -57,6 +58,41 @@ describe('expirePendingDatabaseSubscription', () => {
 		replacement.ready(registered);
 
 		assert.strictEqual(await replacement, registered);
+	});
+});
+
+describe('activeDatabaseSubscription', () => {
+	it('hides a retired placeholder and passes anything else through', () => {
+		const subscriptions = new Map();
+		const placeholder = createPendingDatabaseSubscription('db1', subscriptions);
+		assert.strictEqual(activeDatabaseSubscription(placeholder), placeholder);
+
+		expirePendingDatabaseSubscription('db1', placeholder, subscriptions);
+
+		assert.strictEqual(activeDatabaseSubscription(placeholder), undefined);
+		assert.strictEqual(activeDatabaseSubscription(undefined), undefined);
+		const registered = { send() {} };
+		assert.strictEqual(activeDatabaseSubscription(registered), registered);
+	});
+
+	it('lets a connection that cached the retired placeholder converge on a late registration', async () => {
+		const subscriptions = new Map();
+		// Outbound connections cache the subscription they were built with and seed every reconnect from
+		// it; siblings for the same database cache the same object.
+		const connection = { subscription: createPendingDatabaseSubscription('db1', subscriptions) };
+		const sibling = { subscription: connection.subscription };
+
+		expirePendingDatabaseSubscription('db1', connection.subscription, subscriptions);
+		assert.strictEqual(await connection.subscription, undefined);
+
+		// Replicator.subscribe() finally registers the real queue, in the map only.
+		const registered = { send() {} };
+		subscriptions.set('db1', registered);
+
+		for (const holder of [connection, sibling]) {
+			const seeded = activeDatabaseSubscription(holder.subscription) ?? subscriptions.get('db1');
+			assert.strictEqual(seeded, registered);
+		}
 	});
 });
 

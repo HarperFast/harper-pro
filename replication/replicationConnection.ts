@@ -988,6 +988,7 @@ export function readDbisCursorSync(
  */
 export type DatabaseSubscription = {
 	then?: unknown; // present only on the unresolved placeholder
+	retired?: boolean; // a placeholder given up on by a bounded wait — never usable, always re-derive
 	auditStore?: any;
 	dbisDB?: DbisStore;
 	[key: string]: any;
@@ -1243,7 +1244,19 @@ export function createPendingDatabaseSubscription(
  * placeholder that a late `Replicator.subscribe()` can still resolve.
  *
  * A placeholder already superseded in the map is left alone: the real subscription is authoritative.
+ *
+ * The `retired` mark is what makes this safe to do to a shared object. Outbound connections cache the
+ * subscription they were constructed with and seed every reconnect from it, and sibling connections for
+ * the same database cache the SAME placeholder — so without the mark, a socket would re-seed itself with
+ * a placeholder that now resolves to `undefined`, close immediately, and never converge even once
+ * `Replicator.subscribe()` registers the real queue. Every consumer must treat a retired placeholder as
+ * absent and re-derive from the map.
  */
+/** A retired placeholder must never be used, nor shadow a real registration that landed after it. */
+export function activeDatabaseSubscription(subscription?: DatabaseSubscription): DatabaseSubscription | undefined {
+	return subscription?.retired ? undefined : subscription;
+}
+
 export function expirePendingDatabaseSubscription(
 	databaseName: string,
 	subscription: DatabaseSubscription | undefined,
@@ -1252,6 +1265,7 @@ export function expirePendingDatabaseSubscription(
 	if (!subscription?.then || typeof subscription.ready !== 'function') return false;
 	if (subscriptions.get(databaseName) !== subscription) return false;
 	subscriptions.delete(databaseName);
+	subscription.retired = true;
 	subscription.ready(undefined);
 	return true;
 }
@@ -1940,10 +1954,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
-	let tableSubscriptionToReplicator: DatabaseSubscription = options.subscription;
+	// A retired placeholder is never usable and must not shadow a later real registration, so seed from
+	// the map instead of the connection's cached reference (expirePendingDatabaseSubscription).
+	let tableSubscriptionToReplicator: DatabaseSubscription =
+		activeDatabaseSubscription(options.subscription) ?? (options.subscription && dbSubscriptions.get(databaseName));
 	if (tableSubscriptionToReplicator?.then)
 		(tableSubscriptionToReplicator as Promise<any>)
 			.then((sub) => {
+				// A retired placeholder settles to undefined (expirePendingDatabaseSubscription): leave the
+				// local reference as the promise so the request path re-derives from dbSubscriptions rather
+				// than treating a resolved `undefined` as a usable subscription.
+				if (!sub) return;
 				tableSubscriptionToReplicator = sub;
 				if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
 			})
@@ -3372,6 +3393,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								return;
 							}
 						} else tableSubscriptionToReplicator = dbSubscriptions.get(databaseName);
+						tableSubscriptionToReplicator = activeDatabaseSubscription(tableSubscriptionToReplicator);
 						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
 						if (!tableSubscriptionToReplicator) {
 							// Wait for it to be created. Registered in dbSubscriptions (not the module-level map
@@ -5427,7 +5449,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		return true;
 	}
 	function setDatabase(databaseName) {
-		tableSubscriptionToReplicator = tableSubscriptionToReplicator || dbSubscriptions.get(databaseName);
+		tableSubscriptionToReplicator =
+			activeDatabaseSubscription(tableSubscriptionToReplicator) || dbSubscriptions.get(databaseName);
 		if (!checkDatabaseAccess(databaseName)) {
 			throw new Error(`Access to database "${databaseName}" is not permitted`);
 		}
