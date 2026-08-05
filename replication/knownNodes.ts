@@ -7,7 +7,7 @@ import { forEachReplicatedDatabase } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
 import { isMainThread } from 'worker_threads';
-import { ClientError } from '../core/utility/errors/hdbError.js';
+import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
@@ -754,35 +754,206 @@ const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array
 
 type AwaitingReplication = {
 	txnTime: number;
-	onConfirm: () => void;
+	onConfirm: (nodeName: string) => void;
+	settled: boolean;
 };
-export let commitsAwaitingReplication: Map<string, AwaitingReplication[]>;
+// A Set, not an array: both settle paths (confirmed, and timed out — see createConfirmationWaiter)
+// remove their own entry the instant they settle, via `.delete(entry)`. That's an O(1) operation on a
+// Set regardless of how many other waiters are pending, unlike an array (indexOf+splice is O(n), and
+// doing that from inside a for-of over the same array is unsafe — see harper-pro#213's review history
+// below). It also means every entry's lifetime is bounded by its own settlement, never by whether some
+// unrelated later event happens to sweep it up — the earlier revisions of this fix that deferred
+// timeout cleanup to "whenever the next confirmation notification arrives" could still leak entries
+// forever against a peer that never sends another update.
+export let commitsAwaitingReplication: Map<string, Set<AwaitingReplication>>;
+
+/**
+ * The names of peers that, per their last-known replicated-time shared status, have already
+ * applied `txnTime` for `databaseName` — i.e. confirmations that landed before a waiter for this
+ * write registered. `notifyConfirmedWaiters` only fires on the NEXT status update for a peer, so
+ * a peer that already crossed `txnTime` before we start waiting will never re-cross it — its ack
+ * would otherwise be silently missed and a fully-replicated write would time out anyway
+ * (see `createConfirmationWaiter`, called with this as `alreadyConfirmedPeers`).
+ *
+ * Returns names, not a count (harper-pro#633 review): the seed and `notifyConfirmedWaiters` both
+ * feed the same per-peer `Set` on the waiter entry, so a peer whose watcher callback fires *after*
+ * this seed already counted it — a real race, since the shared-buffer write and the JS watcher
+ * callback that reacts to it are not atomic — contributes the same name twice and is naturally
+ * deduplicated by `Set.add`, instead of incrementing a bare counter twice for one peer.
+ *
+ * Takes the map explicitly (mirrors `notifyConfirmedWaiters` taking `awaiting`) so it's
+ * unit-testable without the module's live `replicationConfirmationFloat64s` state.
+ */
+export function countAlreadyConfirmedPeers(
+	confirmationsByNode: Map<string, Map<string, Float64Array>>,
+	databaseName: string,
+	txnTime: number
+): Set<string> {
+	const confirmedPeers = new Set<string>();
+	for (const [nodeName, confirmationsForNode] of confirmationsByNode) {
+		const replicatedTime = confirmationsForNode.get(databaseName);
+		if (replicatedTime && replicatedTime[0] >= txnTime) confirmedPeers.add(nodeName);
+	}
+	return confirmedPeers;
+}
+
+// How long a `replicatedConfirmation` write waits for the requested number of peer acks before
+// giving up. Without a bound, a confirmation that never arrives (e.g. `replicateTo` naming a peer
+// that never applies this specific write, a peer that drops its connection mid-wait, or any other
+// gap between the requested count and what actually gets acked) hangs the request forever — the
+// promise below had no reject path at all (harper-pro#213).
+//
+// Own default (900000ms), independent of REPLICATION_BLOBTIMEOUT: confirmation and blob transfer are
+// unrelated concerns, and this must not shrink just because an operator tunes blob timeout down for
+// reasons that have nothing to do with confirmation (e.g. failing fast on stalled blob transfers).
+// Not independently user-configurable yet — that needs a dedicated CONFIG_PARAMS entry in core
+// (getConfigValue only resolves keys registered in CONFIG_PARAM_MAP), left as a follow-up; see the
+// dispatch Findings for this fix.
+const REPLICATION_CONFIRMATION_DEFAULT_TIMEOUT_MS = 900000;
+// Still raised (never lowered) to at least the configured blob timeout: a confirmation can legitimately
+// be waiting on a large blob that is still within its own supported transfer window, and rejecting
+// sooner than that would fail a healthy, merely-slow write as if it had timed out.
+const REPLICATION_CONFIRMATION_TIMEOUT_MS = Math.max(
+	REPLICATION_CONFIRMATION_DEFAULT_TIMEOUT_MS,
+	env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 0
+);
+
+/**
+ * Fire `onConfirm(nodeName)` for every waiter in `awaiting` whose `txnTime` falls in
+ * `(lastTime, updatedTime]`. Each waiter removes itself from `awaiting` (via `Set.delete`) the
+ * moment it fully settles — see createConfirmationWaiter — so nothing here needs to compact,
+ * snapshot, or otherwise guard against mutation during iteration: deleting the *current* item
+ * mid-for-of over a Set is well-defined and safe (unlike an array, where the equivalent splice
+ * shifts later indices and skips entries).
+ *
+ * `nodeName` identifies which peer's status update this crossing came from — required so the
+ * waiter can track confirmations by peer identity rather than a bare count (harper-pro#633
+ * review: the same peer could otherwise be counted once via `alreadyConfirmedPeers` and again
+ * here for that peer's own first post-registration update, producing a false confirmation).
+ */
+export function notifyConfirmedWaiters(
+	awaiting: Set<AwaitingReplication>,
+	nodeName: string,
+	lastTime: number,
+	updatedTime: number
+): void {
+	for (const waiter of awaiting) {
+		if (waiter.txnTime > lastTime && waiter.txnTime <= updatedTime) {
+			waiter.onConfirm(nodeName);
+		}
+	}
+}
+
+/**
+ * Build the promise a `replicatedConfirmation` write awaits, and register its waiter entry in
+ * `awaiting`. Extracted from the `replicationConfirmation(...)` registration below so the
+ * settle/timeout/cleanup behavior is unit-testable directly, without going through a real commit.
+ */
+export function createConfirmationWaiter(
+	awaiting: Set<AwaitingReplication>,
+	databaseName: string,
+	txnTime: number,
+	confirmationCount: number,
+	timeoutMs: number = REPLICATION_CONFIRMATION_TIMEOUT_MS,
+	alreadyConfirmedPeers: Set<string> = new Set()
+): Promise<void> {
+	// Seeded (not just checked-and-early-returned) so the count-up-to-confirmationCount math below
+	// stays in one place. Computing alreadyConfirmedPeers and adding `entry` to `awaiting` both happen
+	// synchronously in the caller's turn — with nothing awaited between them — so no peer ack can land
+	// in the gap; this is what closes the race, not just an optimization.
+	if (alreadyConfirmedPeers.size >= confirmationCount) return Promise.resolve();
+	return new Promise((resolve, reject) => {
+		// Confirmations are tracked by peer identity, not a bare counter: the same peer's status
+		// update can otherwise be credited twice — once via the `alreadyConfirmedPeers` seed and
+		// again via its own first post-registration notifyConfirmedWaiters crossing, since the
+		// shared-buffer write and the JS watcher callback that reacts to it are not atomic
+		// (harper-pro#633 review). `Set.add` on the same name is a no-op, so a peer contributes at
+		// most once regardless of how many times it's reported confirmed.
+		const confirmed = new Set(alreadyConfirmedPeers);
+		const entry: AwaitingReplication = {
+			txnTime,
+			settled: false,
+			onConfirm: (nodeName) => {
+				if (entry.settled) return; // a peer that acks after we've already timed out is a no-op, not a double-resolve
+				confirmed.add(nodeName);
+				if (confirmed.size === confirmationCount) {
+					entry.settled = true;
+					clearTimeout(timer);
+					awaiting.delete(entry);
+					resolve();
+				}
+			},
+		};
+		const timer = setTimeout(() => {
+			if (entry.settled) return;
+			entry.settled = true;
+			// O(1) regardless of how many other waiters are pending or expiring in this same tick — an
+			// outage that times out many waiters at once costs O(n) total here, not O(n²).
+			awaiting.delete(entry);
+			reject(
+				new ServerError(
+					`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${confirmed.size})`,
+					504
+				)
+			);
+		}, timeoutMs);
+		timer.unref?.();
+		awaiting.add(entry);
+	});
+}
+
+/**
+ * Filter `nodes` down to peers this node's own self-record actually replicates `databaseName` to —
+ * the pure core of `getReplicationRecipients`, extracted (mirroring `createConfirmationWaiter`'s
+ * extraction from its registration call below) so it's unit-testable without a live server/hdb_nodes.
+ * `nodes` typed `any[]` because `server.nodes` is typed against Server.ts's own (unexported) `Node`,
+ * distinct from this module's `Node` — the same cross-module friction other replication/ call sites
+ * already route around with `as any` (see `shouldReplicateFromNode` callers).
+ */
+export function filterReplicationRecipients(nodes: any[], selfReplicates: any, databaseName: string): any[] {
+	if (selfReplicates == null || selfReplicates === true) return nodes;
+	return nodes.filter((node) => routeEntriesIncludePeer(selfReplicates.sendsTo, node.name, databaseName));
+}
+
+/**
+ * The peers this node actually replicates `databaseName` to — used to bound `replicatedConfirmation`
+ * counts to what's actually reachable, rather than every node known to the cluster. Under a directional
+ * or sharded topology, `server.nodes` can include peers this node never sends `databaseName` to at all;
+ * a confirmationCount that fits within the full node count but exceeds this node's real recipient set
+ * is guaranteed to time out (harper-pro#633 review). Falls back to the full `server.nodes` list for the
+ * legacy full-mesh self-record (`true`, or an absent/unset one) — the common, non-directional case this
+ * previously handled correctly.
+ */
+function getReplicationRecipients(databaseName: string) {
+	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
+	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
+}
 
 replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void> => {
-	if (confirmationCount > server.nodes.length) {
+	const recipients = getReplicationRecipients(databaseName);
+	if (confirmationCount > recipients.length) {
 		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
 		throw new ClientError(
-			`Cannot confirm replication to more nodes (${confirmationCount}) than are in the network (${server.nodes.length} nodes: ${server.nodes.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
+			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
 		);
 	}
 	if (!commitsAwaitingReplication) {
 		commitsAwaitingReplication = new Map();
 		startSubscriptionToReplications();
 	}
-	let awaiting: AwaitingReplication[] = commitsAwaitingReplication.get(databaseName);
+	let awaiting: Set<AwaitingReplication> = commitsAwaitingReplication.get(databaseName);
 	if (!awaiting) {
-		awaiting = [];
+		awaiting = new Set();
 		commitsAwaitingReplication.set(databaseName, awaiting);
 	}
-	return new Promise((resolve) => {
-		let count = 0;
-		awaiting.push({
-			txnTime,
-			onConfirm: () => {
-				if (++count === confirmationCount) resolve();
-			},
-		});
-	});
+	return createConfirmationWaiter(
+		awaiting,
+		databaseName,
+		txnTime,
+		confirmationCount,
+		undefined,
+		countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime)
+	);
 });
 // Per-node confirmation watchers. Previously the per-node-update callback below called
 // forEachReplicatedDatabase and discarded the returned remove handle, so every hdb_nodes
@@ -839,11 +1010,12 @@ function startSubscriptionToReplications() {
 					() => {
 						const updatedTime = replicatedTime[0];
 						const lastTime = replicatedTime.lastTime;
-						for (const { txnTime, onConfirm } of commitsAwaitingReplication.get(databaseName) || []) {
-							if (txnTime > lastTime && txnTime <= updatedTime) {
-								onConfirm();
-							}
-						}
+						notifyConfirmedWaiters(
+							commitsAwaitingReplication.get(databaseName) || new Set(),
+							nodeNameAtUpdate,
+							lastTime,
+							updatedTime
+						);
 						replicatedTime.lastTime = updatedTime;
 					}
 				);
