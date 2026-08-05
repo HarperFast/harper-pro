@@ -1,5 +1,4 @@
-// harper-pro#642 end-to-end regression: a stuck sender-side setup gate must not leave the connection
-// ping-alive forever; the receiver's watchdog must reconnect from the durable cursor and converge.
+// harper-pro#642: a stuck sender-side setup gate must not leave the connection ping-alive forever.
 
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';

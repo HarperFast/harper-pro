@@ -4,6 +4,7 @@ import {
 	createPendingDatabaseSubscription,
 	expirePendingDatabaseSubscription,
 	resolveSendSubscriptionSetup,
+	subscriptionForConnection,
 	subscriptionForDatabase,
 } from '#src/replication/replicationConnection';
 
@@ -76,22 +77,19 @@ describe('activeDatabaseSubscription', () => {
 
 	it('lets a connection that cached the retired placeholder converge on a late registration', async () => {
 		const subscriptions = new Map();
-		// Outbound connections cache the subscription they were built with and seed every reconnect from
-		// it; siblings for the same database cache the same object.
 		const connection = { subscription: createPendingDatabaseSubscription('db1', subscriptions) };
 		const sibling = { subscription: connection.subscription };
 
 		expirePendingDatabaseSubscription('db1', connection.subscription, subscriptions);
 		assert.strictEqual(await connection.subscription, undefined);
 
-		// Replicator.subscribe() finally registers the real queue, in the map only.
 		const registered = { send() {} };
 		subscriptions.set('db1', registered);
 
 		for (const holder of [connection, sibling]) {
-			const seeded = activeDatabaseSubscription(holder.subscription) ?? subscriptions.get('db1');
-			assert.strictEqual(seeded, registered);
+			assert.strictEqual(subscriptionForConnection(holder.subscription, 'db1', subscriptions), registered);
 		}
+		assert.strictEqual(subscriptions.get('db1'), registered);
 	});
 });
 
@@ -111,11 +109,7 @@ describe('subscriptionForDatabase', () => {
 		const registered = { send() {} };
 		subscriptions.set('db1', registered);
 
-		// The request handler's path when its cached reference is the retired placeholder.
-		assert.strictEqual(
-			activeDatabaseSubscription(retired) ?? subscriptionForDatabase('db1', subscriptions),
-			registered
-		);
+		assert.strictEqual(subscriptionForConnection(retired, 'db1', subscriptions), registered);
 		assert.strictEqual(subscriptions.get('db1'), registered);
 	});
 
@@ -136,7 +130,6 @@ describe('persistent setup mismatch', () => {
 		const placeholders = [];
 		const failures = [];
 
-		// Each iteration is one peer retry against a database this node never registers.
 		for (let retry = 0; retry < 5; retry++) {
 			const placeholder = subscriptions.get('db1') ?? createPendingDatabaseSubscription('db1', subscriptions);
 			placeholders.push(placeholder);

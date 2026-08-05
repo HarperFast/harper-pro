@@ -1,7 +1,5 @@
-// harper-pro#642: ping/pong must not count as application setup progress.
-
 import assert from 'node:assert';
-// Retained only for the fake-timer seam, as in receiveWatchdog.test.mjs / pauseStallWatchdog.test.mjs.
+// Only for the fake-timer seam, as in receiveWatchdog.test.mjs / pauseStallWatchdog.test.mjs.
 import sinon from 'sinon';
 import {
 	awaitWithTimeout,
@@ -217,7 +215,6 @@ describe('createSubscriptionSetupWatchdog', () => {
 		clock.tick(120_000);
 		assert.strictEqual(onTimeout.calls.length, 0);
 
-		// Recurring pause/resume must not keep re-granting a full window.
 		watchdog.resume();
 		clock.tick(29_999);
 		assert.strictEqual(onTimeout.calls.length, 0);
