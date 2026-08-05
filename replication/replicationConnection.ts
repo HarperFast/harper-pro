@@ -2237,7 +2237,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	}
 	function cloneSyncIsInProgress(): boolean {
 		const cloneRootPath = env.get(CONFIG_PARAMS.ROOTPATH) ?? process.env.ROOTPATH;
-		return typeof cloneRootPath !== 'string' || existsSync(join(cloneRootPath, '.cloneSyncBaseline.json'));
+		return (
+			typeof cloneRootPath !== 'string' ||
+			existsSync(join(cloneRootPath, '.cloneSyncBaseline.json')) ||
+			existsSync(join(cloneRootPath, '.cloneSyncInProgress'))
+		);
 	}
 	if (databaseName) {
 		setDatabase(databaseName);

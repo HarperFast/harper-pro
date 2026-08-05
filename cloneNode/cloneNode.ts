@@ -90,6 +90,7 @@ const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
 const DEFAULT_REPLICATION_PORT = '9933';
 const CLONE_SYNC_BASELINE_FILE = '.cloneSyncBaseline.json';
+const CLONE_SYNC_IN_PROGRESS_FILE = '.cloneSyncInProgress';
 const CLONE_AVAILABILITY_FINALIZATION_FILE = '.cloneAvailabilityFinalization';
 
 const CONFIG_TO_EXCLUDE_FROM_CLONE = {
@@ -248,9 +249,11 @@ export async function cloneNode(): Promise<void> {
 			const { set: setStatus } = await import('../core/server/status/index.js');
 			try {
 				await setStatus({ id: 'availability', status: 'Available' });
-				removeCloneAvailabilityFinalization();
-				removeCloneSyncBaseline();
-				log('Completed interrupted clone availability finalization');
+				if (removeCloneSyncBaseline()) {
+					removeCloneSyncInProgress();
+					removeCloneAvailabilityFinalization();
+					log('Completed interrupted clone availability finalization');
+				}
 			} catch (err) {
 				log(`Failed to publish Available during recovery finalization; will retry on next start: ${err}`, 'error');
 			}
@@ -259,6 +262,7 @@ export async function cloneNode(): Promise<void> {
 	}
 	if (forceClone) {
 		removeCloneSyncBaseline();
+		removeCloneSyncInProgress();
 		removeCloneAvailabilityFinalization();
 		if (hdbConfig?.cloned) {
 			hdbConfig.cloned = false;
@@ -278,6 +282,7 @@ export async function cloneNode(): Promise<void> {
 	if (freshClone || !systemExists) {
 		await installHarper();
 	}
+	writeCloneSyncInProgress();
 
 	// Custody clone gate (#166): mark the clone bootstrap BEFORE Harper starts so the
 	// secretCustody component does not self-generate a cluster env-secrets keypair — the leader's
@@ -498,10 +503,12 @@ export async function cloneNode(): Promise<void> {
 			log(`Synchronized but failed to set availability to Available: ${err}; leaving recovery marker`, 'error');
 			return;
 		}
-		removeCloneAvailabilityFinalization();
-		removeCloneSyncBaseline();
+		if (removeCloneSyncBaseline()) {
+			removeCloneSyncInProgress();
+			removeCloneAvailabilityFinalization();
+		}
 	} else {
-		removeCloneSyncBaseline();
+		if (removeCloneSyncBaseline()) removeCloneSyncInProgress();
 	}
 
 	log(`Clone from leader node ${leaderURL} complete`);
@@ -539,6 +546,7 @@ async function monitorSync(targetResult?: { targets: Record<string, number>; err
 			await setStatus({ id: 'availability', status: 'Available' });
 		} catch (err) {
 			log(`Failed to set availability status to Available: ${err}`, 'error');
+			return 'failed';
 		}
 		return 'skipped';
 	}
@@ -627,6 +635,10 @@ function cloneSyncBaselinePath(): string {
 	return join(rootPath, CLONE_SYNC_BASELINE_FILE);
 }
 
+function cloneSyncInProgressPath(): string {
+	return join(rootPath, CLONE_SYNC_IN_PROGRESS_FILE);
+}
+
 function cloneAvailabilityFinalizationPath(): string {
 	return join(rootPath, CLONE_AVAILABILITY_FINALIZATION_FILE);
 }
@@ -665,6 +677,12 @@ function writeCloneSyncBaseline(leaderBaseline: number): void {
 	log(`Persisted clone synchronization baseline to: ${path}`, 'debug');
 }
 
+function writeCloneSyncInProgress(): void {
+	const path = cloneSyncInProgressPath();
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, 'true', 'utf8');
+}
+
 function writeCloneAvailabilityFinalization(): void {
 	const path = cloneAvailabilityFinalizationPath();
 	const temporaryPath = `${path}.${process.pid}.tmp`;
@@ -672,11 +690,22 @@ function writeCloneAvailabilityFinalization(): void {
 	renameSync(temporaryPath, path);
 }
 
-function removeCloneSyncBaseline(): void {
+function removeCloneSyncBaseline(): boolean {
 	try {
 		unlinkSync(cloneSyncBaselinePath());
+		return true;
 	} catch (err: any) {
-		if (err?.code !== 'ENOENT') log(`Failed to remove clone synchronization baseline: ${err}`, 'error');
+		if (err?.code === 'ENOENT') return true;
+		log(`Failed to remove clone synchronization baseline: ${err}`, 'error');
+		return false;
+	}
+}
+
+function removeCloneSyncInProgress(): void {
+	try {
+		unlinkSync(cloneSyncInProgressPath());
+	} catch (err: any) {
+		if (err?.code !== 'ENOENT') log(`Failed to remove clone synchronization in-progress marker: ${err}`, 'error');
 	}
 }
 
