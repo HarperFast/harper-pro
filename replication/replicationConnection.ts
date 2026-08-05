@@ -3554,8 +3554,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
-							| undefined;
+							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -3866,6 +3865,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										}
 									}
 									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+									// Capture the current generation before scanning. A commit after this live scan
+									// drains must wake this iteration; subscribing afterward can miss that commit.
+									const nextTransaction = whenNextTransaction(auditStore);
 									auditLogIterable =
 										(auditStore.reusableIterable && auditLogIterable) ??
 										auditStore.getRange({
@@ -3902,7 +3904,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									await whenNextTransaction(auditStore);
+									await nextTransaction;
 								} while (!closed);
 							})
 							.catch((error) => {
