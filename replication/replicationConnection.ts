@@ -4199,6 +4199,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										}
 									}
 									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+									// Capture the current generation before scanning. A commit after this live scan
+									// drains must wake this iteration; subscribing afterward can miss that commit.
+									const nextTransaction = whenNextTransaction(auditStore);
 									auditLogIterable =
 										(auditStore.reusableIterable && auditLogIterable) ??
 										auditStore.getRange({
@@ -4235,7 +4238,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									await whenNextTransaction(auditStore);
+									await nextTransaction;
 								} while (!closed);
 							})
 							.catch((error) => {
