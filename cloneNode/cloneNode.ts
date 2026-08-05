@@ -30,6 +30,7 @@ import {
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
+import { isReplicatedDatabase as isReplicatedDatabaseUnder } from './replicatedDatabases.ts';
 
 /**
  * Environment Variables:
@@ -573,21 +574,26 @@ async function monitorSync(): Promise<SyncOutcome> {
  * and record the most recent timestamp for each database in a JSON file.
  * @returns {Promise<void>}
  */
-// Filter by this node's `replication.databases` — a database the clone doesn't subscribe to must
-// not be pre-created (cloneSchemas) or become a sync target (getLastUpdatedRecord: its socket
-// never exists and its data never arrives, so a target would wedge the sync monitor). Name-based
-// subset of the gating in `shouldReplicateFromNode` (`replication/knownNodes.ts`): `undefined` or
-// `'*'` accept everything; an array accepts only the names it lists. A sharded entry replicates
-// only from same-shard peers — a predicate that needs the leader's shard, unknown at this point —
-// so `excludeSharded` callers (sync targets) treat it as not replicated: when it does replicate,
-// its socket exists and the watermark rule plus the seen-socket ratchet still verify it.
-function isReplicatedDatabase(dbName: string, options?: { excludeSharded?: boolean }): boolean {
-	const databaseReplications = envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES);
-	if (!databaseReplications || databaseReplications === '*') return true;
-	if (!Array.isArray(databaseReplications)) return true;
-	return databaseReplications.some((entry: any) =>
-		typeof entry === 'string' ? entry === dbName : entry?.name === dbName && !(options?.excludeSharded && entry.sharded)
-	);
+// A database the clone doesn't subscribe to must not be pre-created (cloneSchemas) or become a
+// sync target (getLastUpdatedRecord: its socket never exists, so a target would wedge the sync
+// monitor). A sharded entry replicates only from a same-shard leader (`shouldReplicateFromNode`);
+// the leader's shard comes from its configuration. Fail closed on an unreadable configuration by
+// treating sharded entries as replicated: a wrong inclusion stalls the clone visibly, a wrong
+// exclusion would skip verifying a database that is being copied.
+function isReplicatedDatabase(dbName: string, shardedReplicates?: (entry: any) => boolean): boolean {
+	return isReplicatedDatabaseUnder(envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES), dbName, shardedReplicates);
+}
+
+async function leaderShardedReplicates(): Promise<(entry: any) => boolean> {
+	try {
+		const leaderConfiguration: any = await leaderRequest({ operation: 'get_configuration' });
+		const leaderShard = leaderConfiguration?.replication?.shard;
+		const localShard = envMgr.get(CONFIG_PARAMS.REPLICATION_SHARD);
+		return () => leaderShard === localShard;
+	} catch (err) {
+		log(`Could not read the leader configuration for shard matching (${err}); keeping sharded sync targets`);
+		return () => true;
+	}
 }
 
 async function getLastUpdatedRecord(): Promise<Record<string, number>> {
@@ -596,11 +602,12 @@ async function getLastUpdatedRecord(): Promise<Record<string, number>> {
 	const systemDb: Record<string, any> = await leaderRequest({ operation: 'describe_database', database: 'system' });
 	lastUpdated['system'] = findMostRecentTimestamp(systemDb);
 
+	const shardedReplicates = await leaderShardedReplicates();
 	const allDb: Record<string, any> = await leaderRequest({ operation: 'describe_all' });
 	for (const db in allDb) {
 		// requestId is part of the describe response so we ignore it
 		if (typeof allDb[db] !== 'object') continue;
-		if (!isReplicatedDatabase(db, { excludeSharded: true })) continue;
+		if (!isReplicatedDatabase(db, shardedReplicates)) continue;
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
 	}
 
