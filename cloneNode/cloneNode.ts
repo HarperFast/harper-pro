@@ -90,6 +90,7 @@ const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
 const DEFAULT_REPLICATION_PORT = '9933';
 const CLONE_SYNC_BASELINE_FILE = '.cloneSyncBaseline.json';
+const CLONE_AVAILABILITY_FINALIZATION_FILE = '.cloneAvailabilityFinalization';
 
 const CONFIG_TO_EXCLUDE_FROM_CLONE = {
 	clustering_nodename: true,
@@ -243,15 +244,27 @@ export async function cloneNode(): Promise<void> {
 		envMgr.initSync();
 		const { main } = await import('../core/bin/run.js');
 		await main();
-		if (pathExists(cloneSyncBaselinePath())) {
+		if (pathExists(cloneAvailabilityFinalizationPath())) {
 			const { set: setStatus } = await import('../core/server/status/index.js');
-			await setStatus({ id: 'availability', status: 'Available' });
-			removeCloneSyncBaseline();
-			log('Completed interrupted clone availability finalization');
+			try {
+				await setStatus({ id: 'availability', status: 'Available' });
+				removeCloneAvailabilityFinalization();
+				removeCloneSyncBaseline();
+				log('Completed interrupted clone availability finalization');
+			} catch (err) {
+				log(`Failed to publish Available during recovery finalization; will retry on next start: ${err}`, 'error');
+			}
 		}
 		return;
 	}
-	if (hdbConfig?.cloned && forceClone) removeCloneSyncBaseline();
+	if (forceClone) {
+		removeCloneSyncBaseline();
+		removeCloneAvailabilityFinalization();
+		if (hdbConfig?.cloned) {
+			hdbConfig.cloned = false;
+			updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		}
+	}
 
 	if (!usingCertAuth) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
@@ -475,8 +488,7 @@ export async function cloneNode(): Promise<void> {
 		}
 	}
 
-	// Persist clone completion before publishing availability. The baseline remains as a recovery
-	// marker until both writes succeed, so a crash in between can finish availability on restart.
+	if (syncOutcome === 'synced') writeCloneAvailabilityFinalization();
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
 	if (syncOutcome === 'synced') {
 		const { set: setStatus } = await import('../core/server/status/index.js');
@@ -486,6 +498,9 @@ export async function cloneNode(): Promise<void> {
 			log(`Synchronized but failed to set availability to Available: ${err}; leaving recovery marker`, 'error');
 			return;
 		}
+		removeCloneAvailabilityFinalization();
+		removeCloneSyncBaseline();
+	} else {
 		removeCloneSyncBaseline();
 	}
 
@@ -612,6 +627,10 @@ function cloneSyncBaselinePath(): string {
 	return join(rootPath, CLONE_SYNC_BASELINE_FILE);
 }
 
+function cloneAvailabilityFinalizationPath(): string {
+	return join(rootPath, CLONE_AVAILABILITY_FINALIZATION_FILE);
+}
+
 function readCloneSyncBaseline(): number | undefined {
 	const path = cloneSyncBaselinePath();
 	if (!pathExists(path)) return undefined;
@@ -646,11 +665,26 @@ function writeCloneSyncBaseline(leaderBaseline: number): void {
 	log(`Persisted clone synchronization baseline to: ${path}`, 'debug');
 }
 
+function writeCloneAvailabilityFinalization(): void {
+	const path = cloneAvailabilityFinalizationPath();
+	const temporaryPath = `${path}.${process.pid}.tmp`;
+	writeFileSync(temporaryPath, 'true', 'utf8');
+	renameSync(temporaryPath, path);
+}
+
 function removeCloneSyncBaseline(): void {
 	try {
 		unlinkSync(cloneSyncBaselinePath());
 	} catch (err: any) {
 		if (err?.code !== 'ENOENT') log(`Failed to remove clone synchronization baseline: ${err}`, 'error');
+	}
+}
+
+function removeCloneAvailabilityFinalization(): void {
+	try {
+		unlinkSync(cloneAvailabilityFinalizationPath());
+	} catch (err: any) {
+		if (err?.code !== 'ENOENT') log(`Failed to remove clone availability finalization marker: ${err}`, 'error');
 	}
 }
 

@@ -7,7 +7,7 @@ import {
 	getNextAvailableLoopbackAddress,
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
@@ -120,6 +120,7 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		ctx.cloneCtx = cloneCtx;
 		await startHarper(cloneCtx, cloneOptions);
 		const baselinePath = join(cloneCtx.harper.dataRootDir, '.cloneSyncBaseline.json');
+		const availabilityFinalizationPath = join(cloneCtx.harper.dataRootDir, '.cloneAvailabilityFinalization');
 
 		// Wait until the follower has committed SOME but not all records, then kill it mid-copy.
 		let caughtPartial = false;
@@ -175,5 +176,21 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		});
 		equal(ends.length, 2, 'first and last records must both be present');
 		ok(caughtPartial, 'test should have interrupted the copy mid-stream (tune RECORD_COUNT/throttle if this fails)');
+
+		await sendOperation(cloneCtx.harper, { operation: 'set_status', id: 'availability', status: 'Unavailable' });
+		await killHarper(cloneCtx);
+		writeFileSync(
+			baselinePath,
+			JSON.stringify({ version: 1, leaderURL: cloneOptions.env.HDB_LEADER_URL, leaderBaseline: 1 })
+		);
+		await startHarper(cloneCtx, cloneOptions);
+		await sleep(1000);
+		const availability = await sendOperation(cloneCtx.harper, { operation: 'get_status', id: 'availability' });
+		equal(availability.status, 'Unavailable', 'an in-progress baseline must not finalize an already-cloned node');
+		ok(existsSync(baselinePath), 'the in-progress baseline must remain available for a forced clone to resume');
+		ok(
+			!existsSync(availabilityFinalizationPath),
+			'only a confirmed sync may create an availability finalization marker'
+		);
 	});
 });

@@ -195,4 +195,24 @@ describe('checkCloneSyncStatus', () => {
 		);
 		assert.deepStrictEqual(result, { synced: true });
 	});
+
+	it('ignores empty connection and socket entries while finding the leader', () => {
+		const result = checkCloneSyncStatus(
+			{ system: 50 },
+			{
+				connections: [
+					null,
+					{
+						url: leaderURL,
+						database_sockets: [
+							null,
+							{ database: 'system', connected: true, lastReceivedStatus: 'Waiting', lastReceivedVersion: 50 },
+						],
+					},
+				],
+			},
+			leaderURL
+		);
+		assert.deepStrictEqual(result, { synced: true });
+	});
 });

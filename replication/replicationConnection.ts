@@ -83,7 +83,8 @@ import {
 	registerBlobReceiveInFlight,
 	unregisterBlobReceiveInFlight,
 } from '../core/resources/blob.ts';
-import { promises as fsPromises } from 'node:fs';
+import { existsSync, promises as fsPromises } from 'node:fs';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
@@ -1996,13 +1997,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) {
 					await flushCopyRowsDurable();
 				}
-				getSharedStatus();
-				replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
-					localTime,
-					replicationSharedStatus[RECEIVED_VERSION_POSITION]
-				);
-				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
-				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
+				const sharedStatus = getSharedStatus();
+				if (!sharedStatus) return;
+				sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(localTime, sharedStatus[RECEIVED_VERSION_POSITION]);
+				sharedStatus[RECEIVED_TIME_POSITION] = Date.now();
+				sharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_WAITING;
 			},
 		};
 	}
@@ -2235,6 +2234,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (options.connection) options.connection.sharedStatus = replicationSharedStatus;
 		}
 		return replicationSharedStatus;
+	}
+	function cloneSyncIsInProgress(): boolean {
+		const cloneRootPath = env.get(CONFIG_PARAMS.ROOTPATH) ?? process.env.ROOTPATH;
+		return typeof cloneRootPath !== 'string' || existsSync(join(cloneRootPath, '.cloneSyncBaseline.json'));
 	}
 	if (databaseName) {
 		setDatabase(databaseName);
@@ -4898,10 +4901,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// (set in the indirect block below).
 			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
 			// The status buffer is worker-local, while the sequence cursor is durable. Seed the
-			// receive watermark after a worker restart so a completed copy does not look incomplete
-			// until the leader happens to send another record. An outstanding copy cursor remains
-			// authoritative and must not be promoted this way.
-			if (connectedNode === node && !copyCursor && hasPersistedResumeCursor) {
+			// Deliberately restore a completed copy's status after a worker restart, but never promote
+			// its durable cursor while clone bootstrap is still in progress.
+			if (connectedNode === node && !copyCursor && hasPersistedResumeCursor && !cloneSyncIsInProgress()) {
 				const sharedStatus = getSharedStatus();
 				if (sharedStatus) {
 					sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
