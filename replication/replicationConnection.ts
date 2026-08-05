@@ -1954,10 +1954,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
-	// A retired placeholder is never usable and must not shadow a later real registration, so seed from
-	// the map instead of the connection's cached reference (expirePendingDatabaseSubscription).
-	let tableSubscriptionToReplicator: DatabaseSubscription =
-		activeDatabaseSubscription(options.subscription) ?? (options.subscription && dbSubscriptions.get(databaseName));
+	// A retired placeholder is never usable and must not shadow a later real registration, so re-derive
+	// from the map rather than the connection's cached reference (expirePendingDatabaseSubscription). A
+	// fresh placeholder, not `undefined`, keeps the receive path's bounded wait and its clean
+	// no-subscription close — and a late Replicator.subscribe() can still resolve it.
+	let tableSubscriptionToReplicator: DatabaseSubscription = activeDatabaseSubscription(options.subscription);
+	if (options.subscription && !tableSubscriptionToReplicator)
+		tableSubscriptionToReplicator =
+			dbSubscriptions.get(databaseName) ?? createPendingDatabaseSubscription(databaseName, dbSubscriptions);
 	if (tableSubscriptionToReplicator?.then)
 		(tableSubscriptionToReplicator as Promise<any>)
 			.then((sub) => {
