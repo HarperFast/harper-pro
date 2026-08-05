@@ -21,7 +21,8 @@ export async function checkSyncStatus(
 	targetTimestamps: Record<string, number>,
 	clusterStatus: () => Promise<any>,
 	leaderReplicationURL: string,
-	log: SyncMonitorLog
+	log: SyncMonitorLog,
+	requiredSocketDatabases: string[] = Object.keys(targetTimestamps)
 ): Promise<SyncCheckResult> {
 	const clusterResponse = await clusterStatus();
 	log(`clone sync check cluster status response: ${JSON.stringify(clusterResponse)}`, 'debug');
@@ -87,11 +88,13 @@ export async function checkSyncStatus(
 		if (Number.isFinite(receivedAt) && receivedAt > latestReceivedMs) latestReceivedMs = receivedAt;
 	}
 
-	// A database with a target but no socket yet (its subscription is still registering with the
+	// A required database with no socket yet (its subscription is still registering with the
 	// main thread) is pending, not verified — otherwise a lone early socket (e.g. the system DB,
 	// whose small copy finishes in seconds) could complete the check before the data databases'
-	// sockets even appear.
-	for (const dbName in targetTimestamps) {
+	// sockets even appear. Only databases the clone actually subscribes to are required: a legacy
+	// (v4) leader never replicates the system database, so demanding its socket would wedge the
+	// clone; when the socket does exist it is still verified by the loop above.
+	for (const dbName of requiredSocketDatabases) {
 		if (!socketDatabases.has(dbName)) {
 			log(`Database ${dbName}: no replication socket to the leader yet`, 'debug');
 			syncComplete = false;
@@ -108,6 +111,8 @@ export type MonitorSyncLoopOptions = {
 	stallTimeoutMs: number;
 	checkIntervalMs: number;
 	log: SyncMonitorLog;
+	/** Databases whose replication socket must exist before sync can complete (default: every target). */
+	requiredSocketDatabases?: string[];
 	/** Test hooks: injectable clock and delay. */
 	now?: () => number;
 	delay?: (ms: number) => Promise<unknown>;
@@ -136,7 +141,8 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 				options.targetTimestamps,
 				options.clusterStatus,
 				options.leaderReplicationURL,
-				options.log
+				options.log,
+				options.requiredSocketDatabases ?? Object.keys(options.targetTimestamps)
 			);
 			checkPromise.catch(() => {});
 			const result = await Promise.race([

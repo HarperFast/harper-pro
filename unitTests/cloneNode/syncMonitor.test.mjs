@@ -125,6 +125,34 @@ describe('checkSyncStatus', () => {
 		assert.equal(result.syncComplete, false);
 	});
 
+	it('completes without a socket for a database outside requiredSocketDatabases (v4 leader)', async () => {
+		// A legacy (v4) leader never replicates the system database: system sits in the targets
+		// (added unconditionally) but its socket never appears, and must not wedge the clone.
+		const result = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () => statusResponse([{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(3000) }]),
+			LEADER_URL,
+			noopLog,
+			['data']
+		);
+		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0 });
+	});
+
+	it('still verifies a non-required database whenever its socket exists', async () => {
+		const result = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: undefined },
+					{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(3000) },
+				]),
+			LEADER_URL,
+			noopLog,
+			['data']
+		);
+		assert.equal(result.syncComplete, false);
+	});
+
 	it('ignores arrivals on already-synced databases (wedged-copy regression)', async () => {
 		const result = await checkSyncStatus(
 			{ system: 1000, data: 2000 },
@@ -183,6 +211,22 @@ describe('monitorSyncLoop', () => {
 			stallTimeoutMs: 10000,
 			checkIntervalMs: 1000,
 			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'synced');
+	});
+
+	it('honors requiredSocketDatabases so a socketless system DB cannot wedge a v4-leader clone', async () => {
+		const clock = fakeClock();
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000, data: 2000 },
+			clusterStatus: async () =>
+				statusResponse([{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(1000) }]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			checkIntervalMs: 1000,
+			log: noopLog,
+			requiredSocketDatabases: ['data'],
 			...clock,
 		});
 		assert.equal(outcome, 'synced');

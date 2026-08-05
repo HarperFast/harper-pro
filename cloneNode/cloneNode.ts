@@ -519,6 +519,11 @@ async function monitorSync(): Promise<SyncOutcome> {
 		stallTimeoutMs,
 		checkIntervalMs: DEFAULT_SYNC_CHECK_INTERVAL_MS,
 		log,
+		// Every user database must have its replication socket before sync can complete, but not
+		// `system` (added to the targets unconditionally above): a legacy (v4) leader never
+		// replicates the system database, so requiring its socket would wedge the clone. When the
+		// socket exists (v5 leaders) it is still verified.
+		requiredSocketDatabases: Object.keys(targetTimestamps).filter((database) => database !== 'system'),
 	});
 
 	if (outcome === 'synced') {
