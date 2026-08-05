@@ -62,6 +62,14 @@ async function waitForLog(node, pattern, timeoutMs = RECOVERY_TIMEOUT_MS) {
 	return '';
 }
 
+async function teardownNode(node) {
+	try {
+		await teardownHarper({ harper: node });
+	} catch (err) {
+		console.error(`Failed to tear down node ${node.hostname}:`, err);
+	}
+}
+
 function countSetupWatchdogWarnings(log, database = DB) {
 	return log
 		.split('\n')
@@ -122,7 +130,7 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 	});
 
 	after(async () => {
-		await Promise.all([ctx.source, ctx.receiver].filter(Boolean).map((node) => teardownHarper({ harper: node })));
+		await Promise.all([ctx.source, ctx.receiver].filter(Boolean).map(teardownNode));
 	});
 
 	test('a ping-alive setup hang reconnects and converges without a restart', async () => {
@@ -206,7 +214,7 @@ suite('sender subscription setup recovery', { timeout: 120000 }, (ctx) => {
 	});
 
 	after(async () => {
-		await Promise.all([ctx.source, ctx.receiver].filter(Boolean).map((node) => teardownHarper({ harper: node })));
+		await Promise.all([ctx.source, ctx.receiver].filter(Boolean).map(teardownNode));
 	});
 
 	test('the bounded sender gate closes first and the replacement subscription converges', async () => {
@@ -260,7 +268,7 @@ suite('system subscription setup recovery', { timeout: 120000 }, (ctx) => {
 	});
 
 	after(async () => {
-		await Promise.all([ctx.source, ctx.receiver].filter(Boolean).map((node) => teardownHarper({ harper: node })));
+		await Promise.all([ctx.source, ctx.receiver].filter(Boolean).map(teardownNode));
 	});
 
 	test('an unsolicited handshake schema cannot acknowledge the stalled system request', async () => {
