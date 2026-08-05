@@ -249,8 +249,7 @@ export async function cloneNode(): Promise<void> {
 			const { set: setStatus } = await import('../core/server/status/index.js');
 			try {
 				await setStatus({ id: 'availability', status: 'Available' });
-				if (removeCloneSyncBaseline()) {
-					removeCloneSyncInProgress();
+				if (removeCloneSyncBaseline() && removeCloneSyncInProgress()) {
 					removeCloneAvailabilityFinalization();
 					log('Completed interrupted clone availability finalization');
 				}
@@ -489,22 +488,17 @@ export async function cloneNode(): Promise<void> {
 		}
 	}
 
-	if (syncOutcome === 'synced') writeCloneAvailabilityFinalization();
+	writeCloneAvailabilityFinalization();
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
-	if (syncOutcome === 'synced') {
-		const { set: setStatus } = await import('../core/server/status/index.js');
-		try {
-			await setStatus({ id: 'availability', status: 'Available' });
-		} catch (err) {
-			log(`Synchronized but failed to set availability to Available: ${err}; leaving recovery marker`, 'error');
-			return;
-		}
-		if (removeCloneSyncBaseline()) {
-			removeCloneSyncInProgress();
-			removeCloneAvailabilityFinalization();
-		}
-	} else {
-		if (removeCloneSyncBaseline()) removeCloneSyncInProgress();
+	const { set: setStatus } = await import('../core/server/status/index.js');
+	try {
+		await setStatus({ id: 'availability', status: 'Available' });
+	} catch (err) {
+		log(`Clone completed but failed to set availability to Available: ${err}; leaving recovery marker`, 'error');
+		return;
+	}
+	if (removeCloneSyncBaseline() && removeCloneSyncInProgress()) {
+		removeCloneAvailabilityFinalization();
 	}
 
 	log(`Clone from leader node ${leaderURL} complete`);
@@ -532,18 +526,7 @@ type SyncOutcome = 'synced' | 'skipped' | 'failed';
  */
 async function monitorSync(targetResult?: { targets: Record<string, number>; errors: string[] }): Promise<SyncOutcome> {
 	if (skipSyncMonitor) {
-		const { set: setStatus } = await import('../core/server/status/index.js');
-		// The operator opted out of the sync gate, so the clone is declared ready. Publish Available
-		// (best-effort) — this also clears any Unavailable persisted by a prior failed attempt, since
-		// hdb_status is not replicated and survives restarts — keeping availability consistent with the
-		// cloned flag the caller sets for this outcome.
-		log('Skipping sync monitor (skip-sync-monitor); marking node Available without verifying sync');
-		try {
-			await setStatus({ id: 'availability', status: 'Available' });
-		} catch (err) {
-			log(`Failed to set availability status to Available: ${err}`, 'error');
-			return 'failed';
-		}
+		log('Skipping sync monitor (skip-sync-monitor); completing clone without verifying sync');
 		return 'skipped';
 	}
 
@@ -697,11 +680,14 @@ function removeCloneSyncBaseline(): boolean {
 	}
 }
 
-function removeCloneSyncInProgress(): void {
+function removeCloneSyncInProgress(): boolean {
 	try {
 		unlinkSync(cloneSyncInProgressPath());
+		return true;
 	} catch (err: any) {
-		if (err?.code !== 'ENOENT') log(`Failed to remove clone synchronization in-progress marker: ${err}`, 'error');
+		if (err?.code === 'ENOENT') return true;
+		log(`Failed to remove clone synchronization in-progress marker: ${err}`, 'error');
+		return false;
 	}
 }
 
