@@ -158,17 +158,19 @@ suite('Clone Node - restart after sync starts skips setup', (ctx) => {
 		ok(marker.startedAt > 0, 'the marker must record when the wait began');
 
 		await killHarper(cloneCtx);
-		// cloneConfig rewrites harper-config.yaml on every full setup; an untouched mtime after the
-		// restart is what proves the resume actually skipped setup rather than redoing it.
-		const configPath = join(cloneCtx.harper.dataRootDir, 'harper-config.yaml');
-		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
+		// cloneJWTKeys rewrites the JWT key trio on every full setup, while an ordinary boot only
+		// regenerates them when missing — so an untouched mtime after the restart is what proves the
+		// resume skipped setup. (Config mtime cannot serve here: Harper re-serializes the config file
+		// on every boot.)
+		const jwtPassPath = join(cloneCtx.harper.dataRootDir, 'keys', '.jwtPass');
+		const jwtMtimeBeforeRestart = statSync(jwtPassPath).mtimeMs;
 		await startHarper(cloneCtx, options);
 
 		ok(await waitForAvailable(cloneCtx.harper), 'a resumed clone must still reach Available');
 		equal(
-			statSync(configPath).mtimeMs,
-			configMtimeBeforeRestart,
-			'resume must not rewrite the config — setup was supposed to be skipped'
+			statSync(jwtPassPath).mtimeMs,
+			jwtMtimeBeforeRestart,
+			'resume must not re-clone the JWT keys — setup was supposed to be skipped'
 		);
 		equal(await waitForRowCount(cloneCtx.harper, RECORD_COUNT), RECORD_COUNT, 'all records must be present');
 		equal(existsSync(markerPath), false, 'finalizing the clone must clear the marker');
@@ -184,13 +186,13 @@ suite('Clone Node - restart after sync starts skips setup', (ctx) => {
 		ok(existsSync(markerPath), 'the marker must be present for this to test the forceClone override');
 
 		// FORCE_CLONE must discard the marker and re-run setup, then still converge.
-		const configPath = join(cloneCtx.harper.dataRootDir, 'harper-config.yaml');
-		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
+		const jwtPassPath = join(cloneCtx.harper.dataRootDir, 'keys', '.jwtPass');
+		const jwtMtimeBeforeRestart = statSync(jwtPassPath).mtimeMs;
 		await startHarper(cloneCtx, cloneOptionsFor(cloneCtx, ctx.leader, await leaderToken(), { FORCE_CLONE: true }));
 		ok(await waitForAvailable(cloneCtx.harper), 'a forced reclone must still reach Available');
 		ok(
-			statSync(configPath).mtimeMs > configMtimeBeforeRestart,
-			'forceClone must re-run setup, which rewrites the config'
+			statSync(jwtPassPath).mtimeMs > jwtMtimeBeforeRestart,
+			'forceClone must re-run setup, which re-clones the JWT keys'
 		);
 		equal(await waitForRowCount(cloneCtx.harper, RECORD_COUNT), RECORD_COUNT, 'all records must be present');
 	});
