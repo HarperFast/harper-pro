@@ -1229,6 +1229,33 @@ export function createPendingDatabaseSubscription(
 	return pending;
 }
 
+/**
+ * Settle and unregister a database-subscription placeholder that is still pending, returning whether it
+ * did so.
+ *
+ * A placeholder resolves only when `Replicator.subscribe()` runs for the first table of the database on
+ * this thread. When that never happens — classically because this node does not host the database — the
+ * promise is unsettleable, and it stays reachable from `dbSubscriptions` for the life of the database.
+ * A bounded waiter that closes and lets the peer retry would then attach a fresh reaction (retaining that
+ * connection's setup state) to the same retained promise on every attempt, so a permanent mismatch would
+ * grow waiters without bound. Settling releases every accumulated waiter — they see `undefined` and take
+ * their existing no-subscription path — and unregistering lets the next request start from a fresh
+ * placeholder that a late `Replicator.subscribe()` can still resolve.
+ *
+ * A placeholder already superseded in the map is left alone: the real subscription is authoritative.
+ */
+export function expirePendingDatabaseSubscription(
+	databaseName: string,
+	subscription: DatabaseSubscription | undefined,
+	subscriptions: Map<string, any>
+): boolean {
+	if (!subscription?.then || typeof subscription.ready !== 'function') return false;
+	if (subscriptions.get(databaseName) !== subscription) return false;
+	subscriptions.delete(databaseName);
+	subscription.ready(undefined);
+	return true;
+}
+
 // Small control-plane tables whose convergence gates cluster operations: hdb_deployment gates
 // deploy_component (awaitDeploymentRow), hdb_nodes gates membership. Copying them first keeps a
 // large, high-churn, largely node-local table (notably hdb_analytics, which by insertion order sorts
@@ -2691,6 +2718,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			resume: removePauseReason,
 		});
 		if (!resolved?.send) {
+			// A timeout (`undefined`) leaves the placeholder pending: settle it, or the peer's retry stacks
+			// another waiter on the same promise (see expirePendingDatabaseSubscription).
+			if (!resolved) expirePendingDatabaseSubscription(databaseName, tableSubscriptionToReplicator, dbSubscriptions);
 			logger.error?.(
 				connectionId,
 				`No local subscription registered for database ${databaseName} after ${SUBSCRIPTION_RESOLVE_TIMEOUT}ms; closing so replication resumes from the last durable cursor`
@@ -3381,16 +3411,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									maybeStallSubscriptionSetupForTest(databaseName) ?? getHDBNodeTable().subscribe(authorization.name);
 								whenSubscribedToHdbNodes
 									.then(async (subscription) => {
-										subscriptionToHdbNodes = subscription;
-										// The setup wait below is bounded. If it timed out and closed this socket before the
-										// subscription promise eventually resolved, retire the late subscription immediately
-										// instead of leaking a global hdb_nodes listener after the WS close event already fired.
+										// The setup wait below is bounded. If it timed out and closed this socket before this
+										// promise resolved, retire the late subscription instead of leaking a global hdb_nodes
+										// listener past the close event.
 										if (closed || wsClosed) {
-											const lateSubscription = subscriptionToHdbNodes;
-											subscriptionToHdbNodes = undefined;
-											lateSubscription?.end();
+											subscription?.end();
 											return;
 										}
+										subscriptionToHdbNodes = subscription;
 										for await (const event of subscriptionToHdbNodes) {
 											const shouldClose = await shouldCloseSendAuthWatch(event, authorization.name, databaseName, {
 												isClosed: () => closed,
@@ -3804,6 +3832,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									(gate, reason) => {
 										if (closed || wsClosed) return;
 										closed = true;
+										// Settle the placeholder we timed out on, or every retry attaches another waiter to
+										// the same permanently-pending promise (see expirePendingDatabaseSubscription).
+										if (gate === 'database' && reason === 'timeout')
+											expirePendingDatabaseSubscription(databaseName, tableSubscriptionToReplicator, dbSubscriptions);
 										const databaseHint =
 											gate === 'database' ? '; this can also mean this node does not host the database' : '';
 										const failure =
