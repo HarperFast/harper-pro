@@ -1227,17 +1227,10 @@ export function createPendingDatabaseSubscription(
 	return pending;
 }
 
-/** A retired placeholder must never be used, nor shadow a real registration that landed after it. */
 export function activeDatabaseSubscription(subscription?: DatabaseSubscription): DatabaseSubscription | undefined {
 	return subscription?.retired ? undefined : subscription;
 }
 
-/**
- * The database subscription a connection or subscription request should use, given whatever reference it
- * already holds: the registered one, or a fresh placeholder. A retired placeholder is never used, and —
- * because `createPendingDatabaseSubscription` registers unconditionally — a placeholder is never created
- * over a registration that landed in the meantime.
- */
 export function subscriptionForConnection(
 	cached: DatabaseSubscription | undefined,
 	databaseName: string,
@@ -1980,7 +1973,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	if (tableSubscriptionToReplicator?.then)
 		(tableSubscriptionToReplicator as Promise<any>)
 			.then((sub) => {
-				if (!sub) return; // a retired placeholder settles to undefined; the request path re-derives
+				if (!sub) return;
 				tableSubscriptionToReplicator = sub;
 				if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
 			})
