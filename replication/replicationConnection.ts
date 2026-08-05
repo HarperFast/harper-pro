@@ -805,10 +805,8 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
 }
 
-// Test-only fault injection for harper-pro#642. The first dynamic send-authorization setup for the named
-// database never resolves, before DB_SCHEMA or replay can start, while the independent ping loop keeps the
-// socket transport-live. One-shot per process so a receiver watchdog reconnect reaches the normal setup
-// path. Never arms in production: the env var is set only by the regression test.
+// Test-only fault injection for harper-pro#642: one-shot per process, so a receiver watchdog reconnect
+// reaches the normal setup path. Never arms in production — only the regression test sets the env var.
 let subscriptionSetupStallForTestArmed = false;
 export function maybeStallSubscriptionSetupForTest(databaseName?: string): Promise<never> | undefined {
 	if (!process.env.HARPER_TEST_SUBSCRIPTION_SETUP_STALL_ONCE_DB) return;
@@ -1053,7 +1051,6 @@ async function awaitWithTimeoutOutcome<T>(
 	}
 }
 
-/** Await a promise-like setup dependency without letting a never-settling promise wedge the connection. */
 export async function awaitWithTimeout<T>(
 	value: T | PromiseLike<T> | undefined,
 	timeout: number
@@ -1236,10 +1233,19 @@ export function activeDatabaseSubscription(subscription?: DatabaseSubscription):
 }
 
 /**
- * The database subscription a connection or subscription request should use: the registered one, or a
- * fresh placeholder. Never a retired placeholder, and — because `createPendingDatabaseSubscription`
- * registers unconditionally — never creating one over a registration that landed in the meantime.
+ * The database subscription a connection or subscription request should use, given whatever reference it
+ * already holds: the registered one, or a fresh placeholder. A retired placeholder is never used, and —
+ * because `createPendingDatabaseSubscription` registers unconditionally — a placeholder is never created
+ * over a registration that landed in the meantime.
  */
+export function subscriptionForConnection(
+	cached: DatabaseSubscription | undefined,
+	databaseName: string,
+	subscriptions: Map<string, any>
+): DatabaseSubscription {
+	return activeDatabaseSubscription(cached) ?? subscriptionForDatabase(databaseName, subscriptions);
+}
+
 export function subscriptionForDatabase(databaseName: string, subscriptions: Map<string, any>): DatabaseSubscription {
 	return (
 		activeDatabaseSubscription(subscriptions.get(databaseName)) ??
@@ -1966,19 +1972,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
-	// A retired placeholder is never usable and must not shadow a later real registration, so re-derive
-	// from the map rather than the connection's cached reference (expirePendingDatabaseSubscription). A
-	// fresh placeholder, not `undefined`, keeps the receive path's bounded wait and its clean
-	// no-subscription close — and a late Replicator.subscribe() can still resolve it.
-	let tableSubscriptionToReplicator: DatabaseSubscription = activeDatabaseSubscription(options.subscription);
-	if (options.subscription && !tableSubscriptionToReplicator)
-		tableSubscriptionToReplicator = subscriptionForDatabase(databaseName, dbSubscriptions);
+	// Re-derive rather than trusting the cached reference: the connection seeds every reconnect from the
+	// subscription it was built with, which may since have been retired (expirePendingDatabaseSubscription).
+	let tableSubscriptionToReplicator: DatabaseSubscription = options.subscription
+		? subscriptionForConnection(options.subscription, databaseName, dbSubscriptions)
+		: undefined;
 	if (tableSubscriptionToReplicator?.then)
 		(tableSubscriptionToReplicator as Promise<any>)
 			.then((sub) => {
-				// A retired placeholder settles to undefined; leave the local reference as the promise so the
-				// request path re-derives rather than treating it as a usable subscription.
-				if (!sub) return;
+				if (!sub) return; // a retired placeholder settles to undefined; the request path re-derives
 				tableSubscriptionToReplicator = sub;
 				if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
 			})
@@ -2797,18 +2799,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// not a transaction, special message
 				const message = decode(body);
 				const [command, data, tableId] = message;
-				if (
-					isSubscriptionSetupProgressFrame(
-						command,
-						databaseName,
-						message[2],
-						pendingSubscriptionSetupRequestId,
-						message[3]
-					)
-				) {
-					pendingSubscriptionSetupRequestId = undefined;
-					subscriptionSetupWatchdog?.complete();
-				}
 				switch (command) {
 					case NODE_NAME: {
 						if (data) {
@@ -2885,6 +2875,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						break;
 					}
 					case DB_SCHEMA: {
+						if (
+							isSubscriptionSetupProgressFrame(
+								command,
+								databaseName,
+								message[2],
+								pendingSubscriptionSetupRequestId,
+								message[3]
+							)
+						) {
+							pendingSubscriptionSetupRequestId = undefined;
+							subscriptionSetupWatchdog?.complete();
+						}
 						logger.debug?.(
 							connectionId,
 							'Received table definitions for',
@@ -3397,14 +3399,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
 						let sentNodeIds = new Set<number>();
 						let closed = false;
-						// A retired placeholder is truthy, so it must be filtered before anything reads it or decides
-						// whether to consult the map — carrying it forward would skip the lookup below.
-						tableSubscriptionToReplicator = activeDatabaseSubscription(tableSubscriptionToReplicator);
-						if (
-							tableSubscriptionToReplicator &&
-							!tableSubscriptionToReplicator.then &&
-							databaseName !== tableSubscriptionToReplicator.databaseName
-						) {
+						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
+						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
+						tableSubscriptionToReplicator = subscriptionForConnection(
+							tableSubscriptionToReplicator,
+							databaseName,
+							dbSubscriptions
+						);
+						if (!tableSubscriptionToReplicator.then && databaseName !== tableSubscriptionToReplicator.databaseName) {
 							logger.error?.(
 								'Subscription request for wrong database',
 								databaseName,
@@ -3413,13 +3415,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							return;
 						}
 						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
-						if (!tableSubscriptionToReplicator) {
-							// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
-							// from for this connection, so writing anywhere else would leave a placeholder pending forever.
-							tableSubscriptionToReplicator = subscriptionForDatabase(databaseName, dbSubscriptions);
-							if (tableSubscriptionToReplicator.then)
-								logger.debug?.('Waiting for subscription to database ' + databaseName);
-						}
+						if (tableSubscriptionToReplicator.then)
+							logger.debug?.('Waiting for subscription to database ' + databaseName);
 						// Local config-route directionality for this peer, resolved once and reused by the send
 						// authority gate below and the send-side excludeTables further down. harper-pro#498.
 						const sendRoute = getConfigRouteReplicates(options, remoteNodeName);
@@ -4238,6 +4235,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							})
 							.catch((error) => {
 								logger.error?.(connectionId, 'Error handling subscription to node', error);
+								// An authorization-watch rejection before it resolves reaches this chain too (the setup
+								// gate awaits the same promise), and that chain has already closed with a more accurate
+								// code — so a second close here would only overwrite the reason.
+								if (closed || wsClosed) return;
+								closed = true;
 								close(1008, 'Error handling subscription to node ' + error);
 							});
 						break;
