@@ -256,6 +256,34 @@ describe('monitorSyncLoop', () => {
 		assert.equal(outcome, 'stalled');
 	});
 
+	it('holds a v5 clone whose data DB completes before the system socket ever registers', async () => {
+		const clock = fakeClock();
+		// The reverse ordering of the early-system race: data is fully synced on the very first
+		// poll while the system subscription has not registered yet. With system in the required
+		// set (derived from the leader version probe), completion must wait for the system socket
+		// to appear and verify — never return on the data-only first poll.
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000, data: 2000 },
+			clusterStatus: async () =>
+				clock.now() < 2000
+					? statusResponse([{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(clock.now()) }])
+					: statusResponse([
+							{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(clock.now()) },
+							clock.now() < 4000
+								? { database: 'system', lastReceivedVersion: undefined, lastReceivedLocalTime: utc(clock.now()) }
+								: { database: 'system', lastReceivedVersion: 1500, lastReceivedLocalTime: utc(clock.now()) },
+						]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			checkIntervalMs: 1000,
+			log: noopLog,
+			requiredSocketDatabases: ['data', 'system'],
+			...clock,
+		});
+		assert.equal(outcome, 'synced');
+		assert.ok(clock.now() >= 4000, 'must have waited through the late-registering system socket');
+	});
+
 	it('honors requiredSocketDatabases so a socketless system DB cannot wedge a v4-leader clone', async () => {
 		const clock = fakeClock();
 		const outcome = await monitorSyncLoop({

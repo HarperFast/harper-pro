@@ -512,6 +512,21 @@ async function monitorSync(): Promise<SyncOutcome> {
 		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s`
 	);
 
+	// Whether the system database's socket is required is a leader-capability question: a legacy
+	// (v4) leader never replicates the system database, so requiring its socket would wedge the
+	// clone, while on a v5+ leader it must be required up front — otherwise a small user database
+	// completing before the system subscription registers could finish the clone with the system
+	// copy unverified. registration_info is the lightweight version probe present on every leader
+	// version (see core/bin/cliOperations.ts). An unreadable version leaves system optional; the
+	// seen-socket ratchet in monitorSyncLoop still verifies it once its socket appears.
+	let systemSocketRequired = false;
+	try {
+		const registration: any = await leaderRequest({ operation: 'registration_info' });
+		systemSocketRequired = parseInt(String(registration?.version ?? ''), 10) >= 5;
+	} catch (err) {
+		log(`Could not read leader version (${err}); not requiring a system replication socket`);
+	}
+
 	const outcome = await monitorSyncLoop({
 		targetTimestamps,
 		clusterStatus,
@@ -519,11 +534,9 @@ async function monitorSync(): Promise<SyncOutcome> {
 		stallTimeoutMs,
 		checkIntervalMs: DEFAULT_SYNC_CHECK_INTERVAL_MS,
 		log,
-		// Every user database must have its replication socket before sync can complete, but not
-		// `system` (added to the targets unconditionally above): a legacy (v4) leader never
-		// replicates the system database, so requiring its socket would wedge the clone. When the
-		// socket exists (v5 leaders) it is still verified.
-		requiredSocketDatabases: Object.keys(targetTimestamps).filter((database) => database !== 'system'),
+		requiredSocketDatabases: Object.keys(targetTimestamps).filter(
+			(database) => database !== 'system' || systemSocketRequired
+		),
 	});
 
 	if (outcome === 'synced') {
@@ -554,6 +567,21 @@ async function monitorSync(): Promise<SyncOutcome> {
  * and record the most recent timestamp for each database in a JSON file.
  * @returns {Promise<void>}
  */
+// Filter by this node's `replication.databases` — a database the clone doesn't subscribe to must
+// not be pre-created (cloneSchemas) or become a sync target (getLastUpdatedRecord: its socket
+// never exists and its data never arrives, so a target would wedge the sync monitor). Matches the
+// gating used by `shouldReplicateFromNode` in `replication/knownNodes.ts`: `undefined` or `'*'`
+// accept everything; an array accepts only the names it lists (objects with `.name` are
+// sharded-database entries).
+function isReplicatedDatabase(dbName: string): boolean {
+	const databaseReplications = envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES);
+	if (!databaseReplications || databaseReplications === '*') return true;
+	if (!Array.isArray(databaseReplications)) return true;
+	return databaseReplications.some((entry: any) =>
+		typeof entry === 'string' ? entry === dbName : entry?.name === dbName
+	);
+}
+
 async function getLastUpdatedRecord(): Promise<Record<string, number>> {
 	log('Getting last updated record timestamp for all database', 'debug');
 	const lastUpdated: Record<string, number> = {};
@@ -564,6 +592,7 @@ async function getLastUpdatedRecord(): Promise<Record<string, number>> {
 	for (const db in allDb) {
 		// requestId is part of the describe response so we ignore it
 		if (typeof allDb[db] !== 'object') continue;
+		if (!isReplicatedDatabase(db)) continue;
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
 	}
 
@@ -916,19 +945,6 @@ async function cloneSchemas(): Promise<void> {
 	// plus a `requestId` sibling we need to skip.
 	const { createSchema, createTable } = await import('../core/dataLayer/schema.js');
 	const { databases } = await import('../core/resources/databases.js');
-
-	// Filter by this node's `replication.databases` so we don't materialize empty databases the
-	// clone isn't even subscribing to. Matches the gating used by `shouldReplicateFromNode` in
-	// `replication/knownNodes.ts`: `undefined` or `'*'` accept everything; an array accepts only
-	// the names it lists (objects with `.name` are sharded-database entries).
-	const databaseReplications = envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES);
-	const isReplicatedDatabase = (dbName: string): boolean => {
-		if (!databaseReplications || databaseReplications === '*') return true;
-		if (!Array.isArray(databaseReplications)) return true;
-		return databaseReplications.some((entry: any) =>
-			typeof entry === 'string' ? entry === dbName : entry?.name === dbName
-		);
-	};
 
 	for (const dbName of Object.keys(allDb)) {
 		const dbDescribe = allDb[dbName];
