@@ -4904,9 +4904,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// a proxied/indirect subscription has no direct cursor and instead arms from `proxiedSkipCursor`
 			// (set in the indirect block below).
 			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
-			// The status buffer is worker-local, while the sequence cursor is durable. Seed the
-			// Deliberately restore a completed copy's status after a worker restart, but never promote
-			// its durable cursor while clone bootstrap is still in progress.
+			// Restore a completed copy's worker-local status from its durable cursor, but never while
+			// clone bootstrap is still in progress.
 			if (connectedNode === node && !copyCursor && hasPersistedResumeCursor && !cloneSyncIsInProgress()) {
 				const sharedStatus = getSharedStatus();
 				if (sharedStatus) {

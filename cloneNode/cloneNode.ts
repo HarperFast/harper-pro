@@ -359,11 +359,7 @@ export async function cloneNode(): Promise<void> {
 	}
 	if (syncTargetResult?.errors.length) {
 		updateConfigValue(CONFIG_PARAMS.CLONED, false);
-		log(
-			`Invalid clone synchronization targets: ${syncTargetResult.errors.join('; ')}; clone was not joined and remains Unavailable`,
-			'error'
-		);
-		return;
+		throw new Error(`Invalid clone synchronization targets: ${syncTargetResult.errors.join('; ')}`);
 	}
 
 	// Base set node request
