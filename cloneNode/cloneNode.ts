@@ -268,11 +268,9 @@ export async function cloneNode(): Promise<void> {
 		await installHarper();
 	}
 
-	// Custody clone gate (#166): mark the clone bootstrap BEFORE Harper starts so the
-	// secretCustody component does not self-generate a cluster env-secrets keypair — the leader's
-	// key is cloned right after replication is established (cloneEnvSecretsKeys), and a
-	// self-generated key would diverge from the cluster and could encrypt new secrets before the
-	// real key arrives. Custody stays dormant until the cloned key is registered.
+	// Custody clone gate (#166): latch BEFORE Harper starts (and on every clone-mode boot, resume
+	// included) so secretCustody never self-generates an env-secrets keypair that diverges from the
+	// cluster key cloned later by cloneEnvSecretsKeys.
 	const { setCloneBootstrapInProgress } = await import('../security/custodyState.js');
 	setCloneBootstrapInProgress(true);
 
@@ -300,12 +298,8 @@ export async function cloneNode(): Promise<void> {
 	// must not be treated as success.
 	const syncOutcome = await monitorSync(syncStartedAt);
 	if (syncOutcome === 'failed') {
-		// Leave Harper running so get_status stays queryable for the control plane (availability is
-		// now Unavailable). Throwing here would propagate to bin/harper.js and exit the already-started
-		// process. Explicitly clear the cloned flag rather than just skipping the write: on a forced
-		// reclone, cloneConfig() has already carried the previous `cloned: true` into the rewritten
-		// config, so a bare return would leave it set and the next non-forced start would skip cloning
-		// despite the unconfirmed sync. Clearing it ensures a subsequent start retries the clone.
+		// Return (don't throw) so Harper stays running and queryable. Clear `cloned` explicitly: a
+		// forced reclone has already carried the previous `cloned: true` into the rewritten config.
 		updateConfigValue(CONFIG_PARAMS.CLONED, false);
 		log(
 			`Clone from leader node ${leaderURL} did not complete synchronization; node is running but Unavailable and not marked as cloned`,
@@ -532,10 +526,8 @@ async function monitorSync(syncStartedAt: number): Promise<SyncOutcome> {
 	const { set: setStatus } = await import('../core/server/status/index.js');
 
 	if (skipSyncMonitor) {
-		// The operator opted out of the sync gate, so the clone is declared ready. Publish Available
-		// (best-effort) — this also clears any Unavailable persisted by a prior failed attempt, since
-		// hdb_status is not replicated and survives restarts — keeping availability consistent with the
-		// cloned flag the caller sets for this outcome.
+		// Best-effort Available: also clears an Unavailable persisted by a prior failed attempt
+		// (hdb_status is not replicated and survives restarts).
 		log('Skipping sync monitor (skip-sync-monitor); marking node Available without verifying sync');
 		try {
 			await setStatus({ id: 'availability', status: 'Available' });
@@ -547,20 +539,16 @@ async function monitorSync(syncStartedAt: number): Promise<SyncOutcome> {
 
 	const { clusterStatus } = await import('../replication/clusterStatus.js');
 
-	// The node is not ready to serve traffic until the clone has caught up with the leader. Publish
-	// Unavailable up front so get_status always carries a definite availability signal for the whole
-	// sync wait. Best-effort: a failed write here must not abort the clone (the loop still runs and
-	// publishes Available on success).
+	// Publish Unavailable up front so get_status carries a definite signal for the whole wait;
+	// best-effort, since the loop still publishes Available on success.
 	try {
 		await setStatus({ id: 'availability', status: 'Unavailable' });
 	} catch (err) {
 		log(`Failed to set availability status to Unavailable: ${err}`, 'error');
 	}
 
-	// Test/diagnostic hook (not a user-facing option): deterministically exercise the
-	// unconfirmed-sync failure path. Loopback replication is too fast and bidirectional to force a
-	// real sync timeout in tests, so this lets the failure-branch behavior — stay Unavailable, do not
-	// mark cloned, keep the node running — be asserted deterministically.
+	// Test hook: loopback replication is too fast to force a real sync timeout, so this makes the
+	// failure branch deterministically testable.
 	if (process.env.CLONE_SIMULATE_SYNC_FAILURE === 'true') {
 		log('CLONE_SIMULATE_SYNC_FAILURE set; treating clone sync as unconfirmed', 'error');
 		return 'failed';
