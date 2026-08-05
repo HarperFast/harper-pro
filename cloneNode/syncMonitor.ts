@@ -9,8 +9,8 @@ export type SyncCheckResult = {
 };
 
 /**
- * Check whether every database with a target timestamp has caught up, and report the freshest
- * arrival stamp among the databases that have not.
+ * Check whether every database has caught up with the leader, and report the freshest arrival
+ * stamp among the databases that have not.
  *
  * Completion and liveness are deliberately separate signals: `lastReceivedVersion` is frozen for the
  * whole bulk copy (it jumps to copyStartTime only on the post-copy end_txn), so it can only answer
@@ -50,13 +50,17 @@ export async function checkSyncStatus(
 
 	let syncComplete = true;
 	let latestReceivedMs = 0;
+	const socketDatabases = new Set<string>();
 	for (const socket of leaderConnection.database_sockets) {
 		const dbName = socket.database;
-		const targetTime = targetTimestamps[dbName];
-		if (!targetTime) {
-			log(`Database ${dbName}: No target timestamp, skipping sync check`, 'debug');
-			continue;
-		}
+		socketDatabases.add(dbName);
+		// A missing target — an empty database, or a leader whose describe cannot report
+		// last_updated_record (RocksDB, harper#2091) — must not skip verification, or the check
+		// passes vacuously when every target is absent (#655). The received-version watermark is
+		// held at 0 for the whole bulk copy and only becomes positive via the final end_txn the
+		// sender emits at copyStartTime, so a positive watermark is the copy's own completion
+		// signal, independent of the leader's describe support.
+		const targetTime = targetTimestamps[dbName] || 1;
 
 		// Raw version (high-precision float64) preserves the sub-millisecond precision needed for
 		// an accurate comparison against the leader's last_updated_record targets.
@@ -81,6 +85,17 @@ export async function checkSyncStatus(
 		// for a minutes-scale window, and Number.isFinite drops undefined/unparseable values.
 		const receivedAt = socket.lastReceivedLocalTime ? Date.parse(socket.lastReceivedLocalTime) : NaN;
 		if (Number.isFinite(receivedAt) && receivedAt > latestReceivedMs) latestReceivedMs = receivedAt;
+	}
+
+	// A database with a target but no socket yet (its subscription is still registering with the
+	// main thread) is pending, not verified — otherwise a lone early socket (e.g. the system DB,
+	// whose small copy finishes in seconds) could complete the check before the data databases'
+	// sockets even appear.
+	for (const dbName in targetTimestamps) {
+		if (!socketDatabases.has(dbName)) {
+			log(`Database ${dbName}: no replication socket to the leader yet`, 'debug');
+			syncComplete = false;
+		}
 	}
 
 	return { syncComplete, latestReceivedMs };

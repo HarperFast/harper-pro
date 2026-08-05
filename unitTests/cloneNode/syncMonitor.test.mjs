@@ -1,9 +1,11 @@
 /**
  * Coverage for the clone sync monitor. Completion = every database's received version reaches the
- * leader's target. Failure is stall-based (the copy freezes the version watermark, so a total-time
- * cap would fail any clone larger than the timeout allows): the deadline slides forward only on
- * arrivals for databases still below target, so neither a synced-but-busy database nor an
- * untracked one can mask a wedged copy.
+ * leader's target — or, when the leader reports no target for a database (empty, or a RocksDB
+ * leader whose describe omits last_updated_record, harper#2091), any positive received version,
+ * which only the sender's final copy end_txn can produce (#655). Failure is stall-based (the copy
+ * freezes the version watermark, so a total-time cap would fail any clone larger than the timeout
+ * allows): the deadline slides forward only on arrivals for databases still pending, so a
+ * synced-but-busy database cannot mask a wedged copy.
  */
 import assert from 'node:assert/strict';
 import { checkSyncStatus, monitorSyncLoop } from '#src/cloneNode/syncMonitor';
@@ -63,7 +65,9 @@ describe('checkSyncStatus', () => {
 		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 9000 });
 	});
 
-	it('ignores arrivals on sockets without a target timestamp', async () => {
+	it('treats a socket without a target as pending until its watermark is positive', async () => {
+		// A no-target database is a real pending copy, not an ignorable socket: its arrivals slide
+		// the stall deadline, and only the final copy end_txn (positive watermark) completes it.
 		const result = await checkSyncStatus(
 			{ system: 1000 },
 			async () =>
@@ -74,7 +78,51 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 1000 });
+		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 8000 });
+	});
+
+	it('does not pass vacuously when every target is missing (#655 regression)', async () => {
+		// The RocksDB describe path reports last_updated_record for no table (harper#2091), so every
+		// clone target is 0. Skipping 0-target databases made the first poll succeed with zero
+		// verification, marking the clone Available seconds into a multi-GB copy.
+		const result = await checkSyncStatus(
+			{ system: 0, data: 0 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: undefined },
+					{ database: 'data', lastReceivedVersion: undefined },
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.equal(result.syncComplete, false);
+	});
+
+	it('completes a no-target database once the final copy end_txn advances its watermark', async () => {
+		const copyStartTime = 1785939110564;
+		const result = await checkSyncStatus(
+			{ system: 0, data: 0 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: copyStartTime, lastReceivedLocalTime: utc(copyStartTime) },
+					{ database: 'data', lastReceivedVersion: copyStartTime, lastReceivedLocalTime: utc(copyStartTime) },
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0 });
+	});
+
+	it('holds completion while a target database has no socket yet', async () => {
+		// The system DB's small copy can finish before the data databases' subscriptions have even
+		// registered with the main thread; a lone early socket must not complete the check.
+		const result = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () => statusResponse([{ database: 'system', lastReceivedVersion: 1500, lastReceivedLocalTime: utc(1000) }]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.equal(result.syncComplete, false);
 	});
 
 	it('ignores arrivals on already-synced databases (wedged-copy regression)', async () => {
@@ -225,6 +273,30 @@ describe('monitorSyncLoop', () => {
 		});
 		assert.equal(outcome, 'stalled');
 		assert.equal(clock.now(), 12000);
+	});
+
+	it('waits through a copy with no targets and completes on the final end_txn (#655)', async () => {
+		const clock = fakeClock();
+		// All-zero targets (RocksDB leader, harper#2091): the loop must poll through the whole copy —
+		// arrivals sliding the deadline past the stall window — and complete only when the watermark
+		// turns positive, never on the first poll.
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 0, data: 0 },
+			clusterStatus: async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: 500, lastReceivedLocalTime: utc(clock.now()) },
+					clock.now() < 25000
+						? { database: 'data', lastReceivedVersion: undefined, lastReceivedLocalTime: utc(clock.now()) }
+						: { database: 'data', lastReceivedVersion: 30000, lastReceivedLocalTime: utc(clock.now()) },
+				]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'synced');
+		assert.ok(clock.now() >= 25000, 'loop must have run well past the stall window');
 	});
 
 	it('stalls out when the cluster status check never settles', async () => {
