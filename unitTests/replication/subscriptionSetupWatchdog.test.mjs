@@ -1,5 +1,4 @@
 import assert from 'node:assert';
-// Only for the fake-timer seam, as in receiveWatchdog.test.mjs / pauseStallWatchdog.test.mjs.
 import sinon from 'sinon';
 import {
 	awaitWithTimeout,
@@ -228,9 +227,9 @@ describe('createSubscriptionSetupWatchdog', () => {
 
 		watchdog.arm();
 		for (let i = 0; i < 5; i++) {
-			clock.tick(10_000); // active progress
+			clock.tick(10_000);
 			watchdog.pause();
-			clock.tick(5_000); // paused; must not count
+			clock.tick(5_000);
 			watchdog.resume();
 		}
 		assert.strictEqual(onTimeout.calls.length, 0);

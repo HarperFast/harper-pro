@@ -1,5 +1,3 @@
-// harper-pro#642: a stuck sender-side setup gate must not leave the connection ping-alive forever.
-
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
