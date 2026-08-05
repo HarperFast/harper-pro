@@ -1,11 +1,10 @@
-// harper-pro#642: a bounded setup wait must not leave the placeholder it timed out on pending.
-
 import assert from 'node:assert';
 import {
 	activeDatabaseSubscription,
 	createPendingDatabaseSubscription,
 	expirePendingDatabaseSubscription,
 	resolveSendSubscriptionSetup,
+	subscriptionForDatabase,
 } from '#src/replication/replicationConnection';
 
 const SETUP_TIMEOUT = 5;
@@ -96,6 +95,41 @@ describe('activeDatabaseSubscription', () => {
 	});
 });
 
+describe('subscriptionForDatabase', () => {
+	it('returns the registered subscription without re-registering', () => {
+		const registered = { send() {} };
+		const subscriptions = new Map([['db1', registered]]);
+
+		assert.strictEqual(subscriptionForDatabase('db1', subscriptions), registered);
+		assert.strictEqual(subscriptions.get('db1'), registered);
+	});
+
+	it('never installs a placeholder over a registration that landed after an expiry', async () => {
+		const subscriptions = new Map();
+		const retired = createPendingDatabaseSubscription('db1', subscriptions);
+		expirePendingDatabaseSubscription('db1', retired, subscriptions);
+		const registered = { send() {} };
+		subscriptions.set('db1', registered);
+
+		// The request handler's path when its cached reference is the retired placeholder.
+		assert.strictEqual(
+			activeDatabaseSubscription(retired) ?? subscriptionForDatabase('db1', subscriptions),
+			registered
+		);
+		assert.strictEqual(subscriptions.get('db1'), registered);
+	});
+
+	it('registers a fresh placeholder when nothing is registered', async () => {
+		const subscriptions = new Map();
+		const placeholder = subscriptionForDatabase('db1', subscriptions);
+
+		assert.strictEqual(subscriptions.get('db1'), placeholder);
+		const registered = { send() {} };
+		placeholder.ready(registered);
+		assert.strictEqual(await placeholder, registered);
+	});
+});
+
 describe('persistent setup mismatch', () => {
 	it('does not accumulate waiters on one retained promise across retries', async () => {
 		const subscriptions = new Map();
@@ -115,7 +149,6 @@ describe('persistent setup mismatch', () => {
 
 		assert.strictEqual(failures.length, 5);
 		assert.deepStrictEqual(failures[0], ['database', 'timeout']);
-		// A retry must not re-race the promise the previous attempt already gave up on.
 		assert.strictEqual(new Set(placeholders).size, 5);
 		assert.strictEqual(subscriptions.has('db1'), false);
 		assert.strictEqual(await whenAllSettled(placeholders), 'settled');
