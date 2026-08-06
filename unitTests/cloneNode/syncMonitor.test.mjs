@@ -287,6 +287,42 @@ describe('monitorSyncLoop', () => {
 		assert.equal(checks, 1, 'must check exactly once, not zero times, before giving up');
 	});
 
+	it('reports stalled, not unconverged, when the one mandatory check at a spent ceiling times out', async () => {
+		const clock = fakeClock();
+		// The check never resolves — same shape as a wedged status pipeline — so the mandatory first
+		// check times out rather than getting a definite answer. That is not evidence of
+		// non-convergence, so this must not report 'unconverged' (which the caller treats as
+		// terminal and clears the resume marker for).
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: () => new Promise(() => {}),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			maxDurationMs: 0,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'stalled');
+	});
+
+	it('reports stalled, not unconverged, when the one mandatory check at a spent ceiling errors', async () => {
+		const clock = fakeClock();
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: async () => {
+				throw new Error('cluster status unavailable');
+			},
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			maxDurationMs: 0,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'stalled');
+	});
+
 	it('stalls out when the cluster status check never settles', async () => {
 		const clock = fakeClock();
 		const outcome = await monitorSyncLoop({

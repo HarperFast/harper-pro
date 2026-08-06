@@ -254,15 +254,6 @@ export async function cloneNode(): Promise<void> {
 		clearSyncStartedMarker();
 		resumeMarker = undefined;
 	}
-	if (resumeMarker && !resumeMarker.targetTimestamps) {
-		// Predates target-timestamp persistence (a marker from an older build, or a torn write) —
-		// there is nothing to resume monitoring with, so fail closed to a full attempt rather than
-		// limping into monitorSync with no targets and getting stuck failing forever.
-		log('Clone sync marker is missing its target snapshot; running full clone setup');
-		clearSyncStartedMarker();
-		resumeMarker = undefined;
-	}
-
 	if (!usingCertAuth && !resumeMarker) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
 		// Cannot check if cloning with WS - module initialization order prevents access to required variables
@@ -294,33 +285,32 @@ export async function cloneNode(): Promise<void> {
 	let syncStartedAt: number;
 
 	if (resumeMarker) {
-		// Only the marker holds the URL replication was established on, and checkSyncStatus matches it
-		// exactly — the heuristic URL this would otherwise keep is wrong for a TLS-only leader. Reuse
-		// its pinned targets/size rather than asking the leader again: the leader may have moved on
-		// (new writes shift the target) or the auth used for setup may no longer be valid, and neither
-		// should disturb a wait already in progress.
+		// checkSyncStatus matches leaderReplicationURL exactly, and only the marker holds the value
+		// refined against a TLS-only (e.g. v4) leader.
 		leaderReplicationURL = resumeMarker.leaderReplicationURL ?? leaderReplicationURL;
 		targetTimestamps = resumeMarker.targetTimestamps;
 		totalBytes = resumeMarker.totalBytes ?? 0;
 		syncStartedAt = resumeMarker.startedAt ?? Date.now();
 		log(`Clone sync already in progress; replication already established with ${leaderReplicationURL}`);
 
+		if (!targetTimestamps) {
+			// setNode() succeeded but the leader snapshot fetch below didn't finish before the last
+			// crash. Replication is already established, so retry only the fetch, not establishReplicationSetup.
+			({ targetTimestamps, totalBytes } = await getLastUpdatedRecord());
+			writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, false);
+		}
+
 		if (!resumeMarker.setupComplete) {
-			// Crashed after setNode() succeeded but before JWT/custody/SSH key cloning finished.
-			// Replication is already established — re-running establishReplicationSetup would redo the
-			// component re-extract + npm install and tear down the replication boot via restartWorkers —
-			// so only resume the remaining (idempotent) stages before entering the wait.
-			log('Resuming remaining clone setup (JWT/custody/SSH keys) before monitoring sync');
 			if (!(await finishCloneSetup())) return;
 			writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, true);
 		}
 	} else {
 		await establishReplicationSetup();
 		syncStartedAt = Date.now();
+		// Persisted before the leader snapshot fetch below: a crash during that fetch must resume
+		// here (retry the fetch only) rather than repeat establishReplicationSetup.
+		writeSyncStartedMarker(syncStartedAt, undefined, 0, false);
 
-		// Snapshot the leader's current targets and on-disk size as soon as replication is established;
-		// this snapshot — and the fact that replication no longer needs to be (re-)established — rides
-		// the marker across any future resumes instead of being fetched/redone again.
 		({ targetTimestamps, totalBytes } = await getLastUpdatedRecord());
 		writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, false);
 
@@ -389,11 +379,9 @@ export async function cloneNode(): Promise<void> {
 }
 
 /**
- * First half of one-time clone setup — everything up to and including `setNode()`, i.e. the leader
- * accepting this node and starting to push data. Must not be repeated once `setNode()` succeeds: a
- * resumed clone that redid this would re-extract components, `npm install`, and tear down the
- * replication boot it just resumed via `restartWorkers`. Failures here throw uncaught — the clone
- * is not viable and there is nothing graceful to fall back to before replication exists.
+ * First half of one-time clone setup, through `setNode()` accepting this node onto the leader.
+ * Must never be repeated once that succeeds (component re-extract, `npm install`, and a
+ * `restartWorkers` that would tear down the replication just resumed). Failures throw uncaught.
  */
 async function establishReplicationSetup(): Promise<void> {
 	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
@@ -481,13 +469,17 @@ async function establishReplicationSetup(): Promise<void> {
 }
 
 /**
- * Second half of one-time clone setup — JWT, custody, and SSH key cloning. These run after
- * `setNode()` has already started the bulk copy, are individually idempotent (each overwrites
- * rather than appends), and are safe to resume on their own: a restart that finds replication
- * already established but this half incomplete re-runs only this half, not `establishReplicationSetup`.
- * Returns false when the clone is not viable (Harper keeps running, Unavailable and not marked cloned).
+ * Second half of one-time clone setup: JWT, custody, and SSH key cloning, idempotent so a resume
+ * can re-run just this half. Returns false when the clone is not viable (Harper keeps running,
+ * Unavailable and not marked cloned).
  */
 async function finishCloneSetup(): Promise<boolean> {
+	// Test hook: this half normally finishes in milliseconds, too fast for a test to reliably catch
+	// the marker with setupComplete still false. Holds the resume-only-the-remaining-stages window
+	// open long enough to interrupt deterministically.
+	const simulatedDelayMs = parseInt(process.env.CLONE_SIMULATE_SETUP_DELAY_MS, 10);
+	if (simulatedDelayMs > 0) await sleep(simulatedDelayMs);
+
 	try {
 		await cloneJWTKeys();
 	} catch (err) {
@@ -517,18 +509,12 @@ async function finishCloneSetup(): Promise<boolean> {
 }
 
 /**
- * Marker written as soon as `setNode()` succeeds, so a restart never repeats `establishReplicationSetup`
- * (full app re-install, worker restart under replication that's already resuming) — the largest
- * remaining crash window this PR closes. It carries the replication URL because that is refined
- * from the leader's own config (v4 leaders are TLS-only) and checkSyncStatus matches it exactly
- * against cluster_status. It also pins the targets and ceiling basis fetched from the leader at
- * that same point: a resume reuses that snapshot rather than re-fetching (the leader's own data may
- * have moved on, and re-auth can fail if a token expired while this node was down) — only a
- * genuinely new attempt refreshes them. `setupComplete` distinguishes "replication established,
- * JWT/custody/SSH keys still pending" from "fully done, go straight to monitoring" — a resume that
- * finds it false re-runs only `finishCloneSetup` (idempotent) rather than skipping straight to the
- * wait, and a resume that finds it true must NOT re-run key cloning (it would rewrite the JWT keys
- * on every restart during a long wait).
+ * Marker written once `setNode()` succeeds, so a restart never repeats `establishReplicationSetup`.
+ * `leaderReplicationURL` is the leader-config-refined value checkSyncStatus matches exactly against
+ * cluster_status (the heuristic URL is wrong for a TLS-only leader). `targetTimestamps`/`totalBytes`
+ * pin the leader snapshot a resume reuses instead of re-fetching; absent until that fetch succeeds.
+ * `setupComplete` is false until `finishCloneSetup` (JWT/custody/SSH keys) also finishes — a resume
+ * re-runs exactly whichever of the fetch or `finishCloneSetup` didn't complete, never `setNode()`.
  */
 type SyncStartedMarker = {
 	leaderURL?: string;
@@ -547,7 +533,7 @@ function syncStartedMarkerPath(): string {
 // the full setup path.
 function writeSyncStartedMarker(
 	startedAt: number,
-	targetTimestamps: Record<string, number>,
+	targetTimestamps: Record<string, number> | undefined,
 	totalBytes: number,
 	setupComplete: boolean
 ): void {

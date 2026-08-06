@@ -273,17 +273,27 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 	test('a restart caught between replication setup and finishing key cloning does not redo replication setup', async () => {
 		const partialCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		ctx.partialCtx = partialCtx;
-		const options = cloneOptionsFor(partialCtx, await leaderToken());
-		await startHarper(partialCtx, options);
+		// finishCloneSetup (JWT/custody/SSH keys) normally finishes in milliseconds — too fast for the
+		// 25ms marker poll below to reliably land before setupComplete flips true. The delay hook holds
+		// that window open so this test deterministically exercises the setupComplete:false resume path
+		// instead of vacuously passing via the already-covered setupComplete:true path.
+		const firstBootOptions = cloneOptionsFor(partialCtx, await leaderToken(), {
+			CLONE_SIMULATE_SETUP_DELAY_MS: 3000,
+		});
+		await startHarper(partialCtx, firstBootOptions);
 
-		// Catch the marker at its FIRST appearance — written as soon as setNode() succeeds, which is
-		// before JWT/custody/SSH key cloning necessarily finishes. This is the crash window the marker
-		// split closes: replication is already established, so a resume from here must not repeat it.
-		await waitForMarker(partialCtx.harper.dataRootDir);
+		const markerPath = await waitForMarker(partialCtx.harper.dataRootDir);
+		const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+		equal(
+			marker.setupComplete,
+			false,
+			'must catch the marker before key cloning finishes to exercise this resume path'
+		);
 		const configPath = join(partialCtx.harper.dataRootDir, 'harper-config.yaml');
 		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
 		await killHarper(partialCtx);
-		await startHarper(partialCtx, options);
+		// Resume without the delay hook so finishCloneSetup actually completes this time.
+		await startHarper(partialCtx, cloneOptionsFor(partialCtx, await leaderToken()));
 
 		await waitForAvailableStatus(partialCtx.harper);
 		equal(

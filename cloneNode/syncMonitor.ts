@@ -107,10 +107,10 @@ export type MonitorSyncLoopOptions = {
  * `maxDurationMs`. Errors from the status check do not count as progress, so a wedged status
  * pipeline still stalls out.
  *
- * Always performs at least one check before enforcing either deadline: `maxDurationMs` can arrive
- * already elapsed (a resumed clone's ceiling is relative to when the wait first began, not this
- * process start), and a bare deadline check with zero checks would call that `unconverged` even if
- * replication had actually converged in the meantime.
+ * Always performs at least one check before enforcing either deadline — `maxDurationMs` can arrive
+ * already elapsed on a resume — and only reports `unconverged` if that check (or a later one)
+ * actually got a definite answer; a check that merely timed out or errored reports `stalled`
+ * instead, so a transient blip can't erase resumable state.
  */
 export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<'synced' | 'stalled' | 'unconverged'> {
 	const now = options.now ?? Date.now;
@@ -120,6 +120,9 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 	let lastProgressAt = startedAt;
 	let loopCount = 0;
 	let firstCheck = true;
+	// Only a check that actually got a response (complete or not) counts as "we looked and it
+	// isn't done yet" — a timeout or thrown error is no information, not evidence of non-convergence.
+	let gotDefiniteCheck = false;
 
 	while (firstCheck || (now() - lastProgressAt < options.stallTimeoutMs && now() - startedAt < maxDurationMs)) {
 		firstCheck = false;
@@ -148,6 +151,7 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 			const { syncComplete, latestReceivedMs } = result;
 
 			if (syncComplete) return 'synced';
+			gotDefiniteCheck = true;
 
 			if (latestReceivedMs > lastProgressAt) lastProgressAt = latestReceivedMs;
 
@@ -166,5 +170,5 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 		await delay(options.checkIntervalMs);
 	}
 
-	return now() - startedAt >= maxDurationMs ? 'unconverged' : 'stalled';
+	return gotDefiniteCheck && now() - startedAt >= maxDurationMs ? 'unconverged' : 'stalled';
 }
