@@ -1153,7 +1153,7 @@ export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() 
 } {
 	let timer: NodeJS.Timeout | undefined;
 	let pending = false;
-	let paused = false;
+	let pauseDepth = 0;
 	// Remaining budget (ms) for the current pending window, consumed as time elapses. Only `arm()`
 	// resets it to a full window (a superseding request); `pause()`/`resume()` preserve whatever was
 	// left, so a link with recurring, short back-pressure pauses can't keep re-granting a full window
@@ -1173,7 +1173,7 @@ export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() 
 	};
 	const schedule = () => {
 		clearTimer();
-		if (!pending || paused) return;
+		if (!pending || pauseDepth > 0) return;
 		scheduledAt = performance.now(); // monotonic — immune to wall-clock adjustments
 		timer = setTimeout(fire, remainingMs).unref();
 	};
@@ -1188,19 +1188,17 @@ export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() 
 			clearTimer();
 		},
 		pause() {
-			if (paused) return;
+			if (pauseDepth++ > 0) return;
 			if (pending && timer) remainingMs = Math.max(0, remainingMs - (performance.now() - scheduledAt));
-			paused = true;
 			clearTimer();
 		},
 		resume() {
-			if (!paused) return;
-			paused = false;
+			if (pauseDepth === 0 || --pauseDepth > 0) return;
 			schedule();
 		},
 		stop() {
 			pending = false;
-			paused = false;
+			pauseDepth = 0;
 			clearTimer();
 		},
 	};
@@ -2108,6 +2106,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// (received-version watermark suppressed) and it could never reach Available.
 			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
+			subscriptionSetupWatchdog?.resume();
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 			pendingCopyCursor = null;
@@ -2739,6 +2738,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	 * then abandon the message rather than fall through to a `.send()`.
 	 */
 	async function whenSubscriptionResolved(): Promise<boolean> {
+		if (tableSubscriptionToReplicator?.retired)
+			tableSubscriptionToReplicator = subscriptionForConnection(
+				tableSubscriptionToReplicator,
+				databaseName,
+				dbSubscriptions
+			);
 		if (!tableSubscriptionToReplicator?.then) return true;
 		// Socket intake is paused for the duration of the wait — see awaitPendingSubscription. Liveness while
 		// paused belongs to the pause-stall watchdog, whose threshold is floored above
@@ -3044,6 +3049,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					case COPY_START:
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
 						inCopyMode = true;
+						subscriptionSetupWatchdog?.pause();
 						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
 						copiedTablesThisPass.clear(); // reset per-pass reload-marker tracking (harper-pro#495)
 						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)

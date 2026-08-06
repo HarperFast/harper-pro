@@ -239,6 +239,24 @@ describe('createSubscriptionSetupWatchdog', () => {
 		assert.strictEqual(onTimeout.calls.length, 1);
 	});
 
+	it('preserves setup budget through copy and nested back-pressure pauses', () => {
+		const onTimeout = counter();
+		const watchdog = createSubscriptionSetupWatchdog({ timeoutMs: 60_000, onTimeout });
+
+		watchdog.arm();
+		clock.tick(10_000);
+		watchdog.pause();
+		clock.tick(60_000);
+		watchdog.pause();
+		watchdog.resume();
+		clock.tick(60_000);
+		assert.strictEqual(onTimeout.calls.length, 0);
+
+		watchdog.resume();
+		clock.tick(50_000);
+		assert.strictEqual(onTimeout.calls.length, 1);
+	});
+
 	it('does not rearm on resume after setup completed while paused', () => {
 		const onTimeout = counter();
 		const watchdog = createSubscriptionSetupWatchdog({ timeoutMs: 60_000, onTimeout });
