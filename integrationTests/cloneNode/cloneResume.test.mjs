@@ -291,6 +291,11 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		);
 		const configPath = join(partialCtx.harper.dataRootDir, 'harper-config.yaml');
 		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
+		// installHarper() already wrote a self-generated .jwtPass before cloneNode reached the delay
+		// hook, so its mere existence wouldn't prove anything — an mtime change is what shows
+		// cloneJWTKeys actually ran (and overwrote it) during the resume, not just that install did.
+		const jwtPassPath = join(partialCtx.harper.dataRootDir, 'keys', '.jwtPass');
+		const jwtMtimeBeforeRestart = statSync(jwtPassPath).mtimeMs;
 		await killHarper(partialCtx);
 		// Resume without the delay hook so finishCloneSetup actually completes this time.
 		await startHarper(partialCtx, cloneOptionsFor(partialCtx, await leaderToken()));
@@ -301,10 +306,10 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			configMtimeBeforeRestart,
 			'resume must not redo replication setup — setNode()/cloneConfig() only run on a fresh attempt'
 		);
-		// The kill landed before finishCloneSetup wrote anything (it was still in the delay hook), so
-		// the JWT key existing now proves the resume actually ran the remaining stages, not just that
-		// replication converged on its own.
-		ok(existsSync(join(partialCtx.harper.dataRootDir, 'keys', '.jwtPass')), 'resume must still clone the JWT keys');
+		ok(
+			statSync(jwtPassPath).mtimeMs > jwtMtimeBeforeRestart,
+			'resume must still clone the JWT keys — setupComplete was false when killed'
+		);
 		let finalCount = -1;
 		for (let retries = 0; retries < 60; retries++) {
 			finalCount = await countRows(partialCtx.harper);
