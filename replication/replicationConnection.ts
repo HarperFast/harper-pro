@@ -2444,7 +2444,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	subscriptionSetupWatchdog = createSubscriptionSetupWatchdog({
 		timeoutMs: () => subscriptionSetupTimeoutMs,
 		onTimeout: () => {
-			if (wsClosed) return;
+			if (wsClosed || inCopyMode) return;
 			pendingSubscriptionSetupRequestId = undefined;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
@@ -3467,6 +3467,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												close(1008, `Unauthorized database subscription to ${databaseName}`);
 												return;
 											}
+										}
+										if (!closed && !wsClosed) {
+											closed = true;
+											close(1011, `Replication authorization watch ended for ${databaseName}`);
 										}
 									})
 									.catch((error) => {
@@ -5471,7 +5475,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	}
 	function setDatabase(databaseName) {
 		tableSubscriptionToReplicator =
-			activeDatabaseSubscription(tableSubscriptionToReplicator) || dbSubscriptions.get(databaseName);
+			activeDatabaseSubscription(tableSubscriptionToReplicator) ??
+			activeDatabaseSubscription(dbSubscriptions.get(databaseName));
 		if (!checkDatabaseAccess(databaseName)) {
 			throw new Error(`Access to database "${databaseName}" is not permitted`);
 		}
