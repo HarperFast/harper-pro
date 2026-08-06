@@ -383,9 +383,9 @@ suite(
 					// Concurrently: resume write load on the leader, flood the follower's own admin
 					// API (main-thread IPC pressure), and tight-poll cluster_status for convergence --
 					// all in the foreground of this same async function, run together via Promise.all.
-					// This marker is deliberately written while reconnection is still in flight. Verify it
-					// before sending the existing post-convergence marker, so a later write cannot hide a
-					// sender that missed the audit-tail wakeup during catch-up.
+					// This marker is deliberately written while reconnection is still in flight. It covers
+					// a write during catch-up; the post-convergence marker below remains the isolated
+					// check that a later write cannot hide a missed audit-tail wakeup.
 					const inFlightMarker = `post${cycle}-in-flight-${Date.now()}`;
 					const inFlightMarkerPromise = Promise.all(
 						DB_NAMES.map((db) =>
