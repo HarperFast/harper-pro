@@ -254,6 +254,14 @@ export async function cloneNode(): Promise<void> {
 		clearSyncStartedMarker();
 		resumeMarker = undefined;
 	}
+	if (resumeMarker && !resumeMarker.targetTimestamps) {
+		// Predates target-timestamp persistence (a marker from an older build, or a torn write) —
+		// there is nothing to resume monitoring with, so fail closed to a full attempt rather than
+		// limping into monitorSync with no targets and getting stuck failing forever.
+		log('Clone sync marker is missing its target snapshot; running full clone setup');
+		clearSyncStartedMarker();
+		resumeMarker = undefined;
+	}
 
 	if (!usingCertAuth && !resumeMarker) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
@@ -281,22 +289,49 @@ export async function cloneNode(): Promise<void> {
 	logger.initLogSettings();
 	harperLogger = logger.loggerWithTag('cloneNode');
 
+	let targetTimestamps: Record<string, number> | undefined;
+	let totalBytes = 0;
+	let syncStartedAt: number;
+
 	if (resumeMarker) {
 		// Only the marker holds the URL replication was established on, and checkSyncStatus matches it
-		// exactly — the heuristic URL this would otherwise keep is wrong for a TLS-only leader.
+		// exactly — the heuristic URL this would otherwise keep is wrong for a TLS-only leader. Reuse
+		// its pinned targets/size rather than asking the leader again: the leader may have moved on
+		// (new writes shift the target) or the auth used for setup may no longer be valid, and neither
+		// should disturb a wait already in progress.
 		leaderReplicationURL = resumeMarker.leaderReplicationURL ?? leaderReplicationURL;
-		log(`Clone sync already in progress; skipping clone setup and monitoring sync on ${leaderReplicationURL}`);
-	} else if (!(await establishCloneSetup())) return;
+		targetTimestamps = resumeMarker.targetTimestamps;
+		totalBytes = resumeMarker.totalBytes ?? 0;
+		syncStartedAt = resumeMarker.startedAt ?? Date.now();
+		log(`Clone sync already in progress; replication already established with ${leaderReplicationURL}`);
 
-	// The wait's start survives restarts via the marker, so the absolute ceiling bounds the clone's
-	// total wall time rather than granting every restart a fresh budget.
-	const syncStartedAt: number = resumeMarker?.startedAt ?? Date.now();
-	if (!resumeMarker) writeSyncStartedMarker(syncStartedAt);
+		if (!resumeMarker.setupComplete) {
+			// Crashed after setNode() succeeded but before JWT/custody/SSH key cloning finished.
+			// Replication is already established — re-running establishReplicationSetup would redo the
+			// component re-extract + npm install and tear down the replication boot via restartWorkers —
+			// so only resume the remaining (idempotent) stages before entering the wait.
+			log('Resuming remaining clone setup (JWT/custody/SSH keys) before monitoring sync');
+			if (!(await finishCloneSetup())) return;
+			writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, true);
+		}
+	} else {
+		await establishReplicationSetup();
+		syncStartedAt = Date.now();
+
+		// Snapshot the leader's current targets and on-disk size as soon as replication is established;
+		// this snapshot — and the fact that replication no longer needs to be (re-)established — rides
+		// the marker across any future resumes instead of being fetched/redone again.
+		({ targetTimestamps, totalBytes } = await getLastUpdatedRecord());
+		writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, false);
+
+		if (!(await finishCloneSetup())) return;
+		writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, true);
+	}
 
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
 	// once sync is confirmed and availability has been published as Available — a timeout or failure
 	// must not be treated as success.
-	const syncOutcome = await monitorSync(syncStartedAt);
+	const syncOutcome = await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
 	if (syncOutcome === 'failed') {
 		// Return (don't throw) so Harper stays running and queryable. Clear `cloned` explicitly: a
 		// forced reclone has already carried the previous `cloned: true` into the rewritten config.
@@ -354,10 +389,13 @@ export async function cloneNode(): Promise<void> {
 }
 
 /**
- * One-time clone setup — everything that must not be repeated once the sync wait has begun. Returns
- * false when the clone is not viable (Harper keeps running, Unavailable and not marked cloned).
+ * First half of one-time clone setup — everything up to and including `setNode()`, i.e. the leader
+ * accepting this node and starting to push data. Must not be repeated once `setNode()` succeeds: a
+ * resumed clone that redid this would re-extract components, `npm install`, and tear down the
+ * replication boot it just resumed via `restartWorkers`. Failures here throw uncaught — the clone
+ * is not viable and there is nothing graceful to fall back to before replication exists.
  */
-async function establishCloneSetup(): Promise<boolean> {
+async function establishReplicationSetup(): Promise<void> {
 	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
 	const leaderConfigData = await cloneConfig();
 
@@ -440,7 +478,16 @@ async function establishCloneSetup(): Promise<boolean> {
 	log('Sending set node request to leader to establish replication and trigger data sync');
 	const setNodeResponse = await setNode(setNodeRequest);
 	log(`Response from set node: ${setNodeResponse}`);
+}
 
+/**
+ * Second half of one-time clone setup — JWT, custody, and SSH key cloning. These run after
+ * `setNode()` has already started the bulk copy, are individually idempotent (each overwrites
+ * rather than appends), and are safe to resume on their own: a restart that finds replication
+ * already established but this half incomplete re-runs only this half, not `establishReplicationSetup`.
+ * Returns false when the clone is not viable (Harper keeps running, Unavailable and not marked cloned).
+ */
+async function finishCloneSetup(): Promise<boolean> {
 	try {
 		await cloneJWTKeys();
 	} catch (err) {
@@ -470,22 +517,51 @@ async function establishCloneSetup(): Promise<boolean> {
 }
 
 /**
- * Marker written when the sync wait begins, so a restart resumes the wait instead of redoing setup.
- * It carries the replication URL because that is refined from the leader's own config (v4 leaders
- * are TLS-only) and checkSyncStatus matches it exactly against cluster_status.
+ * Marker written as soon as `setNode()` succeeds, so a restart never repeats `establishReplicationSetup`
+ * (full app re-install, worker restart under replication that's already resuming) — the largest
+ * remaining crash window this PR closes. It carries the replication URL because that is refined
+ * from the leader's own config (v4 leaders are TLS-only) and checkSyncStatus matches it exactly
+ * against cluster_status. It also pins the targets and ceiling basis fetched from the leader at
+ * that same point: a resume reuses that snapshot rather than re-fetching (the leader's own data may
+ * have moved on, and re-auth can fail if a token expired while this node was down) — only a
+ * genuinely new attempt refreshes them. `setupComplete` distinguishes "replication established,
+ * JWT/custody/SSH keys still pending" from "fully done, go straight to monitoring" — a resume that
+ * finds it false re-runs only `finishCloneSetup` (idempotent) rather than skipping straight to the
+ * wait, and a resume that finds it true must NOT re-run key cloning (it would rewrite the JWT keys
+ * on every restart during a long wait).
  */
+type SyncStartedMarker = {
+	leaderURL?: string;
+	leaderReplicationURL?: string;
+	startedAt?: number;
+	targetTimestamps?: Record<string, number>;
+	totalBytes?: number;
+	setupComplete?: boolean;
+};
+
 function syncStartedMarkerPath(): string {
 	return join(rootPath, 'tmp', 'clone-sync-started.json');
 }
 
 // writeJsonSync logs and swallows write failures; losing the marker only costs a future restart
 // the full setup path.
-function writeSyncStartedMarker(startedAt: number): void {
-	writeJsonSync(syncStartedMarkerPath(), { leaderURL, leaderReplicationURL, startedAt });
+function writeSyncStartedMarker(
+	startedAt: number,
+	targetTimestamps: Record<string, number>,
+	totalBytes: number,
+	setupComplete: boolean
+): void {
+	writeJsonSync(syncStartedMarkerPath(), {
+		leaderURL,
+		leaderReplicationURL,
+		startedAt,
+		targetTimestamps,
+		totalBytes,
+		setupComplete,
+	});
 }
 
-function readSyncStartedMarker():
-	{ leaderURL?: string; leaderReplicationURL?: string; startedAt?: number } | undefined {
+function readSyncStartedMarker(): SyncStartedMarker | undefined {
 	try {
 		return JSON.parse(readFileSync(syncStartedMarkerPath(), 'utf8'));
 	} catch {
@@ -521,8 +597,16 @@ type SyncOutcome = 'synced' | 'skipped' | 'failed';
  * Polls at regular intervals until sync completes, failing only on a stall — the deadline slides
  * forward whenever replication data arrives — plus an absolute ceiling sized from the leader's
  * reported bytes, so a copy that keeps receiving without converging still reaches a verdict.
+ *
+ * `targetTimestamps`/`totalBytes` are the snapshot taken when the wait began (fresh attempt) or
+ * pinned in the resume marker (restart) — the caller decides which; this function never talks to
+ * the leader itself.
  */
-async function monitorSync(syncStartedAt: number): Promise<SyncOutcome> {
+async function monitorSync(
+	syncStartedAt: number,
+	targetTimestamps: Record<string, number> | undefined,
+	totalBytes: number
+): Promise<SyncOutcome> {
 	const { set: setStatus } = await import('../core/server/status/index.js');
 
 	if (skipSyncMonitor) {
@@ -554,9 +638,6 @@ async function monitorSync(syncStartedAt: number): Promise<SyncOutcome> {
 		return 'failed';
 	}
 
-	// Get last updated record timestamps for all DB and write to file
-	// These values can be used for checking when the clone replication has caught up with the leader
-	const { targetTimestamps, totalBytes } = await getLastUpdatedRecord();
 	if (!targetTimestamps || Object.keys(targetTimestamps).length === 0) {
 		log('No target timestamps available to check synchronization status; leaving availability Unavailable', 'error');
 		return 'failed';
@@ -611,6 +692,11 @@ async function monitorSync(syncStartedAt: number): Promise<SyncOutcome> {
 			`Replication data is still arriving after ${Math.round(maxDurationMs / 1000)}s but one or more databases never reached the leader's targets; giving up — leaving availability Unavailable and not marking node as cloned`,
 			'error'
 		);
+		// The ceiling itself (not a transient stall) is what was exhausted, so the budget can never
+		// recover on a later restart — every future start would repeat this exact verdict forever.
+		// Clear the marker so the next start is a genuinely new attempt with a fresh ceiling, rather
+		// than a resume permanently pinned to a spent one.
+		clearSyncStartedMarker();
 		return 'failed';
 	}
 

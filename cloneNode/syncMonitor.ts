@@ -106,6 +106,11 @@ export type MonitorSyncLoopOptions = {
  * `stallTimeoutMs`, so a healthy clone is never timed out for being large) or on exceeding
  * `maxDurationMs`. Errors from the status check do not count as progress, so a wedged status
  * pipeline still stalls out.
+ *
+ * Always performs at least one check before enforcing either deadline: `maxDurationMs` can arrive
+ * already elapsed (a resumed clone's ceiling is relative to when the wait first began, not this
+ * process start), and a bare deadline check with zero checks would call that `unconverged` even if
+ * replication had actually converged in the meantime.
  */
 export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<'synced' | 'stalled' | 'unconverged'> {
 	const now = options.now ?? Date.now;
@@ -114,8 +119,10 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 	const startedAt = now();
 	let lastProgressAt = startedAt;
 	let loopCount = 0;
+	let firstCheck = true;
 
-	while (now() - lastProgressAt < options.stallTimeoutMs && now() - startedAt < maxDurationMs) {
+	while (firstCheck || (now() - lastProgressAt < options.stallTimeoutMs && now() - startedAt < maxDurationMs)) {
+		firstCheck = false;
 		try {
 			// Bound each status check by the poll interval: clusterStatus's worker path resolves only
 			// when a cluster-status reply message arrives, so an unbounded await would hang this loop
