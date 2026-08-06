@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785928953444,
+  "lastUpdate": 1786015689012,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -2703,6 +2703,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 1800.32,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "dcfd505bb675f0ddc6ac5ae5f66525c3959477b4",
+          "message": "ci: fix retry.sh unbound-variable edge case, raise integration job budgets\n\nIndependent pre-push review found two issues:\n- retry.sh read $1 as the label before checking $#, so a zero-arg call\n  hit bash's \"unbound variable\" error under set -u instead of the\n  intended usage diagnostic. Check $# first.\n- run-integration-tests/run-cluster-tests kept their pre-existing\n  15-minute timeout even though each now runs two sequential retry.sh\n  calls that can burn up to 3 minutes of backoff apiece before\n  succeeding on the last attempt. Raise both to 25 minutes.\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-30T16:00:42Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/dcfd505bb675f0ddc6ac5ae5f66525c3959477b4"
+        },
+        "date": 1786015687712,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 10614.84,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 21138.93,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 14347.11,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 5104.76,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 3791.3,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 1473.54,
             "unit": "ops/sec"
           }
         ]
