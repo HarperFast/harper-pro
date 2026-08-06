@@ -296,7 +296,9 @@ export async function cloneNode(): Promise<void> {
 		if (!targetTimestamps) {
 			// setNode() succeeded but the leader snapshot fetch below didn't finish before the last
 			// crash. Replication is already established, so retry only the fetch, not establishReplicationSetup.
-			({ targetTimestamps, totalBytes } = await getLastUpdatedRecord());
+			const snapshot = await fetchSyncSnapshot();
+			if (!snapshot) return;
+			({ targetTimestamps, totalBytes } = snapshot);
 			writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, false);
 		}
 
@@ -311,7 +313,9 @@ export async function cloneNode(): Promise<void> {
 		// here (retry the fetch only) rather than repeat establishReplicationSetup.
 		writeSyncStartedMarker(syncStartedAt, undefined, 0, false);
 
-		({ targetTimestamps, totalBytes } = await getLastUpdatedRecord());
+		const snapshot = await fetchSyncSnapshot();
+		if (!snapshot) return;
+		({ targetTimestamps, totalBytes } = snapshot);
 		writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, false);
 
 		if (!(await finishCloneSetup())) return;
@@ -698,6 +702,32 @@ async function monitorSync(
  * and record the most recent timestamp for each database in a JSON file.
  * @returns {Promise<void>}
  */
+/**
+ * Contained snapshot fetch: an unreachable leader or expired token must not throw out of
+ * cloneNode() and exit the already-running process (bin/harper.js exits on rejection). The marker
+ * is retained, so the next start retries only this fetch while replication keeps resuming.
+ */
+async function fetchSyncSnapshot(): Promise<
+	{ targetTimestamps: Record<string, number>; totalBytes: number } | undefined
+> {
+	try {
+		return await getLastUpdatedRecord();
+	} catch (err) {
+		const { set: setStatus } = await import('../core/server/status/index.js');
+		try {
+			await setStatus({ id: 'availability', status: 'Unavailable' });
+		} catch (statusErr) {
+			log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
+		}
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		log(
+			`Could not fetch sync targets from leader ${leaderURL} (${err}); node is running but Unavailable and not marked as cloned`,
+			'error'
+		);
+		return undefined;
+	}
+}
+
 async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string, number>; totalBytes: number }> {
 	log('Getting last updated record timestamp for all database', 'debug');
 	const lastUpdated: Record<string, number> = {};
