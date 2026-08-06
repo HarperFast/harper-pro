@@ -301,6 +301,10 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			configMtimeBeforeRestart,
 			'resume must not redo replication setup — setNode()/cloneConfig() only run on a fresh attempt'
 		);
+		// The kill landed before finishCloneSetup wrote anything (it was still in the delay hook), so
+		// the JWT key existing now proves the resume actually ran the remaining stages, not just that
+		// replication converged on its own.
+		ok(existsSync(join(partialCtx.harper.dataRootDir, 'keys', '.jwtPass')), 'resume must still clone the JWT keys');
 		let finalCount = -1;
 		for (let retries = 0; retries < 60; retries++) {
 			finalCount = await countRows(partialCtx.harper);

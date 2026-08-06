@@ -123,8 +123,9 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 	// Only a check that actually got a response (complete or not) counts as "we looked and it
 	// isn't done yet" — a timeout or thrown error is no information, not evidence of non-convergence.
 	let gotDefiniteCheck = false;
+	const deadlinePassed = () => now() - lastProgressAt >= options.stallTimeoutMs || now() - startedAt >= maxDurationMs;
 
-	while (firstCheck || (now() - lastProgressAt < options.stallTimeoutMs && now() - startedAt < maxDurationMs)) {
+	while (firstCheck || !deadlinePassed()) {
 		firstCheck = false;
 		try {
 			// Bound each status check by the poll interval: clusterStatus's worker path resolves only
@@ -145,6 +146,7 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 			]);
 			if (result === 'timed-out') {
 				options.log(`Cluster status check did not respond within ${options.checkIntervalMs}ms`);
+				if (deadlinePassed()) break;
 				await delay(options.checkIntervalMs);
 				continue;
 			}
@@ -169,7 +171,7 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 		}
 		// Skip the trailing sleep when the loop is about to exit anyway — otherwise the single
 		// mandatory check at an already-spent budget pays a full checkIntervalMs of pure latency.
-		if (now() - lastProgressAt >= options.stallTimeoutMs || now() - startedAt >= maxDurationMs) break;
+		if (deadlinePassed()) break;
 		await delay(options.checkIntervalMs);
 	}
 
