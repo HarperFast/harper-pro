@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786015689012,
+  "lastUpdate": 1786015692183,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -6241,6 +6241,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 115.66,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "dcfd505bb675f0ddc6ac5ae5f66525c3959477b4",
+          "message": "ci: fix retry.sh unbound-variable edge case, raise integration job budgets\n\nIndependent pre-push review found two issues:\n- retry.sh read $1 as the label before checking $#, so a zero-arg call\n  hit bash's \"unbound variable\" error under set -u instead of the\n  intended usage diagnostic. Check $# first.\n- run-integration-tests/run-cluster-tests kept their pre-existing\n  15-minute timeout even though each now runs two sequential retry.sh\n  calls that can burn up to 3 minutes of backoff apiece before\n  succeeding on the last attempt. Raise both to 25 minutes.\n\nCo-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>",
+          "timestamp": "2026-07-30T16:00:42Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/dcfd505bb675f0ddc6ac5ae5f66525c3959477b4"
+        },
+        "date": 1786015692142,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 8.53,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 12.56,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 16,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 73.21,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 80.01,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 59.7,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 110.2,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 207.43,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 345.85,
             "unit": "ms"
           }
         ]
