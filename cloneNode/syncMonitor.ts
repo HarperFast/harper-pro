@@ -167,6 +167,9 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 		} catch (err) {
 			options.log(`Error checking sync status: ${err}`, 'error');
 		}
+		// Skip the trailing sleep when the loop is about to exit anyway — otherwise the single
+		// mandatory check at an already-spent budget pays a full checkIntervalMs of pure latency.
+		if (now() - lastProgressAt >= options.stallTimeoutMs || now() - startedAt >= maxDurationMs) break;
 		await delay(options.checkIntervalMs);
 	}
 

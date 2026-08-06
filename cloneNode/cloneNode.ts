@@ -296,10 +296,9 @@ export async function cloneNode(): Promise<void> {
 		if (!targetTimestamps) {
 			// setNode() succeeded but the leader snapshot fetch below didn't finish before the last
 			// crash. Replication is already established, so retry only the fetch, not establishReplicationSetup.
-			const snapshot = await fetchSyncSnapshot();
+			const snapshot = await fetchAndPersistSnapshot(syncStartedAt);
 			if (!snapshot) return;
 			({ targetTimestamps, totalBytes } = snapshot);
-			writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, false);
 		}
 
 		if (!resumeMarker.setupComplete) {
@@ -313,10 +312,9 @@ export async function cloneNode(): Promise<void> {
 		// here (retry the fetch only) rather than repeat establishReplicationSetup.
 		writeSyncStartedMarker(syncStartedAt, undefined, 0, false);
 
-		const snapshot = await fetchSyncSnapshot();
+		const snapshot = await fetchAndPersistSnapshot(syncStartedAt);
 		if (!snapshot) return;
 		({ targetTimestamps, totalBytes } = snapshot);
-		writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, false);
 
 		if (!(await finishCloneSetup())) return;
 		writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, true);
@@ -698,14 +696,9 @@ async function monitorSync(
 }
 
 /**
- * Will loop through a system describe and a describeAll to compare the last updated record for each table
- * and record the most recent timestamp for each database in a JSON file.
- * @returns {Promise<void>}
- */
-/**
  * Contained snapshot fetch: an unreachable leader or expired token must not throw out of
- * cloneNode() and exit the already-running process (bin/harper.js exits on rejection). The marker
- * is retained, so the next start retries only this fetch while replication keeps resuming.
+ * cloneNode() and exit the already-running process. The marker is retained, so the next start
+ * retries only this fetch while replication keeps resuming.
  */
 async function fetchSyncSnapshot(): Promise<
 	{ targetTimestamps: Record<string, number>; totalBytes: number } | undefined
@@ -728,6 +721,22 @@ async function fetchSyncSnapshot(): Promise<
 	}
 }
 
+/** Shared by the fresh and resume-retry call sites: fetch the leader snapshot and, if it
+ *  succeeds, persist it right away so a later crash never re-triggers the fetch needlessly. */
+async function fetchAndPersistSnapshot(
+	syncStartedAt: number
+): Promise<{ targetTimestamps: Record<string, number>; totalBytes: number } | undefined> {
+	const snapshot = await fetchSyncSnapshot();
+	if (!snapshot) return undefined;
+	writeSyncStartedMarker(syncStartedAt, snapshot.targetTimestamps, snapshot.totalBytes, false);
+	return snapshot;
+}
+
+/**
+ * Will loop through a system describe and a describeAll to compare the last updated record for each table
+ * and record the most recent timestamp for each database in a JSON file.
+ * @returns {Promise<void>}
+ */
 async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string, number>; totalBytes: number }> {
 	log('Getting last updated record timestamp for all database', 'debug');
 	const lastUpdated: Record<string, number> = {};
