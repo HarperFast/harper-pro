@@ -283,4 +283,20 @@ describe('createSubscriptionSetupWatchdog', () => {
 		clock.tick(60_000);
 		assert.strictEqual(onTimeout.calls.length, 1);
 	});
+
+	it('keeps an active pause when a request is cancelled and rearmed', () => {
+		const onTimeout = counter();
+		const watchdog = createSubscriptionSetupWatchdog({ timeoutMs: 60_000, onTimeout });
+
+		watchdog.pause();
+		watchdog.arm();
+		watchdog.stop();
+		watchdog.arm();
+		clock.tick(60_000);
+		assert.strictEqual(onTimeout.calls.length, 0);
+
+		watchdog.resume();
+		clock.tick(60_000);
+		assert.strictEqual(onTimeout.calls.length, 1);
+	});
 });

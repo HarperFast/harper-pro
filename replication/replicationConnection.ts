@@ -1198,7 +1198,6 @@ export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() 
 		},
 		stop() {
 			pending = false;
-			pauseDepth = 0;
 			clearTimer();
 		},
 	};
@@ -3046,10 +3045,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						);
 						(getSharedStatus().buffer as any).notify();
 						break;
-					case COPY_START:
+					case COPY_START: {
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
+						const copyWasAlreadyActive = inCopyMode;
 						inCopyMode = true;
-						subscriptionSetupWatchdog?.pause();
+						if (!copyWasAlreadyActive) subscriptionSetupWatchdog?.pause();
 						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
 						copiedTablesThisPass.clear(); // reset per-pass reload-marker tracking (harper-pro#495)
 						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)
@@ -3070,6 +3070,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
+					}
 					case COPY_COMPLETE:
 						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
 						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
@@ -3880,6 +3881,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									(gate, reason) => {
 										if (closed || wsClosed) return;
 										closed = true;
+										subscriptionToHdbNodes?.end();
 										// Settle the placeholder we timed out on, or every retry attaches another waiter to
 										// the same permanently-pending promise (see expirePendingDatabaseSubscription).
 										if (gate === 'database' && reason === 'timeout')
