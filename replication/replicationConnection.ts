@@ -489,6 +489,26 @@ export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pau
 }
 
 /**
+ * Whether this connection drives the keep-alive ping tick, keyed on knowing the remote url: a
+ * connection that dialed out is the client and owns the keepalive, while a server-accepted one has
+ * no url and relies on the client's pings to keep its own receive watchdog fed. Every outbound
+ * connection must therefore be built with its url — see `operationConnectionOptions` in
+ * replicator.ts for the one that was not (harper-pro#674).
+ */
+export function shouldRunKeepalive(options?: { url?: string }): boolean {
+	return Boolean(options?.url);
+}
+
+/**
+ * Whether the keep-alive must defer its first ping to the socket's 'open' event: `ws.ping()` throws
+ * while the socket is CONNECTING, which it still is when the replicated-operation path creates the
+ * session (harper-pro#674).
+ */
+export function keepaliveArmsOnOpen(readyState: number): boolean {
+	return readyState === WebSocket.CONNECTING;
+}
+
+/**
  * Handle an error that escaped `onWSMessage` (the inbound handler in `replicateOverWS`).
  *
  * Historically this was logged and swallowed. That silently dropped the rest of the failed frame
@@ -2307,7 +2327,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// fall back to the normal ping timeout otherwise (harper-pro#460). Evaluated per check/arm because
 	// inCopyMode flips during the connection's life.
 	const currentReceiveSilenceThresholdMs = () => (inCopyMode ? COPY_TIMEOUT : RECEIVE_SILENCE_THRESHOLD_MS);
-	if (options.url) {
+	if (shouldRunKeepalive(options)) {
 		const sendPing = () => {
 			// Note any socket activity since the last interval (incoming pong/data or our send buffer
 			// draining as the peer consumes) — either proves the peer is still alive.
@@ -2342,8 +2362,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			bytesRead = ws._socket?.bytesRead;
 			bytesWritten = ws._socket?.bytesWritten;
 		};
-		sendPingInterval = setInterval(sendPing, PING_INTERVAL).unref();
-		sendPing(); // send the first ping immediately so we can measure latency
+		const startKeepalive = () => {
+			sendPingInterval = setInterval(sendPing, PING_INTERVAL).unref();
+			sendPing(); // send the first ping immediately so we can measure latency
+		};
+		// `ws.ping()` THROWS while the socket is still CONNECTING, and the replicated-operation path
+		// creates the session before 'open' (it registers its own open handler after this call), so
+		// arming synchronously there would reject every replicated operation. Wait for the socket
+		// instead; a connect that never opens simply never arms.
+		if (keepaliveArmsOnOpen(ws.readyState)) ws.once('open', startKeepalive);
+		else startKeepalive();
 	}
 	// Both client and server arm the receive watchdog. On the client this is independent of the
 	// sendPing tick above: if that tick is missed or its ws.terminate() does not propagate a
