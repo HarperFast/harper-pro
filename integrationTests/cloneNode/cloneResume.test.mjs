@@ -60,6 +60,11 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: { port: leaderCtx.harper.hostname + ':9933', securePort: null },
+				// The sync monitor only genuinely runs on lmdb: under RocksDB the audit store's
+				// getKeys() is a stub, so describe reports no last_updated_record, every target is 0,
+				// and checkSyncStatus skips every database and reports synced on the first poll
+				// (harper-pro#611). These tests interrupt the sync WAIT, so they need it to exist.
+				storage: { engine: 'lmdb' },
 			},
 			env: { HARPER_NO_FLUSH_ON_EXIT: true },
 		});
@@ -100,6 +105,7 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
+				storage: { engine: 'lmdb' },
 			},
 			env: {
 				HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
@@ -153,7 +159,11 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			}
 			await sleep(25);
 		}
-		throw new Error(`clone did not finish setup (setupComplete marker) within ${timeoutMs}ms`);
+		throw new Error(
+			`clone did not finish setup (setupComplete marker) within ${timeoutMs}ms; last marker: ${
+				existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '(absent — clone may have already finalized)'
+			}`
+		);
 	}
 
 	test('resumes the bulk copy after a mid-copy kill instead of restarting from zero', async () => {
@@ -169,6 +179,7 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
+				storage: { engine: 'lmdb' },
 			},
 			env: {
 				HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
@@ -373,6 +384,12 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			statSync(jwtPassPath).mtimeMs > jwtMtimeBeforeRestart,
 			'forceClone must re-run setup, which re-clones the JWT keys'
 		);
-		equal(await countRows(forceCtx.harper), RECORD_COUNT, 'all records must be present after the forced reclone');
+		let forcedCount = -1;
+		for (let retries = 0; retries < 60; retries++) {
+			forcedCount = await countRows(forceCtx.harper);
+			if (forcedCount === RECORD_COUNT) break;
+			await sleep(500);
+		}
+		equal(forcedCount, RECORD_COUNT, 'all records must be present after the forced reclone');
 	});
 });

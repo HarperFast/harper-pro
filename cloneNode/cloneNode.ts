@@ -550,7 +550,10 @@ function writeSyncStartedMarker(stage: Omit<SyncStartedMarker, 'leaderURL' | 'le
 	const target = syncStartedMarkerPath();
 	const temp = `${target}.tmp`;
 	mkdirSync(dirname(target), { recursive: true });
-	writeFileSync(temp, JSON.stringify({ leaderURL, leaderReplicationURL, ...stage }), { mode: 0o600 });
+	// Stage flags are always present, never absent-meaning-false, so the file states plainly how far
+	// setup got for anyone reading it during an incident.
+	const marker: SyncStartedMarker = { leaderURL, leaderReplicationURL, setupComplete: false, ...stage };
+	writeFileSync(temp, JSON.stringify(marker), { mode: 0o600 });
 	renameSync(temp, target);
 }
 
