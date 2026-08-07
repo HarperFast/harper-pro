@@ -84,7 +84,7 @@ jobs:
           check-latest: ${{ matrix.node-version == '26' }}
 
       - name: Install dependencies
-        run: npm install
+        run: .github/scripts/retry.sh "npm install" -- npm install
 
       - name: Build
         run: npm run build || true # we currently have type errors so just ignore that
@@ -104,7 +104,9 @@ jobs:
     name: Integration Tests ${{matrix.shard}}/3 (Node.js v${{ matrix.node-version }})
     runs-on: ubuntu-latest
     needs: [generate-node-version-matrix, build]
-    timeout-minutes: 15
+    # 15 + 10: two sequential retry.sh calls (re2 rebuild, harperdb@4 install) can each
+    # burn the full 30/60/90s backoff before succeeding on the last attempt.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -135,18 +137,21 @@ jobs:
         with:
           name: harper-build-artifacts-node-${{ matrix.node-version }}
 
+      # The artifact-restored node_modules/ already has everything resolved; this only needs to
+      # recreate node_modules/.bin symlinks, so --offline keeps it off the registry entirely.
       - name: Relink bin scripts
-        run: npm install --ignore-scripts
+        run: npm rebuild --ignore-scripts --offline
 
       # re2 downloads its native binary from a post-install script (unlike lmdb/msgpackr/rocksdb,
       # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
+      # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
       - name: Build re2 native binary
-        run: npm rebuild re2
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
 
       - name: Install harperdb@4 for legacy tests
         run: |
           mkdir -p /tmp/harperdb-legacy
-          npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+          .github/scripts/retry.sh "npm install harperdb@4" -- npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
 
       # A zero-match glob makes node:test's run() silently collect no tests and exit 0
       # (a false green). Fail loudly instead if the extglob exclusion ever stops expanding.
@@ -185,7 +190,9 @@ jobs:
     name: Cluster Integration Tests ${{matrix.shard}}/6 (Node.js v${{ matrix.node-version }})
     runs-on: ubuntu-latest
     needs: [generate-node-version-matrix, build]
-    timeout-minutes: 15
+    # 15 + 10: two sequential retry.sh calls (re2 rebuild, harperdb@4 install) can each
+    # burn the full 30/60/90s backoff before succeeding on the last attempt.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -216,18 +223,21 @@ jobs:
         with:
           name: harper-build-artifacts-node-${{ matrix.node-version }}
 
+      # The artifact-restored node_modules/ already has everything resolved; this only needs to
+      # recreate node_modules/.bin symlinks, so --offline keeps it off the registry entirely.
       - name: Relink bin scripts
-        run: npm install --ignore-scripts
+        run: npm rebuild --ignore-scripts --offline
 
       # re2 downloads its native binary from a post-install script (unlike lmdb/msgpackr/rocksdb,
       # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
+      # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
       - name: Build re2 native binary
-        run: npm rebuild re2
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
 
       - name: Install harperdb@4 for legacy tests
         run: |
           mkdir -p /tmp/harperdb-legacy
-          npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+          .github/scripts/retry.sh "npm install harperdb@4" -- npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
 
       - name: Guard against empty cluster test glob
         env:

@@ -70,6 +70,9 @@ type ConnectedWorkerStatus = {
 };
 type ReplicationConnectionStatus = {
 	url?: string;
+	// Explicit unsubscribe keeps the entry alive for iterator/URL cleanup, but it is no longer
+	// an active subscription and must not take the existing-entry reuse fast path.
+	unsubscribed?: boolean;
 	nodes: ({
 		name: string;
 		url: string;
@@ -648,29 +651,37 @@ export async function startOnMainThread(options) {
 		logger.info('Setting up node replication for', node);
 		if (!node) {
 			// deleted node
+			const removedNode = nodeMap.get(hostname);
 			nodeMap.delete(hostname);
-			for (const [url, dbReplicationWorkers] of connectionReplicationMap) {
-				let foundNode;
-				for (const [_database, { nodes }] of dbReplicationWorkers) {
-					const node = nodes[0];
-					if (!node) continue;
-					if (node.name == hostname) {
-						foundNode = true;
-						for (const [database, { worker }] of dbReplicationWorkers) {
-							dbReplicationWorkers.delete(database);
-							logger.warn('Node was deleted, unsubscribing from node', hostname, database, url);
-							worker?.postMessage({ type: 'unsubscribe-from-node', node: hostname, nodes, database, url });
+			let url = removedNode ? getNodeURL(removedNode) : undefined;
+			let dbReplicationWorkers = url && connectionReplicationMap.get(url);
+
+			// Fall back to the entry scan for legacy/incomplete nodeMap state. Normally the URL is
+			// resolved above, which keeps cleanup working even when worker reassignment emptied the map.
+			if (!dbReplicationWorkers) {
+				for (const [candidateUrl, entries] of connectionReplicationMap) {
+					let foundNode = false;
+					for (const { nodes } of entries.values()) {
+						if (nodes[0]?.name === hostname) {
+							foundNode = true;
+							break;
 						}
+					}
+					if (foundNode) {
+						url = candidateUrl;
+						dbReplicationWorkers = entries;
 						break;
 					}
 				}
-				if (foundNode) {
-					const dbReplicationWorkers = connectionReplicationMap.get(url);
-					dbReplicationWorkers.iterator.remove();
-					connectionReplicationMap.delete(url);
-					return;
-				}
 			}
+			if (!dbReplicationWorkers || !url) return;
+			for (const [database, { worker, nodes }] of dbReplicationWorkers) {
+				dbReplicationWorkers.delete(database);
+				logger.warn('Node was deleted, unsubscribing from node', hostname, database, url);
+				worker?.postMessage({ type: 'unsubscribe-from-node', node: hostname, nodes, database, url });
+			}
+			dbReplicationWorkers.iterator?.remove();
+			connectionReplicationMap.delete(url);
 			return;
 		}
 		if (isSelf) return;
@@ -801,8 +812,17 @@ export async function startOnMainThread(options) {
 				// still-retrying connection or builds a fresh one — replicator.isReusableConnection). We
 				// deliberately do NOT re-subscribe every connected:false entry on an ordinary onNodeUpdate —
 				// doing so disrupts in-flight replication (e.g. an active legacy-node base copy).
-				if (shouldSubscribe && !(forceResubscribe && existingEntry.connected === false)) {
+				if (
+					shouldSubscribe &&
+					!existingEntry.unsubscribed &&
+					!(forceResubscribe && existingEntry.connected === false)
+				) {
 					return;
+				}
+				if (shouldSubscribe && existingEntry.unsubscribed) {
+					existingEntry.unsubscribed = false;
+					existingEntry.disconnectedAt = undefined;
+					existingEntry.createdAt = Date.now();
 				}
 			} else if (shouldSubscribe) {
 				nextWorkerIndex = nextWorkerIndex % httpWorkers.length; // wrap around as necessary
@@ -901,6 +921,9 @@ export async function startOnMainThread(options) {
 						reportIdentityMismatchOnce(registeredNodes);
 					}
 				}
+				// Keep the entry for URL/iterator cleanup, but bypass the reuse fast path after an
+				// explicit unsubscribe so restoring membership can schedule subscribe-to-node again.
+				if (existingEntry) existingEntry.unsubscribed = true;
 				const request = {
 					type: 'unsubscribe-from-node',
 					database: databaseName,

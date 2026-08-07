@@ -95,7 +95,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 const DB_NAMES = ['data0', 'data1', 'data2', 'data3', 'data4', 'data5'];
-const KILL_CYCLES = 3;
+const KILL_CYCLES = Number(process.env.HARPER_TEST_CONNECTED_BIT_KILL_CYCLES) || 3;
 const POLL_INTERVAL_MS = 150;
 const CONVERGENCE_TIMEOUT_MS = 25000; // well under WEDGE_RECONCILE_THRESHOLD_MS (30_000ms, subscriptionManager.ts)
 const DATA_FLOW_TIMEOUT_MS = 15000;
@@ -383,6 +383,20 @@ suite(
 					// Concurrently: resume write load on the leader, flood the follower's own admin
 					// API (main-thread IPC pressure), and tight-poll cluster_status for convergence --
 					// all in the foreground of this same async function, run together via Promise.all.
+					// This marker is deliberately written while reconnection is still in flight. It covers
+					// a write during catch-up; the post-convergence marker below remains the isolated
+					// check that a later write cannot hide a missed audit-tail wakeup.
+					const inFlightMarker = `post${cycle}-in-flight-${Date.now()}`;
+					const inFlightMarkerPromise = Promise.all(
+						DB_NAMES.map((db) =>
+							sendOperation(ctx.leader, {
+								operation: 'upsert',
+								database: db,
+								table: 'test',
+								records: [{ id: inFlightMarker, name: 'post-restart' }],
+							})
+						)
+					);
 					const convergencePromise = (async () => {
 						const deadline = restartedAt + CONVERGENCE_TIMEOUT_MS;
 						while (Date.now() < deadline) {
@@ -398,6 +412,7 @@ suite(
 
 					const [convergedAt] = await Promise.all([
 						convergencePromise,
+						inFlightMarkerPromise,
 						writeBurst(ctx.leader, DB_NAMES, WRITE_BURST_COUNT, WRITE_BURST_CONCURRENCY, `post${cycle}`),
 						adminFlood(ctx.follower, FLOOD_COUNT, FLOOD_CONCURRENCY),
 					]);
@@ -408,6 +423,29 @@ suite(
 						`cycle ${cycle}: replication did not reconcile back to connected:true within ${CONVERGENCE_TIMEOUT_MS}ms of restart -- wedged stuck-false`
 					);
 					console.log(`[qa587] cycle ${cycle}: converged in ${cycleResult.convergenceMs}ms after restart`);
+
+					for (const db of DB_NAMES) {
+						let seen = false;
+						const dDeadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
+						while (Date.now() < dDeadline) {
+							const res = await sendOperation(ctx.follower, {
+								operation: 'search_by_id',
+								database: db,
+								table: 'test',
+								ids: [inFlightMarker],
+								get_attributes: ['id'],
+							}).catch(() => []);
+							if (Array.isArray(res) && res.some((r) => r.id === inFlightMarker)) {
+								seen = true;
+								break;
+							}
+							await delay(200);
+						}
+						ok(
+							seen,
+							`cycle ${cycle}: post-restart in-flight write on ${db} did not replicate to follower (false-green connected:true)`
+						);
+					}
 
 					// Non-blind proof #2 / no-false-green check: a fresh write made AFTER convergence
 					// must actually replicate, not just flip the bit.

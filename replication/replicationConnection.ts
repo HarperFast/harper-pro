@@ -115,6 +115,7 @@ const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
 const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime + copy-order version
 const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
+const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -248,6 +249,10 @@ const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 
 // — the receive watchdog keeps being reset by the very frames we are not processing — so we close instead
 // and let reconnect backoff retry, which costs one log line per attempt rather than one per message.
 const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000);
+const SEND_SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(
+	process.env.HARPER_TEST_SEND_SUBSCRIPTION_RESOLVE_TIMEOUT_MS,
+	SUBSCRIPTION_RESOLVE_TIMEOUT
+);
 
 // Wall-clock ceiling on the gap between socket flushes / event-loop yields during a bulk copy.
 // Reading a large cold table out of RocksDB dominates copy cost (decompress + decode), so a purely
@@ -342,6 +347,17 @@ const STORAGE_IS_ROCKSDB = (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_
 // to 'close', etc.) this timer-based watchdog is the belt-and-suspenders that forces the
 // reconnect — see harper-pro#233.
 const RECEIVE_SILENCE_THRESHOLD_MS = PING_TIMEOUT;
+// Application-level setup must complete after the transport handshake. A live ping/pong socket is not
+// proof that the peer got past its send-authorization/database-subscription awaits and entered the replay
+// loop (harper-pro#642). Keep this strictly behind both sequential sender subscription-resolution bounds
+// so the sender gets first chance to identify the exact gate and close/retry, with the receiver-side
+// watchdog as the independent net. The extra ping interval prevents equal-deadline timer races.
+const TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS = Number(process.env.HARPER_TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS);
+const SUBSCRIPTION_SETUP_TIMEOUT_MS = positiveMsOr(
+	TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS,
+	Math.max(PING_TIMEOUT * 2, SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL)
+);
+const SEND_SUBSCRIPTION_SETUP_BUDGET_MS = SEND_SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL;
 // While the receive socket is paused for back-pressure the byte-silence watchdog above is stopped —
 // `ws.pause()` freezes `bytesRead`, so it can no longer tell a healthy back-pressure pause from a peer
 // that died mid-pause — and the active sendPing is exempt while `pauseReasons > 0`. That left a paused
@@ -470,6 +486,19 @@ export async function shouldCloseSendAuthWatch(
  */
 export function shouldTerminateIdlePing(idleMs: number, pingTimeout: number, pauseReasons: number): boolean {
 	return pauseReasons === 0 && idleMs >= pingTimeout;
+}
+
+/**
+ * Keyed on `options.url`, which the dialing side supplies: without a keepalive nothing is written
+ * while the peer works, and the receive watchdog kills the socket mid-operation.
+ */
+export function shouldRunKeepalive(options?: { url?: string }): boolean {
+	return Boolean(options?.url);
+}
+
+/** `ws.ping()` throws while CONNECTING, so a session created before 'open' defers its first ping. */
+export function keepaliveArmsOnOpen(readyState: number): boolean {
+	return readyState === WebSocket.CONNECTING;
 }
 
 /**
@@ -789,6 +818,18 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
 }
 
+// Test-only fault injection for harper-pro#642: one-shot per process, so a receiver watchdog reconnect
+// reaches the normal setup path. Never arms in production — only the regression test sets the env var.
+let subscriptionSetupStallForTestArmed = false;
+export function maybeStallSubscriptionSetupForTest(databaseName?: string): Promise<never> | undefined {
+	if (!process.env.HARPER_TEST_SUBSCRIPTION_SETUP_STALL_ONCE_DB) return;
+	if (subscriptionSetupStallForTestArmed || process.env.HARPER_TEST_SUBSCRIPTION_SETUP_STALL_ONCE_DB !== databaseName)
+		return;
+	subscriptionSetupStallForTestArmed = true;
+	logger.warn?.(`[test] stalling subscription setup before DB_SCHEMA for db "${databaseName}" (harper-pro#642)`);
+	return new Promise<never>(() => {});
+}
+
 /**
  * Mark an error as a *source-reported* blob unavailability: the sender told us (via a BLOB_CHUNK
  * `error` marker) that it cannot provide this blob — classically `ENOENT` because the blob was
@@ -968,6 +1009,7 @@ export function matchesCloneCopyCompletion(marker: DbisCursor | undefined, clone
  */
 export type DatabaseSubscription = {
 	then?: unknown; // present only on the unresolved placeholder
+	retired?: boolean; // a placeholder given up on by a bounded wait — never usable, always re-derive
 	auditStore?: any;
 	dbisDB?: DbisStore;
 	[key: string]: any;
@@ -1011,12 +1053,65 @@ export function resolveDatabaseStores(
 	return { auditStore, dbisDB };
 }
 
+const SETUP_TIMED_OUT = Symbol('setup timed out');
+
+async function awaitWithTimeoutOutcome<T>(
+	value: T | PromiseLike<T> | undefined,
+	timeout: number
+): Promise<T | undefined | typeof SETUP_TIMED_OUT> {
+	if (!value || typeof (value as any).then !== 'function') return value as T | undefined;
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([
+			value,
+			new Promise<typeof SETUP_TIMED_OUT>((resolve) => {
+				timer = setTimeout(() => resolve(SETUP_TIMED_OUT), timeout);
+				timer.unref();
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+export async function awaitWithTimeout<T>(
+	value: T | PromiseLike<T> | undefined,
+	timeout: number
+): Promise<T | undefined> {
+	const outcome = await awaitWithTimeoutOutcome(value, timeout);
+	return outcome === SETUP_TIMED_OUT ? undefined : outcome;
+}
+
+/**
+ * Resolve the two sender-side gates that precede DB_SCHEMA/replay, reporting the exact gate that failed
+ * to settle. Rejections intentionally propagate to the existing subscription-handler catch; only timeout
+ * is converted to `undefined` so the caller can close and retry without losing the durable cursor.
+ */
+export async function resolveSendSubscriptionSetup<TAuthorization, TDatabase>(
+	authorizationSubscription: TAuthorization | PromiseLike<TAuthorization> | undefined,
+	databaseSubscription: TDatabase | PromiseLike<TDatabase> | undefined,
+	timeout: number,
+	onFailure: (gate: 'authorization' | 'database', reason: 'timeout' | 'unavailable') => void
+): Promise<TDatabase | undefined> {
+	if (authorizationSubscription) {
+		const resolvedAuthorizationSubscription = await awaitWithTimeoutOutcome(authorizationSubscription, timeout);
+		if (resolvedAuthorizationSubscription === SETUP_TIMED_OUT || !resolvedAuthorizationSubscription) {
+			onFailure('authorization', resolvedAuthorizationSubscription === SETUP_TIMED_OUT ? 'timeout' : 'unavailable');
+			return;
+		}
+	}
+	const resolvedDatabaseSubscription = await awaitWithTimeoutOutcome(databaseSubscription, timeout);
+	if (resolvedDatabaseSubscription === SETUP_TIMED_OUT || !resolvedDatabaseSubscription) {
+		onFailure('database', resolvedDatabaseSubscription === SETUP_TIMED_OUT ? 'timeout' : 'unavailable');
+		return;
+	}
+	return resolvedDatabaseSubscription;
+}
+
 /**
  * Await a database subscription that may still be the pending placeholder, bounded by `timeout` ms.
  * Resolves to the registered `IterableEventQueue`, or to `undefined` if the registration did not land in
  * time. A subscription that is already resolved (or absent) is returned as-is without yielding.
- *
- * The timer is unref'd and always cleared, so neither outcome holds the event loop open.
  *
  * `backpressure` (the receive path's `addPauseReason`/`removePauseReason`) is applied around the wait and
  * ONLY around a wait that actually happens. It is load-bearing rather than defensive: the receive path
@@ -1025,8 +1120,6 @@ export function resolveDatabaseStores(
  * the socket, a peer mid-copy queues a full timeout's worth of large frames and exhausts the worker heap
  * before the timeout can close the connection. Paired in a `finally` so the pause is balanced on every
  * outcome, including a rejection.
- *
- * Exported for unit coverage; the production caller is `whenSubscriptionResolved` in `replicateOverWS`.
  */
 export async function awaitPendingSubscription(
 	subscription: DatabaseSubscription | undefined,
@@ -1034,20 +1127,103 @@ export async function awaitPendingSubscription(
 	backpressure?: { pause: () => void; resume: () => void }
 ): Promise<DatabaseSubscription | undefined> {
 	if (!subscription?.then) return subscription;
-	let timer: NodeJS.Timeout;
 	backpressure?.pause();
 	try {
-		return await Promise.race([
-			subscription as Promise<DatabaseSubscription>,
-			new Promise<undefined>((resolve) => {
-				timer = setTimeout(() => resolve(undefined), timeout);
-				timer.unref();
-			}),
-		]);
+		return await awaitWithTimeout(subscription, timeout);
 	} finally {
-		clearTimeout(timer);
 		backpressure?.resume();
 	}
+}
+
+export function isSubscriptionSetupProgressFrame(
+	command: number | undefined,
+	requestedDatabase: string | undefined,
+	frameDatabase: string | undefined,
+	requestId: number | undefined,
+	frameRequestId: number | undefined
+): boolean {
+	return (
+		command === DB_SCHEMA &&
+		requestId !== undefined &&
+		frameDatabase === requestedDatabase &&
+		frameRequestId === requestId
+	);
+}
+
+export function resolveSubscriptionSetupCapability(
+	capabilities: any,
+	localTimeoutMs: number,
+	usePeerBudget = true
+): { supported: boolean; timeoutMs: number } {
+	const supported = capabilities?.subscriptionSetupAck >= SUBSCRIPTION_SETUP_ACK_CAPABILITY;
+	const peerSetupBudgetMs = capabilities?.subscriptionSetupBudgetMs;
+	const maxPeerSetupBudgetMs = Math.max(localTimeoutMs * 4, 10 * 60_000);
+	return {
+		supported,
+		timeoutMs:
+			usePeerBudget && supported && Number.isFinite(peerSetupBudgetMs) && peerSetupBudgetMs > 0
+				? Math.max(localTimeoutMs, Math.min(peerSetupBudgetMs, maxPeerSetupBudgetMs))
+				: localTimeoutMs,
+	};
+}
+
+export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() => number); onTimeout: () => void }): {
+	arm: () => void;
+	complete: () => void;
+	pause: () => void;
+	resume: () => void;
+	stop: () => void;
+} {
+	let timer: NodeJS.Timeout | undefined;
+	let pending = false;
+	let pauseDepth = 0;
+	// Remaining budget (ms) for the current pending window, consumed as time elapses. Only `arm()`
+	// resets it to a full window (a superseding request); `pause()`/`resume()` preserve whatever was
+	// left, so a link with recurring, short back-pressure pauses can't keep re-granting a full window
+	// forever and never trip this independent recovery net.
+	let remainingMs = 0;
+	let scheduledAt = 0;
+	const clearTimer = () => {
+		if (timer) {
+			clearTimeout(timer);
+			timer = undefined;
+		}
+	};
+	const fire = () => {
+		timer = undefined;
+		pending = false;
+		opts.onTimeout();
+	};
+	const schedule = () => {
+		clearTimer();
+		if (!pending || pauseDepth > 0) return;
+		scheduledAt = performance.now(); // monotonic — immune to wall-clock adjustments
+		timer = setTimeout(fire, remainingMs).unref();
+	};
+	return {
+		arm() {
+			pending = true;
+			remainingMs = typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs;
+			schedule();
+		},
+		complete() {
+			pending = false;
+			clearTimer();
+		},
+		pause() {
+			if (pauseDepth++ > 0) return;
+			if (pending && timer) remainingMs = Math.max(0, remainingMs - (performance.now() - scheduledAt));
+			clearTimer();
+		},
+		resume() {
+			if (pauseDepth === 0 || --pauseDepth > 0) return;
+			schedule();
+		},
+		stop() {
+			pending = false;
+			clearTimer();
+		},
+	};
 }
 
 /**
@@ -1069,6 +1245,60 @@ export function createPendingDatabaseSubscription(
 	// Register in the same map the resolver reads, so Replicator.subscribe() finds and resolves this one.
 	subscriptions.set(databaseName, pending);
 	return pending;
+}
+
+export function activeDatabaseSubscription(subscription?: DatabaseSubscription): DatabaseSubscription | undefined {
+	return subscription?.retired ? undefined : subscription;
+}
+
+export function subscriptionForConnection(
+	cached: DatabaseSubscription | undefined,
+	databaseName: string,
+	subscriptions: Map<string, any>
+): DatabaseSubscription {
+	return activeDatabaseSubscription(cached) ?? subscriptionForDatabase(databaseName, subscriptions);
+}
+
+export function subscriptionForDatabase(databaseName: string, subscriptions: Map<string, any>): DatabaseSubscription {
+	return (
+		activeDatabaseSubscription(subscriptions.get(databaseName)) ??
+		createPendingDatabaseSubscription(databaseName, subscriptions)
+	);
+}
+
+/**
+ * Settle and unregister a database-subscription placeholder that is still pending, returning whether it
+ * did so.
+ *
+ * A placeholder resolves only when `Replicator.subscribe()` runs for the first table of the database on
+ * this thread. When that never happens — classically because this node does not host the database — the
+ * promise is unsettleable, and it stays reachable from `dbSubscriptions` for the life of the database.
+ * A bounded waiter that closes and lets the peer retry would then attach a fresh reaction (retaining that
+ * connection's setup state) to the same retained promise on every attempt, so a permanent mismatch would
+ * grow waiters without bound. Settling releases every accumulated waiter — they see `undefined` and take
+ * their existing no-subscription path — and unregistering lets the next request start from a fresh
+ * placeholder that a late `Replicator.subscribe()` can still resolve.
+ *
+ * A placeholder already superseded in the map is left alone: the real subscription is authoritative.
+ *
+ * The `retired` mark is what makes this safe to do to a shared object. Outbound connections cache the
+ * subscription they were constructed with and seed every reconnect from it, and sibling connections for
+ * the same database cache the SAME placeholder — so without the mark, a socket would re-seed itself with
+ * a placeholder that now resolves to `undefined`, close immediately, and never converge even once
+ * `Replicator.subscribe()` registers the real queue. Every consumer must treat a retired placeholder as
+ * absent and re-derive from the map.
+ */
+export function expirePendingDatabaseSubscription(
+	databaseName: string,
+	subscription: DatabaseSubscription | undefined,
+	subscriptions: Map<string, any>
+): boolean {
+	if (!subscription?.then || typeof subscription.ready !== 'function') return false;
+	if (subscriptions.get(databaseName) !== subscription) return false;
+	subscriptions.delete(databaseName);
+	subscription.retired = true;
+	subscription.ready(undefined);
+	return true;
 }
 
 // Small control-plane tables whose convergence gates cluster operations: hdb_deployment gates
@@ -1755,10 +1985,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
-	let tableSubscriptionToReplicator: DatabaseSubscription = options.subscription;
+	// Re-derive rather than trusting the cached reference: the connection seeds every reconnect from the
+	// subscription it was built with, which may since have been retired (expirePendingDatabaseSubscription).
+	let tableSubscriptionToReplicator: DatabaseSubscription = options.subscription
+		? subscriptionForConnection(options.subscription, databaseName, dbSubscriptions)
+		: undefined;
 	if (tableSubscriptionToReplicator?.then)
 		(tableSubscriptionToReplicator as Promise<any>)
 			.then((sub) => {
+				if (!sub) return;
 				tableSubscriptionToReplicator = sub;
 				if (tableSubscriptionToReplicator.auditStore) auditStore = tableSubscriptionToReplicator.auditStore;
 			})
@@ -1906,6 +2141,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// (received-version watermark suppressed) and it could never reach Available.
 			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
+			subscriptionSetupWatchdog?.resume();
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 			pendingCopyCursor = null;
@@ -2027,6 +2263,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
+	let peerSupportsSubscriptionSetupAck = false;
+	let nextSubscriptionSetupRequestId = 0;
+	let pendingSubscriptionSetupRequestId: number | undefined;
+	let subscriptionSetupTimeoutMs = SUBSCRIPTION_SETUP_TIMEOUT_MS;
+	// Outbound-only application setup guard (harper-pro#642). Unlike receiveWatchdog it deliberately
+	// ignores ping/pong bytes: those prove the socket is alive, not that the peer entered its replay loop.
+	let subscriptionSetupWatchdog:
+		| {
+				arm: () => void;
+				complete: () => void;
+				pause: () => void;
+				resume: () => void;
+				stop: () => void;
+		  }
+		| undefined;
 	// Companion to receiveWatchdog that guards the back-pressure-paused window the byte watchdog is
 	// blind to (harper-pro#466). Armed on pause, stopped on resume — see addPauseReason/removePauseReason.
 	let pauseStallWatchdog: { reset: () => void; stop: () => void } | undefined;
@@ -2092,7 +2343,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// fall back to the normal ping timeout otherwise (harper-pro#460). Evaluated per check/arm because
 	// inCopyMode flips during the connection's life.
 	const currentReceiveSilenceThresholdMs = () => (inCopyMode ? COPY_TIMEOUT : RECEIVE_SILENCE_THRESHOLD_MS);
-	if (options.url) {
+	if (shouldRunKeepalive(options)) {
 		const sendPing = () => {
 			// Note any socket activity since the last interval (incoming pong/data or our send buffer
 			// draining as the peer consumes) — either proves the peer is still alive.
@@ -2127,8 +2378,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			bytesRead = ws._socket?.bytesRead;
 			bytesWritten = ws._socket?.bytesWritten;
 		};
-		sendPingInterval = setInterval(sendPing, PING_INTERVAL).unref();
-		sendPing(); // send the first ping immediately so we can measure latency
+		// Both call sites are callbacks — an interval, and the 'open' listener below — where a throw is
+		// an uncaught exception rather than something a caller can reject. Stop the tick instead of
+		// crashing; the receive watchdog still guards liveness.
+		const tick = () => {
+			try {
+				sendPing();
+			} catch (error) {
+				clearInterval(sendPingInterval);
+				logger.warn?.(connectionId, 'stopped replication keepalive', remoteNodeName, error);
+			}
+		};
+		const startKeepalive = () => {
+			sendPingInterval = setInterval(tick, PING_INTERVAL).unref();
+			tick(); // ping immediately so we can measure latency
+		};
+		if (keepaliveArmsOnOpen(ws.readyState)) ws.once('open', startKeepalive);
+		else startKeepalive();
 	}
 	// Both client and server arm the receive watchdog. On the client this is independent of the
 	// sendPing tick above: if that tick is missed or its ws.terminate() does not propagate a
@@ -2224,6 +2490,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			else ws.terminate();
 		},
 	});
+	subscriptionSetupWatchdog = createSubscriptionSetupWatchdog({
+		timeoutMs: () => subscriptionSetupTimeoutMs,
+		onTimeout: () => {
+			if (wsClosed || inCopyMode) return;
+			pendingSubscriptionSetupRequestId = undefined;
+			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+			logger.warn?.(
+				`Subscription-setup watchdog: no application response from ${remoteNodeName}${dbContext} for ${subscriptionSetupTimeoutMs}ms while transport remained connected — reconnecting from the durable cursor (harper-pro#642) — ${truthSnapshotForLog()}`
+			);
+			if (options.connection) options.connection.forceReconnect();
+			else ws.terminate();
+		},
+	});
 	ws._socket?.setMaxListeners(200); // we should allow a lot of drain listeners for concurrent blob streams
 	let ratioOfBackPressureTime = 0;
 	let lastBackPressureCheck = 0;
@@ -2280,6 +2559,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (pauseReasons === 0) {
 			ws.pause();
 			pauseStartTime = Date.now();
+			subscriptionSetupWatchdog?.pause();
 			// Suspend the receive watchdog while the socket is intentionally paused — `bytesRead`
 			// is frozen by `ws.pause()` so the byte check cannot tell legitimate backpressure
 			// from peer silence, and firing here would terminate a healthy mid-ingest connection.
@@ -2298,6 +2578,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		pauseReasons--;
 		if (pauseReasons === 0) {
 			ws.resume();
+			subscriptionSetupWatchdog?.resume();
 			// Resuming: the byte watchdog can see the socket again, so retire the pause-stall watchdog and
 			// restart the silence window from the resume point — we deliberately do not penalize the
 			// connection for the time it spent paused.
@@ -2507,6 +2788,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	 * then abandon the message rather than fall through to a `.send()`.
 	 */
 	async function whenSubscriptionResolved(): Promise<boolean> {
+		if (tableSubscriptionToReplicator?.retired)
+			tableSubscriptionToReplicator = subscriptionForConnection(
+				tableSubscriptionToReplicator,
+				databaseName,
+				dbSubscriptions
+			);
 		if (!tableSubscriptionToReplicator?.then) return true;
 		// Socket intake is paused for the duration of the wait — see awaitPendingSubscription. Liveness while
 		// paused belongs to the pause-stall watchdog, whose threshold is floored above
@@ -2516,6 +2803,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			resume: removePauseReason,
 		});
 		if (!resolved?.send) {
+			// A timeout (`undefined`) leaves the placeholder pending: settle it, or the peer's retry stacks
+			// another waiter on the same promise (see expirePendingDatabaseSubscription).
+			if (!resolved) expirePendingDatabaseSubscription(databaseName, tableSubscriptionToReplicator, dbSubscriptions);
 			logger.error?.(
 				connectionId,
 				`No local subscription registered for database ${databaseName} after ${SUBSCRIPTION_RESOLVE_TIMEOUT}ms; closing so replication resumes from the last durable cursor`
@@ -2560,6 +2850,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				switch (command) {
 					case NODE_NAME: {
 						if (data) {
+							const setupCapability = resolveSubscriptionSetupCapability(
+								message[4],
+								SUBSCRIPTION_SETUP_TIMEOUT_MS,
+								!(TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS > 0)
+							);
+							peerSupportsSubscriptionSetupAck = setupCapability.supported;
+							subscriptionSetupTimeoutMs = setupCapability.timeoutMs;
 							// this is the node name
 							if (remoteNodeName) {
 								if (remoteNodeName !== data) {
@@ -2626,6 +2923,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						break;
 					}
 					case DB_SCHEMA: {
+						if (
+							isSubscriptionSetupProgressFrame(
+								command,
+								databaseName,
+								message[2],
+								pendingSubscriptionSetupRequestId,
+								message[3]
+							)
+						) {
+							pendingSubscriptionSetupRequestId = undefined;
+							subscriptionSetupWatchdog?.complete();
+						}
 						logger.debug?.(
 							connectionId,
 							'Received table definitions for',
@@ -2787,9 +3096,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						);
 						(getSharedStatus().buffer as any).notify();
 						break;
-					case COPY_START:
+					case COPY_START: {
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
+						const copyWasAlreadyActive = inCopyMode;
 						inCopyMode = true;
+						if (!copyWasAlreadyActive) subscriptionSetupWatchdog?.pause();
 						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
 						copiedTablesThisPass.clear(); // reset per-pass reload-marker tracking (harper-pro#495)
 						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)
@@ -2826,6 +3137,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						}
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
+					}
 					case COPY_COMPLETE:
 						// Copy signalled complete. Stay in copy mode so batches still committing keep advancing the
 						// cursor; maybeFinishCopy exits copy mode and clears the cursor once those commits drain.
@@ -3148,29 +3460,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					case SUBSCRIPTION_REQUEST: {
 						nodeSubscriptions = data;
 						excludedNodes = message[2]; // use the third argument for exclusion list
+						const subscriptionSetupRequestId = message[3];
 						// permission check to make sure that this node is allowed to subscribe to this database, that is that
 						// we have publish permission for this node/database
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
 						let sentNodeIds = new Set<number>();
 						let closed = false;
-						if (tableSubscriptionToReplicator) {
-							if (databaseName !== tableSubscriptionToReplicator.databaseName && !tableSubscriptionToReplicator.then) {
-								logger.error?.(
-									'Subscription request for wrong database',
-									databaseName,
-									tableSubscriptionToReplicator.databaseName
-								);
-								return;
-							}
-						} else tableSubscriptionToReplicator = dbSubscriptions.get(databaseName);
-						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
-						if (!tableSubscriptionToReplicator) {
-							// Wait for it to be created. Registered in dbSubscriptions (not the module-level map
-							// unconditionally): that is the map Replicator.subscribe() resolves from for this
-							// connection, so writing anywhere else would leave the placeholder pending forever.
-							logger.debug?.('Waiting for subscription to database ' + databaseName);
-							tableSubscriptionToReplicator = createPendingDatabaseSubscription(databaseName, dbSubscriptions);
+						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
+						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
+						tableSubscriptionToReplicator = subscriptionForConnection(
+							tableSubscriptionToReplicator,
+							databaseName,
+							dbSubscriptions
+						);
+						if (!tableSubscriptionToReplicator.then && databaseName !== tableSubscriptionToReplicator.databaseName) {
+							logger.error?.(
+								'Subscription request for wrong database',
+								databaseName,
+								tableSubscriptionToReplicator.databaseName
+							);
+							return;
 						}
+						logger.debug?.(connectionId, 'received subscription request for', databaseName, 'at', nodeSubscriptions);
+						if (tableSubscriptionToReplicator.then)
+							logger.debug?.('Waiting for subscription to database ' + databaseName);
 						// Local config-route directionality for this peer, resolved once and reused by the send
 						// authority gate below and the send-side excludeTables further down. harper-pro#498.
 						const sendRoute = getConfigRouteReplicates(options, remoteNodeName);
@@ -3198,9 +3511,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							// so skip the hdb_nodes auth watch entirely. Only when there is no directional config route
 							// (undefined) do we watch the subscriber's hdb_nodes record for dynamic (de)authorization.
 							if (configSendDecision === undefined) {
-								whenSubscribedToHdbNodes = getHDBNodeTable().subscribe(authorization.name);
-								whenSubscribedToHdbNodes.then(
-									async (subscription) => {
+								whenSubscribedToHdbNodes =
+									maybeStallSubscriptionSetupForTest(databaseName) ?? getHDBNodeTable().subscribe(authorization.name);
+								whenSubscribedToHdbNodes
+									.then(async (subscription) => {
+										// The setup wait below is bounded. If it timed out and closed this socket before this
+										// promise resolved, retire the late subscription instead of leaking a global hdb_nodes
+										// listener past the close event.
+										if (closed || wsClosed) {
+											subscription?.end();
+											return;
+										}
 										subscriptionToHdbNodes = subscription;
 										for await (const event of subscriptionToHdbNodes) {
 											const shouldClose = await shouldCloseSendAuthWatch(event, authorization.name, databaseName, {
@@ -3221,11 +3542,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												return;
 											}
 										}
-									},
-									(error) => {
+										if (!closed && !wsClosed) {
+											closed = true;
+											close(1011, `Replication authorization watch ended for ${databaseName}`);
+										}
+									})
+									.catch((error) => {
 										logger.error?.(connectionId, 'Error subscribing to HDB nodes', error);
-									}
-								);
+										// This catch also receives a throw from the watch loop itself, after the subscription
+										// resolved. Logging alone would leave the replay loop running with no live
+										// authorization watcher, so a later revocation would go unobserved: fail closed and
+										// let the retry rebuild the watch.
+										if (!closed && !wsClosed) {
+											closed = true;
+											close(1011, `Replication authorization watch failed for ${databaseName}`);
+										}
+									});
 							}
 						} else if (!(authorization?.role?.permission?.super_user || authorization.replicates)) {
 							ws.send(encode([DISCONNECT]));
@@ -3593,8 +3925,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
-							| undefined;
+							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -3604,10 +3935,40 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							if (subscription.copyResume) copyResume = subscription.copyResume;
 						}
 
-						// wait for internal subscription, might be waiting for a table to be registered
-						(whenSubscribedToHdbNodes || Promise.resolve())
+						// A promise that never settles here would leave this WS ping-alive forever with the
+						// receiver seeing no application frames and no cursor progress (harper-pro#642). Bound
+						// each gate separately so the log identifies which one stuck, then close transiently so
+						// the peer retries from its last durable cursor.
+						Promise.resolve()
 							.then(async () => {
-								tableSubscriptionToReplicator = await tableSubscriptionToReplicator;
+								const resolvedDatabaseSubscription = await resolveSendSubscriptionSetup(
+									whenSubscribedToHdbNodes,
+									tableSubscriptionToReplicator,
+									SEND_SUBSCRIPTION_RESOLVE_TIMEOUT,
+									(gate, reason) => {
+										if (closed || wsClosed) return;
+										closed = true;
+										subscriptionToHdbNodes?.end();
+										// Settle the placeholder we timed out on, or every retry attaches another waiter to
+										// the same permanently-pending promise (see expirePendingDatabaseSubscription).
+										if (gate === 'database' && reason === 'timeout')
+											expirePendingDatabaseSubscription(databaseName, tableSubscriptionToReplicator, dbSubscriptions);
+										const databaseHint =
+											gate === 'database' ? '; this can also mean this node does not host the database' : '';
+										const failure =
+											reason === 'timeout'
+												? `Timed out waiting for ${gate} subscription setup`
+												: `${gate} subscription setup resolved without a subscription`;
+										logger.error?.(
+											connectionId,
+											`${failure} for ${databaseName}${databaseHint}; closing so the subscriber retries from its durable cursor (harper-pro#642)`
+										);
+										close(1011, `Replication ${gate} setup ${reason === 'timeout' ? 'timed out' : 'unavailable'}`);
+									}
+								);
+								if (!resolvedDatabaseSubscription) return;
+								tableSubscriptionToReplicator = resolvedDatabaseSubscription;
+								if (closed || wsClosed) return;
 								auditStore = tableSubscriptionToReplicator.auditStore;
 								tableById = tableSubscriptionToReplicator.tableById.map(tableToTableEntry);
 								subscribedNodeIds = [];
@@ -3625,7 +3986,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									subscribedNodeName = name;
 								}
 
-								sendDBSchema(databaseName);
+								sendDBSchema(databaseName, subscriptionSetupRequestId);
 								if (!schemaUpdateListener) {
 									schemaUpdateListener = onUpdatedTable((table) => {
 										if (table.databaseName === databaseName) {
@@ -3905,6 +4266,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										}
 									}
 									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+									// Capture the current generation before scanning. A commit after this live scan
+									// drains must wake this iteration; subscribing afterward can miss that commit.
+									const nextTransaction = whenNextTransaction(auditStore);
 									auditLogIterable =
 										(auditStore.reusableIterable && auditLogIterable) ??
 										auditStore.getRange({
@@ -3941,11 +4305,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									await whenNextTransaction(auditStore);
+									await nextTransaction;
 								} while (!closed);
 							})
 							.catch((error) => {
 								logger.error?.(connectionId, 'Error handling subscription to node', error);
+								// An authorization-watch rejection before it resolves reaches this chain too (the setup
+								// gate awaits the same promise), and that chain has already closed with a more accurate
+								// code — so a second close here would only overwrite the reason.
+								if (closed || wsClosed) return;
+								closed = true;
 								close(1008, 'Error handling subscription to node ' + error);
 							});
 						break;
@@ -4392,8 +4761,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	ws.on('close', (code, reasonBuffer) => {
 		// cleanup
 		wsClosed = true;
+		pendingSubscriptionSetupRequestId = undefined;
 		clearInterval(sendPingInterval);
 		receiveWatchdog?.stop();
+		subscriptionSetupWatchdog?.stop();
 		pauseStallWatchdog?.stop();
 		copyProgressWatchdog?.stop();
 		clearInterval(blobsTimer);
@@ -5128,10 +5499,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.debug?.(connectionId, 'sending subscription request', nodeSubscriptions, dbisDB?.path);
 			clearTimeout(delayedClose);
 			if (nodeSubscriptions.length > 0) {
-				ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded]));
+				const requestId = peerSupportsSubscriptionSetupAck ? ++nextSubscriptionSetupRequestId : undefined;
+				ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded, requestId]));
+				// Start a fresh request -> first application-response window on every non-empty request. This is
+				// intentionally after send(): a synchronous send failure must not leave an orphaned timer.
+				if (requestId === undefined) {
+					pendingSubscriptionSetupRequestId = undefined;
+					subscriptionSetupWatchdog?.stop();
+				} else {
+					pendingSubscriptionSetupRequestId = requestId;
+					subscriptionSetupWatchdog?.arm();
+				}
 				// Track the excluded list we just sent
 				lastSentExcludedNodes = excluded ? [...excluded] : [];
 			} else {
+				pendingSubscriptionSetupRequestId = undefined;
+				subscriptionSetupWatchdog?.stop();
 				// no nodes means we are unsubscribing/disconnecting
 				// don't immediately close the connection, but wait a bit to see if we get any messages, since opening new connections is a bit expensive
 				const scheduleClose = () => {
@@ -5181,7 +5564,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		return true;
 	}
 	function setDatabase(databaseName) {
-		tableSubscriptionToReplicator = tableSubscriptionToReplicator || dbSubscriptions.get(databaseName);
+		tableSubscriptionToReplicator =
+			activeDatabaseSubscription(tableSubscriptionToReplicator) ??
+			activeDatabaseSubscription(dbSubscriptions.get(databaseName));
 		if (!checkDatabaseAccess(databaseName)) {
 			throw new Error(`Access to database "${databaseName}" is not permitted`);
 		}
@@ -5215,9 +5600,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			});
 		}
 		logger.trace?.('Sending database info for node', thisNodeName, 'database name', databaseName);
-		ws.send(encode([NODE_NAME, thisNodeName, databaseName, tables]));
+		ws.send(
+			encode([
+				NODE_NAME,
+				thisNodeName,
+				databaseName,
+				tables,
+				{
+					subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
+					subscriptionSetupBudgetMs: SEND_SUBSCRIPTION_SETUP_BUDGET_MS,
+				},
+			])
+		);
 	}
-	function sendDBSchema(databaseName) {
+	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
 		const database = getDatabases()?.[databaseName];
 		const tables = [];
 		for (const tableName in database) {
@@ -5240,7 +5636,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			});
 		}
 
-		ws.send(encode([DB_SCHEMA, tables, databaseName]));
+		ws.send(encode([DB_SCHEMA, tables, databaseName, subscriptionSetupRequestId]));
 	}
 	blobsTimer = setInterval(
 		() => {
