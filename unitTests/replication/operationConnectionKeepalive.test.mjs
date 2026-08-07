@@ -1,16 +1,8 @@
 /**
- * Regression coverage for the replicated-operation keep-alive (issue #674).
- *
- * Background: `replicateOperation` → `sendOperationToNode` opens a one-shot replication WS and awaits
- * `OPERATION_RESPONSE` with no timeout. It used to build that connection with an empty `{}`, which
- * left the keep-alive ping tick disarmed — so while the peer executed the operation (a
- * deploy_component install can run for minutes) nothing was written in either direction, the receive
- * watchdog terminated the socket after 2 x replication.pingTimeout (~120s by default), and the
- * pending response rejected with `Connection closed  1006`. The peer's work is never cancelled by
- * that close, so a peer that was still installing got reported as a failed replication.
- *
- * `shouldRunKeepalive` is the gate `replicateOverWS` gives the ping tick, and
- * `operationConnectionOptions` is what the operation socket is built with; the two must agree.
+ * Regression coverage for issue #674: the replicated-operation socket was built with empty options,
+ * leaving the keep-alive disarmed, so the receive watchdog killed it at 2 x replication.pingTimeout
+ * while the peer was still working. `operationConnectionOptions` and `shouldRunKeepalive` are the two
+ * halves of that contract and must agree.
  */
 
 import { expect } from 'chai';
