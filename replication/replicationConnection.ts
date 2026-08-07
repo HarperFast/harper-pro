@@ -2363,8 +2363,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			bytesWritten = ws._socket?.bytesWritten;
 		};
 		const startKeepalive = () => {
-			sendPingInterval = setInterval(sendPing, PING_INTERVAL).unref();
-			sendPing(); // send the first ping immediately so we can measure latency
+			// Deferred below to an 'open' listener, where a throw is an uncaught exception rather than
+			// something the dial path can reject. The receive watchdog still guards liveness.
+			try {
+				sendPingInterval = setInterval(sendPing, PING_INTERVAL).unref();
+				sendPing(); // send the first ping immediately so we can measure latency
+			} catch (error) {
+				logger.warn?.(connectionId, 'could not start replication keepalive', remoteNodeName, error);
+			}
 		};
 		// `ws.ping()` THROWS while the socket is still CONNECTING, and the replicated-operation path
 		// creates the session before 'open' (it registers its own open handler after this call), so

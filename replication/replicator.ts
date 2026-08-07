@@ -629,7 +629,13 @@ export async function sendOperationToNode(node, operation, options?) {
 			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
 			if (logger.logsAtLevel('debug'))
 				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(operation));
-			resolve(session.sendOperation(operation));
+			// A throw from inside this listener (encode failure, socket state) is an uncaught exception
+			// that also leaves this promise pending forever; reject it instead.
+			try {
+				resolve(session.sendOperation(operation));
+			} catch (error) {
+				reject(error);
+			}
 		});
 		socket.on('error', (error) => {
 			reject(error);
