@@ -45,8 +45,14 @@ suite('Replicated operation survives peer work longer than the watchdog window (
 				pingTimeout: PING_TIMEOUT_MS,
 			},
 		});
-		await startHarper(nodeA, { config: config(nodeA.harper.hostname), env: { HARPER_NO_FLUSH_ON_EXIT: true } });
-		await startHarper(nodeB, { config: config(nodeB.harper.hostname), env: { HARPER_NO_FLUSH_ON_EXIT: true } });
+		await startHarper(nodeA, {
+			config: config(nodeA.harper.hostname),
+			env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_INSTALL_DELAY_MS: String(INSTALL_MS) },
+		});
+		await startHarper(nodeB, {
+			config: config(nodeB.harper.hostname),
+			env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_INSTALL_DELAY_MS: String(INSTALL_MS) },
+		});
 		ctx.nodes = [nodeA.harper, nodeB.harper];
 
 		const tokenResp = await sendOperation(ctx.nodes[0], {
