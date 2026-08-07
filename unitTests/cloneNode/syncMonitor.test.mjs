@@ -227,6 +227,102 @@ describe('monitorSyncLoop', () => {
 		assert.equal(clock.now(), 12000);
 	});
 
+	it('gives up at the maximum duration when data keeps arriving but sync never converges', async () => {
+		const clock = fakeClock();
+		// The non-converging shape: records keep being applied (arrivals track the clock, so the stall
+		// deadline never expires) while the version watermark never reaches target.
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: undefined, lastReceivedLocalTime: utc(clock.now()) },
+				]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			maxDurationMs: 60000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'unconverged');
+		assert.ok(clock.now() >= 60000, 'must run to the maximum duration, not stall early');
+	});
+
+	it('checks once and succeeds even when the ceiling has already elapsed (resumed clone at a spent budget)', async () => {
+		const clock = fakeClock();
+		// A resumed clone can arrive here with maxDurationMs already 0 (the persisted ceiling minus
+		// elapsed time). The check must still run once — a zero-budget bail-out with no check would
+		// call a clone that had actually converged 'unconverged'.
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: async () =>
+				statusResponse([{ database: 'system', lastReceivedVersion: 1500, lastReceivedLocalTime: utc(0) }]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			maxDurationMs: 0,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'synced');
+	});
+
+	it('performs exactly one check before reporting unconverged when the ceiling has already elapsed', async () => {
+		const clock = fakeClock();
+		let checks = 0;
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: async () => {
+				checks++;
+				return statusResponse([{ database: 'system', lastReceivedVersion: undefined }]);
+			},
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			maxDurationMs: 0,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'unconverged');
+		assert.equal(checks, 1, 'must check exactly once, not zero times, before giving up');
+	});
+
+	it('reports stalled, not unconverged, when the one mandatory check at a spent ceiling times out', async () => {
+		const clock = fakeClock();
+		// The check never resolves — same shape as a wedged status pipeline — so the mandatory first
+		// check times out rather than getting a definite answer. That is not evidence of
+		// non-convergence, so this must not report 'unconverged' (which the caller treats as
+		// terminal and clears the resume marker for).
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: () => new Promise(() => {}),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			maxDurationMs: 0,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'stalled');
+	});
+
+	it('reports stalled, not unconverged, when the one mandatory check at a spent ceiling errors', async () => {
+		const clock = fakeClock();
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: async () => {
+				throw new Error('cluster status unavailable');
+			},
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			maxDurationMs: 0,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'stalled');
+	});
+
 	it('stalls out when the cluster status check never settles', async () => {
 		const clock = fakeClock();
 		const outcome = await monitorSyncLoop({

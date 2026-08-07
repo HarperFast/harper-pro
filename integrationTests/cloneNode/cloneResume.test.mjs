@@ -1,5 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import {
 	startHarper,
 	teardownHarper,
@@ -59,6 +60,11 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: { port: leaderCtx.harper.hostname + ':9933', securePort: null },
+				// The sync monitor only genuinely runs on lmdb: under RocksDB the audit store's
+				// getKeys() is a stub, so describe reports no last_updated_record, every target is 0,
+				// and checkSyncStatus skips every database and reports synced on the first poll
+				// (harper-pro#611). These tests interrupt the sync WAIT, so they need it to exist.
+				storage: { engine: 'lmdb' },
 			},
 			env: { HARPER_NO_FLUSH_ON_EXIT: true },
 		});
@@ -87,9 +93,78 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 	after(async () => {
 		// Tear down via the live ctx objects — `startHarper` on restart reassigns `cloneCtx.harper`, so a
 		// snapshot captured before the restart would point at the dead process and leak the live one.
-		const live = [ctx.leaderCtx, ctx.cloneCtx].filter((c) => c?.harper?.process);
+		const live = [ctx.leaderCtx, ctx.cloneCtx, ctx.resumeCtx, ctx.partialCtx, ctx.reconcileCtx, ctx.forceCtx].filter(
+			(c) => c?.harper?.process
+		);
 		await Promise.all(live.map((c) => teardownHarper(c)));
 	});
+
+	function cloneOptionsFor(cloneCtx, token, extraEnv = {}) {
+		return {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false },
+				replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
+				storage: { engine: 'lmdb' },
+			},
+			env: {
+				HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
+				HDB_LEADER_TOKEN: token,
+				ALLOW_SELF_SIGNED: true,
+				HARPER_NO_FLUSH_ON_EXIT: true,
+				// throttle the copy so it is still running when we interrupt it
+				REPLICATION_COPYCHECKPOINTRECORDS: 25,
+				REPLICATION_RECEIVEEVENTHIGHWATERMARK: 5,
+				...extraEnv,
+			},
+		};
+	}
+
+	async function leaderToken() {
+		const response = await sendOperation(ctx.leader, {
+			operation: 'create_authentication_tokens',
+			authorization: ctx.leader.admin,
+			expires_in: '15Minutes',
+		});
+		return response.operation_token;
+	}
+
+	// The marker cloneNode writes as soon as replication is established (setNode() succeeds) — the
+	// sentinel that replication setup itself must never be repeated. `setupComplete` flips true only
+	// once JWT/custody/SSH key cloning also finishes; a kill before that leaves it false.
+	function markerPathFor(dataRootDir) {
+		return join(dataRootDir, 'tmp', 'clone-sync-started.json');
+	}
+
+	async function waitForMarker(dataRootDir, timeoutMs = 120000) {
+		const markerPath = markerPathFor(dataRootDir);
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (existsSync(markerPath)) return markerPath;
+			await sleep(25);
+		}
+		throw new Error(`clone did not record its sync marker within ${timeoutMs}ms`);
+	}
+
+	async function waitForMarkerSetupComplete(dataRootDir, timeoutMs = 120000) {
+		const markerPath = markerPathFor(dataRootDir);
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (existsSync(markerPath)) {
+				try {
+					if (JSON.parse(readFileSync(markerPath, 'utf8')).setupComplete) return markerPath;
+				} catch {
+					// marker is being rewritten; retry
+				}
+			}
+			await sleep(25);
+		}
+		throw new Error(
+			`clone did not finish setup (setupComplete marker) within ${timeoutMs}ms; last marker: ${
+				existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '(absent — clone may have already finalized)'
+			}`
+		);
+	}
 
 	test('resumes the bulk copy after a mid-copy kill instead of restarting from zero', async () => {
 		const tokenResponse = await sendOperation(ctx.leader, {
@@ -104,6 +179,7 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
+				storage: { engine: 'lmdb' },
 			},
 			env: {
 				HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
@@ -155,5 +231,165 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		});
 		equal(ends.length, 2, 'first and last records must both be present');
 		ok(caughtPartial, 'test should have interrupted the copy mid-stream (tune RECORD_COUNT/throttle if this fails)');
+	});
+
+	test('a restart once the sync wait has begun skips setup and still converges', async () => {
+		const resumeCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		ctx.resumeCtx = resumeCtx;
+		const options = cloneOptionsFor(resumeCtx, await leaderToken());
+		await startHarper(resumeCtx, options);
+
+		// Wait for setupComplete specifically (not just the marker's first appearance): JWT/custody/SSH
+		// key cloning still runs after the marker is first written, and this test's claim is about a
+		// restart once ALL of setup — not just replication — has finished.
+		const markerPath = await waitForMarkerSetupComplete(resumeCtx.harper.dataRootDir);
+		// A resume monitors the URL recorded here; checkSyncStatus matches it exactly.
+		const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+		equal(marker.leaderReplicationURL, `ws://${ctx.leader.hostname}:9933`);
+		equal(marker.leaderURL, `http://${ctx.leader.hostname}:9925`);
+		ok(marker.startedAt > 0, 'the marker must record when the wait began');
+		equal(marker.setupComplete, true);
+
+		await killHarper(resumeCtx);
+		// cloneJWTKeys rewrites the key trio, and cloneConfig rewrites harper-config.yaml, only on
+		// (re-)running setup — a boot merely regenerates missing keys — so untouched mtimes after the
+		// restart prove the resume skipped setup entirely.
+		const jwtPassPath = join(resumeCtx.harper.dataRootDir, 'keys', '.jwtPass');
+		const configPath = join(resumeCtx.harper.dataRootDir, 'harper-config.yaml');
+		const jwtMtimeBeforeRestart = statSync(jwtPassPath).mtimeMs;
+		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
+		await startHarper(resumeCtx, options);
+
+		await waitForAvailableStatus(resumeCtx.harper);
+		equal(
+			statSync(jwtPassPath).mtimeMs,
+			jwtMtimeBeforeRestart,
+			'resume must not re-clone the JWT keys — setup was supposed to be skipped'
+		);
+		equal(
+			statSync(configPath).mtimeMs,
+			configMtimeBeforeRestart,
+			'resume must not rewrite the config — replication setup was supposed to be skipped'
+		);
+		let finalCount = -1;
+		for (let retries = 0; retries < 60; retries++) {
+			finalCount = await countRows(resumeCtx.harper);
+			if (finalCount === RECORD_COUNT) break;
+			await sleep(500);
+		}
+		equal(finalCount, RECORD_COUNT, 'all records must be present after the resumed wait');
+		equal(existsSync(markerPath), false, 'finalizing the clone must clear the marker');
+	});
+
+	test('a restart caught between replication setup and finishing key cloning does not redo replication setup', async () => {
+		const partialCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		ctx.partialCtx = partialCtx;
+		// finishCloneSetup (JWT/custody/SSH keys) normally finishes in milliseconds — too fast for the
+		// 25ms marker poll below to reliably land before setupComplete flips true. The delay hook holds
+		// that window open so this test deterministically exercises the setupComplete:false resume path
+		// instead of vacuously passing via the already-covered setupComplete:true path.
+		const firstBootOptions = cloneOptionsFor(partialCtx, await leaderToken(), {
+			CLONE_SIMULATE_SETUP_DELAY_MS: 3000,
+		});
+		await startHarper(partialCtx, firstBootOptions);
+
+		const markerPath = await waitForMarker(partialCtx.harper.dataRootDir);
+		const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+		equal(
+			marker.setupComplete,
+			false,
+			'must catch the marker before key cloning finishes to exercise this resume path'
+		);
+		const configPath = join(partialCtx.harper.dataRootDir, 'harper-config.yaml');
+		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
+		// installHarper() already wrote a self-generated .jwtPass before cloneNode reached the delay
+		// hook, so its mere existence wouldn't prove anything — an mtime change is what shows
+		// cloneJWTKeys actually ran (and overwrote it) during the resume, not just that install did.
+		const jwtPassPath = join(partialCtx.harper.dataRootDir, 'keys', '.jwtPass');
+		const jwtMtimeBeforeRestart = statSync(jwtPassPath).mtimeMs;
+		await killHarper(partialCtx);
+		// Resume without the delay hook so finishCloneSetup actually completes this time.
+		await startHarper(partialCtx, cloneOptionsFor(partialCtx, await leaderToken()));
+
+		await waitForAvailableStatus(partialCtx.harper);
+		equal(
+			statSync(configPath).mtimeMs,
+			configMtimeBeforeRestart,
+			'resume must not redo replication setup — setNode()/cloneConfig() only run on a fresh attempt'
+		);
+		ok(
+			statSync(jwtPassPath).mtimeMs > jwtMtimeBeforeRestart,
+			'resume must still clone the JWT keys — setupComplete was false when killed'
+		);
+		let finalCount = -1;
+		for (let retries = 0; retries < 60; retries++) {
+			finalCount = await countRows(partialCtx.harper);
+			if (finalCount === RECORD_COUNT) break;
+			await sleep(500);
+		}
+		equal(finalCount, RECORD_COUNT, 'the clone must still converge after resuming the remaining setup stages');
+	});
+
+	test('an indeterminate marker is reconciled against hdb_nodes instead of redoing replication setup', async () => {
+		const reconcileCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		ctx.reconcileCtx = reconcileCtx;
+		await startHarper(reconcileCtx, cloneOptionsFor(reconcileCtx, await leaderToken()));
+
+		const markerPath = await waitForMarkerSetupComplete(reconcileCtx.harper.dataRootDir);
+		const established = JSON.parse(readFileSync(markerPath, 'utf8'));
+		await killHarper(reconcileCtx);
+
+		// Rewind the marker to the state a crash inside establishReplicationSetup leaves behind: the
+		// intent recorded, the outcome unknown. setNode() did in fact complete, so the next start must
+		// discover that from hdb_nodes rather than replaying replication setup.
+		writeFileSync(
+			markerPath,
+			JSON.stringify({
+				leaderURL: established.leaderURL,
+				startedAt: established.startedAt,
+				replicationEstablished: false,
+			})
+		);
+		const configPath = join(reconcileCtx.harper.dataRootDir, 'harper-config.yaml');
+		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
+
+		await startHarper(reconcileCtx, cloneOptionsFor(reconcileCtx, await leaderToken()));
+		await waitForAvailableStatus(reconcileCtx.harper);
+		equal(
+			statSync(configPath).mtimeMs,
+			configMtimeBeforeRestart,
+			'reconciliation must not rerun cloneConfig — hdb_nodes already proves replication is established'
+		);
+		equal(
+			await countRows(reconcileCtx.harper),
+			RECORD_COUNT,
+			'the clone must converge after reconciling an indeterminate marker'
+		);
+	});
+
+	test('forceClone takes the full setup path even with the marker present', async () => {
+		const forceCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		ctx.forceCtx = forceCtx;
+		await startHarper(forceCtx, cloneOptionsFor(forceCtx, await leaderToken()));
+
+		const markerPath = await waitForMarker(forceCtx.harper.dataRootDir);
+		await killHarper(forceCtx);
+		ok(existsSync(markerPath), 'the marker must be present for this to test the forceClone override');
+		const jwtPassPath = join(forceCtx.harper.dataRootDir, 'keys', '.jwtPass');
+		const jwtMtimeBeforeRestart = statSync(jwtPassPath).mtimeMs;
+
+		await startHarper(forceCtx, cloneOptionsFor(forceCtx, await leaderToken(), { FORCE_CLONE: true }));
+		await waitForAvailableStatus(forceCtx.harper);
+		ok(
+			statSync(jwtPassPath).mtimeMs > jwtMtimeBeforeRestart,
+			'forceClone must re-run setup, which re-clones the JWT keys'
+		);
+		let forcedCount = -1;
+		for (let retries = 0; retries < 60; retries++) {
+			forcedCount = await countRows(forceCtx.harper);
+			if (forcedCount === RECORD_COUNT) break;
+			await sleep(500);
+		}
+		equal(forcedCount, RECORD_COUNT, 'all records must be present after the forced reclone');
 	});
 });
