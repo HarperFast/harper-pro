@@ -596,17 +596,9 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 }
 
 /**
- * Connection options for the one-shot socket a replicated operation is sent over.
- *
- * Carrying the remote url is what arms the keep-alive ping tick in `replicateOverWS`
- * (`shouldRunKeepalive`), and a replicated operation needs it: the peer can legitimately take
- * minutes to execute (deploy_component's install, restart_service), and nothing is written on this
- * socket while it does. Built with an empty `{}` the socket was silent in both directions, so the
- * receive watchdog terminated it after 2 x replication.pingTimeout (~120s by default) and the
- * pending response rejected with `Connection closed  1006` — reporting a peer that was still
- * installing as a failed replication (harper-pro#674). With the keepalive the peer's pongs keep both
- * ends' watchdogs fed, while a peer that has genuinely stopped responding is still terminated on the
- * same clock.
+ * The url is required, not incidental: it arms the keep-alive, and without it this socket is silent
+ * for as long as the peer takes to execute (minutes, for a deploy install) and the receive watchdog
+ * terminates it at 2 x replication.pingTimeout.
  */
 export function operationConnectionOptions(url: string): { url: string } {
 	return { url };
@@ -629,8 +621,7 @@ export async function sendOperationToNode(node, operation, options?) {
 			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
 			if (logger.logsAtLevel('debug'))
 				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(operation));
-			// A throw from inside this listener (encode failure, socket state) is an uncaught exception
-			// that also leaves this promise pending forever; reject it instead.
+			// A throw inside this listener is an uncaught exception, and leaves this promise pending.
 			try {
 				resolve(session.sendOperation(operation));
 			} catch (error) {
