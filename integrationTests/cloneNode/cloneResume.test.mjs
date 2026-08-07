@@ -7,6 +7,7 @@ import {
 	getNextAvailableLoopbackAddress,
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
+import { existsSync, writeFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
@@ -118,6 +119,8 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		};
 		ctx.cloneCtx = cloneCtx;
 		await startHarper(cloneCtx, cloneOptions);
+		const baselinePath = join(cloneCtx.harper.dataRootDir, '.cloneSyncBaseline.json');
+		const availabilityFinalizationPath = join(cloneCtx.harper.dataRootDir, '.cloneAvailabilityFinalization');
 
 		// Wait until the follower has committed SOME but not all records, then kill it mid-copy.
 		let caughtPartial = false;
@@ -131,12 +134,30 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			if (count === RECORD_COUNT) break; // copy finished before we could interrupt
 			await sleep(25);
 		}
+		ok(existsSync(baselinePath), 'the pre-copy synchronization baseline must remain durable during the copy');
 		await killHarper(cloneCtx);
 
 		// Restart on the SAME data dir: cloneNode re-enters the clone flow (cloned flag isn't set yet)
 		// and the persisted copy cursor must resume the copy rather than restart it from zero.
 		await startHarper(cloneCtx, cloneOptions);
+		let observedResumeUnavailable = false;
+		const resumeStatusDeadline = Date.now() + 5000;
+		while (Date.now() < resumeStatusDeadline) {
+			let availability;
+			try {
+				availability = await sendOperation(cloneCtx.harper, { operation: 'get_status', id: 'availability' });
+			} catch {}
+			const count = await countRows(cloneCtx.harper);
+			if (count < RECORD_COUNT) {
+				ok(availability?.status !== 'Available', 'A resumed clone must stay Unavailable while rows are still missing');
+				if (availability?.status === 'Unavailable') observedResumeUnavailable = true;
+			}
+			if (count === RECORD_COUNT) break;
+			await sleep(50);
+		}
+		ok(observedResumeUnavailable, 'A resumed clone should publish Unavailable before continuing its copy');
 		await waitForAvailableStatus(cloneCtx.harper);
+		ok(!existsSync(baselinePath), 'the persisted synchronization baseline should be removed after clone completion');
 
 		// The key correctness property: every record is present after the interrupted+resumed copy.
 		let finalCount = -1;
@@ -155,5 +176,21 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		});
 		equal(ends.length, 2, 'first and last records must both be present');
 		ok(caughtPartial, 'test should have interrupted the copy mid-stream (tune RECORD_COUNT/throttle if this fails)');
+
+		await sendOperation(cloneCtx.harper, { operation: 'set_status', id: 'availability', status: 'Unavailable' });
+		await killHarper(cloneCtx);
+		writeFileSync(
+			baselinePath,
+			JSON.stringify({ version: 1, leaderURL: cloneOptions.env.HDB_LEADER_URL, leaderBaseline: 1 })
+		);
+		await startHarper(cloneCtx, cloneOptions);
+		await sleep(1000);
+		const availability = await sendOperation(cloneCtx.harper, { operation: 'get_status', id: 'availability' });
+		equal(availability.status, 'Unavailable', 'an in-progress baseline must not finalize an already-cloned node');
+		ok(existsSync(baselinePath), 'the in-progress baseline must remain available for a forced clone to resume');
+		ok(
+			!existsSync(availabilityFinalizationPath),
+			'only a confirmed sync may create an availability finalization marker'
+		);
 	});
 });

@@ -28,6 +28,36 @@ const HDB_LEADER_URL = values['leader-url'] || process.env.HDB_LEADER_URL || val
 // Check to see if extra args are passed to harper, this could be the case with api-ops through the CLI
 const hasPositionalArg = Boolean(process.argv[2] && !process.argv[2].startsWith('-'));
 
+async function completeCloneAvailabilityFinalization() {
+	const { existsSync } = require('node:fs');
+	const { join } = require('node:path');
+	const { getHdbBasePath } = require('../core/utility/environment/environmentManager.js');
+	const rootPath = getHdbBasePath();
+	if (typeof rootPath !== 'string') return;
+	const finalizationPath = join(rootPath, '.cloneAvailabilityFinalization');
+	if (!existsSync(finalizationPath)) return;
+	try {
+		const { set: setStatus } = require('../core/server/status/index.js');
+		await setStatus({ id: 'availability', status: 'Available' });
+		unlinkIfPresent(join(rootPath, '.cloneSyncBaseline.json'));
+		if (unlinkIfPresent(join(rootPath, '.cloneSyncInProgress'))) unlinkIfPresent(finalizationPath);
+	} catch (error) {
+		console.error(`Failed to complete clone availability finalization: ${error}`);
+	}
+}
+
+function unlinkIfPresent(path) {
+	const { unlinkSync } = require('node:fs');
+	try {
+		unlinkSync(path);
+		return true;
+	} catch (error) {
+		if (error?.code === 'ENOENT') return true;
+		console.error(`Failed to remove clone finalization marker ${path}: ${error}`);
+		return false;
+	}
+}
+
 if (HDB_LEADER_URL && !hasPositionalArg) {
 	// If rootpath is provided ensure that an uppercase version of the arg is also added to process.argv so it can be picked
 	// by anything expecting it in uppercase.
@@ -44,7 +74,8 @@ if (HDB_LEADER_URL && !hasPositionalArg) {
 	// Clone Node will start Harper after cloning is complete. If this node is already marked as cloned,
 	// it will skip the cloning process and just start Harper.
 	cloneNode()
-		.then((message) => {
+		.then(async (message) => {
+			await completeCloneAvailabilityFinalization();
 			if (message) {
 				console.log(message);
 			}

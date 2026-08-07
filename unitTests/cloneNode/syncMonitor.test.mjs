@@ -16,7 +16,13 @@ const utc = (ms) => new Date(ms).toUTCString();
 
 function statusResponse(sockets) {
 	return {
-		connections: [{ name: 'leader', url: LEADER_URL, database_sockets: sockets }],
+		connections: [
+			{
+				name: 'leader',
+				url: LEADER_URL,
+				database_sockets: sockets.map((socket) => ({ connected: true, lastReceivedStatus: 'Waiting', ...socket })),
+			},
+		],
 	};
 }
 
@@ -47,6 +53,30 @@ describe('checkSyncStatus', () => {
 			noopLog
 		);
 		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 7000 });
+	});
+
+	it('requires every target socket to be connected and waiting, even if its watermark is current', async () => {
+		const missingSocket = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () =>
+				statusResponse([
+					{ database: 'system', connected: true, lastReceivedStatus: 'Waiting', lastReceivedVersion: 1000 },
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.deepEqual(missingSocket, { syncComplete: false, latestReceivedMs: 0 });
+
+		const receivingSocket = await checkSyncStatus(
+			{ system: 1000 },
+			async () =>
+				statusResponse([
+					{ database: 'system', connected: true, lastReceivedStatus: 'Receiving', lastReceivedVersion: 1000 },
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.deepEqual(receivingSocket, { syncComplete: false, latestReceivedMs: 0 });
 	});
 
 	it('scans every socket for arrival stamps instead of returning on the first laggard', async () => {

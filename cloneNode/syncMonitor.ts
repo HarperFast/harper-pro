@@ -36,7 +36,7 @@ export async function checkSyncStatus(
 		return { syncComplete: false, latestReceivedMs: 0 };
 	}
 
-	const leaderConnection = clusterResponse.connections.find((conn) => conn.url === leaderReplicationURL);
+	const leaderConnection = clusterResponse.connections.find((conn) => conn?.url === leaderReplicationURL);
 
 	if (!leaderConnection) {
 		log('No connection found matching leader replication URL, will wait and retry');
@@ -50,18 +50,18 @@ export async function checkSyncStatus(
 
 	let syncComplete = true;
 	let latestReceivedMs = 0;
-	for (const socket of leaderConnection.database_sockets) {
-		const dbName = socket.database;
-		const targetTime = targetTimestamps[dbName];
-		if (!targetTime) {
-			log(`Database ${dbName}: No target timestamp, skipping sync check`, 'debug');
+	for (const [dbName, targetTime] of Object.entries(targetTimestamps)) {
+		const socket = leaderConnection.database_sockets.find((candidate) => candidate?.database === dbName);
+		if (!socket) {
+			syncComplete = false;
+			log(`No leader socket found for database ${dbName}`, 'debug');
 			continue;
 		}
 
 		// Raw version (high-precision float64) preserves the sub-millisecond precision needed for
 		// an accurate comparison against the leader's last_updated_record targets.
 		const receivedVersion = socket.lastReceivedVersion;
-		if (receivedVersion && receivedVersion >= targetTime) {
+		if (socket.connected === true && socket.lastReceivedStatus === 'Waiting' && receivedVersion >= targetTime) {
 			log(`Database ${dbName}: Synchronized`, 'debug');
 			continue;
 		}

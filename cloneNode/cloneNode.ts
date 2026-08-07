@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { accessSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { accessSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -30,6 +30,12 @@ import {
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
+import {
+	CLONE_SYNC_BASELINE_VERSION,
+	deriveCloneTargets,
+	isReplicatedDatabase,
+	validateCloneSyncBaseline,
+} from './syncStatus.ts';
 
 /**
  * Environment Variables:
@@ -83,6 +89,9 @@ import { monitorSyncLoop } from './syncMonitor.ts';
 const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
 const DEFAULT_REPLICATION_PORT = '9933';
+const CLONE_SYNC_BASELINE_FILE = '.cloneSyncBaseline.json';
+const CLONE_SYNC_IN_PROGRESS_FILE = '.cloneSyncInProgress';
+const CLONE_AVAILABILITY_FINALIZATION_FILE = '.cloneAvailabilityFinalization';
 
 const CONFIG_TO_EXCLUDE_FROM_CLONE = {
 	clustering_nodename: true,
@@ -183,6 +192,7 @@ let harperLogger: any;
 let leaderReplicationURL: string;
 let hdbConfig: Record<string, any> = {};
 let freshClone: boolean = false;
+let cloneDatabaseReplications: unknown;
 
 export async function cloneNode(): Promise<void> {
 	// Clone using websockets with certificate-based auth, or with credential/token auth if provided
@@ -234,7 +244,29 @@ export async function cloneNode(): Promise<void> {
 		log('Skipping clone, instance already marked as cloned. Starting Harper.');
 		envMgr.initSync();
 		const { main } = await import('../core/bin/run.js');
-		return main();
+		await main();
+		if (pathExists(cloneAvailabilityFinalizationPath())) {
+			const { set: setStatus } = await import('../core/server/status/index.js');
+			try {
+				await setStatus({ id: 'availability', status: 'Available' });
+				if (removeCloneSyncBaseline() && removeCloneSyncInProgress()) {
+					removeCloneAvailabilityFinalization();
+					log('Completed interrupted clone availability finalization');
+				}
+			} catch (err) {
+				log(`Failed to publish Available during recovery finalization; will retry on next start: ${err}`, 'error');
+			}
+		}
+		return;
+	}
+	if (forceClone) {
+		removeCloneSyncBaseline();
+		removeCloneSyncInProgress();
+		removeCloneAvailabilityFinalization();
+		if (hdbConfig?.cloned) {
+			hdbConfig.cloned = false;
+			updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		}
 	}
 
 	if (!usingCertAuth) {
@@ -249,6 +281,7 @@ export async function cloneNode(): Promise<void> {
 	if (freshClone || !systemExists) {
 		await installHarper();
 	}
+	writeCloneSyncInProgress();
 
 	// Custody clone gate (#166): mark the clone bootstrap BEFORE Harper starts so the
 	// secretCustody component does not self-generate a cluster env-secrets keypair — the leader's
@@ -261,6 +294,16 @@ export async function cloneNode(): Promise<void> {
 	// Start Harper to prepare for clone operations
 	const { main } = await import('../core/bin/run.js');
 	await main();
+	if (!skipSyncMonitor) {
+		const { set: setStatus } = await import('../core/server/status/index.js');
+		try {
+			await setStatus({ id: 'availability', status: 'Unavailable' });
+		} catch (statusErr) {
+			updateConfigValue(CONFIG_PARAMS.CLONED, false);
+			log(`Failed to publish Unavailable before clone initialization: ${statusErr}`, 'error');
+			throw statusErr;
+		}
+	}
 
 	logger.initLogSettings();
 	harperLogger = logger.loggerWithTag('cloneNode');
@@ -301,6 +344,21 @@ export async function cloneNode(): Promise<void> {
 	// environment that has the cluster CA chain).
 	if (!usingCertAuth) {
 		await cloneSchemas();
+	}
+	let syncTargetResult;
+	if (!skipSyncMonitor) {
+		try {
+			syncTargetResult = await getCloneSyncTargets();
+		} catch (err) {
+			syncTargetResult = {
+				targets: Object.create(null),
+				errors: [`Failed to obtain clone synchronization targets: ${err}`],
+			};
+		}
+	}
+	if (syncTargetResult?.errors.length) {
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		throw new Error(`Invalid clone synchronization targets: ${syncTargetResult.errors.join('; ')}`);
 	}
 
 	// Base set node request
@@ -376,7 +434,7 @@ export async function cloneNode(): Promise<void> {
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
 	// once sync is confirmed and availability has been published as Available — a timeout or failure
 	// must not be treated as success.
-	const syncOutcome = await monitorSync();
+	const syncOutcome = await monitorSync(syncTargetResult);
 	if (syncOutcome === 'failed') {
 		// Leave Harper running so get_status stays queryable for the control plane (availability is
 		// now Unavailable). Throwing here would propagate to bin/harper.js and exit the already-started
@@ -430,60 +488,49 @@ export async function cloneNode(): Promise<void> {
 		}
 	}
 
-	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
+	writeCloneAvailabilityFinalization();
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
+	const { set: setStatus } = await import('../core/server/status/index.js');
+	try {
+		await setStatus({ id: 'availability', status: 'Available' });
+	} catch (err) {
+		log(`Clone completed but failed to set availability to Available: ${err}; leaving recovery marker`, 'error');
+		return;
+	}
+	if (removeCloneSyncBaseline() && removeCloneSyncInProgress()) {
+		removeCloneAvailabilityFinalization();
+	}
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
 
 /**
  * Result of monitoring clone synchronization.
- * - `synced`: sync was confirmed and `availability` was published as Available.
- * - `skipped`: sync monitoring was disabled (skip-sync-monitor); `availability` is left untouched.
+ * - `synced`: sync was confirmed; the caller still must finalize config and publish Available.
+ * - `skipped`: sync monitoring was disabled (skip-sync-monitor); `availability` is published as Available.
  * - `failed`: sync was not confirmed (stall timeout, missing targets, or a failed status write);
  *   `availability` is left Unavailable and the node must not be marked as cloned.
  */
 type SyncOutcome = 'synced' | 'skipped' | 'failed';
 
 /**
- * Monitors database synchronization after cloning and drives this node's `availability` status.
+ * Monitors database synchronization after cloning.
  *
  * `availability` is a cooperative, multi-writer status whose contract is owned by core; this is the
  * clone producer upholding it. It is published as Unavailable up front so `get_status` always
- * carries a definite signal for the control plane — never an absent field — and is only flipped to
- * Available once sync is confirmed and that write succeeds. On any failure it is left Unavailable.
+ * carries a definite signal for the control plane — never an absent field. This function only
+ * confirms sync; the caller publishes Available after durably marking the clone complete.
  *
  * Polls at regular intervals until sync completes, failing only on a stall — the deadline slides
  * forward whenever replication data arrives, so a large clone is never timed out while healthy.
  */
-async function monitorSync(): Promise<SyncOutcome> {
-	const { set: setStatus } = await import('../core/server/status/index.js');
-
+async function monitorSync(targetResult?: { targets: Record<string, number>; errors: string[] }): Promise<SyncOutcome> {
 	if (skipSyncMonitor) {
-		// The operator opted out of the sync gate, so the clone is declared ready. Publish Available
-		// (best-effort) — this also clears any Unavailable persisted by a prior failed attempt, since
-		// hdb_status is not replicated and survives restarts — keeping availability consistent with the
-		// cloned flag the caller sets for this outcome.
-		log('Skipping sync monitor (skip-sync-monitor); marking node Available without verifying sync');
-		try {
-			await setStatus({ id: 'availability', status: 'Available' });
-		} catch (err) {
-			log(`Failed to set availability status to Available: ${err}`, 'error');
-		}
+		log('Skipping sync monitor (skip-sync-monitor); completing clone without verifying sync');
 		return 'skipped';
 	}
 
 	const { clusterStatus } = await import('../replication/clusterStatus.js');
-
-	// The node is not ready to serve traffic until the clone has caught up with the leader. Publish
-	// Unavailable up front so get_status always carries a definite availability signal for the whole
-	// sync wait. Best-effort: a failed write here must not abort the clone (the loop still runs and
-	// publishes Available on success).
-	try {
-		await setStatus({ id: 'availability', status: 'Unavailable' });
-	} catch (err) {
-		log(`Failed to set availability status to Unavailable: ${err}`, 'error');
-	}
 
 	// Test/diagnostic hook (not a user-facing option): deterministically exercise the
 	// unconfirmed-sync failure path. Loopback replication is too fast and bidirectional to force a
@@ -494,10 +541,15 @@ async function monitorSync(): Promise<SyncOutcome> {
 		return 'failed';
 	}
 
-	// Get last updated record timestamps for all DB and write to file
-	// These values can be used for checking when the clone replication has caught up with the leader
-	const targetTimestamps = await getLastUpdatedRecord();
-	if (!targetTimestamps || Object.keys(targetTimestamps).length === 0) {
+	if (!targetResult || targetResult.errors.length > 0) {
+		log(
+			`Invalid clone synchronization targets: ${targetResult?.errors.join('; ') || 'none available'}; leaving availability Unavailable`,
+			'error'
+		);
+		return 'failed';
+	}
+	const targetTimestamps = targetResult.targets;
+	if (Object.keys(targetTimestamps).length === 0) {
 		log('No target timestamps available to check synchronization status; leaving availability Unavailable', 'error');
 		return 'failed';
 	}
@@ -523,17 +575,6 @@ async function monitorSync(): Promise<SyncOutcome> {
 
 	if (outcome === 'synced') {
 		log('All databases synchronized');
-
-		// Only report Available — and let the caller finalize the clone — once the status
-		// write itself succeeds. A failed write must not be treated as a successful sync,
-		// otherwise the node would be marked cloned without a readiness signal.
-		try {
-			await setStatus({ id: 'availability', status: 'Available' });
-		} catch (err) {
-			log(`Synchronized but failed to set availability to Available: ${err}; leaving Unavailable`, 'error');
-			return 'failed';
-		}
-
 		return 'synced';
 	}
 
@@ -544,48 +585,118 @@ async function monitorSync(): Promise<SyncOutcome> {
 	return 'failed';
 }
 
-/**
- * Will loop through a system describe and a describeAll to compare the last updated record for each table
- * and record the most recent timestamp for each database in a JSON file.
- * @returns {Promise<void>}
- */
-async function getLastUpdatedRecord(): Promise<Record<string, number>> {
-	log('Getting last updated record timestamp for all database', 'debug');
-	const lastUpdated: Record<string, number> = {};
+async function getCloneSyncTargets() {
+	log('Getting leader baseline for clone synchronization', 'debug');
+	const databaseDescriptions = Object.create(null) as Record<string, unknown>;
 	const systemDb: Record<string, any> = await leaderRequest({ operation: 'describe_database', database: 'system' });
-	lastUpdated['system'] = findMostRecentTimestamp(systemDb);
+	databaseDescriptions.system = systemDb;
 
 	const allDb: Record<string, any> = await leaderRequest({ operation: 'describe_all' });
 	for (const db in allDb) {
-		// requestId is part of the describe response so we ignore it
-		if (typeof allDb[db] !== 'object') continue;
-		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
+		if (allDb[db] && typeof allDb[db] === 'object') databaseDescriptions[db] = allDb[db];
 	}
+	let leaderBaseline = readCloneSyncBaseline();
+	const isResuming = leaderBaseline !== undefined;
+	if (isResuming) {
+		log(`Reusing persisted clone synchronization baseline ${leaderBaseline}`, 'debug');
+	} else {
+		const timeResponse = await leaderRequest({ operation: 'system_information', attributes: ['time'] });
+		leaderBaseline = timeResponse?.time?.current;
+	}
+	const result = deriveCloneTargets(databaseDescriptions, cloneDatabaseReplications, leaderBaseline);
 
-	const lastUpdatedFilePath: string = join(rootPath, 'tmp', 'lastUpdated.json');
-	log(`Writing last updated database timestamps to: ${lastUpdatedFilePath}`, 'debug');
-	writeJsonSync(lastUpdatedFilePath, lastUpdated);
+	if (result.errors.length === 0 && !isResuming) writeCloneSyncBaseline(leaderBaseline!);
 
-	return lastUpdated;
+	return result;
 }
 
-/**
- * Find the most recent last_updated_record timestamp across all tables in a database
- * @param {Object} dbObj - Database object or describe response containing tables
- * @returns {number} - Most recent timestamp, or 0 if none found
- */
-function findMostRecentTimestamp(dbObj: Record<string, any>): number {
-	let mostRecent = 0;
-	for (const table in dbObj) {
-		const tableObj = dbObj[table];
-		// requestId is part of the describe response so we ignore it
-		if (typeof tableObj !== 'object' || tableObj == null) continue;
-		if (tableObj.last_updated_record > mostRecent) {
-			mostRecent = tableObj.last_updated_record;
-		}
-	}
+function cloneSyncBaselinePath(): string {
+	return join(rootPath, CLONE_SYNC_BASELINE_FILE);
+}
 
-	return mostRecent;
+function cloneSyncInProgressPath(): string {
+	return join(rootPath, CLONE_SYNC_IN_PROGRESS_FILE);
+}
+
+function cloneAvailabilityFinalizationPath(): string {
+	return join(rootPath, CLONE_AVAILABILITY_FINALIZATION_FILE);
+}
+
+function readCloneSyncBaseline(): number | undefined {
+	const path = cloneSyncBaselinePath();
+	if (!pathExists(path)) return undefined;
+
+	let persisted: any;
+	try {
+		persisted = JSON.parse(readFileSync(path, 'utf8'));
+	} catch (err) {
+		throw new Error(`Invalid persisted clone synchronization baseline at ${path}: ${err}`);
+	}
+	if (forceClone && persisted?.leaderURL !== leaderURL) {
+		removeCloneSyncBaseline();
+		return undefined;
+	}
+	try {
+		return validateCloneSyncBaseline(persisted, leaderURL);
+	} catch (err) {
+		throw new Error(`${err} at ${path}`);
+	}
+}
+
+function writeCloneSyncBaseline(leaderBaseline: number): void {
+	const path = cloneSyncBaselinePath();
+	const temporaryPath = `${path}.${process.pid}.tmp`;
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(
+		temporaryPath,
+		JSON.stringify({ version: CLONE_SYNC_BASELINE_VERSION, leaderURL, leaderBaseline }, null, 2),
+		'utf8'
+	);
+	renameSync(temporaryPath, path);
+	log(`Persisted clone synchronization baseline to: ${path}`, 'debug');
+}
+
+function writeCloneSyncInProgress(): void {
+	const path = cloneSyncInProgressPath();
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, 'true', 'utf8');
+}
+
+function writeCloneAvailabilityFinalization(): void {
+	const path = cloneAvailabilityFinalizationPath();
+	const temporaryPath = `${path}.${process.pid}.tmp`;
+	writeFileSync(temporaryPath, 'true', 'utf8');
+	renameSync(temporaryPath, path);
+}
+
+function removeCloneSyncBaseline(): boolean {
+	try {
+		unlinkSync(cloneSyncBaselinePath());
+		return true;
+	} catch (err: any) {
+		if (err?.code === 'ENOENT') return true;
+		log(`Failed to remove clone synchronization baseline: ${err}`, 'error');
+		return false;
+	}
+}
+
+function removeCloneSyncInProgress(): boolean {
+	try {
+		unlinkSync(cloneSyncInProgressPath());
+		return true;
+	} catch (err: any) {
+		if (err?.code === 'ENOENT') return true;
+		log(`Failed to remove clone synchronization in-progress marker: ${err}`, 'error');
+		return false;
+	}
+}
+
+function removeCloneAvailabilityFinalization(): void {
+	try {
+		unlinkSync(cloneAvailabilityFinalizationPath());
+	} catch (err: any) {
+		if (err?.code !== 'ENOENT') log(`Failed to remove clone availability finalization marker: ${err}`, 'error');
+	}
 }
 
 /**
@@ -823,6 +934,7 @@ async function cloneConfig(): Promise<Record<string, any>> {
 	// Apply command-line and environment variable overrides
 	const cliArgs = assignCMDENVVariables(Object.keys(CONFIG_PARAM_MAP), true);
 	Object.assign(configData, cliArgs);
+	cloneDatabaseReplications = configData[CONFIG_PARAMS.REPLICATION_DATABASES];
 
 	// Write final configuration to file
 	createConfigFile(configData, true);
@@ -916,19 +1028,11 @@ async function cloneSchemas(): Promise<void> {
 	// clone isn't even subscribing to. Matches the gating used by `shouldReplicateFromNode` in
 	// `replication/knownNodes.ts`: `undefined` or `'*'` accept everything; an array accepts only
 	// the names it lists (objects with `.name` are sharded-database entries).
-	const databaseReplications = envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES);
-	const isReplicatedDatabase = (dbName: string): boolean => {
-		if (!databaseReplications || databaseReplications === '*') return true;
-		if (!Array.isArray(databaseReplications)) return true;
-		return databaseReplications.some((entry: any) =>
-			typeof entry === 'string' ? entry === dbName : entry?.name === dbName
-		);
-	};
-
+	const databaseReplications = cloneDatabaseReplications;
 	for (const dbName of Object.keys(allDb)) {
 		const dbDescribe = allDb[dbName];
 		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;
-		if (!isReplicatedDatabase(dbName)) {
+		if (!isReplicatedDatabase(databaseReplications, dbName)) {
 			log(`Skipping schema pre-create for '${dbName}' (not in replication.databases)`, 'debug');
 			continue;
 		}
@@ -1121,21 +1225,6 @@ function pathExists(path: string): boolean {
 		return true;
 	} catch {
 		return false;
-	}
-}
-
-/**
- * Write the given data as JSON to a file at the specified path
- * @param path
- * @param data
- */
-function writeJsonSync(path: string, data: any): void {
-	try {
-		// Create directory if it doesn't exist
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, JSON.stringify(data, null, 2), 'utf8');
-	} catch (err) {
-		log(`Error writing JSON to ${path}: ${err}`, 'error');
 	}
 }
 

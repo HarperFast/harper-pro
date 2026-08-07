@@ -3,6 +3,7 @@ import { equal, ok } from 'node:assert';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { readLog } from '../cluster/clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -12,6 +13,8 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	'bin',
 	'harper.js'
 );
+
+const COPY_STALL_TIMEOUT_MS = 15000;
 
 async function sendOperation(node, operation) {
 	const response = await fetch(node.operationsAPIURL, {
@@ -40,6 +43,15 @@ async function waitForAvailableStatus(node, timeoutMs = 120000, checkInterval = 
 	throw new Error(`Node status did not become Available within ${timeoutMs}ms`);
 }
 
+async function waitForLog(node, text, timeoutMs = 30000) {
+	const timeoutAt = Date.now() + timeoutMs;
+	while (Date.now() < timeoutAt) {
+		if ((await readLog(node)).includes(text)) return;
+		await sleep(100);
+	}
+	throw new Error(`Log did not contain ${JSON.stringify(text)} within ${timeoutMs}ms`);
+}
+
 suite('Clone Node', (ctx) => {
 	before(async () => {
 		ctx.nodes = [];
@@ -56,6 +68,7 @@ suite('Clone Node', (ctx) => {
 				replication: {
 					port: nodeCtx.harper.hostname + ':9933',
 					securePort: null,
+					blobTimeout: COPY_STALL_TIMEOUT_MS,
 				},
 			},
 			// set some random custom env var to verify it gets copied to the clone
@@ -64,6 +77,7 @@ suite('Clone Node', (ctx) => {
 				LOGGING_LEVEL: 'debug',
 				LOGGING_ROTATION_MAXSIZE: '101M',
 				MQTT_NETWORK_PORT: 1212,
+				HARPER_TEST_COPY_STALL_ONCE_DB: 'data',
 			},
 		});
 		ctx.nodes.push(nodeCtx.harper);
@@ -159,6 +173,20 @@ suite('Clone Node', (ctx) => {
 			},
 		});
 		ctx.nodes.push(cloneCtx.harper);
+		await waitForLog(ctx.nodes[0], '[test] stalling outbound base copy mid-flight for db "data"');
+
+		const stallCheckDeadline = Date.now() + 5000;
+		let observedUnavailable = false;
+		while (Date.now() < stallCheckDeadline) {
+			let availability;
+			try {
+				availability = await sendOperation(ctx.nodes[1], { operation: 'get_status', id: 'availability' });
+			} catch {}
+			ok(availability?.status !== 'Available', 'Clone must remain Unavailable while its base copy is stalled');
+			if (availability?.status === 'Unavailable') observedUnavailable = true;
+			await sleep(200);
+		}
+		ok(observedUnavailable, 'Clone should publish Unavailable while its base copy is stalled');
 
 		await waitForAvailableStatus(ctx.nodes[1]);
 
@@ -205,25 +233,13 @@ suite('Clone Node', (ctx) => {
 		equal(clusterStatusNode2.connections.length, 1, 'Clone node should have 1 connection');
 		equal(clusterStatusNode2.connections?.[0]?.database_sockets.length, 2, 'Clone node should be connected to leader');
 
-		// Verify that data was cloned successfully by querying the clone node for data that was inserted into the leader node before cloning.
-		// "Available" status doesn't guarantee all data has finished copying, so retry until the record appears.
-		let responseData;
-		for (let retries = 0; ; retries++) {
-			try {
-				responseData = await sendOperation(ctx.nodes[1], {
-					operation: 'search_by_id',
-					table: 'test',
-					get_attributes: ['id', 'name'],
-					ids: ['1'],
-				});
-				if (responseData.length === 1) break;
-			} catch {}
-			if (retries >= 20) {
-				equal(responseData?.length ?? 0, 1, 'Should find 1 record in clone node');
-				break;
-			}
-			await sleep(500);
-		}
+		const responseData = await sendOperation(ctx.nodes[1], {
+			operation: 'search_by_id',
+			table: 'test',
+			get_attributes: ['id', 'name'],
+			ids: ['1'],
+		});
+		equal(responseData.length, 1, 'Available clone should serve the copied record immediately');
 		equal(responseData[0].name, 'test-clone', 'Record name should match the original');
 
 		const sshKeys = await sendOperation(ctx.nodes[1], {
