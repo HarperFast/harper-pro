@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { accessSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { accessSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -280,44 +280,54 @@ export async function cloneNode(): Promise<void> {
 	logger.initLogSettings();
 	harperLogger = logger.loggerWithTag('cloneNode');
 
-	let targetTimestamps: Record<string, number> | undefined;
-	let totalBytes = 0;
-	let syncStartedAt: number;
+	const syncStartedAt: number = resumeMarker?.startedAt ?? Date.now();
+	let targetTimestamps: Record<string, number> | undefined = resumeMarker?.targetTimestamps;
+	let totalBytes: number = resumeMarker?.totalBytes ?? 0;
 
-	if (resumeMarker) {
-		// checkSyncStatus matches leaderReplicationURL exactly, and only the marker holds the value
-		// refined against a TLS-only (e.g. v4) leader.
-		leaderReplicationURL = resumeMarker.leaderReplicationURL ?? leaderReplicationURL;
-		targetTimestamps = resumeMarker.targetTimestamps;
-		totalBytes = resumeMarker.totalBytes ?? 0;
-		syncStartedAt = resumeMarker.startedAt ?? Date.now();
-		log(`Clone sync already in progress; replication already established with ${leaderReplicationURL}`);
+	try {
+		if (resumeMarker?.replicationEstablished) {
+			// checkSyncStatus matches leaderReplicationURL exactly, and only the marker holds the value
+			// refined against a TLS-only (e.g. v4) leader.
+			leaderReplicationURL = resumeMarker.leaderReplicationURL ?? leaderReplicationURL;
+			log(`Clone sync already in progress; replication already established with ${leaderReplicationURL}`);
+		} else {
+			// A marker recording only the intent to establish replication is indeterminate — the crash
+			// may have landed either side of setNode(). hdb_nodes is the durable evidence: its peer row
+			// is written only once the leader exchange succeeds, and carries the refined URL.
+			const establishedURL = resumeMarker ? await findEstablishedLeaderURL() : undefined;
+			if (establishedURL) {
+				leaderReplicationURL = establishedURL;
+				log(`Reconciled interrupted setup: replication is already established with ${leaderReplicationURL}`);
+			} else {
+				// Record the intent first, so a crash inside establishReplicationSetup is reconcilable
+				// rather than a silent replay of cloneConfig/restartWorkers/setNode.
+				writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
+				await establishReplicationSetup();
+			}
+			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: true, targetTimestamps, totalBytes });
+		}
 
 		if (!targetTimestamps) {
-			// setNode() succeeded but the leader snapshot fetch below didn't finish before the last
-			// crash. Replication is already established, so retry only the fetch, not establishReplicationSetup.
 			const snapshot = await fetchAndPersistSnapshot(syncStartedAt);
 			if (!snapshot) return;
 			({ targetTimestamps, totalBytes } = snapshot);
 		}
 
-		if (!resumeMarker.setupComplete) {
+		if (!resumeMarker?.setupComplete) {
 			if (!(await finishCloneSetup())) return;
-			writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, true);
+			writeSyncStartedMarker({
+				startedAt: syncStartedAt,
+				replicationEstablished: true,
+				targetTimestamps,
+				totalBytes,
+				setupComplete: true,
+			});
 		}
-	} else {
-		await establishReplicationSetup();
-		syncStartedAt = Date.now();
-		// Persisted before the leader snapshot fetch below: a crash during that fetch must resume
-		// here (retry the fetch only) rather than repeat establishReplicationSetup.
-		writeSyncStartedMarker(syncStartedAt, undefined, 0, false);
-
-		const snapshot = await fetchAndPersistSnapshot(syncStartedAt);
-		if (!snapshot) return;
-		({ targetTimestamps, totalBytes } = snapshot);
-
-		if (!(await finishCloneSetup())) return;
-		writeSyncStartedMarker(syncStartedAt, targetTimestamps, totalBytes, true);
+	} catch (err) {
+		// Contained rather than thrown: a rejection here reaches bin/harper.js, which exits the
+		// already-started process instead of leaving it queryable.
+		await abandonClone(`Clone from leader node ${leaderURL} failed during setup (${err})`);
+		return;
 	}
 
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
@@ -511,17 +521,18 @@ async function finishCloneSetup(): Promise<boolean> {
 }
 
 /**
- * Marker written once `setNode()` succeeds, so a restart never repeats `establishReplicationSetup`.
- * `leaderReplicationURL` is the leader-config-refined value checkSyncStatus matches exactly against
- * cluster_status (the heuristic URL is wrong for a TLS-only leader). `targetTimestamps`/`totalBytes`
- * pin the leader snapshot a resume reuses instead of re-fetching; absent until that fetch succeeds.
- * `setupComplete` is false until `finishCloneSetup` (JWT/custody/SSH keys) also finishes — a resume
- * re-runs exactly whichever of the fetch or `finishCloneSetup` didn't complete, never `setNode()`.
+ * Records how far one-time clone setup got, so a restart repeats only what did not finish.
+ * `replicationEstablished` false means the intent to run `setNode()` was recorded but its outcome is
+ * unknown — reconciled against hdb_nodes on the next start. `leaderReplicationURL` is the
+ * leader-config-refined value checkSyncStatus matches exactly against cluster_status (the heuristic
+ * URL is wrong for a TLS-only leader). `targetTimestamps`/`totalBytes` pin the leader snapshot a
+ * resume reuses instead of re-fetching. `setupComplete` covers `finishCloneSetup` (JWT/custody/SSH).
  */
 type SyncStartedMarker = {
 	leaderURL?: string;
 	leaderReplicationURL?: string;
 	startedAt?: number;
+	replicationEstablished?: boolean;
 	targetTimestamps?: Record<string, number>;
 	totalBytes?: number;
 	setupComplete?: boolean;
@@ -531,22 +542,44 @@ function syncStartedMarkerPath(): string {
 	return join(rootPath, 'tmp', 'clone-sync-started.json');
 }
 
-// writeJsonSync logs and swallows write failures; losing the marker only costs a future restart
-// the full setup path.
-function writeSyncStartedMarker(
-	startedAt: number,
-	targetTimestamps: Record<string, number> | undefined,
-	totalBytes: number,
-	setupComplete: boolean
-): void {
-	writeJsonSync(syncStartedMarkerPath(), {
-		leaderURL,
-		leaderReplicationURL,
-		startedAt,
-		targetTimestamps,
-		totalBytes,
-		setupComplete,
-	});
+/**
+ * Temp-then-rename, and failures propagate: the marker is rewritten at every stage boundary, so an
+ * in-place write that tears or fails silently could destroy state already earned and replay setup.
+ */
+function writeSyncStartedMarker(stage: Omit<SyncStartedMarker, 'leaderURL' | 'leaderReplicationURL'>): void {
+	const target = syncStartedMarkerPath();
+	const temp = `${target}.tmp`;
+	mkdirSync(dirname(target), { recursive: true });
+	writeFileSync(temp, JSON.stringify({ leaderURL, leaderReplicationURL, ...stage }), { mode: 0o600 });
+	renameSync(temp, target);
+}
+
+/**
+ * Durable evidence that `setNode()` completed: the leader's hdb_nodes row, which is written only
+ * after the leader exchange succeeds and is also the only record of the refined replication URL.
+ */
+async function findEstablishedLeaderURL(): Promise<string | undefined> {
+	try {
+		const { databases } = await import('../core/resources/databases.js');
+		const { getThisNodeName } = await import('../core/server/nodeName.js');
+		const thisNodeName = getThisNodeName();
+		const leaderHost = new URL(leaderURL).hostname;
+		const peerURLs: string[] = [];
+		for await (const node of databases.system.hdb_nodes.search([])) {
+			if (!node?.name || node.name === thisNodeName || !node.url) continue;
+			peerURLs.push(node.url);
+			try {
+				if (new URL(node.url).hostname === leaderHost) return node.url;
+			} catch {
+				// a peer row with an unparseable url cannot be matched by host; fall through
+			}
+		}
+		// A clone's node table holds only itself and its leader, so a lone peer is unambiguous.
+		return peerURLs.length === 1 ? peerURLs[0] : undefined;
+	} catch (err) {
+		log(`Could not read hdb_nodes to reconcile clone setup state: ${err}`, 'error');
+		return undefined;
+	}
 }
 
 function readSyncStartedMarker(): SyncStartedMarker | undefined {
@@ -560,6 +593,7 @@ function readSyncStartedMarker(): SyncStartedMarker | undefined {
 function clearSyncStartedMarker(): void {
 	try {
 		rmSync(syncStartedMarkerPath(), { force: true });
+		rmSync(`${syncStartedMarkerPath()}.tmp`, { force: true });
 	} catch (err) {
 		log(`Could not clear clone sync marker: ${err}`, 'error');
 	}
@@ -706,19 +740,21 @@ async function fetchSyncSnapshot(): Promise<
 	try {
 		return await getLastUpdatedRecord();
 	} catch (err) {
-		const { set: setStatus } = await import('../core/server/status/index.js');
-		try {
-			await setStatus({ id: 'availability', status: 'Unavailable' });
-		} catch (statusErr) {
-			log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
-		}
-		updateConfigValue(CONFIG_PARAMS.CLONED, false);
-		log(
-			`Could not fetch sync targets from leader ${leaderURL} (${err}); node is running but Unavailable and not marked as cloned`,
-			'error'
-		);
+		await abandonClone(`Could not fetch sync targets from leader ${leaderURL} (${err})`);
 		return undefined;
 	}
+}
+
+/** Leave Harper running and queryable, reporting Unavailable and not cloned, so a later start retries. */
+async function abandonClone(reason: string): Promise<void> {
+	const { set: setStatus } = await import('../core/server/status/index.js');
+	try {
+		await setStatus({ id: 'availability', status: 'Unavailable' });
+	} catch (statusErr) {
+		log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
+	}
+	updateConfigValue(CONFIG_PARAMS.CLONED, false);
+	log(`${reason}; node is running but Unavailable and not marked as cloned`, 'error');
 }
 
 /** Shared by the fresh and resume-retry call sites: fetch the leader snapshot and, if it
@@ -728,7 +764,12 @@ async function fetchAndPersistSnapshot(
 ): Promise<{ targetTimestamps: Record<string, number>; totalBytes: number } | undefined> {
 	const snapshot = await fetchSyncSnapshot();
 	if (!snapshot) return undefined;
-	writeSyncStartedMarker(syncStartedAt, snapshot.targetTimestamps, snapshot.totalBytes, false);
+	writeSyncStartedMarker({
+		startedAt: syncStartedAt,
+		replicationEstablished: true,
+		targetTimestamps: snapshot.targetTimestamps,
+		totalBytes: snapshot.totalBytes,
+	});
 	return snapshot;
 }
 

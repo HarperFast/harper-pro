@@ -1,6 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import {
 	startHarper,
 	teardownHarper,
@@ -88,7 +88,7 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 	after(async () => {
 		// Tear down via the live ctx objects — `startHarper` on restart reassigns `cloneCtx.harper`, so a
 		// snapshot captured before the restart would point at the dead process and leak the live one.
-		const live = [ctx.leaderCtx, ctx.cloneCtx, ctx.resumeCtx, ctx.partialCtx, ctx.forceCtx].filter(
+		const live = [ctx.leaderCtx, ctx.cloneCtx, ctx.resumeCtx, ctx.partialCtx, ctx.reconcileCtx, ctx.forceCtx].filter(
 			(c) => c?.harper?.process
 		);
 		await Promise.all(live.map((c) => teardownHarper(c)));
@@ -317,6 +317,43 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			await sleep(500);
 		}
 		equal(finalCount, RECORD_COUNT, 'the clone must still converge after resuming the remaining setup stages');
+	});
+
+	test('an indeterminate marker is reconciled against hdb_nodes instead of redoing replication setup', async () => {
+		const reconcileCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		ctx.reconcileCtx = reconcileCtx;
+		await startHarper(reconcileCtx, cloneOptionsFor(reconcileCtx, await leaderToken()));
+
+		const markerPath = await waitForMarkerSetupComplete(reconcileCtx.harper.dataRootDir);
+		const established = JSON.parse(readFileSync(markerPath, 'utf8'));
+		await killHarper(reconcileCtx);
+
+		// Rewind the marker to the state a crash inside establishReplicationSetup leaves behind: the
+		// intent recorded, the outcome unknown. setNode() did in fact complete, so the next start must
+		// discover that from hdb_nodes rather than replaying replication setup.
+		writeFileSync(
+			markerPath,
+			JSON.stringify({
+				leaderURL: established.leaderURL,
+				startedAt: established.startedAt,
+				replicationEstablished: false,
+			})
+		);
+		const configPath = join(reconcileCtx.harper.dataRootDir, 'harper-config.yaml');
+		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
+
+		await startHarper(reconcileCtx, cloneOptionsFor(reconcileCtx, await leaderToken()));
+		await waitForAvailableStatus(reconcileCtx.harper);
+		equal(
+			statSync(configPath).mtimeMs,
+			configMtimeBeforeRestart,
+			'reconciliation must not rerun cloneConfig — hdb_nodes already proves replication is established'
+		);
+		equal(
+			await countRows(reconcileCtx.harper),
+			RECORD_COUNT,
+			'the clone must converge after reconciling an indeterminate marker'
+		);
 	});
 
 	test('forceClone takes the full setup path even with the marker present', async () => {
