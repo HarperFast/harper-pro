@@ -907,6 +907,7 @@ type DbisCursor = {
 	currentTable?: string;
 	afterKey?: any;
 	copyOrder?: number;
+	cloneAttempt?: string;
 };
 
 /**
@@ -943,12 +944,16 @@ export type DbisStore = {
  */
 export function readDbisCursorSync(
 	dbisDB: DbisStore | undefined,
-	kind: 'seq' | 'copyCursor',
+	kind: 'seq' | 'copyCursor' | 'cloneCopyComplete',
 	id: any
 ): DbisCursor | undefined {
 	// getSync is load-bearing here: reverting it to get() would return a MaybePromise that no longer
 	// satisfies the DbisCursor | undefined return type — a tsc error, not a silent full-copy regression.
 	return dbisDB?.getSync([Symbol.for(kind), id]);
+}
+
+export function matchesCloneCopyCompletion(marker: DbisCursor | undefined, cloneAttempt: string | undefined): boolean {
+	return typeof cloneAttempt === 'string' && marker?.cloneAttempt === cloneAttempt;
 }
 
 /**
@@ -1878,6 +1883,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				return;
 			}
 			if (copyFlushInFlight) return; // a flush is persisting the final cursor; finish on its completion
+			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
+			if (cloneAttempt && copyFromNodeId !== undefined) {
+				try {
+					getDatabaseStores().dbisDB?.put([Symbol.for('cloneCopyComplete'), copyFromNodeId], { cloneAttempt });
+				} catch (error) {
+					logger.warn?.(connectionId, 'failed to persist clone copy completion', databaseName, error);
+					setTimeout(maybeFinishCopy, 1000).unref?.();
+					return;
+				}
+			}
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
@@ -2785,6 +2800,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						getSharedStatus()[RECEIVED_VERSION_POSITION] = 0;
+						if (copyFromNodeId !== undefined)
+							getDatabaseStores().dbisDB?.remove([Symbol.for('cloneCopyComplete'), copyFromNodeId]);
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
 					case COPY_COMPLETE:
@@ -4889,6 +4907,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 			auditStore?.ensureLogExists?.(node.name);
 			const sequenceEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
+			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
+			const copyCompletion = readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId);
+			if (matchesCloneCopyCompletion(copyCompletion, cloneAttempt)) {
+				const sharedStatus = getSharedStatus();
+				sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(sharedStatus[RECEIVED_VERSION_POSITION], 1);
+			}
 			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
 			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
 			// data predates copyStartTime and would never be delivered by an audit-log resume).

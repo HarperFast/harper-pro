@@ -11,6 +11,7 @@ import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
+import { isExplicitDatabaseSubscription } from './replicatedDatabases.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -722,7 +723,7 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 									(!dbReplication.sharded || node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD));
 					}))) &&
 			selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName())) ||
-		node.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe)
+		isExplicitDatabaseSubscription(node.subscriptions, databaseName)
 	);
 }
 

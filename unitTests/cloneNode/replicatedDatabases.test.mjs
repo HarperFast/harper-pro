@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { isReplicatedDatabase } from '#src/cloneNode/replicatedDatabases';
+import { isExplicitDatabaseSubscription, isReplicatedDatabase } from '#src/replication/replicatedDatabases';
 
 describe('isReplicatedDatabase', () => {
 	it('accepts everything when replication.databases is unset or a wildcard', () => {
@@ -35,5 +35,10 @@ describe('isReplicatedDatabase', () => {
 		// Callers that cannot evaluate the leader's shard must keep the database as a sync target:
 		// a wrong inclusion stalls the clone visibly, a wrong exclusion skips verifying a copy.
 		assert.equal(isReplicatedDatabase([{ name: 'data', sharded: true }], 'data'), true);
+	});
+
+	it('includes explicit subscriptions using the same predicate as node replication', () => {
+		assert.equal(isExplicitDatabaseSubscription([{ database: 'data', subscribe: true }], 'data'), true);
+		assert.equal(isExplicitDatabaseSubscription([{ schema: 'data', subscribe: false }], 'data'), false);
 	});
 });

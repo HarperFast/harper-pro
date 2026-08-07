@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { accessSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { accessSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -30,7 +30,10 @@ import {
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
-import { isReplicatedDatabase as isReplicatedDatabaseUnder } from './replicatedDatabases.ts';
+import {
+	isExplicitDatabaseSubscription,
+	isReplicatedDatabase as isReplicatedDatabaseUnder,
+} from '../replication/replicatedDatabases.ts';
 
 /**
  * Environment Variables:
@@ -84,6 +87,8 @@ import { isReplicatedDatabase as isReplicatedDatabaseUnder } from './replicatedD
 const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
 const DEFAULT_REPLICATION_PORT = '9933';
+const CLONE_ATTEMPT_FILE = '.cloneAttempt.json';
+const CLONE_ATTEMPT_ENV = 'HARPER_CLONE_ATTEMPT';
 
 const CONFIG_TO_EXCLUDE_FROM_CLONE = {
 	clustering_nodename: true,
@@ -237,6 +242,7 @@ export async function cloneNode(): Promise<void> {
 		const { main } = await import('../core/bin/run.js');
 		return main();
 	}
+	startCloneAttempt();
 
 	if (!usingCertAuth) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
@@ -433,6 +439,7 @@ export async function cloneNode(): Promise<void> {
 
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
+	clearCloneAttempt();
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
@@ -604,11 +611,20 @@ async function getLastUpdatedRecord(): Promise<Record<string, number>> {
 	lastUpdated['system'] = findMostRecentTimestamp(systemDb);
 
 	const shardedReplicates = await leaderShardedReplicates();
+	const { getHDBNodeTable } = await import('../replication/knownNodes.ts');
+	let leaderNode: any;
+	for (const node of getHDBNodeTable().search([])) {
+		if (node?.isLeader || node?.url === leaderReplicationURL) {
+			leaderNode = node;
+			break;
+		}
+	}
 	const allDb: Record<string, any> = await leaderRequest({ operation: 'describe_all' });
 	for (const db in allDb) {
 		// requestId is part of the describe response so we ignore it
 		if (typeof allDb[db] !== 'object') continue;
-		if (!isReplicatedDatabase(db, shardedReplicates)) continue;
+		if (!isReplicatedDatabase(db, shardedReplicates) && !isExplicitDatabaseSubscription(leaderNode?.subscriptions, db))
+			continue;
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
 	}
 
@@ -1173,6 +1189,40 @@ function writeJsonSync(path: string, data: any): void {
 		writeFileSync(path, JSON.stringify(data, null, 2), 'utf8');
 	} catch (err) {
 		log(`Error writing JSON to ${path}: ${err}`, 'error');
+	}
+}
+
+function cloneAttemptPath(): string {
+	return join(rootPath, CLONE_ATTEMPT_FILE);
+}
+
+function startCloneAttempt(): void {
+	const path = cloneAttemptPath();
+	let attemptId: string | undefined;
+	if (!forceClone && pathExists(path)) {
+		try {
+			const persisted = JSON.parse(readFileSync(path, 'utf8'));
+			if (persisted?.leaderURL === leaderURL && typeof persisted?.attemptId === 'string') attemptId = persisted.attemptId;
+		} catch (error) {
+			log(`Could not read persisted clone attempt at ${path}: ${error}`, 'error');
+		}
+	}
+	if (!attemptId) {
+		attemptId = randomBytes(16).toString('hex');
+		const temporaryPath = `${path}.${process.pid}.tmp`;
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(temporaryPath, JSON.stringify({ leaderURL, attemptId }), 'utf8');
+		renameSync(temporaryPath, path);
+	}
+	process.env[CLONE_ATTEMPT_ENV] = attemptId;
+}
+
+function clearCloneAttempt(): void {
+	delete process.env[CLONE_ATTEMPT_ENV];
+	try {
+		unlinkSync(cloneAttemptPath());
+	} catch (error: any) {
+		if (error?.code !== 'ENOENT') log(`Could not remove clone attempt marker: ${error}`, 'error');
 	}
 }
 
