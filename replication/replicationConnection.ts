@@ -1897,6 +1897,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					});
 				} catch (error) {
 					logger.warn?.(connectionId, 'failed to persist clone copy completion', databaseName, error);
+					close(1011, 'Failed to persist clone copy completion');
 					return;
 				}
 			}
@@ -2807,9 +2808,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
-						if (sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
-						if (copyFromNodeId !== undefined) {
+						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
+						if (cloneAttempt && copyFromNodeId !== undefined) {
 							try {
 								getDatabaseStores().dbisDB?.remove([Symbol.for('cloneCopyComplete'), copyFromNodeId]);
 							} catch (error) {
@@ -4926,18 +4928,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const nodeId = auditStore && getIdOfRemoteNode(node.name, auditStore);
 			auditStore?.ensureLogExists?.(node.name);
 			const sequenceEntry = readDbisCursorSync(dbisDB, 'seq', nodeId);
-			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
-			const copyCompletion = cloneAttempt
-				? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId)
-				: undefined;
-			if (matchesCloneCopyCompletion(copyCompletion, cloneAttempt)) {
-				const sharedStatus = getSharedStatus();
-				if (sharedStatus)
-					sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
-						sharedStatus[RECEIVED_VERSION_POSITION],
-						copyCompletion.copyStartTime!
-					);
-			}
 			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
 			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
 			// data predates copyStartTime and would never be delivered by an audit-log resume).
@@ -4947,6 +4937,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				nodeId,
 				() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
 			);
+			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
+			const copyCompletion = cloneAttempt
+				? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId)
+				: undefined;
+			if (!copyCursor && matchesCloneCopyCompletion(copyCompletion, cloneAttempt)) {
+				const sharedStatus = getSharedStatus();
+				if (sharedStatus)
+					sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+						sharedStatus[RECEIVED_VERSION_POSITION],
+						copyCompletion.copyStartTime!
+					);
+			}
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
 				sequenceEntry?.seqId ?? 1,

@@ -12,6 +12,11 @@ describe('isReplicatedDatabase', () => {
 		assert.equal(isReplicatedDatabase(['data'], 'other'), false);
 	});
 
+	it('lets callers select the safe fallback for malformed non-array configuration', () => {
+		assert.equal(isReplicatedDatabase('data', 'data'), true);
+		assert.equal(isReplicatedDatabase('data', 'data', undefined, false), false);
+	});
+
 	it('matches unsharded object entries by name regardless of the shard predicate', () => {
 		assert.equal(
 			isReplicatedDatabase([{ name: 'data' }], 'data', () => false),

@@ -1,10 +1,11 @@
 export function isReplicatedDatabase(
 	databaseReplications: unknown,
 	dbName: string,
-	shardedReplicates: (entry: any) => boolean = () => true
+	shardedReplicates: (entry: any) => boolean = () => true,
+	nonArrayFallback: boolean = true
 ): boolean {
 	if (!databaseReplications || databaseReplications === '*') return true;
-	if (!Array.isArray(databaseReplications)) return true;
+	if (!Array.isArray(databaseReplications)) return nonArrayFallback;
 	return databaseReplications.some((entry: any) =>
 		typeof entry === 'string'
 			? entry === dbName

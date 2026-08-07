@@ -242,7 +242,7 @@ export async function cloneNode(): Promise<void> {
 		const { main } = await import('../core/bin/run.js');
 		return main();
 	}
-	startCloneAttempt(forceClone && hdbConfig?.cloned);
+	startCloneAttempt();
 
 	if (!usingCertAuth) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
@@ -983,6 +983,7 @@ async function cloneSchemas(): Promise<void> {
 	for (const dbName of Object.keys(allDb)) {
 		const dbDescribe = allDb[dbName];
 		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;
+		if (!isReplicatedDatabase(dbName)) continue;
 		if (!databases[dbName]) {
 			try {
 				await createSchema({ database: dbName, operation: OPERATIONS_ENUM.CREATE_DATABASE });
@@ -1193,10 +1194,10 @@ function cloneAttemptPath(): string {
 	return join(rootPath, CLONE_ATTEMPT_FILE);
 }
 
-function startCloneAttempt(resetAttempt: boolean): void {
+function startCloneAttempt(): void {
 	const path = cloneAttemptPath();
 	let attemptId: string | undefined;
-	if (!resetAttempt && pathExists(path)) {
+	if (pathExists(path)) {
 		try {
 			const persisted = JSON.parse(readFileSync(path, 'utf8'));
 			if (typeof persisted?.attemptId === 'string') attemptId = persisted.attemptId;

@@ -713,8 +713,11 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 	return (
 		(peerFeedsUs &&
 			hasLocalDatabase &&
-			isReplicatedDatabase(databaseReplications, databaseName, (entry) =>
-				node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD)
+			isReplicatedDatabase(
+				databaseReplications,
+				databaseName,
+				(entry) => node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD),
+				false
 			) &&
 			selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName())) ||
 		isExplicitDatabaseSubscription(node.subscriptions, databaseName)
