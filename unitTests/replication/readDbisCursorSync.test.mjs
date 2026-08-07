@@ -19,7 +19,7 @@
  */
 
 import { expect } from 'chai';
-import { readDbisCursorSync } from '#src/replication/replicationConnection';
+import { matchesCloneCopyCompletion, readDbisCursorSync } from '#src/replication/replicationConnection';
 
 /**
  * __dbis__ store stub modeling the RocksDB MaybePromise contract.
@@ -48,6 +48,7 @@ function rocksLikeDbis(disk = {}, cachedKeys = []) {
 const NODE_ID = 7;
 const seqKeyStr = `${Symbol.for('seq').toString()}|${NODE_ID}`;
 const copyKeyStr = `${Symbol.for('copyCursor').toString()}|${NODE_ID}`;
+const completionKeyStr = `${Symbol.for('cloneCopyComplete').toString()}|${NODE_ID}`;
 
 describe('readDbisCursorSync', () => {
 	// THE bug-closing case: the seq row is NOT in the block cache, so RocksDB get() returns a Promise.
@@ -87,6 +88,16 @@ describe('readDbisCursorSync', () => {
 		const dbis = rocksLikeDbis({ [copyKeyStr]: cursor } /* not cached */);
 		expect(typeof dbis.get([Symbol.for('copyCursor'), NODE_ID]).then).to.equal('function'); // hazard
 		expect(readDbisCursorSync(dbis, 'copyCursor', NODE_ID)).to.deep.equal(cursor);
+	});
+
+	it('returns a clone copy-completion marker on a block-cache MISS', () => {
+		const marker = { cloneAttempt: 'attempt-1', copyStartTime: 1000 };
+		const dbis = rocksLikeDbis({ [completionKeyStr]: marker });
+		expect(readDbisCursorSync(dbis, 'cloneCopyComplete', NODE_ID)).to.deep.equal(marker);
+		expect(matchesCloneCopyCompletion(marker, 'attempt-1')).to.equal(true);
+		expect(matchesCloneCopyCompletion(marker, 'another-attempt')).to.equal(false);
+		expect(matchesCloneCopyCompletion({ cloneAttempt: 'attempt-1' }, 'attempt-1')).to.equal(false);
+		expect(matchesCloneCopyCompletion(undefined, 'attempt-1')).to.equal(false);
 	});
 
 	// A genuinely-absent cursor -> undefined (falsy). This is the legitimate fresh-subscription /
