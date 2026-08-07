@@ -1,19 +1,9 @@
 /**
- * End-to-end regression guard for harper-pro#674: a replicated operation whose peer-side execution
- * outlives the receive-watchdog window.
- *
- * The origin sends a replicated operation over a one-shot WS and awaits OPERATION_RESPONSE with no
- * timeout. Nothing is written on that socket while the peer executes, so without a keep-alive the
- * receive watchdog terminates it after 2 x replication.pingTimeout and the origin rejects the pending
- * response with `Connection closed  1006` — reporting a peer that is still installing as a failed
- * replication. Closing the socket cancels nothing on the peer, so the deploy also lands anyway.
- *
- * pingInterval/pingTimeout are lowered here so that window is seconds rather than the ~120s default,
- * and the component's install sleeps well past it. On unfixed code the deploy fails with a failed
- * peer_result; with the keepalive the peer's pongs hold the connection open for the whole install.
- *
- * The unit test (unitTests/replication/operationConnectionKeepalive.test.mjs) covers the predicates
- * only — this is the one that proves the wired lifecycle.
+ * Regression guard for harper-pro#674, which the predicate-level unit test cannot catch: nothing is
+ * written on a replicated operation's one-shot WS while the peer executes, so without a keep-alive
+ * the receive watchdog terminates it and the origin reports a peer that is still installing as a
+ * failed replication. pingInterval/pingTimeout are lowered so that window is seconds instead of the
+ * ~120s default, and the install outlasts it.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -40,8 +30,7 @@ const FIXTURE_PATH = join(import.meta.dirname, 'fixture-slow-install');
 const PING_INTERVAL_MS = 1000;
 const PING_TIMEOUT_MS = 2000;
 const INSTALL_MS = 12_000;
-// `install.command` is split on spaces before spawning, so the script cannot contain any.
-const INSTALL_COMMAND = `node -e setTimeout(()=>{},${INSTALL_MS})`;
+const INSTALL_COMMAND = 'node install-delay.mjs';
 
 suite('Replicated operation survives peer work longer than the watchdog window (#674)', { timeout: 180_000 }, (ctx) => {
 	before(async () => {
@@ -70,12 +59,22 @@ suite('Replicated operation survives peer work longer than the watchdog window (
 			hostname: ctx.nodes[0].hostname,
 			authorization: 'Bearer ' + tokenResp.operation_token,
 		});
-		for (let retries = 0; retries < 15; retries++) {
+		let connected = false;
+		for (let retries = 0; retries < 15 && !connected; retries++) {
 			const status = await Promise.all(ctx.nodes.map((n) => sendOperation(n, { operation: 'cluster_status' })));
-			if (status.every((r) => (r.connections ?? []).every((c) => (c.database_sockets ?? []).every((s) => s.connected))))
-				break;
-			await delay(200 * (retries + 1));
+			// Require sockets to exist: `every` over an empty connections/sockets list is vacuously true,
+			// which would report an unmeshed cluster as ready.
+			connected = status.every(
+				(r) =>
+					(r.connections ?? []).length > 0 &&
+					r.connections.every(
+						(c) => (c.database_sockets ?? []).length > 0 && c.database_sockets.every((s) => s.connected)
+					)
+			);
+			if (!connected) await delay(200 * (retries + 1));
 		}
+		// Fail here rather than letting the deploy fail later for an unrelated reason.
+		ok(connected, 'nodes did not converge to connected before the deploy');
 	});
 
 	after(async () => {
