@@ -40,5 +40,6 @@ describe('isReplicatedDatabase', () => {
 	it('includes explicit subscriptions using the same predicate as node replication', () => {
 		assert.equal(isExplicitDatabaseSubscription([{ database: 'data', subscribe: true }], 'data'), true);
 		assert.equal(isExplicitDatabaseSubscription([{ schema: 'data', subscribe: false }], 'data'), false);
+		assert.equal(isExplicitDatabaseSubscription([null, 'data'], 'data'), false);
 	});
 });

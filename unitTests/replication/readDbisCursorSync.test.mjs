@@ -91,11 +91,12 @@ describe('readDbisCursorSync', () => {
 	});
 
 	it('returns a clone copy-completion marker on a block-cache MISS', () => {
-		const marker = { cloneAttempt: 'attempt-1' };
+		const marker = { cloneAttempt: 'attempt-1', copyStartTime: 1000 };
 		const dbis = rocksLikeDbis({ [completionKeyStr]: marker });
 		expect(readDbisCursorSync(dbis, 'cloneCopyComplete', NODE_ID)).to.deep.equal(marker);
 		expect(matchesCloneCopyCompletion(marker, 'attempt-1')).to.equal(true);
 		expect(matchesCloneCopyCompletion(marker, 'another-attempt')).to.equal(false);
+		expect(matchesCloneCopyCompletion({ cloneAttempt: 'attempt-1' }, 'attempt-1')).to.equal(false);
 		expect(matchesCloneCopyCompletion(undefined, 'attempt-1')).to.equal(false);
 	});
 

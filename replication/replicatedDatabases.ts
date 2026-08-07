@@ -13,5 +13,10 @@ export function isReplicatedDatabase(
 }
 
 export function isExplicitDatabaseSubscription(subscriptions: unknown, dbName: string): boolean {
-	return Array.isArray(subscriptions) && subscriptions.some((sub) => (sub.database || sub.schema) === dbName && sub.subscribe);
+	return (
+		Array.isArray(subscriptions) &&
+		subscriptions.some(
+			(sub) => sub && typeof sub === 'object' && (sub.database || sub.schema) === dbName && sub.subscribe
+		)
+	);
 }

@@ -242,7 +242,7 @@ export async function cloneNode(): Promise<void> {
 		const { main } = await import('../core/bin/run.js');
 		return main();
 	}
-	startCloneAttempt();
+	startCloneAttempt(forceClone && hdbConfig?.cloned);
 
 	if (!usingCertAuth) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
@@ -315,6 +315,7 @@ export async function cloneNode(): Promise<void> {
 		operation: string;
 		verify_tls: boolean;
 		url: string;
+		isLeader: true;
 		authorization?:
 			| {
 					username: string;
@@ -327,6 +328,7 @@ export async function cloneNode(): Promise<void> {
 		operation: OPERATIONS_ENUM.ADD_NODE,
 		verify_tls: false, // set node cross-signs the cluster with harper self-signed certs
 		url: leaderReplicationURL,
+		isLeader: true,
 	};
 
 	if (!usingCertAuth) {
@@ -981,11 +983,6 @@ async function cloneSchemas(): Promise<void> {
 	for (const dbName of Object.keys(allDb)) {
 		const dbDescribe = allDb[dbName];
 		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;
-		if (!isReplicatedDatabase(dbName)) {
-			log(`Skipping schema pre-create for '${dbName}' (not in replication.databases)`, 'debug');
-			continue;
-		}
-
 		if (!databases[dbName]) {
 			try {
 				await createSchema({ database: dbName, operation: OPERATIONS_ENUM.CREATE_DATABASE });
@@ -1196,23 +1193,28 @@ function cloneAttemptPath(): string {
 	return join(rootPath, CLONE_ATTEMPT_FILE);
 }
 
-function startCloneAttempt(): void {
+function startCloneAttempt(resetAttempt: boolean): void {
 	const path = cloneAttemptPath();
 	let attemptId: string | undefined;
-	if (!forceClone && pathExists(path)) {
+	if (!resetAttempt && pathExists(path)) {
 		try {
 			const persisted = JSON.parse(readFileSync(path, 'utf8'));
-			if (persisted?.leaderURL === leaderURL && typeof persisted?.attemptId === 'string') attemptId = persisted.attemptId;
+			if (typeof persisted?.attemptId === 'string') attemptId = persisted.attemptId;
 		} catch (error) {
 			log(`Could not read persisted clone attempt at ${path}: ${error}`, 'error');
 		}
 	}
 	if (!attemptId) {
 		attemptId = randomBytes(16).toString('hex');
-		const temporaryPath = `${path}.${process.pid}.tmp`;
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(temporaryPath, JSON.stringify({ leaderURL, attemptId }), 'utf8');
-		renameSync(temporaryPath, path);
+		try {
+			const temporaryPath = `${path}.${process.pid}.tmp`;
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(temporaryPath, JSON.stringify({ attemptId }), { encoding: 'utf8', mode: 0o600 });
+			renameSync(temporaryPath, path);
+		} catch (error) {
+			log(`Could not persist clone attempt at ${path}: ${error}`, 'error');
+			return;
+		}
 	}
 	process.env[CLONE_ATTEMPT_ENV] = attemptId;
 }
