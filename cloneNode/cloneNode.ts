@@ -522,16 +522,25 @@ async function monitorSync(): Promise<SyncOutcome> {
 		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s`
 	);
 
-	// Whether the system database's socket is required is a leader-capability question: a legacy
-	// (v4) leader never replicates the system database, so requiring its socket would wedge the
-	// clone, while on a v5+ leader it must be required up front — otherwise a small user database
-	// completing before the system subscription registers could finish the clone with the system
-	// copy unverified. registration_info is the version probe present on every leader version
-	// (see core/bin/cliOperations.ts). Fail CLOSED: only a positively-read legacy major version
-	// exempts system; a missing/unparseable version or a persistently failing probe requires it,
-	// so a transient probe error against a v5 leader cannot reopen the premature-Available race.
-	let systemSocketRequired = true;
-	for (let attempt = 1; attempt <= 3; attempt++) {
+	// Whether the system database's socket is required has two independent gates.
+	//
+	// Local: this node only ever opens a system socket if its own `replication.databases` covers
+	// `system` — `shouldReplicateFromNode` runs every database, system included, through that
+	// filter. A node configured with e.g. `databases: ['data']` never subscribes to system, so
+	// requiring that socket would wedge the clone Unavailable forever.
+	//
+	// Leader capability: a legacy (v4) leader never replicates the system database either, while a
+	// v5+ leader must have it required up front — otherwise a small user database completing before
+	// the system subscription registers could finish the clone with the system copy unverified.
+	// registration_info is the version probe present on every leader version (see
+	// core/bin/cliOperations.ts). Fail CLOSED on that probe: only a positively-read legacy major
+	// version exempts system; a missing/unparseable version or a persistently failing probe requires
+	// it, so a transient probe error against a v5 leader cannot reopen the premature-Available race.
+	let systemSocketRequired = isReplicatedDatabase(SYSTEM_SCHEMA_NAME);
+	if (!systemSocketRequired) {
+		log(`'${SYSTEM_SCHEMA_NAME}' is not in this node's replication.databases; not requiring its socket`, 'debug');
+	}
+	for (let attempt = 1; systemSocketRequired && attempt <= 3; attempt++) {
 		try {
 			const registration: any = await leaderRequest({ operation: 'registration_info' });
 			// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.

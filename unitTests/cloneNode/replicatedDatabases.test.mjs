@@ -12,6 +12,15 @@ describe('isReplicatedDatabase', () => {
 		assert.equal(isReplicatedDatabase(['data'], 'other'), false);
 	});
 
+	it('excludes the system database when replication.databases lists only user databases', () => {
+		// `shouldReplicateFromNode` runs every database through this filter, system included, so a
+		// node configured with `databases: ['data']` never opens a system replication socket. The
+		// clone's sync monitor must not require that socket, or it waits Unavailable forever.
+		assert.equal(isReplicatedDatabase(['data'], 'system'), false);
+		assert.equal(isReplicatedDatabase(undefined, 'system'), true);
+		assert.equal(isReplicatedDatabase('*', 'system'), true);
+	});
+
 	it('lets callers select the safe fallback for malformed non-array configuration', () => {
 		assert.equal(isReplicatedDatabase('data', 'data'), true);
 		assert.equal(isReplicatedDatabase('data', 'data', undefined, false), false);

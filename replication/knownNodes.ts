@@ -716,7 +716,7 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 			isReplicatedDatabase(
 				databaseReplications,
 				databaseName,
-				(entry) => node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD),
+				() => node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD),
 				false
 			) &&
 			selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName())) ||
