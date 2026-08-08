@@ -227,6 +227,25 @@ describe('checkSyncStatus', () => {
 		assertResult(result, { syncComplete: true, latestReceivedMs: 0 });
 	});
 
+	it('ignores a socket for a database exempted from the targets (table-less on the leader)', async () => {
+		// A table-less leader database is left out of targetTimestamps entirely, because cluster_status
+		// resolves a socket's status buffer through the database's first table and so can never report a
+		// watermark for it. Its socket must therefore be skipped, not held pending forever.
+		const result = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: 1500, lastReceivedLocalTime: utc(5000) },
+					{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(7000) },
+					{ database: 'analytics', lastReceivedLocalTime: utc(9000) },
+				]),
+			LEADER_URL,
+			noopLog,
+			['data']
+		);
+		assertResult(result, { syncComplete: true, latestReceivedMs: 0 });
+	});
+
 	it('reports incomplete when none of the leader databases has a socket yet', async () => {
 		const result = await checkSyncStatus(
 			{ system: 1000, data: 2000 },
