@@ -278,8 +278,6 @@ const LEADING_DUP_SKIP_ENABLED = env.get(CONFIG_PARAMS.REPLICATION_LEADINGDUPLIC
 export const LEADING_DUP_SKIP_LOG = 'leading-duplicate fast-skip';
 // Process-wide counter of records suppressed by the fast-skip, for in-process tests/observability.
 export let leadingDuplicateSkipCount = 0;
-// Distinctive log substring for the copy-mode identity-tie skip (see the decode loop). Keep stable.
-export const COPY_DUP_SKIP_LOG = 'copy identity-tie skip';
 
 /**
  * Decide whether an incremental replication start must be upgraded to a bounded base copy because
@@ -764,24 +762,15 @@ function blobFilePathsForValue(value: unknown): string[] | null {
 }
 
 /**
- * Whether an incoming replication record is a *provably-already-applied* identity tie with the record
- * already stored locally: SAME version AND SAME origin node — exactly the condition core Table.ts's apply
- * loop uses to drop a duplicate (`precedesExistingVersion(txnTime, existingEntry, nodeId) === 0`
- * early-matches on `txnTime === existingEntry.version && nodeId === existingEntry.nodeId`) — and, when the
- * record carries file-backed blobs, every one of those blob files is present on disk. Anything ambiguous
- * (no local record, different version or node, a blob file we cannot find) returns false so the record
- * flows to the apply loop untouched.
- *
- * The blob check deliberately inspects the EXISTING record's blobs, not the incoming duplicate's: the two
- * carry the same content, and only the stored one reflects the durable on-disk state a skip would rely on.
- * A missing blob file must NOT tie — that record has to reach the apply loop so the dangling reference can
- * be repaired. The version comparison is intentionally broader than `_writeDelete`'s tie check (`< 0`
- * there): a re-delivered idempotent re-delete whose version and node already match locally is safe to tie.
+ * Whether an incoming record is a provably-already-applied identity tie with the one stored locally:
+ * same version AND same origin node — the condition core's `precedesExistingVersion` early-matches as a
+ * tie — and, for a blob-carrying record, every one of the STORED record's blob files present on disk
+ * (the incoming duplicate's own blobs are still in flight, so they prove nothing). Anything ambiguous
+ * returns false and the record flows to the apply loop.
  *
  * Presence, not completeness: a file that exists but is a PENDING/error stub still ties, so a base copy
- * will not repair it. That is deliberate — verifying completeness means inflating every compressed blob
- * (core's `isBlobComplete`), which is unaffordable per record on this path. Incomplete local blobs are the
- * blob repair sweep's job (harper-pro#388), not a base copy's.
+ * will not repair it — that is `repair_blob_data`'s job (harper-pro#388). Distinguishing a stub needs a
+ * per-record header read, and full verification (core's `isBlobComplete`) inflates compressed blobs.
  *
  * `blobPathsOf`/`access` are injected so the decision is unit-testable without a real blob store.
  */
@@ -2763,7 +2752,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.trace?.(connectionId, 'identity-tie: getEntry threw, letting record flow', id, error);
 			return undefined;
 		}
-		return existing && typeof existing.then === 'function' ? undefined : existing;
+		if (existing && typeof existing.then === 'function') {
+			logger.trace?.(connectionId, 'identity-tie: getEntry returned a promise, letting record flow', id);
+			return undefined;
+		}
+		return existing;
 	}
 
 	/**
@@ -2771,6 +2764,27 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	 * which is still proof the link is delivering. Callers must have refreshed `replicationSharedStatus`
 	 * (getSharedStatus()) first.
 	 */
+	/**
+	 * Release the in-flight receive stream for a blob whose record we are not going to apply. Without
+	 * this the stream stays in `blobsInFlight` holding the blob's buffered bytes — the chunk handler
+	 * deliberately does not backpressure a stream with no consumer attached — until the `blobsTimer`
+	 * sweep reclaims it `blobTimeout` later.
+	 *
+	 * A still-receiving stream is destroyed but LEFT in the map on purpose: later chunks then route to
+	 * the dropped-chunk branch instead of recreating a reader-less PassThrough that would backpressure
+	 * the socket, and the final chunk removes it and releases its marker. A stream that already ended is
+	 * waiting for a record that will never come, so nothing else would ever collect it.
+	 */
+	function discardIncomingBlobStream(blobId: any) {
+		const stream = blobsInFlight.get(blobId);
+		if (!stream) return;
+		if (stream.writableEnded) {
+			blobsInFlight.delete(blobId);
+			unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
+		}
+		stream.destroy?.();
+	}
+
 	function noteReceiveLiveness() {
 		replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 		replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
@@ -4189,14 +4203,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														entry.localTime
 													);
 													getSharedStatus()[SENDING_TIME_POSITION] = 1;
-													// Preserve the record's ORIGIN node, not ours. A base copy synthesizes audit
-													// entries from the primary store, and stamping them with this node's id would
-													// re-attribute every copied record to the copier: the follower then stores our
-													// id as the origin, so a later identity comparison against the true origin can
-													// never tie. That is what let a reverse copy silently re-mint (and drop) blob
-													// files for records the follower itself originated. `entry.nodeId` is already
-													// this node's local id for the origin (undefined/0 = us), which is exactly the
-													// id space the wire uses and the follower remaps.
+													// The record's ORIGIN, not ours: stamping a copy with the copier's id
+													// re-attributes every copied record, so it can never tie against its true
+													// origin on the follower. `entry.nodeId` is this node's local id for that
+													// origin (undefined/0 = us) — the same id space the wire uses.
 													const recordNodeId = entry.nodeId ?? nodeId;
 													const encoded = createAuditEntry({
 														version: entry.version,
@@ -4445,18 +4455,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					);
 				}
 				const id = auditRecord.recordId;
-				// Copy-mode identity-tie skip. A base copy applies every record as a snapshot and re-mints its
-				// blobs as fresh local files, dereferencing the ones we already hold. When the copy SOURCE is
-				// simply handing back a record we ourselves originated — same version, same origin node, as on
-				// the reverse leg of a bidirectional add_node whose full copy lands after the peer has received
-				// our data — that re-mint trades durable local blob bytes for a re-transfer of identical
-				// content. If the copy is then interrupted mid-blob, the record is left pointing at a PENDING
-				// stub the source can never fill, because it never held those bytes either: the blob is lost on
-				// BOTH nodes. Copy frames sit outside the leading-duplicate resume window (a copy has no resume
-				// cursor to bound), so the tie is checked here instead — before the decode, so no local blob
-				// file is minted for a record we are not going to apply. Restricted to blob-carrying records:
-				// re-applying an identical blob-less record is wasteful but harmless, and this check costs a
-				// point read per record.
+				// A copy frame is applied as a snapshot with no duplicate detection, so it re-mints the
+				// record's blobs as fresh local files and dereferences the durable ones we already hold —
+				// and if the copy is interrupted mid-blob the record is left on a PENDING stub the source
+				// cannot fill. Skip a frame that ties with what we have, which copy mode would otherwise
+				// never detect: it is outside the leading-duplicate window (a copy has no resume cursor).
+				// Blob-carrying records only; re-applying an identical blob-less record is harmless.
 				if (
 					messageIsCopyFrame &&
 					!!(auditRecord.extendedType & HAS_BLOBS) &&
@@ -4467,20 +4471,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						true
 					))
 				) {
+					// Decode only to learn the blob fileIds, so their in-flight receive streams can be
+					// released; saveBlob is never reached, so no local file is minted. A blob whose chunks
+					// arrive entirely after its record has no stream yet — the blobsTimer sweep reclaims
+					// those, bounded by the sender's in-flight cap.
+					try {
+						decodeWithBlobCallback(
+							() => auditRecord.getValue(tableDecoder),
+							(remoteBlob) => discardIncomingBlobStream(getFileId(remoteBlob)),
+							auditStore?.rootStore
+						);
+					} catch (error) {
+						logger.trace?.(connectionId, 'copy identity-tie: could not enumerate skipped blobs', id, error);
+					}
 					noteReceiveLiveness();
-					// Keep the copy resume cursor moving over skipped keys; a skipped record has no in-flight
-					// blob to wait on (we kept our durable one), so the cursor is already durable at this key.
+					// A skipped key is already durable locally, so the copy cursor may advance over it.
 					if (tableDecoder?.name) lastCopyFrameKey = { table: tableDecoder.name, id };
-					logger.trace?.(
-						connectionId,
-						COPY_DUP_SKIP_LOG,
-						'id',
-						id,
-						'version',
-						auditRecord.version,
-						'table',
-						tableDecoder?.name
-					);
+					logger.trace?.(connectionId, 'copy identity-tie skip', 'id', id, 'version', auditRecord.version);
 					decoder.position = start + eventLength;
 					continue;
 				}

@@ -76,6 +76,24 @@ describe('isDurableIdentityTie — provably-already-applied record detection', (
 		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, throwing, present)).to.equal(false);
 	});
 
+	it('ties a record originated on a THIRD node, not just one we originated ourselves', async () => {
+		// A copy hands back records from every origin in the mesh, so the tie must not assume node 0.
+		expect(await isDurableIdentityTie(entry({ nodeId: 7 }), VERSION, 7, true, () => ['/blobs/a'], present)).to.equal(
+			true
+		);
+		expect(await isDurableIdentityTie(entry({ nodeId: 7 }), VERSION, 0, true, () => ['/blobs/a'], present)).to.equal(
+			false
+		);
+	});
+
+	it('uses the real blob-path resolver and fs.access by default', async () => {
+		// The injected collaborators above never exercise the defaults; a record whose blobs cannot be
+		// resolved to a path must not tie through them.
+		expect(
+			await isDurableIdentityTie(entry({ value: { id: 1, note: 'no blobs here' } }), VERSION, NODE_ID, true)
+		).to.equal(false);
+	});
+
 	it('does not touch the filesystem for a blob-less record', async () => {
 		let inspected = 0;
 		const counting = () => {
