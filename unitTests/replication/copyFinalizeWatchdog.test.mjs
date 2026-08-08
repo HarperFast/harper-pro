@@ -7,104 +7,76 @@
  * and the arm/stop handoff with `maybeFinishCopy`.
  */
 
-import { expect } from 'chai';
-import sinon from 'sinon';
+import assert from 'node:assert';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createCopyFinalizeWatchdog } from '#src/replication/replicationConnection';
 
-const THRESHOLD = 300_000; // stand-in for COPY_FINALIZE_TIMEOUT; the factory takes it as a param
+// Real timers rather than a fake clock: the shared watchdog floors its reset throttle at 100ms, so a
+// threshold below that would be measuring the throttle. Waits are multiples of the threshold so a loaded
+// machine cannot turn "has not fired yet" into a false pass.
+const THRESHOLD = 150;
 
 describe('createCopyFinalizeWatchdog', () => {
-	let clock;
-
-	beforeEach(() => {
-		clock = sinon.useFakeTimers();
-	});
-
-	afterEach(() => {
-		clock.restore();
-	});
-
-	it('fires onStall once after thresholdMs when finalization makes no progress (the finalization wedge)', () => {
-		const onStall = sinon.spy();
+	it('fires onStall once when finalization makes no progress (the wedge)', async () => {
+		let stalls = 0;
 		const watchdog = createCopyFinalizeWatchdog({
 			thresholdMs: THRESHOLD,
-			getProgress: () => 0, // no commit drained, no blob finished, no flush settled
-			onStall,
+			getProgress: () => 0,
+			onStall: () => stalls++,
 		});
 
 		watchdog.reset(); // armed at COPY_COMPLETE
-
-		clock.tick(THRESHOLD - 1);
-		expect(onStall.callCount).to.equal(0);
-
-		clock.tick(1);
-		expect(onStall.callCount).to.equal(1);
+		await delay(THRESHOLD * 4);
+		watchdog.stop();
+		assert.strictEqual(stalls, 1, 'a frozen finalization fires exactly once, not in a reconnect loop');
 	});
 
-	it('does NOT fire while the drain is progressing (a big copy finalizing slowly)', () => {
-		const onStall = sinon.spy();
+	it('does not fire while the drain is progressing', async () => {
+		let stalls = 0;
 		let progress = 0;
 		const watchdog = createCopyFinalizeWatchdog({
 			thresholdMs: THRESHOLD,
 			getProgress: () => progress,
-			onStall,
+			onStall: () => stalls++,
 		});
 
 		watchdog.reset();
-		// 20 windows, each with one tick of progress just before the deadline.
-		for (let i = 0; i < 20; i++) {
-			clock.tick(THRESHOLD - 1);
-			progress += 1; // a blob finished / a cursor flush succeeded
-			clock.tick(1); // watchdog checks, sees progress, re-arms from the new baseline
+		for (let i = 0; i < 6; i++) {
+			await delay(THRESHOLD / 2);
+			progress++; // a finalization gate closed
 		}
-		expect(onStall.callCount).to.equal(0);
+		watchdog.stop();
+		assert.strictEqual(stalls, 0, 'a slow but progressing finalization must never be force-reconnected');
 	});
 
-	it('self-re-arms after progress, so a drain that dies LATER is still caught', () => {
-		const onStall = sinon.spy();
+	it('self-re-arms after progress, so a drain that dies later is still caught', async () => {
+		let stalls = 0;
 		let progress = 0;
 		const watchdog = createCopyFinalizeWatchdog({
 			thresholdMs: THRESHOLD,
 			getProgress: () => progress,
-			onStall,
-		});
-
-		watchdog.reset(); // t=0, baseline 0, timer at t=THRESHOLD
-		clock.tick(THRESHOLD - 1);
-		progress = 1; // last commit drained just before the first deadline
-		clock.tick(1); // t=THRESHOLD: progress advanced → re-baseline to 1, re-arm at t=2*THRESHOLD
-
-		clock.tick(THRESHOLD - 1);
-		expect(onStall.callCount).to.equal(0);
-		clock.tick(1); // t=2*THRESHOLD: progress unchanged → fires
-		expect(onStall.callCount).to.equal(1);
-	});
-
-	it('stop() prevents firing — the maybeFinishCopy path', () => {
-		const onStall = sinon.spy();
-		const watchdog = createCopyFinalizeWatchdog({
-			thresholdMs: THRESHOLD,
-			getProgress: () => 0,
-			onStall,
+			onStall: () => stalls++,
 		});
 
 		watchdog.reset();
-		clock.tick(THRESHOLD - 1);
+		await delay(THRESHOLD / 2);
+		progress++; // last sign of life
+		await delay(THRESHOLD * 4); // frozen from here
+		watchdog.stop();
+		assert.strictEqual(stalls, 1);
+	});
+
+	it('stop() prevents firing — the maybeFinishCopy path', async () => {
+		let stalls = 0;
+		const watchdog = createCopyFinalizeWatchdog({
+			thresholdMs: THRESHOLD,
+			getProgress: () => 0,
+			onStall: () => stalls++,
+		});
+
+		watchdog.reset();
 		watchdog.stop(); // copy finalized
-		clock.tick(THRESHOLD * 3);
-		expect(onStall.callCount).to.equal(0);
-	});
-
-	it('fires only once per stall — the reconnect drives recovery, not a repeated timer', () => {
-		const onStall = sinon.spy();
-		const watchdog = createCopyFinalizeWatchdog({
-			thresholdMs: THRESHOLD,
-			getProgress: () => 0,
-			onStall,
-		});
-
-		watchdog.reset();
-		clock.tick(THRESHOLD * 5);
-		expect(onStall.callCount).to.equal(1);
+		await delay(THRESHOLD * 4);
+		assert.strictEqual(stalls, 0, 'a finished copy must not be reconnected out from under itself');
 	});
 });

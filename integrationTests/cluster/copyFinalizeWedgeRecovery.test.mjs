@@ -83,19 +83,10 @@ async function pollUntil(predicate, timeoutMs = RECOVERY_TIMEOUT_MS) {
 	return false;
 }
 
-/**
- * The receiver's watermark for what it has applied from the source. It is deliberately suppressed while
- * in copy mode, so it advancing past zero is the observable that the copy actually FINALIZED — not merely
- * that rows arrived (they are visible as soon as their batch commits, wedge or no wedge).
- */
-async function receivedVersion(node) {
-	const status = await sendOperation(node, { operation: 'cluster_status' }).catch(() => null);
-	for (const connection of status?.connections ?? []) {
-		for (const socket of connection.database_sockets ?? []) {
-			if (socket.database === STALL_DB && socket.lastReceivedVersion > 0) return socket.lastReceivedVersion;
-		}
-	}
-	return 0;
+/** Count of completed base copies in the receiver's log — the reconnect's copy is the second. */
+async function copiesCompleted(node) {
+	const log = await readLog(node).catch(() => '');
+	return (log.match(/bulk copy complete/g) ?? []).length;
 }
 
 suite('Replication copy-finalization wedge recovery', { timeout: 180000 }, (ctx) => {
@@ -154,10 +145,12 @@ suite('Replication copy-finalization wedge recovery', { timeout: 180000 }, (ctx)
 		);
 		ok(reported, 'a base copy stuck after COPY_COMPLETE must be reported at error level, not silently');
 
-		// The other half: it must RECOVER. Asserting on arriving rows would not prove it — copied rows are
-		// visible as soon as their batch commits, wedge or no wedge.
-		const finalized = await pollUntil(async () => (await receivedVersion(ctx.nodes[1])) > 0);
-		ok(finalized, 'the retried copy must finalize and leave copy mode (received version advances)');
+		// The other half: it must RECOVER, and recovery has to be observed as the copy actually RE-RUNNING.
+		// Neither arriving rows nor the received-version watermark prove it: rows are visible as soon as
+		// their batch commits and the watermark advances when the sequence update is decoded, both of which
+		// happen while the copy is still wedged.
+		const recopied = await pollUntil(async () => (await copiesCompleted(ctx.nodes[1])) > 1);
+		ok(recopied, 'the watchdog must reconnect and the copy must re-run, not just be reported');
 
 		await sendOperation(ctx.nodes[0], {
 			operation: 'insert',
