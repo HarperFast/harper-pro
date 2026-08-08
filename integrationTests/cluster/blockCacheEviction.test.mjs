@@ -27,6 +27,14 @@
  *   is what the field repro had and a 2-node test does not. Do not read a pass here as evidence that the
  *   MaybePromise sites are still correct — this suite is a real-world rolling-restart check on top of,
  *   not instead of, the unit tests above.
+ *
+ * What it has ACTUALLY caught, which is not the class above: the RocksDB WriteBufferManager write stall
+ *   of rocksdb-js#755. `blockCacheSize` sizes more than the block cache — Harper derives the process-wide
+ *   WriteBufferManager from it (`blockCacheSize / 3`, `allowStall` on) — so this suite's deliberately small
+ *   cache is also a deliberately small stalling write budget, and a derived memtable-history target above
+ *   that budget stalled every write to the receiving database permanently. Fixed in rocksdb-js 2.7.1 (this
+ *   repo pins `^2.7.1`). A failure here that ends at `bulk copy complete` with no following
+ *   `last sequence committed <copyStartTime>` line is that shape: check the binding version first.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
@@ -48,8 +56,10 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 // churn rather than staying resident regardless of restart. Per the header above, the startup
 // `hdb_nodes` scan can still warm the rows before the point reads in this suite run, so this does not
 // guarantee a cache-miss Promise — it's sized this way anyway so a warm cache from a stale prior run
-// isn't what's papering over a real miss. We deliberately do NOT shrink the WriteBufferManager — a tiny
-// WBM with allowStall stalls the schema writes during startup.
+// isn't what's papering over a real miss. We deliberately do NOT shrink the WriteBufferManager
+// explicitly — a tiny WBM with allowStall stalls the schema writes during startup. Note it is shrunk
+// IMPLICITLY all the same: Harper derives the WBM from the block cache (`blockCacheSize / 3`, so ~10.7MB
+// here, allowStall on), which is exactly why this suite is the one that caught rocksdb-js#755.
 const SMALL_ROCKS = { blockCacheSize: 32 * 1024 * 1024 };
 
 // Some padded records so the data table spans multiple SST blocks (cache pressure). Convergence is
@@ -191,7 +201,14 @@ suite(
 			});
 
 			const onB = await waitForRecord(ctx.nodeB, 'seed-sentinel');
-			ok(onB, 'node B should have received the seeded data (sentinel) before we start perturbing it');
+			if (!onB) {
+				// The seeding hook is where the wedge actually surfaces in CI, and a bare "sentinel never
+				// arrived" said nothing about whether B was subscribed, receiving, or stuck mid-copy.
+				ok(
+					false,
+					`node B should have received the seeded data (sentinel) before we start perturbing it${await describeReplication(ctx.nodeB)}`
+				);
+			}
 		});
 
 		after(async () => {

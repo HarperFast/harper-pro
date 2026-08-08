@@ -329,6 +329,29 @@ const PING_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_PINGTIMEOUT) ?? PING_INTE
 // inCopyMode the byte-level idle watchdog uses this higher copy-phase threshold instead of PING_TIMEOUT;
 // the copy-progress watchdog (#453) still catches a genuinely frozen copy on its own clock.
 const COPY_TIMEOUT = env.get(CONFIG_PARAMS.REPLICATION_COPYTIMEOUT) ?? 300000;
+// Zero-progress bound on the base-copy FINALIZATION window (COPY_COMPLETE → copy actually finished); see
+// createCopyFinalizeWatchdog for why that window has no other guard. Deliberately shares
+// `replication.copyTimeout` rather than adding a knob: both answer "how long may a copy sit still before
+// we stop believing in it", and the final copy-cursor flush of a large base copy is the slowest step
+// either has to tolerate. The env override exists only so the regression test does not have to wait it out.
+const TEST_COPY_FINALIZE_TIMEOUT_MS = Number(process.env.HARPER_TEST_COPY_FINALIZE_TIMEOUT_MS);
+const COPY_FINALIZE_TIMEOUT = positiveMsOr(TEST_COPY_FINALIZE_TIMEOUT_MS, COPY_TIMEOUT);
+// Consecutive copy-durability-flush timeouts per database. A fixed bound cannot tell a flush that will
+// never settle from one that is merely slower than we guessed, and rejecting the slow one pins the node in
+// a permanent copy-retry loop it can never escape. Each timeout therefore doubles the next attempt's bound
+// (capped) so a legitimately slow flush outgrows the bound within a retry or two, while one that never
+// settles keeps failing loudly instead of blocking the apply loop forever.
+const copyFlushTimeoutsByDatabase = new Map<string, number>();
+const COPY_FLUSH_BOUND_MAX_DOUBLINGS = 3;
+// Native flushes we have stopped waiting on but that are still running. Capped rather than serialized: a
+// retry must be able to start a real flush (chaining behind a stalled one can never make the newly rewritten
+// copy rows durable, and if the first never settles the chain never runs), but a permanently stalled store
+// must not accumulate one queued flush per retry forever.
+const copyFlushOutstandingByDatabase = new Map<string, number>();
+const MAX_OUTSTANDING_COPY_FLUSHES = 3;
+// Ceiling on the whole finalization window, as a multiple of the (escalating) threshold, past which no
+// progress signal may keep deferring the watchdog.
+const COPY_FINALIZE_DEADLINE_MULTIPLE = 4;
 // W1 (harper-pro#431): safety net behind the explicit DOWN write — a link whose last liveness is older
 // than this reads as down even if still marked CONNECTED, so a worker that died/wedged without writing
 // DOWN can't pin a stale CONNECTED. Derived from the configured keepalive (not a fixed default) so a
@@ -816,6 +839,20 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 	copyStallForTestArmed = true;
 	logger.warn?.(`[test] stalling outbound base copy mid-flight for db "${databaseName}" (harper-pro#453)`);
 	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
+}
+
+// Test-only fault injection for the copy-finalization watchdog. When HARPER_TEST_COPY_FINALIZE_STALL_ONCE_DB
+// names a database, the FIRST copy-cursor flush for it never settles on the RECEIVER: the copy's onCommit
+// awaits it forever, so `maybeFinishCopy` never runs and the node parks in copy mode permanently — the wedge
+// shape, but with the event loop still alive so a JS watchdog can act on it. One-shot per process, so the
+// copy after the forced reconnect finalizes normally.
+let copyFinalizeStallForTestArmed = false;
+export function maybeStallCopyFinalizeForTest(databaseName?: string): Promise<never> | undefined {
+	if (!process.env.HARPER_TEST_COPY_FINALIZE_STALL_ONCE_DB) return;
+	if (copyFinalizeStallForTestArmed || process.env.HARPER_TEST_COPY_FINALIZE_STALL_ONCE_DB !== databaseName) return;
+	copyFinalizeStallForTestArmed = true;
+	logger.warn?.(`[test] stalling copy finalization flush for db "${databaseName}"`);
+	return new Promise<never>(() => {});
 }
 
 // Test-only fault injection for harper-pro#642: one-shot per process, so a receiver watchdog reconnect
@@ -1553,6 +1590,57 @@ export function createPauseStallWatchdog(opts: {
 		onSilence: opts.onStall,
 	});
 }
+
+/**
+ * Reject with `timeoutError` if `work` has not settled within `timeoutMs`, leaving the original promise to
+ * settle (or not) on its own. For awaits whose caller has a defined failure path but no defined behavior
+ * for "never returns". The error is supplied rather than built here so the caller can distinguish its own
+ * timeout from a genuine failure of `work` by identity.
+ */
+export function rejectIfUnsettled<T>(work: Promise<T>, timeoutMs: number, timeoutError: Error): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	return Promise.race([
+		work,
+		new Promise<never>((_, reject) => {
+			timer = setTimeout(() => reject(timeoutError), timeoutMs);
+			timer.unref?.();
+		}),
+	]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Liveness watchdog for the base-copy FINALIZATION window — COPY_COMPLETE until the copy actually
+ * finishes (commits drained, blobs durable, copy cursor flushed, copy mode exited). Until that completes
+ * the received-version watermark stays suppressed, so the node can never reach Available.
+ *
+ * Every other guard is off for precisely this window, which is why it needs its own:
+ *   - `copyProgressWatchdog` is `stop()`ed at COPY_COMPLETE and returns early on `copyCompleteReceived`
+ *     (there are no more copy frames to count — #453).
+ *   - `receiveWatchdog` is widened to COPY_TIMEOUT while `inCopyMode` (#460) and the sender has nothing
+ *     left to send, so byte silence here is expected rather than evidence of a stall.
+ *   - `subscriptionSetupWatchdog` is paused for the duration of the copy.
+ *
+ * Keyed on finalization progress rather than wall clock, so a large-but-progressing drain re-arms every
+ * window; only ZERO progress for the full threshold fires. Built on `createReceiveWatchdog` for the
+ * shared throttled timer, so it self-re-arms on progress and detects between 1x and 2x `thresholdMs`.
+ *
+ * Reach: this covers stalls that leave the event loop alive. It cannot recover one wedged inside a
+ * blocking native call (rocksdb-js#755's WriteBufferManager stall parked the worker in a futex, where no
+ * JS timer can fire) — that belongs to the binding, and was fixed in rocksdb-js 2.7.1.
+ *
+ * Exported for `unitTests/replication/copyFinalizeWatchdog.test.mjs`.
+ */
+export function createCopyFinalizeWatchdog(opts: {
+	thresholdMs: number | (() => number);
+	getProgress: () => number;
+	onStall: () => void;
+}): { reset: () => void; stop: () => void } {
+	return createReceiveWatchdog({
+		intervalMs: opts.thresholdMs,
+		getBytesRead: opts.getProgress,
+		onSilence: opts.onStall,
+	});
+}
 let secureContexts: Map<string, tls.SecureContext>;
 /**
  * Handles reconnection, and requesting catch-up
@@ -2091,6 +2179,26 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				);
 		}
 	}
+	// `wsClosed` alone is not ownership: forceReconnect() schedules the replacement without waiting for this
+	// socket's close event, so a late callback from a superseded connection can still see wsClosed === false
+	// and clear the cursor the replacement copy is relying on.
+	const supersededOrClosed = () => wsClosed || (options.connection != null && options.connection.socket !== ws);
+	// Progress toward FINALIZING, deliberately not `consumerProgress`: that counter advances on every commit,
+	// so live traffic from a busy leader would re-arm the watchdog forever while the copy stayed stuck. Only
+	// a finalization gate actually closing counts — the commit queue reaching empty, a blob finishing, a
+	// cursor flush succeeding. Commits that merely churn a non-empty queue are not progress toward a copy
+	// that can only finish at zero. Off entirely outside the window it guards, so the default apply path
+	// pays nothing for it.
+	function noteCopyFinalizeProgress(fromCommit = false) {
+		if (fromCommit && outstandingCommits > 0) return;
+		// Ceiling on how long progress may keep deferring the watchdog. Live traffic can drain the commit
+		// queue to zero over and over while a different gate stays stuck, so "some gate closed recently"
+		// cannot be the only guard. Past the ceiling nothing counts, so the watchdog fires on its next
+		// check — this bounds the wedge at the ceiling plus one (possibly escalated) threshold rather than
+		// firing exactly at it. A false positive costs a resumed copy, not data.
+		if (performance.now() - copyCompleteAt > COPY_FINALIZE_DEADLINE_MULTIPLE * COPY_FINALIZE_TIMEOUT) return;
+		copyFinalizeProgress++;
+	}
 	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
 	// received AND every copied batch has committed (outstandingCommits drained, which includes the final
 	// end_txn that advances the resume seqId to copyStartTime). We deliberately stay in copy mode until
@@ -2119,6 +2227,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
 			subscriptionSetupWatchdog?.resume();
+			// Retired before the flags its onStall re-checks are cleared, so the timer stops waking the
+			// event loop for the rest of the connection's life.
+			copyFinalizeWatchdog?.stop();
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 			pendingCopyCursor = null;
@@ -2169,15 +2280,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyFlushInFlight = true;
 			Promise.resolve(flushRootStore())
 				.then(() => {
+					// A superseded connection must not touch shared copy state: its replacement is already
+					// copying, and persisting this cursor (or finishing below) would rewind or clear the live
+					// copy's progress.
+					if (supersededOrClosed()) return;
 					// rows up to cursorAtFlush are now durable in SST; dbisDB is WAL-on, so this persist is durable.
 					// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
 					if (copyFromNodeId !== undefined)
 						getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
 					copyFlushBackoffUntil = 0;
 					copyFlushRetryMs = 0; // flush succeeded; reset backoff
+					if (copyCompleteReceived) noteCopyFinalizeProgress();
 					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
 				})
 				.catch((error) => {
+					if (supersededOrClosed()) return;
 					pendingCopyCursor ??= cursorAtFlush; // hold the staged cursor
 					// Escalating backoff (250ms → 30s cap) instead of an immediate re-flush, so a persistent flush
 					// failure idles rather than busy-looping; a scheduled retry drives progress without another event.
@@ -2186,6 +2303,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					clearTimeout(copyFlushRetryTimer);
 					copyFlushRetryTimer = setTimeout(() => {
 						copyFlushRetryTimer = undefined;
+						if (supersededOrClosed()) return;
 						flushDurableCopyCursor();
 					}, copyFlushRetryMs);
 					copyFlushRetryTimer.unref?.();
@@ -2193,6 +2311,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				})
 				.finally(() => {
 					copyFlushInFlight = false;
+					if (supersededOrClosed()) return;
 					maybeFinishCopy();
 				});
 			return;
@@ -2204,11 +2323,58 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// suite exercises this path.)
 	function copyStoreFlush(): (() => Promise<unknown>) | undefined {
 		const rootStore = auditStore?.rootStore;
-		return typeof rootStore?.flush === 'function'
-			? () => rootStore.flush()
-			: rootStore?.flushed !== undefined
-				? () => Promise.resolve(rootStore.flushed)
-				: undefined;
+		const flush =
+			typeof rootStore?.flush === 'function'
+				? () => rootStore.flush()
+				: rootStore?.flushed !== undefined
+					? () => Promise.resolve(rootStore.flushed)
+					: undefined;
+		if (!flush) return undefined;
+		// A flush that never settles is strictly worse than one that fails. onCommit awaits this, and the
+		// per-database apply subscription is REUSED across reconnects (subscriptionForDatabase returns the
+		// cached active one), so the hung await bricks that database's apply loop for the life of the process
+		// — a watchdog reconnect cannot clear it, as the recovery test proves. Rejecting on a bound routes a
+		// hang into the failure path this code already handles: core skips the seq persist, the subscription
+		// unwinds, and the copy re-runs from the durable cursor rather than resuming past undurable rows.
+		return () => {
+			// The bound rejects our WAIT, never the flush itself — the native call cannot be cancelled and is
+			// still running. Refuse to start another once too many are outstanding, so a permanently stalled
+			// store fails fast instead of queueing one more native flush on every retry.
+			const outstanding = copyFlushOutstandingByDatabase.get(databaseName) ?? 0;
+			if (outstanding >= MAX_OUTSTANDING_COPY_FLUSHES)
+				return Promise.reject(
+					new Error(
+						`copy durability flush for database "${databaseName}" not started: ${outstanding} earlier flushes are still unsettled`
+					)
+				);
+			copyFlushOutstandingByDatabase.set(databaseName, outstanding + 1);
+			// `.then` on a resolved promise so a SYNCHRONOUS throw from flush() becomes a rejection that
+			// releases the slot below, rather than escaping past the release and leaking capacity until no
+			// copy for this database can ever flush again.
+			const underlying = Promise.resolve().then(() => maybeStallCopyFinalizeForTest(databaseName) ?? flush());
+			const release = () => {
+				copyFlushOutstandingByDatabase.set(databaseName, (copyFlushOutstandingByDatabase.get(databaseName) ?? 1) - 1);
+			};
+			underlying.then(release, release);
+			const doublings = copyFlushTimeoutsByDatabase.get(databaseName) ?? 0;
+			const boundMs = COPY_FINALIZE_TIMEOUT * 2 ** Math.min(doublings, COPY_FLUSH_BOUND_MAX_DOUBLINGS);
+			const timeoutError = new Error(
+				`copy durability flush for database "${databaseName}" from ${remoteNodeName} did not settle within ${boundMs}ms`
+			);
+			return rejectIfUnsettled(underlying, boundMs, timeoutError).then(
+				(value) => {
+					copyFlushTimeoutsByDatabase.delete(databaseName);
+					return value;
+				},
+				(error) => {
+					// Identity, not message: a genuine flush failure (disk full, store closing) is not evidence
+					// that the bound was too tight and must not widen it. Deliberately not fenced by connection
+					// ownership — the bound tracks the STORE's behavior, which a replacement connection inherits.
+					if (error === timeoutError) copyFlushTimeoutsByDatabase.set(databaseName, doublings + 1);
+					throw error;
+				}
+			);
+		};
 	}
 	// Force the copied DB durable and await it. Gates [seq] = copyStartTime behind the copyApply rows'
 	// durability: those rows are WAL-off with no transaction-log entry, and core awaits the end_txn onCommit
@@ -2264,6 +2430,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// while in copy mode; if it stalls past the threshold while still `connected`, the copy has wedged.
 	let copyProgressWatchdog: { reset: () => void; stop: () => void } | undefined;
 	let copyProgressFrames = 0;
+	// Guards COPY_COMPLETE → copy actually finished, the one phase the three watchdogs above all leave
+	// unguarded. Armed at COPY_COMPLETE, stopped when copy mode exits. See createCopyFinalizeWatchdog.
+	let copyFinalizeWatchdog: { reset: () => void; stop: () => void } | undefined;
+	let copyFinalizeProgress = 0;
+	let copyCompleteAt = 0;
 	// Count ONLY base-copy frames as progress — COPY_START, the per-batch copy records (isCopyFrame), and
 	// copy BLOB_CHUNKs — not every 'message'. replicateOverWS is bidirectional, so counting arbitrary
 	// frames (schema/subscription updates, reverse-direction traffic) could re-arm the watchdog once per
@@ -2462,6 +2633,27 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
 				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${blobTimeout}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
+			);
+			if (options.connection) options.connection.forceReconnect();
+			else ws.terminate();
+		},
+	});
+	// The stuck-state detail is logged inline because the forced reconnect immediately clears it, and it is
+	// the only record of WHY finalization never completed.
+	copyFinalizeWatchdog = createCopyFinalizeWatchdog({
+		// Widens with the flush bound. A fixed threshold would force-reconnect at 1x while the escalation was
+		// still waiting out a slow-but-honest flush at 2x or 4x, so the escalation could never take effect.
+		thresholdMs: () =>
+			COPY_FINALIZE_TIMEOUT *
+			2 ** Math.min(copyFlushTimeoutsByDatabase.get(databaseName) ?? 0, COPY_FLUSH_BOUND_MAX_DOUBLINGS),
+		getProgress: () => copyFinalizeProgress,
+		onStall: () => {
+			// Finalization may have completed between the last arm and this fire; a finished copy must not be
+			// reconnected out from under itself.
+			if (supersededOrClosed() || !inCopyMode || !copyCompleteReceived) return;
+			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+			logger.error?.(
+				`Copy-finalization watchdog: base copy from ${remoteNodeName}${dbContext} received COPY_COMPLETE but did not finalize within ${COPY_FINALIZE_TIMEOUT}ms — this node stays in copy mode and can never become available; terminating connection and reconnecting to resume the copy — stuck on {outstandingCommits: ${outstandingCommits}, outstandingBlobs: ${outstandingBlobsToFinish.length}, blobGap: ${hasBlobGap}, copyFlushInFlight: ${copyFlushInFlight}, pendingCopyCursor: ${pendingCopyCursor != null}} — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -3106,7 +3298,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// No more copy frames will arrive, so stop watching for copy-progress stalls now rather
 						// than leaving the timer to wake the event loop until the commit drain finishes (#453).
 						copyProgressWatchdog?.stop();
+						copyCompleteAt = performance.now();
 						maybeFinishCopy();
+						if (inCopyMode) copyFinalizeWatchdog?.reset();
 						logger.debug?.(connectionId, 'bulk copy complete from', remoteNodeName);
 						break;
 					case SEQUENCE_ID_UPDATE:
@@ -4602,6 +4796,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// Consumer-progress tick for pauseStallWatchdog: the apply loop committed a queued batch,
 					// which advances even while the receive socket is paused for back-pressure (harper-pro#466).
 					consumerProgress++;
+					if (copyCompleteReceived) noteCopyFinalizeProgress(true);
 					if (commitBacklogPaused) {
 						commitBacklogPaused = false;
 						removePauseReason();
@@ -4728,6 +4923,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		subscriptionSetupWatchdog?.stop();
 		pauseStallWatchdog?.stop();
 		copyProgressWatchdog?.stop();
+		copyFinalizeWatchdog?.stop();
+		clearTimeout(copyFlushRetryTimer);
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
 		// The blobsTimer that would otherwise reap stalled receives is now cleared, and the connection is
@@ -5106,6 +5303,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
 					const index = outstandingBlobsToFinish.indexOf(tracked);
 					if (index > -1) outstandingBlobsToFinish.splice(index, 1);
+					if (copyCompleteReceived) noteCopyFinalizeProgress();
 					// Advance the durable watermark when the LAST in-flight blob settles without a held gap. The
 					// splice above runs first so the length check sees the post-removal count. A local/transient
 					// save FAILURE set `hasBlobGap` in the `.catch` (which runs before this `.finally`), so the
