@@ -48,15 +48,10 @@ export async function repairBlobs(
 
 				// Verify the blobs are now complete on disk — the peer may have sent empty bytes if
 				// its own copy was also incomplete (promisedWrites returns Buffer.alloc(0)).
-				const allComplete = entry.value
-					? (() => {
-							let complete = true;
-							findBlobsInObject(entry.value, (blob) => {
-								if (!isBlobComplete(blob)) complete = false;
-							});
-							return complete;
-						})()
-					: false;
+				const repairedBlobs: any[] = [];
+				findBlobsInObject(entry.value, (blob) => repairedBlobs.push(blob));
+				const allComplete =
+					repairedBlobs.length > 0 && (await Promise.all(repairedBlobs.map(isBlobComplete))).every(Boolean);
 
 				if (!allComplete) continue; // peer's copy was also incomplete, try next peer
 
