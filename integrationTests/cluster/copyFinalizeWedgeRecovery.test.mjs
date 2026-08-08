@@ -127,7 +127,8 @@ suite('Replication copy-finalization wedge recovery', { timeout: 180000 }, (ctx)
 		// registered for worker message type subscribe-to-node") on a loaded runner, leaving the
 		// subscription unset. Re-issue until the base copy is actually observed starting — fixture setup,
 		// not part of what is being asserted.
-		for (let attempt = 0; attempt < 3; attempt++) {
+		let copying = false;
+		for (let attempt = 0; attempt < 3 && !copying; attempt++) {
 			await sendOperation(ctx.nodes[1], {
 				operation: 'add_node',
 				rejectUnauthorized: false,
@@ -135,12 +136,12 @@ suite('Replication copy-finalization wedge recovery', { timeout: 180000 }, (ctx)
 				isLeader: true,
 				authorization: ctx.nodes[1].admin,
 			}).catch(() => {});
-			const copying = await pollUntil(
+			copying = await pollUntil(
 				async () => /Requesting full copy of database data/.test(await readLog(ctx.nodes[1]).catch(() => '')),
 				30000
 			);
-			if (copying) break;
 		}
+		ok(copying, 'fixture: the base copy never started, so the wedge under test was never reached');
 
 		// Half the invariant: the wedge must be LOUD, or an operator cannot tell a copy that will never
 		// finish from one that is merely slow.
