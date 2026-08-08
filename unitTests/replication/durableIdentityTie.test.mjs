@@ -10,7 +10,7 @@
  * PENDING stub the peer can never fill (it never held the bytes either), losing the blob on both nodes.
  *
  * So a false positive here is data loss, not a slow path: the predicate must be true ONLY for a true
- * identity tie (same version AND same origin node) whose blob files are all present on disk.
+ * identity tie (same version AND same origin node) whose blobs are all durably complete on disk.
  */
 
 import { expect } from 'chai';
@@ -19,9 +19,8 @@ import { isDurableIdentityTie } from '#src/replication/replicationConnection';
 const VERSION = 1700000000000;
 const NODE_ID = 3;
 const entry = (overrides = {}) => ({ version: VERSION, nodeId: NODE_ID, value: { id: 1 }, ...overrides });
-const noBlobs = () => [];
-const present = () => Promise.resolve();
-const missing = () => Promise.reject(new Error('ENOENT'));
+const complete = () => Promise.resolve(true);
+const incomplete = () => Promise.resolve(false);
 
 describe('isDurableIdentityTie — provably-already-applied record detection', () => {
 	it('is a tie for the same version and node when the record carries no blobs', async () => {
@@ -47,60 +46,42 @@ describe('isDurableIdentityTie — provably-already-applied record detection', (
 		expect(await isDurableIdentityTie(entry(), VERSION, undefined, false)).to.equal(false);
 	});
 
-	it('is a tie for a blob record whose every blob file is on disk', async () => {
-		expect(
-			await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, () => ['/blobs/a', '/blobs/b'], present)
-		).to.equal(true);
+	it('is a tie for a blob record whose blobs are all durably complete', async () => {
+		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, complete)).to.equal(true);
 	});
 
-	it('is not a tie when a blob file is missing, so the record can reach the repair path', async () => {
-		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, () => ['/blobs/a'], missing)).to.equal(false);
+	it('is NOT a tie when a local blob is incomplete, so the copy can repair it', async () => {
+		// A PENDING/truncated stub must reach the apply loop: a skipped key is also staged as a durable
+		// copy cursor, so tying here would make the damage permanent rather than merely unrepaired.
+		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, incomplete)).to.equal(false);
 	});
 
-	it('is not a tie when a single blob of several is missing', async () => {
-		const access = (path) => (path === '/blobs/b' ? Promise.reject(new Error('ENOENT')) : Promise.resolve());
-		expect(
-			await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, () => ['/blobs/a', '/blobs/b'], access)
-		).to.equal(false);
-	});
-
-	it('is not a tie when the blobs cannot be fully accounted for', async () => {
-		// null = the header claimed blobs but none was found, or one had no resolvable path.
-		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, () => null, present)).to.equal(false);
-	});
-
-	it('is not a tie when blob inspection throws', async () => {
-		const throwing = () => {
-			throw new Error('unreadable value');
-		};
-		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, throwing, present)).to.equal(false);
+	it('is not a tie when blob verification throws', async () => {
+		const throwing = () => Promise.reject(new Error('unreadable value'));
+		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, throwing)).to.equal(false);
 	});
 
 	it('ties a record originated on a THIRD node, not just one we originated ourselves', async () => {
 		// A copy hands back records from every origin in the mesh, so the tie must not assume node 0.
-		expect(await isDurableIdentityTie(entry({ nodeId: 7 }), VERSION, 7, true, () => ['/blobs/a'], present)).to.equal(
-			true
-		);
-		expect(await isDurableIdentityTie(entry({ nodeId: 7 }), VERSION, 0, true, () => ['/blobs/a'], present)).to.equal(
-			false
-		);
+		expect(await isDurableIdentityTie(entry({ nodeId: 7 }), VERSION, 7, true, complete)).to.equal(true);
+		expect(await isDurableIdentityTie(entry({ nodeId: 7 }), VERSION, 0, true, complete)).to.equal(false);
 	});
 
-	it('uses the real blob-path resolver and fs.access by default', async () => {
-		// The injected collaborators above never exercise the defaults; a record whose blobs cannot be
-		// resolved to a path must not tie through them.
+	it('uses the real blob verifier by default', async () => {
+		// The injected verifier above never exercises the default; a value with no reachable blob must
+		// not tie through it either.
 		expect(
 			await isDurableIdentityTie(entry({ value: { id: 1, note: 'no blobs here' } }), VERSION, NODE_ID, true)
 		).to.equal(false);
 	});
 
-	it('does not touch the filesystem for a blob-less record', async () => {
+	it('does not touch the blob store for a blob-less record', async () => {
 		let inspected = 0;
 		const counting = () => {
 			inspected++;
-			return noBlobs();
+			return Promise.resolve(false);
 		};
-		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, false, counting, missing)).to.equal(true);
+		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, false, counting)).to.equal(true);
 		expect(inspected).to.equal(0);
 	});
 });
