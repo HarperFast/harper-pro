@@ -281,6 +281,18 @@ suite(
 			const seeded = await recordCount(ctx.source);
 			equal(seeded, RECORD_COUNT, `expected ${RECORD_COUNT} seeded rows on source, got ${seeded}`);
 			console.log(`[qa692] A seeded ${seeded} blob records`);
+
+			// Verify the seed BEFORE any node joins, so a later source-side blob failure can never be blamed
+			// on seeding: this is the only point where A has done nothing but write its own blobs.
+			const seedFailures = (
+				await Promise.all(Array.from({ length: RECORD_COUNT }, (_, id) => verifyBlobContent(ctx.source, id)))
+			).filter((r) => !r.ok);
+			equal(
+				seedFailures.length,
+				0,
+				`seeding is not sound: ${seedFailures.length}/${RECORD_COUNT} blobs on A do not read back correctly ` +
+					`immediately after seeding, before any peer exists: ${seedFailures.map((f) => `id=${f.id}:${f.reason}`).join(', ')}`
+			);
 		});
 
 		after(async () => {
@@ -438,6 +450,13 @@ suite(
 			console.log(
 				`--- Layer 2: blob content --- A failures=${aContentFailures.length}/${RECORD_COUNT} B failures=${bContentFailures.length}/${receiverIds.size}`
 			);
+			if (aContentFailures.length)
+				console.log(
+					`  A content failures: ${aContentFailures
+						.map((f) => `id=${f.id}:${f.reason}`)
+						.slice(0, 20)
+						.join(' | ')}`
+				);
 			if (bContentFailures.length)
 				console.log(
 					`  B content failures: ${bContentFailures
@@ -481,7 +500,9 @@ suite(
 			equal(
 				aContentFailures.length,
 				0,
-				`sanity failed: source A itself has ${aContentFailures.length} corrupt/missing blobs — not a receiver defect, investigate seeding`
+				`SOURCE-SIDE DEFECT: A itself has ${aContentFailures.length} corrupt/missing blob(s) it wrote and never lost — ` +
+					`seeding was verified clean in before(), so this is the source losing blobs during the copy, not a receiver ` +
+					`defect and not seeding: ${aContentFailures.map((f) => `id=${f.id}:${f.reason}`).join(', ')}`
 			);
 			equal(
 				bContentFailures.length,
