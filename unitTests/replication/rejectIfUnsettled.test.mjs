@@ -6,69 +6,48 @@
  * turn the undefined case into the defined one.
  */
 
-import { expect } from 'chai';
-import sinon from 'sinon';
+import assert from 'node:assert';
+import { setTimeout as delay } from 'node:timers/promises';
 import { rejectIfUnsettled } from '#src/replication/replicationConnection';
 
+const BOUND = 100;
+
 describe('rejectIfUnsettled', () => {
-	let clock;
-
-	beforeEach(() => {
-		clock = sinon.useFakeTimers();
-	});
-
-	afterEach(() => {
-		clock.restore();
-	});
-
 	it('resolves with the work value when it settles in time (the normal flush)', async () => {
-		const result = rejectIfUnsettled(Promise.resolve('flushed'), 1000, new Error('too slow'));
-		await clock.tickAsync(0);
-		expect(await result).to.equal('flushed');
+		const result = await rejectIfUnsettled(Promise.resolve('flushed'), BOUND, new Error('too slow'));
+		assert.strictEqual(result, 'flushed');
 	});
 
 	it('propagates the work rejection unchanged — a failed flush already has a defined path', async () => {
 		const failure = new Error('disk full');
-		const result = rejectIfUnsettled(Promise.reject(failure), 1000, new Error('too slow'));
-		await clock.tickAsync(0);
-		await result.then(
-			() => expect.fail('should have rejected'),
-			(error) => expect(error).to.equal(failure)
+		await assert.rejects(
+			rejectIfUnsettled(Promise.reject(failure), BOUND, new Error('too slow')),
+			(error) => error === failure
 		);
 	});
 
-	it('rejects with the given error once the bound elapses on a promise that never settles', async () => {
+	it('rejects with the caller-supplied error once the bound elapses', async () => {
 		// Identity, not message: the caller widens its bound only for its own timeout.
 		const timeoutError = new Error('flush did not settle');
-		const result = rejectIfUnsettled(new Promise(() => {}), 1000, timeoutError);
-		await clock.tickAsync(999);
-		let settled = false;
-		result.catch(() => (settled = true));
-		await clock.tickAsync(0);
-		expect(settled).to.equal(false);
-
-		await clock.tickAsync(1);
-		await result.then(
-			() => expect.fail('should have rejected'),
-			(error) => expect(error).to.equal(timeoutError)
+		await assert.rejects(
+			rejectIfUnsettled(new Promise(() => {}), BOUND, timeoutError),
+			(error) => error === timeoutError
 		);
 	});
 
-	it('a late rejection from the work promise does not become an unhandled rejection', async () => {
+	it('a work rejection arriving after the bound does not go unhandled', async () => {
 		let rejectWork;
 		const work = new Promise((_, reject) => (rejectWork = reject));
-		const result = rejectIfUnsettled(work, 1000, new Error('flush did not settle'));
-		await clock.tickAsync(1000);
-		await result.catch(() => {});
-
-		const unhandled = sinon.spy();
-		process.on('unhandledRejection', unhandled);
+		const unhandled = [];
+		const onUnhandled = (reason) => unhandled.push(reason);
+		process.on('unhandledRejection', onUnhandled);
 		try {
+			await assert.rejects(rejectIfUnsettled(work, BOUND, new Error('flush did not settle')));
 			rejectWork(new Error('flush failed after we gave up on it'));
-			for (let i = 0; i < 5; i++) await clock.tickAsync(0);
-			expect(unhandled.callCount).to.equal(0);
+			await delay(50);
+			assert.deepStrictEqual(unhandled, []);
 		} finally {
-			process.off('unhandledRejection', unhandled);
+			process.off('unhandledRejection', onUnhandled);
 		}
 	});
 });
