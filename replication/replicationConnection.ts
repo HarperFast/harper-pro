@@ -796,8 +796,7 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
  * Completeness, not mere presence: a PENDING/truncated stub must NOT tie. A base copy is how such a
  * record gets repaired, and a skipped key is also staged as a durable copy cursor — so tying on a stub
  * would not just miss the repair, it would make the miss permanent.
- *
- * `verifyBlobs` is injected so the decision is unit-testable without a real blob store.
+
  */
 export async function isDurableIdentityTie(
 	existing: { version?: number; nodeId?: number; value?: unknown } | undefined,
@@ -2677,7 +2676,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			pendingCopyCursor = null;
 			lastDurableCopyCursor = null;
 			lastDurableCopyCursorPersisted = true;
-			skippedBlobIds.clear(); // any whose chunks never arrived are moot once the copy is over
 			copyProgressWatchdog?.stop(); // copy is done; no longer watching for copy-progress stalls (#453)
 			// Copy is over: narrow the byte watchdog back from COPY_TIMEOUT to PING_TIMEOUT so an idle/dead
 			// connection in normal replication is still detected on the normal timeout. stop()+reset() so the
@@ -3010,7 +3008,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	const repairDeclines: Record<string, number> = {};
 	// fileIds whose record was skipped as an identity tie. The chunk handler drops their chunks on sight,
 	// so a blob whose bytes arrive after its record never opens a stream no consumer will ever drain.
-	// An entry is removed by its own final chunk; the copy's end clears any whose chunks never came.
+	// Retired by the blob's own final chunk, by a record that does apply it (fileIds are shared), or by
+	// the connection closing.
 	const skippedBlobIds = new Set();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
@@ -3499,8 +3498,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	 * for the chunk handler to drop on sight — the record frame routinely outruns its blob.
 	 */
 	function discardIncomingBlobStream(blobId: any) {
-		skippedBlobIds.add(blobId);
 		const stream = blobsInFlight.get(blobId);
+		// A fileId can back more than one record (saveBlob reuses an existing one), so another record
+		// that is NOT being skipped may already be saving these bytes. Leave it entirely alone: it owns
+		// the stream, and tombstoning the fileId would starve its remaining chunks.
+		if (stream?.connectedToBlob) return;
+		skippedBlobIds.add(blobId);
 		if (!stream) return;
 		if (stream.writableEnded) {
 			blobsInFlight.delete(blobId);
@@ -3973,10 +3976,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						);
 
 						if (skippedBlobIds.has(fileId)) {
-							// The record these bytes belong to was skipped as an identity tie, so nothing will ever
+							// Every record referencing these bytes was skipped as an identity tie, so nothing will
 							// attach a consumer. Drop the chunk rather than let it open (or feed) a reader-less
-							// stream that would hold the whole blob until the timeout sweep.
-							if (finished) skippedBlobIds.delete(fileId);
+							// stream holding the whole blob until the timeout sweep. The final chunk retires the
+							// tombstone and any stream/lock the blob had taken before the record arrived.
+							if (finished) {
+								skippedBlobIds.delete(fileId);
+								if (blobsInFlight.delete(fileId)) unregisterBlobReceiveInFlight(fileId, auditStore?.rootStore);
+							}
 							break;
 						}
 						if (!stream) {
@@ -5280,7 +5287,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						logger.trace?.(connectionId, 'copy identity-tie: could not enumerate skipped blobs', id, error);
 					}
 					noteReceiveLiveness();
-					// A skipped key is already durable locally, so the copy cursor may advance over it.
 					if (tableDecoder?.name) lastCopyFrameKey = { table: tableDecoder.name, id };
 					logger.trace?.(connectionId, 'copy identity-tie skip', 'id', id, 'version', auditRecord.version);
 					decoder.position = start + eventLength;
@@ -5716,6 +5722,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// core's source-idle watchdog. This clamps the resume cursor (transient failure) so the reconnect
 		// re-requests them promptly — a worker restart on the sender (deploy_component lifecycle) closes the
 		// WS mid-blob, and holding the stream for the full timeout is what leaves the blob diverged.
+		// Tombstones only matter while the sender that queued those chunks is still attached; a reconnect
+		// re-streams from the resume cursor, so carrying them across would drop chunks we do want.
+		skippedBlobIds.clear();
 		if (blobsInFlight.size > 0) {
 			const aborted = abortInFlightBlobsOnClose(blobsInFlight, remoteNodeName, (blobId) =>
 				unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore)
@@ -6041,6 +6050,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	function receiveBlobs(remoteBlob: Blob, id: string | number, copyFrameIndex?: number, repairTarget?: any) {
 		// write the blob to the blob store
 		const blobId = getFileId(remoteBlob);
+		// A record that IS being applied always outranks a tombstone left by a skipped record sharing
+		// this fileId — otherwise its remaining chunks would be dropped and it would save a stub.
+		skippedBlobIds.delete(blobId);
 		let stream = blobsInFlight.get(blobId);
 		logger.debug?.('Received transaction with blob', blobId, 'has stream', !!stream, 'ended', !!stream?.writableEnded);
 		if (stream) {
