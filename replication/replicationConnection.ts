@@ -2103,11 +2103,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				);
 		}
 	}
-	// Publish this (database, peer) link's base-copy state into the shared status buffer so readiness
-	// readers (the clone sync gate via cluster_status) get a positive "a copy is still running" fact
-	// rather than having to infer it from the deliberately-frozen received-version watermark. A no-op
-	// before the buffer is resolvable (no auditStore/peer yet), which is itself pre-copy.
+	// Only the connection that OWNS this (db, peer) subscription may write the slot: the buffer is keyed
+	// on (auditStore, database, peer) alone, so an inbound or retrieval connection sharing it could
+	// otherwise clear a veto belonging to the copy actually running — the same ownership guard the
+	// CONNECTED/liveness writes use (W1 / harper-pro#431). A no-op before the buffer is resolvable, which
+	// is itself pre-copy.
 	function setBaseCopyState(state: number) {
+		if (options.connection?.nodeSubscriptions === undefined) return;
 		const sharedStatus = getSharedStatus();
 		if (sharedStatus) sharedStatus[BASE_COPY_STATE_POSITION] = state;
 	}
@@ -2148,9 +2150,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// per-frame throttle can't swallow this transition re-arm (mirrors the COPY_START widen). (#460)
 			receiveWatchdog?.stop();
 			receiveWatchdog?.reset();
-			// The copied rows are durable and the resume cursor is gone — the one point at which the base
-			// copy is genuinely complete, so the only place that clears the published state. Readiness
-			// readers block on this; clearing it any earlier re-opens the false-completion hole.
+			// Rows durable, cursor gone: the one point at which the base copy is genuinely complete.
 			setBaseCopyState(BASE_COPY_IDLE);
 			// The copy's rows are now durable; signal the audit-stream subscribers to re-read the tables
 			// copyApply snapshotted without per-row events — cluster-machinery system tables (harper-pro#489)
@@ -3115,9 +3115,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						receiveWatchdog?.stop();
 						receiveWatchdog?.reset();
 						noteCopyProgress(); // COPY_START is itself copy progress; arm the watchdog (#453)
-						// Publish "a base copy is in flight for this (db, peer)" so readiness readers (the clone
-						// sync gate, cluster_status) have a positive signal instead of inferring it from a frozen
-						// watermark. Cleared only in maybeFinishCopy().
 						setBaseCopyState(BASE_COPY_IN_PROGRESS);
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
@@ -3914,7 +3911,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
+							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
+							| undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -4756,12 +4754,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		subscriptionSetupWatchdog?.stop();
 		pauseStallWatchdog?.stop();
 		copyProgressWatchdog?.stop();
-		// The published base-copy state means "a copy is running on this link RIGHT NOW", so a closed
-		// connection must retract it — an aborted copy would otherwise leave it set for the life of the
-		// process and permanently veto readiness for this (database, peer). Retracting is safe because it
-		// is only ever a veto: completion still requires the received-version watermark, which the
-		// abandoned copy never advanced, so the resumed copy re-sets this on its next COPY_START.
-		if (inCopyMode) setBaseCopyState(BASE_COPY_IDLE);
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
 		// The blobsTimer that would otherwise reap stalled receives is now cleared, and the connection is
@@ -4782,6 +4774,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		while (blobSentCallbacks.length > 0) blobSentCallbacks.shift()?.();
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
+		}
+		// A closed link is not copying, so retract the veto — an aborted copy would otherwise block
+		// readiness for this (database, peer) for the life of the process. Last, and guarded: resolving the
+		// buffer can touch a store a concurrent drop_database/shutdown already closed, and a throw from a
+		// 'close' listener becomes an uncaughtException having skipped every cleanup above.
+		try {
+			setBaseCopyState(BASE_COPY_IDLE);
+		} catch (error) {
+			logger.debug?.(connectionId, 'could not retract base-copy state on close', error);
 		}
 		logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
 	});

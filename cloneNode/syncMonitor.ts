@@ -30,35 +30,36 @@ export function normalizeTargetVersion(value: unknown): number {
  * Check whether every database this node subscribed to the leader for has finished receiving the
  * leader's data, and report the freshest arrival stamp among those that have not.
  *
- * The required set is the leader connection's `database_sockets` restricted to the databases the
- * leader reported. `subscribeToNode` populates that map synchronously for every database it sets up
- * replication for, before any socket connects, so it is this node's own subscription intent — not
- * merely the links that happen to be up — and intersecting it with the leader's own database list
- * keeps a local-only database (which the leader will never send anything for) from stalling the clone.
+ * Two sets decide what is examined. `targetTimestamps` is every database the leader reported that this
+ * node replicates, and a socket for anything outside it is skipped — a local-only database the leader
+ * will never send for must not stall the clone. `requiredSocketDatabases` is the subset whose socket
+ * must EXIST: a leader database with no socket is otherwise invisible to a loop over sockets, so a
+ * `system` copy that finishes in seconds could complete the check while `data` was never subscribed at
+ * all (a swallowed schema pre-create failure, or a database the leader created after the pre-create
+ * step). It is deliberately narrower than `targetTimestamps` — a legacy leader never replicates
+ * `system`, so requiring every target's socket wedges those clones.
  *
- * Every database must produce POSITIVE evidence of being caught up; anything unknown counts as not
- * caught up. Three independent conditions, all required:
+ * Each examined database must produce POSITIVE evidence of being caught up; anything unknown counts as
+ * not caught up. Three independent conditions, all required:
  *
- *  1. No base copy in flight (`baseCopyInProgress`). The bulk copy is the whole reason a clone is not
- *     immediately queryable, and it is the one fact the watermark below cannot express.
- *  2. A positive received-version watermark. It is deliberately frozen for the entire bulk copy and
- *     only advances to `copyStartTime` on the single end_txn the leader sends after the copy — so
- *     `> 0` means "the leader has declared this database's base copy fully delivered", including for
- *     a database with no rows at all.
+ *  1. No base copy in flight (`baseCopyInProgress`) — the one fact the watermark below cannot express.
+ *  2. A positive received-version watermark. It is frozen for the entire bulk copy and advances to
+ *     `copyStartTime` only on the single end_txn the leader sends afterwards, so `> 0` means "the
+ *     leader declared this database's base copy delivered" — true for an empty database too.
  *  3. If the leader supplied a usable target timestamp, the watermark has reached it. This covers
- *     writes the leader took while the copy was running; a target of 0 means the leader could not
- *     tell us (see `normalizeTargetVersion`), which weakens this check to (1) + (2) rather than
- *     waiving it.
+ *     writes the leader took during the copy; a target of 0 means the leader could not tell us (see
+ *     `normalizeTargetVersion`), which weakens this to (1) + (2) rather than waiving it.
  *
- * Completion and liveness are deliberately separate signals: the watermark can only answer "is it
- * done?", while `lastReceivedLocalTime` advances on every applied record, copy records included, so
- * it answers "is it still moving?" and is what slides the stall deadline.
+ * Completion and liveness are separate signals: the watermark answers "is it done?", while
+ * `lastReceivedLocalTime` advances on every applied record, copy records included, so it answers "is it
+ * still moving?" and is what slides the stall deadline.
  */
 export async function checkSyncStatus(
 	targetTimestamps: Record<string, number>,
 	clusterStatus: () => Promise<any>,
 	leaderReplicationURL: string,
-	log: SyncMonitorLog
+	log: SyncMonitorLog,
+	requiredSocketDatabases: readonly string[] = []
 ): Promise<SyncCheckResult> {
 	const clusterResponse = await clusterStatus();
 	log(`clone sync check cluster status response: ${JSON.stringify(clusterResponse)}`, 'debug');
@@ -87,20 +88,18 @@ export async function checkSyncStatus(
 
 	const pending: string[] = [];
 	let latestReceivedMs = 0;
-	// Guards the degenerate "nothing was checked, so everything must be fine" pass: if not one of the
-	// leader's databases has a socket yet, there is no evidence of anything, which is not completion.
-	let requiredChecked = 0;
+	let examined = 0;
+	const socketsSeen = new Set<string>();
 	for (const socket of leaderConnection.database_sockets) {
 		const dbName = socket.database;
 		// Membership, not value, decides whether we wait on a database: `targetTimestamps` has an entry
-		// for every database the leader reported, even when its timestamp is unusable (0). A socket for a
-		// database the leader does NOT have (local-only on this node) will never receive anything from it,
-		// so waiting on it would stall the clone forever — skip it, and don't let it slide the deadline.
+		// for every replicated database the leader reported, even when its timestamp is unusable (0).
 		if (!Object.hasOwn(targetTimestamps, dbName)) {
 			log(`Database ${dbName}: not present on the leader, skipping sync check`, 'debug');
 			continue;
 		}
-		requiredChecked++;
+		socketsSeen.add(dbName);
+		examined++;
 		const targetTime = normalizeTargetVersion(targetTimestamps[dbName]);
 		// Raw version (high-precision float64) preserves the sub-millisecond precision needed for an
 		// accurate comparison against the leader's last_updated_record targets.
@@ -139,7 +138,15 @@ export async function checkSyncStatus(
 		if (Number.isFinite(receivedAt) && receivedAt > latestReceivedMs) latestReceivedMs = receivedAt;
 	}
 
-	if (!requiredChecked) {
+	for (const dbName of requiredSocketDatabases) {
+		if (socketsSeen.has(dbName)) continue;
+		pending.push(`${dbName}: no replication subscription to the leader yet`);
+		log(`Database ${dbName}: Not yet synchronized — no socket to the leader`, 'debug');
+	}
+
+	// The degenerate "nothing was checked, so everything must be fine" pass: with no required set to
+	// fall back on, a poll that matched none of the leader's databases has evidence of nothing.
+	if (!examined && !pending.length) {
 		const leaderDatabases = Object.keys(targetTimestamps).join(', ');
 		log(`No database sockets to the leader for any of its databases (${leaderDatabases}) yet`, 'debug');
 		return { syncComplete: false, latestReceivedMs: 0, pending: ["no subscriptions to the leader's databases yet"] };
@@ -155,6 +162,8 @@ export type MonitorSyncLoopOptions = {
 	stallTimeoutMs: number;
 	checkIntervalMs: number;
 	log: SyncMonitorLog;
+	/** Leader databases whose replication socket must exist before the clone can be complete. */
+	requiredSocketDatabases?: readonly string[];
 	/** Test hooks: injectable clock and delay. */
 	now?: () => number;
 	delay?: (ms: number) => Promise<unknown>;
@@ -183,7 +192,8 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 				options.targetTimestamps,
 				options.clusterStatus,
 				options.leaderReplicationURL,
-				options.log
+				options.log,
+				options.requiredSocketDatabases
 			);
 			checkPromise.catch(() => {});
 			const result = await Promise.race([

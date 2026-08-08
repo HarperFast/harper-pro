@@ -1,16 +1,11 @@
 /**
- * Coverage for the clone sync monitor.
+ * Coverage for the clone sync monitor. Completion requires POSITIVE evidence per database — its socket
+ * exists, no base copy is in flight, the received-version watermark has advanced, and (when the leader
+ * could supply one) it is past the leader's target. Anything unknown counts as not caught up.
  *
- * Completion requires POSITIVE evidence per database — no base copy in flight, a received-version
- * watermark that has actually advanced, and (when the leader could supply one) that watermark past
- * the leader's target. The gate used to fail OPEN instead: it started from syncComplete = true and
- * skipped any database whose target it could not determine, which on RocksDB is every database
- * (describe cannot read the newest audit key there), so the very first poll declared a clone with
- * zero rows copied "synchronized" and published availability: Available.
- *
- * Failure is stall-based (the copy freezes the version watermark, so a total-time cap would fail any
- * clone larger than the timeout allows): the deadline slides forward only on arrivals for databases
- * still pending, so neither a synced-but-busy database nor a skipped one can mask a wedged copy.
+ * Failure is stall-based (the copy freezes the watermark, so a total-time cap would fail any clone
+ * larger than the timeout allows): the deadline slides forward only on arrivals for databases still
+ * pending, so neither a synced-but-busy database nor a skipped one can mask a wedged copy.
  */
 import assert from 'node:assert/strict';
 import { checkSyncStatus, monitorSyncLoop, normalizeTargetVersion } from '#src/cloneNode/syncMonitor';
@@ -173,6 +168,57 @@ describe('checkSyncStatus', () => {
 			noopLog
 		);
 		assertResult(result, { syncComplete: false, latestReceivedMs: 1000, pendingCount: 1 });
+	});
+
+	it('holds completion while a required database has no socket at all', async () => {
+		// The reachable partial-set hole: `system` copies in seconds and meets its target, while `data`
+		// was never subscribed (a swallowed schema pre-create, or a database the leader added later). A
+		// loop over the sockets that exist cannot see it, so the required set has to carry it.
+		const sockets = [{ database: 'system', lastReceivedVersion: 1500, lastReceivedLocalTime: utc(5000) }];
+		const withoutRequired = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () => statusResponse(sockets),
+			LEADER_URL,
+			noopLog
+		);
+		assertResult(withoutRequired, { syncComplete: true, latestReceivedMs: 0 });
+
+		const withRequired = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () => statusResponse(sockets),
+			LEADER_URL,
+			noopLog,
+			['data']
+		);
+		assertResult(withRequired, { syncComplete: false, latestReceivedMs: 0, pendingCount: 1 });
+	});
+
+	it('completes once the required socket appears and is caught up', async () => {
+		const result = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: 1500, lastReceivedLocalTime: utc(5000) },
+					{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(7000) },
+				]),
+			LEADER_URL,
+			noopLog,
+			['data']
+		);
+		assertResult(result, { syncComplete: true, latestReceivedMs: 0 });
+	});
+
+	it('does not require a socket for a database outside the required set (legacy leader / system)', async () => {
+		// A v4 leader never replicates `system`, so `system` is deliberately not in the required set;
+		// requiring it would wedge those clones at Unavailable.
+		const result = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () => statusResponse([{ database: 'data', lastReceivedVersion: 2500, lastReceivedLocalTime: utc(7000) }]),
+			LEADER_URL,
+			noopLog,
+			['data']
+		);
+		assertResult(result, { syncComplete: true, latestReceivedMs: 0 });
 	});
 
 	it('reports incomplete when none of the leader databases has a socket yet', async () => {
