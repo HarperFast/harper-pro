@@ -85,6 +85,7 @@ import {
 	decodeWithBlobCallback,
 	deleteBlob,
 	saveBlob,
+	isBlobComplete,
 	getFileId,
 	findBlobsInObject,
 	getFilePathForBlob,
@@ -94,7 +95,6 @@ import {
 	registerBlobReceiveInFlight,
 	unregisterBlobReceiveInFlight,
 } from '../core/resources/blob.ts';
-import { promises as fsPromises } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
@@ -776,65 +776,46 @@ export function isReplicationConnectionClosedError(error: unknown): boolean {
 	);
 }
 
-/**
- * On-disk paths of every file-backed blob reachable from a stored record value, or `null` when the
- * record's blobs cannot be fully accounted for — none was found despite the header claiming blobs, or
- * one has no path (e.g. it lives only in a patch chain). `null` means "cannot prove the local copy is
- * complete", never "there are no blobs".
- */
-function blobFilePathsForValue(value: unknown): string[] | null {
-	const paths: string[] = [];
-	let sawBlob = false;
-	let allResolved = true;
-	findBlobsInObject(value, (blob: any) => {
-		sawBlob = true;
-		const path = getFilePathForBlob(blob);
-		if (path) paths.push(path);
-		else allResolved = false;
-	});
-	return sawBlob && allResolved ? paths : null;
+/** Whether every blob reachable from a stored record value is durably complete on disk. */
+async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
+	const blobs: any[] = [];
+	findBlobsInObject(value, (blob: any) => blobs.push(blob));
+	// The header claimed blobs but none was reachable (e.g. one living only in a patch chain): we
+	// cannot prove the local copy is whole, so it must not tie.
+	if (blobs.length === 0) return false;
+	return (await Promise.all(blobs.map((blob) => isBlobComplete(blob)))).every(Boolean);
 }
 
 /**
  * Whether an incoming record is a provably-already-applied identity tie with the one stored locally:
  * same version AND same origin node — the condition core's `precedesExistingVersion` early-matches as a
- * tie — and, for a blob-carrying record, every one of the STORED record's blob files present on disk
- * (the incoming duplicate's own blobs are still in flight, so they prove nothing). Anything ambiguous
- * returns false and the record flows to the apply loop.
+ * tie — and, for a blob-carrying record, every one of the STORED record's blobs durably complete on
+ * disk (the incoming duplicate's own blobs are still in flight, so they prove nothing). Anything
+ * ambiguous returns false and the record flows to the apply loop.
  *
- * Presence, not completeness: a file that exists but is a PENDING/error stub still ties, so a base copy
- * will not repair it — that is `repair_blob_data`'s job (harper-pro#388). Distinguishing a stub needs a
- * per-record header read, and full verification (core's `isBlobComplete`) inflates compressed blobs.
+ * Completeness, not mere presence: a PENDING/truncated stub must NOT tie. A base copy is how such a
+ * record gets repaired, and a skipped key is also staged as a durable copy cursor — so tying on a stub
+ * would not just miss the repair, it would make the miss permanent.
  *
- * `blobPathsOf`/`access` are injected so the decision is unit-testable without a real blob store.
+ * `verifyBlobs` is injected so the decision is unit-testable without a real blob store.
  */
 export async function isDurableIdentityTie(
 	existing: { version?: number; nodeId?: number; value?: unknown } | undefined,
 	incomingVersion: number,
 	sourceNodeId: number | undefined,
 	hasBlobs: boolean,
-	blobPathsOf: (value: unknown) => string[] | null = blobFilePathsForValue,
-	access: (path: string) => Promise<unknown> = fsPromises.access
+	verifyBlobs: (value: unknown) => Promise<boolean> = storedBlobsAreComplete
 ): Promise<boolean> {
-	// No mapped source node id → we cannot prove which node originated the incoming record.
 	if (sourceNodeId === undefined) return false;
 	if (!existing) return false;
 	if (existing.version !== incomingVersion) return false;
 	if ((existing.nodeId ?? 0) !== sourceNodeId) return false;
 	if (!hasBlobs) return true;
-	let paths: string[] | null;
 	try {
-		paths = blobPathsOf(existing.value);
+		return await verifyBlobs(existing.value);
 	} catch {
 		return false;
 	}
-	if (!paths) return false;
-	try {
-		await Promise.all(paths.map((path) => access(path)));
-	} catch {
-		return false;
-	}
-	return true;
 }
 
 /**
@@ -2694,6 +2675,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 			pendingCopyCursor = null;
+			lastDurableCopyCursor = null;
+			lastDurableCopyCursorPersisted = true;
+			skippedBlobIds.clear(); // any whose chunks never arrived are moot once the copy is over
 			copyProgressWatchdog?.stop(); // copy is done; no longer watching for copy-progress stalls (#453)
 			// Copy is over: narrow the byte watchdog back from COPY_TIMEOUT to PING_TIMEOUT so an idle/dead
 			// connection in normal replication is still detected on the normal timeout. stop()+reset() so the
@@ -3024,6 +3008,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// the copy. A hit resets the run (healthy duplicates also reset it — still inside the window).
 	const repairWindowMissRunByNode = new Map<number | undefined, number>();
 	const repairDeclines: Record<string, number> = {};
+	// fileIds whose record was skipped as an identity tie. The chunk handler drops their chunks on sight,
+	// so a blob whose bytes arrive after its record never opens a stream no consumer will ever drain.
+	// An entry is removed by its own final chunk; the copy's end clears any whose chunks never came.
+	const skippedBlobIds = new Set();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
 	const blobSentCallbacks: Array<(v?: any) => void> = [];
@@ -3500,22 +3488,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	}
 
 	/**
-	 * Stamp the receive-side liveness signals for a record we just processed — including one we skipped,
-	 * which is still proof the link is delivering. Callers must have refreshed `replicationSharedStatus`
-	 * (getSharedStatus()) first.
-	 */
-	/**
-	 * Release the in-flight receive stream for a blob whose record we are not going to apply. Without
-	 * this the stream stays in `blobsInFlight` holding the blob's buffered bytes — the chunk handler
-	 * deliberately does not backpressure a stream with no consumer attached — until the `blobsTimer`
-	 * sweep reclaims it `blobTimeout` later.
+	 * Release the receive-side state for a blob whose record we are not going to apply. Nothing else
+	 * ever will: the chunk handler does not backpressure a stream with no consumer attached (it assumes
+	 * a record eventually attaches one), so without this the blob's bytes stay buffered in
+	 * `blobsInFlight` until the `blobsTimer` sweep reclaims it `blobTimeout` later.
 	 *
-	 * A still-receiving stream is destroyed but LEFT in the map on purpose: later chunks then route to
-	 * the dropped-chunk branch instead of recreating a reader-less PassThrough that would backpressure
-	 * the socket, and the final chunk removes it and releases its marker. A stream that already ended is
-	 * waiting for a record that will never come, so nothing else would ever collect it.
+	 * A stream that is still receiving is destroyed but LEFT in the map: later chunks then route to the
+	 * dropped-chunk branch instead of recreating a reader-less PassThrough that would backpressure the
+	 * socket. The chunks may also not have arrived yet, so the fileId is recorded in `skippedBlobIds`
+	 * for the chunk handler to drop on sight — the record frame routinely outruns its blob.
 	 */
 	function discardIncomingBlobStream(blobId: any) {
+		skippedBlobIds.add(blobId);
 		const stream = blobsInFlight.get(blobId);
 		if (!stream) return;
 		if (stream.writableEnded) {
@@ -3525,6 +3509,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		stream.destroy?.();
 	}
 
+	/**
+	 * Stamp the receive-side liveness signals for a record we just processed — including one we skipped,
+	 * which is still proof the link is delivering. Callers must have refreshed `replicationSharedStatus`
+	 * (getSharedStatus()) first.
+	 */
 	function noteReceiveLiveness() {
 		replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
 		replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
@@ -3983,6 +3972,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							finished
 						);
 
+						if (skippedBlobIds.has(fileId)) {
+							// The record these bytes belong to was skipped as an identity tie, so nothing will ever
+							// attach a consumer. Drop the chunk rather than let it open (or feed) a reader-less
+							// stream that would hold the whole blob until the timeout sweep.
+							if (finished) skippedBlobIds.delete(fileId);
+							break;
+						}
 						if (!stream) {
 							stream = createBlobReceiveStream(blobTimeout);
 							blobsInFlight.set(fileId, stream);
