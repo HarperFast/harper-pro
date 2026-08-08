@@ -29,7 +29,7 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
-import { monitorSyncLoop } from './syncMonitor.ts';
+import { monitorSyncLoop, normalizeTargetVersion } from './syncMonitor.ts';
 
 /**
  * Environment Variables:
@@ -501,6 +501,19 @@ async function monitorSync(): Promise<SyncOutcome> {
 		log('No target timestamps available to check synchronization status; leaving availability Unavailable', 'error');
 		return 'failed';
 	}
+	// A target of 0 means the leader could not tell us that database's newest version — most often
+	// because `describe_table` cannot read the newest audit key on a RocksDB transaction-log store, so
+	// `last_updated_record` is absent for schema-defined tables. The gate does NOT waive itself for
+	// those databases (base-copy completion is still required, see checkSyncStatus), but it does lose
+	// the "and any writes the leader took during the copy have landed" half of the check, so say so.
+	const withoutTargets = Object.keys(targetTimestamps).filter((db) => !normalizeTargetVersion(targetTimestamps[db]));
+	if (withoutTargets.length) {
+		log(
+			`Leader reported no usable last_updated_record for database(s) ${withoutTargets.join(', ')}; ` +
+				'sync will be gated on base-copy completion only for those databases',
+			'warn'
+		);
+	}
 
 	// The default window must outlast the copy layer's own abort+resume recovery cycle; 300000 is
 	// COPY_TIMEOUT's own default in replicationConnection.ts.
@@ -570,7 +583,13 @@ async function getLastUpdatedRecord(): Promise<Record<string, number>> {
 }
 
 /**
- * Find the most recent last_updated_record timestamp across all tables in a database
+ * Find the most recent last_updated_record timestamp across all tables in a database.
+ *
+ * `last_updated_record` is not a single shape: describe fills it from the audit store's newest key
+ * (a number) or, failing that, from the `__updatedtime__` index's newest key — the composite
+ * `[timestamp, primaryKey]`. Comparing that array numerically yields NaN, so the raw value would
+ * silently read as "no timestamp"; normalizeTargetVersion collapses both shapes to a number.
+ *
  * @param {Object} dbObj - Database object or describe response containing tables
  * @returns {number} - Most recent timestamp, or 0 if none found
  */
@@ -580,8 +599,9 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 		const tableObj = dbObj[table];
 		// requestId is part of the describe response so we ignore it
 		if (typeof tableObj !== 'object' || tableObj == null) continue;
-		if (tableObj.last_updated_record > mostRecent) {
-			mostRecent = tableObj.last_updated_record;
+		const lastUpdated = normalizeTargetVersion(tableObj.last_updated_record);
+		if (lastUpdated > mostRecent) {
+			mostRecent = lastUpdated;
 		}
 	}
 
@@ -1067,9 +1087,10 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 /**
  * Log a message to the console and to the Harper logger if it is initialized
  * @param message
- * @param level - 'notify' for general messages, 'error' for error messages
+ * @param level - 'notify' for general messages, 'warn' for degraded-but-continuing conditions,
+ *   'error' for error messages
  */
-type LogLevel = 'notify' | 'error' | 'debug';
+type LogLevel = 'notify' | 'warn' | 'error' | 'debug';
 function log(message: string, level: LogLevel = 'notify'): void {
 	const isError = level === 'error';
 	const isDebug = level === 'debug';
@@ -1078,7 +1099,8 @@ function log(message: string, level: LogLevel = 'notify'): void {
 		else if (isDebug) {
 			harperLogger.debug?.(message);
 			return;
-		} else harperLogger.notify?.(message);
+		} else if (level === 'warn') harperLogger.warn?.(message);
+		else harperLogger.notify?.(message);
 	}
 
 	if (isError) console.error(message);

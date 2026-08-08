@@ -1,12 +1,19 @@
 /**
- * Coverage for the clone sync monitor. Completion = every database's received version reaches the
- * leader's target. Failure is stall-based (the copy freezes the version watermark, so a total-time
- * cap would fail any clone larger than the timeout allows): the deadline slides forward only on
- * arrivals for databases still below target, so neither a synced-but-busy database nor an
- * untracked one can mask a wedged copy.
+ * Coverage for the clone sync monitor.
+ *
+ * Completion requires POSITIVE evidence per database — no base copy in flight, a received-version
+ * watermark that has actually advanced, and (when the leader could supply one) that watermark past
+ * the leader's target. The gate used to fail OPEN instead: it started from syncComplete = true and
+ * skipped any database whose target it could not determine, which on RocksDB is every database
+ * (describe cannot read the newest audit key there), so the very first poll declared a clone with
+ * zero rows copied "synchronized" and published availability: Available.
+ *
+ * Failure is stall-based (the copy freezes the version watermark, so a total-time cap would fail any
+ * clone larger than the timeout allows): the deadline slides forward only on arrivals for databases
+ * still pending, so neither a synced-but-busy database nor a skipped one can mask a wedged copy.
  */
 import assert from 'node:assert/strict';
-import { checkSyncStatus, monitorSyncLoop } from '#src/cloneNode/syncMonitor';
+import { checkSyncStatus, monitorSyncLoop, normalizeTargetVersion } from '#src/cloneNode/syncMonitor';
 
 const LEADER_URL = 'wss://leader:9933';
 const noopLog = () => {};
@@ -20,6 +27,32 @@ function statusResponse(sockets) {
 	};
 }
 
+/** Assert the completion + liveness signals without pinning the human-readable reason strings. */
+function assertResult(result, { syncComplete, latestReceivedMs, pendingCount }) {
+	assert.equal(result.syncComplete, syncComplete);
+	assert.equal(result.latestReceivedMs, latestReceivedMs);
+	assert.equal(result.pending.length, pendingCount ?? (syncComplete ? 0 : result.pending.length));
+	if (syncComplete) assert.deepEqual(result.pending, []);
+}
+
+describe('normalizeTargetVersion', () => {
+	it('accepts a plain version number', () => {
+		assert.equal(normalizeTargetVersion(1786207156882.293), 1786207156882.293);
+	});
+
+	it('takes the timestamp component of a composite __updatedtime__ key', () => {
+		// describe's fallback path assigns the whole index key; comparing that array numerically is NaN,
+		// which read as "no target" and silently disabled the catch-up half of the gate.
+		assert.equal(normalizeTargetVersion([1786207156882.293, 'a']), 1786207156882.293);
+	});
+
+	it('collapses unusable values to 0 (unknown, never satisfied)', () => {
+		for (const value of [undefined, null, 0, -1, NaN, Infinity, 'nope', {}, [], ['a']]) {
+			assert.equal(normalizeTargetVersion(value), 0, `${JSON.stringify(value)} must be unusable`);
+		}
+	});
+});
+
 describe('checkSyncStatus', () => {
 	it('reports complete when every database meets its target', async () => {
 		const result = await checkSyncStatus(
@@ -32,7 +65,7 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0 });
+		assertResult(result, { syncComplete: true, latestReceivedMs: 0 });
 	});
 
 	it('reports incomplete when any database is behind its target', async () => {
@@ -46,7 +79,70 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 7000 });
+		assertResult(result, { syncComplete: false, latestReceivedMs: 7000, pendingCount: 1 });
+	});
+
+	it('does not treat a database with no usable target as synced (false-completion regression)', async () => {
+		// The failing large-clone shape: describe gave no last_updated_record (RocksDB), so the target is
+		// 0, and the copy is still running so the watermark is still frozen at 0. The old gate skipped
+		// this database entirely and returned synced on the first poll.
+		const result = await checkSyncStatus(
+			{ system: 0, data: 0 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: 0, lastReceivedLocalTime: utc(5000) },
+					{ database: 'data', lastReceivedVersion: 0, lastReceivedLocalTime: utc(7000) },
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assertResult(result, { syncComplete: false, latestReceivedMs: 7000, pendingCount: 2 });
+	});
+
+	it('accepts a delivered base copy when the leader supplied no target', async () => {
+		// Same missing-target situation, but the post-copy end_txn has advanced the watermark to
+		// copyStartTime — the leader has declared the base copy fully delivered, so this is complete.
+		const result = await checkSyncStatus(
+			{ data: 0 },
+			async () =>
+				statusResponse([{ database: 'data', lastReceivedVersion: 1786207156882, lastReceivedLocalTime: utc(7000) }]),
+			LEADER_URL,
+			noopLog
+		);
+		assertResult(result, { syncComplete: true, latestReceivedMs: 0 });
+	});
+
+	it('never reports complete while a base copy is in flight', async () => {
+		// Even a watermark past the target cannot override an in-flight copy: a second connection sharing
+		// the (db, peer) status buffer can advance the watermark while this one is still copying.
+		const result = await checkSyncStatus(
+			{ data: 2000 },
+			async () =>
+				statusResponse([
+					{ database: 'data', lastReceivedVersion: 5000, baseCopyInProgress: true, lastReceivedLocalTime: utc(7000) },
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assertResult(result, { syncComplete: false, latestReceivedMs: 7000, pendingCount: 1 });
+	});
+
+	it('normalizes a composite target key before comparing', async () => {
+		const behind = await checkSyncStatus(
+			{ data: [2000, 'row-1'] },
+			async () => statusResponse([{ database: 'data', lastReceivedVersion: 1999, lastReceivedLocalTime: utc(7000) }]),
+			LEADER_URL,
+			noopLog
+		);
+		assertResult(behind, { syncComplete: false, latestReceivedMs: 7000, pendingCount: 1 });
+
+		const caughtUp = await checkSyncStatus(
+			{ data: [2000, 'row-1'] },
+			async () => statusResponse([{ database: 'data', lastReceivedVersion: 2000, lastReceivedLocalTime: utc(7000) }]),
+			LEADER_URL,
+			noopLog
+		);
+		assertResult(caughtUp, { syncComplete: true, latestReceivedMs: 0 });
 	});
 
 	it('scans every socket for arrival stamps instead of returning on the first laggard', async () => {
@@ -60,21 +156,34 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 9000 });
+		assertResult(result, { syncComplete: false, latestReceivedMs: 9000, pendingCount: 2 });
 	});
 
-	it('ignores arrivals on sockets without a target timestamp', async () => {
+	it('skips databases the leader does not have, including their arrivals', async () => {
+		// A local-only database will never receive anything from the leader, so waiting on it would stall
+		// every clone. Membership in the leader's database list — not the timestamp's value — decides.
 		const result = await checkSyncStatus(
 			{ system: 1000 },
 			async () =>
 				statusResponse([
 					{ database: 'system', lastReceivedVersion: 500, lastReceivedLocalTime: utc(1000) },
-					{ database: 'untracked', lastReceivedLocalTime: utc(8000) },
+					{ database: 'local-only', lastReceivedLocalTime: utc(8000) },
 				]),
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 1000 });
+		assertResult(result, { syncComplete: false, latestReceivedMs: 1000, pendingCount: 1 });
+	});
+
+	it('reports incomplete when none of the leader databases has a socket yet', async () => {
+		const result = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () =>
+				statusResponse([{ database: 'local-only', lastReceivedVersion: 9000, lastReceivedLocalTime: utc(8000) }]),
+			LEADER_URL,
+			noopLog
+		);
+		assertResult(result, { syncComplete: false, latestReceivedMs: 0, pendingCount: 1 });
 	});
 
 	it('ignores arrivals on already-synced databases (wedged-copy regression)', async () => {
@@ -88,7 +197,7 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 0 });
+		assertResult(result, { syncComplete: false, latestReceivedMs: 0, pendingCount: 1 });
 	});
 
 	it('ignores non-date sentinel strings in the arrival field', async () => {
@@ -98,7 +207,7 @@ describe('checkSyncStatus', () => {
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 0 });
+		assertResult(result, { syncComplete: false, latestReceivedMs: 0, pendingCount: 1 });
 	});
 
 	it('reports no progress when the leader connection has not appeared yet', async () => {
@@ -109,7 +218,7 @@ describe('checkSyncStatus', () => {
 			{ connections: [{ name: 'leader', url: LEADER_URL, database_sockets: [] }] },
 		]) {
 			const result = await checkSyncStatus({ system: 1000 }, async () => response, LEADER_URL, noopLog);
-			assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 0 });
+			assertResult(result, { syncComplete: false, latestReceivedMs: 0, pendingCount: 1 });
 		}
 	});
 });
@@ -138,6 +247,36 @@ describe('monitorSyncLoop', () => {
 			...clock,
 		});
 		assert.equal(outcome, 'synced');
+	});
+
+	it('waits out a full base copy before reporting synced (large-clone regression)', async () => {
+		const clock = fakeClock();
+		// The observed 10 GB shape: no usable target, copy frames keep arriving (so the deadline slides)
+		// while baseCopyInProgress holds and the watermark stays frozen, then the post-copy end_txn lands.
+		let checks = 0;
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { data: 0 },
+			clusterStatus: async () => {
+				checks++;
+				const copying = clock.now() < 30000;
+				return statusResponse([
+					{
+						database: 'data',
+						baseCopyInProgress: copying || undefined,
+						lastReceivedVersion: copying ? 0 : 1786207156882,
+						lastReceivedLocalTime: utc(clock.now()),
+					},
+				]);
+			},
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'synced');
+		assert.ok(checks > 1, 'must not have completed on the first poll');
+		assert.ok(clock.now() >= 30000, 'must have waited for the copy to finish');
 	});
 
 	it('stalls out when no replication data ever arrives', async () => {

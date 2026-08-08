@@ -152,6 +152,18 @@ export const LAST_ERROR_CODE_POSITION = 11; // close code of the most recent dis
 export const LAST_ERROR_TIME_POSITION = 12; // wall-clock ms of the most recent disconnect
 export const CONNECTION_STATE_DOWN = 0;
 export const CONNECTION_STATE_CONNECTED = 2;
+// Base-copy state for this (database, peer) link. The received-version watermark is deliberately
+// frozen for the whole bulk copy (see the `!inCopyMode` guard on RECEIVED_VERSION_POSITION), so
+// "watermark below target" is the only thing that distinguishes an in-flight copy from a finished
+// one — and any reader that cannot resolve a target is left guessing. That is what let the clone
+// sync gate declare a node Available with zero rows copied. This slot states it positively: set on
+// COPY_START and cleared by maybeFinishCopy() (COPY_COMPLETE + commits drained + blobs durable + the
+// final cursor flush), i.e. exactly when the copied rows are durable — or retracted on close, since a
+// dead connection is not copying. It is only ever a VETO: clearing it never asserts completeness on
+// its own, which still requires the received-version watermark an aborted copy never advanced.
+export const BASE_COPY_STATE_POSITION = 13;
+export const BASE_COPY_IDLE = 0;
+export const BASE_COPY_IN_PROGRESS = 1;
 // LIVENESS_STALE_MS is defined below, after PING_TIMEOUT, so it can be derived from the configured
 // keepalive window rather than a fixed default.
 export type ConnectionTruth = {
@@ -2091,6 +2103,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				);
 		}
 	}
+	// Publish this (database, peer) link's base-copy state into the shared status buffer so readiness
+	// readers (the clone sync gate via cluster_status) get a positive "a copy is still running" fact
+	// rather than having to infer it from the deliberately-frozen received-version watermark. A no-op
+	// before the buffer is resolvable (no auditStore/peer yet), which is itself pre-copy.
+	function setBaseCopyState(state: number) {
+		const sharedStatus = getSharedStatus();
+		if (sharedStatus) sharedStatus[BASE_COPY_STATE_POSITION] = state;
+	}
 	// Finish the copy — leave copy mode and remove the resume cursor — only once COPY_COMPLETE has been
 	// received AND every copied batch has committed (outstandingCommits drained, which includes the final
 	// end_txn that advances the resume seqId to copyStartTime). We deliberately stay in copy mode until
@@ -2128,6 +2148,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// per-frame throttle can't swallow this transition re-arm (mirrors the COPY_START widen). (#460)
 			receiveWatchdog?.stop();
 			receiveWatchdog?.reset();
+			// The copied rows are durable and the resume cursor is gone — the one point at which the base
+			// copy is genuinely complete, so the only place that clears the published state. Readiness
+			// readers block on this; clearing it any earlier re-opens the false-completion hole.
+			setBaseCopyState(BASE_COPY_IDLE);
 			// The copy's rows are now durable; signal the audit-stream subscribers to re-read the tables
 			// copyApply snapshotted without per-row events — cluster-machinery system tables (harper-pro#489)
 			// and user-DB tables with live MQTT/SSE/WS subscribers (harper-pro#495).
@@ -3091,6 +3115,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						receiveWatchdog?.stop();
 						receiveWatchdog?.reset();
 						noteCopyProgress(); // COPY_START is itself copy progress; arm the watchdog (#453)
+						// Publish "a base copy is in flight for this (db, peer)" so readiness readers (the clone
+						// sync gate, cluster_status) have a positive signal instead of inferring it from a frozen
+						// watermark. Cleared only in maybeFinishCopy().
+						setBaseCopyState(BASE_COPY_IN_PROGRESS);
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
@@ -4728,6 +4756,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		subscriptionSetupWatchdog?.stop();
 		pauseStallWatchdog?.stop();
 		copyProgressWatchdog?.stop();
+		// The published base-copy state means "a copy is running on this link RIGHT NOW", so a closed
+		// connection must retract it — an aborted copy would otherwise leave it set for the life of the
+		// process and permanently veto readiness for this (database, peer). Retracting is safe because it
+		// is only ever a veto: completion still requires the received-version watermark, which the
+		// abandoned copy never advanced, so the resumed copy re-sets this on its next COPY_START.
+		if (inCopyMode) setBaseCopyState(BASE_COPY_IDLE);
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
 		// The blobsTimer that would otherwise reap stalled receives is now cleared, and the connection is
