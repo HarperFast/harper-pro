@@ -48,8 +48,6 @@ export async function repairBlobs(
 
 				// Verify the blobs are now complete on disk — the peer may have sent empty bytes if
 				// its own copy was also incomplete (promisedWrites returns Buffer.alloc(0)).
-				// isBlobComplete is async: it must be awaited, or every blob "verifies" and an
-				// unrepaired record is reported as repaired.
 				const repairedBlobs: any[] = [];
 				findBlobsInObject(entry.value, (blob) => repairedBlobs.push(blob));
 				const allComplete =
