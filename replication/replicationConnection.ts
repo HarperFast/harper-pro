@@ -343,9 +343,12 @@ const COPY_FINALIZE_TIMEOUT = positiveMsOr(TEST_COPY_FINALIZE_TIMEOUT_MS, COPY_T
 // settles keeps failing loudly instead of blocking the apply loop forever.
 const copyFlushTimeoutsByDatabase = new Map<string, number>();
 const COPY_FLUSH_BOUND_MAX_DOUBLINGS = 3;
-// The flush a bound gave up waiting on is still running natively; the next attempt chains behind it rather
-// than queueing a second one.
-const copyFlushInFlightByDatabase = new Map<string, Promise<unknown>>();
+// Native flushes we have stopped waiting on but that are still running. Capped rather than serialized: a
+// retry must be able to start a real flush (chaining behind a stalled one can never make the newly rewritten
+// copy rows durable, and if the first never settles the chain never runs), but a permanently stalled store
+// must not accumulate one queued flush per retry forever.
+const copyFlushOutstandingByDatabase = new Map<string, number>();
+const MAX_OUTSTANDING_COPY_FLUSHES = 3;
 // W1 (harper-pro#431): safety net behind the explicit DOWN write — a link whose last liveness is older
 // than this reads as down even if still marked CONNECTED, so a worker that died/wedged without writing
 // DOWN can't pin a stale CONNECTED. Derived from the configured keepalive (not a fixed default) so a
@@ -2327,17 +2330,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// unwinds, and the copy re-runs from the durable cursor rather than resuming past undurable rows.
 		return () => {
 			// The bound rejects our WAIT, never the flush itself — the native call cannot be cancelled and is
-			// still running. Chaining behind it rather than calling `flush()` again keeps a permanently stalled
-			// store from accumulating one queued native flush per retry, and keeps each flush covering the rows
-			// written before it (a shared flush would not cover rows the retry is trying to make durable).
-			const pending = copyFlushInFlightByDatabase.get(databaseName);
-			const underlying = pending
-				? pending.then(runFlush, runFlush)
-				: (maybeStallCopyFinalizeForTest(databaseName) ?? flush());
-			copyFlushInFlightByDatabase.set(databaseName, underlying);
+			// still running. Refuse to start another once too many are outstanding, so a permanently stalled
+			// store fails fast instead of queueing one more native flush on every retry.
+			const outstanding = copyFlushOutstandingByDatabase.get(databaseName) ?? 0;
+			if (outstanding >= MAX_OUTSTANDING_COPY_FLUSHES)
+				return Promise.reject(
+					new Error(
+						`copy durability flush for database "${databaseName}" not started: ${outstanding} earlier flushes are still unsettled`
+					)
+				);
+			copyFlushOutstandingByDatabase.set(databaseName, outstanding + 1);
+			const underlying = maybeStallCopyFinalizeForTest(databaseName) ?? flush();
 			const release = () => {
-				if (copyFlushInFlightByDatabase.get(databaseName) === underlying)
-					copyFlushInFlightByDatabase.delete(databaseName);
+				copyFlushOutstandingByDatabase.set(databaseName, (copyFlushOutstandingByDatabase.get(databaseName) ?? 1) - 1);
 			};
 			underlying.then(release, release);
 			const doublings = copyFlushTimeoutsByDatabase.get(databaseName) ?? 0;
@@ -2359,9 +2364,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				}
 			);
 		};
-		function runFlush() {
-			return maybeStallCopyFinalizeForTest(databaseName) ?? flush!();
-		}
 	}
 	// Force the copied DB durable and await it. Gates [seq] = copyStartTime behind the copyApply rows'
 	// durability: those rows are WAL-off with no transaction-log entry, and core awaits the end_txn onCommit
