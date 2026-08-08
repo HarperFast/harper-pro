@@ -289,6 +289,8 @@ const LEADING_DUP_SKIP_ENABLED = env.get(CONFIG_PARAMS.REPLICATION_LEADINGDUPLIC
 export const LEADING_DUP_SKIP_LOG = 'leading-duplicate fast-skip';
 // Process-wide counter of records suppressed by the fast-skip, for in-process tests/observability.
 export let leadingDuplicateSkipCount = 0;
+// Distinctive log substring for the copy-mode identity-tie skip (see the decode loop). Keep stable.
+export const COPY_DUP_SKIP_LOG = 'copy identity-tie skip';
 
 /**
  * Decide whether an incremental replication start must be upgraded to a bounded base copy because
@@ -774,6 +776,76 @@ export function isReplicationConnectionClosedError(error: unknown): boolean {
 		error !== null &&
 		(error as { replicationConnectionClosed?: boolean }).replicationConnectionClosed === true
 	);
+}
+
+/**
+ * On-disk paths of every file-backed blob reachable from a stored record value, or `null` when the
+ * record's blobs cannot be fully accounted for — none was found despite the header claiming blobs, or
+ * one has no path (e.g. it lives only in a patch chain). `null` means "cannot prove the local copy is
+ * complete", never "there are no blobs".
+ */
+function blobFilePathsForValue(value: unknown): string[] | null {
+	const paths: string[] = [];
+	let sawBlob = false;
+	let allResolved = true;
+	findBlobsInObject(value, (blob: any) => {
+		sawBlob = true;
+		const path = getFilePathForBlob(blob);
+		if (path) paths.push(path);
+		else allResolved = false;
+	});
+	return sawBlob && allResolved ? paths : null;
+}
+
+/**
+ * Whether an incoming replication record is a *provably-already-applied* identity tie with the record
+ * already stored locally: SAME version AND SAME origin node — exactly the condition core Table.ts's apply
+ * loop uses to drop a duplicate (`precedesExistingVersion(txnTime, existingEntry, nodeId) === 0`
+ * early-matches on `txnTime === existingEntry.version && nodeId === existingEntry.nodeId`) — and, when the
+ * record carries file-backed blobs, every one of those blob files is present on disk. Anything ambiguous
+ * (no local record, different version or node, a blob file we cannot find) returns false so the record
+ * flows to the apply loop untouched.
+ *
+ * The blob check deliberately inspects the EXISTING record's blobs, not the incoming duplicate's: the two
+ * carry the same content, and only the stored one reflects the durable on-disk state a skip would rely on.
+ * A missing blob file must NOT tie — that record has to reach the apply loop so the dangling reference can
+ * be repaired. The version comparison is intentionally broader than `_writeDelete`'s tie check (`< 0`
+ * there): a re-delivered idempotent re-delete whose version and node already match locally is safe to tie.
+ *
+ * Presence, not completeness: a file that exists but is a PENDING/error stub still ties, so a base copy
+ * will not repair it. That is deliberate — verifying completeness means inflating every compressed blob
+ * (core's `isBlobComplete`), which is unaffordable per record on this path. Incomplete local blobs are the
+ * blob repair sweep's job (harper-pro#388), not a base copy's.
+ *
+ * `blobPathsOf`/`access` are injected so the decision is unit-testable without a real blob store.
+ */
+export async function isDurableIdentityTie(
+	existing: { version?: number; nodeId?: number; value?: unknown } | undefined,
+	incomingVersion: number,
+	sourceNodeId: number | undefined,
+	hasBlobs: boolean,
+	blobPathsOf: (value: unknown) => string[] | null = blobFilePathsForValue,
+	access: (path: string) => Promise<unknown> = fsPromises.access
+): Promise<boolean> {
+	// No mapped source node id → we cannot prove which node originated the incoming record.
+	if (sourceNodeId === undefined) return false;
+	if (!existing) return false;
+	if (existing.version !== incomingVersion) return false;
+	if ((existing.nodeId ?? 0) !== sourceNodeId) return false;
+	if (!hasBlobs) return true;
+	let paths: string[] | null;
+	try {
+		paths = blobPathsOf(existing.value);
+	} catch {
+		return false;
+	}
+	if (!paths) return false;
+	try {
+		await Promise.all(paths.map((path) => access(path)));
+	} catch {
+		return false;
+	}
+	return true;
 }
 
 /**
@@ -3393,7 +3465,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	 * @param hasBlobs        whether the audit header's HAS_BLOBS bit is set on the incoming record
 	 *
 	 * NOTE: the blob-present check intentionally inspects the EXISTING (already-applied) record's blobs,
-	 * not the incoming duplicate's — they share fileIds, and the existing record reflects the durable
+	 * not the incoming duplicate's — they share content, and the existing record reflects the durable
 	 * on-disk state we must not skip a repair for. So the incoming value is not needed here.
 	 */
 	async function isSkippableLeadingDuplicate(
@@ -3414,50 +3486,33 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			return false;
 		}
 		// Within the leading-duplicate window. Read the existing record to confirm a TRUE identity tie.
+		return isDurableIdentityTie(readLocalEntry(tableDecoder, id), incomingVersion, sourceNodeId, hasBlobs);
+	}
+
+	/**
+	 * The locally stored entry for `id`, or undefined when it cannot be read as a plain synchronous entry —
+	 * a getEntry throw, or a store that hands back a thenable. Both mean "we cannot prove anything about the
+	 * local state", which every caller treats as "let the record flow".
+	 */
+	function readLocalEntry(tableDecoder: any, id: any) {
 		let existing;
 		try {
 			existing = tableDecoder?.getEntry?.(id);
-			if (existing && typeof existing.then === 'function') existing = await existing;
+			if (existing && typeof existing.then === 'function') return undefined;
 		} catch (error) {
-			logger.trace?.(connectionId, 'leading-dup-skip: getEntry threw, letting record flow', id, error);
-			return false;
+			logger.trace?.(connectionId, 'identity-tie: getEntry threw, letting record flow', id, error);
+			return undefined;
 		}
-		if (!existing) return false; // nothing stored locally → not a duplicate; must apply.
-		// Identity tie = SAME version AND SAME node. This is exactly the condition core Table.ts's apply loop
-		// uses to drop a duplicate: `precedesExistingVersion(txnTime, existingEntry, nodeId) === 0` early-
-		// matches when `txnTime === existingEntry.version && nodeId === existingEntry.nodeId`. We read the
-		// existing entry via the SAME getEntry the apply loop reads, and `incomingVersion`/`sourceNodeId` are
-		// the same `txnTime`/`options.nodeId` the apply loop sees — so a true here is a guaranteed tie-drop
-		// there. A different node or an older/newer version is a real CRDT input the apply loop's resequencing
-		// must still fold — never skip those.
-		if (existing.version !== incomingVersion) return false;
-		if ((existing.nodeId ?? 0) !== sourceNodeId) return false;
-		// Intentionally broader than `_writeDelete`'s tie check (`<= 0` here vs `< 0` there): this only
-		// elides re-delivered idempotent re-deletes whose version and node already match locally — safe.
-		// Blob handling. A leading duplicate carrying a file-backed blob may be skipped only if the blob
-		// file is complete on disk (the prior apply saved it); a damaged blob must NOT be skipped —
-		// it has to reach the apply loop so the dangling reference can be repaired (separate PR). A record
-		// with no blob is always fine to skip. We inspect the *existing* record's blobs (same fileIds as
-		// the duplicate) so the check reflects the durable on-disk state, not the still-in-flight resave.
-		if (hasBlobs) {
-			let sawBlob = false;
-			const blobs: any[] = [];
-			try {
-				findBlobsInObject(existing.value, (blob) => {
-					sawBlob = true;
-					blobs.push(blob);
-				});
-			} catch (error) {
-				logger.trace?.(connectionId, 'leading-dup-skip: blob inspection threw, letting record flow', id, error);
-				return false;
-			}
-			// Header said HAS_BLOBS but we could not find a blob to verify (e.g. blob lives only in a patch
-			// chain) — be conservative and let it flow.
-			if (!sawBlob) return false;
-			for (const blob of blobs)
-				if ((await blobFileMissingOrIncompleteAsync(blob)) !== false) return false;
+		return existing;
+	}
+
+	function noteReceiveLiveness() {
+		replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
+		replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
+		if (options.connection?.nodeSubscriptions !== undefined) {
+			replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+			replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = replicationSharedStatus[RECEIVED_TIME_POSITION];
 		}
-		return true;
 	}
 
 	ws.on('message', (body: Buffer) => {
@@ -4897,12 +4952,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														entry.localTime
 													);
 													getSharedStatus()[SENDING_TIME_POSITION] = 1;
+													// Preserve the record's ORIGIN node, not ours. A base copy synthesizes audit
+													// entries from the primary store, and stamping them with this node's id would
+													// re-attribute every copied record to the copier: the follower then stores our
+													// id as the origin, so a later identity comparison against the true origin can
+													// never tie. That is what let a reverse copy silently re-mint (and drop) blob
+													// files for records the follower itself originated. `entry.nodeId` is already
+													// this node's local id for the origin (undefined/0 = us), which is exactly the
+													// id space the wire uses and the follower remaps.
+													const recordNodeId = entry.nodeId ?? nodeId;
 													const encoded = createAuditEntry({
 														version: entry.version,
 														tableId: table.tableId,
 														recordId: entry.key,
 														previousVersion: null,
-														nodeId,
+														nodeId: recordNodeId,
 														type: 'put',
 														encodedRecord: (() => {
 															decodeWithBlobCallback(
@@ -4928,7 +4992,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 															encoded,
 															version: entry.version,
 															residencyId: entry.residencyId,
-															nodeId,
+															nodeId: recordNodeId,
 															extendedType: entry.metadataFlags,
 														},
 														entry.localTime
@@ -5054,6 +5118,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			let event; // could also get txnTime from decoder.getFloat64(0);
 			let sequenceIdReceived;
 			let maxBatchVersion; // highest record version in this batch (non-copy); end_txn resume cursor when no sequence-update set lastSequenceIdReceived
+			// Last copy-frame key seen in this message body, applied OR skipped as an identity tie — the copy
+			// resume cursor must cover skipped keys too, or a copy whose records we all already hold would
+			// never advance it and every reconnect would restart the copy from the beginning.
+			let lastCopyFrameKey: { table: string; id: any } | undefined;
 			let lastYieldTime = performance.now();
 			// Latch the copy-frame status ONCE for this whole WS message body. The decode loop below awaits
 			// (waitForDrain / setImmediate) and ws does not serialize async message handlers, so a later
@@ -5171,6 +5239,45 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					);
 				}
 				const id = auditRecord.recordId;
+				// Copy-mode identity-tie skip. A base copy applies every record as a snapshot and re-mints its
+				// blobs as fresh local files, dereferencing the ones we already hold. When the copy SOURCE is
+				// simply handing back a record we ourselves originated — same version, same origin node, as on
+				// the reverse leg of a bidirectional add_node whose full copy lands after the peer has received
+				// our data — that re-mint trades durable local blob bytes for a re-transfer of identical
+				// content. If the copy is then interrupted mid-blob, the record is left pointing at a PENDING
+				// stub the source can never fill, because it never held those bytes either: the blob is lost on
+				// BOTH nodes. Copy frames sit outside the leading-duplicate resume window (a copy has no resume
+				// cursor to bound), so the tie is checked here instead — before the decode, so no local blob
+				// file is minted for a record we are not going to apply. Restricted to blob-carrying records:
+				// re-applying an identical blob-less record is wasteful but harmless, and this check costs a
+				// point read per record.
+				if (
+					messageIsCopyFrame &&
+					!!(auditRecord.extendedType & HAS_BLOBS) &&
+					(await isDurableIdentityTie(
+						readLocalEntry(tableDecoder, id),
+						auditRecord.version,
+						remoteShortIdToLocalId.get(auditRecord.nodeId),
+						true
+					))
+				) {
+					noteReceiveLiveness();
+					// Keep the copy resume cursor moving over skipped keys; a skipped record has no in-flight
+					// blob to wait on (we kept our durable one), so the cursor is already durable at this key.
+					if (tableDecoder?.name) lastCopyFrameKey = { table: tableDecoder.name, id };
+					logger.trace?.(
+						connectionId,
+						COPY_DUP_SKIP_LOG,
+						'id',
+						id,
+						'version',
+						auditRecord.version,
+						'table',
+						tableDecoder?.name
+					);
+					decoder.position = start + eventLength;
+					continue;
+				}
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
 				// Dangling-blob repair pairing (#699): computed only for blob-carrying records in the windows
@@ -5309,15 +5416,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// to a record `version` could push it past the leader's actual log position and skip entries.
 				if (STORAGE_IS_ROCKSDB && !inCopyMode && auditRecord.version > (maxBatchVersion ?? 0))
 					maxBatchVersion = auditRecord.version;
-				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
-				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
-				// Received data is a liveness signal for the authoritative connection state (W1 / #431) — but
-				// only when this connection OWNS the (db, peer) subscription the truth represents; an inbound
-				// or retrieval connection sharing the buffer must not refresh liveness for a link it is not.
-				if (options.connection?.nodeSubscriptions !== undefined) {
-					replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
-					replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = replicationSharedStatus[RECEIVED_TIME_POSITION];
-				}
+				noteReceiveLiveness();
 
 				if (event) {
 					// Leading-duplicate fast-skip: on a resumed stream the first records re-streamed from the
@@ -5381,6 +5480,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// live subscribers" — a copy frame with version >= copyStartTime carries a real audit entry
 					// and already delivers per-row events, so it needs no marker and is intentionally excluded.
 					if (event.isCopyApply && event.table) copiedTablesThisPass.add(event.table);
+					if (messageIsCopyFrame && event.table) lastCopyFrameKey = { table: event.table, id: event.id };
 					tableSubscriptionToReplicator.send(event);
 					// Per-record backpressure: a single large WS message can synchronously decode
 					// thousands of records, each holding a decoded value object and a closure over
@@ -5498,11 +5598,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// otherwise from the blob save `.finally`. Same key-based durability guarantee as before; it
 						// just no longer comes from blocking onCommit. Pass/anchor values were captured at decode
 						// time; a stale-pass staging is dropped inside the watermark.
-						if (event?.table && copyFromNodeId !== undefined) {
+						if ((event?.table || lastCopyFrameKey) && copyFromNodeId !== undefined) {
 							copyWatermark.stageCursor(copyFrameIndex, copyFramePass, {
 								copyStartTime: copyFrameStartTime,
-								currentTable: event.table,
-								afterKey: event.id,
+								currentTable: event?.table ?? lastCopyFrameKey!.table,
+								afterKey: event?.id ?? lastCopyFrameKey!.id,
 								copyOrder: copyFrameOrder, // validated by the leader before it trusts the resume skip (#421)
 							});
 						} else if (event && !event.table && copyFromNodeId !== undefined) {
