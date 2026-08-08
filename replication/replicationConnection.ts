@@ -176,6 +176,12 @@ export type ConnectionTruth = {
 // Pure derivation of connection truth from a status buffer, separated from the buffer fetch so it can be
 // unit-tested without a live auditStore. `connected` requires the CONNECTED state AND fresh liveness, so a
 // worker that died/wedged without writing DOWN reads as not-connected once its liveness goes stale.
+// Pure derivation of the base-copy veto from a status buffer, separated from the buffer fetch for the
+// same reason deriveConnectionTruth is: so the slot and constant a reader compares against are covered
+// by a unit test rather than only by a live copy.
+export function deriveBaseCopyInProgress(status: Float64Array): boolean {
+	return status[BASE_COPY_STATE_POSITION] === BASE_COPY_IN_PROGRESS;
+}
 export function deriveConnectionTruth(status: Float64Array, now: number = Date.now()): ConnectionTruth {
 	const state = status[CONNECTION_STATE_POSITION];
 	const lastLiveness = status[LAST_LIVENESS_TIME_POSITION];
@@ -4775,12 +4781,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
-		// A closed link is not copying, so retract the veto — an aborted copy would otherwise block
-		// readiness for this (database, peer) for the life of the process. Last, and guarded: resolving the
-		// buffer can touch a store a concurrent drop_database/shutdown already closed, and a throw from a
-		// 'close' listener becomes an uncaughtException having skipped every cleanup above.
+		// Retract the veto only when this link's copy is NOT genuinely unfinished. A close mid-copy leaves
+		// it set on purpose: the watermark can already be positive (the sequence-update writes are not
+		// `inCopyMode`-guarded, and a peer's inbound connection shares this buffer), so retracting here
+		// would let the next poll read "no copy running, positive watermark" and publish Available during
+		// the reconnect window with a partial copy on disk. A resumed COPY_START re-sets it,
+		// maybeFinishCopy clears it, and a copy that never resumes correctly stalls the clone out. Any
+		// other close — no copy, or COPY_COMPLETE already received — does retract, so an idle link never
+		// carries a stale veto. Last and guarded: resolving the buffer can touch a store a concurrent
+		// drop_database/shutdown already closed, and a throw from a 'close' listener would become an
+		// uncaughtException having skipped every cleanup above.
 		try {
-			setBaseCopyState(BASE_COPY_IDLE);
+			if (!inCopyMode || copyCompleteReceived) setBaseCopyState(BASE_COPY_IDLE);
 		} catch (error) {
 			logger.debug?.(connectionId, 'could not retract base-copy state on close', error);
 		}

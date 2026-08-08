@@ -496,7 +496,8 @@ async function monitorSync(): Promise<SyncOutcome> {
 
 	// Get last updated record timestamps for all DB and write to file
 	// These values can be used for checking when the clone replication has caught up with the leader
-	const targetTimestamps = await getLastUpdatedRecord();
+	const leaderTableCounts = new Map<string, number>();
+	const targetTimestamps = await getLastUpdatedRecord(leaderTableCounts);
 	if (!targetTimestamps || Object.keys(targetTimestamps).length === 0) {
 		log('No target timestamps available to check synchronization status; leaving availability Unavailable', 'error');
 		return 'failed';
@@ -525,13 +526,15 @@ async function monitorSync(): Promise<SyncOutcome> {
 		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s`
 	);
 
-	// The leader's user databases must each have a replication subscription before the clone can be
-	// complete: a loop over the sockets that exist cannot see a database that was never subscribed, so a
+	// The leader's non-empty user databases must each have a replication subscription before the clone can
+	// be complete: a loop over the sockets that exist cannot see a database that was never subscribed, so a
 	// `system` copy finishing in seconds would otherwise satisfy the check while a user database — lost to
 	// a swallowed schema pre-create failure, or created on the leader after that step — stayed empty.
-	// `system` itself is excluded on purpose: a legacy (v4) leader never replicates it, and requiring its
-	// socket would wedge those clones at Unavailable.
-	const requiredSocketDatabases = Object.keys(targetTimestamps).filter((db) => db !== SYSTEM_SCHEMA_NAME);
+	// Two deliberate exclusions, each of which would otherwise turn a working clone into a hard failure:
+	// `system`, because a legacy (v4) leader never replicates it; and a table-less database, because
+	// cluster_status resolves a socket's status buffer through the FIRST TABLE of the database
+	// (`replication/clusterStatus.ts`), so a database with no tables can never report a watermark at all.
+	const requiredSocketDatabases = getRequiredSocketDatabases(targetTimestamps, leaderTableCounts);
 
 	const outcome = await monitorSyncLoop({
 		targetTimestamps,
@@ -567,6 +570,30 @@ async function monitorSync(): Promise<SyncOutcome> {
 }
 
 /**
+ * Count a describe response's tables, skipping the `requestId` sibling and any non-object entry.
+ */
+function countTables(dbDescribe: Record<string, any>): number {
+	let count = 0;
+	for (const table in dbDescribe) {
+		if (dbDescribe[table] && typeof dbDescribe[table] === 'object') count++;
+	}
+	return count;
+}
+
+/**
+ * The leader databases whose replication socket must exist before the clone can report Available.
+ * See the call site in monitorSync for why `system` and table-less databases are excluded.
+ */
+function getRequiredSocketDatabases(
+	targetTimestamps: Record<string, number>,
+	leaderTableCounts: Map<string, number>
+): string[] {
+	return Object.keys(targetTimestamps).filter(
+		(db) => db !== SYSTEM_SCHEMA_NAME && (leaderTableCounts.get(db) ?? 0) > 0
+	);
+}
+
+/**
  * Whether this node replicates `dbName` at all, per its own `replication.databases`. Matches the
  * gating `shouldReplicateFromNode` uses in `replication/knownNodes.ts`: `undefined` or `'*'` accept
  * everything; an array accepts only the names it lists (objects with `.name` are sharded entries).
@@ -588,7 +615,7 @@ function isReplicatedDatabase(dbName: string): boolean {
  * and record the most recent timestamp for each database in a JSON file.
  * @returns {Promise<void>}
  */
-async function getLastUpdatedRecord(): Promise<Record<string, number>> {
+async function getLastUpdatedRecord(tableNamesByDatabase?: Map<string, number>): Promise<Record<string, number>> {
 	log('Getting last updated record timestamp for all database', 'debug');
 	const lastUpdated: Record<string, number> = {};
 	const systemDb: Record<string, any> = await leaderRequest({ operation: 'describe_database', database: 'system' });
@@ -605,6 +632,7 @@ async function getLastUpdatedRecord(): Promise<Record<string, number>> {
 			continue;
 		}
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
+		tableNamesByDatabase?.set(db, countTables(allDb[db]));
 	}
 
 	const lastUpdatedFilePath: string = join(rootPath, 'tmp', 'lastUpdated.json');
@@ -631,8 +659,7 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 		const tableObj = dbObj[table];
 		// requestId is part of the describe response so we ignore it
 		if (typeof tableObj !== 'object' || tableObj == null) continue;
-		// A table the leader will never send us cannot move the watermark, so letting its timestamp set
-		// the target would leave the clone waiting on data that is not coming.
+		// A non-replicated table's timestamp would be a target the watermark can never reach.
 		if (tableObj.replicate === false) continue;
 		const lastUpdated = normalizeTargetVersion(tableObj.last_updated_record);
 		if (lastUpdated > mostRecent) {

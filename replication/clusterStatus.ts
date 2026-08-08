@@ -15,8 +15,7 @@ import {
 	BACK_PRESSURE_RATIO_POSITION,
 	BLOB_FAILURE_COUNT_POSITION,
 	LAST_BLOB_FAILURE_TIME_POSITION,
-	BASE_COPY_STATE_POSITION,
-	BASE_COPY_IN_PROGRESS,
+	deriveBaseCopyInProgress,
 	readConnectionTruth,
 } from './replicationConnection.ts';
 import '../core/server/serverHelpers/serverUtilities.ts';
@@ -67,8 +66,7 @@ export async function clusterStatus() {
 			// the duration of a copy, so without this an operator (or the clone sync gate) cannot tell an
 			// in-flight copy from a link that simply has nothing new. `|| undefined` keeps the field off a
 			// healthy socket, matching the other optional signals here.
-			socket.baseCopyInProgress =
-				replicationSharedStatus[BASE_COPY_STATE_POSITION] === BASE_COPY_IN_PROGRESS || undefined;
+			socket.baseCopyInProgress = deriveBaseCopyInProgress(replicationSharedStatus) || undefined;
 			// Blob-replication divergence (harper-pro#386): a non-zero count means replicated blobs failed
 			// to save durably on this link. `connected: true` alone can hide that; surface it here so an
 			// operator (or alert) sees the divergence and its recency.

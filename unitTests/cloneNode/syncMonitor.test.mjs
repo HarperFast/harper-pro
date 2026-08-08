@@ -9,6 +9,12 @@
  */
 import assert from 'node:assert/strict';
 import { checkSyncStatus, monitorSyncLoop, normalizeTargetVersion } from '#src/cloneNode/syncMonitor';
+import {
+	deriveBaseCopyInProgress,
+	BASE_COPY_STATE_POSITION,
+	BASE_COPY_IDLE,
+	BASE_COPY_IN_PROGRESS,
+} from '#src/replication/replicationConnection';
 
 const LEADER_URL = 'wss://leader:9933';
 const noopLog = () => {};
@@ -441,5 +447,26 @@ describe('monitorSyncLoop', () => {
 			...clock,
 		});
 		assert.equal(outcome, 'stalled');
+	});
+});
+
+describe('deriveBaseCopyInProgress', () => {
+	// The gate's veto is only as good as the slot and constant the reader compares against; every other
+	// test here hand-feeds `baseCopyInProgress`, so without this a wrong slot index would go unnoticed.
+	it('reads the base-copy slot, not a neighbour', () => {
+		const status = new Float64Array(16);
+		assert.equal(deriveBaseCopyInProgress(status), false);
+
+		status[BASE_COPY_STATE_POSITION] = BASE_COPY_IN_PROGRESS;
+		assert.equal(deriveBaseCopyInProgress(status), true);
+
+		status[BASE_COPY_STATE_POSITION] = BASE_COPY_IDLE;
+		assert.equal(deriveBaseCopyInProgress(status), false);
+	});
+
+	it('is not confused by the neighbouring slots the same buffer carries', () => {
+		const status = new Float64Array(16);
+		for (let i = 0; i < status.length; i++) if (i !== BASE_COPY_STATE_POSITION) status[i] = Date.now();
+		assert.equal(deriveBaseCopyInProgress(status), false);
 	});
 });
