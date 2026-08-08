@@ -51,7 +51,7 @@ const RECORD_COUNT = 8;
 const B_ORIGINATED_ID = RECORD_COUNT; // the one record the reverse copy must genuinely deliver
 const CONVERGENCE_TIMEOUT_MS = 90000;
 const COPY_SETTLE_MS = 15000;
-const RESTART_SETTLE_MS = 20000;
+const READY_CONSECUTIVE_PROBES = 8;
 const OP_TIMEOUT_MS = 20000;
 // Shared with blobCopyInterruptionIntegrity.test.mjs: an authoritative (no sourcedFrom) blob table whose
 // ~1 MiB payload is a pure function of the record id.
@@ -113,17 +113,25 @@ async function recordCount(node) {
 	}
 }
 
+/**
+ * Wait for the fixture's table to be describable, and require several consecutive successes a second
+ * apart: a deploy restart tears the listener down asynchronously, so a single success can still be the
+ * outgoing process answering. Consecutive successes across the restart window prove the new one is up
+ * without guessing how long the restart takes.
+ */
 async function waitForReady(node) {
 	const deadline = Date.now() + CONVERGENCE_TIMEOUT_MS;
+	let consecutive = 0;
 	let lastError;
 	while (Date.now() < deadline) {
 		try {
 			await op(node, { operation: 'describe_table', database: 'data', table: 'BlobCopyRecord' });
-			return;
+			if (++consecutive >= READY_CONSECUTIVE_PROBES) return;
 		} catch (error) {
 			lastError = error;
-			await delay(500);
+			consecutive = 0;
 		}
+		await delay(1000);
 	}
 	throw new Error(`${node.hostname} never served the fixture table: ${lastError?.message ?? lastError}`);
 }
@@ -132,9 +140,6 @@ async function deployFixture(node) {
 	const payload = await targz(FIXTURE_PATH);
 	const response = await op(node, { operation: 'deploy_component', project: PROJECT, payload, restart: true }, 30000);
 	equal(response.message, `Successfully deployed: ${PROJECT}, restarting Harper`);
-	// The restart drops the listener. Sit out the restart before polling, so readiness is not answered by
-	// the process that is about to go away, then wait for the fixture's table to be describable.
-	await delay(RESTART_SETTLE_MS);
 	await waitForReady(node);
 }
 
