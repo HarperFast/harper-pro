@@ -52,7 +52,7 @@ function nodeStartOptions(node, { stall = false } = {}) {
 	return {
 		config: {
 			analytics: { aggregatePeriod: -1 },
-			logging: { colors: false, stdStreams: false, console: true },
+			logging: { colors: false, stdStreams: false, console: true, level: 'debug' },
 			replication: {
 				port: node.hostname + ':9933',
 				securePort: null,
@@ -83,7 +83,11 @@ async function pollUntil(predicate, timeoutMs = RECOVERY_TIMEOUT_MS) {
 	return false;
 }
 
-/** Count of completed base copies in the receiver's log — the reconnect's copy is the second. */
+/**
+ * Count of completed base copies in the receiver's log — the reconnect's copy is the second. `bulk copy
+ * complete` is a debug line, which is why the fixture pins `logging.level` rather than relying on the
+ * harness default.
+ */
 async function copiesCompleted(node) {
 	const log = await readLog(node).catch(() => '');
 	return (log.match(/bulk copy complete/g) ?? []).length;

@@ -2574,10 +2574,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// pays nothing for it.
 	function noteCopyFinalizeProgress(fromCommit = false) {
 		if (fromCommit && outstandingCommits > 0) return;
-		// Hard ceiling on how long progress may keep deferring the watchdog. Live traffic can drain the
-		// commit queue to zero over and over while a different gate stays stuck, so "some gate closed
-		// recently" cannot be the only guard; past the ceiling nothing counts and the watchdog fires on its
-		// next check. A false positive costs a resumed copy, not data.
+		// Ceiling on how long progress may keep deferring the watchdog. Live traffic can drain the commit
+		// queue to zero over and over while a different gate stays stuck, so "some gate closed recently"
+		// cannot be the only guard. Past the ceiling nothing counts, so the watchdog fires on its next
+		// check — this bounds the wedge at the ceiling plus one (possibly escalated) threshold rather than
+		// firing exactly at it. A false positive costs a resumed copy, not data.
 		if (performance.now() - copyCompleteAt > COPY_FINALIZE_DEADLINE_MULTIPLE * COPY_FINALIZE_TIMEOUT) return;
 		copyFinalizeProgress++;
 	}
