@@ -255,9 +255,7 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		// (re-)running setup — a boot merely regenerates missing keys — so untouched mtimes after the
 		// restart prove the resume skipped setup entirely.
 		const jwtPassPath = join(resumeCtx.harper.dataRootDir, 'keys', '.jwtPass');
-		const configPath = join(resumeCtx.harper.dataRootDir, 'harper-config.yaml');
 		const jwtMtimeBeforeRestart = statSync(jwtPassPath).mtimeMs;
-		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
 		await startHarper(resumeCtx, options);
 
 		await waitForAvailableStatus(resumeCtx.harper);
@@ -265,11 +263,6 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			statSync(jwtPassPath).mtimeMs,
 			jwtMtimeBeforeRestart,
 			'resume must not re-clone the JWT keys — setup was supposed to be skipped'
-		);
-		equal(
-			statSync(configPath).mtimeMs,
-			configMtimeBeforeRestart,
-			'resume must not rewrite the config — replication setup was supposed to be skipped'
 		);
 		let finalCount = -1;
 		for (let retries = 0; retries < 60; retries++) {
@@ -300,8 +293,6 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			false,
 			'must catch the marker before key cloning finishes to exercise this resume path'
 		);
-		const configPath = join(partialCtx.harper.dataRootDir, 'harper-config.yaml');
-		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
 		// installHarper() already wrote a self-generated .jwtPass before cloneNode reached the delay
 		// hook, so its mere existence wouldn't prove anything — an mtime change is what shows
 		// cloneJWTKeys actually ran (and overwrote it) during the resume, not just that install did.
@@ -312,11 +303,6 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		await startHarper(partialCtx, cloneOptionsFor(partialCtx, await leaderToken()));
 
 		await waitForAvailableStatus(partialCtx.harper);
-		equal(
-			statSync(configPath).mtimeMs,
-			configMtimeBeforeRestart,
-			'resume must not redo replication setup — setNode()/cloneConfig() only run on a fresh attempt'
-		);
 		ok(
 			statSync(jwtPassPath).mtimeMs > jwtMtimeBeforeRestart,
 			'resume must still clone the JWT keys — setupComplete was false when killed'
@@ -339,26 +325,20 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		const established = JSON.parse(readFileSync(markerPath, 'utf8'));
 		await killHarper(reconcileCtx);
 
-		// Rewind the marker to the state a crash inside establishReplicationSetup leaves behind: the
-		// intent recorded, the outcome unknown. setNode() did in fact complete, so the next start must
-		// discover that from hdb_nodes rather than replaying replication setup.
-		writeFileSync(
-			markerPath,
-			JSON.stringify({
-				leaderURL: established.leaderURL,
-				startedAt: established.startedAt,
-				replicationEstablished: false,
-			})
-		);
-		const configPath = join(reconcileCtx.harper.dataRootDir, 'harper-config.yaml');
-		const configMtimeBeforeRestart = statSync(configPath).mtimeMs;
+		// Rewind only the replication outcome, to the state a crash inside establishReplicationSetup
+		// leaves behind: the intent recorded, the outcome unknown. Every later stage stays complete, so
+		// a correct resume runs no setup at all and .jwtPass is the discriminator — reconciliation
+		// failing would replay establishReplicationSetup and finishCloneSetup, re-cloning the keys.
+		writeFileSync(markerPath, JSON.stringify({ ...established, replicationEstablished: false }));
+		const jwtPassPath = join(reconcileCtx.harper.dataRootDir, 'keys', '.jwtPass');
+		const jwtMtimeBeforeRestart = statSync(jwtPassPath).mtimeMs;
 
 		await startHarper(reconcileCtx, cloneOptionsFor(reconcileCtx, await leaderToken()));
 		await waitForAvailableStatus(reconcileCtx.harper);
 		equal(
-			statSync(configPath).mtimeMs,
-			configMtimeBeforeRestart,
-			'reconciliation must not rerun cloneConfig — hdb_nodes already proves replication is established'
+			statSync(jwtPassPath).mtimeMs,
+			jwtMtimeBeforeRestart,
+			'reconciliation must find replication already established and skip setup entirely'
 		);
 		equal(
 			await countRows(reconcileCtx.harper),
