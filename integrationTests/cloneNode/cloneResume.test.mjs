@@ -136,6 +136,31 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		return join(dataRootDir, 'tmp', 'clone-sync-started.json');
 	}
 
+	// The marker moves through stages (intent -> replication established -> setup complete), so a test
+	// that needs a particular stage must wait for it: waiting for the file to merely exist now lands on
+	// the intent write, which is recorded before replication setup even starts.
+	async function waitForMarkerStage(dataRootDir, isReady, description, timeoutMs = 120000) {
+		const markerPath = markerPathFor(dataRootDir);
+		const deadline = Date.now() + timeoutMs;
+		let last;
+		while (Date.now() < deadline) {
+			if (existsSync(markerPath)) {
+				try {
+					last = JSON.parse(readFileSync(markerPath, 'utf8'));
+					if (isReady(last)) return markerPath;
+				} catch {
+					// marker is being rewritten; retry
+				}
+			}
+			await sleep(25);
+		}
+		throw new Error(
+			`clone did not reach ${description} within ${timeoutMs}ms; last marker: ${
+				last ? JSON.stringify(last) : '(never written)'
+			}`
+		);
+	}
+
 	async function waitForMarker(dataRootDir, timeoutMs = 120000) {
 		const markerPath = markerPathFor(dataRootDir);
 		const deadline = Date.now() + timeoutMs;
@@ -225,12 +250,10 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		});
 		await startHarper(partialCtx, firstBootOptions);
 
-		const markerPath = await waitForMarker(partialCtx.harper.dataRootDir);
-		const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
-		equal(
-			marker.setupComplete,
-			false,
-			'must catch the marker before key cloning finishes to exercise this resume path'
+		await waitForMarkerStage(
+			partialCtx.harper.dataRootDir,
+			(m) => m.replicationEstablished && !m.setupComplete,
+			'replication established with key cloning still pending'
 		);
 		// installHarper() already wrote a self-generated .jwtPass before cloneNode reached the delay
 		// hook, so its mere existence wouldn't prove anything — an mtime change is what shows
@@ -264,9 +287,12 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			reconcileCtx,
 			cloneOptionsFor(reconcileCtx, await leaderToken(), { CLONE_SIMULATE_SETUP_DELAY_MS: 3000 })
 		);
-		const markerPath = await waitForMarker(reconcileCtx.harper.dataRootDir);
+		const markerPath = await waitForMarkerStage(
+			reconcileCtx.harper.dataRootDir,
+			(m) => m.replicationEstablished && !m.setupComplete,
+			'replication established with key cloning still pending'
+		);
 		const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
-		equal(marker.replicationEstablished, true, 'the marker must record replication before key cloning');
 		await killHarper(reconcileCtx);
 
 		// Rewind only the replication outcome, to what a crash inside establishReplicationSetup leaves:
