@@ -2231,18 +2231,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// A held gap permanently blocks the staged cursor, but the pre-gap snapshot is still safe to
 			// persist — do that once, so a reconnect resumes the copy from the last gap-free point rather
 			// than from the last cadence flush (#683). In-flight blobs without a gap drain in bounded time
-			// and the normal path below persists then, so they just wait, as before. This runs inside the
-			// blob-save `.finally` whose promise onCommit awaits, so a synchronous store throw here (likely
-			// correlated with the very fault that latched the gap, e.g. ENOSPC) must not escape as a
-			// rejection of that awaited promise — catch, log, and leave the snapshot unpersisted.
-			if (hasBlobGap && lastDurableCopyCursor && !lastDurableCopyCursorPersisted) {
-				try {
-					persistCopyCursor(lastDurableCopyCursor, true);
-				} catch (error) {
-					lastDurableCopyCursorPersisted = false;
-					logger.warn?.(connectionId, 'failed to persist the pre-gap copy cursor snapshot', error);
-				}
-			}
+			// and the normal path below persists then, so they just wait, as before.
+			if (hasBlobGap && lastDurableCopyCursor && !lastDurableCopyCursorPersisted)
+				persistCopyCursor(lastDurableCopyCursor, true);
 			return;
 		}
 		if (pendingCopyCursor) {
@@ -2261,77 +2252,88 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// by lastDurableCopyCursorPersisted) so it flushes immediately — it is the last persist this
 	// connection will ever perform, and (b)'s reconnect must find it on disk (#683).
 	function persistCopyCursor(cursor: typeof pendingCopyCursor, isDurableSnapshot: boolean) {
-		// Once the connection is closed its persists must stop: a replacement connection owns the same
-		// [copyCursor, nodeId] key and has moved (or removed) it, so a late write from this closure —
-		// the flush-failure retry timer, or a flush `.then` that resolves after close — would overwrite
-		// newer resume state with stale, or resurrect a cursor for a completed copy (#683 review).
-		if (wsClosed || copyFromNodeId === undefined) return;
-		if (!copyApplyActive()) {
-			// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
-			// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
-			getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursor);
-			if (isDurableSnapshot) lastDurableCopyCursorPersisted = true;
-			else {
-				pendingCopyCursor = null;
-				if (cursor === lastDurableCopyCursor) lastDurableCopyCursorPersisted = true;
-			}
-			logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
-			maybeFinishCopy();
-			return;
-		}
-		// copy-apply rows are WAL-off with no transaction-log entry, so the cursor must sit behind an explicit
-		// RocksDB flush (memtable -> SST). Flush the copied DB on a size/time cadence (or immediately when
-		// finishing) and persist the staged cursor only once the flush resolves; never persist without a
-		// durable flush, or a crash would lose the unflushed rows the cursor claims. If the store isn't
-		// reachable, hold the cursor rather than risk loss. (harper-pro#480)
-		const flushRootStore = copyStoreFlush();
-		const flushNow =
-			isDurableSnapshot ||
-			copyCompleteReceived ||
-			copyBytesSinceFlush >= COPY_CURSOR_FLUSH_BYTES ||
-			performance.now() - lastCopyFlushTime >= COPY_CURSOR_FLUSH_INTERVAL_MS;
-		if (!flushNow || copyFlushInFlight || !flushRootStore || performance.now() < copyFlushBackoffUntil) return;
-		const cursorAtFlush = cursor;
-		if (isDurableSnapshot) lastDurableCopyCursorPersisted = true;
-		else pendingCopyCursor = null;
-		copyBytesSinceFlush = 0;
-		lastCopyFlushTime = performance.now();
-		copyFlushInFlight = true;
-		Promise.resolve(flushRootStore())
-			.then(() => {
-				// rows up to cursorAtFlush are now durable in SST; dbisDB is WAL-on, so this persist is durable.
-				// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
-				// The close-check mirrors the entry guard: the flush may resolve after this connection died.
-				if (wsClosed) return;
-				if (copyFromNodeId !== undefined)
-					getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
-				if (cursorAtFlush === lastDurableCopyCursor) lastDurableCopyCursorPersisted = true;
-				copyFlushBackoffUntil = 0;
-				copyFlushRetryMs = 0; // flush succeeded; reset backoff
-				logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
-			})
-			.catch((error) => {
-				if (isDurableSnapshot) lastDurableCopyCursorPersisted = false;
-				else pendingCopyCursor ??= cursorAtFlush; // hold the staged cursor
-				// Escalating backoff (250ms → 30s cap) instead of an immediate re-flush, so a persistent flush
-				// failure idles rather than busy-looping; a scheduled retry drives progress without another event.
-				copyFlushRetryMs = Math.min(copyFlushRetryMs ? copyFlushRetryMs * 2 : 250, 30000);
-				copyFlushBackoffUntil = performance.now() + copyFlushRetryMs;
-				clearTimeout(copyFlushRetryTimer);
-				copyFlushRetryTimer = setTimeout(() => {
-					copyFlushRetryTimer = undefined;
-					flushDurableCopyCursor();
-				}, copyFlushRetryMs);
-				copyFlushRetryTimer.unref?.();
-				logger.warn?.(connectionId, `copy cursor flush failed; backing off ${copyFlushRetryMs}ms`, error);
-			})
-			.finally(() => {
-				copyFlushInFlight = false;
+		// Once this closure no longer owns the link its persists must stop: a replacement connection
+		// owns the same [copyCursor, nodeId] key and has moved (or removed) it, so a late write from
+		// here — the flush-failure retry timer, or a flush `.then` that resolves late — would overwrite
+		// newer resume state with stale, or resurrect a cursor for a completed copy.
+		if (connectionSuperseded() || copyFromNodeId === undefined) return;
+		// Restore the staged/snapshot state, back off, and schedule a re-drive. Shared by the async
+		// flush `.catch` and the synchronous catch at the bottom: this function runs from the blob-save
+		// `.finally` whose promise onCommit awaits, so a synchronous store throw (dbisDB.put, or
+		// flushRootStore() evaluated before Promise.resolve — likely the same ENOSPC that failed the
+		// blob save) must not escape as a rejection of that awaited promise.
+		const onPersistFailure = (error: unknown) => {
+			copyFlushInFlight = false;
+			if (isDurableSnapshot) lastDurableCopyCursorPersisted = false;
+			else pendingCopyCursor ??= cursor; // hold the staged cursor
+			// Escalating backoff (250ms → 30s cap) instead of an immediate re-flush, so a persistent flush
+			// failure idles rather than busy-looping; a scheduled retry drives progress without another event.
+			copyFlushRetryMs = Math.min(copyFlushRetryMs ? copyFlushRetryMs * 2 : 250, 30000);
+			copyFlushBackoffUntil = performance.now() + copyFlushRetryMs;
+			clearTimeout(copyFlushRetryTimer);
+			copyFlushRetryTimer = setTimeout(() => {
+				copyFlushRetryTimer = undefined;
+				flushDurableCopyCursor();
+			}, copyFlushRetryMs);
+			copyFlushRetryTimer.unref?.();
+			logger.warn?.(connectionId, `copy cursor flush failed; backing off ${copyFlushRetryMs}ms`, error);
+		};
+		try {
+			if (!copyApplyActive()) {
+				// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
+				// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
+				getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursor);
+				if (isDurableSnapshot) lastDurableCopyCursorPersisted = true;
+				else {
+					pendingCopyCursor = null;
+					if (cursor === lastDurableCopyCursor) lastDurableCopyCursorPersisted = true;
+				}
+				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
 				maybeFinishCopy();
-				// A gap that latched while THIS flush was in flight deferred its snapshot persist on
-				// copyFlushInFlight; on a quiescent link nothing else re-invokes it, so re-enter now (#683).
-				if (hasBlobGap) flushDurableCopyCursor();
-			});
+				return;
+			}
+			// copy-apply rows are WAL-off with no transaction-log entry, so the cursor must sit behind an explicit
+			// RocksDB flush (memtable -> SST). Flush the copied DB on a size/time cadence (or immediately when
+			// finishing) and persist the staged cursor only once the flush resolves; never persist without a
+			// durable flush, or a crash would lose the unflushed rows the cursor claims. If the store isn't
+			// reachable, hold the cursor rather than risk loss. (harper-pro#480)
+			const flushRootStore = copyStoreFlush();
+			const flushNow =
+				isDurableSnapshot ||
+				copyCompleteReceived ||
+				copyBytesSinceFlush >= COPY_CURSOR_FLUSH_BYTES ||
+				performance.now() - lastCopyFlushTime >= COPY_CURSOR_FLUSH_INTERVAL_MS;
+			if (!flushNow || copyFlushInFlight || !flushRootStore || performance.now() < copyFlushBackoffUntil) return;
+			const cursorAtFlush = cursor;
+			if (isDurableSnapshot) lastDurableCopyCursorPersisted = true;
+			else pendingCopyCursor = null;
+			copyBytesSinceFlush = 0;
+			lastCopyFlushTime = performance.now();
+			copyFlushInFlight = true;
+			Promise.resolve(flushRootStore())
+				.then(() => {
+					// rows up to cursorAtFlush are now durable in SST; dbisDB is WAL-on, so this persist is durable.
+					// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
+					// The ownership check mirrors the entry guard: the flush may resolve after this closure died.
+					if (connectionSuperseded()) return;
+					if (copyFromNodeId !== undefined)
+						getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
+					if (cursorAtFlush === lastDurableCopyCursor) lastDurableCopyCursorPersisted = true;
+					copyFlushBackoffUntil = 0;
+					copyFlushRetryMs = 0; // flush succeeded; reset backoff
+					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
+				})
+				.catch(onPersistFailure)
+				.finally(() => {
+					copyFlushInFlight = false;
+					maybeFinishCopy();
+					// A gap that latched while THIS flush was in flight deferred its snapshot persist on
+					// copyFlushInFlight; on a quiescent link nothing else re-invokes it, so re-enter now (#683).
+					if (hasBlobGap) flushDurableCopyCursor();
+				});
+		} catch (error) {
+			onPersistFailure(error);
+		}
 	}
 	// Select the copied DB's flush primitive: RocksDB exposes flush() (memtable -> SST); LMDB exposes a
 	// `flushed` promise. Returns undefined if neither is reachable. (replication targets RocksDB; the LMDB
@@ -2587,16 +2589,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// keyed on copy app-frame progress instead, so pings can't suppress it. Armed only while in copy mode
 	// (reset on COPY_START and on each in-copy 'message'; stopped on copy finish / pause). On a stall it
 	// forces the same close-independent reconnect, which restarts the copy from the leader. (harper-pro#453)
+	// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 900000 and is shared with blobsTimer; guard
+	// against a misconfigured 0/negative that would otherwise forceReconnect in a tight loop.
+	const effectiveBlobTimeoutMs = blobTimeout > 0 ? blobTimeout : 900000;
 	copyProgressWatchdog = createReceiveWatchdog({
-		// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 900000 and is shared with blobsTimer; guard
-		// against a misconfigured 0/negative that would otherwise forceReconnect in a tight loop.
-		intervalMs: blobTimeout > 0 ? blobTimeout : 900000,
+		intervalMs: effectiveBlobTimeoutMs,
 		getBytesRead: () => copyProgressFrames,
 		onSilence: () => {
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${blobTimeout}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
+				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${effectiveBlobTimeoutMs}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -2607,12 +2610,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// its durable cursors are pinned and only a reconnect (which re-streams the gapped blob) can heal
 	// it. Bound that state to blobTimeout instead of waiting for an unrelated reconnect (#683).
 	blobGapReconnectTimer = createBlobGapReconnectTimer({
-		timeoutMs: blobTimeout > 0 ? blobTimeout : 900000,
+		timeoutMs: effectiveBlobTimeoutMs,
 		onGapHeld: () => {
-			if (wsClosed) return;
+			// The repeating fire must die with ownership, not just with 'close': the forced reconnect's
+			// teardown of THIS socket is best-effort and may never fire 'close' (#420), and a zombie
+			// closure re-firing every cycle would terminate each healthy replacement mid-copy.
+			if (connectionSuperseded()) {
+				blobGapReconnectTimer?.stop();
+				return;
+			}
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Blob-gap watchdog: a blob gap from ${remoteNodeName}${dbContext} has pinned the resume cursor for ${blobTimeout}ms while connected — terminating connection and reconnecting to re-stream the gapped blob (harper-pro#683) — ${truthSnapshotForLog()}`
+				`Blob-gap watchdog: a blob gap from ${remoteNodeName}${dbContext} has pinned the resume cursor for ${effectiveBlobTimeoutMs}ms while connected — terminating connection and reconnecting to re-stream the gapped blob (harper-pro#683) — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -2740,6 +2749,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
 	let wsClosed = false;
+	// Whether this closure no longer owns the (peer, db) link. `wsClosed` alone is NOT enough:
+	// forceReconnect's teardown of the old socket is best-effort and may never fire 'close' (the
+	// open-but-idle wedge, #420), while the replacement connection installs a new `socket` on the
+	// shared connection object. Anything this closure persists (copy cursors) or forces (the
+	// blob-gap watchdog's reconnect) after that point would act against the replacement's state,
+	// so it must check ownership, not just closure (#683).
+	const connectionSuperseded = () => wsClosed || (options.connection != null && options.connection.socket !== ws);
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
 	// committed AND its blob (and all earlier blobs) have finished saving; the persisted replication
 	// resume cursor must never advance past that point. We track this with an ASYNC watermark rather
@@ -5047,8 +5063,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// gap and pins its resume cursor until a reconnect (#683).
 			let sentAnyChunk = false;
 			for (let attempt = 0; ; attempt++) {
-				const iterator = blob.stream()[Symbol.asyncIterator]();
+				// Opened inside the try: if core surfaces the 503 synchronously from stream() rather than
+				// from the first iterator.next(), the retry (and the error frame) must still engage.
+				let iterator: AsyncIterator<any> | undefined;
 				try {
+					iterator = blob.stream()[Symbol.asyncIterator]();
 					let lastBuffer: Buffer;
 					while (true) {
 						let result: IteratorResult<any>;
@@ -5133,7 +5152,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					break;
 				} catch (error) {
 					try {
-						await iterator.return?.();
+						await iterator?.return?.();
 					} catch {}
 					if (shouldRetrySourceBlobRead({ error, sentAnyChunk, wsClosed, draining: isDrainingBlobSends(), attempt })) {
 						logger.debug?.(
