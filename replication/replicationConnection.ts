@@ -959,7 +959,11 @@ export function createBlobGapReconnectTimer(opts: { timeoutMs: number; onGapHeld
 		timer = setTimeout(() => {
 			timer = undefined;
 			arm();
-			opts.onGapHeld();
+			// A throw from the callback in a bare timer would crash the worker — and, re-armed, repeat
+			// the crash every cycle. The callback logs before acting, so swallowing loses no signal.
+			try {
+				opts.onGapHeld();
+			} catch {}
 		}, opts.timeoutMs);
 		timer.unref?.();
 	};
@@ -2291,6 +2295,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			clearTimeout(copyFlushRetryTimer);
 			copyFlushRetryTimer = setTimeout(() => {
 				copyFlushRetryTimer = undefined;
+				// This timer IS the backoff expiring: timers can fire fractionally early relative to
+				// performance.now(), and an early fire hitting the backoff guard would no-op with nothing
+				// left to re-drive a quiescent link.
+				copyFlushBackoffUntil = 0;
 				flushDurableCopyCursor();
 			}, copyFlushRetryMs);
 			copyFlushRetryTimer.unref?.();
