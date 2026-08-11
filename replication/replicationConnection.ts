@@ -80,6 +80,7 @@ import {
 	getFileId,
 	findBlobsInObject,
 	getFilePathForBlob,
+	holdBlobFile,
 	registerBlobReceiveInFlight,
 	unregisterBlobReceiveInFlight,
 } from '../core/resources/blob.ts';
@@ -4814,6 +4815,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			return;
 		}
 		blobsBeingSent.add(id);
+		// Retain the file for as long as this send needs it. The blob was resolved from the record
+		// being replicated, but the file is not opened until `blob.stream()` below — and between here
+		// and there this send can park on the outstanding-sends cap for an unbounded time. A write
+		// that supersedes the record in that gap reclaims the file, so the send reads a missing file
+		// and reports it to the peer as unrecoverable at source; the peer then advances its resume
+		// cursor past a record whose bytes it will never have (harper-pro#403/#388).
+		// A null hold means reclamation already claimed the file: the read below will fail, and the
+		// error frame it produces is the honest answer for the peer.
+		const releaseBlobHold = holdBlobFile(blob);
+		if (!releaseBlobHold) logger.debug?.(`Blob ${id} is already being reclaimed; sending it will report it missing`);
 		// Acquire a send slot before opening the blob stream. Enforcing the cap only at the audit
 		// writer's backpressure check didn't bound concurrency: there it sat in an else-if behind the
 		// drain wait (unreachable while the socket stayed congested) and the GET_RECORD path never
@@ -4843,6 +4854,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (wsClosed) {
 				clearTimeout(parkWarnTimer);
 				blobsBeingSent.delete(id);
+				releaseBlobHold?.();
 				return;
 			}
 			if (isDrainingBlobSends()) {
@@ -4852,6 +4864,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				clearTimeout(parkWarnTimer);
 				warnBlobSendDeclined(id, 'worker draining for shutdown (while parked on the outstanding-sends cap)');
 				blobsBeingSent.delete(id);
+				releaseBlobHold?.();
 				return;
 			}
 		}
@@ -4864,13 +4877,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				waitedMs: Date.now() - parkStartedAt,
 			});
 		}
-		const iterator = blob.stream()[Symbol.asyncIterator]();
 		// Track this send so a worker restart can gracefully drain it (finish it if it's still making
 		// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
 		const drainToken = registerBlobSend();
+		// Counted before the try so the finally's decrement always has a matching increment, which lets
+		// the stream open inside the try: a throw there would otherwise skip the finally and leak the
+		// retention hold and the blobsBeingSent entry.
+		outstandingBlobsBeingSent++;
+		let iterator: AsyncIterator<any> | undefined;
 		try {
+			iterator = blob.stream()[Symbol.asyncIterator]();
 			let lastBuffer: Buffer;
-			outstandingBlobsBeingSent++;
 			// Per-chunk timeout: races each iterator.next() against a setTimeout reject so a stuck
 			// underlying read can't park the send loop forever. The local blob file may be missing or
 			// confidently corrupt; the read stream then sits without emitting `data`, `end`, or
@@ -4963,7 +4980,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 		} catch (error) {
 			try {
-				await iterator.return?.();
+				await iterator?.return?.();
 			} catch {}
 			// Throttle the warn (a peer backfilling thousands of already-deleted blobs makes this fire
 			// at kHz); the error frame below is unconditional
@@ -5000,6 +5017,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		} finally {
 			endBlobSend(drainToken);
 			blobsBeingSent.delete(id);
+			releaseBlobHold?.();
 			outstandingBlobsBeingSent--;
 			while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
 				blobSentCallbacks.shift()?.();
