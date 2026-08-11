@@ -68,6 +68,7 @@ import {
 	SEND_AUTH_UNCHANGED,
 } from './knownNodes.ts';
 import * as process from 'node:process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { isIP } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';
 import {
@@ -879,6 +880,59 @@ export function isUnrecoverableSourceBlobError(error: unknown): boolean {
  */
 export function isPermanentSourceBlobErrorCode(errorCode: unknown, errorStatus?: unknown): boolean {
 	return errorCode === 'ENOENT' || errorStatus === 404 || errorStatus === 500;
+}
+
+// Escalating waits for re-reading a source blob whose read failed with a 503 before forwarding the
+// error to the receiver. The dominant 503 is a PENDING placeholder left by a concurrent replication
+// receive (harper-pro#481) — a rolling population that heals within seconds at this node — while a
+// forwarded 503 latches the receiver's blob gap and pins its resume cursor until a reconnect (#683).
+// A few short in-place retries are far cheaper than that whole-link cost.
+export const BLOB_SEND_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+
+/**
+ * Whether a failed source blob read is worth retrying in place before forwarding the error to the
+ * receiver: 503 means transiently unavailable at this node (pending replication receive, or a read
+ * mid-write) — unlike the permanent classes above (ENOENT/404/500) or a local fs fault, both of which
+ * should be forwarded immediately. Pure so the classification is unit-testable (#683).
+ */
+export function isRetriableSourceBlobReadError(error: unknown): boolean {
+	return typeof error === 'object' && error !== null && (error as { statusCode?: number }).statusCode === 503;
+}
+
+/**
+ * One-shot reconnect timer for a held blob gap (#683). `hasBlobGap` latches on the first transient
+ * blob-save failure and nothing in the connection's lifetime clears it — only a reconnect (fresh
+ * connection state) re-streams the gapped blob, whose source-side fault typically heals within
+ * seconds. A gapped connection keeps flowing frames and answering pings, so no byte/frame watchdog
+ * ever notices it; without this timer the durable cursors stay pinned until an UNRELATED reconnect
+ * happens along (observed 3.7h in the field), and each such reconnect resumes a whole-table base
+ * copy. Armed at the first latch; fires `onGapHeld` once if the connection is still up after
+ * `timeoutMs`. `stop()` cancels on connection close. Exported so the one-shot/cancel contract is
+ * unit-testable; the production caller wires `onGapHeld` to the #453-style force-reconnect.
+ */
+export function createBlobGapReconnectTimer(opts: { timeoutMs: number; onGapHeld: () => void }): {
+	arm: () => void;
+	stop: () => void;
+	isArmed: () => boolean;
+} {
+	let timer: NodeJS.Timeout | undefined;
+	let fired = false;
+	return {
+		arm() {
+			if (timer || fired) return;
+			timer = setTimeout(() => {
+				timer = undefined;
+				fired = true;
+				opts.onGapHeld();
+			}, opts.timeoutMs);
+			timer.unref?.();
+		},
+		stop() {
+			if (timer) clearTimeout(timer);
+			timer = undefined;
+		},
+		isArmed: () => timer !== undefined,
+	};
 }
 
 /**
@@ -2033,6 +2087,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// durable-advance points (onCommit when nothing is in flight, and the blob save `.finally` when the last
 	// blob drains) persist it via flushDurableCopyCursor(). Null when there is nothing pending to persist.
 	let pendingCopyCursor: { copyStartTime: number; currentTable: any; afterKey: any; copyOrder: any } | null = null;
+	// Last durable-ELIGIBLE staged cursor: the value of `pendingCopyCursor` the last time nothing was
+	// in flight and no gap was held. Once `hasBlobGap` latches, nothing staged after this point can
+	// ever be persisted on this connection — but this snapshot still can (behind the same store
+	// flush), so a reconnect resumes the copy from the last gap-free point instead of from wherever
+	// the cadence last happened to flush (#683). `Persisted` is the one-shot guard for that gap-path
+	// persist (initialized true so a null snapshot is never "dirty").
+	let lastDurableCopyCursor: typeof pendingCopyCursor = null;
+	let lastDurableCopyCursorPersisted = true;
 	// Durability gate for copy-apply rows (harper-pro#480): bulk-copy frames are applied WAL-off with NO
 	// transaction-log entry, so the resume cursor must only advance behind an explicit RocksDB flush
 	// (memtable -> SST). flushDurableCopyCursor() flushes the copied DB on a size/time cadence (or immediately
@@ -2122,6 +2184,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 			pendingCopyCursor = null;
+			lastDurableCopyCursor = null;
+			lastDurableCopyCursorPersisted = true;
 			copyProgressWatchdog?.stop(); // copy is done; no longer watching for copy-progress stalls (#453)
 			// Copy is over: narrow the byte watchdog back from COPY_TIMEOUT to PING_TIMEOUT so an idle/dead
 			// connection in normal replication is still detected on the normal timeout. stop()+reset() so the
@@ -2140,64 +2204,96 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// is in flight, and the blob save `.finally` when the last blob drains) so the key-based cursor advances
 	// without the apply loop ever blocking on blobs. A no-op outside copy mode / when blobs are still pending.
 	function flushDurableCopyCursor() {
-		if (outstandingBlobsToFinish.length > 0 || hasBlobGap) return;
+		if (outstandingBlobsToFinish.length > 0 || hasBlobGap) {
+			// A held gap permanently blocks the staged cursor, but the pre-gap snapshot is still safe to
+			// persist — do that once, so a reconnect resumes the copy from the last gap-free point rather
+			// than from the last cadence flush (#683). In-flight blobs without a gap drain in bounded time
+			// and the normal path below persists then, so they just wait, as before.
+			if (hasBlobGap && lastDurableCopyCursor && !lastDurableCopyCursorPersisted)
+				persistCopyCursor(lastDurableCopyCursor, true);
+			return;
+		}
+		if (pendingCopyCursor) {
+			// Everything staged is durable-eligible right now; remember it for the gap path above (#683).
+			lastDurableCopyCursor = pendingCopyCursor;
+			lastDurableCopyCursorPersisted = false;
+		}
 		if (pendingCopyCursor && copyFromNodeId !== undefined) {
-			if (!copyApplyActive()) {
-				// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
-				// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
-				getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], pendingCopyCursor);
-				pendingCopyCursor = null;
-				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
-				maybeFinishCopy();
-				return;
-			}
-			// copy-apply rows are WAL-off with no transaction-log entry, so the cursor must sit behind an explicit
-			// RocksDB flush (memtable -> SST). Flush the copied DB on a size/time cadence (or immediately when
-			// finishing) and persist the staged cursor only once the flush resolves; never persist without a
-			// durable flush, or a crash would lose the unflushed rows the cursor claims. If the store isn't
-			// reachable, hold the cursor rather than risk loss. (harper-pro#480)
-			const flushRootStore = copyStoreFlush();
-			const flushNow =
-				copyCompleteReceived ||
-				copyBytesSinceFlush >= COPY_CURSOR_FLUSH_BYTES ||
-				performance.now() - lastCopyFlushTime >= COPY_CURSOR_FLUSH_INTERVAL_MS;
-			if (!flushNow || copyFlushInFlight || !flushRootStore || performance.now() < copyFlushBackoffUntil) return;
-			const cursorAtFlush = pendingCopyCursor;
-			pendingCopyCursor = null;
-			copyBytesSinceFlush = 0;
-			lastCopyFlushTime = performance.now();
-			copyFlushInFlight = true;
-			Promise.resolve(flushRootStore())
-				.then(() => {
-					// rows up to cursorAtFlush are now durable in SST; dbisDB is WAL-on, so this persist is durable.
-					// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
-					if (copyFromNodeId !== undefined)
-						getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
-					copyFlushBackoffUntil = 0;
-					copyFlushRetryMs = 0; // flush succeeded; reset backoff
-					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
-				})
-				.catch((error) => {
-					pendingCopyCursor ??= cursorAtFlush; // hold the staged cursor
-					// Escalating backoff (250ms → 30s cap) instead of an immediate re-flush, so a persistent flush
-					// failure idles rather than busy-looping; a scheduled retry drives progress without another event.
-					copyFlushRetryMs = Math.min(copyFlushRetryMs ? copyFlushRetryMs * 2 : 250, 30000);
-					copyFlushBackoffUntil = performance.now() + copyFlushRetryMs;
-					clearTimeout(copyFlushRetryTimer);
-					copyFlushRetryTimer = setTimeout(() => {
-						copyFlushRetryTimer = undefined;
-						flushDurableCopyCursor();
-					}, copyFlushRetryMs);
-					copyFlushRetryTimer.unref?.();
-					logger.warn?.(connectionId, `copy cursor flush failed; backing off ${copyFlushRetryMs}ms`, error);
-				})
-				.finally(() => {
-					copyFlushInFlight = false;
-					maybeFinishCopy();
-				});
+			persistCopyCursor(pendingCopyCursor, false);
 			return;
 		}
 		maybeFinishCopy();
+	}
+	// Persist a durable-eligible copy cursor. The staged-cursor path (isDurableSnapshot=false) keeps the
+	// #480 cadence; the gap-path snapshot persist (isDurableSnapshot=true) is one-shot per gap (guarded
+	// by lastDurableCopyCursorPersisted) so it flushes immediately — it is the last persist this
+	// connection will ever perform, and (b)'s reconnect must find it on disk (#683).
+	function persistCopyCursor(cursor: typeof pendingCopyCursor, isDurableSnapshot: boolean) {
+		if (copyFromNodeId === undefined) return;
+		if (!copyApplyActive()) {
+			// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
+			// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
+			getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursor);
+			if (isDurableSnapshot) lastDurableCopyCursorPersisted = true;
+			else {
+				pendingCopyCursor = null;
+				if (cursor === lastDurableCopyCursor) lastDurableCopyCursorPersisted = true;
+			}
+			logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
+			maybeFinishCopy();
+			return;
+		}
+		// copy-apply rows are WAL-off with no transaction-log entry, so the cursor must sit behind an explicit
+		// RocksDB flush (memtable -> SST). Flush the copied DB on a size/time cadence (or immediately when
+		// finishing) and persist the staged cursor only once the flush resolves; never persist without a
+		// durable flush, or a crash would lose the unflushed rows the cursor claims. If the store isn't
+		// reachable, hold the cursor rather than risk loss. (harper-pro#480)
+		const flushRootStore = copyStoreFlush();
+		const flushNow =
+			isDurableSnapshot ||
+			copyCompleteReceived ||
+			copyBytesSinceFlush >= COPY_CURSOR_FLUSH_BYTES ||
+			performance.now() - lastCopyFlushTime >= COPY_CURSOR_FLUSH_INTERVAL_MS;
+		if (!flushNow || copyFlushInFlight || !flushRootStore || performance.now() < copyFlushBackoffUntil) return;
+		const cursorAtFlush = cursor;
+		if (isDurableSnapshot) lastDurableCopyCursorPersisted = true;
+		else pendingCopyCursor = null;
+		copyBytesSinceFlush = 0;
+		lastCopyFlushTime = performance.now();
+		copyFlushInFlight = true;
+		Promise.resolve(flushRootStore())
+			.then(() => {
+				// rows up to cursorAtFlush are now durable in SST; dbisDB is WAL-on, so this persist is durable.
+				// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
+				if (copyFromNodeId !== undefined)
+					getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
+				if (cursorAtFlush === lastDurableCopyCursor) lastDurableCopyCursorPersisted = true;
+				copyFlushBackoffUntil = 0;
+				copyFlushRetryMs = 0; // flush succeeded; reset backoff
+				logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
+			})
+			.catch((error) => {
+				if (isDurableSnapshot) lastDurableCopyCursorPersisted = false;
+				else pendingCopyCursor ??= cursorAtFlush; // hold the staged cursor
+				// Escalating backoff (250ms → 30s cap) instead of an immediate re-flush, so a persistent flush
+				// failure idles rather than busy-looping; a scheduled retry drives progress without another event.
+				copyFlushRetryMs = Math.min(copyFlushRetryMs ? copyFlushRetryMs * 2 : 250, 30000);
+				copyFlushBackoffUntil = performance.now() + copyFlushRetryMs;
+				clearTimeout(copyFlushRetryTimer);
+				copyFlushRetryTimer = setTimeout(() => {
+					copyFlushRetryTimer = undefined;
+					flushDurableCopyCursor();
+				}, copyFlushRetryMs);
+				copyFlushRetryTimer.unref?.();
+				logger.warn?.(connectionId, `copy cursor flush failed; backing off ${copyFlushRetryMs}ms`, error);
+			})
+			.finally(() => {
+				copyFlushInFlight = false;
+				maybeFinishCopy();
+				// A gap that latched while THIS flush was in flight deferred its snapshot persist on
+				// copyFlushInFlight; on a quiescent link nothing else re-invokes it, so re-enter now (#683).
+				if (hasBlobGap) flushDurableCopyCursor();
+			});
 	}
 	// Select the copied DB's flush primitive: RocksDB exposes flush() (memtable -> SST); LMDB exposes a
 	// `flushed` promise. Returns undefined if neither is reachable. (replication targets RocksDB; the LMDB
@@ -2263,6 +2359,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// they do the byte-level receiveWatchdog. `copyProgressFrames` advances on every received 'message'
 	// while in copy mode; if it stalls past the threshold while still `connected`, the copy has wedged.
 	let copyProgressWatchdog: { reset: () => void; stop: () => void } | undefined;
+	let blobGapReconnectTimer: ReturnType<typeof createBlobGapReconnectTimer> | undefined;
 	let copyProgressFrames = 0;
 	// Count ONLY base-copy frames as progress — COPY_START, the per-batch copy records (isCopyFrame), and
 	// copy BLOB_CHUNKs — not every 'message'. replicateOverWS is bidirectional, so counting arbitrary
@@ -2462,6 +2559,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
 				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${blobTimeout}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
+			);
+			if (options.connection) options.connection.forceReconnect();
+			else ws.terminate();
+		},
+	});
+	// Blob-gap watchdog: a connection whose `hasBlobGap` latched keeps flowing frames and answering
+	// pings, so neither the byte watchdog nor the copy-progress watchdog above ever notices it — yet
+	// its durable cursors are pinned and only a reconnect (which re-streams the gapped blob) can heal
+	// it. Bound that state to blobTimeout instead of waiting for an unrelated reconnect (#683).
+	blobGapReconnectTimer = createBlobGapReconnectTimer({
+		timeoutMs: blobTimeout > 0 ? blobTimeout : 900000,
+		onGapHeld: () => {
+			if (wsClosed) return;
+			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+			logger.warn?.(
+				`Blob-gap watchdog: a blob gap from ${remoteNodeName}${dbContext} has pinned the resume cursor for ${blobTimeout}ms while connected — terminating connection and reconnecting to re-stream the gapped blob (harper-pro#683) — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -3079,6 +3192,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						inCopyMode = true;
 						if (!copyWasAlreadyActive) subscriptionSetupWatchdog?.pause();
 						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
+						// A prior pass's snapshot must not be persisted under this pass's copyStartTime/order (#683)
+						lastDurableCopyCursor = null;
+						lastDurableCopyCursorPersisted = true;
 						copiedTablesThisPass.clear(); // reset per-pass reload-marker tracking (harper-pro#495)
 						copyBytesSinceFlush = 0; // reset the copy-apply flush gate for this (re)start (harper-pro#480)
 						lastCopyFlushTime = performance.now();
@@ -4728,6 +4844,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		subscriptionSetupWatchdog?.stop();
 		pauseStallWatchdog?.stop();
 		copyProgressWatchdog?.stop();
+		blobGapReconnectTimer?.stop();
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
 		// The blobsTimer that would otherwise reap stalled receives is now cleared, and the connection is
@@ -4864,12 +4981,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				waitedMs: Date.now() - parkStartedAt,
 			});
 		}
-		const iterator = blob.stream()[Symbol.asyncIterator]();
 		// Track this send so a worker restart can gracefully drain it (finish it if it's still making
 		// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
 		const drainToken = registerBlobSend();
 		try {
-			let lastBuffer: Buffer;
 			outstandingBlobsBeingSent++;
 			// Per-chunk timeout: races each iterator.next() against a setTimeout reject so a stuck
 			// underlying read can't park the send loop forever. The local blob file may be missing or
@@ -4883,120 +4998,153 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS env var overrides it; set it to 0 to disable.
 			const rawEnv = process.env.HARPER_BLOB_SEND_CHUNK_TIMEOUT_MS;
 			const chunkTimeoutMs = rawEnv != null && rawEnv !== '' ? Math.max(0, Number(rawEnv) || 0) : blobTimeout;
-			while (true) {
-				let result: IteratorResult<any>;
-				if (chunkTimeoutMs > 0) {
-					let timer: NodeJS.Timeout | undefined;
-					try {
-						result = await Promise.race([
-							iterator.next(),
-							new Promise<never>((_, reject) => {
-								timer = setTimeout(
-									() => reject(new Error(`Blob send chunk timeout after ${chunkTimeoutMs}ms (fileId=${id})`)),
-									chunkTimeoutMs
-								);
-								timer.unref();
-							}),
-						]);
-					} finally {
-						if (timer) clearTimeout(timer);
+			// Once any chunk is on the wire the receiver holds partial state, so a failed read can only be
+			// resolved by the error frame; before that, a 503 read fault (transiently unavailable at this
+			// node — typically a PENDING placeholder from a concurrent receive, which heals within seconds)
+			// is retried in place rather than forwarded, since a forwarded 503 latches the receiver's blob
+			// gap and pins its resume cursor until a reconnect (#683).
+			let sentAnyChunk = false;
+			for (let attempt = 0; ; attempt++) {
+				const iterator = blob.stream()[Symbol.asyncIterator]();
+				try {
+					let lastBuffer: Buffer;
+					while (true) {
+						let result: IteratorResult<any>;
+						if (chunkTimeoutMs > 0) {
+							let timer: NodeJS.Timeout | undefined;
+							try {
+								result = await Promise.race([
+									iterator.next(),
+									new Promise<never>((_, reject) => {
+										timer = setTimeout(
+											() => reject(new Error(`Blob send chunk timeout after ${chunkTimeoutMs}ms (fileId=${id})`)),
+											chunkTimeoutMs
+										);
+										timer.unref();
+									}),
+								]);
+							} finally {
+								if (timer) clearTimeout(timer);
+							}
+						} else {
+							result = await iterator.next();
+						}
+						if (result.done) break;
+						const buffer = result.value as Buffer;
+						if (lastBuffer) {
+							logger.debug?.('Sending blob chunk', id, 'length', lastBuffer.length);
+							// do the previous buffer so we know if it is the last one or not
+							ws.send(
+								encode([
+									BLOB_CHUNK,
+									{
+										fileId: id,
+										size: blob.size,
+									},
+									lastBuffer,
+								])
+							);
+							sentAnyChunk = true;
+						}
+						lastBuffer = buffer;
+						// Optional-chain the guard: the connection can close during an await, leaving `_socket` null.
+						if (ws._socket?.writableNeedDrain) {
+							logger.debug?.('draining', id);
+							// Waiting on the socket to flush IS progress — mark it so a shutdown drain doesn't misread a
+							// slow-but-alive peer (a large chunk taking longer than the stall window to flush) as stalled.
+							noteBlobSendProgress(drainToken);
+							// Races against close/error so a mid-flush disconnect still lets `finally` below run
+							// (endBlobSend/outstandingBlobsBeingSent cleanup) instead of hanging on a `drain` that
+							// will never fire (harper-pro#529 review, cb1kenobi).
+							await waitForDrainOrSocketEnd(ws._socket, ws);
+							logger.debug?.('drained', id);
+						}
+						recordAction(buffer.length, 'bytes-sent', `${remoteNodeName}.${databaseName}`, 'replication', 'blob');
+						noteBlobSendProgress(drainToken);
 					}
-				} else {
-					result = await iterator.next();
-				}
-				if (result.done) break;
-				const buffer = result.value as Buffer;
-				if (lastBuffer) {
-					logger.debug?.('Sending blob chunk', id, 'length', lastBuffer.length);
-					// do the previous buffer so we know if it is the last one or not
+					logger.debug?.('Sending final blob chunk', id, 'length', lastBuffer.length);
+					if (checkExcessMessageSize(lastBuffer.length)) throw new Error('Blob chunk too large');
 					ws.send(
 						encode([
 							BLOB_CHUNK,
 							{
 								fileId: id,
 								size: blob.size,
+								finished: true,
 							},
 							lastBuffer,
 						])
 					);
-				}
-				lastBuffer = buffer;
-				// Optional-chain the guard: the connection can close during an await, leaving `_socket` null.
-				if (ws._socket?.writableNeedDrain) {
-					logger.debug?.('draining', id);
-					// Waiting on the socket to flush IS progress — mark it so a shutdown drain doesn't misread a
-					// slow-but-alive peer (a large chunk taking longer than the stall window to flush) as stalled.
+					sentAnyChunk = true;
 					noteBlobSendProgress(drainToken);
-					// Races against close/error so a mid-flush disconnect still lets `finally` below run
-					// (endBlobSend/outstandingBlobsBeingSent cleanup) instead of hanging on a `drain` that
-					// will never fire (harper-pro#529 review, cb1kenobi).
-					await waitForDrainOrSocketEnd(ws._socket, ws);
-					logger.debug?.('drained', id);
+					// Keep this send "in flight" until the terminal frame has actually flushed to the socket, so a
+					// concurrent shutdown drain waits for the `finished:true` frame rather than exiting with it still
+					// buffered (which would leave the peer's blob diverged until it re-requests). Only waits under
+					// backpressure; if the peer stops reading, the drain's stall detection abandons it after the
+					// stall window and the receiver re-requests (harper-pro#527).
+					if (ws._socket?.writableNeedDrain) {
+						// Same close/error race as the mid-loop wait above — otherwise a peer that disconnects
+						// while this terminal-frame flush is parked on backpressure never lets `finally` run.
+						await waitForDrainOrSocketEnd(ws._socket, ws);
+						noteBlobSendProgress(drainToken);
+					}
+					break;
+				} catch (error) {
+					try {
+						await iterator.return?.();
+					} catch {}
+					if (
+						!sentAnyChunk &&
+						!wsClosed &&
+						attempt < BLOB_SEND_RETRY_DELAYS_MS.length &&
+						isRetriableSourceBlobReadError(error)
+					) {
+						logger.debug?.(
+							'Blob read transiently unavailable; retrying before forwarding the error',
+							id,
+							'attempt',
+							attempt + 1,
+							errorToString(error)
+						);
+						await delay(BLOB_SEND_RETRY_DELAYS_MS[attempt]);
+						noteBlobSendProgress(drainToken);
+						continue;
+					}
+					// Throttle the warn (a peer backfilling thousands of already-deleted blobs makes this fire
+					// at kHz); the error frame below is unconditional
+					const errorLogTime = Date.now();
+					if (errorLogTime - lastBlobSendErrorLog >= 5000) {
+						if (blobSendErrorsSuppressed > 0) {
+							logger.warn?.(`Suppressed ${blobSendErrorsSuppressed} additional blob send errors in the last 5s`);
+						}
+						blobSendErrorsSuppressed = 0;
+						lastBlobSendErrorLog = errorLogTime;
+						logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
+					} else blobSendErrorsSuppressed++;
+					// Forward the error CODE and STATUS alongside the message so the receiver can tell a PERMANENT
+					// source failure — the blob is gone (ENOENT/404) or confidently corrupt/incomplete (500,
+					// harper-pro#429) — from a TRANSIENT read fault (EIO, EMFILE, timeout, 503 write-in-progress —
+					// a reconnect may succeed). Only the former lets the receiver advance the resume cursor past the
+					// blob; the latter must still hold so the gap is retried. `errorCode` is the fs `.code` (set by
+					// pre-#1425 core); `errorStatus` is the HTTP-style status core PR harper#1425 attaches to
+					// `BlobReadError` (its read paths no longer carry a raw fs `.code`). See harper-pro#403 and
+					// receiveBlobs's classification.
+					ws.send(
+						encode([
+							BLOB_CHUNK,
+							{
+								fileId: id,
+								finished: true,
+								error: errorToString(error),
+								errorCode: (error as { code?: string })?.code,
+								errorStatus: (error as { statusCode?: number })?.statusCode,
+							},
+							Buffer.alloc(0),
+						])
+					);
+					break;
 				}
-				recordAction(buffer.length, 'bytes-sent', `${remoteNodeName}.${databaseName}`, 'replication', 'blob');
-				noteBlobSendProgress(drainToken);
 			}
-			logger.debug?.('Sending final blob chunk', id, 'length', lastBuffer.length);
-			if (checkExcessMessageSize(lastBuffer.length)) throw new Error('Blob chunk too large');
-			ws.send(
-				encode([
-					BLOB_CHUNK,
-					{
-						fileId: id,
-						size: blob.size,
-						finished: true,
-					},
-					lastBuffer,
-				])
-			);
-			noteBlobSendProgress(drainToken);
-			// Keep this send "in flight" until the terminal frame has actually flushed to the socket, so a
-			// concurrent shutdown drain waits for the `finished:true` frame rather than exiting with it still
-			// buffered (which would leave the peer's blob diverged until it re-requests). Only waits under
-			// backpressure; if the peer stops reading, the drain's stall detection abandons it after the
-			// stall window and the receiver re-requests (harper-pro#527).
-			if (ws._socket?.writableNeedDrain) {
-				// Same close/error race as the mid-loop wait above — otherwise a peer that disconnects
-				// while this terminal-frame flush is parked on backpressure never lets `finally` run.
-				await waitForDrainOrSocketEnd(ws._socket, ws);
-				noteBlobSendProgress(drainToken);
-			}
-		} catch (error) {
-			try {
-				await iterator.return?.();
-			} catch {}
-			// Throttle the warn (a peer backfilling thousands of already-deleted blobs makes this fire
-			// at kHz); the error frame below is unconditional
-			const errorLogTime = Date.now();
-			if (errorLogTime - lastBlobSendErrorLog >= 5000) {
-				if (blobSendErrorsSuppressed > 0) {
-					logger.warn?.(`Suppressed ${blobSendErrorsSuppressed} additional blob send errors in the last 5s`);
-				}
-				blobSendErrorsSuppressed = 0;
-				lastBlobSendErrorLog = errorLogTime;
-				logger.warn?.('Error sending blob', error, 'blob id', id, 'for record', recordId);
-			} else blobSendErrorsSuppressed++;
-			// Forward the error CODE and STATUS alongside the message so the receiver can tell a PERMANENT
-			// source failure — the blob is gone (ENOENT/404) or confidently corrupt/incomplete (500,
-			// harper-pro#429) — from a TRANSIENT read fault (EIO, EMFILE, timeout, 503 write-in-progress —
-			// a reconnect may succeed). Only the former lets the receiver advance the resume cursor past the
-			// blob; the latter must still hold so the gap is retried. `errorCode` is the fs `.code` (set by
-			// pre-#1425 core); `errorStatus` is the HTTP-style status core PR harper#1425 attaches to
-			// `BlobReadError` (its read paths no longer carry a raw fs `.code`). See harper-pro#403 and
-			// receiveBlobs's classification.
-			ws.send(
-				encode([
-					BLOB_CHUNK,
-					{
-						fileId: id,
-						finished: true,
-						error: errorToString(error),
-						errorCode: (error as { code?: string })?.code,
-						errorStatus: (error as { statusCode?: number })?.statusCode,
-					},
-					Buffer.alloc(0),
-				])
-			);
 		} finally {
 			endBlobSend(drainToken);
 			blobsBeingSent.delete(id);
@@ -5052,6 +5200,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							connectionId,
 							`Blob ${blobId} receive interrupted by connection close; will re-request on reconnect`
 						);
+						// No watchdog arm here: this branch only runs because the connection is already closing,
+						// so the healing reconnect is already in motion (#683).
 						hasBlobGap = true;
 						return;
 					}
@@ -5079,8 +5229,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// clamp the persisted resume cursor at the last fully-durable transaction
 						// (lastDurableSequenceId) instead of advancing over the gap; records keep flowing live and
 						// the next reconnect/restart resumes from the clamp and re-saves the disrupted blob. A
-						// transient catch-up fault (e.g. a blob-stream timeout) clears on resume.
+						// transient catch-up fault (e.g. a blob-stream timeout) clears on resume. Nothing else in
+						// the connection's lifetime clears the latch, so bound it: the watchdog forces the healing
+						// reconnect if none happens on its own (#683).
 						hasBlobGap = true;
+						blobGapReconnectTimer?.arm();
 					}
 					// Either failure is an observable divergence: surface the metric (cluster_status) and, on a
 					// sustained link, one escalation line — see harper-pro#386.
