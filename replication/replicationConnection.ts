@@ -925,22 +925,45 @@ export const BLOB_SEND_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
  * Whether a failed source blob read is worth retrying in place before forwarding the error to the
  * receiver: 503 means transiently unavailable at this node (pending replication receive, or a read
  * mid-write) — unlike the permanent classes above (ENOENT/404/500) or a local fs fault, both of which
- * should be forwarded immediately. Pure so the classification is unit-testable (#683).
+ * should be forwarded immediately (#683).
  */
 export function isRetriableSourceBlobReadError(error: unknown): boolean {
 	return typeof error === 'object' && error !== null && (error as { statusCode?: number }).statusCode === 503;
 }
 
 /**
- * One-shot reconnect timer for a held blob gap (#683). `hasBlobGap` latches on the first transient
+ * Whether `sendBlobs` should retry a failed source blob read in place instead of forwarding the
+ * error frame (#683): only a 503-class fault, only while the receiver holds no partial state
+ * (nothing sent yet), never on a closed connection or one draining for worker shutdown (the peer
+ * re-requests on reconnect, #527), and only within the bounded delay schedule.
+ */
+export function shouldRetrySourceBlobRead(state: {
+	error: unknown;
+	sentAnyChunk: boolean;
+	wsClosed: boolean;
+	draining: boolean;
+	attempt: number;
+}): boolean {
+	return (
+		!state.sentAnyChunk &&
+		!state.wsClosed &&
+		!state.draining &&
+		state.attempt < BLOB_SEND_RETRY_DELAYS_MS.length &&
+		isRetriableSourceBlobReadError(state.error)
+	);
+}
+
+/**
+ * Repeating reconnect timer for a held blob gap (#683). `hasBlobGap` latches on the first transient
  * blob-save failure and nothing in the connection's lifetime clears it — only a reconnect (fresh
  * connection state) re-streams the gapped blob, whose source-side fault typically heals within
  * seconds. A gapped connection keeps flowing frames and answering pings, so no byte/frame watchdog
  * ever notices it; without this timer the durable cursors stay pinned until an UNRELATED reconnect
  * happens along (observed 3.7h in the field), and each such reconnect resumes a whole-table base
- * copy. Armed at the first latch; fires `onGapHeld` once if the connection is still up after
- * `timeoutMs`. `stop()` cancels on connection close. Exported so the one-shot/cancel contract is
- * unit-testable; the production caller wires `onGapHeld` to the #453-style force-reconnect.
+ * copy. Armed at the first latch; fires `onGapHeld` after each `timeoutMs` the connection remains
+ * up, re-arming itself — `forceReconnect()` can be a no-op (a retry already scheduled and later
+ * abandoned), and a one-shot fire landing there would leave the wedge unbounded again. `stop()`
+ * cancels on connection close.
  */
 export function createBlobGapReconnectTimer(opts: { timeoutMs: number; onGapHeld: () => void }): {
 	arm: () => void;
@@ -948,17 +971,17 @@ export function createBlobGapReconnectTimer(opts: { timeoutMs: number; onGapHeld
 	isArmed: () => boolean;
 } {
 	let timer: NodeJS.Timeout | undefined;
-	let fired = false;
+	const arm = () => {
+		if (timer) return;
+		timer = setTimeout(() => {
+			timer = undefined;
+			arm();
+			opts.onGapHeld();
+		}, opts.timeoutMs);
+		timer.unref?.();
+	};
 	return {
-		arm() {
-			if (timer || fired) return;
-			timer = setTimeout(() => {
-				timer = undefined;
-				fired = true;
-				opts.onGapHeld();
-			}, opts.timeoutMs);
-			timer.unref?.();
-		},
+		arm,
 		stop() {
 			if (timer) clearTimeout(timer);
 			timer = undefined;
@@ -2278,9 +2301,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// A held gap permanently blocks the staged cursor, but the pre-gap snapshot is still safe to
 			// persist — do that once, so a reconnect resumes the copy from the last gap-free point rather
 			// than from the last cadence flush (#683). In-flight blobs without a gap drain in bounded time
-			// and the normal path below persists then, so they just wait, as before.
-			if (hasBlobGap && lastDurableCopyCursor && !lastDurableCopyCursorPersisted)
-				persistCopyCursor(lastDurableCopyCursor, true);
+			// and the normal path below persists then, so they just wait, as before. This runs inside the
+			// blob-save `.finally` whose promise onCommit awaits, so a synchronous store throw here (likely
+			// correlated with the very fault that latched the gap, e.g. ENOSPC) must not escape as a
+			// rejection of that awaited promise — catch, log, and leave the snapshot unpersisted.
+			if (hasBlobGap && lastDurableCopyCursor && !lastDurableCopyCursorPersisted) {
+				try {
+					persistCopyCursor(lastDurableCopyCursor, true);
+				} catch (error) {
+					lastDurableCopyCursorPersisted = false;
+					logger.warn?.(connectionId, 'failed to persist the pre-gap copy cursor snapshot', error);
+				}
+			}
 			return;
 		}
 		if (pendingCopyCursor) {
@@ -2299,7 +2331,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// by lastDurableCopyCursorPersisted) so it flushes immediately — it is the last persist this
 	// connection will ever perform, and (b)'s reconnect must find it on disk (#683).
 	function persistCopyCursor(cursor: typeof pendingCopyCursor, isDurableSnapshot: boolean) {
-		if (copyFromNodeId === undefined) return;
+		// Once the connection is closed its persists must stop: a replacement connection owns the same
+		// [copyCursor, nodeId] key and has moved (or removed) it, so a late write from this closure —
+		// the flush-failure retry timer, or a flush `.then` that resolves after close — would overwrite
+		// newer resume state with stale, or resurrect a cursor for a completed copy (#683 review).
+		if (wsClosed || copyFromNodeId === undefined) return;
 		if (!copyApplyActive()) {
 			// Non-copyApply copies (LMDB, or the system DB) stay audited (durable via the transaction log), so
 			// the cursor needs no RocksDB flush gate — persist it directly, exactly as before copyApply. (#480)
@@ -2335,6 +2371,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			.then(() => {
 				// rows up to cursorAtFlush are now durable in SST; dbisDB is WAL-on, so this persist is durable.
 				// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
+				// The close-check mirrors the entry guard: the flush may resolve after this connection died.
+				if (wsClosed) return;
 				if (copyFromNodeId !== undefined)
 					getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
 				if (cursorAtFlush === lastDurableCopyCursor) lastDurableCopyCursorPersisted = true;
@@ -4950,6 +4988,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		pauseStallWatchdog?.stop();
 		copyProgressWatchdog?.stop();
 		blobGapReconnectTimer?.stop();
+		// A pending copy-cursor flush retry must die with the connection: persistCopyCursor guards on
+		// wsClosed, and leaving the timer would only wake a closure whose persists are all no-ops now.
+		clearTimeout(copyFlushRetryTimer);
+		copyFlushRetryTimer = undefined;
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
 		// The blobsTimer that would otherwise reap stalled receives is now cleared, and the connection is
@@ -5198,12 +5240,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					try {
 						await iterator.return?.();
 					} catch {}
-					if (
-						!sentAnyChunk &&
-						!wsClosed &&
-						attempt < BLOB_SEND_RETRY_DELAYS_MS.length &&
-						isRetriableSourceBlobReadError(error)
-					) {
+					if (shouldRetrySourceBlobRead({ error, sentAnyChunk, wsClosed, draining: isDrainingBlobSends(), attempt })) {
 						logger.debug?.(
 							'Blob read transiently unavailable; retrying before forwarding the error',
 							id,
@@ -5211,8 +5248,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							attempt + 1,
 							errorToString(error)
 						);
+						// Deliberately NOT noted as blob-send progress: a purely-retrying send has moved no
+						// bytes, and a shutdown drain should be free to reap it (the peer re-requests, #527).
 						await delay(BLOB_SEND_RETRY_DELAYS_MS[attempt]);
-						noteBlobSendProgress(drainToken);
 						continue;
 					}
 					// Throttle the warn (a peer backfilling thousands of already-deleted blobs makes this fire
