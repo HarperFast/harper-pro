@@ -922,6 +922,21 @@ export function shouldRetrySourceBlobRead(state: {
 }
 
 /**
+ * Whether a `replicateOverWS` closure no longer owns its (peer, db) link (#683). `wsClosed` alone
+ * is NOT sufficient: `forceReconnect`'s teardown of the old socket is best-effort and may never
+ * fire 'close' (the #420 open-but-idle wedge), while the replacement installs a new `socket` on
+ * the shared connection object — so ownership is socket identity, the same test the close handler
+ * uses. An inbound connection (no `connection` object) degrades to `wsClosed`.
+ */
+export function isConnectionSuperseded(
+	wsClosed: boolean,
+	connection: { socket?: unknown } | null | undefined,
+	ws: unknown
+): boolean {
+	return wsClosed || (connection != null && connection.socket !== ws);
+}
+
+/**
  * Repeating reconnect timer for a held blob gap (#683). `hasBlobGap` latches on the first transient
  * blob-save failure and nothing in the connection's lifetime clears it — only a reconnect (fresh
  * connection state) re-streams the gapped blob, whose source-side fault typically heals within
@@ -2184,6 +2199,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// and risk a crash that loses both the cursor and the not-yet-durable rows, leaving the next start to
 	// resume from seqId with gaps.
 	function maybeFinishCopy() {
+		// The removal below targets the same [copyCursor, nodeId] key the ownership guards in
+		// persistCopyCursor protect: a superseded closure's late flush `.finally` reaching here would
+		// delete the REPLACEMENT connection's cursor and force a from-scratch re-copy (#683).
+		if (connectionSuperseded()) return;
 		// Finishing REMOVES the copy resume cursor and exits copy mode, so it must only happen once the copy
 		// is fully durable: COPY_COMPLETE received, every batch committed (outstandingCommits drained), AND —
 		// since onCommit no longer awaits blobs (#426) — every copied blob durably saved with no held gap.
@@ -2263,7 +2282,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// flushRootStore() evaluated before Promise.resolve — likely the same ENOSPC that failed the
 		// blob save) must not escape as a rejection of that awaited promise.
 		const onPersistFailure = (error: unknown) => {
-			copyFlushInFlight = false;
 			if (isDurableSnapshot) lastDurableCopyCursorPersisted = false;
 			else pendingCopyCursor ??= cursor; // hold the staged cursor
 			// Escalating backoff (250ms → 30s cap) instead of an immediate re-flush, so a persistent flush
@@ -2309,8 +2327,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			else pendingCopyCursor = null;
 			copyBytesSinceFlush = 0;
 			lastCopyFlushTime = performance.now();
+			// flushRootStore() can throw synchronously; invoke it BEFORE taking the in-flight flag so the
+			// catch below never clears a flag a different, genuinely in-flight flush owns.
+			const flushStarted = flushRootStore();
 			copyFlushInFlight = true;
-			Promise.resolve(flushRootStore())
+			Promise.resolve(flushStarted)
 				.then(() => {
 					// rows up to cursorAtFlush are now durable in SST; dbisDB is WAL-on, so this persist is durable.
 					// Order (flush data -> persist cursor) keeps the cursor from ever pointing past durable rows.
@@ -2749,13 +2770,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
 	let wsClosed = false;
-	// Whether this closure no longer owns the (peer, db) link. `wsClosed` alone is NOT enough:
-	// forceReconnect's teardown of the old socket is best-effort and may never fire 'close' (the
-	// open-but-idle wedge, #420), while the replacement connection installs a new `socket` on the
-	// shared connection object. Anything this closure persists (copy cursors) or forces (the
-	// blob-gap watchdog's reconnect) after that point would act against the replacement's state,
-	// so it must check ownership, not just closure (#683).
-	const connectionSuperseded = () => wsClosed || (options.connection != null && options.connection.socket !== ws);
+	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
+	// watchdog's reconnect) after losing ownership would act against the replacement's state.
+	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
 	// Receive-side resume-cursor durability watermark. A record is "fully durable" only once it is
 	// committed AND its blob (and all earlier blobs) have finished saving; the persisted replication
 	// resume cursor must never advance past that point. We track this with an ASYNC watermark rather
@@ -5123,6 +5140,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						recordAction(buffer.length, 'bytes-sent', `${remoteNodeName}.${databaseName}`, 'replication', 'blob');
 						noteBlobSendProgress(drainToken);
 					}
+					// A zero-chunk stream (a legitimately empty blob) leaves lastBuffer unset; send the
+					// terminal frame with an empty body rather than throwing. The old TypeError here fed the
+					// receiver a code-less error frame, classified transient, latching its gap — with the
+					// repeating watchdog that would now mean a reconnect cycle every blobTimeout, forever.
+					lastBuffer ??= Buffer.alloc(0);
 					logger.debug?.('Sending final blob chunk', id, 'length', lastBuffer.length);
 					if (checkExcessMessageSize(lastBuffer.length)) throw new Error('Blob chunk too large');
 					ws.send(
