@@ -4517,13 +4517,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						);
 					} else {
 						// Any other decode failure: skip + advance, and COUNT it (decode-drop) — the class we don't
-						// recognize is the one an operator most needs a number for (harper-pro#537 review). Known gap:
-						// a blob that is in-flight/mid-restream at decode time also surfaces here as a generic underrun
-						// and is skipped rather than held; telling that transient case apart from a permanently
-						// undecodable record needs the #403 blob-gap taxonomy wired into this path (a naive hold would
-						// re-wedge a permanently-missing blob) — tracked as follow-up, not done here. Decoder
-						// dictionaries passed as objects (not eager JSON.stringify) so the format cost is paid only when
-						// the log emits.
+						// recognize is the one an operator most needs a number for (harper-pro#537 review). What lands
+						// here is a truncated/mis-framed or structure-forked record VALUE buffer: a blob reference
+						// decodes to a lazy handle (no read on this path), so an in-flight blob produces no decode error
+						// at all — its transient (503 → hold) vs permanent split is the async receiveBlobs/#403 path,
+						// not this catch. Decoder dictionaries passed as objects (not eager JSON.stringify) so the
+						// format cost is paid only when the log emits.
 						recordAction(true, DECODE_DROP_METRIC, databaseName + '.' + tableDecoder.name);
 						logger.error?.(
 							connectionId,
