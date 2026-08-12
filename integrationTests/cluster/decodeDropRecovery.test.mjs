@@ -134,8 +134,10 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 	});
 
 	after(async () => {
-		await teardownHarper(ctx.nodeA).catch(() => {});
-		await teardownHarper(ctx.nodeB).catch(() => {});
+		// Guard against a before-hook that threw/skipped before either node was assigned —
+		// teardownHarper(undefined) would throw synchronously, which .catch() wouldn't reach.
+		if (ctx.nodeA) await teardownHarper(ctx.nodeA).catch(() => {});
+		if (ctx.nodeB) await teardownHarper(ctx.nodeB).catch(() => {});
 	});
 
 	test('B joins A, skips the undecodable records, and stays alive', async () => {
@@ -150,8 +152,10 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 		});
 
 		// (1) every clean row arrives — the leg is NOT starved behind the poison record.
-		const count = await waitForCount(ctx.nodeB, EXPECTED_GOOD);
-		ok(count >= EXPECTED_GOOD, `B has ${count} rows, expected >= ${EXPECTED_GOOD}`);
+		// waitForCount throws if B never reaches EXPECTED_GOOD within the timeout; that throw
+		// is the assertion (a trailing ok(count >= target) would be dead — waitForCount only
+		// returns on success).
+		await waitForCount(ctx.nodeB, EXPECTED_GOOD);
 
 		// (2) the poison records were skipped, not applied.
 		for (let i = 1; i <= POISON_COUNT; i++) {
