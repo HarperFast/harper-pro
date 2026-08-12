@@ -1388,6 +1388,13 @@ export function isCopyResumeOrderCompatible(copyOrder: number | undefined, order
 // `decode-missing-structure` counter as the local-read drop. (harper#1163)
 export const DECODE_MISSING_STRUCTURE_METRIC = 'decode-missing-structure';
 
+// Every dropped/held record is counted, so a stuck-but-retrying node can't look identical to a healthy
+// one and a silent skip can't masquerade as "caught up" (harper-pro#537 review). `decode-drop`: record
+// skipped and the cursor advanced (any decode failure that is not the missing-structure class above).
+// `decode-hold`: record retained, connection closed to resync, cursor NOT advanced (unknown table id).
+export const DECODE_DROP_METRIC = 'decode-drop';
+export const DECODE_HOLD_METRIC = 'decode-hold';
+
 /**
  * Classify a decode error thrown while applying a received copy/audit record, choosing how loudly to
  * surface the skip. (harper-pro#537)
@@ -4405,6 +4412,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						connectionId,
 						`No decoder for table id ${auditRecord.tableId} in ${databaseName}; holding and reconnecting to resync table structures`
 					);
+					recordAction(true, DECODE_HOLD_METRIC, databaseName + '.' + auditRecord.tableId);
+					// Latch inbound off BEFORE closing (markInboundClosed-first, #440): frames already queued on the
+					// messageProcessing chain — or delivered by the peer before the close handshake completes — would
+					// otherwise run onWSMessage and advance the resume cursor past this held record, silently turning
+					// the hold into a skip. `close()` alone does not set `wsClosed`.
+					wsClosed = true;
 					close(1011, 'missing table structure; reconnecting to resync');
 					return;
 				}
@@ -4486,10 +4499,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						}
 					);
 				} catch (error) {
-					// A decode failure here is treated as permanent: skip the record and let the cursor advance
-					// (harper-pro#537). The old bare catch already skipped, but silently — it never distinguished
-					// or metricized the genuinely-unrecoverable missing-structure case. classifyReplicationDecodeError
-					// only chooses how loudly to surface the drop.
+					// tableDecoder is guaranteed set here (the unknown-tableId case returns above), so the derefs
+					// below are safe without optional chaining. Every failure is counted; classifyReplicationDecodeError
+					// only picks the label (harper-pro#537). The old bare catch skipped silently — no metric, no class.
 					if (classifyReplicationDecodeError(error) === 'skip-missing-structure') {
 						// Missing shared structure (harper#1163): genuinely absent on this node, re-copy re-ships the
 						// same undecodable bytes. Surface it through the same metric core's local-read path fires so
@@ -4504,10 +4516,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							error
 						);
 					} else {
-						// Unexpected post-root-cause decode failure — log loudly for investigation. Still skipped (the
-						// record is undecodable on this node); the cursor advances past it below. Pass the decoder
-						// dictionaries as objects (not eager JSON.stringify) so the formatting cost is paid only when
-						// the log actually emits, not on every dropped record.
+						// Any other decode failure: skip + advance, and COUNT it (decode-drop) — the class we don't
+						// recognize is the one an operator most needs a number for (harper-pro#537 review). Known gap:
+						// a blob that is in-flight/mid-restream at decode time also surfaces here as a generic underrun
+						// and is skipped rather than held; telling that transient case apart from a permanently
+						// undecodable record needs the #403 blob-gap taxonomy wired into this path (a naive hold would
+						// re-wedge a permanently-missing blob) — tracked as follow-up, not done here. Decoder
+						// dictionaries passed as objects (not eager JSON.stringify) so the format cost is paid only when
+						// the log emits.
+						recordAction(true, DECODE_DROP_METRIC, databaseName + '.' + tableDecoder.name);
 						logger.error?.(
 							connectionId,
 							'Error decoding replication message, record id: ' + id,
