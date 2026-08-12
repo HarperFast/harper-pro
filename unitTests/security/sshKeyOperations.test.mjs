@@ -12,6 +12,10 @@
  *  - `update_ssh_key` rotation and `list_ssh_keys` (names only) are externally unchanged
  *  - degraded mode: no custody → plaintext (today's behavior) plus a loud WARN
  *
+ * Plus `generate: true` (harper-pro#594), where the node mints the keypair itself: the minted private
+ * half must take that same seal-then-replicate path, and `generate` must not survive into the
+ * replicated op. The encoding of the minted key is covered in `sshKeyGeneration.test.mjs`.
+ *
  * The at-use half — decrypting to a transient 0600 file for the git invocation — lives in core
  * (`materializeGitSSH`) and is covered by core's Application tests.
  */
@@ -175,6 +179,61 @@ describe('sshKeyOperations sealing', () => {
 			assert.equal(entry.key, undefined);
 			assert.ok('host' in entry && 'hostname' in entry);
 		}
+	});
+
+	describe('generate: true (harper-pro#594)', () => {
+		it('mints the keypair, returns the public half, and seals the private half like a supplied key', async () => {
+			const req = request({ name: 'minted', generate: true, host: 'gh', hostname: 'github.com' });
+			const response = await ops.addSSHKey(req);
+
+			assert.equal(response.message, 'Added ssh key: minted');
+			assert.match(response.public_key, /^ssh-ed25519 [A-Za-z0-9+/=]+ harper:minted$/);
+
+			// the private half took the same seal-at-rest path a client-supplied key takes
+			const stored = storedKeyFor('minted');
+			assert.ok(stored.startsWith('enc:v1:'), 'the minted key must be sealed at rest');
+			assert.match(decrypt(stored), /^-----BEGIN OPENSSH PRIVATE KEY-----\n/);
+			assert.equal(statSync(join(sshDir, 'minted.key')).mode & 0o777, 0o600);
+
+			// the minted plaintext must not reach the wire either
+			assert.equal(req.key, stored);
+			assert.ok(!req.key.includes('OPENSSH PRIVATE KEY'));
+		});
+
+		it('strips `generate` before replicating, so a peer stores the minted key instead of minting its own', async () => {
+			// left in place, the replicated op would carry both `generate` and the minted `key` — which
+			// addSSHKey's mutual-exclusion guard would then reject on every peer
+			const req = request({ name: 'minted', generate: true, host: 'gh', hostname: 'github.com' });
+			await ops.addSSHKey(req);
+
+			assert.ok(!('generate' in req), 'the replicated op body must not carry `generate`');
+			assert.ok(req.key.startsWith('enc:v1:'), 'it carries the sealed minted key instead');
+		});
+
+		it('refuses `generate` together with `key`', async () => {
+			await assert.rejects(
+				ops.addSSHKey(request({ name: 'both', generate: true, key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' })),
+				/Provide either `key` or `generate: true`, not both/
+			);
+		});
+
+		it('refuses neither `generate` nor `key`', async () => {
+			await assert.rejects(
+				ops.addSSHKey(request({ name: 'neither', host: 'gh', hostname: 'example.com' })),
+				/requires `key`, or `generate: true`/
+			);
+		});
+
+		it('rejects a duplicate name before minting anything', async () => {
+			await ops.addSSHKey(request({ name: 'taken', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' }));
+			const before = storedKeyFor('taken');
+
+			await assert.rejects(
+				ops.addSSHKey(request({ name: 'taken', generate: true, host: 'gh', hostname: 'example.com' })),
+				/Key already exists/
+			);
+			assert.equal(storedKeyFor('taken'), before, 'the existing key must be untouched');
+		});
 	});
 
 	it('get_ssh_key returns the stored envelope, so the clone path carries ciphertext too', async () => {

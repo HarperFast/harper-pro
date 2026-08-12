@@ -1,21 +1,6 @@
 import Joi from 'joi';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { tmpdir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
-import {
-	constants,
-	access,
-	readFile,
-	writeFile,
-	unlink,
-	chmod,
-	appendFile,
-	mkdir,
-	mkdtemp,
-	readdir,
-	rm,
-} from 'node:fs/promises';
+import { constants, access, readFile, writeFile, unlink, chmod, appendFile, mkdir, readdir } from 'node:fs/promises';
 
 import { validateBySchema } from '../core/validation/validationWrapper.js';
 import harperLogger from '../core/utility/logging/harper_logger.js';
@@ -26,6 +11,7 @@ import { getSecretCustody } from '../core/resources/secretDecryptor.ts';
 import { encryptEnvelope, parseEnvelopeFields } from '../core/utility/secretEnvelope.ts';
 import { ENV_ENCRYPTED_PREFIX } from '../core/utility/envFile.ts';
 import { replicateOperation } from '../replication/replicator.ts';
+import { generateEd25519SSHKeyPair } from './sshKeyGeneration.ts';
 
 // SSH key name can only be alphanumeric, dash and underscores
 const SSH_KEY_NAME_REGEX = /^[a-zA-Z0-9-_]+$/;
@@ -91,31 +77,6 @@ function sealSSHKey(name: string, key: string): string {
 	return ENV_ENCRYPTED_PREFIX + encryptEnvelope(key, publicKey, fingerprint);
 }
 
-const execFileAsync = promisify(execFile);
-
-// Mint an ed25519 keypair on this node (via ssh-keygen) for `add_ssh_key generate=true`, so the
-// private key is created on the cluster and never travels from the client. Async (never blocks the
-// event loop); temp material is removed before returning. The minted private key then flows through
-// the same seal-at-rest + replicate path (sealSSHKey) as a client-supplied key.
-async function generateEd25519KeyPair(comment: string): Promise<{ privateKey: string; publicKey: string }> {
-	const dir = await mkdtemp(join(tmpdir(), 'hdb-ssh-'));
-	const keyFile = join(dir, 'id');
-	try {
-		try {
-			await execFileAsync('ssh-keygen', ['-t', 'ed25519', '-N', '', '-C', comment, '-f', keyFile]);
-		} catch (error) {
-			// ssh-keygen couldn't run (e.g. not on PATH) — surface an actionable ClientError, never key
-			// material (ssh-keygen writes the key to `keyFile`, not to stderr).
-			throw new ClientError(`SSH key generation failed: ssh-keygen could not run (${(error as Error).message})`);
-		}
-		const privateKey = await readFile(keyFile, 'utf8');
-		const publicKey = (await readFile(`${keyFile}.pub`, 'utf8')).trim();
-		return { privateKey, publicKey };
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-}
-
 const addValidationSchema = Joi.object({
 	name: Joi.string().pattern(SSH_KEY_NAME_REGEX).required().messages({ 'string.pattern.base': SSH_KEY_NAME_ERROR_MSG }),
 	// `key` is optional so it can be omitted with `generate: true` (the server mints it); the
@@ -179,11 +140,15 @@ interface AddSSHKeyRequest {
  *
  * @param req - The request object containing the SSH key details.
  * @param req.name - The name of the SSH key to add.
- * @param req.key - The SSH key contents, either plaintext or an `enc:v1:` envelope.
+ * @param req.key - The SSH key contents, either plaintext or an `enc:v1:` envelope. Mutually
+ * exclusive with `generate`; exactly one of the two is required.
+ * @param req.generate - Mint an ed25519 keypair on this node instead of supplying `key`, so the
+ * private half never travels from the client. The public half comes back as `public_key`.
  * @param req.host - The Host alias to use in the SSH config block.
  * @param req.hostname - The HostName (real hostname) to use in the SSH config block.
  * @param req.known_hosts - Optional known_hosts entries to append to the known_hosts file.
- * @returns An object containing a success message and optional replication results.
+ * @returns An object containing a success message, optional replication results, and `public_key`
+ * when the keypair was generated.
  */
 export async function addSSHKey(
 	req: AddSSHKeyRequest
@@ -198,9 +163,9 @@ export async function addSSHKey(
 		throw new ClientError('Provide either `key` or `generate: true`, not both.');
 	}
 
-	// Reject a duplicate name BEFORE minting anything. With `generate: true` a taken name means the add
-	// is already doomed, so generating first would spawn ssh-keygen and write throwaway private-key
-	// material to a temp file for a request guaranteed to throw below.
+	// Reject a duplicate name BEFORE minting anything: with `generate: true` a taken name means the add
+	// is already doomed, so there is no reason to mint private-key material for a request guaranteed to
+	// throw below.
 	const { filePath, configFile, knownHostsFile } = getSSHPaths(req.name);
 	if (await exists(filePath)) {
 		throw new ClientError('Key already exists. Use update_ssh_key or delete_ssh_key and then add_ssh_key');
@@ -208,10 +173,11 @@ export async function addSSHKey(
 
 	// With `generate: true`, mint the keypair here so the private key never leaves the cluster; the
 	// public half is returned for the caller to register (e.g. a GitHub deploy key). The minted key
-	// then flows through the same seal-at-rest + replicate path (sealSSHKey) as a supplied one.
+	// then flows through the same seal-at-rest + replicate path (sealSSHKey) as a supplied one, and the
+	// plaintext only ever exists in this process — see sshKeyGeneration.ts.
 	let publicKey: string | undefined;
 	if (req.generate) {
-		const generated = await generateEd25519KeyPair(`harper:${req.name}`);
+		const generated = await generateEd25519SSHKeyPair(`harper:${req.name}`);
 		req.key = generated.privateKey;
 		publicKey = generated.publicKey;
 		delete req.generate; // peers receive a plain (then sealed) key add and must not re-generate
