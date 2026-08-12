@@ -3969,7 +3969,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
+							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
+							| undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the

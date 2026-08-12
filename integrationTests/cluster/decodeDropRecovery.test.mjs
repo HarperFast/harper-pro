@@ -40,10 +40,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 const STRESS = process.env.HARPER_RUN_STRESS_TESTS === '1';
-const FIXTURE_PATH = join(
-	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
-	'fixture-decode-drop'
-);
+const FIXTURE_PATH = join(import.meta.dirname ?? new URL('.', import.meta.url).pathname, 'fixture-decode-drop');
 
 const TOTAL_ROWS = 200;
 // Records whose id starts with this prefix throw on value-decode at the receiver.
