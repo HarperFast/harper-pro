@@ -31,7 +31,7 @@
  */
 
 import { suite, test, before, after } from 'node:test';
-import { ok, equal, match } from 'node:assert/strict';
+import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
@@ -39,7 +39,11 @@ import { sendOperation, readLog } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
-	'..', '..', 'dist', 'bin', 'harper.js'
+	'..',
+	'..',
+	'dist',
+	'bin',
+	'harper.js'
 );
 
 const STRESS = process.env.HARPER_RUN_STRESS_TESTS === '1';
@@ -73,7 +77,9 @@ async function waitForCount(node, target, timeoutMs = CONVERGE_TIMEOUT_MS) {
 				table: 'CopyCursorTest',
 			});
 			if ((desc.record_count ?? 0) >= target) return desc.record_count;
-		} catch { /* transient */ }
+		} catch {
+			/* transient */
+		}
 		await delay(500);
 	}
 	throw new Error(`Timed out after ${timeoutMs}ms waiting for CopyCursorTest count >= ${target}`);
@@ -134,7 +140,7 @@ suite(
 					copyStartTime: Date.now() + 24 * 60 * 60 * 1000, // 24h ahead: suppress audit replay
 					currentTable: 'CopyCursorTest',
 					afterKey: POISON_AFTER_KEY,
-					copyOrder: 1,            // COPY_ORDER_VERSION = 1 (replicationConnection.ts:117)
+					copyOrder: 1, // COPY_ORDER_VERSION = 1 (replicationConnection.ts:117)
 				},
 			};
 			const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
@@ -219,7 +225,7 @@ suite(
 			ok(
 				countOnB < countOnA,
 				`SYMPTOM: B should have fewer rows than A (poisoned cursor skipped row-0001..row-0500). ` +
-				`A=${countOnA}, B=${countOnB}`
+					`A=${countOnA}, B=${countOnB}`
 			);
 			equal(
 				countOnB,
@@ -229,15 +235,13 @@ suite(
 
 			// Confirm B believes itself current: cluster_status shows connected with no active copy.
 			const status = await sendOperation(nodeB, { operation: 'cluster_status' });
-			const aConn = (status.connections ?? []).find((c) =>
-				(c.url ?? c.name ?? '').includes(nodeA.hostname)
-			);
+			const aConn = (status.connections ?? []).find((c) => (c.url ?? c.name ?? '').includes(nodeA.hostname));
 			ok(aConn, 'B should have a connection entry for A in cluster_status');
 			const allConnected = (aConn.database_sockets ?? []).every((s) => s.connected === true);
 			ok(
 				allConnected,
 				`B believes it is connected and current (no active copy) while missing ${countOnA - countOnB} rows. ` +
-				`Sockets: ${JSON.stringify(aConn.database_sockets)}`
+					`Sockets: ${JSON.stringify(aConn.database_sockets)}`
 			);
 
 			// Confirm the injected cursor appeared in B's log (proves hook fired, not a stale full copy).
@@ -269,11 +273,7 @@ suite(
 				get_attributes: ['id', 'val'],
 				ids: ['row-1000'],
 			}).catch(() => []);
-			equal(
-				lastRow.length,
-				1,
-				'row-1000 (post-cursor) must be present on B'
-			);
+			equal(lastRow.length, 1, 'row-1000 (post-cursor) must be present on B');
 		});
 	}
 );

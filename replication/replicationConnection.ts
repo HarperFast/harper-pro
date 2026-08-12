@@ -856,7 +856,9 @@ export function maybeInjectCopyCursorForTest(existingCursor: any, databaseName?:
 	// inject on the wrong database leg.
 	if (injected.db && injected.db !== databaseName) return existingCursor;
 	process.env.HARPER_TEST_INJECT_COPY_CURSOR_JSON = ''; // one-shot: clear so reconnect uses real cursor
-	logger.warn?.(`[test] injecting synthetic copyCursor for cursor-trust characterization (harper-pro#537), db ${databaseName}`);
+	logger.warn?.(
+		`[test] injecting synthetic copyCursor for cursor-trust characterization (harper-pro#537), db ${databaseName}`
+	);
 	return injected.cursor;
 }
 
@@ -5352,9 +5354,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// data predates copyStartTime and would never be delivered by an audit-log resume).
 			const copyCursor = maybeInjectCopyCursorForTest(
 				discardMalformedCopyCursor(
-					nodeId === undefined
-						? undefined
-						: readDbisCursorSync(dbisDB, 'copyCursor', nodeId),
+					nodeId === undefined ? undefined : readDbisCursorSync(dbisDB, 'copyCursor', nodeId),
 					dbisDB,
 					nodeId,
 					() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
