@@ -868,9 +868,18 @@ export function maybeInjectCopyCursorForTest(existingCursor: any, databaseName?:
 // below without needing a genuinely corrupt blob on the sender. This reproduces the wedge trigger
 // (#521 closed-and-resumed on exactly this throw, looping forever) so the test can assert #545 skips
 // it and keeps the leg alive. Never arms in production: the env var is set only by the regression test.
+//
+// The prefix is read ONCE at module load, not per record: the hook is called on the per-record
+// receive-apply hot path, and a `process.env` read there is a native getter on every record. These
+// test env vars are set before the Harper process starts, so a load-time read is both correct and
+// free — the unset (production) path is a single cached-undefined check.
+const DECODE_FAIL_RECORD_PREFIX_FOR_TEST = process.env.HARPER_TEST_DECODE_FAIL_RECORD_PREFIX;
 export function maybeInjectDecodeFailureForTest(recordId: unknown): void {
-	const prefix = process.env.HARPER_TEST_DECODE_FAIL_RECORD_PREFIX;
-	if (prefix && typeof recordId === 'string' && recordId.startsWith(prefix)) {
+	if (
+		DECODE_FAIL_RECORD_PREFIX_FOR_TEST &&
+		typeof recordId === 'string' &&
+		recordId.startsWith(DECODE_FAIL_RECORD_PREFIX_FOR_TEST)
+	) {
 		throw new Error('Unexpected end of MessagePack data (test-injected, harper-pro#537)');
 	}
 }
