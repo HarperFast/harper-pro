@@ -862,6 +862,19 @@ export function maybeInjectCopyCursorForTest(existingCursor: any, databaseName?:
 	return injected.cursor;
 }
 
+// Test-only fault injection for the harper-pro#537/#545 decode-drop recovery test. When
+// HARPER_TEST_DECODE_FAIL_RECORD_PREFIX is set on the RECEIVER, the value decode for any record whose
+// id starts with that prefix throws the field's torn-value error, driving the classify-skip catch
+// below without needing a genuinely corrupt blob on the sender. This reproduces the wedge trigger
+// (#521 closed-and-resumed on exactly this throw, looping forever) so the test can assert #545 skips
+// it and keeps the leg alive. Never arms in production: the env var is set only by the regression test.
+export function maybeInjectDecodeFailureForTest(recordId: unknown): void {
+	const prefix = process.env.HARPER_TEST_DECODE_FAIL_RECORD_PREFIX;
+	if (prefix && typeof recordId === 'string' && recordId.startsWith(prefix)) {
+		throw new Error('Unexpected end of MessagePack data (test-injected, harper-pro#537)');
+	}
+}
+
 /**
  * Mark an error as a *source-reported* blob unavailability: the sender told us (via a BLOB_CHUNK
  * `error` marker) that it cannot provide this blob — classically `ENOENT` because the blob was
@@ -4475,6 +4488,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
 				try {
+					maybeInjectDecodeFailureForTest(id);
 					decodeBlobsWithWrites(
 						() => {
 							event = {
