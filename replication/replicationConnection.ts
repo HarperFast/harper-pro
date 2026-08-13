@@ -801,6 +801,35 @@ export function armReplicationWedgeForTest(connection: any, ws: WebSocket, datab
 	return true; // tell the watchdog to treat this connection's byte count as frozen
 }
 
+// Test-only fault injection for the stale-watchdog-fire regression test. When
+// HARPER_TEST_LEAK_CONNECTION_AFTER_COPY_START_DB names a database, the FIRST receive connection for it
+// is turned into a leaked instance right after COPY_START: terminate/close are neutralized (no 'close'
+// ever fires, so closeConnection never retires this instance's watchdogs) and the socket is paused (no
+// further frames). The caller also flips the byte watchdog's frozen-bytes flag so it reaps the leg at
+// copyTimeout, exactly the production shape: a silent leg born, reaped at the copy timeout, leaving a
+// live armed copy-progress timer behind. One-shot per worker thread, so the reconnect's fresh socket
+// completes the copy normally. Never arms in production: the env var is set only by the regression test.
+let leakConnectionForTestArmed = false;
+export function maybeLeakConnectionAfterCopyStartForTest(
+	connection: any,
+	ws: WebSocket,
+	databaseName?: string
+): boolean {
+	if (!process.env.HARPER_TEST_LEAK_CONNECTION_AFTER_COPY_START_DB) return false;
+	if (
+		!connection ||
+		leakConnectionForTestArmed ||
+		process.env.HARPER_TEST_LEAK_CONNECTION_AFTER_COPY_START_DB !== databaseName
+	)
+		return false;
+	leakConnectionForTestArmed = true;
+	logger.warn?.(`[test] leaking replication connection after COPY_START for db "${databaseName}"`);
+	ws.terminate = () => {};
+	ws.close = () => {};
+	ws._socket?.pause();
+	return true;
+}
+
 // Test-only fault injection for harper-pro#453. When HARPER_TEST_COPY_STALL_ONCE_DB names a database,
 // the FIRST outbound base copy for it is stalled mid-flight: right after COPY_START the send loop awaits
 // a promise that never resolves, so no further copy frames (and no COPY_COMPLETE) are sent — but the
@@ -2399,7 +2428,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// sendPing tick above: if that tick is missed or its ws.terminate() does not propagate a
 	// 'close' event, the watchdog forces the reconnect path. See harper-pro#233 for the failure
 	// modes observed in the field.
-	const wedgedForTest = armReplicationWedgeForTest(options.connection, ws, databaseName);
+	// `let` so the leak-after-COPY_START test hook can flip it mid-connection (see COPY_START below).
+	let wedgedForTest = armReplicationWedgeForTest(options.connection, ws, databaseName);
 	// W1 T1 (#431): truth snapshot for watchdog fire logs — what the shared-memory connection truth said
 	// at the moment a worker-local watchdog decided to act (see formatTruthSnapshot for how the
 	// demotion soak reads this).
@@ -2418,10 +2448,29 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			return 'truth=error';
 		}
 	};
+	// Watchdog fires act on the SHARED connection object, but the watchdogs are per replicateOverWS
+	// instance. An instance whose socket was already replaced on the connection (its teardown never ran,
+	// e.g. close suppressed on a paused socket) firing forceReconnect would tear down the CURRENT healthy
+	// leg — observed in production as one "no base-copy progress" kill per churn cycle against a live,
+	// committing copy. Mirror the close handler's socket-identity guard (NodeReplicationConnection
+	// connect()): a superseded instance retires its own timers and stands down instead of acting.
+	const firingFromSupersededInstance = (watchdogName: string) => {
+		if (!options.connection || options.connection.socket === ws) return false;
+		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+		logger.warn?.(
+			`${watchdogName} fired on a superseded connection instance for ${remoteNodeName}${dbContext}; ignoring and retiring this instance's watchdogs`
+		);
+		receiveWatchdog?.stop();
+		pauseStallWatchdog?.stop();
+		copyProgressWatchdog?.stop();
+		subscriptionSetupWatchdog?.stop();
+		return true;
+	};
 	receiveWatchdog = createReceiveWatchdog({
 		intervalMs: currentReceiveSilenceThresholdMs,
 		getBytesRead: () => (wedgedForTest ? 0 : (ws._socket?.bytesRead ?? 0)),
 		onSilence: () => {
+			if (firingFromSupersededInstance('Receive watchdog')) return;
 			// Warn-level: if the active sendPing was healthy this watchdog should not have fired,
 			// so it is a signal that something is wrong upstream (event-loop stall, keepalive timer
 			// misbehaving, peer accepting bytes but not progressing the protocol). Surface it so
@@ -2447,6 +2496,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		thresholdMs: PAUSE_STALL_THRESHOLD_MS,
 		getProgress: () => consumerProgress,
 		onStall: () => {
+			if (firingFromSupersededInstance('Receive watchdog')) return;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
 				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting — ${truthSnapshotForLog()}`
@@ -2480,6 +2530,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		intervalMs: blobTimeout > 0 ? blobTimeout : 900000,
 		getBytesRead: () => copyProgressFrames,
 		onSilence: () => {
+			if (firingFromSupersededInstance('Copy-progress watchdog')) return;
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
@@ -2492,6 +2543,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	subscriptionSetupWatchdog = createSubscriptionSetupWatchdog({
 		timeoutMs: () => subscriptionSetupTimeoutMs,
 		onTimeout: () => {
+			if (firingFromSupersededInstance('Subscription-setup watchdog')) return;
 			if (wsClosed || inCopyMode) return;
 			pendingSubscriptionSetupRequestId = undefined;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
@@ -3113,6 +3165,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						receiveWatchdog?.stop();
 						receiveWatchdog?.reset();
 						noteCopyProgress(); // COPY_START is itself copy progress; arm the watchdog (#453)
+						// Test-only: turn this instance into a leaked, silent leg now that the copy-progress
+						// watchdog is armed — reproduces the stale-fire class the identity guard suppresses.
+						if (maybeLeakConnectionAfterCopyStartForTest(options.connection, ws, databaseName)) wedgedForTest = true;
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
