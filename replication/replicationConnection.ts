@@ -2287,7 +2287,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// threshold and mask a genuinely stalled copy. Re-arms the watchdog while copying. (harper-pro#453)
 	const noteCopyProgress = () => {
 		copyProgressFrames++;
-		copyProgressWatchdog?.reset();
+		// Not while paused for back-pressure: the commit-backlog pause trips mid-frame, and the same
+		// frame's (or an already-buffered frame's) progress note would re-arm the watchdog addPauseReason
+		// just stopped. A pause outlasting blobTimeout then reads as a copy stall and the watchdog kills a
+		// healthy, actively-committing leg. Same invariant as resetPingTimer (harper-pro#466 review):
+		// while paused the pause-stall watchdog is the liveness guard; removePauseReason re-arms this one.
+		if (pauseReasons === 0) copyProgressWatchdog?.reset();
 	};
 	let blobsTimer;
 	const DELAY_CLOSE_TIME = 60000; // amount of time to wait before closing the connection if we haven't any activity and there are no subscriptions
