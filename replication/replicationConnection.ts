@@ -44,7 +44,13 @@ import {
 	decideThrottledWarn,
 	type ThrottleState,
 } from './blobSendWarnThrottle.ts';
-import { HAS_STRUCTURE_UPDATE, lastMetadata, lastValueEncoding, METADATA } from '../core/resources/RecordEncoder.ts';
+import {
+	HAS_STRUCTURE_UPDATE,
+	isMissingStructureError,
+	lastMetadata,
+	lastValueEncoding,
+	METADATA,
+} from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
 import { WebSocket } from 'ws';
@@ -830,6 +836,32 @@ export function maybeStallSubscriptionSetupForTest(databaseName?: string): Promi
 	return new Promise<never>(() => {});
 }
 
+// Test-only fault injection for harper-pro#537 symptom characterization. When
+// HARPER_TEST_INJECT_COPY_CURSOR_JSON is set on the RECEIVER node, the subscription handshake
+// overrides the copyCursor with the JSON-parsed value — as if a prior interrupted copy had left a
+// poisoned resume cursor in the __dbis__ store. This lets integration tests demonstrate the
+// cursor-trust behavior (leader resumes at afterKey, skipping all earlier rows) without filesystem
+// manipulation or a real interrupted copy. One-shot via env-clear so the post-test reconnect uses the
+// real (absent) cursor.  Never arms in production: the env var is set only by the regression test.
+export function maybeInjectCopyCursorForTest(existingCursor: any, databaseName?: string): any {
+	if (!process.env.HARPER_TEST_INJECT_COPY_CURSOR_JSON) return existingCursor;
+	if (existingCursor) return existingCursor; // never override a real cursor
+	let injected: any;
+	try {
+		injected = JSON.parse(process.env.HARPER_TEST_INJECT_COPY_CURSOR_JSON);
+	} catch {
+		return existingCursor;
+	}
+	// Only fire for the named db (the JSON encodes { db, cursor }), so a two-database node doesn't
+	// inject on the wrong database leg.
+	if (injected.db && injected.db !== databaseName) return existingCursor;
+	process.env.HARPER_TEST_INJECT_COPY_CURSOR_JSON = ''; // one-shot: clear so reconnect uses real cursor
+	logger.warn?.(
+		`[test] injecting synthetic copyCursor for cursor-trust characterization (harper-pro#537), db ${databaseName}`
+	);
+	return injected.cursor;
+}
+
 /**
  * Mark an error as a *source-reported* blob unavailability: the sender told us (via a BLOB_CHUNK
  * `error` marker) that it cannot provide this blob — classically `ENOENT` because the blob was
@@ -1348,6 +1380,44 @@ export function orderTablesForCopy(tableNames: string[]): string[] {
  */
 export function isCopyResumeOrderCompatible(copyOrder: number | undefined, orderVersion: number): boolean {
 	return copyOrder === orderVersion;
+}
+
+// Metric fired when a received replication record can't be decoded because its shared structure is
+// genuinely absent on this node. Mirrors core RecordEncoder's `MISSING_STRUCTURE_METRIC` (that const
+// is not exported; kept in sync by name) so the copy/audit-apply drop is surfaced through the same
+// `decode-missing-structure` counter as the local-read drop. (harper#1163)
+export const DECODE_MISSING_STRUCTURE_METRIC = 'decode-missing-structure';
+
+// Every dropped/held record is counted, so a stuck-but-retrying node can't look identical to a healthy
+// one and a silent skip can't masquerade as "caught up" (harper-pro#537 review). `decode-drop`: record
+// skipped and the cursor advanced (any decode failure that is not the missing-structure class above).
+// `decode-hold`: record retained, connection closed to resync, cursor NOT advanced (unknown table id).
+export const DECODE_DROP_METRIC = 'decode-drop';
+export const DECODE_HOLD_METRIC = 'decode-hold';
+
+/**
+ * Classify a decode error thrown while applying a received copy/audit record, choosing how loudly to
+ * surface the skip. (harper-pro#537)
+ *
+ * Both verdicts SKIP the record and let the resume cursor advance — a decode error reaching this
+ * catch is treated as permanent. Transient conditions are already handled upstream (blob-gap `hold`,
+ * apply-queue backpressure), and every known source of a decode failure has been root-caused, so one
+ * that still reaches here is almost certainly unrecoverable old-version/corrupt data that no re-copy
+ * can heal (re-fetching re-ships the same undecodable bytes). Holding the leg would only wedge it, so
+ * we drop the record and keep the copy moving; the verdicts differ only in observability:
+ *
+ * - `skip-missing-structure`: the record references a shared structure genuinely absent on this node
+ *   (`isMissingStructureError` — structon/msgpackr already reloaded structures from durable storage
+ *   and retried before throwing; harper#1163). Surfaced through the same `decode-missing-structure`
+ *   metric core's local-read path fires, so it is alertable rather than laundered as emptiness.
+ * - `skip`: any other decode failure — unexpected post-root-cause, so it is logged loudly at error
+ *   level for investigation.
+ *
+ * Exported so the policy can be exercised in isolation by
+ * `unitTests/replication/classifyReplicationDecodeError.test.mjs`.
+ */
+export function classifyReplicationDecodeError(error: unknown): 'skip-missing-structure' | 'skip' {
+	return isMissingStructureError(error) ? 'skip-missing-structure' : 'skip';
 }
 
 /**
@@ -4327,7 +4397,29 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				const auditRecord = readAuditEntry(body, start, start + eventLength);
 				const tableDecoder = tableDecoders[auditRecord.tableId];
 				if (!tableDecoder) {
-					logger.error?.(`No table found with an id of ${auditRecord.tableId}`);
+					// No structure/decoder for this table id yet. tableDecoders is populated only by a
+					// TABLE_FIXED_STRUCTURE message, which the sender always emits BEFORE the first record of a
+					// table (see the length-gated send at ~2882) over an ordered WS — so reaching here means the
+					// structure sync was missed (a reset/edge case) or the table's schema has not propagated to
+					// this node yet (#1497 family). Both are TRANSIENT/recoverable — categorically unlike an
+					// undecodable record (handled as permanent below). So HOLD rather than skip-and-advance: skipping
+					// would seal a still-deliverable record under the resume cursor, and falling through would crash
+					// (the decode throws on `tableDecoder.name`, then the catch's `tableDecoder.decoder` deref throws
+					// again and escapes the catch — a wedge). Close so the leg reconnects and resumes from the durable
+					// cursor, which re-sends TABLE_FIXED_STRUCTURE and lets the record decode. The cursor is not
+					// advanced (we return before this record applies), so nothing is lost.
+					logger.error?.(
+						connectionId,
+						`No decoder for table id ${auditRecord.tableId} in ${databaseName}; holding and reconnecting to resync table structures`
+					);
+					recordAction(true, DECODE_HOLD_METRIC, databaseName + '.' + auditRecord.tableId);
+					// Latch inbound off BEFORE closing (markInboundClosed-first, #440): frames already queued on the
+					// messageProcessing chain — or delivered by the peer before the close handshake completes — would
+					// otherwise run onWSMessage and advance the resume cursor past this held record, silently turning
+					// the hold into a skip. `close()` alone does not set `wsClosed`.
+					wsClosed = true;
+					close(1011, 'missing table structure; reconnecting to resync');
+					return;
 				}
 				// Lazily compute receive-side exclusions once remoteNodeName is known.
 				// Prefer routeReplicates from the subscriber-side connection; fall back to
@@ -4382,8 +4474,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				const id = auditRecord.recordId;
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
-				// Boxed (not the bare error) so the re-throw below can't be defeated by a falsy thrown value.
-				let decodeFailure: { error: unknown } | undefined;
 				try {
 					decodeBlobsWithWrites(
 						() => {
@@ -4409,35 +4499,50 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						}
 					);
 				} catch (error) {
-					// Guarded dereferences: tableDecoder is undefined for an unknown tableId. An unguarded log
-					// line here used to throw its own TypeError, masking the original error and escaping to the
-					// outer catch — closing by accident. The guard keeps the unknown-tableId case skip-and-log;
-					// the deliberate close for a resolved-decoder value-decode failure is the re-throw below (#440).
-					logger.error?.(
-						'Error decoding replication message, record id: ' + id,
-						' typed structures for current decoder: ' +
-							(JSON.stringify(tableDecoder?.decoder?.typedStructs) ?? 'unknown table decoder'),
-						' structures for current decoder: ' +
-							(JSON.stringify(tableDecoder?.decoder?.structures) ?? 'unknown table decoder'),
-						'encoded message',
-						auditRecord.encoded.subarray(0, 1000),
-						auditRecord,
-						error
-					);
-					// A resolved decoder (tableDecoder set) means these bytes are a real record whose structures
-					// forked from the sender's (#1163/#1453); the resume cursor (maxBatchVersion -> end_txn)
-					// advances below regardless of `event`, so skipping loses the record permanently. Latch the
-					// error to re-throw onto the outer close path — the reconnect rebuilds this table's decoder
-					// from the peer's re-sent structures, healing the fork on resume. An unresolved decoder
-					// (unknown tableId) is transient schema propagation, not a fork, so it still skips.
-					if (shouldCloseOnRecordDecodeFailure(tableDecoder)) decodeFailure = { error };
+					// tableDecoder is guaranteed set here (the unknown-tableId case returns above), so the derefs
+					// below are safe without optional chaining. Every failure is counted; classifyReplicationDecodeError
+					// only picks the label (harper-pro#537). The old bare catch skipped silently — no metric, no class.
+					if (classifyReplicationDecodeError(error) === 'skip-missing-structure') {
+						// Missing shared structure (harper#1163): genuinely absent on this node, re-copy re-ships the
+						// same undecodable bytes. Surface it through the same metric core's local-read path fires so
+						// the drop is alertable rather than laundered as emptiness. Kept concise: this is the #537
+						// flood path (an interrupted copy can replay thousands of these), so we do NOT stringify the
+						// decoder's full struct dictionaries per record — the metric carries the volume and `error`
+						// already names the specific missing structure.
+						recordAction(true, DECODE_MISSING_STRUCTURE_METRIC, databaseName + '.' + tableDecoder.name);
+						logger.warn?.(
+							connectionId,
+							`Skipping replication record referencing a shared structure missing on this node (permanent; see harper#1163), table: ${tableDecoder.name}, record id: ${id}`,
+							error
+						);
+					} else {
+						// Any other decode failure: skip + advance, and COUNT it (decode-drop) — the class we don't
+						// recognize is the one an operator most needs a number for (harper-pro#537 review). What lands
+						// here is a truncated/mis-framed or structure-forked record VALUE buffer: a blob reference
+						// decodes to a lazy handle (no read on this path), so an in-flight blob produces no decode error
+						// at all — its transient (503 → hold) vs permanent split is the async receiveBlobs/#403 path,
+						// not this catch. Decoder dictionaries passed as objects (not eager JSON.stringify) so the
+						// format cost is paid only when the log emits.
+						recordAction(true, DECODE_DROP_METRIC, databaseName + '.' + tableDecoder.name);
+						logger.error?.(
+							connectionId,
+							'Error decoding replication message, record id: ' + id,
+							'typed structures for current decoder',
+							tableDecoder.decoder.typedStructs,
+							'structures for current decoder',
+							tableDecoder.decoder.structures,
+							'encoded message',
+							auditRecord.encoded.subarray(0, 1000),
+							auditRecord,
+							error
+						);
+					}
 				}
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
 					// a window to complete, then unlink the files. (mirrors the pattern at the relocate path above.)
 					setTimeout(() => receivedBlobs.forEach(deleteBlob), 60000).unref();
 				}
-				if (decodeFailure) throw decodeFailure.error; // re-throw after blob cleanup, before the resume cursor advances past this record
 				// During a bulk copy, do NOT advance the received-version watermark per copied record:
 				// records arrive in primary-key order carrying their original (possibly newest) versions, so a
 				// single record at the leader's latest timestamp would otherwise let checkSyncStatus mark the
@@ -5263,11 +5368,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// A persisted copy cursor means a bulk copy from this node was interrupted mid-stream. We must
 			// resume that copy (not treat the persisted seqId as a normal start point — the un-copied table
 			// data predates copyStartTime and would never be delivered by an audit-log resume).
-			const copyCursor = discardMalformedCopyCursor(
-				nodeId === undefined ? undefined : readDbisCursorSync(dbisDB, 'copyCursor', nodeId),
-				dbisDB,
-				nodeId,
-				() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
+			const copyCursor = maybeInjectCopyCursorForTest(
+				discardMalformedCopyCursor(
+					nodeId === undefined ? undefined : readDbisCursorSync(dbisDB, 'copyCursor', nodeId),
+					dbisDB,
+					nodeId,
+					() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
+				),
+				databaseName
 			);
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
