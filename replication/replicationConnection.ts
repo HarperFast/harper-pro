@@ -818,6 +818,23 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
 }
 
+// Test-only fault injection for the copy-progress false-fire repro: when HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB
+// names a database, the FIRST copy-batch commit for it is delayed by HARPER_TEST_COPY_COMMIT_DELAY_MS (default
+// 4000) at the top of onCommit. outstandingCommits stays elevated for the delay, so the commit-backlog
+// back-pressure pause stays open that long — simulating a receiver whose apply is slow but progressing.
+// One-shot per process so the copy converges promptly once the pause window has been exercised.
+// Never arms in production: the env vars are set only by the regression test.
+let copyCommitDelayForTestArmed = false;
+export function maybeDelayCopyCommitForTest(databaseName?: string): Promise<void> | undefined {
+	if (!process.env.HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB) return undefined;
+	if (copyCommitDelayForTestArmed || process.env.HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB !== databaseName)
+		return undefined;
+	copyCommitDelayForTestArmed = true;
+	const ms = Number(process.env.HARPER_TEST_COPY_COMMIT_DELAY_MS) || 4000;
+	logger.warn?.(`[test] delaying first base-copy commit by ${ms}ms for db "${databaseName}"`);
+	return new Promise((resolve) => setTimeout(resolve, ms).unref());
+}
+
 // Test-only fault injection for harper-pro#642: one-shot per process, so a receiver watchdog reconnect
 // reaches the normal setup path. Never arms in production — only the regression test sets the env var.
 let subscriptionSetupStallForTestArmed = false;
@@ -4586,6 +4603,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						: Math.max(lastSequenceIdReceived ?? 0, maxBatchVersion), // resume cursor from the batch even without a sequence-update
 				remoteNodeIds: receivingDataFromNodeIds,
 				async onCommit() {
+					// Test-only: hold this copy commit (and so the commit-backlog pause) open — see the hook.
+					const testCommitDelay = isCopyFrame && maybeDelayCopyCommitForTest(databaseName);
+					if (testCommitDelay) await testCommitDelay;
 					if (event) {
 						const latency = Date.now() - event.timestamp;
 						if (databaseName !== 'system') {
