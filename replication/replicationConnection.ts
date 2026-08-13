@@ -1980,6 +1980,13 @@ export class NodeReplicationConnection extends EventEmitter {
 		// MaxListenersExceededWarning). The fresh connect re-registers its own. See harper-pro#420.
 		this.removeAllListeners('subscriptions-updated');
 		const socket = this.socket;
+		// The session being superseded must be retired explicitly: terminate() below is best-effort, and
+		// the exact wedge this path recovers (open-but-idle, possibly paused socket) is one where the
+		// 'close' event may never deliver — leaving the old replicateOverWS instance's keepalive,
+		// sweep intervals, subscriptions, and watchdog timers alive indefinitely, one leak per recovery
+		// cycle. Capture the promise BEFORE resetSession() inside scheduleReconnect() replaces it.
+		// retireInstance is idempotent, so a close that does deliver later is a no-op.
+		const supersededSession = this.session;
 		// Sets reconnectScheduled and arms one backoff retry (matching the close-handler backoff so a
 		// repeatedly-wedging peer backs off the same way, #339). connect() clears reconnectScheduled once
 		// the new socket is installed, which keeps a late close from the old socket from double-scheduling.
@@ -1990,6 +1997,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		} catch {
 			// already destroyed — the scheduled connect still runs
 		}
+		supersededSession?.then?.((session) => session?.retire?.('superseded by forceReconnect')).catch?.(() => {});
 	}
 
 	getRecord(request) {
@@ -2453,17 +2461,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// e.g. close suppressed on a paused socket) firing forceReconnect would tear down the CURRENT healthy
 	// leg — observed in production as one "no base-copy progress" kill per churn cycle against a live,
 	// committing copy. Mirror the close handler's socket-identity guard (NodeReplicationConnection
-	// connect()): a superseded instance retires its own timers and stands down instead of acting.
+	// connect()): a superseded instance runs its own full retirement and stands down instead of acting.
+	// forceReconnect also retires the superseded session explicitly, so this fires only for a leak that
+	// escaped that path — a backstop, not the primary teardown.
 	const firingFromSupersededInstance = (watchdogName: string) => {
 		if (!options.connection || options.connection.socket === ws) return false;
 		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 		logger.warn?.(
-			`${watchdogName} fired on a superseded connection instance for ${remoteNodeName}${dbContext}; ignoring and retiring this instance's watchdogs`
+			`${watchdogName} fired on a superseded connection instance for ${remoteNodeName}${dbContext}; ignoring and retiring this instance`
 		);
-		receiveWatchdog?.stop();
-		pauseStallWatchdog?.stop();
-		copyProgressWatchdog?.stop();
-		subscriptionSetupWatchdog?.stop();
+		retireInstance(undefined, 'superseded instance retired by stale watchdog fire');
 		return true;
 	};
 	receiveWatchdog = createReceiveWatchdog({
@@ -2496,7 +2503,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		thresholdMs: PAUSE_STALL_THRESHOLD_MS,
 		getProgress: () => consumerProgress,
 		onStall: () => {
-			if (firingFromSupersededInstance('Receive watchdog')) return;
+			if (firingFromSupersededInstance('Pause-stall watchdog')) return;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
 				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting — ${truthSnapshotForLog()}`
@@ -4799,8 +4806,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		lastPingTime = null;
 	});
-	ws.on('close', (code, reasonBuffer) => {
-		// cleanup
+	// Complete teardown of THIS replicateOverWS instance: every interval, watchdog, subscription,
+	// pending request, and in-flight blob it owns. Runs on the socket's real 'close' and on explicit
+	// supersession (forceReconnect retiring the previous session, or a stale watchdog fire detecting
+	// its socket was replaced) — a superseded instance whose close never fires would otherwise keep
+	// its keepalive refreshing shared liveness and leak an instance per recovery cycle. Idempotent so
+	// supersession followed by a late real close runs it once.
+	let instanceRetired = false;
+	function retireInstance(code?, reasonBuffer?) {
+		if (instanceRetired) return;
+		instanceRetired = true;
 		wsClosed = true;
 		pendingSubscriptionSetupRequestId = undefined;
 		clearInterval(sendPingInterval);
@@ -4830,7 +4845,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
 		logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
-	});
+	}
+	ws.on('close', retireInstance);
 
 	function close(code?, reason?, intentional?: boolean) {
 		try {
@@ -5699,6 +5715,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// cleanup
 			if (subscriptionRequest) subscriptionRequest.end();
 			if (auditSubscription) auditSubscription.emit('close');
+		},
+		// Full teardown for a session whose socket is being replaced without a delivered 'close'
+		// (forceReconnect on an open-but-wedged socket). See retireInstance.
+		retire(reason?: string) {
+			retireInstance(undefined, reason);
 		},
 		getRecord(request) {
 			// send a request for a specific record

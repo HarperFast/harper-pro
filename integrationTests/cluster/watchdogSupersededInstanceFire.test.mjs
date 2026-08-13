@@ -17,12 +17,15 @@
  * This test builds one leaked instance deterministically via the env-gated
  * HARPER_TEST_LEAK_CONNECTION_AFTER_COPY_START_DB hook on the subscriber: right after COPY_START
  * (copy-progress timer armed) the leg's terminate/close are neutralized and its socket paused, and
- * the byte watchdog sees frozen bytes — so it reaps the leg at copyTimeout, recovery reconnects,
- * and the leaked instance's copy-progress timer fires at blobTimeout against the new live leg.
- * Without the socket-identity guard the stale fire kills the healthy replacement (a third connect,
- * plus the misleading "no base-copy progress" line). With the guard the stale instance logs that it
- * is superseded, retires its timers, and the live leg is untouched: exactly two connects, zero
- * copy-progress kills.
+ * the byte watchdog sees frozen bytes — so it reaps the leg at copyTimeout. The fix is layered:
+ * forceReconnect explicitly retires the superseded session (retireInstance: every interval,
+ * watchdog, subscription, and pending request), which must complete even though this leg's close
+ * can never deliver — proven by the retirement completion log line ("superseded by forceReconnect",
+ * printed after the full teardown body ran) and by the armed copy-progress timer being provably
+ * dead (no fire at blobTimeout, when frames never resumed on that socket). The stale-fire
+ * socket-identity guard remains as a backstop and must NOT be needed on this path. Without the fix
+ * the leaked timer fires "no base-copy progress" against the healthy replacement and forces a third
+ * connect; with it: exactly two connects, zero copy-progress kills, no backstop engagement.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert';
@@ -157,11 +160,23 @@ suite('Stale watchdog fire from a superseded connection instance', { timeout: 12
 			'precondition: the byte watchdog must have reaped the leaked leg'
 		);
 
-		// The stale copy-progress fire must not be acted on: no "no base-copy progress" kill, and
-		// exactly two data-leg connects (the leaked leg and its replacement). A third connect means
-		// the stale fire tore down the healthy replacement.
+		// The leaked instance must have been retired EXPLICITLY: its close can never deliver (the leak
+		// hook neutralized it), so this line only appears if forceReconnect drove retireInstance to
+		// completion — it is the last statement of the teardown body, after every clearInterval and
+		// watchdog stop.
+		ok(
+			log.includes('superseded by forceReconnect'),
+			'forceReconnect must explicitly retire the superseded session despite the undeliverable close'
+		);
+
+		// Its armed copy-progress timer must be dead: no "no base-copy progress" kill at blobTimeout,
+		// and exactly two data-leg connects (the leaked leg and its replacement). A third connect means
+		// a stale fire tore down the healthy replacement.
 		const staleKills = log.split('\n').filter((line) => line.includes('Copy-progress watchdog: no base-copy progress'));
-		ok(staleKills.length === 0, `the stale fire must not kill the healthy leg; got:\n${staleKills.join('\n')}`);
+		ok(
+			staleKills.length === 0,
+			`the leaked instance's timer must not fire and kill the healthy leg; got:\n${staleKills.join('\n')}`
+		);
 		const connects = log.split('\n').filter((line) => line.includes('Connected to') && line.includes(`db: ${DB}`));
 		equal(
 			connects.length,
@@ -169,10 +184,11 @@ suite('Stale watchdog fire from a superseded connection instance', { timeout: 12
 			`expected exactly 2 data-leg connects (leaked + replacement); got:\n${connects.join('\n')}`
 		);
 
-		// And the suppression must be the visible mechanism, not a silent accident.
+		// The stale-fire guard is a backstop for leaks that escape explicit retirement; on this path
+		// the primary teardown must make it unnecessary.
 		ok(
-			log.includes('fired on a superseded connection instance'),
-			'the leaked instance must detect it is superseded and stand down'
+			!log.includes('fired on a superseded connection instance'),
+			'the backstop guard must not need to engage when forceReconnect retired the session'
 		);
 	});
 });
