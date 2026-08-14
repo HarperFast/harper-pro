@@ -113,7 +113,7 @@ test('waitUntil retries predicate errors and reports the last one on timeout', a
 			},
 			{ timeoutMs: 20, pollMs: 1, label: 'eventual value' }
 		),
-		/^Timed out waiting for: eventual value$/
+		/^Error: Timed out waiting for: eventual value$/
 	);
 });
 
