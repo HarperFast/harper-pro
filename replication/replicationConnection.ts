@@ -808,6 +808,35 @@ export function armReplicationWedgeForTest(connection: any, ws: WebSocket, datab
 	return true; // tell the watchdog to treat this connection's byte count as frozen
 }
 
+// Test-only fault injection for the stale-watchdog-fire regression test. When
+// HARPER_TEST_LEAK_CONNECTION_AFTER_COPY_START_DB names a database, the FIRST receive connection for it
+// is turned into a leaked instance right after COPY_START: terminate/close are neutralized (no 'close'
+// ever fires, so closeConnection never retires this instance's watchdogs) and the socket is paused (no
+// further frames). The caller also flips the byte watchdog's frozen-bytes flag so it reaps the leg at
+// copyTimeout, exactly the production shape: a silent leg born, reaped at the copy timeout, leaving a
+// live armed copy-progress timer behind. One-shot per worker thread, so the reconnect's fresh socket
+// completes the copy normally. Never arms in production: the env var is set only by the regression test.
+let leakConnectionForTestArmed = false;
+export function maybeLeakConnectionAfterCopyStartForTest(
+	connection: any,
+	ws: WebSocket,
+	databaseName?: string
+): boolean {
+	if (!process.env.HARPER_TEST_LEAK_CONNECTION_AFTER_COPY_START_DB) return false;
+	if (
+		!connection ||
+		leakConnectionForTestArmed ||
+		process.env.HARPER_TEST_LEAK_CONNECTION_AFTER_COPY_START_DB !== databaseName
+	)
+		return false;
+	leakConnectionForTestArmed = true;
+	logger.warn?.(`[test] leaking replication connection after COPY_START for db "${databaseName}"`);
+	ws.terminate = () => {};
+	ws.close = () => {};
+	ws._socket?.pause();
+	return true;
+}
+
 // Test-only fault injection for harper-pro#453. When HARPER_TEST_COPY_STALL_ONCE_DB names a database,
 // the FIRST outbound base copy for it is stalled mid-flight: right after COPY_START the send loop awaits
 // a promise that never resolves, so no further copy frames (and no COPY_COMPLETE) are sent — but the
@@ -823,6 +852,23 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 	copyStallForTestArmed = true;
 	logger.warn?.(`[test] stalling outbound base copy mid-flight for db "${databaseName}" (harper-pro#453)`);
 	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
+}
+
+// Test-only fault injection for the copy-progress false-fire repro: when HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB
+// names a database, the FIRST copy-batch commit for it is delayed by HARPER_TEST_COPY_COMMIT_DELAY_MS (default
+// 4000) at the top of onCommit. outstandingCommits stays elevated for the delay, so the commit-backlog
+// back-pressure pause stays open that long — simulating a receiver whose apply is slow but progressing.
+// One-shot per process so the copy converges promptly once the pause window has been exercised.
+// Never arms in production: the env vars are set only by the regression test.
+let copyCommitDelayForTestArmed = false;
+export function maybeDelayCopyCommitForTest(databaseName?: string): Promise<void> | undefined {
+	if (!process.env.HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB) return undefined;
+	if (copyCommitDelayForTestArmed || process.env.HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB !== databaseName)
+		return undefined;
+	copyCommitDelayForTestArmed = true;
+	const ms = Number(process.env.HARPER_TEST_COPY_COMMIT_DELAY_MS) || 4000;
+	logger.warn?.(`[test] delaying first base-copy commit by ${ms}ms for db "${databaseName}"`);
+	return new Promise((resolve) => setTimeout(resolve, ms).unref());
 }
 
 // Test-only fault injection for harper-pro#642: one-shot per process, so a receiver watchdog reconnect
@@ -1859,6 +1905,10 @@ export class NodeReplicationConnection extends EventEmitter {
 	latency = 0;
 	replicateTablesByDefault: boolean;
 	session: any; // this is a promise that resolves to the session object, which is the object that handles the replication
+	// The one live replicateOverWS instance bound to `this.socket`, kept as a direct handle (not just the
+	// `session` promise, which resetSession() replaces on every reconnect) so any path that replaces the
+	// socket can retire the instance it supersedes synchronously. Cleared by retireSession().
+	liveSession?: any;
 	sessionResolve: Function;
 	sessionReject: Function;
 	url: string;
@@ -1905,6 +1955,13 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.scheduleReconnect();
 			return;
 		}
+		// The socket this connection owns has just been replaced, so the session bound to the previous one
+		// is superseded by definition: retire it here rather than relying on that socket's 'close', which
+		// for an open-but-idle/paused wedge may arrive late or never. Without this, the old instance's
+		// keepalive (still refreshing shared liveness), sweep/back-pressure intervals, subscriptions,
+		// pending requests, and watchdog timers survive — one leaked instance per reconnect cycle.
+		// retireInstance is idempotent, so the real close doing this later is a no-op.
+		this.retireSession('socket replaced by reconnect');
 		// A forceReconnect-scheduled reconnect is now realized — stop suppressing the close handler's own
 		// retry. Clearing this only after this.socket is reassigned (rather than in the scheduling timer)
 		// keeps a late close from the superseded socket from arming a second connect() during the
@@ -1945,6 +2002,15 @@ export class NodeReplicationConnection extends EventEmitter {
 					},
 					{ replicates: true } // pre-authorized, but should only make publish: true if we are allowing reverse subscriptions
 				);
+				// Only the instance on the current socket is live. If this open raced a replacement, the
+				// instance is born superseded: retire it immediately rather than leave it running, and do
+				// not resolve — `sessionResolve` now belongs to the replacement attempt's promise, so
+				// handing it this dead session would serve requests over a retired instance.
+				if (this.socket !== socket) {
+					session.retire?.('superseded before open');
+					return;
+				}
+				this.liveSession = session;
 				this.sessionResolve(session);
 			} catch (error) {
 				// replicateOverWS does a fair amount of synchronous setup (setDatabase, audit
@@ -1985,6 +2051,8 @@ export class NodeReplicationConnection extends EventEmitter {
 			// finally propagated its close. Acting on it would wrongly tear down the live connection (mark it
 			// disconnected, drop its subscription listener, reset its session). See harper-pro#420.
 			if (this.socket !== socket) return;
+			// This socket's own close listener (retireInstance) has already torn the instance down.
+			if (this.liveSession === session) this.liveSession = undefined;
 			// Only treat the close as terminal when something explicitly marked it as a deliberate
 			// teardown (user unsubscribe or the empty-subscription delayed close). Protocol-level
 			// closes — peer DISCONNECT, unauthorized after open, node-name-mismatch, invalid
@@ -2053,6 +2121,23 @@ export class NodeReplicationConnection extends EventEmitter {
 		// Doubling reaches 30 s in ~6 retries (~62 s total) and resets on success.
 		this.retryTime = Math.min(this.retryTime << 1, 30_000);
 	}
+	// Retire the live replicateOverWS instance: the single enforcement point for "at most one live session
+	// per connection". Every path that supersedes a session (socket replaced in connect(), forceReconnect)
+	// calls this; the socket's own 'close' does the same teardown through retireInstance, which is
+	// idempotent, so whichever happens first wins and the other is a no-op.
+	retireSession(reason: string) {
+		const session = this.liveSession;
+		this.liveSession = undefined;
+		try {
+			session?.retire?.(reason);
+		} catch (error) {
+			// Teardown must never abort the recovery it is part of: forceReconnect still has a reconnect to
+			// schedule after this, and connect() a fresh socket to finish wiring up.
+			logger.warn?.(
+				`Error retiring superseded replication session to ${this.url} (db: "${this.databaseName}"): ${error.message}`
+			);
+		}
+	}
 	resetSession() {
 		this.session = new Promise((resolve, reject) => {
 			this.sessionResolve = resolve;
@@ -2100,6 +2185,12 @@ export class NodeReplicationConnection extends EventEmitter {
 		// MaxListenersExceededWarning). The fresh connect re-registers its own. See harper-pro#420.
 		this.removeAllListeners('subscriptions-updated');
 		const socket = this.socket;
+		// Retire the superseded session now, not when the replacement socket arrives: this path recovers a
+		// wedged-but-open socket, so its keepalive would keep refreshing shared liveness (masking an
+		// unhealthy replacement) and its watchdogs stay armed for the whole backoff window. terminate()
+		// below is best-effort and the 'close' it should trigger may never deliver, which is exactly why
+		// this cannot be left to the close listener. retireInstance is idempotent.
+		this.retireSession('superseded by forceReconnect');
 		// Sets reconnectScheduled and arms one backoff retry (matching the close-handler backoff so a
 		// repeatedly-wedging peer backs off the same way, #339). connect() clears reconnectScheduled once
 		// the new socket is installed, which keeps a late close from the old socket from double-scheduling.
@@ -2506,7 +2597,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// threshold and mask a genuinely stalled copy. Re-arms the watchdog while copying. (harper-pro#453)
 	const noteCopyProgress = () => {
 		copyProgressFrames++;
-		copyProgressWatchdog?.reset();
+		// Not while paused for back-pressure: the commit-backlog pause trips mid-frame, and the same
+		// frame's (or an already-buffered frame's) progress note would re-arm the watchdog addPauseReason
+		// just stopped. A pause outlasting blobTimeout then reads as a copy stall and the watchdog kills a
+		// healthy, actively-committing leg. Same invariant as resetPingTimer (harper-pro#466 review):
+		// while paused the pause-stall watchdog is the liveness guard; removePauseReason re-arms this one.
+		if (pauseReasons === 0) copyProgressWatchdog?.reset();
 	};
 	let blobsTimer;
 	const DELAY_CLOSE_TIME = 60000; // amount of time to wait before closing the connection if we haven't any activity and there are no subscriptions
@@ -2613,7 +2709,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// sendPing tick above: if that tick is missed or its ws.terminate() does not propagate a
 	// 'close' event, the watchdog forces the reconnect path. See harper-pro#233 for the failure
 	// modes observed in the field.
-	const wedgedForTest = armReplicationWedgeForTest(options.connection, ws, databaseName);
+	// `let` so the leak-after-COPY_START test hook can flip it mid-connection (see COPY_START below).
+	let wedgedForTest = armReplicationWedgeForTest(options.connection, ws, databaseName);
 	// W1 T1 (#431): truth snapshot for watchdog fire logs — what the shared-memory connection truth said
 	// at the moment a worker-local watchdog decided to act (see formatTruthSnapshot for how the
 	// demotion soak reads this).
@@ -2632,10 +2729,29 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			return 'truth=error';
 		}
 	};
+	// Watchdog fires act on the SHARED connection object, but the watchdogs are per replicateOverWS
+	// instance. An instance whose socket was already replaced on the connection (its teardown never ran,
+	// e.g. close suppressed on a paused socket) firing forceReconnect would tear down the CURRENT healthy
+	// leg — observed in production as one "no base-copy progress" kill per churn cycle against a live,
+	// committing copy. Mirror the close handler's socket-identity guard (NodeReplicationConnection
+	// connect()): a superseded instance runs its own full retirement and stands down instead of acting.
+	// The connection retires the session it supersedes (retireSession, on forceReconnect and on socket
+	// replacement in connect()), so this fires only for a leak that escaped those — a backstop, not the
+	// primary teardown.
+	const firingFromSupersededInstance = (watchdogName: string) => {
+		if (!options.connection || options.connection.socket === ws) return false;
+		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+		logger.warn?.(
+			`${watchdogName} fired on a superseded connection instance for ${remoteNodeName}${dbContext}; ignoring and retiring this instance`
+		);
+		retireInstance(undefined, 'superseded instance retired by stale watchdog fire');
+		return true;
+	};
 	receiveWatchdog = createReceiveWatchdog({
 		intervalMs: currentReceiveSilenceThresholdMs,
 		getBytesRead: () => (wedgedForTest ? 0 : (ws._socket?.bytesRead ?? 0)),
 		onSilence: () => {
+			if (firingFromSupersededInstance('Receive watchdog')) return;
 			// Warn-level: if the active sendPing was healthy this watchdog should not have fired,
 			// so it is a signal that something is wrong upstream (event-loop stall, keepalive timer
 			// misbehaving, peer accepting bytes but not progressing the protocol). Surface it so
@@ -2661,6 +2777,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		thresholdMs: PAUSE_STALL_THRESHOLD_MS,
 		getProgress: () => consumerProgress,
 		onStall: () => {
+			if (firingFromSupersededInstance('Pause-stall watchdog')) return;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
 				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting — ${truthSnapshotForLog()}`
@@ -2695,6 +2812,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		intervalMs: effectiveBlobTimeoutMs,
 		getBytesRead: () => copyProgressFrames,
 		onSilence: () => {
+			if (firingFromSupersededInstance('Copy-progress watchdog')) return;
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
@@ -2729,6 +2847,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	subscriptionSetupWatchdog = createSubscriptionSetupWatchdog({
 		timeoutMs: () => subscriptionSetupTimeoutMs,
 		onTimeout: () => {
+			if (firingFromSupersededInstance('Subscription-setup watchdog')) return;
 			if (wsClosed || inCopyMode) return;
 			pendingSubscriptionSetupRequestId = undefined;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
@@ -3356,6 +3475,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						receiveWatchdog?.stop();
 						receiveWatchdog?.reset();
 						noteCopyProgress(); // COPY_START is itself copy progress; arm the watchdog (#453)
+						// Test-only: turn this instance into a leaked, silent leg now that the copy-progress
+						// watchdog is armed — reproduces the stale-fire class the identity guard suppresses.
+						if (maybeLeakConnectionAfterCopyStartForTest(options.connection, ws, databaseName)) wedgedForTest = true;
 						copyModeStartTime = data; // copyStartTime anchor chosen by the leader
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
@@ -4886,6 +5008,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						: Math.max(lastSequenceIdReceived ?? 0, maxBatchVersion), // resume cursor from the batch even without a sequence-update
 				remoteNodeIds: receivingDataFromNodeIds,
 				async onCommit() {
+					// Test-only: hold this copy commit (and so the commit-backlog pause) open — see the hook.
+					const testCommitDelay = isCopyFrame && maybeDelayCopyCommitForTest(databaseName);
+					if (testCommitDelay) await testCommitDelay;
 					if (event) {
 						const latency = Date.now() - event.timestamp;
 						if (databaseName !== 'system') {
@@ -5019,8 +5144,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		lastPingTime = null;
 	});
-	ws.on('close', (code, reasonBuffer) => {
-		// cleanup
+	// Complete teardown of THIS replicateOverWS instance: every interval, watchdog, subscription,
+	// pending request, and in-flight blob it owns. Runs on the socket's real 'close' and on explicit
+	// supersession (forceReconnect retiring the previous session, or a stale watchdog fire detecting
+	// its socket was replaced) — a superseded instance whose close never fires would otherwise keep
+	// its keepalive refreshing shared liveness and leak an instance per recovery cycle. Idempotent so
+	// supersession followed by a late real close runs it once.
+	let instanceRetired = false;
+	function retireInstance(code?, reasonBuffer?) {
+		if (instanceRetired) return;
+		instanceRetired = true;
 		wsClosed = true;
 		pendingSubscriptionSetupRequestId = undefined;
 		clearInterval(sendPingInterval);
@@ -5055,7 +5188,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
 		logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
-	});
+	}
+	ws.on('close', retireInstance);
 
 	function close(code?, reason?, intentional?: boolean) {
 		try {
@@ -5967,6 +6101,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// cleanup
 			if (subscriptionRequest) subscriptionRequest.end();
 			if (auditSubscription) auditSubscription.emit('close');
+		},
+		// Full teardown for a session whose socket is being replaced without a delivered 'close'
+		// (forceReconnect on an open-but-wedged socket). See retireInstance.
+		retire(reason?: string) {
+			retireInstance(undefined, reason);
 		},
 		getRecord(request) {
 			// send a request for a specific record
