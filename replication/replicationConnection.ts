@@ -1739,6 +1739,10 @@ export class NodeReplicationConnection extends EventEmitter {
 	latency = 0;
 	replicateTablesByDefault: boolean;
 	session: any; // this is a promise that resolves to the session object, which is the object that handles the replication
+	// The one live replicateOverWS instance bound to `this.socket`, kept as a direct handle (not just the
+	// `session` promise, which resetSession() replaces on every reconnect) so any path that replaces the
+	// socket can retire the instance it supersedes synchronously. Cleared by retireSession().
+	liveSession?: any;
 	sessionResolve: Function;
 	sessionReject: Function;
 	url: string;
@@ -1785,6 +1789,13 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.scheduleReconnect();
 			return;
 		}
+		// The socket this connection owns has just been replaced, so the session bound to the previous one
+		// is superseded by definition: retire it here rather than relying on that socket's 'close', which
+		// for an open-but-idle/paused wedge may arrive late or never. Without this, the old instance's
+		// keepalive (still refreshing shared liveness), sweep/back-pressure intervals, subscriptions,
+		// pending requests, and watchdog timers survive — one leaked instance per reconnect cycle.
+		// retireInstance is idempotent, so the real close doing this later is a no-op.
+		this.retireSession('socket replaced by reconnect');
 		// A forceReconnect-scheduled reconnect is now realized — stop suppressing the close handler's own
 		// retry. Clearing this only after this.socket is reassigned (rather than in the scheduling timer)
 		// keeps a late close from the superseded socket from arming a second connect() during the
@@ -1825,6 +1836,15 @@ export class NodeReplicationConnection extends EventEmitter {
 					},
 					{ replicates: true } // pre-authorized, but should only make publish: true if we are allowing reverse subscriptions
 				);
+				// Only the instance on the current socket is live. If this open raced a replacement, the
+				// instance is born superseded: retire it immediately rather than leave it running, and do
+				// not resolve — `sessionResolve` now belongs to the replacement attempt's promise, so
+				// handing it this dead session would serve requests over a retired instance.
+				if (this.socket !== socket) {
+					session.retire?.('superseded before open');
+					return;
+				}
+				this.liveSession = session;
 				this.sessionResolve(session);
 			} catch (error) {
 				// replicateOverWS does a fair amount of synchronous setup (setDatabase, audit
@@ -1865,6 +1885,8 @@ export class NodeReplicationConnection extends EventEmitter {
 			// finally propagated its close. Acting on it would wrongly tear down the live connection (mark it
 			// disconnected, drop its subscription listener, reset its session). See harper-pro#420.
 			if (this.socket !== socket) return;
+			// This socket's own close listener (retireInstance) has already torn the instance down.
+			if (this.liveSession === session) this.liveSession = undefined;
 			// Only treat the close as terminal when something explicitly marked it as a deliberate
 			// teardown (user unsubscribe or the empty-subscription delayed close). Protocol-level
 			// closes — peer DISCONNECT, unauthorized after open, node-name-mismatch, invalid
@@ -1933,6 +1955,23 @@ export class NodeReplicationConnection extends EventEmitter {
 		// Doubling reaches 30 s in ~6 retries (~62 s total) and resets on success.
 		this.retryTime = Math.min(this.retryTime << 1, 30_000);
 	}
+	// Retire the live replicateOverWS instance: the single enforcement point for "at most one live session
+	// per connection". Every path that supersedes a session (socket replaced in connect(), forceReconnect)
+	// calls this; the socket's own 'close' does the same teardown through retireInstance, which is
+	// idempotent, so whichever happens first wins and the other is a no-op.
+	retireSession(reason: string) {
+		const session = this.liveSession;
+		this.liveSession = undefined;
+		try {
+			session?.retire?.(reason);
+		} catch (error) {
+			// Teardown must never abort the recovery it is part of: forceReconnect still has a reconnect to
+			// schedule after this, and connect() a fresh socket to finish wiring up.
+			logger.warn?.(
+				`Error retiring superseded replication session to ${this.url} (db: "${this.databaseName}"): ${error.message}`
+			);
+		}
+	}
 	resetSession() {
 		this.session = new Promise((resolve, reject) => {
 			this.sessionResolve = resolve;
@@ -1980,13 +2019,12 @@ export class NodeReplicationConnection extends EventEmitter {
 		// MaxListenersExceededWarning). The fresh connect re-registers its own. See harper-pro#420.
 		this.removeAllListeners('subscriptions-updated');
 		const socket = this.socket;
-		// The session being superseded must be retired explicitly: terminate() below is best-effort, and
-		// the exact wedge this path recovers (open-but-idle, possibly paused socket) is one where the
-		// 'close' event may never deliver — leaving the old replicateOverWS instance's keepalive,
-		// sweep intervals, subscriptions, and watchdog timers alive indefinitely, one leak per recovery
-		// cycle. Capture the promise BEFORE resetSession() inside scheduleReconnect() replaces it.
-		// retireInstance is idempotent, so a close that does deliver later is a no-op.
-		const supersededSession = this.session;
+		// Retire the superseded session now, not when the replacement socket arrives: this path recovers a
+		// wedged-but-open socket, so its keepalive would keep refreshing shared liveness (masking an
+		// unhealthy replacement) and its watchdogs stay armed for the whole backoff window. terminate()
+		// below is best-effort and the 'close' it should trigger may never deliver, which is exactly why
+		// this cannot be left to the close listener. retireInstance is idempotent.
+		this.retireSession('superseded by forceReconnect');
 		// Sets reconnectScheduled and arms one backoff retry (matching the close-handler backoff so a
 		// repeatedly-wedging peer backs off the same way, #339). connect() clears reconnectScheduled once
 		// the new socket is installed, which keeps a late close from the old socket from double-scheduling.
@@ -1997,7 +2035,6 @@ export class NodeReplicationConnection extends EventEmitter {
 		} catch {
 			// already destroyed — the scheduled connect still runs
 		}
-		supersededSession?.then?.((session) => session?.retire?.('superseded by forceReconnect')).catch?.(() => {});
 	}
 
 	getRecord(request) {
@@ -2462,8 +2499,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// leg — observed in production as one "no base-copy progress" kill per churn cycle against a live,
 	// committing copy. Mirror the close handler's socket-identity guard (NodeReplicationConnection
 	// connect()): a superseded instance runs its own full retirement and stands down instead of acting.
-	// forceReconnect also retires the superseded session explicitly, so this fires only for a leak that
-	// escaped that path — a backstop, not the primary teardown.
+	// The connection retires the session it supersedes (retireSession, on forceReconnect and on socket
+	// replacement in connect()), so this fires only for a leak that escaped those — a backstop, not the
+	// primary teardown.
 	const firingFromSupersededInstance = (watchdogName: string) => {
 		if (!options.connection || options.connection.socket === ws) return false;
 		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
