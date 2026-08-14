@@ -15,7 +15,7 @@
  *   active-entry fast path when restored membership schedules a fresh subscribe-to-node.
  */
 import { suite, test, before, after } from 'node:test';
-import { equal, ok } from 'node:assert';
+import { equal, ok, rejects } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
 	startHarper,
@@ -66,15 +66,44 @@ async function connected(node, peerHostname) {
 async function waitUntil(fn, { timeoutMs = 45000, pollMs = 500, label = 'condition' } = {}) {
 	const deadline = Date.now() + timeoutMs;
 	let last;
+	let lastError;
 	while (Date.now() < deadline) {
-		last = await fn();
+		try {
+			last = await fn();
+		} catch (error) {
+			lastError = error;
+		}
 		if (last) return last;
 		await delay(pollMs);
 	}
-	throw new Error(`Timed out waiting for: ${label}`);
+	const lastErrorMessage = lastError instanceof Error ? `; last error: ${lastError.message}` : '';
+	throw new Error(`Timed out waiting for: ${label}${lastErrorMessage}`, { cause: lastError });
 }
 
 suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
+	test('waitUntil retries predicate errors and reports the last one on timeout', async () => {
+		let attempts = 0;
+		const value = await waitUntil(
+			async () => {
+				attempts++;
+				if (attempts === 1) throw new Error('attribute schema is not ready');
+				return 'ready';
+			},
+			{ timeoutMs: 100, pollMs: 1 }
+		);
+		equal(value, 'ready');
+
+		await rejects(
+			waitUntil(
+				async () => {
+					throw new Error('last transient response');
+				},
+				{ timeoutMs: 20, pollMs: 1, label: 'retryable operation' }
+			),
+			/Timed out waiting for: retryable operation; last error: last transient response/
+		);
+	});
+
 	before(async () => {
 		const hostnameA = await getNextAvailableLoopbackAddress();
 		const hostnameB = await getNextAvailableLoopbackAddress();
