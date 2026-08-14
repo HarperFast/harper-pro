@@ -70,6 +70,7 @@ async function waitUntil(fn, { timeoutMs = 45000, pollMs = 500, label = 'conditi
 	while (Date.now() < deadline) {
 		try {
 			last = await fn();
+			lastError = undefined;
 		} catch (error) {
 			lastError = error;
 		}
@@ -100,6 +101,19 @@ test('waitUntil retries predicate errors and reports the last one on timeout', a
 			{ timeoutMs: 20, pollMs: 1, label: 'retryable operation' }
 		),
 		/Timed out waiting for: retryable operation; last error: last transient response/
+	);
+
+	attempts = 0;
+	await rejects(
+		waitUntil(
+			async () => {
+				attempts++;
+				if (attempts === 1) throw new Error('stale connection error');
+				return null;
+			},
+			{ timeoutMs: 20, pollMs: 1, label: 'eventual value' }
+		),
+		/^Timed out waiting for: eventual value$/
 	);
 });
 
