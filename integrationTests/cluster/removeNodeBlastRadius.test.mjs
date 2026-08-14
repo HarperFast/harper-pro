@@ -76,34 +76,34 @@ async function waitUntil(fn, { timeoutMs = 45000, pollMs = 500, label = 'conditi
 		if (last) return last;
 		await delay(pollMs);
 	}
-	const lastErrorMessage = lastError instanceof Error ? `; last error: ${lastError.message}` : '';
+	const lastErrorMessage = lastError === undefined ? '' : `; last error: ${String(lastError)}`;
 	throw new Error(`Timed out waiting for: ${label}${lastErrorMessage}`, { cause: lastError });
 }
 
-suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
-	test('waitUntil retries predicate errors and reports the last one on timeout', async () => {
-		let attempts = 0;
-		const value = await waitUntil(
+test('waitUntil retries predicate errors and reports the last one on timeout', async () => {
+	let attempts = 0;
+	const value = await waitUntil(
+		async () => {
+			attempts++;
+			if (attempts === 1) throw new Error('attribute schema is not ready');
+			return 'ready';
+		},
+		{ timeoutMs: 5000, pollMs: 1 }
+	);
+	equal(value, 'ready');
+
+	await rejects(
+		waitUntil(
 			async () => {
-				attempts++;
-				if (attempts === 1) throw new Error('attribute schema is not ready');
-				return 'ready';
+				throw 'last transient response';
 			},
-			{ timeoutMs: 100, pollMs: 1 }
-		);
-		equal(value, 'ready');
+			{ timeoutMs: 20, pollMs: 1, label: 'retryable operation' }
+		),
+		/Timed out waiting for: retryable operation; last error: last transient response/
+	);
+});
 
-		await rejects(
-			waitUntil(
-				async () => {
-					throw new Error('last transient response');
-				},
-				{ timeoutMs: 20, pollMs: 1, label: 'retryable operation' }
-			),
-			/Timed out waiting for: retryable operation; last error: last transient response/
-		);
-	});
-
+suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 	before(async () => {
 		const hostnameA = await getNextAvailableLoopbackAddress();
 		const hostnameB = await getNextAvailableLoopbackAddress();
@@ -312,7 +312,7 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 					table: 'qa758',
 					ids: ['post-resubscribe-1'],
 					get_attributes: ['id', 'value'],
-				}).catch(() => []);
+				});
 				return r.length ? r : null;
 			},
 			{ timeoutMs: 20000, label: 'B receiving a fresh write from A after re-subscribe' }
@@ -337,7 +337,7 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 					table: 'qa758',
 					ids: ['post-resubscribe-c'],
 					get_attributes: ['id', 'value'],
-				}).catch(() => []);
+				});
 				return r.length ? r : null;
 			},
 			{ timeoutMs: 20000, label: 'B receiving a fresh write from C after re-subscribe' }
