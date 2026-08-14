@@ -111,7 +111,7 @@ test('waitUntil retries predicate errors and reports the last one on timeout', a
 				if (attempts === 1) throw new Error('stale connection error');
 				return null;
 			},
-			{ timeoutMs: 20, pollMs: 1, label: 'eventual value' }
+			{ timeoutMs: 200, pollMs: 1, label: 'eventual value' }
 		),
 		/^Error: Timed out waiting for: eventual value$/
 	);
