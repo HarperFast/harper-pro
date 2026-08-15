@@ -776,6 +776,11 @@ export function isReplicationConnectionClosedError(error: unknown): boolean {
 	);
 }
 
+/** Keeps separate copy transfers of a reused file id from sharing receive state. */
+export function getBlobTransferKey(fileId: unknown, transferId: number | undefined): string {
+	return transferId === undefined ? `file:${fileId}` : `transfer:${transferId}`;
+}
+
 /** Whether every blob reachable from a stored record value is durably complete on disk. */
 async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	if (value == null) return false;
@@ -3494,14 +3499,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		return (blob as Blob & { replicationTransferId?: number }).replicationTransferId;
 	}
 
-	function blobStreamKey(fileId: any, transferId: number | undefined): string {
-		return transferId === undefined ? `file:${fileId}` : `transfer:${transferId}`;
-	}
-
 	// Drop skipped transfer chunks without leaving a reader-less stream in flight.
 	function discardIncomingBlobStream(blob: Blob) {
 		const transferId = getBlobTransferId(blob);
-		const streamKey = blobStreamKey(getFileId(blob), transferId);
+		const streamKey = getBlobTransferKey(getFileId(blob), transferId);
 		const stream = blobsInFlight.get(streamKey);
 		if (stream?.connectedToBlob) return;
 		if (!stream) {
@@ -3966,7 +3967,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// this is a blob chunk, we need to write it to the blob store
 						const blobInfo = message[1];
 						const { fileId, transferId, size, finished, error, errorCode, errorStatus } = blobInfo;
-						const streamKey = blobStreamKey(fileId, transferId);
+						const streamKey = getBlobTransferKey(fileId, transferId);
 						let stream = blobsInFlight.get(streamKey);
 						logger.debug?.(
 							'Received blob',
@@ -6131,7 +6132,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// write the blob to the blob store
 		const blobId = getFileId(remoteBlob);
 		const transferId = getBlobTransferId(remoteBlob);
-		const streamKey = blobStreamKey(blobId, transferId);
+		const streamKey = getBlobTransferKey(blobId, transferId);
 		// A record that IS being applied always outranks a tombstone for the same transfer. A matching
 		// file id alone is insufficient: adjacent copy records can share an id while requiring distinct
 		// transfers, and clearing either one's tombstone would route the other record's chunks incorrectly.

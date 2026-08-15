@@ -14,7 +14,7 @@
  */
 
 import { expect } from 'chai';
-import { isDurableIdentityTie } from '#src/replication/replicationConnection';
+import { getBlobTransferKey, isDurableIdentityTie } from '#src/replication/replicationConnection';
 
 const VERSION = 1700000000000;
 const NODE_ID = 3;
@@ -83,5 +83,16 @@ describe('isDurableIdentityTie — provably-already-applied record detection', (
 		};
 		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, false, counting)).to.equal(true);
 		expect(inspected).to.equal(0);
+	});
+});
+
+describe('getBlobTransferKey — copy blob receive isolation', () => {
+	it('separates distinct copy transfers that reuse a file id', () => {
+		expect(getBlobTransferKey('42', 1)).to.not.equal(getBlobTransferKey('42', 2));
+		expect(getBlobTransferKey('42', 1)).to.equal('transfer:1');
+	});
+
+	it('keeps legacy senders keyed by file id', () => {
+		expect(getBlobTransferKey('42', undefined)).to.equal('file:42');
 	});
 });
