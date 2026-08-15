@@ -5967,7 +5967,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			for (let attempt = 0; ; attempt++) {
 				// Opened inside the try: if core surfaces the 503 synchronously from stream() rather than
 				// from the first iterator.next(), the retry (and the error frame) must still engage.
-				let iterator: AsyncIterator<any> | undefined;
+				let iterator: AsyncIterator<Uint8Array> | undefined;
 				try {
 					iterator = blob.stream()[Symbol.asyncIterator]();
 					let lastBuffer: Buffer;
