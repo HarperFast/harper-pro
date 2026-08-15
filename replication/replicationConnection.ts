@@ -4989,7 +4989,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// origin on the follower. `entry.nodeId` is this node's local id for that
 													// origin (undefined/0 = us) — the same id space the wire uses.
 													const recordNodeId = entry.nodeId ?? nodeId;
-													const clearCopyBlobTransferTags = tagCopyBlobTransfers(entry.value);
+											const clearCopyBlobTransferTags =
+												entry.metadataFlags & HAS_BLOBS ? tagCopyBlobTransfers(entry.value) : () => {};
 													const encoded = createAuditEntry({
 														version: entry.version,
 														tableId: table.tableId,
@@ -5289,24 +5290,32 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						true
 					))
 				) {
-					// Decode only to learn the blob fileIds, so their in-flight receive streams can be
-					// released; saveBlob is never reached, so no local file is minted. A blob whose chunks
-					// arrive entirely after its record has no stream yet — the blobsTimer sweep reclaims
-					// those, bounded by the sender's in-flight cap.
+					const skippedBlobs: Blob[] = [];
+					let enumeratedSkippedBlobs = false;
 					try {
 						decodeWithBlobCallback(
 							() => auditRecord.getValue(tableDecoder),
-							(remoteBlob) => discardIncomingBlobStream(remoteBlob),
+							(remoteBlob) => skippedBlobs.push(remoteBlob),
 							auditStore?.rootStore
 						);
+						enumeratedSkippedBlobs = true;
 					} catch (error) {
 						logger.trace?.(connectionId, 'copy identity-tie: could not enumerate skipped blobs', id, error);
 					}
-					noteReceiveLiveness();
-					if (tableDecoder?.name) lastCopyFrameKey = { table: tableDecoder.name, id };
-					logger.trace?.(connectionId, 'copy identity-tie skip', 'id', id, 'version', auditRecord.version);
-					decoder.position = start + eventLength;
-					continue;
+					if (
+						enumeratedSkippedBlobs &&
+						skippedBlobs.length > 0 &&
+						skippedBlobs.every((blob) =>
+							Object.hasOwn(blob, 'replicationTransferId')
+						)
+					) {
+						for (const blob of skippedBlobs) discardIncomingBlobStream(blob);
+						noteReceiveLiveness();
+						if (tableDecoder?.name) lastCopyFrameKey = { table: tableDecoder.name, id };
+						logger.trace?.(connectionId, 'copy identity-tie skip', 'id', id, 'version', auditRecord.version);
+						decoder.position = start + eventLength;
+						continue;
+					}
 				}
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
@@ -5926,12 +5935,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				return;
 			}
 		}
-		fileIdsBeingSent.add(id);
-		// Track this send so a worker restart can gracefully drain it (finish it if it's still making
-		// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
-		const drainToken = registerBlobSend();
+		let fileSendClaimed = false;
+		let outstandingSlotClaimed = false;
+		let drainToken: ReturnType<typeof registerBlobSend> | undefined;
 		try {
+			fileIdsBeingSent.add(id);
+			fileSendClaimed = true;
+			// Track this send so a worker restart can gracefully drain it (finish it if it's still making
+			// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
+			drainToken = registerBlobSend();
 			outstandingBlobsBeingSent++;
+			outstandingSlotClaimed = true;
 			// Per-chunk timeout: races each iterator.next() against a setTimeout reject so a stuck
 			// underlying read can't park the send loop forever. The local blob file may be missing or
 			// confidently corrupt; the read stream then sits without emitting `data`, `end`, or
@@ -6099,16 +6113,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				}
 			}
 		} finally {
-			endBlobSend(drainToken);
+			if (drainToken) endBlobSend(drainToken);
 			blobsBeingSent.delete(blobSendKey);
 			releaseBlobHold?.();
-			fileIdsBeingSent.delete(id);
-			const nextFileSend = blobFileSentCallbacks.get(id)?.shift();
-			if (nextFileSend) nextFileSend();
-			else blobFileSentCallbacks.delete(id);
-			outstandingBlobsBeingSent--;
-			while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
-				blobSentCallbacks.shift()?.();
+			if (fileSendClaimed) {
+				fileIdsBeingSent.delete(id);
+				const nextFileSend = blobFileSentCallbacks.get(id)?.shift();
+				if (nextFileSend) nextFileSend();
+				else blobFileSentCallbacks.delete(id);
+			}
+			if (outstandingSlotClaimed) {
+				outstandingBlobsBeingSent--;
+				while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
+					blobSentCallbacks.shift()?.();
+				}
 			}
 		}
 	}
