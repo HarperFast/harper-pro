@@ -5,7 +5,7 @@ on:
     # Nightly at 07:00 UTC (~midnight PT / 03:00 ET)
     - cron: '0 7 * * *'
   repository_dispatch:
-    types: [ sync_core ]
+    types: [sync_core]
   workflow_dispatch:
 
 permissions:
@@ -38,6 +38,11 @@ jobs:
         with:
           node-version: latest
           registry-url: 'https://registry.npmjs.org'
+
+      # A coordinated PR may have merged a core:set-branch override; the sync
+      # must always track main, and this repairs .gitmodules in the sync PR.
+      - name: Reset core branch tracking
+        run: git submodule set-branch --branch main core
 
       - name: Sync core
         run: npm run core:sync
