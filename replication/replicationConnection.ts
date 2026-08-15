@@ -3490,10 +3490,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		return existing;
 	}
 
-	function takeBlobTransferId(blob: Blob): number | undefined {
-		const transferId = (blob as Blob & { replicationTransferId?: number }).replicationTransferId;
-		if (transferId !== undefined) delete (blob as Blob & { replicationTransferId?: number }).replicationTransferId;
-		return transferId;
+	function getBlobTransferId(blob: Blob): number | undefined {
+		return (blob as Blob & { replicationTransferId?: number }).replicationTransferId;
 	}
 
 	function blobStreamKey(fileId: any, transferId: number | undefined): string {
@@ -3502,7 +3500,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 	// Drop skipped transfer chunks without leaving a reader-less stream in flight.
 	function discardIncomingBlobStream(blob: Blob) {
-		const transferId = takeBlobTransferId(blob);
+		const transferId = getBlobTransferId(blob);
 		const streamKey = blobStreamKey(getFileId(blob), transferId);
 		const stream = blobsInFlight.get(streamKey);
 		if (stream?.connectedToBlob) return;
@@ -6131,7 +6129,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	function receiveBlobs(remoteBlob: Blob, id: string | number, copyFrameIndex?: number, repairTarget?: any) {
 		// write the blob to the blob store
 		const blobId = getFileId(remoteBlob);
-		const transferId = takeBlobTransferId(remoteBlob);
+		const transferId = getBlobTransferId(remoteBlob);
 		const streamKey = blobStreamKey(blobId, transferId);
 		// A record that IS being applied always outranks a tombstone for the same transfer. A matching
 		// file id alone is insufficient: adjacent copy records can share an id while requiring distinct
