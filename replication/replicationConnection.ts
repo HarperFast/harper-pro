@@ -3986,6 +3986,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							// attach a consumer. Drop the chunk rather than let it open (or feed) a reader-less
 							// stream holding the whole blob until the timeout sweep. The final chunk retires the
 							// tombstone and any stream/lock the blob had taken before the record arrived.
+							skippedBlobIds.set(streamKey, Date.now());
 							if (finished) {
 								skippedBlobIds.delete(streamKey);
 								if (blobsInFlight.delete(streamKey)) unregisterBlobReceiveInFlight(fileId, auditStore?.rootStore);
