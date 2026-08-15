@@ -88,7 +88,7 @@ function blobStoreFiles(dataRootDir, db = 'data') {
 
 const sharedConfig = (host) => ({
 	analytics: { aggregatePeriod: -1 },
-	logging: { colors: false, stdStreams: false, console: true, level: 'warn' },
+	logging: { colors: false, stdStreams: false, console: true, level: 'trace' },
 	replication: { securePort: host + ':9933', databases: ['data'] },
 });
 
@@ -266,6 +266,11 @@ suite('base copy of records the receiver already holds preserves its blob files'
 		ok(
 			/Requesting full copy of database data/.test(sourceLog),
 			'precondition never armed: A never requested a full copy from B, so no copy frames were applied'
+		);
+		equal(
+			(sourceLog.match(/copy identity-tie skip/g) ?? []).length,
+			RECORD_COUNT,
+			'expected the receiver-side identity-tie gate to skip every A-originated blob record from B\'s copy'
 		);
 
 		const filesAfter = blobStoreFiles(ctx.source.dataRootDir);
