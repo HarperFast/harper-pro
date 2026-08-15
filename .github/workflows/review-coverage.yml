@@ -18,6 +18,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
-      # org policy requires full-sha pinning; renovate bumps this, so it still tracks
-      # the gate's parser (dispatch@main) at dep-bot cadence
-      - uses: HarperFast/dispatch/actions/review-coverage@a3210e62d4ffce378898605fd6afb3d4e1d0bee1 # main
+      # the action's public home is the harper repo (GitHub bars public repos from
+      # using private-repo actions); org policy requires full-sha pinning — renovate
+      # bumps this toward harper main. Pinned to the harper PR branch until it merges.
+      - uses: HarperFast/harper/.github/actions/review-coverage@d92fd32a164c25f2bf3aac12317f1be992d675cb # main
