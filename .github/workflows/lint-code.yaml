@@ -18,3 +18,4 @@ jobs:
           package-manager-cache: false
       - run: npm i
       - run: npm run lint:required
+      - run: node build-tools/companion-check.test.mjs
