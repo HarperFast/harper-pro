@@ -5998,11 +5998,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							ws.send(
 								encode([
 									BLOB_CHUNK,
-							{
-								fileId: id,
-								transferId,
-								size: blob.size,
-							},
+									{
+										fileId: id,
+										transferId,
+										size: blob.size,
+									},
 									lastBuffer,
 								])
 							);
