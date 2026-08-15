@@ -269,7 +269,7 @@ suite('base copy of records the receiver already holds preserves its blob files'
 		);
 		ok(
 			(sourceLog.match(/copy identity-tie skip/g) ?? []).length >= RECORD_COUNT,
-			'expected the receiver-side identity-tie gate to skip every A-originated blob record from B\'s copy'
+			"expected the receiver-side identity-tie gate to skip every A-originated blob record from B's copy"
 		);
 
 		const filesAfter = blobStoreFiles(ctx.source.dataRootDir);

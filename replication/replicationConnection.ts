@@ -4989,8 +4989,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// origin on the follower. `entry.nodeId` is this node's local id for that
 													// origin (undefined/0 = us) — the same id space the wire uses.
 													const recordNodeId = entry.nodeId ?? nodeId;
-											const clearCopyBlobTransferTags =
-												entry.metadataFlags & HAS_BLOBS ? tagCopyBlobTransfers(entry.value) : () => {};
+													const clearCopyBlobTransferTags =
+														entry.metadataFlags & HAS_BLOBS ? tagCopyBlobTransfers(entry.value) : () => {};
 													const encoded = createAuditEntry({
 														version: entry.version,
 														tableId: table.tableId,
@@ -5305,9 +5305,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					if (
 						enumeratedSkippedBlobs &&
 						skippedBlobs.length > 0 &&
-						skippedBlobs.every((blob) =>
-							Object.hasOwn(blob, 'replicationTransferId')
-						)
+						skippedBlobs.every((blob) => Object.hasOwn(blob, 'replicationTransferId'))
 					) {
 						for (const blob of skippedBlobs) discardIncomingBlobStream(blob);
 						noteReceiveLiveness();
