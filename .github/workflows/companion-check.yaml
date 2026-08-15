@@ -128,6 +128,7 @@ jobs:
                 return stateOf(data);
               } catch (e) {
                 if (e.status !== 404) return `unreadable (${e.status || e.message})`;
+                // 404 falls through: definitive miss unless the secret can see more.
               }
               // Oracle guard: the secret never serves foreign-org refs or fork PRs.
               if (crossToken && allowSecret && dep.owner.toLowerCase() === owner.toLowerCase()) {
@@ -148,7 +149,7 @@ jobs:
                   return `unreadable (${e.message})`;
                 }
               }
-              return 'unreadable (404)';
+              return 'missing';
             }
 
             async function evaluate({ deps, unparseable }, allowSecret) {
@@ -172,14 +173,15 @@ jobs:
                 return { state: 'failure', description: `${closed.ref} closed without merging` };
               const missing = states.find((s) => s.state === 'missing');
               if (missing)
-                return { state: 'failure', description: `${missing.ref} not found (typo, or token lacks access?)` };
+                return {
+                  state: 'failure',
+                  description: `${missing.ref} not found or inaccessible (typo? private repo needs COMPANION_CHECK_TOKEN?)`,
+                };
               const unreadable = states.find((s) => s.state.startsWith('unreadable'));
               if (unreadable)
                 return {
                   state: 'pending',
-                  description:
-                    `Cannot read ${unreadable.ref} ${unreadable.state.slice(11)}` +
-                    (crossToken ? '' : ' - COMPANION_CHECK_TOKEN needed?'),
+                  description: `Cannot read ${unreadable.ref} ${unreadable.state.slice(11)}`,
                 };
               const open = states.filter((s) => s.state === 'open');
               if (open.length)
@@ -262,11 +264,12 @@ jobs:
             if (failures) core.setFailed(`${failures} PR(s) could not be updated`);
 
   normalize-core:
-    # contains() is case-insensitive, matching the evaluator's marker parse
+    # contains() is case-insensitive; both spellings the evaluator accepts
     if: >-
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
-      contains(github.event.pull_request.body, 'depends-on:')
+      (contains(github.event.pull_request.body, 'depends-on:') ||
+       contains(github.event.pull_request.body, 'depends on:'))
     runs-on: ubuntu-latest
     steps:
       # App token: repository_dispatch events created with GITHUB_TOKEN do

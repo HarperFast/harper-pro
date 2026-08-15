@@ -41,7 +41,9 @@ jobs:
 
       # A coordinated PR may have merged a core:set-branch override; the sync
       # must always track main, and this repairs .gitmodules in the sync PR.
+      # Release-line dispatches keep their own tracking.
       - name: Reset core branch tracking
+        if: github.ref_name == github.event.repository.default_branch
         run: git submodule set-branch --branch main core
 
       - name: Sync core
