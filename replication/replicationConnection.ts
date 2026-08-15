@@ -3011,7 +3011,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// so a blob whose bytes arrive after its record never opens a stream no consumer will ever drain.
 	// Retired by the blob's own final chunk, by a record that does apply the same transfer, or by
 	// the connection closing.
-	const skippedBlobIds = new Set();
+	const skippedBlobIds = new Map<any, number>();
 	// A file id can be reused by distinct records. Keep the copy receive stream keyed by the sender's
 	// per-transfer token instead, so a skipped record cannot drop bytes an applied record still needs.
 	let nextBlobTransferId = 1;
@@ -3490,33 +3490,32 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		return existing;
 	}
 
-	/**
-	 * Release the receive-side state for a blob whose record we are not going to apply. Nothing else
-	 * ever will: the chunk handler does not backpressure a stream with no consumer attached (it assumes
-	 * a record eventually attaches one), so without this the blob's bytes stay buffered in
-	 * `blobsInFlight` until the `blobsTimer` sweep reclaims it `blobTimeout` later.
-	 *
-	 * A stream that is still receiving is destroyed but LEFT in the map: later chunks then route to the
-	 * dropped-chunk branch instead of recreating a reader-less PassThrough that would backpressure the
-	 * socket. The chunks may also not have arrived yet, so the fileId is recorded in `skippedBlobIds`
-	 * for the chunk handler to drop on sight — the record frame routinely outruns its blob.
-	 */
-	function takeBlobTransferId(blob: Blob): any {
+	function takeBlobTransferId(blob: Blob): number | undefined {
 		const transferId = (blob as Blob & { replicationTransferId?: number }).replicationTransferId;
 		if (transferId !== undefined) delete (blob as Blob & { replicationTransferId?: number }).replicationTransferId;
-		return transferId ?? getFileId(blob);
+		return transferId;
 	}
 
+	function blobStreamKey(fileId: any, transferId: number | undefined): string {
+		return transferId === undefined ? `file:${fileId}` : `transfer:${transferId}`;
+	}
+
+	// Drop skipped transfer chunks without leaving a reader-less stream in flight.
 	function discardIncomingBlobStream(blob: Blob) {
 		const transferId = takeBlobTransferId(blob);
-		const stream = blobsInFlight.get(transferId);
+		const streamKey = blobStreamKey(getFileId(blob), transferId);
+		const stream = blobsInFlight.get(streamKey);
 		if (stream?.connectedToBlob) return;
-		skippedBlobIds.add(transferId);
-		if (!stream) return;
-		if (stream.writableEnded) {
-			blobsInFlight.delete(transferId);
-			unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
+		if (!stream) {
+			skippedBlobIds.set(streamKey, Date.now());
+			return;
 		}
+		if (stream.writableEnded) {
+			blobsInFlight.delete(streamKey);
+			unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
+			return;
+		}
+		skippedBlobIds.set(streamKey, Date.now());
 		stream.destroy?.();
 	}
 
@@ -3968,8 +3967,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						if (inCopyMode) noteCopyProgress(); // copy blob chunk arriving — the copy is advancing (#453)
 						// this is a blob chunk, we need to write it to the blob store
 						const blobInfo = message[1];
-						const { fileId, transferId = fileId, size, finished, error, errorCode, errorStatus } = blobInfo;
-						let stream = blobsInFlight.get(transferId);
+						const { fileId, transferId, size, finished, error, errorCode, errorStatus } = blobInfo;
+						const streamKey = blobStreamKey(fileId, transferId);
+						let stream = blobsInFlight.get(streamKey);
 						logger.debug?.(
 							'Received blob',
 							fileId,
@@ -3983,14 +3983,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							finished
 						);
 
-						if (skippedBlobIds.has(transferId)) {
+						if (skippedBlobIds.has(streamKey)) {
 							// Every record referencing these bytes was skipped as an identity tie, so nothing will
 							// attach a consumer. Drop the chunk rather than let it open (or feed) a reader-less
 							// stream holding the whole blob until the timeout sweep. The final chunk retires the
 							// tombstone and any stream/lock the blob had taken before the record arrived.
 							if (finished) {
-								skippedBlobIds.delete(transferId);
-								if (blobsInFlight.delete(transferId)) unregisterBlobReceiveInFlight(fileId, auditStore?.rootStore);
+								skippedBlobIds.delete(streamKey);
+								if (blobsInFlight.delete(streamKey)) unregisterBlobReceiveInFlight(fileId, auditStore?.rootStore);
 							}
 							break;
 						}
@@ -3998,7 +3998,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							stream = createBlobReceiveStream(blobTimeout);
 							stream.fileId = fileId;
 							stream.expectedSize = size;
-							blobsInFlight.set(transferId, stream);
+							blobsInFlight.set(streamKey, stream);
 							registerBlobReceiveInFlight(fileId, auditStore?.rootStore);
 						}
 						if (size !== undefined) stream.expectedSize = size;
@@ -4033,10 +4033,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									// (see the destroyed branch below) so intervening chunks were dropped rather
 									// than recreating a reader-less stream. Now that the blob is complete it will
 									// never connect to a record — forget it instead of writing to a dead stream.
-									blobsInFlight.delete(transferId);
+									blobsInFlight.delete(streamKey);
 									unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
 								} else stream.end(blobBody);
-								if (stream.connectedToBlob) blobsInFlight.delete(transferId);
+								if (stream.connectedToBlob) blobsInFlight.delete(streamKey);
 							} else if (stream.destroyed || stream.writableEnded) {
 								// The stream was already torn down before this mid-blob chunk arrived —
 								// typically because saveBlob's pipeline failed (e.g. ENOENT on
@@ -4090,7 +4090,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								`Error receiving blob for ${stream.recordId} from ${remoteNodeName} and streaming to storage`,
 								error
 							);
-							blobsInFlight.delete(transferId);
+							blobsInFlight.delete(streamKey);
 							if (!stream.connectedToBlob) unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
 						}
 						break;
@@ -5752,6 +5752,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (hdbNodesSubscription) hdbNodesSubscription.end();
 		// Wake queued blob senders and writer waits so they observe wsClosed instead of parking forever
 		while (blobSentCallbacks.length > 0) blobSentCallbacks.shift()?.();
+		for (const callbacks of blobFileSentCallbacks.values()) {
+			while (callbacks.length > 0) callbacks.shift()?.();
+		}
+		blobFileSentCallbacks.clear();
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
@@ -5782,6 +5786,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// The same blobs can't be sent concurrently of the packets will get mixed up. The receiving
 	// end should handle aggregated the results of the same blob for separate record requests.
 	const blobsBeingSent = new Set();
+	// Copy frames use a per-record transfer id so a skipped record cannot suppress an applied record
+	// with the same file id. Keep those transfers serialized by file id: a mixed-version receiver only
+	// knows the file id and would otherwise merge concurrent streams into one corrupt blob.
+	const fileIdsBeingSent = new Set();
+	const blobFileSentCallbacks = new Map<any, Array<() => void>>();
 	let blobSendErrorsSuppressed = 0;
 	let lastBlobSendErrorLog = 0;
 	// Throttle state for the blob-send visibility warnings below (park-on-cap, unpark, declined).
@@ -5906,6 +5915,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				waitedMs: Date.now() - parkStartedAt,
 			});
 		}
+		while (fileIdsBeingSent.has(id)) {
+			await new Promise<void>((resolve) => {
+				const callbacks = blobFileSentCallbacks.get(id);
+				if (callbacks) callbacks.push(resolve);
+				else blobFileSentCallbacks.set(id, [resolve]);
+			});
+			if (wsClosed) {
+				blobsBeingSent.delete(blobSendKey);
+				return;
+			}
+		}
+		fileIdsBeingSent.add(id);
 		// Track this send so a worker restart can gracefully drain it (finish it if it's still making
 		// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
 		const drainToken = registerBlobSend();
@@ -6081,6 +6102,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			endBlobSend(drainToken);
 			blobsBeingSent.delete(blobSendKey);
 			releaseBlobHold?.();
+			fileIdsBeingSent.delete(id);
+			const nextFileSend = blobFileSentCallbacks.get(id)?.shift();
+			if (nextFileSend) nextFileSend();
+			else blobFileSentCallbacks.delete(id);
 			outstandingBlobsBeingSent--;
 			while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
 				blobSentCallbacks.shift()?.();
@@ -6091,18 +6116,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// write the blob to the blob store
 		const blobId = getFileId(remoteBlob);
 		const transferId = takeBlobTransferId(remoteBlob);
+		const streamKey = blobStreamKey(blobId, transferId);
 		// A record that IS being applied always outranks a tombstone for the same transfer. A matching
 		// file id alone is insufficient: adjacent copy records can share an id while requiring distinct
 		// transfers, and clearing either one's tombstone would route the other record's chunks incorrectly.
-		skippedBlobIds.delete(transferId);
-		let stream = blobsInFlight.get(transferId);
+		skippedBlobIds.delete(streamKey);
+		let stream = blobsInFlight.get(streamKey);
 		logger.debug?.('Received transaction with blob', blobId, 'has stream', !!stream, 'ended', !!stream?.writableEnded);
 		if (stream) {
-			if (stream.writableEnded) blobsInFlight.delete(transferId);
+			if (stream.writableEnded) blobsInFlight.delete(streamKey);
 		} else {
 			stream = createBlobReceiveStream(blobTimeout);
 			stream.fileId = blobId;
-			blobsInFlight.set(transferId, stream);
+			blobsInFlight.set(streamKey, stream);
 			registerBlobReceiveInFlight(blobId, auditStore?.rootStore);
 		}
 		stream.connectedToBlob = true;
@@ -6752,6 +6778,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					unregisterBlobReceiveInFlight(stream.fileId ?? blobId, auditStore?.rootStore);
 					stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
 				}
+			}
+			for (const [streamKey, skippedAt] of skippedBlobIds) {
+				if (skippedAt + blobTimeout <= now) skippedBlobIds.delete(streamKey);
 			}
 			// Sweep more often than the idle threshold: with the interval coupled to blobTimeout (900s
 			// default), an orphaned stream could hold its buffered chunks for up to 2x blobTimeout.

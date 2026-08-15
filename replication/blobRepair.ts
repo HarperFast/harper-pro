@@ -51,7 +51,7 @@ export async function repairBlobs(
 				const repairedBlobs: any[] = [];
 				findBlobsInObject(entry.value, (blob) => repairedBlobs.push(blob));
 				const allComplete =
-					repairedBlobs.length > 0 && (await Promise.all(repairedBlobs.map(isBlobComplete))).every(Boolean);
+					repairedBlobs.length > 0 && (await Promise.all(repairedBlobs.map((blob) => isBlobComplete(blob)))).every(Boolean);
 
 				if (!allComplete) continue; // peer's copy was also incomplete, try next peer
 
