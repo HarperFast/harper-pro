@@ -165,13 +165,26 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		});
 		const seeded = await waitUntil(
 			async () => {
-				const r = await sendOperation(ctx.nodeB, {
-					operation: 'search_by_id',
-					database: 'data',
-					table: 'qa758',
-					ids: ['seed-1'],
-					get_attributes: ['id', 'value'],
-				});
+				let r;
+				try {
+					r = await sendOperation(ctx.nodeB, {
+						operation: 'search_by_id',
+						database: 'data',
+						table: 'qa758',
+						ids: ['seed-1'],
+						get_attributes: ['id', 'value'],
+					});
+				} catch (error) {
+					// 'value' is a dynamically-created attribute born on A during the upsert above, and
+					// attribute metadata reaches B's serving worker asynchronously from the record itself
+					// (the replicatedConfirmation: 1 ack can even come from C, with nothing on B yet).
+					// search_by_id validates get_attributes against B's known attributes BEFORE reading,
+					// so until that metadata lands B answers "unknown attribute 'value'" instead of an
+					// empty result. Retry that specific transient exactly like an empty result — measured
+					// heal is single-digit milliseconds — and let every other error keep failing the test.
+					if (!String(error?.message).includes(`unknown attribute 'value'`)) throw error;
+					return null;
+				}
 				return r.length ? r : null;
 			},
 			{ label: 'seed-1 replicated to B' }
