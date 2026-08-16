@@ -190,6 +190,7 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 					}
 					equal(response.status, 200, JSON.stringify(body));
 				}
+				lastUnknownAttribute = undefined;
 				return body.length ? body : null;
 			},
 			{ label: 'seed-1 replicated to B' }
