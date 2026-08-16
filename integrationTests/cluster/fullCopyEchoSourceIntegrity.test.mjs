@@ -11,7 +11,7 @@ import { suite, test, before, after } from 'node:test';
 import { equal, deepEqual } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { concurrent, fetchWithRetry, readLog } from './clusterShared.mjs';
 
@@ -60,7 +60,7 @@ function blobStoreSnapshot(dataRootDir) {
 	return files
 		.map((p) => {
 			const buf = readFileSync(p);
-			const id = p.split('/').pop();
+			const id = basename(p);
 			if (buf.length < HEADER_SIZE) return { id, status: 'too-small' };
 			const headerValue = buf.readBigUInt64BE(0);
 			const type = Number(headerValue >> 48n);
