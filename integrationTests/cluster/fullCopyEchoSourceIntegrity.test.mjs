@@ -78,7 +78,17 @@ function blobStoreSnapshot(dataRootDir) {
 				type === 0xff ? 'error' : type === 0xfe ? 'pending' : buf.length < HEADER_SIZE + size ? 'truncated' : 'ok';
 			return { id, status };
 		})
-		.sort((a, b) => parseInt(a.id, 16) - parseInt(b.id, 16));
+		.sort((a, b) => {
+			// hex file ids sort numerically; any non-hex stray (temp/OS file) sorts last, by name,
+			// so the comparator stays total and the snapshot deterministic
+			const na = parseInt(a.id, 16);
+			const nb = parseInt(b.id, 16);
+			if (Number.isNaN(na) || Number.isNaN(nb)) {
+				if (Number.isNaN(na) && Number.isNaN(nb)) return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+				return Number.isNaN(na) ? 1 : -1;
+			}
+			return na - nb;
+		});
 }
 
 async function op(node, operation, timeoutMs = OP_TIMEOUT_MS) {
@@ -97,7 +107,8 @@ async function verifyBlobContent(node, id) {
 	const resp = await fetchWithRetry(node.httpURL + '/BlobCopyImage/' + id, { retries: 5 });
 	if (resp.status !== 200) return { id, ok: false, reason: `status=${resp.status}` };
 	const bytes = Buffer.from(await resp.arrayBuffer());
-	if (!bytes.equals(expectedBytesForId(id))) return { id, ok: false, reason: `length=${bytes.length}` };
+	if (bytes.length !== BLOB_SIZE) return { id, ok: false, reason: `length=${bytes.length} expected=${BLOB_SIZE}` };
+	if (!bytes.equals(expectedBytesForId(id))) return { id, ok: false, reason: 'bytes-mismatch' };
 	return { id, ok: true };
 }
 
@@ -147,6 +158,14 @@ suite('QA-692: a joining receiver must not rewrite the source blob store', { tim
 		equal(preJoin.length, RECORD_COUNT, 'sanity: one blob file per seeded record');
 
 		const hostnameB = await getNextAvailableLoopbackAddress();
+		// The echo rewrite only strikes the node whose name sorts BELOW its peer's (the version-tie
+		// falls to the alphabetical node-name comparison), so this test only has teeth while the
+		// source's name sorts first. Assert it, so an allocator change can't silently defang the guard.
+		equal(
+			ctx.source.hostname < hostnameB,
+			true,
+			`precondition: source name (${ctx.source.hostname}) must sort below receiver name (${hostnameB}) for the echo to target the source`
+		);
 		const receiverCtx = { name: ctx.name, harper: { hostname: hostnameB } };
 		await startHarper(receiverCtx, { config: sharedConfig(hostnameB), env: { HARPER_NO_FLUSH_ON_EXIT: true } });
 		ctx.receiver = receiverCtx.harper;
@@ -179,18 +198,42 @@ suite('QA-692: a joining receiver must not rewrite the source blob store', { tim
 			await delay(500);
 		}
 		equal(count, RECORD_COUNT, 'receiver full copy should converge');
-		// Settle window: the reverse copy (source pulling from the new peer) and blob saves run
-		// after the forward copy converges; the echo-rewrite this test pins happened in here.
-		await delay(10000);
 
+		// The echo this test pins rides the SOURCE's own subscription to the new peer, so make the
+		// negative non-vacuous: wait until A actually reports a replication connection to B before
+		// judging A's store. Without this, a slow mesh setup would let the assertions pass before
+		// the reverse copy ever ran.
+		const connDeadline = Date.now() + 60000;
+		let reverseConnected = false;
+		while (Date.now() < connDeadline && !reverseConnected) {
+			const status = await op(ctx.source, { operation: 'cluster_status' });
+			reverseConnected = (status.connections ?? []).some(
+				(c) =>
+					(c.url ?? c.name ?? '').includes(ctx.receiver.hostname) &&
+					(c.database_sockets ?? []).some((s) => s.connected !== false)
+			);
+			if (!reverseConnected) await delay(500);
+		}
+		equal(reverseConnected, true, 'source should establish its reverse replication connection to the new peer');
+		// Settle window: the reverse copy and its blob saves run after the forward copy converges;
+		// on the unfixed sender the echo-rewrite of A's store happened in here. Snapshot twice a few
+		// seconds apart so a rewrite still in flight at the first snapshot cannot slip through.
+		await delay(10000);
 		const postJoin = blobStoreSnapshot(ctx.source.dataRootDir);
-		deepEqual(
-			postJoin,
-			preJoin,
-			`DEFECT SIGNATURE (QA-692): the source blob store changed after a receiver joined — the reverse ` +
-				`full copy echoed the source's own rows back and they were re-applied instead of identity-skipped ` +
-				`(pre=${JSON.stringify(preJoin)} post=${JSON.stringify(postJoin)})`
-		);
+		await delay(3000);
+		const postJoinStable = blobStoreSnapshot(ctx.source.dataRootDir);
+		for (const [label, snapshot] of [
+			['post-join', postJoin],
+			['post-join+3s', postJoinStable],
+		]) {
+			deepEqual(
+				snapshot,
+				preJoin,
+				`DEFECT SIGNATURE (QA-692): the source blob store changed after a receiver joined (${label}) — the reverse ` +
+					`full copy echoed the source's own rows back and they were re-applied instead of identity-skipped ` +
+					`(pre=${JSON.stringify(preJoin)} ${label}=${JSON.stringify(snapshot)})`
+			);
+		}
 
 		const allIds = Array.from({ length: RECORD_COUNT }, (_, i) => i);
 		const sourceResults = await Promise.all(allIds.map((id) => verifyBlobContent(ctx.source, id)));
