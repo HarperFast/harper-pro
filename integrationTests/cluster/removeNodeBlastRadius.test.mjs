@@ -171,6 +171,7 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		let lastUnknownAttribute;
 		const seeded = await waitUntil(
 			async () => {
+				lastUnknownAttribute = undefined;
 				const response = await fetch(ctx.nodeB.operationsAPIURL, {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
@@ -190,7 +191,6 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 					}
 					equal(response.status, 200, JSON.stringify(body));
 				}
-				lastUnknownAttribute = undefined;
 				return body.length ? body : null;
 			},
 			{ label: 'seed-1 replicated to B' }
