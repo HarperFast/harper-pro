@@ -1,20 +1,11 @@
 /**
- * QA-692 regression (source:gh-pro:537 family). When an empty node B joins via add_node,
- * the mesh is bidirectional: the established source A, having no resume cursor for the new
- * peer, requests a full copy FROM B (by design, harper-pro#426) — so B echoes A's own rows
- * back while B's forward copy is still filling. The bulk-copy sender used to stamp its own
- * nodeId on every copied row, so the echo arrived at A attributed to B; the version tie then
- * fell to the alphabetical node-name tie-break instead of the identity match, and the
- * name-smaller node re-applied its ENTIRE own dataset — re-minting every blob from the
- * peer's stream and deleting its original files. A SIGKILL of B mid-echo left A's committed
- * records referencing permanent pending stubs with the good files already gone (the QA-692
- * nightly failure: source A "corrupt" with 2 unreadable blobs despite never being killed).
- *
- * This test pins the invariant deterministically, with no kill race: after a receiver joins
- * and both directions settle, the source's blob store must be byte-for-byte untouched —
- * same file ids, no deletions, no re-mints — and both nodes must serve every blob's exact
- * expected content. On the unfixed sender this fails on every run (the echo rewrites all of
- * A's blob files).
+ * QA-692 regression: replication/DESIGN.md invariant 16 (bulk copies preserve row origin).
+ * A joining receiver's reverse full copy echoes the source's own rows back; a sender that
+ * re-attributes them to itself makes the echo win the version tie on the name-smaller node,
+ * which then re-mints every blob and unlinks its originals — so a receiver crash mid-echo
+ * destroys source blobs. Pinned deterministically, no kill race: after a receiver joins and
+ * the reverse copy provably runs, the source's blob-store file set must be untouched and
+ * both nodes must serve every blob's exact expected bytes.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, deepEqual } from 'node:assert/strict';
@@ -22,7 +13,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
-import { concurrent, fetchWithRetry } from './clusterShared.mjs';
+import { concurrent, fetchWithRetry, readLog } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -79,8 +70,7 @@ function blobStoreSnapshot(dataRootDir) {
 			return { id, status };
 		})
 		.sort((a, b) => {
-			// hex file ids sort numerically; any non-hex stray (temp/OS file) sorts last, by name,
-			// so the comparator stays total and the snapshot deterministic
+			// hex ids numerically; non-hex strays (temp/OS files) last, by name
 			const na = parseInt(a.id, 16);
 			const nb = parseInt(b.id, 16);
 			if (Number.isNaN(na) || Number.isNaN(nb)) {
@@ -158,9 +148,7 @@ suite('QA-692: a joining receiver must not rewrite the source blob store', { tim
 		equal(preJoin.length, RECORD_COUNT, 'sanity: one blob file per seeded record');
 
 		const hostnameB = await getNextAvailableLoopbackAddress();
-		// The echo rewrite only strikes the node whose name sorts BELOW its peer's (the version-tie
-		// falls to the alphabetical node-name comparison), so this test only has teeth while the
-		// source's name sorts first. Assert it, so an allocator change can't silently defang the guard.
+		// the echo rewrite only strikes the node whose name sorts below its peer's
 		equal(
 			ctx.source.hostname < hostnameB,
 			true,
@@ -199,25 +187,18 @@ suite('QA-692: a joining receiver must not rewrite the source blob store', { tim
 		}
 		equal(count, RECORD_COUNT, 'receiver full copy should converge');
 
-		// The echo this test pins rides the SOURCE's own subscription to the new peer, so make the
-		// negative non-vacuous: wait until A actually reports a replication connection to B before
-		// judging A's store. Without this, a slow mesh setup would let the assertions pass before
-		// the reverse copy ever ran.
+		// The echo rides the SOURCE's own subscription to the new peer; the source's log line is the
+		// direct proof the reverse full-copy walk was requested, so the no-change assertions below
+		// cannot pass vacuously before it ran.
+		const reverseCopyMarker = `Requesting full copy of database data from wss://${ctx.receiver.hostname}:`;
 		const connDeadline = Date.now() + 60000;
-		let reverseConnected = false;
-		while (Date.now() < connDeadline && !reverseConnected) {
-			const status = await op(ctx.source, { operation: 'cluster_status' });
-			reverseConnected = (status.connections ?? []).some(
-				(c) =>
-					(c.url ?? c.name ?? '').includes(ctx.receiver.hostname) &&
-					(c.database_sockets ?? []).some((s) => s.connected !== false)
-			);
-			if (!reverseConnected) await delay(500);
+		let reverseCopyRequested = false;
+		while (Date.now() < connDeadline && !reverseCopyRequested) {
+			reverseCopyRequested = (await readLog(ctx.source)).includes(reverseCopyMarker);
+			if (!reverseCopyRequested) await delay(500);
 		}
-		equal(reverseConnected, true, 'source should establish its reverse replication connection to the new peer');
-		// Settle window: the reverse copy and its blob saves run after the forward copy converges;
-		// on the unfixed sender the echo-rewrite of A's store happened in here. Snapshot twice a few
-		// seconds apart so a rewrite still in flight at the first snapshot cannot slip through.
+		equal(reverseCopyRequested, true, 'source should have requested its reverse full copy from the new peer');
+		// settle, then snapshot twice so a rewrite still in flight cannot slip through
 		await delay(10000);
 		const postJoin = blobStoreSnapshot(ctx.source.dataRootDir);
 		await delay(3000);

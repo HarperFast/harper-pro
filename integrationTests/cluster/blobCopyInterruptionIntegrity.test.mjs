@@ -242,7 +242,6 @@ async function verifyBlobContent(node, id) {
 		if (!bytes.equals(expectedBytesForId(id))) return { id, ok: false, reason: 'bytes-mismatch' };
 		return { id, ok: true };
 	} catch (e) {
-		// undici's cause distinguishes a network blip from a server-side mid-stream abort
 		const cause = e?.cause ? ` (cause: ${e.cause.message || e.cause})` : '';
 		return { id, ok: false, reason: `threw ${(e && e.message) || e}${cause}` };
 	}
