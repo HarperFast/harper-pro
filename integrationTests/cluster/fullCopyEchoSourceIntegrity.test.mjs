@@ -187,17 +187,25 @@ suite('QA-692: a joining receiver must not rewrite the source blob store', { tim
 		}
 		equal(count, RECORD_COUNT, 'receiver full copy should converge');
 
-		// The echo rides the SOURCE's own subscription to the new peer; the source's log line is the
-		// direct proof the reverse full-copy walk was requested, so the no-change assertions below
-		// cannot pass vacuously before it ran.
+		// The echo rides the SOURCE's own subscription to the new peer. Per-record watermark advance
+		// is suppressed during a copy; only COPY_COMPLETE's end_txn moves lastReceivedVersion to
+		// copyStartTime — so a positive value on A's connection to B proves the reverse copy RAN TO
+		// COMPLETION, and the no-change assertions below cannot pass vacuously before it.
 		const reverseCopyMarker = `Requesting full copy of database data from wss://${ctx.receiver.hostname}:`;
-		const connDeadline = Date.now() + 60000;
+		const connDeadline = Date.now() + 90000;
+		let reverseCopyDone = false;
 		let reverseCopyRequested = false;
-		while (Date.now() < connDeadline && !reverseCopyRequested) {
-			reverseCopyRequested = (await readLog(ctx.source)).includes(reverseCopyMarker);
-			if (!reverseCopyRequested) await delay(500);
+		while (Date.now() < connDeadline && !reverseCopyDone) {
+			reverseCopyRequested ||= (await readLog(ctx.source)).includes(reverseCopyMarker);
+			const status = await op(ctx.source, { operation: 'cluster_status' });
+			const conn = (status.connections ?? []).find((c) => (c.url ?? c.name ?? '').includes(ctx.receiver.hostname));
+			reverseCopyDone = (conn?.database_sockets ?? []).some(
+				(s) => typeof s.lastReceivedVersion === 'number' && s.lastReceivedVersion > 1
+			);
+			if (!reverseCopyDone) await delay(500);
 		}
 		equal(reverseCopyRequested, true, 'source should have requested its reverse full copy from the new peer');
+		equal(reverseCopyDone, true, 'the reverse full copy should run to completion (COPY_COMPLETE watermark)');
 		// settle, then snapshot twice so a rewrite still in flight cannot slip through
 		await delay(10000);
 		const postJoin = blobStoreSnapshot(ctx.source.dataRootDir);
