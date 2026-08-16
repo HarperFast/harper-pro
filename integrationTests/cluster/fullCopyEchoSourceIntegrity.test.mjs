@@ -200,7 +200,7 @@ suite('QA-692: a joining receiver must not rewrite the source blob store', { tim
 			const status = await op(ctx.source, { operation: 'cluster_status' });
 			const conn = (status.connections ?? []).find((c) => (c.url ?? c.name ?? '').includes(ctx.receiver.hostname));
 			reverseCopyDone = (conn?.database_sockets ?? []).some(
-				(s) => typeof s.lastReceivedVersion === 'number' && s.lastReceivedVersion > 1
+				(s) => s.database === 'data' && typeof s.lastReceivedVersion === 'number' && s.lastReceivedVersion > 1
 			);
 			if (!reverseCopyDone) await delay(500);
 		}
