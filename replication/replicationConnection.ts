@@ -83,8 +83,7 @@ import {
 	registerBlobReceiveInFlight,
 	unregisterBlobReceiveInFlight,
 } from '../core/resources/blob.ts';
-import { existsSync, promises as fsPromises } from 'node:fs';
-import { join } from 'node:path';
+import { promises as fsPromises } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
@@ -150,6 +149,7 @@ export const CONNECTION_STATE_POSITION = 9;
 export const LAST_LIVENESS_TIME_POSITION = 10; // wall-clock ms of last confirmed liveness (pong or received message)
 export const LAST_ERROR_CODE_POSITION = 11; // close code of the most recent disconnect
 export const LAST_ERROR_TIME_POSITION = 12; // wall-clock ms of the most recent disconnect
+export const COPY_IN_PROGRESS_POSITION = 13;
 export const CONNECTION_STATE_DOWN = 0;
 export const CONNECTION_STATE_CONNECTED = 2;
 // LIVENESS_STALE_MS is defined below, after PING_TIMEOUT, so it can be derived from the configured
@@ -908,6 +908,8 @@ type DbisCursor = {
 	currentTable?: string;
 	afterKey?: any;
 	copyOrder?: number;
+	cloneAttempt?: string;
+	complete?: boolean;
 };
 
 /**
@@ -944,12 +946,35 @@ export type DbisStore = {
  */
 export function readDbisCursorSync(
 	dbisDB: DbisStore | undefined,
-	kind: 'seq' | 'copyCursor',
+	kind: 'seq' | 'copyCursor' | 'cloneCopyComplete',
 	id: any
 ): DbisCursor | undefined {
 	// getSync is load-bearing here: reverting it to get() would return a MaybePromise that no longer
 	// satisfies the DbisCursor | undefined return type — a tsc error, not a silent full-copy regression.
 	return dbisDB?.getSync([Symbol.for(kind), id]);
+}
+
+export function getReceivedWatermarkSeed(
+	copyCursor: DbisCursor | undefined,
+	sequenceEntry: DbisCursor | undefined,
+	copyCompletion: DbisCursor | undefined,
+	activeCloneAttempt: string | undefined
+): number | undefined {
+	if (copyCursor) return;
+	if (!activeCloneAttempt) {
+		// Outside clone bootstrap, preserve ordinary restart reporting from the durable sequence cursor.
+		const sequenceId = sequenceEntry?.seqId;
+		return typeof sequenceId === 'number' && Number.isFinite(sequenceId) && sequenceId > 1 ? sequenceId : undefined;
+	}
+	if (
+		activeCloneAttempt &&
+		copyCompletion?.complete === true &&
+		copyCompletion.cloneAttempt === activeCloneAttempt &&
+		typeof copyCompletion.copyStartTime === 'number' &&
+		Number.isFinite(copyCompletion.copyStartTime)
+	) {
+		return copyCompletion.copyStartTime;
+	}
 }
 
 /**
@@ -1879,6 +1904,28 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				return;
 			}
 			if (copyFlushInFlight) return; // a flush is persisting the final cursor; finish on its completion
+			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT || undefined;
+			if (cloneAttempt !== undefined && copyFromNodeId !== undefined) {
+				try {
+					getDatabaseStores().dbisDB?.putSync([Symbol.for('cloneCopyComplete'), copyFromNodeId], {
+						cloneAttempt,
+						copyStartTime: copyModeStartTime,
+						complete: true,
+					});
+					const sharedStatus = getSharedStatus();
+					if (sharedStatus)
+						sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+							sharedStatus[RECEIVED_VERSION_POSITION],
+							copyModeStartTime
+						);
+				} catch (error) {
+					logger.warn?.(connectionId, 'failed to persist clone copy completion', databaseName, error);
+					close(1011, 'Failed to persist clone copy completion');
+					return;
+				}
+			}
+			const sharedStatus = getSharedStatus();
+			if (sharedStatus) sharedStatus[COPY_IN_PROGRESS_POSITION] = 0;
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
@@ -2234,14 +2281,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (options.connection) options.connection.sharedStatus = replicationSharedStatus;
 		}
 		return replicationSharedStatus;
-	}
-	function cloneSyncIsInProgress(): boolean {
-		const cloneRootPath = env.get(CONFIG_PARAMS.ROOTPATH) ?? process.env.ROOTPATH;
-		return (
-			typeof cloneRootPath !== 'string' ||
-			existsSync(join(cloneRootPath, '.cloneSyncBaseline.json')) ||
-			existsSync(join(cloneRootPath, '.cloneSyncInProgress'))
-		);
 	}
 	if (databaseName) {
 		setDatabase(databaseName);
@@ -2796,6 +2835,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT || undefined;
+						const sharedStatus = getSharedStatus();
+						if (sharedStatus) {
+							sharedStatus[COPY_IN_PROGRESS_POSITION] = 1;
+							if (cloneAttempt) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
+						}
+						if (cloneAttempt !== undefined && copyFromNodeId !== undefined) {
+							try {
+								// Absence is a legacy state, so record in-progress explicitly before any cursor flush.
+								getDatabaseStores().dbisDB?.putSync([Symbol.for('cloneCopyComplete'), copyFromNodeId], {
+									cloneAttempt,
+									copyStartTime: copyModeStartTime,
+									complete: false,
+								});
+							} catch (error) {
+								closeOnInboundMessageError(error, {
+									connectionId,
+									logger,
+									markInboundClosed: () => (wsClosed = true),
+									close,
+								});
+								return;
+							}
+						}
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
 					case COPY_COMPLETE:
@@ -4904,14 +4967,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// a proxied/indirect subscription has no direct cursor and instead arms from `proxiedSkipCursor`
 			// (set in the indirect block below).
 			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
-			// Restore a completed copy's worker-local status from its durable cursor, but never while
-			// clone bootstrap is still in progress.
-			if (connectedNode === node && !copyCursor && hasPersistedResumeCursor && !cloneSyncIsInProgress()) {
+			const activeCloneAttempt = process.env.HARPER_CLONE_ATTEMPT || undefined;
+			const copyCompletion =
+				activeCloneAttempt === undefined || nodeId === undefined
+					? undefined
+					: readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId);
+			const receivedWatermarkSeed =
+				connectedNode === node
+					? getReceivedWatermarkSeed(copyCursor, sequenceEntry, copyCompletion, activeCloneAttempt)
+					: undefined;
+			if (receivedWatermarkSeed !== undefined) {
 				const sharedStatus = getSharedStatus();
 				if (sharedStatus) {
 					sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
 						sharedStatus[RECEIVED_VERSION_POSITION],
-						sequenceEntry.seqId!
+						receivedWatermarkSeed
 					);
 				}
 			}

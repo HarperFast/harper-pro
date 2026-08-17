@@ -55,7 +55,7 @@ describe('checkSyncStatus', () => {
 		assert.deepEqual(result, { syncComplete: false, latestReceivedMs: 7000 });
 	});
 
-	it('requires every target socket to be connected and waiting, even if its watermark is current', async () => {
+	it('requires every target socket to be connected and out of copy mode, even if its watermark is current', async () => {
 		const missingSocket = await checkSyncStatus(
 			{ system: 1000, data: 2000 },
 			async () =>
@@ -67,16 +67,25 @@ describe('checkSyncStatus', () => {
 		);
 		assert.deepEqual(missingSocket, { syncComplete: false, latestReceivedMs: 0 });
 
-		const receivingSocket = await checkSyncStatus(
+		const copyingSocket = await checkSyncStatus(
+			{ system: 1000 },
+			async () =>
+				statusResponse([{ database: 'system', connected: true, copyInProgress: true, lastReceivedVersion: 1000 }]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.deepEqual(copyingSocket, { syncComplete: false, latestReceivedMs: 0 });
+
+		const receivingIncrementalUpdates = await checkSyncStatus(
 			{ system: 1000 },
 			async () =>
 				statusResponse([
-					{ database: 'system', connected: true, lastReceivedStatus: 'Receiving', lastReceivedVersion: 1000 },
+					{ database: 'system', lastReceivedStatus: 'Receiving', copyInProgress: false, lastReceivedVersion: 1000 },
 				]),
 			LEADER_URL,
 			noopLog
 		);
-		assert.deepEqual(receivingSocket, { syncComplete: false, latestReceivedMs: 0 });
+		assert.deepEqual(receivingIncrementalUpdates, { syncComplete: true, latestReceivedMs: 0 });
 	});
 
 	it('scans every socket for arrival stamps instead of returning on the first laggard', async () => {

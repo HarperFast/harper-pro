@@ -77,7 +77,7 @@ export function checkCloneSyncStatus(
 		if (socket.connected !== true) {
 			return { synced: false, reason: `Leader socket for database ${databaseName} is not connected` };
 		}
-		if (socket.lastReceivedStatus !== 'Waiting') {
+		if (socket.copyInProgress === true) {
 			return { synced: false, reason: `Database ${databaseName} is still receiving its base copy` };
 		}
 		const receivedVersion = socket.lastReceivedVersion;

@@ -1,7 +1,10 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { mkdtemp, writeFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { readLog } from '../cluster/clusterShared.mjs';
 
@@ -459,10 +462,13 @@ suite('Clone Node - unconfirmed sync leaves node Unavailable and uncloned', (ctx
 	});
 
 	test('reports Unavailable, stays queryable, and is not marked cloned', async () => {
+		const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-clone-stale-finalization-'));
+		await writeFile(join(dataRootDir, '.cloneAvailabilityFinalization'), 'true');
 		const cloneCtx = {
 			name: ctx.name,
 			harper: {
 				hostname: await getNextAvailableLoopbackAddress(),
+				dataRootDir,
 			},
 		};
 		await startHarper(cloneCtx, {
@@ -506,5 +512,9 @@ suite('Clone Node - unconfirmed sync leaves node Unavailable and uncloned', (ctx
 		// A node whose sync never confirmed must not be marked cloned, so a restart can retry the clone.
 		const config = await sendOperation(ctx.nodes[1], { operation: 'get_configuration' });
 		ok(config.cloned !== true, 'an unconfirmed clone must not be marked cloned');
+		ok(
+			!existsSync(join(dataRootDir, '.cloneAvailabilityFinalization')),
+			'a stale finalization marker must not survive into a new clone attempt'
+		);
 	});
 });

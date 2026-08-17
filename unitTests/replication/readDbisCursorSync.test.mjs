@@ -19,7 +19,7 @@
  */
 
 import { expect } from 'chai';
-import { readDbisCursorSync } from '#src/replication/replicationConnection';
+import { getReceivedWatermarkSeed, readDbisCursorSync } from '#src/replication/replicationConnection';
 
 /**
  * __dbis__ store stub modeling the RocksDB MaybePromise contract.
@@ -48,6 +48,7 @@ function rocksLikeDbis(disk = {}, cachedKeys = []) {
 const NODE_ID = 7;
 const seqKeyStr = `${Symbol.for('seq').toString()}|${NODE_ID}`;
 const copyKeyStr = `${Symbol.for('copyCursor').toString()}|${NODE_ID}`;
+const completionKeyStr = `${Symbol.for('cloneCopyComplete').toString()}|${NODE_ID}`;
 
 describe('readDbisCursorSync', () => {
 	// THE bug-closing case: the seq row is NOT in the block cache, so RocksDB get() returns a Promise.
@@ -89,6 +90,13 @@ describe('readDbisCursorSync', () => {
 		expect(readDbisCursorSync(dbis, 'copyCursor', NODE_ID)).to.deep.equal(cursor);
 	});
 
+	it('returns the real clone copy-completion marker on a block-cache MISS', () => {
+		const completion = { cloneAttempt: 'attempt-1', copyStartTime: 1000, complete: true };
+		const dbis = rocksLikeDbis({ [completionKeyStr]: completion });
+		expect(typeof dbis.get([Symbol.for('cloneCopyComplete'), NODE_ID]).then).to.equal('function');
+		expect(readDbisCursorSync(dbis, 'cloneCopyComplete', NODE_ID)).to.deep.equal(completion);
+	});
+
 	// A genuinely-absent cursor -> undefined (falsy). This is the legitimate fresh-subscription /
 	// full-copy case, distinct from a Promise masquerading as a present cursor.
 	it('returns undefined when the cursor row is genuinely absent', () => {
@@ -100,5 +108,36 @@ describe('readDbisCursorSync', () => {
 	// Optional-chains through a missing store rather than throwing (matches `dbisDB?.` at the call sites).
 	it('tolerates an undefined store', () => {
 		expect(readDbisCursorSync(undefined, 'seq', NODE_ID)).to.equal(undefined);
+	});
+});
+
+describe('getReceivedWatermarkSeed', () => {
+	const sequenceEntry = { seqId: 900 };
+	const completion = { cloneAttempt: 'attempt-1', copyStartTime: 1000, complete: true };
+
+	it('keeps ordinary restart seeding when no clone attempt is active', () => {
+		expect(getReceivedWatermarkSeed(undefined, sequenceEntry, undefined, undefined)).to.equal(900);
+		expect(getReceivedWatermarkSeed(undefined, sequenceEntry, undefined, '')).to.equal(900);
+	});
+
+	it('seeds a clone restart only from completion for the active attempt', () => {
+		expect(getReceivedWatermarkSeed(undefined, sequenceEntry, completion, 'attempt-1')).to.equal(1000);
+		expect(getReceivedWatermarkSeed(undefined, sequenceEntry, completion, 'attempt-2')).to.equal(undefined);
+		expect(
+			getReceivedWatermarkSeed(undefined, sequenceEntry, { ...completion, complete: false }, 'attempt-1')
+		).to.equal(undefined);
+	});
+
+	it('does not seed while a copy cursor exists', () => {
+		expect(
+			getReceivedWatermarkSeed({ copyStartTime: 800, currentTable: 'items' }, sequenceEntry, completion, 'attempt-1')
+		).to.equal(undefined);
+	});
+
+	it('does not publish an invalid numeric watermark', () => {
+		expect(getReceivedWatermarkSeed(undefined, {}, undefined, undefined)).to.equal(undefined);
+		expect(
+			getReceivedWatermarkSeed(undefined, sequenceEntry, { ...completion, copyStartTime: Number.NaN }, 'attempt-1')
+		).to.equal(undefined);
 	});
 });

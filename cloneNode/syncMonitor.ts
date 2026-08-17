@@ -13,9 +13,8 @@ export type SyncCheckResult = {
  * arrival stamp among the databases that have not.
  *
  * Completion and liveness are deliberately separate signals: `lastReceivedVersion` is frozen for the
- * whole bulk copy (it jumps to copyStartTime only on the post-copy end_txn), so it can only answer
- * "is it done?". `lastReceivedLocalTime` advances on every applied record, copy records included,
- * so it answers "is it still moving?".
+ * whole bulk copy, while `copyInProgress` is cleared only after the copy's rows and completion marker
+ * are durable. `lastReceivedLocalTime` advances on every applied record, so it answers "is it moving?".
  */
 export async function checkSyncStatus(
 	targetTimestamps: Record<string, number>,
@@ -61,7 +60,7 @@ export async function checkSyncStatus(
 		// Raw version (high-precision float64) preserves the sub-millisecond precision needed for
 		// an accurate comparison against the leader's last_updated_record targets.
 		const receivedVersion = socket.lastReceivedVersion;
-		if (socket.connected === true && socket.lastReceivedStatus === 'Waiting' && receivedVersion >= targetTime) {
+		if (socket.connected === true && socket.copyInProgress !== true && receivedVersion >= targetTime) {
 			log(`Database ${dbName}: Synchronized`, 'debug');
 			continue;
 		}

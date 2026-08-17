@@ -92,6 +92,8 @@ const DEFAULT_REPLICATION_PORT = '9933';
 const CLONE_SYNC_BASELINE_FILE = '.cloneSyncBaseline.json';
 const CLONE_SYNC_IN_PROGRESS_FILE = '.cloneSyncInProgress';
 const CLONE_AVAILABILITY_FINALIZATION_FILE = '.cloneAvailabilityFinalization';
+const CLONE_ATTEMPT_FILE = '.cloneAttempt.json';
+const CLONE_ATTEMPT_ENV = 'HARPER_CLONE_ATTEMPT';
 
 const CONFIG_TO_EXCLUDE_FROM_CLONE = {
 	clustering_nodename: true,
@@ -249,7 +251,7 @@ export async function cloneNode(): Promise<void> {
 			const { set: setStatus } = await import('../core/server/status/index.js');
 			try {
 				await setStatus({ id: 'availability', status: 'Available' });
-				if (removeCloneSyncBaseline() && removeCloneSyncInProgress()) {
+				if (removeCloneSyncBaseline() && removeCloneSyncInProgress() && removeCloneAttempt()) {
 					removeCloneAvailabilityFinalization();
 					log('Completed interrupted clone availability finalization');
 				}
@@ -263,6 +265,7 @@ export async function cloneNode(): Promise<void> {
 		removeCloneSyncBaseline();
 		removeCloneSyncInProgress();
 		removeCloneAvailabilityFinalization();
+		if (!removeCloneAttempt()) throw new Error('Could not clear the previous clone attempt marker');
 		if (hdbConfig?.cloned) {
 			hdbConfig.cloned = false;
 			updateConfigValue(CONFIG_PARAMS.CLONED, false);
@@ -281,6 +284,16 @@ export async function cloneNode(): Promise<void> {
 	if (freshClone || !systemExists) {
 		await installHarper();
 	}
+	if (
+		pathExists(cloneAvailabilityFinalizationPath()) &&
+		(!removeCloneSyncBaseline() || !removeCloneSyncInProgress() || !removeCloneAttempt())
+	) {
+		throw new Error('Could not clear state from a completed clone attempt');
+	}
+	if (!removeCloneAvailabilityFinalization()) {
+		throw new Error('Could not clear stale clone availability finalization marker');
+	}
+	startCloneAttempt();
 	writeCloneSyncInProgress();
 
 	// Custody clone gate (#166): mark the clone bootstrap BEFORE Harper starts so the
@@ -449,6 +462,13 @@ export async function cloneNode(): Promise<void> {
 		);
 		return;
 	}
+	if (process.env.HARPER_TEST_PAUSE_AFTER_CLONE_SYNC_ONCE === 'true') {
+		const pauseMarker = join(rootPath, '.testPauseAfterCloneSync');
+		if (!pathExists(pauseMarker)) {
+			writeFileSync(pauseMarker, 'true', 'utf8');
+			await new Promise(() => {});
+		}
+	}
 
 	// Delete clone-temp-admin only after monitorSync() so that the account remains valid while
 	// the leader establishes replication and syncs real users. Deleting it earlier leaves the
@@ -497,7 +517,7 @@ export async function cloneNode(): Promise<void> {
 		log(`Clone completed but failed to set availability to Available: ${err}; leaving recovery marker`, 'error');
 		return;
 	}
-	if (removeCloneSyncBaseline() && removeCloneSyncInProgress()) {
+	if (removeCloneSyncBaseline() && removeCloneSyncInProgress() && removeCloneAttempt()) {
 		removeCloneAvailabilityFinalization();
 	}
 
@@ -622,6 +642,10 @@ function cloneAvailabilityFinalizationPath(): string {
 	return join(rootPath, CLONE_AVAILABILITY_FINALIZATION_FILE);
 }
 
+function cloneAttemptPath(): string {
+	return join(rootPath, CLONE_ATTEMPT_FILE);
+}
+
 function readCloneSyncBaseline(): number | undefined {
 	const path = cloneSyncBaselinePath();
 	if (!pathExists(path)) return undefined;
@@ -662,6 +686,31 @@ function writeCloneSyncInProgress(): void {
 	writeFileSync(path, 'true', 'utf8');
 }
 
+function startCloneAttempt(): void {
+	const path = cloneAttemptPath();
+	let attemptId: string | undefined;
+	if (pathExists(path) && pathExists(cloneSyncInProgressPath())) {
+		try {
+			const persisted = JSON.parse(readFileSync(path, 'utf8'));
+			if (typeof persisted?.attemptId === 'string' && persisted.attemptId) attemptId = persisted.attemptId;
+		} catch (err) {
+			log(`Could not read persisted clone attempt at ${path}: ${err}`, 'error');
+		}
+	}
+	if (!attemptId) {
+		attemptId = randomBytes(16).toString('hex');
+		const temporaryPath = `${path}.${process.pid}.tmp`;
+		try {
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(temporaryPath, JSON.stringify({ attemptId }), { encoding: 'utf8', mode: 0o600 });
+			renameSync(temporaryPath, path);
+		} catch (err) {
+			throw new Error(`Could not persist clone attempt at ${path}: ${err}`);
+		}
+	}
+	process.env[CLONE_ATTEMPT_ENV] = attemptId;
+}
+
 function writeCloneAvailabilityFinalization(): void {
 	const path = cloneAvailabilityFinalizationPath();
 	const temporaryPath = `${path}.${process.pid}.tmp`;
@@ -691,11 +740,29 @@ function removeCloneSyncInProgress(): boolean {
 	}
 }
 
-function removeCloneAvailabilityFinalization(): void {
+function removeCloneAttempt(): boolean {
+	try {
+		unlinkSync(cloneAttemptPath());
+		delete process.env[CLONE_ATTEMPT_ENV];
+		return true;
+	} catch (err: any) {
+		if (err?.code === 'ENOENT') {
+			delete process.env[CLONE_ATTEMPT_ENV];
+			return true;
+		}
+		log(`Failed to remove clone attempt marker: ${err}`, 'error');
+		return false;
+	}
+}
+
+function removeCloneAvailabilityFinalization(): boolean {
 	try {
 		unlinkSync(cloneAvailabilityFinalizationPath());
+		return true;
 	} catch (err: any) {
-		if (err?.code !== 'ENOENT') log(`Failed to remove clone availability finalization marker: ${err}`, 'error');
+		if (err?.code === 'ENOENT') return true;
+		log(`Failed to remove clone availability finalization marker: ${err}`, 'error');
+		return false;
 	}
 }
 

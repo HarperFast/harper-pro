@@ -73,8 +73,9 @@ Per (database, remote_node) pair: an mmap-backed `Float64Array` shared across th
 | 10       | `LAST_LIVENESS_TIME_POSITION`     |
 | 11       | `LAST_ERROR_CODE_POSITION`        |
 | 12       | `LAST_ERROR_TIME_POSITION`        |
+| 13       | `COPY_IN_PROGRESS_POSITION`       |
 
-The buffer is 16 `Float64` slots (128 bytes); 0–12 are used, 13–15 are headroom. These are written concurrently by `replicationConnection.ts` without explicit synchronization (single-writer-per-field in practice). Don't introduce read-modify-write patterns on this buffer.
+The buffer is 16 `Float64` slots (128 bytes); 0–13 are used, 14–15 are headroom. These are written concurrently by `replicationConnection.ts` without explicit synchronization (single-writer-per-field in practice). Don't introduce read-modify-write patterns on this buffer.
 
 **Connection truth (W1 / harper-pro#431).** Slots 9–12 make the owning worker thread the authoritative source for an outbound subscription's link state, rather than relying solely on the edge-triggered worker→main `postMessage` mirror (`connected-to-node` / `disconnected-from-node`), which desyncs when a terminal/idle state is reached without a `'close'` (open-but-idle wedge, #289/#233). The worker writes `CONNECTION_STATE_CONNECTED` + `LAST_LIVENESS_TIME` on pong and on received data, `CONNECTION_STATE_DOWN` + error on close/`forceReconnect`, and refreshes liveness during a backpressure pause (matching `shouldTerminateIdlePing`'s `pauseReasons` exemption). The main thread reads it via `deriveConnectionTruth` / `readConnectionTruth`: `connected` requires `CONNECTED` **and** fresh liveness (`< LIVENESS_STALE_MS`, derived from `PING_TIMEOUT`), so a worker that died/wedged without writing `DOWN` still reads down once liveness goes stale. `clusterStatus.ts` reports it (authoritative `connected` + `lastConnectionError`); `subscriptionManager.ts → reconcileWorkers` corrects the inferred flag against it, feeding the existing wedge recovery.
 

@@ -148,9 +148,7 @@ describe('checkCloneSyncStatus', () => {
 				connections: [
 					{
 						url: leaderURL,
-						database_sockets: [
-							{ database: 'data', connected: true, lastReceivedStatus: 'Receiving', lastReceivedVersion: 100 },
-						],
+						database_sockets: [{ database: 'data', connected: true, copyInProgress: true, lastReceivedVersion: 100 }],
 					},
 				],
 			},

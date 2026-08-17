@@ -115,12 +115,15 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				// reliably catch (and kill) mid-stream before it finishes
 				REPLICATION_COPYCHECKPOINTRECORDS: 25,
 				REPLICATION_RECEIVEEVENTHIGHWATERMARK: 5,
+				HARPER_TEST_PAUSE_AFTER_CLONE_SYNC_ONCE: true,
 			},
 		};
 		ctx.cloneCtx = cloneCtx;
 		await startHarper(cloneCtx, cloneOptions);
 		const baselinePath = join(cloneCtx.harper.dataRootDir, '.cloneSyncBaseline.json');
 		const availabilityFinalizationPath = join(cloneCtx.harper.dataRootDir, '.cloneAvailabilityFinalization');
+		const postSyncPausePath = join(cloneCtx.harper.dataRootDir, '.testPauseAfterCloneSync');
+		const cloneAttemptPath = join(cloneCtx.harper.dataRootDir, '.cloneAttempt.json');
 
 		// Wait until the follower has committed SOME but not all records, then kill it mid-copy.
 		let caughtPartial = false;
@@ -156,8 +159,22 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			await sleep(50);
 		}
 		ok(observedResumeUnavailable, 'A resumed clone should publish Unavailable before continuing its copy');
+		const postSyncPauseDeadline = Date.now() + 120000;
+		while (!existsSync(postSyncPausePath) && Date.now() < postSyncPauseDeadline) await sleep(100);
+		ok(existsSync(postSyncPausePath), 'the resumed clone should pause after its durable copies complete');
+		equal(
+			await countRows(cloneCtx.harper),
+			RECORD_COUNT,
+			'all copied rows should be visible before the post-copy restart'
+		);
+		await killHarper(cloneCtx);
+
+		// Restart after every copy cursor is gone: completion for this persisted attempt must restore
+		// the worker watermark without starting another base copy.
+		await startHarper(cloneCtx, cloneOptions);
 		await waitForAvailableStatus(cloneCtx.harper);
 		ok(!existsSync(baselinePath), 'the persisted synchronization baseline should be removed after clone completion');
+		ok(!existsSync(cloneAttemptPath), 'the persisted clone attempt should be removed after clone completion');
 
 		// The key correctness property: every record is present after the interrupted+resumed copy.
 		let finalCount = -1;

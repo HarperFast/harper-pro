@@ -40,7 +40,13 @@ async function completeCloneAvailabilityFinalization() {
 		const { set: setStatus } = require('../core/server/status/index.js');
 		await setStatus({ id: 'availability', status: 'Available' });
 		unlinkIfPresent(join(rootPath, '.cloneSyncBaseline.json'));
-		if (unlinkIfPresent(join(rootPath, '.cloneSyncInProgress'))) unlinkIfPresent(finalizationPath);
+		if (
+			unlinkIfPresent(join(rootPath, '.cloneSyncInProgress')) &&
+			unlinkIfPresent(join(rootPath, '.cloneAttempt.json'))
+		) {
+			delete process.env.HARPER_CLONE_ATTEMPT;
+			unlinkIfPresent(finalizationPath);
+		}
 	} catch (error) {
 		console.error(`Failed to complete clone availability finalization: ${error}`);
 	}
