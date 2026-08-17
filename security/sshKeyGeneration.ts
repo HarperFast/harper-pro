@@ -55,9 +55,8 @@ function wrapBase64(value: string): string {
 /**
  * Generates an ed25519 keypair and returns it in OpenSSH's own formats.
  *
- * @param comment - the comment to embed in both halves, as `ssh-keygen -C` would. It lands verbatim
- * on the single-line public key, so it must not contain a newline; `add_ssh_key` derives it from a
- * key name already constrained to `[a-zA-Z0-9-_]`.
+ * @param comment - the comment to embed in both halves, as `ssh-keygen -C` would. Spaces are fine —
+ * ssh treats the rest of the line as the comment — but a line break is rejected, see below.
  * @returns `privateKey` as an unencrypted `openssh-key-v1` PEM (what goes in an `IdentityFile`) and
  * `publicKey` as a single `ssh-ed25519 <base64> <comment>` line (what a host registers).
  */
@@ -65,6 +64,15 @@ export async function generateEd25519SSHKeyPair(comment: string): Promise<{
 	privateKey: string;
 	publicKey: string;
 }> {
+	// The comment lands verbatim on the one-line public key, so a line break would split it in two and
+	// leave the tail parseable as a separate entry by whatever consumes the key (an `authorized_keys`
+	// file, a deploy-key field). Today's only caller derives the comment from a key name already
+	// constrained to `[a-zA-Z0-9-_]` by `SSH_KEY_NAME_REGEX`, so this is unreachable — but that guard
+	// lives in another module, and this one is exported, so the invariant is kept with the code that
+	// depends on it. A plain Error rather than a ClientError: reaching it means a caller bug, not bad
+	// client input.
+	if (/[\r\n]/.test(comment)) throw new Error('SSH key comment must not contain a line break');
+
 	const { publicKey, privateKey } = await generateKeyPairAsync('ed25519');
 	const rawPublicKey = rawKeyBytes(publicKey, 'x');
 	const seed = rawKeyBytes(privateKey, 'd');

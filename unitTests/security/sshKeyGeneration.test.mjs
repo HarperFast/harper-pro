@@ -80,6 +80,22 @@ describe('ed25519 SSH keypair generation', () => {
 		assert.equal(blob.length, 4 + 11 + 4 + 32);
 	});
 
+	it('rejects a comment containing a line break, and accepts one containing spaces', async () => {
+		// a line break would split the one-line public key, leaving the tail parseable as its own entry
+		for (const comment of ['harper:deploy\nssh-ed25519 AAAA injected', 'harper:deploy\r', '\n', 'a\r\nb']) {
+			await assert.rejects(
+				generateEd25519SSHKeyPair(comment),
+				/must not contain a line break/,
+				`expected rejection for ${JSON.stringify(comment)}`
+			);
+		}
+
+		// spaces are legitimate — ssh treats the remainder of the line as the comment
+		const { publicKey } = await generateEd25519SSHKeyPair('harper deploy key');
+		assert.equal(publicKey.split(' ').slice(2).join(' '), 'harper deploy key');
+		assert.ok(!publicKey.includes('\n'));
+	});
+
 	it('mints a distinct keypair per call', async () => {
 		const first = await generateEd25519SSHKeyPair('harper:one');
 		const second = await generateEd25519SSHKeyPair('harper:two');
