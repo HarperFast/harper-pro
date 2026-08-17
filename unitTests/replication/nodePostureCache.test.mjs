@@ -19,6 +19,7 @@ import {
 	recordNodePosture,
 	getCachedNodePosture,
 	clearNodePostureCache,
+	selfNodeReplicates,
 } from '#src/replication/knownNodes';
 
 describe('node posture cache (harper-pro#460)', () => {
@@ -61,5 +62,12 @@ describe('node posture cache (harper-pro#460)', () => {
 		clearNodePostureCache();
 		recordNodePosture({ name: 'edge-2', replicates: true });
 		assert.equal(getCachedNodePosture('edge-2'), undefined);
+	});
+
+	it('selfNodeReplicates defaults to replicating when the cached posture has no replicates field', () => {
+		clearNodePostureCache();
+		recordNodePosture({ name: 'edge-3', url: 'ws://127.0.0.1:9944' }); // decoded, but no replicates
+		const rangeVisibleNullSelf = { getSync: () => null, getKeys: (options) => [options?.start] };
+		assert.equal(selfNodeReplicates(rangeVisibleNullSelf, 'edge-3'), true);
 	});
 });

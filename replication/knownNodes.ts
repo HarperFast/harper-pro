@@ -389,18 +389,26 @@ function nodePostureCachePath(): string | undefined {
 }
 
 function loadNodePostureCache(): Map<string, any> {
-	if (nodePostureCache) return nodePostureCache;
-	nodePostureCache = new Map();
+	// Main is the sole writer, so its in-memory map is the source of truth; workers read the file fresh
+	// (their heap is separate and would otherwise go stale against main's writes). The reconstruct path
+	// that reads this only runs on a decode failure, so the per-call read cost is off the hot path.
+	if (isMainThread && nodePostureCache) return nodePostureCache;
+	const cache = new Map<string, any>();
 	const file = nodePostureCachePath();
 	if (file) {
 		try {
 			const parsed = JSON.parse(readFileSync(file, 'utf8'));
-			for (const name in parsed) nodePostureCache.set(name, parsed[name]);
+			// Guard the shape: a truncated/hand-edited file can parse to a primitive or array, and
+			// `for...in` over those would seed the cache with index keys.
+			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+				for (const name in parsed) cache.set(name, parsed[name]);
+			}
 		} catch {
 			// absent (first boot) or unreadable: start empty and self-populate on decode.
 		}
 	}
-	return nodePostureCache;
+	if (isMainThread) nodePostureCache = cache;
+	return cache;
 }
 
 /** Drops the in-memory cache so the next read reloads from disk. Test seam for the persistence path. */
@@ -416,6 +424,7 @@ export function getCachedNodePosture(name: unknown): any {
 
 /** Record a successfully-decoded node's posture (`node.url` marks a real record, not a reconstruct). */
 export function recordNodePosture(node: any): void {
+	if (!isMainThread) return; // single writer: only main persists; workers read the file on demand
 	if (!node || typeof node.name !== 'string' || !node.url) return;
 	const cache = loadNodePostureCache();
 	const posture: any = {};
@@ -423,7 +432,6 @@ export function recordNodePosture(node: any): void {
 	const prev = cache.get(node.name);
 	if (prev && JSON.stringify(prev) === JSON.stringify(posture)) return;
 	cache.set(node.name, posture);
-	if (!isMainThread) return; // single writer: only main persists, workers keep the in-memory copy
 	const file = nodePostureCachePath();
 	if (!file) return;
 	try {
@@ -827,7 +835,9 @@ export function selfNodeReplicates(store: any, name: string): any {
 	// replication; recover the real posture from the cache, else default to replicating. harper-pro#460.
 	if (storeRecordRangeVisible(store, name)) {
 		const cached = getCachedNodePosture(name);
-		return cached ? cached.replicates : true;
+		// A cached posture that lacks `replicates` must still default to replicating, otherwise this
+		// silently disables replication the same way the bare null did.
+		return cached && cached.replicates !== undefined ? cached.replicates : true;
 	}
 	return undefined;
 }
