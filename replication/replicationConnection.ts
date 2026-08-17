@@ -4959,6 +4959,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				nodeId,
 				() => logger.warn?.('Discarding malformed copy-resume cursor (no currentTable) for', node.name, databaseName)
 			);
+			if (connectedNode === node && copyCursor) {
+				const sharedStatus = getSharedStatus();
+				if (sharedStatus) sharedStatus[COPY_IN_PROGRESS_POSITION] = 1;
+			}
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
 				sequenceEntry?.seqId ?? 1,
