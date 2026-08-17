@@ -465,6 +465,7 @@ export async function cloneNode(): Promise<void> {
 	if (process.env.HARPER_TEST_PAUSE_AFTER_CLONE_SYNC_ONCE === 'true') {
 		const pauseMarker = join(rootPath, '.testPauseAfterCloneSync');
 		if (!pathExists(pauseMarker)) {
+			log('HARPER_TEST_PAUSE_AFTER_CLONE_SYNC_ONCE is pausing clone finalization', 'error');
 			writeFileSync(pauseMarker, 'true', 'utf8');
 			await new Promise(() => {});
 		}

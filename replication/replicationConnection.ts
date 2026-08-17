@@ -1637,6 +1637,7 @@ export class NodeReplicationConnection extends EventEmitter {
 				// covers the case where even this doesn't run (worker died).
 				if (this.sharedStatus && this.nodeSubscriptions !== undefined) {
 					this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+					this.sharedStatus[COPY_IN_PROGRESS_POSITION] = 0;
 					this.sharedStatus[LAST_ERROR_CODE_POSITION] = code ?? 0;
 					this.sharedStatus[LAST_ERROR_TIME_POSITION] = Date.now();
 				}
@@ -1720,8 +1721,10 @@ export class NodeReplicationConnection extends EventEmitter {
 			}
 			this.isConnected = false;
 			// Watchdog-forced teardown of a wedged link: mark down in shared memory (W1 / harper-pro#431).
-			if (this.sharedStatus && this.nodeSubscriptions !== undefined)
+			if (this.sharedStatus && this.nodeSubscriptions !== undefined) {
 				this.sharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+				this.sharedStatus[COPY_IN_PROGRESS_POSITION] = 0;
+			}
 		}
 		// Drop this connection's stale subscription listener before reconnecting. The close handler
 		// normally does this (removeAllListeners), but its socket-identity guard early-returns for a
@@ -1912,12 +1915,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						copyStartTime: copyModeStartTime,
 						complete: true,
 					});
-					const sharedStatus = getSharedStatus();
-					if (sharedStatus)
-						sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
-							sharedStatus[RECEIVED_VERSION_POSITION],
-							copyModeStartTime
-						);
 				} catch (error) {
 					logger.warn?.(connectionId, 'failed to persist clone copy completion', databaseName, error);
 					close(1011, 'Failed to persist clone copy completion');
@@ -1925,7 +1922,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				}
 			}
 			const sharedStatus = getSharedStatus();
-			if (sharedStatus) sharedStatus[COPY_IN_PROGRESS_POSITION] = 0;
+			if (sharedStatus) {
+				if (cloneAttempt)
+					sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+						sharedStatus[RECEIVED_VERSION_POSITION],
+						copyModeStartTime
+					);
+				sharedStatus[COPY_IN_PROGRESS_POSITION] = 0;
+			}
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
