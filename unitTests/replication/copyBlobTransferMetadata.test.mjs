@@ -1,0 +1,108 @@
+import assert from 'node:assert';
+import { createAuditEntry, readAuditEntry } from '#src/core/resources/auditStore';
+import { Blob, createBlob, decodeWithBlobCallback } from '#src/core/resources/blob';
+import { table } from '#src/core/resources/databases';
+import {
+	collectAuditRecordBlobsFromBinary,
+	encodeWithCopyBlobTransferTags,
+} from '#src/replication/replicationConnection';
+
+describe('copy blob transfer metadata', () => {
+	it('clears temporary tags after an encoding failure and never reuses their ids', () => {
+		const blob = new Blob(['payload']);
+		let failedTransferId;
+		assert.throws(
+			() =>
+				encodeWithCopyBlobTransferTags(
+					{ first: blob, second: blob },
+					() => {
+						failedTransferId = blob.replicationTransferId;
+						assert.equal(typeof failedTransferId, 'number');
+						throw new Error('encode failed');
+					},
+					() => 'file-id'
+				),
+			/encode failed/
+		);
+		assert.equal(Object.hasOwn(blob, 'replicationTransferId'), false);
+
+		let nextTransferId;
+		encodeWithCopyBlobTransferTags(
+			{ blob },
+			() => {
+				nextTransferId = blob.replicationTransferId;
+				return Buffer.alloc(0);
+			},
+			() => 'file-id'
+		);
+		assert(nextTransferId > failedTransferId);
+		assert.equal(Object.hasOwn(blob, 'replicationTransferId'), false);
+	});
+
+	it('enumerates from independent binary bytes without touching the memoized audit value', () => {
+		const binaryValue = Buffer.from([1, 2, 3]);
+		let getValueCalls = 0;
+		let decodeCalls = 0;
+		const auditRecord = {
+			getBinaryValue: () => binaryValue,
+			getValue: () => {
+				getValueCalls++;
+				return { blob: 'memoized' };
+			},
+		};
+		const tableDecoder = {
+			decoder: {
+				decode(value, options) {
+					decodeCalls++;
+					assert.equal(value, binaryValue);
+					assert.deepEqual(options, { noMetadata: true });
+				},
+			},
+		};
+
+		assert.deepEqual(collectAuditRecordBlobsFromBinary(auditRecord, tableDecoder), []);
+		assert.equal(decodeCalls, 1);
+		assert.equal(getValueCalls, 0);
+		assert.deepEqual(auditRecord.getValue(), { blob: 'memoized' });
+	});
+
+	it('enumerates a real blob extension without poisoning a later value decode', async () => {
+		const CopyBlobTransfer = table({
+			database: 'copyBlobTransferMetadata',
+			table: 'records',
+			attributes: [
+				{ name: 'id', isPrimaryKey: true },
+				{ name: 'blob', type: 'Blob' },
+			],
+		});
+		await CopyBlobTransfer.put({ id: 'record', blob: createBlob(Buffer.alloc(9000, 1)) });
+		const storedEntry = CopyBlobTransfer.primaryStore.getEntry('record');
+		let encodedRecord;
+		decodeWithBlobCallback(
+			() => {
+				encodedRecord = CopyBlobTransfer.primaryStore.encoder.encode(storedEntry.value);
+			},
+			() => {}
+		);
+		const auditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'put',
+					tableId: CopyBlobTransfer.tableId,
+					recordId: 'record',
+					version: storedEntry.version,
+					nodeId: 0,
+					encodedRecord,
+				})
+			)
+		);
+
+		const blobs = collectAuditRecordBlobsFromBinary(
+			auditRecord,
+			CopyBlobTransfer.primaryStore,
+			CopyBlobTransfer.primaryStore.rootStore
+		);
+		assert.equal(blobs.length, 1);
+		assert(auditRecord.getValue(CopyBlobTransfer.primaryStore).blob instanceof Blob);
+	});
+});

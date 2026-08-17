@@ -781,6 +781,66 @@ export function getBlobTransferKey(fileId: unknown, transferId: number | undefin
 	return transferId === undefined ? `file:${fileId}` : `transfer:${transferId}`;
 }
 
+let nextCopyBlobTransferId = 1;
+
+/** Core's blob codec only carries own enumerable metadata, so scope the temporary tag to one synchronous encode. */
+export function encodeWithCopyBlobTransferTags(
+	value: unknown,
+	encodeRecord: () => Buffer,
+	fileIdForBlob: (blob: Blob) => unknown = getFileId
+): Buffer {
+	const taggedBlobs: Array<{
+		blob: Blob & { replicationTransferId?: number };
+		transferId: number;
+		previousTransferId: number | undefined;
+		hadTransferId: boolean;
+	}> = [];
+	const transferIdByBlob = new WeakMap<Blob, number>();
+	findBlobsInObject(value, (blob) => {
+		if (!fileIdForBlob(blob)) return;
+		let transferId = transferIdByBlob.get(blob);
+		if (transferId !== undefined) return;
+		transferId = nextCopyBlobTransferId++;
+		transferIdByBlob.set(blob, transferId);
+		const taggedBlob = blob as Blob & { replicationTransferId?: number };
+		taggedBlobs.push({
+			blob: taggedBlob,
+			transferId,
+			previousTransferId: taggedBlob.replicationTransferId,
+			hadTransferId: Object.hasOwn(taggedBlob, 'replicationTransferId'),
+		});
+		taggedBlob.replicationTransferId = transferId;
+	});
+	try {
+		return encodeRecord();
+	} finally {
+		for (const { blob, transferId, previousTransferId, hadTransferId } of taggedBlobs) {
+			if (blob.replicationTransferId !== transferId) continue;
+			if (hadTransferId) blob.replicationTransferId = previousTransferId;
+			else delete blob.replicationTransferId;
+		}
+	}
+}
+
+export function collectAuditRecordBlobsFromBinary(
+	auditRecord: { getBinaryValue?: () => Buffer },
+	tableDecoder: { decoder: { decode: (value: Buffer, options: { noMetadata: boolean }) => unknown } },
+	rootStore?: any
+): Blob[] {
+	if (!auditRecord.getBinaryValue) throw new TypeError('Copy audit record does not expose its binary value');
+	const blobs: Blob[] = [];
+	decodeWithBlobCallback(
+		() => {
+			tableDecoder.decoder.decode(auditRecord.getBinaryValue(), { noMetadata: true });
+		},
+		(blob) => {
+			blobs.push(blob);
+		},
+		rootStore
+	);
+	return blobs;
+}
+
 /** Whether every blob reachable from a stored record value is durably complete on disk. */
 async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	if (value == null) return false;
@@ -3019,7 +3079,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	const skippedBlobIds = new Map<any, number>();
 	// A file id can be reused by distinct records. Keep the copy receive stream keyed by the sender's
 	// per-transfer token instead, so a skipped record cannot drop bytes an applied record still needs.
-	let nextBlobTransferId = 1;
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
 	const blobSentCallbacks: Array<(v?: any) => void> = [];
@@ -4989,31 +5048,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// origin on the follower. `entry.nodeId` is this node's local id for that
 													// origin (undefined/0 = us) — the same id space the wire uses.
 													const recordNodeId = entry.nodeId ?? nodeId;
-													const clearCopyBlobTransferTags =
-														entry.metadataFlags & HAS_BLOBS ? tagCopyBlobTransfers(entry.value) : () => {};
-													const encoded = createAuditEntry({
-														version: entry.version,
-														tableId: table.tableId,
-														recordId: entry.key,
-														previousVersion: null,
-														nodeId: recordNodeId,
-														type: 'put',
-														encodedRecord: (() => {
-															try {
+													const encodeCopyRecord = () =>
+														createAuditEntry({
+															version: entry.version,
+															tableId: table.tableId,
+															recordId: entry.key,
+															previousVersion: null,
+															nodeId: recordNodeId,
+															type: 'put',
+															encodedRecord: (() => {
 																decodeWithBlobCallback(
 																	() => table.primaryStore.encoder.encode(entry.value),
 																	(blob) => sendBlobs(blob, entry.key)
 																);
 																return lastValueEncoding!;
-															} finally {
-																clearCopyBlobTransferTags();
-															}
-														})(),
-														extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
-														residencyId: entry.residencyId,
-														previousResidencyId: null,
-														expiresAt: entry.expiresAt,
-													} as any);
+															})(),
+															extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
+															residencyId: entry.residencyId,
+															previousResidencyId: null,
+															expiresAt: entry.expiresAt,
+														} as any);
+													const encoded =
+														entry.metadataFlags & HAS_BLOBS
+															? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
+															: encodeCopyRecord();
 													await sendAuditRecord(
 														{
 															// make it look like an audit record
@@ -5290,20 +5348,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						true
 					))
 				) {
-					const skippedBlobs: Blob[] = [];
-					let enumeratedSkippedBlobs = false;
+					let skippedBlobs: Blob[] | undefined;
 					try {
-						decodeWithBlobCallback(
-							() => auditRecord.getValue(tableDecoder),
-							(remoteBlob) => skippedBlobs.push(remoteBlob),
-							auditStore?.rootStore
-						);
-						enumeratedSkippedBlobs = true;
+						skippedBlobs = collectAuditRecordBlobsFromBinary(auditRecord, tableDecoder, auditStore?.rootStore);
 					} catch (error) {
 						logger.trace?.(connectionId, 'copy identity-tie: could not enumerate skipped blobs', id, error);
 					}
 					if (
-						enumeratedSkippedBlobs &&
+						skippedBlobs &&
 						skippedBlobs.length > 0 &&
 						skippedBlobs.every((blob) => Object.hasOwn(blob, 'replicationTransferId'))
 					) {
@@ -5821,25 +5873,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			reason,
 		});
 	}
-	function tagCopyBlobTransfers(value: unknown): () => void {
-		const taggedBlobs: Array<{ blob: Blob; transferId: number }> = [];
-		const transferIdByBlob = new Map<Blob, number>();
-		findBlobsInObject(value, (blob) => {
-			const fileId = getFileId(blob);
-			if (!fileId) return;
-			const transferId = transferIdByBlob.get(blob) ?? nextBlobTransferId++;
-			transferIdByBlob.set(blob, transferId);
-			(blob as Blob & { replicationTransferId?: number }).replicationTransferId = transferId;
-			taggedBlobs.push({ blob, transferId });
-		});
-		return () => {
-			for (const { blob, transferId } of taggedBlobs) {
-				if ((blob as Blob & { replicationTransferId?: number }).replicationTransferId === transferId)
-					delete (blob as Blob & { replicationTransferId?: number }).replicationTransferId;
-			}
-		};
-	}
-
 	async function sendBlobs(blob: Blob, recordId: any) {
 		// found a blob, start sending it
 		const id = getFileId(blob);

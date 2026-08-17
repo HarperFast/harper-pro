@@ -7,6 +7,13 @@ import type { Logger } from '../core/utility/logging/logger.ts';
 
 const logger = harperLogger.forComponent('blob-repair').conditional as Logger;
 
+export async function allBlobsAreComplete(
+	blobs: any[],
+	checkBlob: (blob: any) => Promise<boolean> = isBlobComplete
+): Promise<boolean> {
+	return blobs.length > 0 && (await Promise.all(blobs.map((blob) => checkBlob(blob)))).every(Boolean);
+}
+
 export async function repairBlobs(
 	dbName: string
 ): Promise<{ checked: number; repaired: number; failed: number; noConnection: number }> {
@@ -50,9 +57,7 @@ export async function repairBlobs(
 				// its own copy was also incomplete (promisedWrites returns Buffer.alloc(0)).
 				const repairedBlobs: any[] = [];
 				findBlobsInObject(entry.value, (blob) => repairedBlobs.push(blob));
-				const allComplete =
-					repairedBlobs.length > 0 &&
-					(await Promise.all(repairedBlobs.map((blob) => isBlobComplete(blob)))).every(Boolean);
+				const allComplete = await allBlobsAreComplete(repairedBlobs);
 
 				if (!allComplete) continue; // peer's copy was also incomplete, try next peer
 
