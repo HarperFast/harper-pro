@@ -194,23 +194,10 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		});
 
 		const cloneCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
-		const cloneOptions = {
-			config: {
-				analytics: { aggregatePeriod: -1 },
-				logging: { colors: false },
-				replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
-			},
-			env: {
-				HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
-				HDB_LEADER_TOKEN: tokenResponse.operation_token,
-				ALLOW_SELF_SIGNED: true,
-				HARPER_NO_FLUSH_ON_EXIT: true,
-				// frequent checkpoints + aggressive receive throttling so the copy is slow enough to
-				// reliably catch (and kill) mid-stream before it finishes
-				REPLICATION_COPYCHECKPOINTRECORDS: 25,
-				REPLICATION_RECEIVEEVENTHIGHWATERMARK: 5,
-			},
-		};
+		// cloneOptionsFor rather than a literal: it already carries the copy throttling this test needs
+		// and, critically, CLONE_SETUP_TRACE_FILE — without which setupRunCount below counts nothing and
+		// the assertion passes vacuously.
+		const cloneOptions = cloneOptionsFor(cloneCtx, tokenResponse.operation_token);
 		ctx.cloneCtx = cloneCtx;
 		await startHarper(cloneCtx, cloneOptions);
 
