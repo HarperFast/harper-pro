@@ -73,17 +73,28 @@ describe('copy blob transfer metadata', () => {
 			attributes: [
 				{ name: 'id', isPrimaryKey: true },
 				{ name: 'blob', type: 'Blob' },
+				{ name: 'inlineBlob', type: 'Blob' },
 			],
 		});
-		await CopyBlobTransfer.put({ id: 'record', blob: createBlob(Buffer.alloc(9000, 1)) });
+		await CopyBlobTransfer.put({
+			id: 'record',
+			blob: createBlob(Buffer.alloc(9000, 1)),
+			inlineBlob: createBlob(Buffer.from('inline')),
+		});
 		const storedEntry = CopyBlobTransfer.primaryStore.getEntry('record');
-		let encodedRecord;
-		decodeWithBlobCallback(
-			() => {
-				encodedRecord = CopyBlobTransfer.primaryStore.encoder.encode(storedEntry.value);
-			},
-			() => {}
-		);
+		let sentTransferId;
+		const encodedRecord = encodeWithCopyBlobTransferTags(storedEntry.value, () => {
+			let encoded;
+			decodeWithBlobCallback(
+				() => {
+					encoded = CopyBlobTransfer.primaryStore.encoder.encode(storedEntry.value);
+				},
+				(blob) => {
+					sentTransferId = blob.replicationTransferId;
+				}
+			);
+			return encoded;
+		});
 		const auditRecord = readAuditEntry(
 			Buffer.from(
 				createAuditEntry({
@@ -103,6 +114,10 @@ describe('copy blob transfer metadata', () => {
 			CopyBlobTransfer.primaryStore.rootStore
 		);
 		assert.equal(blobs.length, 1);
-		assert(auditRecord.getValue(CopyBlobTransfer.primaryStore).blob instanceof Blob);
+		assert.equal(blobs[0].replicationTransferId, sentTransferId);
+		assert.equal(Object.hasOwn(blobs[0], 'replicationTransferId'), true);
+		const decodedValue = auditRecord.getValue(CopyBlobTransfer.primaryStore);
+		assert(decodedValue.blob instanceof Blob);
+		assert(decodedValue.inlineBlob instanceof Blob);
 	});
 });

@@ -859,10 +859,9 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
  * disk (the incoming duplicate's own blobs are still in flight, so they prove nothing). Anything
  * ambiguous returns false and the record flows to the apply loop.
  *
- * Completeness, not mere presence: a PENDING/truncated stub must NOT tie. A base copy is how such a
- * record gets repaired, and a skipped key is also staged as a durable copy cursor — so tying on a stub
- * would not just miss the repair, it would make the miss permanent.
-
+ * Completeness, not mere presence: a PENDING/truncated stub must NOT take this fast-skip path. Its
+ * recovery remains owned by the normal apply/backfill paths, and this optimization must not preempt
+ * either one by treating an incomplete local value as durable.
  */
 export async function isDurableIdentityTie(
 	existing: { version?: number; nodeId?: number; value?: unknown } | undefined,
@@ -3077,8 +3076,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// Retired by the blob's own final chunk, by a record that does apply the same transfer, or by
 	// the connection closing.
 	const skippedBlobIds = new Map<any, number>();
-	// A file id can be reused by distinct records. Keep the copy receive stream keyed by the sender's
-	// per-transfer token instead, so a skipped record cannot drop bytes an applied record still needs.
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
 	const blobSentCallbacks: Array<(v?: any) => void> = [];
@@ -5972,6 +5969,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		try {
 			fileIdsBeingSent.add(id);
 			fileSendClaimed = true;
+			while (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+				await new Promise((resolve) => blobSentCallbacks.push(resolve));
+				if (wsClosed) return;
+				if (isDrainingBlobSends()) {
+					warnBlobSendDeclined(id, 'worker draining for shutdown (after waiting for the same file id)');
+					return;
+				}
+			}
 			// Track this send so a worker restart can gracefully drain it (finish it if it's still making
 			// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
 			drainToken = registerBlobSend();
