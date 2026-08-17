@@ -63,11 +63,6 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: { port: leaderCtx.harper.hostname + ':9933', securePort: null },
-				// The sync monitor only genuinely runs on lmdb: under RocksDB the audit store's
-				// getKeys() is a stub, so describe reports no last_updated_record, every target is 0,
-				// and checkSyncStatus skips every database and reports synced on the first poll
-				// (harper-pro#655). These tests interrupt the sync WAIT, so they need it to exist.
-				storage: { engine: 'lmdb' },
 			},
 			env: { HARPER_NO_FLUSH_ON_EXIT: true },
 		});
@@ -125,7 +120,6 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
-				storage: { engine: 'lmdb' },
 			},
 			env: {
 				HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
@@ -205,7 +199,6 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false },
 				replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
-				storage: { engine: 'lmdb' },
 			},
 			env: {
 				HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
