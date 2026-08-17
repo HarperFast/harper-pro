@@ -1558,7 +1558,10 @@ export const DECODE_HOLD_METRIC = 'decode-hold';
  * registration into the root store, the synchronous `saveBlob` start) so
  * `classifyReplicationDecodeError` can tell a local blob-store fault apart from a genuinely
  * undecodable record value. Thrown only by the decode blob callback in `onWSMessage`; the original
- * fault rides `cause`. (harper-pro#715)
+ * fault rides `cause`. The classifier's `instanceof` relies on the wrapper crossing the decode stack
+ * identity-intact: the blob extension invokes the callback bare, msgpackr's unpack catches annotate
+ * and rethrow the same object (safe here — the wrapper always has a `message`), and
+ * `decodeBlobsWithWrites` rethrows raw. (harper-pro#715)
  */
 export class BlobSetupError extends Error {
 	constructor(cause: unknown) {
@@ -4889,15 +4892,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				} catch (error) {
 					// tableDecoder is guaranteed set here (the unknown-tableId case returns above), so the derefs
 					// below are safe without optional chaining. Every failure is counted; classifyReplicationDecodeError
-					// only picks the label (harper-pro#537). The old bare catch skipped silently — no metric, no class.
+					// picks the disposition (skip labels per harper-pro#537, hold for blob-setup faults per #715).
+					// The old bare catch skipped silently — no metric, no class.
 					const decodeErrorVerdict = classifyReplicationDecodeError(error);
 					if (decodeErrorVerdict === 'hold-blob-setup') {
 						// Local blob-store fault from receiveBlobs's synchronous setup, not an undecodable record —
 						// skipping would seal a still-deliverable record under the resume cursor (harper-pro#715).
-						// Hold exactly like the missing-decoder branch above: latch inbound off first (#440), close,
-						// and let the reconnect resume from the durable cursor and re-request the record. Blobs
-						// already accepted for this record are deliberately NOT unlinked: the reconnect re-stream
-						// re-saves the same fileIds (the transient-gap rule in receiveBlobs's .catch).
+						// Blobs already accepted for this record are deliberately NOT unlinked: the reconnect
+						// re-stream re-saves the same fileIds (the transient-gap rule in receiveBlobs's .catch).
 						recordAction(true, DECODE_HOLD_METRIC, databaseName + '.' + tableDecoder.name);
 						logger.warn?.(
 							connectionId,
