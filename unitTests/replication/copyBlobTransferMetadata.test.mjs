@@ -39,6 +39,26 @@ describe('copy blob transfer metadata', () => {
 		assert.equal(Object.hasOwn(blob, 'replicationTransferId'), false);
 	});
 
+	it('clears temporary tags when blob enumeration fails', () => {
+		const firstBlob = new Blob(['first']);
+		const secondBlob = new Blob(['second']);
+		let visited = 0;
+		assert.throws(
+			() =>
+				encodeWithCopyBlobTransferTags(
+					{ firstBlob, secondBlob },
+					() => Buffer.alloc(0),
+					() => {
+						if (++visited === 2) throw new Error('enumeration failed');
+						return 'file-id';
+					}
+				),
+			/enumeration failed/
+		);
+		assert.equal(Object.hasOwn(firstBlob, 'replicationTransferId'), false);
+		assert.equal(Object.hasOwn(secondBlob, 'replicationTransferId'), false);
+	});
+
 	it('enumerates from independent binary bytes without touching the memoized audit value', () => {
 		const binaryValue = Buffer.from([1, 2, 3]);
 		let getValueCalls = 0;

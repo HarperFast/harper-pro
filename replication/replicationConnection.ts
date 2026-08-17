@@ -803,22 +803,22 @@ export function encodeWithCopyBlobTransferTags(
 		hadTransferId: boolean;
 	}> = [];
 	const transferIdByBlob = new WeakMap<Blob, number>();
-	findBlobsInObject(value, (blob) => {
-		if (!fileIdForBlob(blob)) return;
-		let transferId = transferIdByBlob.get(blob);
-		if (transferId !== undefined) return;
-		transferId = nextCopyBlobTransferId++;
-		transferIdByBlob.set(blob, transferId);
-		const taggedBlob = blob as Blob & { replicationTransferId?: number };
-		taggedBlobs.push({
-			blob: taggedBlob,
-			transferId,
-			previousTransferId: taggedBlob.replicationTransferId,
-			hadTransferId: Object.hasOwn(taggedBlob, 'replicationTransferId'),
-		});
-		taggedBlob.replicationTransferId = transferId;
-	});
 	try {
+		findBlobsInObject(value, (blob) => {
+			if (!fileIdForBlob(blob)) return;
+			let transferId = transferIdByBlob.get(blob);
+			if (transferId !== undefined) return;
+			transferId = nextCopyBlobTransferId++;
+			transferIdByBlob.set(blob, transferId);
+			const taggedBlob = blob as Blob & { replicationTransferId?: number };
+			taggedBlobs.push({
+				blob: taggedBlob,
+				transferId,
+				previousTransferId: taggedBlob.replicationTransferId,
+				hadTransferId: Object.hasOwn(taggedBlob, 'replicationTransferId'),
+			});
+			taggedBlob.replicationTransferId = transferId;
+		});
 		return encodeRecord();
 	} finally {
 		for (const { blob, transferId, previousTransferId, hadTransferId } of taggedBlobs) {
