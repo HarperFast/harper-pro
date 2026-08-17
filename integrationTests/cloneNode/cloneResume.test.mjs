@@ -1,6 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import {
 	startHarper,
 	teardownHarper,
@@ -8,12 +8,15 @@ import {
 	getNextAvailableLoopbackAddress,
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
 // Big enough (and fat enough per record) that the bulk copy spans many checkpoints and takes long
 // enough to reliably catch it mid-copy before killing the follower.
+// Loopback addresses are recycled between suite runs; this keeps one run's setup counts out of the next.
+const RUN_ID = Date.now().toString(36);
 const RECORD_COUNT = 4000;
 const PAYLOAD = 'x'.repeat(2048);
 
@@ -63,7 +66,7 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				// The sync monitor only genuinely runs on lmdb: under RocksDB the audit store's
 				// getKeys() is a stub, so describe reports no last_updated_record, every target is 0,
 				// and checkSyncStatus skips every database and reports synced on the first poll
-				// (harper-pro#611). These tests interrupt the sync WAIT, so they need it to exist.
+				// (harper-pro#655). These tests interrupt the sync WAIT, so they need it to exist.
 				storage: { engine: 'lmdb' },
 			},
 			env: { HARPER_NO_FLUSH_ON_EXIT: true },
@@ -97,7 +100,24 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			(c) => c?.harper?.process
 		);
 		await Promise.all(live.map((c) => teardownHarper(c)));
+		for (const c of [ctx.cloneCtx, ctx.partialCtx, ctx.reconcileCtx, ctx.forceCtx]) {
+			if (c?.harper?.hostname) rmSync(setupTraceFile(c), { force: true });
+		}
 	});
+
+	// Counts establishReplicationSetup invocations across restarts. Without this the resume tests pass
+	// whether or not setup was skipped, since a full replay also converges — convergence alone proves
+	// nothing about whether the marker was honoured.
+	function setupTraceFile(cloneCtx) {
+		const host = cloneCtx.harper.hostname.replace(/[.:]/g, '-');
+		return join(tmpdir(), `clone-setup-trace-${RUN_ID}-${host}`);
+	}
+
+	function setupRunCount(cloneCtx) {
+		const file = setupTraceFile(cloneCtx);
+		if (!existsSync(file)) return 0;
+		return readFileSync(file, 'utf8').split('\n').filter(Boolean).length;
+	}
 
 	function cloneOptionsFor(cloneCtx, token, extraEnv = {}) {
 		return {
@@ -115,6 +135,7 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 				// throttle the copy so it is still running when we interrupt it
 				REPLICATION_COPYCHECKPOINTRECORDS: 25,
 				REPLICATION_RECEIVEEVENTHIGHWATERMARK: 5,
+				CLONE_SETUP_TRACE_FILE: setupTraceFile(cloneCtx),
 				...extraEnv,
 			},
 		};
@@ -236,6 +257,11 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		});
 		equal(ends.length, 2, 'first and last records must both be present');
 		ok(caughtPartial, 'test should have interrupted the copy mid-stream (tune RECORD_COUNT/throttle if this fails)');
+		equal(
+			setupRunCount(cloneCtx),
+			1,
+			'the restart must skip replication setup entirely, not replay cloneConfig/restartWorkers/setNode'
+		);
 	});
 
 	test('a restart caught between replication setup and finishing key cloning does not redo replication setup', async () => {
@@ -276,9 +302,12 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			await sleep(500);
 		}
 		equal(finalCount, RECORD_COUNT, 'the clone must still converge after resuming the remaining setup stages');
+		// The title of this test. Convergence and the JWT mtime above both pass after a full replay too,
+		// so this is the only assertion that actually holds replication setup to running once.
+		equal(setupRunCount(partialCtx), 1, 'the resume must re-run only finishCloneSetup, not replication setup');
 	});
 
-	test('an indeterminate marker is reconciled against hdb_nodes instead of failing the clone', async () => {
+	test('an indeterminate marker replays setup and the clone still converges', async () => {
 		const reconcileCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		ctx.reconcileCtx = reconcileCtx;
 		// Same hook the staged test uses: hold setup open so the marker is observable rather than
@@ -296,9 +325,10 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 		await killHarper(reconcileCtx);
 
 		// Rewind only the replication outcome, to what a crash inside establishReplicationSetup leaves:
-		// intent recorded, outcome unknown. setNode() did complete, so the restart must discover that
-		// from hdb_nodes. This proves the reconciliation path runs and the clone still converges; it
-		// cannot separately prove setup was skipped, since nothing setup touches is observable here.
+		// intent recorded, outcome unknown. The clone replays setup rather than inferring from hdb_nodes
+		// — a local peer row is not evidence the leader accepted this node, since setNode() catches a
+		// failed exchange, writes the peer anyway and reports success. Replay is safe: ensureNode upserts
+		// and the copy resumes from its cursor. The trace below pins that this is a replay, not a skip.
 		writeFileSync(markerPath, JSON.stringify({ ...marker, replicationEstablished: false }));
 
 		await startHarper(reconcileCtx, cloneOptionsFor(reconcileCtx, await leaderToken()));
@@ -309,7 +339,8 @@ suite('Clone Node - resume after mid-copy disconnect', (ctx) => {
 			if (reconciledCount === RECORD_COUNT) break;
 			await sleep(500);
 		}
-		equal(reconciledCount, RECORD_COUNT, 'the clone must converge after reconciling an indeterminate marker');
+		equal(reconciledCount, RECORD_COUNT, 'the clone must converge after replaying setup for an indeterminate marker');
+		equal(setupRunCount(reconcileCtx), 2, 'an indeterminate marker must replay setup rather than trust hdb_nodes');
 	});
 
 	test('forceClone takes the full setup path even with the marker present', async () => {

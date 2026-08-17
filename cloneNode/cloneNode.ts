@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { accessSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { accessSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -291,19 +291,13 @@ export async function cloneNode(): Promise<void> {
 			leaderReplicationURL = resumeMarker.leaderReplicationURL ?? leaderReplicationURL;
 			log(`Clone sync already in progress; replication already established with ${leaderReplicationURL}`);
 		} else {
-			// A marker recording only the intent to establish replication is indeterminate — the crash
-			// may have landed either side of setNode(). hdb_nodes is the durable evidence: its peer row
-			// is written only once the leader exchange succeeds, and carries the refined URL.
-			const establishedURL = resumeMarker ? await findEstablishedLeaderURL() : undefined;
-			if (establishedURL) {
-				leaderReplicationURL = establishedURL;
-				log(`Reconciled interrupted setup: replication is already established with ${leaderReplicationURL}`);
-			} else {
-				// Record the intent first, so a crash inside establishReplicationSetup is reconcilable
-				// rather than a silent replay of cloneConfig/restartWorkers/setNode.
-				writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
-				await establishReplicationSetup();
-			}
+			// A marker recording only the intent is indeterminate — the crash may have landed either side
+			// of setNode(). Replay rather than infer: a local hdb_nodes row is not evidence the leader
+			// accepted this node, because setNode() catches a failed exchange, writes the peer anyway and
+			// returns success-with-warning. Replay is cheap and safe — ensureNode upserts by node name,
+			// and a base copy already running resumes from its durable cursor rather than restarting.
+			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
+			await establishReplicationSetup();
 			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: true, targetTimestamps, totalBytes });
 		}
 
@@ -396,6 +390,12 @@ export async function cloneNode(): Promise<void> {
  * `restartWorkers` that would tear down the replication just resumed). Failures throw uncaught.
  */
 async function establishReplicationSetup(): Promise<void> {
+	// Test hook: appends one line per invocation so a resume test can assert this ran exactly once
+	// across a restart. Without it the resume tests pass either way — a replayed setup also converges,
+	// so convergence alone proves nothing about whether the marker was honoured.
+	const traceFile = process.env.CLONE_SETUP_TRACE_FILE;
+	if (traceFile) appendFileSync(traceFile, `${Date.now()}\n`);
+
 	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
 	const leaderConfigData = await cloneConfig();
 
@@ -555,34 +555,6 @@ function writeSyncStartedMarker(stage: Omit<SyncStartedMarker, 'leaderURL' | 'le
 	const marker: SyncStartedMarker = { leaderURL, leaderReplicationURL, setupComplete: false, ...stage };
 	writeFileSync(temp, JSON.stringify(marker), { mode: 0o600 });
 	renameSync(temp, target);
-}
-
-/**
- * Durable evidence that `setNode()` completed: the leader's hdb_nodes row, which is written only
- * after the leader exchange succeeds and is also the only record of the refined replication URL.
- */
-async function findEstablishedLeaderURL(): Promise<string | undefined> {
-	try {
-		const { databases } = await import('../core/resources/databases.js');
-		const { getThisNodeName } = await import('../core/server/nodeName.js');
-		const thisNodeName = getThisNodeName();
-		const leaderHost = new URL(leaderURL).hostname;
-		const peerURLs: string[] = [];
-		for await (const node of databases.system.hdb_nodes.search([])) {
-			if (!node?.name || node.name === thisNodeName || !node.url) continue;
-			peerURLs.push(node.url);
-			try {
-				if (new URL(node.url).hostname === leaderHost) return node.url;
-			} catch {
-				// a peer row with an unparseable url cannot be matched by host; fall through
-			}
-		}
-		// A clone's node table holds only itself and its leader, so a lone peer is unambiguous.
-		return peerURLs.length === 1 ? peerURLs[0] : undefined;
-	} catch (err) {
-		log(`Could not read hdb_nodes to reconcile clone setup state: ${err}`, 'error');
-		return undefined;
-	}
 }
 
 function readSyncStartedMarker(): SyncStartedMarker | undefined {
