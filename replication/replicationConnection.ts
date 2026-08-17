@@ -76,6 +76,7 @@ import {
 } from './knownNodes.ts';
 import * as process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { open as openFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';
 import {
@@ -85,8 +86,8 @@ import {
 	decodeWithBlobCallback,
 	deleteBlob,
 	saveBlob,
-	isBlobComplete,
 	getFileId,
+	getFilePathForBlob,
 	findBlobsInObject,
 	getFilePathForBlob,
 	blobHeaderIndicatesIncomplete,
@@ -782,6 +783,12 @@ export function getBlobTransferKey(fileId: unknown, transferId: number | undefin
 }
 
 let nextCopyBlobTransferId = 1;
+const BLOB_HEADER_SIZE = 8;
+const UNCOMPRESSED_BLOB_TYPE = 0;
+const DEFLATE_BLOB_TYPE = 1;
+const PENDING_BLOB_TYPE = 0xfe;
+const ERROR_BLOB_TYPE = 0xff;
+const UNKNOWN_BLOB_SIZE = 0xffffffffffff;
 
 /** Core's blob codec only carries own enumerable metadata, so scope the temporary tag to one synchronous encode. */
 export function encodeWithCopyBlobTransferTags(
@@ -841,25 +848,55 @@ export function collectAuditRecordBlobsFromBinary(
 	return blobs;
 }
 
-/** Whether every blob reachable from a stored record value is durably complete on disk. */
+export function isCompleteBlobHeader(header: Uint8Array, fileSize: number): boolean {
+	if (header.byteLength < BLOB_HEADER_SIZE || fileSize < BLOB_HEADER_SIZE) return false;
+	const value = new DataView(header.buffer, header.byteOffset, BLOB_HEADER_SIZE).getBigUint64(0);
+	const type = Number(value >> 48n);
+	const contentSize = Number(value & 0xffffffffffffn);
+	if (type === PENDING_BLOB_TYPE || type === ERROR_BLOB_TYPE || contentSize === UNKNOWN_BLOB_SIZE) return false;
+	if (type === UNCOMPRESSED_BLOB_TYPE) return fileSize === BLOB_HEADER_SIZE + contentSize;
+	// A finalized deflate header is written only after the body stream finishes. Full inflation remains
+	// the repair sweep's job; doing it per copy frame makes the tie gate O(dataset bytes).
+	return type === DEFLATE_BLOB_TYPE && fileSize > BLOB_HEADER_SIZE;
+}
+
+async function hasDurableBlobHeader(blob: Blob): Promise<boolean> {
+	const path = getFilePathForBlob(blob as any);
+	if (!path) return false;
+	let file: Awaited<ReturnType<typeof openFile>> | undefined;
+	try {
+		file = await openFile(path, 'r');
+		const header = Buffer.allocUnsafe(BLOB_HEADER_SIZE);
+		const [{ size }, { bytesRead }] = await Promise.all([file.stat(), file.read(header, 0, BLOB_HEADER_SIZE, 0)]);
+		return bytesRead === BLOB_HEADER_SIZE && isCompleteBlobHeader(header, size);
+	} catch {
+		return false;
+	} finally {
+		if (file) await file.close().catch(() => {});
+	}
+}
+
+/** Whether every file-backed blob reachable from a stored record is durably finalized on disk. */
 async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	if (value == null) return false;
-	const blobs: any[] = [];
-	findBlobsInObject(value, (blob: any) => blobs.push(blob));
+	const blobs: Blob[] = [];
+	findBlobsInObject(value, (blob: Blob) => {
+		if (getFileId(blob)) blobs.push(blob);
+	});
 	// The header claimed blobs but none was reachable (e.g. one living only in a patch chain): we
 	// cannot prove the local copy is whole, so it must not tie.
 	if (blobs.length === 0) return false;
-	return (await Promise.all(blobs.map((blob) => isBlobComplete(blob)))).every(Boolean);
+	return (await Promise.all(blobs.map(hasDurableBlobHeader))).every(Boolean);
 }
 
 /**
  * Whether an incoming record is a provably-already-applied identity tie with the one stored locally:
  * same version AND same origin node — the condition core's `precedesExistingVersion` early-matches as a
- * tie — and, for a blob-carrying record, every one of the STORED record's blobs durably complete on
+ * tie — and, for a blob-carrying record, every one of the STORED record's file-backed blobs durably finalized on
  * disk (the incoming duplicate's own blobs are still in flight, so they prove nothing). Anything
  * ambiguous returns false and the record flows to the apply loop.
  *
- * Completeness, not mere presence: a PENDING/truncated stub must NOT take this fast-skip path. Its
+ * A finalized header, not mere file presence: a PENDING/truncated stub must NOT take this fast-skip path. Its
  * recovery remains owned by the normal apply/backfill paths, and this optimization must not preempt
  * either one by treating an incomplete local value as durable.
  */

@@ -14,7 +14,7 @@
  */
 
 import { expect } from 'chai';
-import { getBlobTransferKey, isDurableIdentityTie } from '#src/replication/replicationConnection';
+import { getBlobTransferKey, isCompleteBlobHeader, isDurableIdentityTie } from '#src/replication/replicationConnection';
 
 const VERSION = 1700000000000;
 const NODE_ID = 3;
@@ -50,9 +50,7 @@ describe('isDurableIdentityTie — provably-already-applied record detection', (
 		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, complete)).to.equal(true);
 	});
 
-	it('is NOT a tie when a local blob is incomplete, so the copy can repair it', async () => {
-		// A PENDING/truncated stub must reach the apply loop: a skipped key is also staged as a durable
-		// copy cursor, so tying here would make the damage permanent rather than merely unrepaired.
+	it('does not fast-skip a record when a local blob is incomplete', async () => {
 		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, true, incomplete)).to.equal(false);
 	});
 
@@ -83,6 +81,31 @@ describe('isDurableIdentityTie — provably-already-applied record detection', (
 		};
 		expect(await isDurableIdentityTie(entry(), VERSION, NODE_ID, false, counting)).to.equal(true);
 		expect(inspected).to.equal(0);
+	});
+});
+
+describe('isCompleteBlobHeader — bounded copy-path durability proof', () => {
+	function header(type, size) {
+		const bytes = Buffer.alloc(8);
+		bytes.writeBigUInt64BE((BigInt(type) << 48n) | BigInt(size));
+		return bytes;
+	}
+
+	it('requires the exact body length for an uncompressed blob', () => {
+		expect(isCompleteBlobHeader(header(0, 100), 108)).to.equal(true);
+		expect(isCompleteBlobHeader(header(0, 100), 107)).to.equal(false);
+		expect(isCompleteBlobHeader(header(0, 100), 109)).to.equal(false);
+	});
+
+	it('accepts a finalized deflate header without reading the body', () => {
+		expect(isCompleteBlobHeader(header(1, 100), 40)).to.equal(true);
+		expect(isCompleteBlobHeader(header(1, 100), 8)).to.equal(false);
+	});
+
+	it('rejects unfinished and error headers', () => {
+		expect(isCompleteBlobHeader(header(0, 0xffffffffffffn), 100)).to.equal(false);
+		expect(isCompleteBlobHeader(header(0xfe, 10), 18)).to.equal(false);
+		expect(isCompleteBlobHeader(header(0xff, 10), 18)).to.equal(false);
 	});
 });
 
