@@ -7,6 +7,8 @@ import { forEachReplicatedDatabase } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
 import { isMainThread } from 'worker_threads';
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import * as path from 'node:path';
 import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -373,6 +375,69 @@ export function mergeReconstructedNode(reconstructed: any, oldNode: any): any {
 }
 
 /**
+ * Decode-independent, restart-surviving cache of each peer's replication posture. On a fresh process
+ * boot with no in-memory oldNode, mergeReconstructedNode has nothing to recover a constrained peer's
+ * `replicates` from, so a decode-failing row would widen it to full mesh (or drop it). This supplies
+ * the last-known-good posture as the merge source instead. harper-pro#460.
+ */
+const NODE_POSTURE_FIELDS = ['name', 'url', 'replicates', 'isLeader', 'shard', 'ca'] as const;
+let nodePostureCache: Map<string, any> | undefined;
+
+function nodePostureCachePath(): string | undefined {
+	const rootPath = env.get(CONFIG_PARAMS.ROOTPATH);
+	return rootPath ? path.join(rootPath, 'replication-node-posture.json') : undefined;
+}
+
+function loadNodePostureCache(): Map<string, any> {
+	if (nodePostureCache) return nodePostureCache;
+	nodePostureCache = new Map();
+	const file = nodePostureCachePath();
+	if (file) {
+		try {
+			const parsed = JSON.parse(readFileSync(file, 'utf8'));
+			for (const name in parsed) nodePostureCache.set(name, parsed[name]);
+		} catch {
+			// absent (first boot) or unreadable: start empty and self-populate on decode.
+		}
+	}
+	return nodePostureCache;
+}
+
+/** Drops the in-memory cache so the next read reloads from disk. Test seam for the persistence path. */
+export function clearNodePostureCache(): void {
+	nodePostureCache = undefined;
+}
+
+/** Last-known-good posture for a peer, usable as an oldNode fallback for mergeReconstructedNode. */
+export function getCachedNodePosture(name: unknown): any {
+	if (typeof name !== 'string' || !name) return undefined;
+	return loadNodePostureCache().get(name);
+}
+
+/** Record a successfully-decoded node's posture (`node.url` marks a real record, not a reconstruct). */
+export function recordNodePosture(node: any): void {
+	if (!node || typeof node.name !== 'string' || !node.url) return;
+	const cache = loadNodePostureCache();
+	const posture: any = {};
+	for (const f of NODE_POSTURE_FIELDS) if (node[f] !== undefined) posture[f] = node[f];
+	const prev = cache.get(node.name);
+	if (prev && JSON.stringify(prev) === JSON.stringify(posture)) return;
+	cache.set(node.name, posture);
+	if (!isMainThread) return; // single writer: only main persists, workers keep the in-memory copy
+	const file = nodePostureCachePath();
+	if (!file) return;
+	try {
+		const obj: any = {};
+		for (const [k, v] of cache) obj[k] = v;
+		const tmp = `${file}.${process.pid}.tmp`;
+		writeFileSync(tmp, JSON.stringify(obj));
+		renameSync(tmp, file); // atomic: a concurrent reader never sees a torn file
+	} catch (error) {
+		logger.warn?.('Failed to persist replication node posture cache', error);
+	}
+}
+
+/**
  * Existence probe for an hdb_nodes key that prefers the RANGE/scan path. A v5-era shared-structure
  * row can transiently misread to `[]`/null through the point lookup (`doesExist`/`get`) at early
  * boot (harper-pro#352), but `getKeys` lists the key reliably because it never decodes the value.
@@ -419,13 +484,16 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 	server.nodes = server.nodes.filter((node) => node && node.name !== node_name);
 	if (event.type === 'put' && node_name !== getThisNodeName()) {
 		// add any new nodes
-		if (event.value) server.nodes.push(event.value);
-		else {
+		if (event.value) {
+			server.nodes.push(event.value);
+			recordNodePosture(event.value);
+		} else {
 			// put event with no decodable value — reconstruct a minimal descriptor from the key so
 			// server.nodes (and the outbound subscription fired below) still reflect the peer
 			// (harper-pro#460). A genuine delete is handled separately via isGenuineNodeDeletion.
 			let reconstructed = reconstructNodeFromKey(node_name);
-			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
+			if (reconstructed)
+				reconstructed = mergeReconstructedNode(reconstructed, oldNode ?? getCachedNodePosture(node_name));
 			// Cast: this is a deliberate partial recovery descriptor (name + replicates, plus any
 			// enriched fields from oldNode); the next decodable update supplies the rest.
 			if (reconstructed) server.nodes.push(reconstructed as any);
@@ -467,7 +535,8 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			// THAT instead, so the outbound subscription is (re)created; the next decodable event
 			// replaces it with the full record.
 			let reconstructed = reconstructNodeFromKey(event.id);
-			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
+			if (reconstructed)
+				reconstructed = mergeReconstructedNode(reconstructed, oldNode ?? getCachedNodePosture(event.id));
 			if (reconstructed) {
 				logger.warn?.(
 					'hdb_nodes change event for',
@@ -512,9 +581,13 @@ export function probeNodeRow(store: any, key: unknown): { outcome: 'deleted' | '
 		// present-but-undecodable row → decode failure, reconstruct.
 		return { outcome: 'decode-failure' };
 	}
-	// A clean null is a genuine tombstone (removed node); undefined means physically absent. Either
-	// way there is no live peer here — do not reconstruct.
-	if (record == null) return { outcome: 'deleted' };
+	// A null point-read is ambiguous: RecordEncoder.decode returns null for a genuine tombstone AND for
+	// an undecodable-but-present row (missing shared structure, harper#1163). Disambiguate by range
+	// visibility: remove_node hard-deletes the key (gone from the range), whereas a decode-failing row
+	// stays range-visible. Treating the latter as a tombstone silently dropped the live peer (harper-pro#460).
+	if (record == null) {
+		return storeRecordRangeVisible(store, key as any) ? { outcome: 'decode-failure' } : { outcome: 'deleted' };
+	}
 	// The point lookup returned something present (a valid record, or a misread `[]`/partial). Treat
 	// it as still-present: a valid record is used directly; an invalid-but-present value reconstructs.
 	return { outcome: 'decode-failure', record };
@@ -654,7 +727,11 @@ function rebuildKnownNodes(listener: (node: any, id: string) => void) {
 			// reconstruct's `true` — otherwise a transient decode miss during this scan would widen a
 			// constrained peer back to full mesh. Same treatment as the two processNodeUpdateEvent reconstruct
 			// sites. systemdb-routing / harper-pro#489.
-			if (oldNode) node = mergeReconstructedNode(node, oldNode);
+			// A fresh process boot has no in-memory oldNode; fall back to the posture cache. harper-pro#460.
+			const mergeSource = oldNode ?? getCachedNodePosture(targetName);
+			if (mergeSource) node = mergeReconstructedNode(node, mergeSource);
+		} else {
+			recordNodePosture(node);
 		}
 		// server.nodes holds PEERS, never this node itself — mirror processNodeUpdateEvent's
 		// `node_name !== getThisNodeName()` guard. The per-row event path always excluded self; the scan
@@ -743,7 +820,16 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
  * `replicates: false` is preserved. Store is passed explicitly so it stays unit-testable.
  */
 export function selfNodeReplicates(store: any, name: string): any {
-	return store.getSync(name)?.replicates;
+	const record = store.getSync(name);
+	if (record != null) return record.replicates;
+	// A range-visible self key that read null is a decode failure, not a deletion (see probeNodeRow).
+	// shouldReplicateFromNode ANDs this in, so returning falsy here would silently disable ALL outbound
+	// replication; recover the real posture from the cache, else default to replicating. harper-pro#460.
+	if (storeRecordRangeVisible(store, name)) {
+		const cached = getCachedNodePosture(name);
+		return cached ? cached.replicates : true;
+	}
+	return undefined;
 }
 
 const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array>>();
