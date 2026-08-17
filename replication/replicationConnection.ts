@@ -5836,8 +5836,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// re-streams from the resume cursor, so carrying them across would drop chunks we do want.
 		skippedBlobIds.clear();
 		if (blobsInFlight.size > 0) {
-			const aborted = abortInFlightBlobsOnClose(blobsInFlight, remoteNodeName, (blobId, stream) =>
-				unregisterBlobReceiveInFlight(stream.fileId ?? blobId, auditStore?.rootStore)
+			const aborted = abortInFlightBlobsOnClose(blobsInFlight, remoteNodeName, (_blobId, stream) =>
+				unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore)
 			);
 			logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`);
 		}
