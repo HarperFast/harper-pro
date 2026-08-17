@@ -595,6 +595,15 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 	return connection;
 }
 
+/**
+ * The url is required, not incidental: it arms the keep-alive, and without it this socket is silent
+ * for as long as the peer takes to execute (minutes, for a deploy install) and the receive watchdog
+ * terminates it at 2 x replication.pingTimeout.
+ */
+export function operationConnectionOptions(url: string): { url: string } {
+	return { url };
+}
+
 export async function sendOperationToNode(node, operation, options?) {
 	if (!options) options = {};
 	options.serverName = node.name;
@@ -603,24 +612,27 @@ export async function sendOperationToNode(node, operation, options?) {
 	// specific CA (hdb_nodes.ca) so createWebSocket trusts it, matching how the worker subscription path
 	// trusts each node's CA. Bootstrap callers (add_node/clone) pass a bare { url } node with no ca and are unaffected.
 	if (node.ca) options.nodeCA = node.ca;
-	const socket = await createWebSocket(getNodeURL(node), options);
-	const session = replicateOverWS(socket, {}, {});
+	const nodeUrl = getNodeURL(node);
+	const socket = await createWebSocket(nodeUrl, options);
+	const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), {});
 	return new Promise((resolve, reject) => {
 		socket.on('open', () => {
 			// operation may carry a secret (registry token / ssh key / password); redact before
 			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
 			if (logger.logsAtLevel('debug'))
-				logger.debug(
-					'Sending operation connection to ' + getNodeURL(node) + ' opened',
-					redactOperationForLog(operation)
-				);
-			resolve(session.sendOperation(operation));
+				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(operation));
+			// A throw inside this listener is an uncaught exception, and leaves this promise pending.
+			try {
+				resolve(session.sendOperation(operation));
+			} catch (error) {
+				reject(error);
+			}
 		});
 		socket.on('error', (error) => {
 			reject(error);
 		});
 		socket.on('close', (error) => {
-			logger.info('Sending operation connection to ' + getNodeURL(node) + ' closed', error);
+			logger.info('Sending operation connection to ' + nodeUrl + ' closed', error);
 		});
 	}).finally(() => {
 		socket.close();

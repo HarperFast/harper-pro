@@ -1,5 +1,14 @@
 import { parseArgs } from 'node:util';
-import { accessSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import {
+	accessSync,
+	appendFileSync,
+	readFileSync,
+	writeFileSync,
+	mkdirSync,
+	renameSync,
+	rmSync,
+	unlinkSync,
+} from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -30,6 +39,10 @@ import {
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
+import {
+	isExplicitDatabaseSubscription,
+	isReplicatedDatabase as isReplicatedDatabaseUnder,
+} from '../replication/replicatedDatabases.ts';
 
 /**
  * Environment Variables:
@@ -88,6 +101,8 @@ const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
 // keeps arriving without ever converging (arrivals slide the stall deadline).
 const MIN_MAX_CLONE_DURATION_MS = 3600000;
 const DEFAULT_REPLICATION_PORT = '9933';
+const CLONE_ATTEMPT_FILE = '.cloneAttempt.json';
+const CLONE_ATTEMPT_ENV = 'HARPER_CLONE_ATTEMPT';
 
 const CONFIG_TO_EXCLUDE_FROM_CLONE = {
 	clustering_nodename: true,
@@ -243,6 +258,7 @@ export async function cloneNode(): Promise<void> {
 		const { main } = await import('../core/bin/run.js');
 		return main();
 	}
+	startCloneAttempt();
 
 	// A marker means a previous start completed setup and began the sync wait; setup must not be
 	// repeated (full app re-install, worker restart under resumed replication). forceClone overrides,
@@ -380,6 +396,7 @@ export async function cloneNode(): Promise<void> {
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
 	clearSyncStartedMarker();
+	clearCloneAttempt();
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
@@ -439,6 +456,7 @@ async function establishReplicationSetup(): Promise<void> {
 		operation: string;
 		verify_tls: boolean;
 		url: string;
+		isLeader: true;
 		authorization?:
 			| {
 					username: string;
@@ -451,6 +469,7 @@ async function establishReplicationSetup(): Promise<void> {
 		operation: OPERATIONS_ENUM.ADD_NODE,
 		verify_tls: false, // set node cross-signs the cluster with harper self-signed certs
 		url: leaderReplicationURL,
+		isLeader: true,
 	};
 
 	if (!usingCertAuth) {
@@ -658,6 +677,37 @@ async function monitorSync(
 		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s, or if ${Math.round(totalBytes / 1024 / 1024)}MB has not converged within ${Math.round(maxDurationMs / 1000)}s`
 	);
 
+	// Whether the system database's socket is required has two independent gates.
+	//
+	// Local: this node only ever opens a system socket if its own `replication.databases` covers
+	// `system` — `shouldReplicateFromNode` runs every database, system included, through that
+	// filter. A node configured with e.g. `databases: ['data']` never subscribes to system, so
+	// requiring that socket would wedge the clone Unavailable forever.
+	//
+	// Leader capability: a legacy (v4) leader never replicates the system database either, while a
+	// v5+ leader must have it required up front — otherwise a small user database completing before
+	// the system subscription registers could finish the clone with the system copy unverified.
+	// registration_info is the version probe present on every leader version (see
+	// core/bin/cliOperations.ts). Fail CLOSED on that probe: only a positively-read legacy major
+	// version exempts system; a missing/unparseable version or a persistently failing probe requires
+	// it, so a transient probe error against a v5 leader cannot reopen the premature-Available race.
+	let systemSocketRequired = isReplicatedDatabase(SYSTEM_SCHEMA_NAME);
+	if (!systemSocketRequired) {
+		log(`'${SYSTEM_SCHEMA_NAME}' is not in this node's replication.databases; not requiring its socket`, 'debug');
+	}
+	for (let attempt = 1; systemSocketRequired && attempt <= 3; attempt++) {
+		try {
+			const registration: any = await leaderRequest({ operation: 'registration_info' });
+			// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
+			const leaderMajorVersion = Number(String(registration?.version ?? '').match(/\d+/)?.[0] ?? NaN);
+			systemSocketRequired = !(leaderMajorVersion >= 1 && leaderMajorVersion < 5);
+			break;
+		} catch (err) {
+			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
+			if (attempt < 3) await sleep(1000);
+		}
+	}
+
 	const outcome = await monitorSyncLoop({
 		targetTimestamps,
 		clusterStatus,
@@ -666,6 +716,9 @@ async function monitorSync(
 		maxDurationMs,
 		checkIntervalMs: DEFAULT_SYNC_CHECK_INTERVAL_MS,
 		log,
+		requiredSocketDatabases: Object.keys(targetTimestamps).filter(
+			(database) => database !== 'system' || systemSocketRequired
+		),
 	});
 
 	if (outcome === 'synced') {
@@ -753,6 +806,28 @@ async function fetchAndPersistSnapshot(
  * and record the most recent timestamp for each database in a JSON file.
  * @returns {Promise<void>}
  */
+// A database the clone doesn't subscribe to must not be pre-created (cloneSchemas) or become a
+// sync target (getLastUpdatedRecord: its socket never exists, so a target would wedge the sync
+// monitor). A sharded entry replicates only from a same-shard leader (`shouldReplicateFromNode`);
+// the leader's shard comes from its configuration. Fail closed on an unreadable configuration by
+// treating sharded entries as replicated: a wrong inclusion stalls the clone visibly, a wrong
+// exclusion would skip verifying a database that is being copied.
+function isReplicatedDatabase(dbName: string, shardedReplicates?: (entry: any) => boolean): boolean {
+	return isReplicatedDatabaseUnder(envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES), dbName, shardedReplicates);
+}
+
+async function leaderShardedReplicates(): Promise<(entry: any) => boolean> {
+	try {
+		const leaderConfiguration: any = await leaderRequest({ operation: 'get_configuration' });
+		const leaderShard = leaderConfiguration?.replication?.shard;
+		const localShard = envMgr.get(CONFIG_PARAMS.REPLICATION_SHARD);
+		return () => leaderShard === localShard;
+	} catch (err) {
+		log(`Could not read the leader configuration for shard matching (${err}); keeping sharded sync targets`);
+		return () => true;
+	}
+}
+
 async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string, number>; totalBytes: number }> {
 	log('Getting last updated record timestamp for all database', 'debug');
 	const lastUpdated: Record<string, number> = {};
@@ -762,10 +837,21 @@ async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string
 	lastUpdated['system'] = findMostRecentTimestamp(systemDb);
 	totalBytes += sumTableSizes(systemDb);
 
+	const shardedReplicates = await leaderShardedReplicates();
+	const { getHDBNodeTable } = await import('../replication/knownNodes.ts');
+	let leaderNode: any;
+	for (const node of getHDBNodeTable().search([])) {
+		if (node?.isLeader || node?.url === leaderReplicationURL) {
+			leaderNode = node;
+			break;
+		}
+	}
 	const allDb: Record<string, any> = await leaderRequest({ operation: 'describe_all' });
 	for (const db in allDb) {
 		// requestId is part of the describe response so we ignore it
 		if (typeof allDb[db] !== 'object') continue;
+		if (!isReplicatedDatabase(db, shardedReplicates) && !isExplicitDatabaseSubscription(leaderNode?.subscriptions, db))
+			continue;
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
 		totalBytes += sumTableSizes(allDb[db]);
 	}
@@ -1132,27 +1218,10 @@ async function cloneSchemas(): Promise<void> {
 	const { createSchema, createTable } = await import('../core/dataLayer/schema.js');
 	const { databases } = await import('../core/resources/databases.js');
 
-	// Filter by this node's `replication.databases` so we don't materialize empty databases the
-	// clone isn't even subscribing to. Matches the gating used by `shouldReplicateFromNode` in
-	// `replication/knownNodes.ts`: `undefined` or `'*'` accept everything; an array accepts only
-	// the names it lists (objects with `.name` are sharded-database entries).
-	const databaseReplications = envMgr.get(CONFIG_PARAMS.REPLICATION_DATABASES);
-	const isReplicatedDatabase = (dbName: string): boolean => {
-		if (!databaseReplications || databaseReplications === '*') return true;
-		if (!Array.isArray(databaseReplications)) return true;
-		return databaseReplications.some((entry: any) =>
-			typeof entry === 'string' ? entry === dbName : entry?.name === dbName
-		);
-	};
-
 	for (const dbName of Object.keys(allDb)) {
 		const dbDescribe = allDb[dbName];
 		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;
-		if (!isReplicatedDatabase(dbName)) {
-			log(`Skipping schema pre-create for '${dbName}' (not in replication.databases)`, 'debug');
-			continue;
-		}
-
+		if (!isReplicatedDatabase(dbName)) continue;
 		if (!databases[dbName]) {
 			try {
 				await createSchema({ database: dbName, operation: OPERATIONS_ENUM.CREATE_DATABASE });
@@ -1356,6 +1425,45 @@ function writeJsonSync(path: string, data: any): void {
 		writeFileSync(path, JSON.stringify(data, null, 2), 'utf8');
 	} catch (err) {
 		log(`Error writing JSON to ${path}: ${err}`, 'error');
+	}
+}
+
+function cloneAttemptPath(): string {
+	return join(rootPath, CLONE_ATTEMPT_FILE);
+}
+
+function startCloneAttempt(): void {
+	const path = cloneAttemptPath();
+	let attemptId: string | undefined;
+	if (pathExists(path)) {
+		try {
+			const persisted = JSON.parse(readFileSync(path, 'utf8'));
+			if (typeof persisted?.attemptId === 'string') attemptId = persisted.attemptId;
+		} catch (error) {
+			log(`Could not read persisted clone attempt at ${path}: ${error}`, 'error');
+		}
+	}
+	if (!attemptId) {
+		attemptId = randomBytes(16).toString('hex');
+		try {
+			const temporaryPath = `${path}.${process.pid}.tmp`;
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(temporaryPath, JSON.stringify({ attemptId }), { encoding: 'utf8', mode: 0o600 });
+			renameSync(temporaryPath, path);
+		} catch (error) {
+			log(`Could not persist clone attempt at ${path}: ${error}`, 'error');
+			return;
+		}
+	}
+	process.env[CLONE_ATTEMPT_ENV] = attemptId;
+}
+
+function clearCloneAttempt(): void {
+	delete process.env[CLONE_ATTEMPT_ENV];
+	try {
+		unlinkSync(cloneAttemptPath());
+	} catch (error: any) {
+		if (error?.code !== 'ENOENT') log(`Could not remove clone attempt marker: ${error}`, 'error');
 	}
 }
 
