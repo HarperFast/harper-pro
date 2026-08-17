@@ -1122,6 +1122,7 @@ type DbisCursor = {
 	currentTable?: string;
 	afterKey?: any;
 	copyOrder?: number;
+	cloneAttempt?: string;
 };
 
 /**
@@ -1158,12 +1159,21 @@ export type DbisStore = {
  */
 export function readDbisCursorSync(
 	dbisDB: DbisStore | undefined,
-	kind: 'seq' | 'copyCursor',
+	kind: 'seq' | 'copyCursor' | 'cloneCopyComplete',
 	id: any
 ): DbisCursor | undefined {
 	// getSync is load-bearing here: reverting it to get() would return a MaybePromise that no longer
 	// satisfies the DbisCursor | undefined return type — a tsc error, not a silent full-copy regression.
 	return dbisDB?.getSync([Symbol.for(kind), id]);
+}
+
+export function matchesCloneCopyCompletion(marker: DbisCursor | undefined, cloneAttempt: string | undefined): boolean {
+	return (
+		typeof cloneAttempt === 'string' &&
+		marker?.cloneAttempt === cloneAttempt &&
+		typeof marker.copyStartTime === 'number' &&
+		Number.isFinite(marker.copyStartTime)
+	);
 }
 
 /**
@@ -2382,6 +2392,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				return;
 			}
 			if (copyFlushInFlight) return; // a flush is persisting the final cursor; finish on its completion
+			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
+			if (cloneAttempt && copyFromNodeId !== undefined) {
+				try {
+					getDatabaseStores().dbisDB?.put([Symbol.for('cloneCopyComplete'), copyFromNodeId], {
+						cloneAttempt,
+						copyStartTime: copyModeStartTime,
+					});
+				} catch (error) {
+					logger.warn?.(connectionId, 'failed to persist clone copy completion', databaseName, error);
+					close(1011, 'Failed to persist clone copy completion');
+					return;
+				}
+			}
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
@@ -3483,6 +3506,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
+						const sharedStatus = getSharedStatus();
+						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
+						if (cloneAttempt && copyFromNodeId !== undefined) {
+							try {
+								getDatabaseStores().dbisDB?.remove([Symbol.for('cloneCopyComplete'), copyFromNodeId]);
+							} catch (error) {
+								closeOnInboundMessageError(error, {
+									connectionId,
+									logger,
+									markInboundClosed: () => (wsClosed = true),
+									close,
+								});
+								return;
+							}
+						}
 						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
 						break;
 					}
@@ -5751,6 +5790,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				),
 				databaseName
 			);
+			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
+			const copyCompletion = cloneAttempt
+				? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId)
+				: undefined;
+			if (!copyCursor && matchesCloneCopyCompletion(copyCompletion, cloneAttempt)) {
+				const sharedStatus = getSharedStatus();
+				if (sharedStatus)
+					sharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
+						sharedStatus[RECEIVED_VERSION_POSITION],
+						copyCompletion.copyStartTime!
+					);
+			}
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
 			let startTime = Math.max(
 				sequenceEntry?.seqId ?? 1,
