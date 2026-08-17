@@ -28,7 +28,7 @@ import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog } from './clusterShared.mjs';
+import { sendOperation, readLog, restartNode, stopNodeProcess, pollHealth } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -117,10 +117,15 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 
 		const payload = await targz(FIXTURE_PATH);
 		await Promise.all([
-			sendOperation(ctx.nodeA, { operation: 'deploy_component', project: 'decode-drop', payload, restart: true }),
-			sendOperation(ctx.nodeB, { operation: 'deploy_component', project: 'decode-drop', payload, restart: true }),
+			sendOperation(ctx.nodeA, { operation: 'deploy_component', project: 'decode-drop', payload }),
+			sendOperation(ctx.nodeB, { operation: 'deploy_component', project: 'decode-drop', payload }),
 		]);
-		await delay(10_000);
+		// deploy_component restart:true answers before the old process exits; restart explicitly and
+		// wait for the pid change + health so the steps below can't race the outgoing process.
+		for (const node of [ctx.nodeA, ctx.nodeB]) {
+			await restartNode(node);
+			await pollHealth(node);
+		}
 
 		// Seed clean rows + poison rows on A, interleaved so a starved leg (poison stops progress)
 		// is distinguishable from a healthy skip (clean rows keep flowing past the poison).
@@ -134,10 +139,15 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 	});
 
 	after(async () => {
-		// Guard against a before-hook that threw/skipped before either node was assigned —
-		// teardownHarper(undefined) would throw synchronously, which .catch() wouldn't reach.
-		if (ctx.nodeA) await teardownHarper(ctx.nodeA).catch(() => {});
-		if (ctx.nodeB) await teardownHarper(ctx.nodeB).catch(() => {});
+		// Nodes restart during setup, so teardownHarper's spawned-child handle is stale — stop the
+		// live process first (see clusterShared.stopNodeProcess), and pass the { harper } shape:
+		// a bare node has no .harper, so teardownHarper silently no-ops and leaks the node.
+		await Promise.all(
+			[ctx.nodeA, ctx.nodeB].filter(Boolean).map(async (node) => {
+				await stopNodeProcess(node).catch(() => {});
+				await teardownHarper({ harper: node }).catch(() => {});
+			})
+		);
 	});
 
 	test('B joins A, skips the undecodable records, and stays alive', async () => {
@@ -148,7 +158,7 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 			port: 9933,
 			isLeader: true,
 			rejectUnauthorized: false,
-			authorization: { username: ctx.nodeA.HDB_ADMIN_USERNAME, password: ctx.nodeA.HDB_ADMIN_PASSWORD },
+			authorization: ctx.nodeA.admin,
 		});
 
 		// (1) every clean row arrives — the leg is NOT starved behind the poison record.

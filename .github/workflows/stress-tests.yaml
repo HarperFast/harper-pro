@@ -135,6 +135,9 @@ jobs:
           - name: 'decode-drop-recovery'
             file: 'integrationTests/cluster/decodeDropRecovery.test.mjs'
             env_vars: ''
+          - name: 'poisoned-copy-cursor-data-loss'
+            file: 'integrationTests/cluster/poisonedCopyCursorDataLoss.test.mjs'
+            env_vars: ''
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
