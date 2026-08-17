@@ -867,7 +867,8 @@ async function hasDurableBlobHeader(blob: Blob): Promise<boolean> {
 	try {
 		file = await openFile(path, 'r');
 		const header = Buffer.allocUnsafe(BLOB_HEADER_SIZE);
-		const [{ size }, { bytesRead }] = await Promise.all([file.stat(), file.read(header, 0, BLOB_HEADER_SIZE, 0)]);
+		const { size } = await file.stat();
+		const { bytesRead } = await file.read(header, 0, BLOB_HEADER_SIZE, 0);
 		return bytesRead === BLOB_HEADER_SIZE && isCompleteBlobHeader(header, size);
 	} catch {
 		return false;
