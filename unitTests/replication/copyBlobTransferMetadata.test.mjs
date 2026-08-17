@@ -2,6 +2,7 @@ import assert from 'node:assert';
 import { createAuditEntry, readAuditEntry } from '#src/core/resources/auditStore';
 import { Blob, createBlob, decodeWithBlobCallback } from '#src/core/resources/blob';
 import { table } from '#src/core/resources/databases';
+import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
 import {
 	collectAuditRecordBlobsFromBinary,
 	encodeWithCopyBlobTransferTags,
@@ -87,6 +88,7 @@ describe('copy blob transfer metadata', () => {
 	});
 
 	it('enumerates a real blob extension without poisoning a later value decode', async () => {
+		setHdbBasePath(process.env.STORAGE_PATH);
 		const CopyBlobTransfer = table({
 			database: 'copyBlobTransferMetadata',
 			table: 'records',
