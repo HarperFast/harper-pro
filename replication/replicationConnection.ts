@@ -529,13 +529,12 @@ export function keepaliveArmsOnOpen(readyState: number): boolean {
  * (harper-pro#432) territory.
  *
  * Coverage: FRAME-level errors (header/command decode, audit-entry structure, unexpected rejections
- * from awaited handler work) reach the outer catch directly. A per-record VALUE decode failure is
- * caught first by the inner catch around `decodeBlobsWithWrites` — which logs the decoder's structures
- * and the offending bytes for diagnosis, then RE-THROWS (only when the table decoder resolved) so it
- * rides this same close path instead of skip-and-logging while the resume cursor advances past the
- * hole. That closes the #1163/#1453 structure-fork silent-gap class: the reconnect rebuilds the table
- * decoder from the peer's re-sent structures, healing the fork on resume. An unknown tableId (decoder
- * unresolved — a transient schema-propagation case, not a fork) stays skip-and-log.
+ * from awaited handler work) reach the outer catch directly. A per-record VALUE decode failure never
+ * reaches here: the inner catch around `decodeBlobsWithWrites` disposes of it per
+ * `classifyReplicationDecodeError` — skip-and-count for a genuinely undecodable value
+ * (harper-pro#537), or its own hold-and-reconnect close when the fault is local blob setup
+ * (harper-pro#715); an unknown tableId (transient schema propagation) holds via the missing-decoder
+ * branch before decode is attempted.
  *
  * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
  * catch in `onWSMessage`.
@@ -558,21 +557,6 @@ export function closeOnInboundMessageError(
 		error
 	);
 	deps.close(1011, 'Error handling incoming replication message');
-}
-
-/**
- * The close-vs-skip decision for a per-record value-decode failure inside `onWSMessage`'s inner
- * catch (around `decodeBlobsWithWrites`): a resolved `tableDecoder` means the offending bytes are a
- * real record whose structures forked from the sender's (#1163/#1453), so the caller latches the
- * error to re-throw onto `closeOnInboundMessageError`'s close-and-reconnect path instead of skipping
- * past it — see the inline comment at the call site for the full reasoning. An unresolved decoder
- * (unknown tableId) is transient schema propagation, not a fork, and still skips.
- *
- * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
- * inner value-decode catch in `onWSMessage`.
- */
-export function shouldCloseOnRecordDecodeFailure(tableDecoder: unknown): boolean {
-	return !!tableDecoder;
 }
 
 /**
@@ -1570,15 +1554,25 @@ export const DECODE_DROP_METRIC = 'decode-drop';
 export const DECODE_HOLD_METRIC = 'decode-hold';
 
 /**
- * Classify a decode error thrown while applying a received copy/audit record, choosing how loudly to
- * surface the skip. (harper-pro#537)
+ * Marks a synchronous throw from `receiveBlobs`'s setup prologue (stream creation, in-flight
+ * registration into the root store, the synchronous `saveBlob` start) so
+ * `classifyReplicationDecodeError` can tell a local blob-store fault apart from a genuinely
+ * undecodable record value. Thrown only by the decode blob callback in `onWSMessage`; the original
+ * fault rides `cause`. (harper-pro#715)
+ */
+export class BlobSetupError extends Error {
+	constructor(cause: unknown) {
+		super('Blob setup failed while decoding a replication record', { cause });
+	}
+}
+
+/**
+ * Classify a decode error thrown while applying a received copy/audit record. (harper-pro#537, #715)
  *
- * Both verdicts SKIP the record and let the resume cursor advance — a decode error reaching this
- * catch is treated as permanent. Transient conditions are already handled upstream (blob-gap `hold`,
- * apply-queue backpressure), and every known source of a decode failure has been root-caused, so one
- * that still reaches here is almost certainly unrecoverable old-version/corrupt data that no re-copy
- * can heal (re-fetching re-ships the same undecodable bytes). Holding the leg would only wedge it, so
- * we drop the record and keep the copy moving; the verdicts differ only in observability:
+ * The skip verdicts drop the record and let the resume cursor advance — a genuine decode error
+ * reaching this catch is permanent (every known decode-failure source has been root-caused as
+ * unrecoverable old-version/corrupt data that a re-copy re-ships byte-identically; holding the leg
+ * would only wedge it). They differ only in observability:
  *
  * - `skip-missing-structure`: the record references a shared structure genuinely absent on this node
  *   (`isMissingStructureError` — structon/msgpackr already reloaded structures from durable storage
@@ -1587,10 +1581,18 @@ export const DECODE_HOLD_METRIC = 'decode-hold';
  * - `skip`: any other decode failure — unexpected post-root-cause, so it is logged loudly at error
  *   level for investigation.
  *
+ * `hold-blob-setup` is the exception (harper-pro#715): a `BlobSetupError` did not come from the
+ * value decoder at all — `receiveBlobs` runs synchronously inside the decode callback, so a local,
+ * typically transient blob-store fault (EMFILE, directory creation, a store error registering the
+ * in-flight marker) surfaces through the same catch. That record is still deliverable; skipping
+ * would seal it under the advancing resume cursor, so the caller holds: close, reconnect, resume
+ * from the durable cursor, and re-request it — mirroring the missing-decoder hold.
+ *
  * Exported so the policy can be exercised in isolation by
  * `unitTests/replication/classifyReplicationDecodeError.test.mjs`.
  */
-export function classifyReplicationDecodeError(error: unknown): 'skip-missing-structure' | 'skip' {
+export function classifyReplicationDecodeError(error: unknown): 'hold-blob-setup' | 'skip-missing-structure' | 'skip' {
+	if (error instanceof BlobSetupError) return 'hold-blob-setup';
 	return isMissingStructureError(error) ? 'skip-missing-structure' : 'skip';
 }
 
@@ -4334,8 +4336,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
-							| undefined;
+							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -4873,7 +4874,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						},
 						auditStore?.rootStore,
 						(blob) => {
-							const localBlob = receiveBlobs(blob, id);
+							let localBlob;
+							try {
+								localBlob = receiveBlobs(blob, id);
+							} catch (blobSetupFault) {
+								// A sync throw here is a local blob-store fault, not an undecodable value; tag it so
+								// the catch below holds instead of skip-and-advancing (harper-pro#715).
+								throw new BlobSetupError(blobSetupFault);
+							}
 							(receivedBlobs ??= []).push(localBlob);
 							return localBlob;
 						}
@@ -4882,7 +4890,25 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// tableDecoder is guaranteed set here (the unknown-tableId case returns above), so the derefs
 					// below are safe without optional chaining. Every failure is counted; classifyReplicationDecodeError
 					// only picks the label (harper-pro#537). The old bare catch skipped silently — no metric, no class.
-					if (classifyReplicationDecodeError(error) === 'skip-missing-structure') {
+					const decodeErrorVerdict = classifyReplicationDecodeError(error);
+					if (decodeErrorVerdict === 'hold-blob-setup') {
+						// Local blob-store fault from receiveBlobs's synchronous setup, not an undecodable record —
+						// skipping would seal a still-deliverable record under the resume cursor (harper-pro#715).
+						// Hold exactly like the missing-decoder branch above: latch inbound off first (#440), close,
+						// and let the reconnect resume from the durable cursor and re-request the record. Blobs
+						// already accepted for this record are deliberately NOT unlinked: the reconnect re-stream
+						// re-saves the same fileIds (the transient-gap rule in receiveBlobs's .catch).
+						recordAction(true, DECODE_HOLD_METRIC, databaseName + '.' + tableDecoder.name);
+						logger.warn?.(
+							connectionId,
+							`Blob setup failed while decoding record ${id} in ${tableDecoder.name}; holding and reconnecting to retry`,
+							(error as BlobSetupError).cause
+						);
+						wsClosed = true;
+						close(1011, 'blob setup failed while decoding; reconnecting to retry');
+						return;
+					}
+					if (decodeErrorVerdict === 'skip-missing-structure') {
 						// Missing shared structure (harper#1163): genuinely absent on this node, re-copy re-ships the
 						// same undecodable bytes. Surface it through the same metric core's local-read path fires so
 						// the drop is alertable rather than laundered as emptiness. Kept concise: this is the #537
@@ -5815,9 +5841,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				databaseName
 			);
 			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
-			const copyCompletion = cloneAttempt
-				? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId)
-				: undefined;
+			const copyCompletion = cloneAttempt ? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId) : undefined;
 			if (!copyCursor && matchesCloneCopyCompletion(copyCompletion, cloneAttempt)) {
 				const sharedStatus = getSharedStatus();
 				if (sharedStatus)
