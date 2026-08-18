@@ -182,8 +182,10 @@ describe('sshKeyOperations sealing', () => {
 	});
 
 	describe('generate: true (harper-pro#594)', () => {
+		// deliberately not `hostname: 'github.com'` — that branch fetches api.github.com for real, and a
+		// unit test should not depend on the network (or on GitHub's unauthenticated rate limit)
 		it('mints the keypair, returns the public half, and seals the private half like a supplied key', async () => {
-			const req = request({ name: 'minted', generate: true, host: 'gh', hostname: 'github.com' });
+			const req = request({ name: 'minted', generate: true, host: 'gh', hostname: 'example.com' });
 			const response = await ops.addSSHKey(req);
 
 			assert.equal(response.message, 'Added ssh key: minted');
@@ -203,7 +205,7 @@ describe('sshKeyOperations sealing', () => {
 		it('strips `generate` before replicating, so a peer stores the minted key instead of minting its own', async () => {
 			// left in place, the replicated op would carry both `generate` and the minted `key` — which
 			// addSSHKey's mutual-exclusion guard would then reject on every peer
-			const req = request({ name: 'minted', generate: true, host: 'gh', hostname: 'github.com' });
+			const req = request({ name: 'minted', generate: true, host: 'gh', hostname: 'example.com' });
 			await ops.addSSHKey(req);
 
 			assert.ok(!('generate' in req), 'the replicated op body must not carry `generate`');
@@ -215,6 +217,19 @@ describe('sshKeyOperations sealing', () => {
 				ops.addSSHKey(request({ name: 'both', generate: true, key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' })),
 				/Provide either `key` or `generate: true`, not both/
 			);
+		});
+
+		it("refuses a stringified `generate`, rather than minting for a truthy 'false'", async () => {
+			// validateBySchema discards Joi's coerced value, so without .strict() the raw string stays on
+			// the request — and 'false' is truthy, which would mint a keypair the caller declined
+			for (const value of ['false', 'true', 'FALSE']) {
+				await assert.rejects(
+					ops.addSSHKey(request({ name: 'stringy', generate: value, host: 'gh', hostname: 'example.com' })),
+					/must be a boolean/,
+					`expected ${JSON.stringify(value)} to be rejected outright`
+				);
+			}
+			assert.throws(() => readFileSync(join(sshDir, 'stringy.key')), /ENOENT/, 'nothing may have been minted');
 		});
 
 		it('refuses neither `generate` nor `key`', async () => {

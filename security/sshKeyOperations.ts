@@ -80,8 +80,10 @@ function sealSSHKey(name: string, key: string): string {
 const addValidationSchema = Joi.object({
 	name: Joi.string().pattern(SSH_KEY_NAME_REGEX).required().messages({ 'string.pattern.base': SSH_KEY_NAME_ERROR_MSG }),
 	// `key` is optional so it can be omitted with `generate: true` (the server mints it); the
-	// "key xor generate" invariant is enforced in addSSHKey for a precise error.
-	generate: Joi.boolean().optional(),
+	// "key xor generate" invariant is enforced in addSSHKey for a precise error. `.strict()` because
+	// Joi would otherwise accept the strings 'true'/'false' by coercion, and `validateBySchema`
+	// discards the coerced value — leaving the raw, always-truthy string on the request.
+	generate: Joi.boolean().strict().optional(),
 	key: Joi.string().optional(),
 	host: Joi.string().required(),
 	hostname: Joi.string().required(),
@@ -156,10 +158,17 @@ export async function addSSHKey(
 	const validation = validateBySchema(req, addValidationSchema);
 	if (validation) throw new ClientError(validation.message);
 
+	// Read `generate` as a strict boolean rather than for truthiness. `validateBySchema` discards
+	// Joi's coerced value, so a caller that stringifies booleans reaches here with `req.generate`
+	// still the string it sent — and `'false'` is truthy, which would mint a keypair the caller
+	// explicitly declined. The schema's `.strict()` rejects those strings; this comparison means the
+	// branch below cannot be reached by anything but a literal `true` even if that changes.
+	const generate = req.generate === true;
+
 	// `generate` and `key` are mutually exclusive: reject both up front. (The origin strips `generate`
-	// before replicating — below — so a peer never receives both and this guard never trips on the
+	// before replicating — below — so a peer never receives it and this guard never trips on the
 	// replicated op.)
-	if (req.generate && req.key) {
+	if (generate && req.key) {
 		throw new ClientError('Provide either `key` or `generate: true`, not both.');
 	}
 
@@ -173,15 +182,19 @@ export async function addSSHKey(
 
 	// With `generate: true`, mint the keypair here so the private key never leaves the cluster; the
 	// public half is returned for the caller to register (e.g. a GitHub deploy key). The minted key
-	// then flows through the same seal-at-rest + replicate path (sealSSHKey) as a supplied one, and the
-	// plaintext only ever exists in this process — see sshKeyGeneration.ts.
+	// then flows through the same seal-at-rest + replicate path (sealSSHKey) as a supplied one, so
+	// where custody is registered the plaintext stays in this process. On a node with NO custody it
+	// does not: `sealSSHKey` passes the key through and it is replicated in the clear, same as a
+	// supplied key in that mode (see the WARN there).
 	let publicKey: string | undefined;
-	if (req.generate) {
+	if (generate) {
 		const generated = await generateEd25519SSHKeyPair(`harper:${req.name}`);
 		req.key = generated.privateKey;
 		publicKey = generated.publicKey;
-		delete req.generate; // peers receive a plain (then sealed) key add and must not re-generate
 	}
+	// Unconditionally, so no variant of the flag — including a literal `false` — reaches a peer, which
+	// must store the key it is sent rather than minting a different one of its own.
+	delete req.generate;
 
 	const { name, key, host, hostname, known_hosts } = req;
 	if (!key) throw new ClientError('add_ssh_key requires `key`, or `generate: true` to mint one');
