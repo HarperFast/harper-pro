@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1786963127984,
+  "lastUpdate": 1787049466320,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -3275,6 +3275,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 1964.21,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "0e27cb2ae0f8f6e554459ef872e9bd0fb09d2fe9",
+          "message": "Add companion-check workflow: coordinated PRs auto-merge once their harper companion lands (#704)\n\n* ci: companion-check gate for PRs dependent on companion PRs (e.g. harper core)\n\nAdds a workflow posting a companion-check commit status driven by\nDepends-on: markers in PR bodies, so a coordinated harper-pro PR can be\napproved and armed for auto-merge, then merge automatically once its\nharper companion lands. Merging such a PR fires the existing sync_core\nrepository_dispatch so the core pointer is re-pointed at harper main\npromptly instead of at the nightly run.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* ci: harden companion-check per cross-model review\n\nFail closed on unparseable markers, support repo#N shorthand, bound and\ndedupe refs, isolate per-dep/per-PR errors, restrict the cross-repo\ntoken to same-org refs, guard sweep/event races, and skip no-marker PRs\nin the cron sweep.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* ci: fail closed on partial markers, heal statuses in sweep, harden sync\n\nRound-2 review fixes matching the documentation-repo copy, plus\nharper-pro-specific ones: split the closed-event concurrency group so an\nedit to a merged PR cannot cancel a pending sync_core dispatch, drop the\ndead case variant in the normalize-core condition, and make Sync Core\nreset core's branch tracking to main so a merged core:set-branch\noverride cannot wedge the nightly or dispatched sync. Adds the\nself-contained node test harness for the embedded script.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* ci: run companion-check tests in runLinter; hedge not-found diagnostic\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* ci: definitive 404s fail closed; align normalize grammar; guard sync reset to main\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* test: stateful script-block extraction and per-scenario fetch isolation (review feedback)\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-08-18T02:44:53Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/0e27cb2ae0f8f6e554459ef872e9bd0fb09d2fe9"
+        },
+        "date": 1787049464748,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 12719.26,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 25847.03,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 21427.14,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 5797.15,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 4524.35,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 1592.46,
             "unit": "ops/sec"
           }
         ]
