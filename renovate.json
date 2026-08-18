@@ -26,11 +26,21 @@
 			"groupSlug": "all-minor-patch",
 			"matchUpdateTypes": ["minor", "patch"],
 			"matchCurrentVersion": "!/^0/",
-			"matchPackageNames": ["!node", "!docker.io/node"]
+			"matchPackageNames": ["!node", "!docker.io/node"],
+			"matchManagers": ["!github-actions"]
 		},
 		{
-			"description": "Automerge is scoped to workflow actions because PR CI runs the workflows. No PR-triggered job builds Dockerfile, Dockerfile-gpu or Dockerfile-openshift, so a base-image bump would otherwise merge on a suite that never compiled the image.",
+			"description": "Automerge is limited to actions in pull-request workflows, where the updated action is exercised before merge. Release, scheduled, and other workflows stay human-reviewed.",
 			"matchManagers": ["github-actions"],
+			"matchFileNames": [
+				".github/workflows/claude-review.yml",
+				".github/workflows/gemini-review.yml",
+				".github/workflows/integration-tests.yaml",
+				".github/workflows/lint-code.yaml",
+				".github/workflows/unit-tests.yaml",
+				".github/workflows/validate-caller-workflows.yml",
+				".github/workflows/ycsb-single-node.yml"
+			],
 			"automerge": true
 		},
 		{
