@@ -785,9 +785,6 @@ export function getBlobTransferKey(fileId: unknown, transferId: number | undefin
 let nextCopyBlobTransferId = 1;
 const BLOB_HEADER_SIZE = 8;
 const UNCOMPRESSED_BLOB_TYPE = 0;
-const DEFLATE_BLOB_TYPE = 1;
-const PENDING_BLOB_TYPE = 0xfe;
-const ERROR_BLOB_TYPE = 0xff;
 const UNKNOWN_BLOB_SIZE = 0xffffffffffff;
 
 /** Core's blob codec only carries own enumerable metadata, so scope the temporary tag to one synchronous encode. */
@@ -853,11 +850,10 @@ export function isCompleteBlobHeader(header: Uint8Array, fileSize: number): bool
 	const value = new DataView(header.buffer, header.byteOffset, BLOB_HEADER_SIZE).getBigUint64(0);
 	const type = Number(value >> 48n);
 	const contentSize = Number(value & 0xffffffffffffn);
-	if (type === PENDING_BLOB_TYPE || type === ERROR_BLOB_TYPE || contentSize === UNKNOWN_BLOB_SIZE) return false;
-	if (type === UNCOMPRESSED_BLOB_TYPE) return fileSize === BLOB_HEADER_SIZE + contentSize;
-	// A finalized deflate header is written only after the body stream finishes. Full inflation remains
-	// the repair sweep's job; doing it per copy frame makes the tie gate O(dataset bytes).
-	return type === DEFLATE_BLOB_TYPE && fileSize > BLOB_HEADER_SIZE;
+	if (contentSize === UNKNOWN_BLOB_SIZE) return false;
+	// Compressed bodies cannot be proven complete from file bytes; core verifies the writer lock instead.
+	if (type !== UNCOMPRESSED_BLOB_TYPE) return false;
+	return fileSize === BLOB_HEADER_SIZE + contentSize;
 }
 
 async function hasDurableBlobHeader(blob: Blob): Promise<boolean> {

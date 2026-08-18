@@ -97,8 +97,9 @@ describe('isCompleteBlobHeader — bounded copy-path durability proof', () => {
 		expect(isCompleteBlobHeader(header(0, 100), 109)).to.equal(false);
 	});
 
-	it('accepts a finalized deflate header without reading the body', () => {
-		expect(isCompleteBlobHeader(header(1, 100), 40)).to.equal(true);
+	it('rejects compressed blobs because file bytes cannot prove completeness', () => {
+		expect(isCompleteBlobHeader(header(1, 100), 40)).to.equal(false);
+		expect(isCompleteBlobHeader(header(1, 100), 108)).to.equal(false);
 		expect(isCompleteBlobHeader(header(1, 100), 8)).to.equal(false);
 	});
 
