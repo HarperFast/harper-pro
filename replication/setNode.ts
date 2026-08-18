@@ -26,6 +26,11 @@ const validationSchema = Joi.object({
 	isLeader: Joi.boolean(),
 });
 
+// Strict ISO 8601 with a required UTC/offset designator (Z or +/-HH:MM). `new Date(string)` also accepts
+// ambiguous forms like "01/02/2024" or a zone-less "2024-01-01T00:00:00" (parsed in the host's local
+// time), which would make a start_time cutoff host-dependent, so require an explicit zone.
+const ISO_8601_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+
 /**
  * Resolve the `replicates` value to write for THIS node's own hdb_nodes row from add_node/set_node.
  * Preserve an existing directional record (authored from config routes by startOnMainThread on the main
@@ -52,6 +57,24 @@ export async function setNode(req: any) {
 	const validation = validateBySchema(req, validationSchema);
 	if (validation) {
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
+	}
+
+	// Normalize and validate the optional data cutoff at the boundary, and persist a number so readers see
+	// one shape. Only a strict ISO 8601 UTC string or an epoch-ms number is accepted; anything else (a typo
+	// like "yesterday", or an ambiguous host-local form) is rejected rather than accepted and silently
+	// downgraded to a full copy, which is the opposite of what start_time asks for.
+	if (req.start_time != null) {
+		let normalized: number;
+		if (typeof req.start_time === 'number') normalized = req.start_time;
+		else if (typeof req.start_time === 'string' && ISO_8601_UTC.test(req.start_time))
+			normalized = new Date(req.start_time).getTime();
+		else normalized = NaN;
+		if (!Number.isFinite(normalized)) {
+			throw new ClientError(
+				`start_time must be an ISO 8601 UTC timestamp (e.g. 2024-01-01T00:00:00Z) or epoch milliseconds, received ${JSON.stringify(req.start_time)}`
+			);
+		}
+		req.start_time = normalized;
 	}
 
 	if (req.operation === 'remove_node') {
