@@ -116,6 +116,7 @@ describe('collectBlobRepairTargets (#699)', () => {
 			declines
 		);
 		await collectBlobRepairTargets(decoderFor(entry), 'k', 5, 2, async () => false, declines);
+		await collectBlobRepairTargets(decoderFor(entry), 'k', 5, 2, async () => undefined, declines);
 		await collectBlobRepairTargets(decoderFor(entry), 'k', 5, undefined, async () => true, declines);
 		await collectBlobRepairTargets(
 			decoderFor(entry),
@@ -134,6 +135,7 @@ describe('collectBlobRepairTargets (#699)', () => {
 			'no-file-blobs': 1,
 			'multi-blob': 1,
 			'healthy': 1,
+			'not-probeable': 1,
 			'no-source-node': 1,
 			'error': 1,
 		});

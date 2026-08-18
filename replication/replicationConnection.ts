@@ -1072,7 +1072,8 @@ export async function collectBlobRepairTargets(
 		// where a mismatch writes one field's bytes into another field's file — so they are left to
 		// backfill (harper-pro#388). The field population is single-blob rows.
 		if (blobs.length !== 1) return decline(blobs.length === 0 ? 'no-file-blobs' : 'multi-blob');
-		return (await blobFileDamaged(blobs[0])) === true ? [blobs[0]] : decline('healthy');
+		const damaged = await blobFileDamaged(blobs[0]);
+		return damaged === true ? [blobs[0]] : decline(damaged === false ? 'healthy' : 'not-probeable');
 	} catch {
 		return decline('error');
 	}
@@ -1092,11 +1093,8 @@ export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boole
 		let handle;
 		try {
 			handle = await fsPromises.open(filePath, 'r');
-		} catch {
-			// Unknown filesystem failures are not proof that the stored file is healthy. Selecting it
-			// makes repairBlobFile re-check under the write lock; if that still cannot start, the
-			// delivery holds its cursor instead of fresh-saving bytes the tie-skipped record will not use.
-			return true;
+		} catch (error) {
+			return (error as { code?: string })?.code === 'ENOENT' ? true : undefined;
 		}
 		try {
 			const size = (await handle.stat()).size;
@@ -1108,9 +1106,7 @@ export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boole
 			await handle.close();
 		}
 	} catch {
-		// A stat/read/close failure is also uncertainty, not proof of health. Conservatively select
-		// the target so the locked sync re-check either repairs it or holds this delivery for retry.
-		return true;
+		return undefined;
 	}
 }
 
