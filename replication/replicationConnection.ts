@@ -3229,14 +3229,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		let existing;
 		try {
 			existing = tableDecoder?.getEntry?.(id);
+			if (existing && typeof existing.then === 'function') existing = await existing;
 		} catch (error) {
 			logger.trace?.(connectionId, 'leading-dup-skip: getEntry threw, letting record flow', id, error);
 			return false;
 		}
 		if (!existing) return false; // nothing stored locally → not a duplicate; must apply.
-		// Defensive: a synchronous getEntry(id) is expected here, but if a store ever hands back a thenable
-		// we must not treat it as an entry — let the record flow (safe, just unoptimized).
-		if (typeof existing.then === 'function') return false;
 		// Identity tie = SAME version AND SAME node. This is exactly the condition core Table.ts's apply loop
 		// uses to drop a duplicate: `precedesExistingVersion(txnTime, existingEntry, nodeId) === 0` early-
 		// matches when `txnTime === existingEntry.version && nodeId === existingEntry.nodeId`. We read the
@@ -3249,20 +3247,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// Intentionally broader than `_writeDelete`'s tie check (`<= 0` here vs `< 0` there): this only
 		// elides re-delivered idempotent re-deletes whose version and node already match locally — safe.
 		// Blob handling. A leading duplicate carrying a file-backed blob may be skipped only if the blob
-		// file is already present on disk (the prior apply saved it); a MISSING blob must NOT be skipped —
+		// file is complete on disk (the prior apply saved it); a damaged blob must NOT be skipped —
 		// it has to reach the apply loop so the dangling reference can be repaired (separate PR). A record
 		// with no blob is always fine to skip. We inspect the *existing* record's blobs (same fileIds as
 		// the duplicate) so the check reflects the durable on-disk state, not the still-in-flight resave.
 		if (hasBlobs) {
-			let allPresent = true;
 			let sawBlob = false;
-			const blobPaths: string[] = [];
+			const blobs: any[] = [];
 			try {
 				findBlobsInObject(existing.value, (blob) => {
 					sawBlob = true;
-					const path = getFilePathForBlob(blob as any);
-					if (path) blobPaths.push(path);
-					else allPresent = false;
+					blobs.push(blob);
 				});
 			} catch (error) {
 				logger.trace?.(connectionId, 'leading-dup-skip: blob inspection threw, letting record flow', id, error);
@@ -3270,14 +3265,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 			// Header said HAS_BLOBS but we could not find a blob to verify (e.g. blob lives only in a patch
 			// chain) — be conservative and let it flow.
-			if (!sawBlob || !allPresent) return false;
-			// Check each blob path asynchronously (avoids blocking the event loop under load).
-			// fsPromises.access resolves if present, throws if missing — treat a throw as "not present".
-			try {
-				await Promise.all(blobPaths.map((p) => fsPromises.access(p)));
-			} catch {
-				return false;
-			}
+			if (!sawBlob) return false;
+			const damageStates = await Promise.all(blobs.map(blobFileMissingOrIncompleteAsync));
+			if (damageStates.some((damaged) => damaged !== false)) return false;
 		}
 		return true;
 	}
