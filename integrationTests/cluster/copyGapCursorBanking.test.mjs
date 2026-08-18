@@ -38,7 +38,7 @@ import {
 	getNextAvailableLoopbackAddress,
 	targz,
 } from '@harperfast/integration-testing';
-import { sendOperation, fetchWithRetry, concurrent, readLog } from './clusterShared.mjs';
+import { sendOperation, fetchWithRetry, concurrent, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -148,9 +148,9 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 			operation: 'deploy_component',
 			project: 'large-blob-deterministic',
 			payload,
-			restart: true,
+			restart: false,
 		});
-		await delay(8000); // restart settle
+		await restartNode(ctx.nodes[0]);
 		// Seed with count-verified retries: under load the deploy restart can race the first GETs, so
 		// re-request every id until describe_table confirms the full set (GETs are idempotent).
 		for (let attempt = 0; attempt < 20; attempt++) {
@@ -176,7 +176,10 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 	});
 
 	after(async () => {
-		if (ctx.nodes) await Promise.all(ctx.nodes.map((n) => teardownHarper({ harper: n }).catch(() => null)));
+		if (ctx.nodes) {
+			await stopNodeProcess(ctx.nodes[0]).catch(() => null);
+			await Promise.all(ctx.nodes.map((n) => teardownHarper({ harper: n }).catch(() => null)));
+		}
 	});
 
 	test('each gap cycle banks the prefix walked before its first fault, and the copy converges', async () => {
