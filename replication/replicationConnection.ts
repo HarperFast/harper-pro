@@ -912,6 +912,28 @@ export function maybeInjectCopyCursorForTest(existingCursor: any, databaseName?:
 	return injected.cursor;
 }
 
+// Test-only fault injection for the harper-pro#537/#545 decode-drop recovery test. When
+// HARPER_TEST_DECODE_FAIL_RECORD_PREFIX is set on the RECEIVER, the value decode for any record whose
+// id starts with that prefix throws the field's torn-value error, driving the classify-skip catch
+// below without needing a genuinely corrupt blob on the sender. This reproduces the wedge trigger
+// (#521 closed-and-resumed on exactly this throw, looping forever) so the test can assert #545 skips
+// it and keeps the leg alive. Never arms in production: the env var is set only by the regression test.
+//
+// The prefix is read ONCE at module load, not per record: the hook is called on the per-record
+// receive-apply hot path, and a `process.env` read there is a native getter on every record. These
+// test env vars are set before the Harper process starts, so a load-time read is both correct and
+// free — the unset (production) path is a single cached-undefined check.
+const DECODE_FAIL_RECORD_PREFIX_FOR_TEST = process.env.HARPER_TEST_DECODE_FAIL_RECORD_PREFIX;
+export function maybeInjectDecodeFailureForTest(recordId: unknown): void {
+	if (
+		DECODE_FAIL_RECORD_PREFIX_FOR_TEST &&
+		typeof recordId === 'string' &&
+		recordId.startsWith(DECODE_FAIL_RECORD_PREFIX_FOR_TEST)
+	) {
+		throw new Error('Unexpected end of MessagePack data (test-injected, harper-pro#537)');
+	}
+}
+
 /**
  * Mark an error as a *source-reported* blob unavailability: the sender told us (via a BLOB_CHUNK
  * `error` marker) that it cannot provide this blob — classically `ENOENT` because the blob was
@@ -4443,7 +4465,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
+							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
+							| undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -5016,6 +5039,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				}
 				let repairIndex = 0;
 				try {
+					maybeInjectDecodeFailureForTest(id);
 					decodeBlobsWithWrites(
 						() => {
 							event = {

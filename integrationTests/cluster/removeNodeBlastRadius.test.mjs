@@ -163,19 +163,41 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 			records: [{ id: 'seed-1', value: 'before-removal' }],
 			replicatedConfirmation: 1,
 		});
+		// 'value' is born on A by the upsert above and its metadata reaches B asynchronously from
+		// the record itself (the replicatedConfirmation: 1 ack can come from C, and search_by_id
+		// validates get_attributes before reading), so B validly answers "unknown attribute" for
+		// a few milliseconds. Retry only that validation transient; any other failure — including
+		// the same response text on the final timeout — still fails the test with its diagnostic.
+		let lastUnknownAttribute;
 		const seeded = await waitUntil(
 			async () => {
-				const r = await sendOperation(ctx.nodeB, {
-					operation: 'search_by_id',
-					database: 'data',
-					table: 'qa758',
-					ids: ['seed-1'],
-					get_attributes: ['id', 'value'],
+				lastUnknownAttribute = undefined;
+				const response = await fetch(ctx.nodeB.operationsAPIURL, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						operation: 'search_by_id',
+						database: 'data',
+						table: 'qa758',
+						ids: ['seed-1'],
+						get_attributes: ['id', 'value'],
+					}),
 				});
-				return r.length ? r : null;
+				const body = await response.json();
+				if (response.status !== 200) {
+					if (typeof body?.error === 'string' && body.error.startsWith('unknown attribute')) {
+						lastUnknownAttribute = body.error;
+						return null;
+					}
+					equal(response.status, 200, JSON.stringify(body));
+				}
+				return body.length ? body : null;
 			},
 			{ label: 'seed-1 replicated to B' }
-		);
+		).catch((error) => {
+			if (lastUnknownAttribute) error.message += ` — B still answering: ${lastUnknownAttribute}`;
+			throw error;
+		});
 		equal(seeded[0].value, 'before-removal');
 	});
 
