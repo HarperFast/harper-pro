@@ -3266,8 +3266,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Header said HAS_BLOBS but we could not find a blob to verify (e.g. blob lives only in a patch
 			// chain) — be conservative and let it flow.
 			if (!sawBlob) return false;
-			const damageStates = await Promise.all(blobs.map(blobFileMissingOrIncompleteAsync));
-			if (damageStates.some((damaged) => damaged !== false)) return false;
+			for (const blob of blobs)
+				if ((await blobFileMissingOrIncompleteAsync(blob)) !== false) return false;
 		}
 		return true;
 	}
