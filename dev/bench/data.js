@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787049466320,
+  "lastUpdate": 1787049468704,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -7550,6 +7550,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 85.03,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "0e27cb2ae0f8f6e554459ef872e9bd0fb09d2fe9",
+          "message": "Add companion-check workflow: coordinated PRs auto-merge once their harper companion lands (#704)\n\n* ci: companion-check gate for PRs dependent on companion PRs (e.g. harper core)\n\nAdds a workflow posting a companion-check commit status driven by\nDepends-on: markers in PR bodies, so a coordinated harper-pro PR can be\napproved and armed for auto-merge, then merge automatically once its\nharper companion lands. Merging such a PR fires the existing sync_core\nrepository_dispatch so the core pointer is re-pointed at harper main\npromptly instead of at the nightly run.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* ci: harden companion-check per cross-model review\n\nFail closed on unparseable markers, support repo#N shorthand, bound and\ndedupe refs, isolate per-dep/per-PR errors, restrict the cross-repo\ntoken to same-org refs, guard sweep/event races, and skip no-marker PRs\nin the cron sweep.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* ci: fail closed on partial markers, heal statuses in sweep, harden sync\n\nRound-2 review fixes matching the documentation-repo copy, plus\nharper-pro-specific ones: split the closed-event concurrency group so an\nedit to a merged PR cannot cancel a pending sync_core dispatch, drop the\ndead case variant in the normalize-core condition, and make Sync Core\nreset core's branch tracking to main so a merged core:set-branch\noverride cannot wedge the nightly or dispatched sync. Adds the\nself-contained node test harness for the embedded script.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* ci: run companion-check tests in runLinter; hedge not-found diagnostic\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* ci: definitive 404s fail closed; align normalize grammar; guard sync reset to main\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n* test: stateful script-block extraction and per-scenario fetch isolation (review feedback)\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-08-18T02:44:53Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/0e27cb2ae0f8f6e554459ef872e9bd0fb09d2fe9"
+        },
+        "date": 1787049468679,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 5.4,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 7.64,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 9.26,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 63.99,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 73.6,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 46.58,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 94.97,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 95.72,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 378.17,
             "unit": "ms"
           }
         ]
