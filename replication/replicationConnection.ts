@@ -1015,20 +1015,33 @@ export function shouldRetrySourceBlobRead(state: {
  * uses the normal fresh-save path. A tie guarantees content identity, so bytes-for-bytes overwrite
  * of the existing file is sound; positional pairing is sound for the same reason (identical
  * structure). Never throws: any read/decode surprise returns null (normal path, no repair).
+ *
+ * `getEntry` may return a Promise (block-cache miss) — AWAITED here, never treated as absence: on a
+ * resumed copy the re-delivered span was applied by a PREVIOUS connection, so cold entries are the
+ * norm in exactly the window this function exists for. Callers run on the serialized message chain
+ * (before decode), where awaiting is safe. Every decline increments its class in `declines` so a
+ * field non-fire is attributable — a silent null is indistinguishable from "no damage" (#699's
+ * observability lesson, applied to the fix itself).
  */
 export async function collectBlobRepairTargets(
 	tableDecoder: any,
 	id: any,
 	incomingVersion: number,
 	sourceNodeId: number | undefined,
-	blobFileDamaged: (blob: any) => Promise<boolean | undefined> | boolean | undefined
+	blobFileDamaged: (blob: any) => Promise<boolean | undefined> | boolean | undefined,
+	declines?: Record<string, number>
 ): Promise<any[] | null> {
+	const decline = (reason: string) => {
+		if (declines) declines[reason] = (declines[reason] ?? 0) + 1;
+		return null;
+	};
 	try {
-		if (sourceNodeId === undefined) return null;
-		const existing = tableDecoder?.getEntry?.(id);
-		if (!existing || typeof existing.then === 'function') return null;
-		if (existing.version !== incomingVersion) return null;
-		if ((existing.nodeId ?? 0) !== sourceNodeId) return null;
+		if (sourceNodeId === undefined) return decline('no-source-node');
+		let existing = tableDecoder?.getEntry?.(id);
+		if (existing && typeof existing.then === 'function') existing = await existing;
+		if (!existing) return decline('no-stored-entry');
+		if (existing.version !== incomingVersion) return decline('version-mismatch');
+		if ((existing.nodeId ?? 0) !== sourceNodeId) return decline('node-mismatch');
 		const blobs: any[] = [];
 		findBlobsInObject(existing.value, (blob: any) => {
 			blobs.push(blob);
@@ -1038,10 +1051,10 @@ export async function collectBlobRepairTargets(
 		// incoming decode callbacks positionally — an unverified cross-traversal ordering assumption
 		// where a mismatch writes one field's bytes into another field's file — so they are left to
 		// backfill (harper-pro#388). The field population is single-blob rows.
-		if (blobs.length !== 1) return null;
-		return (await blobFileDamaged(blobs[0])) === true ? [blobs[0]] : null;
+		if (blobs.length !== 1) return decline(blobs.length === 0 ? 'no-file-blobs' : 'multi-blob');
+		return (await blobFileDamaged(blobs[0])) === true ? [blobs[0]] : decline('healthy');
 	} catch {
-		return null;
+		return decline('error');
 	}
 }
 
@@ -2753,6 +2766,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// record is genuinely new and the per-record getEntry would be a pure miss tax for the rest of
 	// the copy. A hit resets the run (healthy duplicates also reset it — still inside the window).
 	let repairWindowMissRun = 0;
+	// Per-decline-class counts from collectBlobRepairTargets, logged at retire: a repair that never
+	// fires is otherwise indistinguishable from "no damage" (#699's observability lesson).
+	const repairDeclines: Record<string, number> = {};
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
 	const blobSentCallbacks: Array<(v?: any) => void> = [];
@@ -4961,22 +4977,29 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					((messageIsCopyFrame && (copyResumeRequested || sawCopyRestart)) ||
 						leadingDupCursorByNode.has(localSourceNodeId as any))
 				) {
-					const existsLocally = (() => {
-						try {
-							const entry = tableDecoder?.getEntry?.(id);
-							return entry != null && typeof entry.then !== 'function';
-						} catch {
-							return false;
-						}
-					})();
-					if (existsLocally) {
+					// AWAIT a Promise-returning getEntry (block-cache miss) rather than treating it as
+					// absence: the re-delivered span was applied by a PREVIOUS connection, so its entries are
+					// cold in exactly this window — a sync-only check reads the whole span as missing, which
+					// both skips every repair AND latches the window off after 8 records (observed as
+					// inPlaceRepairs=0 with the damage intact). Awaiting is safe here: this runs on the
+					// serialized message chain, before decode. Only a RESOLVED absence counts toward the
+					// miss-run latch, so the latch still turns the probe off once the walk passes the span.
+					let storedEntry: any = null;
+					try {
+						storedEntry = tableDecoder?.getEntry?.(id);
+						if (storedEntry && typeof storedEntry.then === 'function') storedEntry = await storedEntry;
+					} catch {
+						storedEntry = null;
+					}
+					if (storedEntry != null) {
 						repairWindowMissRun = 0;
 						repairTargets = await collectBlobRepairTargets(
 							tableDecoder,
 							id,
 							auditRecord.version,
 							localSourceNodeId,
-							blobFileMissingOrIncompleteAsync
+							blobFileMissingOrIncompleteAsync,
+							repairDeclines
 						);
 					} else repairWindowMissRun++;
 				}
@@ -5382,6 +5405,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
+		// One aggregate line per connection, only when the repair window was consulted: which decline
+		// classes suppressed in-place repairs. debug so it costs nothing in the default config, but a
+		// field non-fire investigation (repairs expected, none logged) has an answer in the same log.
+		if (Object.keys(repairDeclines).length > 0)
+			logger.debug?.(connectionId, 'blob repair declines for this connection', JSON.stringify(repairDeclines));
 		logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
 	}
 	ws.on('close', retireInstance);

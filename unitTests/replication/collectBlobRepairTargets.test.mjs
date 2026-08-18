@@ -45,9 +45,37 @@ describe('collectBlobRepairTargets (#699)', () => {
 		expect(await collectBlobRepairTargets(decoderFor(localEntry), 'k', 5, 1, async () => true)).to.equal(null);
 	});
 
-	it('returns null with no stored entry, an async entry, an unmapped source node, or a throwing read', async () => {
+	it('awaits a Promise-returning getEntry instead of treating a block-cache miss as absence (#699)', async () => {
+		// A cold entry is the NORM in the repair window: the re-delivered span was applied by a
+		// PREVIOUS connection, so getEntry routinely returns a Promise there. Treating a thenable as
+		// absence made the repair silently never fire on a resumed copy (and latched the caller's
+		// probe window off). A resolved entry must repair; only a RESOLVED null is absence.
+		const entry = { version: 5, nodeId: 2, value: { x: blobA } };
+		expect(await collectBlobRepairTargets(decoderFor(Promise.resolve(entry)), 'k', 5, 2, async () => true)).to.deep.equal(
+			[blobA]
+		);
+		expect(await collectBlobRepairTargets(decoderFor(Promise.resolve(null)), 'k', 5, 2, async () => true)).to.equal(
+			null
+		);
+	});
+
+	it('counts each decline class so a field non-fire is attributable (#699)', async () => {
+		const entry = { version: 5, nodeId: 2, value: { x: blobA } };
+		const declines = {};
+		await collectBlobRepairTargets(decoderFor(entry), 'k', 6, 2, async () => true, declines);
+		await collectBlobRepairTargets(decoderFor(entry), 'k', 5, 3, async () => true, declines);
+		await collectBlobRepairTargets(decoderFor(entry), 'k', 5, 2, async () => false, declines);
+		await collectBlobRepairTargets(decoderFor(Promise.resolve(null)), 'k', 5, 2, async () => true, declines);
+		expect(declines).to.deep.equal({
+			'version-mismatch': 1,
+			'node-mismatch': 1,
+			healthy: 1,
+			'no-stored-entry': 1,
+		});
+	});
+
+	it('returns null with no stored entry, an unmapped source node, or a throwing read', async () => {
 		expect(await collectBlobRepairTargets(decoderFor(undefined), 'k', 5, 2, async () => true)).to.equal(null);
-		expect(await collectBlobRepairTargets(decoderFor({ then: () => {} }), 'k', 5, 2, async () => true)).to.equal(null);
 		expect(
 			await collectBlobRepairTargets(decoderFor({ version: 5, nodeId: 2 }), 'k', 5, undefined, async () => true)
 		).to.equal(null);
