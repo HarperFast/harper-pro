@@ -4173,6 +4173,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								if (!skippedMessageSequenceUpdateTimer) {
 									skippedMessageSequenceUpdateTimer = setTimeout(() => {
 										skippedMessageSequenceUpdateTimer = null;
+										// skipAuditRecord re-arms this whenever the handle is falsy, including after
+										// teardown has cleared it.
+										if (connectionSuperseded()) return;
 										// check to see if we are too far behind, but if so, send a sequence update
 										if ((sentSequenceId || 0) + SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY / 2 < currentSequenceId) {
 											if (DEBUG_MODE)
@@ -5150,6 +5153,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					if (!lastSequenceIdCommitted && sequenceIdReceived) {
 						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
 						setTimeout(() => {
+							// A retired session's watermark would overwrite the live session's confirmation slot.
+							if (connectionSuperseded()) return;
 							// Gate the receipt on the durable watermark. Now that onCommit no longer awaits the
 							// blob saves, a commit's blobs may still be in flight at send time; confirming the raw
 							// committed sequence would tell the sender we durably hold past `lastDurableSequenceId`
@@ -5231,6 +5236,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		copyFlushRetryTimer = undefined;
 		clearInterval(blobsTimer);
 		clearInterval(backPressureInterval);
+		// delayedClose is deliberately left alone: it is the terminal latch that finishes an orphaned
+		// connection to a removed database, and both cancelling it and guarding it on wsClosed lose
+		// that latch on a plain close.
+		clearTimeout(skippedMessageSequenceUpdateTimer);
+		skippedMessageSequenceUpdateTimer = null;
 		// The blobsTimer that would otherwise reap stalled receives is now cleared, and the connection is
 		// gone, so abort any in-flight blob receives immediately instead of waiting up to blobTimeout for
 		// core's source-idle watchdog. This clamps the resume cursor (transient failure) so the reconnect
