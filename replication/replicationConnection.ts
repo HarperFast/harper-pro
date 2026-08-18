@@ -1558,12 +1558,14 @@ export const DECODE_HOLD_METRIC = 'decode-hold';
  * registration into the root store, the synchronous `saveBlob` start) so
  * `classifyReplicationDecodeError` can tell a local blob-store fault apart from a genuinely
  * undecodable record value. Thrown only by the decode blob callback in `onWSMessage`; the original
- * fault rides `cause`. The classifier's `instanceof` relies on the wrapper crossing the decode stack
- * identity-intact: the blob extension invokes the callback bare, msgpackr's unpack catches annotate
- * and rethrow the same object (safe here — the wrapper always has a `message`), and
- * `decodeBlobsWithWrites` rethrows raw. (harper-pro#715)
+ * fault rides `cause`. The classifier matches the `isBlobSetupError` brand (with `instanceof` as a
+ * same-realm fallback) so classification survives prototype-identity loss across module instances;
+ * the object itself still crosses the decode stack intact: the blob extension invokes the callback
+ * bare, msgpackr's unpack catches annotate and rethrow the same object (safe here — the wrapper
+ * always has a `message`), and `decodeBlobsWithWrites` rethrows raw. (harper-pro#715)
  */
 export class BlobSetupError extends Error {
+	readonly isBlobSetupError = true;
 	constructor(cause: unknown) {
 		super('Blob setup failed while decoding a replication record', { cause });
 	}
@@ -1595,7 +1597,7 @@ export class BlobSetupError extends Error {
  * `unitTests/replication/classifyReplicationDecodeError.test.mjs`.
  */
 export function classifyReplicationDecodeError(error: unknown): 'hold-blob-setup' | 'skip-missing-structure' | 'skip' {
-	if (error instanceof BlobSetupError) return 'hold-blob-setup';
+	if ((error as BlobSetupError)?.isBlobSetupError || error instanceof BlobSetupError) return 'hold-blob-setup';
 	return isMissingStructureError(error) ? 'skip-missing-structure' : 'skip';
 }
 

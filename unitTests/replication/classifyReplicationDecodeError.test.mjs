@@ -67,4 +67,9 @@ describe('classifyReplicationDecodeError', () => {
 		const fault = new Error('ENOSPC: no space left on device');
 		expect(new BlobSetupError(fault).cause).to.equal(fault);
 	});
+
+	it('holds on the isBlobSetupError brand even without the prototype (cross-module-instance safety)', () => {
+		const branded = Object.assign(new Error('EMFILE: too many open files'), { isBlobSetupError: true });
+		expect(classifyReplicationDecodeError(branded)).to.equal('hold-blob-setup');
+	});
 });
