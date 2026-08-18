@@ -1549,7 +1549,8 @@ export const DECODE_MISSING_STRUCTURE_METRIC = 'decode-missing-structure';
 // Every dropped/held record is counted, so a stuck-but-retrying node can't look identical to a healthy
 // one and a silent skip can't masquerade as "caught up" (harper-pro#537 review). `decode-drop`: record
 // skipped and the cursor advanced (any decode failure that is not the missing-structure class above).
-// `decode-hold`: record retained, connection closed to resync, cursor NOT advanced (unknown table id).
+// `decode-hold`: record retained, connection closed to resync, cursor NOT advanced (unknown table
+// id, or a local blob-setup fault per harper-pro#715).
 export const DECODE_DROP_METRIC = 'decode-drop';
 export const DECODE_HOLD_METRIC = 'decode-hold';
 
@@ -1558,11 +1559,10 @@ export const DECODE_HOLD_METRIC = 'decode-hold';
  * registration into the root store, the synchronous `saveBlob` start) so
  * `classifyReplicationDecodeError` can tell a local blob-store fault apart from a genuinely
  * undecodable record value. Thrown only by the decode blob callback in `onWSMessage`; the original
- * fault rides `cause`. The classifier matches the `isBlobSetupError` brand (with `instanceof` as a
- * same-realm fallback) so classification survives prototype-identity loss across module instances;
- * the object itself still crosses the decode stack intact: the blob extension invokes the callback
- * bare, msgpackr's unpack catches annotate and rethrow the same object (safe here — the wrapper
- * always has a `message`), and `decodeBlobsWithWrites` rethrows raw. (harper-pro#715)
+ * fault rides `cause`. Constraint: the decode stack must surface this object with its own properties
+ * intact — the classifier matches the `isBlobSetupError` brand (with `instanceof` as a same-realm
+ * fallback), so a layer that rethrows a *new* error would silently demote the verdict to a
+ * cursor-advancing skip. (harper-pro#715)
  */
 export class BlobSetupError extends Error {
 	readonly isBlobSetupError = true;
