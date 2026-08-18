@@ -1070,8 +1070,11 @@ export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boole
 		let handle;
 		try {
 			handle = await fsPromises.open(filePath, 'r');
-		} catch (error) {
-			return (error as { code?: string })?.code === 'ENOENT' ? true : false;
+		} catch {
+			// Unknown filesystem failures are not proof that the stored file is healthy. Selecting it
+			// makes repairBlobFile re-check under the write lock; if that still cannot start, the
+			// delivery holds its cursor instead of fresh-saving bytes the tie-skipped record will not use.
+			return true;
 		}
 		try {
 			const size = (await handle.stat()).size;
@@ -1083,7 +1086,9 @@ export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boole
 			await handle.close();
 		}
 	} catch {
-		return false;
+		// A stat/read/close failure is also uncertainty, not proof of health. Conservatively select
+		// the target so the locked sync re-check either repairs it or holds this delivery for retry.
+		return true;
 	}
 }
 
@@ -3704,10 +3709,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 						if (!stream) {
 							stream = createBlobReceiveStream(blobTimeout);
-							stream.expectedSize = size;
 							blobsInFlight.set(fileId, stream);
 							registerBlobReceiveInFlight(fileId, auditStore?.rootStore);
 						}
+						if (size !== undefined) stream.expectedSize = size;
 						stream.lastChunk = Date.now();
 						const blobBody = message[2];
 						recordAction(
@@ -5735,7 +5740,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				repairTarget.size === undefined || remoteBlob.size === undefined || repairTarget.size === remoteBlob.size;
 			if (sizesMatch)
 				finished = decodeFromDatabase(
-					() => repairBlobFile(repairTarget, stream),
+					() => repairBlobFile(repairTarget, stream, () => stream.expectedSize ?? remoteBlob.size),
 					tableSubscriptionToReplicator.auditStore?.rootStore
 				);
 			if (!finished) {
