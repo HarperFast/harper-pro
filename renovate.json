@@ -30,7 +30,7 @@
 			"matchManagers": ["!github-actions"]
 		},
 		{
-			"description": "Automerge after required human approval is limited to actions exercised by required pull-request checks. Release, scheduled, and other workflows stay human-reviewed.",
+			"description": "This rule only enables automerge for actions in selected pull-request test workflows. Repository rules remain responsible for required checks and approval; release, scheduled, and other workflows stay human-reviewed.",
 			"matchManagers": ["github-actions"],
 			"matchFileNames": [
 				".github/workflows/integration-tests.yaml",
