@@ -200,16 +200,17 @@ export async function stopNodeProcess(node, { timeoutMs = 15000 } = {}) {
  * @returns {Promise<Object>} the first successful cluster_status response
  */
 export async function pollHealth(node, { retries = 60, intervalMs = 2000 } = {}) {
+	let lastError;
 	for (let i = 0; i < retries; i++) {
 		try {
 			const status = await sendOperation(node, { operation: 'cluster_status' });
 			if (status) return status;
-		} catch {
-			/* transient during restart */
+		} catch (error) {
+			lastError = error; // transient during restart; kept so a persistent fault isn't swallowed
 		}
 		await delay(intervalMs);
 	}
-	throw new Error(`node ${node.hostname} did not come healthy in time`);
+	throw new Error(`node ${node.hostname} did not come healthy in time`, { cause: lastError });
 }
 
 /**
