@@ -15,7 +15,7 @@
  * unlink in O(1), and a staged cursor is only retained when an unsettled tag separates it from
  * the next one (only the last staged cursor below each potential barrier position can ever be
  * returned), so a single hung blob during a fast dense walk holds O(in-flight blobs) state, not
- * O(copied records).
+ * O(copied records). The receive timeout settles hung tags retained across COPY_START passes.
  */
 
 export interface CopyCursorValue {
@@ -178,13 +178,10 @@ export class CopyCursorWatermark {
 		// never surface — replace it. This is the memory bound: |staged| <= unsettled tags + 1.
 		const tail = this.#staged.length > this.#stagedHead ? this.#staged[this.#staged.length - 1] : undefined;
 		if (tail) {
-			let separated = false;
-			for (let i = tail.index + 1; i <= frameIndex; i++) {
-				if (this.#tagByIndex.has(i)) {
-					separated = true;
-					break;
-				}
-			}
+			if (frameIndex < tail.index) return;
+			let nextTag = this.#tagHead;
+			while (nextTag && nextTag.index <= tail.index) nextTag = nextTag.next;
+			const separated = nextTag !== null && nextTag.index <= frameIndex;
 			if (!separated) {
 				tail.index = frameIndex;
 				tail.cursor = cursor;

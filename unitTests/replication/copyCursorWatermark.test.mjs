@@ -138,6 +138,14 @@ describe('CopyCursorWatermark (#699)', () => {
 		expect(watermark.takeDurable().afterKey).to.equal('fresh');
 	});
 
+	it('rejects out-of-order staged cursors without lowering the watermark', () => {
+		const watermark = new CopyCursorWatermark();
+		const pass = watermark.currentPass;
+		watermark.stageCursor(5, pass, cursor('five'));
+		watermark.stageCursor(3, pass, cursor('three'));
+		expect(watermark.takeDurable()).to.deep.equal(cursor('five'));
+	});
+
 	it('keeps the barrier latched across passes (the reconnect is the healer)', () => {
 		const f1 = watermark.beginFrame();
 		watermark.trackBlob(f1);

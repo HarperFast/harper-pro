@@ -45,6 +45,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 const BLOB_RECORDS = 40; // /LargeLocation/{n} on A — each a deterministic ~50 KB file-backed blob
 const BLOB_BYTES = 50 * 1024;
 const FAIL_INTERVAL = 15; // mean fault spacing (fixture jitters ±3) — sustained but survivable supply
+const INITIAL_DAMAGED_RECORDS = 2;
 const BLOB_SLOW_MS = 400; // every save held in flight, so the pre-#699 snapshot instant never occurs
 const GAP_RECONNECT_MS = 3000; // #683 watchdog cycle, shortened from the 900s default
 
@@ -93,6 +94,26 @@ function missingPayloadIds(dataRootDir, totalRecords, db = 'data') {
 	}
 	const missing = [];
 	for (let id = 0; id < totalRecords; id++) if (!onDisk.has(expectedPayloadHash(id))) missing.push(id);
+	return missing;
+}
+
+async function missingReferencedPayloadIds(node, totalRecords) {
+	const missing = [];
+	for (let id = 0; id < totalRecords; id++) {
+		try {
+			const response = await fetchWithRetry(node.httpURL + '/LargeLocationImage/' + id, { retries: 3 });
+			if (!response.ok) {
+				missing.push(`${id}:status=${response.status}`);
+				continue;
+			}
+			const bytes = Buffer.from(await response.arrayBuffer());
+			if (bytes.length !== BLOB_BYTES || createHash('sha1').update(bytes).digest('hex') !== expectedPayloadHash(id)) {
+				missing.push(`${id}:bytes=${bytes.length}`);
+			}
+		} catch (error) {
+			missing.push(`${id}:error=${error?.message ?? error}`);
+		}
+	}
 	return missing;
 }
 
@@ -183,6 +204,7 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 		let bCount = 0;
 		let bLog = '';
 		let resumeKeys = [];
+		let inPlaceRepairs = 0;
 		const deadline = Date.now() + 360000;
 		while (Date.now() < deadline) {
 			bCount =
@@ -192,19 +214,25 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 			resumeKeys = [...bLog.matchAll(/Resuming interrupted copy of database data .* after key (\S+)/g)].map((m) =>
 				Number(m[1])
 			);
-			if (bCount >= aCount && new Set(resumeKeys).size >= 2 && missingPayloadIds(B.dataRootDir, aCount).length === 0)
+			inPlaceRepairs = (bLog.match(/Repaired blob file in place/g) ?? []).length;
+			if (
+				bCount >= aCount &&
+				new Set(resumeKeys).size >= 2 &&
+				inPlaceRepairs >= INITIAL_DAMAGED_RECORDS &&
+				missingPayloadIds(B.dataRootDir, aCount).length === 0
+			)
 				break;
 			await delay(2000);
 		}
 
-		const missing = missingPayloadIds(B.dataRootDir, aCount);
+		const missing = await missingReferencedPayloadIds(B, aCount);
 		const injected = (bLog.match(/\[blob-fail-slow-injector\] failing save /g) ?? []).length;
 		const watchdogFires = (bLog.match(/Blob-gap watchdog/g) ?? []).length;
-		const inPlaceRepairs = (bLog.match(/Repaired blob file in place/g) ?? []).length;
 		const bankedReconnects = (bLog.match(/reconnecting immediately to re-stream/g) ?? []).length;
 		console.log(
 			`banking test: injected=${injected} watchdogFires=${watchdogFires} bankedReconnects=${bankedReconnects} ` +
-				`resumeKeys=[${resumeKeys}] B records=${bCount}/${aCount} missingPayloadIds=[${missing}] inPlaceRepairs=${inPlaceRepairs}`
+				`resumeKeys=[${resumeKeys}] B records=${bCount}/${aCount} missingReferencedPayloadIds=[${missing}] ` +
+				`inPlaceRepairs=${inPlaceRepairs}`
 		);
 
 		ok(injected >= 2, `fault supply never materialized (${injected} injected failures)`);
@@ -237,8 +265,8 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 		// the repair, that record's reference stays dangling and the payload oracle above fails once
 		// the orphan sweep runs — this assertion makes the repair path's engagement explicit.
 		ok(
-			inPlaceRepairs >= 1,
-			`no in-place blob repair occurred (${inPlaceRepairs}) — re-delivered duplicates are not healing dangling references`
+			inPlaceRepairs >= INITIAL_DAMAGED_RECORDS,
+			`only ${inPlaceRepairs}/${INITIAL_DAMAGED_RECORDS} initially damaged records were repaired in place`
 		);
 	});
 });

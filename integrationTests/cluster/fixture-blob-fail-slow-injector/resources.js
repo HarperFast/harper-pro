@@ -84,3 +84,12 @@ if ((Number.isFinite(interval) && interval > 0) || (Number.isFinite(slowMs) && s
 		'[blob-fail-slow-injector] installed; slowMs=' + slowMs + ' failing every ' + (interval || 0) + 'th /blobs/ save'
 	);
 }
+
+export class LargeLocationImage extends Resource {
+	async get(target) {
+		target.checkPermission = false;
+		const record = await databases.data.LargeLocation.get(Number(target.id));
+		if (!record?.image) return new Response(null, { status: 404 });
+		return new Response(record.image, { headers: { 'Content-Type': 'application/octet-stream' } });
+	}
+}

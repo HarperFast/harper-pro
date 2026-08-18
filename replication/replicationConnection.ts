@@ -1014,21 +1014,32 @@ export function shouldRetrySourceBlobRead(state: {
  * this record is not a tie, has no stored counterpart, or has no damaged blob — the caller then
  * uses the normal fresh-save path. A tie guarantees content identity, so bytes-for-bytes overwrite
  * of the existing file is sound; positional pairing is sound for the same reason (identical
- * structure). Never throws: any read/decode surprise returns null (normal path, no repair).
+ * structure). MaybePromise reads are awaited because resumed spans are commonly cold. Never
+ * throws: any read/decode surprise returns null (normal path, no repair).
  */
 export async function collectBlobRepairTargets(
 	tableDecoder: any,
 	id: any,
 	incomingVersion: number,
 	sourceNodeId: number | undefined,
-	blobFileDamaged: (blob: any) => Promise<boolean | undefined> | boolean | undefined
+	blobFileDamaged: (blob: any) => Promise<boolean | undefined> | boolean | undefined,
+	declines?: Record<string, number>,
+	preloadedEntry?: any
 ): Promise<any[] | null> {
+	const decline = (reason: string) => {
+		if (declines) declines[reason] = (declines[reason] ?? 0) + 1;
+		return null;
+	};
 	try {
-		if (sourceNodeId === undefined) return null;
-		const existing = tableDecoder?.getEntry?.(id);
-		if (!existing || typeof existing.then === 'function') return null;
-		if (existing.version !== incomingVersion) return null;
-		if ((existing.nodeId ?? 0) !== sourceNodeId) return null;
+		if (sourceNodeId === undefined) return decline('no-source-node');
+		let existing = preloadedEntry;
+		if (existing === undefined) {
+			existing = tableDecoder?.getEntry?.(id);
+			if (existing && typeof existing.then === 'function') existing = await existing;
+		}
+		if (!existing) return decline('no-stored-entry');
+		if (existing.version !== incomingVersion) return decline('version-mismatch');
+		if ((existing.nodeId ?? 0) !== sourceNodeId) return decline('node-mismatch');
 		const blobs: any[] = [];
 		findBlobsInObject(existing.value, (blob: any) => {
 			blobs.push(blob);
@@ -1038,10 +1049,10 @@ export async function collectBlobRepairTargets(
 		// incoming decode callbacks positionally — an unverified cross-traversal ordering assumption
 		// where a mismatch writes one field's bytes into another field's file — so they are left to
 		// backfill (harper-pro#388). The field population is single-blob rows.
-		if (blobs.length !== 1) return null;
-		return (await blobFileDamaged(blobs[0])) === true ? [blobs[0]] : null;
+		if (blobs.length !== 1) return decline(blobs.length === 0 ? 'no-file-blobs' : 'multi-blob');
+		return (await blobFileDamaged(blobs[0])) === true ? [blobs[0]] : decline('healthy');
 	} catch {
-		return null;
+		return decline('error');
 	}
 }
 
@@ -1064,8 +1075,9 @@ export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boole
 		}
 		try {
 			const size = (await handle.stat()).size;
+			if (size < 8) return true;
 			const header = Buffer.allocUnsafe(8);
-			if (size >= 8 && (await handle.read(header, 0, 8, 0)).bytesRead < 8) return true;
+			if ((await handle.read(header, 0, 8, 0)).bytesRead < 8) return true;
 			return blobHeaderIndicatesIncomplete(header, size);
 		} finally {
 			await handle.close();
@@ -2541,6 +2553,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// its async flush completion) from the prior pass writing under the new pass would claim keys the
 		// new walk has not delivered — validated at every asynchronous edge below, not just staging.
 		const passAtPersist = copyWatermark.currentPass;
+		const reconnectAtDrainedBarrier = () => {
+			if (!immediate || !copyWatermark.barrierDrained) return;
+			logger.warn?.(
+				`Banked copy cursor at held blob gap for ${remoteNodeName}; reconnecting immediately to re-stream from it (harper-pro#699)`
+			);
+			if (options.connection) options.connection.forceReconnect();
+			else ws.terminate();
+		};
 		// Restore the staged state, back off, and schedule a re-drive. Shared by the async
 		// flush `.catch` and the synchronous catch at the bottom: this function runs from the blob-save
 		// `.finally` whose promise onCommit awaits, so a synchronous store throw (dbisDB.put, or
@@ -2572,6 +2592,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				if (pendingCopyCursor === cursor) pendingCopyCursor = null;
 				logger.trace?.(connectionId, 'copy cursor advanced (blobs durable)');
 				maybeFinishCopy();
+				reconnectAtDrainedBarrier();
 				return;
 			}
 			// copy-apply rows are WAL-off with no transaction-log entry, so the cursor must sit behind an explicit
@@ -2612,13 +2633,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// the next pass re-delivers — this is what makes gap-heal cadence track walk time rather
 					// than blobGapReconnectMs. Banking-gated by construction (this persist IS banked
 					// progress), so a link that banks nothing still paces at the watchdog interval. (#699)
-					if (immediate && copyWatermark.barrierDrained) {
-						logger.warn?.(
-							`Banked copy cursor at held blob gap for ${remoteNodeName}; reconnecting immediately to re-stream from it (harper-pro#699)`
-						);
-						if (options.connection) options.connection.forceReconnect();
-						else ws.terminate();
-					}
+					reconnectAtDrainedBarrier();
 				})
 				.catch(onPersistFailure)
 				.finally(() => {
@@ -2752,7 +2767,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// re-delivered duplicates are contiguous, so a run of stored-entry misses means every later
 	// record is genuinely new and the per-record getEntry would be a pure miss tax for the rest of
 	// the copy. A hit resets the run (healthy duplicates also reset it — still inside the window).
-	let repairWindowMissRun = 0;
+	const repairWindowMissRunByNode = new Map<number | undefined, number>();
+	const repairDeclines: Record<string, number> = {};
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
 	const blobSentCallbacks: Array<(v?: any) => void> = [];
@@ -2949,7 +2965,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// it. Bound that state to blobTimeout instead of waiting for an unrelated reconnect (#683).
 	// Tunable separately from blobTimeout: the copy cursor now banks up to the gap (#699), so a
 	// shorter cycle retries the gapped blob sooner without also shortening blob stream timeouts.
-	const blobGapReconnectMs = positiveMsOr(env.get('replication_blobGapReconnectMs'), effectiveBlobTimeoutMs);
+	const blobGapReconnectMs = Math.max(
+		positiveMsOr(env.get('replication_blobGapReconnectMs'), effectiveBlobTimeoutMs),
+		1000
+	);
 	blobGapReconnectTimer = createBlobGapReconnectTimer({
 		timeoutMs: blobGapReconnectMs,
 		onGapHeld: () => {
@@ -3582,6 +3601,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
 						const copyWasAlreadyActive = inCopyMode;
 						if (copyWasAlreadyActive) sawCopyRestart = true;
+						repairWindowMissRunByNode.clear();
 						inCopyMode = true;
 						if (!copyWasAlreadyActive) subscriptionSetupWatchdog?.pause();
 						pendingCopyCursor = null; // discard any cursor staged by a prior copy on this connection
@@ -4957,28 +4977,37 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				let repairTargets: any[] | null = null;
 				if (
 					auditRecord.extendedType & HAS_BLOBS &&
-					repairWindowMissRun < 8 &&
+					(repairWindowMissRunByNode.get(localSourceNodeId) ?? 0) < 8 &&
 					((messageIsCopyFrame && (copyResumeRequested || sawCopyRestart)) ||
 						leadingDupCursorByNode.has(localSourceNodeId as any))
 				) {
-					const existsLocally = (() => {
-						try {
-							const entry = tableDecoder?.getEntry?.(id);
-							return entry != null && typeof entry.then !== 'function';
-						} catch {
-							return false;
-						}
-					})();
-					if (existsLocally) {
-						repairWindowMissRun = 0;
+					let storedEntry: any = null;
+					let entryReadResolved = false;
+					try {
+						storedEntry = tableDecoder?.getEntry?.(id);
+						if (storedEntry && typeof storedEntry.then === 'function') storedEntry = await storedEntry;
+						entryReadResolved = true;
+					} catch {
+						repairDeclines['entry-read-error'] = (repairDeclines['entry-read-error'] ?? 0) + 1;
+					}
+					if (storedEntry != null) {
+						repairWindowMissRunByNode.delete(localSourceNodeId);
 						repairTargets = await collectBlobRepairTargets(
 							tableDecoder,
 							id,
 							auditRecord.version,
 							localSourceNodeId,
-							blobFileMissingOrIncompleteAsync
+							blobFileMissingOrIncompleteAsync,
+							repairDeclines,
+							storedEntry
 						);
-					} else repairWindowMissRun++;
+					} else if (entryReadResolved) {
+						repairWindowMissRunByNode.set(
+							localSourceNodeId,
+							(repairWindowMissRunByNode.get(localSourceNodeId) ?? 0) + 1
+						);
+						repairDeclines['no-stored-entry'] = (repairDeclines['no-stored-entry'] ?? 0) + 1;
+					}
 				}
 				let repairIndex = 0;
 				try {
@@ -5382,6 +5411,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
+		if (Object.keys(repairDeclines).length > 0)
+			logger.warn?.(connectionId, 'blob repair declines for this connection', repairDeclines);
 		logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
 	}
 	ws.on('close', retireInstance);
@@ -5691,29 +5722,31 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		stream.lastChunk = Date.now();
 		stream.recordId = id;
 		if (remoteBlob.size === undefined && stream.expectedSize) (remoteBlob as any).size = stream.expectedSize;
+		if (stream.blob && inPlaceRepairedBlobs.has(stream.blob)) return stream.blob;
 		// In-place dangling-reference repair (#699): this record is an identity-tie duplicate and
 		// `repairTarget` is the stored record's damaged blob — stream the re-delivered bytes INTO its
 		// existing fileId instead of minting a fresh one the tie-skipped record would never reference.
-		// repairBlobFile declines (undefined) when the file healed meanwhile or a writer holds its
-		// lock; fall through to the normal fresh-save path in that case. The tracked promise below is
-		// identical either way, so a failed repair holds the resume cursor exactly like a failed save.
+		// A repair that cannot acquire its file lock fails this delivery and holds the resume cursor;
+		// saving fresh would let the tie-skipped record keep its damaged reference while the cursor advances.
 		let localBlob: any;
 		let finished: Promise<void> | undefined;
-		// Size guard: on a true tie the descriptor sizes must agree; a mismatch means this stream is
-		// not the stored blob's content (mis-paired or diverged), so decline and save fresh.
-		if (
-			repairTarget &&
-			!stream.blob &&
-			(repairTarget.size === undefined || remoteBlob.size === undefined || repairTarget.size === remoteBlob.size)
-		) {
-			finished = decodeFromDatabase(
-				() => repairBlobFile(repairTarget, stream),
-				tableSubscriptionToReplicator.auditStore?.rootStore
-			);
-			if (finished) {
-				localBlob = repairTarget;
-				inPlaceRepairedBlobs.add(repairTarget);
+		if (repairTarget && !stream.blob) {
+			const sizesMatch =
+				repairTarget.size === undefined || remoteBlob.size === undefined || repairTarget.size === remoteBlob.size;
+			if (sizesMatch)
+				finished = decodeFromDatabase(
+					() => repairBlobFile(repairTarget, stream),
+					tableSubscriptionToReplicator.auditStore?.rootStore
+				);
+			if (!finished) {
+				const reason = sizesMatch ? 'repair-start-declined' : 'repair-size-mismatch';
+				repairDeclines[reason] = (repairDeclines[reason] ?? 0) + 1;
+				const error = new Error(`Blob repair deferred for damaged file ${getFileId(repairTarget)} (${reason})`);
+				stream.destroy(error);
+				finished = Promise.reject(error);
 			}
+			localBlob = repairTarget;
+			inPlaceRepairedBlobs.add(repairTarget);
 		}
 		if (!localBlob) {
 			localBlob = stream.blob ?? createBlob(stream, remoteBlob);
@@ -5767,12 +5800,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							`Blob ${blobId} for record ${id} is unrecoverable at source ${remoteNodeName} (${errorToString(err)}); ` +
 								`advancing the resume cursor past it — the record's blob stays diverged until backfilled (harper-pro#388).`
 						);
-						// The failed save left a header-only stub on disk (saveBlob writes the size header before the
-						// body, and the non-deleteOnFailure error path keeps a non-empty file). Since we are advancing
-						// past this unrecoverable blob, unlink the stub: a missing file is the unambiguous "needs
-						// backfill" signal for #388, whereas an 8-byte stub masquerades as a real (empty) blob and
-						// accumulates unreclaimed. Transient gaps are NOT cleaned — their reconnect re-stream re-saves
-						// the same fileId, overwriting the stub.
+						// Missing is the unambiguous backfill signal. This also unlinks a damaged in-place repair
+						// target, but never healthy bytes: this branch only follows a failed write to that target.
 						deleteBlob(localBlob);
 					} else {
 						logger.error?.(`Blob save failed for ${blobId} from ${remoteNodeName}`, err);
@@ -5981,9 +6010,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				databaseName
 			);
 			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
-			const copyCompletion = cloneAttempt
-				? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId)
-				: undefined;
+			const copyCompletion = cloneAttempt ? readDbisCursorSync(dbisDB, 'cloneCopyComplete', nodeId) : undefined;
 			if (!copyCursor && matchesCloneCopyCompletion(copyCompletion, cloneAttempt)) {
 				const sharedStatus = getSharedStatus();
 				if (sharedStatus)
