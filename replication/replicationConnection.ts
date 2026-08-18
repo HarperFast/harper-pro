@@ -2612,12 +2612,32 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// the next pass re-delivers — this is what makes gap-heal cadence track walk time rather
 					// than blobGapReconnectMs. Banking-gated by construction (this persist IS banked
 					// progress), so a link that banks nothing still paces at the watchdog interval. (#699)
-					if (immediate && copyWatermark.barrierDrained) {
-						logger.warn?.(
-							`Banked copy cursor at held blob gap for ${remoteNodeName}; reconnecting immediately to re-stream from it (harper-pro#699)`
-						);
-						if (options.connection) options.connection.forceReconnect();
-						else ws.terminate();
+					// FLOOR on the immediate reconnect: banking-gated is not rate-bounded. Under a MOVING
+					// transient fault supply (live write contention — distinct from a fixed damaged set,
+					// which banks nothing and stays watchdog-paced) every cycle banks a little, so
+					// back-to-back reconnects re-walk the tail continuously (measured: 27 copy starts in
+					// 76s) — and each reconnect aborts in-flight receives, minting PENDING stubs (#481) at
+					// that rate. Pace banked reconnects to half the watchdog interval, capped at 15s: heal
+					// cadence still tracks walk time for any realistic knob value, while a fault-dense link
+					// cannot churn faster than ~4 reconnects/min. The stamp lives on the shared connection
+					// object (each cycle is a fresh closure); a floored cycle leaves the watchdog as pacer,
+					// exactly like a zero-bank cycle. Inbound sessions (no connection object) have nowhere
+					// to carry the stamp, so they stay watchdog-paced entirely.
+					if (immediate && copyWatermark.barrierDrained && options.connection) {
+						const floorMs = Math.min(15000, Math.floor(blobGapReconnectMs / 2));
+						const sinceLast = Date.now() - ((options.connection as any).lastBankedReconnectAt ?? 0);
+						if (sinceLast >= floorMs) {
+							(options.connection as any).lastBankedReconnectAt = Date.now();
+							logger.warn?.(
+								`Banked copy cursor at held blob gap for ${remoteNodeName}; reconnecting immediately to re-stream from it (harper-pro#699)`
+							);
+							options.connection.forceReconnect();
+						} else {
+							logger.debug?.(
+								connectionId,
+								`banked copy cursor persisted; deferring the immediate reconnect (${sinceLast}ms since the last one, floor ${floorMs}ms) — the blob-gap watchdog paces this cycle (harper-pro#699)`
+							);
+						}
 					}
 				})
 				.catch(onPersistFailure)
