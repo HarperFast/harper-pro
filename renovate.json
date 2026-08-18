@@ -11,7 +11,7 @@
 	"lockFileMaintenance": { "enabled": false },
 	"packageRules": [
 		{
-			"matchFiles": ["package.json"],
+			"matchFileNames": ["package.json"],
 			"enabled": false
 		},
 		{
