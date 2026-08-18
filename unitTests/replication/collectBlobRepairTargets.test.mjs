@@ -10,7 +10,11 @@
  */
 
 import { expect } from 'chai';
-import { collectBlobRepairTargets } from '#src/replication/replicationConnection';
+import {
+	advanceRepairWindowMissRun,
+	collectBlobRepairTargets,
+	resolveStoredEntryForRepair,
+} from '#src/replication/replicationConnection';
 
 const blobA = new Blob(['a']);
 const blobB = new Blob(['b']);
@@ -74,6 +78,27 @@ describe('collectBlobRepairTargets (#699)', () => {
 		});
 	});
 
+	it("splits 'not-probeable' from 'healthy': an unanswerable probe is never proof of health (#720)", async () => {
+		const entry = { version: 5, nodeId: 2, value: { x: blobA } };
+		const declines = {};
+		await collectBlobRepairTargets(decoderFor(entry), 'k', 5, 2, async () => undefined, declines);
+		expect(declines).to.deep.equal({ 'not-probeable': 1 });
+		expect(declines.healthy).to.equal(undefined);
+	});
+
+	it('uses a caller-resolved entry instead of re-reading, so probe and gate observe the SAME entry (#720)', async () => {
+		// getEntry throws if called: the pass-through must prevent the second read entirely.
+		const poisonedDecoder = {
+			getEntry: () => {
+				throw new Error('re-read — pass-through not honored');
+			},
+		};
+		const entry = { version: 5, nodeId: 2, value: { x: blobA } };
+		expect(
+			await collectBlobRepairTargets(poisonedDecoder, 'k', 5, 2, async () => true, undefined, entry)
+		).to.deep.equal([blobA]);
+	});
+
 	it('returns null with no stored entry, an unmapped source node, or a throwing read', async () => {
 		expect(await collectBlobRepairTargets(decoderFor(undefined), 'k', 5, 2, async () => true)).to.equal(null);
 		expect(
@@ -99,5 +124,53 @@ describe('collectBlobRepairTargets (#699)', () => {
 		expect(
 			await collectBlobRepairTargets(decoderFor(entry), 'k', 5, 2, () => Promise.reject(new Error('probe fault')))
 		).to.equal(null);
+	});
+});
+
+describe('resolveStoredEntryForRepair (#720) — the caller-side cold-cache probe, pinned directly', () => {
+	// Mutation-tested gap (#720 review): reverting the caller-side await left the whole suite green.
+	// These pin the caller half: a thenable that RESOLVES to an entry is presence (resets the miss
+	// run); only a RESOLVED absence is absence; a read fault is distinguishable from absence.
+	it('resolves a Promise-returning getEntry to its entry (block-cache miss = presence, not absence)', async () => {
+		const entry = { version: 5, nodeId: 2 };
+		expect(await resolveStoredEntryForRepair(decoderFor(Promise.resolve(entry)), 'k')).to.deep.equal({
+			entry,
+			failed: false,
+		});
+	});
+
+	it('reports a resolved null/undefined as absence without a failure', async () => {
+		expect(await resolveStoredEntryForRepair(decoderFor(Promise.resolve(null)), 'k')).to.deep.equal({
+			entry: null,
+			failed: false,
+		});
+		expect(await resolveStoredEntryForRepair(decoderFor(undefined), 'k')).to.deep.equal({
+			entry: null,
+			failed: false,
+		});
+	});
+
+	it('reports a throwing or rejecting read as failed, distinct from absence', async () => {
+		expect(
+			await resolveStoredEntryForRepair(
+				{
+					getEntry: () => {
+						throw new Error('read fault');
+					},
+				},
+				'k'
+			)
+		).to.deep.equal({ entry: null, failed: true });
+		expect(
+			await resolveStoredEntryForRepair(decoderFor(Promise.reject(new Error('async read fault'))), 'k')
+		).to.deep.equal({ entry: null, failed: true });
+	});
+});
+
+describe('advanceRepairWindowMissRun (#720) — the 8-miss latch semantics, pinned directly', () => {
+	it('a present entry resets the run; only a resolved absence advances it', () => {
+		expect(advanceRepairWindowMissRun(7, true)).to.equal(0);
+		expect(advanceRepairWindowMissRun(0, false)).to.equal(1);
+		expect(advanceRepairWindowMissRun(7, false)).to.equal(8);
 	});
 });

@@ -1019,9 +1019,13 @@ export function shouldRetrySourceBlobRead(state: {
  * `getEntry` may return a Promise (block-cache miss) — AWAITED here, never treated as absence: on a
  * resumed copy the re-delivered span was applied by a PREVIOUS connection, so cold entries are the
  * norm in exactly the window this function exists for. Callers run on the serialized message chain
- * (before decode), where awaiting is safe. Every decline increments its class in `declines` so a
+ * (before decode), where awaiting is safe. The production caller resolves the entry once for its own
+ * window gating and passes it via `resolvedEntry` so the record is not read (and decoded) twice, and
+ * so the probe and the tie gate observe the SAME entry — an await between two reads would otherwise
+ * open a divergence window (#720 review). Every decline increments its class in `declines` so a
  * field non-fire is attributable — a silent null is indistinguishable from "no damage" (#699's
- * observability lesson, applied to the fix itself).
+ * observability lesson, applied to the fix itself). `not-probeable` is split from `healthy`: a probe
+ * that cannot answer (no backing file, or an I/O fault) must never report as proof of health.
  */
 export async function collectBlobRepairTargets(
 	tableDecoder: any,
@@ -1029,7 +1033,8 @@ export async function collectBlobRepairTargets(
 	incomingVersion: number,
 	sourceNodeId: number | undefined,
 	blobFileDamaged: (blob: any) => Promise<boolean | undefined> | boolean | undefined,
-	declines?: Record<string, number>
+	declines?: Record<string, number>,
+	resolvedEntry?: any
 ): Promise<any[] | null> {
 	const decline = (reason: string) => {
 		if (declines) declines[reason] = (declines[reason] ?? 0) + 1;
@@ -1037,7 +1042,7 @@ export async function collectBlobRepairTargets(
 	};
 	try {
 		if (sourceNodeId === undefined) return decline('no-source-node');
-		let existing = tableDecoder?.getEntry?.(id);
+		let existing = resolvedEntry !== undefined ? resolvedEntry : tableDecoder?.getEntry?.(id);
 		if (existing && typeof existing.then === 'function') existing = await existing;
 		if (!existing) return decline('no-stored-entry');
 		if (existing.version !== incomingVersion) return decline('version-mismatch');
@@ -1052,18 +1057,51 @@ export async function collectBlobRepairTargets(
 		// where a mismatch writes one field's bytes into another field's file — so they are left to
 		// backfill (harper-pro#388). The field population is single-blob rows.
 		if (blobs.length !== 1) return decline(blobs.length === 0 ? 'no-file-blobs' : 'multi-blob');
-		return (await blobFileDamaged(blobs[0])) === true ? [blobs[0]] : decline('healthy');
+		const damaged = await blobFileDamaged(blobs[0]);
+		if (damaged === true) return [blobs[0]];
+		return decline(damaged === undefined ? 'not-probeable' : 'healthy');
 	} catch {
 		return decline('error');
 	}
 }
 
 /**
+ * Resolve a table's stored entry for the repair window, tolerating the block-cache-miss Promise
+ * (#720 review: extracted so the caller-side cold-cache behavior is unit-testable — the previous
+ * inline probe treated a thenable as absence, which both skipped every repair on a resumed copy AND
+ * advanced the 8-miss window latch, and no test could tell). `entry` is null for a resolved absence;
+ * `failed: true` marks a read/rejection fault so the caller can count it distinctly from absence.
+ */
+export async function resolveStoredEntryForRepair(
+	tableDecoder: any,
+	id: any
+): Promise<{ entry: any | null; failed: boolean }> {
+	try {
+		let entry = tableDecoder?.getEntry?.(id);
+		if (entry && typeof entry.then === 'function') entry = await entry;
+		return { entry: entry ?? null, failed: false };
+	} catch {
+		return { entry: null, failed: true };
+	}
+}
+
+/**
+ * Advance or reset the repair window's consecutive-miss run (#720 review: pure so the latch
+ * semantics are pinned by unit test). Only a RESOLVED absence advances the run — a present entry
+ * resets it — so the latch stands down once the resumed walk passes the re-delivered span, and a
+ * cold cache can never latch the window off (the pre-fix failure).
+ */
+export function advanceRepairWindowMissRun(missRun: number, entryPresent: boolean): number {
+	return entryPresent ? 0 : missRun + 1;
+}
+
+/**
  * Async damage probe for repair-candidate blobs: same header semantics as core's sync classifier
  * (shared `blobHeaderIndicatesIncomplete`), but on fs promises so the per-duplicate probes of a
- * resumed copy never block the receive worker's event loop. `undefined` = not a probeable file
- * blob. Lock/in-flight consultation is deliberately absent here — `repairBlobFile` re-checks
- * synchronously (including the :blob lock) immediately before writing.
+ * resumed copy never block the receive worker's event loop. `undefined` = the probe cannot answer:
+ * not a probeable file blob, or an I/O fault other than ENOENT (#720 review — an unanswerable probe
+ * must never report as healthy). Lock/in-flight consultation is deliberately absent here —
+ * `repairBlobFile` re-checks synchronously (including the :blob lock) immediately before writing.
  */
 export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boolean | undefined> {
 	try {
@@ -1073,7 +1111,11 @@ export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boole
 		try {
 			handle = await fsPromises.open(filePath, 'r');
 		} catch (error) {
-			return (error as { code?: string })?.code === 'ENOENT' ? true : false;
+			// ENOENT is a positive answer (missing = damaged); any OTHER open fault means the probe
+			// cannot answer — report unprobeable (undefined), never "healthy": a systemic fs fault
+			// during the repair window must not masquerade as proof of health (#720 review). Either
+			// way the caller declines to repair, so behavior is unchanged — only attribution improves.
+			return (error as { code?: string })?.code === 'ENOENT' ? true : undefined;
 		}
 		try {
 			const size = (await handle.stat()).size;
@@ -1084,7 +1126,7 @@ export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boole
 			await handle.close();
 		}
 	} catch {
-		return false;
+		return undefined;
 	}
 }
 
@@ -3199,14 +3241,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		let existing;
 		try {
 			existing = tableDecoder?.getEntry?.(id);
+			// getEntry returns a Promise on a block-cache miss, and this function only runs in the resume
+			// leading-duplicate tail — records applied by a PREVIOUS connection, i.e. the cold-cache case —
+			// so a thenable is the NORM here, not a surprise. Treating it as "not an entry" silently
+			// disabled the fast-skip in its only window and dropped the promise unhandled (#720 review).
+			if (existing && typeof existing.then === 'function') existing = await existing;
 		} catch (error) {
 			logger.trace?.(connectionId, 'leading-dup-skip: getEntry threw, letting record flow', id, error);
 			return false;
 		}
 		if (!existing) return false; // nothing stored locally → not a duplicate; must apply.
-		// Defensive: a synchronous getEntry(id) is expected here, but if a store ever hands back a thenable
-		// we must not treat it as an entry — let the record flow (safe, just unoptimized).
-		if (typeof existing.then === 'function') return false;
 		// Identity tie = SAME version AND SAME node. This is exactly the condition core Table.ts's apply loop
 		// uses to drop a duplicate: `precedesExistingVersion(txnTime, existingEntry, nodeId) === 0` early-
 		// matches when `txnTime === existingEntry.version && nodeId === existingEntry.nodeId`. We read the
@@ -4984,24 +5028,32 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// inPlaceRepairs=0 with the damage intact). Awaiting is safe here: this runs on the
 					// serialized message chain, before decode. Only a RESOLVED absence counts toward the
 					// miss-run latch, so the latch still turns the probe off once the walk passes the span.
-					let storedEntry: any = null;
-					try {
-						storedEntry = tableDecoder?.getEntry?.(id);
-						if (storedEntry && typeof storedEntry.then === 'function') storedEntry = await storedEntry;
-					} catch {
-						storedEntry = null;
-					}
+					// The resolved entry is passed through to collectBlobRepairTargets so the record is read
+					// once and the probe and tie gate observe the SAME entry (#720 review). Every exit here
+					// counts a decline class — probe faults, resolved absence, and the latch engaging are the
+					// dominant field non-fire causes, and they were previously unattributed (#720 review).
+					const { entry: storedEntry, failed: probeFailed } = await resolveStoredEntryForRepair(
+						tableDecoder,
+						id
+					);
+					if (probeFailed) repairDeclines['probe-error'] = (repairDeclines['probe-error'] ?? 0) + 1;
 					if (storedEntry != null) {
-						repairWindowMissRun = 0;
+						repairWindowMissRun = advanceRepairWindowMissRun(repairWindowMissRun, true);
 						repairTargets = await collectBlobRepairTargets(
 							tableDecoder,
 							id,
 							auditRecord.version,
 							localSourceNodeId,
 							blobFileMissingOrIncompleteAsync,
-							repairDeclines
+							repairDeclines,
+							storedEntry
 						);
-					} else repairWindowMissRun++;
+					} else {
+						if (!probeFailed) repairDeclines['probe-absent'] = (repairDeclines['probe-absent'] ?? 0) + 1;
+						repairWindowMissRun = advanceRepairWindowMissRun(repairWindowMissRun, false);
+						if (repairWindowMissRun === 8)
+							repairDeclines['window-latched'] = (repairDeclines['window-latched'] ?? 0) + 1;
+					}
 				}
 				let repairIndex = 0;
 				try {
