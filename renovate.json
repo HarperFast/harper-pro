@@ -30,13 +30,12 @@
 			"matchManagers": ["!github-actions"]
 		},
 		{
-			"description": "Automerge is limited to actions in pull-request test workflows, where the updated action is exercised before merge. Release, scheduled, and other workflows stay human-reviewed.",
+			"description": "Automerge after required human approval is limited to actions exercised by required pull-request checks. Release, scheduled, and other workflows stay human-reviewed.",
 			"matchManagers": ["github-actions"],
 			"matchFileNames": [
 				".github/workflows/integration-tests.yaml",
 				".github/workflows/lint-code.yaml",
-				".github/workflows/unit-tests.yaml",
-				".github/workflows/ycsb-single-node.yml"
+				".github/workflows/unit-tests.yaml"
 			],
 			"groupName": "pull-request test workflow actions",
 			"groupSlug": "pr-test-workflow-actions",
