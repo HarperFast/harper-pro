@@ -76,6 +76,8 @@ import {
 } from './knownNodes.ts';
 import * as process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
+import { open as openFile } from 'node:fs/promises';
+import { promises as fsPromises } from 'node:fs';
 import { isIP } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';
 import {
@@ -94,7 +96,6 @@ import {
 	registerBlobReceiveInFlight,
 	unregisterBlobReceiveInFlight,
 } from '../core/resources/blob.ts';
-import { promises as fsPromises } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
@@ -736,19 +737,19 @@ export function refreshBlobStreamsOnResume(blobsInFlight: Map<any, { lastChunk?:
  * handler in `replicateOverWS`. Deleting the current entry mid-iteration is safe for a Map.
  */
 export function abortInFlightBlobsOnClose(
-	blobsInFlight: Map<any, { destroy?: (error: Error) => void; writableEnded?: boolean }>,
+	blobsInFlight: Map<any, { destroy?: (error: Error) => void; writableEnded?: boolean; fileId?: any }>,
 	remoteNodeName: string,
-	onAbort?: (blobId: any) => void
+	onAbort?: (blobId: any, stream: { fileId?: any }) => void
 ): number {
 	let aborted = 0;
 	for (const [blobId, stream] of blobsInFlight) {
 		if (stream.writableEnded) {
 			// Fully received, waiting for its record — preserve its bytes, but release its marker (see above).
-			onAbort?.(blobId);
+			onAbort?.(blobId, stream);
 			continue;
 		}
 		blobsInFlight.delete(blobId);
-		onAbort?.(blobId);
+		onAbort?.(blobId, stream);
 		const error = new Error(
 			`Replication connection to ${remoteNodeName || 'unknown'} closed before blob ${blobId} finished; will re-request on reconnect`
 		) as Error & { replicationConnectionClosed?: boolean };
@@ -774,6 +775,147 @@ export function isReplicationConnectionClosedError(error: unknown): boolean {
 		error !== null &&
 		(error as { replicationConnectionClosed?: boolean }).replicationConnectionClosed === true
 	);
+}
+
+/** Keeps separate copy transfers of a reused file id from sharing receive state. */
+export function getBlobTransferKey(fileId: unknown, transferId: number | undefined): string {
+	return transferId === undefined ? `file:${fileId}` : `transfer:${transferId}`;
+}
+
+let nextCopyBlobTransferId = 1;
+const BLOB_HEADER_SIZE = 8;
+const UNCOMPRESSED_BLOB_TYPE = 0;
+const UNKNOWN_BLOB_SIZE = 0xffffffffffff;
+
+/** Core's blob codec only carries own enumerable metadata, so scope the temporary tag to one synchronous encode. */
+export function encodeWithCopyBlobTransferTags(
+	value: unknown,
+	encodeRecord: () => Buffer,
+	fileIdForBlob: (blob: Blob) => unknown = getFileId
+): Buffer {
+	const taggedBlobs: Array<{
+		blob: Blob & { replicationTransferId?: number };
+		transferId: number;
+		previousTransferId: number | undefined;
+		hadTransferId: boolean;
+	}> = [];
+	const transferIdByBlob = new WeakMap<Blob, number>();
+	try {
+		findBlobsInObject(value, (blob) => {
+			if (!fileIdForBlob(blob)) return;
+			let transferId = transferIdByBlob.get(blob);
+			if (transferId !== undefined) return;
+			transferId = nextCopyBlobTransferId++;
+			transferIdByBlob.set(blob, transferId);
+			const taggedBlob = blob as Blob & { replicationTransferId?: number };
+			taggedBlobs.push({
+				blob: taggedBlob,
+				transferId,
+				previousTransferId: taggedBlob.replicationTransferId,
+				hadTransferId: Object.hasOwn(taggedBlob, 'replicationTransferId'),
+			});
+			taggedBlob.replicationTransferId = transferId;
+		});
+		return encodeRecord();
+	} finally {
+		for (const { blob, transferId, previousTransferId, hadTransferId } of taggedBlobs) {
+			if (blob.replicationTransferId !== transferId) continue;
+			if (hadTransferId) blob.replicationTransferId = previousTransferId;
+			else delete blob.replicationTransferId;
+		}
+	}
+}
+
+export function collectAuditRecordBlobsFromBinary(
+	auditRecord: { getBinaryValue?: () => Buffer },
+	tableDecoder: { decoder: { decode: (value: Buffer, options: { noMetadata: boolean }) => unknown } },
+	rootStore?: any
+): Blob[] {
+	if (!auditRecord.getBinaryValue) throw new TypeError('Copy audit record does not expose its binary value');
+	const blobs: Blob[] = [];
+	decodeWithBlobCallback(
+		() => {
+			tableDecoder.decoder.decode(auditRecord.getBinaryValue(), { noMetadata: true });
+		},
+		(blob) => {
+			blobs.push(blob);
+		},
+		rootStore
+	);
+	return blobs;
+}
+
+export function isCompleteBlobHeader(header: Uint8Array, fileSize: number): boolean {
+	if (header.byteLength < BLOB_HEADER_SIZE || fileSize < BLOB_HEADER_SIZE) return false;
+	const value = new DataView(header.buffer, header.byteOffset, BLOB_HEADER_SIZE).getBigUint64(0);
+	const type = Number(value >> 48n);
+	const contentSize = Number(value & 0xffffffffffffn);
+	if (contentSize === UNKNOWN_BLOB_SIZE) return false;
+	// Compressed bodies cannot be proven complete from file bytes; core verifies the writer lock instead.
+	if (type !== UNCOMPRESSED_BLOB_TYPE) return false;
+	return fileSize === BLOB_HEADER_SIZE + contentSize;
+}
+
+async function hasDurableBlobHeader(blob: Blob): Promise<boolean> {
+	const path = getFilePathForBlob(blob as any);
+	if (!path) return false;
+	let file: Awaited<ReturnType<typeof openFile>> | undefined;
+	try {
+		file = await openFile(path, 'r');
+		const header = Buffer.allocUnsafe(BLOB_HEADER_SIZE);
+		const { size } = await file.stat();
+		const { bytesRead } = await file.read(header, 0, BLOB_HEADER_SIZE, 0);
+		return bytesRead === BLOB_HEADER_SIZE && isCompleteBlobHeader(header, size);
+	} catch {
+		return false;
+	} finally {
+		if (file) await file.close().catch(() => {});
+	}
+}
+
+/** Whether every file-backed blob reachable from a stored record is durably finalized on disk. */
+async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
+	if (value == null) return false;
+	const blobs: Blob[] = [];
+	findBlobsInObject(value, (blob: Blob) => {
+		if (getFileId(blob)) blobs.push(blob);
+	});
+	// The header claimed blobs but none was reachable (e.g. one living only in a patch chain): we
+	// cannot prove the local copy is whole, so it must not tie.
+	if (blobs.length === 0) return false;
+	for (const blob of blobs)
+		if (!(await hasDurableBlobHeader(blob))) return false;
+	return true;
+}
+
+/**
+ * Whether an incoming record is a provably-already-applied identity tie with the one stored locally:
+ * same version AND same origin node — the condition core's `precedesExistingVersion` early-matches as a
+ * tie — and, for a blob-carrying record, every one of the STORED record's file-backed blobs durably finalized on
+ * disk (the incoming duplicate's own blobs are still in flight, so they prove nothing). Anything
+ * ambiguous returns false and the record flows to the apply loop.
+ *
+ * A finalized header, not mere file presence: a PENDING/truncated stub must NOT take this fast-skip path. Its
+ * recovery remains owned by the normal apply/backfill paths, and this optimization must not preempt
+ * either one by treating an incomplete local value as durable.
+ */
+export async function isDurableIdentityTie(
+	existing: { version?: number; nodeId?: number; value?: unknown } | undefined,
+	incomingVersion: number,
+	sourceNodeId: number | undefined,
+	hasBlobs: boolean,
+	verifyBlobs: (value: unknown) => Promise<boolean> = storedBlobsAreComplete
+): Promise<boolean> {
+	if (sourceNodeId === undefined) return false;
+	if (!existing) return false;
+	if (existing.version !== incomingVersion) return false;
+	if ((existing.nodeId ?? 0) !== sourceNodeId) return false;
+	if (!hasBlobs) return true;
+	try {
+		return await verifyBlobs(existing.value);
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -2963,6 +3105,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// the copy. A hit resets the run (healthy duplicates also reset it — still inside the window).
 	const repairWindowMissRunByNode = new Map<number | undefined, number>();
 	const repairDeclines: Record<string, number> = {};
+	// Blob-transfer ids whose record was skipped as an identity tie. The chunk handler drops their chunks on sight,
+	// so a blob whose bytes arrive after its record never opens a stream no consumer will ever drain.
+	// Retired by the blob's own final chunk, by a record that does apply the same transfer, or by
+	// the connection closing.
+	const skippedBlobIds = new Map<any, number>();
 	const outstandingBlobsToFinish: Promise<void>[] = [];
 	let outstandingBlobsBeingSent = 0;
 	const blobSentCallbacks: Array<(v?: any) => void> = [];
@@ -3393,7 +3540,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	 * @param hasBlobs        whether the audit header's HAS_BLOBS bit is set on the incoming record
 	 *
 	 * NOTE: the blob-present check intentionally inspects the EXISTING (already-applied) record's blobs,
-	 * not the incoming duplicate's — they share fileIds, and the existing record reflects the durable
+	 * not the incoming duplicate's — they share content, and the existing record reflects the durable
 	 * on-disk state we must not skip a repair for. So the incoming value is not needed here.
 	 */
 	async function isSkippableLeadingDuplicate(
@@ -3414,50 +3561,65 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			return false;
 		}
 		// Within the leading-duplicate window. Read the existing record to confirm a TRUE identity tie.
+		return isDurableIdentityTie(readLocalEntry(tableDecoder, id), incomingVersion, sourceNodeId, hasBlobs);
+	}
+
+	/**
+	 * The locally stored entry for `id`, or undefined when it cannot be read as a plain synchronous entry —
+	 * a getEntry throw, or a store that hands back a thenable. Both mean "we cannot prove anything about the
+	 * local state", which every caller treats as "let the record flow".
+	 */
+	function readLocalEntry(tableDecoder: any, id: any) {
 		let existing;
 		try {
 			existing = tableDecoder?.getEntry?.(id);
-			if (existing && typeof existing.then === 'function') existing = await existing;
+			if (existing && typeof existing.then === 'function') return undefined;
 		} catch (error) {
-			logger.trace?.(connectionId, 'leading-dup-skip: getEntry threw, letting record flow', id, error);
-			return false;
+			logger.trace?.(connectionId, 'identity-tie: getEntry threw, letting record flow', id, error);
+			return undefined;
 		}
-		if (!existing) return false; // nothing stored locally → not a duplicate; must apply.
-		// Identity tie = SAME version AND SAME node. This is exactly the condition core Table.ts's apply loop
-		// uses to drop a duplicate: `precedesExistingVersion(txnTime, existingEntry, nodeId) === 0` early-
-		// matches when `txnTime === existingEntry.version && nodeId === existingEntry.nodeId`. We read the
-		// existing entry via the SAME getEntry the apply loop reads, and `incomingVersion`/`sourceNodeId` are
-		// the same `txnTime`/`options.nodeId` the apply loop sees — so a true here is a guaranteed tie-drop
-		// there. A different node or an older/newer version is a real CRDT input the apply loop's resequencing
-		// must still fold — never skip those.
-		if (existing.version !== incomingVersion) return false;
-		if ((existing.nodeId ?? 0) !== sourceNodeId) return false;
-		// Intentionally broader than `_writeDelete`'s tie check (`<= 0` here vs `< 0` there): this only
-		// elides re-delivered idempotent re-deletes whose version and node already match locally — safe.
-		// Blob handling. A leading duplicate carrying a file-backed blob may be skipped only if the blob
-		// file is complete on disk (the prior apply saved it); a damaged blob must NOT be skipped —
-		// it has to reach the apply loop so the dangling reference can be repaired (separate PR). A record
-		// with no blob is always fine to skip. We inspect the *existing* record's blobs (same fileIds as
-		// the duplicate) so the check reflects the durable on-disk state, not the still-in-flight resave.
-		if (hasBlobs) {
-			let sawBlob = false;
-			const blobs: any[] = [];
-			try {
-				findBlobsInObject(existing.value, (blob) => {
-					sawBlob = true;
-					blobs.push(blob);
-				});
-			} catch (error) {
-				logger.trace?.(connectionId, 'leading-dup-skip: blob inspection threw, letting record flow', id, error);
-				return false;
-			}
-			// Header said HAS_BLOBS but we could not find a blob to verify (e.g. blob lives only in a patch
-			// chain) — be conservative and let it flow.
-			if (!sawBlob) return false;
-			for (const blob of blobs)
-				if ((await blobFileMissingOrIncompleteAsync(blob)) !== false) return false;
+		if (existing && typeof existing.then === 'function') {
+			logger.trace?.(connectionId, 'identity-tie: getEntry returned a promise, letting record flow', id);
+			return undefined;
 		}
-		return true;
+		return existing;
+	}
+
+	function getBlobTransferId(blob: Blob): number | undefined {
+		return (blob as Blob & { replicationTransferId?: number }).replicationTransferId;
+	}
+
+	// Drop skipped transfer chunks without leaving a reader-less stream in flight.
+	function discardIncomingBlobStream(blob: Blob) {
+		const transferId = getBlobTransferId(blob);
+		const streamKey = getBlobTransferKey(getFileId(blob), transferId);
+		const stream = blobsInFlight.get(streamKey);
+		if (stream?.connectedToBlob) return;
+		if (!stream) {
+			skippedBlobIds.set(streamKey, Date.now());
+			return;
+		}
+		if (stream.writableEnded) {
+			blobsInFlight.delete(streamKey);
+			unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
+			return;
+		}
+		skippedBlobIds.set(streamKey, Date.now());
+		stream.destroy?.();
+	}
+
+	/**
+	 * Stamp the receive-side liveness signals for a record we just processed — including one we skipped,
+	 * which is still proof the link is delivering. Callers must have refreshed `replicationSharedStatus`
+	 * (getSharedStatus()) first.
+	 */
+	function noteReceiveLiveness() {
+		replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
+		replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
+		if (options.connection?.nodeSubscriptions !== undefined) {
+			replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+			replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = replicationSharedStatus[RECEIVED_TIME_POSITION];
+		}
 	}
 
 	ws.on('message', (body: Buffer) => {
@@ -3894,8 +4056,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						if (inCopyMode) noteCopyProgress(); // copy blob chunk arriving — the copy is advancing (#453)
 						// this is a blob chunk, we need to write it to the blob store
 						const blobInfo = message[1];
-						const { fileId, size, finished, error, errorCode, errorStatus } = blobInfo;
-						let stream = blobsInFlight.get(fileId);
+						const { fileId, transferId, size, finished, error, errorCode, errorStatus } = blobInfo;
+						const streamKey = getBlobTransferKey(fileId, transferId);
+						let stream = blobsInFlight.get(streamKey);
 						logger.debug?.(
 							'Received blob',
 							fileId,
@@ -3909,9 +4072,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							finished
 						);
 
+						if (skippedBlobIds.has(streamKey)) {
+							// Every record referencing these bytes was skipped as an identity tie, so nothing will
+							// attach a consumer. Drop the chunk rather than let it open (or feed) a reader-less
+							// stream holding the whole blob until the timeout sweep. The final chunk retires the
+							// tombstone and any stream/lock the blob had taken before the record arrived.
+							skippedBlobIds.set(streamKey, Date.now());
+							if (finished) {
+								skippedBlobIds.delete(streamKey);
+								if (blobsInFlight.delete(streamKey)) unregisterBlobReceiveInFlight(fileId, auditStore?.rootStore);
+							}
+							break;
+						}
 						if (!stream) {
 							stream = createBlobReceiveStream(blobTimeout);
-							blobsInFlight.set(fileId, stream);
+							stream.fileId = fileId;
+							stream.expectedSize = size;
+							blobsInFlight.set(streamKey, stream);
 							registerBlobReceiveInFlight(fileId, auditStore?.rootStore);
 						}
 						if (size !== undefined) stream.expectedSize = size;
@@ -3946,10 +4123,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									// (see the destroyed branch below) so intervening chunks were dropped rather
 									// than recreating a reader-less stream. Now that the blob is complete it will
 									// never connect to a record — forget it instead of writing to a dead stream.
-									blobsInFlight.delete(fileId);
-									unregisterBlobReceiveInFlight(fileId, auditStore?.rootStore);
+									blobsInFlight.delete(streamKey);
+									unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
 								} else stream.end(blobBody);
-								if (stream.connectedToBlob) blobsInFlight.delete(fileId);
+								if (stream.connectedToBlob) blobsInFlight.delete(streamKey);
 							} else if (stream.destroyed || stream.writableEnded) {
 								// The stream was already torn down before this mid-blob chunk arrived —
 								// typically because saveBlob's pipeline failed (e.g. ENOENT on
@@ -4003,8 +4180,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								`Error receiving blob for ${stream.recordId} from ${remoteNodeName} and streaming to storage`,
 								error
 							);
-							blobsInFlight.delete(fileId);
-							if (!stream.connectedToBlob) unregisterBlobReceiveInFlight(fileId, auditStore?.rootStore);
+							blobsInFlight.delete(streamKey);
+							if (!stream.connectedToBlob) unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore);
 						}
 						break;
 					}
@@ -4322,7 +4499,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							remoteNodeName,
 							databaseName
 						);
-						const sendAuditRecord = (auditRecord, localTime) => {
+						const sendAuditRecord = (auditRecord, localTime, subscriptionNodeId = auditRecord.nodeId) => {
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnTime) {
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
@@ -4390,7 +4567,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								encoder._mergeStructures(encoder.getStructures());
 								if (encoder.typedStructs) encoder.lastTypedStructuresLength = encoder.typedStructs.length;
 							}
-							const timeRange = subscribedNodeIds?.[nodeId];
+							const timeRange = subscribedNodeIds?.[subscriptionNodeId];
 							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
 							// in the subscribedNodeIds list, than it matches the subscription
 							const matchesSubscription =
@@ -4897,25 +5074,35 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														entry.localTime
 													);
 													getSharedStatus()[SENDING_TIME_POSITION] = 1;
-													const encoded = createAuditEntry({
-														version: entry.version,
-														tableId: table.tableId,
-														recordId: entry.key,
-														previousVersion: null,
-														nodeId,
-														type: 'put',
-														encodedRecord: (() => {
-															decodeWithBlobCallback(
-																() => table.primaryStore.encoder.encode(entry.value),
-																(blob) => sendBlobs(blob, entry.key)
-															);
-															return lastValueEncoding!;
-														})(),
-														extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
-														residencyId: entry.residencyId,
-														previousResidencyId: null,
-														expiresAt: entry.expiresAt,
-													} as any);
+													// The record's ORIGIN, not ours: stamping a copy with the copier's id
+													// re-attributes every copied record, so it can never tie against its true
+													// origin on the follower. `entry.nodeId` is this node's local id for that
+													// origin (undefined/0 = us) — the same id space the wire uses.
+													const recordNodeId = entry.nodeId ?? nodeId;
+													const encodeCopyRecord = () =>
+														createAuditEntry({
+															version: entry.version,
+															tableId: table.tableId,
+															recordId: entry.key,
+															previousVersion: null,
+															nodeId: recordNodeId,
+															type: 'put',
+															encodedRecord: (() => {
+																decodeWithBlobCallback(
+																	() => table.primaryStore.encoder.encode(entry.value),
+																	(blob) => sendBlobs(blob, entry.key)
+																);
+																return lastValueEncoding!;
+															})(),
+															extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
+															residencyId: entry.residencyId,
+															previousResidencyId: null,
+															expiresAt: entry.expiresAt,
+														} as any);
+													const encoded =
+														entry.metadataFlags & HAS_BLOBS
+															? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
+															: encodeCopyRecord();
 													await sendAuditRecord(
 														{
 															// make it look like an audit record
@@ -4928,10 +5115,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 															encoded,
 															version: entry.version,
 															residencyId: entry.residencyId,
-															nodeId,
+															nodeId: recordNodeId,
 															extendedType: entry.metadataFlags,
 														},
-														entry.localTime
+														entry.localTime,
+														nodeId
 													);
 													logger.debug?.(
 														'sent record from table',
@@ -5054,6 +5242,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			let event; // could also get txnTime from decoder.getFloat64(0);
 			let sequenceIdReceived;
 			let maxBatchVersion; // highest record version in this batch (non-copy); end_txn resume cursor when no sequence-update set lastSequenceIdReceived
+			// Last copy-frame key seen in this message body, applied OR skipped as an identity tie — the copy
+			// resume cursor must cover skipped keys too, or a copy whose records we all already hold would
+			// never advance it and every reconnect would restart the copy from the beginning.
+			let lastCopyFrameKey: { table: string; id: any } | undefined;
 			let lastYieldTime = performance.now();
 			// Latch the copy-frame status ONCE for this whole WS message body. The decode loop below awaits
 			// (waitForDrain / setImmediate) and ws does not serialize async message handlers, so a later
@@ -5171,6 +5363,41 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					);
 				}
 				const id = auditRecord.recordId;
+				// A copy frame is applied as a snapshot with no duplicate detection, so it re-mints the
+				// record's blobs as fresh local files and dereferences the durable ones we already hold —
+				// and if the copy is interrupted mid-blob the record is left on a PENDING stub the source
+				// cannot fill. Skip a frame that ties with what we have, which copy mode would otherwise
+				// never detect: it is outside the leading-duplicate window (a copy has no resume cursor).
+				// Blob-carrying records only; re-applying an identical blob-less record is harmless.
+				if (
+					messageIsCopyFrame &&
+					!!(auditRecord.extendedType & HAS_BLOBS) &&
+					(await isDurableIdentityTie(
+						readLocalEntry(tableDecoder, id),
+						auditRecord.version,
+						remoteShortIdToLocalId?.get(auditRecord.nodeId),
+						true
+					))
+				) {
+					let skippedBlobs: Blob[] | undefined;
+					try {
+						skippedBlobs = collectAuditRecordBlobsFromBinary(auditRecord, tableDecoder, auditStore?.rootStore);
+					} catch (error) {
+						logger.trace?.(connectionId, 'copy identity-tie: could not enumerate skipped blobs', id, error);
+					}
+					if (
+						skippedBlobs &&
+						skippedBlobs.length > 0 &&
+						skippedBlobs.every((blob) => Object.hasOwn(blob, 'replicationTransferId'))
+					) {
+						for (const blob of skippedBlobs) discardIncomingBlobStream(blob);
+						noteReceiveLiveness();
+						if (tableDecoder?.name) lastCopyFrameKey = { table: tableDecoder.name, id };
+						logger.trace?.(connectionId, 'copy identity-tie skip', 'id', id, 'version', auditRecord.version);
+						decoder.position = start + eventLength;
+						continue;
+					}
+				}
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
 				// Dangling-blob repair pairing (#699): computed only for blob-carrying records in the windows
@@ -5309,15 +5536,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// to a record `version` could push it past the leader's actual log position and skip entries.
 				if (STORAGE_IS_ROCKSDB && !inCopyMode && auditRecord.version > (maxBatchVersion ?? 0))
 					maxBatchVersion = auditRecord.version;
-				replicationSharedStatus[RECEIVED_TIME_POSITION] = Date.now();
-				replicationSharedStatus[RECEIVING_STATUS_POSITION] = RECEIVING_STATUS_RECEIVING;
-				// Received data is a liveness signal for the authoritative connection state (W1 / #431) — but
-				// only when this connection OWNS the (db, peer) subscription the truth represents; an inbound
-				// or retrieval connection sharing the buffer must not refresh liveness for a link it is not.
-				if (options.connection?.nodeSubscriptions !== undefined) {
-					replicationSharedStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
-					replicationSharedStatus[LAST_LIVENESS_TIME_POSITION] = replicationSharedStatus[RECEIVED_TIME_POSITION];
-				}
+				noteReceiveLiveness();
 
 				if (event) {
 					// Leading-duplicate fast-skip: on a resumed stream the first records re-streamed from the
@@ -5381,6 +5600,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// live subscribers" — a copy frame with version >= copyStartTime carries a real audit entry
 					// and already delivers per-row events, so it needs no marker and is intentionally excluded.
 					if (event.isCopyApply && event.table) copiedTablesThisPass.add(event.table);
+					if (messageIsCopyFrame && event.table) lastCopyFrameKey = { table: event.table, id: event.id };
 					tableSubscriptionToReplicator.send(event);
 					// Per-record backpressure: a single large WS message can synchronously decode
 					// thousands of records, each holding a decoded value object and a closure over
@@ -5498,11 +5718,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// otherwise from the blob save `.finally`. Same key-based durability guarantee as before; it
 						// just no longer comes from blocking onCommit. Pass/anchor values were captured at decode
 						// time; a stale-pass staging is dropped inside the watermark.
-						if (event?.table && copyFromNodeId !== undefined) {
+						if ((event?.table || lastCopyFrameKey) && copyFromNodeId !== undefined) {
 							copyWatermark.stageCursor(copyFrameIndex, copyFramePass, {
 								copyStartTime: copyFrameStartTime,
-								currentTable: event.table,
-								afterKey: event.id,
+								currentTable: event?.table ?? lastCopyFrameKey!.table,
+								afterKey: event?.id ?? lastCopyFrameKey!.id,
 								copyOrder: copyFrameOrder, // validated by the leader before it trusts the resume skip (#421)
 							});
 						} else if (event && !event.table && copyFromNodeId !== undefined) {
@@ -5608,9 +5828,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// core's source-idle watchdog. This clamps the resume cursor (transient failure) so the reconnect
 		// re-requests them promptly — a worker restart on the sender (deploy_component lifecycle) closes the
 		// WS mid-blob, and holding the stream for the full timeout is what leaves the blob diverged.
+		// Tombstones only matter while the sender that queued those chunks is still attached; a reconnect
+		// re-streams from the resume cursor, so carrying them across would drop chunks we do want.
+		skippedBlobIds.clear();
 		if (blobsInFlight.size > 0) {
-			const aborted = abortInFlightBlobsOnClose(blobsInFlight, remoteNodeName, (blobId) =>
-				unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore)
+			const aborted = abortInFlightBlobsOnClose(blobsInFlight, remoteNodeName, (_blobId, stream) =>
+				unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore)
 			);
 			logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`);
 		}
@@ -5619,6 +5842,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (hdbNodesSubscription) hdbNodesSubscription.end();
 		// Wake queued blob senders and writer waits so they observe wsClosed instead of parking forever
 		while (blobSentCallbacks.length > 0) blobSentCallbacks.shift()?.();
+		for (const callbacks of blobFileSentCallbacks.values()) {
+			while (callbacks.length > 0) callbacks.shift()?.();
+		}
+		blobFileSentCallbacks.clear();
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
@@ -5649,6 +5876,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// The same blobs can't be sent concurrently of the packets will get mixed up. The receiving
 	// end should handle aggregated the results of the same blob for separate record requests.
 	const blobsBeingSent = new Set();
+	// Copy frames use a per-record transfer id so a skipped record cannot suppress an applied record
+	// with the same file id. Keep those transfers serialized by file id: a mixed-version receiver only
+	// knows the file id and would otherwise merge concurrent streams into one corrupt blob.
+	const fileIdsBeingSent = new Set();
+	const blobFileSentCallbacks = new Map<any, Array<() => void>>();
 	let blobSendErrorsSuppressed = 0;
 	let lastBlobSendErrorLog = 0;
 	// Throttle state for the blob-send visibility warnings below (park-on-cap, unpark, declined).
@@ -5675,7 +5907,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	async function sendBlobs(blob: Blob, recordId: any) {
 		// found a blob, start sending it
 		const id = getFileId(blob);
-		if (blobsBeingSent.has(id)) {
+		const transferId = (blob as Blob & { replicationTransferId?: number }).replicationTransferId;
+		const blobSendKey = transferId ?? id;
+		if (blobsBeingSent.has(blobSendKey)) {
 			logger.debug?.('Blob already being sent', id);
 			return;
 		}
@@ -5689,7 +5923,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			warnBlobSendDeclined(id, 'worker draining for shutdown');
 			return;
 		}
-		blobsBeingSent.add(id);
+		blobsBeingSent.add(blobSendKey);
 		// Retain the file for as long as this send needs it. The blob was resolved from the record
 		// being replicated, but the file is not opened until `blob.stream()` below — and between here
 		// and there this send can park on the outstanding-sends cap for an unbounded time. A write
@@ -5728,7 +5962,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			await new Promise((resolve) => blobSentCallbacks.push(resolve));
 			if (wsClosed) {
 				clearTimeout(parkWarnTimer);
-				blobsBeingSent.delete(id);
+				blobsBeingSent.delete(blobSendKey);
 				releaseBlobHold?.();
 				return;
 			}
@@ -5738,7 +5972,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// pre-queue check above).
 				clearTimeout(parkWarnTimer);
 				warnBlobSendDeclined(id, 'worker draining for shutdown (while parked on the outstanding-sends cap)');
-				blobsBeingSent.delete(id);
+				blobsBeingSent.delete(blobSendKey);
 				releaseBlobHold?.();
 				return;
 			}
@@ -5752,11 +5986,37 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				waitedMs: Date.now() - parkStartedAt,
 			});
 		}
-		// Track this send so a worker restart can gracefully drain it (finish it if it's still making
-		// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
-		const drainToken = registerBlobSend();
+		while (fileIdsBeingSent.has(id)) {
+			await new Promise<void>((resolve) => {
+				const callbacks = blobFileSentCallbacks.get(id);
+				if (callbacks) callbacks.push(resolve);
+				else blobFileSentCallbacks.set(id, [resolve]);
+			});
+			if (wsClosed) {
+				blobsBeingSent.delete(blobSendKey);
+				releaseBlobHold?.();
+				return;
+			}
+		}
+		let fileSendClaimed = false;
+		let outstandingSlotClaimed = false;
+		let drainToken: ReturnType<typeof registerBlobSend> | undefined;
 		try {
+			fileIdsBeingSent.add(id);
+			fileSendClaimed = true;
+			while (outstandingBlobsBeingSent >= MAX_OUTSTANDING_BLOBS_BEING_SENT) {
+				await new Promise((resolve) => blobSentCallbacks.push(resolve));
+				if (wsClosed) return;
+				if (isDrainingBlobSends()) {
+					warnBlobSendDeclined(id, 'worker draining for shutdown (after waiting for the same file id)');
+					return;
+				}
+			}
+			// Track this send so a worker restart can gracefully drain it (finish it if it's still making
+			// progress) before shutting down, rather than tearing it down mid-stream. See blobSendDrain.ts.
+			drainToken = registerBlobSend();
 			outstandingBlobsBeingSent++;
+			outstandingSlotClaimed = true;
 			// Per-chunk timeout: races each iterator.next() against a setTimeout reject so a stuck
 			// underlying read can't park the send loop forever. The local blob file may be missing or
 			// confidently corrupt; the read stream then sits without emitting `data`, `end`, or
@@ -5778,7 +6038,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			for (let attempt = 0; ; attempt++) {
 				// Opened inside the try: if core surfaces the 503 synchronously from stream() rather than
 				// from the first iterator.next(), the retry (and the error frame) must still engage.
-				let iterator: AsyncIterator<any> | undefined;
+				let iterator: AsyncIterator<Uint8Array> | undefined;
 				try {
 					iterator = blob.stream()[Symbol.asyncIterator]();
 					let lastBuffer: Buffer;
@@ -5813,6 +6073,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									BLOB_CHUNK,
 									{
 										fileId: id,
+										transferId,
 										size: blob.size,
 									},
 									lastBuffer,
@@ -5848,6 +6109,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							BLOB_CHUNK,
 							{
 								fileId: id,
+								transferId,
 								size: blob.size,
 								finished: true,
 							},
@@ -5909,6 +6171,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							BLOB_CHUNK,
 							{
 								fileId: id,
+								transferId,
 								finished: true,
 								error: errorToString(error),
 								errorCode: (error as { code?: string })?.code,
@@ -5921,25 +6184,40 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				}
 			}
 		} finally {
-			endBlobSend(drainToken);
-			blobsBeingSent.delete(id);
+			if (drainToken) endBlobSend(drainToken);
+			blobsBeingSent.delete(blobSendKey);
 			releaseBlobHold?.();
-			outstandingBlobsBeingSent--;
-			while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
-				blobSentCallbacks.shift()?.();
+			if (fileSendClaimed) {
+				fileIdsBeingSent.delete(id);
+				const nextFileSend = blobFileSentCallbacks.get(id)?.shift();
+				if (nextFileSend) nextFileSend();
+				else blobFileSentCallbacks.delete(id);
+			}
+			if (outstandingSlotClaimed) {
+				outstandingBlobsBeingSent--;
+				while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
+					blobSentCallbacks.shift()?.();
+				}
 			}
 		}
 	}
 	function receiveBlobs(remoteBlob: Blob, id: string | number, copyFrameIndex?: number, repairTarget?: any) {
 		// write the blob to the blob store
 		const blobId = getFileId(remoteBlob);
-		let stream = blobsInFlight.get(blobId);
+		const transferId = getBlobTransferId(remoteBlob);
+		const streamKey = getBlobTransferKey(blobId, transferId);
+		// A record that IS being applied always outranks a tombstone for the same transfer. A matching
+		// file id alone is insufficient: adjacent copy records can share an id while requiring distinct
+		// transfers, and clearing either one's tombstone would route the other record's chunks incorrectly.
+		skippedBlobIds.delete(streamKey);
+		let stream = blobsInFlight.get(streamKey);
 		logger.debug?.('Received transaction with blob', blobId, 'has stream', !!stream, 'ended', !!stream?.writableEnded);
 		if (stream) {
-			if (stream.writableEnded) blobsInFlight.delete(blobId);
+			if (stream.writableEnded) blobsInFlight.delete(streamKey);
 		} else {
 			stream = createBlobReceiveStream(blobTimeout);
-			blobsInFlight.set(blobId, stream);
+			stream.fileId = blobId;
+			blobsInFlight.set(streamKey, stream);
 			registerBlobReceiveInFlight(blobId, auditStore?.rootStore);
 		}
 		stream.connectedToBlob = true;
@@ -6586,9 +6864,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						`Timeout waiting for blob stream to finish ${blobId} for record ${stream.recordId ?? 'unknown'} from ${remoteNodeName}`
 					);
 					blobsInFlight.delete(blobId);
-					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
+					unregisterBlobReceiveInFlight(stream.fileId ?? blobId, auditStore?.rootStore);
 					stream.destroy(new Error(`Timeout waiting for blob stream in replication from ${remoteNodeName}`));
 				}
+			}
+			for (const [streamKey, skippedAt] of skippedBlobIds) {
+				if (skippedAt + blobTimeout <= now) skippedBlobIds.delete(streamKey);
 			}
 			// Sweep more often than the idle threshold: with the interval coupled to blobTimeout (900s
 			// default), an orphaned stream could hold its buffered chunks for up to 2x blobTimeout.
