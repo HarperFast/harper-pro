@@ -1,7 +1,9 @@
 import { run } from 'node:test';
 import { availableParallelism } from 'node:os';
 import { spec } from 'node:test/reporters';
-import { parseArgs } from 'node:util';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { inspect, parseArgs } from 'node:util';
 
 /**
  * Custom test runner for Harper Pro integration tests.
@@ -45,8 +47,10 @@ const stream = run({
 	},
 });
 
-stream.on('test:fail', () => {
+const failures = [];
+stream.on('test:fail', (event) => {
 	process.exitCode = 1;
+	if (event?.details?.error) failures.push({ name: event.name, error: event.details.error });
 });
 
 stream.on('end', () => {
@@ -73,6 +77,12 @@ const armGraceIfDone = () => {
 	// top-level `test:enqueue` disarms the timer below, so we only fire on a true stall.
 	if (enqueuedTop > 0 && completedTop >= enqueuedTop) {
 		graceTimer = setTimeout(() => {
+			if (failures.length > 0) {
+				console.error('\n[run.mjs] Failure details captured before final reporting stalled:');
+				for (const failure of failures) {
+					console.error(`\n${failure.name}:\n${inspect(failure.error, { colors: false, depth: null })}`);
+				}
+			}
 			console.error(
 				`\n[run.mjs] All ${completedTop} top-level test(s) completed but the process did not ` +
 					`exit within ${EXIT_GRACE_MS}ms — a child outlived teardown (open handles keeping the event ` +
@@ -84,12 +94,24 @@ const armGraceIfDone = () => {
 	}
 };
 // Count only real top-level tests/suites, not the per-file wrapper. Under process
-// isolation each file emits a nesting-0 `test:enqueue` whose `name` equals its `file`,
+// isolation each file emits a nesting-0 `test:enqueue` whose `name` identifies its `file`,
 // in addition to the enqueue for the actual test/suite inside it. The file wrapper never
 // emits `test:complete` when its child hangs (that's the whole failure mode), so counting
 // it would keep enqueued > completed forever and the backstop would never arm. Excluding
-// `name === file` leaves just the genuine tests, whose completes we can balance against.
-const isFileWrapper = (e) => !!(e?.name && e.name === e.file);
+// the wrapper leaves just the genuine tests, whose completes we can balance against.
+const normalizeTestPath = (path) => {
+	if (!path) return null;
+	try {
+		return resolve(path.startsWith('file:') ? fileURLToPath(path) : path);
+	} catch {
+		return null;
+	}
+};
+const isFileWrapper = (event) => {
+	const name = normalizeTestPath(event?.name);
+	const file = normalizeTestPath(event?.file);
+	return name !== null && name === file;
+};
 stream.on('test:enqueue', (e) => {
 	if ((e?.nesting ?? 0) === 0 && !isFileWrapper(e)) {
 		enqueuedTop++;
