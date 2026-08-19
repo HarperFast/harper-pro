@@ -77,6 +77,7 @@ import {
 import * as process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { open as openFile } from 'node:fs/promises';
+import { promises as fsPromises } from 'node:fs';
 import { isIP } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';
 import {
@@ -87,7 +88,6 @@ import {
 	deleteBlob,
 	saveBlob,
 	getFileId,
-	getFilePathForBlob,
 	findBlobsInObject,
 	getFilePathForBlob,
 	blobHeaderIndicatesIncomplete,
@@ -2773,8 +2773,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 			pendingCopyCursor = null;
-			lastDurableCopyCursor = null;
-			lastDurableCopyCursorPersisted = true;
 			copyProgressWatchdog?.stop(); // copy is done; no longer watching for copy-progress stalls (#453)
 			// Copy is over: narrow the byte watchdog back from COPY_TIMEOUT to PING_TIMEOUT so an idle/dead
 			// connection in normal replication is still detected on the normal timeout. stop()+reset() so the
