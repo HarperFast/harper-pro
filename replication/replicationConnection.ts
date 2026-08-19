@@ -90,6 +90,7 @@ import {
 	getFilePathForBlob,
 	blobHeaderIndicatesIncomplete,
 	repairBlobFile,
+	holdBlobFile,
 	registerBlobReceiveInFlight,
 	unregisterBlobReceiveInFlight,
 } from '../core/resources/blob.ts';
@@ -5494,6 +5495,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			return;
 		}
 		blobsBeingSent.add(id);
+		// Retain the file for as long as this send needs it. The blob was resolved from the record
+		// being replicated, but the file is not opened until `blob.stream()` below — and between here
+		// and there this send can park on the outstanding-sends cap for an unbounded time. A write
+		// that supersedes the record in that gap reclaims the file, so the send reads a missing file
+		// and reports it to the peer as unrecoverable at source; the peer then advances its resume
+		// cursor past a record whose bytes it will never have (harper-pro#403/#388).
+		// A null hold means reclamation already claimed the file: the read below will fail, and the
+		// error frame it produces is the honest answer for the peer.
+		const releaseBlobHold = holdBlobFile(blob);
+		if (!releaseBlobHold) logger.debug?.(`Blob ${id} is already being reclaimed; sending it will report it missing`);
 		// Acquire a send slot before opening the blob stream. Enforcing the cap only at the audit
 		// writer's backpressure check didn't bound concurrency: there it sat in an else-if behind the
 		// drain wait (unreachable while the socket stayed congested) and the GET_RECORD path never
@@ -5523,6 +5534,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (wsClosed) {
 				clearTimeout(parkWarnTimer);
 				blobsBeingSent.delete(id);
+				releaseBlobHold?.();
 				return;
 			}
 			if (isDrainingBlobSends()) {
@@ -5532,6 +5544,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				clearTimeout(parkWarnTimer);
 				warnBlobSendDeclined(id, 'worker draining for shutdown (while parked on the outstanding-sends cap)');
 				blobsBeingSent.delete(id);
+				releaseBlobHold?.();
 				return;
 			}
 		}
@@ -5715,6 +5728,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		} finally {
 			endBlobSend(drainToken);
 			blobsBeingSent.delete(id);
+			releaseBlobHold?.();
 			outstandingBlobsBeingSent--;
 			while (outstandingBlobsBeingSent < MAX_OUTSTANDING_BLOBS_BEING_SENT && blobSentCallbacks.length > 0) {
 				blobSentCallbacks.shift()?.();
