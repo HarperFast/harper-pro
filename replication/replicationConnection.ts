@@ -750,16 +750,18 @@ export function abortInFlightBlobsOnClose(
 		}
 		blobsInFlight.delete(blobId);
 		onAbort?.(blobId, stream);
-		const error = new Error(
-			`Replication connection to ${remoteNodeName || 'unknown'} closed before blob ${blobId} finished; will re-request on reconnect`
-		) as Error & { replicationConnectionClosed?: boolean };
-		// Mark it so receiveBlobs's .catch treats it as a routine, self-healing interruption (clamp +
-		// re-request) rather than logging an error and bumping the divergence metric on every restart.
-		error.replicationConnectionClosed = true;
-		stream.destroy?.(error);
+		stream.destroy?.(createReplicationConnectionClosedError(remoteNodeName, blobId));
 		aborted++;
 	}
 	return aborted;
+}
+
+function createReplicationConnectionClosedError(remoteNodeName: string, blobId: any) {
+	const error = new Error(
+		`Replication connection to ${remoteNodeName || 'unknown'} closed before blob ${blobId} finished; will re-request on reconnect`
+	) as Error & { replicationConnectionClosed?: boolean };
+	error.replicationConnectionClosed = true;
+	return error;
 }
 
 /**
@@ -6260,6 +6262,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			);
 		}
 		stream.blob = localBlob; // record the blob so we can reuse it if another request uses the same blob
+		if (
+			finished &&
+			!stream.writableEnded &&
+			!stream.destroyed &&
+			isConnectionSuperseded(wsClosed, options.connection, ws)
+		) {
+			// The close handler may have swept blobsInFlight before this already-queued record handler
+			// creates and attaches its stream. Without this post-attach ownership check, the orphaned
+			// source has no producer or connection timer left and an in-place repair holds its file lock
+			// until core's long source-idle timeout. Fail it now so the next connection can repair it.
+			stream.destroy(createReplicationConnectionClosedError(remoteNodeName, blobId));
+		}
 		if (finished) {
 			// A copy-frame blob gates the copy cursor by walk position; a gapped settle clamps the
 			// watermark from this frame onward while earlier frames keep banking (#699).
