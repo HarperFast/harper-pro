@@ -883,7 +883,9 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	// The header claimed blobs but none was reachable (e.g. one living only in a patch chain): we
 	// cannot prove the local copy is whole, so it must not tie.
 	if (blobs.length === 0) return false;
-	return (await Promise.all(blobs.map(hasDurableBlobHeader))).every(Boolean);
+	for (const blob of blobs)
+		if (!(await hasDurableBlobHeader(blob))) return false;
+	return true;
 }
 
 /**
