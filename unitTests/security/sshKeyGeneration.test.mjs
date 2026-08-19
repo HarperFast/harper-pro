@@ -9,7 +9,7 @@
  * run wherever ssh-keygen exists (CI's Linux images, macOS) and skip where it doesn't (Windows,
  * which is the whole reason the subprocess had to go).
  */
-import assert from 'node:assert/strict';
+import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -68,16 +68,16 @@ describe('ed25519 SSH keypair generation', () => {
 
 		// `<type> <base64> <comment>`, on one line — the shape a host's deploy-key field expects
 		const [type, encoded, comment] = publicKey.split(' ');
-		assert.equal(type, 'ssh-ed25519');
-		assert.equal(comment, 'harper:deploy');
+		assert.strictEqual(type, 'ssh-ed25519');
+		assert.strictEqual(comment, 'harper:deploy');
 		assert.ok(!publicKey.includes('\n'), 'the public key must be a single line');
 
 		// the blob restates the type, then the raw 32-byte key, as RFC 4251 strings
 		const blob = Buffer.from(encoded, 'base64');
-		assert.equal(blob.readUInt32BE(0), 'ssh-ed25519'.length);
-		assert.equal(blob.subarray(4, 15).toString('utf8'), 'ssh-ed25519');
-		assert.equal(blob.readUInt32BE(15), 32);
-		assert.equal(blob.length, 4 + 11 + 4 + 32);
+		assert.strictEqual(blob.readUInt32BE(0), 'ssh-ed25519'.length);
+		assert.strictEqual(blob.subarray(4, 15).toString('utf8'), 'ssh-ed25519');
+		assert.strictEqual(blob.readUInt32BE(15), 32);
+		assert.strictEqual(blob.length, 4 + 11 + 4 + 32);
 	});
 
 	it('rejects a comment containing a line break, and accepts one containing spaces', async () => {
@@ -92,7 +92,7 @@ describe('ed25519 SSH keypair generation', () => {
 
 		// spaces are legitimate — ssh treats the remainder of the line as the comment
 		const { publicKey } = await generateEd25519SSHKeyPair('harper deploy key');
-		assert.equal(publicKey.split(' ').slice(2).join(' '), 'harper deploy key');
+		assert.strictEqual(publicKey.split(' ').slice(2).join(' '), 'harper deploy key');
 		assert.ok(!publicKey.includes('\n'));
 	});
 
@@ -100,8 +100,8 @@ describe('ed25519 SSH keypair generation', () => {
 		const first = await generateEd25519SSHKeyPair('harper:one');
 		const second = await generateEd25519SSHKeyPair('harper:two');
 
-		assert.notEqual(first.privateKey, second.privateKey);
-		assert.notEqual(first.publicKey.split(' ')[1], second.publicKey.split(' ')[1]);
+		assert.notStrictEqual(first.privateKey, second.privateKey);
+		assert.notStrictEqual(first.publicKey.split(' ')[1], second.publicKey.split(' ')[1]);
 	});
 
 	it('pads the private section correctly for any comment length', async () => {
@@ -110,10 +110,10 @@ describe('ed25519 SSH keypair generation', () => {
 		for (let length = 1; length <= 16; length++) {
 			const comment = 'c'.repeat(length);
 			const { privateKey, publicKey } = await generateEd25519SSHKeyPair(comment);
-			assert.equal(publicKey.split(' ')[2], comment);
+			assert.strictEqual(publicKey.split(' ')[2], comment);
 			if (hasSSHKeygen) {
 				const derived = execFileSync('ssh-keygen', ['-y', '-f', writeKeyFile(privateKey)], { encoding: 'utf8' });
-				assert.equal(
+				assert.strictEqual(
 					derived.trim(),
 					publicKey,
 					`ssh-keygen should re-derive our public key (comment length ${length})`
@@ -131,7 +131,7 @@ describe('ed25519 SSH keypair generation', () => {
 			const { privateKey, publicKey } = await generateEd25519SSHKeyPair('harper:deploy');
 
 			const derived = execFileSync('ssh-keygen', ['-y', '-f', writeKeyFile(privateKey)], { encoding: 'utf8' });
-			assert.equal(derived.trim(), publicKey);
+			assert.strictEqual(derived.trim(), publicKey);
 		});
 
 		it('fingerprints both halves identically', async () => {
@@ -143,7 +143,7 @@ describe('ed25519 SSH keypair generation', () => {
 				execFileSync('ssh-keygen', ['-l', '-f', file], { encoding: 'utf8' }).trim().split(' ')[1];
 
 			assert.match(fingerprintOf(publicKeyFile), /^SHA256:/);
-			assert.equal(fingerprintOf(writeKeyFile(privateKey)), fingerprintOf(publicKeyFile));
+			assert.strictEqual(fingerprintOf(writeKeyFile(privateKey)), fingerprintOf(publicKeyFile));
 		});
 
 		it('signs with the private key and verifies against the public key', async () => {
