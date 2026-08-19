@@ -64,8 +64,19 @@ const writeStderrSync = (output) => {
 stream.on('test:fail', (event) => {
 	process.exitCode = 1;
 	if (event?.details?.error) {
-		if (failures.length < MAX_CAPTURED_FAILURES) failures.push({ name: event.name, error: event.details.error });
-		else omittedFailureCount++;
+		if (failures.length < MAX_CAPTURED_FAILURES) {
+			const detail = inspect(event.details.error, {
+				colors: false,
+				depth: 8,
+				maxArrayLength: 100,
+				maxStringLength: 8_192,
+			});
+			failures.push({
+				name: event.name,
+				detail: detail.slice(0, MAX_FAILURE_DETAIL_LENGTH),
+				truncated: detail.length > MAX_FAILURE_DETAIL_LENGTH,
+			});
+		} else omittedFailureCount++;
 	}
 });
 
@@ -97,9 +108,8 @@ const armGraceIfDone = () => {
 			if (failures.length > 0) {
 				output += '\n[run.mjs] Failure details captured before final reporting stalled:\n';
 				for (const failure of failures) {
-					const detail = inspect(failure.error, { colors: false, depth: null });
-					output += `\n${failure.name}:\n${detail.slice(0, MAX_FAILURE_DETAIL_LENGTH)}`;
-					if (detail.length > MAX_FAILURE_DETAIL_LENGTH) output += '\n[run.mjs] Failure detail truncated.';
+					output += `\n${failure.name}:\n${failure.detail}`;
+					if (failure.truncated) output += '\n[run.mjs] Failure detail truncated.';
 				}
 			}
 			if (omittedFailureCount > 0) output += `\n[run.mjs] ${omittedFailureCount} additional failure(s) omitted.`;
