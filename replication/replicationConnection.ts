@@ -95,7 +95,7 @@ import {
 	unregisterBlobReceiveInFlight,
 } from '../core/resources/blob.ts';
 import { promises as fsPromises } from 'node:fs';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Transform } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
 const logger = forComponent('replication').conditional as Logger;
@@ -275,6 +275,42 @@ const SEND_SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(
 // make the pacer fire on every record (a setImmediate yield per row), throttling the copy to a crawl —
 // the very pathology this bounds — so clamp rather than trust the operator-supplied value.
 const COPY_CHECKPOINT_MAX_INTERVAL_MS = Math.max(env.get('replication_copyCheckpointMaxIntervalMs') ?? 5000, 1);
+
+// ---- test-only instrumentation for the receive-side blob memory bound (harper-pro#659 / harper#2226) ----
+// Both are read at call time (never cached) so a test can set them per node without a rebuild, and both
+// are no-ops unless the env var is present, so nothing in this block runs in production.
+//
+// BLOB_RECEIVE_GAUGE_MS: emit one greppable line per interval with the received-but-not-durable blob
+// accounting for this connection. This is the measurement that discriminates WHERE the retained bytes
+// live — `blobsInFlight` (the reported hypothesis) or already-connected saves that are no longer in the
+// map (what the code path actually implies).
+const blobReceiveGaugeMs = () => Number(process.env.HARPER_TEST_BLOB_RECEIVE_GAUGE_MS ?? 0) || 0;
+// BLOB_SAVE_THROTTLE_MS: stand in for a blob-write path slower than the network delivers. Inserting the
+// delay DOWNSTREAM of the receive PassThrough is faithful to a slow disk: the PassThrough drains at the
+// throttle's rate, so any back-pressure the receive loop is capable of applying still applies.
+const blobSaveThrottleMs = () => Number(process.env.HARPER_TEST_BLOB_SAVE_THROTTLE_MS ?? 0) || 0;
+
+/**
+ * Wrap a blob receive stream in a slow Transform when HARPER_TEST_BLOB_SAVE_THROTTLE_MS is set, so the
+ * save drains slower than the sender delivers. Returns the stream unchanged when the knob is absent.
+ *
+ * The wrapper deliberately does NOT carry `blobStreamIdleTimeoutMs` over: core arms its source-idle
+ * watchdog off the stream it is handed, and a deliberately-throttled source would otherwise be destroyed
+ * as a stall. Errors are forwarded so a destroyed receive stream still fails the save.
+ */
+function throttleBlobSaveSourceForTest(stream: PassThrough): PassThrough | Transform {
+	const delayMs = blobSaveThrottleMs();
+	if (!delayMs) return stream;
+	const throttle = new Transform({
+		highWaterMark: 16384,
+		transform(chunk, _encoding, callback) {
+			setTimeout(() => callback(null, chunk), delayMs);
+		},
+	});
+	stream.on('error', (error) => throttle.destroy(error));
+	stream.pipe(throttle);
+	return throttle;
+}
 
 // Leading-duplicate fast-skip (PR B, stacks on the #368 clamp work). On resume the leader re-streams
 // from the follower's resume cursor, so the first records of a resumed stream are records this follower
@@ -2949,6 +2985,30 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// missing blob. 900000 lets in-flight transfers complete across a peer restart window.
 	const blobTimeout = env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 900000;
 	const blobsInFlight = new Map();
+	// ---- received-but-not-durable blob accounting (harper-pro#659 / harper#2226) ----
+	// Two DISTINCT classes of retained blob bytes, counted separately because they need different
+	// bounds and only ONE of them is visible in `blobsInFlight`:
+	//   PRE-RECORD   a stream whose record has not arrived, so nothing drains it. Summed from
+	//                `stream.preRecordBytes` over `blobsInFlight` at sample time (so a swept or
+	//                aborted stream needs no decrement bookkeeping). Takes NO back-pressure: the
+	//                #457 exemption skips the pause for a consumer-less stream.
+	//   UNSETTLED    a stream already connected to a `saveBlob` pipeline that has not settled. These
+	//                are DELETED from `blobsInFlight` the moment they connect, so neither
+	//                `blobsInFlight.size` nor the `blobsTimer` sweep can see them.
+	let queuedMessages = 0;
+	let queuedMessageBytes = 0;
+	let peakQueuedMessageBytes = 0;
+	let unsettledSaveBytes = 0;
+	let unsettledSaveBlobs = 0;
+	let blobsCompletedBeforeRecord = 0; // fully arrived ahead of their record: never eligible for back-pressure
+	let blobBackpressurePauses = 0; // times a connected stream's write() actually paused the socket
+	let peakUnsettledSaveBytes = 0;
+	let peakPreRecordBufferedBytes = 0;
+	const sumPreRecordBufferedBytes = () => {
+		let bytes = 0;
+		for (const stream of blobsInFlight.values()) if (!stream.connectedToBlob) bytes += stream.preRecordBytes ?? 0;
+		return bytes;
+	};
 	// Blobs whose file was (or is being) repaired IN PLACE (#699): these are files a committed
 	// record already references, so they must never enter a decode-failure/relocation cleanup list.
 	const inPlaceRepairedBlobs = new WeakSet();
@@ -3454,8 +3514,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Header said HAS_BLOBS but we could not find a blob to verify (e.g. blob lives only in a patch
 			// chain) — be conservative and let it flow.
 			if (!sawBlob) return false;
-			for (const blob of blobs)
-				if ((await blobFileMissingOrIncompleteAsync(blob)) !== false) return false;
+			for (const blob of blobs) if ((await blobFileMissingOrIncompleteAsync(blob)) !== false) return false;
 		}
 		return true;
 	}
@@ -3464,10 +3523,20 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// Reset the receive watchdog synchronously on every frame — async processing below may
 		// take a long time and we want a single late frame to count as proof of life immediately.
 		resetPingTimer();
+		// Inbound-backlog gauge (harper#2226 investigation): each queued frame's `body` is retained by
+		// this closure until its turn in the chain runs, so the chain is itself a queue of raw frames.
+		queuedMessages++;
+		queuedMessageBytes += body.byteLength;
+		if (queuedMessageBytes > peakQueuedMessageBytes) peakQueuedMessageBytes = queuedMessageBytes;
+		const settleQueued = () => {
+			queuedMessages--;
+			queuedMessageBytes -= body.byteLength;
+		};
 		messageProcessing = messageProcessing.then(
 			() => (wsClosed ? undefined : onWSMessage(body)),
 			() => (wsClosed ? undefined : onWSMessage(body))
 		);
+		messageProcessing = messageProcessing.then(settleQueued, settleQueued);
 	});
 	let authorizationFinished = false;
 	function checkAuthorization(): boolean {
@@ -3917,6 +3986,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						if (size !== undefined) stream.expectedSize = size;
 						stream.lastChunk = Date.now();
 						const blobBody = message[2];
+						// Classify this chunk's bytes (see the gauge block by `blobsInFlight`). A connected
+						// stream's bytes stay counted as unsettled until its save settles; the `.finally` in
+						// `receiveBlobs` subtracts the stream's whole tally in one go.
+						if (stream.connectedToBlob) {
+							stream.unsettledBytes = (stream.unsettledBytes ?? 0) + blobBody.byteLength;
+							unsettledSaveBytes += blobBody.byteLength;
+							if (unsettledSaveBytes > peakUnsettledSaveBytes) peakUnsettledSaveBytes = unsettledSaveBytes;
+						} else {
+							stream.preRecordBytes = (stream.preRecordBytes ?? 0) + blobBody.byteLength;
+						}
 						recordAction(
 							blobBody.byteLength,
 							'bytes-received',
@@ -3984,6 +4063,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									// Exposure is bounded by the sender's in-flight blob cap
 									// (MAX_OUTSTANDING_BLOBS_BEING_SENT) and the blobsTimer reclaims a truly orphaned stream.
 								} else {
+									blobBackpressurePauses++;
 									addPauseReason();
 									const release = () => {
 										stream.off('drain', release);
@@ -4645,8 +4725,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
-							| undefined;
+							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -5942,6 +6021,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			blobsInFlight.set(blobId, stream);
 			registerBlobReceiveInFlight(blobId, auditStore?.rootStore);
 		}
+		if (!stream.connectedToBlob) {
+			// The record has arrived: everything buffered pre-record becomes unsettled-save state, and a
+			// stream that was already COMPLETE never had a chance to take back-pressure.
+			const carried = stream.preRecordBytes ?? 0;
+			stream.preRecordBytes = 0;
+			stream.unsettledBytes = (stream.unsettledBytes ?? 0) + carried;
+			unsettledSaveBytes += carried;
+			if (unsettledSaveBytes > peakUnsettledSaveBytes) peakUnsettledSaveBytes = unsettledSaveBytes;
+			unsettledSaveBlobs++;
+			if (stream.writableEnded) blobsCompletedBeforeRecord++;
+		}
 		stream.connectedToBlob = true;
 		stream.lastChunk = Date.now();
 		stream.recordId = id;
@@ -5973,7 +6063,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			inPlaceRepairedBlobs.add(repairTarget);
 		}
 		if (!localBlob) {
-			localBlob = stream.blob ?? createBlob(stream, remoteBlob);
+			localBlob = stream.blob ?? createBlob(throttleBlobSaveSourceForTest(stream), remoteBlob);
 			// start the save immediately. TODO: If we could add support for blobs to directly pass on a stream to the consumer
 			// we would skip this
 			finished = decodeFromDatabase(
@@ -6060,6 +6150,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					}
 				})
 				.finally(() => {
+					unsettledSaveBytes -= stream.unsettledBytes ?? 0;
+					stream.unsettledBytes = 0;
+					unsettledSaveBlobs--;
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
 					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
 					// Settle before flushDurableCopyCursor below so the watermark sees this blob's outcome
@@ -6570,6 +6663,24 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 
 		ws.send(encode([DB_SCHEMA, tables, databaseName, subscriptionSetupRequestId]));
+	}
+	if (blobReceiveGaugeMs() > 0) {
+		setInterval(() => {
+			const preRecordBufferedBytes = sumPreRecordBufferedBytes();
+			if (preRecordBufferedBytes > peakPreRecordBufferedBytes) peakPreRecordBufferedBytes = preRecordBufferedBytes;
+			const { arrayBuffers, external } = process.memoryUsage();
+			logger.warn?.(
+				`[blob-receive-gauge] db=${databaseName} peer=${remoteNodeName}` +
+					` blobsInFlight=${blobsInFlight.size} preRecordBytes=${preRecordBufferedBytes}` +
+					` unsettledSaveBlobs=${unsettledSaveBlobs} unsettledSaveBytes=${unsettledSaveBytes}` +
+					` peakPreRecordBytes=${peakPreRecordBufferedBytes} peakUnsettledSaveBytes=${peakUnsettledSaveBytes}` +
+					` completedBeforeRecord=${blobsCompletedBeforeRecord} bpPauses=${blobBackpressurePauses}` +
+					` pendingSavePromises=${outstandingBlobsToFinish.length}` +
+					` queuedMessages=${queuedMessages} queuedMessageBytes=${queuedMessageBytes}` +
+					` peakQueuedMessageBytes=${peakQueuedMessageBytes} pauseReasons=${pauseReasons}` +
+					` arrayBuffers=${arrayBuffers} external=${external}`
+			);
+		}, blobReceiveGaugeMs()).unref();
 	}
 	blobsTimer = setInterval(
 		() => {
