@@ -23,11 +23,15 @@ describe('integration test runner', function () {
 		runner.stdout.setEncoding('utf8').on('data', (chunk) => (stdout += chunk));
 		runner.stderr.setEncoding('utf8').on('data', (chunk) => (stderr += chunk));
 		const forcedKill = setTimeout(() => runner.kill('SIGKILL'), 5_000);
-		const result = await new Promise((resolveResult, reject) => {
-			runner.once('error', reject);
-			runner.once('close', (code, signal) => resolveResult({ code, signal }));
-		});
-		clearTimeout(forcedKill);
+		let result;
+		try {
+			result = await new Promise((resolveResult, reject) => {
+				runner.once('error', reject);
+				runner.once('close', (code, signal) => resolveResult({ code, signal }));
+			});
+		} finally {
+			clearTimeout(forcedKill);
+		}
 
 		assert.strictEqual(result.signal, null, `runner was killed after hanging:\n${stdout}\n${stderr}`);
 		assert.strictEqual(result.code, 1);
