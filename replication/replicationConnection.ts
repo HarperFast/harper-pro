@@ -5992,6 +5992,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			});
 			if (wsClosed) {
 				blobsBeingSent.delete(blobSendKey);
+				releaseBlobHold?.();
 				return;
 			}
 		}
