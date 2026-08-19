@@ -737,9 +737,9 @@ export function refreshBlobStreamsOnResume(blobsInFlight: Map<any, { lastChunk?:
  * handler in `replicateOverWS`. Deleting the current entry mid-iteration is safe for a Map.
  */
 export function abortInFlightBlobsOnClose(
-	blobsInFlight: Map<any, { destroy?: (error: Error) => void; writableEnded?: boolean; fileId?: any }>,
+	blobsInFlight: Map<string, { destroy?: (error: Error) => void; writableEnded?: boolean; fileId?: string }>,
 	remoteNodeName: string,
-	onAbort?: (blobId: string | number, stream: { fileId?: any }) => void
+	onAbort?: (blobId: string, stream: { fileId?: string }) => void
 ): number {
 	let aborted = 0;
 	for (const [blobId, stream] of blobsInFlight) {
@@ -756,7 +756,7 @@ export function abortInFlightBlobsOnClose(
 	return aborted;
 }
 
-function createReplicationConnectionClosedError(remoteNodeName: string, blobId: string | number) {
+function createReplicationConnectionClosedError(remoteNodeName: string, blobId: string) {
 	const error = new Error(
 		`Replication connection to ${remoteNodeName || 'unknown'} closed before blob ${blobId} finished; will re-request on reconnect`
 	) as Error & { replicationConnectionClosed?: boolean };
@@ -768,7 +768,7 @@ export function abortLateBlobReceiveAfterClose(
 	connectionClosed: boolean,
 	stream: { writableEnded?: boolean; destroyed?: boolean; destroy: (error: Error) => void },
 	remoteNodeName: string,
-	blobId: string | number
+	blobId: string
 ): boolean {
 	if (!connectionClosed || stream.writableEnded || stream.destroyed) return false;
 	stream.destroy(createReplicationConnectionClosedError(remoteNodeName, blobId));
