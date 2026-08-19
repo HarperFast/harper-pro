@@ -1,6 +1,7 @@
 import { run } from 'node:test';
 import { availableParallelism } from 'node:os';
 import { spec } from 'node:test/reporters';
+import { writeSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inspect, parseArgs } from 'node:util';
@@ -47,10 +48,25 @@ const stream = run({
 	},
 });
 
+const MAX_CAPTURED_FAILURES = 10;
+const MAX_FAILURE_DETAIL_LENGTH = 32_768;
 const failures = [];
+let omittedFailureCount = 0;
+const writeStderrSync = (output) => {
+	const buffer = Buffer.from(output);
+	let offset = 0;
+	while (offset < buffer.length) {
+		const written = writeSync(process.stderr.fd, buffer, offset, buffer.length - offset);
+		if (written === 0) break;
+		offset += written;
+	}
+};
 stream.on('test:fail', (event) => {
 	process.exitCode = 1;
-	if (event?.details?.error) failures.push({ name: event.name, error: event.details.error });
+	if (event?.details?.error) {
+		if (failures.length < MAX_CAPTURED_FAILURES) failures.push({ name: event.name, error: event.details.error });
+		else omittedFailureCount++;
+	}
 });
 
 stream.on('end', () => {
@@ -77,17 +93,23 @@ const armGraceIfDone = () => {
 	// top-level `test:enqueue` disarms the timer below, so we only fire on a true stall.
 	if (enqueuedTop > 0 && completedTop >= enqueuedTop) {
 		graceTimer = setTimeout(() => {
+			let output = '';
 			if (failures.length > 0) {
-				console.error('\n[run.mjs] Failure details captured before final reporting stalled:');
+				output += '\n[run.mjs] Failure details captured before final reporting stalled:\n';
 				for (const failure of failures) {
-					console.error(`\n${failure.name}:\n${inspect(failure.error, { colors: false, depth: null })}`);
+					const detail = inspect(failure.error, { colors: false, depth: null });
+					output += `\n${failure.name}:\n${detail.slice(0, MAX_FAILURE_DETAIL_LENGTH)}`;
+					if (detail.length > MAX_FAILURE_DETAIL_LENGTH) output += '\n[run.mjs] Failure detail truncated.';
 				}
 			}
-			console.error(
-				`\n[run.mjs] All ${completedTop} top-level test(s) completed but the process did not ` +
-					`exit within ${EXIT_GRACE_MS}ms — a child outlived teardown (open handles keeping the event ` +
-					`loop alive). Forcing exit so the CI job fails fast instead of hanging to its hard timeout.`
-			);
+			if (omittedFailureCount > 0) output += `\n[run.mjs] ${omittedFailureCount} additional failure(s) omitted.`;
+			output +=
+				`\n\n[run.mjs] All ${completedTop} top-level test(s) completed but the process did not ` +
+				`exit within ${EXIT_GRACE_MS}ms — a child outlived teardown (open handles keeping the event ` +
+				`loop alive). Forcing exit so the CI job fails fast instead of hanging to its hard timeout.\n`;
+			try {
+				writeStderrSync(output);
+			} catch {}
 			process.exit(process.exitCode || 1);
 		}, EXIT_GRACE_MS);
 		graceTimer.unref?.(); // never let the backstop itself hold the loop open
