@@ -6245,10 +6245,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					);
 			}
 			// if we are connected directly to the node, we start from the last sequence number we received at the top level
-			let startTime = Math.max(
-				sequenceEntry?.seqId ?? 1,
-				(typeof node.startTime === 'string' ? new Date(node.startTime).getTime() : node.startTime) ?? 1
-			);
+			// setNode persists the operator's start point as `start_time` (snake); routes/the Node type use
+			// `startTime` (camel). Read both, else an add_node start point is dropped and the join full-copies.
+			const nodeStartTime = node.startTime ?? (node as any).start_time;
+			const parsedStartTime = typeof nodeStartTime === 'string' ? new Date(nodeStartTime).getTime() : nodeStartTime;
+			// setNode validates start_time at the boundary, so a non-finite value here is a legacy/corrupt
+			// stored row: warn and ignore it rather than letting NaN poison the resume bound.
+			if (nodeStartTime != null && !Number.isFinite(parsedStartTime))
+				logger.warn?.('Ignoring unparseable stored start_time for node', node.name, nodeStartTime);
+			// Never apply the operator's data cutoff to the system database: a joining node needs its cluster
+			// metadata (auth, roles, membership, schema) in full, so only user databases honor start_time.
+			const startCutoff = databaseName === 'system' || !Number.isFinite(parsedStartTime) ? undefined : parsedStartTime;
+			let startTime = Math.max(sequenceEntry?.seqId ?? 1, startCutoff ?? 1);
 			// A genuine resume = we have a persisted last-received sequence id (>1) for this node. Only then
 			// does the leader re-stream an already-applied tail worth fast-skipping. A fresh subscription
 			// (no persisted seqId, which later falls back to a full copy, startTime 0) has no such tail, so we
