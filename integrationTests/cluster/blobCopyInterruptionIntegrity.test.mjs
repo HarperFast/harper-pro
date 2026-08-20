@@ -242,7 +242,8 @@ async function verifyBlobContent(node, id) {
 		if (!bytes.equals(expectedBytesForId(id))) return { id, ok: false, reason: 'bytes-mismatch' };
 		return { id, ok: true };
 	} catch (e) {
-		return { id, ok: false, reason: `threw ${(e && e.message) || e}` };
+		const cause = e?.cause ? ` (cause: ${e.cause.message || e.cause})` : '';
+		return { id, ok: false, reason: `threw ${(e && e.message) || e}${cause}` };
 	}
 }
 
@@ -452,7 +453,7 @@ suite(
 			);
 			if (aContentFailures.length)
 				console.log(
-					`  A content failures: ${aContentFailures
+					`  A content failures (SOURCE side): ${aContentFailures
 						.map((f) => `id=${f.id}:${f.reason}`)
 						.slice(0, 20)
 						.join(' | ')}`
@@ -467,6 +468,11 @@ suite(
 			console.log(
 				`--- Layer 3: blob-store file inspection --- A totalFiles=${aStore.totalFiles} B totalFiles=${bStore.totalFiles}`
 			);
+			if (aStore.structurallyBad.length || aStore.unrecognized.length)
+				console.log(
+					`  A (SOURCE) structurally-bad files: ${aStore.structurallyBad.length} ${JSON.stringify(aStore.structurallyBad.slice(0, 10))} ` +
+						`unrecognized: ${aStore.unrecognized.length} ${JSON.stringify(aStore.unrecognized.slice(0, 10))}`
+				);
 			console.log(
 				`  B missing-backing-file for live id (defect signal): ${bMissingBackingFile.length} ${bMissingBackingFile.slice(0, 20).join(', ')}`
 			);
