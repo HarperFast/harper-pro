@@ -1,8 +1,6 @@
 /**
- * An interrupted base copy can leave `{seq > 1, no copyCursor}` on disk, which read as an incremental
- * resume permanently skips every un-copied row (harper-pro#658). These are the pieces that stop that:
- * the marker scan (fail-closed on an unreadable store), the peer-vs-database matching a marker needs
- * once its peer has left the subscription, the resume veto itself, and the write/clear helpers.
+ * The decision table behind DESIGN.md invariant 16: which markers a handshake honors, which ones a
+ * durable finish retires, and how both fail when the store cannot answer (harper-pro#658).
  */
 
 import { expect } from 'chai';
@@ -83,6 +81,11 @@ describe('readIncompleteCopyMarkers', () => {
 		expect(result.unknown).to.equal(true);
 		expect(warned).to.have.lengthOf(1);
 	});
+
+	it('tolerates a closing database, so a reopen race does not cost a full copy', () => {
+		const result = readIncompleteCopyMarkers(makeDb([], new Error('Can not read from a closed database')));
+		expect(result).to.deep.equal({ peers: new Set(), unknown: false });
+	});
 });
 
 describe('incompleteCopyMarkerApplies', () => {
@@ -145,7 +148,7 @@ describe('copyIncomplete marker write/clear', () => {
 	it('prefers the synchronous mutator, so a failure surfaces as a throw the caller can act on', () => {
 		const store = makeStore({ sync: true, markers: ['node-a'] });
 		writeCopyIncompleteMarker(store, 'node-a', { copyStartTime: 1785944669000 });
-		clearCopyIncompleteMarkers(store, 'node-a', () => true);
+		clearCopyIncompleteMarkers(store, ['node-a'], () => true, true);
 		expect(store.calls).to.deep.equal([
 			['putSync', [COPY_INCOMPLETE_SYMBOL, 'node-a'], { copyStartTime: 1785944669000 }],
 			['removeSync', [COPY_INCOMPLETE_SYMBOL, 'node-a']],
@@ -155,13 +158,13 @@ describe('copyIncomplete marker write/clear', () => {
 	it('falls back to the queueing mutator on a store without one', () => {
 		const store = makeStore({ sync: false, markers: ['node-a'] });
 		expect(typeof writeCopyIncompleteMarker(store, 'node-a', { copyStartTime: 1 }).then).to.equal('function');
-		clearCopyIncompleteMarkers(store, 'node-a', () => true);
+		clearCopyIncompleteMarkers(store, ['node-a'], () => true, true);
 		expect(store.calls.map(([op]) => op)).to.deep.equal(['put', 'remove']);
 	});
 
 	it('sweeps markers whose peer has left the cluster, so nothing is left to re-fire the veto', () => {
 		const store = makeStore({ sync: true, markers: ['gone-leader', 'node-a', 'node-b'] });
-		const retired = clearCopyIncompleteMarkers(store, 'node-a', (peer) => ['node-a', 'node-b'].includes(peer));
+		const retired = clearCopyIncompleteMarkers(store, ['node-a'], (peer) => ['node-a', 'node-b'].includes(peer), true);
 		expect(retired.sort()).to.deep.equal(['gone-leader', 'node-a']);
 		expect(store.calls).to.deep.equal([
 			['removeSync', [COPY_INCOMPLETE_SYMBOL, 'gone-leader']],
@@ -171,15 +174,28 @@ describe('copyIncomplete marker write/clear', () => {
 
 	it('leaves a live peer’s marker alone: its copy is still the one that has to finish', () => {
 		const store = makeStore({ sync: true, markers: ['node-c'] });
-		expect(clearCopyIncompleteMarkers(store, 'node-b', (peer) => ['node-b', 'node-c'].includes(peer))).to.deep.equal([
-			'node-b',
-		]);
+		const inCluster = (peer) => ['node-b', 'node-c'].includes(peer);
+		expect(clearCopyIncompleteMarkers(store, ['node-b'], inCluster, true)).to.deep.equal(['node-b']);
 		expect(store.calls).to.deep.equal([['removeSync', [COPY_INCOMPLETE_SYMBOL, 'node-b']]]);
+	});
+
+	it('retires a proxied source’s marker too: the copy that just finished delivered its rows', () => {
+		const store = makeStore({ sync: true, markers: ['proxied-peer'] });
+		expect(clearCopyIncompleteMarkers(store, ['proxy', 'proxied-peer'], () => true, true).sort()).to.deep.equal([
+			'proxied-peer',
+			'proxy',
+		]);
+	});
+
+	it('does not retire another peer’s marker on a copy that excluded tables', () => {
+		const store = makeStore({ sync: true, markers: ['gone-leader', 'node-a'] });
+		expect(clearCopyIncompleteMarkers(store, ['node-a'], () => false, false)).to.deep.equal(['node-a']);
+		expect(store.calls).to.deep.equal([['removeSync', [COPY_INCOMPLETE_SYMBOL, 'node-a']]]);
 	});
 
 	it('still clears this peer when its own marker never made it to disk', () => {
 		const store = makeStore({ sync: true, markers: [] });
-		expect(clearCopyIncompleteMarkers(store, 'node-a', () => true)).to.deep.equal(['node-a']);
+		expect(clearCopyIncompleteMarkers(store, ['node-a'], () => true, true)).to.deep.equal(['node-a']);
 	});
 
 	it('keeps sweeping after a store throw, so no marker is left behind', () => {
@@ -192,8 +208,9 @@ describe('copyIncomplete marker write/clear', () => {
 		};
 		const retired = clearCopyIncompleteMarkers(
 			store,
-			undefined,
+			[],
 			() => false,
+			true,
 			(error) => warned.push(error)
 		);
 		expect(retired).to.deep.equal(['gone-1', 'gone-2']);
@@ -202,6 +219,6 @@ describe('copyIncomplete marker write/clear', () => {
 	});
 
 	it('clears nothing without a store', () => {
-		expect(clearCopyIncompleteMarkers(undefined, 'node-a', () => true)).to.deep.equal([]);
+		expect(clearCopyIncompleteMarkers(undefined, ['node-a'], () => true, true)).to.deep.equal([]);
 	});
 });

@@ -1530,6 +1530,9 @@ export function readIncompleteCopyMarkers(dbisDB: DbisStore | undefined, warn?: 
 		}
 	} catch (error) {
 		warn?.(error);
+		// A database closing under the handshake is not a corrupt store, and the sibling `seq` scan
+		// tolerates the same error: vetoing on it turns a routine close/reopen race into a full copy.
+		if ((error as Error)?.message?.includes('Can not re')) return { peers, unknown: false };
 		return { peers, unknown: true };
 	}
 	return { peers, unknown: false };
@@ -1565,29 +1568,37 @@ export function incompleteCopyMarkerApplies(
 }
 
 /**
- * Retire the markers a durable finish heals: this peer's own, plus any whose peer has left the cluster.
- * The second half is not optional — nothing else retires an orphan the veto keeps honoring, so the
- * veto would re-fire on every handshake forever.
+ * `putSync` where the store has one: LMDB's `put` only queues the write and reports failure by
+ * rejecting, which a `try` around the call cannot see.
  */
 export function writeCopyIncompleteMarker(store: DbisStore, nodeName: string, marker: DbisCursor) {
 	const key = [Symbol.for('copyIncomplete'), nodeName];
 	return store.putSync ? store.putSync(key, marker) : store.put(key, marker);
 }
 
+/**
+ * Retire the markers a durable finish heals: every peer whose data this copy delivered — its own peer
+ * and the sources it carried, since a base copy hands over the whole database whatever a row's origin —
+ * plus markers whose peer has since left the cluster. That second half is not optional (nothing else
+ * retires an orphan the veto keeps honoring, so the veto would re-fire on every handshake forever) but
+ * it is gated on `coversWholeDatabase`: a copy whose subscription excluded tables cannot stand in for
+ * one that did not, and retiring on it would make an uncovered gap unrecoverable.
+ */
 export function clearCopyIncompleteMarkers(
 	store: DbisStore | undefined,
-	nodeName: string | undefined,
+	healedPeers: Iterable<string | undefined>,
 	isClusterMember: (peer: string) => boolean,
+	coversWholeDatabase: boolean,
 	warn?: (error: unknown) => void
 ): string[] {
 	if (!store) return [];
+	const healed = new Set([...healedPeers].filter((peer): peer is string => typeof peer === 'string'));
 	const { peers } = readIncompleteCopyMarkers(store, warn);
-	const retiring = [...peers].filter((peer) => peer === nodeName || !isClusterMember(peer));
-	if (nodeName && !peers.has(nodeName)) retiring.push(nodeName);
+	const retiring = [...peers].filter((peer) => healed.has(peer) || (coversWholeDatabase && !isClusterMember(peer)));
+	for (const peer of healed) if (!peers.has(peer)) retiring.push(peer);
 	for (const peer of retiring) {
 		const key = [Symbol.for('copyIncomplete'), peer];
-		// Per key, so one store throw cannot abandon the rest of the sweep and leave a marker nothing
-		// else will retire. `remove` is invoked inside the try because it can throw synchronously.
+		// Per key, and `remove` inside the try: a synchronous throw must not abandon the rest of the sweep.
 		try {
 			if (store.removeSync) store.removeSync(key);
 			else Promise.resolve(store.remove(key)).catch((error) => warn?.(error));
@@ -2920,8 +2931,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyIncompleteUnrecorded = undefined;
 			copyIncompleteWriteFailed = false;
 			try {
-				clearCopyIncompleteMarkers(getDatabaseStores().dbisDB, remoteNodeName, isClusterMember, (error) =>
-					logger.error?.(connectionId, 'failed to clear an in-progress base-copy marker', databaseName, error)
+				clearCopyIncompleteMarkers(
+					getDatabaseStores().dbisDB,
+					[remoteNodeName, ...subscribedPeerNames],
+					isClusterMember,
+					subscriptionCoversWholeDatabase,
+					(error) =>
+						logger.error?.(connectionId, 'failed to clear an in-progress base-copy marker', databaseName, error)
 				);
 			} catch (error) {
 				logger.error?.(connectionId, 'failed to clear the in-progress base-copy marker', databaseName, error);
@@ -3213,6 +3229,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// copy BLOB_CHUNKs — not every 'message'. replicateOverWS is bidirectional, so counting arbitrary
 	// frames (schema/subscription updates, reverse-direction traffic) could re-arm the watchdog once per
 	// threshold and mask a genuinely stalled copy. Re-arms the watchdog while copying. (harper-pro#453)
+	// Peers this connection's subscription receives for, and whether that subscription covers the whole
+	// database. Both are read by the marker sweep: a finished copy heals every source it carried, but a
+	// copy that excluded tables cannot retire another peer's marker. Recorded when the request is built.
+	let subscribedPeerNames: string[] = [];
+	let subscriptionCoversWholeDatabase = true;
 	// While `copyIncompleteUnrecorded` holds a copyStartTime the marker has not reached disk. The retry
 	// is time-gated because its only driver is the copy-frame path, the highest-volume one there is.
 	let copyIncompleteUnrecorded: number | undefined;
@@ -5911,6 +5932,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// Record the highest committed sequence (this batch's resume cursor value). Commit ==
 					// visibility; this is monotonic across batches. The durable watermark below only ever
 					// catches up TO this value, never past it.
+					// This commit is about to persist [seq]; the copy-frame retry is time-gated, so a copy whose
+					// stores were unresolved at COPY_START gets its attempt here, before there is a position to
+					// resume from.
+					if (copyIncompleteUnrecorded !== undefined && inCopyMode) recordCopyIncomplete(copyIncompleteUnrecorded);
 					committedSequence = Math.max(committedSequence, endTxnEvent.localTime ?? 0);
 					// Advance the durable watermark WITHOUT awaiting blobs — for copy AND non-copy frames alike.
 					// COPY MODE used to keep a synchronous `await Promise.all(outstandingBlobsToFinish)` here on
@@ -6701,15 +6726,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			logger.warn?.('Could not scan in-progress base-copy markers for', databaseName, error)
 		);
 		receivingDataFromNodeIds = [];
+		subscribedPeerNames = [];
+		subscriptionCoversWholeDatabase = true;
 		const nodeSubscriptions = options.connection?.nodeSubscriptions.map((node: any) => {
 			const tableSubs = [];
 			let { replicateByDefault } = node;
+			subscribedPeerNames.push(node.name);
 			// Tables excluded by this node's receivesFrom config for this peer+database
 			const receiverExcludedTables = getExcludedTablesForRouteEntries(
 				node.routeReplicates?.receivesFrom,
 				node.name,
 				databaseName
 			);
+			if (receiverExcludedTables?.size || !replicateByDefault) subscriptionCoversWholeDatabase = false;
 			if (node.subscriptions) {
 				// if the node has explicit subscriptions, we need to use that to determine subscriptions
 				for (const subscription of node.subscriptions) {
@@ -6722,6 +6751,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					}
 				}
 				replicateByDefault = false; // now turn off the default replication because it was an explicit list of subscriptions
+				subscriptionCoversWholeDatabase = false; // an explicit table list is not the whole database
 			} else {
 				// note that if replicateByDefault is enabled, we are listing the *excluded* tables
 				for (const tableName in tables) {
