@@ -242,7 +242,8 @@ async function verifyBlobContent(node, id) {
 		if (!bytes.equals(expectedBytesForId(id))) return { id, ok: false, reason: 'bytes-mismatch' };
 		return { id, ok: true };
 	} catch (e) {
-		return { id, ok: false, reason: `threw ${(e && e.message) || e}` };
+		const cause = e?.cause ? ` (cause: ${e.cause.message || e.cause})` : '';
+		return { id, ok: false, reason: `threw ${(e && e.message) || e}${cause}` };
 	}
 }
 
@@ -281,6 +282,18 @@ suite(
 			const seeded = await recordCount(ctx.source);
 			equal(seeded, RECORD_COUNT, `expected ${RECORD_COUNT} seeded rows on source, got ${seeded}`);
 			console.log(`[qa692] A seeded ${seeded} blob records`);
+
+			// Verify the seed BEFORE any node joins, so a later source-side blob failure can never be blamed
+			// on seeding: this is the only point where A has done nothing but write its own blobs.
+			const seedFailures = (
+				await Promise.all(Array.from({ length: RECORD_COUNT }, (_, id) => verifyBlobContent(ctx.source, id)))
+			).filter((r) => !r.ok);
+			equal(
+				seedFailures.length,
+				0,
+				`seeding is not sound: ${seedFailures.length}/${RECORD_COUNT} blobs on A do not read back correctly ` +
+					`immediately after seeding, before any peer exists: ${seedFailures.map((f) => `id=${f.id}:${f.reason}`).join(', ')}`
+			);
 		});
 
 		after(async () => {
@@ -438,6 +451,13 @@ suite(
 			console.log(
 				`--- Layer 2: blob content --- A failures=${aContentFailures.length}/${RECORD_COUNT} B failures=${bContentFailures.length}/${receiverIds.size}`
 			);
+			if (aContentFailures.length)
+				console.log(
+					`  A content failures (SOURCE side): ${aContentFailures
+						.map((f) => `id=${f.id}:${f.reason}`)
+						.slice(0, 20)
+						.join(' | ')}`
+				);
 			if (bContentFailures.length)
 				console.log(
 					`  B content failures: ${bContentFailures
@@ -448,6 +468,11 @@ suite(
 			console.log(
 				`--- Layer 3: blob-store file inspection --- A totalFiles=${aStore.totalFiles} B totalFiles=${bStore.totalFiles}`
 			);
+			if (aStore.structurallyBad.length || aStore.unrecognized.length)
+				console.log(
+					`  A (SOURCE) structurally-bad files: ${aStore.structurallyBad.length} ${JSON.stringify(aStore.structurallyBad.slice(0, 10))} ` +
+						`unrecognized: ${aStore.unrecognized.length} ${JSON.stringify(aStore.unrecognized.slice(0, 10))}`
+				);
 			console.log(
 				`  B missing-backing-file for live id (defect signal): ${bMissingBackingFile.length} ${bMissingBackingFile.slice(0, 20).join(', ')}`
 			);
@@ -481,7 +506,9 @@ suite(
 			equal(
 				aContentFailures.length,
 				0,
-				`sanity failed: source A itself has ${aContentFailures.length} corrupt/missing blobs — not a receiver defect, investigate seeding`
+				`SOURCE-SIDE DEFECT: A itself has ${aContentFailures.length} corrupt/missing blob(s) it wrote and never lost — ` +
+					`seeding was verified clean in before(), so this is the source losing blobs during the copy, not a receiver ` +
+					`defect and not seeding: ${aContentFailures.map((f) => `id=${f.id}:${f.reason}`).join(', ')}`
 			);
 			equal(
 				bContentFailures.length,

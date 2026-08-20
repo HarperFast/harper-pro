@@ -20,7 +20,8 @@ function blobForId(id) {
 					yield buf;
 				}
 			})()
-		)
+		),
+		{ size: CHUNK * CHUNKS, saveBeforeCommit: true }
 	);
 }
 

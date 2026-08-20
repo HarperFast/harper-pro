@@ -1,0 +1,4 @@
+type DecodeDropTest @table @export {
+	id: ID @primaryKey
+	val: String
+}

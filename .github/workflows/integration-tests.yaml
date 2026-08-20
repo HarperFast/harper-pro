@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       node-versions: ${{ steps.set-node-versions.outputs.node-versions }}
+      build-node-versions: ${{ steps.set-node-versions.outputs.build-node-versions }}
 
     steps:
       - name: Checkout code
@@ -34,12 +35,15 @@ jobs:
 
       - name: Set Node versions
         id: set-node-versions
+        env:
+          NODE_VERSION_INPUT: ${{ github.event.inputs.node-version }}
         run: |
           if [ "${{ github.event_name }}" == "pull_request" ]; then
-            # PR pushes run a single representative Node version to keep the dev loop fast;
-            # the full 22/24/26 matrix runs on push to main/release and on the nightly schedule.
+            # Keep the full PR suites on one representative runtime, but build every supported
+            # runtime for the focused cluster regression job below.
             echo "node-versions=[24]" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.inputs.node-version }}" == "all" ] || [ -z "${{ github.event.inputs.node-version }}" ]; then
+            echo 'build-node-versions=[22, 24, "26.5.0"]' >> $GITHUB_OUTPUT
+          elif [ "$NODE_VERSION_INPUT" == "all" ] || [ -z "$NODE_VERSION_INPUT" ]; then
             # TEMPORARY: pinned to 26.5.0 instead of floating "26" — 26.5.1's llhttp/undici bump
             # (deps: llhttp 9.4.2->9.4.3, undici 8.7.0->8.9.0) breaks analytics.test.mjs,
             # addNodeLeaderNoMeshLeak.test.mjs, and the Cluster 6/6 shard on Node 26 only. The
@@ -49,11 +53,17 @@ jobs:
             # depth in this pass. Remove this pin once the underlying issue is fixed — see
             # harper#2025, which stays open until then.
             echo "node-versions=[22, 24, \"26.5.0\"]" >> $GITHUB_OUTPUT
+            echo 'build-node-versions=[22, 24, "26.5.0"]' >> $GITHUB_OUTPUT
           else
             # Manual dispatch intentionally does NOT apply the 26.5.0 pin above: selecting "26"
             # here floats to the latest 26.x release, so it doubles as the live reproducer for
             # checking whether harper#2025 is still reproducing on the newest Node 26 patch.
-            echo "node-versions=[${{ github.event.inputs.node-version }}]" >> $GITHUB_OUTPUT
+            if [[ ! "$NODE_VERSION_INPUT" =~ ^(22|24|26)$ ]]; then
+              echo "::error::unsupported Node version '$NODE_VERSION_INPUT'"
+              exit 1
+            fi
+            echo "node-versions=[$NODE_VERSION_INPUT]" >> $GITHUB_OUTPUT
+            echo "build-node-versions=[$NODE_VERSION_INPUT]" >> $GITHUB_OUTPUT
           fi
 
   build:
@@ -64,7 +74,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.node-versions) }}
+        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.build-node-versions) }}
 
     steps:
       - name: Checkout code
@@ -182,6 +192,73 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: harper-server-logs-node-${{ matrix.node-version }}-shard-${{ matrix.shard }}
+          path: /tmp/harper-integration-test-logs/
+          retention-days: 3
+          if-no-files-found: ignore
+
+  run-copy-gap-runtime-regression:
+    name: Copy-gap Runtime Regression (Node.js v${{ matrix.node-version }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [generate-node-version-matrix, build]
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.build-node-versions) }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          package-manager-cache: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harper-build-artifacts-node-${{ matrix.node-version }}
+
+      - name: Relink bin scripts
+        run: npm rebuild --ignore-scripts --offline
+
+      - name: Build re2 native binary
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
+
+      - name: Install harperdb@4 for legacy tests
+        run: |
+          mkdir -p /tmp/harperdb-legacy
+          .github/scripts/retry.sh "npm install harperdb@4" -- npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+
+      - name: Guard copy-gap regression path
+        env:
+          TEST_FILE: integrationTests/cluster/copyGapCursorBanking.test.mjs
+        run: |
+          if [ ! -f "$TEST_FILE" ]; then
+            echo "::error::copy-gap regression file '$TEST_FILE' does not exist — this job would run no tests."
+            exit 1
+          fi
+          if ! grep -Fq 'Copy-cursor banking under sustained transient blob faults (#699)' "$TEST_FILE"; then
+            echo "::error::copy-gap regression case is missing from '$TEST_FILE' — this job would run without its intended test."
+            exit 1
+          fi
+
+      - name: Run copy-gap runtime regression
+        env:
+          HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
+          HARPER_LEGACY_VERSION_PATH: /tmp/harperdb-legacy/node_modules/harperdb
+        run: npm run test:integration -- integrationTests/cluster/copyGapCursorBanking.test.mjs
+
+      - name: Upload Harper server logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harper-copy-gap-logs-node-${{ matrix.node-version }}
           path: /tmp/harper-integration-test-logs/
           retention-days: 3
           if-no-files-found: ignore

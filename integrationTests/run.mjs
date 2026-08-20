@@ -1,7 +1,10 @@
 import { run } from 'node:test';
 import { availableParallelism } from 'node:os';
 import { spec } from 'node:test/reporters';
-import { parseArgs } from 'node:util';
+import { writeSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { inspect, parseArgs } from 'node:util';
 
 /**
  * Custom test runner for Harper Pro integration tests.
@@ -45,8 +48,36 @@ const stream = run({
 	},
 });
 
-stream.on('test:fail', () => {
+const MAX_CAPTURED_FAILURES = 10;
+const MAX_FAILURE_DETAIL_LENGTH = 32_768;
+const failures = [];
+let omittedFailureCount = 0;
+const writeStderrSync = (output) => {
+	const buffer = Buffer.from(output);
+	let offset = 0;
+	while (offset < buffer.length) {
+		const written = writeSync(process.stderr.fd, buffer, offset, buffer.length - offset);
+		if (written === 0) break;
+		offset += written;
+	}
+};
+stream.on('test:fail', (event) => {
 	process.exitCode = 1;
+	if (event?.details?.error) {
+		if (failures.length < MAX_CAPTURED_FAILURES) {
+			const detail = inspect(event.details.error, {
+				colors: false,
+				depth: 8,
+				maxArrayLength: 100,
+				maxStringLength: 8_192,
+			});
+			failures.push({
+				name: event.name,
+				detail: detail.slice(0, MAX_FAILURE_DETAIL_LENGTH),
+				truncated: detail.length > MAX_FAILURE_DETAIL_LENGTH,
+			});
+		} else omittedFailureCount++;
+	}
 });
 
 stream.on('end', () => {
@@ -73,23 +104,46 @@ const armGraceIfDone = () => {
 	// top-level `test:enqueue` disarms the timer below, so we only fire on a true stall.
 	if (enqueuedTop > 0 && completedTop >= enqueuedTop) {
 		graceTimer = setTimeout(() => {
-			console.error(
-				`\n[run.mjs] All ${completedTop} top-level test(s) completed but the process did not ` +
-					`exit within ${EXIT_GRACE_MS}ms — a child outlived teardown (open handles keeping the event ` +
-					`loop alive). Forcing exit so the CI job fails fast instead of hanging to its hard timeout.`
-			);
+			let output = '';
+			if (failures.length > 0) {
+				output += '\n[run.mjs] Failure details captured before final reporting stalled:\n';
+				for (const failure of failures) {
+					output += `\n${failure.name}:\n${failure.detail}`;
+					if (failure.truncated) output += '\n[run.mjs] Failure detail truncated.';
+				}
+			}
+			if (omittedFailureCount > 0) output += `\n[run.mjs] ${omittedFailureCount} additional failure(s) omitted.`;
+			output +=
+				`\n\n[run.mjs] All ${completedTop} top-level test(s) completed but the process did not ` +
+				`exit within ${EXIT_GRACE_MS}ms — a child outlived teardown (open handles keeping the event ` +
+				`loop alive). Forcing exit so the CI job fails fast instead of hanging to its hard timeout.\n`;
+			try {
+				writeStderrSync(output);
+			} catch {}
 			process.exit(process.exitCode || 1);
 		}, EXIT_GRACE_MS);
 		graceTimer.unref?.(); // never let the backstop itself hold the loop open
 	}
 };
 // Count only real top-level tests/suites, not the per-file wrapper. Under process
-// isolation each file emits a nesting-0 `test:enqueue` whose `name` equals its `file`,
+// isolation each file emits a nesting-0 `test:enqueue` whose `name` identifies its `file`,
 // in addition to the enqueue for the actual test/suite inside it. The file wrapper never
 // emits `test:complete` when its child hangs (that's the whole failure mode), so counting
 // it would keep enqueued > completed forever and the backstop would never arm. Excluding
-// `name === file` leaves just the genuine tests, whose completes we can balance against.
-const isFileWrapper = (e) => !!(e?.name && e.name === e.file);
+// the wrapper leaves just the genuine tests, whose completes we can balance against.
+const normalizeTestPath = (path) => {
+	if (!path) return null;
+	try {
+		return resolve(path.startsWith('file:') ? fileURLToPath(path) : path);
+	} catch {
+		return null;
+	}
+};
+const isFileWrapper = (event) => {
+	const name = normalizeTestPath(event?.name);
+	const file = normalizeTestPath(event?.file);
+	return name !== null && name === file;
+};
 stream.on('test:enqueue', (e) => {
 	if ((e?.nesting ?? 0) === 0 && !isFileWrapper(e)) {
 		enqueuedTop++;
