@@ -44,7 +44,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 
 const BLOB_RECORDS = 40; // /LargeLocation/{n} on A — each a deterministic ~50 KB file-backed blob
 const BLOB_BYTES = 50 * 1024;
-const FAIL_INTERVAL = 15; // mean fault spacing (fixture jitters ±3) — sustained but survivable supply
+const FAIL_INTERVAL = 5; // dense enough that the resumed repair pass also encounters a fault
 const INITIAL_DAMAGED_RECORDS = 2;
 const BLOB_SLOW_MS = 400; // every save held in flight, so the pre-#699 snapshot instant never occurs
 const GAP_RECONNECT_MS = 3000; // #683 watchdog cycle, shortened from the 900s default
