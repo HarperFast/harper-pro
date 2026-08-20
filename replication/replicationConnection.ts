@@ -6313,12 +6313,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// creates and attaches its stream. Without this post-attach ownership check, the orphaned
 			// source has no producer or connection timer left and an in-place repair holds its file lock
 			// until core's long source-idle timeout. Fail it now so the next connection can repair it.
-			abortLateBlobReceiveAfterClose(
-				isConnectionSuperseded(wsClosed, options.connection, ws),
-				stream,
-				remoteNodeName,
-				blobId
-			);
+			// CONTROL BRANCH ONLY — do not merge. Hardcoded false neutralizes the #732 ownership
+			// guard so production behavior equals origin/main, while leaving the exported function
+			// (and its unit tests) intact. Measures whether the regression test fails on base.
+			abortLateBlobReceiveAfterClose(false && isConnectionSuperseded(wsClosed, options.connection, ws), stream, remoteNodeName, blobId);
 		}
 		if (finished) {
 			// A copy-frame blob gates the copy cursor by walk position; a gapped settle clamps the
