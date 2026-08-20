@@ -11,6 +11,7 @@ import { getSecretCustody } from '../core/resources/secretDecryptor.ts';
 import { encryptEnvelope, parseEnvelopeFields } from '../core/utility/secretEnvelope.ts';
 import { ENV_ENCRYPTED_PREFIX } from '../core/utility/envFile.ts';
 import { replicateOperation } from '../replication/replicator.ts';
+import { generateEd25519SSHKeyPair } from './sshKeyGeneration.ts';
 
 // SSH key name can only be alphanumeric, dash and underscores
 const SSH_KEY_NAME_REGEX = /^[a-zA-Z0-9-_]+$/;
@@ -78,7 +79,12 @@ function sealSSHKey(name: string, key: string): string {
 
 const addValidationSchema = Joi.object({
 	name: Joi.string().pattern(SSH_KEY_NAME_REGEX).required().messages({ 'string.pattern.base': SSH_KEY_NAME_ERROR_MSG }),
-	key: Joi.string().required(),
+	// `key` is optional so it can be omitted with `generate: true` (the server mints it); the
+	// "key xor generate" invariant is enforced in addSSHKey for a precise error. `.strict()` because
+	// Joi would otherwise accept the strings 'true'/'false' by coercion, and `validateBySchema`
+	// discards the coerced value — leaving the raw, always-truthy string on the request.
+	generate: Joi.boolean().strict().optional(),
+	key: Joi.string().optional(),
 	host: Joi.string().required(),
 	hostname: Joi.string().required(),
 	known_hosts: Joi.string().optional(),
@@ -118,7 +124,8 @@ function getSSHPaths(keyName: string | undefined): {
 
 interface AddSSHKeyRequest {
 	name: string;
-	key: string;
+	key?: string; // optional when `generate` is true (the server mints the keypair)
+	generate?: boolean;
 	host: string;
 	hostname: string;
 	known_hosts?: string;
@@ -135,25 +142,63 @@ interface AddSSHKeyRequest {
  *
  * @param req - The request object containing the SSH key details.
  * @param req.name - The name of the SSH key to add.
- * @param req.key - The SSH key contents, either plaintext or an `enc:v1:` envelope.
+ * @param req.key - The SSH key contents, either plaintext or an `enc:v1:` envelope. Mutually
+ * exclusive with `generate`; exactly one of the two is required.
+ * @param req.generate - Mint an ed25519 keypair on this node instead of supplying `key`, so the
+ * private half never travels from the client. The public half comes back as `public_key`.
  * @param req.host - The Host alias to use in the SSH config block.
  * @param req.hostname - The HostName (real hostname) to use in the SSH config block.
  * @param req.known_hosts - Optional known_hosts entries to append to the known_hosts file.
- * @returns An object containing a success message and optional replication results.
+ * @returns An object containing a success message, optional replication results, and `public_key`
+ * when the keypair was generated.
  */
-export async function addSSHKey(req: AddSSHKeyRequest): Promise<{ message: string; replicated?: unknown[] }> {
+export async function addSSHKey(
+	req: AddSSHKeyRequest
+): Promise<{ message: string; replicated?: unknown[]; public_key?: string }> {
 	const validation = validateBySchema(req, addValidationSchema);
 	if (validation) throw new ClientError(validation.message);
 
-	const { name, key, host, hostname, known_hosts } = req;
-	harperLogger?.trace('adding ssh key', name);
+	// Read `generate` as a strict boolean rather than for truthiness. `validateBySchema` discards
+	// Joi's coerced value, so a caller that stringifies booleans reaches here with `req.generate`
+	// still the string it sent — and `'false'` is truthy, which would mint a keypair the caller
+	// explicitly declined. The schema's `.strict()` rejects those strings; this comparison means the
+	// branch below cannot be reached by anything but a literal `true` even if that changes.
+	const generate = req.generate === true;
 
-	const { filePath, configFile, knownHostsFile } = getSSHPaths(name);
+	// `generate` and `key` are mutually exclusive: reject both up front. (The origin strips `generate`
+	// before replicating — below — so a peer never receives it and this guard never trips on the
+	// replicated op.)
+	if (generate && req.key) {
+		throw new ClientError('Provide either `key` or `generate: true`, not both.');
+	}
 
-	// Check if the key already exists
+	// Reject a duplicate name BEFORE minting anything: with `generate: true` a taken name means the add
+	// is already doomed, so there is no reason to mint private-key material for a request guaranteed to
+	// throw below.
+	const { filePath, configFile, knownHostsFile } = getSSHPaths(req.name);
 	if (await exists(filePath)) {
 		throw new ClientError('Key already exists. Use update_ssh_key or delete_ssh_key and then add_ssh_key');
 	}
+
+	// With `generate: true`, mint the keypair here so the private key never leaves the cluster; the
+	// public half is returned for the caller to register (e.g. a GitHub deploy key). The minted key
+	// then flows through the same seal-at-rest + replicate path (sealSSHKey) as a supplied one, so
+	// where custody is registered the plaintext stays in this process. On a node with NO custody it
+	// does not: `sealSSHKey` passes the key through and it is replicated in the clear, same as a
+	// supplied key in that mode (see the WARN there).
+	let publicKey: string | undefined;
+	if (generate) {
+		const generated = await generateEd25519SSHKeyPair(`harper:${req.name}`);
+		req.key = generated.privateKey;
+		publicKey = generated.publicKey;
+	}
+	// Unconditionally, so no variant of the flag — including a literal `false` — reaches a peer, which
+	// must store the key it is sent rather than minting a different one of its own.
+	delete req.generate;
+
+	const { name, key, host, hostname, known_hosts } = req;
+	if (!key) throw new ClientError('add_ssh_key requires `key`, or `generate: true` to mint one');
+	harperLogger?.trace('adding ssh key', name);
 
 	// Seal before anything durable or replicated happens, and replicate the envelope rather than
 	// the plaintext the caller supplied.
@@ -210,8 +255,11 @@ Host ${host}
 	if (known_hosts) {
 		await appendFile(knownHostsFile, known_hosts);
 	}
-	let response = await replicateOperation(req);
+	const response = await replicateOperation(req);
 	response.message = `Added ssh key: ${name}${additionalMessage}`;
+	// `replicateOperation` returns `{ message, replicated? }`; attach `public_key` via Object.assign so
+	// the extra field doesn't trip the compiler on that narrower return type.
+	if (publicKey) Object.assign(response, { public_key: publicKey });
 
 	return response;
 }
