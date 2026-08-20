@@ -910,8 +910,7 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	// The header claimed blobs but none was reachable (e.g. one living only in a patch chain): we
 	// cannot prove the local copy is whole, so it must not tie.
 	if (blobs.length === 0) return false;
-	for (const blob of blobs)
-		if (!(await hasDurableBlobHeader(blob))) return false;
+	for (const blob of blobs) if (!(await hasDurableBlobHeader(blob))) return false;
 	return true;
 }
 
@@ -1477,7 +1476,7 @@ export type DbisStore = {
  */
 export function readDbisCursorSync(
 	dbisDB: DbisStore | undefined,
-	kind: 'seq' | 'copyCursor' | 'cloneCopyComplete',
+	kind: 'seq' | 'copyCursor' | 'cloneCopyComplete' | 'copyIncomplete',
 	id: any
 ): DbisCursor | undefined {
 	// getSync is load-bearing here: reverting it to get() would return a MaybePromise that no longer
@@ -1492,6 +1491,37 @@ export function matchesCloneCopyCompletion(marker: DbisCursor | undefined, clone
 		typeof marker.copyStartTime === 'number' &&
 		Number.isFinite(marker.copyStartTime)
 	);
+}
+
+/**
+ * While a base copy is incomplete, the persisted resume state must never select the direct
+ * seq-cursor path: the un-copied rows' versions predate the copy, so the leader's audit-log replay
+ * from a seq position can never deliver them and the gap is permanent (harper-pro#658).
+ *
+ * The seq cursor alone cannot express this. Mid-copy sequence updates persist while the copy is
+ * still in flight, and core's `updateRecordedSequenceId` stores `Math.max(existing, localTime)`, so
+ * a copy-era seq value can never be walked back. The copy cursor is not a reliable counter-signal
+ * either: it is absent for the first `copyCursorFlushIntervalMs`/`copyCursorFlushBytes` of a copy,
+ * for a whole copy whose `copyFromNodeId` never resolved, and after
+ * `discardMalformedCopyCursor` removes a bad one. `copyIncomplete` (written at COPY_START, removed
+ * only when the copy is fully durable) is therefore the authority on "a copy was interrupted", and
+ * a surviving marker forces a fresh full copy instead of an incremental resume.
+ *
+ * Keyed by node NAME, not node id, so it also covers the copy whose `copyFromNodeId` was undefined.
+ * The store read is guarded behind the cheap checks so the default path (a usable copy cursor, or an
+ * already-full-copy request) never pays for a cold point-read on a reconnect storm.
+ *
+ * Exported for unit coverage (unitTests/replication/incompleteCopyForcesFullCopy.test.mjs);
+ * production callers go through `replicateOverWS`.
+ */
+export function incompleteCopyForcesFullCopy(
+	copyCursor: DbisCursor | undefined,
+	startTime: number,
+	dbisDB: DbisStore | undefined,
+	nodeName: string | undefined
+): boolean {
+	if (copyCursor || startTime <= 1 || !nodeName) return false;
+	return readDbisCursorSync(dbisDB, 'copyIncomplete', nodeName) !== undefined;
 }
 
 /**
@@ -2807,6 +2837,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
 			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
+			// The copy is fully durable, so the in-progress marker may go (harper-pro#658). Swallow a
+			// removal failure: this runs from promise continuations (the copy-flush `.finally`), where a
+			// throw becomes an unhandled rejection, and a retained marker costs one extra idempotent full
+			// copy on the next start — the safe direction.
+			try {
+				getDatabaseStores().dbisDB?.remove([Symbol.for('copyIncomplete'), remoteNodeName]);
+			} catch (error) {
+				logger.warn?.(connectionId, 'failed to clear the in-progress base-copy marker', databaseName, error);
+			}
 			inCopyMode = false;
 			subscriptionSetupWatchdog?.resume();
 			// Retired before the flags its onStall re-checks are cleared, so the timer stops waking the
@@ -4039,6 +4078,32 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						// Record — before any frame of this copy can advance the seq cursor — that a copy is in
+						// flight, so an interrupted copy can never be resumed as an incremental seq resume
+						// (harper-pro#658). Fail closed: without this marker on disk the invariant is
+						// unenforceable, and continuing would re-open the silent-data-loss window.
+						const copyIncompleteStore = getDatabaseStores().dbisDB;
+						if (!copyIncompleteStore || !remoteNodeName) {
+							logger.error?.(
+								connectionId,
+								`Cannot record an in-progress base copy for database ${databaseName} from ${remoteNodeName || 'unknown node'}; closing rather than risk resuming this copy from the sequence cursor (harper-pro#658)`
+							);
+							close(1011, 'Cannot record in-progress base copy');
+							return;
+						}
+						try {
+							copyIncompleteStore.put([Symbol.for('copyIncomplete'), remoteNodeName], {
+								copyStartTime: copyModeStartTime,
+							});
+						} catch (error) {
+							closeOnInboundMessageError(error, {
+								connectionId,
+								logger,
+								markInboundClosed: () => (wsClosed = true),
+								close,
+							});
+							return;
+						}
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
 						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
@@ -4869,8 +4934,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
-							| undefined;
+							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -6689,6 +6753,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				logger.warn?.(
 					`Resuming interrupted copy of database ${databaseName} from ${getNodeURL(node)} at table ${copyCursor.currentTable} after key ${copyCursor.afterKey}`
 				);
+			} else if (incompleteCopyForcesFullCopy(copyCursor, startTime, dbisDB, node.name)) {
+				// A base copy from this node was interrupted and left no resumable cursor, so the persisted
+				// seq position is not a baseline we hold: the un-copied rows predate it and an incremental
+				// resume would skip them forever. Copy from scratch instead (harper-pro#658).
+				startTime = 0;
+				// This copy re-delivers records the interrupted copy already committed, so it carries the same
+				// identity-tie blob-repair hazard as a cursor resume: arm that window (harper-pro#699).
+				copyResumeRequested = true;
+				logger.warn?.(
+					`Requesting full copy of database ${databaseName} from ${getNodeURL(node)} (a base copy was interrupted with no resumable copy cursor)`
+				);
 			}
 			logger.trace?.(connectionId, 'defining subscription request', node.name, databaseName, new Date(startTime));
 			// Arm the leading-duplicate fast-skip for this source node. Incoming records from this node with
@@ -6711,7 +6786,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						? startTime
 						: undefined
 					: proxiedSkipCursor;
-			if (nodeId !== undefined && !copyResume && leadingDupArmCursor !== undefined && leadingDupArmCursor > 1) {
+			if (
+				nodeId !== undefined &&
+				!copyResume &&
+				startTime !== 0 &&
+				leadingDupArmCursor !== undefined &&
+				leadingDupArmCursor > 1
+			) {
 				leadingDupCursorByNode.set(nodeId, leadingDupArmCursor);
 				logger.debug?.(
 					connectionId,
