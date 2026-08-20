@@ -119,14 +119,23 @@ describe('replication inbound frame queue budget — #2226 unbounded receive que
 		expect(gate.queuedBytes).to.equal(1000 << 20); // 1 GB queued, never a pause
 	});
 
-	it('treats a non-finite budget as disabled rather than pausing every frame', () => {
+	it('lands a junk budget on the default with the bound still ACTIVE, never unbounded', () => {
 		// receiveQueueBudget keeps this unreachable in production; the gate is exported, so it holds on
-		// its own. A NaN budget would otherwise fail every comparison in both directions.
-		for (const budget of [NaN, Infinity, -1]) {
+		// its own. A NaN budget would otherwise fail every comparison in both directions — every frame
+		// pausing and every settle resuming. Falling back to DISABLED would be the other wrong answer:
+		// it restores the unbounded queue this whole change exists to remove.
+		for (const budget of [NaN, Infinity, -1, 'abc', null, undefined]) {
 			const gate = createReceiveQueueGate(budget);
-			for (let i = 0; i < 100; i++) expect(gate.admit(1 << 20)).to.equal(false);
-			expect(gate.paused).to.equal(false);
+			let paused = false;
+			for (let i = 0; i < 64 && !paused; i++) paused = gate.admit(1 << 20);
+			expect(paused, `budget ${String(budget)} left the queue unbounded`).to.equal(true);
+			expect(gate.maxFrames).to.equal(512); // the 32 MB default's ceiling
 		}
+	});
+
+	it('coerces a numeric string rather than disabling the bound', () => {
+		const gate = createReceiveQueueGate('1048576');
+		expect(gate.maxFrames).to.equal(16);
 	});
 
 	describe('receiveQueueBudget', () => {

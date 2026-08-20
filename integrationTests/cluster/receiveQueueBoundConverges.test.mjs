@@ -166,10 +166,11 @@ suite('Inbound receive-queue budget converges (base copy)', { timeout: 300000 },
 			`the receive-queue budget never engaged at the configured ${TINY_QUEUE_BUDGET}B, so this run does not ` +
 				`exercise the pause path (a pause at the 32 MB default would not prove the config reached the gate)`
 		);
-		// The bound itself. NOTE this does NOT fail if the gate is removed: on a fast loopback receiver an
-		// unbounded queue stays shallow anyway, and reproducing real growth needs a rate mismatch this
-		// harness cannot create. What this suite proves is deadlock-freedom under constant pausing and
-		// that the configured value reaches the gate; the policy math is unit-tested.
+		// The bound itself. Loose in MAGNITUDE — at the floor budget maxFrames is 1, so the frame ceiling
+		// binds first and the observed peak runs ~6.5 KB against a ~1.1 MB allowance — but it does fail if
+		// the gate is removed, since there are then no pause lines at all and the peak reads 0. What
+		// neither suite reproduces is unbounded GROWTH: a fast loopback receiver keeps even an unbounded
+		// queue shallow, so that behavior is field measurement (harper-pro#733), not a test.
 		const peak = Math.max(
 			0,
 			...log

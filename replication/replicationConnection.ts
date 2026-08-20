@@ -772,9 +772,10 @@ export function createReceiveQueueGate(highWaterMark: number): {
 	readonly pauses: number;
 } {
 	// Defensive: production goes through receiveQueueBudget, but this is exported, and a non-finite
-	// budget here fails every comparison — every frame would pause and every settle resume. Treat junk
-	// as disabled rather than as a per-frame pause/resume storm.
-	if (!Number.isFinite(highWaterMark) || highWaterMark < 0) highWaterMark = 0;
+	// budget here fails every comparison — every frame would pause and every settle resume. Route junk
+	// through the same coercion the config path uses, so there is one definition of the policy and junk
+	// lands on the default with the bound still active rather than restoring the unbounded queue.
+	highWaterMark = receiveQueueBudget(highWaterMark);
 	const lowWaterMark = Math.max(1, Math.floor(highWaterMark / 2));
 	// In read-chunk units, so `maxFrames * SOCKET_READ_CHUNK_BYTES <= highWaterMark`: the worst case,
 	// every queued frame pinning a whole chunk, lands at the byte budget instead of a multiple of it.
