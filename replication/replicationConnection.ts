@@ -1501,21 +1501,56 @@ export function matchesCloneCopyCompletion(marker: DbisCursor | undefined, clone
  * and neither can the copy cursor, which is absent until the first flush cadence closes, for a whole
  * copy whose `copyFromNodeId` never resolved, and after `discardMalformedCopyCursor` deletes a bad
  * one. A surviving `copyIncomplete` marker is therefore the authority, and forces a fresh full copy.
- *
- * Ordered so the default path — a usable copy cursor, or a subscription already asking for a full
- * copy — never pays for a store read.
  */
 export function incompleteCopyForcesFullCopy(
 	copyCursor: DbisCursor | undefined,
 	startTime: number,
-	dbisDB: DbisStore | undefined,
-	nodeName: string | undefined
+	markerApplies: boolean
 ): boolean {
-	if (copyCursor || startTime <= 1 || !nodeName) return false;
-	// A store we cannot read cannot rule the marker out, and COPY_START refuses to run a copy it
-	// cannot record — so take the same posture here instead of admitting an unverifiable resume.
-	if (!dbisDB) return true;
-	return readDbisCursorSync(dbisDB, 'copyIncomplete', nodeName) !== undefined;
+	return !copyCursor && startTime > 1 && markerApplies;
+}
+
+/**
+ * The peers this database holds an incomplete base copy from, read once per handshake rather than per
+ * subscribed source. `unknown` is the fail-closed case: a store we cannot read cannot rule a marker
+ * out, and `COPY_START` treats a copy it could not record as one whose interruption is undetectable,
+ * so the resume side takes the same view rather than admitting an unverifiable incremental resume.
+ */
+export function readIncompleteCopyMarkers(dbisDB: DbisStore | undefined): { peers: Set<string>; unknown: boolean } {
+	const peers = new Set<string>();
+	if (!dbisDB) return { peers, unknown: true };
+	try {
+		for (const entry of dbisDB.getRange({
+			start: Symbol.for('copyIncomplete'),
+			end: [Symbol.for('copyIncomplete'), Buffer.from([0xff])],
+		})) {
+			const name = (entry as any)?.key?.[1];
+			if (typeof name === 'string') peers.add(name);
+		}
+	} catch (error) {
+		// A closed database (the sibling `seq` scan tolerates the same class) is not evidence of absence.
+		if (!(error as Error)?.message?.includes('Can not re')) throw error;
+		return { peers, unknown: true };
+	}
+	return { peers, unknown: false };
+}
+
+/**
+ * Does an incomplete-copy marker apply to `nodeName`'s subscription? A marker names the peer the copy
+ * came from, but the condition it records — this database's copy never finished — is database-wide, so
+ * a marker whose peer has left the subscription (leader removed or demoted, or now reached through a
+ * proxy) can never be matched by name. It still has to be honored, so it falls to whichever sources we
+ * do have; any of them can re-deliver the un-copied rows.
+ */
+export function incompleteCopyMarkerApplies(
+	markers: { peers: Set<string>; unknown: boolean },
+	nodeName: string | undefined,
+	subscribedNames: string[]
+): boolean {
+	if (markers.unknown) return true;
+	if (markers.peers.size === 0) return false;
+	if (nodeName && markers.peers.has(nodeName)) return true;
+	return !subscribedNames.some((name) => markers.peers.has(name));
 }
 
 /**
@@ -2852,6 +2887,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// failure is contained rather than thrown — this runs from promise continuations (the
 			// copy-flush `.finally`) — but it is logged at error level, not swallowed: a marker that
 			// cannot be cleared makes every later reconnect re-copy from scratch.
+			if (copyIncompleteUnrecorded !== undefined)
+				logger.error?.(
+					connectionId,
+					`Base copy of database ${databaseName} from ${remoteNodeName} completed without ever recording its in-progress marker; an interruption of it would not have been detectable (harper-pro#658)`
+				);
+			copyIncompleteUnrecorded = undefined;
 			try {
 				const cleared = clearCopyIncompleteMarker(getDatabaseStores().dbisDB, remoteNodeName);
 				if (cleared && typeof (cleared as any).then === 'function')
@@ -3148,8 +3189,42 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// copy BLOB_CHUNKs — not every 'message'. replicateOverWS is bidirectional, so counting arbitrary
 	// frames (schema/subscription updates, reverse-direction traffic) could re-arm the watchdog once per
 	// threshold and mask a genuinely stalled copy. Re-arms the watchdog while copying. (harper-pro#453)
+	// Copy-incomplete marker state (harper-pro#658). `copyIncompleteUnrecorded` holds the copyStartTime of
+	// a copy whose marker has not reached disk yet, so the attempt is retried from copy progress.
+	let copyIncompleteUnrecorded: number | undefined;
+	function recordCopyIncomplete(copyStartTime: number) {
+		const store = getDatabaseStores().dbisDB;
+		if (!store || !remoteNodeName) {
+			copyIncompleteUnrecorded = copyStartTime;
+			logger.warn?.(
+				connectionId,
+				`Cannot yet record the in-progress base copy of database ${databaseName} from ${remoteNodeName || 'unknown node'}; retrying as the copy proceeds (harper-pro#658)`
+			);
+			return;
+		}
+		try {
+			const marked = writeCopyIncompleteMarker(store, remoteNodeName, { copyStartTime });
+			// A store without a synchronous mutator only queues the write and reports failure by rejecting,
+			// so keep the retry armed until the queued write settles.
+			if (marked && typeof (marked as any).then === 'function') {
+				copyIncompleteUnrecorded = copyStartTime;
+				(marked as Promise<unknown>).then(
+					() => {
+						if (copyIncompleteUnrecorded === copyStartTime) copyIncompleteUnrecorded = undefined;
+					},
+					(error) => logger.error?.(connectionId, 'in-progress base-copy marker write failed', databaseName, error)
+				);
+				return;
+			}
+			copyIncompleteUnrecorded = undefined;
+		} catch (error) {
+			copyIncompleteUnrecorded = copyStartTime;
+			logger.error?.(connectionId, 'in-progress base-copy marker write failed', databaseName, error);
+		}
+	}
 	const noteCopyProgress = () => {
 		copyProgressFrames++;
+		if (copyIncompleteUnrecorded !== undefined && inCopyMode) recordCopyIncomplete(copyIncompleteUnrecorded);
 		// Not while paused for back-pressure: the commit-backlog pause trips mid-frame, and the same
 		// frame's (or an already-buffered frame's) progress note would re-arm the watchdog addPauseReason
 		// just stopped. A pause outlasting blobTimeout then reads as a copy stall and the watchdog kills a
@@ -4059,36 +4134,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						(getSharedStatus().buffer as any).notify();
 						break;
 					case COPY_START: {
-						// Record that a copy is in flight BEFORE entering copy mode, so no frame of this copy can
-						// be applied under a resume state that would later look incremental (harper-pro#658). Fail
-						// closed: a copy we cannot record is a copy whose interruption we cannot detect.
-						const copyIncompleteStore = getDatabaseStores().dbisDB;
-						if (!copyIncompleteStore || !remoteNodeName) {
-							logger.error?.(
-								connectionId,
-								`Cannot record an in-progress base copy for database ${databaseName} from ${remoteNodeName || 'unknown node'}; closing rather than risk resuming this copy from the sequence cursor (harper-pro#658)`
-							);
-							wsClosed = true; // no queued frame may still apply as part of this copy
-							close(1011, 'Cannot record in-progress base copy');
-							return;
-						}
-						const closeOnMarkerFailure = (error: unknown) =>
-							closeOnInboundMessageError(error, {
-								connectionId,
-								logger,
-								markInboundClosed: () => (wsClosed = true),
-								close,
-							});
-						try {
-							const marked = writeCopyIncompleteMarker(copyIncompleteStore, remoteNodeName, {
-								copyStartTime: data,
-							});
-							if (marked && typeof (marked as any).then === 'function')
-								(marked as Promise<unknown>).then(undefined, closeOnMarkerFailure);
-						} catch (error) {
-							closeOnMarkerFailure(error);
-							return;
-						}
+						// Record that a copy is in flight BEFORE entering copy mode, so no frame of it can be
+						// applied under a resume state that would later look incremental (harper-pro#658).
+						// Deliberately NOT fail-closed: `getDatabaseStores()` returns empty stores exactly for a
+						// database this node has no local tables for yet — the bootstrap case a full copy exists
+						// for — so refusing the copy would strand a new node in a close/reconnect loop instead of
+						// costing it one extra copy. Retry while the copy runs (the stores resolve as soon as the
+						// schema records land) and leave the pre-marker window at today's exposure.
+						recordCopyIncomplete(data);
 						// the leader is (re)starting a bulk copy; track a resume cursor for it
 						const copyWasAlreadyActive = inCopyMode;
 						if (copyWasAlreadyActive) sawCopyRestart = true;
@@ -6605,6 +6658,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (!error.message.includes('Can not re')) throw error;
 		}
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
+		// One scan per handshake instead of a point-read per subscribed source (harper-pro#658).
+		const incompleteCopyMarkers = readIncompleteCopyMarkers(dbisDB);
+		const subscribedNodeNames: string[] = (options.connection?.nodeSubscriptions ?? []).map((node: any) => node.name);
 		receivingDataFromNodeIds = [];
 		const nodeSubscriptions = options.connection?.nodeSubscriptions.map((node: any) => {
 			const tableSubs = [];
@@ -6772,7 +6828,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				logger.warn?.(
 					`Resuming interrupted copy of database ${databaseName} from ${getNodeURL(node)} at table ${copyCursor.currentTable} after key ${copyCursor.afterKey}`
 				);
-			} else if (incompleteCopyForcesFullCopy(copyCursor, startTime, dbisDB, node.name)) {
+			} else if (
+				incompleteCopyForcesFullCopy(
+					copyCursor,
+					startTime,
+					incompleteCopyMarkerApplies(incompleteCopyMarkers, node.name, subscribedNodeNames)
+				)
+			) {
 				// A base copy from this node was interrupted and left no resumable cursor, so the persisted
 				// seq position is not a baseline we hold: the un-copied rows predate it and an incremental
 				// resume would skip them forever. Copy from scratch instead (harper-pro#658).

@@ -1,76 +1,111 @@
 /**
  * An interrupted base copy can leave `{seq > 1, no copyCursor}` on disk, which read as an incremental
- * resume permanently skips every un-copied row (harper-pro#658). `incompleteCopyForcesFullCopy` is
- * the read-side guard on that state, and the marker helpers are the write side: both must fail
- * closed, and both must reach for the store's synchronous mutator (see their docblocks).
+ * resume permanently skips every un-copied row (harper-pro#658). These are the pieces that stop that:
+ * the marker scan (fail-closed on an unreadable store), the peer-vs-database matching a marker needs
+ * once its peer has left the subscription, the resume veto itself, and the write/clear helpers.
  */
 
 import { expect } from 'chai';
 import {
 	incompleteCopyForcesFullCopy,
+	incompleteCopyMarkerApplies,
+	readIncompleteCopyMarkers,
 	writeCopyIncompleteMarker,
 	clearCopyIncompleteMarker,
 } from '#src/replication/replicationConnection';
 
 const COPY_INCOMPLETE_SYMBOL = Symbol.for('copyIncomplete');
 
-function makeDb(entries = []) {
-	const reads = [];
-	return {
-		reads,
-		getSync(key) {
-			reads.push(key);
-			const [symbol, id] = key;
-			const found = entries.find((entry) => entry.symbol === symbol && entry.id === id);
-			return found?.value;
-		},
-	};
-}
-
-function markerFor(nodeName, copyStartTime = 1785944669000) {
-	return { symbol: COPY_INCOMPLETE_SYMBOL, id: nodeName, value: { copyStartTime } };
+function markers(peers, unknown = false) {
+	return { peers: new Set(peers), unknown };
 }
 
 describe('incompleteCopyForcesFullCopy', () => {
-	it('forces a full copy when a marker survives an interrupted copy with no cursor', () => {
-		const db = makeDb([markerFor('node-a')]);
-		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, db, 'node-a')).to.equal(true);
-		expect(db.reads).to.deep.equal([[COPY_INCOMPLETE_SYMBOL, 'node-a']]);
+	const cursor = { copyStartTime: 1785944669000, currentTable: 'dog', afterKey: 'k-42' };
+
+	it('forces a full copy for a marked source with no resumable cursor', () => {
+		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, true)).to.equal(true);
 	});
 
-	it('does not force a full copy when no marker is on disk (a copy that finished, or never ran)', () => {
-		const db = makeDb();
-		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, db, 'node-a')).to.equal(false);
-	});
-
-	it('is keyed by node name, so another node’s interrupted copy does not force this one to re-copy', () => {
-		const db = makeDb([markerFor('node-b')]);
-		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, db, 'node-a')).to.equal(false);
+	it('does not force one when no marker applies (a copy that finished, or never ran)', () => {
+		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, false)).to.equal(false);
 	});
 
 	it('prefers a usable copy cursor: a resumable copy is not restarted from scratch', () => {
-		const db = makeDb([markerFor('node-a')]);
-		const copyCursor = { copyStartTime: 1785944669000, currentTable: 'dog', afterKey: 'k-42' };
-		expect(incompleteCopyForcesFullCopy(copyCursor, 1785944669174, db, 'node-a')).to.equal(false);
-		expect(db.reads).to.deep.equal([]);
+		expect(incompleteCopyForcesFullCopy(cursor, 1785944669174, true)).to.equal(false);
 	});
 
-	it('skips the store read when the subscription is already requesting a full copy', () => {
-		const db = makeDb([markerFor('node-a')]);
-		expect(incompleteCopyForcesFullCopy(undefined, 0, db, 'node-a')).to.equal(false);
-		expect(incompleteCopyForcesFullCopy(undefined, 1, db, 'node-a')).to.equal(false);
-		expect(db.reads).to.deep.equal([]);
+	it('leaves a subscription that is already requesting a full copy alone', () => {
+		expect(incompleteCopyForcesFullCopy(undefined, 0, true)).to.equal(false);
+		expect(incompleteCopyForcesFullCopy(undefined, 1, true)).to.equal(false);
+	});
+});
+
+describe('readIncompleteCopyMarkers', () => {
+	function makeDb(keys, throwing) {
+		const ranges = [];
+		return {
+			ranges,
+			getRange(options) {
+				ranges.push(options);
+				if (throwing) throw throwing;
+				return keys.map((key) => ({ key, value: { copyStartTime: 1 } }));
+			},
+		};
+	}
+
+	it('collects the peer names of every marker in one scan of the marker keyspace', () => {
+		const db = makeDb([
+			[COPY_INCOMPLETE_SYMBOL, 'node-a'],
+			[COPY_INCOMPLETE_SYMBOL, 'node-b'],
+		]);
+		const result = readIncompleteCopyMarkers(db);
+		expect([...result.peers]).to.deep.equal(['node-a', 'node-b']);
+		expect(result.unknown).to.equal(false);
+		expect(db.ranges).to.have.lengthOf(1);
+		expect(db.ranges[0].start).to.equal(COPY_INCOMPLETE_SYMBOL);
 	});
 
-	it('skips the store read when there is no node name to key by', () => {
-		const db = makeDb([markerFor('node-a')]);
-		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, db, undefined)).to.equal(false);
-		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, db, '')).to.equal(false);
-		expect(db.reads).to.deep.equal([]);
+	it('reports no markers for an empty keyspace', () => {
+		const result = readIncompleteCopyMarkers(makeDb([]));
+		expect(result.peers.size).to.equal(0);
+		expect(result.unknown).to.equal(false);
 	});
 
-	it('fails closed when there is no store to rule the marker out', () => {
-		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, undefined, 'node-a')).to.equal(true);
+	it('fails closed when there is no store to read', () => {
+		expect(readIncompleteCopyMarkers(undefined)).to.deep.equal({ peers: new Set(), unknown: true });
+	});
+
+	it('fails closed on a closed database rather than reading absence into it', () => {
+		const result = readIncompleteCopyMarkers(makeDb([], new Error('Can not read from a closed database')));
+		expect(result.unknown).to.equal(true);
+	});
+
+	it('propagates an unexpected store error instead of masking it', () => {
+		expect(() => readIncompleteCopyMarkers(makeDb([], new Error('disk on fire')))).to.throw('disk on fire');
+	});
+});
+
+describe('incompleteCopyMarkerApplies', () => {
+	it('applies to the peer the interrupted copy came from', () => {
+		expect(incompleteCopyMarkerApplies(markers(['node-a']), 'node-a', ['node-a', 'node-b'])).to.equal(true);
+	});
+
+	it('does not apply to an unrelated peer while the marked one is still subscribed', () => {
+		expect(incompleteCopyMarkerApplies(markers(['node-a']), 'node-b', ['node-a', 'node-b'])).to.equal(false);
+	});
+
+	it('falls to the remaining sources once the marked peer has left the subscription', () => {
+		expect(incompleteCopyMarkerApplies(markers(['gone-leader']), 'node-b', ['node-b', 'node-c'])).to.equal(true);
+	});
+
+	it('applies to nothing when there are no markers', () => {
+		expect(incompleteCopyMarkerApplies(markers([]), 'node-a', ['node-a'])).to.equal(false);
+	});
+
+	it('applies everywhere when the marker state could not be read', () => {
+		expect(incompleteCopyMarkerApplies(markers([], true), 'node-a', ['node-a'])).to.equal(true);
+		expect(incompleteCopyMarkerApplies(markers([], true), undefined, [])).to.equal(true);
 	});
 });
 
@@ -113,10 +148,8 @@ describe('copyIncomplete marker write/clear', () => {
 
 	it('falls back to the queueing mutators and hands their promise back for the caller to route', () => {
 		const store = makeStore({ sync: false });
-		const written = writeCopyIncompleteMarker(store, 'node-a', { copyStartTime: 1 });
-		const cleared = clearCopyIncompleteMarker(store, 'node-a');
-		expect(typeof written.then).to.equal('function');
-		expect(typeof cleared.then).to.equal('function');
+		expect(typeof writeCopyIncompleteMarker(store, 'node-a', { copyStartTime: 1 }).then).to.equal('function');
+		expect(typeof clearCopyIncompleteMarker(store, 'node-a').then).to.equal('function');
 		expect(store.calls.map(([op]) => op)).to.deep.equal(['put', 'remove']);
 	});
 
