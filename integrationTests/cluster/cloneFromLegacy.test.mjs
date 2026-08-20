@@ -18,7 +18,7 @@ import { equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, readLog } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -177,6 +177,35 @@ suite('Clone from legacy v4 leader', { timeout: 240000 }, (ctx) => {
 		ok(
 			legacyConn.database_sockets?.some?.((s) => s.connected),
 			'Clone node should have at least one connected database socket to the v4 source after clone'
+		);
+
+		// harper-pro#737. A v4 leader's leader heuristic is ungated, so it can decide this brand-new clone
+		// is *its* leader and ask for a base copy of the data it just handed over. Whether it gets that far
+		// is a connect-timing race, so the filter check only applies when the request actually arrives; the
+		// BigInt check is unconditional, since that is the symptom this test exists to keep out.
+		let legacyLog = await readLog(legacy);
+		for (let i = 0; i < 20 && !/Requesting full copy of database data/.test(legacyLog); i++) {
+			await delay(500);
+			legacyLog = await readLog(legacy);
+		}
+		if (/Requesting full copy of database data/.test(legacyLog)) {
+			// Either branch of the gate is a pass: whether there was anything to withhold depends on how much
+			// of the clone own copy had landed when the leader asked. What must not happen is the copy going
+			// out unexamined.
+			let gated = false;
+			for (let i = 0; i < 20 && !gated; i++) {
+				gated = /harper-pro#737/.test(await readLog(cloneCtx.harper));
+				if (!gated) await delay(500);
+			}
+			ok(gated, 'The v4 leader asked the clone for a base copy of the data it just supplied; the clone must gate it');
+			legacyLog = await readLog(legacy);
+		}
+		// readLog returns '' for a path that does not exist, which would make the check below pass without
+		// having read anything.
+		ok(legacyLog.length > 0, 'The v4 leader log must be readable for the assertion below to mean anything');
+		ok(
+			!/cannot be converted to a BigInt/.test(legacyLog),
+			'The v4 leader must not hit an undecodable audit entry while forwarding its own log'
 		);
 	});
 
