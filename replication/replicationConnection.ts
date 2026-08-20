@@ -72,6 +72,7 @@ import {
 	routeEntriesIncludePeer,
 	resolveNodeForSendAuth,
 	isGenuineNodeDeletion,
+	nodeRecordPhysicallyExists,
 	SEND_AUTH_UNCHANGED,
 } from './knownNodes.ts';
 import * as process from 'node:process';
@@ -910,7 +911,8 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	// The header claimed blobs but none was reachable (e.g. one living only in a patch chain): we
 	// cannot prove the local copy is whole, so it must not tie.
 	if (blobs.length === 0) return false;
-	for (const blob of blobs) if (!(await hasDurableBlobHeader(blob))) return false;
+	for (const blob of blobs)
+		if (!(await hasDurableBlobHeader(blob))) return false;
 	return true;
 }
 
@@ -1494,13 +1496,10 @@ export function matchesCloneCopyCompletion(marker: DbisCursor | undefined, clone
 }
 
 /**
- * While a base copy is incomplete, the persisted resume state must never select the direct seq-cursor
- * path: the un-copied rows' versions predate the copy, so an audit-log replay from a seq position can
- * never deliver them and the gap is permanent (harper-pro#658). The seq cursor cannot express this on
- * its own (core stores `Math.max(existing, localTime)`, so a copy-era value can never be walked back)
- * and neither can the copy cursor, which is absent until the first flush cadence closes, for a whole
- * copy whose `copyFromNodeId` never resolved, and after `discardMalformedCopyCursor` deletes a bad
- * one. A surviving `copyIncomplete` marker is therefore the authority, and forces a fresh full copy.
+ * A seq position recorded while a base copy was incomplete is not a baseline this node holds: the
+ * un-copied rows' versions predate it, so an audit replay from it can never deliver them. Neither the
+ * seq nor the copy cursor can express that state, so a surviving marker is the authority over both.
+ * See DESIGN.md invariant 16 (harper-pro#658).
  */
 export function incompleteCopyForcesFullCopy(
 	copyCursor: DbisCursor | undefined,
@@ -1511,12 +1510,11 @@ export function incompleteCopyForcesFullCopy(
 }
 
 /**
- * The peers this database holds an incomplete base copy from, read once per handshake rather than per
- * subscribed source. An absent store means no markers: nothing can have been recorded in a store that
- * does not exist, and the veto only matters alongside a persisted seq cursor, which needs the same
- * store to have been read. `unknown` is reserved for a store that exists but cannot be scanned, where
- * a marker cannot be ruled out — `values: false` keeps one undecodable entry from being the thing that
- * makes it unscannable (the sibling `seq` scan is tolerant of the same class, harper-pro#352).
+ * The peers this database holds an incomplete base copy from. An absent store means no markers —
+ * nothing can have been recorded in a store that does not exist, and reading it as a veto would
+ * override an `add_node start_time` cutoff into re-copying the history it excludes. `unknown` is only
+ * for a store that exists but cannot be scanned; `values: false` keeps one undecodable entry from
+ * being what makes it unscannable (as harper-pro#352 did for the sibling `seq` scan).
  */
 export function readIncompleteCopyMarkers(dbisDB: DbisStore | undefined, warn?: (error: unknown) => void) {
 	const peers = new Set<string>();
@@ -1538,28 +1536,38 @@ export function readIncompleteCopyMarkers(dbisDB: DbisStore | undefined, warn?: 
 }
 
 /**
- * Does an incomplete-copy marker apply to `nodeName`'s subscription? A marker names the peer the copy
- * came from, but the condition it records — this database's copy never finished — is database-wide, so
- * a marker whose peer has left the subscription (leader removed or demoted, or now reached through a
- * proxy) can never be matched by name. It still has to be honored, so it falls to whichever sources we
- * do have; any of them can re-deliver the un-copied rows.
+ * Is this peer still in the cluster? A probe failure reads as "still a member": that keeps a marker
+ * from being swept, and from fanning out to every source, on the strength of an unreadable node table.
+ */
+function isClusterMember(peer: string): boolean {
+	try {
+		return nodeRecordPhysicallyExists(peer);
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * A marker names the peer a copy came from, but the state it records is database-wide, so a marker
+ * whose peer has left the CLUSTER can never be matched by name and falls to whichever sources remain.
+ * Membership, not this connection's node list: that list is one peer plus what it proxies, so a live
+ * peer would look departed — over-vetoing here and, worse, being swept while its copy still matters.
  */
 export function incompleteCopyMarkerApplies(
 	markers: { peers: Set<string>; unknown: boolean },
 	nodeName: string | undefined,
-	subscribedNames: string[]
+	isClusterMember: (peer: string) => boolean
 ): boolean {
 	if (markers.unknown) return true;
 	if (markers.peers.size === 0) return false;
 	if (nodeName && markers.peers.has(nodeName)) return true;
-	return !subscribedNames.some((name) => markers.peers.has(name));
+	return [...markers.peers].some((peer) => !isClusterMember(peer));
 }
 
 /**
- * Write and clear the in-progress-copy marker through the store's SYNCHRONOUS mutator where it has
- * one. RocksDB aliases `put` to `putSync`, but LMDB's `put` only queues the write and reports failure
- * by rejecting — invisible to a surrounding `try`, so a fail-closed write would otherwise continue as
- * if it had persisted. The return value is handed back so a caller can still route a rejection.
+ * Retire the markers a durable finish heals: this peer's own, plus any whose peer has left the cluster.
+ * The second half is not optional — nothing else retires an orphan the veto keeps honoring, so the
+ * veto would re-fire on every handshake forever.
  */
 export function writeCopyIncompleteMarker(store: DbisStore, nodeName: string, marker: DbisCursor) {
 	const key = [Symbol.for('copyIncomplete'), nodeName];
@@ -1569,21 +1577,23 @@ export function writeCopyIncompleteMarker(store: DbisStore, nodeName: string, ma
 export function clearCopyIncompleteMarkers(
 	store: DbisStore | undefined,
 	nodeName: string | undefined,
-	subscribedNames: string[] = [],
+	isClusterMember: (peer: string) => boolean,
 	warn?: (error: unknown) => void
 ): string[] {
 	if (!store) return [];
 	const { peers } = readIncompleteCopyMarkers(store, warn);
-	// This peer's own marker, plus every marker whose peer has left the subscription: those are the ones
-	// `incompleteCopyMarkerApplies` honors through its orphan fallback, so nothing else will ever retire
-	// them and the veto would re-fire on every handshake forever (a re-copy storm). A durable finish
-	// heals the database, which is the same premise the fallback asserts.
-	const retiring = [...peers].filter((peer) => peer === nodeName || !subscribedNames.includes(peer));
+	const retiring = [...peers].filter((peer) => peer === nodeName || !isClusterMember(peer));
 	if (nodeName && !peers.has(nodeName)) retiring.push(nodeName);
 	for (const peer of retiring) {
 		const key = [Symbol.for('copyIncomplete'), peer];
-		if (store.removeSync) store.removeSync(key);
-		else Promise.resolve(store.remove(key)).catch((error) => warn?.(error));
+		// Per key, so one store throw cannot abandon the rest of the sweep and leave a marker nothing
+		// else will retire. `remove` is invoked inside the try because it can throw synchronously.
+		try {
+			if (store.removeSync) store.removeSync(key);
+			else Promise.resolve(store.remove(key)).catch((error) => warn?.(error));
+		} catch (error) {
+			warn?.(error);
+		}
 	}
 	return retiring;
 }
@@ -2902,8 +2912,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
 			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
-			// A durable finish retires this peer's marker and sweeps any marker whose peer has left the
-			// subscription — nothing else can retire those, and the orphan fallback keeps honoring them.
 			if (copyIncompleteWriteFailed)
 				logger.error?.(
 					connectionId,
@@ -2912,12 +2920,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyIncompleteUnrecorded = undefined;
 			copyIncompleteWriteFailed = false;
 			try {
-				clearCopyIncompleteMarkers(
-					getDatabaseStores().dbisDB,
-					remoteNodeName,
-					(options.connection?.nodeSubscriptions ?? []).map((node: any) => node.name),
-					(error) =>
-						logger.error?.(connectionId, 'failed to clear an in-progress base-copy marker', databaseName, error)
+				clearCopyIncompleteMarkers(getDatabaseStores().dbisDB, remoteNodeName, isClusterMember, (error) =>
+					logger.error?.(connectionId, 'failed to clear an in-progress base-copy marker', databaseName, error)
 				);
 			} catch (error) {
 				logger.error?.(connectionId, 'failed to clear the in-progress base-copy marker', databaseName, error);
@@ -3209,9 +3213,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// copy BLOB_CHUNKs — not every 'message'. replicateOverWS is bidirectional, so counting arbitrary
 	// frames (schema/subscription updates, reverse-direction traffic) could re-arm the watchdog once per
 	// threshold and mask a genuinely stalled copy. Re-arms the watchdog while copying. (harper-pro#453)
-	// Copy-incomplete marker state (harper-pro#658). While `copyIncompleteUnrecorded` holds a
-	// copyStartTime the marker has not reached disk; the retry is time-gated because it is driven from
-	// copy frames, the highest-volume path there is.
+	// While `copyIncompleteUnrecorded` holds a copyStartTime the marker has not reached disk. The retry
+	// is time-gated because its only driver is the copy-frame path, the highest-volume one there is.
 	let copyIncompleteUnrecorded: number | undefined;
 	let copyIncompleteWriteFailed = false;
 	let copyIncompleteWarned = false;
@@ -3232,13 +3235,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		try {
 			const marked = writeCopyIncompleteMarker(store, remoteNodeName, { copyStartTime });
-			// A store without a synchronous mutator only queues the write and reports failure by rejecting,
-			// so the latch stays set until the queued write settles.
+			// A queueing mutator reports failure by rejecting, so the latch stays set until it settles.
 			if (marked && typeof (marked as any).then === 'function') {
 				copyIncompleteUnrecorded = copyStartTime;
 				(marked as Promise<unknown>).then(
 					() => {
-						if (copyIncompleteUnrecorded === copyStartTime) copyIncompleteUnrecorded = undefined;
+						if (copyIncompleteUnrecorded !== copyStartTime) return;
+						copyIncompleteUnrecorded = undefined;
+						copyIncompleteWriteFailed = false;
 					},
 					(error) => {
 						copyIncompleteWriteFailed = true;
@@ -3248,6 +3252,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				return;
 			}
 			copyIncompleteUnrecorded = undefined;
+			copyIncompleteWriteFailed = false; // a retry that lands must not leave a false alarm behind
 		} catch (error) {
 			copyIncompleteUnrecorded = copyStartTime;
 			copyIncompleteWriteFailed = true;
@@ -5039,7 +5044,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
+							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
+							| undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -6691,11 +6697,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (!error.message.includes('Can not re')) throw error;
 		}
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
-		// One scan per handshake instead of a point-read per subscribed source (harper-pro#658).
 		const incompleteCopyMarkers = readIncompleteCopyMarkers(dbisDB, (error) =>
 			logger.warn?.('Could not scan in-progress base-copy markers for', databaseName, error)
 		);
-		const subscribedNodeNames: string[] = (options.connection?.nodeSubscriptions ?? []).map((node: any) => node.name);
 		receivingDataFromNodeIds = [];
 		const nodeSubscriptions = options.connection?.nodeSubscriptions.map((node: any) => {
 			const tableSubs = [];
@@ -6867,7 +6871,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				incompleteCopyForcesFullCopy(
 					copyCursor,
 					startTime,
-					incompleteCopyMarkerApplies(incompleteCopyMarkers, node.name, subscribedNodeNames)
+					incompleteCopyMarkerApplies(incompleteCopyMarkers, node.name, isClusterMember)
 				)
 			) {
 				// A base copy from this node was interrupted and left no resumable cursor, so the persisted
