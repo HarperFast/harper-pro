@@ -237,6 +237,20 @@ export function positiveMsOr(value: unknown, defaultMs: number): number {
 }
 
 const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
+// Flush a bulk-copy batch once it approaches the payload cap, so a run of large rows can't assemble a
+// single oversized frame (harper-pro#711) that would throw and wedge the copy with no operator escape
+// (existing rows can't be split). Leaves headroom for the in-progress record; a single row above this
+// still relies on raising replication_maxPayload.
+const COPY_FLUSH_BYTES = Math.floor(MAX_PAYLOAD * 0.9);
+
+// Pure oversized-frame predicate, extracted so it is unit-testable (the frameWriter/copyFlushPacer
+// pattern, harper-pro#440). A frame at exactly the cap is allowed; only a strictly larger one is rejected.
+export function exceedsMaxPayload(messageSize: number, maxPayload: number = MAX_PAYLOAD): boolean {
+	return messageSize > maxPayload;
+}
+// Throttle the oversized-send error: it closes and reconnects the leg, so it would otherwise re-log on
+// every reconnect cycle. Module-level so the throttle survives across the per-cycle connection instances.
+const oversizedSendWarnThrottle = createThrottleState();
 // When receiving a replication message, we apply per-record backpressure to keep a single
 // large batch from synchronously decoding thousands of records and ballooning the worker
 // heap past its limit. If the local replicator queue grows beyond this threshold we pause
@@ -2198,6 +2212,10 @@ export async function createWebSocket(
 		noDelay: true, // we want to send the data immediately
 		// we set this very high (2x times the v22 default) because it performs better
 		highWaterMark: 128 * 1024,
+		// Match the server's accept cap (replicator.ts) so the configurable send guard (replication_maxPayload)
+		// is the binding limit on client-initiated legs too. Otherwise ws defaults to 100 MiB here, just under
+		// the 100 MB send default, and raising replication_maxPayload to clear a wedge would hit a silent 1009.
+		maxPayload: 10 * 1024 * 1024 * 1024,
 		rejectUnauthorized: rejectUnauthorized !== false,
 		secureContext: undefined,
 	};
@@ -2331,8 +2349,9 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.socket._socket.unref();
 			// in normal startup, just use info, but adjust log level to warn if we were previously disconnected, because there was a warn message on the disconnect and we want to keep symmetry
 			logger[this.isConnected ? 'info' : 'warn']?.(`Connected to ${this.url}, db: ${this.databaseName}`);
-			this.retries = 0;
-			this.retryTime = INITIAL_RETRY_TIME;
+			// Reset backoff on first successful SEND (onFrameSent), not here on open: a leg that reopens and
+			// immediately fails to send (an oversized frame throws and closes it) must keep escalating toward
+			// the 30 s cap instead of hot-looping at 500 ms and accumulating native TLS state (harper-pro#339).
 			// if we have already connected, we need to send a reconnected event
 			if (this.nodeSubscriptions) {
 				connectedToNode({
@@ -2472,6 +2491,14 @@ export class NodeReplicationConnection extends EventEmitter {
 		// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
 		// Doubling reaches 30 s in ~6 retries (~62 s total) and resets on success.
 		this.retryTime = Math.min(this.retryTime << 1, 30_000);
+	}
+	// Called by replicateOverWS after a frame is actually sent: real progress, so it is safe to reset the
+	// backoff. Gated on a non-zero retries so the healthy hot path (already reset) does nothing.
+	onFrameSent() {
+		if (this.retries !== 0 || this.retryTime !== INITIAL_RETRY_TIME) {
+			this.retries = 0;
+			this.retryTime = INITIAL_RETRY_TIME;
+		}
 	}
 	// Retire the live replicateOverWS instance: the single enforcement point for "at most one live session
 	// per connection". Every path that supersedes a session (socket replaced in connect(), forceReconnect)
@@ -4800,8 +4827,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						const sendQueuedData = () => {
 							if (frame.position - frame.encodingStart > 8) {
 								// if we have more than just a txn time, send it
-								if (checkExcessMessageSize(frame.position - frame.encodingStart)) return;
+								// Throw, don't return: a silent return skips this transaction while later ones
+								// keep advancing the peer's resume cursor past it, losing it permanently. Throwing
+								// closes the leg so it resumes from the un-advanced cursor (as the blob path does).
+								if (checkExcessMessageSize(frame.position - frame.encodingStart))
+									throw new Error('Replication message too large to send');
 								ws.send(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
+								// A frame actually went out: tell the outbound connection so it can reset its reconnect
+								// backoff on genuine progress rather than on bare socket-open (harper-pro#339).
+								options.connection?.onFrameSent?.();
 								logger.debug?.(connectionId, 'Sent message, size:', frame.position - frame.encodingStart);
 								if (databaseName !== 'system') {
 									recordAction(
@@ -5136,7 +5170,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// naturally above; this also bounds same-version bulk data into committable batches.) The
 													// watermark is only advanced to copyStartTime by the single end_txn after the whole copy.
 													if (
-														++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS &&
+														(++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS ||
+															frame.position - frame.encodingStart >= COPY_FLUSH_BYTES) &&
 														frame.position - frame.encodingStart > 8
 													) {
 														recordsSinceCheckpoint = 0;
@@ -6935,16 +6970,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	};
 
 	function checkExcessMessageSize(messageSize) {
-		if (messageSize > MAX_PAYLOAD) {
-			logger.error?.(
-				connectionId,
-				'Message too large to send, size:',
-				messageSize,
-				'remote node:',
-				remoteNodeName,
-				'database:',
-				databaseName
-			);
+		if (exceedsMaxPayload(messageSize)) {
+			const { emit, suppressedCount } = decideThrottledWarn(oversizedSendWarnThrottle, Date.now());
+			if (emit)
+				logger.error?.(
+					connectionId,
+					'Message too large to send, size:',
+					messageSize,
+					'remote node:',
+					remoteNodeName,
+					'database:',
+					databaseName,
+					suppressedCount ? `(${suppressedCount} suppressed)` : ''
+				);
 			return true;
 		}
 	}
