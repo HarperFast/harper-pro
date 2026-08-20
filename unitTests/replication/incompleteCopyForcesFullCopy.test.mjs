@@ -1,15 +1,16 @@
 /**
- * A base copy killed mid-stream can leave `{seq > 1, no copyCursor}` on disk: mid-copy sequence
- * updates persist (and core stores `Math.max(existing, localTime)`, so they cannot be walked back)
- * while the copy cursor is still absent — for the first flush interval/byte budget of a copy, for a
- * whole copy whose `copyFromNodeId` never resolved, or after a malformed one is discarded. Read as
- * an incremental resume, that state permanently skips every un-copied row (harper-pro#658).
- * `incompleteCopyForcesFullCopy` is the read-side guard: a surviving `copyIncomplete` marker means
- * the seq cursor is not a baseline we hold, so the subscription must request a full copy instead.
+ * An interrupted base copy can leave `{seq > 1, no copyCursor}` on disk, which read as an incremental
+ * resume permanently skips every un-copied row (harper-pro#658). `incompleteCopyForcesFullCopy` is
+ * the read-side guard on that state, and the marker helpers are the write side: both must fail
+ * closed, and both must reach for the store's synchronous mutator (see their docblocks).
  */
 
 import { expect } from 'chai';
-import { incompleteCopyForcesFullCopy } from '#src/replication/replicationConnection';
+import {
+	incompleteCopyForcesFullCopy,
+	writeCopyIncompleteMarker,
+	clearCopyIncompleteMarker,
+} from '#src/replication/replicationConnection';
 
 const COPY_INCOMPLETE_SYMBOL = Symbol.for('copyIncomplete');
 
@@ -68,7 +69,61 @@ describe('incompleteCopyForcesFullCopy', () => {
 		expect(db.reads).to.deep.equal([]);
 	});
 
-	it('tolerates a missing dbisDB', () => {
-		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, undefined, 'node-a')).to.equal(false);
+	it('fails closed when there is no store to rule the marker out', () => {
+		expect(incompleteCopyForcesFullCopy(undefined, 1785944669174, undefined, 'node-a')).to.equal(true);
+	});
+});
+
+describe('copyIncomplete marker write/clear', () => {
+	function makeStore({ sync }) {
+		const calls = [];
+		const store = {
+			calls,
+			put(key, value) {
+				calls.push(['put', key, value]);
+				return Promise.resolve(true);
+			},
+			remove(key) {
+				calls.push(['remove', key]);
+				return Promise.resolve(true);
+			},
+		};
+		if (sync) {
+			store.putSync = (key, value) => {
+				calls.push(['putSync', key, value]);
+				return true;
+			};
+			store.removeSync = (key) => {
+				calls.push(['removeSync', key]);
+				return true;
+			};
+		}
+		return store;
+	}
+
+	it('prefers the synchronous mutators, so a failure surfaces as a throw the caller can act on', () => {
+		const store = makeStore({ sync: true });
+		writeCopyIncompleteMarker(store, 'node-a', { copyStartTime: 1785944669000 });
+		clearCopyIncompleteMarker(store, 'node-a');
+		expect(store.calls).to.deep.equal([
+			['putSync', [COPY_INCOMPLETE_SYMBOL, 'node-a'], { copyStartTime: 1785944669000 }],
+			['removeSync', [COPY_INCOMPLETE_SYMBOL, 'node-a']],
+		]);
+	});
+
+	it('falls back to the queueing mutators and hands their promise back for the caller to route', () => {
+		const store = makeStore({ sync: false });
+		const written = writeCopyIncompleteMarker(store, 'node-a', { copyStartTime: 1 });
+		const cleared = clearCopyIncompleteMarker(store, 'node-a');
+		expect(typeof written.then).to.equal('function');
+		expect(typeof cleared.then).to.equal('function');
+		expect(store.calls.map(([op]) => op)).to.deep.equal(['put', 'remove']);
+	});
+
+	it('clears nothing when there is no store or no node name to key by', () => {
+		const store = makeStore({ sync: true });
+		expect(clearCopyIncompleteMarker(undefined, 'node-a')).to.equal(undefined);
+		expect(clearCopyIncompleteMarker(store, undefined)).to.equal(undefined);
+		expect(store.calls).to.deep.equal([]);
 	});
 });
