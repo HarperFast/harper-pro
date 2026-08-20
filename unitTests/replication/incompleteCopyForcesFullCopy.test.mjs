@@ -11,7 +11,7 @@ import {
 	incompleteCopyMarkerApplies,
 	readIncompleteCopyMarkers,
 	writeCopyIncompleteMarker,
-	clearCopyIncompleteMarker,
+	clearCopyIncompleteMarkers,
 } from '#src/replication/replicationConnection';
 
 const COPY_INCOMPLETE_SYMBOL = Symbol.for('copyIncomplete');
@@ -49,7 +49,7 @@ describe('readIncompleteCopyMarkers', () => {
 			getRange(options) {
 				ranges.push(options);
 				if (throwing) throw throwing;
-				return keys.map((key) => ({ key, value: { copyStartTime: 1 } }));
+				return keys.map((key) => ({ key }));
 			},
 		};
 	}
@@ -64,6 +64,7 @@ describe('readIncompleteCopyMarkers', () => {
 		expect(result.unknown).to.equal(false);
 		expect(db.ranges).to.have.lengthOf(1);
 		expect(db.ranges[0].start).to.equal(COPY_INCOMPLETE_SYMBOL);
+		expect(db.ranges[0].values).to.equal(false);
 	});
 
 	it('reports no markers for an empty keyspace', () => {
@@ -72,17 +73,15 @@ describe('readIncompleteCopyMarkers', () => {
 		expect(result.unknown).to.equal(false);
 	});
 
-	it('fails closed when there is no store to read', () => {
-		expect(readIncompleteCopyMarkers(undefined)).to.deep.equal({ peers: new Set(), unknown: true });
+	it('reads no store as no markers, so an add_node start_time cutoff is not overridden', () => {
+		expect(readIncompleteCopyMarkers(undefined)).to.deep.equal({ peers: new Set(), unknown: false });
 	});
 
-	it('fails closed on a closed database rather than reading absence into it', () => {
-		const result = readIncompleteCopyMarkers(makeDb([], new Error('Can not read from a closed database')));
+	it('fails closed on a store it cannot scan, and reports the error instead of throwing', () => {
+		const warned = [];
+		const result = readIncompleteCopyMarkers(makeDb([], new Error('poison entry')), (error) => warned.push(error));
 		expect(result.unknown).to.equal(true);
-	});
-
-	it('propagates an unexpected store error instead of masking it', () => {
-		expect(() => readIncompleteCopyMarkers(makeDb([], new Error('disk on fire')))).to.throw('disk on fire');
+		expect(warned).to.have.lengthOf(1);
 	});
 });
 
@@ -103,17 +102,20 @@ describe('incompleteCopyMarkerApplies', () => {
 		expect(incompleteCopyMarkerApplies(markers([]), 'node-a', ['node-a'])).to.equal(false);
 	});
 
-	it('applies everywhere when the marker state could not be read', () => {
+	it('applies everywhere when the marker state could not be scanned', () => {
 		expect(incompleteCopyMarkerApplies(markers([], true), 'node-a', ['node-a'])).to.equal(true);
 		expect(incompleteCopyMarkerApplies(markers([], true), undefined, [])).to.equal(true);
 	});
 });
 
 describe('copyIncomplete marker write/clear', () => {
-	function makeStore({ sync }) {
+	function makeStore({ sync, markers = [] }) {
 		const calls = [];
 		const store = {
 			calls,
+			getRange() {
+				return markers.map((peer) => ({ key: [COPY_INCOMPLETE_SYMBOL, peer] }));
+			},
 			put(key, value) {
 				calls.push(['put', key, value]);
 				return Promise.resolve(true);
@@ -136,27 +138,39 @@ describe('copyIncomplete marker write/clear', () => {
 		return store;
 	}
 
-	it('prefers the synchronous mutators, so a failure surfaces as a throw the caller can act on', () => {
-		const store = makeStore({ sync: true });
+	it('prefers the synchronous mutator, so a failure surfaces as a throw the caller can act on', () => {
+		const store = makeStore({ sync: true, markers: ['node-a'] });
 		writeCopyIncompleteMarker(store, 'node-a', { copyStartTime: 1785944669000 });
-		clearCopyIncompleteMarker(store, 'node-a');
+		clearCopyIncompleteMarkers(store, 'node-a', ['node-a']);
 		expect(store.calls).to.deep.equal([
 			['putSync', [COPY_INCOMPLETE_SYMBOL, 'node-a'], { copyStartTime: 1785944669000 }],
 			['removeSync', [COPY_INCOMPLETE_SYMBOL, 'node-a']],
 		]);
 	});
 
-	it('falls back to the queueing mutators and hands their promise back for the caller to route', () => {
-		const store = makeStore({ sync: false });
+	it('falls back to the queueing mutator on a store without one', () => {
+		const store = makeStore({ sync: false, markers: ['node-a'] });
 		expect(typeof writeCopyIncompleteMarker(store, 'node-a', { copyStartTime: 1 }).then).to.equal('function');
-		expect(typeof clearCopyIncompleteMarker(store, 'node-a').then).to.equal('function');
+		clearCopyIncompleteMarkers(store, 'node-a', ['node-a']);
 		expect(store.calls.map(([op]) => op)).to.deep.equal(['put', 'remove']);
 	});
 
-	it('clears nothing when there is no store or no node name to key by', () => {
-		const store = makeStore({ sync: true });
-		expect(clearCopyIncompleteMarker(undefined, 'node-a')).to.equal(undefined);
-		expect(clearCopyIncompleteMarker(store, undefined)).to.equal(undefined);
-		expect(store.calls).to.deep.equal([]);
+	it('sweeps markers whose peer has left the subscription, so nothing is left to re-fire the veto', () => {
+		const store = makeStore({ sync: true, markers: ['gone-leader', 'node-a', 'node-b'] });
+		const retired = clearCopyIncompleteMarkers(store, 'node-a', ['node-a', 'node-b']);
+		expect(retired.sort()).to.deep.equal(['gone-leader', 'node-a']);
+		expect(store.calls).to.deep.equal([
+			['removeSync', [COPY_INCOMPLETE_SYMBOL, 'gone-leader']],
+			['removeSync', [COPY_INCOMPLETE_SYMBOL, 'node-a']],
+		]);
+	});
+
+	it('still clears this peer when its own marker never made it to disk', () => {
+		const store = makeStore({ sync: true, markers: [] });
+		expect(clearCopyIncompleteMarkers(store, 'node-a', ['node-a'])).to.deep.equal(['node-a']);
+	});
+
+	it('clears nothing without a store', () => {
+		expect(clearCopyIncompleteMarkers(undefined, 'node-a', ['node-a'])).to.deep.equal([]);
 	});
 });

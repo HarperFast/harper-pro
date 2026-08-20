@@ -1476,7 +1476,7 @@ export type DbisStore = {
  */
 export function readDbisCursorSync(
 	dbisDB: DbisStore | undefined,
-	kind: 'seq' | 'copyCursor' | 'cloneCopyComplete' | 'copyIncomplete',
+	kind: 'seq' | 'copyCursor' | 'cloneCopyComplete',
 	id: any
 ): DbisCursor | undefined {
 	// getSync is load-bearing here: reverting it to get() would return a MaybePromise that no longer
@@ -1512,24 +1512,26 @@ export function incompleteCopyForcesFullCopy(
 
 /**
  * The peers this database holds an incomplete base copy from, read once per handshake rather than per
- * subscribed source. `unknown` is the fail-closed case: a store we cannot read cannot rule a marker
- * out, and `COPY_START` treats a copy it could not record as one whose interruption is undetectable,
- * so the resume side takes the same view rather than admitting an unverifiable incremental resume.
+ * subscribed source. An absent store means no markers: nothing can have been recorded in a store that
+ * does not exist, and the veto only matters alongside a persisted seq cursor, which needs the same
+ * store to have been read. `unknown` is reserved for a store that exists but cannot be scanned, where
+ * a marker cannot be ruled out — `values: false` keeps one undecodable entry from being the thing that
+ * makes it unscannable (the sibling `seq` scan is tolerant of the same class, harper-pro#352).
  */
-export function readIncompleteCopyMarkers(dbisDB: DbisStore | undefined): { peers: Set<string>; unknown: boolean } {
+export function readIncompleteCopyMarkers(dbisDB: DbisStore | undefined, warn?: (error: unknown) => void) {
 	const peers = new Set<string>();
-	if (!dbisDB) return { peers, unknown: true };
+	if (!dbisDB) return { peers, unknown: false };
 	try {
 		for (const entry of dbisDB.getRange({
 			start: Symbol.for('copyIncomplete'),
 			end: [Symbol.for('copyIncomplete'), Buffer.from([0xff])],
+			values: false,
 		})) {
-			const name = (entry as any)?.key?.[1];
+			const name = ((entry as any)?.key ?? entry)?.[1];
 			if (typeof name === 'string') peers.add(name);
 		}
 	} catch (error) {
-		// A closed database (the sibling `seq` scan tolerates the same class) is not evidence of absence.
-		if (!(error as Error)?.message?.includes('Can not re')) throw error;
+		warn?.(error);
 		return { peers, unknown: true };
 	}
 	return { peers, unknown: false };
@@ -1564,10 +1566,26 @@ export function writeCopyIncompleteMarker(store: DbisStore, nodeName: string, ma
 	return store.putSync ? store.putSync(key, marker) : store.put(key, marker);
 }
 
-export function clearCopyIncompleteMarker(store: DbisStore | undefined, nodeName: string | undefined) {
-	if (!store || !nodeName) return;
-	const key = [Symbol.for('copyIncomplete'), nodeName];
-	return store.removeSync ? store.removeSync(key) : store.remove(key);
+export function clearCopyIncompleteMarkers(
+	store: DbisStore | undefined,
+	nodeName: string | undefined,
+	subscribedNames: string[] = [],
+	warn?: (error: unknown) => void
+): string[] {
+	if (!store) return [];
+	const { peers } = readIncompleteCopyMarkers(store, warn);
+	// This peer's own marker, plus every marker whose peer has left the subscription: those are the ones
+	// `incompleteCopyMarkerApplies` honors through its orphan fallback, so nothing else will ever retire
+	// them and the veto would re-fire on every handshake forever (a re-copy storm). A durable finish
+	// heals the database, which is the same premise the fallback asserts.
+	const retiring = [...peers].filter((peer) => peer === nodeName || !subscribedNames.includes(peer));
+	if (nodeName && !peers.has(nodeName)) retiring.push(nodeName);
+	for (const peer of retiring) {
+		const key = [Symbol.for('copyIncomplete'), peer];
+		if (store.removeSync) store.removeSync(key);
+		else Promise.resolve(store.remove(key)).catch((error) => warn?.(error));
+	}
+	return retiring;
 }
 
 /**
@@ -2778,6 +2796,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let copyFlushBackoffUntil = 0;
 	let copyFlushRetryMs = 0;
 	let copyFlushRetryTimer;
+	const COPY_INCOMPLETE_RETRY_MS = 1000;
 	const COPY_CURSOR_FLUSH_BYTES = env.get('replication_copyCursorFlushBytes') ?? 64 * 1024 * 1024;
 	const COPY_CURSOR_FLUSH_INTERVAL_MS = Math.max(env.get('replication_copyCursorFlushIntervalMs') ?? 5000, 1);
 	// copyApply (and its WAL-off durability gate) engages for every RocksDB copy, the system DB included. The
@@ -2883,22 +2902,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
 			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
-			// The copy is fully durable, so the in-progress marker may go (harper-pro#658). A removal
-			// failure is contained rather than thrown — this runs from promise continuations (the
-			// copy-flush `.finally`) — but it is logged at error level, not swallowed: a marker that
-			// cannot be cleared makes every later reconnect re-copy from scratch.
-			if (copyIncompleteUnrecorded !== undefined)
+			// A durable finish retires this peer's marker and sweeps any marker whose peer has left the
+			// subscription — nothing else can retire those, and the orphan fallback keeps honoring them.
+			if (copyIncompleteWriteFailed)
 				logger.error?.(
 					connectionId,
-					`Base copy of database ${databaseName} from ${remoteNodeName} completed without ever recording its in-progress marker; an interruption of it would not have been detectable (harper-pro#658)`
+					`Base copy of database ${databaseName} from ${remoteNodeName} completed after its in-progress marker failed to persist; an interruption of it would not have been detectable (harper-pro#658)`
 				);
 			copyIncompleteUnrecorded = undefined;
+			copyIncompleteWriteFailed = false;
 			try {
-				const cleared = clearCopyIncompleteMarker(getDatabaseStores().dbisDB, remoteNodeName);
-				if (cleared && typeof (cleared as any).then === 'function')
-					(cleared as Promise<unknown>).then(undefined, (error) =>
-						logger.error?.(connectionId, 'failed to clear the in-progress base-copy marker', databaseName, error)
-					);
+				clearCopyIncompleteMarkers(
+					getDatabaseStores().dbisDB,
+					remoteNodeName,
+					(options.connection?.nodeSubscriptions ?? []).map((node: any) => node.name),
+					(error) =>
+						logger.error?.(connectionId, 'failed to clear an in-progress base-copy marker', databaseName, error)
+				);
 			} catch (error) {
 				logger.error?.(connectionId, 'failed to clear the in-progress base-copy marker', databaseName, error);
 			}
@@ -3189,42 +3209,55 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// copy BLOB_CHUNKs — not every 'message'. replicateOverWS is bidirectional, so counting arbitrary
 	// frames (schema/subscription updates, reverse-direction traffic) could re-arm the watchdog once per
 	// threshold and mask a genuinely stalled copy. Re-arms the watchdog while copying. (harper-pro#453)
-	// Copy-incomplete marker state (harper-pro#658). `copyIncompleteUnrecorded` holds the copyStartTime of
-	// a copy whose marker has not reached disk yet, so the attempt is retried from copy progress.
+	// Copy-incomplete marker state (harper-pro#658). While `copyIncompleteUnrecorded` holds a
+	// copyStartTime the marker has not reached disk; the retry is time-gated because it is driven from
+	// copy frames, the highest-volume path there is.
 	let copyIncompleteUnrecorded: number | undefined;
+	let copyIncompleteWriteFailed = false;
+	let copyIncompleteWarned = false;
+	let copyIncompleteRetryAt = 0;
 	function recordCopyIncomplete(copyStartTime: number) {
+		copyIncompleteRetryAt = performance.now() + COPY_INCOMPLETE_RETRY_MS;
 		const store = getDatabaseStores().dbisDB;
 		if (!store || !remoteNodeName) {
 			copyIncompleteUnrecorded = copyStartTime;
-			logger.warn?.(
-				connectionId,
-				`Cannot yet record the in-progress base copy of database ${databaseName} from ${remoteNodeName || 'unknown node'}; retrying as the copy proceeds (harper-pro#658)`
-			);
+			if (!copyIncompleteWarned) {
+				copyIncompleteWarned = true;
+				logger.warn?.(
+					connectionId,
+					`Cannot yet record the in-progress base copy of database ${databaseName} from ${remoteNodeName || 'unknown node'}; retrying as the copy proceeds (harper-pro#658)`
+				);
+			}
 			return;
 		}
 		try {
 			const marked = writeCopyIncompleteMarker(store, remoteNodeName, { copyStartTime });
 			// A store without a synchronous mutator only queues the write and reports failure by rejecting,
-			// so keep the retry armed until the queued write settles.
+			// so the latch stays set until the queued write settles.
 			if (marked && typeof (marked as any).then === 'function') {
 				copyIncompleteUnrecorded = copyStartTime;
 				(marked as Promise<unknown>).then(
 					() => {
 						if (copyIncompleteUnrecorded === copyStartTime) copyIncompleteUnrecorded = undefined;
 					},
-					(error) => logger.error?.(connectionId, 'in-progress base-copy marker write failed', databaseName, error)
+					(error) => {
+						copyIncompleteWriteFailed = true;
+						logger.error?.(connectionId, 'in-progress base-copy marker write failed', databaseName, error);
+					}
 				);
 				return;
 			}
 			copyIncompleteUnrecorded = undefined;
 		} catch (error) {
 			copyIncompleteUnrecorded = copyStartTime;
+			copyIncompleteWriteFailed = true;
 			logger.error?.(connectionId, 'in-progress base-copy marker write failed', databaseName, error);
 		}
 	}
 	const noteCopyProgress = () => {
 		copyProgressFrames++;
-		if (copyIncompleteUnrecorded !== undefined && inCopyMode) recordCopyIncomplete(copyIncompleteUnrecorded);
+		if (copyIncompleteUnrecorded !== undefined && inCopyMode && performance.now() >= copyIncompleteRetryAt)
+			recordCopyIncomplete(copyIncompleteUnrecorded);
 		// Not while paused for back-pressure: the commit-backlog pause trips mid-frame, and the same
 		// frame's (or an already-buffered frame's) progress note would re-arm the watchdog addPauseReason
 		// just stopped. A pause outlasting blobTimeout then reads as a copy stall and the watchdog kills a
@@ -6659,7 +6692,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
 		// One scan per handshake instead of a point-read per subscribed source (harper-pro#658).
-		const incompleteCopyMarkers = readIncompleteCopyMarkers(dbisDB);
+		const incompleteCopyMarkers = readIncompleteCopyMarkers(dbisDB, (error) =>
+			logger.warn?.('Could not scan in-progress base-copy markers for', databaseName, error)
+		);
 		const subscribedNodeNames: string[] = (options.connection?.nodeSubscriptions ?? []).map((node: any) => node.name);
 		receivingDataFromNodeIds = [];
 		const nodeSubscriptions = options.connection?.nodeSubscriptions.map((node: any) => {
