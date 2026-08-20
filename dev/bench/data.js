@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787135931118,
+  "lastUpdate": 1787222422190,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -3379,6 +3379,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 1769.13,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lavinia",
+            "username": "ldt1996",
+            "email": "lavinia@harperdb.io"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "84403ffb6bf2b9da23afc9ff120fa636e15f4a1f",
+          "message": "fix(replication): fail loud on oversized frame, with backoff escalation and copy-batch capping (#713)",
+          "timestamp": "2026-08-20T04:09:06Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/84403ffb6bf2b9da23afc9ff120fa636e15f4a1f"
+        },
+        "date": 1787222419784,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 9631.84,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 16731.05,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 12725.61,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 7376.58,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 4479.88,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 1689.83,
             "unit": "ops/sec"
           }
         ]
