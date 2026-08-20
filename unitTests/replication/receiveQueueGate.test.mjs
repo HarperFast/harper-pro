@@ -119,6 +119,16 @@ describe('replication inbound frame queue budget — #2226 unbounded receive que
 		expect(gate.queuedBytes).to.equal(1000 << 20); // 1 GB queued, never a pause
 	});
 
+	it('treats a non-finite budget as disabled rather than pausing every frame', () => {
+		// receiveQueueBudget keeps this unreachable in production; the gate is exported, so it holds on
+		// its own. A NaN budget would otherwise fail every comparison in both directions.
+		for (const budget of [NaN, Infinity, -1]) {
+			const gate = createReceiveQueueGate(budget);
+			for (let i = 0; i < 100; i++) expect(gate.admit(1 << 20)).to.equal(false);
+			expect(gate.paused).to.equal(false);
+		}
+	});
+
 	describe('receiveQueueBudget', () => {
 		// `env.get` resolves only names registered in CONFIG_PARAMS, so an unregistered key silently
 		// falls back to the default — how replication_leadingDuplicateSkip shipped inert (harper-pro#395).

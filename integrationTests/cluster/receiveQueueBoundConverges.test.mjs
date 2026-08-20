@@ -10,9 +10,9 @@
  * The risk that needs proving is not the bound — that is unit-tested — it is DEADLOCK. Every prior
  * receive-side pause bug in this file (#457 consumer-less blob back-pressure, #403, #420) was a
  * pause that never lifted, and each one wedged replication silently. So this test runs a blob-dense
- * base copy — the scenario that historically wedged — with the budget set absurdly low (4 KB, i.e.
- * smaller than a single blob chunk, so the gate pauses on essentially every frame) and asserts the
- * copy still converges.
+ * base copy — the scenario that historically wedged — with the budget at its floor (one 64 KB socket
+ * read chunk, far below one 512 KB blob's frames, so the gate pauses on essentially every frame) and
+ * asserts the copy still converges.
  *
  * Expected: converges, with the pause having engaged many times. If the gate could strand a pause
  * reason, this is the configuration that would show it.
@@ -144,7 +144,7 @@ suite('Inbound receive-queue budget converges (base copy)', { timeout: 300000 },
 		}
 		// Match the CONFIGURED budget in the warn payload, not merely that a pause happened: 80 x 512 KB
 		// of blob payload can trip the 32 MB DEFAULT on its own, so a bare "did it pause" assertion goes
-		// green even when the configured 4 KB never reached the gate — which is precisely what an
+		// green even when the configured budget never reached the gate — which is precisely what an
 		// unregistered config param would do (harper-pro#395). The logger pretty-prints the details
 		// object across lines, so match within the block that follows the message, not within one line.
 		const engaged = log
