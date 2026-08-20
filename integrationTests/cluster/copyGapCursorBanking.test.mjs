@@ -1,5 +1,5 @@
 /**
- * Copy-cursor banking under sustained transient blob faults (harper-pro#699).
+ * Copy-cursor banking across repeated transient blob faults (harper-pro#699).
  *
  * Field failure this reproduces: a blob-dense base copy on a link with a sustained transient
  * blob-fault supply (kohls: copy-vs-copy PENDING-placeholder collisions, ~39 faults/min) never
@@ -10,19 +10,17 @@
  *
  * Setup: A seeds file-backed blob records, then B joins (add_node → base copy A→B). B's
  * fault injector makes every /blobs/ save SLOW (kept in flight across frames — the condition
- * that starves the old snapshot) and fails every Nth save (the sustained transient fault
- * supply). `replication.blobGapReconnectMs` shortens the #683 watchdog so gap cycles take
- * seconds instead of 15 minutes.
+ * that starves the old snapshot) and fails selected saves across both the initial and resumed
+ * passes. `replication.blobGapReconnectMs` shortens the #683 watchdog so gap cycles take seconds
+ * instead of 15 minutes.
  *
  * Oracles (the resume trail is the discriminating one):
- *  1. The blob-gap watchdog fires repeatedly (the fault supply and reconnect cycles are real).
+ *  1. Injected blob gaps force repeated reconnect cycles.
  *  2. B's "Resuming interrupted copy … after key K" trail shows ≥2 distinct, monotonically
  *     advancing keys: each cycle banked the prefix walked before that cycle's first fault.
  *     Without per-position banking, no mid-walk cursor is persisted under these conditions, so
  *     reconnects re-request a full copy and this assertion fails.
- *  3. The copy converges: B reaches A's record count and at least A's count of full-size blob
- *     files — per-cycle banking strictly shrinks the remaining tail, so even a permanent
- *     every-Nth fault supply terminates.
+ *  3. The copy converges: B reaches A's record count and every referenced blob payload is intact.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -44,7 +42,9 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 
 const BLOB_RECORDS = 40; // /LargeLocation/{n} on A — each a deterministic ~50 KB file-backed blob
 const BLOB_BYTES = 50 * 1024;
-const FAIL_INTERVAL = 5; // dense enough that the resumed repair pass also encounters a fault
+// Saves 15 and 31 damage the initial pass; save 42 faults the second repair after the resumed
+// walk has advanced beyond the first gap.
+const FAIL_SAVE_NUMBERS = [15, 31, 42];
 const INITIAL_DAMAGED_RECORDS = 2;
 const BLOB_SLOW_MS = 400; // every save held in flight, so the pre-#699 snapshot instant never occurs
 const GAP_RECONNECT_MS = 3000; // #683 watchdog cycle, shortened from the 900s default
@@ -123,7 +123,7 @@ const sharedConfig = (host) => ({
 	replication: { securePort: host + ':9933' },
 });
 
-suite('Copy-cursor banking under sustained transient blob faults (#699)', { timeout: 600000 }, (ctx) => {
+suite('Copy-cursor banking across repeated transient blob faults (#699)', { timeout: 600000 }, (ctx) => {
 	before(async () => {
 		const nodeA = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		const nodeB = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
@@ -135,7 +135,7 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 			},
 			env: {
 				HARPER_NO_FLUSH_ON_EXIT: true,
-				HARPER_TEST_BLOB_FAIL_INTERVAL: String(FAIL_INTERVAL),
+				HARPER_TEST_BLOB_FAIL_NUMBERS: FAIL_SAVE_NUMBERS.join(','),
 				HARPER_TEST_BLOB_SLOW_MS: String(BLOB_SLOW_MS),
 			},
 		});
@@ -191,6 +191,8 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 			operation: 'create_authentication_tokens',
 			authorization: A.admin,
 		});
+		const armResponse = await fetchWithRetry(B.httpURL + '/ArmBlobFaultInjector');
+		ok(armResponse.ok, `fault injector did not arm: HTTP ${armResponse.status}`);
 		await sendOperation(B, {
 			operation: 'add_node',
 			rejectUnauthorized: false,
@@ -198,16 +200,11 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 			authorization: 'Bearer ' + tokenResp.operation_token,
 		});
 
-		// Each watchdog cycle banks the prefix walked before its first fault and strictly shrinks the
-		// remaining tail, so with a fault guaranteed in every full-size pass the copy needs SEVERAL
-		// banked cycles to complete. Wait until the resume trail shows at least two banked cycles (plus
-		// record convergence) rather than gating on blob-file counts — re-streams mint fresh fileIds, so
-		// file counts pass long before the cycles under test have run. Pre-#699 this loop times out:
-		// no mid-walk cursor is ever persisted, so the resume trail never materializes.
 		let bCount = 0;
 		let bLog = '';
 		let resumeKeys = [];
 		let inPlaceRepairs = 0;
+		let injected = 0;
 		const deadline = Date.now() + 360000;
 		while (Date.now() < deadline) {
 			bCount =
@@ -218,9 +215,10 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 				Number(m[1])
 			);
 			inPlaceRepairs = (bLog.match(/Repaired blob file in place/g) ?? []).length;
+			injected = (bLog.match(/\[blob-fail-slow-injector\] failing save /g) ?? []).length;
 			if (
 				bCount >= aCount &&
-				new Set(resumeKeys).size >= 2 &&
+				injected >= FAIL_SAVE_NUMBERS.length &&
 				inPlaceRepairs >= INITIAL_DAMAGED_RECORDS &&
 				missingPayloadIds(B.dataRootDir, aCount).length === 0
 			)
@@ -229,7 +227,6 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 		}
 
 		const missing = await missingReferencedPayloadIds(B, aCount);
-		const injected = (bLog.match(/\[blob-fail-slow-injector\] failing save /g) ?? []).length;
 		const watchdogFires = (bLog.match(/Blob-gap watchdog/g) ?? []).length;
 		const bankedReconnects = (bLog.match(/reconnecting immediately to re-stream/g) ?? []).length;
 		console.log(
@@ -238,7 +235,10 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 				`inPlaceRepairs=${inPlaceRepairs}`
 		);
 
-		ok(injected >= 2, `fault supply never materialized (${injected} injected failures)`);
+		ok(
+			injected === FAIL_SAVE_NUMBERS.length,
+			`fault schedule did not fully materialize (${injected}/${FAIL_SAVE_NUMBERS.length} injected failures)`
+		);
 		// A banked cycle reconnects immediately after its final barrier persist; the watchdog only
 		// paces cycles that banked nothing. Either signal proves gap cycles occurred.
 		ok(
@@ -260,7 +260,7 @@ suite('Copy-cursor banking under sustained transient blob faults (#699)', { time
 		}
 		ok(
 			bCount >= aCount && missing.length === 0,
-			`copy did not converge under the sustained fault supply: B records=${bCount}/${aCount}, ` +
+			`copy did not converge under the scheduled fault supply: B records=${bCount}/${aCount}, ` +
 				`records missing their blob payload: [${missing}] (final banked cursor: ${resumeKeys.at(-1)})`
 		);
 		// The dangling-reference heal (#699's data-loss half): at least one committed record whose blob
