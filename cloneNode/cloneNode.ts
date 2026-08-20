@@ -458,6 +458,7 @@ async function establishReplicationSetup(): Promise<void> {
 		verify_tls: boolean;
 		url: string;
 		isLeader: true;
+		requirePeerAck: true;
 		authorization?:
 			| {
 					username: string;
@@ -471,6 +472,11 @@ async function establishReplicationSetup(): Promise<void> {
 		verify_tls: false, // set node cross-signs the cluster with harper self-signed certs
 		url: leaderReplicationURL,
 		isLeader: true,
+		// setNode writes the local peer row and returns success-with-warning when the leader exchange
+		// fails. A clone cannot treat that as success: the marker would record replicationEstablished,
+		// every later start would skip setup permanently, and the monitor would poll a leader that never
+		// accepted this node until the ceiling expired.
+		requirePeerAck: true,
 	};
 
 	if (!usingCertAuth) {
