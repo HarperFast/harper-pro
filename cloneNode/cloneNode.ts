@@ -30,6 +30,7 @@ import {
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
+import { cloneAttemptPath as cloneAttemptFilePath } from './cloneAttempt.ts';
 import {
 	isExplicitDatabaseSubscription,
 	isReplicatedDatabase as isReplicatedDatabaseUnder,
@@ -87,7 +88,6 @@ import {
 const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
 const DEFAULT_REPLICATION_PORT = '9933';
-const CLONE_ATTEMPT_FILE = '.cloneAttempt.json';
 const CLONE_ATTEMPT_ENV = 'HARPER_CLONE_ATTEMPT';
 
 const CONFIG_TO_EXCLUDE_FROM_CLONE = {
@@ -371,6 +371,11 @@ export async function cloneNode(): Promise<void> {
 			log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
 		}
 		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		// A clone that stops here keeps running, and both halves of the in-flight signal would stay set,
+		// so the replication send path would go on withholding this leader's own records from a base copy
+		// back to it for the life of the process (harper-pro#737) — including from a leader that asked for
+		// that copy because it had lost them. Retiring the attempt costs a retry a fresh base copy.
+		clearCloneAttempt();
 		log(
 			`Clone from leader node ${leaderURL} failed to obtain JWT signing keys (${err}); node is running but Unavailable and not marked as cloned`,
 			'error'
@@ -394,6 +399,7 @@ export async function cloneNode(): Promise<void> {
 		// config, so a bare return would leave it set and the next non-forced start would skip cloning
 		// despite the unconfirmed sync. Clearing it ensures a subsequent start retries the clone.
 		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		clearCloneAttempt(); // see the JWT-key failure above (harper-pro#737)
 		log(
 			`Clone from leader node ${leaderURL} did not complete synchronization; node is running but Unavailable and not marked as cloned`,
 			'error'
@@ -1200,26 +1206,40 @@ function writeJsonSync(path: string, data: any): void {
 }
 
 function cloneAttemptPath(): string {
-	return join(rootPath, CLONE_ATTEMPT_FILE);
+	return cloneAttemptFilePath(rootPath);
 }
 
 function startCloneAttempt(): void {
 	const path = cloneAttemptPath();
 	let attemptId: string | undefined;
+	let persistedLeaderHost: string | undefined;
 	if (pathExists(path)) {
 		try {
 			const persisted = JSON.parse(readFileSync(path, 'utf8'));
 			if (typeof persisted?.attemptId === 'string') attemptId = persisted.attemptId;
+			if (typeof persisted?.leaderHost === 'string') persistedLeaderHost = persisted.leaderHost;
 		} catch (error) {
 			log(`Could not read persisted clone attempt at ${path}: ${error}`, 'error');
 		}
 	}
-	if (!attemptId) {
-		attemptId = randomBytes(16).toString('hex');
+	// The marker names the host being cloned from, not just the attempt: the replication send path uses
+	// it to withhold that host's own records from a base copy back to it (harper-pro#737), and a marker
+	// that cannot name the source must not authorize withholding from anyone.
+	let leaderHost: string | undefined = persistedLeaderHost;
+	try {
+		// `new URL('host:9933')` parses as a protocol and yields an empty host, so only a real host is
+		// recorded — and never over a good persisted one, which a resumed attempt still needs.
+		const derived = leaderURL ? new URL(leaderURL).hostname : undefined;
+		if (derived) leaderHost = derived;
+	} catch (error) {
+		log(`Could not derive the leader host from ${leaderURL}: ${error}`, 'error');
+	}
+	if (!attemptId || leaderHost !== persistedLeaderHost) {
+		attemptId ??= randomBytes(16).toString('hex');
 		try {
 			const temporaryPath = `${path}.${process.pid}.tmp`;
 			mkdirSync(dirname(path), { recursive: true });
-			writeFileSync(temporaryPath, JSON.stringify({ attemptId }), { encoding: 'utf8', mode: 0o600 });
+			writeFileSync(temporaryPath, JSON.stringify({ attemptId, leaderHost }), { encoding: 'utf8', mode: 0o600 });
 			renameSync(temporaryPath, path);
 		} catch (error) {
 			log(`Could not persist clone attempt at ${path}: ${error}`, 'error');

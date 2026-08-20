@@ -99,6 +99,7 @@ import {
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
+import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
 const logger = forComponent('replication').conditional as Logger;
 
 // msgpackr v2 removed the built-in `randomAccessStructure` option; that random-access
@@ -331,6 +332,33 @@ export function shouldForceBaseCopyForRetention(
 	// 0 means a base copy was already requested; guard against non-positive/NaN starts too.
 	if (!(requestedStartTime > 0)) return false;
 	return requestedStartTime < Math.max(oldestRetainedTime ?? 0, retentionCutoffTime);
+}
+
+export function hostnameFromNodeUrl(url: unknown): string | undefined {
+	if (typeof url !== 'string') return undefined;
+	try {
+		return new URL(url).hostname;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Should a base copy withhold the records the requesting peer itself originated? Only while this node is
+ * being cloned FROM that peer — see the base-copy section of replication/DESIGN.md for the legacy-v4
+ * wedge this avoids, why the filter is per record, and what it knowingly does not cover. Every input is
+ * matched conservatively: an unrecognized peer, or no clone in flight, copies in full.
+ */
+export function shouldWithholdPeerOwnRecords({
+	cloneSource,
+	peerNames,
+	peerIsOurLeader,
+}: {
+	cloneSource: string | undefined;
+	peerNames: (string | undefined)[];
+	peerIsOurLeader: boolean;
+}): boolean {
+	return !!cloneSource && peerIsOurLeader && peerNames.includes(cloneSource);
 }
 
 export const tableUpdateListeners = new Map();
@@ -910,8 +938,7 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	// The header claimed blobs but none was reachable (e.g. one living only in a patch chain): we
 	// cannot prove the local copy is whole, so it must not tie.
 	if (blobs.length === 0) return false;
-	for (const blob of blobs)
-		if (!(await hasDurableBlobHeader(blob))) return false;
+	for (const blob of blobs) if (!(await hasDurableBlobHeader(blob))) return false;
 	return true;
 }
 
@@ -4869,8 +4896,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
-							| { copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number }
-							| undefined;
+							{ copyStartTime: number; currentTable: string; afterKey: any; copyOrder?: number } | undefined;
 						for (const subscription of nodeSubscriptions) {
 							if (subscription.startTime < currentSequenceId) currentSequenceId = subscription.startTime;
 							// a follower resuming an interrupted bulk copy sends back where it left off. This keeps the
@@ -5072,6 +5098,41 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											// pure function of the table-name set, so it stays stable across runs — which the skip-loop
 											// above (reachedResumeTable) relies on; cross-version cursors are rejected by the guard above. (#421)
 											const orderedTableNames = orderTablesForCopy(tables ? Object.keys(tables) : []);
+											// Every read here can come back missing or unreadable, and the answer to all of them is to
+											// copy in full: withholding is the only outcome that can lose data, and a throw would reach
+											// the outer catch and close the channel, turning a metadata hiccup into a reconnect loop.
+											let withheldOriginNodeId: number | undefined;
+											let withheldRecordCount = 0;
+											try {
+												const peerNodeRow = getHDBNodeTable().primaryStore.getSync(remoteNodeName);
+												if (
+													shouldWithholdPeerOwnRecords({
+														cloneSource: cloneAttemptSource(),
+														// the marker records the host from the leader URL, which need not be the peer's
+														// node name — match either
+														peerNames: [remoteNodeName, hostnameFromNodeUrl(peerNodeRow?.url)],
+														peerIsOurLeader: !!peerNodeRow?.isLeader,
+													})
+												) {
+													// NOT getIdOfRemoteNode: it mints and persists an id for an unseen name, and a fresh id
+													// matches no stored record — it would withhold nothing while reporting that it had.
+													const peerOriginNodeId = exportIdMapping(auditStore)?.[remoteNodeName];
+													// our own id resolves for everything we authored, so filtering on it would withhold
+													// this node's whole dataset
+													withheldOriginNodeId = peerOriginNodeId === nodeId ? undefined : peerOriginNodeId;
+													logger.warn?.(
+														withheldOriginNodeId === undefined
+															? `Copying ${databaseName} to ${remoteNodeName} in full: this node is mid-clone from that peer, but holds no record attributed to it (harper-pro#737).`
+															: `Copying ${databaseName} to ${remoteNodeName} without the records that peer originated: this node is mid-clone from it (harper-pro#737).`
+													);
+												}
+											} catch (error) {
+												withheldOriginNodeId = undefined;
+												logger.warn?.(
+													`Could not determine whether ${remoteNodeName} is the peer this node is cloning from; copying ${databaseName} in full`,
+													error
+												);
+											}
 											for (const tableName of orderedTableNames) {
 												const table = tables[tableName];
 												if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
@@ -5112,6 +5173,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// already-available record metadata integer from the range entry — a pure bitmask
 													// test, no record value decode added to this send path.
 													if (entry.metadataFlags & LOCAL_ONLY) continue;
+													// same origin normalization as recordNodeId below: undefined means we authored it
+													if (withheldOriginNodeId !== undefined && (entry.nodeId ?? nodeId) === withheldOriginNodeId) {
+														withheldRecordCount++;
+														continue;
+													}
 													logger.trace?.(
 														connectionId,
 														'Copying record from',
@@ -5196,6 +5262,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												}
 												logger.info?.('Finished copy table', tableName, remoteNodeName);
 											}
+											if (withheldOriginNodeId !== undefined)
+												logger.warn?.(
+													`Copied ${databaseName} to ${remoteNodeName} without ${withheldRecordCount} record(s) that peer originated (harper-pro#737)`
+												);
 											currentSequenceId = copyStartTime;
 											if (!currentTransaction.txnTime) {
 												// no records pending (none sent, or the last batch landed on a checkpoint flush):
