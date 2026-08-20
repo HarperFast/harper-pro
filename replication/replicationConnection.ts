@@ -237,6 +237,21 @@ export function positiveMsOr(value: unknown, defaultMs: number): number {
 	return ms > 0 ? ms : defaultMs;
 }
 
+/**
+ * Coerce the configured inbound-queue budget. Nothing non-numeric may reach the gate: a NaN disables
+ * neither ceiling but fails every comparison, so every frame would pause AND every settle resume —
+ * `ws.pause()`/`ws.resume()`, four watchdog handoffs and a blob-stream walk per frame, silently, on
+ * the receive hot path. An explicit 0 is the documented disable; anything else is floored at one
+ * socket read chunk, below which the budget cannot hold even a single frame.
+ */
+export function receiveQueueBudget(value: unknown, defaultBytes = 33554432): number {
+	if (value == null || value === '') return defaultBytes;
+	const bytes = Number(value);
+	if (!Number.isFinite(bytes) || bytes < 0) return defaultBytes;
+	if (bytes === 0) return 0;
+	return Math.max(SOCKET_READ_CHUNK_BYTES, Math.floor(bytes));
+}
+
 const MAX_PAYLOAD = env.get('replication_maxPayload') ?? 100_000_000;
 // Flush a bulk-copy batch once it approaches the payload cap, so a run of large rows can't assemble a
 // single oversized frame (harper-pro#711) that would throw and wedge the copy with no operator escape
@@ -263,6 +278,18 @@ const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWater
 // (MAX_EVENT_DELAY_TIME = 3 s). Yield the event loop at least this often (ms) while decoding so the
 // worker stays responsive during a bulk copy/clone.
 const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 100;
+// A queued frame is usually a subarray of the socket read chunk it arrived in, so it pins the whole
+// chunk, not its own length. Both the frame ceiling and the honest retention bound are stated in these
+// units rather than in frame lengths.
+const SOCKET_READ_CHUNK_BYTES = 65536;
+// Ceiling (bytes) on inbound frames accepted but not yet processed: `ws.on('message')` chains each
+// frame onto `messageProcessing`, whose links retain the frame bodies, so a receive loop slower than
+// the peer grows that chain at the inbound line rate (harper-pro#659). RECEIVE_EVENT_HIGH_WATER_MARK
+// bounds a later stage — decoded records awaiting apply — and cannot bound this one. 0 disables.
+// The bound is PER CONNECTION: this budget plus the one frame that crosses it, and that frame is
+// itself bounded only by the accepting side's `maxPayload` (replicator.ts), not by this. A worker
+// holding many (peer, database) links admits that much per link.
+const RECEIVE_QUEUE_HIGH_WATER_MARK = receiveQueueBudget(env.get(CONFIG_PARAMS.REPLICATION_RECEIVEQUEUEHIGHWATERMARK));
 // During a bulk clone copy the leader flushes a checkpoint transaction every this many records so the
 // follower commits incrementally and persists a resume cursor. On reconnect the copy resumes from that
 // cursor instead of restarting from zero. Larger = less overhead but coarser resume granularity.
@@ -743,6 +770,96 @@ export function refreshBlobStreamsOnResume(blobsInFlight: Map<any, { lastChunk?:
 	for (const stream of blobsInFlight.values()) {
 		if (stream.lastChunk !== undefined) stream.lastChunk += pausedMs;
 	}
+}
+
+/**
+ * Byte-and-frame budget for the inbound frame queue (`ws.on('message')` → `messageProcessing`).
+ *
+ * Pure bookkeeping so the policy is unit-testable: `admit` returns true when the caller should pause
+ * the socket, `settle` returns true when it should resume; the caller owns the pause reasons.
+ *
+ * Pausing here is deadlock-free, unlike the BLOB_CHUNK back-pressure pause, because it waits only on
+ * frames already accepted: nothing in the receive loop awaits a FUTURE frame — blob saves are
+ * fire-and-forget via `outstandingBlobsToFinish` (the `await Promise.all(...)` that did create a
+ * circular wait was removed in #426), the apply-queue wait drains from the apply loop, and the blob
+ * drain wait is satisfied by `saveBlob` consuming what it already holds. So a pause taken here lifts.
+ *
+ * Both ceilings are load-bearing: bytes alone leave many small frames unbounded, and each pins the
+ * read chunk it slices rather than its own length. The frame ceiling is derived from the byte budget
+ * in read-chunk units, so one knob moves both and the worst case lands at the budget.
+ */
+export function createReceiveQueueGate(highWaterMark: number): {
+	admit(byteLength: number): boolean;
+	settle(byteLength: number): boolean;
+	readonly queuedBytes: number;
+	readonly queuedFrames: number;
+	readonly paused: boolean;
+	readonly peakQueuedBytes: number;
+	readonly peakQueuedFrames: number;
+	readonly maxFrames: number;
+	readonly pauses: number;
+} {
+	// Defensive: production goes through receiveQueueBudget, but this is exported, and a non-finite
+	// budget here fails every comparison — every frame would pause and every settle resume. Route junk
+	// through the same coercion the config path uses, so there is one definition of the policy and junk
+	// lands on the default with the bound still active rather than restoring the unbounded queue.
+	highWaterMark = receiveQueueBudget(highWaterMark);
+	const lowWaterMark = Math.max(1, Math.floor(highWaterMark / 2));
+	// In read-chunk units, so `maxFrames * SOCKET_READ_CHUNK_BYTES <= highWaterMark`: the worst case,
+	// every queued frame pinning a whole chunk, lands at the byte budget instead of a multiple of it.
+	// No floor above 1 — a floor would decouple the two ceilings below `64 * SOCKET_READ_CHUNK_BYTES`
+	// and silently restore that multiple. The budget's own floor keeps this >= 1.
+	const maxFrames = Math.max(1, Math.floor(highWaterMark / SOCKET_READ_CHUNK_BYTES));
+	const lowWaterFrames = Math.max(1, Math.floor(maxFrames / 2));
+	let queuedBytes = 0;
+	let queuedFrames = 0;
+	let paused = false;
+	let peakQueuedBytes = 0;
+	let peakQueuedFrames = 0;
+	let pauses = 0;
+	return {
+		admit(byteLength: number): boolean {
+			queuedBytes += byteLength;
+			queuedFrames++;
+			if (queuedBytes > peakQueuedBytes) peakQueuedBytes = queuedBytes;
+			if (queuedFrames > peakQueuedFrames) peakQueuedFrames = queuedFrames;
+			// A frame larger than the whole budget is still accepted (it already arrived) and still
+			// pauses: the queue drains to zero and resumes, so it costs one pause cycle, never a wedge.
+			if (paused || highWaterMark <= 0) return false;
+			if (queuedBytes <= highWaterMark && queuedFrames <= maxFrames) return false;
+			paused = true;
+			pauses++;
+			return true;
+		},
+		settle(byteLength: number): boolean {
+			queuedBytes -= byteLength;
+			queuedFrames--;
+			if (!paused || queuedBytes > lowWaterMark || queuedFrames > lowWaterFrames) return false;
+			paused = false;
+			return true;
+		},
+		get queuedBytes() {
+			return queuedBytes;
+		},
+		get queuedFrames() {
+			return queuedFrames;
+		},
+		get paused() {
+			return paused;
+		},
+		get peakQueuedBytes() {
+			return peakQueuedBytes;
+		},
+		get peakQueuedFrames() {
+			return peakQueuedFrames;
+		},
+		get maxFrames() {
+			return maxFrames;
+		},
+		get pauses() {
+			return pauses;
+		},
+	};
 }
 
 /**
@@ -3689,14 +3806,50 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 	}
 
+	const receiveQueue = createReceiveQueueGate(RECEIVE_QUEUE_HIGH_WATER_MARK);
+	const receiveQueueWarnThrottle = createThrottleState();
 	ws.on('message', (body: Buffer) => {
 		// Reset the receive watchdog synchronously on every frame — async processing below may
 		// take a long time and we want a single late frame to count as proof of life immediately.
 		resetPingTimer();
-		messageProcessing = messageProcessing.then(
-			() => (wsClosed ? undefined : onWSMessage(body)),
-			() => (wsClosed ? undefined : onWSMessage(body))
-		);
+		const queuedBytes = body.byteLength;
+		const processThenSettle = async () => {
+			try {
+				if (!wsClosed) await onWSMessage(body);
+			} finally {
+				try {
+					// A settled frame is consumer progress made WHILE the socket is paused — tick it or the
+					// pause-stall watchdog reads a draining queue as a dead leg (#466).
+					consumerProgress++;
+					if (receiveQueue.settle(queuedBytes)) removePauseReason();
+				} catch (error) {
+					// Nothing handles the tail of `messageProcessing`, so a throw here would surface as an
+					// unhandled rejection with the pause refcount half-updated.
+					logger.error?.(connectionId, 'Error settling inbound frame accounting', error);
+				}
+			}
+		};
+		// Enqueue BEFORE the gate: a throw between arrival and enqueue (a logger fault, say) would drop
+		// this frame while later frames kept applying and confirming higher sequence ids — the silent
+		// receiver gap closeOnInboundMessageError exists to prevent (harper-pro#440).
+		messageProcessing = messageProcessing.then(processThenSettle, processThenSettle);
+		try {
+			if (receiveQueue.admit(queuedBytes)) {
+				addPauseReason();
+				warnThrottled(receiveQueueWarnThrottle, 'Pausing replication receive: inbound frame queue over its budget', {
+					database: databaseName,
+					node: remoteNodeName,
+					queuedBytes: receiveQueue.queuedBytes,
+					queuedFrames: receiveQueue.queuedFrames,
+					peakQueuedBytes: receiveQueue.peakQueuedBytes,
+					peakQueuedFrames: receiveQueue.peakQueuedFrames,
+					highWaterMark: RECEIVE_QUEUE_HIGH_WATER_MARK,
+					maxFrames: receiveQueue.maxFrames,
+				});
+			}
+		} catch (error) {
+			logger.error?.(connectionId, 'Error applying inbound frame queue back-pressure', error);
+		}
 	});
 	let authorizationFinished = false;
 	function checkAuthorization(): boolean {
