@@ -13,7 +13,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
-import { concurrent, fetchWithRetry, readLog } from './clusterShared.mjs';
+import { concurrent, fetchWithRetry, readLog, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -28,6 +28,8 @@ const RECORD_COUNT = 12;
 const FIXTURE_PATH = join(import.meta.dirname, 'fixture-qa692-blob-authoritative');
 const PROJECT = 'qa692-blob-authoritative';
 const OP_TIMEOUT_MS = 30000;
+const CONVERGENCE_TIMEOUT_MS = 90000;
+const READY_CONSECUTIVE_PROBES = 8;
 const HEADER_SIZE = 8;
 
 // Must match fixture-qa692-blob-authoritative/resources.js blobForId exactly.
@@ -102,6 +104,30 @@ async function verifyBlobContent(node, id) {
 	return { id, ok: true };
 }
 
+async function waitForReady(node) {
+	const deadline = Date.now() + CONVERGENCE_TIMEOUT_MS;
+	let consecutive = 0;
+	let lastError;
+	while (Date.now() < deadline) {
+		try {
+			await op(node, { operation: 'describe_table', database: 'data', table: 'BlobCopyRecord' });
+			if (++consecutive >= READY_CONSECUTIVE_PROBES) return;
+		} catch (error) {
+			lastError = error;
+			consecutive = 0;
+		}
+		await delay(1000);
+	}
+	throw new Error(`${node.hostname} never served the fixture table: ${lastError?.message ?? lastError}`);
+}
+
+async function deployFixture(node) {
+	const payload = await targz(FIXTURE_PATH);
+	const deployResp = await op(node, { operation: 'deploy_component', project: PROJECT, payload, restart: true });
+	equal(deployResp.message, `Successfully deployed: ${PROJECT}, restarting Harper`);
+	await waitForReady(node);
+}
+
 const sharedConfig = (host) => ({
 	analytics: { aggregatePeriod: -1 },
 	logging: { colors: false, stdStreams: false, console: true, level: 'warn' },
@@ -110,19 +136,13 @@ const sharedConfig = (host) => ({
 
 suite('QA-692: a joining receiver must not rewrite the source blob store', { timeout: 300000 }, (ctx) => {
 	before(async () => {
-		const hostnameA = await getNextAvailableLoopbackAddress();
+		const hostnames = [await getNextAvailableLoopbackAddress(), await getNextAvailableLoopbackAddress()].sort();
+		const [hostnameA, hostnameB] = hostnames;
 		const source = { name: ctx.name, harper: { hostname: hostnameA } };
 		await startHarper(source, { config: sharedConfig(hostnameA), env: { HARPER_NO_FLUSH_ON_EXIT: true } });
 		ctx.source = source.harper;
-		const payload = await targz(FIXTURE_PATH);
-		const deployResp = await op(ctx.source, {
-			operation: 'deploy_component',
-			project: PROJECT,
-			payload,
-			restart: true,
-		});
-		equal(deployResp.message, `Successfully deployed: ${PROJECT}, restarting Harper`);
-		await delay(15000);
+		ctx.receiverHostname = hostnameB;
+		await deployFixture(ctx.source);
 		let nextSeedId = 0;
 		const { execute, finish } = concurrent(
 			() => fetchWithRetry(ctx.source.httpURL + '/SeedBlobCopyRecord/' + nextSeedId++, { retries: 20 }),
@@ -136,10 +156,13 @@ suite('QA-692: a joining receiver must not rewrite the source blob store', { tim
 
 	after(async () => {
 		await Promise.all(
-			[
-				ctx.source && teardownHarper({ harper: ctx.source }),
-				ctx.receiver && teardownHarper({ harper: ctx.receiver }),
-			].filter(Boolean)
+			[ctx.source, ctx.receiver].filter(Boolean).map(async (node) => {
+				try {
+					await stopNodeProcess(node);
+				} finally {
+					await teardownHarper({ harper: node });
+				}
+			})
 		);
 	});
 
@@ -147,24 +170,11 @@ suite('QA-692: a joining receiver must not rewrite the source blob store', { tim
 		const preJoin = blobStoreSnapshot(ctx.source.dataRootDir);
 		equal(preJoin.length, RECORD_COUNT, 'sanity: one blob file per seeded record');
 
-		const hostnameB = await getNextAvailableLoopbackAddress();
-		// the echo rewrite only strikes the node whose name sorts below its peer's
-		equal(
-			ctx.source.hostname < hostnameB,
-			true,
-			`precondition: source name (${ctx.source.hostname}) must sort below receiver name (${hostnameB}) for the echo to target the source`
-		);
+		const hostnameB = ctx.receiverHostname;
 		const receiverCtx = { name: ctx.name, harper: { hostname: hostnameB } };
 		await startHarper(receiverCtx, { config: sharedConfig(hostnameB), env: { HARPER_NO_FLUSH_ON_EXIT: true } });
 		ctx.receiver = receiverCtx.harper;
-		const payload = await targz(FIXTURE_PATH);
-		const deployResp = await op(
-			ctx.receiver,
-			{ operation: 'deploy_component', project: PROJECT, payload, restart: true },
-			30000
-		);
-		equal(deployResp.message, `Successfully deployed: ${PROJECT}, restarting Harper`);
-		await delay(15000);
+		await deployFixture(ctx.receiver);
 		await op(ctx.receiver, {
 			operation: 'add_node',
 			hostname: ctx.source.hostname,
