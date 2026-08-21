@@ -22,9 +22,9 @@
  *     The tear sits well past B's cursor, so every entry behind it is one B still owes its client.
  *   - Both nodes come back. B resumes from its pre-tear cursor and must read *through* the break.
  *
- * The oracle is the LAST row written, not a count: under the defect B stalls at the tear and the
- * tail never arrives, so a single late row is a sharper signal than any total. The count bound is
- * asserted too, since resyncing must cost only the torn frame rather than a silent span.
+ * The oracle is the LAST row written, not just a count: under the defect B stalls at the tear and
+ * the tail never arrives. The complete set is asserted too, since every row was acknowledged and
+ * resyncing must preserve all of them, including the row in the torn frame.
  *
  * What this does NOT cover: the crash-recovery replay arm of #2016 (single-node, core's
  * `replayLogs.ts`); the write side -- nothing here stops a tear being created, which is
@@ -32,7 +32,7 @@
  * yielded and its undecodable payload wedges the receiver instead (#669). Measured against this
  * same harness, the readable shape leaves B at 39/60 rows even on a fixed engine.
  *
- * Requires an engine that reports `resyncPosition`; skipped otherwise (see ENGINE_RESYNCS).
+ * Requires an engine that exports `CorruptFrameError`; skipped otherwise (see ENGINE_RESYNCS).
  */
 import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert/strict';
@@ -118,8 +118,9 @@ function tearFrame(logPath, framesFromEnd) {
 	ok(buffer.subarray(0, 4).toString() === LOG_FILE_MAGIC, `${logPath} is not a transaction log`);
 	const frames = readFrames(buffer);
 	ok(
-		frames.length > framesFromEnd + 2,
-		`log has only ${frames.length} frames; need more than ${framesFromEnd + 2} to tear one mid-log`
+		frames.length > BATCH_ONE + framesFromEnd + 2,
+		`log has only ${frames.length} frames; need more than ${BATCH_ONE + framesFromEnd + 2} ` +
+			"to tear one past B's resume cursor"
 	);
 	const target = frames[frames.length - 1 - framesFromEnd];
 	new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(target.position + 8, buffer.length);
@@ -201,8 +202,12 @@ suite(
 		after(async () => {
 			for (const node of [ctx.nodeA, ctx.nodeB]) {
 				if (!node) continue;
-				await stopNodeProcess(node).catch(() => {});
-				await teardownHarper({ harper: node }).catch(() => {});
+				try {
+					await stopNodeProcess(node);
+				} catch {}
+				try {
+					await teardownHarper({ harper: node });
+				} catch {}
 			}
 		});
 
@@ -239,7 +244,7 @@ suite(
 			await startHarper(restartedB, nodeStartOptions(bHostname));
 			ctx.nodeB = restartedB.harper;
 
-			const finalIds = await waitForRows(ctx.nodeB, TOTAL - 1);
+			const finalIds = await waitForRows(ctx.nodeB, TOTAL);
 
 			// The tail is the oracle: a stream that stopped at the tear never delivers the last row,
 			// however many rows it managed before it.
@@ -249,11 +254,11 @@ suite(
 					'which is what a stream that stopped at the torn frame looks like'
 			);
 
-			// Resyncing must cost the torn frame and nothing else.
+			// Every row was acknowledged, including the row whose frame is torn.
 			const missing = Array.from({ length: TOTAL }, (_, i) => `r${i}`).filter((id) => !finalIds.has(id));
 			ok(
-				missing.length <= 1,
-				`resync should lose at most the torn frame's row, but B is missing ${missing.length}: ${missing.join(', ')}`
+				missing.length === 0,
+				`resync should preserve every acknowledged row, but B is missing ${missing.length}: ${missing.join(', ')}`
 			);
 		});
 	}
