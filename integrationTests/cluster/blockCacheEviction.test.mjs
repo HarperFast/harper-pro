@@ -41,7 +41,7 @@ import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
+import { sendOperation, readLog, restartNode, stopNodeProcess, pollHealth } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -66,19 +66,6 @@ const SMALL_ROCKS = { blockCacheSize: 32 * 1024 * 1024 };
 // checked via sentinel records, not a full count, so the exact number/pagination doesn't matter.
 const SEED_RECORD_COUNT = 500;
 const PADDING = 'x'.repeat(1024);
-
-async function pollHealth(node, { retries = 60, intervalMs = 2000 } = {}) {
-	for (let i = 0; i < retries; i++) {
-		try {
-			const status = await sendOperation(node, { operation: 'cluster_status' });
-			if (status) return status;
-		} catch {
-			/* transient during restart */
-		}
-		await delay(intervalMs);
-	}
-	throw new Error(`node ${node.hostname} did not come healthy in time`);
-}
 
 async function waitForRecord(node, id, { retries = 90, intervalMs = 1000 } = {}) {
 	for (let i = 0; i < retries; i++) {

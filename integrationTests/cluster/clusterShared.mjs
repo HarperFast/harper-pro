@@ -190,6 +190,30 @@ export async function stopNodeProcess(node, { timeoutMs = 15000 } = {}) {
 }
 
 /**
+ * Poll `cluster_status` until the node answers, tolerating the connection errors of a
+ * node that is mid-restart.
+ *
+ * @param {Object} node
+ * @param {Object} [opts]
+ * @param {number} [opts.retries=60]
+ * @param {number} [opts.intervalMs=2000]
+ * @returns {Promise<Object>} the first successful cluster_status response
+ */
+export async function pollHealth(node, { retries = 60, intervalMs = 2000 } = {}) {
+	let lastError;
+	for (let i = 0; i < retries; i++) {
+		try {
+			const status = await sendOperation(node, { operation: 'cluster_status' });
+			if (status) return status;
+		} catch (error) {
+			lastError = error; // transient during restart; kept so a persistent fault isn't swallowed
+		}
+		await delay(intervalMs);
+	}
+	throw new Error(`node ${node.hostname} did not come healthy in time`, { cause: lastError });
+}
+
+/**
  * Poll `cluster_status` on `receiver` until it reports a `lastReceivedVersion` for
  * `source` greater than the version captured *now* on `source` itself. Returns the
  * final receiver-side version when caught up, throws on timeout.
