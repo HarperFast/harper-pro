@@ -7240,7 +7240,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		const wasSchemaDefined = existingTable.schemaDefined;
 		let hasChanges = false;
 		const schemaDefined = tableDefinition.schemaDefined;
-		const attributes = existingTable.attributes || [];
+		// copy: the live Table.attributes must not carry peer entries before table() applies them
+		const attributes = (existingTable.attributes || []).slice();
 		for (let i = 0; i < tableDefinition.attributes?.length; i++) {
 			const ensureAttribute = tableDefinition.attributes[i];
 			const existingAttribute = attributes.find((attr) => attr.name === ensureAttribute.name);
@@ -7267,8 +7268,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				table: tableDefinition.table,
 				database: tableDefinition.database,
 				schemaDefined: tableDefinition.schemaDefined,
-				attributes,
 				...existingTable,
+				// after the spread: a live Table spreads its own `attributes` and `origin` properties, which
+				// must not override the merged copy or the additive semantics
+				attributes,
+				origin: 'cluster',
 			});
 		}
 		return existingTable;
