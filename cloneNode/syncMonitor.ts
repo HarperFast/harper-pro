@@ -112,6 +112,9 @@ export type MonitorSyncLoopOptions = {
 	leaderReplicationURL: string;
 	stallTimeoutMs: number;
 	checkIntervalMs: number;
+	/** Ceiling on the whole wait: arrivals slide the stall deadline, so a copy that applies records
+	 *  without ever converging would otherwise poll forever instead of reaching a verdict. */
+	maxDurationMs?: number;
 	log: SyncMonitorLog;
 	/** Databases whose replication socket must exist before sync can complete (default: every target). */
 	requiredSocketDatabases?: string[];
@@ -121,16 +124,28 @@ export type MonitorSyncLoopOptions = {
 };
 
 /**
- * Poll sync status until every database reaches its target, failing only on a stall: the deadline
- * slides forward whenever replication data arrives, so a healthy clone is never timed out for being
- * large. Errors from the status check do not count as progress, so a wedged status pipeline still
- * stalls out.
+ * Poll sync status until every database reaches its target, failing on a stall (no arrivals for
+ * `stallTimeoutMs`, so a healthy clone is never timed out for being large) or on exceeding
+ * `maxDurationMs`. Errors from the status check do not count as progress, so a wedged status
+ * pipeline still stalls out.
+ *
+ * Always performs at least one check before enforcing either deadline — `maxDurationMs` can arrive
+ * already elapsed on a resume — and only reports `unconverged` if that check (or a later one)
+ * actually got a definite answer; a check that merely timed out or errored reports `stalled`
+ * instead, so a transient blip can't erase resumable state.
  */
-export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<'synced' | 'stalled'> {
+export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<'synced' | 'stalled' | 'unconverged'> {
 	const now = options.now ?? Date.now;
 	const delay = options.delay ?? sleep;
-	let lastProgressAt = now();
+	const maxDurationMs = options.maxDurationMs ?? Number.POSITIVE_INFINITY;
+	const startedAt = now();
+	let lastProgressAt = startedAt;
 	let loopCount = 0;
+	let firstCheck = true;
+	// Only a check that actually got a response (complete or not) counts as "we looked and it
+	// isn't done yet" — a timeout or thrown error is no information, not evidence of non-convergence.
+	let gotDefiniteCheck = false;
+	const deadlinePassed = () => now() - lastProgressAt >= options.stallTimeoutMs || now() - startedAt >= maxDurationMs;
 	const baseRequired = options.requiredSocketDatabases ?? Object.keys(options.targetTimestamps);
 	// Ratchet: a target database whose socket has been seen once stays required even if the socket
 	// later drops, and a non-required one (e.g. `system`, optional because v4 leaders never
@@ -138,7 +153,8 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 	// database finishing first cannot complete the clone while the system copy is still pending.
 	const seenTargetSockets = new Set<string>();
 
-	while (now() - lastProgressAt < options.stallTimeoutMs) {
+	while (firstCheck || !deadlinePassed()) {
+		firstCheck = false;
 		try {
 			// Bound each status check by the poll interval: clusterStatus's worker path resolves only
 			// when a cluster-status reply message arrives, so an unbounded await would hang this loop
@@ -159,6 +175,7 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 			]);
 			if (result === 'timed-out') {
 				options.log(`Cluster status check did not respond within ${options.checkIntervalMs}ms`);
+				if (deadlinePassed()) break;
 				await delay(options.checkIntervalMs);
 				continue;
 			}
@@ -168,6 +185,7 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 			}
 
 			if (syncComplete) return 'synced';
+			gotDefiniteCheck = true;
 
 			if (latestReceivedMs > lastProgressAt) lastProgressAt = latestReceivedMs;
 
@@ -183,8 +201,11 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 		} catch (err) {
 			options.log(`Error checking sync status: ${err}`, 'error');
 		}
+		// Skip the trailing sleep when the loop is about to exit anyway — otherwise the single
+		// mandatory check at an already-spent budget pays a full checkIntervalMs of pure latency.
+		if (deadlinePassed()) break;
 		await delay(options.checkIntervalMs);
 	}
 
-	return 'stalled';
+	return gotDefiniteCheck && now() - startedAt >= maxDurationMs ? 'unconverged' : 'stalled';
 }
