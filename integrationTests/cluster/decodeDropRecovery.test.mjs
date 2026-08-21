@@ -134,7 +134,7 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 	});
 
 	after(async () => {
-		await Promise.all(
+		const cleanupResults = await Promise.allSettled(
 			[ctx.nodeA, ctx.nodeB].filter(Boolean).map(async (node) => {
 				try {
 					await stopNodeProcess(node);
@@ -143,6 +143,10 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 				}
 			})
 		);
+		const cleanupErrors = cleanupResults
+			.filter((result) => result.status === 'rejected')
+			.map((result) => result.reason);
+		if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'Failed to clean up Harper nodes');
 	});
 
 	test('B joins A, skips the undecodable records, and stays alive', async () => {
