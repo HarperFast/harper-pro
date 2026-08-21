@@ -243,7 +243,7 @@ jobs:
             echo "::error::copy-gap regression file '$TEST_FILE' does not exist — this job would run no tests."
             exit 1
           fi
-          if ! grep -Fq 'Copy-cursor banking under sustained transient blob faults (#699)' "$TEST_FILE"; then
+          if ! grep -Fq 'Copy-cursor banking across repeated transient blob faults (#699)' "$TEST_FILE"; then
             echo "::error::copy-gap regression case is missing from '$TEST_FILE' — this job would run without its intended test."
             exit 1
           fi

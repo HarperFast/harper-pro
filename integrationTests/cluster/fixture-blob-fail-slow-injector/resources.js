@@ -1,6 +1,7 @@
-// Test-only component: monkey-patches `fs.createWriteStream` so every /blobs/ save is SLOW
-// (each write callback deferred by HARPER_TEST_BLOB_SLOW_MS) and every Nth save FAILS
-// asynchronously with ENOENT (HARPER_TEST_BLOB_FAIL_INTERVAL, same as fixture-blob-fail-injector).
+// Test-only component: after /ArmBlobFaultInjector is called, monkey-patches data-database
+// /blobs/ saves so every save is SLOW (each write callback deferred by
+// HARPER_TEST_BLOB_SLOW_MS) and selected saves FAIL asynchronously with ENOENT
+// (HARPER_TEST_BLOB_FAIL_NUMBERS).
 //
 // The slowness keeps blob saves continuously in flight during a base copy — the field condition
 // copyGapCursorBanking.test.mjs (harper-pro#699) needs: fast local saves drain between frames,
@@ -10,27 +11,24 @@
 // code resolves `createWriteStream` off the live module object at call time.
 import { createRequire } from 'node:module';
 
-const interval = Number.parseInt(process.env.HARPER_TEST_BLOB_FAIL_INTERVAL || '0', 10);
+const failNumbers = new Set(
+	(process.env.HARPER_TEST_BLOB_FAIL_NUMBERS || '')
+		.split(',')
+		.map((value) => Number.parseInt(value, 10))
+		.filter((value) => Number.isFinite(value) && value > 0)
+);
 const slowMs = Number.parseInt(process.env.HARPER_TEST_BLOB_SLOW_MS || '0', 10);
-if ((Number.isFinite(interval) && interval > 0) || (Number.isFinite(slowMs) && slowMs > 0)) {
+let armed = false;
+let counter = 0;
+if (failNumbers.size > 0 || (Number.isFinite(slowMs) && slowMs > 0)) {
 	const require = createRequire(import.meta.url);
 	const fs = require('node:fs');
 	const { Writable } = require('node:stream');
 	const realCreateWriteStream = fs.createWriteStream;
-	let counter = 0;
-	// Fault spacing is deterministic but APERIODIC (LCG jitter of ±3 around the interval). A fixed
-	// `counter % interval` can phase-lock with a resumed copy whose per-cycle save count is a
-	// multiple of the interval — every cycle then faults on its FIRST re-streamed save and no cycle
-	// can bank progress, a test-harness livelock a real (supply-driven, non-periodic) fault
-	// population does not exhibit.
-	let seed = 1;
-	let nextFailAt = interval;
 	fs.createWriteStream = function patchedCreateWriteStream(path) {
-		if (typeof path === 'string' && path.includes('/blobs/')) {
+		if (armed && typeof path === 'string' && path.includes('/blobs/data/')) {
 			counter++;
-			if (interval > 0 && counter >= nextFailAt) {
-				seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-				nextFailAt = counter + Math.max(2, interval - 3 + (seed % 7));
+			if (failNumbers.has(counter)) {
 				const stream = new Writable({
 					write(_chunk, _enc, cb) {
 						cb(new Error('test-injected: stream torn down'));
@@ -81,8 +79,23 @@ if ((Number.isFinite(interval) && interval > 0) || (Number.isFinite(slowMs) && s
 		return realCreateWriteStream.apply(this, arguments);
 	};
 	console.log(
-		'[blob-fail-slow-injector] installed; slowMs=' + slowMs + ' failing every ' + (interval || 0) + 'th /blobs/ save'
+		'[blob-fail-slow-injector] installed; waiting to arm; slowMs=' +
+			slowMs +
+			' failing data /blobs/ saves ' +
+			[...failNumbers].join(',')
 	);
+}
+
+export class ArmBlobFaultInjector extends Resource {
+	static loadAsInstance = false;
+
+	async get(target) {
+		target.checkPermission = false;
+		counter = 0;
+		armed = true;
+		console.log('[blob-fail-slow-injector] armed at data blob save 0');
+		return { armed, failNumbers: [...failNumbers] };
+	}
 }
 
 export class LargeLocationImage extends Resource {
