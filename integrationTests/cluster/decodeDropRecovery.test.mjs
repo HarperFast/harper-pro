@@ -28,7 +28,7 @@ import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog } from './clusterShared.mjs';
+import { sendOperation, readLog, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -134,10 +134,15 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 	});
 
 	after(async () => {
-		// Guard against a before-hook that threw/skipped before either node was assigned —
-		// teardownHarper(undefined) would throw synchronously, which .catch() wouldn't reach.
-		if (ctx.nodeA) await teardownHarper(ctx.nodeA).catch(() => {});
-		if (ctx.nodeB) await teardownHarper(ctx.nodeB).catch(() => {});
+		await Promise.all(
+			[ctx.nodeA, ctx.nodeB].filter(Boolean).map(async (node) => {
+				try {
+					await stopNodeProcess(node);
+				} finally {
+					await teardownHarper({ harper: node });
+				}
+			})
+		);
 	});
 
 	test('B joins A, skips the undecodable records, and stays alive', async () => {
@@ -148,7 +153,7 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 			port: 9933,
 			isLeader: true,
 			rejectUnauthorized: false,
-			authorization: { username: ctx.nodeA.HDB_ADMIN_USERNAME, password: ctx.nodeA.HDB_ADMIN_PASSWORD },
+			authorization: ctx.nodeA.admin,
 		});
 
 		// (1) every clean row arrives — the leg is NOT starved behind the poison record.
