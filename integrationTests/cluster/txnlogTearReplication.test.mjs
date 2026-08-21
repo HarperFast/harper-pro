@@ -204,10 +204,14 @@ suite(
 				if (!node) continue;
 				try {
 					await stopNodeProcess(node);
-				} catch {}
+				} catch (error) {
+					console.error(`Failed to stop node process for ${node.hostname}:`, error);
+				}
 				try {
 					await teardownHarper({ harper: node });
-				} catch {}
+				} catch (error) {
+					console.error(`Failed to tear down Harper for ${node.hostname}:`, error);
+				}
 			}
 		});
 
