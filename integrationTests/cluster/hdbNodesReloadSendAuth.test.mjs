@@ -416,9 +416,22 @@ suite(
 
 				// The gate should log the SAME Unauthorized-close signature, this time for a genuine
 				// tombstone rather than a reload marker -- confirms this is the same code path, correctly armed.
-				const [logA, logB] = await Promise.all([readLog(nodeA), readLog(nodeB)]);
+				// The marker is emitted by B's send-auth watch closing the sockets A dialed, and only that
+				// watch: A's own cooperative teardown closes the same sockets with 1008 "No longer
+				// subscribed" once it learns of the removal, which is why remove_node must revoke locally
+				// before notifying the peer -- otherwise the peer's teardown gets a round-trip head start
+				// and can erase every socket the watch would have closed (the 2026-08-22 CI flake). Poll
+				// rather than sample once so a slow log flush on a contended runner cannot fail the control.
+				let sawUnauthorizedClose = false;
+				const unauthorizedDeadline = Date.now() + 20000;
+				do {
+					const [logA, logB] = await Promise.all([readLog(nodeA), readLog(nodeB)]);
+					sawUnauthorizedClose = logA.includes(UNAUTHORIZED_MARKER) || logB.includes(UNAUTHORIZED_MARKER);
+					if (sawUnauthorizedClose) break;
+					await delay(250);
+				} while (Date.now() < unauthorizedDeadline);
 				ok(
-					logA.includes(UNAUTHORIZED_MARKER) || logB.includes(UNAUTHORIZED_MARKER),
+					sawUnauthorizedClose,
 					'remove_node should produce the same "Unauthorized database subscription" close signature (genuine de-auth, gate is still armed)'
 				);
 
