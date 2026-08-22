@@ -437,7 +437,7 @@ suite(
 				} while (Date.now() < gateDeAuthDeadline);
 				ok(
 					sawGateDeAuth,
-					'remove_node should produce the send-auth gate\'s "Unauthorized database subscription" de-auth signature (genuine de-auth, gate is still armed)'
+					`remove_node should trip the dynamic send-auth gate: no "${UNAUTHORIZED_MARKER}" close or "${GATE_DEAUTH_LOG_LINE}" warn logged after the removal (genuine de-auth, gate is still armed)`
 				);
 
 				// Full-replication remove_node_back names the remote node itself, so the reciprocal
