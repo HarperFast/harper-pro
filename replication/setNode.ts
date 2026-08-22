@@ -84,9 +84,13 @@ export async function setNode(req: any) {
 		const record = await hdbNodes.get(nodeRecordId);
 		if (!record) throw new ClientError(nodeRecordId + ' does not exist');
 
+		// Revoke locally before notifying the peer: the dynamic send-authorization watch acts on this
+		// delete, so the peer's access must not outlive a round trip to that (possibly offline or
+		// unreachable) peer. The reciprocal remove_node_back below travels on its own operation
+		// connection, so it is unaffected by the teardown this delete triggers.
+		await hdbNodes.delete(nodeRecordId);
+
 		try {
-			// we delete record and req that other node also deletes record (or mark itself as non-replicating)
-			// we do not wait for the other node to respond, it may not even be online anymore
 			await sendOperationToNode(
 				record,
 				{
@@ -104,8 +108,6 @@ export async function setNode(req: any) {
 				err
 			);
 		}
-
-		await hdbNodes.delete(nodeRecordId);
 
 		return `Successfully removed '${nodeRecordId}' from cluster`;
 	}
