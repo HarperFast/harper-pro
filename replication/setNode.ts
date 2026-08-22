@@ -91,7 +91,6 @@ export async function setNode(req: any) {
 		await hdbNodes.delete(nodeRecordId);
 
 		try {
-			// request that the other node also deletes a record (or marks itself as non-replicating)
 			await sendOperationToNode(
 				record,
 				{

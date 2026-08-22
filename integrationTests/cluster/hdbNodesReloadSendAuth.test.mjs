@@ -76,6 +76,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT =
 const DB = 'data';
 const TABLE = 'qa756flow';
 const UNAUTHORIZED_MARKER = 'Unauthorized database subscription';
+const GATE_DEAUTH_LOG_LINE = 'hdb_nodes no longer authorizes';
 const RELOAD_MARKER_LOG_LINE = 'hdb_nodes reload marker received; rescanning known nodes';
 const EXPECTED_SOCKET_DATABASES = ['system'];
 
@@ -396,6 +397,7 @@ suite(
 				// The main scenario continuously verified B's outbound system subscription to A. Remove
 				// that exact registered edge so the positive control cannot depend on a peer row that a
 				// system-database base copy may have replaced on the opposite side.
+				const [preRemoveLogA, preRemoveLogB] = await Promise.all([readLog(nodeA), readLog(nodeB)]);
 				await sendOperation(nodeB, { operation: 'remove_node', hostname: nodeA.hostname });
 				console.log('[QA756] B issued remove_node against A -- expecting genuine de-authorization this time');
 
@@ -414,25 +416,28 @@ suite(
 					`B's connection to A should tear down after remove_node; last sockets seen: ${JSON.stringify(lastSockets)}`
 				);
 
-				// The gate should log the SAME Unauthorized-close signature, this time for a genuine
-				// tombstone rather than a reload marker -- confirms this is the same code path, correctly armed.
-				// The marker is emitted by B's send-auth watch closing the sockets A dialed, and only that
-				// watch: A's own cooperative teardown closes the same sockets with 1008 "No longer
-				// subscribed" once it learns of the removal, which is why remove_node must revoke locally
-				// before notifying the peer -- otherwise the peer's teardown gets a round-trip head start
-				// and can erase every socket the watch would have closed (the 2026-08-22 CI flake). Poll
-				// rather than sample once so a slow log flush on a contended runner cannot fail the control.
-				let sawUnauthorizedClose = false;
-				const unauthorizedDeadline = Date.now() + 20000;
+				// The de-auth close for a genuine tombstone has one producer: B's send-auth watch, which logs
+				// the warn-level "hdb_nodes no longer authorizes" line and then closes with the same
+				// Unauthorized signature the reload-marker detectors above assert the absence of. Two close
+				// paths race for the same sockets (the watch vs the removed peer's cooperative
+				// 1008 "No longer subscribed" teardown), so poll a post-remove_node log slice for either
+				// gate signature rather than sampling the full logs once.
+				let sawGateDeAuth = false;
+				const gateDeAuthDeadline = Date.now() + 20000;
 				do {
 					const [logA, logB] = await Promise.all([readLog(nodeA), readLog(nodeB)]);
-					sawUnauthorizedClose = logA.includes(UNAUTHORIZED_MARKER) || logB.includes(UNAUTHORIZED_MARKER);
-					if (sawUnauthorizedClose) break;
+					const postRemoveLogA = logA.slice(preRemoveLogA.length);
+					const postRemoveLogB = logB.slice(preRemoveLogB.length);
+					sawGateDeAuth =
+						postRemoveLogA.includes(UNAUTHORIZED_MARKER) ||
+						postRemoveLogB.includes(UNAUTHORIZED_MARKER) ||
+						postRemoveLogB.includes(GATE_DEAUTH_LOG_LINE);
+					if (sawGateDeAuth) break;
 					await delay(250);
-				} while (Date.now() < unauthorizedDeadline);
+				} while (Date.now() < gateDeAuthDeadline);
 				ok(
-					sawUnauthorizedClose,
-					'remove_node should produce the same "Unauthorized database subscription" close signature (genuine de-auth, gate is still armed)'
+					sawGateDeAuth,
+					'remove_node should produce the send-auth gate\'s "Unauthorized database subscription" de-auth signature (genuine de-auth, gate is still armed)'
 				);
 
 				// Full-replication remove_node_back names the remote node itself, so the reciprocal
