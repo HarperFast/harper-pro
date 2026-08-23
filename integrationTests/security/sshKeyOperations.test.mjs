@@ -24,7 +24,7 @@ async function sendOperation(node, operation) {
 }
 
 suite('SSH Key Operations', (ctx) => {
-	let githubMetaResponseStatus = 200;
+	let disconnectGitHubMetaRequest = false;
 	let githubMetaRequestCount = 0;
 	const githubMetaServer = createServer((request, response) => {
 		if (request.url !== '/meta') {
@@ -33,9 +33,8 @@ suite('SSH Key Operations', (ctx) => {
 		}
 
 		githubMetaRequestCount++;
-		if (githubMetaResponseStatus !== 200) {
-			response.writeHead(githubMetaResponseStatus, { 'Content-Type': 'text/plain' });
-			response.end('fixture failure');
+		if (disconnectGitHubMetaRequest) {
+			request.socket.destroy();
 			return;
 		}
 
@@ -64,7 +63,7 @@ suite('SSH Key Operations', (ctx) => {
 	});
 
 	beforeEach(async () => {
-		githubMetaResponseStatus = 200;
+		disconnectGitHubMetaRequest = false;
 		githubMetaRequestCount = 0;
 		await rm(join(ctx.harper.dataRootDir, 'ssh'), { recursive: true, force: true });
 	});
@@ -77,8 +76,13 @@ suite('SSH Key Operations', (ctx) => {
 		try {
 			await teardownHarper(ctx);
 		} finally {
-			await new Promise((resolve, reject) => {
-				githubMetaServer.close((error) => (error ? reject(error) : resolve()));
+			await new Promise((resolve) => {
+				if (!githubMetaServer.listening) {
+					resolve();
+					return;
+				}
+				githubMetaServer.close(resolve);
+				githubMetaServer.closeAllConnections();
 			});
 		}
 	});
@@ -195,7 +199,7 @@ suite('SSH Key Operations', (ctx) => {
 	});
 
 	test('add_ssh_key reports the documented fallback when the github metadata fetch fails', async () => {
-		githubMetaResponseStatus = 503;
+		disconnectGitHubMetaRequest = true;
 		let { status, data } = await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',
 			name: 'testkey-github-fallback',
