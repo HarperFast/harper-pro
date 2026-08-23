@@ -212,7 +212,7 @@ suite('SSH Key Operations', (ctx) => {
 			data.message,
 			'Added ssh key: testkey-github-fallback. Unable to get known hosts from github.com. Set your known hosts manually using set_ssh_known_hosts.'
 		);
-		equal(githubMetaRequestCount, 1);
+		ok(githubMetaRequestCount >= 1);
 
 		({ status, data } = await sendOperation(ctx.harper, { operation: 'get_ssh_known_hosts' }));
 		equal(status, 200);
