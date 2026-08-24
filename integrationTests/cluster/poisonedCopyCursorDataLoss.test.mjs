@@ -35,7 +35,7 @@ import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog } from './clusterShared.mjs';
+import { sendOperation, readLog, restartNode, stopNodeProcess, pollHealth } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -160,16 +160,19 @@ suite(
 					operation: 'deploy_component',
 					project: 'poisoned-copy-cursor',
 					payload,
-					restart: true,
 				}),
 				sendOperation(ctx.nodeB, {
 					operation: 'deploy_component',
 					project: 'poisoned-copy-cursor',
 					payload,
-					restart: true,
 				}),
 			]);
-			await delay(10_000);
+			// deploy_component restart:true answers before the old process exits; restart explicitly and
+			// wait for the pid change + health so the steps below can't race the outgoing process.
+			for (const node of [ctx.nodeA, ctx.nodeB]) {
+				await restartNode(node);
+				await pollHealth(node);
+			}
 
 			// Seed TOTAL_ROWS records on A with zero-padded string keys so lexicographic sort
 			// matches numeric order. The poisoned cursor afterKey 'row-0500' sits at the midpoint.
@@ -189,10 +192,14 @@ suite(
 		});
 
 		after(async () => {
-			await Promise.all([
-				ctx.nodeA && teardownHarper({ harper: ctx.nodeA }).catch(() => null),
-				ctx.nodeB && teardownHarper({ harper: ctx.nodeB }).catch(() => null),
-			]);
+			// Nodes restart during setup, so teardownHarper's spawned-child handle is stale — stop the
+			// live process first (see clusterShared.stopNodeProcess).
+			await Promise.all(
+				[ctx.nodeA, ctx.nodeB].filter(Boolean).map(async (node) => {
+					await stopNodeProcess(node).catch(() => {});
+					await teardownHarper({ harper: node }).catch(() => null);
+				})
+			);
 		});
 
 		test('B with poisoned copyCursor afterKey=row-0500 receives only the tail and considers itself current', async () => {
