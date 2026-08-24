@@ -77,93 +77,6 @@ const ENGINE_RESYNCS = await import('@harperfast/rocksdb-js')
 	.catch(() => false);
 const FORCED = process.env.HARPER_TXNLOG_TEAR_FORCE === '1';
 
-function nodeStartOptions(hostname) {
-	return {
-		config: {
-			analytics: { aggregatePeriod: -1 },
-			logging: { colors: false, stdStreams: true, console: true },
-			replication: { securePort: hostname + ':9933', databases: [DATABASE] },
-		},
-	};
-}
-
-/** Walks the entry chain, stopping at the zero-timestamp end-of-entries marker. */
-function readFrames(buffer) {
-	const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-	const frames = [];
-	let position = FILE_HEADER_SIZE;
-	while (position + ENTRY_HEADER_SIZE <= buffer.length) {
-		if (view.getFloat64(position) === 0) break;
-		const length = view.getUint32(position + 8);
-		if (length === 0 || position + ENTRY_HEADER_SIZE + length > buffer.length) break;
-		frames.push({ position, length });
-		position += ENTRY_HEADER_SIZE + length;
-	}
-	return frames;
-}
-
-/**
- * Breaks one frame by declaring a length the file cannot satisfy, so the reader cannot read the
- * frame at all and must find where framing resumes.
- *
- * This is the *unreadable* tear shape. The other shape a partial append can leave -- a declared
- * length that overruns into the following frame but still fits the file -- is readable, so the
- * reader yields it as an entry whose payload is the torn bytes plus its neighbour's. Framing
- * recovery cannot help there: the entry looks well-formed and only the consumer can tell it is
- * garbage, and the receiver currently wedges on it (#669). This test deliberately covers the
- * shape the fix is responsible for.
- */
-function tearFrame(logPath, framesFromEnd) {
-	const buffer = readFileSync(logPath);
-	ok(buffer.subarray(0, 4).toString() === LOG_FILE_MAGIC, `${logPath} is not a transaction log`);
-	const frames = readFrames(buffer);
-	ok(
-		frames.length > BATCH_ONE + framesFromEnd + 2,
-		`log has only ${frames.length} frames; need more than ${BATCH_ONE + framesFromEnd + 2} ` +
-			"to tear one past B's resume cursor"
-	);
-	const target = frames[frames.length - 1 - framesFromEnd];
-	new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(target.position + 8, buffer.length);
-	writeFileSync(logPath, buffer);
-	return { ...target, totalFrames: frames.length };
-}
-
-function localLogPath(dataRootDir) {
-	return join(dataRootDir, 'database', DATABASE, 'transaction_logs', 'local', '1.txnlog');
-}
-
-async function rowIds(node) {
-	const rows = await sendOperation(node, {
-		operation: 'search_by_value',
-		database: DATABASE,
-		table: TABLE,
-		search_attribute: 'id',
-		search_value: '*',
-		get_attributes: ['id'],
-	}).catch(() => []);
-	return new Set((Array.isArray(rows) ? rows : []).map((row) => row.id));
-}
-
-async function waitForRows(node, target, timeoutMs = CONVERGE_TIMEOUT_MS) {
-	const deadline = Date.now() + timeoutMs;
-	let ids = new Set();
-	while (Date.now() < deadline) {
-		ids = await rowIds(node);
-		if (ids.size >= target) return ids;
-		await delay(1000);
-	}
-	return ids;
-}
-
-async function insertRows(node, from, count) {
-	await sendOperation(node, {
-		operation: 'insert',
-		database: DATABASE,
-		table: TABLE,
-		records: Array.from({ length: count }, (_, i) => ({ id: `r${from + i}`, payload: 'x'.repeat(64) })),
-	});
-}
-
 suite(
 	'Mid-log txnlog tear: replication resyncs past it',
 	{ skip: !ENGINE_RESYNCS && !FORCED, timeout: 300_000 },
@@ -267,3 +180,90 @@ suite(
 		});
 	}
 );
+
+function nodeStartOptions(hostname) {
+	return {
+		config: {
+			analytics: { aggregatePeriod: -1 },
+			logging: { colors: false, stdStreams: true, console: true },
+			replication: { securePort: hostname + ':9933', databases: [DATABASE] },
+		},
+	};
+}
+
+/** Walks the entry chain, stopping at the zero-timestamp end-of-entries marker. */
+function readFrames(buffer) {
+	const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+	const frames = [];
+	let position = FILE_HEADER_SIZE;
+	while (position + ENTRY_HEADER_SIZE <= buffer.length) {
+		if (view.getFloat64(position) === 0) break;
+		const length = view.getUint32(position + 8);
+		if (length === 0 || position + ENTRY_HEADER_SIZE + length > buffer.length) break;
+		frames.push({ position, length });
+		position += ENTRY_HEADER_SIZE + length;
+	}
+	return frames;
+}
+
+/**
+ * Breaks one frame by declaring a length the file cannot satisfy, so the reader cannot read the
+ * frame at all and must find where framing resumes.
+ *
+ * This is the *unreadable* tear shape. The other shape a partial append can leave -- a declared
+ * length that overruns into the following frame but still fits the file -- is readable, so the
+ * reader yields it as an entry whose payload is the torn bytes plus its neighbour's. Framing
+ * recovery cannot help there: the entry looks well-formed and only the consumer can tell it is
+ * garbage, and the receiver currently wedges on it (#669). This test deliberately covers the
+ * shape the fix is responsible for.
+ */
+function tearFrame(logPath, framesFromEnd) {
+	const buffer = readFileSync(logPath);
+	ok(buffer.subarray(0, 4).toString() === LOG_FILE_MAGIC, `${logPath} is not a transaction log`);
+	const frames = readFrames(buffer);
+	ok(
+		frames.length > BATCH_ONE + framesFromEnd + 2,
+		`log has only ${frames.length} frames; need more than ${BATCH_ONE + framesFromEnd + 2} ` +
+			"to tear one past B's resume cursor"
+	);
+	const target = frames[frames.length - 1 - framesFromEnd];
+	new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(target.position + 8, buffer.length);
+	writeFileSync(logPath, buffer);
+	return { ...target, totalFrames: frames.length };
+}
+
+function localLogPath(dataRootDir) {
+	return join(dataRootDir, 'database', DATABASE, 'transaction_logs', 'local', '1.txnlog');
+}
+
+async function rowIds(node) {
+	const rows = await sendOperation(node, {
+		operation: 'search_by_value',
+		database: DATABASE,
+		table: TABLE,
+		search_attribute: 'id',
+		search_value: '*',
+		get_attributes: ['id'],
+	}).catch(() => []);
+	return new Set((Array.isArray(rows) ? rows : []).map((row) => row.id));
+}
+
+async function waitForRows(node, target, timeoutMs = CONVERGE_TIMEOUT_MS) {
+	const deadline = Date.now() + timeoutMs;
+	let ids = new Set();
+	while (Date.now() < deadline) {
+		ids = await rowIds(node);
+		if (ids.size >= target) return ids;
+		await delay(1000);
+	}
+	return ids;
+}
+
+async function insertRows(node, from, count) {
+	await sendOperation(node, {
+		operation: 'insert',
+		database: DATABASE,
+		table: TABLE,
+		records: Array.from({ length: count }, (_, i) => ({ id: `r${from + i}`, payload: 'x'.repeat(64) })),
+	});
+}
