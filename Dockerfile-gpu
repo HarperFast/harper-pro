@@ -26,13 +26,11 @@ COPY . .
 
 RUN env NO_USE_GIT=true npm run package
 
-# The global install happens HERE, not in the run stage, and the finished tree is copied
-# across. The CUDA runtime base carries no C/C++ toolchain, so a dependency that reaches
-# node-gyp there dies with `not found: make` — which is what re2 does on Node 25: it fetches
-# its addon from a GitHub release in an install script and falls back to a source build, and
-# re2 >=1.24.1 publishes prebuilds for LTS ABIs only (127/137/147 = Node 22/24/26; 141 =
-# Node 25 does not exist for any platform). This stage is a full node image, so the fallback
-# compiles here instead, against the same Node major and an older glibc than the runtime's.
+# The global install happens here, not in the run stage: the CUDA runtime base carries no
+# C/C++ toolchain, and re2 >=1.24.1 publishes prebuilds for LTS ABIs only (127/137/147 =
+# Node 22/24/26 — 141, Node 25, exists for no platform), so on Node 25 its install script
+# falls back to a source build and dies there with `not found: make`. This stage is a full
+# node image, so the fallback compiles here instead.
 RUN npm install --global --prefix /opt/harper-pro harperfast-harper-pro-*.tgz
 
 FROM ${CUDA_RUNTIME_IMAGE} AS run
@@ -98,16 +96,14 @@ ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 
 COPY --from=build --chown=harperdb:harperdb /opt/harper-pro /home/harperdb/.npm-global
 
-# Assert the copied install resolves and runs here, not just that it was produced upstream:
-# v5.2.0-beta.4 published an image with no harper in it off a green build. The re2 check is
-# the same assertion for the one dependency that ships no prebuild in its npm tarball and
-# materializes its addon from an install script — npm treats a skipped install script as a
-# warning ("not yet covered by allowScripts"), so without this the image would publish green
-# and only fail when the WAF loads re2 in production.
+# Every native addon here was resolved against the build stage, so the copied tree is bound to
+# its Node major and needs its glibc to be no newer than this base's — an inverted
+# CUDA_RUNTIME_IMAGE override breaks that. These loads are what fails the build when it does,
+# and `harper version` proves the relocated bin symlink still resolves.
 RUN <<-EOF
   set -e
   harper version
-  node -e "require('$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro/node_modules/re2')"
+  (cd "$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro" && node -e "for (const m of ['lmdb', '@harperfast/rocksdb-js', 'argon2', 're2']) require(m);")
   mkdir -p /home/harperdb/harper
   chown harperdb:harperdb /home/harperdb/harper
 EOF

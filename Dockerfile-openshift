@@ -64,15 +64,15 @@ WORKDIR /home/harperdb
 
 # Install Harper Pro globally from the tarball produced in the build stage.
 COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
-# See Dockerfile for why `set -e` and both assertions are load-bearing here. The UBI runtime
-# is a `-minimal` image with no C/C++ toolchain, so a dependency that reaches node-gyp here
-# cannot recover — re2 resolves a prebuild for this image's Node major today, and the
-# assertion is what catches the day that stops being true.
+# See Dockerfile for why `set -e` and both assertions are load-bearing here. This runtime is a
+# `-minimal` image with no C/C++ toolchain, so a dependency that reaches node-gyp here cannot
+# recover — re2 resolves a prebuild for this image's Node major today, and the assertion is
+# what catches the day that stops being true.
 RUN <<-EOF
     set -e
     npm install --global harperfast-harper-pro-*.tgz
     harper version
-    node -e "require('$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro/node_modules/re2')"
+    (cd "$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro" && node -e "require('re2')")
     npm cache clean --force
     rm -f harperfast-harper-pro-*.tgz
     chown -R 1001:0 /home/harperdb
