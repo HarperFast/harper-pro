@@ -177,15 +177,22 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 		});
 		const deadline = Date.now() + CONVERGE_TIMEOUT_MS;
 		let live = false;
+		let lastErr;
 		while (Date.now() < deadline) {
 			try {
 				if (await hasRow(ctx.nodeB, 'row-live-1')) {
 					live = true;
 					break;
 				}
-			} catch {}
+				lastErr = undefined;
+			} catch (err) {
+				lastErr = err;
+			}
 			await delay(500);
 		}
-		ok(live, 'a live write after the poison must replicate to B (leg alive)');
+		ok(
+			live,
+			`a live write after the poison must replicate to B (leg alive)${lastErr ? ` (last error: ${lastErr.message})` : ''}`
+		);
 	});
 });
