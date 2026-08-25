@@ -271,8 +271,17 @@ export async function setNode(req: any) {
 	if (req.operation === 'update_node') {
 		message = `Successfully updated '${url}'`;
 	} else message = `Successfully added '${url}' to cluster`;
-	if (targetNodeResponseError)
+	if (targetNodeResponseError) {
+		// Opt-in only, so add_node/set_node keep reporting success-with-warning for every other caller:
+		// the local peer row is written either way, but for a caller whose next step depends on the
+		// leader having accepted this node — cloneNode, which then skips setup on restart — a warning
+		// inside a success string is indistinguishable from success. requirePeerAck makes it a failure.
+		if (req.requirePeerAck) {
+			targetNodeResponseError.message = `${url} did not accept this node: ${targetNodeResponseError.message}`;
+			throw targetNodeResponseError;
+		}
 		message += ' but there was an error updating target node: ' + targetNodeResponseError.message;
+	}
 	return message;
 }
 

@@ -1,5 +1,14 @@
 import { parseArgs } from 'node:util';
-import { accessSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
+import {
+	accessSync,
+	appendFileSync,
+	readFileSync,
+	writeFileSync,
+	mkdirSync,
+	renameSync,
+	rmSync,
+	unlinkSync,
+} from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -58,6 +67,8 @@ import {
  * - CLONE_SYNC_TIMEOUT: Sync stall timeout in milliseconds — the clone fails only if no replication
  *   data arrives for this long, not on total elapsed time. Intended for minutes-scale values;
  *   arrival stamps have second precision (default: max(300000, 2 x replication.copyTimeout))
+ * - CLONE_MAX_DURATION: Absolute ceiling in milliseconds on the sync wait (default: derived from
+ *   the size the leader reports, floored at one hour; 24h when no size is reported)
  * - REPLICATION_PORT: Port for replication
  * - FORCE_CLONE: Force clone even if node exists (default: false)
  * - ROOTPATH: Harper installation root path
@@ -87,6 +98,9 @@ import {
 
 const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
+// Floor for the size-derived sync-wait ceiling, which guarantees the wait terminates even when data
+// keeps arriving without ever converging (arrivals slide the stall deadline).
+const MIN_MAX_CLONE_DURATION_MS = 3600000;
 const DEFAULT_REPLICATION_PORT = '9933';
 const CLONE_ATTEMPT_ENV = 'HARPER_CLONE_ATTEMPT';
 
@@ -165,6 +179,8 @@ const skipSyncMonitor: boolean = values['skip-sync-monitor'] ?? process.env.CLON
 // default stall window at 2x the replication copy timeout.
 const parsedSyncTimeout: number = parseInt(values['sync-timeout'] || process.env.CLONE_SYNC_TIMEOUT, 10);
 const explicitSyncTimeoutMs: number | undefined = parsedSyncTimeout > 0 ? parsedSyncTimeout : undefined;
+const parsedMaxDuration: number = parseInt(process.env.CLONE_MAX_DURATION, 10);
+const explicitMaxCloneDurationMs: number | undefined = parsedMaxDuration > 0 ? parsedMaxDuration : undefined;
 // `replication.port` in HARPER_SET_CONFIG / HARPER_DEFAULT_CONFIG accepts both a numeric port
 // and a `host:port` string; cloneNode treats `replicationPort` as a port number (substituted
 // into the leader URL and written to REPLICATION_PORT), so strip any leading `host:`.
@@ -244,7 +260,17 @@ export async function cloneNode(): Promise<void> {
 	}
 	startCloneAttempt();
 
-	if (!usingCertAuth) {
+	// A marker means a previous start completed setup and began the sync wait; setup must not be
+	// repeated (full app re-install, worker restart under resumed replication). forceClone overrides,
+	// and a marker written against a different leader is discarded rather than resumed.
+	if (forceClone) clearSyncStartedMarker();
+	let resumeMarker = forceClone ? undefined : readSyncStartedMarker();
+	if (resumeMarker && resumeMarker.leaderURL !== leaderURL) {
+		log(`Clone sync marker was for leader ${resumeMarker.leaderURL}; running full clone setup for ${leaderURL}`);
+		clearSyncStartedMarker();
+		resumeMarker = undefined;
+	}
+	if (!usingCertAuth && !resumeMarker) {
 		// Request to leader to verify connectivity and credentials before proceeding with clone
 		// Cannot check if cloning with WS - module initialization order prevents access to required variables
 		await leaderRequest({ operation: OPERATIONS_ENUM.GET_STATUS });
@@ -257,11 +283,9 @@ export async function cloneNode(): Promise<void> {
 		await installHarper();
 	}
 
-	// Custody clone gate (#166): mark the clone bootstrap BEFORE Harper starts so the
-	// secretCustody component does not self-generate a cluster env-secrets keypair — the leader's
-	// key is cloned right after replication is established (cloneEnvSecretsKeys), and a
-	// self-generated key would diverge from the cluster and could encrypt new secrets before the
-	// real key arrives. Custody stays dormant until the cloned key is registered.
+	// Custody clone gate (#166): latch BEFORE Harper starts (and on every clone-mode boot, resume
+	// included) so secretCustody never self-generates an env-secrets keypair that diverges from the
+	// cluster key cloned later by cloneEnvSecretsKeys.
 	const { setCloneBootstrapInProgress } = await import('../security/custodyState.js');
 	setCloneBootstrapInProgress(true);
 
@@ -272,134 +296,59 @@ export async function cloneNode(): Promise<void> {
 	logger.initLogSettings();
 	harperLogger = logger.loggerWithTag('cloneNode');
 
-	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
-	const leaderConfigData = await cloneConfig();
-
-	// Refine the leader replication URL using the leader's own config. This is the only way to
-	// pick the right scheme (ws:// vs wss://) when bootstrapping against a leader whose
-	// replication port is TLS-only — most notably v4 leaders, whose default config binds
-	// `replication.securePort: 9933` with no plain WS sibling. The initial heuristic above
-	// emits `ws://` which v4 silently refuses (TCP-level reset), so the v5 → v4 clone never
-	// completes the set_node handshake.
-	const refinedLeaderReplicationURL = deriveLeaderReplicationURL(leaderConfigData, leaderReplicationURL);
-	if (refinedLeaderReplicationURL !== leaderReplicationURL) {
-		log(
-			`Adjusted leader replication URL from ${leaderReplicationURL} to ${refinedLeaderReplicationURL} based on leader config`
-		);
-		leaderReplicationURL = refinedLeaderReplicationURL;
-	}
-
-	// Clone applications that are deployed on the leader but not referenced in harper-config
-	await cloneApplications();
-
-	// Pre-create the leader's user databases (and any tables we don't already have locally) on
-	// this clone *before* establishing replication. Replication subscriptions are only set up for
-	// databases that already exist locally — see `forEachReplicatedDatabase` in
-	// `replication/replicator.ts`, which iterates `databases` and only fires subscriptions for the
-	// ones it finds. If we leave the user databases for the leader's incoming push to "create"
-	// them, the v5 clone never opens an outgoing subscription to the leader and never asks for
-	// the historical data. That manifests as the clone sitting at "Available never reached" with
-	// `database 'data' does not exist` errors in the log, because the leader (especially v4) does
-	// not push schema for user databases unless this side has explicitly subscribed.
-	//
-	// Doing this only matters for credential / token auth (HTTP `describe_all` available); cert
-	// auth has no way to talk to the leader before replication is up, so we skip there and rely on
-	// the existing self-bootstrap (cert-auth users are bootstrapping inside an already-clustered
-	// environment that has the cluster CA chain).
-	if (!usingCertAuth) {
-		await cloneSchemas();
-	}
-
-	// Base set node request
-	type SetNodeRequest = {
-		operation: string;
-		verify_tls: boolean;
-		url: string;
-		isLeader: true;
-		authorization?:
-			| {
-					username: string;
-					password: string;
-			  }
-			| string;
-	};
-
-	const setNodeRequest: SetNodeRequest = {
-		operation: OPERATIONS_ENUM.ADD_NODE,
-		verify_tls: false, // set node cross-signs the cluster with harper self-signed certs
-		url: leaderReplicationURL,
-		isLeader: true,
-	};
-
-	if (!usingCertAuth) {
-		// If cloning using credential/token auth, we need to include the leader credentials in the set node request so that the leader can authenticate this node
-		if (leaderToken) {
-			setNodeRequest.authorization = 'Bearer ' + leaderToken;
-		} else {
-			setNodeRequest.authorization = {
-				username: leaderUsername,
-				password: leaderPassword,
-			};
-		}
-	}
-
-	// Restarting workers to ensure new configuration it loaded.
-	log('Restarting workers to apply new configuration');
-	const { restartWorkers } = await import('../core/server/threads/manageThreads.js');
-	await restartWorkers();
-
-	// Dynamically importing setNode because it was causing early usage of rootpath var install before it was initialized.
-	const { setNode } = await import('../replication/setNode.js');
-
-	// Set node will set up replication between this node and the leader,
-	// which will trigger the sync of data including some system tables like users and roles.
-	log('Sending set node request to leader to establish replication and trigger data sync');
-	const setNodeResponse = await setNode(setNodeRequest);
-	log(`Response from set node: ${setNodeResponse}`);
+	const syncStartedAt: number = resumeMarker?.startedAt ?? Date.now();
+	let targetTimestamps: Record<string, number> | undefined = resumeMarker?.targetTimestamps;
+	let totalBytes: number = resumeMarker?.totalBytes ?? 0;
 
 	try {
-		await cloneJWTKeys();
-	} catch (err) {
-		// A node without the leader's JWT signing keys cannot issue or validate tokens, so the clone is
-		// not viable. Mirror the unconfirmed-sync handling below: keep Harper running so get_status stays
-		// queryable, publish Unavailable, clear the cloned flag so a subsequent start retries the clone,
-		// and stop before finalizing.
-		const { set: setStatus } = await import('../core/server/status/index.js');
-		try {
-			await setStatus({ id: 'availability', status: 'Unavailable' });
-		} catch (statusErr) {
-			log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
+		if (resumeMarker?.replicationEstablished) {
+			// checkSyncStatus matches leaderReplicationURL exactly, and only the marker holds the value
+			// refined against a TLS-only (e.g. v4) leader.
+			leaderReplicationURL = resumeMarker.leaderReplicationURL ?? leaderReplicationURL;
+			log(`Clone sync already in progress; replication already established with ${leaderReplicationURL}`);
+		} else {
+			// A marker recording only the intent is indeterminate — the crash may have landed either side
+			// of setNode(). Replay rather than infer: a local hdb_nodes row is not evidence the leader
+			// accepted this node, because setNode() catches a failed exchange, writes the peer anyway and
+			// returns success-with-warning. Replay is cheap and safe — ensureNode upserts by node name,
+			// and a base copy already running resumes from its durable cursor rather than restarting.
+			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
+			await establishReplicationSetup();
+			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: true, targetTimestamps, totalBytes });
 		}
-		updateConfigValue(CONFIG_PARAMS.CLONED, false);
-		// A clone that stops here keeps running, and both halves of the in-flight signal would stay set,
-		// so the replication send path would go on withholding this leader's own records from a base copy
-		// back to it for the life of the process (harper-pro#737) — including from a leader that asked for
-		// that copy because it had lost them. Retiring the attempt costs a retry a fresh base copy.
-		clearCloneAttempt();
-		log(
-			`Clone from leader node ${leaderURL} failed to obtain JWT signing keys (${err}); node is running but Unavailable and not marked as cloned`,
-			'error'
-		);
+
+		if (!targetTimestamps) {
+			const snapshot = await fetchAndPersistSnapshot(syncStartedAt);
+			if (!snapshot) return;
+			({ targetTimestamps, totalBytes } = snapshot);
+		}
+
+		if (!resumeMarker?.setupComplete) {
+			if (!(await finishCloneSetup())) return;
+			writeSyncStartedMarker({
+				startedAt: syncStartedAt,
+				replicationEstablished: true,
+				targetTimestamps,
+				totalBytes,
+				setupComplete: true,
+			});
+		}
+	} catch (err) {
+		// Contained rather than thrown: a rejection here reaches bin/harper.js, which exits the
+		// already-started process instead of leaving it queryable.
+		await abandonClone(`Clone from leader node ${leaderURL} failed during setup (${err})`);
 		return;
 	}
-
-	await cloneEnvSecretsKeys();
-
-	await cloneSSHKeys();
 
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
 	// once sync is confirmed and availability has been published as Available — a timeout or failure
 	// must not be treated as success.
-	const syncOutcome = await monitorSync();
+	const syncOutcome = await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
 	if (syncOutcome === 'failed') {
-		// Leave Harper running so get_status stays queryable for the control plane (availability is
-		// now Unavailable). Throwing here would propagate to bin/harper.js and exit the already-started
-		// process. Explicitly clear the cloned flag rather than just skipping the write: on a forced
-		// reclone, cloneConfig() has already carried the previous `cloned: true` into the rewritten
-		// config, so a bare return would leave it set and the next non-forced start would skip cloning
-		// despite the unconfirmed sync. Clearing it ensures a subsequent start retries the clone.
+		// Return (don't throw) so Harper stays running and queryable. Clear `cloned` explicitly: a
+		// forced reclone has already carried the previous `cloned: true` into the rewritten config.
 		updateConfigValue(CONFIG_PARAMS.CLONED, false);
-		clearCloneAttempt(); // see the JWT-key failure above (harper-pro#737)
+		clearCloneAttempt(); // same in-flight signal as the JWT-key failure below (harper-pro#737)
 		log(
 			`Clone from leader node ${leaderURL} did not complete synchronization; node is running but Unavailable and not marked as cloned`,
 			'error'
@@ -447,9 +396,213 @@ export async function cloneNode(): Promise<void> {
 
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
+	clearSyncStartedMarker();
 	clearCloneAttempt();
 
 	log(`Clone from leader node ${leaderURL} complete`);
+}
+
+/**
+ * First half of one-time clone setup, through `setNode()` accepting this node onto the leader.
+ * Must never be repeated once that succeeds (component re-extract, `npm install`, and a
+ * `restartWorkers` that would tear down the replication just resumed). Failures throw uncaught.
+ */
+async function establishReplicationSetup(): Promise<void> {
+	// Test hook: appends one line per invocation so a resume test can assert this ran exactly once
+	// across a restart. Without it the resume tests pass either way — a replayed setup also converges,
+	// so convergence alone proves nothing about whether the marker was honoured.
+	const traceFile = process.env.CLONE_SETUP_TRACE_FILE;
+	if (traceFile) appendFileSync(traceFile, `${Date.now()}\n`);
+
+	// Get the config from the leader and write it to the existing local config file, excluding any parameters that should not be cloned
+	const leaderConfigData = await cloneConfig();
+
+	// Refine the leader replication URL using the leader's own config. This is the only way to
+	// pick the right scheme (ws:// vs wss://) when bootstrapping against a leader whose
+	// replication port is TLS-only — most notably v4 leaders, whose default config binds
+	// `replication.securePort: 9933` with no plain WS sibling. The initial heuristic above
+	// emits `ws://` which v4 silently refuses (TCP-level reset), so the v5 → v4 clone never
+	// completes the set_node handshake.
+	const refinedLeaderReplicationURL = deriveLeaderReplicationURL(leaderConfigData, leaderReplicationURL);
+	if (refinedLeaderReplicationURL !== leaderReplicationURL) {
+		log(
+			`Adjusted leader replication URL from ${leaderReplicationURL} to ${refinedLeaderReplicationURL} based on leader config`
+		);
+		leaderReplicationURL = refinedLeaderReplicationURL;
+	}
+
+	// Clone applications that are deployed on the leader but not referenced in harper-config
+	await cloneApplications();
+
+	// Pre-create the leader's user databases (and any tables we don't already have locally) on
+	// this clone *before* establishing replication. Replication subscriptions are only set up for
+	// databases that already exist locally — see `forEachReplicatedDatabase` in
+	// `replication/replicator.ts`, which iterates `databases` and only fires subscriptions for the
+	// ones it finds. If we leave the user databases for the leader's incoming push to "create"
+	// them, the v5 clone never opens an outgoing subscription to the leader and never asks for
+	// the historical data. That manifests as the clone sitting at "Available never reached" with
+	// `database 'data' does not exist` errors in the log, because the leader (especially v4) does
+	// not push schema for user databases unless this side has explicitly subscribed.
+	//
+	// Doing this only matters for credential / token auth (HTTP `describe_all` available); cert
+	// auth has no way to talk to the leader before replication is up, so we skip there and rely on
+	// the existing self-bootstrap (cert-auth users are bootstrapping inside an already-clustered
+	// environment that has the cluster CA chain).
+	if (!usingCertAuth) {
+		await cloneSchemas();
+	}
+
+	// Base set node request
+	type SetNodeRequest = {
+		operation: string;
+		verify_tls: boolean;
+		url: string;
+		isLeader: true;
+		requirePeerAck: true;
+		authorization?:
+			| {
+					username: string;
+					password: string;
+			  }
+			| string;
+	};
+
+	const setNodeRequest: SetNodeRequest = {
+		operation: OPERATIONS_ENUM.ADD_NODE,
+		verify_tls: false, // set node cross-signs the cluster with harper self-signed certs
+		url: leaderReplicationURL,
+		isLeader: true,
+		// setNode writes the local peer row and returns success-with-warning when the leader exchange
+		// fails. A clone cannot treat that as success: the marker would record replicationEstablished,
+		// every later start would skip setup permanently, and the monitor would poll a leader that never
+		// accepted this node until the ceiling expired.
+		requirePeerAck: true,
+	};
+
+	if (!usingCertAuth) {
+		// If cloning using credential/token auth, we need to include the leader credentials in the set node request so that the leader can authenticate this node
+		if (leaderToken) {
+			setNodeRequest.authorization = 'Bearer ' + leaderToken;
+		} else {
+			setNodeRequest.authorization = {
+				username: leaderUsername,
+				password: leaderPassword,
+			};
+		}
+	}
+
+	// Restarting workers to ensure new configuration it loaded.
+	log('Restarting workers to apply new configuration');
+	const { restartWorkers } = await import('../core/server/threads/manageThreads.js');
+	await restartWorkers();
+
+	// Dynamically importing setNode because it was causing early usage of rootpath var install before it was initialized.
+	const { setNode } = await import('../replication/setNode.js');
+
+	// Set node will set up replication between this node and the leader,
+	// which will trigger the sync of data including some system tables like users and roles.
+	log('Sending set node request to leader to establish replication and trigger data sync');
+	const setNodeResponse = await setNode(setNodeRequest);
+	log(`Response from set node: ${setNodeResponse}`);
+}
+
+/**
+ * Second half of one-time clone setup: JWT, custody, and SSH key cloning, idempotent so a resume
+ * can re-run just this half. Returns false when the clone is not viable (Harper keeps running,
+ * Unavailable and not marked cloned).
+ */
+async function finishCloneSetup(): Promise<boolean> {
+	// Test hook: this half normally finishes in milliseconds, too fast for a test to reliably catch
+	// the marker with setupComplete still false. Holds the resume-only-the-remaining-stages window
+	// open long enough to interrupt deterministically.
+	const simulatedDelayMs = parseInt(process.env.CLONE_SIMULATE_SETUP_DELAY_MS, 10);
+	if (simulatedDelayMs > 0) await sleep(simulatedDelayMs);
+
+	try {
+		await cloneJWTKeys();
+	} catch (err) {
+		// A node without the leader's JWT signing keys cannot issue or validate tokens, so the clone is
+		// not viable. Mirror the unconfirmed-sync handling below: keep Harper running so get_status stays
+		// queryable, publish Unavailable, clear the cloned flag so a subsequent start retries the clone,
+		// and stop before finalizing.
+		const { set: setStatus } = await import('../core/server/status/index.js');
+		try {
+			await setStatus({ id: 'availability', status: 'Unavailable' });
+		} catch (statusErr) {
+			log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
+		}
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		// A clone that stops here keeps running, and both halves of the in-flight signal would stay set,
+		// so the replication send path would go on withholding this leader's own records from a base copy
+		// back to it for the life of the process (harper-pro#737) — including from a leader that asked for
+		// that copy because it had lost them. Retiring the attempt costs a retry a fresh base copy.
+		clearCloneAttempt();
+		log(
+			`Clone from leader node ${leaderURL} failed to obtain JWT signing keys (${err}); node is running but Unavailable and not marked as cloned`,
+			'error'
+		);
+		return false;
+	}
+
+	await cloneEnvSecretsKeys();
+
+	await cloneSSHKeys();
+
+	return true;
+}
+
+/**
+ * Records how far one-time clone setup got, so a restart repeats only what did not finish.
+ * `replicationEstablished` false means the intent to run `setNode()` was recorded but its outcome is
+ * unknown — reconciled against hdb_nodes on the next start. `leaderReplicationURL` is the
+ * leader-config-refined value checkSyncStatus matches exactly against cluster_status (the heuristic
+ * URL is wrong for a TLS-only leader). `targetTimestamps`/`totalBytes` pin the leader snapshot a
+ * resume reuses instead of re-fetching. `setupComplete` covers `finishCloneSetup` (JWT/custody/SSH).
+ */
+type SyncStartedMarker = {
+	leaderURL?: string;
+	leaderReplicationURL?: string;
+	startedAt?: number;
+	replicationEstablished?: boolean;
+	targetTimestamps?: Record<string, number>;
+	totalBytes?: number;
+	setupComplete?: boolean;
+};
+
+function syncStartedMarkerPath(): string {
+	return join(rootPath, 'tmp', 'clone-sync-started.json');
+}
+
+/**
+ * Temp-then-rename, and failures propagate: the marker is rewritten at every stage boundary, so an
+ * in-place write that tears or fails silently could destroy state already earned and replay setup.
+ */
+function writeSyncStartedMarker(stage: Omit<SyncStartedMarker, 'leaderURL' | 'leaderReplicationURL'>): void {
+	const target = syncStartedMarkerPath();
+	const temp = `${target}.tmp`;
+	mkdirSync(dirname(target), { recursive: true });
+	// Stage flags are always present, never absent-meaning-false, so the file states plainly how far
+	// setup got for anyone reading it during an incident.
+	const marker: SyncStartedMarker = { leaderURL, leaderReplicationURL, setupComplete: false, ...stage };
+	writeFileSync(temp, JSON.stringify(marker), { mode: 0o600 });
+	renameSync(temp, target);
+}
+
+function readSyncStartedMarker(): SyncStartedMarker | undefined {
+	try {
+		return JSON.parse(readFileSync(syncStartedMarkerPath(), 'utf8'));
+	} catch {
+		return undefined;
+	}
+}
+
+function clearSyncStartedMarker(): void {
+	try {
+		rmSync(syncStartedMarkerPath(), { force: true });
+		rmSync(`${syncStartedMarkerPath()}.tmp`, { force: true });
+	} catch (err) {
+		log(`Could not clear clone sync marker: ${err}`, 'error');
+	}
 }
 
 /**
@@ -470,16 +623,23 @@ type SyncOutcome = 'synced' | 'skipped' | 'failed';
  * Available once sync is confirmed and that write succeeds. On any failure it is left Unavailable.
  *
  * Polls at regular intervals until sync completes, failing only on a stall — the deadline slides
- * forward whenever replication data arrives, so a large clone is never timed out while healthy.
+ * forward whenever replication data arrives — plus an absolute ceiling sized from the leader's
+ * reported bytes, so a copy that keeps receiving without converging still reaches a verdict.
+ *
+ * `targetTimestamps`/`totalBytes` are the snapshot taken when the wait began (fresh attempt) or
+ * pinned in the resume marker (restart) — the caller decides which; this function never talks to
+ * the leader itself.
  */
-async function monitorSync(): Promise<SyncOutcome> {
+async function monitorSync(
+	syncStartedAt: number,
+	targetTimestamps: Record<string, number> | undefined,
+	totalBytes: number
+): Promise<SyncOutcome> {
 	const { set: setStatus } = await import('../core/server/status/index.js');
 
 	if (skipSyncMonitor) {
-		// The operator opted out of the sync gate, so the clone is declared ready. Publish Available
-		// (best-effort) — this also clears any Unavailable persisted by a prior failed attempt, since
-		// hdb_status is not replicated and survives restarts — keeping availability consistent with the
-		// cloned flag the caller sets for this outcome.
+		// Best-effort Available: also clears an Unavailable persisted by a prior failed attempt
+		// (hdb_status is not replicated and survives restarts).
 		log('Skipping sync monitor (skip-sync-monitor); marking node Available without verifying sync');
 		try {
 			await setStatus({ id: 'availability', status: 'Available' });
@@ -491,28 +651,21 @@ async function monitorSync(): Promise<SyncOutcome> {
 
 	const { clusterStatus } = await import('../replication/clusterStatus.js');
 
-	// The node is not ready to serve traffic until the clone has caught up with the leader. Publish
-	// Unavailable up front so get_status always carries a definite availability signal for the whole
-	// sync wait. Best-effort: a failed write here must not abort the clone (the loop still runs and
-	// publishes Available on success).
+	// Publish Unavailable up front so get_status carries a definite signal for the whole wait;
+	// best-effort, since the loop still publishes Available on success.
 	try {
 		await setStatus({ id: 'availability', status: 'Unavailable' });
 	} catch (err) {
 		log(`Failed to set availability status to Unavailable: ${err}`, 'error');
 	}
 
-	// Test/diagnostic hook (not a user-facing option): deterministically exercise the
-	// unconfirmed-sync failure path. Loopback replication is too fast and bidirectional to force a
-	// real sync timeout in tests, so this lets the failure-branch behavior — stay Unavailable, do not
-	// mark cloned, keep the node running — be asserted deterministically.
+	// Test hook: loopback replication is too fast to force a real sync timeout, so this makes the
+	// failure branch deterministically testable.
 	if (process.env.CLONE_SIMULATE_SYNC_FAILURE === 'true') {
 		log('CLONE_SIMULATE_SYNC_FAILURE set; treating clone sync as unconfirmed', 'error');
 		return 'failed';
 	}
 
-	// Get last updated record timestamps for all DB and write to file
-	// These values can be used for checking when the clone replication has caught up with the leader
-	const targetTimestamps = await getLastUpdatedRecord();
 	if (!targetTimestamps || Object.keys(targetTimestamps).length === 0) {
 		log('No target timestamps available to check synchronization status; leaving availability Unavailable', 'error');
 		return 'failed';
@@ -523,9 +676,17 @@ async function monitorSync(): Promise<SyncOutcome> {
 	const stallTimeoutMs: number =
 		explicitSyncTimeoutMs ??
 		Math.max(DEFAULT_SYNC_TIMEOUT_MS, 2 * (envMgr.get(CONFIG_PARAMS.REPLICATION_COPYTIMEOUT) ?? 300000));
+	// Sized from what the leader holds, assuming a deliberately pessimistic ~350KB/s sustained. A
+	// leader reporting no usable sizes gets a generous fixed ceiling instead of the floor — absent
+	// data must not shrink the budget. The elapsed subtraction charges time already spent by earlier
+	// attempts (syncStartedAt survives restarts via the marker), so restarts cannot renew the budget.
+	const ceilingMs: number =
+		explicitMaxCloneDurationMs ??
+		(totalBytes > 0 ? Math.max(MIN_MAX_CLONE_DURATION_MS, Math.ceil((totalBytes / 350_000) * 1000)) : 86400000);
+	const maxDurationMs: number = Math.max(0, ceilingMs - Math.max(0, Date.now() - syncStartedAt));
 
 	log(
-		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s`
+		`Starting to monitor sync status. Will check every ${DEFAULT_SYNC_CHECK_INTERVAL_MS}ms and fail if no replication data arrives for ${Math.round(stallTimeoutMs / 1000)}s, or if ${Math.round(totalBytes / 1024 / 1024)}MB has not converged within ${Math.round(maxDurationMs / 1000)}s`
 	);
 
 	// Whether the system database's socket is required has two independent gates.
@@ -564,6 +725,7 @@ async function monitorSync(): Promise<SyncOutcome> {
 		clusterStatus,
 		leaderReplicationURL,
 		stallTimeoutMs,
+		maxDurationMs,
 		checkIntervalMs: DEFAULT_SYNC_CHECK_INTERVAL_MS,
 		log,
 		requiredSocketDatabases: Object.keys(targetTimestamps).filter(
@@ -587,11 +749,68 @@ async function monitorSync(): Promise<SyncOutcome> {
 		return 'synced';
 	}
 
+	if (outcome === 'unconverged') {
+		log(
+			`Replication data is still arriving after ${Math.round(maxDurationMs / 1000)}s but one or more databases never reached the leader's targets; giving up — leaving availability Unavailable and not marking node as cloned`,
+			'error'
+		);
+		// The ceiling itself (not a transient stall) is what was exhausted, so the budget can never
+		// recover on a later restart — every future start would repeat this exact verdict forever.
+		// Clear the marker so the next start is a genuinely new attempt with a fresh ceiling, rather
+		// than a resume permanently pinned to a spent one.
+		clearSyncStartedMarker();
+		return 'failed';
+	}
+
 	log(
 		`No replication data received for ${Math.round(stallTimeoutMs / 1000)}s; sync is stalled — leaving availability Unavailable and not marking node as cloned`,
 		'error'
 	);
 	return 'failed';
+}
+
+/**
+ * Contained snapshot fetch: an unreachable leader or expired token must not throw out of
+ * cloneNode() and exit the already-running process. The marker is retained, so the next start
+ * retries only this fetch while replication keeps resuming.
+ */
+async function fetchSyncSnapshot(): Promise<
+	{ targetTimestamps: Record<string, number>; totalBytes: number } | undefined
+> {
+	try {
+		return await getLastUpdatedRecord();
+	} catch (err) {
+		await abandonClone(`Could not fetch sync targets from leader ${leaderURL} (${err})`);
+		return undefined;
+	}
+}
+
+/** Leave Harper running and queryable, reporting Unavailable and not cloned, so a later start retries. */
+async function abandonClone(reason: string): Promise<void> {
+	const { set: setStatus } = await import('../core/server/status/index.js');
+	try {
+		await setStatus({ id: 'availability', status: 'Unavailable' });
+	} catch (statusErr) {
+		log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
+	}
+	updateConfigValue(CONFIG_PARAMS.CLONED, false);
+	log(`${reason}; node is running but Unavailable and not marked as cloned`, 'error');
+}
+
+/** Shared by the fresh and resume-retry call sites: fetch the leader snapshot and, if it
+ *  succeeds, persist it right away so a later crash never re-triggers the fetch needlessly. */
+async function fetchAndPersistSnapshot(
+	syncStartedAt: number
+): Promise<{ targetTimestamps: Record<string, number>; totalBytes: number } | undefined> {
+	const snapshot = await fetchSyncSnapshot();
+	if (!snapshot) return undefined;
+	writeSyncStartedMarker({
+		startedAt: syncStartedAt,
+		replicationEstablished: true,
+		targetTimestamps: snapshot.targetTimestamps,
+		totalBytes: snapshot.totalBytes,
+	});
+	return snapshot;
 }
 
 /**
@@ -621,11 +840,14 @@ async function leaderShardedReplicates(): Promise<(entry: any) => boolean> {
 	}
 }
 
-async function getLastUpdatedRecord(): Promise<Record<string, number>> {
+async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string, number>; totalBytes: number }> {
 	log('Getting last updated record timestamp for all database', 'debug');
 	const lastUpdated: Record<string, number> = {};
+	// The same describe responses carry the leader's on-disk sizes, which size the wait's ceiling.
+	let totalBytes = 0;
 	const systemDb: Record<string, any> = await leaderRequest({ operation: 'describe_database', database: 'system' });
 	lastUpdated['system'] = findMostRecentTimestamp(systemDb);
+	totalBytes += sumTableSizes(systemDb);
 
 	const shardedReplicates = await leaderShardedReplicates();
 	const { getHDBNodeTable } = await import('../replication/knownNodes.ts');
@@ -643,13 +865,14 @@ async function getLastUpdatedRecord(): Promise<Record<string, number>> {
 		if (!isReplicatedDatabase(db, shardedReplicates) && !isExplicitDatabaseSubscription(leaderNode?.subscriptions, db))
 			continue;
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
+		totalBytes += sumTableSizes(allDb[db]);
 	}
 
 	const lastUpdatedFilePath: string = join(rootPath, 'tmp', 'lastUpdated.json');
 	log(`Writing last updated database timestamps to: ${lastUpdatedFilePath}`, 'debug');
 	writeJsonSync(lastUpdatedFilePath, lastUpdated);
 
-	return lastUpdated;
+	return { targetTimestamps: lastUpdated, totalBytes };
 }
 
 /**
@@ -669,6 +892,18 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 	}
 
 	return mostRecent;
+}
+
+/** Sum the on-disk table sizes in one describe response, for sizing the sync wait's ceiling. */
+function sumTableSizes(dbObj: Record<string, any>): number {
+	let total = 0;
+	for (const table in dbObj) {
+		const tableObj = dbObj[table];
+		if (typeof tableObj !== 'object' || tableObj == null) continue;
+		const size = tableObj.db_size ?? tableObj.table_size;
+		if (typeof size === 'number' && size > 0) total += size;
+	}
+	return total;
 }
 
 /**
