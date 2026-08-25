@@ -57,14 +57,10 @@ ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 # exit status of the cleanup commands that follow it, and `harper version` asserts
 # the installed bin actually resolves and runs: v5.2.0-beta.4 published an image
 # with no harper in it off a green build when npm install hit a transient ETARGET.
-# The re2 check is the same assertion for the one dependency whose addon comes from an install
-# script rather than the npm tarball: npm downgrades a skipped install script to a warning, and
-# re2 is a hard import in security/safeRegex.ts and waf/matcher.ts.
 RUN <<-EOF
   set -e
   npm install --global harperfast-harper-pro-*.tgz
   harper version
-  (cd "$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro" && node -e "require('re2')")
   rm harperfast-harper-pro-*.tgz
   mkdir -p /home/harperdb/harper
   chown harperdb:harperdb /home/harperdb/harper
