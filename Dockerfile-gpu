@@ -26,6 +26,15 @@ COPY . .
 
 RUN env NO_USE_GIT=true npm run package
 
+# The global install happens HERE, not in the run stage, and the finished tree is copied
+# across. The CUDA runtime base carries no C/C++ toolchain, so a dependency that reaches
+# node-gyp there dies with `not found: make` — which is what re2 does on Node 25: it fetches
+# its addon from a GitHub release in an install script and falls back to a source build, and
+# re2 >=1.24.1 publishes prebuilds for LTS ABIs only (127/137/147 = Node 22/24/26; 141 =
+# Node 25 does not exist for any platform). This stage is a full node image, so the fallback
+# compiles here instead, against the same Node major and an older glibc than the runtime's.
+RUN npm install --global --prefix /opt/harper-pro harperfast-harper-pro-*.tgz
+
 FROM ${CUDA_RUNTIME_IMAGE} AS run
 
 ARG NODE_VERSION=24
@@ -83,19 +92,22 @@ RUN <<EOF
   rm /tmp/install-pnpm.sh
 EOF
 
-COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
-
 # Configure NPM
 ENV NPM_CONFIG_PREFIX=/home/harperdb/.npm-global
 ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 
-# Install Harper Pro globally. See Dockerfile for why `set -e` and the assertion
-# are load-bearing here.
+COPY --from=build --chown=harperdb:harperdb /opt/harper-pro /home/harperdb/.npm-global
+
+# Assert the copied install resolves and runs here, not just that it was produced upstream:
+# v5.2.0-beta.4 published an image with no harper in it off a green build. The re2 check is
+# the same assertion for the one dependency that ships no prebuild in its npm tarball and
+# materializes its addon from an install script — npm treats a skipped install script as a
+# warning ("not yet covered by allowScripts"), so without this the image would publish green
+# and only fail when the WAF loads re2 in production.
 RUN <<-EOF
   set -e
-  npm install --global harperfast-harper-pro-*.tgz
   harper version
-  rm harperfast-harper-pro-*.tgz
+  node -e "require('$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro/node_modules/re2')"
   mkdir -p /home/harperdb/harper
   chown harperdb:harperdb /home/harperdb/harper
 EOF
