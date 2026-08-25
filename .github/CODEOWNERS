@@ -10,5 +10,5 @@
 /build-tools/ @HarperFast/developers @HarperFast/devops
 
 # Dependency bumps (Renovate and manual) need one reviewer, not the whole team
-package.json      @kriszyp
-package-lock.json @kriszyp
+/package.json      @kriszyp
+/package-lock.json @kriszyp
