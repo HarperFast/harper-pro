@@ -31,10 +31,12 @@ jobs:
         # build-pc job so its dispatch-only base image can never block this
         # standard release image (see build-pc / the PUBLISH_PC_VARIANT gate).
         include:
-          - { node-version: 24, platform: linux/amd64, runner: ubuntu-latest }
-          - { node-version: 24, platform: linux/arm64, runner: ubuntu-24.04-arm }
-          - { node-version: 25, platform: linux/amd64, runner: ubuntu-latest }
-          - { node-version: 25, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { node-version: 22, node-build-version: 22, platform: linux/amd64, runner: ubuntu-latest }
+          - { node-version: 22, node-build-version: 22, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { node-version: 24, node-build-version: 24, platform: linux/amd64, runner: ubuntu-latest }
+          - { node-version: 24, node-build-version: 24, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { node-version: 26, node-build-version: 26.5.0, platform: linux/amd64, runner: ubuntu-latest }
+          - { node-version: 26, node-build-version: 26.5.0, platform: linux/arm64, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,8 +62,8 @@ jobs:
           # -trixie: the runtime requires Debian trixie's glibc (see Dockerfile);
           # matrix.node-version stays the bare major for tag naming.
           build-args: |
-            NODE_BUILD_VERSION=${{ matrix.node-version }}-trixie
-            NODE_VERSION=${{ matrix.node-version }}-trixie
+            NODE_BUILD_VERSION=${{ matrix.node-build-version }}-trixie
+            NODE_VERSION=${{ matrix.node-build-version }}-trixie
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=harperfast/harper-pro,push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
@@ -83,7 +85,7 @@ jobs:
     needs: [build]
     strategy:
       matrix:
-        node-version: [24, 25]
+        node-version: [22, 24, 26]
     outputs:
       docker-image-tag: ${{ steps.meta.outputs.version }}
     steps:
@@ -250,7 +252,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: [24, 25]
+        include:
+          - { node-version: 22, node-build-version: 22, node-package-version: '' }
+          - { node-version: 24, node-build-version: 24, node-package-version: '' }
+          - { node-version: 26, node-build-version: 26.5.0, node-package-version: 26.5.0 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -275,8 +280,9 @@ jobs:
           file: Dockerfile-gpu
           platforms: linux/amd64
           build-args: |
-            NODE_BUILD_VERSION=${{ matrix.node-version }}
+            NODE_BUILD_VERSION=${{ matrix.node-build-version }}
             NODE_VERSION=${{ matrix.node-version }}
+            NODE_PACKAGE_VERSION=${{ matrix.node-package-version }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=harperfast/harper-pro-gpu,push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
@@ -298,7 +304,7 @@ jobs:
     needs: [build-gpu]
     strategy:
       matrix:
-        node-version: [24, 25]
+        node-version: [22, 24, 26]
     outputs:
       docker-image-tag: ${{ steps.meta.outputs.version }}
     steps:
