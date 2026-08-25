@@ -14,11 +14,11 @@ concurrency:
 
 jobs:
   mention:
-    uses: HarperFast/ai-review-prompts/.github/workflows/_claude-mention.yml@f6daed301f8a7ece74593506de38c6e80820b00b # main 2026-05-06
+    uses: HarperFast/ai-review-prompts/.github/workflows/_claude-mention.yml@4632c5d93dae1e6548e6c30c5ced8fb2df69f4e5 # main 2026-08-25 (#89 fleet turn/effort/model defaults; #88 sibling + cannot-fail-test lenses; #85/#87 calibration)
     with:
       # Same SHA as the `uses:` ref above. See claude-review.yml in
       # this repo for why the duplication is unavoidable.
-      ai-review-prompts-ref: f6daed301f8a7ece74593506de38c6e80820b00b
+      ai-review-prompts-ref: 4632c5d93dae1e6548e6c30c5ced8fb2df69f4e5
       repo-specific-conventions: |
         ## Harper Pro notes
 
