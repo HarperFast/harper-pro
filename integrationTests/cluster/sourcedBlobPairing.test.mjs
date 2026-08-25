@@ -327,6 +327,7 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 
 			await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 			await waitForAllWorkers(ctx.nodes, id, ctx.agentsByNode, 'PairPointProbe');
+			// Recheck the raw stores after every worker has materialized the record.
 			const scans = await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 			deepEqual(scans[0].record, scans[1].record, `${id} raw stores must converge`);
 			equal(scans[0].record.payloadToken, scans[0].record.token, `${id} raw record/blob pairing`);
