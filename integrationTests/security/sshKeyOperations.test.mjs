@@ -1,16 +1,17 @@
-import { suite, test, before, after } from 'node:test';
+import { suite, test, before, beforeEach, afterEach, after } from 'node:test';
 import { equal, deepEqual, ok } from 'node:assert';
+import { rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { startHarper, teardownHarper } from '@harperfast/integration-testing';
 
-process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
-	'..',
-	'..',
-	'dist',
-	'bin',
-	'harper.js'
-);
+const TEST_DIRECTORY = import.meta.dirname ?? module.path;
+const GITHUB_META_FETCH_PRELOAD = join(TEST_DIRECTORY, 'fixtures', 'redirectGitHubMetaFetch.mjs');
+const GITHUB_SSH_KEYS = ['ssh-ed25519 fixture-key-one', 'ecdsa-sha2-nistp256 fixture-key-two'];
+const GITHUB_KNOWN_HOSTS = GITHUB_SSH_KEYS.map((key) => `github.com ${key}\n`).join('');
+
+process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIRECTORY, '..', '..', 'dist', 'bin', 'harper.js');
 
 async function sendOperation(node, operation) {
 	const response = await fetch(node.operationsAPIURL, {
@@ -23,12 +24,67 @@ async function sendOperation(node, operation) {
 }
 
 suite('SSH Key Operations', (ctx) => {
+	let disconnectGitHubMetaRequest = false;
+	let githubMetaRequestCount = 0;
+	const githubMetaServer = createServer((request, response) => {
+		if (request.url !== '/meta') {
+			response.writeHead(404).end();
+			return;
+		}
+
+		githubMetaRequestCount++;
+		if (disconnectGitHubMetaRequest) {
+			request.socket.destroy();
+			return;
+		}
+
+		response.writeHead(200, { 'Content-Type': 'application/json' });
+		response.end(JSON.stringify({ ssh_keys: GITHUB_SSH_KEYS }));
+	});
+
 	before(async () => {
-		await startHarper(ctx);
+		await new Promise((resolve, reject) => {
+			githubMetaServer.once('error', reject);
+			githubMetaServer.listen(0, '127.0.0.1', () => {
+				githubMetaServer.off('error', reject);
+				resolve();
+			});
+		});
+		const { port } = githubMetaServer.address();
+		const nodeOptions = [process.env.NODE_OPTIONS, `--import=${pathToFileURL(GITHUB_META_FETCH_PRELOAD).href}`]
+			.filter(Boolean)
+			.join(' ');
+		await startHarper(ctx, {
+			env: {
+				HARPER_SSH_KEY_GITHUB_META_FIXTURE_URL: `http://127.0.0.1:${port}/meta`,
+				NODE_OPTIONS: nodeOptions,
+			},
+		});
+	});
+
+	beforeEach(async () => {
+		disconnectGitHubMetaRequest = false;
+		githubMetaRequestCount = 0;
+		await rm(join(ctx.harper.dataRootDir, 'ssh'), { recursive: true, force: true });
+	});
+
+	afterEach(async () => {
+		await rm(join(ctx.harper.dataRootDir, 'ssh'), { recursive: true, force: true });
 	});
 
 	after(async () => {
-		await teardownHarper(ctx);
+		try {
+			await teardownHarper(ctx);
+		} finally {
+			await new Promise((resolve) => {
+				if (!githubMetaServer.listening) {
+					resolve();
+					return;
+				}
+				githubMetaServer.close(resolve);
+				githubMetaServer.closeAllConnections();
+			});
+		}
 	});
 
 	test('list_ssh_keys and get_ssh_known_hosts return empty state by default', async () => {
@@ -66,9 +122,6 @@ suite('SSH Key Operations', (ctx) => {
 		// the only consumer is cloneSSHKeys, which never needs the plaintext.
 		ok(data.key.startsWith('enc:v1:'), 'expected key to be returned as an enc:v1: envelope');
 		ok(!data.key.includes('random\nstring'), 'expected key to not be returned in plaintext');
-
-		// cleanup
-		await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey1' });
 	});
 
 	test('add_ssh_key generate=true mints a keypair and returns the public key', async () => {
@@ -90,9 +143,6 @@ suite('SSH Key Operations', (ctx) => {
 		({ status, data } = await sendOperation(ctx.harper, { operation: 'get_ssh_key', name: 'testkey-generated' }));
 		equal(status, 200);
 		ok(data.key.startsWith('enc:v1:'), 'expected the minted key to be sealed at rest');
-
-		// cleanup
-		await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey-generated' });
 	});
 
 	test('add_ssh_key rejects generate=true together with an explicit key', async () => {
@@ -129,12 +179,9 @@ suite('SSH Key Operations', (ctx) => {
 		({ status, data } = await sendOperation(ctx.harper, { operation: 'get_ssh_known_hosts' }));
 		equal(status, 200);
 		deepEqual(data, { known_hosts: 'gitlab.com fake1\ngitlab.com fake2' });
-
-		// cleanup
-		await sendOperation(ctx.harper, { operation: 'set_ssh_known_hosts', known_hosts: null });
 	});
 
-	test('add_ssh_key with github.com hostname fetches known_hosts automatically', async () => {
+	test('add_ssh_key with github.com hostname fetches known_hosts from the controlled endpoint', async () => {
 		let { status, data } = await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',
 			name: 'testkey-github',
@@ -144,13 +191,32 @@ suite('SSH Key Operations', (ctx) => {
 		});
 		equal(status, 200);
 		equal(data.message, 'Added ssh key: testkey-github');
+		equal(githubMetaRequestCount, 1);
 
 		({ status, data } = await sendOperation(ctx.harper, { operation: 'get_ssh_known_hosts' }));
 		equal(status, 200);
-		ok(data.known_hosts.split('\n').length > 2, 'expected known_hosts to contain auto-fetched github entries');
+		deepEqual(data, { known_hosts: GITHUB_KNOWN_HOSTS });
+	});
 
-		// cleanup
-		await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey-github' });
+	test('add_ssh_key reports the documented fallback when the github metadata fetch fails', async () => {
+		disconnectGitHubMetaRequest = true;
+		let { status, data } = await sendOperation(ctx.harper, {
+			operation: 'add_ssh_key',
+			name: 'testkey-github-fallback',
+			key: 'random\nstring',
+			host: 'testkey-github-fallback.github.com',
+			hostname: 'github.com',
+		});
+		equal(status, 200);
+		equal(
+			data.message,
+			'Added ssh key: testkey-github-fallback. Unable to get known hosts from github.com. Set your known hosts manually using set_ssh_known_hosts.'
+		);
+		ok(githubMetaRequestCount >= 1);
+
+		({ status, data } = await sendOperation(ctx.harper, { operation: 'get_ssh_known_hosts' }));
+		equal(status, 200);
+		deepEqual(data, { known_hosts: '' });
 	});
 
 	test('update_ssh_key updates an existing key', async () => {
@@ -169,9 +235,6 @@ suite('SSH Key Operations', (ctx) => {
 		});
 		equal(status, 200);
 		equal(data.message, 'Updated ssh key: testkey-update');
-
-		// cleanup
-		await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey-update' });
 	});
 
 	test('delete_ssh_key removes a key', async () => {
@@ -210,9 +273,6 @@ suite('SSH Key Operations', (ctx) => {
 		});
 		ok(status >= 400);
 		equal(data.error, 'Key already exists. Use update_ssh_key or delete_ssh_key and then add_ssh_key');
-
-		// cleanup
-		await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey-duplicate' });
 	});
 
 	test('update_ssh_key on nonexistent key returns error', async () => {
