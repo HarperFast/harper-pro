@@ -7269,7 +7269,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		const wasSchemaDefined = existingTable.schemaDefined;
 		let hasChanges = false;
 		const schemaDefined = tableDefinition.schemaDefined;
-		// copy: the live Table.attributes must not carry peer entries before table() applies them
 		const attributes = (existingTable.attributes || []).slice();
 		for (let i = 0; i < tableDefinition.attributes?.length; i++) {
 			const ensureAttribute = tableDefinition.attributes[i];
@@ -7298,8 +7297,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				database: tableDefinition.database,
 				schemaDefined: tableDefinition.schemaDefined,
 				...existingTable,
-				// after the spread: a live Table spreads its own `attributes` and `origin` properties, which
-				// must not override the merged copy or the additive semantics
+				// Preserve the merged peer view after a live Table contributes its own properties (harper#2258).
 				attributes,
 				origin: 'cluster',
 			});
