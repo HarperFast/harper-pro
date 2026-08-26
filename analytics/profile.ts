@@ -18,10 +18,11 @@ import * as log from '../core/utility/logging/harper_logger.js';
 import type { Scope } from '../core/components/Scope.ts';
 
 type Profile = ReturnType<typeof timeProfiler.stop>;
-type Sample = Profile['sample'][0];
+type Sample = NonNullable<Profile['sample']>[number];
 type ProfileLocationId = Sample['locationId'][number];
-type ProfileFunctionId = Profile['function'][number]['id'];
-type TimeProfileSample = Sample & { value: number[] };
+type ProfileFunctionId = NonNullable<Profile['function']>[number]['id'];
+type TimeProfileSample = Omit<Sample, 'value'> & { value: number[] };
+type TimeProfile = Omit<Profile, 'sample'> & { sample: TimeProfileSample[] };
 const basePath = getHdbBasePath();
 let capturePeriod = 1000;
 export const userCodeFolders = basePath ? [basePath] : [];
@@ -97,7 +98,7 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	// Start GPU measurement early so it runs in parallel with CPU profiling work
 	const gpuPromise = getWorkerIndex() === 0 && gpuAvailable ? getGpuUtilization() : null;
 	try {
-		const profile = timeProfiler.stop(true) as Profile & { sample: TimeProfileSample[] };
+		const profile = timeProfiler.stop(true) as TimeProfile;
 		const strings = profile.stringTable.strings;
 		for (let func of profile.function) {
 			fileNameById.set(func.id, strings[func.filename as number]);
