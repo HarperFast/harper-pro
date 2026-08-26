@@ -20,6 +20,7 @@ import type { Scope } from '../core/components/Scope.ts';
 type Profile = ReturnType<typeof timeProfiler.stop>;
 type Sample = Profile['sample'][0];
 type ProfileLocationId = Sample['locationId'][number];
+type ProfileFunctionId = Profile['function'][number]['id'];
 type TimeProfileSample = Sample & { value: number[] };
 const basePath = getHdbBasePath();
 let capturePeriod = 1000;
@@ -89,7 +90,7 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	const secondsPerHit = SAMPLING_INTERVAL_IN_MICROSECONDS / 1_000_000;
 	const CHILD_TIME_THRESHOLD = 0.001;
 	const locationById = new Map<ProfileLocationId, any>();
-	const fileNameById = new Map<ProfileLocationId, any>();
+	const fileNameById = new Map<ProfileFunctionId, any>();
 	const samplesByLocationId = new Map<ProfileLocationId, number>();
 	let totalUserCount = 0;
 	let totalHarperCount = 0;
