@@ -19,6 +19,7 @@ import type { Scope } from '../core/components/Scope.ts';
 
 type Profile = ReturnType<typeof timeProfiler.stop>;
 type Sample = Profile['sample'][0];
+type ProfileNumeric = Sample['value'][number];
 const basePath = getHdbBasePath();
 let capturePeriod = 1000;
 export const userCodeFolders = basePath ? [basePath] : [];
@@ -86,9 +87,9 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	const hitCountThreshold = 100;
 	const secondsPerHit = SAMPLING_INTERVAL_IN_MICROSECONDS / 1_000_000;
 	const CHILD_TIME_THRESHOLD = 0.001;
-	const locationById = new Map<number, any>();
-	const fileNameById = new Map<number, any>();
-	const samplesByLocationId = new Map<number, number>();
+	const locationById = new Map<ProfileNumeric, any>();
+	const fileNameById = new Map<ProfileNumeric, any>();
+	const samplesByLocationId = new Map<ProfileNumeric, number>();
 	let totalUserCount = 0;
 	let totalHarperCount = 0;
 	// Start GPU measurement early so it runs in parallel with CPU profiling work
@@ -97,10 +98,10 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 		const profile = timeProfiler.stop(true);
 		const strings = profile.stringTable.strings;
 		for (let func of profile.function) {
-			fileNameById.set(func.id as number, strings[func.filename as number]);
+			fileNameById.set(func.id, strings[func.filename as number]);
 		}
 		for (let location of profile.location) {
-			locationById.set(location.id as number, location.line[0]);
+			locationById.set(location.id, location.line[0]);
 		}
 
 		for (const sample of profile.sample) {
@@ -153,14 +154,14 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 			let fileName = fileNameById.get(locationById.get(locationId).functionId);
 			if (userCodeFolders.some((userCodeFolder) => fileName.startsWith(userCodeFolder))) {
 				// the call frame location is in user code
-				const sampleCount = sample.value[0];
+				const sampleCount = getSampleCount(sample);
 				totalUserCount += sampleCount;
 				if (!recordedTopSample)
 					samplesByLocationId.set(locationId, (samplesByLocationId.get(locationId) ?? 0) + sampleCount);
 				return; // if the highest point in the call stack is in user code, we don't need to check the rest of the call stack, this "counts" as user execution
 			}
 			if (fileName.startsWith(PACKAGE_ROOT)) {
-				const sampleCount = sample.value[0];
+				const sampleCount = getSampleCount(sample);
 				totalHarperCount += sampleCount;
 				if (!recordedTopSample) {
 					samplesByLocationId.set(locationId, (samplesByLocationId.get(locationId) ?? 0) + sampleCount);
@@ -169,6 +170,12 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 			}
 		}
 	}
+}
+
+function getSampleCount(sample: Sample): number {
+	const sampleCount = sample.value[0];
+	if (typeof sampleCount !== 'number') throw new TypeError('CPU profile sample count must be a number');
+	return sampleCount;
 }
 
 /**

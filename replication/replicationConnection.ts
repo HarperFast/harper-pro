@@ -78,7 +78,7 @@ import * as process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { open as openFile } from 'node:fs/promises';
 import { promises as fsPromises } from 'node:fs';
-import { isIP } from 'node:net';
+import { isIP, type Socket } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';
 import {
 	createBlob,
@@ -101,6 +101,9 @@ import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
 const logger = forComponent('replication').conditional as Logger;
+
+type ReplicationWebSocket = WebSocket & { _socket: Socket | null };
+type ReplicationConnectionError = Error & { code?: string; isHandled?: boolean };
 
 // msgpackr v2 removed the built-in `randomAccessStructure` option; that random-access
 // struct support now lives in the `structon` package (the same wrapper core's
@@ -1134,7 +1137,7 @@ export function shouldLogSustainedBlobDivergence(
 // code and only recovers with the fix. One-shot per worker thread, so the reconnect's fresh socket
 // recovers normally. Never arms in production: the env var is set only by the regression test.
 let replicationWedgeForTestArmed = false;
-export function armReplicationWedgeForTest(connection: any, ws: WebSocket, databaseName?: string): boolean {
+export function armReplicationWedgeForTest(connection: any, ws: ReplicationWebSocket, databaseName?: string): boolean {
 	// Guard the env var first: an unset var is undefined, and `undefined !== undefined` is false, so a
 	// connection with an undefined databaseName would otherwise arm the wedge in production.
 	if (!process.env.HARPER_TEST_REPLICATION_WEDGE_DB) return false;
@@ -1159,7 +1162,7 @@ export function armReplicationWedgeForTest(connection: any, ws: WebSocket, datab
 let leakConnectionForTestArmed = false;
 export function maybeLeakConnectionAfterCopyStartForTest(
 	connection: any,
-	ws: WebSocket,
+	ws: ReplicationWebSocket,
 	databaseName?: string
 ): boolean {
 	if (!process.env.HARPER_TEST_LEAK_CONNECTION_AFTER_COPY_START_DB) return false;
@@ -2405,7 +2408,7 @@ export async function createWebSocket(
 			wsOptions.secureContext = replicationSecureContext;
 		}
 	}
-	return new WebSocket(url, 'harperdb-replication-v1', wsOptions);
+	return new WebSocket(url, 'harperdb-replication-v1', wsOptions) as ReplicationWebSocket;
 }
 
 const INITIAL_RETRY_TIME = 500;
@@ -2414,7 +2417,7 @@ const INITIAL_RETRY_TIME = 500;
  * sockets that may be disconnected and reconnected
  */
 export class NodeReplicationConnection extends EventEmitter {
-	socket: WebSocket;
+	socket: ReplicationWebSocket;
 	startTime: number;
 	retryTime = INITIAL_RETRY_TIME;
 	retries = 0;
@@ -2558,7 +2561,7 @@ export class NodeReplicationConnection extends EventEmitter {
 				this.socket.terminate();
 			}
 		});
-		this.socket.on('error', (error) => {
+		this.socket.on('error', (error: ReplicationConnectionError) => {
 			if (error.code === 'SELF_SIGNED_CERT_IN_CHAIN') {
 				logger.warn?.(
 					`Can not connect to ${this.url}, this server does not have a certificate authority for the certificate provided by ${this.url}`
@@ -2749,7 +2752,7 @@ export class NodeReplicationConnection extends EventEmitter {
 /**
  * This handles both incoming and outgoing WS allowing either one to issue a subscription and get replication and/or handle subscription requests
  */
-export function replicateOverWS(ws: WebSocket, options: any, authorization: any) {
+export function replicateOverWS(ws: ReplicationWebSocket, options: any, authorization: any) {
 	const p = options.port || options.securePort;
 	const connectionId =
 		(process.pid % 1000) +
