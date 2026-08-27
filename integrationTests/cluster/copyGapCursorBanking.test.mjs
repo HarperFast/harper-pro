@@ -2,7 +2,7 @@
  * Copy-cursor banking across repeated transient blob faults (harper-pro#699).
  *
  * Field failure this reproduces: a blob-dense base copy on a link with a sustained transient
- * blob-fault supply (kohls: copy-vs-copy PENDING-placeholder collisions, ~39 faults/min) never
+ * blob-fault supply (copy-vs-copy PENDING-placeholder collisions, ~39 faults/min) never
  * advances its durable copy cursor. The pre-#699 receiver clamps on a per-connection boolean
  * (`hasBlobGap`), and its pre-gap snapshot is captured only at an instant with ZERO blobs in
  * flight — which a blob-dense copy never reaches — so every blob-gap watchdog reconnect (#683)
@@ -16,10 +16,10 @@
  *
  * Oracles (the resume trail is the discriminating one):
  *  1. Injected blob gaps force repeated reconnect cycles.
- *  2. B's "Resuming interrupted copy … after key K" trail shows ≥2 distinct, monotonically
- *     advancing keys: each cycle banked the prefix walked before that cycle's first fault.
- *     Without per-position banking, no mid-walk cursor is persisted under these conditions, so
- *     reconnects re-request a full copy and this assertion fails.
+ *  2. B's "Resuming interrupted copy … after key K" trail shows ≥2 cycles that never regress, at
+ *     least one of them banked past the first record: each cycle banked the prefix walked before
+ *     that cycle's first fault. Without per-position banking, no mid-walk cursor is persisted
+ *     under these conditions, so reconnects re-request a full copy and this assertion fails.
  *  3. The copy converges: B reaches A's record count and every referenced blob payload is intact.
  */
 
@@ -245,13 +245,20 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			watchdogFires + bankedReconnects >= 1,
 			`no gap cycle occurred (watchdog=${watchdogFires}, bankedReconnects=${bankedReconnects}) — test exercised nothing`
 		);
-		// The #699 signal: reconnect cycles resume from persisted mid-walk cursors that ADVANCE.
 		ok(
 			resumeKeys.length >= 2,
 			`fewer than 2 cursor-based copy resumes (${resumeKeys.length}) — cycles are not banking progress`
 		);
-		const distinct = new Set(resumeKeys);
-		ok(distinct.size >= 2, `resume keys never advanced across cycles: [${resumeKeys}]`);
+		ok(
+			resumeKeys.every((key) => Number.isFinite(key)),
+			`a copy resume logged an unparseable cursor key: [${resumeKeys}]`
+		);
+		// Repair saves share the injector's fault-ordinal counter, so a resumed pass whose own first
+		// fault is the repair of the record at the gap re-banks the same prefix.
+		ok(
+			resumeKeys.some((key) => key > 0),
+			`no cycle banked past the first record: [${resumeKeys}] — the copy is re-walking from the start`
+		);
 		for (let i = 1; i < resumeKeys.length; i++) {
 			ok(
 				resumeKeys[i] >= resumeKeys[i - 1],
