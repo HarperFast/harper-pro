@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import { createAuditEntry, readAuditEntry } from '#src/core/resources/auditStore';
+import { storedFieldsOnly } from '#src/core/resources/RecordEncoder';
 import { Blob, createBlob, decodeWithBlobCallback } from '#src/core/resources/blob';
 import { table, tables } from '#src/core/resources/databases';
 import { loadGQLSchema } from '#src/core/resources/graphql';
@@ -9,11 +10,11 @@ import {
 	collectAuditRecordBlobsFromBinary,
 	encodeWithCopyBlobTransferTags,
 	getResidencyProjectionRecord,
-	resolveIndexedProjectionValue,
+	isResolverOwnedIndexedName,
 } from '#src/replication/replicationConnection';
 
 describe('copy blob transfer metadata', () => {
-	it('keeps computed response fields out of copy payloads', async () => {
+	it('resolver output never enters copy payloads, and legacy contamination cannot outrank the resolver', async () => {
 		setHdbBasePath(process.env.STORAGE_PATH);
 		await loadGQLSchema(`
 			type ComputedCopyMetadata @table {
@@ -23,9 +24,18 @@ describe('copy blob transfer metadata', () => {
 			}
 		`);
 		const ComputedCopy = tables.ComputedCopyMetadata;
+		const encoder = ComputedCopy.primaryStore.encoder;
 		await ComputedCopy.put({ id: 'record', source: 'before' });
 		const stored = ComputedCopy.primaryStore.getEntry('record');
-		const encodedRecord = ComputedCopy.primaryStore.encoder.encode(stored.value);
+
+		// Non-vacuity: without the projection, re-encoding the materialized record routes through its
+		// response toJSON and the computed value reaches the bytes — the copy sender's projection is
+		// load-bearing on this path, not decorative.
+		const unprojected = encoder.decode(Buffer.from(encoder.encode(stored.value)));
+		assert.equal(unprojected.derived, 'before', 'premise: an unprojected re-encode carries the computed value');
+
+		// The copy sender's actual shape: project to stored fields, then encode.
+		const encodedRecord = Buffer.from(encoder.encode(storedFieldsOnly(encoder, stored.value)));
 		const auditRecord = readAuditEntry(
 			Buffer.from(
 				createAuditEntry({
@@ -39,23 +49,16 @@ describe('copy blob transfer metadata', () => {
 			)
 		);
 		const copied = auditRecord.getValue(ComputedCopy.primaryStore);
-		assert.equal(Object.hasOwn(copied, 'derived'), false);
-		assert.equal(Object.hasOwn(copied, 'source'), true);
+		assert.equal(copied.derived, undefined, 'the projected copy payload must not carry the computed value');
 		assert.equal(copied.source, 'before');
-		assert.equal(stored.value.derived, 'before');
-		await ComputedCopy.put({ ...copied, id: 'received' });
-		const received = ComputedCopy.primaryStore.getEntry('received').value;
-		assert.equal(Object.hasOwn(received, 'derived'), false);
-		assert.equal(received.derived, 'before');
 
-		const legacyEncodedRecord = Buffer.from(
-			ComputedCopy.primaryStore.encoder.encode({
-				id: 'legacy',
-				source: 'trusted',
-				derived: 'forged',
-			})
+		// An affected-release sender ships bytes with the computed value as a stored field; the
+		// receiver's durable write projects it away and the resolver stays authoritative.
+		const legacyEncodedRecord = Buffer.from(encoder.encode({ id: 'legacy', source: 'trusted', derived: 'forged' }));
+		assert(
+			legacyEncodedRecord.includes(Buffer.from('forged')),
+			'premise: affected-sender bytes carry the forged value'
 		);
-		assert(legacyEncodedRecord.includes(Buffer.from('forged')), 'affected-sender bytes must contain the forged value');
 		const legacyAuditRecord = readAuditEntry(
 			Buffer.from(
 				createAuditEntry({
@@ -69,36 +72,38 @@ describe('copy blob transfer metadata', () => {
 			)
 		);
 		const legacyCopy = legacyAuditRecord.getValue(ComputedCopy.primaryStore);
-		assert.equal(Object.hasOwn(legacyCopy, 'derived'), false);
-		await ComputedCopy.put(legacyCopy);
-		assert.equal(ComputedCopy.primaryStore.getEntry('legacy').value.derived, 'trusted');
-
-		const fullRecord = auditRecord.getValue(ComputedCopy.primaryStore, true);
-		const partialProjection = {};
-		for (const name in ComputedCopy.indices)
-			partialProjection[name] = resolveIndexedProjectionValue(ComputedCopy, fullRecord, name);
-		assert.deepEqual(partialProjection, { derived: 'before' });
+		const receiveContext = {};
+		await transaction(receiveContext, async () => {
+			// the replication apply path writes under the replay marker, which skips public-path validation
+			receiveContext.transaction.isReplay = true;
+			const options = { isNotification: true, ensureLoaded: false, async: true };
+			const resource = await ComputedCopy.getResource('legacy', receiveContext, options);
+			resource._writeUpdate('legacy', legacyCopy, true, options);
+		});
+		const legacyStored = ComputedCopy.primaryStore.getEntry('legacy').value;
 		assert.equal(
-			resolveIndexedProjectionValue({ propertyResolvers: {} }, { toString: 'stored' }, 'toString'),
-			'stored'
+			Object.hasOwn(legacyStored, 'derived'),
+			false,
+			'the receiver write must project the forged value away'
 		);
-		const resolverFailure = new Error('resolver failed');
-		assert.throws(
-			() =>
-				resolveIndexedProjectionValue(
-					{
-						tableName: 'ComputedCopyMetadata',
-						propertyResolvers: {
-							derived: () => {
-								throw resolverFailure;
-							},
-						},
-					},
-					fullRecord,
-					'derived'
-				),
-			(error) => error.cause === resolverFailure && /ComputedCopyMetadata/.test(error.message)
-		);
+		assert.equal(legacyStored.derived, 'trusted', 'the resolver must be authoritative');
+
+		// Resolver-owned indexed names are skipped when building a residency partial: this table's only
+		// index is the computed attribute, so the partial never materializes at all.
+		assert.equal(isResolverOwnedIndexedName(ComputedCopy, 'derived'), true);
+		assert.equal(isResolverOwnedIndexedName(ComputedCopy, 'source'), false);
+		assert.equal(isResolverOwnedIndexedName({ primaryStore: { encoder: {} } }, 'derived'), false);
+		let partialRecord = null;
+		for (const name in ComputedCopy.indices) {
+			if (isResolverOwnedIndexedName(ComputedCopy, name)) continue;
+			partialRecord ??= {};
+			partialRecord[name] = auditRecord.getValue(ComputedCopy.primaryStore, true)[name];
+		}
+		assert.equal(partialRecord, null, 'a computed-only index set produces no residency partial');
+
+		// Residency-changing patches reconstruct the record at the audit timestamp so peers do not
+		// receive bodyless invalidations.
+		const fullRecord = auditRecord.getValue(ComputedCopy.primaryStore, true);
 		const projectionArgs = [];
 		const projectionAuditRecord = {
 			version: 123,
@@ -117,7 +122,7 @@ describe('copy blob transfer metadata', () => {
 					recordId: 'record',
 					version: stored.version,
 					nodeId: 0,
-					encodedRecord: Buffer.from(ComputedCopy.primaryStore.encoder.encode({ source: 'patch-only' })),
+					encodedRecord: Buffer.from(encoder.encode({ source: 'patch-only' })),
 				})
 			)
 		);
@@ -125,31 +130,6 @@ describe('copy blob transfer metadata', () => {
 		const reconstructedPatch = getResidencyProjectionRecord(patchAuditRecord, ComputedCopy.primaryStore);
 		assert.equal(reconstructedPatch.id, 'record');
 		assert.equal(reconstructedPatch.source, 'before');
-		const partialEncodedRecord = Buffer.from(ComputedCopy.primaryStore.encoder.encode(partialProjection));
-		const partialAuditRecord = readAuditEntry(
-			Buffer.from(
-				createAuditEntry({
-					type: 'invalidate',
-					tableId: ComputedCopy.tableId,
-					recordId: 'residency',
-					version: stored.version + 2,
-					nodeId: 0,
-					encodedRecord: partialEncodedRecord,
-				})
-			)
-		);
-		const partialCopy = partialAuditRecord.getValue(ComputedCopy.primaryStore);
-		assert.equal(partialCopy.derived, 'before');
-		assert.equal(Object.hasOwn(partialCopy, 'derived'), true);
-		const context = {};
-		await transaction(context, async () => {
-			const options = { isNotification: true, ensureLoaded: false, async: true };
-			const resource = await ComputedCopy.getResource('residency', context, options);
-			resource._writeInvalidate('residency', partialCopy, options);
-		});
-		const invalidated = ComputedCopy.primaryStore.getEntry('residency').value;
-		assert.equal(invalidated.derived, 'before');
-		assert.equal(Object.hasOwn(invalidated, 'derived'), true);
 	});
 
 	it('clears temporary tags after an encoding failure and never reuses their ids', () => {

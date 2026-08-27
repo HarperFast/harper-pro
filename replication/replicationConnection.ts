@@ -51,6 +51,7 @@ import {
 	lastMetadata,
 	lastValueEncoding,
 	METADATA,
+	storedFieldsOnly,
 } from '../core/resources/RecordEncoder.ts';
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
@@ -370,16 +371,14 @@ export function hostnameFromNodeUrl(url: unknown): string | undefined {
 	}
 }
 
-export function resolveIndexedProjectionValue(table: any, record: any, name: string) {
-	const resolvers = table.propertyResolvers;
-	const resolver = resolvers && Object.hasOwn(resolvers, name) ? resolvers[name] : undefined;
-	try {
-		return resolver ? resolver(record) : record[name];
-	} catch (error) {
-		throw new Error(`Failed to resolve indexed residency projection "${name}" for ${table.tableName}`, {
-			cause: error,
-		});
-	}
+/**
+ * Is this indexed attribute's value owned by a resolver (`@computed`/`@relationship`)? Resolver
+ * output is never replicated (HarperFast/harper#2359): a residency partial carries stored indexed
+ * fields only, and a non-resident peer that lacks the stored inputs simply does not index the
+ * resolved attribute. The core durable projection enforces the same rule on the receiving side.
+ */
+export function isResolverOwnedIndexedName(table: any, name: string): boolean {
+	return table.primaryStore?.encoder?.resolvedAttributeNames?.has(name) === true;
 }
 
 export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any) {
@@ -4869,13 +4868,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								let fullRecord: any,
 									partialRecord = null;
 								for (const name in table.indices) {
+									if (isResolverOwnedIndexedName(table, name)) continue; // resolver output is never replicated
 									if (!partialRecord) {
 										fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore);
 										if (!fullRecord) break; // if there is no record, as is the case with a relocate, we can't send it
 										partialRecord = {};
 									}
 									// if there are any indices, we need to preserve a partial invalidated record to ensure we can still do searches
-									partialRecord[name] = resolveIndexedProjectionValue(table, fullRecord, name);
+									partialRecord[name] = fullRecord[name];
 								}
 								invalidationEntry = createAuditEntry({
 									...auditRecord,
@@ -5371,7 +5371,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 															type: 'put',
 															encodedRecord: (() => {
 																decodeWithBlobCallback(
-																	() => table.primaryStore.encoder.encode(entry.value),
+																	// Resolver output is never replicated: the copy row re-encodes a materialized
+																	// record whose response toJSON the encoder would otherwise consult, so project
+																	// it to stored fields first (HarperFast/harper#2359).
+																	() =>
+																		table.primaryStore.encoder.encode(
+																			storedFieldsOnly(table.primaryStore.encoder, entry.value)
+																		),
 																	(blob) => sendBlobs(blob, entry.key)
 																);
 																return lastValueEncoding!;
