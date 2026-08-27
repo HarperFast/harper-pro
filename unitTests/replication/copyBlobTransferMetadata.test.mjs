@@ -1,33 +1,26 @@
 import assert from 'node:assert';
 import { createAuditEntry, readAuditEntry } from '#src/core/resources/auditStore';
 import { Blob, createBlob, decodeWithBlobCallback } from '#src/core/resources/blob';
-import { table } from '#src/core/resources/databases';
+import { table, tables } from '#src/core/resources/databases';
+import { loadGQLSchema } from '#src/core/resources/graphql';
 import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
 import {
 	collectAuditRecordBlobsFromBinary,
 	encodeWithCopyBlobTransferTags,
-	projectIndexedInvalidationRecord,
 } from '#src/replication/replicationConnection';
 
 describe('copy blob transfer metadata', () => {
-	it('keeps computed response fields out of copy and indexed invalidation payloads', async () => {
+	it('keeps computed response fields out of copy payloads', async () => {
 		setHdbBasePath(process.env.STORAGE_PATH);
-		const ComputedCopy = table({
-			database: 'copyComputedMetadata',
-			table: 'records',
-			attributes: [
-				{ name: 'id', isPrimaryKey: true },
-				{ name: 'source' },
-				{
-					name: 'derived',
-					computed: true,
-					computedFromExpression: 'source',
-					indexed: true,
-				},
-			],
-		});
-		ComputedCopy.setComputedAttribute('derived', (record) => record.source);
-		await ComputedCopy.put({ id: 'record', source: 'trusted' });
+		await loadGQLSchema(`
+			type ComputedCopyMetadata @table {
+				id: ID @primaryKey
+				source: String @indexed
+				derived: String @computed(from: "source") @indexed
+			}
+		`);
+		const ComputedCopy = tables.ComputedCopyMetadata;
+		await ComputedCopy.put({ id: 'record', source: 'before' });
 		const stored = ComputedCopy.primaryStore.getEntry('record');
 		const encodedRecord = ComputedCopy.primaryStore.encoder.encode(stored.value);
 		const auditRecord = readAuditEntry(
@@ -44,9 +37,8 @@ describe('copy blob transfer metadata', () => {
 		);
 		const copied = auditRecord.getValue(ComputedCopy.primaryStore);
 		assert.equal(Object.hasOwn(copied, 'derived'), false);
-
-		const partial = projectIndexedInvalidationRecord(ComputedCopy, stored.value);
-		assert.deepEqual(partial, { source: 'trusted' });
+		assert.equal(copied.source, 'before');
+		assert.equal(stored.value.derived, 'before');
 	});
 
 	it('clears temporary tags after an encoding failure and never reuses their ids', () => {

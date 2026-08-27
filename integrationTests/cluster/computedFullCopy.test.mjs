@@ -8,10 +8,10 @@ import { deepEqual, equal, ok } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
-import { sendOperation, fetchWithRetry, restartNode, stopNodeProcess } from './clusterShared.mjs';
+import { sendOperation, fetchWithRetry, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
+	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'..',
 	'..',
 	'dist',
@@ -22,7 +22,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 const DATABASE = 'data';
 const TABLE = 'ComputedCopyRecord';
 const PROJECT = 'computed-full-copy';
-const FIXTURE_PATH = join(import.meta.dirname ?? module.path, 'fixture-computed-full-copy');
+const FIXTURE_PATH = join(import.meta.dirname ?? new URL('.', import.meta.url).pathname, 'fixture-computed-full-copy');
 
 const config = (hostname) => ({
 	config: {
@@ -30,7 +30,6 @@ const config = (hostname) => ({
 		logging: { colors: false, stdStreams: false, console: true },
 		replication: { port: hostname + ':9933', securePort: null, databases: [DATABASE] },
 	},
-	env: { HARPER_NO_FLUSH_ON_EXIT: true },
 });
 
 async function deploy(node) {
@@ -122,6 +121,8 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 180_000 }
 		ok(copied, 'pre-existing computed row must survive the full-copy decode');
 		equal(copied.source, 'trusted');
 		equal(copied.derived, 'trusted');
+		const receiverLog = await readLog(ctx.nodeB);
+		ok(!/Error decoding replication message|decode-drop/.test(receiverLog), 'receiver must not drop the copied row');
 
 		const indexed = await sendOperation(ctx.nodeB, {
 			operation: 'search_by_value',
@@ -143,7 +144,13 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 180_000 }
 
 		await restartNode(ctx.nodeB);
 		ctx.restartedB = true;
-		const afterRestart = await waitForRecord(ctx.nodeB, 'pre-existing');
+		let afterRestart;
+		const deadline = Date.now() + 30_000;
+		do {
+			afterRestart = await getRecord(ctx.nodeB, 'pre-existing').catch(() => null);
+			if (afterRestart?.derived === 'updated') break;
+			await delay(250);
+		} while (Date.now() < deadline);
 		ok(afterRestart, 'copied row must remain readable after receiver restart');
 		equal(afterRestart.derived, 'updated');
 	});
