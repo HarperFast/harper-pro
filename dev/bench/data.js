@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787741050344,
+  "lastUpdate": 1787839035850,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -3743,6 +3743,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 1821.61,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "fe108481ad21103b4b2dffbe41c357d9e204b656",
+          "message": "Route dependency-manifest reviews to a single code owner (#758)\n\n* Route dependency-manifest reviews to a single code owner\n\nGitHub auto-requests @HarperFast/developers when a PR is opened, so a\ndependency bump lands in every team member's review queue for a lockfile\ndiff. Scope package.json and package-lock.json to one owner; the last\nmatching pattern wins, so everything else still routes to the team.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* Anchor dependency CODEOWNERS patterns\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n---------\n\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>\nCo-authored-by: GPT-5 Codex <noreply@openai.com>",
+          "timestamp": "2026-08-26T11:57:10Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/fe108481ad21103b4b2dffbe41c357d9e204b656"
+        },
+        "date": 1787839034378,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 12588.96,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 27069.89,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 21496.69,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 7070.18,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 5077.14,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2476.54,
             "unit": "ops/sec"
           }
         ]
