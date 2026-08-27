@@ -86,9 +86,14 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 		]);
 		const nodeA = { name: ctx.name, harper: { hostname: hostnameA } };
 		const nodeB = { name: ctx.name, harper: { hostname: hostnameB } };
-		await Promise.all([startHarper(nodeA, config(hostnameA)), startHarper(nodeB, config(hostnameB))]);
-		ctx.nodeA = nodeA.harper;
-		ctx.nodeB = nodeB.harper;
+		await Promise.all([
+			startHarper(nodeA, config(hostnameA)).then(() => {
+				ctx.nodeA = nodeA.harper;
+			}),
+			startHarper(nodeB, config(hostnameB)).then(() => {
+				ctx.nodeB = nodeB.harper;
+			}),
+		]);
 		const payload = await targz(FIXTURE_PATH);
 		await Promise.all([deploy(ctx.nodeA, payload), deploy(ctx.nodeB, payload)]);
 		await Promise.all([waitForTable(ctx.nodeA), waitForTable(ctx.nodeB)]);
@@ -101,11 +106,22 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 	});
 
 	after(async () => {
-		if (ctx.restartedB && ctx.nodeB) await stopNodeProcess(ctx.nodeB).catch(() => {});
-		await Promise.all([
-			ctx.nodeA && teardownHarper({ harper: ctx.nodeA }),
-			ctx.nodeB && teardownHarper({ harper: ctx.nodeB }),
-		]);
+		const teardownNode = async (label, node, restarted = false) => {
+			if (!node) return;
+			if (restarted) {
+				try {
+					await stopNodeProcess(node);
+				} catch (error) {
+					console.error(`Failed to stop ${label} (${node.hostname}):`, error);
+				}
+			}
+			try {
+				await teardownHarper({ harper: node });
+			} catch (error) {
+				console.error(`Failed to tear down ${label} (${node.hostname}):`, error);
+			}
+		};
+		await Promise.all([teardownNode('node A', ctx.nodeA), teardownNode('node B', ctx.nodeB, ctx.restartedB)]);
 	});
 
 	test('full copy, computed index, mutation, and restart preserve the row', async () => {
