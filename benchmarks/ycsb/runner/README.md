@@ -29,31 +29,43 @@ numbers stay comparable and there's no lock to manage.
 Four workflows across two repos share the host. Their crons are spaced an hour apart so they
 normally fire, and therefore drain, in this order:
 
-| UTC        | Repo       | Workflow                  | Typical run |
-| ---------- | ---------- | ------------------------- | ----------- |
-| `20 6`     | harper-pro | `stress-large-data`       | 11-26 min   |
-| `20 7`     | harper-pro | `ycsb-cluster-nightly`    | 22-30 min   |
-| `20 8`     | harper     | `perf-benchmarks-nightly` | 35-39 min   |
-| `20 9` Mon | harper     | `large-deploy-test`       | 2-4 min     |
+| UTC        | Repo       | Workflow                  | Measured run |
+| ---------- | ---------- | ------------------------- | ------------ |
+| `20 6`     | harper-pro | `stress-large-data`       | 11-26 min    |
+| `20 7`     | harper-pro | `ycsb-cluster-nightly`    | 22-30 min    |
+| `20 8`     | harper     | `perf-benchmarks-nightly` | 36-39 min    |
+| `20 9` Mon | harper     | `large-deploy-test`       | 2-4 min      |
 
-The window is sized so the whole sequence is off the host before the working day: the host is
+Sized so the whole sequence is off the host before the working day: the last slot ends by
+about 10:00 UTC normally, against an 11:00 UTC deadline (05:00 MDT / 04:00 MST). The host is
 somebody's desktop, and desktop contention lands in the numbers.
 
 **The order is advisory, not enforced.** Nothing declares a dependency between these
-workflows — the spacing just exceeds each job's normal runtime. Two things break it on a slow
-night, and both are worth knowing before you read a gap in the trend data as a regression:
+workflows — the spacing just exceeds each job's measured runtime by a wide margin. Three
+things can break it, all worth knowing before reading a gap in the trend data as a
+regression:
 
-- A workflow still running when the next one fires makes that one queue. GitHub concurrency
-  groups are **repo-scoped**, so `harper-bench-exclusive` only serializes the two harper-pro
-  workflows against each other; harper's two jobs are in a different repo and are drained on
-  whatever poll cycle sees them queued. A long `stress-large-data` night can therefore drain
-  as 1 → 3 → 2 → 4.
-- The crons are UTC and do not follow DST. The times above are MDT-relative (`20 6` = 00:20
-  MDT); from November through March the same crons land an hour earlier in local time, so
-  the first slot runs at 23:20 the previous evening.
+- **A job overrunning its slot.** The supervisor polls `REPOS` in fixed order, harper-pro
+  first, and drains one job per repo per pass, so a queued harper-pro job always beats a
+  queued harper one. But `harper-bench-exclusive` is repo-scoped: it defers a second
+  harper-pro run, and a concurrency-deferred run is not `status=queued`, which is the only
+  status `has_queued_bench_job` scans. So if `stress-large-data` ever ran past 08:20,
+  `ycsb-cluster-nightly` would be invisible to the supervisor while `perf-benchmarks-nightly`
+  was visible, and the night would drain 1 → 3 → 2 → 4. This needs the first slot to take
+  over an hour; the measured ceiling is 26 minutes, so it has not been observed.
+- **GitHub's scheduler delay, which is unbounded.** On 2026-08-27 every scheduled workflow in
+  harper-pro fired about 3 hours late and `ycsb-cluster-nightly` ran until 13:57 UTC. Nothing
+  in these crons defends against that.
+- **DST.** The crons are UTC and do not follow it. The bound above holds year-round, but local
+  times shift: `20 6` is 00:20 MDT and 23:20 MST, so from November through March the first
+  slot starts the previous evening, when the desktop is likelier to be in use.
 
-Neither loses data — every job still runs, serialized — but a trend point can land out of
-order, and an evening slot can pick up desktop contention.
+A reordered night still collects every trend point, just out of order. A run can be lost
+outright, though: a queued run GitHub never places is auto-cancelled after 24 hours. That is
+what happened between 2026-08-09 10:12 UTC and 2026-08-10 10:13 UTC, when the supervisor was
+down — one `ycsb-cluster-nightly` run was cancelled and the next night's `stress-large-data`
+waited 3h45 for a runner. Nothing alarms on this; check the host if a night is missing
+entirely.
 
 ## Prerequisites
 
