@@ -39,6 +39,10 @@ describe('copy blob transfer metadata', () => {
 		assert.equal(Object.hasOwn(copied, 'derived'), false);
 		assert.equal(copied.source, 'before');
 		assert.equal(stored.value.derived, 'before');
+		await ComputedCopy.put({ ...copied, id: 'received' });
+		const received = ComputedCopy.primaryStore.getEntry('received').value;
+		assert.equal(Object.hasOwn(received, 'derived'), false);
+		assert.equal(received.derived, 'before');
 	});
 
 	it('clears temporary tags after an encoding failure and never reuses their ids', () => {

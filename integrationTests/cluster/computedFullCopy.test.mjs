@@ -122,6 +122,7 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 180_000 }
 		equal(copied.source, 'trusted');
 		equal(copied.derived, 'trusted');
 		const receiverLog = await readLog(ctx.nodeB);
+		ok(receiverLog.length > 0, 'receiver log must be available for decode-drop verification');
 		ok(!/Error decoding replication message|decode-drop/.test(receiverLog), 'receiver must not drop the copied row');
 
 		const indexed = await sendOperation(ctx.nodeB, {
