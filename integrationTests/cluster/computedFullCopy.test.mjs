@@ -32,8 +32,7 @@ const config = (hostname) => ({
 	},
 });
 
-async function deploy(node) {
-	const payload = await targz(FIXTURE_PATH);
+async function deploy(node, payload) {
 	await sendOperation(node, {
 		operation: 'deploy_component',
 		project: PROJECT,
@@ -90,7 +89,8 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 		await Promise.all([startHarper(nodeA, config(hostnameA)), startHarper(nodeB, config(hostnameB))]);
 		ctx.nodeA = nodeA.harper;
 		ctx.nodeB = nodeB.harper;
-		await Promise.all([deploy(ctx.nodeA), deploy(ctx.nodeB)]);
+		const payload = await targz(FIXTURE_PATH);
+		await Promise.all([deploy(ctx.nodeA, payload), deploy(ctx.nodeB, payload)]);
 		await Promise.all([waitForTable(ctx.nodeA), waitForTable(ctx.nodeB)]);
 		await sendOperation(ctx.nodeA, {
 			operation: 'insert',
