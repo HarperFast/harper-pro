@@ -128,6 +128,21 @@ const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
 const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime + copy-order version
 const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
+
+export function projectIndexedInvalidationRecord(table: any, fullRecord: any) {
+	const partialRecord = {};
+	for (const name in table.indices) {
+		const attribute = table.attributes?.find((attribute: any) => attribute.name === name);
+		const expression =
+			attribute?.computedFromExpression ??
+			(typeof attribute?.computed?.from === 'string' ? attribute.computed.from : undefined);
+		const source =
+			typeof expression === 'string' && /^[A-Za-z_$][\w$]*$/.test(expression.trim()) ? expression.trim() : null;
+		if (source) partialRecord[source] = fullRecord[source];
+		else partialRecord[name] = fullRecord[name];
+	}
+	return partialRecord;
+}
 const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
@@ -4850,16 +4865,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								let extendedType = 0;
 								if (residencyId) extendedType |= HAS_CURRENT_RESIDENCY_ID;
 								if (auditRecord.previousResidencyId) extendedType |= HAS_PREVIOUS_RESIDENCY_ID;
-								let fullRecord: any,
-									partialRecord = null;
-								for (const name in table.indices) {
-									if (!partialRecord) {
-										fullRecord = auditRecord.getValue(primaryStore, true);
-										if (!fullRecord) break; // if there is no record, as is the case with a relocate, we can't send it
-										partialRecord = {};
-									}
-									// if there are any indices, we need to preserve a partial invalidated record to ensure we can still do searches
-									partialRecord[name] = fullRecord[name];
+								let partialRecord = null;
+								if (Object.keys(table.indices).length > 0) {
+									const fullRecord = auditRecord.getValue(primaryStore, true);
+									if (fullRecord) partialRecord = projectIndexedInvalidationRecord(table, fullRecord);
 								}
 								invalidationEntry = createAuditEntry({
 									...auditRecord,

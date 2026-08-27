@@ -6,9 +6,49 @@ import { setHdbBasePath } from '#src/core/utility/environment/environmentManager
 import {
 	collectAuditRecordBlobsFromBinary,
 	encodeWithCopyBlobTransferTags,
+	projectIndexedInvalidationRecord,
 } from '#src/replication/replicationConnection';
 
 describe('copy blob transfer metadata', () => {
+	it('keeps computed response fields out of copy and indexed invalidation payloads', async () => {
+		setHdbBasePath(process.env.STORAGE_PATH);
+		const ComputedCopy = table({
+			database: 'copyComputedMetadata',
+			table: 'records',
+			attributes: [
+				{ name: 'id', isPrimaryKey: true },
+				{ name: 'source' },
+				{
+					name: 'derived',
+					computed: true,
+					computedFromExpression: 'source',
+					indexed: true,
+				},
+			],
+		});
+		ComputedCopy.setComputedAttribute('derived', (record) => record.source);
+		await ComputedCopy.put({ id: 'record', source: 'trusted' });
+		const stored = ComputedCopy.primaryStore.getEntry('record');
+		const encodedRecord = ComputedCopy.primaryStore.encoder.encode(stored.value);
+		const auditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'put',
+					tableId: ComputedCopy.tableId,
+					recordId: 'record',
+					version: stored.version,
+					nodeId: 0,
+					encodedRecord,
+				})
+			)
+		);
+		const copied = auditRecord.getValue(ComputedCopy.primaryStore);
+		assert.equal(Object.hasOwn(copied, 'derived'), false);
+
+		const partial = projectIndexedInvalidationRecord(ComputedCopy, stored.value);
+		assert.deepEqual(partial, { source: 'trusted' });
+	});
+
 	it('clears temporary tags after an encoding failure and never reuses their ids', () => {
 		const blob = new Blob(['payload']);
 		let failedTransferId;
