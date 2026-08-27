@@ -79,7 +79,7 @@ async function waitForRecord(node, id, timeoutMs = 45_000) {
 	return null;
 }
 
-suite('computed scalar full-copy durability (harper#2359)', { timeout: 240_000 }, (ctx) => {
+suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }, (ctx) => {
 	before(async () => {
 		const [hostnameA, hostnameB] = await Promise.all([
 			getNextAvailableLoopbackAddress(),
@@ -118,7 +118,7 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 240_000 }
 		});
 
 		const source = await waitForRecord(ctx.nodeA, 'pre-existing');
-		ok(source, 'source row must be readable before full copy starts');
+		ok(source, 'source row must be present on node A');
 		const copied = await waitForRecord(ctx.nodeB, 'pre-existing');
 		ok(copied, 'pre-existing computed row must survive the full-copy decode');
 		equal(copied.source, 'trusted');

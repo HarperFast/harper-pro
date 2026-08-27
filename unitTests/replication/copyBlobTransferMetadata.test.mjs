@@ -45,6 +45,14 @@ describe('copy blob transfer metadata', () => {
 		assert.equal(Object.hasOwn(received, 'derived'), false);
 		assert.equal(received.derived, 'before');
 
+		const legacyEncodedRecord = Buffer.from(
+			ComputedCopy.primaryStore.encoder.encode({
+				id: 'legacy',
+				source: 'trusted',
+				derived: 'forged',
+			})
+		);
+		assert(legacyEncodedRecord.includes(Buffer.from('forged')), 'affected-sender bytes must contain the forged value');
 		const legacyAuditRecord = readAuditEntry(
 			Buffer.from(
 				createAuditEntry({
@@ -53,11 +61,7 @@ describe('copy blob transfer metadata', () => {
 					recordId: 'legacy',
 					version: stored.version + 1,
 					nodeId: 0,
-					encodedRecord: ComputedCopy.primaryStore.encoder.encode({
-						id: 'legacy',
-						source: 'trusted',
-						derived: 'forged',
-					}),
+					encodedRecord: legacyEncodedRecord,
 				})
 			)
 		);
