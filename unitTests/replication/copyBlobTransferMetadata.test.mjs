@@ -8,6 +8,7 @@ import { setHdbBasePath } from '#src/core/utility/environment/environmentManager
 import {
 	collectAuditRecordBlobsFromBinary,
 	encodeWithCopyBlobTransferTags,
+	getResidencyProjectionRecord,
 	resolveIndexedProjectionValue,
 } from '#src/replication/replicationConnection';
 
@@ -98,6 +99,16 @@ describe('copy blob transfer metadata', () => {
 				),
 			(error) => error.cause === resolverFailure && /ComputedCopyMetadata/.test(error.message)
 		);
+		const projectionArgs = [];
+		const projectionAuditRecord = {
+			version: 123,
+			getValue: (...args) => {
+				projectionArgs.push(args);
+				return fullRecord;
+			},
+		};
+		assert.strictEqual(getResidencyProjectionRecord(projectionAuditRecord, ComputedCopy.primaryStore), fullRecord);
+		assert.deepEqual(projectionArgs, [[ComputedCopy.primaryStore, true, 123]]);
 		const partialEncodedRecord = Buffer.from(ComputedCopy.primaryStore.encoder.encode(partialProjection));
 		const partialAuditRecord = readAuditEntry(
 			Buffer.from(

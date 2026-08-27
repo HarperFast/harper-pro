@@ -382,6 +382,10 @@ export function resolveIndexedProjectionValue(table: any, record: any, name: str
 	}
 }
 
+export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any) {
+	return auditRecord.getValue(primaryStore, true, auditRecord.version);
+}
+
 /**
  * Should a base copy withhold the records the requesting peer itself originated? Only while this node is
  * being cloned FROM that peer — see the base-copy section of replication/DESIGN.md for the legacy-v4
@@ -4866,7 +4870,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									partialRecord = null;
 								for (const name in table.indices) {
 									if (!partialRecord) {
-										fullRecord = auditRecord.getValue(primaryStore, true);
+										fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore);
 										if (!fullRecord) break; // if there is no record, as is the case with a relocate, we can't send it
 										partialRecord = {};
 									}
