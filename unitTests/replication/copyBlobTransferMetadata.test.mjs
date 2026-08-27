@@ -37,12 +37,34 @@ describe('copy blob transfer metadata', () => {
 		);
 		const copied = auditRecord.getValue(ComputedCopy.primaryStore);
 		assert.equal(Object.hasOwn(copied, 'derived'), false);
+		assert.equal(Object.hasOwn(copied, 'source'), true);
 		assert.equal(copied.source, 'before');
 		assert.equal(stored.value.derived, 'before');
 		await ComputedCopy.put({ ...copied, id: 'received' });
 		const received = ComputedCopy.primaryStore.getEntry('received').value;
 		assert.equal(Object.hasOwn(received, 'derived'), false);
 		assert.equal(received.derived, 'before');
+
+		const legacyAuditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'put',
+					tableId: ComputedCopy.tableId,
+					recordId: 'legacy',
+					version: stored.version + 1,
+					nodeId: 0,
+					encodedRecord: ComputedCopy.primaryStore.encoder.encode({
+						id: 'legacy',
+						source: 'trusted',
+						derived: 'forged',
+					}),
+				})
+			)
+		);
+		const legacyCopy = legacyAuditRecord.getValue(ComputedCopy.primaryStore);
+		assert.equal(Object.hasOwn(legacyCopy, 'derived'), false);
+		await ComputedCopy.put(legacyCopy);
+		assert.equal(ComputedCopy.primaryStore.getEntry('legacy').value.derived, 'trusted');
 	});
 
 	it('clears temporary tags after an encoding failure and never reuses their ids', () => {

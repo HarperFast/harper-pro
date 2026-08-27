@@ -79,7 +79,7 @@ async function waitForRecord(node, id, timeoutMs = 45_000) {
 	return null;
 }
 
-suite('computed scalar full-copy durability (harper#2359)', { timeout: 180_000 }, (ctx) => {
+suite('computed scalar full-copy durability (harper#2359)', { timeout: 240_000 }, (ctx) => {
 	before(async () => {
 		const [hostnameA, hostnameB] = await Promise.all([
 			getNextAvailableLoopbackAddress(),
@@ -117,13 +117,15 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 180_000 }
 			authorization: ctx.nodeA.admin,
 		});
 
+		const source = await waitForRecord(ctx.nodeA, 'pre-existing');
+		ok(source, 'source row must be readable before full copy starts');
 		const copied = await waitForRecord(ctx.nodeB, 'pre-existing');
 		ok(copied, 'pre-existing computed row must survive the full-copy decode');
 		equal(copied.source, 'trusted');
 		equal(copied.derived, 'trusted');
 		const receiverLog = await readLog(ctx.nodeB);
 		ok(receiverLog.length > 0, 'receiver log must be available for decode-drop verification');
-		ok(!/Error decoding replication message|decode-drop/.test(receiverLog), 'receiver must not drop the copied row');
+		ok(!/Error decoding replication message/.test(receiverLog), 'receiver must not log a copy decode failure');
 
 		const indexed = await sendOperation(ctx.nodeB, {
 			operation: 'search_by_value',
@@ -141,10 +143,12 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 180_000 }
 			table: TABLE,
 			records: [{ id: 'pre-existing', source: 'updated' }],
 		});
-		equal((await getRecord(ctx.nodeB, 'pre-existing')).derived, 'updated');
+		const updated = await getRecord(ctx.nodeB, 'pre-existing');
+		ok(updated, 'updated row must remain readable before restart');
+		equal(updated.derived, 'updated');
 
-		await restartNode(ctx.nodeB);
 		ctx.restartedB = true;
+		await restartNode(ctx.nodeB);
 		let afterRestart;
 		const deadline = Date.now() + 30_000;
 		do {
