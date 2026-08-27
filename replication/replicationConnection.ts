@@ -370,6 +370,11 @@ export function hostnameFromNodeUrl(url: unknown): string | undefined {
 	}
 }
 
+export function resolveIndexedProjectionValue(table: any, record: any, name: string) {
+	const resolver = table.propertyResolvers?.[name];
+	return resolver ? resolver(record) : record[name];
+}
+
 /**
  * Should a base copy withhold the records the requesting peer itself originated? Only while this node is
  * being cloned FROM that peer — see the base-copy section of replication/DESIGN.md for the legacy-v4
@@ -4859,7 +4864,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										partialRecord = {};
 									}
 									// if there are any indices, we need to preserve a partial invalidated record to ensure we can still do searches
-									partialRecord[name] = fullRecord[name];
+									partialRecord[name] = resolveIndexedProjectionValue(table, fullRecord, name);
 								}
 								invalidationEntry = createAuditEntry({
 									...auditRecord,

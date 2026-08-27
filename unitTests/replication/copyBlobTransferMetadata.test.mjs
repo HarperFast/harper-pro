@@ -8,6 +8,7 @@ import { setHdbBasePath } from '#src/core/utility/environment/environmentManager
 import {
 	collectAuditRecordBlobsFromBinary,
 	encodeWithCopyBlobTransferTags,
+	resolveIndexedProjectionValue,
 } from '#src/replication/replicationConnection';
 
 describe('copy blob transfer metadata', () => {
@@ -71,9 +72,12 @@ describe('copy blob transfer metadata', () => {
 		await ComputedCopy.put(legacyCopy);
 		assert.equal(ComputedCopy.primaryStore.getEntry('legacy').value.derived, 'trusted');
 
-		const partialEncodedRecord = Buffer.from(
-			ComputedCopy.primaryStore.encoder.encode({ id: 'residency', derived: 'projected' })
-		);
+		const fullRecord = auditRecord.getValue(ComputedCopy.primaryStore, true);
+		const partialProjection = {};
+		for (const name in ComputedCopy.indices)
+			partialProjection[name] = resolveIndexedProjectionValue(ComputedCopy, fullRecord, name);
+		assert.deepEqual(partialProjection, { derived: 'before' });
+		const partialEncodedRecord = Buffer.from(ComputedCopy.primaryStore.encoder.encode(partialProjection));
 		const partialAuditRecord = readAuditEntry(
 			Buffer.from(
 				createAuditEntry({
@@ -87,7 +91,7 @@ describe('copy blob transfer metadata', () => {
 			)
 		);
 		const partialCopy = partialAuditRecord.getValue(ComputedCopy.primaryStore);
-		assert.equal(partialCopy.derived, 'projected');
+		assert.equal(partialCopy.derived, 'before');
 		assert.equal(Object.hasOwn(partialCopy, 'derived'), true);
 		const context = {};
 		await transaction(context, async () => {
@@ -96,7 +100,7 @@ describe('copy blob transfer metadata', () => {
 			resource._writeInvalidate('residency', partialCopy, options);
 		});
 		const invalidated = ComputedCopy.primaryStore.getEntry('residency').value;
-		assert.equal(invalidated.derived, 'projected');
+		assert.equal(invalidated.derived, 'before');
 		assert.equal(Object.hasOwn(invalidated, 'derived'), true);
 	});
 
