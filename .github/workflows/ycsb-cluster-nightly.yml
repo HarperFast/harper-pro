@@ -11,7 +11,7 @@ name: YCSB Cluster Nightly (self-hosted)
 
 on:
   schedule:
-    - cron: '0 10 * * *' # ~03:00-04:00 America/Denver (UTC)
+    - cron: '20 7 * * *' # :20 avoids GitHub's scheduler backlog; slot order in benchmarks/ycsb/runner/README.md
   workflow_dispatch:
     inputs:
       scale:
