@@ -77,6 +77,27 @@ describe('copy blob transfer metadata', () => {
 		for (const name in ComputedCopy.indices)
 			partialProjection[name] = resolveIndexedProjectionValue(ComputedCopy, fullRecord, name);
 		assert.deepEqual(partialProjection, { derived: 'before' });
+		assert.equal(
+			resolveIndexedProjectionValue({ propertyResolvers: {} }, { toString: 'stored' }, 'toString'),
+			'stored'
+		);
+		const resolverFailure = new Error('resolver failed');
+		assert.throws(
+			() =>
+				resolveIndexedProjectionValue(
+					{
+						tableName: 'ComputedCopyMetadata',
+						propertyResolvers: {
+							derived: () => {
+								throw resolverFailure;
+							},
+						},
+					},
+					fullRecord,
+					'derived'
+				),
+			(error) => error.cause === resolverFailure && /ComputedCopyMetadata/.test(error.message)
+		);
 		const partialEncodedRecord = Buffer.from(ComputedCopy.primaryStore.encoder.encode(partialProjection));
 		const partialAuditRecord = readAuditEntry(
 			Buffer.from(

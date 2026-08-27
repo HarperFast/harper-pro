@@ -371,8 +371,15 @@ export function hostnameFromNodeUrl(url: unknown): string | undefined {
 }
 
 export function resolveIndexedProjectionValue(table: any, record: any, name: string) {
-	const resolver = table.propertyResolvers?.[name];
-	return resolver ? resolver(record) : record[name];
+	const resolvers = table.propertyResolvers;
+	const resolver = resolvers && Object.hasOwn(resolvers, name) ? resolvers[name] : undefined;
+	try {
+		return resolver ? resolver(record) : record[name];
+	} catch (error) {
+		throw new Error(`Failed to resolve indexed residency projection "${name}" for ${table.tableName}`, {
+			cause: error,
+		});
+	}
 }
 
 /**
