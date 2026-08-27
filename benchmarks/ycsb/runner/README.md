@@ -36,7 +36,7 @@ normally fire, and therefore drain, in this order:
 | `20 8`     | harper     | `perf-benchmarks-nightly` | 36-39 min    |
 | `20 9` Mon | harper     | `large-deploy-test`       | 2-4 min      |
 
-Sized so the whole sequence is off the host before the working day: the last slot ends by
+Rows 3 and 4 are set in `HarperFast/harper`, not here. Sized so the whole sequence is off the host before the working day: the last slot ends by
 about 10:00 UTC normally, against an 11:00 UTC deadline (05:00 MDT / 04:00 MST). The host is
 somebody's desktop, and desktop contention lands in the numbers.
 
@@ -45,14 +45,13 @@ workflows — the spacing just exceeds each job's measured runtime by a wide mar
 things can break it, all worth knowing before reading a gap in the trend data as a
 regression:
 
-- **A job overrunning its slot.** The supervisor polls `REPOS` in fixed order, harper-pro
-  first, and drains one job per repo per pass, so a queued harper-pro job always beats a
-  queued harper one. But `harper-bench-exclusive` is repo-scoped: it defers a second
-  harper-pro run, and a concurrency-deferred run is not `status=queued`, which is the only
-  status `has_queued_bench_job` scans. So if `stress-large-data` ever ran past 08:20,
-  `ycsb-cluster-nightly` would be invisible to the supervisor while `perf-benchmarks-nightly`
-  was visible, and the night would drain 1 → 3 → 2 → 4. This needs the first slot to take
-  over an hour; the measured ceiling is 26 minutes, so it has not been observed.
+- **A job overrunning its slot.** `drain_one` blocks, and each poll pass checks `harper-pro`
+  then `harper`, so harper-pro is favoured only at the _start_ of a pass: a harper job that
+  queues while a long harper-pro job is draining is picked up as soon as that drain returns,
+  before the loop comes back round to harper-pro. If `stress-large-data` were still running
+  when `perf-benchmarks-nightly` fires, the night could drain 1 → 3 → 2 → 4. That needs the
+  first slot to take over two hours against a measured ceiling of 26 minutes, so it has not
+  been observed.
 - **GitHub's scheduler delay, which is unbounded.** On 2026-08-27 every scheduled workflow in
   harper-pro fired about 3 hours late and `ycsb-cluster-nightly` ran until 13:57 UTC. Nothing
   in these crons defends against that.

@@ -30,8 +30,8 @@ on:
           - 'large-catchup'
           - 'large-clone'
   schedule:
-    # First slot of the nightly harper-bench sequence; :20 avoids GitHub's top-of-the-hour
-    # scheduler backlog. Order, local times and how it degrades: benchmarks/ycsb/runner/README.md.
+    # :20 avoids GitHub's top-of-the-hour scheduler backlog. Slot order, local times and how
+    # the sequence degrades: benchmarks/ycsb/runner/README.md.
     - cron: '20 6 * * *'
 
 # The `harper-bench` self-hosted box is shared with ycsb-cluster-nightly.yml. GitHub

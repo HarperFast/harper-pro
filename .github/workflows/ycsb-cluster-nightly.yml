@@ -11,7 +11,7 @@ name: YCSB Cluster Nightly (self-hosted)
 
 on:
   schedule:
-    - cron: '20 7 * * *' # second harper-bench slot; see benchmarks/ycsb/runner/README.md
+    - cron: '20 7 * * *' # :20 avoids GitHub's scheduler backlog; slot order in benchmarks/ycsb/runner/README.md
   workflow_dispatch:
     inputs:
       scale:
