@@ -24,6 +24,37 @@ So `bench-runner-supervisor.sh` polls each repo for a queued job targeting the
 most one job runs at a time across all repos** — strictly serial by construction, so the
 numbers stay comparable and there's no lock to manage.
 
+## Nightly fire order
+
+Four workflows across two repos share the host. Their crons are spaced an hour apart so they
+normally fire, and therefore drain, in this order:
+
+| UTC        | Repo       | Workflow                  | Typical run |
+| ---------- | ---------- | ------------------------- | ----------- |
+| `20 6`     | harper-pro | `stress-large-data`       | 11-26 min   |
+| `20 7`     | harper-pro | `ycsb-cluster-nightly`    | 22-30 min   |
+| `20 8`     | harper     | `perf-benchmarks-nightly` | 35-39 min   |
+| `20 9` Mon | harper     | `large-deploy-test`       | 2-4 min     |
+
+The window is sized so the whole sequence is off the host before the working day: the host is
+somebody's desktop, and desktop contention lands in the numbers.
+
+**The order is advisory, not enforced.** Nothing declares a dependency between these
+workflows — the spacing just exceeds each job's normal runtime. Two things break it on a slow
+night, and both are worth knowing before you read a gap in the trend data as a regression:
+
+- A workflow still running when the next one fires makes that one queue. GitHub concurrency
+  groups are **repo-scoped**, so `harper-bench-exclusive` only serializes the two harper-pro
+  workflows against each other; harper's two jobs are in a different repo and are drained on
+  whatever poll cycle sees them queued. A long `stress-large-data` night can therefore drain
+  as 1 → 3 → 2 → 4.
+- The crons are UTC and do not follow DST. The times above are MDT-relative (`20 6` = 00:20
+  MDT); from November through March the same crons land an hour earlier in local time, so
+  the first slot runs at 23:20 the previous evening.
+
+Neither loses data — every job still runs, serialized — but a trend point can land out of
+order, and an evening slot can pick up desktop contention.
+
 ## Prerequisites
 
 - Docker, and `gh` authenticated as a **repo admin on every served repo** (to mint

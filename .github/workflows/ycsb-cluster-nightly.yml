@@ -11,7 +11,7 @@ name: YCSB Cluster Nightly (self-hosted)
 
 on:
   schedule:
-    - cron: '20 7 * * *' # 01:20 MDT, second in the serialized harper-bench chain
+    - cron: '20 7 * * *' # second harper-bench slot; see benchmarks/ycsb/runner/README.md
   workflow_dispatch:
     inputs:
       scale:
