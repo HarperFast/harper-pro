@@ -23,6 +23,7 @@ const DATABASE = 'data';
 const TABLE = 'ComputedCopyRecord';
 const PROJECT = 'computed-full-copy';
 const FIXTURE_PATH = join(import.meta.dirname ?? new URL('.', import.meta.url).pathname, 'fixture-computed-full-copy');
+const READY_CONSECUTIVE_PROBES = 8;
 
 const config = (hostname) => ({
 	config: {
@@ -42,8 +43,9 @@ async function deploy(node, payload) {
 	});
 }
 
-async function waitForTable(node, timeoutMs = 30_000) {
+async function waitForTable(node, timeoutMs = 45_000) {
 	const deadline = Date.now() + timeoutMs;
+	let consecutiveReady = 0;
 	while (Date.now() < deadline) {
 		const response = await fetchWithRetry(`${node.httpURL}/${TABLE}/`, {
 			headers: {
@@ -51,8 +53,10 @@ async function waitForTable(node, timeoutMs = 30_000) {
 			},
 			retries: 0,
 		}).catch(() => null);
-		if (response && response.status !== 404) return;
-		await delay(250);
+		if (response?.status === 200) {
+			if (++consecutiveReady >= READY_CONSECUTIVE_PROBES) return;
+		} else consecutiveReady = 0;
+		await delay(1_000);
 	}
 	throw new Error(`${TABLE} did not become ready on ${node.hostname}`);
 }
@@ -86,14 +90,16 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 		]);
 		const nodeA = { name: ctx.name, harper: { hostname: hostnameA } };
 		const nodeB = { name: ctx.name, harper: { hostname: hostnameB } };
-		await Promise.all([
-			startHarper(nodeA, config(hostnameA)).then(() => {
-				ctx.nodeA = nodeA.harper;
-			}),
-			startHarper(nodeB, config(hostnameB)).then(() => {
-				ctx.nodeB = nodeB.harper;
-			}),
+		const starts = await Promise.allSettled([
+			startHarper(nodeA, config(hostnameA)),
+			startHarper(nodeB, config(hostnameB)),
 		]);
+		// startHarper replaces context.harper with the complete lifecycle handle. Capture both before
+		// surfacing a partial startup failure so teardown can still clean whichever node did start.
+		ctx.nodeA = nodeA.harper;
+		ctx.nodeB = nodeB.harper;
+		const startErrors = starts.filter((result) => result.status === 'rejected').map((result) => result.reason);
+		if (startErrors.length) throw new AggregateError(startErrors, 'Failed to start computed full-copy nodes');
 		const payload = await targz(FIXTURE_PATH);
 		await Promise.all([deploy(ctx.nodeA, payload), deploy(ctx.nodeB, payload)]);
 		await Promise.all([waitForTable(ctx.nodeA), waitForTable(ctx.nodeB)]);
@@ -107,21 +113,26 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 
 	after(async () => {
 		const teardownNode = async (label, node, restarted = false) => {
-			if (!node) return;
+			const errors = [];
+			if (!node) return errors;
 			if (restarted) {
 				try {
 					await stopNodeProcess(node);
 				} catch (error) {
-					console.error(`Failed to stop ${label} (${node.hostname}):`, error);
+					errors.push(new Error(`Failed to stop ${label} (${node.hostname})`, { cause: error }));
 				}
 			}
 			try {
 				await teardownHarper({ harper: node });
 			} catch (error) {
-				console.error(`Failed to tear down ${label} (${node.hostname}):`, error);
+				errors.push(new Error(`Failed to tear down ${label} (${node.hostname})`, { cause: error }));
 			}
+			return errors;
 		};
-		await Promise.all([teardownNode('node A', ctx.nodeA), teardownNode('node B', ctx.nodeB, ctx.restartedB)]);
+		const errors = (
+			await Promise.all([teardownNode('node A', ctx.nodeA), teardownNode('node B', ctx.nodeB, ctx.restartedB)])
+		).flat();
+		if (errors.length) throw new AggregateError(errors, 'Failed to tear down computed full-copy nodes');
 	});
 
 	test('full copy, computed index, mutation, and restart preserve the row', async () => {
@@ -153,6 +164,28 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 		});
 		deepEqual(indexed, [{ id: 'pre-existing', source: 'trusted', derived: 'trusted' }]);
 
+		ctx.restartedB = true;
+		await restartNode(ctx.nodeB);
+		let afterRestart;
+		const deadline = Date.now() + 30_000;
+		do {
+			afterRestart = await getRecord(ctx.nodeB, 'pre-existing').catch(() => null);
+			if (afterRestart?.derived === 'trusted') break;
+			await delay(250);
+		} while (Date.now() < deadline);
+		ok(afterRestart, 'untouched copied row must remain readable after receiver restart');
+		equal(afterRestart.source, 'trusted');
+		equal(afterRestart.derived, 'trusted');
+		const indexedAfterRestart = await sendOperation(ctx.nodeB, {
+			operation: 'search_by_value',
+			database: DATABASE,
+			table: TABLE,
+			search_attribute: 'derived',
+			search_value: 'trusted',
+			get_attributes: ['id', 'source', 'derived'],
+		});
+		deepEqual(indexedAfterRestart, [{ id: 'pre-existing', source: 'trusted', derived: 'trusted' }]);
+
 		await sendOperation(ctx.nodeB, {
 			operation: 'update',
 			database: DATABASE,
@@ -160,19 +193,7 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 			records: [{ id: 'pre-existing', source: 'updated' }],
 		});
 		const updated = await getRecord(ctx.nodeB, 'pre-existing');
-		ok(updated, 'updated row must remain readable before restart');
+		ok(updated, 'updated row must remain readable after restart');
 		equal(updated.derived, 'updated');
-
-		ctx.restartedB = true;
-		await restartNode(ctx.nodeB);
-		let afterRestart;
-		const deadline = Date.now() + 30_000;
-		do {
-			afterRestart = await getRecord(ctx.nodeB, 'pre-existing').catch(() => null);
-			if (afterRestart?.derived === 'updated') break;
-			await delay(250);
-		} while (Date.now() < deadline);
-		ok(afterRestart, 'copied row must remain readable after receiver restart');
-		equal(afterRestart.derived, 'updated');
 	});
 });

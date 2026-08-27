@@ -3,6 +3,7 @@ import { createAuditEntry, readAuditEntry } from '#src/core/resources/auditStore
 import { Blob, createBlob, decodeWithBlobCallback } from '#src/core/resources/blob';
 import { table, tables } from '#src/core/resources/databases';
 import { loadGQLSchema } from '#src/core/resources/graphql';
+import { transaction } from '#src/core/resources/transaction';
 import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
 import {
 	collectAuditRecordBlobsFromBinary,
@@ -15,7 +16,7 @@ describe('copy blob transfer metadata', () => {
 		await loadGQLSchema(`
 			type ComputedCopyMetadata @table {
 				id: ID @primaryKey
-				source: String @indexed
+				source: String
 				derived: String @computed(from: "source") @indexed
 			}
 		`);
@@ -69,6 +70,34 @@ describe('copy blob transfer metadata', () => {
 		assert.equal(Object.hasOwn(legacyCopy, 'derived'), false);
 		await ComputedCopy.put(legacyCopy);
 		assert.equal(ComputedCopy.primaryStore.getEntry('legacy').value.derived, 'trusted');
+
+		const partialEncodedRecord = Buffer.from(
+			ComputedCopy.primaryStore.encoder.encode({ id: 'residency', derived: 'projected' })
+		);
+		const partialAuditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'invalidate',
+					tableId: ComputedCopy.tableId,
+					recordId: 'residency',
+					version: stored.version + 2,
+					nodeId: 0,
+					encodedRecord: partialEncodedRecord,
+				})
+			)
+		);
+		const partialCopy = partialAuditRecord.getValue(ComputedCopy.primaryStore);
+		assert.equal(partialCopy.derived, 'projected');
+		assert.equal(Object.hasOwn(partialCopy, 'derived'), true);
+		const context = {};
+		await transaction(context, async () => {
+			const options = { isNotification: true, ensureLoaded: false, async: true };
+			const resource = await ComputedCopy.getResource('residency', context, options);
+			resource._writeInvalidate('residency', partialCopy, options);
+		});
+		const invalidated = ComputedCopy.primaryStore.getEntry('residency').value;
+		assert.equal(invalidated.derived, 'projected');
+		assert.equal(Object.hasOwn(invalidated, 'derived'), true);
 	});
 
 	it('clears temporary tags after an encoding failure and never reuses their ids', () => {
