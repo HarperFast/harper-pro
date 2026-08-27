@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787839035850,
+  "lastUpdate": 1787839038308,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -8621,6 +8621,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 118.67,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "fe108481ad21103b4b2dffbe41c357d9e204b656",
+          "message": "Route dependency-manifest reviews to a single code owner (#758)\n\n* Route dependency-manifest reviews to a single code owner\n\nGitHub auto-requests @HarperFast/developers when a PR is opened, so a\ndependency bump lands in every team member's review queue for a lockfile\ndiff. Scope package.json and package-lock.json to one owner; the last\nmatching pattern wins, so everything else still routes to the team.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* Anchor dependency CODEOWNERS patterns\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n---------\n\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>\nCo-authored-by: GPT-5 Codex <noreply@openai.com>",
+          "timestamp": "2026-08-26T11:57:10Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/fe108481ad21103b4b2dffbe41c357d9e204b656"
+        },
+        "date": 1787839038279,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 4.91,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 8.23,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 9.35,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 51.42,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 61.02,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 47.36,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 94.33,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 88.37,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 203.51,
             "unit": "ms"
           }
         ]
