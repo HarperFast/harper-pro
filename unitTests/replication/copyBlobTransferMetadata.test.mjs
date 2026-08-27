@@ -109,6 +109,22 @@ describe('copy blob transfer metadata', () => {
 		};
 		assert.strictEqual(getResidencyProjectionRecord(projectionAuditRecord, ComputedCopy.primaryStore), fullRecord);
 		assert.deepEqual(projectionArgs, [[ComputedCopy.primaryStore, true, 123]]);
+		const patchAuditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'patch',
+					tableId: ComputedCopy.tableId,
+					recordId: 'record',
+					version: stored.version,
+					nodeId: 0,
+					encodedRecord: Buffer.from(ComputedCopy.primaryStore.encoder.encode({ source: 'patch-only' })),
+				})
+			)
+		);
+		assert.equal(patchAuditRecord.getValue(ComputedCopy.primaryStore, true), undefined);
+		const reconstructedPatch = getResidencyProjectionRecord(patchAuditRecord, ComputedCopy.primaryStore);
+		assert.equal(reconstructedPatch.id, 'record');
+		assert.equal(reconstructedPatch.source, 'before');
 		const partialEncodedRecord = Buffer.from(ComputedCopy.primaryStore.encoder.encode(partialProjection));
 		const partialAuditRecord = readAuditEntry(
 			Buffer.from(
