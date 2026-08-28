@@ -1,6 +1,5 @@
 import assert from 'node:assert';
 import { createAuditEntry, readAuditEntry } from '#src/core/resources/auditStore';
-import { storedFieldsOnly } from '#src/core/resources/RecordEncoder';
 import { Blob, createBlob, decodeWithBlobCallback } from '#src/core/resources/blob';
 import { table, tables } from '#src/core/resources/databases';
 import { loadGQLSchema } from '#src/core/resources/graphql';
