@@ -7297,7 +7297,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				database: tableDefinition.database,
 				schemaDefined: tableDefinition.schemaDefined,
 				...existingTable,
-				// Preserve the merged peer view after a live Table contributes its own properties (harper#2258).
+				// keep after the spread — a live Table's own attributes/origin would otherwise override the merge
 				attributes,
 				origin: 'cluster',
 			});
