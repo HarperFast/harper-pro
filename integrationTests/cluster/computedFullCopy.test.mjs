@@ -112,10 +112,10 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 	});
 
 	after(async () => {
-		const teardownNode = async (label, node, restarted = false) => {
+		const teardownNode = async (label, node) => {
 			const errors = [];
 			if (!node) return errors;
-			if (restarted) {
+			if (node.dataRootDir) {
 				try {
 					await stopNodeProcess(node);
 				} catch (error) {
@@ -129,9 +129,7 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 			}
 			return errors;
 		};
-		const errors = (
-			await Promise.all([teardownNode('node A', ctx.nodeA), teardownNode('node B', ctx.nodeB, ctx.restartedB)])
-		).flat();
+		const errors = (await Promise.all([teardownNode('node A', ctx.nodeA), teardownNode('node B', ctx.nodeB)])).flat();
 		if (errors.length) throw new AggregateError(errors, 'Failed to tear down computed full-copy nodes');
 	});
 
@@ -164,7 +162,6 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 		});
 		deepEqual(indexed, [{ id: 'pre-existing', source: 'trusted', derived: 'trusted' }]);
 
-		ctx.restartedB = true;
 		await restartNode(ctx.nodeB);
 		let afterRestart;
 		const deadline = Date.now() + 30_000;
