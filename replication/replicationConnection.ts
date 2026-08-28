@@ -7269,7 +7269,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		const wasSchemaDefined = existingTable.schemaDefined;
 		let hasChanges = false;
 		const schemaDefined = tableDefinition.schemaDefined;
-		const attributes = (existingTable.attributes || []).slice();
+		const attributes = existingTable.attributes?.slice() || [];
 		for (let i = 0; i < tableDefinition.attributes?.length; i++) {
 			const ensureAttribute = tableDefinition.attributes[i];
 			const existingAttribute = attributes.find((attr) => attr.name === ensureAttribute.name);
