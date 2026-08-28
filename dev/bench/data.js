@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1787839038308,
+  "lastUpdate": 1787916380094,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -3795,6 +3795,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2476.54,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Nathan Heskew",
+            "username": "heskew",
+            "email": "nathan@harperdb.io"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "d792a44a51ed09ca5b888065d709e4e846f040dd",
+          "message": "ci: adopt ai-review-prompts fleet defaults and new review lenses (#766)\n\n* ci: adopt ai-review-prompts fleet defaults and new review lenses\n\nBump every ai-review-prompts pin to 4632c5d: claude-sonnet-5 model,\n--effort xhigh, 96-turn review budget (issue-to-pr 100), 30m timeouts\n(#89), the sibling-implementations and cannot-fail-test lenses (#88),\nand the week-of-08-10/08-17 calibration prompt edits (#85/#87).\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01S94XethbGXpAb4DRKMD4kt\n\n* ci: adopt ai-review-prompts #90 cost gates (pin be549ad) + ready_for_review trigger\n\nDraft PRs skip review until flipped ready (label still opts one in),\nmechanical diffs skip pre-run, reasoning effort scales with diff size\n(60/high, 1500/xhigh, else max), synchronize runs debounce 120s.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01S94XethbGXpAb4DRKMD4kt\n\n* ci: admit ready_for_review on label-opted PRs in opt-in mode\n\nkriszyp review finding on the pin-bump PR: with *_ALWAYS_ON unset, the\ncaller gate admitted only labeled events, so a PR opted in by label\nwhile draft never resumed review when flipped ready — the event died at\nthe caller gate. Admit ready_for_review when the opt-in label is still\npresent.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01S94XethbGXpAb4DRKMD4kt\n\n* ci: keep ineligible runs out of the review concurrency group\n\nkriszyp review finding: workflow-level cancel-in-progress fires before\njob if:, so in opt-in mode an ineligible event (a push, or a ready-flip\nwithout the opt-in label) cancels an in-flight label-triggered review\nand then skips — silently losing the requested review. Ineligible runs\nnow take a unique run_id group and can never cancel an eligible one;\neligible runs keep cancelling each other (the debounce contract).\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01S94XethbGXpAb4DRKMD4kt\n\n* ci: only the provider's own label makes a labeled run eligible\n\nReview finding (Codex + kriszyp, independently): the eligibility\npredicate admitted every labeled event, so in opt-in mode an unrelated\nlabel applied mid-review joined the eligible concurrency group,\ncancelled the running review, and the replacement then failed the\nreusable's exact-label gate — no completed review. The same\nunrelated-label cancellation existed in always-on mode before this\nseries (any labeled event shared the group and authorize then skipped).\n\nThe labeled branch now requires the provider's own label, in both the\nconcurrency predicate and the review job gate, and unrelated-label\nevents are ineligible in both modes.\n\nEvent matrix (opt-in / always-on):\n- labeled(provider label): eligible / eligible — supersedes in-flight\n- labeled(other): ineligible / ineligible (was: cancelled + no review)\n- synchronize: ineligible / eligible\n- ready_for_review + label: eligible / eligible\n- ready_for_review, no label: ineligible / eligible\n- opened, reopened: ineligible / eligible\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01S94XethbGXpAb4DRKMD4kt\n\n* ci: ready_for_review runs review but never cancels\n\nkriszyp follow-up finding: the label-opted ready_for_review event sat\nin the shared eligible concurrency group, so on a bot-authored PR it\ncould cancel the trusted labeler's in-flight review and then be\nrejected by author-based authorization — no completed review. The\ncancelling set (concurrency predicate) now excludes ready_for_review;\nthe running set (job gate) keeps it, so trusted-author ready-flips\nstill review, without the power to cancel. Revisit if the reusable\ngains persisted-label authorization.\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01S94XethbGXpAb4DRKMD4kt\n\n* ci: exclude ready_for_review from the always-on cancelling arm\n\nCodex follow-up on the ready-noncancelling fix: ready_for_review is a\nnon-labeled event, so the ALWAYS_ON arm of the concurrency predicate\nstill placed it in the shared cancelling group in always-on mode — a\nlabel-opted bot PR's ready-flip could cancel the labeler's in-flight\nreview and then fail author-based authorization. The cancelling set now\nexcludes ready_for_review in BOTH modes; the job gates are unchanged\n(ready-flips run review, in their own run_id group).\n\nCo-Authored-By: Claude Fable 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01S94XethbGXpAb4DRKMD4kt\n\n---------\n\nCo-authored-by: Claude Fable 5 <noreply@anthropic.com>",
+          "timestamp": "2026-08-27T17:16:53Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/d792a44a51ed09ca5b888065d709e4e846f040dd"
+        },
+        "date": 1787916378465,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 9959.86,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 24362.46,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 17521.59,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 6949.1,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 4565.55,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2339.76,
             "unit": "ops/sec"
           }
         ]
