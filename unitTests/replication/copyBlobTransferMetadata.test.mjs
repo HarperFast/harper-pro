@@ -1,14 +1,150 @@
 import assert from 'node:assert';
 import { createAuditEntry, readAuditEntry } from '#src/core/resources/auditStore';
 import { Blob, createBlob, decodeWithBlobCallback } from '#src/core/resources/blob';
-import { table } from '#src/core/resources/databases';
+import { table, tables } from '#src/core/resources/databases';
+import { loadGQLSchema } from '#src/core/resources/graphql';
+import { transaction } from '#src/core/resources/transaction';
 import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
 import {
 	collectAuditRecordBlobsFromBinary,
 	encodeWithCopyBlobTransferTags,
+	encodeCopyRecordValue,
+	getResidencyProjectionRecord,
+	isResolverOwnedIndexedName,
 } from '#src/replication/replicationConnection';
 
 describe('copy blob transfer metadata', () => {
+	it('resolver output never enters copy payloads, and legacy contamination cannot outrank the resolver', async () => {
+		setHdbBasePath(process.env.STORAGE_PATH);
+		await loadGQLSchema(`
+			type ComputedCopyMetadata @table {
+				id: ID @primaryKey
+				source: String
+				derived: String @computed(from: "source") @indexed
+			}
+		`);
+		const ComputedCopy = tables.ComputedCopyMetadata;
+		const encoder = ComputedCopy.primaryStore.encoder;
+		await ComputedCopy.put({ id: 'record', source: 'before' });
+		const stored = ComputedCopy.primaryStore.getEntry('record');
+
+		// Non-vacuity: the sender's projection is load-bearing on this path, not decorative.
+		const unprojected = encoder.decode(Buffer.from(encoder.encode(stored.value)));
+		assert.equal(unprojected.derived, 'before', 'premise: an unprojected re-encode carries the computed value');
+
+		// The production sender path itself: projection wired into the copy-row encode.
+		const copyBlobs = [];
+		const encodedRecord = Buffer.from(
+			encodeCopyRecordValue(ComputedCopy.primaryStore, stored.value, (blob) => copyBlobs.push(blob))
+		);
+		const auditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'put',
+					tableId: ComputedCopy.tableId,
+					recordId: 'record',
+					version: stored.version,
+					nodeId: 0,
+					encodedRecord,
+				})
+			)
+		);
+		const copied = auditRecord.getValue(ComputedCopy.primaryStore);
+		assert.equal(copied.derived, undefined, 'the projected copy payload must not carry the computed value');
+		assert.equal(copied.source, 'before');
+
+		const legacyEncodedRecord = Buffer.from(encoder.encode({ id: 'legacy', source: 'trusted', derived: 'forged' }));
+		assert(
+			legacyEncodedRecord.includes(Buffer.from('forged')),
+			'premise: affected-sender bytes carry the forged value'
+		);
+		const legacyAuditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'put',
+					tableId: ComputedCopy.tableId,
+					recordId: 'legacy',
+					version: stored.version + 1,
+					nodeId: 0,
+					encodedRecord: legacyEncodedRecord,
+				})
+			)
+		);
+		const legacyCopy = legacyAuditRecord.getValue(ComputedCopy.primaryStore);
+		const receiveContext = {};
+		await transaction(receiveContext, async () => {
+			// the replication apply path writes under the replay marker, which skips public-path validation
+			receiveContext.transaction.isReplay = true;
+			const options = { isNotification: true, ensureLoaded: false, async: true };
+			const resource = await ComputedCopy.getResource('legacy', receiveContext, options);
+			resource._writeUpdate('legacy', legacyCopy, true, options);
+		});
+		const legacyStored = ComputedCopy.primaryStore.getEntry('legacy').value;
+		assert.equal(
+			Object.hasOwn(legacyStored, 'derived'),
+			false,
+			'the receiver write must project the forged value away'
+		);
+		assert.equal(legacyStored.derived, 'trusted', 'the resolver must be authoritative');
+
+		assert.equal(isResolverOwnedIndexedName(ComputedCopy, 'derived'), true);
+		assert.equal(isResolverOwnedIndexedName(ComputedCopy, 'source'), false);
+		assert.equal(isResolverOwnedIndexedName({ primaryStore: { encoder: {} } }, 'derived'), false);
+		let partialRecord = null;
+		for (const name in ComputedCopy.indices) {
+			if (isResolverOwnedIndexedName(ComputedCopy, name)) continue;
+			partialRecord ??= {};
+			partialRecord[name] = getResidencyProjectionRecord(auditRecord, ComputedCopy.primaryStore)[name];
+		}
+		assert.equal(partialRecord, null, 'a computed-only index set produces no residency partial');
+
+		// A patch audit entry whose record no longer exists (deleted/expired before a lagging peer's
+		// send loop reached it) must yield undefined — the caller's no-record break — not a throw that
+		// closes the subscription before its cursor advances and replays the same entry forever.
+		const goneAuditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'patch',
+					tableId: ComputedCopy.tableId,
+					recordId: 'never-existed',
+					version: stored.version + 5,
+					nodeId: 0,
+					encodedRecord: Buffer.from(encoder.encode({ source: 'orphaned-patch' })),
+				})
+			)
+		);
+		assert.equal(getResidencyProjectionRecord(goneAuditRecord, ComputedCopy.primaryStore), undefined);
+
+		const fullRecord = auditRecord.getValue(ComputedCopy.primaryStore, true);
+		const projectionArgs = [];
+		const projectionAuditRecord = {
+			version: 123,
+			recordId: 'record',
+			getValue: (...args) => {
+				projectionArgs.push(args);
+				return fullRecord;
+			},
+		};
+		assert.strictEqual(getResidencyProjectionRecord(projectionAuditRecord, ComputedCopy.primaryStore), fullRecord);
+		assert.deepEqual(projectionArgs, [[ComputedCopy.primaryStore, true, 123]]);
+		const patchAuditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'patch',
+					tableId: ComputedCopy.tableId,
+					recordId: 'record',
+					version: stored.version,
+					nodeId: 0,
+					encodedRecord: Buffer.from(encoder.encode({ source: 'patch-only' })),
+				})
+			)
+		);
+		assert.equal(patchAuditRecord.getValue(ComputedCopy.primaryStore, true), undefined);
+		const reconstructedPatch = getResidencyProjectionRecord(patchAuditRecord, ComputedCopy.primaryStore);
+		assert.equal(reconstructedPatch.id, 'record');
+		assert.equal(reconstructedPatch.source, 'before');
+	});
+
 	it('clears temporary tags after an encoding failure and never reuses their ids', () => {
 		const blob = new Blob(['payload']);
 		let failedTransferId;
