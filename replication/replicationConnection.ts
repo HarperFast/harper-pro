@@ -382,7 +382,24 @@ export function isResolverOwnedIndexedName(table: any, name: string): boolean {
 }
 
 export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any) {
+	// The third argument reconstructs the record AT the audit timestamp, so a partial (patch) entry
+	// yields the merged record rather than an undefined body. That reconstruction reads the current
+	// entry with no null guard in core, and this runs inside the synchronous send loop: a record
+	// deleted/expired before a lagging peer reaches this entry would otherwise throw, close the
+	// subscription BEFORE startTime advances, and replay the same entry on reconnect — a permanent
+	// stall. No current entry -> undefined, which the caller's existing no-record break handles.
+	if (!primaryStore.getEntry(auditRecord.recordId)) return undefined;
 	return auditRecord.getValue(primaryStore, true, auditRecord.version);
+}
+
+/**
+ * Encodes a full-copy row's value with resolver-owned names projected out: the copied row is a
+ * materialized record whose response toJSON the encoder would otherwise consult, and this path does
+ * not pass through recordUpdater's projection. Exported so the wiring itself is unit-testable.
+ */
+export function encodeCopyRecordValue(primaryStore: any, value: any, onBlob: (blob: Blob) => void) {
+	decodeWithBlobCallback(() => primaryStore.encoder.encode(storedFieldsOnly(primaryStore.encoder, value)), onBlob);
+	return lastValueEncoding!;
 }
 
 /**
@@ -4868,7 +4885,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								let fullRecord: any,
 									partialRecord = null;
 								for (const name in table.indices) {
-									if (isResolverOwnedIndexedName(table, name)) continue; // resolver output is never replicated
+									if (isResolverOwnedIndexedName(table, name)) continue;
 									if (!partialRecord) {
 										fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore);
 										if (!fullRecord) break; // if there is no record, as is the case with a relocate, we can't send it
@@ -5369,19 +5386,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 															previousVersion: null,
 															nodeId: recordNodeId,
 															type: 'put',
-															encodedRecord: (() => {
-																decodeWithBlobCallback(
-																	// Resolver output is never replicated: the copy row re-encodes a materialized
-																	// record whose response toJSON the encoder would otherwise consult, so project
-																	// it to stored fields first (HarperFast/harper#2359).
-																	() =>
-																		table.primaryStore.encoder.encode(
-																			storedFieldsOnly(table.primaryStore.encoder, entry.value)
-																		),
-																	(blob) => sendBlobs(blob, entry.key)
-																);
-																return lastValueEncoding!;
-															})(),
+															encodedRecord: encodeCopyRecordValue(table.primaryStore, entry.value, (blob) =>
+																sendBlobs(blob, entry.key)
+															),
 															extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
 															residencyId: entry.residencyId,
 															previousResidencyId: null,

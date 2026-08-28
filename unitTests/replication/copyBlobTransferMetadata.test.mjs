@@ -9,6 +9,7 @@ import { setHdbBasePath } from '#src/core/utility/environment/environmentManager
 import {
 	collectAuditRecordBlobsFromBinary,
 	encodeWithCopyBlobTransferTags,
+	encodeCopyRecordValue,
 	getResidencyProjectionRecord,
 	isResolverOwnedIndexedName,
 } from '#src/replication/replicationConnection';
@@ -28,14 +29,15 @@ describe('copy blob transfer metadata', () => {
 		await ComputedCopy.put({ id: 'record', source: 'before' });
 		const stored = ComputedCopy.primaryStore.getEntry('record');
 
-		// Non-vacuity: without the projection, re-encoding the materialized record routes through its
-		// response toJSON and the computed value reaches the bytes — the copy sender's projection is
-		// load-bearing on this path, not decorative.
+		// Non-vacuity: the sender's projection is load-bearing on this path, not decorative.
 		const unprojected = encoder.decode(Buffer.from(encoder.encode(stored.value)));
 		assert.equal(unprojected.derived, 'before', 'premise: an unprojected re-encode carries the computed value');
 
-		// The copy sender's actual shape: project to stored fields, then encode.
-		const encodedRecord = Buffer.from(encoder.encode(storedFieldsOnly(encoder, stored.value)));
+		// The production sender path itself: projection wired into the copy-row encode.
+		const copyBlobs = [];
+		const encodedRecord = Buffer.from(
+			encodeCopyRecordValue(ComputedCopy.primaryStore, stored.value, (blob) => copyBlobs.push(blob))
+		);
 		const auditRecord = readAuditEntry(
 			Buffer.from(
 				createAuditEntry({
@@ -52,8 +54,6 @@ describe('copy blob transfer metadata', () => {
 		assert.equal(copied.derived, undefined, 'the projected copy payload must not carry the computed value');
 		assert.equal(copied.source, 'before');
 
-		// An affected-release sender ships bytes with the computed value as a stored field; the
-		// receiver's durable write projects it away and the resolver stays authoritative.
 		const legacyEncodedRecord = Buffer.from(encoder.encode({ id: 'legacy', source: 'trusted', derived: 'forged' }));
 		assert(
 			legacyEncodedRecord.includes(Buffer.from('forged')),
@@ -88,8 +88,6 @@ describe('copy blob transfer metadata', () => {
 		);
 		assert.equal(legacyStored.derived, 'trusted', 'the resolver must be authoritative');
 
-		// Resolver-owned indexed names are skipped when building a residency partial: this table's only
-		// index is the computed attribute, so the partial never materializes at all.
 		assert.equal(isResolverOwnedIndexedName(ComputedCopy, 'derived'), true);
 		assert.equal(isResolverOwnedIndexedName(ComputedCopy, 'source'), false);
 		assert.equal(isResolverOwnedIndexedName({ primaryStore: { encoder: {} } }, 'derived'), false);
@@ -97,16 +95,32 @@ describe('copy blob transfer metadata', () => {
 		for (const name in ComputedCopy.indices) {
 			if (isResolverOwnedIndexedName(ComputedCopy, name)) continue;
 			partialRecord ??= {};
-			partialRecord[name] = auditRecord.getValue(ComputedCopy.primaryStore, true)[name];
+			partialRecord[name] = getResidencyProjectionRecord(auditRecord, ComputedCopy.primaryStore)[name];
 		}
 		assert.equal(partialRecord, null, 'a computed-only index set produces no residency partial');
 
-		// Residency-changing patches reconstruct the record at the audit timestamp so peers do not
-		// receive bodyless invalidations.
+		// A patch audit entry whose record no longer exists (deleted/expired before a lagging peer's
+		// send loop reached it) must yield undefined — the caller's no-record break — not a throw that
+		// closes the subscription before its cursor advances and replays the same entry forever.
+		const goneAuditRecord = readAuditEntry(
+			Buffer.from(
+				createAuditEntry({
+					type: 'patch',
+					tableId: ComputedCopy.tableId,
+					recordId: 'never-existed',
+					version: stored.version + 5,
+					nodeId: 0,
+					encodedRecord: Buffer.from(encoder.encode({ source: 'orphaned-patch' })),
+				})
+			)
+		);
+		assert.equal(getResidencyProjectionRecord(goneAuditRecord, ComputedCopy.primaryStore), undefined);
+
 		const fullRecord = auditRecord.getValue(ComputedCopy.primaryStore, true);
 		const projectionArgs = [];
 		const projectionAuditRecord = {
 			version: 123,
+			recordId: 'record',
 			getValue: (...args) => {
 				projectionArgs.push(args);
 				return fullRecord;
