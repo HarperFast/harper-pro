@@ -115,10 +115,12 @@ suite('computed scalar full-copy durability (harper#2359)', { timeout: 300_000 }
 		const teardownNode = async (label, node) => {
 			const errors = [];
 			if (!node) return errors;
-			try {
-				await stopNodeProcess(node);
-			} catch (error) {
-				errors.push(new Error(`Failed to stop ${label} (${node.hostname})`, { cause: error }));
+			if (node.dataRootDir) {
+				try {
+					await stopNodeProcess(node);
+				} catch (error) {
+					errors.push(new Error(`Failed to stop ${label} (${node.hostname})`, { cause: error }));
+				}
 			}
 			try {
 				await teardownHarper({ harper: node });
