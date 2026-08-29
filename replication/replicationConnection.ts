@@ -2164,19 +2164,12 @@ export function createReceiveWatchdog(opts: {
 	// (harper-pro#460). A plain number is still accepted for the fixed-threshold callers.
 	intervalMs: number | (() => number);
 	getBytesRead: () => number;
-	// Transport-evidence gate (harper-pro#697): an app-progress watchdog may reconnect only with
-	// positive evidence that the transport stayed healthy while app progress stopped. When this
-	// sampler is supplied, a primary-silent window is judged by the sampled counter (received peer
-	// bytes): silent on BOTH counters is transport-level silence — the byte-silence watchdog's
-	// jurisdiction, with its own budget — so the watchdog re-arms instead of firing. First-window
-	// movement is confirmed over one extra confirmIntervalMs before firing: bytes buffered behind a
-	// receive pause (or a suspended peer's kernel send buffer) can land moments after a re-arm, so
-	// single-window movement may be stale residue. Residue empties within milliseconds, while a
-	// live-but-frame-dead peer keeps bytes (pongs) arriving every ping cycle — so the confirmation
-	// is transport-scale (the caller sizes it from the ping cadence) and does not redefine
-	// intervalMs as the recovery bound. A sampler that throws or returns undefined provides no
-	// evidence either way: stand down (and report once via onTransportUnobservable) rather than
-	// fire without transport proof.
+	// Transport-evidence gate (harper-pro#697): with a sampler supplied, a primary-silent window
+	// fires only when the sampled counter moved during it AND keeps moving through one extra
+	// confirmIntervalMs (buffered bytes can drain moments after a re-arm, so single-window movement
+	// may be stale residue). Silence on both counters, an undefined sample, or a sampler throw is
+	// never licence to fire: stand down (reporting unobservability once) and leave the state to the
+	// byte-silence watchdog. Full rationale in replication/DESIGN.md item 15(c).
 	getTransportActivity?: () => number | undefined;
 	confirmIntervalMs?: number;
 	onTransportUnobservable?: () => void;
@@ -3567,12 +3560,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	copyProgressWatchdog = createReceiveWatchdog({
 		intervalMs: effectiveBlobTimeoutMs,
 		getBytesRead: () => copyProgressFrames,
-		// Received socket bytes (data + pongs) are the transport evidence for the fire gate
-		// (harper-pro#697). ws.pause() freezes bytesRead, but addPauseReason stops this watchdog,
-		// so a frozen counter at check time always means a silent peer, never local back-pressure.
+		// ws.pause() freezes bytesRead, but addPauseReason stops this watchdog, so a frozen sample
+		// at check time always means a silent peer, never local back-pressure. (harper-pro#697)
 		getTransportActivity: () => ws._socket?.bytesRead,
-		// Two ping cycles: enough for a live peer to prove itself with a fresh pong, so first-window
-		// residue is discarded without redefining blobTimeout as the recovery bound.
+		// Two ping cycles: long enough for a live peer's fresh pong, far below blobTimeout.
 		confirmIntervalMs: Math.max(PING_INTERVAL * 2, 1000),
 		onTransportUnobservable: () =>
 			logger.debug?.(
@@ -4341,7 +4332,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								return;
 							}
 						}
-						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
+						logger.debug?.(
+							connectionId,
+							'bulk copy starting from',
+							remoteNodeName,
+							databaseName ? `(db: "${databaseName}")` : '',
+							new Date(copyModeStartTime)
+						);
 						break;
 					}
 					case COPY_COMPLETE:
