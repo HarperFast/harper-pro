@@ -192,12 +192,9 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 		}
 		ok(connected, 'cluster_status should report the recovered data socket as connected');
 
-		// The recovery must have been the copy-progress watchdog itself, within its documented bound
-		// (1-2× blobTimeout + the transport-evidence confirmation of 2× pingInterval), with the byte
-		// watchdog never acting — pings kept bytesRead alive, so any 'Receive watchdog' line here
-		// would mean the wrong actor recovered the wedge (harper-pro#697 gate regression signature).
-		// Scoped to the data connection: the system database copies over its own socket, whose
-		// (healthy) copy-start and watchdog lines must not leak into these oracles.
+		// The recovery actor must be the copy-progress watchdog, within its documented bound and
+		// with no byte-level fire — scoped to the data connection so the system database's own
+		// socket cannot leak into the oracles (harper-pro#697).
 		const log = await readLog(ctx.nodes[1]);
 		const lineTime = (line) => Date.parse(line.slice(0, 24));
 		const dataDbTag = `(db: "${STALL_DB}")`;
@@ -207,10 +204,12 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 		ok(fires.length >= 1, 'the copy-progress watchdog must have fired on the data connection to drive the recovery');
 		const byteFires = log.split('\n').filter((line) => line.includes('Receive watchdog:') && line.includes(dataDbTag));
 		ok(byteFires.length === 0, 'no byte-level watchdog may act on this ping-alive wedge');
+		// The bound is measured from COPY_START — where noteCopyProgress() first arms the timer —
+		// not from the subscription request, whose setup gates can add unbounded scheduling delay.
 		const copyStartLine = log
 			.split('\n')
-			.find((line) => line.includes(`Requesting full copy of database ${STALL_DB} from`));
-		ok(copyStartLine, 'subscriber log must show the data copy being requested');
+			.find((line) => line.includes('bulk copy starting from') && line.includes(dataDbTag));
+		ok(copyStartLine, 'subscriber log must show the data copy starting');
 		const detectionMs = lineTime(fires[0]) - lineTime(copyStartLine);
 		ok(
 			detectionMs <= COPY_STALL_TIMEOUT_MS * 2 + PING_INTERVAL_MS * 2 + 5000,
