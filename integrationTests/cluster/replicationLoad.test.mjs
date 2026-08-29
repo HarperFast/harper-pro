@@ -178,12 +178,13 @@ suite('Replication Load Testing', { timeout: 300000 }, (ctx) => {
 			for (let j = 0; j < NODE_COUNT; j++) {
 				let retries = 0;
 				let response;
+				let lastUnknownAttribute;
 				do {
 					// Attribute metadata propagates asynchronously after the concurrent create_table
 					// burst, so a node can validly answer "unknown attribute 'name'" for a moment (same
-					// documented transient removeNodeBlastRadius retries). Poll through it like any
-					// other not-yet-converged response instead of failing the suite on it
-					// (nightly 2026-08-21, run 32457825567).
+					// documented transient removeNodeBlastRadius retries). Poll through exactly that
+					// error response like any other not-yet-converged answer, keeping it for the
+					// timeout diagnostic (nightly 2026-08-21, run 32457825567).
 					response = await sendOperation(ctx.nodes[j], {
 						operation: 'search_by_value',
 						database: db,
@@ -191,12 +192,19 @@ suite('Replication Load Testing', { timeout: 300000 }, (ctx) => {
 						search_attribute: 'name',
 						search_value: '*',
 					}).catch((error) => {
-						if (String(error?.message ?? error).includes('unknown attribute')) return undefined;
+						const message = String(error?.message ?? error);
+						if (message.includes('"error":"unknown attribute')) {
+							lastUnknownAttribute = message;
+							return undefined;
+						}
 						throw error;
 					});
 					if (retries++ > 0) {
 						if (retries > 10) {
-							ok(false, 'Timed out waiting for replication');
+							ok(
+								false,
+								`Timed out waiting for replication${lastUnknownAttribute ? ` — node ${j} still answering: ${lastUnknownAttribute}` : ''}`
+							);
 						}
 						await delay(retries * 100);
 					}
