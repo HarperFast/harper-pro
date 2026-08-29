@@ -2168,14 +2168,17 @@ export function createReceiveWatchdog(opts: {
 	// positive evidence that the transport stayed healthy while app progress stopped. When this
 	// sampler is supplied, a primary-silent window is judged by the sampled counter (received peer
 	// bytes): silent on BOTH counters is transport-level silence — the byte-silence watchdog's
-	// jurisdiction, with its own budget — so the watchdog re-arms instead of firing. Firing takes
-	// TWO consecutive primary-silent windows in which the transport counter moved: bytes buffered
-	// behind a receive pause (or a suspended peer's kernel send buffer) can land moments after a
-	// re-arm, so a single window's movement may be stale residue; residue empties within one
-	// window, while a live-but-frame-dead peer keeps bytes (pongs) arriving every window. A sampler
-	// that throws or returns undefined provides no evidence either way: stand down (and report once
-	// via onTransportUnobservable) rather than fire without transport proof.
+	// jurisdiction, with its own budget — so the watchdog re-arms instead of firing. First-window
+	// movement is confirmed over one extra confirmIntervalMs before firing: bytes buffered behind a
+	// receive pause (or a suspended peer's kernel send buffer) can land moments after a re-arm, so
+	// single-window movement may be stale residue. Residue empties within milliseconds, while a
+	// live-but-frame-dead peer keeps bytes (pongs) arriving every ping cycle — so the confirmation
+	// is transport-scale (the caller sizes it from the ping cadence) and does not redefine
+	// intervalMs as the recovery bound. A sampler that throws or returns undefined provides no
+	// evidence either way: stand down (and report once via onTransportUnobservable) rather than
+	// fire without transport proof.
 	getTransportActivity?: () => number | undefined;
+	confirmIntervalMs?: number;
 	onTransportUnobservable?: () => void;
 	onSilence: () => void;
 }): { reset: () => void; stop: () => void } {
@@ -2187,8 +2190,7 @@ export function createReceiveWatchdog(opts: {
 	let transportEvidencePending = false;
 	let reportedUnobservable = false;
 	const resolveIntervalMs = () => (typeof opts.intervalMs === 'function' ? opts.intervalMs() : opts.intervalMs);
-	// Selected at construction so ungated callers (byte, pause-stall, finalize) keep their exact
-	// pre-gate path — no sampler closure, no extra call per arm.
+	// Only gated callers pay for the sampler.
 	const snapshotTransport =
 		opts.getTransportActivity &&
 		(() => {
@@ -2218,7 +2220,7 @@ export function createReceiveWatchdog(opts: {
 					// or the socket unobservable at either end of it), or first-window evidence that
 					// could still be buffered residue: re-arm and hold the strike for confirmation.
 					transportEvidencePending = transportMoved;
-					if (!transportKnown && !reportedUnobservable) {
+					if ((!hadBaseline || !transportKnown) && !reportedUnobservable) {
 						reportedUnobservable = true;
 						try {
 							opts.onTransportUnobservable?.();
@@ -2227,7 +2229,10 @@ export function createReceiveWatchdog(opts: {
 						}
 					}
 					lastResetAt = Date.now();
-					timer = setTimeout(check, resolveIntervalMs()).unref();
+					timer = setTimeout(
+						check,
+						transportEvidencePending ? (opts.confirmIntervalMs ?? resolveIntervalMs()) : resolveIntervalMs()
+					).unref();
 					return;
 				}
 			}
@@ -3567,6 +3572,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// (harper-pro#697). ws.pause() freezes bytesRead, but addPauseReason stops this watchdog,
 		// so a frozen counter at check time always means a silent peer, never local back-pressure.
 		getTransportActivity: () => ws._socket?.bytesRead,
+		// Two ping cycles: enough for a live peer to prove itself with a fresh pong, so first-window
+		// residue is discarded without redefining blobTimeout as the recovery bound.
+		confirmIntervalMs: Math.max(PING_INTERVAL * 2, 1000),
 		onTransportUnobservable: () =>
 			logger.debug?.(
 				connectionId,
@@ -3577,7 +3585,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for two consecutive ${effectiveBlobTimeoutMs}ms windows in which peer bytes kept arriving — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
+				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${effectiveBlobTimeoutMs}ms (and through a ${Math.max(PING_INTERVAL * 2, 1000)}ms confirmation) while peer bytes kept arriving — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
