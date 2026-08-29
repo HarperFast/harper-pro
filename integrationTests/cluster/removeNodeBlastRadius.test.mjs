@@ -338,7 +338,25 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		equal(resumedFromC[0].value, 'C-restored-too', 'restoring B membership must re-enable every peer subscription');
 	});
 
-	test('(c) reciprocal removal of B remains durable across B restart', async () => {
+	test('(c) reciprocal removal of B remains durable across B restart', async (t) => {
+		// (c) needs the cluster (b) leaves behind: B re-joined, so A has a B row to remove. When (b)
+		// failed, A answers remove_node with "does not exist" — which reads like a durability
+		// regression but is only (b)'s failure echoing. Skip with the dependency named instead of
+		// producing that misleading assertion (nightly 2026-08-29, run 33239813839).
+		const aRowsForB = await sendOperation(ctx.nodeA, {
+			operation: 'search_by_value',
+			database: 'system',
+			table: 'hdb_nodes',
+			search_attribute: 'name',
+			search_value: ctx.hostnameB,
+			get_attributes: ['name'],
+		});
+		if (aRowsForB.length === 0) {
+			t.skip(
+				'precondition from (b) not met: A has no hdb_nodes row for B, so the (b) re-join failed — see its failure for the root cause'
+			);
+			return;
+		}
 		await sendOperation(ctx.nodeA, { operation: 'remove_node', hostname: ctx.hostnameB });
 		await waitUntil(
 			async () => {
