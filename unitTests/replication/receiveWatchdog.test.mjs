@@ -263,9 +263,7 @@ describe('createReceiveWatchdog', () => {
 
 	describe('transport-evidence gate (harper-pro#697)', () => {
 		it('defers instead of firing when the transport counter is also frozen for the window', () => {
-			// The 2026-08-29 nightly false fire: peer event loop dark, zero bytes (not even pongs)
-			// alongside zero copy frames. That is transport-level silence — the byte watchdog's
-			// jurisdiction — so the gated watchdog must re-arm, not fire.
+			// The 2026-08-29 nightly false fire shape: peer completely dark, both counters frozen.
 			const onSilence = sinon.spy();
 			const watchdog = createReceiveWatchdog({
 				intervalMs: 60_000,
@@ -301,7 +299,6 @@ describe('createReceiveWatchdog', () => {
 		});
 
 		it('a deferred dark window still fires later once sustained transport evidence appears', () => {
-			// Baselines must advance across deferrals: deferral is a stand-down, not a disarm.
 			const onSilence = sinon.spy();
 			let transportBytes = 500;
 			const watchdog = createReceiveWatchdog({
@@ -423,32 +420,77 @@ describe('createReceiveWatchdog', () => {
 
 		it('a window without a baseline (sampler was unobservable at arm) defers even if bytes now read', () => {
 			// Evidence requires a comparison across the window; a baseline that only became
-			// observable mid-window cannot prove peer bytes arrived within it.
+			// observable mid-window cannot prove peer bytes arrived within it. The degraded window
+			// is still reported so the extra recovery delay is explicable.
 			const onSilence = sinon.spy();
+			const onTransportUnobservable = sinon.spy();
 			let sampled;
 			const watchdog = createReceiveWatchdog({
 				intervalMs: 60_000,
 				getBytesRead: () => 0,
 				getTransportActivity: () => sampled,
+				onTransportUnobservable,
 				onSilence,
 			});
 
 			watchdog.reset(); // baseline unknown
 			sampled = 700;
-			clock.tick(60_000); // observable now, but no window-spanning evidence → defer
+			clock.tick(60_000); // observable now, but no window-spanning evidence → defer, reported
 			expect(onSilence.callCount).to.equal(0);
+			expect(onTransportUnobservable.callCount).to.equal(1);
 			sampled = 710;
 			clock.tick(60_000); // baseline established last check; first evidence window → pending strike
 			expect(onSilence.callCount).to.equal(0);
 			sampled = 720;
-			clock.tick(60_000); // second consecutive evidence window → fire
+			clock.tick(60_000); // confirmation (defaults to intervalMs) with continued movement → fire
 			expect(onSilence.callCount).to.equal(1);
 		});
 
+		it('confirmIntervalMs bounds the strike confirmation instead of a second full interval', () => {
+			// The recovery bound stays intervalMs: the caller sizes the confirmation from the ping
+			// cadence, long enough for a live peer's fresh pong and short enough that residue
+			// (already emptied) cannot recur.
+			const onSilence = sinon.spy();
+			let transportBytes = 500;
+			const watchdog = createReceiveWatchdog({
+				intervalMs: 60_000,
+				confirmIntervalMs: 5_000,
+				getBytesRead: () => 0,
+				getTransportActivity: () => transportBytes,
+				onSilence,
+			});
+
+			watchdog.reset();
+			transportBytes += 10;
+			clock.tick(60_000); // evidence window → pending strike, confirmation armed at 5s
+			expect(onSilence.callCount).to.equal(0);
+			transportBytes += 10;
+			clock.tick(5_000); // still moving a ping-cycle later → fire at interval + confirm
+			expect(onSilence.callCount).to.equal(1);
+		});
+
+		it('a residual strike whose confirmation window is dark decays back to the full interval', () => {
+			const onSilence = sinon.spy();
+			let transportBytes = 500;
+			const watchdog = createReceiveWatchdog({
+				intervalMs: 60_000,
+				confirmIntervalMs: 5_000,
+				getBytesRead: () => 0,
+				getTransportActivity: () => transportBytes,
+				onSilence,
+			});
+
+			watchdog.reset();
+			clock.tick(1_000);
+			transportBytes += 10; // buffered residue drains right after the arm, then nothing
+			clock.tick(59_000); // strike held, confirmation armed
+			clock.tick(5_000); // dark confirmation → residue, strike cleared
+			clock.tick(120_000); // fully dark thereafter: never fires
+			expect(onSilence.callCount).to.equal(0);
+		});
+
 		it('throttled resets do not invoke the transport sampler (hot-path cost stays bounded)', () => {
-			// noteCopyProgress() calls reset() per copy frame — thousands per second on a fat-row
-			// copy. The sampler must run only when a reset actually re-arms (or at check time),
-			// never on the throttled fast path.
+			// noteCopyProgress() calls reset() per copy frame — thousands per second on a fat-row copy.
 			const onSilence = sinon.spy();
 			const getTransportActivity = sinon.spy(() => 500);
 			const watchdog = createReceiveWatchdog({

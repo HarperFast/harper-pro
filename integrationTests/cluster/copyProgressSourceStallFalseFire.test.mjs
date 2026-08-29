@@ -158,7 +158,6 @@ async function waitForConvergence(node) {
 	return false;
 }
 
-// Timestamp (ms) of the last log line before `beforeMs` whose text matches `needle`, or undefined.
 function lastLineTimeBefore(log, needle, beforeMs) {
 	let last;
 	for (const line of log.split('\n')) {
@@ -171,9 +170,8 @@ function lastLineTimeBefore(log, needle, beforeMs) {
 	return last;
 }
 
-// Runs the shared scenario: park the copy via the delayed commit, SIGSTOP the source inside the
-// hold, keep it dark for `darkMs` after the resume, SIGCONT. Returns wall-clock marks + the
-// subscriber log captured after the post-stall settle.
+// Parks the copy via the delayed commit, SIGSTOPs the source inside the hold, keeps it dark for
+// `darkMs` after the resume, SIGCONTs.
 async function runStallScenario(ctx, { darkMs }) {
 	const [source, subscriber] = ctx.nodes;
 	await sendOperation(subscriber, {
@@ -216,8 +214,8 @@ async function runStallScenario(ctx, { darkMs }) {
 	}
 
 	ok(await waitForConvergence(subscriber), 'base copy must converge on the subscriber after the source resumes');
-	// Let any watchdog window armed late in the copy elapse before reading the log.
-	await delay(COPY_STALL_TIMEOUT_MS + 1000);
+	await delay(COPY_STALL_TIMEOUT_MS + 1000); // let a late-armed watchdog window elapse before reading the log
+
 	return { sigcontAt, log: await readLog(subscriber), sourceHostname: source.hostname };
 }
 
