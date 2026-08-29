@@ -46,9 +46,10 @@ const TABLES = ['alpha', 'beta'];
 const ROWS_PER_TABLE = 200;
 const ROW_PADDING = 'x'.repeat(20000); // fat rows so the parked copy leaves real data unsent
 const PING_INTERVAL_MS = 1000;
-// Above the suite-1 stall so the reverse (source→subscriber) leg's server-side watchdog stays
-// quiet and the log can be asserted watchdog-free.
-const PING_TIMEOUT_MS = 6000;
+// Above suite 1's ENTIRE SIGSTOP interval (COMMIT_DELAY_MS + 2.5 × blobTimeout ≈ 6.75s) with wide
+// CI-scheduling margin, so no ping-timeout path — the reverse leg's server-side watchdog included —
+// acts anywhere in that suite's log. Suite 2 tolerates reverse-leg fires (its stop spans ~13s).
+const PING_TIMEOUT_MS = 15000;
 const COPY_STALL_TIMEOUT_MS = 1500; // blobTimeout = the copy-progress watchdog budget
 const COMMIT_DELAY_MS = 3000; // one-shot commit hold; SIGSTOP lands inside this window
 const CONVERGENCE_TIMEOUT_MS = 90000;
