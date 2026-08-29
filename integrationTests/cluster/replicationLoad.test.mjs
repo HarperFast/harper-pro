@@ -185,6 +185,7 @@ suite('Replication Load Testing', { timeout: 300000 }, (ctx) => {
 					// documented transient removeNodeBlastRadius retries). Poll through exactly that
 					// error response like any other not-yet-converged answer, keeping it for the
 					// timeout diagnostic (nightly 2026-08-21, run 32457825567).
+					lastUnknownAttribute = undefined;
 					response = await sendOperation(ctx.nodes[j], {
 						operation: 'search_by_value',
 						database: db,
