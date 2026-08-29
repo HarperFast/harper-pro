@@ -170,8 +170,6 @@ function lastLineTimeBefore(log, needle, beforeMs) {
 	return last;
 }
 
-// Parks the copy via the delayed commit, SIGSTOPs the source inside the hold, keeps it dark for
-// `darkMs` after the resume, SIGCONTs.
 async function runStallScenario(ctx, { darkMs }) {
 	const [source, subscriber] = ctx.nodes;
 	await sendOperation(subscriber, {

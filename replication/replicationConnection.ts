@@ -2450,7 +2450,6 @@ export function createReceiveWatchdog(opts: {
 	let transportEvidencePending = false;
 	let reportedUnobservable = false;
 	const resolveIntervalMs = () => (typeof opts.intervalMs === 'function' ? opts.intervalMs() : opts.intervalMs);
-	// Only gated callers pay for the sampler.
 	const snapshotTransport =
 		opts.getTransportActivity &&
 		(() => {
