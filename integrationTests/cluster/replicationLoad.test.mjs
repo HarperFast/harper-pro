@@ -179,12 +179,20 @@ suite('Replication Load Testing', { timeout: 300000 }, (ctx) => {
 				let retries = 0;
 				let response;
 				do {
+					// Attribute metadata propagates asynchronously after the concurrent create_table
+					// burst, so a node can validly answer "unknown attribute 'name'" for a moment (same
+					// documented transient removeNodeBlastRadius retries). Poll through it like any
+					// other not-yet-converged response instead of failing the suite on it
+					// (nightly 2026-08-21, run 32457825567).
 					response = await sendOperation(ctx.nodes[j], {
 						operation: 'search_by_value',
 						database: db,
 						table: 'test',
 						search_attribute: 'name',
 						search_value: '*',
+					}).catch((error) => {
+						if (String(error?.message ?? error).includes('unknown attribute')) return undefined;
+						throw error;
 					});
 					if (retries++ > 0) {
 						if (retries > 10) {
@@ -192,7 +200,7 @@ suite('Replication Load Testing', { timeout: 300000 }, (ctx) => {
 						}
 						await delay(retries * 100);
 					}
-				} while (response.length != NODE_COUNT);
+				} while (!response || response.length != NODE_COUNT);
 			}
 		}
 		console.log('done');
