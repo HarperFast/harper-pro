@@ -29,7 +29,7 @@ import { ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, readLog } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -190,5 +190,22 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 			await delay(POLL_INTERVAL_MS);
 		}
 		ok(connected, 'cluster_status should report the recovered data socket as connected');
+
+		// The recovery must have been the copy-progress watchdog itself, within its documented bound
+		// (1-2× blobTimeout + the transport-evidence confirmation of 2× pingInterval), with the byte
+		// watchdog never acting — pings kept bytesRead alive, so any 'Receive watchdog' line here
+		// would mean the wrong actor recovered the wedge (harper-pro#697 gate regression signature).
+		const log = await readLog(ctx.nodes[1]);
+		const lineTime = (line) => Date.parse(line.slice(0, 24));
+		const fires = log.split('\n').filter((line) => line.includes('Copy-progress watchdog:'));
+		ok(fires.length >= 1, 'the copy-progress watchdog must have fired to drive the recovery');
+		ok(!log.includes('Receive watchdog:'), 'no byte-level watchdog may act on this ping-alive wedge');
+		const copyStartLine = log.split('\n').find((line) => line.includes('bulk copy starting from'));
+		ok(copyStartLine, 'subscriber log must show the stalled bulk copy starting');
+		const detectionMs = lineTime(fires[0]) - lineTime(copyStartLine);
+		ok(
+			detectionMs <= COPY_STALL_TIMEOUT_MS * 2 + PING_INTERVAL_MS * 2 + 5000,
+			`copy-progress fire must land within its documented bound; took ${detectionMs}ms`
+		);
 	});
 });
