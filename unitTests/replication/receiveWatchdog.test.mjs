@@ -263,7 +263,6 @@ describe('createReceiveWatchdog', () => {
 
 	describe('transport-evidence gate (harper-pro#697)', () => {
 		it('defers instead of firing when the transport counter is also frozen for the window', () => {
-			// The 2026-08-29 nightly false fire shape: peer completely dark, both counters frozen.
 			const onSilence = sinon.spy();
 			const watchdog = createReceiveWatchdog({
 				intervalMs: 60_000,
@@ -278,8 +277,6 @@ describe('createReceiveWatchdog', () => {
 		});
 
 		it('fires after two consecutive copy-silent windows with peer-byte movement (the #453 wedge signature)', () => {
-			// A live-but-frame-dead peer keeps pongs arriving in EVERY window, so the confirmation
-			// window costs one extra interval, never the detection.
 			const onSilence = sinon.spy();
 			let transportBytes = 500;
 			const watchdog = createReceiveWatchdog({
@@ -447,9 +444,6 @@ describe('createReceiveWatchdog', () => {
 		});
 
 		it('confirmIntervalMs bounds the strike confirmation instead of a second full interval', () => {
-			// The recovery bound stays intervalMs: the caller sizes the confirmation from the ping
-			// cadence, long enough for a live peer's fresh pong and short enough that residue
-			// (already emptied) cannot recur.
 			const onSilence = sinon.spy();
 			let transportBytes = 500;
 			const watchdog = createReceiveWatchdog({
@@ -490,7 +484,6 @@ describe('createReceiveWatchdog', () => {
 		});
 
 		it('throttled resets do not invoke the transport sampler (hot-path cost stays bounded)', () => {
-			// noteCopyProgress() calls reset() per copy frame — thousands per second on a fat-row copy.
 			const onSilence = sinon.spy();
 			const getTransportActivity = sinon.spy(() => 500);
 			const watchdog = createReceiveWatchdog({
