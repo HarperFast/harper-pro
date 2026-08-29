@@ -279,7 +279,9 @@ describe('createReceiveWatchdog', () => {
 			expect(onSilence.callCount).to.equal(0);
 		});
 
-		it('fires when peer bytes moved during the copy-silent window (the #453 wedge signature)', () => {
+		it('fires after two consecutive copy-silent windows with peer-byte movement (the #453 wedge signature)', () => {
+			// A live-but-frame-dead peer keeps pongs arriving in EVERY window, so the confirmation
+			// window costs one extra interval, never the detection.
 			const onSilence = sinon.spy();
 			let transportBytes = 500;
 			const watchdog = createReceiveWatchdog({
@@ -291,13 +293,15 @@ describe('createReceiveWatchdog', () => {
 
 			watchdog.reset();
 			transportBytes += 10; // a pong arrived; the peer is alive yet sends no copy frames
-			clock.tick(60_000);
+			clock.tick(60_000); // first evidence window — held as a pending strike
+			expect(onSilence.callCount).to.equal(0);
+			transportBytes += 10; // pongs keep coming
+			clock.tick(60_000); // second consecutive evidence window — confirmed
 			expect(onSilence.callCount).to.equal(1);
 		});
 
-		it('a deferred dark window still fires later once transport evidence appears', () => {
-			// Baselines must advance across deferrals: dark window (defer), then a window with pongs
-			// but still no frames (the wedge) must fire — deferral is a stand-down, not a disarm.
+		it('a deferred dark window still fires later once sustained transport evidence appears', () => {
+			// Baselines must advance across deferrals: deferral is a stand-down, not a disarm.
 			const onSilence = sinon.spy();
 			let transportBytes = 500;
 			const watchdog = createReceiveWatchdog({
@@ -311,14 +315,18 @@ describe('createReceiveWatchdog', () => {
 			clock.tick(60_000); // dark window → deferred
 			expect(onSilence.callCount).to.equal(0);
 			transportBytes += 10;
-			clock.tick(60_000); // bytes moved this window, frames did not → fire
+			clock.tick(60_000); // first evidence window → pending strike
+			expect(onSilence.callCount).to.equal(0);
+			transportBytes += 10;
+			clock.tick(60_000); // second consecutive evidence window → fire
 			expect(onSilence.callCount).to.equal(1);
 		});
 
-		it('bytes early in the window count as evidence even if the transport is dark at expiry', () => {
-			// Pins the contract the fire log states: peer bytes arrived DURING the copy-silent
-			// window — not "the transport is alive at expiry". A pong right after arm followed by
-			// darkness still fires; the byte watchdog then owns whatever follows the reconnect.
+		it('a residual byte burst just after a re-arm does not fire without a second evidence window', () => {
+			// The race the confirmation window exists for: bytes buffered behind a receive pause (or
+			// a suspended peer's kernel send buffer) — e.g. a partial-frame tail — land moments after
+			// removePauseReason re-arms the watchdog. That one-window movement is stale residue, not
+			// proof of a live peer; it empties within the window and everything after is dark.
 			const onSilence = sinon.spy();
 			let transportBytes = 500;
 			const watchdog = createReceiveWatchdog({
@@ -330,9 +338,31 @@ describe('createReceiveWatchdog', () => {
 
 			watchdog.reset();
 			clock.tick(1_000);
-			transportBytes += 10; // lone pong at t=1s, then nothing
-			clock.tick(59_000);
-			expect(onSilence.callCount).to.equal(1);
+			transportBytes += 10; // the buffered tail drains right after the arm, then nothing
+			clock.tick(179_000); // three windows: evidence-then-dark must decay, not accumulate
+			expect(onSilence.callCount).to.equal(0);
+		});
+
+		it('a pending strike is cleared by primary progress, so alternating stall/progress never fires', () => {
+			const onSilence = sinon.spy();
+			let frames = 0;
+			let transportBytes = 500;
+			const watchdog = createReceiveWatchdog({
+				intervalMs: 60_000,
+				getBytesRead: () => frames,
+				getTransportActivity: () => transportBytes,
+				onSilence,
+			});
+
+			watchdog.reset();
+			transportBytes += 10;
+			clock.tick(60_000); // evidence window → pending strike
+			frames += 1;
+			transportBytes += 10;
+			clock.tick(60_000); // copy progressed → strike cleared
+			transportBytes += 10;
+			clock.tick(60_000); // evidence again → pending strike only, no fire
+			expect(onSilence.callCount).to.equal(0);
 		});
 
 		it('an undefined sampler is no evidence: stands down and reports unobservability once', () => {
@@ -374,6 +404,23 @@ describe('createReceiveWatchdog', () => {
 			expect(onTransportUnobservable.callCount).to.equal(1);
 		});
 
+		it('a throwing onTransportUnobservable reporter is contained like the sampler', () => {
+			const onSilence = sinon.spy();
+			const watchdog = createReceiveWatchdog({
+				intervalMs: 60_000,
+				getBytesRead: () => 0,
+				getTransportActivity: () => undefined,
+				onTransportUnobservable: () => {
+					throw new Error('logger failed during shutdown');
+				},
+				onSilence,
+			});
+
+			watchdog.reset();
+			clock.tick(120_000); // the reporter throw would otherwise escape the unref'd timer
+			expect(onSilence.callCount).to.equal(0);
+		});
+
 		it('a window without a baseline (sampler was unobservable at arm) defers even if bytes now read', () => {
 			// Evidence requires a comparison across the window; a baseline that only became
 			// observable mid-window cannot prove peer bytes arrived within it.
@@ -391,7 +438,10 @@ describe('createReceiveWatchdog', () => {
 			clock.tick(60_000); // observable now, but no window-spanning evidence → defer
 			expect(onSilence.callCount).to.equal(0);
 			sampled = 710;
-			clock.tick(60_000); // baseline established last check; movement this window → fire
+			clock.tick(60_000); // baseline established last check; first evidence window → pending strike
+			expect(onSilence.callCount).to.equal(0);
+			sampled = 720;
+			clock.tick(60_000); // second consecutive evidence window → fire
 			expect(onSilence.callCount).to.equal(1);
 		});
 

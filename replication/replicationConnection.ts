@@ -2166,12 +2166,15 @@ export function createReceiveWatchdog(opts: {
 	getBytesRead: () => number;
 	// Transport-evidence gate (harper-pro#697): an app-progress watchdog may reconnect only with
 	// positive evidence that the transport stayed healthy while app progress stopped. When this
-	// sampler is supplied, a window with zero primary progress fires only if the sampled counter
-	// (received peer bytes) moved during that same window; a window silent on BOTH counters is
-	// transport-level silence — the byte-silence watchdog's jurisdiction, with its own budget — so
-	// the watchdog re-arms instead of firing. A sampler that throws or returns undefined provides
-	// no evidence either way: stand down (and report once via onTransportUnobservable) rather than
-	// fire without transport proof.
+	// sampler is supplied, a primary-silent window is judged by the sampled counter (received peer
+	// bytes): silent on BOTH counters is transport-level silence — the byte-silence watchdog's
+	// jurisdiction, with its own budget — so the watchdog re-arms instead of firing. Firing takes
+	// TWO consecutive primary-silent windows in which the transport counter moved: bytes buffered
+	// behind a receive pause (or a suspended peer's kernel send buffer) can land moments after a
+	// re-arm, so a single window's movement may be stale residue; residue empties within one
+	// window, while a live-but-frame-dead peer keeps bytes (pongs) arriving every window. A sampler
+	// that throws or returns undefined provides no evidence either way: stand down (and report once
+	// via onTransportUnobservable) rather than fire without transport proof.
 	getTransportActivity?: () => number | undefined;
 	onTransportUnobservable?: () => void;
 	onSilence: () => void;
@@ -2181,19 +2184,23 @@ export function createReceiveWatchdog(opts: {
 	let lastResetAt = 0;
 	let transportAtArm = 0;
 	let transportKnown = false;
+	let transportEvidencePending = false;
 	let reportedUnobservable = false;
 	const resolveIntervalMs = () => (typeof opts.intervalMs === 'function' ? opts.intervalMs() : opts.intervalMs);
-	const snapshotTransport = () => {
-		if (!opts.getTransportActivity) return;
-		let sampled;
-		try {
-			sampled = opts.getTransportActivity();
-		} catch {
-			sampled = undefined; // a throwing sampler must degrade to "unobservable", never crash the timer
-		}
-		transportKnown = sampled !== undefined;
-		transportAtArm = sampled ?? 0;
-	};
+	// Selected at construction so ungated callers (byte, pause-stall, finalize) keep their exact
+	// pre-gate path — no sampler closure, no extra call per arm.
+	const snapshotTransport =
+		opts.getTransportActivity &&
+		(() => {
+			let sampled;
+			try {
+				sampled = opts.getTransportActivity();
+			} catch {
+				sampled = undefined; // a throwing sampler must degrade to "unobservable", never crash the timer
+			}
+			transportKnown = sampled !== undefined;
+			transportAtArm = sampled ?? 0;
+		});
 	// Coalesce rapid reset() calls (e.g. message frames arriving thousands of times per second
 	// during a large copy) so we do not churn setTimeout/clearTimeout per frame. Granularity loss
 	// is small relative to intervalMs — at worst the watchdog fires this much earlier or later.
@@ -2201,16 +2208,23 @@ export function createReceiveWatchdog(opts: {
 	function check() {
 		const current = opts.getBytesRead();
 		if (current === bytesReadAtArm) {
-			if (opts.getTransportActivity) {
+			if (snapshotTransport) {
 				const hadBaseline = transportKnown;
 				const baseline = transportAtArm;
 				snapshotTransport();
-				if (!hadBaseline || !transportKnown || transportAtArm === baseline) {
-					// No positive evidence the peer was alive during this window (bytes frozen, or the
-					// socket unobservable at either end of it): re-arm and stand down.
+				const transportMoved = hadBaseline && transportKnown && transportAtArm !== baseline;
+				if (!transportMoved || !transportEvidencePending) {
+					// Either no positive evidence the peer was alive during this window (bytes frozen,
+					// or the socket unobservable at either end of it), or first-window evidence that
+					// could still be buffered residue: re-arm and hold the strike for confirmation.
+					transportEvidencePending = transportMoved;
 					if (!transportKnown && !reportedUnobservable) {
 						reportedUnobservable = true;
-						opts.onTransportUnobservable?.();
+						try {
+							opts.onTransportUnobservable?.();
+						} catch {
+							// diagnostics must never crash the timer callback
+						}
 					}
 					lastResetAt = Date.now();
 					timer = setTimeout(check, resolveIntervalMs()).unref();
@@ -2226,7 +2240,8 @@ export function createReceiveWatchdog(opts: {
 		// the new baseline; otherwise a throttled-reset-then-silence sequence would leave the
 		// watchdog permanently inactive (see PR #234 review).
 		bytesReadAtArm = current;
-		snapshotTransport();
+		snapshotTransport?.();
+		transportEvidencePending = false;
 		lastResetAt = Date.now();
 		timer = setTimeout(check, resolveIntervalMs()).unref();
 	}
@@ -2237,7 +2252,8 @@ export function createReceiveWatchdog(opts: {
 			lastResetAt = now;
 			if (timer) clearTimeout(timer);
 			bytesReadAtArm = opts.getBytesRead();
-			snapshotTransport();
+			snapshotTransport?.();
+			transportEvidencePending = false;
 			timer = setTimeout(check, resolveIntervalMs()).unref();
 		},
 		stop() {
@@ -3541,21 +3557,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// keyed on copy app-frame progress instead, so pings can't suppress it. Armed only while in copy mode
 	// (reset on COPY_START and on each in-copy 'message'; stopped on copy finish / pause). On a stall it
 	// forces the same close-independent reconnect, which restarts the copy from the leader. (harper-pro#453)
-	// Fires only with transport evidence (received peer bytes in the silent window — see
-	// getTransportActivity below); a fully dark window belongs to the byte watchdog. (harper-pro#697)
 	// blobTimeout (REPLICATION_BLOBTIMEOUT) defaults to 900000 and is shared with blobsTimer; guard
 	// against a misconfigured 0/negative that would otherwise forceReconnect in a tight loop.
 	const effectiveBlobTimeoutMs = blobTimeout > 0 ? blobTimeout : 900000;
 	copyProgressWatchdog = createReceiveWatchdog({
 		intervalMs: effectiveBlobTimeoutMs,
 		getBytesRead: () => copyProgressFrames,
-		// The #453 wedge signature is ping-alive-but-frame-dead, so a fire requires received peer
-		// bytes (pongs/data) within the silent window. A window dark on bytes too is a transport
-		// stall — a starved/suspended peer, not a wedged copy — owned by the byte-silence watchdog
-		// at COPY_TIMEOUT; firing here on the shorter blobTimeout would needlessly restart a copy
-		// that resumes on its own (the 2026-08-29 nightly false fire, harper-pro#697). ws.pause()
-		// freezes bytesRead, but addPauseReason stops this watchdog, so a frozen counter at check
-		// time always means a silent peer, never local back-pressure.
+		// Received socket bytes (data + pongs) are the transport evidence for the fire gate
+		// (harper-pro#697). ws.pause() freezes bytesRead, but addPauseReason stops this watchdog,
+		// so a frozen counter at check time always means a silent peer, never local back-pressure.
 		getTransportActivity: () => ws._socket?.bytesRead,
 		onTransportUnobservable: () =>
 			logger.debug?.(
@@ -3567,7 +3577,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${effectiveBlobTimeoutMs}ms while peer bytes still arrived during the window — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
+				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for two consecutive ${effectiveBlobTimeoutMs}ms windows in which peer bytes kept arriving — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
