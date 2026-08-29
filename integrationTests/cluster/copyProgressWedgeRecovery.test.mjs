@@ -132,9 +132,10 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 			authorization: ctx.nodes[1].admin,
 		});
 
-		// Let the copy-progress watchdog fire (at ~COPY_STALL_TIMEOUT) and forceReconnect re-establish, so the
-		// retried copy can complete. The byte watchdog (pingTimeout) is deliberately shorter yet must NOT
-		// recover anything, because pings keep bytesRead advancing — proving copy-progress is the recovery path.
+		// Let the copy-progress watchdog fire (COPY_STALL_TIMEOUT plus its 2×pingInterval
+		// transport-evidence confirmation) and forceReconnect re-establish, so the retried copy can
+		// complete. The byte watchdog (pingTimeout) is deliberately shorter yet must NOT recover
+		// anything, because pings keep bytesRead advancing — proving copy-progress is the recovery path.
 		await delay(COPY_STALL_TIMEOUT_MS + 8000);
 
 		const recordId = 'after-stall-1';
@@ -195,13 +196,21 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 		// (1-2× blobTimeout + the transport-evidence confirmation of 2× pingInterval), with the byte
 		// watchdog never acting — pings kept bytesRead alive, so any 'Receive watchdog' line here
 		// would mean the wrong actor recovered the wedge (harper-pro#697 gate regression signature).
+		// Scoped to the data connection: the system database copies over its own socket, whose
+		// (healthy) copy-start and watchdog lines must not leak into these oracles.
 		const log = await readLog(ctx.nodes[1]);
 		const lineTime = (line) => Date.parse(line.slice(0, 24));
-		const fires = log.split('\n').filter((line) => line.includes('Copy-progress watchdog:'));
-		ok(fires.length >= 1, 'the copy-progress watchdog must have fired to drive the recovery');
-		ok(!log.includes('Receive watchdog:'), 'no byte-level watchdog may act on this ping-alive wedge');
-		const copyStartLine = log.split('\n').find((line) => line.includes('bulk copy starting from'));
-		ok(copyStartLine, 'subscriber log must show the stalled bulk copy starting');
+		const dataDbTag = `(db: "${STALL_DB}")`;
+		const fires = log
+			.split('\n')
+			.filter((line) => line.includes('Copy-progress watchdog:') && line.includes(dataDbTag));
+		ok(fires.length >= 1, 'the copy-progress watchdog must have fired on the data connection to drive the recovery');
+		const byteFires = log.split('\n').filter((line) => line.includes('Receive watchdog:') && line.includes(dataDbTag));
+		ok(byteFires.length === 0, 'no byte-level watchdog may act on this ping-alive wedge');
+		const copyStartLine = log
+			.split('\n')
+			.find((line) => line.includes(`Requesting full copy of database ${STALL_DB} from`));
+		ok(copyStartLine, 'subscriber log must show the data copy being requested');
 		const detectionMs = lineTime(fires[0]) - lineTime(copyStartLine);
 		ok(
 			detectionMs <= COPY_STALL_TIMEOUT_MS * 2 + PING_INTERVAL_MS * 2 + 5000,
