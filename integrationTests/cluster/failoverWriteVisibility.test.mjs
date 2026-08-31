@@ -32,7 +32,7 @@ import {
 	targz,
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
+import { sendOperation, fetchWithRetry, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -309,48 +309,34 @@ suite('QA-651: post-failover write-visibility divergence', { timeout: 480000 }, 
 		logProbe('immediate C (post-kill batch, before catch-up wait)', immediateC);
 
 		// --- Phase 4: wait for B/C convergence on the post-kill batch ---
-		// No waitForCatchUp() call here (deliberately, not an oversight): it infers a
-		// target version from the *source*'s own highest lastReceivedVersion across
-		// ALL of the source's connections, then checks it against the receiver's
-		// single direct link to that source. In this full mesh, each edge is direct
-		// (no relaying), so a receiver's link-from-source can only ever reflect data
-		// that flowed over that specific edge — it can't reach a target derived from
-		// the source's *other* edges. Measured directly: the immediate (zero-wait)
-		// probe above already showed C at 25/25 on every surface the instant B's
-		// batch landed, yet waitForCatchUp(nodeC, nodeB, {timeoutMs: 15000}) still
-		// timed out waiting on that metric — proof the version-metadata proxy doesn't
-		// track real convergence here, in either direction, regardless of bound. The
-		// original swallowed 60s waitForCatchUp(B<-C) was the same structural
-		// mismatch, just always the losing direction, silently eating ~60s of every
-		// run. The belt-and-suspenders poll below checks actual record counts (the
-		// same surfaces the rest of this spec already trusts) and is the real,
-		// non-vacuous oracle for convergence.
-		let converged = false;
-		for (let i = 0; i < 40; i++) {
-			const [bCount, cCount] = await Promise.all([
-				sendOperation(nodeB, {
+		// Tag-scoped rather than a table-wide count: the pre-kill batch is still landing here, so
+		// only the post-kill writer tag distinguishes "the batch arrived".
+		let bCount = 0;
+		let cCount = 0;
+		const countTagged = (node, signal) =>
+			sendOperation(
+				node,
+				{
 					operation: 'search_by_value',
 					database: 'data',
 					table: 'Ledger',
 					search_attribute: 'writer',
 					search_value: 'post',
-				}).then((r) => r.length),
-				sendOperation(nodeC, {
-					operation: 'search_by_value',
-					database: 'data',
-					table: 'Ledger',
-					search_attribute: 'writer',
-					search_value: 'post',
-				}).then((r) => r.length),
-			]);
-			if (bCount === POST_KILL_COUNT && cCount === POST_KILL_COUNT) {
-				converged = true;
-				break;
+				},
+				{ signal }
+			).then((r) => r.length);
+		await waitForCondition(
+			async (signal) => {
+				[bCount, cCount] = await Promise.all([countTagged(nodeB, signal), countTagged(nodeC, signal)]);
+				return bCount === POST_KILL_COUNT && cCount === POST_KILL_COUNT;
+			},
+			{
+				timeoutMs: 20_000,
+				description: () =>
+					`the post-kill batch (${POST_KILL_COUNT} writes) to converge across B (${bCount}) and C (${cCount})`,
 			}
-			await delay(500);
-		}
-		console.log(`[QA-651] post-kill batch converged across B/C: ${converged}`);
-		ok(converged, `post-kill batch (${POST_KILL_COUNT} writes) never converged across B/C within the poll budget`);
+		);
+		console.log(`[QA-651] post-kill batch converged across B/C: B ${bCount}, C ${cCount}`);
 
 		// --- Phase 5: full 5-surface + raw-store probe on both survivors, both tags ---
 		const results = {};
