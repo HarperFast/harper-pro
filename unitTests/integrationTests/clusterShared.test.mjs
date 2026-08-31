@@ -1,19 +1,10 @@
 /**
- * Coverage for the cluster integration-test wait primitive (D-245).
- *
- * `waitForCatchUp()` used to live here. It compared the *maximum* `lastReceivedVersion` across every
- * one of the source's connections against the *minimum* across the receiver's link from that source;
- * those are per-(database, peer) inbound watermarks, so the two operands never measured the same
- * quantity. After a leader death the dead peer's frozen entry raised the target above anything the
- * surviving edge would carry, and a quiet source fell back to `Date.now() - 60_000`, already in the
- * past, so the wait returned having proven nothing. `waitForCondition` owns only the bounded polling
- * and leaves the convergence predicate with the test that knows what it wrote.
+ * Coverage for `waitForCondition`, the bounded wait the cluster integration tests poll with (D-245).
  */
 
 import { expect } from 'chai';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import * as clusterShared from '../../integrationTests/cluster/clusterShared.mjs';
 import { sendOperation, waitForCondition } from '../../integrationTests/cluster/clusterShared.mjs';
 
 async function startStub(handler) {
@@ -28,10 +19,6 @@ async function startStub(handler) {
 }
 
 describe('cluster test helpers — waitForCondition', () => {
-	it('no longer exports a generic catch-up oracle', () => {
-		expect(clusterShared.waitForCatchUp).to.equal(undefined);
-	});
-
 	it("returns the probe's first truthy value and stops polling", async () => {
 		let calls = 0;
 		const result = await waitForCondition(
@@ -98,6 +85,37 @@ describe('cluster test helpers — waitForCondition', () => {
 		} finally {
 			await stub.close();
 		}
+	});
+
+	it("reports the probe's own failure when it lands on the deadline", async () => {
+		const error = await waitForCondition(
+			async (signal) => {
+				await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+				throw new Error('node answered 500');
+			},
+			{ timeoutMs: 50, description: 'a doomed probe' }
+		).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.message).to.equal('Timed out after 50ms waiting for a doomed probe');
+		expect(error?.cause?.message).to.equal('node answered 500');
+	});
+
+	it('aborts requests the probe left in flight when it fails', async () => {
+		let probeSignal;
+		const error = await waitForCondition(
+			(signal) => {
+				probeSignal = signal;
+				throw new Error('boom');
+			},
+			{ timeoutMs: 5000 }
+		).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.message).to.equal('boom');
+		expect(probeSignal?.aborted).to.equal(true);
 	});
 
 	it('polls a real operations response until the count catches up', async () => {

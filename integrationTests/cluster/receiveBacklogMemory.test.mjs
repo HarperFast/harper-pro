@@ -198,14 +198,12 @@ suite('Replication receive-side backlog memory bound', { skip: !STRESS, timeout:
 			await sampler;
 		}
 
-		// Assertion: no receive-side OOM marker in the log.
 		const log = await readLog(nodeCtxB.harper);
 		ok(
 			!log.includes('ERR_WORKER_OUT_OF_MEMORY'),
 			'ERR_WORKER_OUT_OF_MEMORY appeared in B log; receive-side memory pressure is unbounded'
 		);
 
-		// Assertion: peak resident-set is comfortably under the unbounded-decode regime.
 		// The wtk failure burst past 2 GB old-gen inside a single message. Anything
 		// near or under 1.5 GB means the HWM-driven pause is taking effect.
 		const { peakRss } = peakMemory(samples);

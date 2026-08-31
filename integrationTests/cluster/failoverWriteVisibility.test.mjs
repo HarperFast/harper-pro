@@ -309,10 +309,8 @@ suite('QA-651: post-failover write-visibility divergence', { timeout: 480000 }, 
 		logProbe('immediate C (post-kill batch, before catch-up wait)', immediateC);
 
 		// --- Phase 4: wait for B/C convergence on the post-kill batch ---
-		// The predicate is the tagged batch itself, on both survivors: replication's own
-		// lastReceivedVersion counters are per-(database, peer) *inbound* watermarks, so no pair
-		// of them measures the same quantity on two nodes and none of them can stand in for
-		// "the batch arrived" (see waitForCondition in clusterShared.mjs).
+		// Tag-scoped rather than a table-wide count: the pre-kill batch is still landing here, so
+		// only the post-kill writer tag distinguishes "the batch arrived".
 		let bCount = 0;
 		let cCount = 0;
 		const countTagged = (node, signal) =>

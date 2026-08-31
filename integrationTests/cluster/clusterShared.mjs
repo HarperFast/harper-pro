@@ -200,11 +200,6 @@ export async function stopNodeProcess(node, { timeoutMs = 15000 } = {}) {
  * wait rather than only the gaps between polls — a node that accepts the connection but never
  * answers fails the wait instead of outliving it. Any other probe error propagates immediately.
  *
- * There is deliberately no shared "has `receiver` caught up to `source`" predicate: `cluster_status`
- * reports per-(database, peer) *inbound* watermarks, so no pair of them measures the same quantity
- * on two nodes, and the ceiling one link can reach depends on which origin logs that link carries,
- * which no operation reports. Convergence stays with the caller, which knows what it wrote.
- *
  * @param {(signal: AbortSignal) => unknown} probe - truthy return = satisfied
  * @param {Object} [opts]
  * @param {number} [opts.timeoutMs=120000]
@@ -219,6 +214,7 @@ export async function waitForCondition(probe, opts = {}) {
 	const controller = new AbortController();
 	const { signal } = controller;
 	const deadline = setTimeout(() => controller.abort(new Error(`deadline of ${timeoutMs}ms reached`)), timeoutMs);
+	let lastError;
 	try {
 		while (!signal.aborted) {
 			try {
@@ -226,16 +222,19 @@ export async function waitForCondition(probe, opts = {}) {
 				if (result) return result;
 			} catch (error) {
 				if (!signal.aborted) throw error;
+				lastError = error;
 			}
 			if (signal.aborted) break;
 			await delay(pollMs, undefined, { signal }).catch(() => {});
 		}
 	} finally {
+		// aborts requests the probe left in flight, not just the deadline timer
+		controller.abort();
 		clearTimeout(deadline);
 	}
 	const { description } = opts;
 	const what = typeof description === 'function' ? description() : (description ?? 'condition');
-	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: signal.reason });
+	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: lastError ?? signal.reason });
 }
 
 /**
