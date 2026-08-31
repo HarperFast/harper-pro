@@ -5,13 +5,17 @@ import { setTimeout as delay } from 'node:timers/promises';
  * Send an operation to a Harper node and validate the response
  * @param {Object} node - The Harper node instance
  * @param {Object} operation - The operation to send
+ * @param {Object} [options]
+ * @param {AbortSignal} [options.signal] - aborts the request; pass `waitForCondition`'s signal so a
+ * node that accepts the connection and never answers cannot outlive the wait's deadline
  * @returns {Promise<Object>} The response data
  */
-export async function sendOperation(node, operation) {
+export async function sendOperation(node, operation, options) {
 	const response = await fetch(node.operationsAPIURL, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(operation),
+		signal: options?.signal,
 	});
 	const responseData = await response.json();
 	equal(response.status, 200, JSON.stringify(responseData));
@@ -190,51 +194,48 @@ export async function stopNodeProcess(node, { timeoutMs = 15000 } = {}) {
 }
 
 /**
- * Poll `cluster_status` on `receiver` until it reports a `lastReceivedVersion` for
- * `source` greater than the version captured *now* on `source` itself. Returns the
- * final receiver-side version when caught up, throws on timeout.
+ * Poll `probe` until it returns a truthy value, and return that value.
  *
- * @param {Object} receiver - The catching-up Harper node
- * @param {Object} source - The Harper node we expect to be replicating *from*
+ * `probe` is handed an AbortSignal that fires at the deadline, so `timeoutMs` bounds the whole
+ * wait rather than only the gaps between polls — a node that accepts the connection but never
+ * answers fails the wait instead of outliving it. Any other probe error propagates immediately.
+ *
+ * There is deliberately no shared "has `receiver` caught up to `source`" predicate: `cluster_status`
+ * reports per-(database, peer) *inbound* watermarks, so no pair of them measures the same quantity
+ * on two nodes, and the ceiling one link can reach depends on which origin logs that link carries,
+ * which no operation reports. Convergence stays with the caller, which knows what it wrote.
+ *
+ * @param {(signal: AbortSignal) => unknown} probe - truthy return = satisfied
  * @param {Object} [opts]
  * @param {number} [opts.timeoutMs=120000]
  * @param {number} [opts.pollMs=500]
+ * @param {string|(() => string)} [opts.description] - what is being waited for, for the timeout
+ * message; a function is called at timeout so it can report the probe's last observation
+ * @returns {Promise<*>} the probe's first truthy value
  */
-export async function waitForCatchUp(receiver, source, opts = {}) {
+export async function waitForCondition(probe, opts = {}) {
 	const timeoutMs = opts.timeoutMs ?? 120000;
 	const pollMs = opts.pollMs ?? 500;
-	// Capture source's version threshold up front. Catch-up = receiver's lastReceived
-	// for this connection >= sourceTarget.
-	const sourceStatus = await sendOperation(source, { operation: 'cluster_status' });
-	// We want a version that's been written on `source` (i.e. its own outgoing replication
-	// state). Use the highest `lastReceivedVersion` it tracks across its connections as a
-	// proxy for "writes have flowed through" — or just stamp `Date.now()` if no peers yet.
-	let sourceTarget = 0;
-	for (const conn of sourceStatus.connections ?? []) {
-		for (const sock of conn.database_sockets ?? []) {
-			if (typeof sock.lastReceivedVersion === 'number' && sock.lastReceivedVersion > sourceTarget) {
-				sourceTarget = sock.lastReceivedVersion;
+	const controller = new AbortController();
+	const { signal } = controller;
+	const deadline = setTimeout(() => controller.abort(new Error(`deadline of ${timeoutMs}ms reached`)), timeoutMs);
+	try {
+		while (!signal.aborted) {
+			try {
+				const result = await probe(signal);
+				if (result) return result;
+			} catch (error) {
+				if (!signal.aborted) throw error;
 			}
+			if (signal.aborted) break;
+			await delay(pollMs, undefined, { signal }).catch(() => {});
 		}
+	} finally {
+		clearTimeout(deadline);
 	}
-	// If we couldn't infer one, fall back to a wall-clock-ish stamp; replication versions
-	// are timestamp-derived so this is a safe upper bound for "before the test started".
-	if (sourceTarget === 0) sourceTarget = Date.now() - 60_000;
-
-	const sourceHostname = source.hostname;
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		const receiverStatus = await sendOperation(receiver, { operation: 'cluster_status' });
-		const sourceConn = (receiverStatus.connections ?? []).find((c) => (c.url ?? c.name ?? '').includes(sourceHostname));
-		if (sourceConn) {
-			const versions = (sourceConn.database_sockets ?? [])
-				.map((s) => s.lastReceivedVersion)
-				.filter((v) => typeof v === 'number');
-			if (versions.length && Math.min(...versions) >= sourceTarget) return Math.min(...versions);
-		}
-		await delay(pollMs);
-	}
-	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${receiver.hostname} to catch up to ${sourceHostname}`);
+	const { description } = opts;
+	const what = typeof description === 'function' ? description() : (description ?? 'condition');
+	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: signal.reason });
 }
 
 /**
