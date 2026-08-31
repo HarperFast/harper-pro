@@ -46,14 +46,33 @@ describe('cluster test helpers — waitForCondition', () => {
 
 	it('paces the polls instead of spinning', async () => {
 		let calls = 0;
-		await waitForCondition(
+		const error = await waitForCondition(
 			() => {
-				calls++;
+				// bails out rather than letting a lost delay spin until the deadline can never fire
+				if (++calls > 20) throw new Error(`spun ${calls} times in 200ms`);
 				return false;
 			},
 			{ pollMs: 50, timeoutMs: 200 }
-		).catch(() => {});
+		).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.message).to.contain('Timed out after 200ms');
 		expect(calls).to.be.lessThan(20);
+	});
+
+	it('surfaces the timeout even when the description throws', async () => {
+		const error = await waitForCondition(() => false, {
+			pollMs: 1,
+			timeoutMs: 30,
+			description: () => {
+				throw new Error('bad description');
+			},
+		}).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.message).to.equal('Timed out after 30ms waiting for condition (description threw: bad description)');
 	});
 
 	it('bounds a request that is accepted but never answered', async () => {

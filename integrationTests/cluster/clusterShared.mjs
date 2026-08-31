@@ -225,7 +225,9 @@ export async function waitForCondition(probe, opts = {}) {
 				lastError = error;
 			}
 			if (signal.aborted) break;
-			await delay(pollMs, undefined, { signal }).catch(() => {});
+			await delay(pollMs, undefined, { signal }).catch((error) => {
+				if (!signal.aborted) throw error;
+			});
 		}
 	} finally {
 		// aborts requests the probe left in flight, not just the deadline timer
@@ -233,7 +235,15 @@ export async function waitForCondition(probe, opts = {}) {
 		clearTimeout(deadline);
 	}
 	const { description } = opts;
-	const what = typeof description === 'function' ? description() : (description ?? 'condition');
+	let what = description ?? 'condition';
+	if (typeof description === 'function') {
+		// a description that throws must not replace the timeout it was meant to explain
+		try {
+			what = description();
+		} catch (error) {
+			what = `condition (description threw: ${error.message})`;
+		}
+	}
 	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: lastError ?? signal.reason });
 }
 
