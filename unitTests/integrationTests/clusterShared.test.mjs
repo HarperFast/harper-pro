@@ -1,7 +1,3 @@
-/**
- * Coverage for `waitForCondition`, the bounded wait the cluster integration tests poll with (D-245).
- */
-
 import { expect } from 'chai';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
@@ -46,6 +42,18 @@ describe('cluster test helpers — waitForCondition', () => {
 		);
 		expect(error?.message).to.match(/^Timed out after 60ms waiting for count \d+ to reach 10$/);
 		expect(observed).to.be.greaterThan(0);
+	});
+
+	it('paces the polls instead of spinning', async () => {
+		let calls = 0;
+		await waitForCondition(
+			() => {
+				calls++;
+				return false;
+			},
+			{ pollMs: 50, timeoutMs: 200 }
+		).catch(() => {});
+		expect(calls).to.be.lessThan(20);
 	});
 
 	it('bounds a request that is accepted but never answered', async () => {
