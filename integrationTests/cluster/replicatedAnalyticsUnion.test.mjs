@@ -175,6 +175,28 @@ function waitForAnalytics(node, startTime, { minimumCount, minimumRows = 1 }) {
 	);
 }
 
+// Settled means a whole aggregate period passed and changed nothing, which is the only way to
+// know the previous phase has finished flushing — elapsed time alone cannot promise it, and a
+// straggling flush arriving after the baseline read would otherwise satisfy the next phase's
+// growth on its own. Polling one period apart is what makes two equal reads mean that.
+function waitForSettledAnalytics(node, startTime) {
+	let previous;
+	let rows = [];
+	return waitForCondition(
+		async (signal) => {
+			rows = await getTableWriteAnalytics(node, { startTime, replicated: false, signal });
+			const settled = previous?.length === rows.length && analyticsCount(previous) === analyticsCount(rows) && rows;
+			previous = rows;
+			return settled;
+		},
+		{
+			timeoutMs: ANALYTICS_TIMEOUT_MS,
+			pollMs: AGGREGATE_PERIOD_SECONDS * 1000,
+			description: () => `${node.hostname}'s ${TABLE} analytics to stop changing; last saw ${JSON.stringify(rows)}`,
+		}
+	);
+}
+
 // Key order is not part of the response contract, so compare rows by content: the local and
 // the fanned-out copy of the same row must be indistinguishable field for field.
 function canonicalize(value) {
@@ -270,14 +292,12 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 			waitForAnalytics(nodeB, startTime, { minimumCount: 1 }),
 		]);
 
-		// Cross the boundary rather than infer it: a full quiet period means phase two cannot share
-		// phase one's bucket however fast the host runs the writes, and it leaves nothing of phase
-		// one still to flush — so the baseline read below can only grow again when phase two lands.
-		await delay(AGGREGATE_PERIOD_SECONDS * 1000);
-		const baselineSignal = AbortSignal.timeout(ANALYTICS_TIMEOUT_MS);
+		// Cross the boundary rather than infer it, and take the baseline only once each node has
+		// gone a full period without aggregating anything new: phase two then cannot share phase
+		// one's bucket, and nothing of phase one is left to flush into phase two's growth.
 		const [baseA, baseB] = await Promise.all([
-			getTableWriteAnalytics(nodeA, { startTime, replicated: false, signal: baselineSignal }),
-			getTableWriteAnalytics(nodeB, { startTime, replicated: false, signal: baselineSignal }),
+			waitForSettledAnalytics(nodeA, startTime),
+			waitForSettledAnalytics(nodeB, startTime),
 		]);
 
 		await writePhase(nodeA, 'A', 'after-boundary', PHASE_TWO_WRITES.A);
