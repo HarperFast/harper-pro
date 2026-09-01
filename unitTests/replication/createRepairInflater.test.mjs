@@ -42,6 +42,17 @@ describe('createRepairInflater', () => {
 		assert.equal(inflated.destroyed, true);
 	});
 
+	it('refuses a non-finite or negative expected size instead of running with the bomb bound disabled', () => {
+		const source = new PassThrough();
+		for (const badSize of [NaN, Infinity, -1, 1.5, undefined]) {
+			assert.throws(
+				() => createRepairInflater(source, badSize),
+				/requires a valid expected size/,
+				`size ${badSize} must be refused`
+			);
+		}
+	});
+
 	it('fails a body that inflates past the expected size instead of draining it', async () => {
 		const bomb = deflateSync(Buffer.alloc(16 * 1024 * 1024));
 		const source = new PassThrough();
