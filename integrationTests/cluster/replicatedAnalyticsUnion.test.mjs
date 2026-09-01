@@ -1,19 +1,19 @@
 /**
- * Integration test: `get_analytics { replicated: true }` returns an exact union of the
- * cluster's analytics — every node's rows exactly once, none duplicated, none lost
+ * Integration test: exact cross-node union for `get_analytics { replicated: true }`
  * (contract from HarperFast/harper#1130, peer-response materialization from #482).
  *
  * `analytics.replicate: false` is the default, so `hdb_analytics` does not replicate and a
- * cluster-wide analytics query has to fan out. Core forwards the same query to each peer
- * with `replicated` cleared so peers answer locally only, then concatenates
- * (core/resources/analytics/read.ts); Pro's replication channel is what materializes each
- * peer's response. A merge that re-counted the local rows, or that dropped a peer whose
- * response was still a promise, shows up here as a row/count mismatch against the two
- * nodes' own local queries.
+ * cluster-wide analytics query has to fan out: core forwards the query to each peer with
+ * `replicated` cleared and concatenates the responses (core/resources/analytics/read.ts),
+ * and Pro's replication channel is what turns each peer's lazily-produced rows into
+ * something encodable. Both halves fail quietly — a peer whose response never materialized
+ * is logged and omitted, and a merge that re-counted the local rows just returns more rows —
+ * so the only way to catch either is to compare the fan-out against the same two nodes'
+ * local queries.
  *
  * Both nodes create the table BEFORE they are joined, so each node's db-write analytics come
  * from its own client writes rather than from applying the peer's replicated schema. The
- * write phases are asymmetric in both row count and payload size, so a node's rows can never
+ * write phases are asymmetric in both row count and payload width, so a node's rows can never
  * be mistaken for its peer's, and they straddle two aggregate periods so the union has to
  * hold across more than one aggregation flush.
  */
@@ -61,8 +61,8 @@ function waitForClusterConnection(nodes) {
 			);
 			return statuses.every(
 				(status) =>
-					status.connections.length === 1 &&
-					status.connections[0].database_sockets.length === 1 &&
+					status.connections?.length === 1 &&
+					status.connections[0].database_sockets?.length === 1 &&
 					status.connections[0].database_sockets[0].connected
 			);
 		},
@@ -158,19 +158,25 @@ function analyticsCount(rows) {
 	return rows.reduce((total, row) => total + row.count, 0);
 }
 
-function waitForAnalyticsGrowth(node, startTime, minimumCount) {
+function originsOf(rows) {
+	return new Set(rows.map(({ node }) => node));
+}
+
+// Aggregation writes one db-write row per path per period, so `minimumRows` is how many
+// distinct aggregate periods this node's analytics have to span.
+function waitForAnalytics(node, startTime, { minimumCount, minimumRows = 1 }) {
 	let rows = [];
 	return waitForCondition(
 		async (signal) => {
 			rows = await getTableWriteAnalytics(node, { startTime, replicated: false, signal });
-			return analyticsCount(rows) >= minimumCount && rows;
+			return rows.length >= minimumRows && analyticsCount(rows) >= minimumCount && rows;
 		},
 		{
 			timeoutMs: ANALYTICS_TIMEOUT_MS,
 			pollMs: POLL_INTERVAL_MS,
 			description: () =>
-				`${node.hostname} to aggregate at least ${minimumCount} ${TABLE} writes; ` +
-				`last saw ${analyticsCount(rows)} in ${JSON.stringify(rows)}`,
+				`${node.hostname} to aggregate at least ${minimumCount} ${TABLE} writes over ` +
+				`${minimumRows} period(s); last saw ${analyticsCount(rows)} in ${JSON.stringify(rows)}`,
 		}
 	);
 }
@@ -199,15 +205,18 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 			getNextAvailableLoopbackAddress(),
 			getNextAvailableLoopbackAddress(),
 		]);
-		const nodeCtxA = { name: ctx.name, harper: { hostname: hostnameA } };
-		const nodeCtxB = { name: ctx.name, harper: { hostname: hostnameB } };
+		// `startHarper` replaces `nodeCtx.harper`, so the node contexts — not the started
+		// nodes — are what `after` has to hold: if one start rejects, the other has still
+		// spawned a Harper and only its context knows the process handle to kill.
+		ctx.nodeCtxA = { name: ctx.name, harper: { hostname: hostnameA } };
+		ctx.nodeCtxB = { name: ctx.name, harper: { hostname: hostnameB } };
 
 		await Promise.all([
-			startHarper(nodeCtxA, nodeStartOptions(hostnameA)),
-			startHarper(nodeCtxB, nodeStartOptions(hostnameB)),
+			startHarper(ctx.nodeCtxA, nodeStartOptions(hostnameA)),
+			startHarper(ctx.nodeCtxB, nodeStartOptions(hostnameB)),
 		]);
-		ctx.nodeA = nodeCtxA.harper;
-		ctx.nodeB = nodeCtxB.harper;
+		ctx.nodeA = ctx.nodeCtxA.harper;
+		ctx.nodeB = ctx.nodeCtxB.harper;
 
 		const createTable = {
 			operation: 'create_table',
@@ -235,10 +244,7 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 	});
 
 	after(async () => {
-		await Promise.all([
-			ctx.nodeA && teardownHarper({ harper: ctx.nodeA }),
-			ctx.nodeB && teardownHarper({ harper: ctx.nodeB }),
-		]);
+		await Promise.all([ctx.nodeCtxA && teardownHarper(ctx.nodeCtxA), ctx.nodeCtxB && teardownHarper(ctx.nodeCtxB)]);
 	});
 
 	test("returns each node's local analytics exactly once after a second write phase", async () => {
@@ -254,8 +260,8 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 		await waitForExactRows([nodeA, nodeB], phaseOneIds);
 
 		const [phaseOneA, phaseOneB] = await Promise.all([
-			waitForAnalyticsGrowth(nodeA, startTime, 1),
-			waitForAnalyticsGrowth(nodeB, startTime, 1),
+			waitForAnalytics(nodeA, startTime, { minimumCount: 1 }),
+			waitForAnalytics(nodeB, startTime, { minimumCount: 1 }),
 		]);
 		const phaseOneCountA = analyticsCount(phaseOneA);
 		const phaseOneCountB = analyticsCount(phaseOneB);
@@ -269,37 +275,42 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 		].sort();
 		await waitForExactRows([nodeA, nodeB], allIds);
 
-		// A growing count can only come from a later aggregation flush, so waiting for one
-		// past each node's phase-one total is what puts the union across a period boundary.
+		// Wait for a second period's row on each node, not just a higher count: the union has to
+		// hold across an aggregation boundary, and this is what puts it there before we read.
 		await Promise.all([
-			waitForAnalyticsGrowth(nodeA, startTime, phaseOneCountA + 1),
-			waitForAnalyticsGrowth(nodeB, startTime, phaseOneCountB + 1),
+			waitForAnalytics(nodeA, startTime, { minimumCount: phaseOneCountA + 1, minimumRows: 2 }),
+			waitForAnalytics(nodeB, startTime, { minimumCount: phaseOneCountB + 1, minimumRows: 2 }),
 		]);
 
 		// A closed window pins all four queries to the same set of aggregation rows; without it
 		// a flush landing between the local and the fanned-out read would look like a mismatch.
 		const endTime = Date.now() + 1;
+		const signal = AbortSignal.timeout(ANALYTICS_TIMEOUT_MS);
 		const [localA, localB, distributedFromA, distributedFromB] = await Promise.all([
-			getTableWriteAnalytics(nodeA, { startTime, endTime, replicated: false }),
-			getTableWriteAnalytics(nodeB, { startTime, endTime, replicated: false }),
-			getTableWriteAnalytics(nodeA, { startTime, endTime, replicated: true }),
-			getTableWriteAnalytics(nodeB, { startTime, endTime, replicated: true }),
+			getTableWriteAnalytics(nodeA, { startTime, endTime, replicated: false, signal }),
+			getTableWriteAnalytics(nodeB, { startTime, endTime, replicated: false, signal }),
+			getTableWriteAnalytics(nodeA, { startTime, endTime, replicated: true, signal }),
+			getTableWriteAnalytics(nodeB, { startTime, endTime, replicated: true, signal }),
 		]);
 
 		ok(analyticsCount(localA) > phaseOneCountA, 'node A must have aggregated its second write phase');
 		ok(analyticsCount(localB) > phaseOneCountB, 'node B must have aggregated its second write phase');
 		equal(analyticsCount(distributedFromA), analyticsCount(localA) + analyticsCount(localB));
 		equal(analyticsCount(distributedFromB), analyticsCount(localA) + analyticsCount(localB));
-		// Aggregation writes one db-write row per path per period, so two rows for this table
-		// on one node means that node's analytics really do span two aggregate periods.
 		ok(new Set(localA.map(({ id }) => id)).size >= 2, 'node A must span at least two aggregate periods');
 		ok(new Set(localB.map(({ id }) => id)).size >= 2, 'node B must span at least two aggregate periods');
 
-		const nodeAIdentity = new Set(localA.map(({ node }) => node));
-		const nodeBIdentity = new Set(localB.map(({ node }) => node));
+		const nodeAIdentity = originsOf(localA);
+		const nodeBIdentity = originsOf(localB);
 		equal(nodeAIdentity.size, 1, `node A's rows must carry one origin: ${JSON.stringify([...nodeAIdentity])}`);
 		equal(nodeBIdentity.size, 1, `node B's rows must carry one origin: ${JSON.stringify([...nodeBIdentity])}`);
 		notEqual([...nodeAIdentity][0], [...nodeBIdentity][0]);
+
+		// Both origins present, then row-for-row equality: the first says which half of the union
+		// went missing, the second catches a peer's rows being replaced by re-labelled local ones.
+		const bothOrigins = new Set([...nodeAIdentity, ...nodeBIdentity]);
+		deepStrictEqual(originsOf(distributedFromA), bothOrigins);
+		deepStrictEqual(originsOf(distributedFromB), bothOrigins);
 
 		const expectedUnion = canonicalRows([...localA, ...localB]);
 		deepStrictEqual(canonicalRows(distributedFromA), expectedUnion);
