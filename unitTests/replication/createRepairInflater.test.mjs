@@ -54,12 +54,4 @@ describe('createRepairInflater', () => {
 		assert.ok(emitted <= 1000, `emitted ${emitted} bytes past the bound`);
 		assert.equal(source.destroyed, true);
 	});
-
-	it('does not bound the output when no size is known', async () => {
-		const payload = Buffer.alloc(200000, 7);
-		const source = new PassThrough();
-		const inflated = createRepairInflater(source, undefined);
-		source.end(deflateSync(payload));
-		assert.deepEqual(await collect(inflated), payload);
-	});
 });

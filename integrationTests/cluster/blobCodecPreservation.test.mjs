@@ -72,37 +72,33 @@ function listBlobFiles(dataRootDir, db = DB) {
 	return files.sort();
 }
 
-// A node's settled blob bodies, keyed for comparison across nodes (fileIds differ per node):
-// re-read until two consecutive sweeps agree so a mid-write file is never asserted against.
-async function settledBlobFiles(node, expectedCount, { timeoutMs = 90000 } = {}) {
-	const deadline = Date.now() + timeoutMs;
-	let previous;
-	while (Date.now() < deadline) {
-		const files = listBlobFiles(node.dataRootDir);
-		if (files.length >= expectedCount) {
-			const snapshot = files.map((file) => readFileSync(file));
-			if (
-				previous &&
-				previous.length === snapshot.length &&
-				previous.every((buffer, i) => buffer.equals(snapshot[i]))
-			) {
-				return snapshot;
-			}
-			previous = snapshot;
-		} else {
-			previous = undefined;
-		}
-		await delay(500);
-	}
-	throw new Error(`blob files on ${node.hostname} never settled at ${expectedCount}`);
-}
-
 function contentOf(fileBuffer) {
 	const type = fileBuffer[1];
 	const body = fileBuffer.subarray(HEADER_SIZE);
 	if (type === DEFLATE_TYPE) return inflateSync(body);
 	equal(type, UNCOMPRESSED_TYPE, `unexpected blob header type ${type}`);
 	return body;
+}
+
+const contentSet = (files) => files.map((file) => contentOf(file).toString()).sort();
+const EXPECTED_CONTENTS = [PAYLOAD_CATCHUP, PAYLOAD_LIVE].sort();
+
+// A node's blob files once every one of them decodes to exactly the written payloads — a file still
+// being written (short body, unfinished deflate stream, placeholder header) cannot satisfy that.
+async function settledBlobFiles(node, { timeoutMs = 90000 } = {}) {
+	const deadline = Date.now() + timeoutMs;
+	let lastFailure;
+	while (Date.now() < deadline) {
+		const files = listBlobFiles(node.dataRootDir).map((file) => readFileSync(file));
+		try {
+			deepStrictEqual(contentSet(files), EXPECTED_CONTENTS);
+			return files;
+		} catch (error) {
+			lastFailure = error;
+		}
+		await delay(500);
+	}
+	throw new Error(`blob files on ${node.hostname} never settled to the written payloads: ${lastFailure?.message}`);
 }
 
 async function waitForRecord(node, id, { timeoutMs = 60000 } = {}) {
@@ -224,19 +220,15 @@ suite('replication preserves the blob codec (harper#2443)', { timeout: 300000 },
 		await Promise.all([waitForRecord(nodeB, 'catchup'), waitForRecord(nodeB, 'live')]);
 		await Promise.all([waitForRecord(nodeC, 'catchup'), waitForRecord(nodeC, 'live')]);
 
-		const filesA = await settledBlobFiles(nodeA, 2);
-		const filesB = await settledBlobFiles(nodeB, 2);
-		const filesC = await settledBlobFiles(nodeC, 2);
+		// every node's files decode to exactly the two written payloads (settledBlobFiles asserts it)
+		const filesA = await settledBlobFiles(nodeA);
+		const filesB = await settledBlobFiles(nodeB);
+		const filesC = await settledBlobFiles(nodeC);
 
-		// Origin stored both blobs compressed, and their content round-trips.
 		for (const file of filesA) {
 			equal(file[1], DEFLATE_TYPE, 'origin must store the blob deflate-compressed');
 			ok(file.length - HEADER_SIZE > MIN_DEFLATE_BODY, `deflate body must span several wire chunks (${file.length})`);
 		}
-		deepStrictEqual(
-			filesA.map((file) => contentOf(file).length).sort((x, y) => x - y),
-			[PAYLOAD_CATCHUP.length, PAYLOAD_LIVE.length].sort((x, y) => x - y)
-		);
 
 		// The advertising receiver stored the sender's bytes verbatim — deflate header included —
 		// even though its own config would never compress: only raw pass-through can produce this.
@@ -246,7 +238,5 @@ suite('replication preserves the blob codec (harper#2443)', { timeout: 300000 },
 
 		// The kill-switched receiver got today's inflated stream and stored plain content.
 		for (const file of filesC) equal(file[1], UNCOMPRESSED_TYPE, 'non-advertising receiver must store uncompressed');
-		const contentSet = (files) => files.map((file) => contentOf(file).toString('base64')).sort();
-		deepStrictEqual(contentSet(filesC), contentSet(filesA), 'kill-switched receiver content must still converge');
 	});
 });
