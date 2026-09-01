@@ -215,7 +215,9 @@ function canonicalRows(rows) {
 	return rows.map((row) => JSON.stringify(canonicalize(row))).sort();
 }
 
-suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
+// Above the sum of the waits below (six × 45s), so a loaded runner fails at whichever wait
+// actually stalled — with its own description — rather than at a generic suite timeout.
+suite('Replicated analytics union', { timeout: 300_000 }, (ctx) => {
 	before(async () => {
 		const [hostnameA, hostnameB] = await Promise.all([
 			getNextAvailableLoopbackAddress(),
