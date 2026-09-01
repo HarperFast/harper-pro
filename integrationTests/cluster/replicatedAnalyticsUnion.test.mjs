@@ -112,27 +112,17 @@ async function readTableIds(node, signal) {
 
 async function waitForExactRows(nodes, expectedIds) {
 	let observed;
-	let lastError;
 	await waitForCondition(
 		async (signal) => {
-			// A node whose copy of the schema has not landed yet answers with an error rather
-			// than an empty result, so a failed read here is a not-ready, not a test failure.
-			observed = await Promise.all(
-				nodes.map((node) =>
-					readTableIds(node, signal).catch((error) => {
-						lastError = error;
-						return null;
-					})
-				)
-			);
-			return observed.every((ids) => ids?.length === expectedIds.length);
+			observed = await Promise.all(nodes.map((node) => readTableIds(node, signal)));
+			return observed.every((ids) => ids.length === expectedIds.length);
 		},
 		{
 			timeoutMs: CONVERGE_TIMEOUT_MS,
 			pollMs: POLL_INTERVAL_MS,
 			description: () =>
 				`the replicated table to converge to ${expectedIds.length} rows on every node; ` +
-				`last saw ${JSON.stringify(observed)}${lastError ? ` (last error: ${lastError.message})` : ''}`,
+				`last saw ${JSON.stringify(observed)}`,
 		}
 	);
 	for (const ids of observed) deepStrictEqual(ids, expectedIds);
@@ -205,16 +195,19 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 			getNextAvailableLoopbackAddress(),
 			getNextAvailableLoopbackAddress(),
 		]);
-		// `startHarper` replaces `nodeCtx.harper`, so the node contexts — not the started
-		// nodes — are what `after` has to hold: if one start rejects, the other has still
-		// spawned a Harper and only its context knows the process handle to kill.
+		// `startHarper` replaces `nodeCtx.harper` with the started node, so `after` has to hold
+		// the contexts rather than the nodes. It also has to see both starts SETTLE: a
+		// fail-fast `Promise.all` would run teardown while the surviving start is still
+		// spawning, and that Harper — not yet on its context — would outlive the suite.
 		ctx.nodeCtxA = { name: ctx.name, harper: { hostname: hostnameA } };
 		ctx.nodeCtxB = { name: ctx.name, harper: { hostname: hostnameB } };
 
-		await Promise.all([
+		const starts = await Promise.allSettled([
 			startHarper(ctx.nodeCtxA, nodeStartOptions(hostnameA)),
 			startHarper(ctx.nodeCtxB, nodeStartOptions(hostnameB)),
 		]);
+		const failedStart = starts.find(({ status }) => status === 'rejected');
+		if (failedStart) throw failedStart.reason;
 		ctx.nodeA = ctx.nodeCtxA.harper;
 		ctx.nodeB = ctx.nodeCtxB.harper;
 
@@ -282,9 +275,11 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 			waitForAnalytics(nodeB, startTime, { minimumCount: phaseOneCountB + 1, minimumRows: 2 }),
 		]);
 
-		// A closed window pins all four queries to the same set of aggregation rows; without it
-		// a flush landing between the local and the fanned-out read would look like a mismatch.
-		const endTime = Date.now() + 1;
+		// The window must close in the PAST. Aggregation stamps each row with the write's
+		// monotonic time, so an end time already elapsed cannot admit a flush that lands while
+		// these four queries are in flight — whereas a window ending a millisecond from now can,
+		// and a row that reached only some of the four reads reads as a union mismatch.
+		const endTime = Date.now() - 1;
 		const signal = AbortSignal.timeout(ANALYTICS_TIMEOUT_MS);
 		const [localA, localB, distributedFromA, distributedFromB] = await Promise.all([
 			getTableWriteAnalytics(nodeA, { startTime, endTime, replicated: false, signal }),
