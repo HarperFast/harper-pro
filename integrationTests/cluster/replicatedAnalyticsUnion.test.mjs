@@ -243,10 +243,13 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 	after(async () => {
 		// allSettled for the same reason as startup: a rejected teardown must not abandon the
 		// other node's, which would leak it and its ports into the rest of the run.
-		const teardowns = await Promise.allSettled(
-			[ctx.nodeCtxA, ctx.nodeCtxB].filter(Boolean).map((nodeCtx) => teardownHarper(nodeCtx))
+		const nodeCtxs = [ctx.nodeCtxA, ctx.nodeCtxB].filter(Boolean);
+		const teardowns = await Promise.allSettled(nodeCtxs.map((nodeCtx) => teardownHarper(nodeCtx)));
+		const failures = teardowns.flatMap(({ status, reason }, index) =>
+			status === 'rejected'
+				? [new Error(`teardown failed for ${nodeCtxs[index].harper?.hostname}`, { cause: reason })]
+				: []
 		);
-		const failures = teardowns.filter(({ status }) => status === 'rejected').map(({ reason }) => reason);
 		if (failures.length > 0) throw new AggregateError(failures, 'node teardown failed');
 	});
 
