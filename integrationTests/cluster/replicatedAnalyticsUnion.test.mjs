@@ -39,8 +39,8 @@ const CONVERGE_TIMEOUT_MS = 45_000;
 const ANALYTICS_TIMEOUT_MS = 45_000;
 const POLL_INTERVAL_MS = 250;
 // Long enough for the clock to leave every already-written analytics row strictly behind an
-// elapsed cutoff; see where the read window is chosen.
-const CUTOFF_SETTLE_MS = 5;
+// elapsed cutoff, on a platform whose `Date.now()` ticks coarsely; see where the window is chosen.
+const CUTOFF_SETTLE_MS = 25;
 const TABLE = 'analytics_union_events';
 const PHASE_ONE_WRITES = { A: 2, B: 3 };
 const PHASE_TWO_WRITES = { A: 3, B: 4 };
@@ -246,8 +246,8 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 		const teardowns = await Promise.allSettled(
 			[ctx.nodeCtxA, ctx.nodeCtxB].filter(Boolean).map((nodeCtx) => teardownHarper(nodeCtx))
 		);
-		const failedTeardown = teardowns.find(({ status }) => status === 'rejected');
-		if (failedTeardown) throw failedTeardown.reason;
+		const failures = teardowns.filter(({ status }) => status === 'rejected').map(({ reason }) => reason);
+		if (failures.length > 0) throw new AggregateError(failures, 'node teardown failed');
 	});
 
 	test("returns each node's local analytics exactly once after a second write phase", async () => {
@@ -262,16 +262,20 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 		].sort();
 		await waitForExactRows([nodeA, nodeB], phaseOneIds);
 
-		const [phaseOneA, phaseOneB] = await Promise.all([
+		await Promise.all([
 			waitForAnalytics(nodeA, startTime, { minimumCount: 1 }),
 			waitForAnalytics(nodeB, startTime, { minimumCount: 1 }),
 		]);
-		const phaseOneCountA = analyticsCount(phaseOneA);
-		const phaseOneCountB = analyticsCount(phaseOneB);
 
-		// Cross the boundary rather than infer it: a full period between the phases means phase
-		// two cannot share phase one's bucket however fast the host runs the writes.
+		// Cross the boundary rather than infer it: a full quiet period means phase two cannot share
+		// phase one's bucket however fast the host runs the writes, and it leaves nothing of phase
+		// one still to flush — so the baseline read below can only grow again when phase two lands.
 		await delay(AGGREGATE_PERIOD_SECONDS * 1000);
+		const [baseA, baseB] = await Promise.all([
+			getTableWriteAnalytics(nodeA, { startTime, replicated: false }),
+			getTableWriteAnalytics(nodeB, { startTime, replicated: false }),
+		]);
+
 		await writePhase(nodeA, 'A', 'after-boundary', PHASE_TWO_WRITES.A);
 		await writePhase(nodeB, 'B', 'after-boundary', PHASE_TWO_WRITES.B);
 		const allIds = [
@@ -281,11 +285,18 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 		].sort();
 		await waitForExactRows([nodeA, nodeB], allIds);
 
-		// Wait for a second period's row on each node, not just a higher count: the union has to
-		// hold across an aggregation boundary, and this is what puts it there before we read.
+		// Both a NEW row and a higher count, measured against the settled baseline: either alone
+		// could be satisfied by phase one's own rows, and it is phase two's aggregation — in its
+		// own period — that the union then has to carry.
 		await Promise.all([
-			waitForAnalytics(nodeA, startTime, { minimumCount: phaseOneCountA + 1, minimumRows: 2 }),
-			waitForAnalytics(nodeB, startTime, { minimumCount: phaseOneCountB + 1, minimumRows: 2 }),
+			waitForAnalytics(nodeA, startTime, {
+				minimumCount: analyticsCount(baseA) + 1,
+				minimumRows: baseA.length + 1,
+			}),
+			waitForAnalytics(nodeB, startTime, {
+				minimumCount: analyticsCount(baseB) + 1,
+				minimumRows: baseB.length + 1,
+			}),
 		]);
 
 		// The window has to be closed for all four reads at once: a flush landing inside it while
@@ -303,8 +314,8 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 			getTableWriteAnalytics(nodeB, { startTime, endTime, replicated: true, signal }),
 		]);
 
-		ok(analyticsCount(localA) > phaseOneCountA, 'node A must have aggregated its second write phase');
-		ok(analyticsCount(localB) > phaseOneCountB, 'node B must have aggregated its second write phase');
+		ok(analyticsCount(localA) > analyticsCount(baseA), 'node A must have aggregated its second write phase');
+		ok(analyticsCount(localB) > analyticsCount(baseB), 'node B must have aggregated its second write phase');
 		equal(analyticsCount(distributedFromA), analyticsCount(localA) + analyticsCount(localB));
 		equal(analyticsCount(distributedFromB), analyticsCount(localA) + analyticsCount(localB));
 		ok(new Set(localA.map(({ id }) => id)).size >= 2, 'node A must span at least two aggregate periods');
