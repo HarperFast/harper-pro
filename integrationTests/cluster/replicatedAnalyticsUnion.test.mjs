@@ -271,9 +271,10 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 		// phase one's bucket however fast the host runs the writes, and it leaves nothing of phase
 		// one still to flush — so the baseline read below can only grow again when phase two lands.
 		await delay(AGGREGATE_PERIOD_SECONDS * 1000);
+		const baselineSignal = AbortSignal.timeout(ANALYTICS_TIMEOUT_MS);
 		const [baseA, baseB] = await Promise.all([
-			getTableWriteAnalytics(nodeA, { startTime, replicated: false }),
-			getTableWriteAnalytics(nodeB, { startTime, replicated: false }),
+			getTableWriteAnalytics(nodeA, { startTime, replicated: false, signal: baselineSignal }),
+			getTableWriteAnalytics(nodeB, { startTime, replicated: false, signal: baselineSignal }),
 		]);
 
 		await writePhase(nodeA, 'A', 'after-boundary', PHASE_TWO_WRITES.A);
