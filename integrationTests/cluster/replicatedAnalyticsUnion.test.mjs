@@ -270,16 +270,16 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 
 		// Wait for a second period's row on each node, not just a higher count: the union has to
 		// hold across an aggregation boundary, and this is what puts it there before we read.
-		await Promise.all([
+		const [phaseTwoA, phaseTwoB] = await Promise.all([
 			waitForAnalytics(nodeA, startTime, { minimumCount: phaseOneCountA + 1, minimumRows: 2 }),
 			waitForAnalytics(nodeB, startTime, { minimumCount: phaseOneCountB + 1, minimumRows: 2 }),
 		]);
 
-		// The window must close in the PAST. Aggregation stamps each row with the write's
-		// monotonic time, so an end time already elapsed cannot admit a flush that lands while
-		// these four queries are in flight — whereas a window ending a millisecond from now can,
-		// and a row that reached only some of the four reads reads as a union mismatch.
-		const endTime = Date.now() - 1;
+		// The window has to be closed for all four reads at once — a flush landing inside it
+		// mid-flight reaches some and not others, and reads as a union mismatch. An elapsed cutoff
+		// excludes any later flush (rows carry the write's monotonic time); raising it to the
+		// newest row already observed keeps a flush from the current millisecond from being cut.
+		const endTime = Math.max(Date.now() - 1, ...[...phaseTwoA, ...phaseTwoB].map(({ id }) => id));
 		const signal = AbortSignal.timeout(ANALYTICS_TIMEOUT_MS);
 		const [localA, localB, distributedFromA, distributedFromB] = await Promise.all([
 			getTableWriteAnalytics(nodeA, { startTime, endTime, replicated: false, signal }),
@@ -301,8 +301,7 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 		equal(nodeBIdentity.size, 1, `node B's rows must carry one origin: ${JSON.stringify([...nodeBIdentity])}`);
 		notEqual([...nodeAIdentity][0], [...nodeBIdentity][0]);
 
-		// Both origins present, then row-for-row equality: the first says which half of the union
-		// went missing, the second catches a peer's rows being replaced by re-labelled local ones.
+		// Origins first, so a dropped peer names which half went missing before the row diff.
 		const bothOrigins = new Set([...nodeAIdentity, ...nodeBIdentity]);
 		deepStrictEqual(originsOf(distributedFromA), bothOrigins);
 		deepStrictEqual(originsOf(distributedFromB), bothOrigins);
