@@ -93,6 +93,8 @@ import {
 	findBlobsInObject,
 	getFilePathForBlob,
 	blobHeaderIndicatesIncomplete,
+	DEFLATE_TYPE,
+	inflatesToExactly,
 	openStoredBlobBody,
 	repairBlobFile,
 	holdBlobFile,
@@ -1480,11 +1482,13 @@ export async function collectBlobRepairTargets(
 }
 
 /**
- * Async damage probe for repair-candidate blobs: same header semantics as core's sync classifier
- * (shared `blobHeaderIndicatesIncomplete`), but on fs promises so the per-duplicate probes of a
- * resumed copy never block the receive worker's event loop. `undefined` = not a probeable file
- * blob. Lock/in-flight consultation is deliberately absent here — `repairBlobFile` re-checks
- * synchronously (including the :blob lock) immediately before writing.
+ * Async damage probe for repair-candidate blobs: same classification as core's sync gate (shared
+ * `blobHeaderIndicatesIncomplete`, and the same streamed inflate for a deflate body, whose header
+ * records the uncompressed length and so says nothing about whether the body is whole), but on fs
+ * promises and streams so the per-duplicate probes of a resumed copy never block the receive
+ * worker's event loop. `undefined` = not a probeable file blob. Lock/in-flight consultation is
+ * deliberately absent here — `repairBlobFile` re-checks synchronously (including the :blob lock)
+ * immediately before writing.
  */
 export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boolean | undefined> {
 	try {
@@ -1496,15 +1500,18 @@ export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boole
 		} catch (error) {
 			return (error as { code?: string })?.code === 'ENOENT' ? true : undefined;
 		}
+		let header: Buffer;
 		try {
 			const size = (await handle.stat()).size;
 			if (size < 8) return true;
-			const header = Buffer.allocUnsafe(8);
+			header = Buffer.allocUnsafe(8);
 			if ((await handle.read(header, 0, 8, 0)).bytesRead < 8) return true;
-			return blobHeaderIndicatesIncomplete(header, size);
+			if (blobHeaderIndicatesIncomplete(header, size)) return true;
 		} finally {
 			await handle.close();
 		}
+		if (header.readUInt16BE(0) !== DEFLATE_TYPE) return false;
+		return !(await inflatesToExactly(filePath, header.readUIntBE(2, 6)));
 	} catch {
 		return undefined;
 	}
