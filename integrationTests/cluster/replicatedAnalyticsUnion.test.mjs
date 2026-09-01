@@ -19,6 +19,7 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { deepStrictEqual, equal, notEqual, ok } from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, waitForCondition } from './clusterShared.mjs';
@@ -37,6 +38,9 @@ const CLUSTER_TIMEOUT_MS = 45_000;
 const CONVERGE_TIMEOUT_MS = 45_000;
 const ANALYTICS_TIMEOUT_MS = 45_000;
 const POLL_INTERVAL_MS = 250;
+// Long enough for the clock to leave every already-written analytics row strictly behind an
+// elapsed cutoff; see where the read window is chosen.
+const CUTOFF_SETTLE_MS = 5;
 const TABLE = 'analytics_union_events';
 const PHASE_ONE_WRITES = { A: 2, B: 3 };
 const PHASE_TWO_WRITES = { A: 3, B: 4 };
@@ -237,7 +241,13 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 	});
 
 	after(async () => {
-		await Promise.all([ctx.nodeCtxA && teardownHarper(ctx.nodeCtxA), ctx.nodeCtxB && teardownHarper(ctx.nodeCtxB)]);
+		// allSettled for the same reason as startup: a rejected teardown must not abandon the
+		// other node's, which would leak it and its ports into the rest of the run.
+		const teardowns = await Promise.allSettled(
+			[ctx.nodeCtxA, ctx.nodeCtxB].filter(Boolean).map((nodeCtx) => teardownHarper(nodeCtx))
+		);
+		const failedTeardown = teardowns.find(({ status }) => status === 'rejected');
+		if (failedTeardown) throw failedTeardown.reason;
 	});
 
 	test("returns each node's local analytics exactly once after a second write phase", async () => {
@@ -259,6 +269,9 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 		const phaseOneCountA = analyticsCount(phaseOneA);
 		const phaseOneCountB = analyticsCount(phaseOneB);
 
+		// Cross the boundary rather than infer it: a full period between the phases means phase
+		// two cannot share phase one's bucket however fast the host runs the writes.
+		await delay(AGGREGATE_PERIOD_SECONDS * 1000);
 		await writePhase(nodeA, 'A', 'after-boundary', PHASE_TWO_WRITES.A);
 		await writePhase(nodeB, 'B', 'after-boundary', PHASE_TWO_WRITES.B);
 		const allIds = [
@@ -270,16 +283,18 @@ suite('Replicated analytics union', { timeout: 180_000 }, (ctx) => {
 
 		// Wait for a second period's row on each node, not just a higher count: the union has to
 		// hold across an aggregation boundary, and this is what puts it there before we read.
-		const [phaseTwoA, phaseTwoB] = await Promise.all([
+		await Promise.all([
 			waitForAnalytics(nodeA, startTime, { minimumCount: phaseOneCountA + 1, minimumRows: 2 }),
 			waitForAnalytics(nodeB, startTime, { minimumCount: phaseOneCountB + 1, minimumRows: 2 }),
 		]);
 
-		// The window has to be closed for all four reads at once — a flush landing inside it
-		// mid-flight reaches some and not others, and reads as a union mismatch. An elapsed cutoff
-		// excludes any later flush (rows carry the write's monotonic time); raising it to the
-		// newest row already observed keeps a flush from the current millisecond from being cut.
-		const endTime = Math.max(Date.now() - 1, ...[...phaseTwoA, ...phaseTwoB].map(({ id }) => id));
+		// The window has to be closed for all four reads at once: a flush landing inside it while
+		// they are in flight reaches some and not others, and reads as a union mismatch. Rows carry
+		// the write's monotonic time, so an ELAPSED cutoff excludes every later flush — and settling
+		// first is what makes it elapsed with respect to the rows just observed, which a bare
+		// `Date.now() - 1` cannot promise for a row written in this same millisecond.
+		await delay(CUTOFF_SETTLE_MS);
+		const endTime = Date.now() - 1;
 		const signal = AbortSignal.timeout(ANALYTICS_TIMEOUT_MS);
 		const [localA, localB, distributedFromA, distributedFromB] = await Promise.all([
 			getTableWriteAnalytics(nodeA, { startTime, endTime, replicated: false, signal }),
