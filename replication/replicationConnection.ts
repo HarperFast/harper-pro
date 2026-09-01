@@ -1053,6 +1053,12 @@ export function collectAuditRecordBlobsFromBinary(
  * error, and the output is capped at `expectedSize` so a peer body cannot inflate without bound.
  */
 export function createRepairInflater(stream: Readable, expectedSize: number): Readable {
+	// The output cap is the only bound on a peer-supplied deflate body, so a non-finite/negative size
+	// makes `inflatedLength > expectedSize` never true and turns the bomb guard into a no-op. The
+	// receive ladder already refuses to bind a codec announced with such a size; refuse here too so the
+	// enforcing layer cannot be handed a size that silently disables its own bound.
+	if (!Number.isSafeInteger(expectedSize) || expectedSize < 0)
+		throw new Error(`Blob repair inflater requires a valid expected size, received ${expectedSize}`);
 	let inflatedLength = 0;
 	const bounded = new Transform({
 		transform(chunk: Buffer, _encoding, callback) {
@@ -4347,12 +4353,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							// The codec decides the on-disk header the save stamps from its first byte, so it binds
 							// immutably to the transfer: unknown, unadvertised, changed mid-transfer, or announced
 							// after the record attached its save is a protocol violation, not something to adapt to.
-							// A size is required alongside it: the inflated length is the only bound on a raw body.
+							// A valid size is required alongside it: the inflated length is the only bound on a raw
+							// body, so a non-finite/negative size (NaN, Infinity) would leave the repair inflater's
+							// output cap disabled — a compression-bomb hole — and must be rejected like a missing one.
 							const codecViolation =
 								codec !== 'deflate' || !localAcceptedBlobCodecs.has(codec)
 									? 'is not an accepted codec'
-									: typeof size !== 'number'
-										? 'was announced without a size'
+									: !Number.isSafeInteger(size) || size < 0
+										? 'was announced without a valid size'
 										: stream.codec === undefined && stream.connectedToBlob
 											? 'arrived after the record began saving'
 											: stream.codec !== undefined && stream.codec !== codec
