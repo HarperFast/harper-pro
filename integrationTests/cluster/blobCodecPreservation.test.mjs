@@ -17,7 +17,8 @@
  * sendBlobs decision.
  */
 import { suite, test, before, after } from 'node:test';
-import { equal, deepStrictEqual } from 'node:assert/strict';
+import { equal, deepStrictEqual, ok } from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -39,11 +40,22 @@ const TABLE = 'CodecBlob';
 const HEADER_SIZE = 8;
 const UNCOMPRESSED_TYPE = 0;
 const DEFLATE_TYPE = 1;
-// Compressible and comfortably multi-chunk on the wire; the string form matters — a string value
-// on a Blob-typed attribute goes through the ordinary write path (coerced to a blob in saveBlob's
-// jurisdiction), which is exactly where the opt-in compression policy is resolved.
-const PAYLOAD_CATCHUP = 'catch-up payload for codec preservation '.repeat(8000);
-const PAYLOAD_LIVE = 'live-tail payload for codec preservation '.repeat(8000);
+// Deterministic hex noise: about half compressible, so the DEFLATE body itself spans several wire
+// chunks (a repeated phrase deflates to a single chunk and never exercises multi-chunk pass-through).
+// The string form matters — a string value on a Blob-typed attribute goes through the ordinary write
+// path (coerced to a blob in saveBlob's jurisdiction), which is where the compression policy resolves.
+function hexNoise(seed, bytes) {
+	const chunks = [];
+	let digest = createHash('sha256').update(seed).digest();
+	for (let produced = 0; produced < bytes; produced += digest.length) {
+		chunks.push(digest);
+		digest = createHash('sha256').update(digest).digest();
+	}
+	return Buffer.concat(chunks).subarray(0, bytes).toString('hex');
+}
+const PAYLOAD_CATCHUP = hexNoise('catch-up payload for codec preservation', 200 * 1024);
+const PAYLOAD_LIVE = hexNoise('live-tail payload for codec preservation', 200 * 1024);
+const MIN_DEFLATE_BODY = 64 * 1024;
 
 function listBlobFiles(dataRootDir, db = DB) {
 	const root = join(dataRootDir, 'blobs', db);
@@ -96,13 +108,17 @@ function contentOf(fileBuffer) {
 async function waitForRecord(node, id, { timeoutMs = 60000 } = {}) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		const result = await sendOperation(node, {
-			operation: 'search_by_id',
-			database: DB,
-			table: TABLE,
-			ids: [id],
-			get_attributes: ['id'],
-		}).catch(() => null);
+		const result = await sendOperation(
+			node,
+			{
+				operation: 'search_by_id',
+				database: DB,
+				table: TABLE,
+				ids: [id],
+				get_attributes: ['id'],
+			},
+			{ signal: AbortSignal.timeout(10000) }
+		).catch(() => null);
 		if (Array.isArray(result) && result.some((r) => r?.id === id)) return;
 		await delay(400);
 	}
@@ -213,7 +229,10 @@ suite('replication preserves the blob codec (harper#2443)', { timeout: 300000 },
 		const filesC = await settledBlobFiles(nodeC, 2);
 
 		// Origin stored both blobs compressed, and their content round-trips.
-		for (const file of filesA) equal(file[1], DEFLATE_TYPE, 'origin must store the blob deflate-compressed');
+		for (const file of filesA) {
+			equal(file[1], DEFLATE_TYPE, 'origin must store the blob deflate-compressed');
+			ok(file.length - HEADER_SIZE > MIN_DEFLATE_BODY, `deflate body must span several wire chunks (${file.length})`);
+		}
 		deepStrictEqual(
 			filesA.map((file) => contentOf(file).length).sort((x, y) => x - y),
 			[PAYLOAD_CATCHUP.length, PAYLOAD_LIVE.length].sort((x, y) => x - y)
