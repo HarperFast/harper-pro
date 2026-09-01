@@ -89,7 +89,6 @@ import {
 	saveBlob,
 	getFileId,
 	findBlobsInObject,
-	getFilePathForBlob,
 	blobFileMissingOrIncompleteAsync,
 	openStoredBlobBody,
 	repairBlobFile,
@@ -1053,12 +1052,12 @@ export function collectAuditRecordBlobsFromBinary(
  * repair issues on the receive stream must settle here rather than surface as an unhandled inflater
  * error, and the output is capped at `expectedSize` so a peer body cannot inflate without bound.
  */
-export function createRepairInflater(stream: Readable, expectedSize: number | undefined): Readable {
+export function createRepairInflater(stream: Readable, expectedSize: number): Readable {
 	let inflatedLength = 0;
 	const bounded = new Transform({
 		transform(chunk: Buffer, _encoding, callback) {
 			inflatedLength += chunk.length;
-			if (expectedSize !== undefined && inflatedLength > expectedSize)
+			if (inflatedLength > expectedSize)
 				return callback(new Error(`Blob repair body inflates past its expected size of ${expectedSize}`));
 			callback(null, chunk);
 		},
@@ -4348,14 +4347,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							// The codec decides the on-disk header the save stamps from its first byte, so it binds
 							// immutably to the transfer: unknown, unadvertised, changed mid-transfer, or announced
 							// after the record attached its save is a protocol violation, not something to adapt to.
+							// A size is required alongside it: the inflated length is the only bound on a raw body.
 							const codecViolation =
 								codec !== 'deflate' || !localAcceptedBlobCodecs.has(codec)
 									? 'is not an accepted codec'
-									: stream.codec === undefined && stream.connectedToBlob
-										? 'arrived after the record began saving'
-										: stream.codec !== undefined && stream.codec !== codec
-											? 'changed mid-transfer'
-											: undefined;
+									: typeof size !== 'number'
+										? 'was announced without a size'
+										: stream.codec === undefined && stream.connectedToBlob
+											? 'arrived after the record began saving'
+											: stream.codec !== undefined && stream.codec !== codec
+												? 'changed mid-transfer'
+												: undefined;
 							if (codecViolation) {
 								stream.destroy(
 									new Error(`Blob codec '${codec}' for ${fileId} from ${remoteNodeName} ${codecViolation}`)
@@ -6254,14 +6256,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// error frame it produces is the honest answer for the peer.
 		const releaseBlobHold = holdBlobFile(blob);
 		if (!releaseBlobHold) logger.debug?.(`Blob ${id} is already being reclaimed; sending it will report it missing`);
-		// The stored-codec announcement must go on the wire synchronously, before the owning record's
-		// frame: the receiver stamps the file header when record decode starts the save, so the codec
-		// must already be pinned on its transfer stream. The `codec` hint prefilters (the uncompressed
-		// majority pays no I/O); the open confirms against the local file header, since a relayed
-		// record can outlive the storage form it was written with. Once announced, this transfer
-		// delivers raw stored bytes or a terminal error frame, never a silently inflated body.
+		// Announced synchronously, before the owning record's frame (DESIGN.md invariant 18); the
+		// `storedCodec` hint only prefilters — the open confirms against the local file header.
 		let storedBody: ReturnType<typeof openStoredBlobBody>;
-		if (peerAcceptedBlobCodecs.has('deflate') && (blob as Blob & { codec?: string }).codec === 'deflate') {
+		if (peerAcceptedBlobCodecs.has('deflate') && (blob as Blob & { storedCodec?: string }).storedCodec === 'deflate') {
 			storedBody = openStoredBlobBody(blob);
 			if (storedBody) {
 				ws.send(
@@ -6382,8 +6380,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// from the first iterator.next(), the retry (and the error frame) must still engage.
 				let iterator: AsyncIterator<Uint8Array> | undefined;
 				try {
-					// A stored body is verified by a concurrent inflate as it sends, so a torn local body
-					// surfaces as an error frame (500, permanent) before the terminal frame.
 					iterator = storedBody ? storedBody.stream()[Symbol.asyncIterator]() : blob.stream()[Symbol.asyncIterator]();
 					let lastBuffer: Buffer;
 					while (true) {
@@ -6530,7 +6526,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		} finally {
 			if (drainToken) endBlobSend(drainToken);
 			blobsBeingSent.delete(blobSendKey);
-			storedBody?.close(); // releases its own file hold when the reader never streamed
+			storedBody?.close();
 			releaseBlobHold?.();
 			if (fileSendClaimed) {
 				fileIdsBeingSent.delete(id);
@@ -6582,9 +6578,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const sizesMatch =
 				repairTarget.size === undefined || remoteBlob.size === undefined || repairTarget.size === remoteBlob.size;
 			if (sizesMatch) {
-				const repairSource = stream.codec
-					? createRepairInflater(stream, stream.expectedSize ?? remoteBlob.size ?? repairTarget.size)
-					: stream;
+				// a codec-pinned stream always carries its announced size (the receive ladder requires it)
+				const repairSource = stream.codec ? createRepairInflater(stream, stream.expectedSize) : stream;
 				finished = decodeFromDatabase(
 					() => repairBlobFile(repairTarget, repairSource, () => stream.expectedSize ?? remoteBlob.size),
 					tableSubscriptionToReplicator.auditStore?.rootStore
@@ -6601,8 +6596,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			inPlaceRepairedBlobs.add(repairTarget);
 		}
 		if (!localBlob) {
-			// A stored-codec transfer lands the peer's raw deflate body under a DEFLATE header; the
-			// receiver's own compression config does not apply (no recompress).
+			// the receiver's own compression config does not apply to a stored-codec transfer (no recompress)
 			localBlob =
 				stream.blob ??
 				(stream.codec
