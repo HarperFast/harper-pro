@@ -1,28 +1,18 @@
 /**
- * Regression guard for the cross-reconnect blob-gap escalation budget (harper-pro#432).
- *
- * Mechanism (replication/replicationConnection.ts):
- *   - The SOURCE holds a blob whose file reads back as core's PENDING placeholder forever (the fixture
- *     stamps its header; in the field an idle-watchdog stub did the same). Every `sendBlobs` read of it
- *     rejects `BlobReadError(…, 503)`; the sender retries in place (BLOB_SEND_RETRY_DELAYS_MS), then
- *     forwards a BLOB_CHUNK `error` marker with `errorStatus: 503`.
- *   - The receiver classifies 503 as TRANSIENT: the save `.catch` latches `hasBlobGap`, pins the durable
- *     resume cursor, and arms the #683 blob-gap reconnect timer. The reconnect re-streams the same
- *     record, the source answers 503 again, and — BEFORE this fix — every per-socket counter restarted
- *     with the socket, so the cursor stayed pinned for as long as the source kept answering 503.
- *   - WITH the fix, the connection's `blobGapBudget` charges one cycle per socket generation for that
- *     delivery; on the `blobGapEscalationCycles`-th cycle it is reclassified as unrecoverable and the
- *     existing advance-past branch skips it (loud error, slot-7 metric, file unlinked = repair signal).
+ * Regression guard for the cross-reconnect blob-gap escalation budget (harper-pro#432; the policy is
+ * replication/DESIGN.md item 8). The source fixture stamps exactly one blob PENDING, so every read of it
+ * answers 503 and the receiver holds its resume cursor on every re-stream; before this change nothing
+ * bounded that across reconnects.
  *
  * Oracles: (1) B's escalation error line — absent on unfixed code, which loops "Blob-gap watchdog"
  * fires for the whole window; (2) the watchdog stops firing once the only bad delivery is escalated;
  * (3) later records replicate; (4) after `restartNode(B)` the source does NOT resend the bad delivery
  * while a later record still replicates — the persisted cursor is past it; (5) repairability: B's read
- * of the skipped record's blob classifies as unavailable (core's PENDING/gone taxonomy, never served as
- * bytes), and once the source is healed `repair_blob_data` on B selects that record. The sweep's fetch
- * itself cannot be asserted here: the operation runs on the main thread, which owns no subscription
- * connections (`noConnection` in its summary — a pre-existing #388 limitation), so the exact-bytes
- * check is made only when the sweep reports a repair.
+ * of the skipped record's blob classifies as unavailable (never served as bytes), and once the source is
+ * healed `repair_blob_data` on B selects that record. The sweep's fetch itself cannot be asserted here:
+ * the operation runs on the main thread, which owns no subscription connections (`noConnection` in its
+ * summary — a pre-existing #388 limitation), so the exact-bytes check is made only when the sweep
+ * reports a repair.
  */
 
 import { suite, test, before, after } from 'node:test';

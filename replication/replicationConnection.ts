@@ -1477,10 +1477,9 @@ export function shouldRetrySourceBlobRead(state: {
 export type BlobGapEscalation = { cycles: number; heldMs: number; overflow: boolean };
 export type BlobGapEscalationBudget = ReturnType<typeof createBlobGapEscalationBudget>;
 
-/** One held delivery's identity across re-streams: the source's file id plus the record it belongs to. */
-export function blobGapDeliveryKey(fileId: unknown, recordId: unknown): string {
+export function blobGapDeliveryKey(fileId: unknown, recordId: unknown, tableName?: string): string {
 	const record = typeof recordId === 'object' && recordId !== null ? JSON.stringify(recordId) : String(recordId);
-	return `${fileId}|${record}`;
+	return `${fileId}|${tableName ?? ''}|${record}`;
 }
 
 // Socket generations an exhausted delivery may go unseen before its entry is dropped: an escalated
@@ -1516,6 +1515,15 @@ export function createBlobGapEscalationBudget(opts: {
 		currentGeneration = generation;
 		return false;
 	};
+	const evictExhausted = (generation: number): boolean => {
+		for (const [key, entry] of held) {
+			if (entry.exhausted && entry.lastGeneration < generation) {
+				held.delete(key);
+				return true;
+			}
+		}
+		return false;
+	};
 	return {
 		/**
 		 * A replacement socket is live: everything from older generations is now stale, and exhausted
@@ -1538,7 +1546,10 @@ export function createBlobGapEscalationBudget(opts: {
 			const at = now();
 			let entry = held.get(key);
 			if (!entry) {
-				if (held.size >= maxTracked) return { cycles: 0, heldMs: 0, overflow: true };
+				// At capacity, an exhausted entry the current socket has not re-held is dead weight (its
+				// record was skipped past); dropping it is not dropping live progress. Overflow is only for a
+				// budget whose every entry is live or still being re-streamed.
+				if (held.size >= maxTracked && !evictExhausted(generation)) return { cycles: 0, heldMs: 0, overflow: true };
 				entry = { firstHeldAt: at, cycles: 0, lastGeneration: -1, exhausted: false };
 				held.set(key, entry);
 			}
@@ -4727,7 +4738,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								},
 								auditStore?.rootStore,
 								(remoteBlob) => {
-									const localBlob = receiveBlobs(remoteBlob, key); // receive the blob;
+									const localBlob = receiveBlobs(remoteBlob, key, undefined, undefined, tableDecoders[tableId]?.name);
 									// track the blobs that were written in case we need to delete them if the record is not moved locally
 									if (!blobsToDelete) blobsToDelete = [];
 									blobsToDelete.push(localBlob);
@@ -5946,7 +5957,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						auditStore?.rootStore,
 						(blob) => {
 							const repairTarget = repairTargets?.[repairIndex++];
-							const localBlob = receiveBlobs(blob, id, copyFrameIndex, repairTarget);
+							const localBlob = receiveBlobs(blob, id, copyFrameIndex, repairTarget, tableDecoder.name);
 							// An in-place-repaired blob is a file a committed record already references (possibly a
 							// coalesced reuse from an earlier record in this message) — never let the decode-failure
 							// cleanup below unlink it.
@@ -6681,7 +6692,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 		}
 	}
-	function receiveBlobs(remoteBlob: Blob, id: string | number, copyFrameIndex?: number, repairTarget?: any) {
+	function receiveBlobs(
+		remoteBlob: Blob,
+		id: string | number,
+		copyFrameIndex?: number,
+		repairTarget?: any,
+		tableName?: string
+	) {
 		// write the blob to the blob store
 		const blobId = getFileId(remoteBlob);
 		const transferId = getBlobTransferId(remoteBlob);
@@ -6799,7 +6816,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							maxCycles: BLOB_GAP_ESCALATION_CYCLES,
 							maxHoldMs: BLOB_GAP_ESCALATION_MS,
 						}));
-						const escalation = budget.charge(blobGapDeliveryKey(blobId, id), blobGapGeneration);
+						const escalation = budget.charge(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
 						if (escalation) markSourceBlobUnavailable(err, escalation);
 					}
 					if (isUnrecoverableSourceBlobError(err)) {
@@ -6862,7 +6879,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
 					if (!saveFailed) {
 						const budget = options.connection?.blobGapBudget;
-						if (budget && budget.size > 0) budget.resolve(blobGapDeliveryKey(blobId, id), blobGapGeneration);
+						if (budget && budget.size > 0) budget.resolve(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
 					}
 					// Settle before flushDurableCopyCursor below so the watermark sees this blob's outcome
 					// (an unrecoverable-source skip settles un-gapped — the cursor advances past it, #403).
