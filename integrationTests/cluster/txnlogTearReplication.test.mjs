@@ -37,11 +37,10 @@ import { readLog, sendOperation, stopNodeProcess, waitForCondition } from './clu
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
-// Kept in step with TRANSACTION_LOG_FILE_HEADER_SIZE / TRANSACTION_LOG_ENTRY_HEADER_SIZE in
-// rocksdb-js `src/binding/transaction_log/transaction_log_file.h`. An entry header is a
-// big-endian float64 timestamp, a uint32 payload length, and a flag byte.
-const FILE_HEADER_SIZE = 13;
-const ENTRY_HEADER_SIZE = 13;
+const engine = await import('@harperfast/rocksdb-js');
+// An entry header is a big-endian float64 timestamp, a uint32 payload length, and a flag byte.
+const { TRANSACTION_LOG_FILE_HEADER_SIZE: FILE_HEADER_SIZE, TRANSACTION_LOG_ENTRY_HEADER_SIZE: ENTRY_HEADER_SIZE } =
+	engine.constants;
 const LOG_FILE_MAGIC = 'WOOF';
 const LOG_ID = 1;
 
@@ -57,13 +56,15 @@ const FRAMES_AFTER_TEAR = 20;
 
 const CONVERGE_TIMEOUT_MS = 90_000;
 const REPORT_TIMEOUT_MS = 30_000;
+// Every direct operation is bounded, so a node that accepts the socket and never answers fails the
+// step it belongs to instead of hanging the file until the suite timeout.
+const OPERATION_TIMEOUT_MS = 30_000;
 // Window in which a write behind the break may (wrongly) reach B before B is read: long enough to
 // span a replication reconnect cycle, since a reconnect restarts the drain from B's cursor.
 const QUARANTINE_SETTLE_MS = 10_000;
 
 suite('Mid-log txnlog tear: replication stops at the break and reports it', { timeout: 300_000 }, (ctx) => {
 	before(async () => {
-		const engine = await import('@harperfast/rocksdb-js');
 		ok(
 			typeof engine.CorruptFrameError === 'function',
 			'the engine must report where framing resumes (rocksdb-js >= 2.8.0 exports CorruptFrameError); ' +
@@ -302,7 +303,7 @@ function localLogPath(dataRootDir) {
 }
 
 /** Every row on the node; a failed query fails the test rather than reading as an empty table. */
-async function readRows(node, signal) {
+async function readRows(node, signal = AbortSignal.timeout(OPERATION_TIMEOUT_MS)) {
 	const rows = await sendOperation(
 		node,
 		{
@@ -354,10 +355,14 @@ function assertRowsPresent(rows, expectedIds, when) {
 }
 
 async function insertRows(node, from, count) {
-	await sendOperation(node, {
-		operation: 'insert',
-		database: DATABASE,
-		table: TABLE,
-		records: rowIds(from, count).map((id) => ({ id, payload: payloadFor(id) })),
-	});
+	await sendOperation(
+		node,
+		{
+			operation: 'insert',
+			database: DATABASE,
+			table: TABLE,
+			records: rowIds(from, count).map((id) => ({ id, payload: payloadFor(id) })),
+		},
+		{ signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS) }
+	);
 }
