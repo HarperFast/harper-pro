@@ -6277,13 +6277,31 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (peerAcceptedBlobCodecs.has('deflate') && (blob as Blob & { storedCodec?: string }).storedCodec === 'deflate') {
 			storedBody = openStoredBlobBody(blob);
 			if (storedBody) {
-				ws.send(
-					encode([
-						BLOB_CHUNK,
-						{ fileId: id, transferId, size: storedBody.size, codec: storedBody.codec },
-						Buffer.alloc(0),
-					])
-				);
+				try {
+					ws.send(
+						encode([
+							BLOB_CHUNK,
+							{ fileId: id, transferId, size: storedBody.size, codec: storedBody.codec },
+							Buffer.alloc(0),
+						])
+					);
+				} catch (announceError) {
+					// A synchronous throw while building or sending the announcement (an encode failure, or
+					// an invalid-argument error out of ws.send) would otherwise propagate before any cleanup
+					// runs. openStoredBlobBody already closed its sniff fd, so close() here releases the
+					// stored-body hold (not a live descriptor); leaking would also strand the blob hold and
+					// the blobsBeingSent claim — the last of which blocks every later send of this blob.
+					// Release all three and stop; the peer re-requests this blob on reconnect, the same
+					// recovery the wsClosed early-returns below rely on.
+					storedBody.close();
+					releaseBlobHold?.();
+					blobsBeingSent.delete(blobSendKey);
+					logger.debug?.(
+						`Blob ${id} codec announcement send failed; releasing and deferring to reconnect`,
+						announceError
+					);
+					return;
+				}
 			}
 		}
 		// Acquire a send slot before opening the blob stream. Enforcing the cap only at the audit
