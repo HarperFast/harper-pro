@@ -21,7 +21,6 @@
 import { createRequire } from 'node:module';
 
 const modulus = Number.parseInt(process.env.HARPER_TEST_BLOB_PENDING_MODULUS || '0', 10);
-// Optional cap on how many files are stamped (0 = every match): COUNT=1 yields exactly one bad delivery.
 const maxStamped = Number.parseInt(process.env.HARPER_TEST_BLOB_PENDING_COUNT || '0', 10);
 const healFile = process.env.HARPER_TEST_BLOB_PENDING_HEAL_FILE;
 const HEADER_SIZE = 8;

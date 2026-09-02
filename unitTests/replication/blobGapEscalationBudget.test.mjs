@@ -180,6 +180,19 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		}
 	});
 
+	it('at capacity drops a dead exhausted entry before declaring overflow, never a live one', () => {
+		const budget = createBlobGapEscalationBudget({ maxCycles: 1, maxHoldMs: 0, maxTracked: 2, now: fakeClock().now });
+		assert.equal(budget.charge(A, 1).cycles, 1); // exhausted, last seen in generation 1
+		const C = blobGapDeliveryKey('c3', 3);
+		budget.beginGeneration(2);
+		budget.charge(B, 2); // live? maxCycles 1 exhausts it too — re-held in generation 2, so not dead
+		assert.equal(budget.size, 2);
+		assert.equal(budget.charge(C, 2).cycles, 1); // A (unseen this generation) evicted to make room
+		assert.equal(budget.size, 2);
+		const D = blobGapDeliveryKey('d4', 4);
+		assert.deepEqual(budget.charge(D, 2), { cycles: 0, heldMs: 0, overflow: true }); // B and C both re-held now
+	});
+
 	it('with both bounds disabled a tracked delivery never escalates', () => {
 		const budget = createBlobGapEscalationBudget({ maxCycles: 0, maxHoldMs: 0, now: fakeClock().now });
 		for (let generation = 1; generation <= 50; generation++) assert.equal(budget.charge(A, generation), undefined);
@@ -206,7 +219,13 @@ describe('blobGapDeliveryKey', () => {
 	it('distinguishes two records that share one source file id', () => {
 		assert.notEqual(blobGapDeliveryKey('f1', 1), blobGapDeliveryKey('f1', 2));
 		assert.equal(blobGapDeliveryKey('f1', 1), blobGapDeliveryKey('f1', 1));
-		assert.equal(blobGapDeliveryKey('f1', 'k'), 'f1|k');
+		assert.notEqual(blobGapDeliveryKey('f1', 'k'), blobGapDeliveryKey('f2', 'k'));
+	});
+
+	it('separates the same record id in different tables', () => {
+		assert.notEqual(blobGapDeliveryKey('f1', 1, 'a'), blobGapDeliveryKey('f1', 1, 'b'));
+		assert.equal(blobGapDeliveryKey('f1', 1, 'a'), blobGapDeliveryKey('f1', 1, 'a'));
+		assert.equal(blobGapDeliveryKey('f1', 'k'), 'f1||k');
 	});
 
 	it('does not collapse structured record ids', () => {
