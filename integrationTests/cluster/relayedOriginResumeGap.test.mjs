@@ -21,25 +21,20 @@
  *   ^
  *   '-leader-  W (witness) a direct follower of O: the same-run control that O's backlog is live
  *
- * Sequence:
- *   1. O writes phase 1. R full-copies O, T full-copies R (O-origin rows, relayed), W full-copies O.
- *      Precondition asserted: T's cluster_status carries no entry for O while T holds every phase-1 row.
- *   2. R is SIGKILLed — T's only path to O is gone.
- *   3. O writes phase 2, the [T, head] backlog T must not lose. W receives it live; T cannot.
- *   4. The backlog ages past the pre-#428 resume floor. That wait is the scenario's own clock, not a poll:
- *      the legacy loss is defined as "older than a minute", the red-proof needs it, and the green run keeps
- *      the identical scenario.
- *   5. T adds O directly as a NON-leader (a leader add full-copied even before #428), so T's subscription to
- *      O resolves cursorless. Restarting R instead would heal T through its DIRECT cursor for R — the
- *      co-subscription path that makes proxiedResumeBacklog.test.mjs self-heal — so the restored path must
- *      be one T has never received from.
- *   6. Green (default): T converges on phase 1 + phase 2, and its log carries the resume decision —
- *      `start time: 1` for O, then "Requesting full copy ... (no resume cursor for this source)". A live
- *      write then lands everywhere, R is restarted, and all four nodes converge.
- *      Red-proof (HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY=1 in the runner's env, forwarded to T only): the
- *      same scenario asserts the loss signature instead — the T<-O link is live (a later write arrives), T
- *      holds no phase-2 row, and its count stays frozen below every other node even after R returns, because
- *      R no longer relays O's rows to a node that is directly connected to O.
+ * Sequence: O writes phase 1 and the chain copies it (T's rows arrive relayed through R; asserted: T holds
+ * every phase-1 row and has no connection to O). R is killed. O writes phase 2 — the [T, head] backlog —
+ * which W receives live and T cannot. The backlog ages past the pre-#428 resume floor: that wait is the
+ * scenario's own clock, not a poll, because the legacy loss is defined as "older than a minute". T then adds
+ * O directly as a NON-leader (a leader add full-copied even before #428). Restarting R instead would heal T
+ * through its DIRECT cursor for R — the co-subscription path that makes proxiedResumeBacklog.test.mjs
+ * self-heal — so the restored path must be one T has never received from.
+ *
+ * Green (default): T converges, its log carries the resume decision (`start time: 1` for O, then the #428
+ * full-copy request), a live write lands everywhere, and all four nodes converge once R returns.
+ * Red-proof (HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY=1 in the runner's environment; the hook is injected
+ * into T and pinned off on every other node): the same scenario asserts the loss signature — the T<-O link
+ * is live, T holds no phase-2 row, and T stays frozen below every peer even after R returns, because a peer
+ * never relays an origin's rows to a node that is directly connected to that origin.
  *
  * W2's receive-side gap detection should turn the red-proof green again; W4's per-origin cursors
  * (harper-pro#434) should make `start time: 1` unreachable and retire the discriminator.
@@ -70,11 +65,16 @@ const PHASE1 = 20;
 const PHASE2 = 30;
 const TOTAL = PHASE1 + PHASE2;
 const LIVE_ID = 'o3-live';
-// The pre-#428 non-leader resume start was `Date.now() - 60000`; the backlog must be older than that.
+// the pre-#428 non-leader resume start was `Date.now() - 60000`
 const LEGACY_RESUME_FLOOR_MS = 60000;
 const AGE_MARGIN_MS = 5000;
 const CONVERGE_TIMEOUT_MS = 90000;
-const PROTECTION_DISABLED = process.env.HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY === '1';
+const HOOK = 'HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY';
+const PROTECTION_DISABLED = process.env[HOOK] === '1';
+// Every child inherits the runner's environment, so the hook is pinned off explicitly on each control node
+// and injected only into the target.
+const hookEnv = (isTarget) => ({ [HOOK]: isTarget && PROTECTION_DISABLED ? '1' : '0' });
+const hookFired = (log) => log.includes(`${HOOK}: resuming database`);
 
 const phase1Ids = Array.from({ length: PHASE1 }, (_, i) => `o1-${i}`);
 const phase2Ids = Array.from({ length: PHASE2 }, (_, i) => `o2-${i}`);
@@ -183,16 +183,12 @@ suite(
 	{ timeout: 480000 },
 	(ctx) => {
 		before(async () => {
-			const hostnames = await Promise.all(Array.from({ length: 4 }, () => getNextAvailableLoopbackAddress()));
+			const roles = ['O', 'R', 'T', 'W'];
+			const hostnames = await Promise.all(roles.map(() => getNextAvailableLoopbackAddress()));
 			const contexts = hostnames.map((hostname) => ({ name: ctx.name, harper: { hostname } }));
-			// Only the target carries the hook: every other node must behave as production does.
-			const envs = [
-				undefined,
-				undefined,
-				PROTECTION_DISABLED ? { HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY: '1' } : undefined,
-				undefined,
-			];
-			await Promise.all(contexts.map((nodeCtx, i) => startHarper(nodeCtx, nodeConfig(hostnames[i], envs[i]))));
+			await Promise.all(
+				contexts.map((nodeCtx, i) => startHarper(nodeCtx, nodeConfig(hostnames[i], hookEnv(roles[i] === 'T'))))
+			);
 			[ctx.O, ctx.R, ctx.T, ctx.W] = contexts.map((nodeCtx) => nodeCtx.harper);
 			const { O, R, T, W } = ctx;
 
@@ -258,7 +254,8 @@ suite(
 			async () => {
 				const { O, R, T, W } = ctx;
 
-				await killHarper({ harper: R });
+				// no shutdown grace: SIGTERM is followed at once by SIGKILL, as close to a crash as the harness gets
+				await killHarper({ harper: R }, { graceMs: 0 });
 				await waitForCondition(async (signal) => !dataSocketConnected(await connectionTo(T, R, signal)), {
 					description: 'T to observe its relay R down',
 				});
@@ -293,11 +290,21 @@ suite(
 					description: 'the live write to reach T over its direct O link',
 				});
 
-				const decision = resumeDecisionFor((await readLog(T)).slice(logBefore.length), O);
+				const logT = await readLog(T);
+				const decision = resumeDecisionFor(logT.slice(logBefore.length), O);
 				ok(decision.cursorless, 'T must have resolved O cursorless (start time: 1): it never subscribed to O');
+				for (const [label, node] of [
+					['O', O],
+					['W', W],
+				]) {
+					ok(
+						!hookFired(await readLog(node)),
+						`${label} must never take the legacy resume: the hook is pinned off there`
+					);
+				}
 				if (!PROTECTION_DISABLED) {
 					ok(decision.fullCopy, 'T must request a full copy from O when the source resolves cursorless');
-					ok(!decision.legacyResume, 'the legacy now-60s resume must be unreachable without the hook');
+					ok(!hookFired(logT), 'the legacy now-60s resume must be unreachable without the hook');
 					await waitForCounts({ O, T, W }, TOTAL + 1, 'live write after the copy');
 				} else {
 					ok(decision.legacyResume, 'with the hook, T must resume O from now-60s instead of copying');
@@ -324,7 +331,7 @@ suite(
 			async () => {
 				const { O, T, W } = ctx;
 				const restarted = { name: ctx.name, harper: { dataRootDir: ctx.R.dataRootDir, hostname: ctx.R.hostname } };
-				await startHarper(restarted, nodeConfig(ctx.R.hostname));
+				await startHarper(restarted, nodeConfig(ctx.R.hostname, hookEnv(false)));
 				ctx.R = restarted.harper;
 				const R = ctx.R;
 
@@ -338,6 +345,7 @@ suite(
 						'frozen-count signature: T stays below every peer with all links up'
 					);
 				}
+				ok(!hookFired(await readLog(R)), 'R must never take the legacy resume: the hook is pinned off there');
 			}
 		);
 	}

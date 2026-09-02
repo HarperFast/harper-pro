@@ -1,8 +1,6 @@
 /**
- * Coverage for the HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY hook behind `cursorlessResumeStartForTest`, the
- * resume start for a source that resolved to no cursor. Unset (the production path) it must always answer 0,
- * the full-copy request harper-pro#428 introduced; set to 1 it restores the pre-#428 `now - 60s` start for a
- * non-leader source so integrationTests/cluster/relayedOriginResumeGap.test.mjs can prove it catches that loss.
+ * The resume start for a source that resolved to no cursor must stay the harper-pro#428 full copy (0) unless
+ * HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY=1 deliberately restores the pre-#428 non-leader `now - 60s` start.
  */
 
 import { expect } from 'chai';
