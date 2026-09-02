@@ -62,8 +62,10 @@ jobs:
             # (core/integrationTests/security/{ocsp,crl}-verification.test.ts,
             # subscription-revocation.test.ts) live in that submodule and are not run by any
             # harper-pro CI workflow, pinned or floating — so there is currently no automated
-            # signal here either way. Remove this pin once core is bumped past that fix; do not
-            # remove it on harper#2025's closure alone.
+            # signal here either way. Bumping `core` past that fix is necessary but not
+            # sufficient: also confirm the OCSP/CRL suites pass against harper-pro's assembled
+            # binary (manually, or by wiring them into a harper-pro workflow) before removing
+            # this pin. Do not remove it on harper#2025's closure, or the core bump, alone.
             echo "node-versions=[22, 24, \"26.5.0\"]" >> $GITHUB_OUTPUT
             echo 'build-node-versions=[22, 24, "26.5.0"]' >> $GITHUB_OUTPUT
           else
