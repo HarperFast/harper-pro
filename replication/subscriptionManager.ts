@@ -383,6 +383,28 @@ function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string }
 // Clear a dead worker from every subscription entry it owned, so findStaleNodeUrls re-binds those
 // entries on a live worker. Pure helper (like findStaleNodeUrls) so its behavior is unit-testable without
 // real worker threads. Returns whether the worker owned any entries. See harper-pro#357.
+// Whether an armed receive-stall kick should still fire, and whether it owes the entry its throttle stamp
+// back. `receiveStallReconnectAt` both claims the kick and throttles re-detection (which needs
+// `lastReceivedTime` past the stamp), so a decision to skip has to say whether the epoch was actually
+// spent: a reconnect inside the stagger window means no kick happened and a fresh socket that stalls too
+// must still be detectable, while progress means the stall resolved and the stamp is correct as it stands.
+export function shouldFireStallKick(args: {
+	current: any;
+	armed: any;
+	armedAt: number;
+	armedGeneration: number;
+	stalledAtWatermark?: number;
+	currentWatermark?: number;
+}): { fire: boolean; releaseThrottle: boolean } {
+	const { current, armed, armedAt, armedGeneration, stalledAtWatermark, currentWatermark } = args;
+	if (current !== armed || armed.receiveStallReconnectAt !== armedAt || armed.unsubscribed)
+		return { fire: false, releaseThrottle: false };
+	if ((armed.connectGeneration ?? 0) !== armedGeneration) return { fire: false, releaseThrottle: true };
+	if (stalledAtWatermark != null && currentWatermark != null && currentWatermark > stalledAtWatermark)
+		return { fire: false, releaseThrottle: false };
+	return { fire: true, releaseThrottle: false };
+}
+
 export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationStatusMap>, worker: any): boolean {
 	let owned = false;
 	for (const dbReplicationWorkers of connectionMap.values()) {
@@ -1000,8 +1022,6 @@ export async function startOnMainThread(options) {
 			}
 			if (existingEntry) {
 				worker = existingEntry.worker;
-				// isLeader is decided on the scheduling path below, and this array becomes `entry.nodes`, which
-				// the wedge re-drive posts from.
 				nodes[0].isLeader = nodes[0].isLeader || existingEntry.nodes?.[0]?.isLeader;
 				existingEntry.nodes = nodes;
 				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
@@ -1115,8 +1135,6 @@ export async function startOnMainThread(options) {
 				// Keep the entry for URL/iterator cleanup, but bypass the reuse fast path after an
 				// explicit unsubscribe so restoring membership can schedule subscribe-to-node again.
 				if (existingEntry) existingEntry.unsubscribed = true;
-				// An armed setup can be up to 30s from firing, and would re-subscribe right after the worker was
-				// told to unsubscribe. Same for a recovery kick.
 				subscribeSetupScheduler.cancel(getNodeURL(node), databaseName);
 				if (existingEntry) {
 					clearTimeout(existingEntry.reDriveTimer);
@@ -1234,8 +1252,6 @@ export async function startOnMainThread(options) {
 		}
 		mainWorkerEntry.connected = true;
 		mainWorkerEntry.connectGeneration = (mainWorkerEntry.connectGeneration ?? 0) + 1;
-		// Real progress for this pair, so the escalated setup delay goes back to its first ceiling. Nothing is
-		// cancelled here — see noteConnected.
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
@@ -1539,18 +1555,16 @@ export async function startOnMainThread(options) {
 					const delay = reDriveBaseDelay + reconnectCount * RECONNECT_STAGGER_MS;
 					reconnectCount++;
 					entry.reDriveTimer = armReDrive(entry, delay, url, databaseName, () => {
-						// Same staleness claim as the wedge path: a newer reconcile re-stamping
-						// receiveStallReconnectAt owns the kick from then on.
-						if (entries?.get(databaseName) !== entry || entry.receiveStallReconnectAt !== now) return;
-						if (entry.unsubscribed) return;
-						// The leg reconnected inside the stagger window: the fresh socket has received nothing yet,
-						// so the watermark below cannot tell it from the stall this kick was armed for.
-						if ((entry.connectGeneration ?? 0) !== stalledAtGeneration) return;
-						// A stagger that runs long enough for the copy to resume makes this kick a reconnect of a
-						// healthy connection; the watermark is the only thing that distinguishes the two.
-						const current = getReceiveStatus(databaseName, nodes[0]?.name)?.lastReceivedTime;
-						if (stalledAtWatermark != null && current != null && current > stalledAtWatermark) return;
-						worker.postMessage(request);
+						const verdict = shouldFireStallKick({
+							current: entries?.get(databaseName),
+							armed: entry,
+							armedAt: now,
+							armedGeneration: stalledAtGeneration,
+							stalledAtWatermark,
+							currentWatermark: getReceiveStatus(databaseName, nodes[0]?.name)?.lastReceivedTime,
+						});
+						if (verdict.releaseThrottle) entry.receiveStallReconnectAt = undefined;
+						if (verdict.fire) worker.postMessage(request);
 					});
 				}
 				if (reconnectCount > 0)

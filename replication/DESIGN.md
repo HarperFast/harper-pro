@@ -152,7 +152,10 @@ is what let a chaos-restart peer's setup delay escalate past its reconvergence b
 the timers armed safe is that each re-checks live state when it fires: the setup re-reads the entry and its
 `unsubscribed` flag, the wedge kick claims its entry through the `disconnectedAt` stamp a connect clears,
 and the stall kick claims it through `connectGeneration` (a stalled connection is `connected: true` with no
-`disconnectedAt`, so the stamp cannot discriminate for it) plus the receive watermark.
+`disconnectedAt`, so the stamp cannot discriminate for it) plus the receive watermark. `shouldFireStallKick`
+holds that decision, because the stamp it checks is also the re-detection throttle: a kick skipped because
+the leg reconnected has to hand the stamp back, or a fresh socket that stalls too is never detected — its
+`lastReceivedTime` can never move past a stamp it never advanced.
 
 Their jitter is drawn once
 per sweep rather than per entry: a per-entry draw would vary consecutive delays by up to ±200 ms and let
