@@ -1532,11 +1532,12 @@ function blobGapKeyPart(value: unknown, depth = 0, seen?: Set<object>): string {
 	}
 }
 
-// Socket generations a delivery may go unseen before its entry is dropped. The #683 timer reconnects
-// precisely to re-stream every held delivery, so one that is not re-held for two generations has
-// healed, been skipped past, or been superseded by a new source file id — it will never be charged
-// again and would otherwise occupy the budget for the process lifetime. A wrong drop (two sockets
-// in a row that died before reaching it) costs that delivery one more budget, never an unbounded hold.
+// Active socket generations (ones that settled at least one budgeted delivery) a delivery may go unseen
+// before its entry is dropped. The #683 timer reconnects precisely to re-stream every held delivery, so
+// one that two such generations did not re-hold has healed, been skipped past, or been superseded by a
+// new source file id — it will never be charged again and would otherwise occupy the budget for the
+// process lifetime. Sockets that die before settling anything (a peer in a restart loop, a copy the
+// watchdogs keep terminating) do not count, so an unstable link cannot reset a held delivery's clock.
 const BLOB_GAP_RETIRE_AFTER_GENERATIONS = 2;
 
 /**
@@ -1550,7 +1551,7 @@ const BLOB_GAP_RETIRE_AFTER_GENERATIONS = 2;
  * generation makes room, and a hold that still cannot be tracked is charged against one shared cohort
  * entry with the same bounds (it conflates its members, which is why `maxTracked` is generous; without
  * it, `maxTracked + 1` persistent gaps could rotate forever with no gap-free generation). Entries unseen
- * for BLOB_GAP_RETIRE_AFTER_GENERATIONS socket generations are retired.
+ * for BLOB_GAP_RETIRE_AFTER_GENERATIONS active socket generations are retired.
  */
 export function createBlobGapEscalationBudget(opts: {
 	maxCycles: number;
@@ -1562,18 +1563,32 @@ export function createBlobGapEscalationBudget(opts: {
 }) {
 	const maxTracked = opts.maxTracked ?? BLOB_GAP_BUDGET_MAX_TRACKED;
 	const now = opts.now ?? (() => performance.now());
-	type Entry = { firstHeldAt: number; cycles: number; lastGeneration: number; exhausted: boolean };
+	type Entry = { firstHeldAt: number; cycles: number; lastGeneration: number; lastEpoch: number; exhausted: boolean };
 	const held = new Map<string, Entry>();
 	let cohort: Entry | undefined;
 	let currentGeneration = opts.generation ?? 0;
 	let capacityWarnedGeneration = -1;
+	// Activity epochs: one per socket generation that charged or settled at least one delivery.
+	let activeEpoch = 0;
+	let activeGeneration = -1;
 	const isStale = (generation: number) => {
 		if (generation < currentGeneration) return true;
 		currentGeneration = generation;
+		if (generation !== activeGeneration) {
+			activeGeneration = generation;
+			activeEpoch++;
+		}
 		return false;
 	};
-	const newEntry = (at: number): Entry => ({ firstHeldAt: at, cycles: 0, lastGeneration: -1, exhausted: false });
+	const newEntry = (at: number): Entry => ({
+		firstHeldAt: at,
+		cycles: 0,
+		lastGeneration: -1,
+		lastEpoch: activeEpoch,
+		exhausted: false,
+	});
 	const advance = (entry: Entry, generation: number, at: number): BlobGapEscalation | undefined => {
+		entry.lastEpoch = activeEpoch;
 		if (entry.lastGeneration !== generation) {
 			entry.cycles++;
 			entry.lastGeneration = generation;
@@ -1601,10 +1616,11 @@ export function createBlobGapEscalationBudget(opts: {
 		beginGeneration(generation: number): void {
 			if (generation <= currentGeneration) return;
 			currentGeneration = generation;
+			const silentSince = activeEpoch - BLOB_GAP_RETIRE_AFTER_GENERATIONS;
 			for (const [key, entry] of held) {
-				if (entry.lastGeneration < generation - BLOB_GAP_RETIRE_AFTER_GENERATIONS) held.delete(key);
+				if (entry.lastEpoch <= silentSince) held.delete(key);
 			}
-			if (cohort && cohort.lastGeneration < generation - BLOB_GAP_RETIRE_AFTER_GENERATIONS) cohort = undefined;
+			if (cohort && cohort.lastEpoch <= silentSince) cohort = undefined;
 		},
 		/**
 		 * `key` is holding the cursor in socket `generation`; returns the escalation to apply once its budget
@@ -1640,6 +1656,16 @@ export function createBlobGapEscalationBudget(opts: {
 			return held.size;
 		},
 	};
+}
+
+// A module-level factory so the budget, which outlives every socket, retains only these two strings and
+// not the allocating socket's whole replicateOverWS scope.
+function blobGapCapacityWarning(peer: string, database: string): (tracked: number) => void {
+	return (tracked) =>
+		logger.warn?.(
+			`Blob-gap escalation budget for ${peer} (db: "${database}") is tracking ${tracked} held deliveries, its capacity; ` +
+				`further held deliveries share one capacity budget until a tracked one settles (harper-pro#432)`
+		);
 }
 
 export function describeBlobGapEscalation(
@@ -6759,8 +6785,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 		}
 	}
-	// Drops a delivery's budget entry: it saved, or a permanent source failure skipped it for good. A
-	// budget with nothing tracked costs one size check, so the healthy path builds no key.
+	// A budget with nothing tracked costs one size check, so the healthy path builds no key.
 	function settleBlobGapBudget(blobId: string, id: unknown, tableName: string | undefined) {
 		const budget = options.connection?.blobGapBudget;
 		if (budget && budget.size > 0) budget.resolve(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
@@ -6893,11 +6918,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								maxCycles: BLOB_GAP_ESCALATION_CYCLES,
 								maxHoldMs: BLOB_GAP_ESCALATION_MS,
 								generation: options.connection.blobGapGeneration,
-								onCapacity: (tracked) =>
-									logger.warn?.(
-										`Blob-gap escalation budget for ${remoteNodeName} (db: "${databaseName}") is tracking ${tracked} held deliveries, its capacity; ` +
-											`further held deliveries share one capacity budget until a tracked one settles (harper-pro#432)`
-									),
+								onCapacity: blobGapCapacityWarning(remoteNodeName, databaseName),
 							}));
 							const escalation = budget.charge(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
 							if (escalation) markSourceBlobUnavailable(err, escalation);

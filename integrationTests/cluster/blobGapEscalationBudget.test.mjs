@@ -184,7 +184,7 @@ suite('Blob-gap escalation budget bounds a 503-forever source (#432)', { timeout
 			authorization: 'Bearer ' + tokenResp.operation_token,
 		});
 
-		// Oracle 1: the budget trips on the configured cycle and the escalation line names the delivery.
+		// The budget trips on the configured cycle and the escalation line names the delivery.
 		const escalation = await waitForCondition(
 			async () => {
 				const log = await readLog(B);
@@ -212,7 +212,7 @@ suite('Blob-gap escalation budget bounds a 503-forever source (#432)', { timeout
 			`[#432] escalated blob ${blobId} of record ${recordId} after ${cyclesText} cycles; watchdog fires so far ${firesAtEscalation}`
 		);
 
-		// Oracle 2 + 3: the copy completes past the skipped delivery, and the watchdog goes quiet.
+		// The copy completes past the skipped delivery, and the watchdog goes quiet.
 		await waitForCondition((signal) => describeTable(B, signal).then((n) => n >= SEED_RECORDS), {
 			timeoutMs: 60000,
 			description: `B to receive all ${SEED_RECORDS} seeded records`,
@@ -239,7 +239,7 @@ suite('Blob-gap escalation budget bounds a 503-forever source (#432)', { timeout
 			description: 'the marker record to replicate to B after the skip',
 		});
 
-		// Oracle 4: the persisted cursor is past the bad delivery. After a restart B resumes from disk; if the
+		// The persisted cursor is past the bad delivery. After a restart B resumes from disk; if the
 		// cursor were still pinned, A would re-stream the bad record (a fresh "Error sending blob" on A and a
 		// fresh hold/escalation on B) before or alongside the second marker.
 		const sourceSendErrorsBefore = count(await readLog(A), SOURCE_SEND_ERROR);
@@ -271,7 +271,7 @@ suite('Blob-gap escalation budget bounds a 503-forever source (#432)', { timeout
 		);
 		equal(count(bLog, WATCHDOG_FIRE), firesAtEscalation, 'B re-held the cursor after restart');
 
-		// Oracle 5: the skipped record is repairable. Heal the source, then run the repair sweep on B.
+		// The skipped record is repairable. Heal the source, then run the repair sweep on B.
 		await writeFile(ctx.healFile, '');
 		await waitForCondition(async () => (await readLog(A)).includes('[blob-pending-source] healed 1 file(s)'), {
 			timeoutMs: 15000,
