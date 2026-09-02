@@ -1,16 +1,7 @@
 /**
- * Coverage for the cross-reconnect blob-gap escalation budget (harper-pro#432).
- *
- * Background: a source-reported 503 (PENDING placeholder / read timeout at the origin) holds the
- * receiver's resume cursor (`hasBlobGap`) until the #683 timer reconnects; the re-stream reproduces the
- * 503 and every per-socket counter restarts with the socket, so a source that answers 503 forever pinned
- * the cursor forever. `createBlobGapEscalationBudget` lives on the persistent NodeReplicationConnection
- * and charges one cycle per socket generation per held delivery; an exhausted delivery is reclassified
- * as unrecoverable (`markSourceBlobUnavailable`) so the existing advance-past branch skips it.
- *
- * These tests pin the contract the production wiring depends on: one charge per generation, the cycle
- * and wall-clock bounds, resolve-resets, per-delivery independence, stickiness after exhaustion (the
- * leapfrog guard), stale-generation inertness, and the never-skip-before-budget capacity policy.
+ * Contract of the cross-reconnect blob-gap escalation budget (harper-pro#432; policy in
+ * replication/DESIGN.md item 8): one charge per socket generation, the two bounds, resolve-resets,
+ * stickiness (the leapfrog guard), generation fencing, retirement, and the capacity policy.
  */
 
 import assert from 'node:assert';
@@ -194,18 +185,34 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		assert.equal(budget.size, 1);
 	});
 
-	it('drops an exhausted delivery unseen for two socket generations, never a live one', () => {
+	it('retires any entry unseen for two socket generations, exhausted or live', () => {
 		const budget = createBlobGapEscalationBudget({ maxCycles: 2, maxHoldMs: 0, now: fakeClock().now });
 		budget.charge(A, 1);
 		budget.charge(B, 1);
-		budget.charge(A, 2); // A exhausted at generation 2; B still live at one cycle
+		budget.charge(A, 2); // A exhausted at generation 2; B live, last held in generation 1
 		budget.beginGeneration(3);
+		assert.equal(budget.size, 2);
 		budget.beginGeneration(4);
-		assert.equal(budget.size, 2); // A last seen in generation 2: not yet two generations silent
+		assert.equal(budget.size, 1); // B silent for generations 2 and 3: retired
 		budget.beginGeneration(5);
-		assert.equal(budget.size, 1); // A dropped; B (live) kept
-		assert.equal(budget.charge(B, 5).cycles, 2);
-		assert.equal(budget.charge(A, 5), undefined); // A re-held after the drop starts a fresh budget
+		assert.equal(budget.size, 0); // A silent for generations 3 and 4: retired
+		assert.equal(budget.charge(A, 5), undefined); // re-held after retirement: a fresh budget
+		assert.equal(budget.charge(B, 5), undefined);
+	});
+
+	it('does not retire a delivery re-held in one of the last two generations', () => {
+		const budget = createBlobGapEscalationBudget({ maxCycles: 5, maxHoldMs: 0, now: fakeClock().now });
+		budget.charge(A, 1);
+		budget.beginGeneration(2); // socket died before re-streaming A
+		budget.beginGeneration(3);
+		assert.equal(budget.size, 1);
+		assert.equal(budget.charge(A, 3), undefined);
+		budget.beginGeneration(4);
+		budget.beginGeneration(5);
+		assert.equal(budget.size, 1);
+		assert.equal(budget.charge(A, 5), undefined);
+		assert.equal(budget.charge(A, 6), undefined);
+		assert.equal(budget.charge(A, 7).cycles, 5);
 	});
 
 	it('keeps an exhausted delivery that is still re-streamed every generation', () => {
