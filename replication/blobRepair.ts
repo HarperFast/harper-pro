@@ -18,6 +18,9 @@ const REPAIR_RETRY_MAX_MS = 1000;
 // scanning at full speed: pacing exists to stop a hot loop, and inferring the rest of the cursor from an
 // unrepairable prefix would silently skip records a later peer can still serve. A repair restarts it.
 const REPAIR_PACING_BUDGET_MS = 60_000;
+// Once unpaced the per-record warn would fire at peer-RTT rate for the rest of the sweep — hundreds of
+// thousands of lines during exactly the incident where the log is the diagnostic channel. Sample it.
+const REPAIR_UNPACED_WARN_EVERY = 100;
 
 export async function allBlobsAreComplete(
 	blobs: any[],
@@ -96,7 +99,15 @@ export async function repairBlobs(
 			pacingSpent = false;
 		} else {
 			failed++;
-			logger.warn?.('Could not repair blob for record', recordId, 'in', tableName, '— no peer had a complete copy');
+			if (!pacingSpent || failed % REPAIR_UNPACED_WARN_EVERY === 0)
+				logger.warn?.(
+					'Could not repair blob for record',
+					recordId,
+					'in',
+					tableName,
+					'— no peer had a complete copy',
+					pacingSpent ? `(${failed} failed so far; sampling 1 in ${REPAIR_UNPACED_WARN_EVERY})` : ''
+				);
 			const delay = backoff.nextDelay();
 			if (delay === undefined) {
 				if (!pacingSpent) {

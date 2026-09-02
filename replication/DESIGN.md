@@ -122,7 +122,9 @@ decorrelated schedule.** Pacing alone is not enough; the storm surface below nee
 | `runNodeUpdateWatcher` (`knownNodes.ts`) — hdb_nodes watcher restart            | full-jitter ceiling 1 s → 30 s                                                                                                                                                                                                                                             | an iteration that survived `NODE_WATCHER_HEALTHY_UPTIME_MS`    |
 | `shouldCloseSendAuthWatch` reprobe (`replicationConnection.ts`)                 | 500 ms → 5 s under a 30 s wall-clock budget, then fails closed                                                                                                                                                                                                             | n/a (one-shot loop)                                            |
 | `fetchJWTKeyWithRetry`, the clone version probe (`cloneNode/`)                  | 250 ms → 1 s / 1 s → 4 s, attempt count unchanged                                                                                                                                                                                                                          | n/a                                                            |
-| `repairBlobs` (`blobRepair.ts`) — per-record                                    | 50 ms → 1 s, only on a record no peer could repair; the sweep ends once the schedule is exhausted (100 consecutive)                                                                                                                                                        | a repaired record                                              |
+| `repairBlobs` (`blobRepair.ts`) — per-record                                    | 50 ms → 1 s, only on a record no peer could repair, under a 60 s per-failure-run pacing budget; once that is spent the sweep keeps scanning unpaced (with a sampled warn) rather than stopping, so an unrepairable prefix cannot hide the records behind it                | a repaired record                                              |
+| copy-cursor flush retry (`replicationConnection.ts`) — `onPersistFailure`       | fixed 250 ms floor, ceiling 250 ms → 30 s; the floor is what the `copyFlushBackoffUntil` guard depends on                                                                                                                                                                  | a flush that persisted the cursor                              |
+| worker readiness re-attempt (`subscriptionManager.ts`)                          | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s, one armed re-attempt at a time                                                                                                                                                                    | components loaded                                              |
 
 **The subscription-setup scheduler is the one with dedup.** `onDatabase` used to turn every qualifying
 node update straight into a retained (not unref'd) 200 ms `setTimeout` plus a `subscribe-to-node`
@@ -139,8 +141,10 @@ A setup is cancelled on
 connect, on unsubscribe, on node deletion, and on a same-name URL migration, all of which became
 reachable once a pending timer could live 30 s instead of 200 ms. The wedge/stall recovery kicks are
 owned the same way — one `entry.reDriveTimer` per entry, so a staggered sweep that outruns the
-reconcile window that started it replaces its predecessor instead of stacking another wave, and only the
-worker that currently owns an entry may retire its pending setup on connect. Their jitter is drawn once
+reconcile window that started it replaces its predecessor instead of stacking another wave, disarmed when
+the owning worker exits or the entry is replaced, and only the worker that currently owns an entry may
+retire its pending setup on connect (the report carries the sending thread id; see
+`connectReportOwnsEntry`). Their jitter is drawn once
 per sweep rather than per entry: a per-entry draw would vary consecutive delays by up to ±200 ms and let
 several dials share a 50 ms instant, which is the concurrency the `RECONNECT_STAGGER_MS` spacing exists to
 bound (#446). The warn moved inside the "actually armed" branch: it now describes an attempt, not an
@@ -148,14 +152,18 @@ event.
 
 The worker boundary has one additional admission point for its asynchronous startup window. Before
 components are ready, one insertion-ordered map retains only the latest subscribe/unsubscribe message
-per actual connection key and database, with one continuation on the readiness promise. After readiness,
+per actual connection key and database, with one continuation on the readiness promise — and, if that
+readiness rejects, exactly one armed re-attempt on the same schedule, so the retained actions apply without
+waiting for another message or the wedge reconcile. After readiness,
 the handlers run inline and allocate no queue state; the existing connection map is then the single-flight
 owner. Subscribe, unsubscribe, force-reconnect, and startup admission all derive the connection key through
 `getSubscriptionConnectionKey`, including the missing nested-URL fallback.
 
-**What is deliberately NOT on this schedule:** the receive/copy watchdogs and their thresholds (they
-_detect_ stalls; this discipline paces _retries_), `blobGapReconnectTimer`, the in-place
-`BLOB_SEND_RETRY_DELAYS_MS` 503 retries, `PING_INTERVAL`/`PING_TIMEOUT`, and `RECONCILE_INTERVAL_MS`.
+**What is deliberately NOT on this schedule:** the receive/copy watchdogs and their thresholds, and the
+doubling copy-finalize _timeout bound_ alongside them (these _detect_ stalls or bound a wait; this
+discipline paces _retries_, and jittering a durability deadline would be actively wrong),
+`blobGapReconnectTimer`, the in-place `BLOB_SEND_RETRY_DELAYS_MS` 503 retries,
+`PING_INTERVAL`/`PING_TIMEOUT`, and `RECONCILE_INTERVAL_MS`.
 
 ---
 

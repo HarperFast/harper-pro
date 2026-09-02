@@ -106,7 +106,7 @@ describe('worker subscription admission', () => {
 		await waitForTurn();
 
 		assert.deepEqual(errors, ['load failed 1', 'load failed 2']);
-		assert.deepEqual(retries, [199, 399], 'the re-attempt delay escalates under the shared schedule');
+		assert.deepEqual(retries, [399, 799], 'the re-attempt delay escalates under the shared schedule');
 		assert.deepEqual(actions, [1], 'the retained action is applied once readiness succeeds');
 		assert.equal(admission.pendingCount(), 0);
 	});
@@ -140,6 +140,23 @@ describe('worker subscription admission', () => {
 		fire();
 		await waitForTurn();
 		assert.equal(readinessCalls, 2, 'the armed retry is the one that re-attempts');
+	});
+
+	// Full jitter with no floor would draw near 0 and re-attempt on the next macrotask, turning a boot-time
+	// component-load failure into a spin of imports and warn lines — the shape this gate exists to bound.
+	it('never re-attempts below the floor, even on a zero draw', async () => {
+		const retries = [];
+		const admission = createWorkerSubscriptionAdmission({
+			whenReady: () => Promise.reject(new Error('load failed')),
+			key: (message) => message.key,
+			dispatch: () => assert.fail('nothing should dispatch'),
+			onError: () => {},
+			retry: (delayMs) => retries.push(delayMs),
+			random: () => 0,
+		});
+		admission.submit({ key: 'peer\0data' });
+		await waitForTurn();
+		assert.deepEqual(retries, [200]);
 	});
 
 	it('stops re-attempting once nothing is pending', async () => {

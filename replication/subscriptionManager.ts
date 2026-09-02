@@ -370,21 +370,18 @@ function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string }
 // `worker: undefined` when httpWorkers is empty, and without this the entry would never
 // get reassigned once workers came back. Pure helper so the reconcile pass below — and its
 // unit tests — can verify the broken-chain detection without spinning up real workers.
-// Clear a dead worker from every subscription entry it owned, so findStaleNodeUrls re-binds those
-// entries on a live worker. Pure helper (like findStaleNodeUrls) so its behavior is unit-testable without
-// real worker threads. Returns whether the worker owned any entries. See harper-pro#357.
-/**
- * Whether a 'connected-to-node' report may retire the entry's pending setup and recovery. The stale-worker
- * path in `onDatabase` recreates an entry on a new worker while the old worker's hung-but-open connection
- * can still report 'open' for the same (url, database); retiring on that report would cancel the
- * replacement's setup and leave it unsubscribed with `connected: true`, which the wedge net then skips.
- * An untagged report (the main thread's own truth-driven up-correction, or an inline subscribe with no
- * worker) is trusted.
- */
+// Whether a 'connected-to-node' report may retire the entry's pending setup and recovery. The stale-worker
+// path in onDatabase recreates an entry on a new worker while the old worker's hung-but-open connection can
+// still report 'open' for the same (url, database); retiring on that report would cancel the replacement's
+// setup and leave it unsubscribed with connected:true, which the wedge net then skips. An untagged report
+// (the main thread's own truth-driven up-correction, or an inline subscribe with no worker) is trusted.
 export function connectReportOwnsEntry(entry: { worker?: any }, reportingThreadId?: number): boolean {
 	return reportingThreadId === undefined || reportingThreadId === entry?.worker?.threadId;
 }
 
+// Clear a dead worker from every subscription entry it owned, so findStaleNodeUrls re-binds those
+// entries on a live worker. Pure helper (like findStaleNodeUrls) so its behavior is unit-testable without
+// real worker threads. Returns whether the worker owned any entries. See harper-pro#357.
 export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationStatusMap>, worker: any): boolean {
 	let owned = false;
 	for (const dbReplicationWorkers of connectionMap.values()) {
@@ -1017,8 +1014,7 @@ export async function startOnMainThread(options) {
 					!existingEntry.unsubscribed &&
 					!(forceResubscribe && existingEntry.connected === false)
 				) {
-					// Nothing new to send for an already-subscribed entry, but an armed setup would otherwise
-					// still be holding the payload from before this update.
+					// An armed setup would otherwise fire with the payload from before this update.
 					subscribeSetupScheduler.refreshPending(getNodeURL(node), databaseName, nodes);
 					return;
 				}
@@ -1118,8 +1114,8 @@ export async function startOnMainThread(options) {
 				// Keep the entry for URL/iterator cleanup, but bypass the reuse fast path after an
 				// explicit unsubscribe so restoring membership can schedule subscribe-to-node again.
 				if (existingEntry) existingEntry.unsubscribed = true;
-				// A setup armed for this pair can now be up to 30s from firing; without this it would
-				// re-subscribe right after we told the worker to unsubscribe. Same for a recovery kick.
+				// A setup armed for this pair can be up to 30s from firing, and would re-subscribe right
+				// after the worker was told to unsubscribe. Same for a recovery kick.
 				subscribeSetupScheduler.cancel(getNodeURL(node), databaseName);
 				if (existingEntry) {
 					clearTimeout(existingEntry.reDriveTimer);
@@ -1691,8 +1687,9 @@ export function createWorkerSubscriptionAdmission(deps: {
 				// gate exists to close (harper-pro#289 / #233). Re-attempt on the shared schedule instead.
 				if (!ready && pending.size > 0) {
 					retryBackoff ??= createBackoff({
-						initialMs: NODE_SUBSCRIBE_DELAY,
+						initialMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
 						maxMs: NODE_SUBSCRIBE_MAX_DELAY_MS,
+						minMs: NODE_SUBSCRIBE_DELAY,
 						random: deps.random,
 					});
 					const delay = retryBackoff.nextDelay();
