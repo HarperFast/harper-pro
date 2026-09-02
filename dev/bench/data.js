@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788335686191,
+  "lastUpdate": 1788335688881,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -9335,6 +9335,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 61.7,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "e506fcb4253dc123ffc6ef50168fbaa35d462094",
+          "message": "Automerge workflow actions only, gate the rest (#702)\n\n* chore(renovate): automerge workflow actions only, gate the rest\n\nAutomerge is scoped to the github-actions manager because PR CI runs the\nworkflows. No PR-triggered job builds Dockerfile, Dockerfile-gpu or\nDockerfile-openshift, so a repo-wide automerge would have landed base-image\nbumps — including the fully-pinned nvidia/cuda runtime — on a suite that never\ncompiled the image.\n\nMajors, 0.x minors, and the load-bearing dependency list never automerge, in\nstep with harper's policy. rocksdb-js is disabled outright; its own release\nworkflow proposes it.\n\nThe root manifest stays disabled (those follow core), but matchFileNames is\nexact-path, so nested manifests under integrationTests/ remain managed — the\ndescription now says root manifest rather than implying all npm dependencies.\nmatchFiles was the removed spelling and worked only through Renovate's\nconfig-migration shim.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* Gate Renovate automerge on exercised workflows\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n* Separate tested action updates from release workflows\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n* Align Renovate automerge with required checks\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n* Clarify Renovate gate ownership\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n* Remove unit workflow from Renovate automerge\n\nCo-Authored-By: GPT-5 Codex <noreply@openai.com>\n\n---------\n\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>\nCo-authored-by: GPT-5 Codex <noreply@openai.com>",
+          "timestamp": "2026-09-01T19:12:37Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/e506fcb4253dc123ffc6ef50168fbaa35d462094"
+        },
+        "date": 1788335688852,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 5.47,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 6.69,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 7.67,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 18.72,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 19.25,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 45.16,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 89.88,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 74.98,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 145.01,
             "unit": "ms"
           }
         ]
