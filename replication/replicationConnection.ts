@@ -1475,14 +1475,15 @@ export function shouldRetrySourceBlobRead(state: {
 	);
 }
 
-export type BlobGapEscalation = { cycles: number; heldMs: number };
+export type BlobGapEscalation = { cycles: number; heldMs: number; cohort?: boolean };
 export type BlobGapEscalationBudget = ReturnType<typeof createBlobGapEscalationBudget>;
 
 /**
  * One held delivery's identity across re-streams. Total and non-throwing: it runs inside the blob-save
  * settlement chain, where a throw would reject the tracked promise onCommit awaits. Record ids are
- * tagged by type (a numeric 1 and a string "1" are different keys) and structured ids serialize
- * element-wise with BigInt support.
+ * tagged by type (a numeric 1 and a string "1" are different keys), free-form strings are
+ * length-prefixed so no delimiter can alias two structures, and structured ids serialize element-wise
+ * with BigInt support.
  */
 export function blobGapDeliveryKey(fileId: unknown, recordId: unknown, tableName?: string): string {
 	return `${fileId}|${tableName ?? ''}|${blobGapKeyPart(recordId)}`;
@@ -1492,7 +1493,7 @@ export function blobGapDeliveryKey(fileId: unknown, recordId: unknown, tableName
 function blobGapKeyPart(value: unknown, depth = 0, seen?: Set<object>): string {
 	switch (typeof value) {
 		case 'string':
-			return 's:' + value;
+			return `s${value.length}:${value}`;
 		case 'number':
 			return 'n:' + value;
 		case 'bigint':
@@ -1513,7 +1514,10 @@ function blobGapKeyPart(value: unknown, depth = 0, seen?: Set<object>): string {
 					'{' +
 					Object.keys(value)
 						.sort()
-						.map((key) => key + '=' + blobGapKeyPart((value as Record<string, unknown>)[key], depth + 1, seen))
+						.map(
+							(key) =>
+								`${key.length}:${key}=` + blobGapKeyPart((value as Record<string, unknown>)[key], depth + 1, seen)
+						)
 						.join(',') +
 					'}'
 				);
@@ -1521,8 +1525,10 @@ function blobGapKeyPart(value: unknown, depth = 0, seen?: Set<object>): string {
 				return 'o:' + Object.prototype.toString.call(value);
 			}
 		}
-		default:
-			return `${typeof value}:${String(value)}`;
+		default: {
+			const text = String(value);
+			return `${typeof value}${text.length}:${text}`;
+		}
 	}
 }
 
@@ -1539,10 +1545,12 @@ const BLOB_GAP_RETIRE_AFTER_GENERATIONS = 2;
  * per socket generation per delivery. Invariants the wiring relies on: exhaustion is STICKY until a
  * successful save of that delivery (forgetting it lets two deliveries with offset phases leapfrog
  * forever); a charge or resolve from a generation older than the newest begun is ignored (a retired
- * socket's late settlements must not touch the live budget); live progress is never dropped for room
- * and no delivery is skipped before its budget — at `maxTracked` the oldest exhausted entry makes room,
- * and with every tracked delivery still live a new hold simply stays untracked (held) until one
- * exhausts. Entries unseen for BLOB_GAP_RETIRE_AFTER_GENERATIONS socket generations are retired.
+ * socket's late settlements must not touch the live budget); live progress is never dropped for room,
+ * and every hold has a terminal bound even at capacity — the oldest exhausted entry not re-held this
+ * generation makes room, and a hold that still cannot be tracked is charged against one shared cohort
+ * entry with the same bounds (it conflates its members, which is why `maxTracked` is generous; without
+ * it, `maxTracked + 1` persistent gaps could rotate forever with no gap-free generation). Entries unseen
+ * for BLOB_GAP_RETIRE_AFTER_GENERATIONS socket generations are retired.
  */
 export function createBlobGapEscalationBudget(opts: {
 	maxCycles: number;
@@ -1556,6 +1564,7 @@ export function createBlobGapEscalationBudget(opts: {
 	const now = opts.now ?? (() => performance.now());
 	type Entry = { firstHeldAt: number; cycles: number; lastGeneration: number; exhausted: boolean };
 	const held = new Map<string, Entry>();
+	let cohort: Entry | undefined;
 	let currentGeneration = opts.generation ?? 0;
 	let capacityWarnedGeneration = -1;
 	const isStale = (generation: number) => {
@@ -1563,11 +1572,24 @@ export function createBlobGapEscalationBudget(opts: {
 		currentGeneration = generation;
 		return false;
 	};
-	// Oldest exhausted entry first (Map iteration is insertion order): its record was already skipped
-	// past, so dropping it never touches live progress; a later re-hold of it starts one more budget.
-	const evictExhausted = (): boolean => {
+	const newEntry = (at: number): Entry => ({ firstHeldAt: at, cycles: 0, lastGeneration: -1, exhausted: false });
+	const advance = (entry: Entry, generation: number, at: number): BlobGapEscalation | undefined => {
+		if (entry.lastGeneration !== generation) {
+			entry.cycles++;
+			entry.lastGeneration = generation;
+		}
+		const heldMs = at - entry.firstHeldAt;
+		if (!entry.exhausted) {
+			entry.exhausted =
+				(opts.maxCycles > 0 && entry.cycles >= opts.maxCycles) || (opts.maxHoldMs > 0 && heldMs >= opts.maxHoldMs);
+		}
+		return entry.exhausted ? { cycles: entry.cycles, heldMs } : undefined;
+	};
+	// Oldest exhausted entry this socket has not re-held (Map iteration is insertion order): its record
+	// was skipped past, so dropping it touches no live progress; a re-held one keeps its stickiness.
+	const evictExhausted = (generation: number): boolean => {
 		for (const [key, entry] of held) {
-			if (entry.exhausted) {
+			if (entry.exhausted && entry.lastGeneration < generation) {
 				held.delete(key);
 				return true;
 			}
@@ -1582,6 +1604,7 @@ export function createBlobGapEscalationBudget(opts: {
 			for (const [key, entry] of held) {
 				if (entry.lastGeneration < generation - BLOB_GAP_RETIRE_AFTER_GENERATIONS) held.delete(key);
 			}
+			if (cohort && cohort.lastGeneration < generation - BLOB_GAP_RETIRE_AFTER_GENERATIONS) cohort = undefined;
 		},
 		/**
 		 * `key` is holding the cursor in socket `generation`; returns the escalation to apply once its budget
@@ -1592,28 +1615,21 @@ export function createBlobGapEscalationBudget(opts: {
 			const at = now();
 			let entry = held.get(key);
 			if (!entry) {
-				if (held.size >= maxTracked && !evictExhausted()) {
+				if (held.size >= maxTracked && !evictExhausted(generation)) {
 					if (capacityWarnedGeneration !== generation) {
 						capacityWarnedGeneration = generation;
 						try {
 							opts.onCapacity?.(held.size);
 						} catch {}
 					}
-					return undefined;
+					cohort ??= newEntry(at);
+					const escalation = advance(cohort, generation, at);
+					return escalation && { ...escalation, cohort: true };
 				}
-				entry = { firstHeldAt: at, cycles: 0, lastGeneration: -1, exhausted: false };
+				entry = newEntry(at);
 				held.set(key, entry);
 			}
-			if (entry.lastGeneration !== generation) {
-				entry.cycles++;
-				entry.lastGeneration = generation;
-			}
-			const heldMs = at - entry.firstHeldAt;
-			if (!entry.exhausted) {
-				entry.exhausted =
-					(opts.maxCycles > 0 && entry.cycles >= opts.maxCycles) || (opts.maxHoldMs > 0 && heldMs >= opts.maxHoldMs);
-			}
-			return entry.exhausted ? { cycles: entry.cycles, heldMs } : undefined;
+			return advance(entry, generation, at);
 		},
 		/** `key` is settled (saved, or skipped past for good); a later hold of it starts a fresh budget. */
 		resolve(key: string, generation: number): void {
@@ -1632,7 +1648,11 @@ export function describeBlobGapEscalation(
 ): string {
 	return (
 		`blob-gap escalation budget exhausted after ${escalation.cycles} reconnect cycle(s) holding it for ${Math.round(escalation.heldMs)}ms ` +
-		`(limits: ${limits.maxCycles || 'no'} cycles / ${limits.maxHoldMs || 'no'} ms)`
+		`(limits: ${limits.maxCycles || 'no'} cycles / ${limits.maxHoldMs || 'no'} ms` +
+		(escalation.cohort
+			? '; charged against the shared capacity budget, the connection tracks its maximum of held deliveries'
+			: '') +
+		')'
 	);
 }
 
@@ -6739,6 +6759,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 		}
 	}
+	// Drops a delivery's budget entry: it saved, or a permanent source failure skipped it for good. A
+	// budget with nothing tracked costs one size check, so the healthy path builds no key.
+	function settleBlobGapBudget(blobId: string, id: unknown, tableName: string | undefined) {
+		const budget = options.connection?.blobGapBudget;
+		if (budget && budget.size > 0) budget.resolve(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
+	}
 	function receiveBlobs(
 		remoteBlob: Blob,
 		id: string | number,
@@ -6822,12 +6848,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyWatermark.trackBlob(copyFrameIndex);
 			let copyBlobGapped = false;
 			let saveFailed = false;
-			// Drops this delivery's budget entry: it saved, or a permanent source failure skipped it for good.
-			// A budget with nothing tracked costs one size check, so the healthy path builds no key.
-			const settleBlobGapBudget = () => {
-				const budget = options.connection?.blobGapBudget;
-				if (budget && budget.size > 0) budget.resolve(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
-			};
 			// We log the rejection via .catch() and also need the resulting promise — not the
 			// raw `finished` — to be what we hand to `Promise.all(outstandingBlobsToFinish)` in
 			// the end_txn onCommit path below. If we pushed `finished` directly, a save
@@ -6876,13 +6896,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								onCapacity: (tracked) =>
 									logger.warn?.(
 										`Blob-gap escalation budget for ${remoteNodeName} (db: "${databaseName}") is tracking ${tracked} held deliveries, its capacity; ` +
-											`further held deliveries stay untracked (held, not skipped) until a tracked one exhausts (harper-pro#432)`
+											`further held deliveries share one capacity budget until a tracked one settles (harper-pro#432)`
 									),
 							}));
 							const escalation = budget.charge(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
 							if (escalation) markSourceBlobUnavailable(err, escalation);
 						} else if (isUnrecoverableSourceBlobError(err)) {
-							settleBlobGapBudget();
+							settleBlobGapBudget(blobId, id, tableName);
 						}
 					} catch (budgetError) {
 						logger.warn?.(`Blob-gap escalation budget error for ${blobId} from ${remoteNodeName}`, budgetError);
@@ -6946,7 +6966,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
 					if (!saveFailed) {
 						try {
-							settleBlobGapBudget();
+							settleBlobGapBudget(blobId, id, tableName);
 						} catch (budgetError) {
 							logger.warn?.(`Blob-gap escalation budget error for ${blobId} from ${remoteNodeName}`, budgetError);
 						}
