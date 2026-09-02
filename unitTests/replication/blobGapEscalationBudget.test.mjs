@@ -143,7 +143,7 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		budget.charge(A, 1);
 		budget.charge(B, 1);
 		const C = blobGapDeliveryKey('c3', 3);
-		assert.equal(budget.charge(C, 1), undefined); // held, charged to the cohort, not tracked
+		assert.equal(budget.charge(C, 1), undefined);
 		assert.equal(budget.charge(C, 1), undefined);
 		assert.equal(budget.size, 2);
 		assert.deepEqual(warnings, [2]);
@@ -173,14 +173,14 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 
 	it('at capacity displaces an exhausted entry the current socket has not re-held, keeping re-held ones sticky', () => {
 		const budget = createBlobGapEscalationBudget({ maxCycles: 1, maxHoldMs: 0, maxTracked: 2, now: fakeClock().now });
-		assert.equal(budget.charge(A, 1).cycles, 1); // exhausted
-		assert.equal(budget.charge(B, 1).cycles, 1); // exhausted
+		assert.equal(budget.charge(A, 1).cycles, 1);
+		assert.equal(budget.charge(B, 1).cycles, 1);
 		const C = blobGapDeliveryKey('c3', 3);
 		budget.beginGeneration(2);
-		assert.equal(budget.charge(A, 2).cycles, 2); // re-held: stays
-		assert.equal(budget.charge(C, 2).cycles, 1); // B (not re-held) displaced
+		assert.equal(budget.charge(A, 2).cycles, 2);
+		assert.equal(budget.charge(C, 2).cycles, 1);
 		assert.equal(budget.size, 2);
-		assert.deepEqual(budget.charge(B, 2), { cycles: 1, heldMs: 0, cohort: true }); // re-held after displacement: cohort
+		assert.deepEqual(budget.charge(B, 2), { cycles: 1, heldMs: 0, cohort: true });
 	});
 
 	it('a lazily created budget starts at the connection generation, so a retired socket cannot seed it', () => {
@@ -205,34 +205,32 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		assert.equal(budget.size, 1);
 	});
 
-	it('retires any entry unseen for two socket generations, exhausted or live', () => {
+	it('retires any entry unseen for two active socket generations, exhausted or live', () => {
 		const budget = createBlobGapEscalationBudget({ maxCycles: 2, maxHoldMs: 0, now: fakeClock().now });
+		const C = blobGapDeliveryKey('c3', 3);
 		budget.charge(A, 1);
 		budget.charge(B, 1);
 		budget.charge(A, 2); // A exhausted at generation 2; B live, last held in generation 1
 		budget.beginGeneration(3);
-		assert.equal(budget.size, 2);
+		budget.charge(C, 3); // generation 3 is active
 		budget.beginGeneration(4);
-		assert.equal(budget.size, 1); // B silent for generations 2 and 3: retired
+		assert.equal(budget.size, 2); // B silent for active generations 2 and 3: retired; A and C kept
+		budget.charge(C, 4);
 		budget.beginGeneration(5);
-		assert.equal(budget.size, 0); // A silent for generations 3 and 4: retired
+		assert.equal(budget.size, 1); // A silent for active generations 3 and 4: retired
 		assert.equal(budget.charge(A, 5), undefined); // re-held after retirement: a fresh budget
-		assert.equal(budget.charge(B, 5), undefined);
 	});
 
-	it('does not retire a delivery re-held in one of the last two generations', () => {
-		const budget = createBlobGapEscalationBudget({ maxCycles: 5, maxHoldMs: 0, now: fakeClock().now });
+	it('sockets that settle nothing do not count toward retirement', () => {
+		// A peer in a restart loop, or a copy the watchdogs keep terminating, burns generations without
+		// re-streaming the held delivery; its clock must survive that.
+		const clock = fakeClock();
+		const budget = createBlobGapEscalationBudget({ maxCycles: 100, maxHoldMs: 10_000, now: clock.now });
 		budget.charge(A, 1);
-		budget.beginGeneration(2); // socket died before re-streaming A
-		budget.beginGeneration(3);
+		for (let generation = 2; generation <= 12; generation++) budget.beginGeneration(generation);
 		assert.equal(budget.size, 1);
-		assert.equal(budget.charge(A, 3), undefined);
-		budget.beginGeneration(4);
-		budget.beginGeneration(5);
-		assert.equal(budget.size, 1);
-		assert.equal(budget.charge(A, 5), undefined);
-		assert.equal(budget.charge(A, 6), undefined);
-		assert.equal(budget.charge(A, 7).cycles, 5);
+		clock.tick(10_000);
+		assert.equal(budget.charge(A, 12).cycles, 2); // wall-clock bound from the original first hold
 	});
 
 	it('keeps an exhausted delivery that is still re-streamed every generation', () => {
