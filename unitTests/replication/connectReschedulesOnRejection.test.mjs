@@ -38,7 +38,11 @@ describe('NodeReplicationConnection connect() reschedules when createWebSocket r
 	// url = null makes createWebSocket reject (TypeError: Invalid URL) before any socket exists or any
 	// listener is attached — the exact pre-'open' rejection shape of the #466 wedge.
 	function makeRejectingConnection() {
-		return new NodeReplicationConnection(null, null, 'db', 'peer');
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		// The retry delay is drawn uniformly under the ceiling (harper-pro#327). Pin the draw to the top of
+		// the window so a single tick advances past exactly one retry.
+		connection.random = () => 0.999999;
+		return connection;
 	}
 
 	it('a createWebSocket rejection leaves reconnectScheduled=true with a pending retry, not a permanent stuck state', async () => {

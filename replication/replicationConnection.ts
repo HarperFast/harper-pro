@@ -101,6 +101,7 @@ import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
+import { createBackoff, type Backoff } from './backoff.ts';
 const logger = forComponent('replication').conditional as Logger;
 
 // msgpackr v2 removed the built-in `randomAccessStructure` option; that random-access
@@ -534,8 +535,13 @@ const PAUSE_STALL_THRESHOLD_MS = Math.max(
 // base-copy resync re-encodes the row against local structures), so a decode blip never de-authorizes
 // a healthy peer, while still bounding how long a revocation carried by an undecodable write can go
 // unenforced. Only reached on a genuine decode failure — a decodable row is evaluated on the first probe.
-const SEND_AUTH_REPROBE_INTERVAL_MS = 500;
-const SEND_AUTH_REPROBE_ATTEMPTS = 60;
+const SEND_AUTH_REPROBE_INITIAL_MS = 500;
+const SEND_AUTH_REPROBE_MAX_MS = 5_000;
+// The grace period is a wall-clock deadline, not a sum of sleeps: a resolver hang or event-loop stall
+// must not extend how long a revocation carried by an undecodable write can go unenforced.
+const SEND_AUTH_REPROBE_BUDGET_MS = 30_000;
+// Defense in depth for the deadline, and the whole bound when the clock does not advance (tests).
+const SEND_AUTH_REPROBE_ATTEMPTS = 120;
 
 /**
  * Decide whether the dynamic send-authorization watch (the per-subscriber `getHDBNodeTable().subscribe`
@@ -573,17 +579,25 @@ export async function shouldCloseSendAuthWatch(
 		isClosed: () => boolean;
 		onReprobeTimeout?: () => void;
 		resolve?: (name: string) => any;
-		sleep?: () => Promise<void>;
+		sleep?: (ms: number) => Promise<void>;
 		reprobeAttempts?: number;
+		reprobeBudgetMs?: number;
+		now?: () => number;
 	}
 ): Promise<boolean> {
 	const resolve = deps.resolve ?? resolveNodeForSendAuth;
-	const sleep = deps.sleep ?? (() => new Promise<void>((r) => setTimeout(r, SEND_AUTH_REPROBE_INTERVAL_MS).unref()));
-	const reprobeAttempts = deps.reprobeAttempts ?? SEND_AUTH_REPROBE_ATTEMPTS;
+	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref()));
+	const backoff = createBackoff({
+		initialMs: SEND_AUTH_REPROBE_INITIAL_MS,
+		maxMs: SEND_AUTH_REPROBE_MAX_MS,
+		budgetMs: deps.reprobeBudgetMs ?? SEND_AUTH_REPROBE_BUDGET_MS,
+		maxAttempts: deps.reprobeAttempts ?? SEND_AUTH_REPROBE_ATTEMPTS,
+		now: deps.now,
+	});
 
 	let node = isGenuineNodeDeletion(event.type) ? undefined : resolve(name);
-	for (let attempt = 0; node === SEND_AUTH_UNCHANGED && attempt < reprobeAttempts && !deps.isClosed(); attempt++) {
-		await sleep();
+	while (node === SEND_AUTH_UNCHANGED && !backoff.exhausted && !deps.isClosed()) {
+		await sleep(backoff.nextDelay());
 		node = resolve(name);
 	}
 	if (node === SEND_AUTH_UNCHANGED) {
@@ -2441,6 +2455,11 @@ export async function createWebSocket(
 }
 
 const INITIAL_RETRY_TIME = 500;
+const MAX_RETRY_TIME = 30_000;
+// Floor under the jittered reconnect delay. Full jitter can draw ~0, and every dial allocates native TLS
+// state that a CPU-saturated process GCs slower than it can be produced (harper-pro#339) — so the window
+// is decorrelated, never opened all the way to an immediate re-dial.
+const MIN_RETRY_TIME = 100;
 /**
  * This represents a persistent connection to a node for replication, which handles
  * sockets that may be disconnected and reconnected
@@ -2448,7 +2467,9 @@ const INITIAL_RETRY_TIME = 500;
 export class NodeReplicationConnection extends EventEmitter {
 	socket: WebSocket;
 	startTime: number;
-	retryTime = INITIAL_RETRY_TIME;
+	// Created on the first failure so a healthy connection allocates nothing extra.
+	retryBackoff: Backoff;
+	random = Math.random; // injectable so the jittered reconnect schedule is deterministically testable
 	retries = 0;
 	isConnected = true; // we start out assuming we will be connected
 	isFinished = false;
@@ -2670,23 +2691,34 @@ export class NodeReplicationConnection extends EventEmitter {
 	scheduleReconnect() {
 		this.reconnectScheduled = true;
 		this.resetSession();
-		setTimeout(() => {
-			this.connect();
-		}, this.retryTime).unref();
-		// Double the interval each retry, capped at 30 s. The previous ~0.4%/retry
+		// Double the ceiling each retry, capped at 30 s. The previous ~0.4%/retry
 		// growth took >1000 retries to reach any meaningful delay, so rapid
 		// reconnects to a dead peer (symphony accepts the TLS handshake then drops
 		// it) would still accumulate unreleased native TLS state faster than V8 can
 		// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
-		// Doubling reaches 30 s in ~6 retries (~62 s total) and resets on success.
-		this.retryTime = Math.min(this.retryTime << 1, 30_000);
+		// Doubling reaches 30 s in ~6 retries and resets on success. The delay is drawn
+		// uniformly under that ceiling so a fleet restarting together does not re-dial in
+		// lockstep — every node used to pick the identical instant.
+		this.retryBackoff ??= createBackoff({
+			initialMs: INITIAL_RETRY_TIME,
+			maxMs: MAX_RETRY_TIME,
+			minMs: MIN_RETRY_TIME,
+			random: this.random,
+		});
+		setTimeout(() => {
+			this.connect();
+		}, this.retryBackoff.nextDelay()).unref();
+	}
+	/** The ceiling the next reconnect will be drawn under; the initial value means "not backed off". */
+	get retryTime(): number {
+		return this.retryBackoff?.ceiling ?? INITIAL_RETRY_TIME;
 	}
 	// Called by replicateOverWS after a frame is actually sent: real progress, so it is safe to reset the
 	// backoff. Gated on a non-zero retries so the healthy hot path (already reset) does nothing.
 	onFrameSent() {
-		if (this.retries !== 0 || this.retryTime !== INITIAL_RETRY_TIME) {
+		if (this.retries !== 0 || this.retryBackoff?.attempts) {
 			this.retries = 0;
-			this.retryTime = INITIAL_RETRY_TIME;
+			this.retryBackoff?.reset();
 		}
 	}
 	// Retire the live replicateOverWS instance: the single enforcement point for "at most one live session
@@ -4678,7 +4710,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												onReprobeTimeout: () =>
 													logger.warn?.(
 														connectionId,
-														`hdb_nodes row for ${authorization.name} did not decode within ${SEND_AUTH_REPROBE_ATTEMPTS * SEND_AUTH_REPROBE_INTERVAL_MS}ms; failing closed so a revocation carried by an undecodable write cannot be missed`
+														`hdb_nodes row for ${authorization.name} did not decode within ${SEND_AUTH_REPROBE_BUDGET_MS}ms; failing closed so a revocation carried by an undecodable write cannot be missed`
 													),
 											});
 											if (shouldClose) {

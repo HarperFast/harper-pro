@@ -35,6 +35,7 @@ import {
 	type ConnectionTruth,
 } from './replicationConnection.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
+import { createBackoff, type Backoff } from './backoff.ts';
 import lodash from 'lodash';
 const { cloneDeep } = lodash;
 import * as env from '../core/utility/environment/environmentManager.js';
@@ -94,6 +95,11 @@ const NODE_SUBSCRIBE_DELAY = 200; // delay before sending node subscribe to othe
 // replicateOverWS instance + TLS buffer). Stagger them so at most ~1 new connection starts
 // per RECONNECT_STAGGER_MS, keeping peak concurrent connection setup bounded.
 const RECONNECT_STAGGER_MS = 50;
+// Ceiling the subscription-setup backoff starts at, and the cap it grows to. The floor stays
+// NODE_SUBSCRIBE_DELAY: that delay exists to let operations complete first, which is unrelated to retry
+// pacing, so jitter is drawn above it rather than through it. See createSubscribeSetupScheduler.
+const NODE_SUBSCRIBE_INITIAL_CEILING_MS = 2 * NODE_SUBSCRIBE_DELAY;
+const NODE_SUBSCRIBE_MAX_DELAY_MS = 30_000;
 // Cadence of the per-process safety-net reconcile that rebinds subscriptions whose
 // worker no longer exists. Pure read-side filter against `workers` and
 // `connectionReplicationMap` on each tick when nothing is wrong, so a short interval
@@ -125,6 +131,127 @@ const RECEIVE_STALL_THRESHOLD_MS = 15 * 60_000;
 // MaxListenersExceededWarning past ~10 databases (harper-pro#357).
 const workersWithExitHandler = new WeakSet<any>();
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
+
+interface SubscribeSchedule {
+	timer?: ReturnType<typeof setTimeout>;
+	backoff: Backoff;
+}
+
+export interface SubscribeSetupScheduler {
+	/** Arm a setup for this pair, or return undefined when one is already pending (deduped). */
+	schedule(url: string, database: string, staggerMs?: number): number | undefined;
+	/** The pair reached 'open': drop the pending setup and the escalated delay. */
+	noteConnected(url: string, database: string): void;
+	cancel(url: string, database: string): void;
+	cancelUrl(url: string): void;
+	pendingCount(): number;
+}
+
+/**
+ * Admission control for subscription setup: **at most one pending setup per (peer URL, database)**,
+ * on an escalating jittered schedule that resets when the pair connects.
+ *
+ * harper-pro#327: `onDatabase` used to turn every qualifying node update straight into a retained
+ * (not unref'd) 200 ms `setTimeout` plus a `subscribe-to-node` message, so whatever re-drove
+ * `onNodeUpdate` amplified 1:1 into main-thread timers, worker-side WebSocket/TLS setup, and
+ * `Setting up subscription with leader` warns — measured at ~1,400 lines/s/node and ending in an OOM
+ * kill. The upstream re-drive rate is not something this module controls (peers, the 5s reconcile,
+ * `deploy_component` reloads and a churning `databases` object all feed it), so the bound has to live
+ * at the decision to schedule.
+ *
+ * Keyed by (url, database) in its own map rather than on the `connectionReplicationMap` entry,
+ * because the stale-worker path in `onDatabase` deletes and recreates that entry — per-entry state
+ * would be wiped on exactly the path that most needs the dedup. `dispatch` re-reads the live entry at
+ * fire time instead of capturing a payload, so a deduped update is never lost (the entry already
+ * holds the newest `nodes`/`worker`) and no closure is allocated per suppressed event.
+ */
+export function createSubscribeSetupScheduler(deps: {
+	dispatch: (url: string, database: string) => void;
+	random?: () => number;
+	initialMs?: number;
+	maxMs?: number;
+	minMs?: number;
+}): SubscribeSetupScheduler {
+	const {
+		dispatch,
+		random,
+		initialMs = NODE_SUBSCRIBE_INITIAL_CEILING_MS,
+		maxMs = NODE_SUBSCRIBE_MAX_DELAY_MS,
+		minMs = NODE_SUBSCRIBE_DELAY,
+	} = deps;
+	const schedules = new Map<string, Map<string, SubscribeSchedule>>();
+
+	function drop(url: string, database: string) {
+		const forUrl = schedules.get(url);
+		const schedule = forUrl?.get(database);
+		if (!schedule) return;
+		clearTimeout(schedule.timer);
+		forUrl!.delete(database);
+		if (forUrl!.size === 0) schedules.delete(url);
+	}
+
+	return {
+		schedule(url, database, staggerMs = 0) {
+			let forUrl = schedules.get(url);
+			if (!forUrl) schedules.set(url, (forUrl = new Map()));
+			let schedule = forUrl.get(database);
+			if (!schedule) {
+				schedule = { backoff: createBackoff({ initialMs, maxMs, minMs, random }) };
+				forUrl.set(database, schedule);
+			} else if (schedule.timer) return undefined;
+			const delay = schedule.backoff.nextDelay() + staggerMs;
+			schedule.timer = setTimeout(() => {
+				schedule.timer = undefined;
+				// A synchronous throw here (postMessage on an uncloneable payload) would take the process
+				// down, and this is the recovery path.
+				try {
+					dispatch(url, database);
+				} catch (error) {
+					logger.error('Error dispatching subscription setup for', database, url, error);
+				}
+			}, delay);
+			schedule.timer.unref?.();
+			return delay;
+		},
+		noteConnected(url, database) {
+			drop(url, database);
+		},
+		cancel(url, database) {
+			drop(url, database);
+		},
+		cancelUrl(url) {
+			const forUrl = schedules.get(url);
+			if (!forUrl) return;
+			for (const schedule of forUrl.values()) clearTimeout(schedule.timer);
+			schedules.delete(url);
+		},
+		pendingCount() {
+			let count = 0;
+			for (const forUrl of schedules.values()) for (const schedule of forUrl.values()) if (schedule.timer) count++;
+			return count;
+		},
+	};
+}
+
+/**
+ * Send the subscribe-to-node the scheduler armed, from the entry's *current* state. The entry can have
+ * been unsubscribed, deleted, or reassigned to another worker during the (now up to 30s) wait. A pair
+ * that connected in the meantime has already had this setup cancelled by `noteConnected`; we
+ * deliberately do not re-check `connected` here, because a re-subscribe after an unsubscribe is
+ * legitimately scheduled while the closing connection still reads connected:true.
+ */
+function dispatchSubscribeSetup(url: string, database: string) {
+	const entry = connectionReplicationMap.get(url)?.get(database);
+	if (!entry || entry.unsubscribed) return;
+	const nodes = entry.nodes;
+	if (!nodes?.[0]) return;
+	const request = { ...nodes[0], type: 'subscribe-to-node', database, nodes };
+	if (entry.worker) {
+		entry.worker.postMessage(request);
+	} else subscribeToNode(request);
+}
+
+const subscribeSetupScheduler = createSubscribeSetupScheduler({ dispatch: dispatchSubscribeSetup });
 
 // Resolve an auditStore for a database (any table's will do — the per-(db, peer) shared-memory status
 // buffer is keyed by database, not table) so the main thread can read the authoritative connection truth
@@ -682,6 +809,7 @@ export async function startOnMainThread(options) {
 			}
 			dbReplicationWorkers.iterator?.remove();
 			connectionReplicationMap.delete(url);
+			subscribeSetupScheduler.cancelUrl(url);
 			return;
 		}
 		if (isSelf) return;
@@ -861,7 +989,6 @@ export async function startOnMainThread(options) {
 								.filter((nodeName) => nodeName !== getThisNodeName()) // find the first node that is not this one
 						)[0]; // try to find the first node
 				const nodeName = nodes[0].name ?? (nodes[0].url && new URL(nodes[0].url).hostname);
-				logger.warn(`Setting up subscription with leader ${leaderName} for node ${nodeName}`);
 				// isLeader is true only if:
 				//   1. it was explicitly persisted (e.g. by add_node { isLeader: true }), OR
 				//   2. there is no leader candidate at all, OR
@@ -871,21 +998,16 @@ export async function startOnMainThread(options) {
 				nodes[0].isLeader = nodes[0].isLeader || !leaderName || (hasExplicitLeader && nodeName === leaderName);
 				nodes[0].url ??= getNodeURL(nodes[0]);
 				// Stagger the subscribe when reassigning (subscribeStagger set) so N databases on one peer
-				// don't dial N catchup connections simultaneously; otherwise use the flat delay. See #446.
-				const subscribeDelay = subscribeStagger
-					? NODE_SUBSCRIBE_DELAY + subscribeStagger.count++ * RECONNECT_STAGGER_MS
-					: NODE_SUBSCRIBE_DELAY;
-				setTimeout(() => {
-					const request = {
-						...nodes[0],
-						type: 'subscribe-to-node',
-						database: databaseName,
-						nodes,
-					};
-					if (worker) {
-						worker.postMessage(request);
-					} else subscribeToNode(request);
-				}, subscribeDelay);
+				// don't dial N catchup connections simultaneously. See #446.
+				const staggerMs = subscribeStagger ? subscribeStagger.count++ * RECONNECT_STAGGER_MS : 0;
+				const subscribeDelay = subscribeSetupScheduler.schedule(getNodeURL(node), databaseName, staggerMs);
+				// undefined means a setup for this (url, database) is already pending: the entry it will
+				// read has just been refreshed above, so there is nothing more to do — and nothing to log.
+				// The warn belongs to an armed setup, not to an event, or a re-drive storm reproduces the
+				// 165k-line logs of harper-pro#327 even though the work itself is now bounded.
+				if (subscribeDelay !== undefined) {
+					logger.warn(`Setting up subscription with leader ${leaderName} for node ${nodeName} in ${subscribeDelay}ms`);
+				}
 			} else {
 				logger.info('Node no longer should be used, unsubscribing from node', {
 					replicates: node.replicates,
@@ -924,6 +1046,9 @@ export async function startOnMainThread(options) {
 				// Keep the entry for URL/iterator cleanup, but bypass the reuse fast path after an
 				// explicit unsubscribe so restoring membership can schedule subscribe-to-node again.
 				if (existingEntry) existingEntry.unsubscribed = true;
+				// A setup armed for this pair can now be up to 30s from firing; without this it would
+				// re-subscribe right after we told the worker to unsubscribe.
+				subscribeSetupScheduler.cancel(getNodeURL(node), databaseName);
 				const request = {
 					type: 'unsubscribe-from-node',
 					database: databaseName,
@@ -1037,6 +1162,8 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		mainWorkerEntry.connected = true;
+		// Real progress for this pair: drop the escalated setup backoff and any setup still pending.
+		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
 		const restoredNode = mainWorkerEntry.nodes[0];
@@ -1181,6 +1308,13 @@ export async function startOnMainThread(options) {
 			getReceiveStatus
 		);
 		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0 && stalledByUrl.size === 0) return;
+		// Decorrelation only, no escalation: these re-drives are already throttled by the disconnectedAt /
+		// receiveStallReconnectAt re-stamps, so the ceiling is fixed and every draw lands in the same window.
+		const reDriveBackoff = createBackoff({
+			initialMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
+			maxMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
+			minMs: NODE_SUBSCRIBE_DELAY,
+		});
 		if (staleNodeUrls.size > 0)
 			logger.warn(
 				'Reconciling replication subscriptions for nodes pointing at exited workers:',
@@ -1259,10 +1393,17 @@ export async function startOnMainThread(options) {
 					);
 					entry.lastRecovery = { mechanism: 'wedge-reconcile', at: reconcileNow };
 					// Stagger reconnects (RECONNECT_STAGGER_MS apart) so opening N TLS connections
-					// simultaneously does not spike memory when there are many databases.
-					const delay = NODE_SUBSCRIBE_DELAY + reconnectCount * RECONNECT_STAGGER_MS;
+					// simultaneously does not spike memory when there are many databases; jitter the base so
+					// every node in a fleet reacting to the same peer outage doesn't fire on the same tick.
+					const delay = reDriveBackoff.nextDelay() + reconnectCount * RECONNECT_STAGGER_MS;
 					reconnectCount++;
-					setTimeout(() => worker.postMessage(request), delay).unref();
+					setTimeout(() => {
+						// The stamp is our claim on this entry: connectedToNode clears disconnectedAt and a later
+						// reconcile re-stamps it, either of which means this re-drive is stale and would interrupt
+						// a connection that has already recovered or been re-driven.
+						if (entries.get(databaseName) !== entry || entry.disconnectedAt !== reconcileNow) return;
+						worker.postMessage(request);
+					}, delay).unref();
 				}
 				if (reconnectCount > 0)
 					logger.warn(
@@ -1298,9 +1439,14 @@ export async function startOnMainThread(options) {
 						database: databaseName,
 						nodes,
 					};
-					const delay = NODE_SUBSCRIBE_DELAY + reconnectCount * RECONNECT_STAGGER_MS;
+					const delay = reDriveBackoff.nextDelay() + reconnectCount * RECONNECT_STAGGER_MS;
 					reconnectCount++;
-					setTimeout(() => worker.postMessage(request), delay).unref();
+					setTimeout(() => {
+						// Same staleness claim as the wedge path: a newer reconcile re-stamping
+						// receiveStallReconnectAt owns the kick from then on.
+						if (entries?.get(databaseName) !== entry || entry.receiveStallReconnectAt !== now) return;
+						worker.postMessage(request);
+					}, delay).unref();
 				}
 				if (reconnectCount > 0)
 					logger.warn(

@@ -1,4 +1,5 @@
 import { setTimeout as sleep } from 'node:timers/promises';
+import { createBackoff } from '../replication/backoff.ts';
 
 /**
  * Helpers for cloning the leader's JWT signing keys onto a new node. All nodes in a cluster must
@@ -10,6 +11,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 export const JWT_KEY_CLONE_RETRIES = 3;
 export const JWT_KEY_CLONE_RETRY_DELAY_MS = 250;
+export const JWT_KEY_CLONE_MAX_DELAY_MS = 1000;
 
 /**
  * Extracts JWT key material from a `get_key` response. The operations layer wraps a bare string return
@@ -35,6 +37,11 @@ export async function fetchJWTKeyWithRetry(
 	delayMs: number = JWT_KEY_CLONE_RETRY_DELAY_MS
 ): Promise<string> {
 	let lastError: unknown;
+	const backoff = createBackoff({
+		initialMs: delayMs,
+		maxMs: Math.max(delayMs, JWT_KEY_CLONE_MAX_DELAY_MS),
+		minMs: delayMs,
+	});
 	for (let attempt = 1; attempt <= retries; attempt++) {
 		try {
 			const key = extractKeyMaterial(await requestKey());
@@ -43,7 +50,7 @@ export async function fetchJWTKeyWithRetry(
 		} catch (err) {
 			lastError = err;
 		}
-		if (attempt < retries) await sleep(delayMs);
+		if (attempt < retries) await sleep(backoff.nextDelay());
 	}
 	throw new Error(`Unable to clone JWT key '${keyName}' from leader after ${retries} attempts`, { cause: lastError });
 }
