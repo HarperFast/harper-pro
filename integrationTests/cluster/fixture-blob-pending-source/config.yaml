@@ -1,0 +1,2 @@
+jsResource:
+  files: resources.js # entry module — runs at component load
