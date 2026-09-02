@@ -1,4 +1,6 @@
 import type { Logger } from '../core/utility/logging/logger.ts';
+import { createHash, type Hash } from 'node:crypto';
+import { toBufferKey } from 'ordered-binary';
 import {
 	getDatabases,
 	databases,
@@ -1480,58 +1482,34 @@ export type BlobGapEscalation = { cycles: number; heldMs: number; cohort?: boole
 export type BlobGapEscalationBudget = ReturnType<typeof createBlobGapEscalationBudget>;
 
 /**
- * One held delivery's identity across re-streams. Total and non-throwing: it runs inside the blob-save
- * settlement chain, where a throw would reject the tracked promise onCommit awaits. Record ids are
- * tagged by type (a numeric 1 and a string "1" are different keys), free-form strings are
- * length-prefixed so no delimiter can alias two structures, and structured ids serialize element-wise
- * with BigInt support.
+ * One held delivery's identity across re-streams. Valid record ids use the same ordered-binary bytes
+ * as the primary stores, then the whole tuple is hashed so no delimiter can alias two deliveries and
+ * no user-controlled id remains retained on the long-lived connection. Invalid ids take a total,
+ * non-throwing fallback because this runs inside the blob-save settlement chain.
  */
 export function blobGapDeliveryKey(fileId: unknown, recordId: unknown, tableName?: string): string {
-	return `${fileId}|${tableName ?? ''}|${blobGapKeyPart(recordId)}`;
+	const hash = createHash('sha256');
+	updateBlobGapKeyHash(hash, safeBlobGapKeyText(fileId));
+	updateBlobGapKeyHash(hash, tableName ?? '');
+	try {
+		updateBlobGapKeyHash(hash, toBufferKey(recordId as any));
+	} catch {
+		updateBlobGapKeyHash(hash, `invalid:${typeof recordId}`);
+	}
+	return hash.digest('base64url');
 }
 
-// Not JSON.stringify: Harper installs a throwing BigInt.prototype.toJSON, which runs before any replacer.
-function blobGapKeyPart(value: unknown, depth = 0, seen?: Set<object>): string {
-	switch (typeof value) {
-		case 'string':
-			return `s${value.length}:${value}`;
-		case 'number':
-			return 'n:' + value;
-		case 'bigint':
-			return 'b:' + value;
-		case 'object': {
-			if (value === null) return 'null';
-			if (depth > 8) return 'deep';
-			if (value instanceof Uint8Array)
-				return 'x:' + Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('hex');
-			if (value instanceof Date) return 'd:' + value.getTime();
-			seen ??= new Set();
-			if (seen.has(value)) return 'cycle';
-			seen.add(value);
-			try {
-				if (Array.isArray(value))
-					return '[' + value.map((item) => blobGapKeyPart(item, depth + 1, seen)).join(',') + ']';
-				return (
-					'{' +
-					Object.keys(value)
-						.sort()
-						.map(
-							(key) =>
-								`${key.length}:${key}=` + blobGapKeyPart((value as Record<string, unknown>)[key], depth + 1, seen)
-						)
-						.join(',') +
-					'}'
-				);
-			} catch {
-				return 'o:' + Object.prototype.toString.call(value);
-			} finally {
-				seen.delete(value);
-			}
-		}
-		default: {
-			const text = String(value);
-			return `${typeof value}${text.length}:${text}`;
-		}
+function updateBlobGapKeyHash(hash: Hash, part: string | Uint8Array): void {
+	const length = typeof part === 'string' ? Buffer.byteLength(part) : part.byteLength;
+	hash.update(`${length}:`).update(part);
+}
+
+function safeBlobGapKeyText(value: unknown): string {
+	if (typeof value === 'string') return value;
+	try {
+		return `${typeof value}:${String(value)}`;
+	} catch {
+		return typeof value;
 	}
 }
 
