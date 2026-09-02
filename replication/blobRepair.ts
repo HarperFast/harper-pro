@@ -11,9 +11,13 @@ const logger = harperLogger.forComponent('blob-repair').conditional as Logger;
 
 // Paces a sweep whose peers cannot serve anything: without it the per-record loop spins as fast as the
 // incomplete-blob cursor yields. Capped low (not at the 30s replication cap) because the delay is paid
-// per unrepairable record while the cursor stays open, so a big backlog must still finish in hours.
+// per unrepairable record while the cursor stays open.
 const REPAIR_RETRY_INITIAL_MS = 50;
 const REPAIR_RETRY_MAX_MS = 1000;
+// Consecutive unrepairable records that end the sweep. A repair resets the count, so this only trips when
+// no peer can serve anything — the cluster-wide-loss case, where pacing alone would hold the
+// incomplete-blob cursor open for ~1s per record across the whole backlog and report nothing until the end.
+const REPAIR_MAX_CONSECUTIVE_FAILURES = 100;
 // One sweep per database per thread. `repair_blob_data` is fire-and-forget, so repeated calls landing on
 // the same thread used to stack concurrent sweeps over the same records, wasting peer fetches and
 // defeating the pacing above. Calls routed to different threads are still independent.
@@ -38,7 +42,11 @@ export async function repairBlobs(
 	let repaired = 0;
 	let failed = 0;
 	let noConnection = 0;
-	const backoff = createBackoff({ initialMs: REPAIR_RETRY_INITIAL_MS, maxMs: REPAIR_RETRY_MAX_MS });
+	const backoff = createBackoff({
+		initialMs: REPAIR_RETRY_INITIAL_MS,
+		maxMs: REPAIR_RETRY_MAX_MS,
+		maxAttempts: REPAIR_MAX_CONSECUTIVE_FAILURES,
+	});
 
 	for await (const { tableName, table, recordId } of findIncompleteBlobRefs(database, dbName)) {
 		checked++;
@@ -91,7 +99,16 @@ export async function repairBlobs(
 			failed++;
 			logger.warn?.('Could not repair blob for record', recordId, 'in', tableName, '— no peer had a complete copy');
 			const delay = backoff.nextDelay();
-			if (delay !== undefined) await pause(delay);
+			if (delay === undefined) {
+				logger.warn?.(
+					'Stopping blob repair for',
+					dbName,
+					`after ${REPAIR_MAX_CONSECUTIVE_FAILURES} consecutive records no peer could repair`,
+					{ checked, repaired, failed, noConnection }
+				);
+				break;
+			}
+			await pause(delay);
 		}
 	}
 

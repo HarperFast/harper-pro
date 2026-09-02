@@ -1207,7 +1207,7 @@ export async function startOnMainThread(options) {
 		}
 	};
 
-	connectedToNode = function (connection) {
+	connectedToNode = function (connection, reportingWorker?) {
 		// Basically undo what we did in disconnectedFromNode and also update the latency
 		const dbReplicationWorkers = connectionReplicationMap.get(connection.url);
 		const mainWorkerEntry = dbReplicationWorkers?.get(connection.database);
@@ -1221,10 +1221,16 @@ export async function startOnMainThread(options) {
 		}
 		mainWorkerEntry.connected = true;
 		// Real progress for this pair: drop the escalated setup backoff, any setup still pending, and any
-		// recovery kick armed for a connection that has since come back.
-		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
-		clearTimeout(mainWorkerEntry.reDriveTimer);
-		mainWorkerEntry.reDriveTimer = undefined;
+		// recovery kick armed for a connection that has since come back. Only the entry's CURRENT owner may
+		// retire that work: the stale-worker path above deletes and recreates the entry on a new worker while
+		// the old worker's hung-but-open connection can still report 'open' for the same (url, database), and
+		// retiring on that report would leave the new worker's setup cancelled and never re-armed. An
+		// internal caller (the truth-driven up-correction) passes no worker and is always trusted.
+		if (!reportingWorker || reportingWorker === mainWorkerEntry.worker) {
+			subscribeSetupScheduler.noteConnected(connection.url, connection.database);
+			clearTimeout(mainWorkerEntry.reDriveTimer);
+			mainWorkerEntry.reDriveTimer = undefined;
+		}
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
 		const restoredNode = mainWorkerEntry.nodes[0];
@@ -1386,12 +1392,15 @@ export async function startOnMainThread(options) {
 			return timer;
 		};
 		// Decorrelation only, no escalation: these re-drives are already throttled by the disconnectedAt /
-		// receiveStallReconnectAt re-stamps, so the ceiling is fixed and every draw lands in the same window.
-		const reDriveBackoff = createBackoff({
-			initialMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
-			maxMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
-			minMs: NODE_SUBSCRIBE_DELAY,
-		});
+		// receiveStallReconnectAt re-stamps, so the ceiling is fixed. ONE draw for the whole sweep, used as a
+		// common base offset: drawing per entry would make consecutive delays differ by up to +/-200ms and let
+		// ~4 dials share any 50ms instant, which is precisely the concurrency #446's stagger bounds.
+		const reDriveBaseDelay =
+			createBackoff({
+				initialMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
+				maxMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
+				minMs: NODE_SUBSCRIBE_DELAY,
+			}).nextDelay() ?? NODE_SUBSCRIBE_DELAY;
 		if (staleNodeUrls.size > 0)
 			logger.warn(
 				'Reconciling replication subscriptions for nodes pointing at exited workers:',
@@ -1472,9 +1481,7 @@ export async function startOnMainThread(options) {
 					// Stagger reconnects (RECONNECT_STAGGER_MS apart) so opening N TLS connections
 					// simultaneously does not spike memory when there are many databases; jitter the base so
 					// every node in a fleet reacting to the same peer outage doesn't fire on the same tick.
-					const backoffDelay = reDriveBackoff.nextDelay();
-					if (backoffDelay === undefined) continue;
-					const delay = backoffDelay + reconnectCount * RECONNECT_STAGGER_MS;
+					const delay = reDriveBaseDelay + reconnectCount * RECONNECT_STAGGER_MS;
 					reconnectCount++;
 					entry.reDriveTimer = armReDrive(entry, delay, url, databaseName, () => {
 						// The stamp is our claim on this entry: connectedToNode clears disconnectedAt and a later
@@ -1521,9 +1528,7 @@ export async function startOnMainThread(options) {
 						database: databaseName,
 						nodes,
 					};
-					const backoffDelay = reDriveBackoff.nextDelay();
-					if (backoffDelay === undefined) continue;
-					const delay = backoffDelay + reconnectCount * RECONNECT_STAGGER_MS;
+					const delay = reDriveBaseDelay + reconnectCount * RECONNECT_STAGGER_MS;
 					reconnectCount++;
 					entry.reDriveTimer = armReDrive(entry, delay, url, databaseName, () => {
 						// Same staleness claim as the wedge path: a newer reconcile re-stamping

@@ -571,8 +571,14 @@ function getSubscriptionConnection(
 	}
 }
 
-export function getSubscriptionConnectionKey(connectingUrl: string, subscriptionUrl?: string): string {
-	return connectingUrl + '-' + (subscriptionUrl ?? connectingUrl);
+// The `connections` key, so subscribe, unsubscribe, force-reconnect and the worker's pre-readiness
+// admission derive byte-identical identity including the missing-nested-URL fallback. The teardown sites
+// pass the pair in the opposite order to the subscribe path; those two URLs are the same for every
+// ordinary subscription and differ only under failover (connectToNextWorker subscribes node B over peer
+// A's URL), where the teardown lookup has always missed. Preserved rather than unified: reordering is a
+// failover behavior change, not a retry-pacing one.
+export function getSubscriptionConnectionKey(url: string, peerUrl?: string): string {
+	return url + '-' + (peerUrl ?? url);
 }
 const nodeNameToRetrievalConnections = new Map<string, Map<string, NodeReplicationConnection>>();
 /**
