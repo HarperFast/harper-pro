@@ -1532,7 +1532,7 @@ function blobGapKeyPart(value: unknown, depth = 0, seen?: Set<object>): string {
 	}
 }
 
-// Active socket generations (ones that settled at least one budgeted delivery) a delivery may go unseen
+// Active socket generations (ones that held a delivery or settled a tracked one) a delivery may go unseen
 // before its entry is dropped. The #683 timer reconnects precisely to re-stream every held delivery, so
 // one that two such generations did not re-hold has healed, been skipped past, or been superseded by a
 // new source file id — it will never be charged again and would otherwise occupy the budget for the
@@ -1568,16 +1568,20 @@ export function createBlobGapEscalationBudget(opts: {
 	let cohort: Entry | undefined;
 	let currentGeneration = opts.generation ?? 0;
 	let capacityWarnedGeneration = -1;
-	// Activity epochs: one per socket generation that charged or settled at least one delivery.
+	// Activity epochs: one per socket generation that held a delivery or settled a tracked one. Unrelated
+	// successful saves do not count — a socket that dies after saving other blobs but before reaching the
+	// held delivery must not look like a generation that could have re-held it.
 	let activeEpoch = 0;
 	let activeGeneration = -1;
-	const isStale = (generation: number) => {
-		if (generation < currentGeneration) return true;
-		currentGeneration = generation;
+	const noteActivity = (generation: number) => {
 		if (generation !== activeGeneration) {
 			activeGeneration = generation;
 			activeEpoch++;
 		}
+	};
+	const isStale = (generation: number) => {
+		if (generation < currentGeneration) return true;
+		currentGeneration = generation;
 		return false;
 	};
 	const newEntry = (at: number): Entry => ({
@@ -1628,6 +1632,7 @@ export function createBlobGapEscalationBudget(opts: {
 		 */
 		charge(key: string, generation: number): BlobGapEscalation | undefined {
 			if (isStale(generation)) return undefined;
+			noteActivity(generation);
 			const at = now();
 			let entry = held.get(key);
 			if (!entry) {
@@ -1650,7 +1655,7 @@ export function createBlobGapEscalationBudget(opts: {
 		/** `key` is settled (saved, or skipped past for good); a later hold of it starts a fresh budget. */
 		resolve(key: string, generation: number): void {
 			if (held.size === 0 || isStale(generation)) return;
-			held.delete(key);
+			if (held.delete(key)) noteActivity(generation);
 		},
 		get size(): number {
 			return held.size;
