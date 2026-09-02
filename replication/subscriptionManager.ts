@@ -72,6 +72,11 @@ type ConnectedWorkerStatus = {
 	// window that started it, so each new decision replaces the entry's pending one instead of stacking
 	// another wave, and connect/unsubscribe/delete can disarm it.
 	reDriveTimer?: ReturnType<typeof setTimeout>;
+	// Bumped on every connect report. The wedge kick claims its entry through `disconnectedAt`, which a
+	// connect clears; a stalled connection is connected:true with no `disconnectedAt`, so the stall kick
+	// needs its own claim or a leg that drops and reconnects inside its stagger window gets force-reconnected
+	// on the strength of the old socket's watermark.
+	connectGeneration?: number;
 	lastRecovery?: { mechanism: string; at: number };
 	lastTruthCorrection?: { direction: 'down' | 'up'; at: number };
 };
@@ -287,10 +292,9 @@ export function dispatchSubscriptionNodes(
 /**
  * Send the subscribe-to-node the scheduler armed. The entry can have been unsubscribed, deleted, or
  * reassigned to another worker during the (now up to 30s) wait, so ownership is re-checked against
- * live state and the message goes to the entry's current worker. A pair that connected in the
- * meantime has already had this setup cancelled by `noteConnected`; we deliberately do not re-check
- * `connected` here, because a re-subscribe after an unsubscribe is legitimately scheduled while the
- * closing connection still reads connected:true.
+ * live state and the message goes to the entry's current worker. `connected` is deliberately NOT
+ * re-checked: a re-subscribe after an unsubscribe is legitimately scheduled while the closing connection
+ * still reads connected:true, and a redundant subscribe on a live connection is a no-op reuse.
  */
 function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 	const entry = connectionReplicationMap.get(url)?.get(database);
@@ -996,8 +1000,8 @@ export async function startOnMainThread(options) {
 			}
 			if (existingEntry) {
 				worker = existingEntry.worker;
-				// This array becomes `entry.nodes`, which the wedge re-drive posts from, and isLeader is only
-				// decided on the scheduling path below — carry it forward or the re-drive loses it.
+				// isLeader is decided on the scheduling path below, and this array becomes `entry.nodes`, which
+				// the wedge re-drive posts from.
 				nodes[0].isLeader = nodes[0].isLeader || existingEntry.nodes?.[0]?.isLeader;
 				existingEntry.nodes = nodes;
 				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
@@ -1111,8 +1115,8 @@ export async function startOnMainThread(options) {
 				// Keep the entry for URL/iterator cleanup, but bypass the reuse fast path after an
 				// explicit unsubscribe so restoring membership can schedule subscribe-to-node again.
 				if (existingEntry) existingEntry.unsubscribed = true;
-				// A setup armed for this pair can be up to 30s from firing, and would re-subscribe right
-				// after the worker was told to unsubscribe. Same for a recovery kick.
+				// An armed setup can be up to 30s from firing, and would re-subscribe right after the worker was
+				// told to unsubscribe. Same for a recovery kick.
 				subscribeSetupScheduler.cancel(getNodeURL(node), databaseName);
 				if (existingEntry) {
 					clearTimeout(existingEntry.reDriveTimer);
@@ -1229,9 +1233,9 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		mainWorkerEntry.connected = true;
-		// Real progress for this pair, so the escalated setup delay goes back to its first ceiling. The
-		// pending setup and the armed recovery are left alone: both re-check live state when they fire, and
-		// a connect report cannot be attributed to the worker that armed them.
+		mainWorkerEntry.connectGeneration = (mainWorkerEntry.connectGeneration ?? 0) + 1;
+		// Real progress for this pair, so the escalated setup delay goes back to its first ceiling. Nothing is
+		// cancelled here — see noteConnected.
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
@@ -1522,8 +1526,10 @@ export async function startOnMainThread(options) {
 					entry.lastRecovery = { mechanism: 'receive-stall-net', at: now };
 					// Throttle clock so this entry is not re-kicked until the threshold elapses again.
 					entry.receiveStallReconnectAt = now;
-					// Watermark this decision was made against, so progress arriving during the delay cancels it.
+					// Watermark this decision was made against, so progress arriving during the delay cancels it,
+					// and the connect generation so a reconnect inside the delay does too.
 					const stalledAtWatermark = getReceiveStatus(databaseName, nodes[0]?.name)?.lastReceivedTime;
+					const stalledAtGeneration = entry.connectGeneration ?? 0;
 					const request = {
 						...nodes[0],
 						type: 'force-reconnect-node',
@@ -1537,6 +1543,9 @@ export async function startOnMainThread(options) {
 						// receiveStallReconnectAt owns the kick from then on.
 						if (entries?.get(databaseName) !== entry || entry.receiveStallReconnectAt !== now) return;
 						if (entry.unsubscribed) return;
+						// The leg reconnected inside the stagger window: the fresh socket has received nothing yet,
+						// so the watermark below cannot tell it from the stall this kick was armed for.
+						if ((entry.connectGeneration ?? 0) !== stalledAtGeneration) return;
 						// A stagger that runs long enough for the copy to resume makes this kick a reconnect of a
 						// healthy connection; the watermark is the only thing that distinguishes the two.
 						const current = getReceiveStatus(databaseName, nodes[0]?.name)?.lastReceivedTime;
