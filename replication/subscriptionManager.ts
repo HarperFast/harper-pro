@@ -933,7 +933,8 @@ export async function startOnMainThread(options) {
 			}
 			// A node that moved to a new URL leaves its old URL's entry behind (pre-existing); at least do
 			// not let a setup armed for the address it left fire against it.
-			const previousUrl = nodeMap.get(node.name) && getNodeURL(nodeMap.get(node.name));
+			const previousNode = nodeMap.get(node.name);
+			const previousUrl = previousNode && getNodeURL(previousNode);
 			if (previousUrl && previousUrl !== getNodeURL(node)) subscribeSetupScheduler.cancelUrl(previousUrl);
 			nodeMap.set(node.name, node);
 		}
