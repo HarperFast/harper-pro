@@ -131,10 +131,10 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		assert.equal(budget.charge(A, 3).cycles, 3);
 	});
 
-	it('at capacity with every tracked delivery live, a new hold stays untracked and held, warned once per generation', () => {
+	it('at capacity with every tracked delivery live, a new hold shares the capacity cohort budget, warned once per generation', () => {
 		const warnings = [];
 		const budget = createBlobGapEscalationBudget({
-			maxCycles: 3,
+			maxCycles: 2,
 			maxHoldMs: 0,
 			maxTracked: 2,
 			now: fakeClock().now,
@@ -143,24 +143,44 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		budget.charge(A, 1);
 		budget.charge(B, 1);
 		const C = blobGapDeliveryKey('c3', 3);
-		assert.equal(budget.charge(C, 1), undefined); // held, not skipped, not tracked
+		assert.equal(budget.charge(C, 1), undefined); // held, charged to the cohort, not tracked
 		assert.equal(budget.charge(C, 1), undefined);
 		assert.equal(budget.size, 2);
 		assert.deepEqual(warnings, [2]);
-		budget.charge(C, 2);
+		assert.deepEqual(budget.charge(C, 2), { cycles: 2, heldMs: 0, cohort: true });
 		assert.deepEqual(warnings, [2, 2]);
-		assert.equal(budget.charge(A, 2), undefined); // tracked deliveries keep their own budget
 	});
 
-	it('at capacity evicts the oldest exhausted entry to track a new hold, even one re-held this generation', () => {
+	it('cap-plus-one persistent gaps still reach a gap-free generation', () => {
+		// Without the cohort, the untracked gap would rotate with the tracked ones forever: each generation
+		// one of them is re-held under a fresh budget and pins the cursor.
+		const budget = createBlobGapEscalationBudget({ maxCycles: 2, maxHoldMs: 0, maxTracked: 2, now: fakeClock().now });
+		const C = blobGapDeliveryKey('c3', 3);
+		const holds = [];
+		for (let generation = 1; generation <= 4; generation++) {
+			budget.beginGeneration(generation);
+			const held = [];
+			for (const [name, key] of [
+				['A', A],
+				['B', B],
+				['C', C],
+			])
+				if (!budget.charge(key, generation)) held.push(name);
+			holds.push(held.join('') || '-');
+		}
+		assert.deepEqual(holds, ['ABC', '-', '-', '-']);
+	});
+
+	it('at capacity displaces an exhausted entry the current socket has not re-held, keeping re-held ones sticky', () => {
 		const budget = createBlobGapEscalationBudget({ maxCycles: 1, maxHoldMs: 0, maxTracked: 2, now: fakeClock().now });
 		assert.equal(budget.charge(A, 1).cycles, 1); // exhausted
 		assert.equal(budget.charge(B, 1).cycles, 1); // exhausted
 		const C = blobGapDeliveryKey('c3', 3);
-		assert.equal(budget.charge(C, 1).cycles, 1); // A evicted to make room
+		budget.beginGeneration(2);
+		assert.equal(budget.charge(A, 2).cycles, 2); // re-held: stays
+		assert.equal(budget.charge(C, 2).cycles, 1); // B (not re-held) displaced
 		assert.equal(budget.size, 2);
-		assert.equal(budget.charge(A, 2).cycles, 1); // A re-held: a fresh budget, evicting B
-		assert.equal(budget.size, 2);
+		assert.deepEqual(budget.charge(B, 2), { cycles: 1, heldMs: 0, cohort: true }); // re-held after displacement: cohort
 	});
 
 	it('a lazily created budget starts at the connection generation, so a retired socket cannot seed it', () => {
@@ -257,7 +277,7 @@ describe('blobGapDeliveryKey', () => {
 	it('separates the same record id in different tables', () => {
 		assert.notEqual(blobGapDeliveryKey('f1', 1, 'a'), blobGapDeliveryKey('f1', 1, 'b'));
 		assert.equal(blobGapDeliveryKey('f1', 1, 'a'), blobGapDeliveryKey('f1', 1, 'a'));
-		assert.equal(blobGapDeliveryKey('f1', 'k', 't'), 'f1|t|s:k');
+		assert.equal(blobGapDeliveryKey('f1', 'k', 't'), 'f1|t|s1:k');
 	});
 
 	it('never throws and keeps types apart', () => {
@@ -271,6 +291,8 @@ describe('blobGapDeliveryKey', () => {
 		const cyclic = {};
 		cyclic.self = cyclic;
 		assert.doesNotThrow(() => blobGapDeliveryKey('f1', cyclic));
+		assert.notEqual(blobGapDeliveryKey('f1', ['a,s1:b']), blobGapDeliveryKey('f1', ['a', 'b']));
+		assert.notEqual(blobGapDeliveryKey('f1', { 'a=1': 2 }), blobGapDeliveryKey('f1', { a: '1=2' }));
 	});
 
 	it('does not collapse structured record ids', () => {
@@ -286,11 +308,17 @@ describe('describeBlobGapEscalation', () => {
 
 	it('names the exhausted budget, its spend, and its limits', () => {
 		const text = describeBlobGapEscalation({ cycles: 3, heldMs: 6_500.4 }, limits);
+		assert.ok(!text.includes('capacity'), text);
 		assert.ok(
 			text.includes('blob-gap escalation budget exhausted after 3 reconnect cycle(s) holding it for 6500ms'),
 			text
 		);
 		assert.ok(text.includes('10 cycles / 1800000 ms'), text);
+	});
+
+	it('names a cohort escalation', () => {
+		const text = describeBlobGapEscalation({ cycles: 3, heldMs: 0, cohort: true }, limits);
+		assert.ok(text.includes('shared capacity budget'), text);
 	});
 
 	it('reports a disabled bound as "no"', () => {
