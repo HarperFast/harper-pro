@@ -10,7 +10,7 @@
  *
  * These tests pin the contract the production wiring depends on: one charge per generation, the cycle
  * and wall-clock bounds, resolve-resets, per-delivery independence, stickiness after exhaustion (the
- * leapfrog guard), stale-generation inertness, and the non-evicting overflow policy.
+ * leapfrog guard), stale-generation inertness, and the never-skip-before-budget capacity policy.
  */
 
 import assert from 'node:assert';
@@ -49,15 +49,13 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		assert.equal(budget.charge(A, 1), undefined);
 		assert.equal(budget.charge(A, 2), undefined);
 		assert.equal(budget.charge(A, 2), undefined);
-		assert.deepEqual(budget.charge(A, 3), { cycles: 3, heldMs: 0, overflow: false });
+		assert.deepEqual(budget.charge(A, 3), { cycles: 3, heldMs: 0 });
 	});
 
 	it('trips on the cycle bound after maxCycles distinct generations', () => {
 		const budget = createBlobGapEscalationBudget({ maxCycles: 2, maxHoldMs: 0, now: fakeClock().now });
 		assert.equal(budget.charge(A, 1), undefined);
-		const escalation = budget.charge(A, 2);
-		assert.equal(escalation.cycles, 2);
-		assert.equal(escalation.overflow, false);
+		assert.equal(budget.charge(A, 2).cycles, 2);
 	});
 
 	it('trips on the wall-clock bound first when the hold outlives maxHoldMs', () => {
@@ -67,7 +65,7 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		clock.tick(999);
 		assert.equal(budget.charge(A, 2), undefined);
 		clock.tick(1);
-		assert.deepEqual(budget.charge(A, 3), { cycles: 3, heldMs: 1_000, overflow: false });
+		assert.deepEqual(budget.charge(A, 3), { cycles: 3, heldMs: 1_000 });
 	});
 
 	it('a successful save before exhaustion resets both the cycle count and the first-held time', () => {
@@ -142,18 +140,58 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		assert.equal(budget.charge(A, 3).cycles, 3);
 	});
 
-	it('never evicts live progress: at capacity a new delivery escalates as overflow and is not tracked', () => {
-		const budget = createBlobGapEscalationBudget({ maxCycles: 3, maxHoldMs: 0, maxTracked: 2, now: fakeClock().now });
+	it('at capacity with every tracked delivery live, a new hold stays untracked and held, warned once per generation', () => {
+		const warnings = [];
+		const budget = createBlobGapEscalationBudget({
+			maxCycles: 3,
+			maxHoldMs: 0,
+			maxTracked: 2,
+			now: fakeClock().now,
+			onCapacity: (tracked) => warnings.push(tracked),
+		});
 		budget.charge(A, 1);
 		budget.charge(B, 1);
 		const C = blobGapDeliveryKey('c3', 3);
-		assert.deepEqual(budget.charge(C, 1), { cycles: 0, heldMs: 0, overflow: true });
+		assert.equal(budget.charge(C, 1), undefined); // held, not skipped, not tracked
+		assert.equal(budget.charge(C, 1), undefined);
 		assert.equal(budget.size, 2);
+		assert.deepEqual(warnings, [2]);
+		budget.charge(C, 2);
+		assert.deepEqual(warnings, [2, 2]);
 		assert.equal(budget.charge(A, 2), undefined); // tracked deliveries keep their own budget
-		assert.equal(budget.charge(A, 3).cycles, 3);
-		budget.resolve(A, 3);
-		assert.equal(budget.charge(C, 3), undefined); // room again: tracked from here
+	});
+
+	it('at capacity evicts the oldest exhausted entry to track a new hold, even one re-held this generation', () => {
+		const budget = createBlobGapEscalationBudget({ maxCycles: 1, maxHoldMs: 0, maxTracked: 2, now: fakeClock().now });
+		assert.equal(budget.charge(A, 1).cycles, 1); // exhausted
+		assert.equal(budget.charge(B, 1).cycles, 1); // exhausted
+		const C = blobGapDeliveryKey('c3', 3);
+		assert.equal(budget.charge(C, 1).cycles, 1); // A evicted to make room
 		assert.equal(budget.size, 2);
+		assert.equal(budget.charge(A, 2).cycles, 1); // A re-held: a fresh budget, evicting B
+		assert.equal(budget.size, 2);
+	});
+
+	it('a lazily created budget starts at the connection generation, so a retired socket cannot seed it', () => {
+		const budget = createBlobGapEscalationBudget({ maxCycles: 1, maxHoldMs: 0, now: fakeClock().now, generation: 2 });
+		assert.equal(budget.charge(A, 1), undefined);
+		assert.equal(budget.size, 0);
+		assert.equal(budget.charge(A, 2).cycles, 1);
+	});
+
+	it('a throwing onCapacity callback is absorbed', () => {
+		const budget = createBlobGapEscalationBudget({
+			maxCycles: 3,
+			maxHoldMs: 0,
+			maxTracked: 1,
+			now: fakeClock().now,
+			onCapacity: () => {
+				throw new Error('boom');
+			},
+		});
+		budget.charge(A, 1);
+		assert.equal(budget.charge(B, 1), undefined);
+		assert.equal(budget.size, 1);
 	});
 
 	it('drops an exhausted delivery unseen for two socket generations, never a live one', () => {
@@ -178,19 +216,6 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 			assert.equal(budget.size, 1);
 			assert.equal(budget.charge(A, generation).cycles, generation);
 		}
-	});
-
-	it('at capacity drops a dead exhausted entry before declaring overflow, never a live one', () => {
-		const budget = createBlobGapEscalationBudget({ maxCycles: 1, maxHoldMs: 0, maxTracked: 2, now: fakeClock().now });
-		assert.equal(budget.charge(A, 1).cycles, 1); // exhausted, last seen in generation 1
-		const C = blobGapDeliveryKey('c3', 3);
-		budget.beginGeneration(2);
-		budget.charge(B, 2); // live? maxCycles 1 exhausts it too — re-held in generation 2, so not dead
-		assert.equal(budget.size, 2);
-		assert.equal(budget.charge(C, 2).cycles, 1); // A (unseen this generation) evicted to make room
-		assert.equal(budget.size, 2);
-		const D = blobGapDeliveryKey('d4', 4);
-		assert.deepEqual(budget.charge(D, 2), { cycles: 0, heldMs: 0, overflow: true }); // B and C both re-held now
 	});
 
 	it('with both bounds disabled a tracked delivery never escalates', () => {
@@ -225,7 +250,20 @@ describe('blobGapDeliveryKey', () => {
 	it('separates the same record id in different tables', () => {
 		assert.notEqual(blobGapDeliveryKey('f1', 1, 'a'), blobGapDeliveryKey('f1', 1, 'b'));
 		assert.equal(blobGapDeliveryKey('f1', 1, 'a'), blobGapDeliveryKey('f1', 1, 'a'));
-		assert.equal(blobGapDeliveryKey('f1', 'k'), 'f1||k');
+		assert.equal(blobGapDeliveryKey('f1', 'k', 't'), 'f1|t|s:k');
+	});
+
+	it('never throws and keeps types apart', () => {
+		assert.doesNotThrow(() => blobGapDeliveryKey('f1', [1n, 2n]));
+		assert.notEqual(blobGapDeliveryKey('f1', [1n]), blobGapDeliveryKey('f1', [2n]));
+		assert.notEqual(blobGapDeliveryKey('f1', 1), blobGapDeliveryKey('f1', '1'));
+		assert.notEqual(blobGapDeliveryKey('f1', 1n), blobGapDeliveryKey('f1', 1));
+		assert.doesNotThrow(() => blobGapDeliveryKey('f1', undefined));
+		assert.doesNotThrow(() => blobGapDeliveryKey('f1', null));
+		assert.doesNotThrow(() => blobGapDeliveryKey('f1', Symbol('k')));
+		const cyclic = {};
+		cyclic.self = cyclic;
+		assert.doesNotThrow(() => blobGapDeliveryKey('f1', cyclic));
 	});
 
 	it('does not collapse structured record ids', () => {
@@ -237,10 +275,10 @@ describe('blobGapDeliveryKey', () => {
 });
 
 describe('describeBlobGapEscalation', () => {
-	const limits = { maxCycles: 10, maxHoldMs: 1_800_000, maxTracked: 10_000 };
+	const limits = { maxCycles: 10, maxHoldMs: 1_800_000 };
 
 	it('names the exhausted budget, its spend, and its limits', () => {
-		const text = describeBlobGapEscalation({ cycles: 3, heldMs: 6_500.4, overflow: false }, limits);
+		const text = describeBlobGapEscalation({ cycles: 3, heldMs: 6_500.4 }, limits);
 		assert.ok(
 			text.includes('blob-gap escalation budget exhausted after 3 reconnect cycle(s) holding it for 6500ms'),
 			text
@@ -249,14 +287,8 @@ describe('describeBlobGapEscalation', () => {
 	});
 
 	it('reports a disabled bound as "no"', () => {
-		const text = describeBlobGapEscalation({ cycles: 2, heldMs: 0, overflow: false }, { ...limits, maxHoldMs: 0 });
+		const text = describeBlobGapEscalation({ cycles: 2, heldMs: 0 }, { ...limits, maxHoldMs: 0 });
 		assert.ok(text.includes('10 cycles / no ms'), text);
-	});
-
-	it('names the overflow policy distinctly', () => {
-		const text = describeBlobGapEscalation({ cycles: 0, heldMs: 0, overflow: true }, limits);
-		assert.ok(text.includes('blob-gap escalation budget overflow'), text);
-		assert.ok(text.includes('10000 held deliveries'), text);
 	});
 });
 
@@ -292,7 +324,7 @@ describe('source-blob status classification for the budget (#432)', () => {
 		const err = markSourceBlobStatus(new Error('Blob error: Blob pending replication'), 503);
 		assert.equal(isUnrecoverableSourceBlobError(err), false);
 		assert.equal(getBlobGapEscalation(err), undefined);
-		const escalation = { cycles: 3, heldMs: 42, overflow: false };
+		const escalation = { cycles: 3, heldMs: 42 };
 		assert.equal(markSourceBlobUnavailable(err, escalation), err);
 		assert.equal(isUnrecoverableSourceBlobError(err), true);
 		assert.deepEqual(getBlobGapEscalation(err), escalation);
