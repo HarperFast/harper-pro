@@ -4344,7 +4344,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						if (!stream) {
 							stream = createBlobReceiveStream(blobTimeout);
 							stream.fileId = fileId;
-							stream.expectedSize = size;
+							// expectedSize is set only by the validated assignment below, so an invalid first
+							// size (NaN/Infinity/negative) is never stored — a codec is then refused without a
+							// valid size rather than binding to a bad bound.
 							blobsInFlight.set(streamKey, stream);
 							registerBlobReceiveInFlight(fileId, auditStore?.rootStore);
 						}
