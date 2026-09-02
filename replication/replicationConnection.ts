@@ -6929,7 +6929,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// loses the gap, even though it never lost the connection (harper-pro#426). A full copy is
 				// idempotent, and the leader collapses redundant requests via the per-connection
 				// min(startTime); the cost of an occasional extra copy is acceptable versus silent data loss.
-				startTime = cursorlessResumeStartForTest(node.isLeader); // 0 = full copy, unless the test hook is set
+				startTime = cursorlessResumeStartForTest(node.isLeader);
 				if (startTime !== 0) {
 					logger.warn?.(
 						`HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY: resuming database ${databaseName} from ${getNodeURL(node)} at ${new Date(startTime).toISOString()} with no resume cursor for this source`
