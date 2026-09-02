@@ -244,7 +244,6 @@ function breakDiagnostic(tear) {
 	);
 }
 
-/** Walks the entry chain, stopping at the zero-timestamp end-of-entries marker. */
 function readFrames(buffer) {
 	const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 	const frames = [];
@@ -291,7 +290,6 @@ function tearFrame(logPath, framesFromEnd) {
 	return { ...target, index, totalFrames: frames.length };
 }
 
-/** Undoes `tearFrame`: the frame declares its real length again, so the log reads through. */
 function repairFrame(logPath, tear) {
 	const buffer = readFileSync(logPath);
 	new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(tear.position + 8, tear.length);
@@ -320,7 +318,7 @@ async function readRows(node, signal = AbortSignal.timeout(OPERATION_TIMEOUT_MS)
 	return rows;
 }
 
-/** Bounded wait for the node to hold at least `count` rows; a query that fails while it settles is a retry. */
+// A query that fails while the node settles is a retry, not a failure.
 function waitForRowCount(node, count) {
 	return waitForCondition(
 		async (signal) => {
