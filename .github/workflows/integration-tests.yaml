@@ -57,18 +57,20 @@ jobs:
             # The pin stays for a separate, still-open reason: a second Node 26.8.x regression
             # (mTLS/OCSP revocation checking fails open when the issuer cert is unavailable,
             # harper#2380) was found and fixed in harper core (HarperFast/harper#2457), but
-            # harper-pro's `core` submodule pointer has not yet caught up to that fix, and
-            # harper-pro's own OCSP/CRL/mTLS-revocation integration tests
-            # (integrationTests/security/{ocsp,crl}-verification.test.ts,
-            # subscription-revocation.test.ts) have not been re-verified against it. Remove this
-            # pin once core is bumped past that fix and those suites pass clean on floating "26".
+            # harper-pro's `core` submodule pointer has not yet caught up to that fix. The
+            # OCSP/CRL/mTLS-revocation suites that exercise this path
+            # (core/integrationTests/security/{ocsp,crl}-verification.test.ts,
+            # subscription-revocation.test.ts) live in that submodule and are not run by any
+            # harper-pro CI workflow, pinned or floating — so there is currently no automated
+            # signal here either way. Remove this pin once core is bumped past that fix; do not
+            # remove it on harper#2025's closure alone.
             echo "node-versions=[22, 24, \"26.5.0\"]" >> $GITHUB_OUTPUT
             echo 'build-node-versions=[22, 24, "26.5.0"]' >> $GITHUB_OUTPUT
           else
             # Manual dispatch intentionally does NOT apply the 26.5.0 pin above: selecting "26"
-            # here floats to the latest 26.x release, so it doubles as the live reproducer for
-            # checking whether the mTLS/OCSP regression (harper#2380) still reproduces once
-            # `core` has been bumped past HarperFast/harper#2457.
+            # here floats to the latest 26.x release, for reproducing a suspected Node-26
+            # regression on demand. It does not run the OCSP/CRL suites (see above) — those
+            # live in the `core` submodule and aren't part of this workflow's test globs.
             if [[ ! "$NODE_VERSION_INPUT" =~ ^(22|24|26)$ ]]; then
               echo "::error::unsupported Node version '$NODE_VERSION_INPUT'"
               exit 1
