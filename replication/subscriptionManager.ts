@@ -383,28 +383,6 @@ function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string }
 // Clear a dead worker from every subscription entry it owned, so findStaleNodeUrls re-binds those
 // entries on a live worker. Pure helper (like findStaleNodeUrls) so its behavior is unit-testable without
 // real worker threads. Returns whether the worker owned any entries. See harper-pro#357.
-// Whether an armed receive-stall kick should still fire, and whether it owes the entry its throttle stamp
-// back. `receiveStallReconnectAt` both claims the kick and throttles re-detection (which needs
-// `lastReceivedTime` past the stamp), so a decision to skip has to say whether the epoch was actually
-// spent: a reconnect inside the stagger window means no kick happened and a fresh socket that stalls too
-// must still be detectable, while progress means the stall resolved and the stamp is correct as it stands.
-export function shouldFireStallKick(args: {
-	current: any;
-	armed: any;
-	armedAt: number;
-	armedGeneration: number;
-	stalledAtWatermark?: number;
-	currentWatermark?: number;
-}): { fire: boolean; releaseThrottle: boolean } {
-	const { current, armed, armedAt, armedGeneration, stalledAtWatermark, currentWatermark } = args;
-	if (current !== armed || armed.receiveStallReconnectAt !== armedAt || armed.unsubscribed)
-		return { fire: false, releaseThrottle: false };
-	if ((armed.connectGeneration ?? 0) !== armedGeneration) return { fire: false, releaseThrottle: true };
-	if (stalledAtWatermark != null && currentWatermark != null && currentWatermark > stalledAtWatermark)
-		return { fire: false, releaseThrottle: false };
-	return { fire: true, releaseThrottle: false };
-}
-
 export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationStatusMap>, worker: any): boolean {
 	let owned = false;
 	for (const dbReplicationWorkers of connectionMap.values()) {
@@ -431,6 +409,28 @@ export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationS
 		}
 	}
 	return owned;
+}
+
+// Whether an armed receive-stall kick should still fire, and whether it owes the entry its throttle stamp
+// back. `receiveStallReconnectAt` both claims the kick and throttles re-detection (which needs
+// `lastReceivedTime` past the stamp), so a decision to skip has to say whether the epoch was actually
+// spent: a reconnect inside the stagger window means no kick happened and a fresh socket that stalls too
+// must still be detectable, while progress means the stall resolved and the stamp is correct as it stands.
+export function shouldFireStallKick(args: {
+	current: any;
+	armed: any;
+	armedAt: number;
+	armedGeneration: number;
+	stalledAtWatermark?: number;
+	currentWatermark?: number;
+}): { fire: boolean; releaseThrottle: boolean } {
+	const { current, armed, armedAt, armedGeneration, stalledAtWatermark, currentWatermark } = args;
+	if (current !== armed || armed.receiveStallReconnectAt !== armedAt || armed.unsubscribed)
+		return { fire: false, releaseThrottle: false };
+	if ((armed.connectGeneration ?? 0) !== armedGeneration) return { fire: false, releaseThrottle: true };
+	if (stalledAtWatermark != null && currentWatermark != null && currentWatermark > stalledAtWatermark)
+		return { fire: false, releaseThrottle: false };
+	return { fire: true, releaseThrottle: false };
 }
 export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatusMap>, httpWorkers: any[]): Set<string> {
 	const staleNodeUrls = new Set<string>();

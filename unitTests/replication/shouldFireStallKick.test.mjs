@@ -1,10 +1,3 @@
-/**
- * The receive-stall kick is armed under `entry.receiveStallReconnectAt`, which is both its claim on the
- * entry and the throttle that gates re-detection (`findStalledReceivingNodeUrls` needs `lastReceivedTime`
- * past the stamp). A skip therefore has to say whether the epoch was really spent, or a kick that never
- * fired can retire the net for that (peer, database) permanently.
- */
-
 import assert from 'node:assert';
 import { shouldFireStallKick } from '#src/replication/subscriptionManager';
 
