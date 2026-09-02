@@ -1,14 +1,12 @@
 /**
  * Regression coverage for harper-pro#327: subscription setup used to be scheduled with a flat 200ms
  * `setTimeout` per qualifying node update — no dedup, no cap, not unref'd — so whatever re-drove
- * `onNodeUpdate` amplified 1:1 into main-thread timers, worker-side WebSocket/TLS setup, and
- * `Setting up subscription with leader` warns. Measured in the field at ~1,400 lines/s/node, ending in
- * an OOM kill (165k lines on the 5.0.31 rig; 116k on merged main for the boot-time DNS variant).
+ * `onNodeUpdate` amplified 1:1 into main-thread timers, worker-side WebSocket/TLS setup, and warn
+ * lines, ending in an OOM kill.
  *
- * The storm test below drives input continuously *across* timer firings, which is the shape of the
- * incident — a one-shot burst would only prove coalescing. Against the old flat-200ms behavior the
- * same input produces one dispatch per event (60,000 of them) and 60,000 live timers, so the
- * dispatch-count and pendingCount assertions both go red.
+ * The storm test drives input continuously *across* timer firings, which is the shape of the incident;
+ * a one-shot burst would only prove coalescing. Against the flat-200ms behavior the same input
+ * produces one dispatch per event and one live timer per event, so both assertions go red.
  */
 
 import { expect } from 'chai';
@@ -124,6 +122,29 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		clock.tick(300);
 		expect(dispatches.length).to.equal(1);
 		expect(dispatches[0].nodes).to.equal(second);
+	});
+
+	// onDatabase's early-return path (an already-subscribed, still-desired entry) never reaches
+	// schedule(), but it does build a fresh payload — so the armed setup has to be told about it or it
+	// dispatches routing/exclusion state from before the update.
+	it('refreshPending replaces the payload of an armed setup without arming one', () => {
+		const { scheduler, dispatches } = makeScheduler(() => 0.5);
+		const armed = [{ name: 'peer-a', url: URL_A }];
+		const refreshed = [{ name: 'peer-a', url: URL_A, routeReplicates: { receives: true } }];
+		scheduler.schedule(URL_A, 'data', armed);
+		scheduler.refreshPending(URL_A, 'data', refreshed);
+		expect(scheduler.pendingCount(), 'no second timer').to.equal(1);
+		clock.tick(300);
+		expect(dispatches.length).to.equal(1);
+		expect(dispatches[0].nodes).to.equal(refreshed);
+	});
+
+	it('refreshPending on a pair with nothing armed does not arm one', () => {
+		const { scheduler, dispatches } = makeScheduler(() => 0.5);
+		scheduler.refreshPending(URL_A, 'data', NODES);
+		expect(scheduler.pendingCount()).to.equal(0);
+		clock.tick(60_000);
+		expect(dispatches).to.deep.equal([]);
 	});
 
 	it('adds the caller-supplied stagger on top of the backoff', () => {

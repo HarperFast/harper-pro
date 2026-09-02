@@ -66,6 +66,11 @@ type ConnectedWorkerStatus = {
 	// last shared-memory truth correction applied to it. Logged with each subsequent fire so the
 	// watchdog-demotion soak can tell "sole detector" fires from ones where another layer (or the
 	// truth-driven path) had already engaged. Telemetry only — never consulted for recovery decisions.
+	// The single recovery timer the reconcile has armed for this entry (wedge re-drive or stall kick).
+	// Owned rather than fire-and-forget: with many databases a staggered sweep can outrun the reconcile
+	// window that started it, so each new decision replaces the entry's pending one instead of stacking
+	// another wave, and connect/unsubscribe/delete can disarm it.
+	reDriveTimer?: ReturnType<typeof setTimeout>;
 	lastRecovery?: { mechanism: string; at: number };
 	lastTruthCorrection?: { direction: 'down' | 'up'; at: number };
 };
@@ -144,6 +149,8 @@ export interface SubscribeSetupScheduler {
 	 * pending (deduped) — the payload is refreshed either way, so the newest one is what fires.
 	 */
 	schedule(url: string, database: string, nodes: any[], staggerMs?: number): number | undefined;
+	/** Replace the payload of an already-armed setup without arming one. */
+	refreshPending(url: string, database: string, nodes: any[]): void;
 	/** The pair reached 'open': drop the pending setup and the escalated delay. */
 	noteConnected(url: string, database: string): void;
 	cancel(url: string, database: string): void;
@@ -153,23 +160,16 @@ export interface SubscribeSetupScheduler {
 
 /**
  * Admission control for subscription setup: **at most one pending setup per (peer URL, database)**,
- * on an escalating jittered schedule that resets when the pair connects.
+ * on an escalating jittered schedule that resets when the pair connects. harper-pro#327 — see
+ * DESIGN.md, "Backoff discipline", for the incident and the rest of the sites.
  *
- * harper-pro#327: `onDatabase` used to turn every qualifying node update straight into a retained
- * (not unref'd) 200 ms `setTimeout` plus a `subscribe-to-node` message, so whatever re-drove
- * `onNodeUpdate` amplified 1:1 into main-thread timers, worker-side WebSocket/TLS setup, and
- * `Setting up subscription with leader` warns — measured at ~1,400 lines/s/node and ending in an OOM
- * kill. The upstream re-drive rate is not something this module controls (peers, the 5s reconcile,
- * `deploy_component` reloads and a churning `databases` object all feed it), so the bound has to live
- * at the decision to schedule.
- *
- * Keyed by (url, database) in its own map rather than on the `connectionReplicationMap` entry,
- * because the stale-worker path in `onDatabase` deletes and recreates that entry — per-entry state
- * would be wiped on exactly the path that most needs the dedup. The payload is carried on the
- * schedule (not read back off the entry at fire time): `onDatabase` replaces `entry.nodes` on its
- * early-return path *without* running the leader/url enrichment, so the entry's array is not
- * necessarily the one a setup should be sent with. Only a call that did enrich reaches this
- * scheduler, so refreshing here on a deduped call keeps "newest payload wins" without losing it.
+ * Keyed in its own map rather than on the `connectionReplicationMap` entry, because the stale-worker
+ * path in `onDatabase` deletes and recreates that entry — per-entry state would be wiped on exactly
+ * the path that most needs the dedup. The payload rides on the schedule rather than being read back
+ * off the entry at fire time: `onDatabase` replaces `entry.nodes` on its early-return path *without*
+ * running the leader/url enrichment, so the entry's array is not necessarily the one a setup should be
+ * sent with. That path calls `refreshPending` instead, which is what keeps "newest payload wins" true
+ * without arming anything.
  */
 export function createSubscribeSetupScheduler(deps: {
 	dispatch: (url: string, database: string, nodes: any[]) => void;
@@ -222,6 +222,10 @@ export function createSubscribeSetupScheduler(deps: {
 			}, delay);
 			schedule.timer.unref?.();
 			return delay;
+		},
+		refreshPending(url, database, nodes) {
+			const schedule = schedules.get(url)?.get(database);
+			if (schedule?.timer) schedule.nodes = nodes;
 		},
 		noteConnected(url, database) {
 			drop(url, database);
@@ -811,7 +815,9 @@ export async function startOnMainThread(options) {
 				}
 			}
 			if (!dbReplicationWorkers || !url) return;
-			for (const [database, { worker, nodes }] of dbReplicationWorkers) {
+			for (const [database, entry] of dbReplicationWorkers) {
+				const { worker, nodes } = entry;
+				clearTimeout(entry.reDriveTimer);
 				dbReplicationWorkers.delete(database);
 				logger.warn('Node was deleted, unsubscribing from node', hostname, database, url);
 				worker?.postMessage({ type: 'unsubscribe-from-node', node: hostname, nodes, database, url });
@@ -849,6 +855,10 @@ export async function startOnMainThread(options) {
 					break;
 				}
 			}
+			// A node that moved to a new URL leaves its old URL's entry behind (pre-existing); at least do
+			// not let a setup armed for the address it left fire against it.
+			const previousUrl = nodeMap.get(node.name) && getNodeURL(nodeMap.get(node.name));
+			if (previousUrl && previousUrl !== getNodeURL(node)) subscribeSetupScheduler.cancelUrl(previousUrl);
 			nodeMap.set(node.name, node);
 		}
 		const databases = getDatabases();
@@ -947,6 +957,10 @@ export async function startOnMainThread(options) {
 			}
 			if (existingEntry) {
 				worker = existingEntry.worker;
+				// isLeader is only decided on the scheduling path below, so a payload built here would drop
+				// it — and this array becomes `entry.nodes`, which the wedge re-drive posts from. Same
+				// OR-accumulation the scheduling path uses.
+				nodes[0].isLeader = nodes[0].isLeader || existingEntry.nodes?.[0]?.isLeader;
 				existingEntry.nodes = nodes;
 				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
 				// forceResubscribe for a connection that has been connected:false past the threshold: that
@@ -959,6 +973,9 @@ export async function startOnMainThread(options) {
 					!existingEntry.unsubscribed &&
 					!(forceResubscribe && existingEntry.connected === false)
 				) {
+					// Nothing new to send for an already-subscribed entry, but an armed setup would otherwise
+					// still be holding the payload from before this update.
+					subscribeSetupScheduler.refreshPending(getNodeURL(node), databaseName, nodes);
 					return;
 				}
 				if (shouldSubscribe && existingEntry.unsubscribed) {
@@ -1060,8 +1077,12 @@ export async function startOnMainThread(options) {
 				// explicit unsubscribe so restoring membership can schedule subscribe-to-node again.
 				if (existingEntry) existingEntry.unsubscribed = true;
 				// A setup armed for this pair can now be up to 30s from firing; without this it would
-				// re-subscribe right after we told the worker to unsubscribe.
+				// re-subscribe right after we told the worker to unsubscribe. Same for a recovery kick.
 				subscribeSetupScheduler.cancel(getNodeURL(node), databaseName);
+				if (existingEntry) {
+					clearTimeout(existingEntry.reDriveTimer);
+					existingEntry.reDriveTimer = undefined;
+				}
 				const request = {
 					type: 'unsubscribe-from-node',
 					database: databaseName,
@@ -1173,8 +1194,11 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		mainWorkerEntry.connected = true;
-		// Real progress for this pair: drop the escalated setup backoff and any setup still pending.
+		// Real progress for this pair: drop the escalated setup backoff, any setup still pending, and any
+		// recovery kick armed for a connection that has since come back.
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
+		clearTimeout(mainWorkerEntry.reDriveTimer);
+		mainWorkerEntry.reDriveTimer = undefined;
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
 		const restoredNode = mainWorkerEntry.nodes[0];
@@ -1319,6 +1343,18 @@ export async function startOnMainThread(options) {
 			getReceiveStatus
 		);
 		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0 && stalledByUrl.size === 0) return;
+		// One armed recovery per entry: a sweep staggered across many databases can still be firing when the
+		// next reconcile decides again, and a superseded wave's timers would otherwise be retained until
+		// they no-op.
+		const armReDrive = (entry: any, delay: number, fire: () => void) => {
+			clearTimeout(entry.reDriveTimer);
+			const timer = setTimeout(() => {
+				entry.reDriveTimer = undefined;
+				fire();
+			}, delay);
+			timer.unref();
+			return timer;
+		};
 		// Decorrelation only, no escalation: these re-drives are already throttled by the disconnectedAt /
 		// receiveStallReconnectAt re-stamps, so the ceiling is fixed and every draw lands in the same window.
 		const reDriveBackoff = createBackoff({
@@ -1408,13 +1444,14 @@ export async function startOnMainThread(options) {
 					// every node in a fleet reacting to the same peer outage doesn't fire on the same tick.
 					const delay = reDriveBackoff.nextDelay() + reconnectCount * RECONNECT_STAGGER_MS;
 					reconnectCount++;
-					setTimeout(() => {
+					entry.reDriveTimer = armReDrive(entry, delay, () => {
 						// The stamp is our claim on this entry: connectedToNode clears disconnectedAt and a later
 						// reconcile re-stamps it, either of which means this re-drive is stale and would interrupt
 						// a connection that has already recovered or been re-driven.
 						if (entries.get(databaseName) !== entry || entry.disconnectedAt !== reconcileNow) return;
+						if (entry.unsubscribed) return; // forceReconnect would reopen work we just told the worker to drop
 						worker.postMessage(request);
-					}, delay).unref();
+					});
 				}
 				if (reconnectCount > 0)
 					logger.warn(
@@ -1444,6 +1481,8 @@ export async function startOnMainThread(options) {
 					entry.lastRecovery = { mechanism: 'receive-stall-net', at: now };
 					// Throttle clock so this entry is not re-kicked until the threshold elapses again.
 					entry.receiveStallReconnectAt = now;
+					// Watermark this decision was made against, so progress arriving during the delay cancels it.
+					const stalledAtWatermark = getReceiveStatus(databaseName, nodes[0]?.name)?.lastReceivedTime;
 					const request = {
 						...nodes[0],
 						type: 'force-reconnect-node',
@@ -1452,12 +1491,17 @@ export async function startOnMainThread(options) {
 					};
 					const delay = reDriveBackoff.nextDelay() + reconnectCount * RECONNECT_STAGGER_MS;
 					reconnectCount++;
-					setTimeout(() => {
+					entry.reDriveTimer = armReDrive(entry, delay, () => {
 						// Same staleness claim as the wedge path: a newer reconcile re-stamping
 						// receiveStallReconnectAt owns the kick from then on.
 						if (entries?.get(databaseName) !== entry || entry.receiveStallReconnectAt !== now) return;
+						if (entry.unsubscribed) return;
+						// A stagger that runs long enough for the copy to resume makes this kick a reconnect of a
+						// healthy connection; the watermark is the only thing that distinguishes the two.
+						const current = getReceiveStatus(databaseName, nodes[0]?.name)?.lastReceivedTime;
+						if (stalledAtWatermark != null && current != null && current > stalledAtWatermark) return;
 						worker.postMessage(request);
-					}, delay).unref();
+					});
 				}
 				if (reconnectCount > 0)
 					logger.warn(

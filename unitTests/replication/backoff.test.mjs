@@ -30,6 +30,18 @@ describe('createBackoff', () => {
 		expect([backoff.nextDelay(), backoff.nextDelay(), backoff.nextDelay()]).to.deep.equal([0, 500, 999]);
 	});
 
+	it('equal jitter draws only from the top half of the window, so the floor scales with the ceiling', () => {
+		const low = createBackoff({ initialMs: 500, maxMs: 30_000, jitter: 'equal', random: () => 0 });
+		expect([low.nextDelay(), low.nextDelay(), low.nextDelay()]).to.deep.equal([250, 500, 1000]);
+		const high = createBackoff({ initialMs: 500, maxMs: 30_000, jitter: 'equal', random: () => 0.999999 });
+		expect([high.nextDelay(), high.nextDelay(), high.nextDelay()]).to.deep.equal([499, 999, 1999]);
+	});
+
+	it('equal jitter still respects an explicit minMs floor above the half-ceiling', () => {
+		const backoff = createBackoff({ initialMs: 400, maxMs: 400, minMs: 300, jitter: 'equal', random: () => 0 });
+		expect(backoff.nextDelay()).to.equal(300);
+	});
+
 	it('floors the jitter window at minMs', () => {
 		const backoff = createBackoff({ initialMs: 1000, maxMs: 1000, minMs: 400, random: () => 0 });
 		expect(backoff.nextDelay(), 'a zero draw still waits the floor').to.equal(400);

@@ -96,9 +96,7 @@ describe('NodeReplicationConnection.forceReconnect', () => {
 
 	it('backs off the retry ceiling on repeated wedges (mirrors the close-handler backoff)', () => {
 		const conn = makeConnection();
-		// The delay is drawn uniformly under the ceiling (harper-pro#327); pin the draw to the top of the
-		// window so the doubling is observable as a wait rather than as a distribution.
-		conn.random = () => 0.999999;
+		conn.random = () => 0.999999; // pin the draw so the doubled ceiling is observable as a wait
 
 		conn.forceReconnect(); // ceiling 500 -> 1000, draws 499
 		expect(conn.retryTime).to.equal(1000);

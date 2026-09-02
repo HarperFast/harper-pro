@@ -587,17 +587,25 @@ export async function shouldCloseSendAuthWatch(
 ): Promise<boolean> {
 	const resolve = deps.resolve ?? resolveNodeForSendAuth;
 	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref()));
-	const backoff = createBackoff({
-		initialMs: SEND_AUTH_REPROBE_INITIAL_MS,
-		maxMs: SEND_AUTH_REPROBE_MAX_MS,
-		budgetMs: deps.reprobeBudgetMs ?? SEND_AUTH_REPROBE_BUDGET_MS,
-		maxAttempts: deps.reprobeAttempts ?? SEND_AUTH_REPROBE_ATTEMPTS,
-		now: deps.now,
-	});
 
 	let node = isGenuineNodeDeletion(event.type) ? undefined : resolve(name);
-	while (node === SEND_AUTH_UNCHANGED && !backoff.exhausted && !deps.isClosed()) {
+	// Built only once a row actually comes back undecodable, so the ordinary decodable event — every
+	// authorization change on a healthy cluster — allocates nothing and never reads the clock.
+	let backoff;
+	while (node === SEND_AUTH_UNCHANGED && !deps.isClosed()) {
+		backoff ??= createBackoff({
+			initialMs: SEND_AUTH_REPROBE_INITIAL_MS,
+			maxMs: SEND_AUTH_REPROBE_MAX_MS,
+			budgetMs: deps.reprobeBudgetMs ?? SEND_AUTH_REPROBE_BUDGET_MS,
+			maxAttempts: deps.reprobeAttempts ?? SEND_AUTH_REPROBE_ATTEMPTS,
+			now: deps.now,
+		});
+		if (backoff.exhausted) break;
 		await sleep(backoff.nextDelay());
+		// Re-check before trusting the next read, not just at the top of the loop: the grace period is
+		// advertised as a deadline, so a row that only becomes decodable after an event-loop stall
+		// pushed us past it must not authorize. Fail closed on the elapsed time, not on the row.
+		if (backoff.exhausted) break;
 		node = resolve(name);
 	}
 	if (node === SEND_AUTH_UNCHANGED) {
@@ -2456,10 +2464,6 @@ export async function createWebSocket(
 
 const INITIAL_RETRY_TIME = 500;
 const MAX_RETRY_TIME = 30_000;
-// Floor under the jittered reconnect delay. Full jitter can draw ~0, and every dial allocates native TLS
-// state that a CPU-saturated process GCs slower than it can be produced (harper-pro#339) — so the window
-// is decorrelated, never opened all the way to an immediate re-dial.
-const MIN_RETRY_TIME = 100;
 /**
  * This represents a persistent connection to a node for replication, which handles
  * sockets that may be disconnected and reconnected
@@ -2697,12 +2701,14 @@ export class NodeReplicationConnection extends EventEmitter {
 		// it) would still accumulate unreleased native TLS state faster than V8 can
 		// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
 		// Doubling reaches 30 s in ~6 retries and resets on success. The delay is drawn
-		// uniformly under that ceiling so a fleet restarting together does not re-dial in
-		// lockstep — every node used to pick the identical instant.
+		// uniformly over the TOP HALF of that ceiling ('equal', not the discipline's default
+		// full jitter): decorrelating a fleet that restarts together is worth having, but this
+		// site's invariant is a dial *rate*, and a ceiling-relative floor is what keeps the
+		// minimum dial interval proportional as the ceiling escalates.
 		this.retryBackoff ??= createBackoff({
 			initialMs: INITIAL_RETRY_TIME,
 			maxMs: MAX_RETRY_TIME,
-			minMs: MIN_RETRY_TIME,
+			jitter: 'equal',
 			random: this.random,
 		});
 		setTimeout(() => {

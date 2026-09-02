@@ -1,10 +1,9 @@
 /**
  * Coverage for the jittered reconnect schedule (harper-pro#327). `scheduleReconnect` used to wait
- * exactly `retryTime` (500ms doubling to a 30s cap), so every node reacting to the same peer outage
- * re-dialed on the same instant — a whole fleet restarting together retried in lockstep, and no
- * production retry path in the repo had jitter at all. The ceiling schedule is unchanged; only the
- * draw under it is new, floored so a near-zero draw cannot become an immediate re-dial (each dial
- * allocates native TLS state, harper-pro#339).
+ * exactly `retryTime`, so every node reacting to the same peer outage re-dialed on the same instant.
+ * The ceiling schedule is unchanged; the draw is equal jitter (the top half of the window) rather than
+ * the discipline's default full jitter, because this site's invariant is a dial *rate* — every dial
+ * allocates native TLS state (harper-pro#339) — so its floor has to scale with the ceiling.
  *
  * `null` for the url makes createWebSocket reject before any socket or listener exists, which is the
  * cheapest way to drive the real scheduleReconnect path without a peer.
@@ -15,7 +14,6 @@ import sinon from 'sinon';
 import { NodeReplicationConnection } from '#src/replication/replicationConnection';
 
 const INITIAL_RETRY_TIME = 500;
-const MIN_RETRY_TIME = 100;
 const MAX_RETRY_TIME = 30_000;
 
 function captureTimerDelays() {
@@ -95,19 +93,22 @@ describe('NodeReplicationConnection reconnect jitter (harper-pro#327)', () => {
 		}
 
 		expect(ceilings).to.deep.equal([1000, 2000, 4000, 8000, 16_000, 30_000, 30_000, 30_000]);
-		for (const delay of timers.values) {
-			expect(delay).to.be.at.least(MIN_RETRY_TIME);
-			expect(delay).to.be.below(MAX_RETRY_TIME);
-		}
+		// Every draw sits in the top half of the ceiling it was drawn under, so the minimum interval
+		// between dials never falls below half of what the jitterless schedule guaranteed.
+		const ceilingFor = (i) => Math.min(INITIAL_RETRY_TIME * 2 ** i, MAX_RETRY_TIME);
+		timers.values.forEach((delay, i) => {
+			expect(delay).to.be.at.least(ceilingFor(i) / 2);
+			expect(delay).to.be.below(ceilingFor(i));
+		});
 	});
 
-	it('never re-dials immediately, even on a zero draw', () => {
+	it('a zero draw still waits half the ceiling, so the dial rate stays bounded as it escalates', () => {
 		expect(
 			scheduleDelays(
 				makeConnection(() => 0),
 				4
 			)
-		).to.deep.equal([MIN_RETRY_TIME, MIN_RETRY_TIME, MIN_RETRY_TIME, MIN_RETRY_TIME]);
+		).to.deep.equal([250, 500, 1000, 2000]);
 	});
 
 	it('retryTime reads as the initial interval before any failure', () => {
@@ -124,6 +125,6 @@ describe('NodeReplicationConnection reconnect jitter (harper-pro#327)', () => {
 
 		expect(connection.retries).to.equal(0);
 		expect(connection.retryTime).to.equal(INITIAL_RETRY_TIME);
-		expect(scheduleDelays(connection, 1)[0]).to.equal(MIN_RETRY_TIME + Math.floor(0.5 * (500 - MIN_RETRY_TIME)));
+		expect(scheduleDelays(connection, 1)[0], 'drawing under the initial ceiling again').to.equal(375);
 	});
 });
