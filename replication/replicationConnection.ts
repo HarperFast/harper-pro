@@ -324,7 +324,8 @@ const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(env.get('replication_subscript
 const BLOB_GAP_ESCALATION_CYCLES = nonNegativeIntegerOr(env.get(CONFIG_PARAMS.REPLICATION_BLOBGAPESCALATIONCYCLES), 10);
 const BLOB_GAP_ESCALATION_MS = nonNegativeIntegerOr(env.get(CONFIG_PARAMS.REPLICATION_BLOBGAPESCALATIONMS), 1_800_000);
 const BLOB_GAP_ESCALATION_ENABLED = BLOB_GAP_ESCALATION_CYCLES > 0 || BLOB_GAP_ESCALATION_MS > 0;
-// Distinct held deliveries one connection's budget tracks before a further hold escalates at once.
+// Distinct held deliveries one connection's budget tracks; beyond it, holds without an exhausted entry to
+// displace stay untracked (held) until one exhausts.
 export const BLOB_GAP_BUDGET_MAX_TRACKED = 10_000;
 const SEND_SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(
 	process.env.HARPER_TEST_SEND_SUBSCRIPTION_RESOLVE_TIMEOUT_MS,
@@ -1474,50 +1475,97 @@ export function shouldRetrySourceBlobRead(state: {
 	);
 }
 
-export type BlobGapEscalation = { cycles: number; heldMs: number; overflow: boolean };
+export type BlobGapEscalation = { cycles: number; heldMs: number };
 export type BlobGapEscalationBudget = ReturnType<typeof createBlobGapEscalationBudget>;
 
+/**
+ * One held delivery's identity across re-streams. Total and non-throwing: it runs inside the blob-save
+ * settlement chain, where a throw would reject the tracked promise onCommit awaits. Record ids are
+ * tagged by type (a numeric 1 and a string "1" are different keys) and structured ids serialize
+ * element-wise with BigInt support.
+ */
 export function blobGapDeliveryKey(fileId: unknown, recordId: unknown, tableName?: string): string {
-	const record = typeof recordId === 'object' && recordId !== null ? JSON.stringify(recordId) : String(recordId);
-	return `${fileId}|${tableName ?? ''}|${record}`;
+	return `${fileId}|${tableName ?? ''}|${blobGapKeyPart(recordId)}`;
+}
+
+// Not JSON.stringify: Harper installs a throwing BigInt.prototype.toJSON, which runs before any replacer.
+function blobGapKeyPart(value: unknown, depth = 0, seen?: Set<object>): string {
+	switch (typeof value) {
+		case 'string':
+			return 's:' + value;
+		case 'number':
+			return 'n:' + value;
+		case 'bigint':
+			return 'b:' + value;
+		case 'object': {
+			if (value === null) return 'null';
+			if (depth > 8) return 'deep';
+			if (value instanceof Uint8Array)
+				return 'x:' + Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('hex');
+			if (value instanceof Date) return 'd:' + value.getTime();
+			seen ??= new Set();
+			if (seen.has(value)) return 'cycle';
+			seen.add(value);
+			try {
+				if (Array.isArray(value))
+					return '[' + value.map((item) => blobGapKeyPart(item, depth + 1, seen)).join(',') + ']';
+				return (
+					'{' +
+					Object.keys(value)
+						.sort()
+						.map((key) => key + '=' + blobGapKeyPart((value as Record<string, unknown>)[key], depth + 1, seen))
+						.join(',') +
+					'}'
+				);
+			} catch {
+				return 'o:' + Object.prototype.toString.call(value);
+			}
+		}
+		default:
+			return `${typeof value}:${String(value)}`;
+	}
 }
 
 // Socket generations an exhausted delivery may go unseen before its entry is dropped: an escalated
 // record is only re-streamed while the cursor is still pinned behind it, so silence across two
 // reconnects means the cursor has passed it. A wrong drop costs that delivery one more budget, never
-// an unbounded hold, whereas never dropping lets escalations fill `maxTracked` and turn every later
-// hold on the connection into an overflow skip.
+// an unbounded hold.
 const BLOB_GAP_RETIRE_AFTER_GENERATIONS = 2;
 
 /**
  * Cross-reconnect escalation budget for held source-blob gaps (harper-pro#432; policy in
  * replication/DESIGN.md item 8). Lives on the persistent `NodeReplicationConnection`; charges one cycle
- * per socket generation per delivery. Three invariants the wiring relies on: exhaustion is STICKY until
- * a successful save of that delivery (forgetting it lets two deliveries with offset phases leapfrog
+ * per socket generation per delivery. Invariants the wiring relies on: exhaustion is STICKY until a
+ * successful save of that delivery (forgetting it lets two deliveries with offset phases leapfrog
  * forever); a charge or resolve from a generation older than the newest begun is ignored (a retired
- * socket's late settlements must not touch the live budget); live progress is never evicted — past
- * `maxTracked` a new delivery escalates as `overflow` instead of resetting an older one, and only
- * exhausted entries are ever dropped (see `beginGeneration`).
+ * socket's late settlements must not touch the live budget); live progress is never dropped and no
+ * delivery is skipped before its budget — at `maxTracked` the oldest exhausted entry makes room, and
+ * with every tracked delivery still live a new hold simply stays untracked (held) until one exhausts.
  */
 export function createBlobGapEscalationBudget(opts: {
 	maxCycles: number;
 	maxHoldMs: number;
 	maxTracked?: number;
 	now?: () => number;
+	generation?: number;
+	onCapacity?: (tracked: number) => void;
 }) {
 	const maxTracked = opts.maxTracked ?? BLOB_GAP_BUDGET_MAX_TRACKED;
 	const now = opts.now ?? (() => performance.now());
 	type Entry = { firstHeldAt: number; cycles: number; lastGeneration: number; exhausted: boolean };
 	const held = new Map<string, Entry>();
-	let currentGeneration = 0;
+	let currentGeneration = opts.generation ?? 0;
+	let capacityWarnedGeneration = -1;
 	const isStale = (generation: number) => {
 		if (generation < currentGeneration) return true;
 		currentGeneration = generation;
 		return false;
 	};
-	const evictExhausted = (generation: number): boolean => {
+	// Oldest exhausted entry first (Map iteration is insertion order): its record was already skipped
+	// past, so dropping it never touches live progress; a later re-hold of it starts one more budget.
+	const evictExhausted = (): boolean => {
 		for (const [key, entry] of held) {
-			if (entry.exhausted && entry.lastGeneration < generation) {
+			if (entry.exhausted) {
 				held.delete(key);
 				return true;
 			}
@@ -1527,8 +1575,7 @@ export function createBlobGapEscalationBudget(opts: {
 	return {
 		/**
 		 * A replacement socket is live: everything from older generations is now stale, and exhausted
-		 * deliveries unseen for BLOB_GAP_RETIRE_AFTER_GENERATIONS generations are dropped. Live (unexhausted)
-		 * progress is never dropped here.
+		 * deliveries unseen for BLOB_GAP_RETIRE_AFTER_GENERATIONS generations are dropped.
 		 */
 		beginGeneration(generation: number): void {
 			if (generation <= currentGeneration) return;
@@ -1546,10 +1593,15 @@ export function createBlobGapEscalationBudget(opts: {
 			const at = now();
 			let entry = held.get(key);
 			if (!entry) {
-				// At capacity, an exhausted entry the current socket has not re-held is dead weight (its
-				// record was skipped past); dropping it is not dropping live progress. Overflow is only for a
-				// budget whose every entry is live or still being re-streamed.
-				if (held.size >= maxTracked && !evictExhausted(generation)) return { cycles: 0, heldMs: 0, overflow: true };
+				if (held.size >= maxTracked && !evictExhausted()) {
+					if (capacityWarnedGeneration !== generation) {
+						capacityWarnedGeneration = generation;
+						try {
+							opts.onCapacity?.(held.size);
+						} catch {}
+					}
+					return undefined;
+				}
 				entry = { firstHeldAt: at, cycles: 0, lastGeneration: -1, exhausted: false };
 				held.set(key, entry);
 			}
@@ -1562,7 +1614,7 @@ export function createBlobGapEscalationBudget(opts: {
 				entry.exhausted =
 					(opts.maxCycles > 0 && entry.cycles >= opts.maxCycles) || (opts.maxHoldMs > 0 && heldMs >= opts.maxHoldMs);
 			}
-			return entry.exhausted ? { cycles: entry.cycles, heldMs, overflow: false } : undefined;
+			return entry.exhausted ? { cycles: entry.cycles, heldMs } : undefined;
 		},
 		/** A successful save of `key` healed its gap; a later hold of it starts a fresh budget. */
 		resolve(key: string, generation: number): void {
@@ -1578,11 +1630,8 @@ export function createBlobGapEscalationBudget(opts: {
 /** The escalation clause of the advance-past error line. */
 export function describeBlobGapEscalation(
 	escalation: BlobGapEscalation,
-	limits: { maxCycles: number; maxHoldMs: number; maxTracked: number }
+	limits: { maxCycles: number; maxHoldMs: number }
 ): string {
-	if (escalation.overflow) {
-		return `blob-gap escalation budget overflow: this connection already tracks ${limits.maxTracked} held deliveries, so this one is skipped at once`;
-	}
 	return (
 		`blob-gap escalation budget exhausted after ${escalation.cycles} reconnect cycle(s) holding it for ${Math.round(escalation.heldMs)}ms ` +
 		`(limits: ${limits.maxCycles || 'no'} cycles / ${limits.maxHoldMs || 'no'} ms)`
@@ -6815,6 +6864,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						const budget = (options.connection.blobGapBudget ??= createBlobGapEscalationBudget({
 							maxCycles: BLOB_GAP_ESCALATION_CYCLES,
 							maxHoldMs: BLOB_GAP_ESCALATION_MS,
+							generation: options.connection.blobGapGeneration,
+							onCapacity: (tracked) =>
+								logger.warn?.(
+									`Blob-gap escalation budget for ${remoteNodeName} (db: "${databaseName}") is tracking ${tracked} held deliveries, its capacity; ` +
+										`further held deliveries stay untracked (held, not skipped) until a tracked one exhausts (harper-pro#432)`
+								),
 						}));
 						const escalation = budget.charge(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
 						if (escalation) markSourceBlobUnavailable(err, escalation);
@@ -6833,7 +6888,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										describeBlobGapEscalation(escalation, {
 											maxCycles: BLOB_GAP_ESCALATION_CYCLES,
 											maxHoldMs: BLOB_GAP_ESCALATION_MS,
-											maxTracked: BLOB_GAP_BUDGET_MAX_TRACKED,
 										}) +
 										`; advancing the resume cursor past it — the record's blob stays diverged until backfilled (repair_blob_data, harper-pro#388/#432).`
 								: `Blob ${blobId} for record ${id} is unrecoverable at source ${remoteNodeName} (${errorToString(err)}); ` +
