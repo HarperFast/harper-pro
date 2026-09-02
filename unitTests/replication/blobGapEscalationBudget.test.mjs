@@ -221,6 +221,33 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		assert.equal(budget.charge(A, 5), undefined); // re-held after retirement: a fresh budget
 	});
 
+	it('successful saves of untracked deliveries do not count toward retirement', () => {
+		// A partial reconnect that saves other blobs and dies before reaching the held delivery.
+		const budget = createBlobGapEscalationBudget({ maxCycles: 3, maxHoldMs: 0, now: fakeClock().now });
+		budget.charge(A, 1);
+		const C = blobGapDeliveryKey('c3', 3);
+		for (let generation = 2; generation <= 6; generation++) {
+			budget.beginGeneration(generation);
+			budget.resolve(C, generation); // never tracked: not activity
+		}
+		assert.equal(budget.size, 1);
+		assert.equal(budget.charge(A, 6), undefined);
+		assert.equal(budget.charge(A, 7).cycles, 3);
+	});
+
+	it('settling a tracked delivery counts as activity', () => {
+		const budget = createBlobGapEscalationBudget({ maxCycles: 3, maxHoldMs: 0, now: fakeClock().now });
+		budget.charge(A, 1);
+		budget.charge(B, 1);
+		budget.beginGeneration(2);
+		budget.resolve(B, 2);
+		budget.beginGeneration(3);
+		budget.charge(B, 3);
+		budget.beginGeneration(4);
+		assert.equal(budget.size, 1); // A silent across two active generations: retired
+		assert.equal(budget.charge(A, 4), undefined);
+	});
+
 	it('sockets that settle nothing do not count toward retirement', () => {
 		// A peer in a restart loop, or a copy the watchdogs keep terminating, burns generations without
 		// re-streaming the held delivery; its clock must survive that.
