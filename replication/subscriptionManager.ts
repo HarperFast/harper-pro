@@ -135,11 +135,15 @@ const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
 interface SubscribeSchedule {
 	timer?: ReturnType<typeof setTimeout>;
 	backoff: Backoff;
+	nodes?: any[];
 }
 
 export interface SubscribeSetupScheduler {
-	/** Arm a setup for this pair, or return undefined when one is already pending (deduped). */
-	schedule(url: string, database: string, staggerMs?: number): number | undefined;
+	/**
+	 * Arm a setup for this pair with `nodes` as its payload, or return undefined when one is already
+	 * pending (deduped) — the payload is refreshed either way, so the newest one is what fires.
+	 */
+	schedule(url: string, database: string, nodes: any[], staggerMs?: number): number | undefined;
 	/** The pair reached 'open': drop the pending setup and the escalated delay. */
 	noteConnected(url: string, database: string): void;
 	cancel(url: string, database: string): void;
@@ -161,12 +165,14 @@ export interface SubscribeSetupScheduler {
  *
  * Keyed by (url, database) in its own map rather than on the `connectionReplicationMap` entry,
  * because the stale-worker path in `onDatabase` deletes and recreates that entry — per-entry state
- * would be wiped on exactly the path that most needs the dedup. `dispatch` re-reads the live entry at
- * fire time instead of capturing a payload, so a deduped update is never lost (the entry already
- * holds the newest `nodes`/`worker`) and no closure is allocated per suppressed event.
+ * would be wiped on exactly the path that most needs the dedup. The payload is carried on the
+ * schedule (not read back off the entry at fire time): `onDatabase` replaces `entry.nodes` on its
+ * early-return path *without* running the leader/url enrichment, so the entry's array is not
+ * necessarily the one a setup should be sent with. Only a call that did enrich reaches this
+ * scheduler, so refreshing here on a deduped call keeps "newest payload wins" without losing it.
  */
 export function createSubscribeSetupScheduler(deps: {
-	dispatch: (url: string, database: string) => void;
+	dispatch: (url: string, database: string, nodes: any[]) => void;
 	random?: () => number;
 	initialMs?: number;
 	maxMs?: number;
@@ -191,21 +197,25 @@ export function createSubscribeSetupScheduler(deps: {
 	}
 
 	return {
-		schedule(url, database, staggerMs = 0) {
+		schedule(url, database, nodes, staggerMs = 0) {
 			let forUrl = schedules.get(url);
 			if (!forUrl) schedules.set(url, (forUrl = new Map()));
 			let schedule = forUrl.get(database);
 			if (!schedule) {
 				schedule = { backoff: createBackoff({ initialMs, maxMs, minMs, random }) };
 				forUrl.set(database, schedule);
-			} else if (schedule.timer) return undefined;
+			}
+			schedule.nodes = nodes;
+			if (schedule.timer) return undefined;
 			const delay = schedule.backoff.nextDelay() + staggerMs;
 			schedule.timer = setTimeout(() => {
 				schedule.timer = undefined;
+				const pending = schedule.nodes;
+				schedule.nodes = undefined;
 				// A synchronous throw here (postMessage on an uncloneable payload) would take the process
 				// down, and this is the recovery path.
 				try {
-					dispatch(url, database);
+					if (pending) dispatch(url, database, pending);
 				} catch (error) {
 					logger.error('Error dispatching subscription setup for', database, url, error);
 				}
@@ -234,17 +244,16 @@ export function createSubscribeSetupScheduler(deps: {
 }
 
 /**
- * Send the subscribe-to-node the scheduler armed, from the entry's *current* state. The entry can have
- * been unsubscribed, deleted, or reassigned to another worker during the (now up to 30s) wait. A pair
- * that connected in the meantime has already had this setup cancelled by `noteConnected`; we
- * deliberately do not re-check `connected` here, because a re-subscribe after an unsubscribe is
- * legitimately scheduled while the closing connection still reads connected:true.
+ * Send the subscribe-to-node the scheduler armed. The entry can have been unsubscribed, deleted, or
+ * reassigned to another worker during the (now up to 30s) wait, so ownership is re-checked against
+ * live state and the message goes to the entry's current worker. A pair that connected in the
+ * meantime has already had this setup cancelled by `noteConnected`; we deliberately do not re-check
+ * `connected` here, because a re-subscribe after an unsubscribe is legitimately scheduled while the
+ * closing connection still reads connected:true.
  */
-function dispatchSubscribeSetup(url: string, database: string) {
+function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 	const entry = connectionReplicationMap.get(url)?.get(database);
-	if (!entry || entry.unsubscribed) return;
-	const nodes = entry.nodes;
-	if (!nodes?.[0]) return;
+	if (!entry || entry.unsubscribed || !nodes[0]) return;
 	const request = { ...nodes[0], type: 'subscribe-to-node', database, nodes };
 	if (entry.worker) {
 		entry.worker.postMessage(request);
@@ -918,6 +927,11 @@ export async function startOnMainThread(options) {
 			}
 			// Use the enriched payload (nodes[0]) so the receive gate sees configRouteReplicates.
 			const shouldSubscribe = shouldReplicateFromNode(nodes[0] as any, databaseName);
+			// Resolve the URL here rather than at the subscribe-scheduling site below: this array becomes
+			// `entry.nodes`, and the early-return path replaces it without ever reaching that site — which
+			// left the wedge re-drive posting a request with no url ("Failed to create web socket to
+			// undefined"). Placed after shouldReplicateFromNode so its verdict is unchanged.
+			nodes[0].url ??= getNodeURL(nodes[0] as any);
 			const httpWorkers = workers.filter((worker) => worker.name === 'http');
 			// Defensively detect entries that point at a worker no longer in the http pool.
 			// This happens when the worker.on('exit') handler below never fired (hung WebSocket
@@ -996,13 +1010,12 @@ export async function startOnMainThread(options) {
 				// We deliberately do NOT honour nodeName === leaderName when leaderName came
 				// from the "first other node in hdb_nodes" fallback — that's just a guess.
 				nodes[0].isLeader = nodes[0].isLeader || !leaderName || (hasExplicitLeader && nodeName === leaderName);
-				nodes[0].url ??= getNodeURL(nodes[0]);
 				// Stagger the subscribe when reassigning (subscribeStagger set) so N databases on one peer
 				// don't dial N catchup connections simultaneously. See #446.
 				const staggerMs = subscribeStagger ? subscribeStagger.count++ * RECONNECT_STAGGER_MS : 0;
-				const subscribeDelay = subscribeSetupScheduler.schedule(getNodeURL(node), databaseName, staggerMs);
-				// undefined means a setup for this (url, database) is already pending: the entry it will
-				// read has just been refreshed above, so there is nothing more to do — and nothing to log.
+				const subscribeDelay = subscribeSetupScheduler.schedule(getNodeURL(node), databaseName, nodes, staggerMs);
+				// undefined means a setup for this (url, database) is already pending: it has just taken
+				// this call's payload, so there is nothing more to do — and nothing to log.
 				// The warn belongs to an armed setup, not to an event, or a re-drive storm reproduces the
 				// 165k-line logs of harper-pro#327 even though the work itself is now bounded.
 				if (subscribeDelay !== undefined) {
@@ -1095,15 +1108,13 @@ export async function startOnMainThread(options) {
 				return;
 			}
 			const mainNode: any = existingWorkerEntry.nodes[0];
-			if (
-				!(
-					mainNode.replicates === true ||
-					mainNode.replicates?.sends ||
-					mainNode.replicates?.sendsTo?.length ||
-					mainNode.replicates?.receivesFrom?.length ||
-					mainNode.subscriptions?.length
-				)
-			) {
+			if (!(
+				mainNode.replicates === true ||
+				mainNode.replicates?.sends ||
+				mainNode.replicates?.sendsTo?.length ||
+				mainNode.replicates?.receivesFrom?.length ||
+				mainNode.subscriptions?.length
+			)) {
 				// no replication, so just return
 				return;
 			}

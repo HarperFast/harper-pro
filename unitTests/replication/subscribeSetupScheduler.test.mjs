@@ -21,10 +21,12 @@ const URL_B = 'wss://peer-b:9933';
 const MIN_DELAY = 200;
 const MAX_DELAY = 30_000;
 
+const NODES = [{ name: 'peer-a', url: URL_A }];
+
 function makeScheduler(random) {
 	const dispatches = [];
 	const scheduler = createSubscribeSetupScheduler({
-		dispatch: (url, database) => dispatches.push({ url, database, at: Date.now() }),
+		dispatch: (url, database, nodes) => dispatches.push({ url, database, nodes, at: Date.now() }),
 		random,
 	});
 	return { scheduler, dispatches };
@@ -50,7 +52,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 
 		// 60,000 qualifying updates spread over 60s of simulated time (~1,000/s, the observed storm rate).
 		for (let i = 0; i < 60_000; i++) {
-			scheduler.schedule(URL_A, 'data');
+			scheduler.schedule(URL_A, 'data', NODES);
 			maxPending = Math.max(maxPending, scheduler.pendingCount());
 			clock.tick(1);
 		}
@@ -66,7 +68,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		let i = 0;
 		const { scheduler } = makeScheduler(() => draws[i++ % draws.length]);
 		for (let attempt = 0; attempt < 40; attempt++) {
-			const delay = scheduler.schedule(URL_A, 'data');
+			const delay = scheduler.schedule(URL_A, 'data', NODES);
 			expect(delay).to.be.at.least(MIN_DELAY);
 			expect(delay).to.be.below(MAX_DELAY);
 			clock.tick(delay);
@@ -75,21 +77,21 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 
 	it('returns undefined instead of arming a second timer for the same pair', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
-		expect(scheduler.schedule(URL_A, 'data')).to.equal(300);
-		expect(scheduler.schedule(URL_A, 'data'), 'deduped').to.equal(undefined);
-		expect(scheduler.schedule(URL_A, 'data'), 'still deduped').to.equal(undefined);
+		expect(scheduler.schedule(URL_A, 'data', NODES)).to.equal(300);
+		expect(scheduler.schedule(URL_A, 'data', NODES), 'deduped').to.equal(undefined);
+		expect(scheduler.schedule(URL_A, 'data', NODES), 'still deduped').to.equal(undefined);
 		clock.tick(60_000);
 		expect(dispatches.length).to.equal(1);
 	});
 
 	it('tracks (url, database) pairs independently', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
-		expect(scheduler.schedule(URL_A, 'data')).to.equal(300);
-		expect(scheduler.schedule(URL_A, 'other')).to.equal(300);
-		expect(scheduler.schedule(URL_B, 'data')).to.equal(300);
+		expect(scheduler.schedule(URL_A, 'data', NODES)).to.equal(300);
+		expect(scheduler.schedule(URL_A, 'other', NODES)).to.equal(300);
+		expect(scheduler.schedule(URL_B, 'data', NODES)).to.equal(300);
 		expect(scheduler.pendingCount()).to.equal(3);
 		clock.tick(300);
-		expect(dispatches).to.deep.equal([
+		expect(dispatches.map(({ url, database, at }) => ({ url, database, at }))).to.deep.equal([
 			{ url: URL_A, database: 'data', at: 300 },
 			{ url: URL_A, database: 'other', at: 300 },
 			{ url: URL_B, database: 'data', at: 300 },
@@ -102,24 +104,38 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		const aDelays = [];
 		const bDelays = [];
 		for (let attempt = 0; attempt < 5; attempt++) {
-			aDelays.push(a.schedule(URL_A, 'data'));
-			bDelays.push(b.schedule(URL_A, 'data'));
+			aDelays.push(a.schedule(URL_A, 'data', NODES));
+			bDelays.push(b.schedule(URL_A, 'data', NODES));
 			clock.tick(MAX_DELAY + MIN_DELAY);
 		}
 		expect(aDelays).to.not.deep.equal(bDelays);
 		for (let i = 0; i < aDelays.length; i++) expect(aDelays[i]).to.be.below(bDelays[i]);
 	});
 
+	// The regression that made the deduped path lose the enriched payload: onDatabase replaces
+	// entry.nodes on its early-return path without running the leader/url enrichment, so the setup has
+	// to carry the payload of the call that armed or last refreshed it, not whatever the entry holds.
+	it('fires with the newest payload a deduped call supplied', () => {
+		const { scheduler, dispatches } = makeScheduler(() => 0.5);
+		const first = [{ name: 'peer-a', url: URL_A }];
+		const second = [{ name: 'peer-a', url: URL_A, isLeader: true }];
+		scheduler.schedule(URL_A, 'data', first);
+		expect(scheduler.schedule(URL_A, 'data', second)).to.equal(undefined);
+		clock.tick(300);
+		expect(dispatches.length).to.equal(1);
+		expect(dispatches[0].nodes).to.equal(second);
+	});
+
 	it('adds the caller-supplied stagger on top of the backoff', () => {
 		const { scheduler } = makeScheduler(() => 0.5);
-		expect(scheduler.schedule(URL_A, 'data', 150)).to.equal(450);
+		expect(scheduler.schedule(URL_A, 'data', NODES, 150)).to.equal(450);
 	});
 
 	it('noteConnected drops the pending setup and the escalated delay', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
-		scheduler.schedule(URL_A, 'data');
+		scheduler.schedule(URL_A, 'data', NODES);
 		clock.tick(300);
-		scheduler.schedule(URL_A, 'data'); // second attempt: escalated to 500
+		scheduler.schedule(URL_A, 'data', NODES); // second attempt: escalated to 500
 		expect(scheduler.pendingCount()).to.equal(1);
 
 		scheduler.noteConnected(URL_A, 'data');
@@ -127,14 +143,14 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		clock.tick(60_000);
 		expect(dispatches.length, 'the cancelled setup never fired').to.equal(1);
 
-		expect(scheduler.schedule(URL_A, 'data'), 'back to the first ceiling after success').to.equal(300);
+		expect(scheduler.schedule(URL_A, 'data', NODES), 'back to the first ceiling after success').to.equal(300);
 	});
 
 	it('cancel() and cancelUrl() disarm pending setups', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
-		scheduler.schedule(URL_A, 'data');
-		scheduler.schedule(URL_A, 'other');
-		scheduler.schedule(URL_B, 'data');
+		scheduler.schedule(URL_A, 'data', NODES);
+		scheduler.schedule(URL_A, 'other', NODES);
+		scheduler.schedule(URL_B, 'data', NODES);
 
 		scheduler.cancel(URL_A, 'data');
 		expect(scheduler.pendingCount()).to.equal(2);
@@ -142,7 +158,9 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		expect(scheduler.pendingCount()).to.equal(1);
 
 		clock.tick(60_000);
-		expect(dispatches).to.deep.equal([{ url: URL_B, database: 'data', at: 300 }]);
+		expect(dispatches.map(({ url, database, at }) => ({ url, database, at }))).to.deep.equal([
+			{ url: URL_B, database: 'data', at: 300 },
+		]);
 	});
 
 	it('a throwing dispatch is contained instead of taking the process down', () => {
@@ -152,10 +170,10 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 			},
 			random: () => 0.5,
 		});
-		scheduler.schedule(URL_A, 'data');
+		scheduler.schedule(URL_A, 'data', NODES);
 		expect(() => clock.tick(300)).to.not.throw();
 		expect(scheduler.pendingCount(), 'ownership released so the pair can be re-armed').to.equal(0);
-		expect(scheduler.schedule(URL_A, 'data')).to.equal(500);
+		expect(scheduler.schedule(URL_A, 'data', NODES)).to.equal(500);
 	});
 });
 
@@ -167,7 +185,7 @@ describe('subscription-setup scheduler timer refs', () => {
 		let armed;
 		globalThis.setTimeout = (fn, ms) => (armed = realSetTimeout(fn, ms));
 		try {
-			createSubscribeSetupScheduler({ dispatch: () => {}, random: () => 0.5 }).schedule(URL_A, 'data');
+			createSubscribeSetupScheduler({ dispatch: () => {}, random: () => 0.5 }).schedule(URL_A, 'data', NODES);
 		} finally {
 			globalThis.setTimeout = realSetTimeout;
 		}
