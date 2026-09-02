@@ -302,34 +302,47 @@ describe('blobGapDeliveryKey', () => {
 	it('separates the same record id in different tables', () => {
 		assert.notEqual(blobGapDeliveryKey('f1', 1, 'a'), blobGapDeliveryKey('f1', 1, 'b'));
 		assert.equal(blobGapDeliveryKey('f1', 1, 'a'), blobGapDeliveryKey('f1', 1, 'a'));
-		assert.equal(blobGapDeliveryKey('f1', 'k', 't'), 'f1|t|s1:k');
+		assert.notEqual(blobGapDeliveryKey('a|b', 1, 'c'), blobGapDeliveryKey('a', 1, 'b|c'));
 	});
 
-	it('never throws and keeps types apart', () => {
+	it('uses the primary store key identity and never throws', () => {
 		assert.doesNotThrow(() => blobGapDeliveryKey('f1', [1n, 2n]));
 		assert.notEqual(blobGapDeliveryKey('f1', [1n]), blobGapDeliveryKey('f1', [2n]));
 		assert.notEqual(blobGapDeliveryKey('f1', 1), blobGapDeliveryKey('f1', '1'));
-		assert.notEqual(blobGapDeliveryKey('f1', 1n), blobGapDeliveryKey('f1', 1));
+		assert.equal(blobGapDeliveryKey('f1', 1n), blobGapDeliveryKey('f1', 1));
+		assert.notEqual(blobGapDeliveryKey('f1', [0]), blobGapDeliveryKey('f1', [-0]));
 		assert.doesNotThrow(() => blobGapDeliveryKey('f1', undefined));
 		assert.doesNotThrow(() => blobGapDeliveryKey('f1', null));
 		assert.doesNotThrow(() => blobGapDeliveryKey('f1', Symbol('k')));
 		const cyclic = {};
 		cyclic.self = cyclic;
 		assert.doesNotThrow(() => blobGapDeliveryKey('f1', cyclic));
-		assert.notEqual(blobGapDeliveryKey('f1', ['a,s1:b']), blobGapDeliveryKey('f1', ['a', 'b']));
-		assert.notEqual(blobGapDeliveryKey('f1', { 'a=1': 2 }), blobGapDeliveryKey('f1', { a: '1=2' }));
 	});
 
 	it('does not collapse structured record ids', () => {
-		assert.notEqual(blobGapDeliveryKey('f1', { a: 1 }), blobGapDeliveryKey('f1', { a: 2 }));
 		assert.notEqual(blobGapDeliveryKey('f1', [1, 2]), blobGapDeliveryKey('f1', [1, 3]));
 		assert.notEqual(blobGapDeliveryKey('f1', Buffer.from([1])), blobGapDeliveryKey('f1', Buffer.from([2])));
 		assert.equal(blobGapDeliveryKey('f1', [1, 2]), blobGapDeliveryKey('f1', [1, 2]));
-		const shared = { value: 1 };
+		const shared = [1, 2];
 		assert.equal(
-			blobGapDeliveryKey('f1', { a: shared, b: shared }),
-			blobGapDeliveryKey('f1', { a: { value: 1 }, b: { value: 1 } })
+			blobGapDeliveryKey('f1', [shared, shared]),
+			blobGapDeliveryKey('f1', [
+				[1, 2],
+				[1, 2],
+			])
 		);
+	});
+
+	it('keeps valid deep ids distinct and every retained key fixed-width', () => {
+		let a = 1;
+		let b = 2;
+		for (let depth = 0; depth < 12; depth++) {
+			a = [a];
+			b = [b];
+		}
+		assert.notEqual(blobGapDeliveryKey('f1', a), blobGapDeliveryKey('f1', b));
+		assert.equal(blobGapDeliveryKey('f1', a).length, 43);
+		assert.equal(blobGapDeliveryKey('f1', 'x'.repeat(20_000)).length, 43);
 	});
 });
 
