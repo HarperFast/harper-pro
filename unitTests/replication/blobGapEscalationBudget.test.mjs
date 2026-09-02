@@ -325,6 +325,11 @@ describe('blobGapDeliveryKey', () => {
 		assert.notEqual(blobGapDeliveryKey('f1', [1, 2]), blobGapDeliveryKey('f1', [1, 3]));
 		assert.notEqual(blobGapDeliveryKey('f1', Buffer.from([1])), blobGapDeliveryKey('f1', Buffer.from([2])));
 		assert.equal(blobGapDeliveryKey('f1', [1, 2]), blobGapDeliveryKey('f1', [1, 2]));
+		const shared = { value: 1 };
+		assert.equal(
+			blobGapDeliveryKey('f1', { a: shared, b: shared }),
+			blobGapDeliveryKey('f1', { a: { value: 1 }, b: { value: 1 } })
+		);
 	});
 });
 
@@ -363,10 +368,11 @@ describe('nonNegativeIntegerOr — escalation bound config parsing', () => {
 		assert.equal(nonNegativeIntegerOr(12, 10), 12);
 	});
 
-	it('falls back for unset, empty, non-numeric, negative, and infinite values', () => {
-		for (const value of [undefined, null, '', 'abc', -1, '-5', Infinity, 'Infinity', NaN]) {
+	it('falls back for unset, empty, non-numeric, negative, infinite, and non-primitive values', () => {
+		for (const value of [undefined, null, '', '   ', 'abc', -1, '-5', Infinity, 'Infinity', NaN, true, false, [], {}]) {
 			assert.equal(nonNegativeIntegerOr(value, 10), 10, String(value));
 		}
+		assert.equal(nonNegativeIntegerOr(Symbol('value'), 10), 10);
 	});
 });
 
