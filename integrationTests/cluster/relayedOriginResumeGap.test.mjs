@@ -339,7 +339,7 @@ suite(
 				if (!PROTECTION_DISABLED) {
 					await waitForCounts({ O, R, T, W }, TOTAL + 1, 'all four nodes after R restarts');
 				} else {
-					await waitForCounts({ O, R, W }, TOTAL + 1, 'R catch-up through its direct O cursor');
+					await waitForCounts({ O, R, W }, TOTAL + 1, 'R catch-up from O after restart');
 					deepEqual(
 						await countsOn({ O, R, T, W }),
 						{ O: TOTAL + 1, R: TOTAL + 1, T: PHASE1 + 1, W: TOTAL + 1 },
