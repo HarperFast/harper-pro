@@ -81,24 +81,32 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 		ctx.nodeB = await startNode();
 
 		for (const node of [ctx.nodeA, ctx.nodeB]) {
-			await sendOperation(node, {
-				operation: 'create_table',
-				database: DATABASE,
-				table: TABLE,
-				primary_key: 'id',
-				attributes: [
-					{ name: 'id', type: 'ID' },
-					{ name: 'payload', type: 'String' },
-				],
-			});
+			await sendOperation(
+				node,
+				{
+					operation: 'create_table',
+					database: DATABASE,
+					table: TABLE,
+					primary_key: 'id',
+					attributes: [
+						{ name: 'id', type: 'ID' },
+						{ name: 'payload', type: 'String' },
+					],
+				},
+				{ signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS) }
+			);
 		}
 
-		await sendOperation(ctx.nodeB, {
-			operation: 'add_node',
-			rejectUnauthorized: false,
-			hostname: ctx.nodeA.hostname,
-			authorization: ctx.nodeB.admin,
-		});
+		await sendOperation(
+			ctx.nodeB,
+			{
+				operation: 'add_node',
+				rejectUnauthorized: false,
+				hostname: ctx.nodeA.hostname,
+				authorization: ctx.nodeB.admin,
+			},
+			{ signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS) }
+		);
 	});
 
 	after(async () => {
@@ -300,7 +308,7 @@ function localLogPath(dataRootDir) {
 	return join(dataRootDir, 'database', DATABASE, 'transaction_logs', 'local', `${LOG_ID}.txnlog`);
 }
 
-/** Every row on the node; a failed query fails the test rather than reading as an empty table. */
+/** A failed query fails the test rather than reading as an empty table. */
 async function readRows(node, signal = AbortSignal.timeout(OPERATION_TIMEOUT_MS)) {
 	const rows = await sendOperation(
 		node,
