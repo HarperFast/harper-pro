@@ -4348,7 +4348,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							blobsInFlight.set(streamKey, stream);
 							registerBlobReceiveInFlight(fileId, auditStore?.rootStore);
 						}
-						if (size !== undefined) stream.expectedSize = size;
+						// Only ever store a valid size: the codec-binding guard below validates the size it
+						// binds a codec with, but a later chunk carrying a non-finite/negative size and no
+						// codec must not overwrite the good expectedSize a bound codec relies on — that would
+						// re-poison the transfer (createRepairInflater would then reject the size and the throw
+						// would ride the record-decode path into a connection close and reconnect loop).
+						if (size !== undefined && Number.isSafeInteger(size) && size >= 0) stream.expectedSize = size;
 						if (codec !== undefined && !stream.destroyed) {
 							// The codec decides the on-disk header the save stamps from its first byte, so it binds
 							// immutably to the transfer: unknown, unadvertised, changed mid-transfer, or announced
