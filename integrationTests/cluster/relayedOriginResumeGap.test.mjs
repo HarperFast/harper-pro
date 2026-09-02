@@ -309,6 +309,7 @@ suite(
 				} else {
 					ok(decision.legacyResume, 'with the hook, T must resume O from now-60s instead of copying');
 					ok(!decision.fullCopy, 'with the hook, T must not request a full copy from O');
+					await waitForCounts({ O, W }, TOTAL + 1, 'the live write on O and its direct follower W');
 					const tIds = await idsOn(T);
 					deepEqual(
 						phase2Ids.filter((id) => tIds.has(id)),
