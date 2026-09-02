@@ -1526,10 +1526,11 @@ function blobGapKeyPart(value: unknown, depth = 0, seen?: Set<object>): string {
 	}
 }
 
-// Socket generations an exhausted delivery may go unseen before its entry is dropped: an escalated
-// record is only re-streamed while the cursor is still pinned behind it, so silence across two
-// reconnects means the cursor has passed it. A wrong drop costs that delivery one more budget, never
-// an unbounded hold.
+// Socket generations a delivery may go unseen before its entry is dropped. The #683 timer reconnects
+// precisely to re-stream every held delivery, so one that is not re-held for two generations has
+// healed, been skipped past, or been superseded by a new source file id — it will never be charged
+// again and would otherwise occupy the budget for the process lifetime. A wrong drop (two sockets
+// in a row that died before reaching it) costs that delivery one more budget, never an unbounded hold.
 const BLOB_GAP_RETIRE_AFTER_GENERATIONS = 2;
 
 /**
@@ -1538,9 +1539,10 @@ const BLOB_GAP_RETIRE_AFTER_GENERATIONS = 2;
  * per socket generation per delivery. Invariants the wiring relies on: exhaustion is STICKY until a
  * successful save of that delivery (forgetting it lets two deliveries with offset phases leapfrog
  * forever); a charge or resolve from a generation older than the newest begun is ignored (a retired
- * socket's late settlements must not touch the live budget); live progress is never dropped and no
- * delivery is skipped before its budget — at `maxTracked` the oldest exhausted entry makes room, and
- * with every tracked delivery still live a new hold simply stays untracked (held) until one exhausts.
+ * socket's late settlements must not touch the live budget); live progress is never dropped for room
+ * and no delivery is skipped before its budget — at `maxTracked` the oldest exhausted entry makes room,
+ * and with every tracked delivery still live a new hold simply stays untracked (held) until one
+ * exhausts. Entries unseen for BLOB_GAP_RETIRE_AFTER_GENERATIONS socket generations are retired.
  */
 export function createBlobGapEscalationBudget(opts: {
 	maxCycles: number;
@@ -1573,20 +1575,17 @@ export function createBlobGapEscalationBudget(opts: {
 		return false;
 	};
 	return {
-		/**
-		 * A replacement socket is live: everything from older generations is now stale, and exhausted
-		 * deliveries unseen for BLOB_GAP_RETIRE_AFTER_GENERATIONS generations are dropped.
-		 */
+		/** A replacement socket is live: older generations are stale, and long-silent entries are retired. */
 		beginGeneration(generation: number): void {
 			if (generation <= currentGeneration) return;
 			currentGeneration = generation;
 			for (const [key, entry] of held) {
-				if (entry.exhausted && entry.lastGeneration < generation - BLOB_GAP_RETIRE_AFTER_GENERATIONS) held.delete(key);
+				if (entry.lastGeneration < generation - BLOB_GAP_RETIRE_AFTER_GENERATIONS) held.delete(key);
 			}
 		},
 		/**
 		 * `key` is holding the cursor in socket `generation`; returns the escalation to apply once its budget
-		 * is exhausted, else undefined (keep holding). Never throws.
+		 * is exhausted, else undefined (keep holding).
 		 */
 		charge(key: string, generation: number): BlobGapEscalation | undefined {
 			if (isStale(generation)) return undefined;
@@ -1616,7 +1615,7 @@ export function createBlobGapEscalationBudget(opts: {
 			}
 			return entry.exhausted ? { cycles: entry.cycles, heldMs } : undefined;
 		},
-		/** A successful save of `key` healed its gap; a later hold of it starts a fresh budget. */
+		/** `key` is settled (saved, or skipped past for good); a later hold of it starts a fresh budget. */
 		resolve(key: string, generation: number): void {
 			if (held.size === 0 || isStale(generation)) return;
 			held.delete(key);
@@ -1627,7 +1626,6 @@ export function createBlobGapEscalationBudget(opts: {
 	};
 }
 
-/** The escalation clause of the advance-past error line. */
 export function describeBlobGapEscalation(
 	escalation: BlobGapEscalation,
 	limits: { maxCycles: number; maxHoldMs: number }
@@ -6824,6 +6822,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			copyWatermark.trackBlob(copyFrameIndex);
 			let copyBlobGapped = false;
 			let saveFailed = false;
+			// Drops this delivery's budget entry: it saved, or a permanent source failure skipped it for good.
+			// A budget with nothing tracked costs one size check, so the healthy path builds no key.
+			const settleBlobGapBudget = () => {
+				const budget = options.connection?.blobGapBudget;
+				if (budget && budget.size > 0) budget.resolve(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
+			};
 			// We log the rejection via .catch() and also need the resulting promise — not the
 			// raw `finished` — to be what we hand to `Promise.all(outstandingBlobsToFinish)` in
 			// the end_txn onCommit path below. If we pushed `finished` directly, a save
@@ -6855,24 +6859,33 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// budget first, so a delivery the origin keeps failing is reclassified as unrecoverable once
 					// its budget is spent and skipped exactly like a 404/500 (harper-pro#432). Charged here, not
 					// at the frame, because only a failed save proves the delivery holds the cursor.
-					if (
-						BLOB_GAP_ESCALATION_ENABLED &&
-						options.connection &&
-						isBudgetedSourceBlobError(err) &&
-						!isUnrecoverableSourceBlobError(err)
-					) {
-						const budget = (options.connection.blobGapBudget ??= createBlobGapEscalationBudget({
-							maxCycles: BLOB_GAP_ESCALATION_CYCLES,
-							maxHoldMs: BLOB_GAP_ESCALATION_MS,
-							generation: options.connection.blobGapGeneration,
-							onCapacity: (tracked) =>
-								logger.warn?.(
-									`Blob-gap escalation budget for ${remoteNodeName} (db: "${databaseName}") is tracking ${tracked} held deliveries, its capacity; ` +
-										`further held deliveries stay untracked (held, not skipped) until a tracked one exhausts (harper-pro#432)`
-								),
-						}));
-						const escalation = budget.charge(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
-						if (escalation) markSourceBlobUnavailable(err, escalation);
+					// Budget bookkeeping must never throw into this chain: a throw here would skip both the hold
+					// and the advance-past branch, and in the `.finally` below it would leave the blob in flight
+					// for good.
+					try {
+						if (
+							BLOB_GAP_ESCALATION_ENABLED &&
+							options.connection &&
+							isBudgetedSourceBlobError(err) &&
+							!isUnrecoverableSourceBlobError(err)
+						) {
+							const budget = (options.connection.blobGapBudget ??= createBlobGapEscalationBudget({
+								maxCycles: BLOB_GAP_ESCALATION_CYCLES,
+								maxHoldMs: BLOB_GAP_ESCALATION_MS,
+								generation: options.connection.blobGapGeneration,
+								onCapacity: (tracked) =>
+									logger.warn?.(
+										`Blob-gap escalation budget for ${remoteNodeName} (db: "${databaseName}") is tracking ${tracked} held deliveries, its capacity; ` +
+											`further held deliveries stay untracked (held, not skipped) until a tracked one exhausts (harper-pro#432)`
+									),
+							}));
+							const escalation = budget.charge(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
+							if (escalation) markSourceBlobUnavailable(err, escalation);
+						} else if (isUnrecoverableSourceBlobError(err)) {
+							settleBlobGapBudget();
+						}
+					} catch (budgetError) {
+						logger.warn?.(`Blob-gap escalation budget error for ${blobId} from ${remoteNodeName}`, budgetError);
 					}
 					if (isUnrecoverableSourceBlobError(err)) {
 						// The sender reported it cannot provide this blob (BLOB_CHUNK `error` marker — typically
@@ -6932,8 +6945,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
 					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
 					if (!saveFailed) {
-						const budget = options.connection?.blobGapBudget;
-						if (budget && budget.size > 0) budget.resolve(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
+						try {
+							settleBlobGapBudget();
+						} catch (budgetError) {
+							logger.warn?.(`Blob-gap escalation budget error for ${blobId} from ${remoteNodeName}`, budgetError);
+						}
 					}
 					// Settle before flushDurableCopyCursor below so the watermark sees this blob's outcome
 					// (an unrecoverable-source skip settles un-gapped — the cursor advances past it, #403).
