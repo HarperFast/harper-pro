@@ -154,13 +154,14 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 
 **Integration tests** live in `../integrationTests/cluster/`:
 
-| File                                 | Purpose                                                 |
-| ------------------------------------ | ------------------------------------------------------- |
-| `clusterShared.mjs`                  | Shared fixture/helper (cluster boot, node setup)        |
-| `fullyConnectedReplication.test.mjs` | Full-mesh topology                                      |
-| `replicationTopology.test.mjs`       | Dynamic membership changes                              |
-| `replicationLoad.test.mjs`           | Concurrent-write load                                   |
-| `excludeTablesReplication.test.mjs`  | Per-route `excludeTables` bridge migration (issue #239) |
+| File                                 | Purpose                                                                                                                                                    |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clusterShared.mjs`                  | Shared fixture/helper (cluster boot, node setup)                                                                                                           |
+| `fullyConnectedReplication.test.mjs` | Full-mesh topology                                                                                                                                         |
+| `replicationTopology.test.mjs`       | Dynamic membership changes                                                                                                                                 |
+| `replicationLoad.test.mjs`           | Concurrent-write load                                                                                                                                      |
+| `excludeTablesReplication.test.mjs`  | Per-route `excludeTables` bridge migration (issue #239)                                                                                                    |
+| `relayedOriginResumeGap.test.mjs`    | Deterministic relayed-origin cursorless resume gap (#432): guards the #428 full copy; `HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY=1` runs its red-proof mode |
 
 Most replication behavior is exercised via integration tests that spin up multi-node clusters. A few function-level invariants that don't need a cluster live in `../unitTests/replication/` (e.g. `listenerLifecycle.test.mjs`, `pingKeepalive.test.mjs`).
 

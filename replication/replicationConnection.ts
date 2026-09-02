@@ -1317,6 +1317,20 @@ export function maybeInjectDecodeFailureForTest(recordId: unknown): void {
 	}
 }
 
+// Test-only override for a source that resolved to NO resume cursor. Unarmed (production) it returns
+// undefined and the caller requests a full copy (harper-pro#428). When HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY=1
+// is set on the RECEIVER it returns the pre-#428 start for a non-leader source — `now - 60s`, which silently
+// skips whatever backlog the source holds that is older than a minute — so
+// integrationTests/cluster/relayedOriginResumeGap.test.mjs can prove its convergence assertion catches that
+// loss. Read per call: it runs once per subscription build.
+export function maybeLegacyCursorlessResumeStartForTest(
+	isLeader: boolean | undefined,
+	now: number = Date.now()
+): number | undefined {
+	if (isLeader || process.env.HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY !== '1') return undefined;
+	return now - 60000;
+}
+
 /**
  * Mark an error as a *source-reported* blob unavailability: the sender told us (via a BLOB_CHUNK
  * `error` marker) that it cannot provide this blob — classically `ENOENT` because the blob was
@@ -6919,14 +6933,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// loses the gap, even though it never lost the connection (harper-pro#426). A full copy is
 				// idempotent, and the leader collapses redundant requests via the per-connection
 				// min(startTime); the cost of an occasional extra copy is acceptable versus silent data loss.
-				if (node.isLeader) {
-					logger.warn?.(`Requesting full copy of database ${databaseName} from ${getNodeURL(node)}`);
-				} else {
+				const legacyStartForTest = maybeLegacyCursorlessResumeStartForTest(node.isLeader);
+				if (legacyStartForTest !== undefined) {
+					startTime = legacyStartForTest;
 					logger.warn?.(
-						`Requesting full copy of database ${databaseName} from ${getNodeURL(node)} (no resume cursor for this source)`
+						`HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY: resuming database ${databaseName} from ${getNodeURL(node)} at ${new Date(startTime).toISOString()} with no resume cursor for this source`
 					);
+				} else {
+					if (node.isLeader) {
+						logger.warn?.(`Requesting full copy of database ${databaseName} from ${getNodeURL(node)}`);
+					} else {
+						logger.warn?.(
+							`Requesting full copy of database ${databaseName} from ${getNodeURL(node)} (no resume cursor for this source)`
+						);
+					}
+					startTime = 0; // use this to indicate that we want to fully copy
 				}
-				startTime = 0; // use this to indicate that we want to fully copy
 			}
 			let copyResume;
 			if (copyCursor) {
