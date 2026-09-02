@@ -54,8 +54,9 @@ const FRAMES_AFTER_TEAR = 20;
 
 const CONVERGE_TIMEOUT_MS = 90_000;
 const REPORT_TIMEOUT_MS = 30_000;
-// How long an acknowledged write behind the break gets to (wrongly) reach B before B is read.
-const QUARANTINE_SETTLE_MS = 5_000;
+// Window in which a write behind the break may (wrongly) reach B before B is read: long enough to
+// span a replication reconnect cycle, since a reconnect restarts the drain from B's cursor.
+const QUARANTINE_SETTLE_MS = 10_000;
 
 suite('Mid-log txnlog tear: replication stops at the break and reports it', { timeout: 300_000 }, (ctx) => {
 	before(async () => {
@@ -113,55 +114,55 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 	});
 
 	test('B receives every entry before the torn frame, nothing behind it, and A reports the break', async () => {
-		// 1. Establish B's resume cursor on a healthy stream.
 		await insertRows(ctx.nodeA, 0, BATCH_ONE);
 		assertExactRows(await waitForRowCount(ctx.nodeB, BATCH_ONE), rowIds(0, BATCH_ONE), 'before B goes offline');
 
-		// 2. B offline. Everything below is written past its cursor, in one source transaction.
 		const bHostname = ctx.nodeB.hostname;
 		const bDataRootDir = ctx.nodeB.dataRootDir;
 		await killHarper({ harper: ctx.nodeB });
 
+		// One insert, so the torn frame sits inside a single source transaction.
 		await insertRows(ctx.nodeA, BATCH_ONE, BATCH_TWO);
 		assertExactRows(await readRows(ctx.nodeA), rowIds(0, TOTAL), 'on A before the tear');
 
-		// 3. Tear a frame near the end of A's log, with A down so the file is quiescent.
-		const aHostname = ctx.nodeA.hostname;
-		const aDataRootDir = ctx.nodeA.dataRootDir;
-		await stopNodeProcess(ctx.nodeA);
-		const tear = tearFrame(localLogPath(aDataRootDir), FRAMES_AFTER_TEAR);
+		// A is stopped so the file is quiescent while it is torn. Its pre-stop handle is kept: a restart
+		// replays the log before logging.root is repointed, so boot-time lines land in the stopped
+		// incarnation's log dir (see replayCatchupSeam.test.mjs).
+		const stoppedA = ctx.nodeA;
+		await stopNodeProcess(stoppedA);
+		const tear = tearFrame(localLogPath(stoppedA.dataRootDir), FRAMES_AFTER_TEAR);
 		const beforeBreak = rowIds(0, tear.index);
 		console.log(
 			`tore frame ${tear.index} (${rowId(tear.index)}) @${tear.position} (len ${tear.length}) of ${tear.totalFrames}; ` +
 				`${FRAMES_AFTER_TEAR} frames follow it`
 		);
 
-		// 4. Both back up. B resumes from its pre-tear cursor and must stop at the break.
-		const restartedA = { name: ctx.name, harper: { dataRootDir: aDataRootDir, hostname: aHostname } };
-		await startHarper(restartedA, nodeStartOptions(aHostname));
+		const restartedA = { name: ctx.name, harper: { dataRootDir: stoppedA.dataRootDir, hostname: stoppedA.hostname } };
+		await startHarper(restartedA, nodeStartOptions(stoppedA.hostname));
 		ctx.nodeA = restartedA.harper;
+		// Only the log is torn; the source table keeps every acknowledged row.
+		assertExactRows(await readRows(ctx.nodeA), rowIds(0, TOTAL), 'on A after the restart');
 
 		const restartedB = { name: ctx.name, harper: { dataRootDir: bDataRootDir, hostname: bHostname } };
 		await startHarper(restartedB, nodeStartOptions(bHostname));
 		ctx.nodeB = restartedB.harper;
 
-		// 5. Everything before the break arrives intact. The sender commits the drained prefix when
-		//    the drain ends, which is after it discovered the break, so this must settle before the
-		//    diagnostic is read and before the negative window opens.
+		// The sender commits the drained prefix when the drain ends, after it discovered the break, so
+		// the prefix must have landed before the diagnostic is read and the negative window opens.
 		assertExactRows(
 			await waitForRowCount(ctx.nodeB, beforeBreak.length),
 			beforeBreak,
 			'after B resumed past its cursor'
 		);
 
-		// 6. A reported the break at the torn frame, with where framing resumes.
 		const diagnostic = breakDiagnostic(tear);
-		await waitForCondition(async () => diagnostic.test(await readLog(ctx.nodeA)), {
+		const logsOfA = async () => [...new Set([await readLog(stoppedA), await readLog(ctx.nodeA)])].join('\n');
+		await waitForCondition(async () => diagnostic.test(await logsOfA()), {
 			timeoutMs: REPORT_TIMEOUT_MS,
 			description: () => `A's hdb.log to report the break as ${diagnostic}`,
 		});
 
-		// 7. Nothing behind the break replicates, including a write A acknowledges after the restart.
+		// A write A acknowledges after the restart is behind the break too, so it must not arrive either.
 		await insertRows(ctx.nodeA, TOTAL, 1);
 		await delay(QUARANTINE_SETTLE_MS);
 		assertExactRows(
@@ -242,7 +243,10 @@ function tearFrame(logPath, framesFromEnd) {
 	const buffer = readFileSync(logPath);
 	ok(buffer.subarray(0, 4).toString() === LOG_FILE_MAGIC, `${logPath} is not a transaction log`);
 	const frames = readFrames(buffer);
-	ok(frames.length === TOTAL, `expected one frame per row (${TOTAL}) in ${logPath}, found ${frames.length}`);
+	ok(
+		frames.length === TOTAL,
+		`${logPath} holds ${frames.length} frames for ${TOTAL} rows; the oracle maps frame k to row k and needs one frame per row`
+	);
 	frames.forEach(({ position, length }, index) => {
 		const payload = buffer.subarray(position + ENTRY_HEADER_SIZE, position + ENTRY_HEADER_SIZE + length);
 		ok(payload.includes(payloadFor(rowId(index))), `frame ${index} does not carry ${rowId(index)}`);
