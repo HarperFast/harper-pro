@@ -105,24 +105,24 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 
 Every retry/reconnect initiation site paces attempts through **one** utility, `createBackoff` in
 `backoff.ts`: an exponential ceiling with **full jitter** (uniform draw across the window) by default,
-`'equal'` jitter (the top half of the window) for a site whose invariant is a rate rather than a
-latency bound, an optional fixed floor, an optional wall-clock budget, and injectable RNG/clock so every bound is
-deterministically testable. Before this there was no jitter anywhere in production code — a fleet
+an optional fixed floor, an optional wall-clock/attempt budget, and injectable RNG/clock so every bound is
+deterministically testable. An exhausted schedule returns no delay rather than `0`, so a missed exhaustion
+check cannot create a busy loop. Before this there was no jitter anywhere in production code — a fleet
 reacting to one event retried in lockstep — and the delays themselves ranged from flat 200 ms to
 jitterless doubling.
 
 The invariant the discipline enforces: **at most one pending attempt per target, on a bounded, capped,
 decorrelated schedule.** Pacing alone is not enough; the storm surface below needed the dedup too.
 
-| Site                                                                            | Schedule                                                                                                                                                                                                                           | Reset signal                                                   |
-| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `createSubscribeSetupScheduler` (`subscriptionManager.ts`) — subscription setup | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s, plus the caller's `RECONNECT_STAGGER_MS` stagger                                                                                                          | `connectedToNode` (also cancels the pending setup)             |
-| `NodeReplicationConnection.scheduleReconnect`                                   | ceiling `INITIAL_RETRY_TIME` 500 ms → 30 s, **equal** jitter (top half): this site's invariant is a dial rate, and only a ceiling-relative floor keeps the minimum interval proportional as the ceiling escalates (harper-pro#339) | `onFrameSent` — first frame actually sent, **not** socket open |
-| `reconcileWorkers` wedge / receive-stall re-drives                              | fixed window (decorrelation only; the re-drives are already throttled by the `disconnectedAt` / `receiveStallReconnectAt` re-stamps), one owned `entry.reDriveTimer` per entry                                                     | n/a — disarmed on connect, unsubscribe, and delete             |
-| `runNodeUpdateWatcher` (`knownNodes.ts`) — hdb_nodes watcher restart            | floor/ceiling 1 s → 30 s                                                                                                                                                                                                           | an iteration that survived `NODE_WATCHER_HEALTHY_UPTIME_MS`    |
-| `shouldCloseSendAuthWatch` reprobe (`replicationConnection.ts`)                 | 500 ms → 5 s under a 30 s wall-clock budget, then fails closed                                                                                                                                                                     | n/a (one-shot loop)                                            |
-| `fetchJWTKeyWithRetry`, the clone version probe (`cloneNode/`)                  | 250 ms → 1 s / 1 s → 4 s, attempt count unchanged                                                                                                                                                                                  | n/a                                                            |
-| `repairBlobs` (`blobRepair.ts`) — per-record                                    | 50 ms → 1 s, only on a record no peer could repair                                                                                                                                                                                 | a repaired record                                              |
+| Site                                                                            | Schedule                                                                                                                                                                                                             | Reset signal                                                   |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `createSubscribeSetupScheduler` (`subscriptionManager.ts`) — subscription setup | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s, plus the caller's `RECONNECT_STAGGER_MS` stagger                                                                                            | `connectedToNode` (also cancels the pending setup)             |
+| `NodeReplicationConnection.scheduleReconnect`                                   | fixed 500 ms floor, ceiling `INITIAL_RETRY_TIME` 500 ms → 30 s, full jitter; the floor preserves the hard minimum from the TLS-state incident while the remaining window decorrelates fleet redials (harper-pro#339) | `onFrameSent` — first frame actually sent, **not** socket open |
+| `reconcileWorkers` wedge / receive-stall re-drives                              | fixed window (decorrelation only; the re-drives are already throttled by the `disconnectedAt` / `receiveStallReconnectAt` re-stamps), one owned `entry.reDriveTimer` per entry                                       | n/a — disarmed on connect, unsubscribe, and delete             |
+| `runNodeUpdateWatcher` (`knownNodes.ts`) — hdb_nodes watcher restart            | full-jitter ceiling 1 s → 30 s                                                                                                                                                                                       | an iteration that survived `NODE_WATCHER_HEALTHY_UPTIME_MS`    |
+| `shouldCloseSendAuthWatch` reprobe (`replicationConnection.ts`)                 | 500 ms → 5 s under a 30 s wall-clock budget, then fails closed                                                                                                                                                       | n/a (one-shot loop)                                            |
+| `fetchJWTKeyWithRetry`, the clone version probe (`cloneNode/`)                  | 250 ms → 1 s / 1 s → 4 s, attempt count unchanged                                                                                                                                                                    | n/a                                                            |
+| `repairBlobs` (`blobRepair.ts`) — per-record                                    | 50 ms → 1 s, only on a record no peer could repair                                                                                                                                                                   | a repaired record                                              |
 
 **The subscription-setup scheduler is the one with dedup.** `onDatabase` used to turn every qualifying
 node update straight into a retained (not unref'd) 200 ms `setTimeout` plus a `subscribe-to-node`
@@ -130,14 +130,24 @@ message, so whatever re-drove `onNodeUpdate` amplified 1:1 into main-thread time
 WebSocket/TLS setup, and `Setting up subscription with leader` warns — ~1,400 lines/s/node in the field,
 ending in an OOM kill. The scheduler holds one armed setup per **(peer URL, database)** in its own map
 (_not_ on the `connectionReplicationMap` entry, which the stale-worker path deletes and recreates), and
-the armed setup carries the payload of the call that armed or last refreshed it — reading `entry.nodes`
-at fire time is _not_ safe, because `onDatabase`'s early-return path replaces that array without
-running the leader/url enrichment (that path calls `refreshPending` instead). A setup is cancelled on
+the armed setup carries the newest level-state payload — reading `entry.nodes` at fire time is _not_
+safe, because `onDatabase`'s early-return path replaces that array without running the leader/url
+enrichment (that path calls `refreshPending` instead). Self-catchup is separate one-shot state: it is
+attached on a fresh array immediately before dispatch and consumed only after the worker message is
+accepted, so timer cancellation, stale dispatch, or a synchronous `postMessage` throw cannot lose it.
+A setup is cancelled on
 connect, on unsubscribe, on node deletion, and on a same-name URL migration, all of which became
 reachable once a pending timer could live 30 s instead of 200 ms. The wedge/stall recovery kicks are
 owned the same way — one `entry.reDriveTimer` per entry, so a staggered sweep that outruns the
 reconcile window that started it replaces its predecessor instead of stacking another wave. The warn
 moved inside the "actually armed" branch: it now describes an attempt, not an event.
+
+The worker boundary has one additional admission point for its asynchronous startup window. Before
+components are ready, one insertion-ordered map retains only the latest subscribe/unsubscribe message
+per actual connection key and database, with one continuation on the readiness promise. After readiness,
+the handlers run inline and allocate no queue state; the existing connection map is then the single-flight
+owner. Subscribe, unsubscribe, force-reconnect, and startup admission all derive the connection key through
+`getSubscriptionConnectionKey`, including the missing nested-URL fallback.
 
 **What is deliberately NOT on this schedule:** the receive/copy watchdogs and their thresholds (they
 _detect_ stalls; this discipline paces _retries_), `blobGapReconnectTimer`, the in-place

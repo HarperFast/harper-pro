@@ -724,7 +724,10 @@ async function monitorSync(
 			break;
 		} catch (err) {
 			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
-			if (attempt < 3) await sleep(versionProbeBackoff.nextDelay());
+			if (attempt < 3) {
+				const delay = versionProbeBackoff.nextDelay();
+				if (delay !== undefined) await sleep(delay);
+			}
 		}
 	}
 

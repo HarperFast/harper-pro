@@ -1,15 +1,14 @@
 /**
  * Coverage for the jittered reconnect schedule (harper-pro#327). `scheduleReconnect` used to wait
  * exactly `retryTime`, so every node reacting to the same peer outage re-dialed on the same instant.
- * The ceiling schedule is unchanged; the draw is equal jitter (the top half of the window) rather than
- * the discipline's default full jitter, because this site's invariant is a dial *rate* — every dial
- * allocates native TLS state (harper-pro#339) — so its floor has to scale with the ceiling.
+ * The ceiling schedule is unchanged; full jitter decorrelates the fleet, while the fixed 500 ms floor
+ * retains the hard minimum interval from the native TLS-state incident (harper-pro#339).
  *
  * `null` for the url makes createWebSocket reject before any socket or listener exists, which is the
  * cheapest way to drive the real scheduleReconnect path without a peer.
  */
 
-import { expect } from 'chai';
+import assert from 'node:assert';
 import sinon from 'sinon';
 import { NodeReplicationConnection } from '#src/replication/replicationConnection';
 
@@ -74,8 +73,9 @@ describe('NodeReplicationConnection reconnect jitter (harper-pro#327)', () => {
 			6
 		);
 
-		expect(early).to.not.deep.equal(late);
-		for (let i = 0; i < early.length; i++) expect(early[i]).to.be.below(late[i]);
+		assert.notDeepEqual(early, late);
+		assert.equal(early[0], INITIAL_RETRY_TIME);
+		for (let i = 1; i < early.length; i++) assert.ok(early[i] < late[i]);
 	});
 
 	it('keeps the unchanged 500ms → 30s ceiling schedule, drawing inside it', () => {
@@ -92,39 +92,39 @@ describe('NodeReplicationConnection reconnect jitter (harper-pro#327)', () => {
 			timers.restore();
 		}
 
-		expect(ceilings).to.deep.equal([1000, 2000, 4000, 8000, 16_000, 30_000, 30_000, 30_000]);
-		// Every draw sits in the top half of the ceiling it was drawn under, so the minimum interval
-		// between dials never falls below half of what the jitterless schedule guaranteed.
+		assert.deepEqual(ceilings, [1000, 2000, 4000, 8000, 16_000, 30_000, 30_000, 30_000]);
 		const ceilingFor = (i) => Math.min(INITIAL_RETRY_TIME * 2 ** i, MAX_RETRY_TIME);
 		timers.values.forEach((delay, i) => {
-			expect(delay).to.be.at.least(ceilingFor(i) / 2);
-			expect(delay).to.be.below(ceilingFor(i));
+			assert.ok(delay >= INITIAL_RETRY_TIME);
+			if (ceilingFor(i) === INITIAL_RETRY_TIME) assert.equal(delay, INITIAL_RETRY_TIME);
+			else assert.ok(delay < ceilingFor(i));
 		});
 	});
 
-	it('a zero draw still waits half the ceiling, so the dial rate stays bounded as it escalates', () => {
-		expect(
+	it('a zero draw still waits the fixed TLS-safety floor', () => {
+		assert.deepEqual(
 			scheduleDelays(
 				makeConnection(() => 0),
 				4
-			)
-		).to.deep.equal([250, 500, 1000, 2000]);
+			),
+			[500, 500, 500, 500]
+		);
 	});
 
 	it('retryTime reads as the initial interval before any failure', () => {
-		expect(makeConnection(Math.random).retryTime).to.equal(INITIAL_RETRY_TIME);
+		assert.equal(makeConnection(Math.random).retryTime, INITIAL_RETRY_TIME);
 	});
 
 	it('onFrameSent resets the ceiling and the retry counter', () => {
 		const connection = makeConnection(() => 0.5);
 		scheduleDelays(connection, 3);
 		connection.retries = 7;
-		expect(connection.retryTime).to.equal(4000);
+		assert.equal(connection.retryTime, 4000);
 
 		connection.onFrameSent();
 
-		expect(connection.retries).to.equal(0);
-		expect(connection.retryTime).to.equal(INITIAL_RETRY_TIME);
-		expect(scheduleDelays(connection, 1)[0], 'drawing under the initial ceiling again').to.equal(375);
+		assert.equal(connection.retries, 0);
+		assert.equal(connection.retryTime, INITIAL_RETRY_TIME);
+		assert.equal(scheduleDelays(connection, 1)[0], 500, 'drawing under the initial ceiling again');
 	});
 });

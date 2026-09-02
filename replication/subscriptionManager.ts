@@ -13,6 +13,7 @@ import {
 	forEachReplicatedDatabase,
 	unsubscribeFromNode,
 	forceReconnectToNode,
+	getSubscriptionConnectionKey,
 } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
 import { parentPort } from 'worker_threads';
@@ -207,7 +208,9 @@ export function createSubscribeSetupScheduler(deps: {
 			}
 			schedule.nodes = nodes;
 			if (schedule.timer) return undefined;
-			const delay = schedule.backoff.nextDelay() + staggerMs;
+			const backoffDelay = schedule.backoff.nextDelay();
+			if (backoffDelay === undefined) return undefined;
+			const delay = backoffDelay + staggerMs;
 			schedule.timer = setTimeout(() => {
 				schedule.timer = undefined;
 				const pending = schedule.nodes;
@@ -247,6 +250,34 @@ export function createSubscribeSetupScheduler(deps: {
 	};
 }
 
+export function dispatchSubscriptionNodes(
+	nodes: any[],
+	deps: {
+		startTime?: number;
+		nodeName?: string;
+		now?: () => number;
+		dispatch: (nodes: any[]) => void;
+		consume: () => void;
+	}
+) {
+	if (deps.startTime === undefined) {
+		deps.dispatch(nodes);
+		return;
+	}
+	const dispatchNodes = [
+		...nodes,
+		{
+			replicateByDefault: nodes[0]?.replicateByDefault,
+			name: deps.nodeName,
+			startTime: deps.startTime,
+			endTime: (deps.now ?? Date.now)(),
+			replicates: true,
+		},
+	];
+	deps.dispatch(dispatchNodes);
+	deps.consume();
+}
+
 /**
  * Send the subscribe-to-node the scheduler armed. The entry can have been unsubscribed, deleted, or
  * reassigned to another worker during the (now up to 30s) wait, so ownership is re-checked against
@@ -258,10 +289,19 @@ export function createSubscribeSetupScheduler(deps: {
 function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 	const entry = connectionReplicationMap.get(url)?.get(database);
 	if (!entry || entry.unsubscribed || !nodes[0]) return;
-	const request = { ...nodes[0], type: 'subscribe-to-node', database, nodes };
-	if (entry.worker) {
-		entry.worker.postMessage(request);
-	} else subscribeToNode(request);
+	const startTime = env.get(CONFIG_PARAMS.REPLICATION_FAILOVER) ? selfCatchupOfDatabase.get(database) : undefined;
+	dispatchSubscriptionNodes(nodes, {
+		startTime,
+		nodeName: getThisNodeName(),
+		dispatch(dispatchNodes) {
+			const request = { ...dispatchNodes[0], type: 'subscribe-to-node', database, nodes: dispatchNodes };
+			if (entry.worker) entry.worker.postMessage(request);
+			else subscribeToNode(request);
+		},
+		consume() {
+			selfCatchupOfDatabase.delete(database);
+		},
+	});
 }
 
 const subscribeSetupScheduler = createSubscribeSetupScheduler({ dispatch: dispatchSubscribeSetup });
@@ -921,20 +961,6 @@ export async function startOnMainThread(options) {
 			// does for table-exclusion. undefined when no config route matches this peer. harper-pro#498.
 			const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
 			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node, routeReplicates, configRouteReplicates }];
-			// Self catchup is done in case we have replicated any records that weren't actually written to our storage
-			// before a crash.
-			if (selfCatchupOfDatabase.has(databaseName) && env.get(CONFIG_PARAMS.REPLICATION_FAILOVER)) {
-				// if we have a self catchup (only do if we have failover enabled), we need to add this node to the list of nodes that need to catch up
-				// and then we will remove it when it is done
-				nodes.push({
-					replicateByDefault: tablesReplicateByDefault,
-					name: getThisNodeName(),
-					startTime: selfCatchupOfDatabase.get(databaseName),
-					endTime: Date.now(),
-					replicates: true,
-				});
-				selfCatchupOfDatabase.delete(databaseName);
-			}
 			// Use the enriched payload (nodes[0]) so the receive gate sees configRouteReplicates.
 			const shouldSubscribe = shouldReplicateFromNode(nodes[0] as any, databaseName);
 			// Resolve the URL here rather than at the subscribe-scheduling site below: this array becomes
@@ -1346,11 +1372,15 @@ export async function startOnMainThread(options) {
 		// One armed recovery per entry: a sweep staggered across many databases can still be firing when the
 		// next reconcile decides again, and a superseded wave's timers would otherwise be retained until
 		// they no-op.
-		const armReDrive = (entry: any, delay: number, fire: () => void) => {
+		const armReDrive = (entry: any, delay: number, url: string, database: string, fire: () => void) => {
 			clearTimeout(entry.reDriveTimer);
 			const timer = setTimeout(() => {
 				entry.reDriveTimer = undefined;
-				fire();
+				try {
+					fire();
+				} catch (error) {
+					logger.error('Error dispatching replication recovery for', url, database, error);
+				}
 			}, delay);
 			timer.unref();
 			return timer;
@@ -1442,9 +1472,11 @@ export async function startOnMainThread(options) {
 					// Stagger reconnects (RECONNECT_STAGGER_MS apart) so opening N TLS connections
 					// simultaneously does not spike memory when there are many databases; jitter the base so
 					// every node in a fleet reacting to the same peer outage doesn't fire on the same tick.
-					const delay = reDriveBackoff.nextDelay() + reconnectCount * RECONNECT_STAGGER_MS;
+					const backoffDelay = reDriveBackoff.nextDelay();
+					if (backoffDelay === undefined) continue;
+					const delay = backoffDelay + reconnectCount * RECONNECT_STAGGER_MS;
 					reconnectCount++;
-					entry.reDriveTimer = armReDrive(entry, delay, () => {
+					entry.reDriveTimer = armReDrive(entry, delay, url, databaseName, () => {
 						// The stamp is our claim on this entry: connectedToNode clears disconnectedAt and a later
 						// reconcile re-stamps it, either of which means this re-drive is stale and would interrupt
 						// a connection that has already recovered or been re-driven.
@@ -1489,9 +1521,11 @@ export async function startOnMainThread(options) {
 						database: databaseName,
 						nodes,
 					};
-					const delay = reDriveBackoff.nextDelay() + reconnectCount * RECONNECT_STAGGER_MS;
+					const backoffDelay = reDriveBackoff.nextDelay();
+					if (backoffDelay === undefined) continue;
+					const delay = backoffDelay + reconnectCount * RECONNECT_STAGGER_MS;
 					reconnectCount++;
-					entry.reDriveTimer = armReDrive(entry, delay, () => {
+					entry.reDriveTimer = armReDrive(entry, delay, url, databaseName, () => {
 						// Same staleness claim as the wedge path: a newer reconcile re-stamping
 						// receiveStallReconnectAt owns the kick from then on.
 						if (entries?.get(databaseName) !== entry || entry.receiveStallReconnectAt !== now) return;
@@ -1586,12 +1620,83 @@ export function requestClusterStatus(message?, port?) {
 // the dynamic import resolves to the cached module with no side effect. Cached after first use.
 let componentsLoadedPromise: Promise<unknown> | undefined;
 function whenWorkerComponentsLoaded(): Promise<unknown> {
-	return (componentsLoadedPromise ??= import('../core/server/threads/threadServer.js').then(
-		(threadServer) => threadServer.whenComponentsLoaded
-	));
+	return (componentsLoadedPromise ??= import('../core/server/threads/threadServer.js')
+		.then((threadServer) => threadServer.whenComponentsLoaded)
+		.catch((error) => {
+			componentsLoadedPromise = undefined;
+			throw error;
+		}));
+}
+
+export function createWorkerSubscriptionAdmission(deps: {
+	whenReady: () => Promise<unknown>;
+	key: (message: any) => string;
+	dispatch: (message: any) => void;
+	onError: (message: any | undefined, error: unknown) => void;
+}) {
+	let ready = false;
+	let flushScheduled = false;
+	const pending = new Map<string, any>();
+
+	function dispatch(message: any) {
+		try {
+			deps.dispatch(message);
+		} catch (error) {
+			deps.onError(message, error);
+		}
+	}
+	function scheduleFlush() {
+		if (flushScheduled) return;
+		flushScheduled = true;
+		deps
+			.whenReady()
+			.then(() => {
+				ready = true;
+				for (const [key, message] of pending) {
+					pending.delete(key);
+					dispatch(message);
+				}
+			})
+			.catch((error) => deps.onError(undefined, error))
+			.finally(() => {
+				flushScheduled = false;
+			});
+	}
+
+	return {
+		submit(message: any) {
+			if (ready && pending.size === 0) {
+				dispatch(message);
+				return;
+			}
+			pending.set(deps.key(message), message);
+			scheduleFlush();
+		},
+		pendingCount() {
+			return pending.size;
+		},
+	};
 }
 
 if (parentPort) {
+	const subscriptionAdmission = createWorkerSubscriptionAdmission({
+		whenReady: whenWorkerComponentsLoaded,
+		key: (message) => getSubscriptionConnectionKey(message.url, message.nodes?.[0]?.url) + '\0' + message.database,
+		dispatch(message) {
+			if (message.type === 'subscribe-to-node') subscribeToNode(message);
+			else unsubscribeFromNode(message);
+		},
+		onError(message, error) {
+			if (message)
+				logger.error(
+					'Error applying deferred replication subscription action for',
+					message.url,
+					message.database,
+					error
+				);
+			else logger.error('Error waiting for worker components before replication subscription setup', error);
+		},
+	});
 	disconnectedFromNode = (connection) => {
 		parentPort.postMessage({ type: 'disconnected-from-node', ...connection });
 	};
@@ -1605,13 +1710,12 @@ if (parentPort) {
 		// "no subscriptions" close, wedging the (peer, db) until restart (harper-pro#289 / #233). Once
 		// components are loaded the predicate is authoritative. In steady state the promise is already
 		// resolved, so this is effectively synchronous.
-		whenWorkerComponentsLoaded().then(() => subscribeToNode(message));
+		subscriptionAdmission.submit(message);
 	});
 	onMessageByType('unsubscribe-from-node', (message) => {
-		// Defer through the same gate as subscribe-to-node so the two stay ordered: a pre-load
-		// subscribe followed by an unsubscribe must apply in that order (else the deferred subscribe
-		// would run after the unsubscribe and re-open a connection the main thread already removed).
-		whenWorkerComponentsLoaded().then(() => unsubscribeFromNode(message));
+		// Before readiness no connection can exist, so the latest action for the pair is authoritative;
+		// after readiness both handlers run inline in parentPort delivery order.
+		subscriptionAdmission.submit(message);
 	});
 	onMessageByType('force-reconnect-node', (message) => {
 		// Reconcile-driven recovery for a connected:true / Receiving / no-progress stall. Acts on an

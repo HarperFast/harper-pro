@@ -90,7 +90,8 @@ export async function repairBlobs(
 		} else {
 			failed++;
 			logger.warn?.('Could not repair blob for record', recordId, 'in', tableName, '— no peer had a complete copy');
-			await pause(backoff.nextDelay());
+			const delay = backoff.nextDelay();
+			if (delay !== undefined) await pause(delay);
 		}
 	}
 

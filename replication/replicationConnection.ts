@@ -601,7 +601,9 @@ export async function shouldCloseSendAuthWatch(
 			now: deps.now,
 		});
 		if (backoff.exhausted) break;
-		await sleep(backoff.nextDelay());
+		const delay = backoff.nextDelay();
+		if (delay === undefined) break;
+		await sleep(delay);
 		// Re-check before trusting the next read, not just at the top of the loop: the grace period is
 		// advertised as a deadline, so a row that only becomes decodable after an event-loop stall
 		// pushed us past it must not authorize. Fail closed on the elapsed time, not on the row.
@@ -2701,19 +2703,19 @@ export class NodeReplicationConnection extends EventEmitter {
 		// it) would still accumulate unreleased native TLS state faster than V8 can
 		// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
 		// Doubling reaches 30 s in ~6 retries and resets on success. The delay is drawn
-		// uniformly over the TOP HALF of that ceiling ('equal', not the discipline's default
-		// full jitter): decorrelating a fleet that restarts together is worth having, but this
-		// site's invariant is a dial *rate*, and a ceiling-relative floor is what keeps the
-		// minimum dial interval proportional as the ceiling escalates.
+		// with full jitter so a fleet reacting to one outage does not redial in lockstep. Keep
+		// the original 500 ms lower bound from #339 while jittering the rest of the window.
 		this.retryBackoff ??= createBackoff({
 			initialMs: INITIAL_RETRY_TIME,
 			maxMs: MAX_RETRY_TIME,
-			jitter: 'equal',
+			minMs: INITIAL_RETRY_TIME,
 			random: this.random,
 		});
+		const delay = this.retryBackoff.nextDelay();
+		if (delay === undefined) return;
 		setTimeout(() => {
 			this.connect();
-		}, this.retryBackoff.nextDelay()).unref();
+		}, delay).unref();
 	}
 	/** The ceiling the next reconnect will be drawn under; the initial value means "not backed off". */
 	get retryTime(): number {

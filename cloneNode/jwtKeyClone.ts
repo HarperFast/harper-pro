@@ -50,7 +50,10 @@ export async function fetchJWTKeyWithRetry(
 		} catch (err) {
 			lastError = err;
 		}
-		if (attempt < retries) await sleep(backoff.nextDelay());
+		if (attempt < retries) {
+			const delay = backoff.nextDelay();
+			if (delay !== undefined) await sleep(delay);
+		}
 	}
 	throw new Error(`Unable to clone JWT key '${keyName}' from leader after ${retries} attempts`, { cause: lastError });
 }

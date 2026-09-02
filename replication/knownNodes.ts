@@ -188,7 +188,6 @@ export async function runNodeUpdateWatcher(
 	const backoff = createBackoff({
 		initialMs: restartDelayMs,
 		maxMs: maxDelayMs,
-		minMs: Math.min(restartDelayMs, maxDelayMs),
 		random: options.random,
 	});
 	const isCurrent = () => generation === (watcherGenerations.get(key) ?? 0);
@@ -227,7 +226,9 @@ export async function runNodeUpdateWatcher(
 		if (now() - startedAt >= healthyUptimeMs) backoff.reset();
 		restarts++;
 		if (restarts >= maxRestarts || !isCurrent()) return;
-		await new Promise((resolve) => setTimeout(resolve, backoff.nextDelay()));
+		const delay = backoff.nextDelay();
+		if (delay === undefined) return;
+		await new Promise((resolve) => setTimeout(resolve, delay).unref());
 	}
 }
 /**

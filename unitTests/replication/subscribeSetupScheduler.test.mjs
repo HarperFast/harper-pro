@@ -9,9 +9,9 @@
  * produces one dispatch per event and one live timer per event, so both assertions go red.
  */
 
-import { expect } from 'chai';
+import assert from 'node:assert';
 import sinon from 'sinon';
-import { createSubscribeSetupScheduler } from '#src/replication/subscriptionManager';
+import { createSubscribeSetupScheduler, dispatchSubscriptionNodes } from '#src/replication/subscriptionManager';
 
 const URL_A = 'wss://peer-a:9933';
 const URL_B = 'wss://peer-b:9933';
@@ -56,9 +56,12 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		}
 
 		// Ceilings double 400 → 30,000; each delay is 200 + 0.5 * (ceiling - 200).
-		expect(dispatches.map((d) => d.at)).to.deep.equal([300, 800, 1700, 3400, 6700, 13_200, 26_100, 41_200, 56_300]);
-		expect(maxPending, 'never more than one pending setup for the pair').to.equal(1);
-		expect(scheduler.pendingCount(), 'exactly one still armed at the end').to.equal(1);
+		assert.deepEqual(
+			dispatches.map((d) => d.at),
+			[300, 800, 1700, 3400, 6700, 13_200, 26_100, 41_200, 56_300]
+		);
+		assert.equal(maxPending, 1, 'never more than one pending setup for the pair');
+		assert.equal(scheduler.pendingCount(), 1, 'exactly one still armed at the end');
 	});
 
 	it('keeps every delay inside the floor and the cap', () => {
@@ -67,33 +70,36 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		const { scheduler } = makeScheduler(() => draws[i++ % draws.length]);
 		for (let attempt = 0; attempt < 40; attempt++) {
 			const delay = scheduler.schedule(URL_A, 'data', NODES);
-			expect(delay).to.be.at.least(MIN_DELAY);
-			expect(delay).to.be.below(MAX_DELAY);
+			assert.ok(delay >= MIN_DELAY);
+			assert.ok(delay < MAX_DELAY);
 			clock.tick(delay);
 		}
 	});
 
 	it('returns undefined instead of arming a second timer for the same pair', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
-		expect(scheduler.schedule(URL_A, 'data', NODES)).to.equal(300);
-		expect(scheduler.schedule(URL_A, 'data', NODES), 'deduped').to.equal(undefined);
-		expect(scheduler.schedule(URL_A, 'data', NODES), 'still deduped').to.equal(undefined);
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES), 300);
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES), undefined, 'deduped');
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES), undefined, 'still deduped');
 		clock.tick(60_000);
-		expect(dispatches.length).to.equal(1);
+		assert.equal(dispatches.length, 1);
 	});
 
 	it('tracks (url, database) pairs independently', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
-		expect(scheduler.schedule(URL_A, 'data', NODES)).to.equal(300);
-		expect(scheduler.schedule(URL_A, 'other', NODES)).to.equal(300);
-		expect(scheduler.schedule(URL_B, 'data', NODES)).to.equal(300);
-		expect(scheduler.pendingCount()).to.equal(3);
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES), 300);
+		assert.equal(scheduler.schedule(URL_A, 'other', NODES), 300);
+		assert.equal(scheduler.schedule(URL_B, 'data', NODES), 300);
+		assert.equal(scheduler.pendingCount(), 3);
 		clock.tick(300);
-		expect(dispatches.map(({ url, database, at }) => ({ url, database, at }))).to.deep.equal([
-			{ url: URL_A, database: 'data', at: 300 },
-			{ url: URL_A, database: 'other', at: 300 },
-			{ url: URL_B, database: 'data', at: 300 },
-		]);
+		assert.deepEqual(
+			dispatches.map(({ url, database, at }) => ({ url, database, at })),
+			[
+				{ url: URL_A, database: 'data', at: 300 },
+				{ url: URL_A, database: 'other', at: 300 },
+				{ url: URL_B, database: 'data', at: 300 },
+			]
+		);
 	});
 
 	it('decorrelates two peers failing on identical timing', () => {
@@ -106,8 +112,8 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 			bDelays.push(b.schedule(URL_A, 'data', NODES));
 			clock.tick(MAX_DELAY + MIN_DELAY);
 		}
-		expect(aDelays).to.not.deep.equal(bDelays);
-		for (let i = 0; i < aDelays.length; i++) expect(aDelays[i]).to.be.below(bDelays[i]);
+		assert.notDeepEqual(aDelays, bDelays);
+		for (let i = 0; i < aDelays.length; i++) assert.ok(aDelays[i] < bDelays[i]);
 	});
 
 	// The regression that made the deduped path lose the enriched payload: onDatabase replaces
@@ -118,10 +124,10 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		const first = [{ name: 'peer-a', url: URL_A }];
 		const second = [{ name: 'peer-a', url: URL_A, isLeader: true }];
 		scheduler.schedule(URL_A, 'data', first);
-		expect(scheduler.schedule(URL_A, 'data', second)).to.equal(undefined);
+		assert.equal(scheduler.schedule(URL_A, 'data', second), undefined);
 		clock.tick(300);
-		expect(dispatches.length).to.equal(1);
-		expect(dispatches[0].nodes).to.equal(second);
+		assert.equal(dispatches.length, 1);
+		assert.equal(dispatches[0].nodes, second);
 	});
 
 	// onDatabase's early-return path (an already-subscribed, still-desired entry) never reaches
@@ -133,23 +139,23 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		const refreshed = [{ name: 'peer-a', url: URL_A, routeReplicates: { receives: true } }];
 		scheduler.schedule(URL_A, 'data', armed);
 		scheduler.refreshPending(URL_A, 'data', refreshed);
-		expect(scheduler.pendingCount(), 'no second timer').to.equal(1);
+		assert.equal(scheduler.pendingCount(), 1, 'no second timer');
 		clock.tick(300);
-		expect(dispatches.length).to.equal(1);
-		expect(dispatches[0].nodes).to.equal(refreshed);
+		assert.equal(dispatches.length, 1);
+		assert.equal(dispatches[0].nodes, refreshed);
 	});
 
 	it('refreshPending on a pair with nothing armed does not arm one', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
 		scheduler.refreshPending(URL_A, 'data', NODES);
-		expect(scheduler.pendingCount()).to.equal(0);
+		assert.equal(scheduler.pendingCount(), 0);
 		clock.tick(60_000);
-		expect(dispatches).to.deep.equal([]);
+		assert.deepEqual(dispatches, []);
 	});
 
 	it('adds the caller-supplied stagger on top of the backoff', () => {
 		const { scheduler } = makeScheduler(() => 0.5);
-		expect(scheduler.schedule(URL_A, 'data', NODES, 150)).to.equal(450);
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES, 150), 450);
 	});
 
 	it('noteConnected drops the pending setup and the escalated delay', () => {
@@ -157,14 +163,14 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		scheduler.schedule(URL_A, 'data', NODES);
 		clock.tick(300);
 		scheduler.schedule(URL_A, 'data', NODES); // second attempt: escalated to 500
-		expect(scheduler.pendingCount()).to.equal(1);
+		assert.equal(scheduler.pendingCount(), 1);
 
 		scheduler.noteConnected(URL_A, 'data');
-		expect(scheduler.pendingCount(), 'the armed setup is cancelled, not just reset').to.equal(0);
+		assert.equal(scheduler.pendingCount(), 0, 'the armed setup is cancelled, not just reset');
 		clock.tick(60_000);
-		expect(dispatches.length, 'the cancelled setup never fired').to.equal(1);
+		assert.equal(dispatches.length, 1, 'the cancelled setup never fired');
 
-		expect(scheduler.schedule(URL_A, 'data', NODES), 'back to the first ceiling after success').to.equal(300);
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES), 300, 'back to the first ceiling after success');
 	});
 
 	it('cancel() and cancelUrl() disarm pending setups', () => {
@@ -174,14 +180,15 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		scheduler.schedule(URL_B, 'data', NODES);
 
 		scheduler.cancel(URL_A, 'data');
-		expect(scheduler.pendingCount()).to.equal(2);
+		assert.equal(scheduler.pendingCount(), 2);
 		scheduler.cancelUrl(URL_A);
-		expect(scheduler.pendingCount()).to.equal(1);
+		assert.equal(scheduler.pendingCount(), 1);
 
 		clock.tick(60_000);
-		expect(dispatches.map(({ url, database, at }) => ({ url, database, at }))).to.deep.equal([
-			{ url: URL_B, database: 'data', at: 300 },
-		]);
+		assert.deepEqual(
+			dispatches.map(({ url, database, at }) => ({ url, database, at })),
+			[{ url: URL_B, database: 'data', at: 300 }]
+		);
 	});
 
 	it('a throwing dispatch is contained instead of taking the process down', () => {
@@ -192,9 +199,9 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 			random: () => 0.5,
 		});
 		scheduler.schedule(URL_A, 'data', NODES);
-		expect(() => clock.tick(300)).to.not.throw();
-		expect(scheduler.pendingCount(), 'ownership released so the pair can be re-armed').to.equal(0);
-		expect(scheduler.schedule(URL_A, 'data', NODES)).to.equal(500);
+		assert.doesNotThrow(() => clock.tick(300));
+		assert.equal(scheduler.pendingCount(), 0, 'ownership released so the pair can be re-armed');
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES), 500);
 	});
 });
 
@@ -210,7 +217,54 @@ describe('subscription-setup scheduler timer refs', () => {
 		} finally {
 			globalThis.setTimeout = realSetTimeout;
 		}
-		expect(armed.hasRef()).to.equal(false);
+		assert.equal(armed.hasRef(), false);
 		clearTimeout(armed);
+	});
+});
+
+describe('self-catchup dispatch', () => {
+	it('attaches the rider on a fresh payload and consumes it only after dispatch', () => {
+		const nodes = [{ name: 'peer-a', url: URL_A, replicateByDefault: true }];
+		let consumed = 0;
+		let dispatched;
+		dispatchSubscriptionNodes(nodes, {
+			startTime: 123,
+			nodeName: 'self',
+			now: () => 456,
+			dispatch: (value) => (dispatched = value),
+			consume: () => consumed++,
+		});
+
+		assert.equal(nodes.length, 1);
+		assert.deepEqual(dispatched, [
+			nodes[0],
+			{
+				replicateByDefault: true,
+				name: 'self',
+				startTime: 123,
+				endTime: 456,
+				replicates: true,
+			},
+		]);
+		assert.equal(consumed, 1);
+	});
+
+	it('retains the rider when dispatch throws', () => {
+		const nodes = [{ name: 'peer-a', url: URL_A }];
+		let consumed = 0;
+		assert.throws(
+			() =>
+				dispatchSubscriptionNodes(nodes, {
+					startTime: 123,
+					nodeName: 'self',
+					dispatch: () => {
+						throw new Error('postMessage failed');
+					},
+					consume: () => consumed++,
+				}),
+			/postMessage failed/
+		);
+		assert.equal(nodes.length, 1);
+		assert.equal(consumed, 0);
 	});
 });

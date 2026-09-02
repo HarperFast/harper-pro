@@ -22,12 +22,22 @@ import { runNodeUpdateWatcher } from '#src/replication/knownNodes';
 function captureTimerDelays() {
 	const realSetTimeout = globalThis.setTimeout;
 	const values = [];
+	let unrefCalls = 0;
 	globalThis.setTimeout = (fn, ms) => {
 		values.push(ms);
-		return realSetTimeout(fn, ms);
+		const timer = realSetTimeout(fn, ms);
+		const unref = timer.unref.bind(timer);
+		timer.unref = () => {
+			unrefCalls++;
+			return unref();
+		};
+		return timer;
 	};
 	return {
 		values,
+		get unrefCalls() {
+			return unrefCalls;
+		},
 		restore() {
 			globalThis.setTimeout = realSetTimeout;
 		},
@@ -136,7 +146,8 @@ describe('runNodeUpdateWatcher restart loop', () => {
 			delays.restore();
 		}
 
-		expect(delays.values).to.deep.equal([4, 7, 15, 31]);
+		expect(delays.values).to.deep.equal([3, 7, 15, 31]);
+		expect(delays.unrefCalls).to.equal(4);
 	});
 
 	it('resets the backoff once an iteration survives the healthy-uptime threshold', async () => {
@@ -162,7 +173,7 @@ describe('runNodeUpdateWatcher restart loop', () => {
 		}
 
 		expect(subscribeCalls).to.equal(4);
-		expect(delays.values, 'a healthy run never escalates').to.deep.equal([4, 4, 4]);
+		expect(delays.values, 'a healthy run never escalates').to.deep.equal([3, 3, 3]);
 	});
 
 	it('forwards events to the listener via the default processEvent path', async () => {
