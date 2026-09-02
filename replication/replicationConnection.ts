@@ -1483,23 +1483,13 @@ export function blobGapDeliveryKey(fileId: unknown, recordId: unknown): string {
 }
 
 /**
- * Cross-reconnect escalation budget for held source-blob gaps (harper-pro#432). A source-reported 503
- * holds the resume cursor (`hasBlobGap`) until the #683 timer reconnects, the re-stream reproduces the
- * 503, and every per-socket counter (sender retries, `blobFailureCount`) restarts with the socket — so a
- * source that answers 503 forever pinned the cursor forever. This object lives on the persistent
- * `NodeReplicationConnection` and charges one cycle per socket generation per delivery; a delivery held
- * for `maxCycles` cycles, or `maxHoldMs` since its first hold, is exhausted and every later hold of it
- * escalates at once (sticky) until a successful save resolves it. Forgetting an exhausted delivery would
- * let two deliveries with offset phases leapfrog forever: A escalates and is forgotten while B still
- * holds, the next cycle re-streams A which starts over while B escalates and is forgotten, and so on.
- *
- * Generations make a retired socket's late settlements inert: a charge or resolve carrying an older
- * generation than the newest seen is ignored. Nothing evicts live progress — at `maxTracked` distinct
- * deliveries a new hold escalates immediately (`overflow`) rather than silently resetting an older one,
- * which for a stream wider than the cap would reopen the unbounded hold. Entries leave on a successful
- * save; process restart resets the budget. The key is (source file id, record id), not the file id
- * alone: adjacent records can share one source file across distinct transfers, and one record's
- * successful save must not erase another's held budget.
+ * Cross-reconnect escalation budget for held source-blob gaps (harper-pro#432; policy in
+ * replication/DESIGN.md item 8). Lives on the persistent `NodeReplicationConnection`; charges one cycle
+ * per socket generation per delivery. Three invariants the wiring relies on: exhaustion is STICKY until
+ * a successful save of that delivery (forgetting it lets two deliveries with offset phases leapfrog
+ * forever); a charge or resolve from a generation older than the newest begun is ignored (a retired
+ * socket's late settlements must not touch the live budget); live progress is never evicted — past
+ * `maxTracked` a new delivery escalates as `overflow` instead of resetting an older one.
  */
 export function createBlobGapEscalationBudget(opts: {
 	maxCycles: number;
@@ -1518,6 +1508,10 @@ export function createBlobGapEscalationBudget(opts: {
 		return false;
 	};
 	return {
+		/** A replacement socket is live: everything from older generations is now stale. */
+		beginGeneration(generation: number): void {
+			if (generation > currentGeneration) currentGeneration = generation;
+		},
 		/**
 		 * `key` is holding the cursor in socket `generation`; returns the escalation to apply once its budget
 		 * is exhausted, else undefined (keep holding). Never throws.
@@ -1553,7 +1547,7 @@ export function createBlobGapEscalationBudget(opts: {
 	};
 }
 
-/** The escalation half of the advance-past error line, so the integration oracle can grep one phrase. */
+/** The escalation clause of the advance-past error line. */
 export function describeBlobGapEscalation(
 	escalation: BlobGapEscalation,
 	limits: { maxCycles: number; maxHoldMs: number; maxTracked: number }
@@ -3002,6 +2996,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	remoteNodeName = authorization.name;
 	if (remoteNodeName && options.connection) options.connection.nodeName = remoteNodeName;
 	const blobGapGeneration: number = options.connection ? ++options.connection.blobGapGeneration : 0;
+	options.connection?.blobGapBudget?.beginGeneration(blobGapGeneration);
 	let lastSequenceIdReceived, lastSequenceIdCommitted;
 	// Bulk-copy resume state (receiver side). While inCopyMode, each committed batch persists a cursor
 	// (copyStartTime + last committed table/key) so an interrupted copy can resume instead of restarting.
