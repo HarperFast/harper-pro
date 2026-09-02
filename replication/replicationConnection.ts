@@ -1479,8 +1479,16 @@ export type BlobGapEscalationBudget = ReturnType<typeof createBlobGapEscalationB
 
 /** One held delivery's identity across re-streams: the source's file id plus the record it belongs to. */
 export function blobGapDeliveryKey(fileId: unknown, recordId: unknown): string {
-	return `${fileId}|${String(recordId)}`;
+	const record = typeof recordId === 'object' && recordId !== null ? JSON.stringify(recordId) : String(recordId);
+	return `${fileId}|${record}`;
 }
+
+// Socket generations an exhausted delivery may go unseen before its entry is dropped: an escalated
+// record is only re-streamed while the cursor is still pinned behind it, so silence across two
+// reconnects means the cursor has passed it. A wrong drop costs that delivery one more budget, never
+// an unbounded hold, whereas never dropping lets escalations fill `maxTracked` and turn every later
+// hold on the connection into an overflow skip.
+const BLOB_GAP_RETIRE_AFTER_GENERATIONS = 2;
 
 /**
  * Cross-reconnect escalation budget for held source-blob gaps (harper-pro#432; policy in
@@ -1489,7 +1497,8 @@ export function blobGapDeliveryKey(fileId: unknown, recordId: unknown): string {
  * a successful save of that delivery (forgetting it lets two deliveries with offset phases leapfrog
  * forever); a charge or resolve from a generation older than the newest begun is ignored (a retired
  * socket's late settlements must not touch the live budget); live progress is never evicted — past
- * `maxTracked` a new delivery escalates as `overflow` instead of resetting an older one.
+ * `maxTracked` a new delivery escalates as `overflow` instead of resetting an older one, and only
+ * exhausted entries are ever dropped (see `beginGeneration`).
  */
 export function createBlobGapEscalationBudget(opts: {
 	maxCycles: number;
@@ -1508,9 +1517,17 @@ export function createBlobGapEscalationBudget(opts: {
 		return false;
 	};
 	return {
-		/** A replacement socket is live: everything from older generations is now stale. */
+		/**
+		 * A replacement socket is live: everything from older generations is now stale, and exhausted
+		 * deliveries unseen for BLOB_GAP_RETIRE_AFTER_GENERATIONS generations are dropped. Live (unexhausted)
+		 * progress is never dropped here.
+		 */
 		beginGeneration(generation: number): void {
-			if (generation > currentGeneration) currentGeneration = generation;
+			if (generation <= currentGeneration) return;
+			currentGeneration = generation;
+			for (const [key, entry] of held) {
+				if (entry.exhausted && entry.lastGeneration < generation - BLOB_GAP_RETIRE_AFTER_GENERATIONS) held.delete(key);
+			}
 		},
 		/**
 		 * `key` is holding the cursor in socket `generation`; returns the escalation to apply once its budget

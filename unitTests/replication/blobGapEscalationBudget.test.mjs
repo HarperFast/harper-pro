@@ -156,6 +156,30 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		assert.equal(budget.size, 2);
 	});
 
+	it('drops an exhausted delivery unseen for two socket generations, never a live one', () => {
+		const budget = createBlobGapEscalationBudget({ maxCycles: 2, maxHoldMs: 0, now: fakeClock().now });
+		budget.charge(A, 1);
+		budget.charge(B, 1);
+		budget.charge(A, 2); // A exhausted at generation 2; B still live at one cycle
+		budget.beginGeneration(3);
+		budget.beginGeneration(4);
+		assert.equal(budget.size, 2); // A last seen in generation 2: not yet two generations silent
+		budget.beginGeneration(5);
+		assert.equal(budget.size, 1); // A dropped; B (live) kept
+		assert.equal(budget.charge(B, 5).cycles, 2);
+		assert.equal(budget.charge(A, 5), undefined); // A re-held after the drop starts a fresh budget
+	});
+
+	it('keeps an exhausted delivery that is still re-streamed every generation', () => {
+		const budget = createBlobGapEscalationBudget({ maxCycles: 1, maxHoldMs: 0, now: fakeClock().now });
+		assert.equal(budget.charge(A, 1).cycles, 1);
+		for (let generation = 2; generation <= 8; generation++) {
+			budget.beginGeneration(generation);
+			assert.equal(budget.size, 1);
+			assert.equal(budget.charge(A, generation).cycles, generation);
+		}
+	});
+
 	it('with both bounds disabled a tracked delivery never escalates', () => {
 		const budget = createBlobGapEscalationBudget({ maxCycles: 0, maxHoldMs: 0, now: fakeClock().now });
 		for (let generation = 1; generation <= 50; generation++) assert.equal(budget.charge(A, generation), undefined);
@@ -183,6 +207,13 @@ describe('blobGapDeliveryKey', () => {
 		assert.notEqual(blobGapDeliveryKey('f1', 1), blobGapDeliveryKey('f1', 2));
 		assert.equal(blobGapDeliveryKey('f1', 1), blobGapDeliveryKey('f1', 1));
 		assert.equal(blobGapDeliveryKey('f1', 'k'), 'f1|k');
+	});
+
+	it('does not collapse structured record ids', () => {
+		assert.notEqual(blobGapDeliveryKey('f1', { a: 1 }), blobGapDeliveryKey('f1', { a: 2 }));
+		assert.notEqual(blobGapDeliveryKey('f1', [1, 2]), blobGapDeliveryKey('f1', [1, 3]));
+		assert.notEqual(blobGapDeliveryKey('f1', Buffer.from([1])), blobGapDeliveryKey('f1', Buffer.from([2])));
+		assert.equal(blobGapDeliveryKey('f1', [1, 2]), blobGapDeliveryKey('f1', [1, 2]));
 	});
 });
 
