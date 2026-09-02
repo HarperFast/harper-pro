@@ -50,20 +50,25 @@ jobs:
             echo "node-versions=[24]" >> $GITHUB_OUTPUT
             echo 'build-node-versions=[22, 24, "26.5.0"]' >> $GITHUB_OUTPUT
           elif [ "$NODE_VERSION_INPUT" == "all" ] || [ -z "$NODE_VERSION_INPUT" ]; then
-            # TEMPORARY: pinned to 26.5.0 instead of floating "26" — 26.5.1's llhttp/undici bump
-            # (deps: llhttp 9.4.2->9.4.3, undici 8.7.0->8.9.0) breaks analytics.test.mjs,
-            # addNodeLeaderNoMeshLeak.test.mjs, and the Cluster 6/6 shard on Node 26 only. The
-            # harper-side counterpart (a TTL-reset-on-write race made visible by the same bump,
-            # confirmed via a curl-based discriminator that rules out an undici-client artifact)
-            # is documented on harper#2025; harper-pro's own root cause was not traced to the same
-            # depth in this pass. Remove this pin once the underlying issue is fixed — see
-            # harper#2025, which stays open until then.
+            # TEMPORARY: pinned to 26.5.0 instead of floating "26". The original reason
+            # (harper#2025 — an undici fetch-stall bug breaking analytics.test.mjs,
+            # addNodeLeaderNoMeshLeak.test.mjs, and the Cluster 6/6 shard on Node 26 only) is
+            # resolved upstream as of undici 8.10.0 / Node 26.8.1, and harper#2025 is closed.
+            # The pin stays for a separate, still-open reason: a second Node 26.8.x regression
+            # (mTLS/OCSP revocation checking fails open when the issuer cert is unavailable,
+            # harper#2380) was found and fixed in harper core (HarperFast/harper#2457), but
+            # harper-pro's `core` submodule pointer has not yet caught up to that fix, and
+            # harper-pro's own OCSP/CRL/mTLS-revocation integration tests
+            # (integrationTests/security/{ocsp,crl}-verification.test.ts,
+            # subscription-revocation.test.ts) have not been re-verified against it. Remove this
+            # pin once core is bumped past that fix and those suites pass clean on floating "26".
             echo "node-versions=[22, 24, \"26.5.0\"]" >> $GITHUB_OUTPUT
             echo 'build-node-versions=[22, 24, "26.5.0"]' >> $GITHUB_OUTPUT
           else
             # Manual dispatch intentionally does NOT apply the 26.5.0 pin above: selecting "26"
             # here floats to the latest 26.x release, so it doubles as the live reproducer for
-            # checking whether harper#2025 is still reproducing on the newest Node 26 patch.
+            # checking whether the mTLS/OCSP regression (harper#2380) still reproduces once
+            # `core` has been bumped past HarperFast/harper#2457.
             if [[ ! "$NODE_VERSION_INPUT" =~ ^(22|24|26)$ ]]; then
               echo "::error::unsupported Node version '$NODE_VERSION_INPUT'"
               exit 1
