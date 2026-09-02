@@ -6,8 +6,11 @@
  * shape is fail-stop (harper#2087): the stream delivers everything before the break, stops there
  * rather than skipping the frame -- a frame is not a transaction boundary, so skipping it could
  * apply part of a source transaction -- and reports the break with the offset where framing
- * resumes. Entries behind the break stay quarantined until the log is repaired or the node is
- * re-cloned; nothing here recovers them.
+ * resumes. Entries behind the break stay quarantined until the log is repaired and the source
+ * restarted, which revives the stream for later transactions. Measured here: it does not bring back
+ * the remainder of the torn transaction, because B's resume cursor already sits at that transaction's
+ * version and the resume is exclusive of it; those rows come back only with a re-clone. The test
+ * therefore pins the revival and leaves that remainder unasserted rather than locking in the loss.
  *
  * One asymmetry the oracle locks in: B ends up with exactly the rows whose frames precede the torn
  * one, and the torn frame sits inside the 50-row source transaction, so that prefix is part of a
@@ -170,6 +173,34 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 			beforeBreak,
 			`${QUARANTINE_SETTLE_MS}ms after A acknowledged a write behind the break`
 		);
+
+		// Repairing the frame and restarting A revives the stream: the write that did not arrive above
+		// now does, which also shows the non-delivery was the stop and not latency. The remainder of the
+		// torn transaction is reported, not asserted (see the file header).
+		const brokenA = ctx.nodeA;
+		await stopNodeProcess(brokenA);
+		repairFrame(localLogPath(brokenA.dataRootDir), tear);
+		const repairedA = { name: ctx.name, harper: { dataRootDir: brokenA.dataRootDir, hostname: brokenA.hostname } };
+		await startHarper(repairedA, nodeStartOptions(brokenA.hostname));
+		ctx.nodeA = repairedA.harper;
+
+		const probeId = rowId(TOTAL);
+		const afterRepair = await waitForCondition(
+			async (signal) => {
+				const rows = await readRows(ctx.nodeB, signal).catch(() => null);
+				return rows?.some((row) => row.id === probeId) ? rows : null;
+			},
+			{
+				timeoutMs: CONVERGE_TIMEOUT_MS,
+				description: () => `${ctx.nodeB.hostname} to receive ${probeId} after the repair`,
+			}
+		);
+		assertRowsPresent(afterRepair, [...beforeBreak, probeId], 'after the log was repaired');
+		const tornTransactionRemainder = rowIds(tear.index, TOTAL - tear.index);
+		const recovered = tornTransactionRemainder.filter((id) => afterRepair.some((row) => row.id === id));
+		console.log(
+			`after repair B holds ${recovered.length}/${tornTransactionRemainder.length} rows of the torn transaction's remainder`
+		);
 	});
 });
 
@@ -259,6 +290,13 @@ function tearFrame(logPath, framesFromEnd) {
 	return { ...target, index, totalFrames: frames.length };
 }
 
+/** Undoes `tearFrame`: the frame declares its real length again, so the log reads through. */
+function repairFrame(logPath, tear) {
+	const buffer = readFileSync(logPath);
+	new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(tear.position + 8, tear.length);
+	writeFileSync(logPath, buffer);
+}
+
 function localLogPath(dataRootDir) {
 	return join(dataRootDir, 'database', DATABASE, 'transaction_logs', 'local', `${LOG_ID}.txnlog`);
 }
@@ -301,6 +339,15 @@ function assertExactRows(rows, expectedIds, when) {
 		`${when}: expected exactly ${expectedIds.length} rows; missing ${missing.length} [${missing.join(', ')}], ` +
 			`unexpected ${extra.length} [${extra.join(', ')}]`
 	);
+	for (const id of expectedIds) {
+		strictEqual(byId.get(id), payloadFor(id), `${when}: ${id} does not hold the payload that was written`);
+	}
+}
+
+function assertRowsPresent(rows, expectedIds, when) {
+	const byId = new Map(rows.map((row) => [row.id, row.payload]));
+	const missing = expectedIds.filter((id) => !byId.has(id));
+	ok(missing.length === 0, `${when}: B is missing ${missing.length} rows [${missing.join(', ')}]`);
 	for (const id of expectedIds) {
 		strictEqual(byId.get(id), payloadFor(id), `${when}: ${id} does not hold the payload that was written`);
 	}
