@@ -8,7 +8,7 @@
  */
 
 import { expect } from 'chai';
-import { clearWorkerFromEntries, connectReportOwnsEntry } from '#src/replication/subscriptionManager';
+import { clearWorkerFromEntries } from '#src/replication/subscriptionManager';
 
 // Build a connectionReplicationMap: Map<url, Map<database, entry>>. node.worker mirrors connectToNextWorker,
 // which assigns it via a configurable, non-writable Object.defineProperty (so it can only be cleared with
@@ -66,30 +66,5 @@ describe('clearWorkerFromEntries', () => {
 
 	it('handles an empty map', () => {
 		expect(clearWorkerFromEntries(new Map(), { id: 1 })).to.equal(false);
-	});
-});
-
-/**
- * The connect edge retires an entry's pending setup and recovery. Only the worker that currently owns the
- * entry may do that: the stale-worker path in `onDatabase` recreates an entry on a new worker while the old
- * worker's hung-but-open connection can still report 'open' for the same (url, database), and retiring on
- * that report would cancel the replacement's setup and leave it unsubscribed with `connected: true`.
- */
-describe('connectReportOwnsEntry', () => {
-	it("lets the entry's current worker retire its pending work", () => {
-		expect(connectReportOwnsEntry({ worker: { threadId: 7 } }, 7)).to.equal(true);
-	});
-
-	it('refuses a report from a superseded worker', () => {
-		expect(connectReportOwnsEntry({ worker: { threadId: 8 } }, 7)).to.equal(false);
-	});
-
-	it('trusts an untagged report (main-thread up-correction, or an inline subscribe with no worker)', () => {
-		expect(connectReportOwnsEntry({ worker: { threadId: 7 } }, undefined)).to.equal(true);
-		expect(connectReportOwnsEntry({}, undefined)).to.equal(true);
-	});
-
-	it('refuses a tagged report for an entry with no worker', () => {
-		expect(connectReportOwnsEntry({}, 7)).to.equal(false);
 	});
 });

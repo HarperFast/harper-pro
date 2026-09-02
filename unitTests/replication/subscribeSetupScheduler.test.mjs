@@ -158,7 +158,11 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		assert.equal(scheduler.schedule(URL_A, 'data', NODES, 150), 450);
 	});
 
-	it('noteConnected drops the pending setup and the escalated delay', () => {
+	// A connect report cannot be attributed to the entry that armed the setup (failover subscribes on a
+	// worker that is not entry.worker, and a superseded worker still reports for the same pair), so the
+	// armed setup is left to fire and only the escalated delay is dropped. Escalating across reconnect
+	// cycles instead is what pushed a chaos-restart peer past its 25s reconvergence budget.
+	it('noteConnected resets the escalated delay and leaves the armed setup to fire', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
 		scheduler.schedule(URL_A, 'data', NODES);
 		clock.tick(300);
@@ -166,11 +170,22 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		assert.equal(scheduler.pendingCount(), 1);
 
 		scheduler.noteConnected(URL_A, 'data');
-		assert.equal(scheduler.pendingCount(), 0, 'the armed setup is cancelled, not just reset');
+		assert.equal(scheduler.pendingCount(), 1, 'still armed');
 		clock.tick(60_000);
-		assert.equal(dispatches.length, 1, 'the cancelled setup never fired');
+		assert.equal(dispatches.length, 2, 'the armed setup fired');
 
 		assert.equal(scheduler.schedule(URL_A, 'data', NODES), 300, 'back to the first ceiling after success');
+	});
+
+	it('a pair that reconnects every cycle never escalates', () => {
+		const { scheduler } = makeScheduler(() => 0.5);
+		const delays = [];
+		for (let cycle = 0; cycle < 5; cycle++) {
+			delays.push(scheduler.schedule(URL_A, 'data', NODES));
+			clock.tick(1000);
+			scheduler.noteConnected(URL_A, 'data');
+		}
+		assert.deepEqual(delays, [300, 300, 300, 300, 300]);
 	});
 
 	it('cancel() and cancelUrl() disarm pending setups', () => {

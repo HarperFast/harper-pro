@@ -116,7 +116,7 @@ decorrelated schedule.** Pacing alone is not enough; the storm surface below nee
 
 | Site                                                                            | Schedule                                                                                                                                                                                                                                                                   | Reset signal                                                   |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `createSubscribeSetupScheduler` (`subscriptionManager.ts`) — subscription setup | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s, plus the caller's `RECONNECT_STAGGER_MS` stagger                                                                                                                                                  | `connectedToNode` (also cancels the pending setup)             |
+| `createSubscribeSetupScheduler` (`subscriptionManager.ts`) — subscription setup | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s, plus the caller's `RECONNECT_STAGGER_MS` stagger                                                                                                                                                  | `connectedToNode` (reset only; the armed setup still fires)    |
 | `NodeReplicationConnection.scheduleReconnect`                                   | fixed 500 ms floor, ceiling `INITIAL_RETRY_TIME` 500 ms → 30 s, full jitter; the floor preserves the hard minimum from the TLS-state incident while the remaining window decorrelates fleet redials (harper-pro#339)                                                       | `onFrameSent` — first frame actually sent, **not** socket open |
 | `reconcileWorkers` wedge / receive-stall re-drives                              | one fixed-window draw per sweep, used as a common base under the existing `RECONNECT_STAGGER_MS` spacing (decorrelation only; the re-drives are already throttled by the `disconnectedAt` / `receiveStallReconnectAt` re-stamps), one owned `entry.reDriveTimer` per entry | n/a — disarmed on connect, unsubscribe, and delete             |
 | `runNodeUpdateWatcher` (`knownNodes.ts`) — hdb_nodes watcher restart            | full-jitter ceiling 1 s → 30 s                                                                                                                                                                                                                                             | an iteration that survived `NODE_WATCHER_HEALTHY_UPTIME_MS`    |
@@ -141,10 +141,14 @@ A setup is cancelled on
 connect, on unsubscribe, on node deletion, and on a same-name URL migration, all of which became
 reachable once a pending timer could live 30 s instead of 200 ms. The wedge/stall recovery kicks are
 owned the same way — one `entry.reDriveTimer` per entry, so a staggered sweep that outruns the
-reconcile window that started it replaces its predecessor instead of stacking another wave, disarmed when
-the owning worker exits or the entry is replaced, and only the worker that currently owns an entry may
-retire its pending setup on connect (the report carries the sending thread id; see
-`connectReportOwnsEntry`). Their jitter is drawn once
+reconcile window that started it replaces its predecessor instead of stacking another wave, and disarmed
+when the owning worker exits or the entry is replaced. A connect report does **not** cancel either timer —
+only the escalated delay is reset. The main thread cannot attribute a report to the entry that armed the
+work (`connectToNextWorker` subscribes a failover peer on a worker that is not `entry.worker`, and a
+superseded worker's hung-but-open connection reports for the same pair as its replacement), so cancelling
+on it would strand a just-recreated entry; both timers re-check live state when they fire instead. Gating
+the reset on that attribution instead is what let a chaos-restart peer's setup delay escalate past its
+reconvergence budget. Their jitter is drawn once
 per sweep rather than per entry: a per-entry draw would vary consecutive delays by up to ±200 ms and let
 several dials share a 50 ms instant, which is the concurrency the `RECONNECT_STAGGER_MS` spacing exists to
 bound (#446). The warn moved inside the "actually armed" branch: it now describes an attempt, not an

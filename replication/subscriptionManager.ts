@@ -16,7 +16,7 @@ import {
 	getSubscriptionConnectionKey,
 } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
-import { parentPort, threadId } from 'worker_threads';
+import { parentPort } from 'worker_threads';
 import {
 	subscribeToNodeUpdates,
 	getHDBNodeTable,
@@ -152,7 +152,7 @@ export interface SubscribeSetupScheduler {
 	schedule(url: string, database: string, nodes: any[], staggerMs?: number): number | undefined;
 	/** Replace the payload of an already-armed setup without arming one. */
 	refreshPending(url: string, database: string, nodes: any[]): void;
-	/** The pair reached 'open': drop the pending setup and the escalated delay. */
+	/** The pair reached 'open': real progress, so drop the escalated delay. */
 	noteConnected(url: string, database: string): void;
 	cancel(url: string, database: string): void;
 	cancelUrl(url: string): void;
@@ -231,7 +231,13 @@ export function createSubscribeSetupScheduler(deps: {
 			if (schedule?.timer) schedule.nodes = nodes;
 		},
 		noteConnected(url, database) {
-			drop(url, database);
+			// Reset only — the armed setup is deliberately left to fire. The main thread cannot attribute a
+			// connect report to the entry that armed the setup: `connectToNextWorker` subscribes a failover
+			// peer on a worker that is not `entry.worker`, and a superseded worker's hung-but-open connection
+			// reports for the same (url, database) as its replacement. Cancelling on a report we cannot
+			// attribute strands a just-recreated entry unsubscribed; letting a redundant subscribe reach a
+			// live connection is what this path always did.
+			schedules.get(url)?.get(database)?.backoff.reset();
 		},
 		cancel(url, database) {
 			drop(url, database);
@@ -370,15 +376,6 @@ function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string }
 // `worker: undefined` when httpWorkers is empty, and without this the entry would never
 // get reassigned once workers came back. Pure helper so the reconcile pass below — and its
 // unit tests — can verify the broken-chain detection without spinning up real workers.
-// Whether a 'connected-to-node' report may retire the entry's pending setup and recovery. The stale-worker
-// path in onDatabase recreates an entry on a new worker while the old worker's hung-but-open connection can
-// still report 'open' for the same (url, database); retiring on that report would cancel the replacement's
-// setup and leave it unsubscribed with connected:true, which the wedge net then skips. An untagged report
-// (the main thread's own truth-driven up-correction, or an inline subscribe with no worker) is trusted.
-export function connectReportOwnsEntry(entry: { worker?: any }, reportingThreadId?: number): boolean {
-	return reportingThreadId === undefined || reportingThreadId === entry?.worker?.threadId;
-}
-
 // Clear a dead worker from every subscription entry it owned, so findStaleNodeUrls re-binds those
 // entries on a live worker. Pure helper (like findStaleNodeUrls) so its behavior is unit-testable without
 // real worker threads. Returns whether the worker owned any entries. See harper-pro#357.
@@ -1232,13 +1229,10 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		mainWorkerEntry.connected = true;
-		// Real progress for this pair: drop the escalated setup backoff, any setup still pending, and any
-		// recovery kick armed for a connection that has since come back.
-		if (connectReportOwnsEntry(mainWorkerEntry, connection.reportingThreadId)) {
-			subscribeSetupScheduler.noteConnected(connection.url, connection.database);
-			clearTimeout(mainWorkerEntry.reDriveTimer);
-			mainWorkerEntry.reDriveTimer = undefined;
-		}
+		// Real progress for this pair, so the escalated setup delay goes back to its first ceiling. The
+		// pending setup and the armed recovery are left alone: both re-check live state when they fire, and
+		// a connect report cannot be attributed to the worker that armed them.
+		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
 		const restoredNode = mainWorkerEntry.nodes[0];
@@ -1742,9 +1736,7 @@ if (parentPort) {
 		parentPort.postMessage({ type: 'disconnected-from-node', ...connection });
 	};
 	connectedToNode = (connection) => {
-		// Tagged so the main thread can tell this worker's report from a superseded worker's; see
-		// connectReportOwnsEntry.
-		parentPort.postMessage({ type: 'connected-to-node', ...connection, reportingThreadId: threadId });
+		parentPort.postMessage({ type: 'connected-to-node', ...connection });
 	};
 	onMessageByType('subscribe-to-node', (message) => {
 		// Defer until this worker has finished loading components (databases/tables + persisted hdb_nodes
