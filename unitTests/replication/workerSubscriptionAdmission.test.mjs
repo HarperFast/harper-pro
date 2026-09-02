@@ -83,6 +83,48 @@ describe('worker subscription admission', () => {
 		assert.equal(keyCalls, 1);
 	});
 
+	// A rejection used to leave the retained action waiting for another inbound message or the ~30s wedge
+	// reconcile — the empty-subscription window the gate exists to close. It now re-attempts itself.
+	it('re-attempts a rejected readiness on an escalating schedule without a new message', async () => {
+		let attempts = 0;
+		const actions = [];
+		const errors = [];
+		const retries = [];
+		const admission = createWorkerSubscriptionAdmission({
+			whenReady: () => (++attempts < 3 ? Promise.reject(new Error(`load failed ${attempts}`)) : Promise.resolve()),
+			key: (message) => message.key,
+			dispatch: (message) => actions.push(message.generation),
+			onError: (_message, error) => errors.push(error.message),
+			retry: (delayMs, attempt) => {
+				retries.push(delayMs);
+				attempt();
+			},
+			random: () => 0.999999,
+		});
+		admission.submit({ key: 'peer\0data', generation: 1 });
+		await waitForTurn();
+		await waitForTurn();
+
+		assert.deepEqual(errors, ['load failed 1', 'load failed 2']);
+		assert.deepEqual(retries, [199, 399], 'the re-attempt delay escalates under the shared schedule');
+		assert.deepEqual(actions, [1], 'the retained action is applied once readiness succeeds');
+		assert.equal(admission.pendingCount(), 0);
+	});
+
+	it('stops re-attempting once nothing is pending', async () => {
+		const retries = [];
+		const admission = createWorkerSubscriptionAdmission({
+			whenReady: () => Promise.reject(new Error('load failed')),
+			key: (message) => message.key,
+			dispatch: () => assert.fail('nothing should dispatch'),
+			onError: () => {},
+			retry: (delayMs) => retries.push(delayMs),
+		});
+		admission.submit({ key: 'peer\0data' });
+		await waitForTurn();
+		assert.equal(retries.length, 1);
+	});
+
 	it('retains bounded state after readiness rejection and retries on the next message', async () => {
 		const firstReadiness = deferred();
 		let attempts = 0;

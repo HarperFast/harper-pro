@@ -1638,9 +1638,13 @@ export function createWorkerSubscriptionAdmission(deps: {
 	key: (message: any) => string;
 	dispatch: (message: any) => void;
 	onError: (message: any | undefined, error: unknown) => void;
+	retry?: (delayMs: number, attempt: () => void) => void;
+	random?: () => number;
 }) {
+	const retry = deps.retry ?? ((delayMs: number, attempt: () => void) => void setTimeout(attempt, delayMs).unref());
 	let ready = false;
 	let flushScheduled = false;
+	let retryBackoff: Backoff | undefined;
 	const pending = new Map<string, any>();
 
 	function dispatch(message: any) {
@@ -1657,6 +1661,7 @@ export function createWorkerSubscriptionAdmission(deps: {
 			.whenReady()
 			.then(() => {
 				ready = true;
+				retryBackoff?.reset();
 				for (const [key, message] of pending) {
 					pending.delete(key);
 					dispatch(message);
@@ -1665,6 +1670,18 @@ export function createWorkerSubscriptionAdmission(deps: {
 			.catch((error) => deps.onError(undefined, error))
 			.finally(() => {
 				flushScheduled = false;
+				// A readiness failure would otherwise strand the retained actions until another message
+				// arrives or the wedge reconcile notices ~30s later — the empty-subscription window this
+				// gate exists to close (harper-pro#289 / #233). Re-attempt on the shared schedule instead.
+				if (!ready && pending.size > 0) {
+					retryBackoff ??= createBackoff({
+						initialMs: NODE_SUBSCRIBE_DELAY,
+						maxMs: NODE_SUBSCRIBE_MAX_DELAY_MS,
+						random: deps.random,
+					});
+					const delay = retryBackoff.nextDelay();
+					if (delay !== undefined) retry(delay, scheduleFlush);
+				}
 			});
 	}
 
