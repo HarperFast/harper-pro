@@ -246,7 +246,8 @@ export function positiveMsOr(value: unknown, defaultMs: number): number {
  * that silently never trips.
  */
 export function nonNegativeIntegerOr(value: unknown, defaultValue: number): number {
-	if (value == null || value === '') return defaultValue;
+	if (typeof value !== 'number' && typeof value !== 'string') return defaultValue;
+	if (typeof value === 'string' && value.trim() === '') return defaultValue;
 	const n = Number(value);
 	return Number.isFinite(n) && n >= 0 ? Math.floor(n) : defaultValue;
 }
@@ -1523,6 +1524,8 @@ function blobGapKeyPart(value: unknown, depth = 0, seen?: Set<object>): string {
 				);
 			} catch {
 				return 'o:' + Object.prototype.toString.call(value);
+			} finally {
+				seen.delete(value);
 			}
 		}
 		default: {
