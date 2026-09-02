@@ -127,6 +127,21 @@ describe('createBlobGapEscalationBudget (#432)', () => {
 		assert.equal(budget.charge(A, 3).cycles, 2);
 	});
 
+	it('beginGeneration retires the previous socket before it settles anything else', () => {
+		// A replacement socket announces itself before its first blob settles, so the retired socket's late
+		// successful save (which would otherwise erase live progress) is already stale.
+		const budget = createBlobGapEscalationBudget({ maxCycles: 3, maxHoldMs: 0, now: fakeClock().now });
+		budget.charge(A, 1);
+		budget.beginGeneration(2);
+		budget.resolve(A, 1);
+		assert.equal(budget.size, 1);
+		assert.equal(budget.charge(A, 1), undefined);
+		assert.equal(budget.charge(A, 2), undefined);
+		assert.equal(budget.charge(A, 3).cycles, 3);
+		budget.beginGeneration(2); // never moves backwards
+		assert.equal(budget.charge(A, 3).cycles, 3);
+	});
+
 	it('never evicts live progress: at capacity a new delivery escalates as overflow and is not tracked', () => {
 		const budget = createBlobGapEscalationBudget({ maxCycles: 3, maxHoldMs: 0, maxTracked: 2, now: fakeClock().now });
 		budget.charge(A, 1);
