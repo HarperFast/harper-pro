@@ -113,6 +113,32 @@ describe('shouldCloseSendAuthWatch', () => {
 		expect(resolved, 'no probe after the deadline').to.equal(1);
 	});
 
+	// The store read is synchronous, so it can carry the clock past the deadline by itself — the sleep is
+	// not the only thing that can overrun the advertised grace period.
+	it('fails closed when the row read itself crosses the deadline', async () => {
+		let clock = 0;
+		let timedOut = false;
+		let resolved = 0;
+		const shouldClose = await shouldCloseSendAuthWatch({ type: 'put' }, 'node-a', 'data', {
+			isClosed: neverClosed,
+			sleep: async () => {
+				clock += 29_000;
+			},
+			now: () => clock,
+			reprobeBudgetMs: 30_000,
+			resolve: () => {
+				if (resolved++ === 0) return SEND_AUTH_UNCHANGED;
+				clock += 5000; // the point read blocks past the deadline, then returns an authorizing row
+				return { name: 'node-a', replicates: true };
+			},
+			onReprobeTimeout: () => {
+				timedOut = true;
+			},
+		});
+		expect(shouldClose, 'a row that arrived after the deadline does not authorize').to.equal(true);
+		expect(timedOut).to.equal(true);
+	});
+
 	it('does not read the clock at all for an immediately decodable row', async () => {
 		const shouldClose = await shouldCloseSendAuthWatch({ type: 'put' }, 'node-a', 'data', {
 			isClosed: neverClosed,

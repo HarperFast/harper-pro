@@ -111,6 +111,37 @@ describe('worker subscription admission', () => {
 		assert.equal(admission.pendingCount(), 0);
 	});
 
+	it('does not add a second attempt or timer while a retry is armed', async () => {
+		let readinessCalls = 0;
+		const retries = [];
+		let fire;
+		const admission = createWorkerSubscriptionAdmission({
+			whenReady: () => {
+				readinessCalls++;
+				return Promise.reject(new Error('load failed'));
+			},
+			key: (message) => message.key,
+			dispatch: () => assert.fail('nothing should dispatch'),
+			onError: () => {},
+			retry: (delayMs, attempt) => {
+				retries.push(delayMs);
+				fire = attempt;
+			},
+		});
+		admission.submit({ key: 'peer\0data' });
+		await waitForTurn();
+		assert.equal(retries.length, 1);
+
+		for (let i = 0; i < 50; i++) admission.submit({ key: `peer\0db-${i}` });
+		await waitForTurn();
+		assert.equal(readinessCalls, 1, 'no second readiness attempt while one is armed');
+		assert.equal(retries.length, 1, 'no second timer');
+
+		fire();
+		await waitForTurn();
+		assert.equal(readinessCalls, 2, 'the armed retry is the one that re-attempts');
+	});
+
 	it('stops re-attempting once nothing is pending', async () => {
 		const retries = [];
 		const admission = createWorkerSubscriptionAdmission({
@@ -125,22 +156,27 @@ describe('worker subscription admission', () => {
 		assert.equal(retries.length, 1);
 	});
 
-	it('retains bounded state after readiness rejection and retries on the next message', async () => {
+	it('retains bounded state after a readiness rejection and applies the newest action on the retry', async () => {
 		const firstReadiness = deferred();
 		let attempts = 0;
 		const actions = [];
 		const errors = [];
+		let fire;
 		const admission = createWorkerSubscriptionAdmission({
 			whenReady: () => (++attempts === 1 ? firstReadiness.promise : Promise.resolve()),
 			key: (message) => message.key,
 			dispatch: (message) => actions.push(message.generation),
 			onError: (_message, error) => errors.push(error.message),
+			retry: (_delayMs, attempt) => (fire = attempt),
 		});
 		admission.submit({ key: 'peer\0data', generation: 1 });
 		firstReadiness.reject(new Error('component load failed'));
 		await waitForTurn();
 		assert.equal(admission.pendingCount(), 1);
+		// A message arriving before the retry fires replaces the retained one rather than adding work.
 		admission.submit({ key: 'peer\0data', generation: 2 });
+		assert.equal(admission.pendingCount(), 1);
+		fire();
 		await waitForTurn();
 
 		assert.deepEqual(errors, ['component load failed']);

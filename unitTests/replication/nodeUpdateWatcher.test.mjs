@@ -158,8 +158,15 @@ describe('runNodeUpdateWatcher restart loop', () => {
 			await runNodeUpdateWatcher(() => {}, {
 				subscribe: async () => {
 					subscribeCalls++;
-					fakeNow += 60_000; // every run stays up well past healthyUptimeMs
-					return makeAsyncIterableFromArray([]);
+					return {
+						// The clock advances while ITERATING, which is the only thing that counts as uptime.
+						[Symbol.asyncIterator]: () => ({
+							next: async () => {
+								fakeNow += 60_000;
+								return { done: true };
+							},
+						}),
+					};
 				},
 				restartDelayMs: 4,
 				maxDelayMs: 256,
@@ -174,6 +181,31 @@ describe('runNodeUpdateWatcher restart loop', () => {
 
 		expect(subscribeCalls).to.equal(4);
 		expect(delays.values, 'a healthy run never escalates').to.deep.equal([3, 3, 3]);
+	});
+
+	// The health clock must start when the subscription goes live, not when the attempt begins: a
+	// subscribe() that blocks past the threshold and then throws was never a live watcher.
+	it('does not count time spent acquiring a subscription as uptime', async () => {
+		let fakeNow = 0;
+		const delays = captureTimerDelays();
+		try {
+			await runNodeUpdateWatcher(() => {}, {
+				subscribe: async () => {
+					fakeNow += 60_000; // a slow acquire, then a failure
+					throw new Error('subscribe timed out');
+				},
+				restartDelayMs: 4,
+				maxDelayMs: 256,
+				healthyUptimeMs: 10_000,
+				now: () => fakeNow,
+				random: () => 0.999999,
+				maxRestarts: 5,
+			});
+		} finally {
+			delays.restore();
+		}
+
+		expect(delays.values, 'a slow failed acquire still escalates').to.deep.equal([3, 7, 15, 31]);
 	});
 
 	it('forwards events to the listener via the default processEvent path', async () => {

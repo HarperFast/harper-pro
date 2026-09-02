@@ -14,14 +14,10 @@ const logger = harperLogger.forComponent('blob-repair').conditional as Logger;
 // per unrepairable record while the cursor stays open.
 const REPAIR_RETRY_INITIAL_MS = 50;
 const REPAIR_RETRY_MAX_MS = 1000;
-// Consecutive unrepairable records that end the sweep. A repair resets the count, so this only trips when
-// no peer can serve anything — the cluster-wide-loss case, where pacing alone would hold the
-// incomplete-blob cursor open for ~1s per record across the whole backlog and report nothing until the end.
-const REPAIR_MAX_CONSECUTIVE_FAILURES = 100;
-// One sweep per database per thread. `repair_blob_data` is fire-and-forget, so repeated calls landing on
-// the same thread used to stack concurrent sweeps over the same records, wasting peer fetches and
-// defeating the pacing above. Calls routed to different threads are still independent.
-const sweepsInFlight = new Set<string>();
+// Wall-clock ceiling on how long one unbroken failure run may spend *pausing*. Once spent the sweep keeps
+// scanning at full speed: pacing exists to stop a hot loop, and inferring the rest of the cursor from an
+// unrepairable prefix would silently skip records a later peer can still serve. A repair restarts it.
+const REPAIR_PACING_BUDGET_MS = 60_000;
 
 export async function allBlobsAreComplete(
 	blobs: any[],
@@ -32,7 +28,7 @@ export async function allBlobsAreComplete(
 
 export async function repairBlobs(
 	dbName: string,
-	deps: { sleep?: (ms: number) => Promise<unknown> } = {}
+	deps: { sleep?: (ms: number) => Promise<unknown>; now?: () => number } = {}
 ): Promise<{ checked: number; repaired: number; failed: number; noConnection: number }> {
 	const database = (databases as any)[dbName];
 	if (!database) throw new Error(`Unknown database '${dbName}'`);
@@ -45,8 +41,10 @@ export async function repairBlobs(
 	const backoff = createBackoff({
 		initialMs: REPAIR_RETRY_INITIAL_MS,
 		maxMs: REPAIR_RETRY_MAX_MS,
-		maxAttempts: REPAIR_MAX_CONSECUTIVE_FAILURES,
+		budgetMs: REPAIR_PACING_BUDGET_MS,
+		now: deps.now,
 	});
+	let pacingSpent = false;
 
 	for await (const { tableName, table, recordId } of findIncompleteBlobRefs(database, dbName)) {
 		checked++;
@@ -95,20 +93,21 @@ export async function repairBlobs(
 
 		if (peerRepaired) {
 			backoff.reset();
+			pacingSpent = false;
 		} else {
 			failed++;
 			logger.warn?.('Could not repair blob for record', recordId, 'in', tableName, '— no peer had a complete copy');
 			const delay = backoff.nextDelay();
 			if (delay === undefined) {
-				logger.warn?.(
-					'Stopping blob repair for',
-					dbName,
-					`after ${REPAIR_MAX_CONSECUTIVE_FAILURES} consecutive records no peer could repair`,
-					{ checked, repaired, failed, noConnection }
-				);
-				break;
-			}
-			await pause(delay);
+				if (!pacingSpent) {
+					pacingSpent = true;
+					logger.warn?.(
+						'Blob repair pacing budget spent for',
+						dbName,
+						`after ${REPAIR_PACING_BUDGET_MS}ms of unrepairable records; continuing the sweep unpaced`
+					);
+				}
+			} else await pause(delay);
 		}
 	}
 
@@ -122,12 +121,8 @@ server.registerOperation?.({
 		if (!request.database) throw new Error('Must provide "database" name for blob repair');
 		const dbName = request.database;
 		if (!(databases as any)[dbName]) throw new Error(`Unknown database '${dbName}'`);
-		if (sweepsInFlight.has(dbName)) return { message: `Blob repair already running for '${dbName}'` };
-		sweepsInFlight.add(dbName);
 		// fire and forget — repair can take hours on large datasets
-		repairBlobs(dbName)
-			.catch((err) => logger.error?.('Blob repair failed', dbName, err))
-			.finally(() => sweepsInFlight.delete(dbName));
+		repairBlobs(dbName).catch((err) => logger.error?.('Blob repair failed', dbName, err));
 		return { message: 'Blob repair started, check logs for progress' };
 	},
 	httpMethod: 'POST',

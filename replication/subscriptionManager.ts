@@ -16,7 +16,7 @@ import {
 	getSubscriptionConnectionKey,
 } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
-import { parentPort } from 'worker_threads';
+import { parentPort, threadId } from 'worker_threads';
 import {
 	subscribeToNodeUpdates,
 	getHDBNodeTable,
@@ -373,12 +373,28 @@ function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string }
 // Clear a dead worker from every subscription entry it owned, so findStaleNodeUrls re-binds those
 // entries on a live worker. Pure helper (like findStaleNodeUrls) so its behavior is unit-testable without
 // real worker threads. Returns whether the worker owned any entries. See harper-pro#357.
+/**
+ * Whether a 'connected-to-node' report may retire the entry's pending setup and recovery. The stale-worker
+ * path in `onDatabase` recreates an entry on a new worker while the old worker's hung-but-open connection
+ * can still report 'open' for the same (url, database); retiring on that report would cancel the
+ * replacement's setup and leave it unsubscribed with `connected: true`, which the wedge net then skips.
+ * An untagged report (the main thread's own truth-driven up-correction, or an inline subscribe with no
+ * worker) is trusted.
+ */
+export function connectReportOwnsEntry(entry: { worker?: any }, reportingThreadId?: number): boolean {
+	return reportingThreadId === undefined || reportingThreadId === entry?.worker?.threadId;
+}
+
 export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationStatusMap>, worker: any): boolean {
 	let owned = false;
 	for (const dbReplicationWorkers of connectionMap.values()) {
 		for (const entry of dbReplicationWorkers.values()) {
 			if (entry.worker === worker) {
 				entry.worker = undefined;
+				// The armed recovery posts to this worker and closes over it; disarm rather than leave the
+				// exited Worker (and its request) retained until the timer's fire-time guard no-ops.
+				clearTimeout(entry.reDriveTimer);
+				entry.reDriveTimer = undefined;
 				owned = true;
 			}
 			// Also drop the dead worker from per-node refs (entry.nodes[].worker); connectToNextWorker sets
@@ -978,14 +994,16 @@ export async function startOnMainThread(options) {
 			// entry stuck and the subscription never recovers.
 			if (existingEntry && httpWorkers.length > 0 && !httpWorkers.includes(existingEntry.worker as any)) {
 				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
+				// The armed recovery closes over the worker being replaced; its fire-time guard would no-op,
+				// but until then it retains an exited Worker and its request per entry.
+				clearTimeout(existingEntry.reDriveTimer);
 				dbReplicationWorkers.delete(databaseName);
 				existingEntry = undefined;
 			}
 			if (existingEntry) {
 				worker = existingEntry.worker;
-				// isLeader is only decided on the scheduling path below, so a payload built here would drop
-				// it — and this array becomes `entry.nodes`, which the wedge re-drive posts from. Same
-				// OR-accumulation the scheduling path uses.
+				// This array becomes `entry.nodes`, which the wedge re-drive posts from, and isLeader is only
+				// decided on the scheduling path below — carry it forward or the re-drive loses it.
 				nodes[0].isLeader = nodes[0].isLeader || existingEntry.nodes?.[0]?.isLeader;
 				existingEntry.nodes = nodes;
 				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
@@ -1057,8 +1075,6 @@ export async function startOnMainThread(options) {
 				// don't dial N catchup connections simultaneously. See #446.
 				const staggerMs = subscribeStagger ? subscribeStagger.count++ * RECONNECT_STAGGER_MS : 0;
 				const subscribeDelay = subscribeSetupScheduler.schedule(getNodeURL(node), databaseName, nodes, staggerMs);
-				// undefined means a setup for this (url, database) is already pending: it has just taken
-				// this call's payload, so there is nothing more to do — and nothing to log.
 				// The warn belongs to an armed setup, not to an event, or a re-drive storm reproduces the
 				// 165k-line logs of harper-pro#327 even though the work itself is now bounded.
 				if (subscribeDelay !== undefined) {
@@ -1207,7 +1223,7 @@ export async function startOnMainThread(options) {
 		}
 	};
 
-	connectedToNode = function (connection, reportingWorker?) {
+	connectedToNode = function (connection) {
 		// Basically undo what we did in disconnectedFromNode and also update the latency
 		const dbReplicationWorkers = connectionReplicationMap.get(connection.url);
 		const mainWorkerEntry = dbReplicationWorkers?.get(connection.database);
@@ -1221,12 +1237,8 @@ export async function startOnMainThread(options) {
 		}
 		mainWorkerEntry.connected = true;
 		// Real progress for this pair: drop the escalated setup backoff, any setup still pending, and any
-		// recovery kick armed for a connection that has since come back. Only the entry's CURRENT owner may
-		// retire that work: the stale-worker path above deletes and recreates the entry on a new worker while
-		// the old worker's hung-but-open connection can still report 'open' for the same (url, database), and
-		// retiring on that report would leave the new worker's setup cancelled and never re-armed. An
-		// internal caller (the truth-driven up-correction) passes no worker and is always trusted.
-		if (!reportingWorker || reportingWorker === mainWorkerEntry.worker) {
+		// recovery kick armed for a connection that has since come back.
+		if (connectReportOwnsEntry(mainWorkerEntry, connection.reportingThreadId)) {
 			subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 			clearTimeout(mainWorkerEntry.reDriveTimer);
 			mainWorkerEntry.reDriveTimer = undefined;
@@ -1644,6 +1656,7 @@ export function createWorkerSubscriptionAdmission(deps: {
 	const retry = deps.retry ?? ((delayMs: number, attempt: () => void) => void setTimeout(attempt, delayMs).unref());
 	let ready = false;
 	let flushScheduled = false;
+	let retryArmed = false;
 	let retryBackoff: Backoff | undefined;
 	const pending = new Map<string, any>();
 
@@ -1655,7 +1668,10 @@ export function createWorkerSubscriptionAdmission(deps: {
 		}
 	}
 	function scheduleFlush() {
-		if (flushScheduled) return;
+		// One readiness attempt and one armed re-attempt at a time: without the second guard, every message
+		// arriving during a boot-time load failure starts its own attempt and arms its own timer, and the
+		// retained continuations grow with input again — the shape this gate exists to bound.
+		if (flushScheduled || retryArmed) return;
 		flushScheduled = true;
 		deps
 			.whenReady()
@@ -1680,7 +1696,13 @@ export function createWorkerSubscriptionAdmission(deps: {
 						random: deps.random,
 					});
 					const delay = retryBackoff.nextDelay();
-					if (delay !== undefined) retry(delay, scheduleFlush);
+					if (delay !== undefined) {
+						retryArmed = true;
+						retry(delay, () => {
+							retryArmed = false;
+							scheduleFlush();
+						});
+					}
 				}
 			});
 	}
@@ -1723,7 +1745,9 @@ if (parentPort) {
 		parentPort.postMessage({ type: 'disconnected-from-node', ...connection });
 	};
 	connectedToNode = (connection) => {
-		parentPort.postMessage({ type: 'connected-to-node', ...connection });
+		// Tagged so the main thread can tell this worker's report from a superseded worker's; see
+		// connectReportOwnsEntry.
+		parentPort.postMessage({ type: 'connected-to-node', ...connection, reportingThreadId: threadId });
 	};
 	onMessageByType('subscribe-to-node', (message) => {
 		// Defer until this worker has finished loading components (databases/tables + persisted hdb_nodes

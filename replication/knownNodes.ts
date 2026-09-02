@@ -192,10 +192,13 @@ export async function runNodeUpdateWatcher(
 	});
 	const isCurrent = () => generation === (watcherGenerations.get(key) ?? 0);
 	while (restarts < maxRestarts && isCurrent()) {
-		const startedAt = now();
+		// Stamped only once the subscription is live: time spent acquiring (or failing) one is not uptime,
+		// so a subscribe() that blocks past the threshold and then throws must not read as a healthy run.
+		let liveSince: number | undefined;
 		try {
 			const events = await subscribe();
 			if (!isCurrent()) break; // superseded while awaiting subscribe
+			liveSince = now();
 			const iterator = events[Symbol.asyncIterator]();
 			watcherIterators.set(key, iterator);
 			try {
@@ -223,7 +226,7 @@ export async function runNodeUpdateWatcher(
 		}
 		// A watcher that stayed up long enough to have done real work restarts quickly; anything shorter
 		// is a failure cycle and keeps escalating toward the cap.
-		if (now() - startedAt >= healthyUptimeMs) backoff.reset();
+		if (liveSince !== undefined && now() - liveSince >= healthyUptimeMs) backoff.reset();
 		restarts++;
 		if (restarts >= maxRestarts || !isCurrent()) return;
 		const delay = backoff.nextDelay();
