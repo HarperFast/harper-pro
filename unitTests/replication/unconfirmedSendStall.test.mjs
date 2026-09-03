@@ -18,7 +18,7 @@
  */
 
 import { expect } from 'chai';
-import { unconfirmedSendStallReason } from '#src/replication/replicationConnection';
+import { unconfirmedSendStallReason, decodeDropResyncAllowed } from '#src/replication/replicationConnection';
 
 const THRESHOLD = 20 * 60_000;
 const NOW = 1_000_000_000;
@@ -103,5 +103,30 @@ describe('unconfirmedSendStallReason', () => {
 			})
 		).to.equal('peer-not-confirming');
 		expect(probes).to.equal(0);
+	});
+});
+
+describe('decodeDropResyncAllowed', () => {
+	const INTERVAL = 5 * 60_000;
+
+	it('allows the first resync on a connection', () => {
+		expect(decodeDropResyncAllowed(0, 0, NOW, INTERVAL)).to.equal(true);
+	});
+
+	it('suppresses a second resync inside the interval', () => {
+		// The trigger is the whole residual decode-failure bucket, not only the structure forks a
+		// resubscribe repairs, so an undecodable record this build can never decode would otherwise close
+		// on every frame carrying that table.
+		expect(decodeDropResyncAllowed(NOW - INTERVAL + 1, 1, NOW, INTERVAL)).to.equal(false);
+	});
+
+	it('allows another once the interval has elapsed', () => {
+		expect(decodeDropResyncAllowed(NOW - INTERVAL, 1, NOW, INTERVAL)).to.equal(true);
+	});
+
+	it('stops entirely once the budget is spent, however long ago the last one was', () => {
+		// A frequency bound alone leaves an unrepairable fault rebuilding the subscription forever, which is
+		// worse than the plain skip-and-advance it replaces.
+		expect(decodeDropResyncAllowed(NOW - 10 * INTERVAL, 3, NOW, INTERVAL, 3)).to.equal(false);
 	});
 });
