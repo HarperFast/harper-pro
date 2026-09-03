@@ -55,7 +55,7 @@ type ConnectedWorkerStatus = {
 	worker: any;
 	connected?: boolean;
 	latency?: number;
-	// R3 (harper-pro#431): BACK_PRESSURE_RATIO_POSITION, copied off shared memory by the reconcile so the
+	// BACK_PRESSURE_RATIO_POSITION (harper-pro#431), copied off shared memory by the reconcile so the
 	// orchestrator has it without an IPC round trip. Nothing here routes on it; adaptive routing (W5/#218)
 	// will. Named for its unit because cluster_status publishes the same slot as `backPressurePercent`.
 	backPressureRatio?: number;
@@ -209,7 +209,7 @@ function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string }
 // entries on a live worker. Pure helper (like findStaleNodeUrls) so its behavior is unit-testable without
 // real worker threads. Returns whether the worker owned any entries. See harper-pro#357.
 //
-// R1 (harper-pro#431): `onOwnedEntry` fires for each (database, peer) this worker owned BEFORE the ownership
+// (harper-pro#431) `onOwnedEntry` fires for each (database, peer) this worker owned BEFORE the ownership
 // reference is dropped, so the caller's down-stamp runs while the dead worker is still provably the owner.
 // Injected rather than done here so this helper stays pure.
 export function clearWorkerFromEntries(
@@ -240,12 +240,17 @@ export function clearWorkerFromEntries(
 	}
 	return owned;
 }
-// R1 (harper-pro#431). The worker 'exit' handler is the fast path, not the correctness boundary: a worker
-// that wedges or leaves the pool without its 'exit' ever landing leaves entries pointing at an owner that is
-// gone. The reconcile applies this per entry so the bound is one tick either way. It is also the ownership
-// guard both writers share — an entry whose worker is still running is never stamped.
-export function hasLiveOwner(entry: { worker?: any }, httpWorkers: any[]): boolean {
-	return Boolean(entry.worker) && httpWorkers.includes(entry.worker);
+// The worker 'exit' handler is the fast path for correcting truth after an owner dies, not the correctness
+// boundary: a worker that wedges or is dropped from the pool without its 'exit' ever landing leaves entries
+// pointing at an owner that is gone. The reconcile applies this per entry so the bound is one tick either way.
+//
+// It requires a worker OBJECT that is no longer in the pool, which is provably dead. `worker: undefined` is
+// NOT that: an entry registered while the pool was empty runs its subscription on the main thread
+// (subscribeToNode is called inline in onDatabase), and that main-thread session writes CONNECTED into the
+// same buffer. Stamping it would flap a healthy link DOWN on every tick and leave a sticky worker-exit code
+// on it. findStaleNodeUrls rebinds those entries; this must not pre-empt it. (harper-pro#431)
+export function hasDeadOwner(entry: { worker?: any }, httpWorkers: any[]): boolean {
+	return Boolean(entry.worker) && !httpWorkers.includes(entry.worker);
 }
 export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatusMap>, httpWorkers: any[]): Set<string> {
 	const staleNodeUrls = new Set<string>();
@@ -336,7 +341,7 @@ export function reconcileEntryWithTruth(
 	if (entry.connected === false && truth.connected) return 'up';
 	return undefined;
 }
-// R4 (harper-pro#431): the main-thread twin of replicateOverWS's fireTelemetryForLog. Both reconcile nets
+// the main-thread twin of replicateOverWS's fireTelemetryForLog. Both reconcile nets
 // act on the entry that OWNS the (db, peer) subscription, so their fires are always owner-backed. Wrapped so
 // a telemetry failure can never abort a recovery pass.
 function recordMainThreadFire(
@@ -364,7 +369,7 @@ function recordMainThreadFire(
 		counts
 	)} ${describePriorSignals(entry, now)}`;
 }
-// R3 (harper-pro#431). `latency` is only copied when the buffer carries one: it is written on pong, so a
+// (harper-pro#431) `latency` is only copied when the buffer carries one: it is written on pong, so a
 // link that has not ponged yet reads 0 and copying that would replace the value connectedToNode mirrored
 // from the connect edge with a false instant reading. `backPressureRatio` is copied unconditionally — 0 is
 // its meaningful "no back-pressure" value. replicator.ts's cache-miss picker still reads the slot directly.
@@ -758,7 +763,7 @@ export async function startOnMainThread(options) {
 					url,
 					clearStatus: true,
 				});
-				// R2 (harper-pro#431): the buffer is keyed by (database, peer) and process-scoped, so a re-add
+				// the buffer is keyed by (database, peer) and process-scoped, so a re-add
 				// inside this process resolves the SAME one and would otherwise read the departed membership's
 				// CONNECTED/liveness/error values before connecting once.
 				try {
@@ -1209,7 +1214,7 @@ export async function startOnMainThread(options) {
 		if (!worker || workersWithExitHandler.has(worker)) return;
 		workersWithExitHandler.add(worker);
 		worker.once('exit', () => {
-			// R1 (harper-pro#431): the dead worker cannot write its own DOWN — that is the whole defect —
+			// the dead worker cannot write its own DOWN — that is the whole defect —
 			// so the main thread stamps it for every (db, peer) the worker owned, while it is still the
 			// recorded owner. Without this the buffer keeps its last CONNECTED stamp and only reads down
 			// once liveness ages past LIVENESS_STALE_MS (>= 120s); the reconcile below then corrects the
@@ -1267,14 +1272,14 @@ export async function startOnMainThread(options) {
 					// One buffer read serves every job on this entry: the two lifecycle corrections, the truth
 					// derivation, and the R3 metrics bridge.
 					status = getReplicationSharedStatus(auditStore, databaseName, nodeName);
-					// R2 (harper-pro#431): a tracked peer that is no longer a cluster member must read zero
+					// a tracked peer that is no longer a cluster member must read zero
 					// shared status, or a same-process re-add inherits its CONNECTED/liveness/error values.
 					// Skipped while nodeMap is empty — mid-boot, nothing has been processed yet, so every entry
 					// would falsely read as removed.
 					const key = `${databaseName}/${nodeName}`;
 					if (nodeMap.size > 0 && !nodeMap.has(nodeName)) {
 						if (status.some((slot) => slot !== 0)) {
-							clearReplicationSharedStatus(auditStore, databaseName, nodeName);
+							status.fill(0);
 							// Reported once while the condition holds, not on every tick: a live writer that kept
 							// re-populating a buffer this keeps zeroing would otherwise log every 5s forever. The
 							// key is dropped again below when the peer is a member, so a genuine recurrence is
@@ -1286,9 +1291,9 @@ export async function startOnMainThread(options) {
 						}
 					} else {
 						reportedNonMemberStatus.delete(key);
-						// R1: the entry's owning worker is gone from the live pool. Stamped before the truth read
-						// below so the correction lands on this tick rather than the next one.
-						if (!hasLiveOwner(entry, httpWorkers) && stampWorkerExitDown(status, now))
+						// The entry's owning worker is gone from the live pool. Stamped before the truth read below
+						// so the correction lands on this tick rather than the next one.
+						if (hasDeadOwner(entry, httpWorkers) && stampWorkerExitDown(status, now))
 							(stampedDeadOwner ??= []).push(key);
 					}
 				} catch (error) {
@@ -1510,7 +1515,7 @@ export function requestClusterStatus(message?, port?) {
 						database,
 						connected,
 						latency,
-						// R3 (harper-pro#431): the reconcile's copy of the owning worker's back-pressure ratio,
+						// the reconcile's copy of the owning worker's back-pressure ratio,
 						// 0..1 — the same slot clusterStatus.ts publishes as `backPressurePercent`, carried on the
 						// entry adaptive routing will read. Named for its unit so the two cannot be confused.
 						backPressureRatio,
