@@ -693,7 +693,7 @@ export function subscribeToNode(request: any) {
 		logger.error('Error in subscription to node', request.nodes[0]?.url, error);
 	}
 }
-export async function unsubscribeFromNode({ url, nodes, database }) {
+export async function unsubscribeFromNode({ url, nodes, database, clearStatus = false }) {
 	logger.trace(
 		'Unsubscribing from node',
 		url,
@@ -708,8 +708,20 @@ export async function unsubscribeFromNode({ url, nodes, database }) {
 		if (connection) {
 			connection.unsubscribe();
 			dbConnections.delete(database);
+			if (clearStatus) releaseSharedStatusOnUnsubscribe(connection);
 		}
 	}
+}
+// R2 (harper-pro#431). `unsubscribe()` only starts the teardown: it closes the socket, and the close handler
+// later stamps CONNECTION_STATE_DOWN + close code 1008 through the connection's retained `sharedStatus` view,
+// gated only on `nodeSubscriptions`, which unsubscribing never clears. No CONNECTED writer ever clears the
+// error slots, so on a same-process re-add that stamp sticks on the live successor's buffer and cluster_status
+// reports a failure the new link never suffered. Take the view away here — before any close can run — so the
+// main thread's own clear in onNodeUpdate(null) is the last word. Deliberately does NOT clear: a re-add can be
+// assigned to a different HTTP worker, whose connection this one cannot see, and its CONNECTED stamp must
+// survive.
+export function releaseSharedStatusOnUnsubscribe(connection) {
+	connection.sharedStatus = undefined;
 }
 
 // Force a wedged-but-connected subscription to tear down and reconnect. Unlike unsubscribeFromNode this

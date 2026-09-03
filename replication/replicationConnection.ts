@@ -169,6 +169,11 @@ export const LAST_ERROR_CODE_POSITION = 11; // close code of the most recent dis
 export const LAST_ERROR_TIME_POSITION = 12; // wall-clock ms of the most recent disconnect
 export const CONNECTION_STATE_DOWN = 0;
 export const CONNECTION_STATE_CONNECTED = 2;
+// LAST_ERROR_CODE for a disconnect this node INFERRED rather than observed on the wire: the worker thread
+// that owned the (db, peer) subscription is gone, so no close frame or socket error ever reported a code.
+// Deliberately outside the 16-bit WebSocket close-code space so it can never collide with a real one, and
+// so an operator reading `lastConnectionError` can tell "the owning worker died" from "the peer closed us".
+export const WORKER_EXIT_ERROR_CODE = 100_001;
 // LIVENESS_STALE_MS is defined below, after PING_TIMEOUT, so it can be derived from the configured
 // keepalive window rather than a fixed default.
 export type ConnectionTruth = {
@@ -225,6 +230,108 @@ export function formatTruthSnapshot(truth: ConnectionTruth | undefined, now: num
 	const liveness = truth.lastLiveness > 0 ? `${Math.round((now - truth.lastLiveness) / 1000)}s ago` : 'never';
 	const closeCode = truth.errorCode ? `, lastCloseCode: ${truth.errorCode}` : '';
 	return `truth={connected: ${truth.connected}, state: ${truth.state}, liveness: ${liveness}${closeCode}}`;
+}
+// R1 (harper-pro#431): mark an outbound subscription DOWN because its owning worker is gone rather than
+// because a close was observed — otherwise the buffer keeps the dead worker's CONNECTED stamp until liveness
+// passes LIVENESS_STALE_MS (>= 120s). `lastLiveness` is left in place as the record of when the dead link was
+// last proven alive; deriveConnectionTruth reads DOWN as not-connected regardless of its freshness.
+//
+// The CALLER owns the ownership guard. Refusing to overwrite a state that is not CONNECTED keeps this
+// idempotent across both writers and stops it rewriting a real close code with the inferred one.
+export function stampWorkerExitDown(status: Float64Array | undefined, now: number = Date.now()): boolean {
+	if (!status || status[CONNECTION_STATE_POSITION] !== CONNECTION_STATE_CONNECTED) return false;
+	status[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+	status[LAST_ERROR_CODE_POSITION] = WORKER_EXIT_ERROR_CODE;
+	status[LAST_ERROR_TIME_POSITION] = now;
+	return true;
+}
+// R4 (harper-pro#431) fire classification. Every watchdog / recovery-net fire records whether the
+// shared-memory connection truth ALSO judged the link down at that moment:
+// - `redundant`     — truth already read down, so the truth-driven path had (or should have had) it too.
+// - `load-bearing`  — truth read up, so this mechanism is the only layer that saw the problem.
+// - `unknown`       — the fire came from a connection that does not own the (db, peer) subscription truth
+//                     (an inbound server socket or a cache-miss retrieval connection), or truth could not
+//                     be read at all. Counted in NEITHER bucket: the buffer describes a different link, so
+//                     scoring the fire against it would bias the evidence.
+// This is measurement only. No net is demoted, no threshold moves, and no fire predicate consults it — the
+// demotion decision (the byte-silence receive watchdog is the candidate) is a later, data-driven one.
+export type FireClassification = 'redundant' | 'load-bearing' | 'unknown';
+// Append only: the index into this list picks the counter slot pair, so reordering or removing a name
+// reassigns existing counters to a different mechanism.
+export const FIRE_MECHANISMS = [
+	'receive-watchdog',
+	'pause-stall',
+	'copy-progress',
+	'blob-gap',
+	'copy-finalize',
+	'subscription-setup',
+	'wedge-reconcile',
+	'receive-stall-net',
+] as const;
+export type FireMechanism = (typeof FIRE_MECHANISMS)[number];
+// Two counter slots per mechanism (redundant, load-bearing) starting here — see the slot map in DESIGN.md.
+export const FIRE_COUNTER_BASE_POSITION = 13;
+// These counters are the one read-modify-write on this buffer, safe only under the single-writer-per-slot-
+// pair invariant stated in DESIGN.md. unitTests/replication/fireCounters.test.mjs pins its disjointness half.
+export function fireCounterPositions(mechanism: string): { redundant: number; loadBearing: number } | undefined {
+	const index = (FIRE_MECHANISMS as readonly string[]).indexOf(mechanism);
+	if (index < 0) return;
+	return { redundant: FIRE_COUNTER_BASE_POSITION + index * 2, loadBearing: FIRE_COUNTER_BASE_POSITION + index * 2 + 1 };
+}
+// `isOwner` must be the same `nodeSubscriptions !== undefined` marker the truth WRITES are gated on, or a
+// fire from an inbound/retrieval socket is scored against truth describing a different link.
+// A buffer that has never reported liveness OR an error says nothing about the link: `deriveConnectionTruth`
+// reads all-zero as not-connected because that is the safe default for the reconcile, but scoring a fire
+// against it as `redundant` would claim a detection that never happened, inflating the bucket the demotion
+// decision reads. A watchdog can fire on a link whose transport connected but never handshook.
+export function classifyFire(truth: ConnectionTruth | undefined, isOwner: boolean): FireClassification {
+	if (!isOwner || !truth) return 'unknown';
+	if (truth.lastLiveness <= 0 && !truth.errorTime) return 'unknown';
+	return truth.connected ? 'load-bearing' : 'redundant';
+}
+// Increment this mechanism's counter for the classification and return both current values, or undefined
+// when nothing was recorded: an unrecognized mechanism, no buffer, a buffer too short to hold the pair (a
+// defensive guard, since an out-of-range Float64Array write is a silent no-op that would otherwise report
+// fabricated counts), or an `unknown` classification. Unknown returns nothing rather than the current
+// totals: those totals belong to the OWNING link, and printing them beside an unknown fire invites reading
+// another link's history as this fire's.
+export function recordFire(
+	status: Float64Array | undefined,
+	mechanism: string,
+	classification: FireClassification
+): { redundant: number; loadBearing: number } | undefined {
+	const positions = fireCounterPositions(mechanism);
+	if (!positions || !status || status.length <= positions.loadBearing) return;
+	if (classification === 'redundant') status[positions.redundant] += 1;
+	else if (classification === 'load-bearing') status[positions.loadBearing] += 1;
+	else return;
+	return { redundant: status[positions.redundant], loadBearing: status[positions.loadBearing] };
+}
+// The structured suffix appended to every fire log line, alongside formatTruthSnapshot's.
+export function formatFireClassification(
+	mechanism: string,
+	classification: FireClassification,
+	counts?: { redundant: number; loadBearing: number }
+): string {
+	const running = counts ? `, redundant: ${counts.redundant}, loadBearing: ${counts.loadBearing}` : '';
+	return `fire={mechanism: ${mechanism}, class: ${classification}${running}}`;
+}
+// Mechanisms that have never fired are omitted, so a healthy link reports nothing rather than eight zeroed
+// pairs.
+export function readFireCounters(
+	status: Float64Array | undefined
+): Record<string, { redundant: number; loadBearing: number }> | undefined {
+	if (!status) return;
+	let counters: Record<string, { redundant: number; loadBearing: number }> | undefined;
+	for (const mechanism of FIRE_MECHANISMS) {
+		const positions = fireCounterPositions(mechanism);
+		if (!positions || status.length <= positions.loadBearing) continue;
+		const redundant = status[positions.redundant];
+		const loadBearing = status[positions.loadBearing];
+		if (!redundant && !loadBearing) continue;
+		(counters ??= {})[mechanism] = { redundant, loadBearing };
+	}
+	return counters;
 }
 
 /**
@@ -3674,8 +3781,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let wedgedForTest = armReplicationWedgeForTest(options.connection, ws, databaseName);
 	// W1 T1 (#431): truth snapshot for watchdog fire logs — what the shared-memory connection truth said
 	// at the moment a worker-local watchdog decided to act (see formatTruthSnapshot for how the
-	// demotion soak reads this).
-	const truthSnapshotForLog = () => {
+	// demotion soak reads this) — plus the R4 fire classification, which records the same judgement as a
+	// per-mechanism counter so the soak can read totals out of cluster_status instead of aggregating logs.
+	// Recording happens HERE rather than at each callback so every fire site is measured identically and
+	// no watchdog's internals are touched (see classifyFire for what `unknown` protects).
+	const fireTelemetryForLog = (mechanism: FireMechanism) => {
 		// This telemetry feeds the watchdog fire logs, emitted from the onSilence/onStall recovery
 		// callbacks immediately before forceReconnect()/ws.terminate(). getSharedStatus() and
 		// deriveConnectionTruth() read shared memory / the auditStore and can throw if that state is
@@ -3684,10 +3794,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// telemetry failure degrades the log line to a marker and recovery always proceeds. (harper-pro#431)
 		try {
 			const status = getSharedStatus();
-			return formatTruthSnapshot(status && deriveConnectionTruth(status));
+			const truth = status && deriveConnectionTruth(status);
+			const classification = classifyFire(truth, options.connection?.nodeSubscriptions !== undefined);
+			const counts = recordFire(status, mechanism, classification);
+			return `${formatTruthSnapshot(truth)} ${formatFireClassification(mechanism, classification, counts)}`;
 		} catch (error) {
 			logger.trace?.(connectionId, 'failed to build connection-truth snapshot for watchdog fire log', error);
-			return 'truth=error';
+			return `truth=error ${formatFireClassification(mechanism, 'unknown')}`;
 		}
 	};
 	// Watchdog fires act on the SHARED connection object, but the watchdogs are per replicateOverWS
@@ -3720,7 +3833,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			const direction = options.url ? 'no activity from' : 'no ping from';
 			logger.warn?.(
-				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${currentReceiveSilenceThresholdMs()}ms — terminating connection and reconnecting — ${truthSnapshotForLog()}`
+				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${currentReceiveSilenceThresholdMs()}ms — terminating connection and reconnecting — ${fireTelemetryForLog('receive-watchdog')}`
 			);
 			// On the client (subscription) side drive recovery through the connection so it does not depend
 			// on terminate() propagating a 'close' (an open-but-idle socket may never emit one). A
@@ -3741,7 +3854,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (firingFromSupersededInstance('Pause-stall watchdog')) return;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting — ${truthSnapshotForLog()}`
+				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting — ${fireTelemetryForLog('pause-stall')}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -3777,7 +3890,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${effectiveBlobTimeoutMs}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
+				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${effectiveBlobTimeoutMs}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${fireTelemetryForLog('copy-progress')}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -3805,7 +3918,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Blob-gap watchdog: a blob gap from ${remoteNodeName}${dbContext} has pinned the resume cursor for ${blobGapReconnectMs}ms while connected — terminating connection and reconnecting to re-stream the gapped blob (harper-pro#683) — ${truthSnapshotForLog()}`
+				`Blob-gap watchdog: a blob gap from ${remoteNodeName}${dbContext} has pinned the resume cursor for ${blobGapReconnectMs}ms while connected — terminating connection and reconnecting to re-stream the gapped blob (harper-pro#683) — ${fireTelemetryForLog('blob-gap')}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -3826,7 +3939,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (supersededOrClosed() || !inCopyMode || !copyCompleteReceived) return;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.error?.(
-				`Copy-finalization watchdog: base copy from ${remoteNodeName}${dbContext} received COPY_COMPLETE but did not finalize within ${COPY_FINALIZE_TIMEOUT}ms — this node stays in copy mode and can never become available; terminating connection and reconnecting to resume the copy — stuck on {outstandingCommits: ${outstandingCommits}, outstandingBlobs: ${outstandingBlobsToFinish.length}, blobGap: ${hasBlobGap}, copyFlushInFlight: ${copyFlushInFlight}, pendingCopyCursor: ${pendingCopyCursor != null}} — ${truthSnapshotForLog()}`
+				`Copy-finalization watchdog: base copy from ${remoteNodeName}${dbContext} received COPY_COMPLETE but did not finalize within ${COPY_FINALIZE_TIMEOUT}ms — this node stays in copy mode and can never become available; terminating connection and reconnecting to resume the copy — stuck on {outstandingCommits: ${outstandingCommits}, outstandingBlobs: ${outstandingBlobsToFinish.length}, blobGap: ${hasBlobGap}, copyFlushInFlight: ${copyFlushInFlight}, pendingCopyCursor: ${pendingCopyCursor != null}} — ${fireTelemetryForLog('copy-finalize')}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -3840,7 +3953,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			pendingSubscriptionSetupRequestId = undefined;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Subscription-setup watchdog: no application response from ${remoteNodeName}${dbContext} for ${subscriptionSetupTimeoutMs}ms while transport remained connected — reconnecting from the durable cursor (harper-pro#642) — ${truthSnapshotForLog()}`
+				`Subscription-setup watchdog: no application response from ${remoteNodeName}${dbContext} for ${subscriptionSetupTimeoutMs}ms while transport remained connected — reconnecting from the durable cursor (harper-pro#642) — ${fireTelemetryForLog('subscription-setup')}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
