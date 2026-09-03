@@ -1126,11 +1126,17 @@ export function routeEntriesIncludePeer(
  * conversely a directional peer that DOES qualify must be excluded, or every subscriber receives
  * its writes once per mesh member and a restart replays that fan-out squared.
  */
-export function qualifiesForMultiHopExclusion(node: any, peerName: string, databaseName: string): boolean {
+export function qualifiesForMultiHopExclusion(
+	node: Partial<NodeRecord> | null | undefined,
+	peerName: string,
+	databaseName: string
+): boolean {
+	const replicates = node?.replicates;
+	if (replicates === true) return true;
+	const directional = typeof replicates === 'object' ? replicates : undefined;
 	return !!(
-		node?.replicates === true ||
-		node?.replicates?.sends ||
-		routeEntriesIncludePeer(node?.replicates?.sendsTo, peerName, databaseName) ||
+		directional?.sends ||
+		routeEntriesIncludePeer(directional?.sendsTo, peerName, databaseName) ||
 		node?.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe !== false)
 	);
 }
