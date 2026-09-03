@@ -68,7 +68,7 @@ export async function clusterStatus() {
 			// `|| undefined` so a healthy link omits the field entirely (matching lastBlobFailure's asDate(0)).
 			socket.blobReplicationFailures = replicationSharedStatus[BLOB_FAILURE_COUNT_POSITION] || undefined;
 			socket.lastBlobFailure = asDate(replicationSharedStatus[LAST_BLOB_FAILURE_TIME_POSITION]);
-			// R4 (harper-pro#431): per-mechanism recovery-fire counts for this link — how often each watchdog
+			// Per-mechanism recovery-fire counts for this link (harper-pro#431) — how often each watchdog
 			// or reconcile net fired while the shared-memory truth already read down (`redundant`) versus
 			// while it still read up (`loadBearing`, i.e. that mechanism was the only layer that saw the
 			// problem). This is the evidence the later watchdog-demotion decision is meant to rest on; nothing

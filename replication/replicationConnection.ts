@@ -231,7 +231,7 @@ export function formatTruthSnapshot(truth: ConnectionTruth | undefined, now: num
 	const closeCode = truth.errorCode ? `, lastCloseCode: ${truth.errorCode}` : '';
 	return `truth={connected: ${truth.connected}, state: ${truth.state}, liveness: ${liveness}${closeCode}}`;
 }
-// R1 (harper-pro#431): mark an outbound subscription DOWN because its owning worker is gone rather than
+// Mark an outbound subscription DOWN because its owning worker is gone (harper-pro#431) rather than
 // because a close was observed — otherwise the buffer keeps the dead worker's CONNECTED stamp until liveness
 // passes LIVENESS_STALE_MS (>= 120s). `lastLiveness` is left in place as the record of when the dead link was
 // last proven alive; deriveConnectionTruth reads DOWN as not-connected regardless of its freshness.
@@ -245,7 +245,7 @@ export function stampWorkerExitDown(status: Float64Array | undefined, now: numbe
 	status[LAST_ERROR_TIME_POSITION] = now;
 	return true;
 }
-// R4 (harper-pro#431) fire classification. Every watchdog / recovery-net fire records whether the
+// Fire classification (harper-pro#431). Every watchdog / recovery-net fire records whether the
 // shared-memory connection truth ALSO judged the link down at that moment:
 // - `redundant`     — truth already read down, so the truth-driven path had (or should have had) it too.
 // - `load-bearing`  — truth read up, so this mechanism is the only layer that saw the problem.

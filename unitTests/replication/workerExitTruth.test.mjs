@@ -6,7 +6,7 @@
  * Two writers, guarded identically, both exercised here:
  *  - `clearWorkerFromEntries`' owned-entry callback, invoked from the worker 'exit' handler BEFORE the
  *    ownership reference is dropped, so the stamp provably cannot land on a successor.
- *  - `hasLiveOwner`, the predicate the reconcile tick applies per entry to cover a worker which wedged or
+ *  - `hasDeadOwner`, the predicate the reconcile tick applies per entry to cover a worker which wedged or
  *    left the pool without its 'exit' ever firing.
  *
  * The invariant both share: an entry whose owner is a LIVE worker is never stamped, and the stamp itself
@@ -26,7 +26,7 @@ import {
 	CONNECTION_STATE_CONNECTED,
 	deriveConnectionTruth,
 } from '#src/replication/replicationConnection';
-import { clearWorkerFromEntries, hasLiveOwner } from '#src/replication/subscriptionManager';
+import { clearWorkerFromEntries, hasDeadOwner } from '#src/replication/subscriptionManager';
 import { REPLICATION_SHARED_STATUS_SLOTS } from '#src/replication/knownNodes';
 
 const NOW = 1_700_000_000_000;
@@ -128,21 +128,24 @@ describe('clearWorkerFromEntries owned-entry callback (R1 exit-handler writer)',
 	});
 });
 
-describe('hasLiveOwner (R1 reconcile-tick guard)', () => {
-	it('is true only for an entry whose worker is in the live pool', () => {
+describe('hasDeadOwner (the reconcile-tick guard)', () => {
+	it('is true only for a worker object that has left the pool — the state this stamps', () => {
+		expect(hasDeadOwner({ worker: { id: 'dead' } }, [{ id: 'live' }])).to.equal(true);
+	});
+
+	it("is false while the entry's worker is still running", () => {
 		const live = { id: 'live' };
-		expect(hasLiveOwner({ worker: live }, [live])).to.equal(true);
+		expect(hasDeadOwner({ worker: live }, [live])).to.equal(false);
 	});
 
-	it('is false for an entry whose worker has left the pool — the state R1 stamps', () => {
-		expect(hasLiveOwner({ worker: { id: 'dead' } }, [{ id: 'live' }])).to.equal(false);
+	it('is false for an entry with no worker, which is a LIVE main-thread subscription', () => {
+		// onDatabase calls subscribeToNode inline when no HTTP worker is available, and that main-thread
+		// session writes CONNECTED into the same buffer. Stamping it would flap a healthy link down on every
+		// tick and leave a sticky worker-exit code on it.
+		expect(hasDeadOwner({ worker: undefined }, [{ id: 'live' }])).to.equal(false);
 	});
 
-	it('is false for an entry with no worker at all (assignment never landed, or exit already cleared it)', () => {
-		expect(hasLiveOwner({ worker: undefined }, [{ id: 'live' }])).to.equal(false);
-	});
-
-	it('is false with an empty pool — no live worker means no live owner for anything', () => {
-		expect(hasLiveOwner({ worker: { id: 'dead' } }, [])).to.equal(false);
+	it('is false with an empty pool, where every subscription runs on the main thread', () => {
+		expect(hasDeadOwner({ worker: undefined }, [])).to.equal(false);
 	});
 });
