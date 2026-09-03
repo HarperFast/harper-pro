@@ -1,19 +1,13 @@
 /**
- * Coverage for R1 (harper-pro#431): correcting connection truth when the worker that owned a (database,
- * peer) subscription is gone. A dead worker cannot write its own DOWN — that is the defect — so the buffer
- * keeps its last CONNECTED stamp and only reads down once liveness ages past LIVENESS_STALE_MS (>= 120s).
+ * Correcting connection truth when the worker that owned a (database, peer) subscription is gone. A dead
+ * worker cannot write its own DOWN, so the buffer keeps its last CONNECTED stamp until liveness ages past
+ * LIVENESS_STALE_MS (>= 120s).
  *
- * Two writers, guarded identically, both exercised here:
- *  - `clearWorkerFromEntries`' owned-entry callback, invoked from the worker 'exit' handler BEFORE the
- *    ownership reference is dropped, so the stamp provably cannot land on a successor.
- *  - `hasDeadOwner`, the predicate the reconcile tick applies per entry to cover a worker which wedged or
- *    left the pool without its 'exit' ever firing.
- *
- * The invariant both share: an entry whose owner is a LIVE worker is never stamped, and the stamp itself
- * only ever overwrites a CONNECTED state — so a successor that has already re-stamped the link cannot be
- * downed by a late fire of either writer.
+ * Two writers share one ownership guard: `clearWorkerFromEntries`' owned-entry callback, fired from the
+ * worker 'exit' handler before the ownership reference is dropped, and `hasDeadOwner`, applied per entry on
+ * each reconcile tick. What the guard has to get right is which states are dead: a worker object missing
+ * from the pool is, and `worker: undefined` is not — that is a live main-thread subscription.
  */
-
 import { expect } from 'chai';
 import {
 	stampWorkerExitDown,
