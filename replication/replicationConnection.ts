@@ -1,4 +1,6 @@
 import type { Logger } from '../core/utility/logging/logger.ts';
+import { createHash, type Hash } from 'node:crypto';
+import { toBufferKey } from 'ordered-binary';
 import {
 	getDatabases,
 	databases,
@@ -96,6 +98,7 @@ import {
 	holdBlobFile,
 	registerBlobReceiveInFlight,
 	unregisterBlobReceiveInFlight,
+	BLOB_UNAVAILABLE_STATUS,
 } from '../core/resources/blob.ts';
 import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
@@ -239,6 +242,19 @@ export function positiveMsOr(value: unknown, defaultMs: number): number {
 }
 
 /**
+ * Read a non-negative integer setting, falling back to `defaultValue` for anything else (unset, empty,
+ * non-numeric, negative, Infinity); fractions floor. Unlike `positiveMsOr`, an explicit 0 is kept: for
+ * the blob-gap escalation bounds it is the documented disable, and `Infinity` must not pass as a bound
+ * that silently never trips.
+ */
+export function nonNegativeIntegerOr(value: unknown, defaultValue: number): number {
+	if (typeof value !== 'number' && typeof value !== 'string') return defaultValue;
+	if (typeof value === 'string' && value.trim() === '') return defaultValue;
+	const n = Number(value);
+	return Number.isFinite(n) && n >= 0 ? Math.floor(n) : defaultValue;
+}
+
+/**
  * Coerce the configured inbound-queue budget. Nothing non-numeric may reach the gate: a NaN disables
  * neither ceiling but fails every comparison, so every frame would pause AND every settle resume —
  * `ws.pause()`/`ws.resume()`, four watchdog handoffs and a blob-stream walk per frame, silently, on
@@ -304,6 +320,16 @@ const COPY_CHECKPOINT_RECORDS = env.get('replication_copyCheckpointRecords') ?? 
 // — the receive watchdog keeps being reset by the very frames we are not processing — so we close instead
 // and let reconnect backoff retry, which costs one log line per attempt rather than one per message.
 const SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(env.get('replication_subscriptionResolveTimeout'), 60000);
+// Bounded cross-reconnect escalation for a source blob that keeps answering 503 (harper-pro#432): once one
+// delivery has held the resume cursor for this many reconnect cycles, or this long since its first hold,
+// the receiver skips it like a permanent source failure (see createBlobGapEscalationBudget). 0 disables
+// that bound; both 0 restores the unbounded pre-#432 hold.
+const BLOB_GAP_ESCALATION_CYCLES = nonNegativeIntegerOr(env.get(CONFIG_PARAMS.REPLICATION_BLOBGAPESCALATIONCYCLES), 10);
+const BLOB_GAP_ESCALATION_MS = nonNegativeIntegerOr(env.get(CONFIG_PARAMS.REPLICATION_BLOBGAPESCALATIONMS), 1_800_000);
+const BLOB_GAP_ESCALATION_ENABLED = BLOB_GAP_ESCALATION_CYCLES > 0 || BLOB_GAP_ESCALATION_MS > 0;
+// Distinct held deliveries one connection's budget tracks; beyond it, holds without an exhausted entry to
+// displace stay untracked (held) until one exhausts.
+export const BLOB_GAP_BUDGET_MAX_TRACKED = 10_000;
 const SEND_SUBSCRIPTION_RESOLVE_TIMEOUT = positiveMsOr(
 	process.env.HARPER_TEST_SEND_SUBSCRIPTION_RESOLVE_TIMEOUT_MS,
 	SUBSCRIPTION_RESOLVE_TIMEOUT
@@ -1337,9 +1363,40 @@ export function maybeLegacyCursorlessResumeStartForTest(
  * evicted/expired at the origin. Set on the error the receive loop destroys the blob stream with, so
  * the blob-save `.catch` in `receiveBlobs` can tell it apart from a local/transient save fault.
  */
-export function markSourceBlobUnavailable(error: Error): Error {
+export function markSourceBlobUnavailable(error: Error, escalation?: BlobGapEscalation): Error {
 	(error as { sourceBlobUnavailable?: boolean }).sourceBlobUnavailable = true;
+	if (escalation) (error as { blobGapEscalation?: BlobGapEscalation }).blobGapEscalation = escalation;
 	return error;
+}
+
+/** The escalation that reclassified this held delivery as unrecoverable, if the budget did (harper-pro#432). */
+export function getBlobGapEscalation(error: unknown): BlobGapEscalation | undefined {
+	return typeof error === 'object' && error !== null
+		? (error as { blobGapEscalation?: BlobGapEscalation }).blobGapEscalation
+		: undefined;
+}
+
+/**
+ * Stamp the origin's forwarded read status on the destroy error. The frame handler cannot know whether
+ * a delivery will hold the cursor (a peer can send error frames for file ids no record references), so
+ * the save `.catch` — which does — is what budgets a 503 hold (harper-pro#432).
+ */
+export function markSourceBlobStatus(error: Error, status: unknown): Error {
+	if (typeof status === 'number') (error as { sourceBlobStatus?: number }).sourceBlobStatus = status;
+	return error;
+}
+
+/**
+ * A source-reported 503 (transiently unavailable at the origin: a PENDING placeholder or read timeout)
+ * — the one transient class the escalation budget bounds. Local save faults and code-less older senders
+ * keep holding indefinitely.
+ */
+export function isBudgetedSourceBlobError(error: unknown): boolean {
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		(error as { sourceBlobStatus?: number }).sourceBlobStatus === BLOB_UNAVAILABLE_STATUS
+	);
 }
 
 /**
@@ -1418,6 +1475,195 @@ export function shouldRetrySourceBlobRead(state: {
 		!state.draining &&
 		state.attempt < BLOB_SEND_RETRY_DELAYS_MS.length &&
 		isRetriableSourceBlobReadError(state.error)
+	);
+}
+
+export type BlobGapEscalation = { cycles: number; heldMs: number; cohort?: boolean };
+export type BlobGapEscalationBudget = ReturnType<typeof createBlobGapEscalationBudget>;
+
+/**
+ * One held delivery's identity across re-streams. Valid record ids use the same ordered-binary bytes
+ * as the primary stores, then the whole tuple is hashed so no delimiter can alias two deliveries and
+ * no user-controlled id remains retained on the long-lived connection. Invalid ids take a total,
+ * non-throwing fallback because this runs inside the blob-save settlement chain.
+ */
+export function blobGapDeliveryKey(fileId: unknown, recordId: unknown, tableName?: string): string {
+	const hash = createHash('sha256');
+	updateBlobGapKeyHash(hash, safeBlobGapKeyText(fileId));
+	updateBlobGapKeyHash(hash, tableName ?? '');
+	try {
+		updateBlobGapKeyHash(hash, toBufferKey(recordId as any));
+	} catch {
+		updateBlobGapKeyHash(hash, `invalid:${typeof recordId}`);
+	}
+	return hash.digest('base64url');
+}
+
+function updateBlobGapKeyHash(hash: Hash, part: string | Uint8Array): void {
+	const length = typeof part === 'string' ? Buffer.byteLength(part) : part.byteLength;
+	hash.update(`${length}:`).update(part);
+}
+
+function safeBlobGapKeyText(value: unknown): string {
+	if (typeof value === 'string') return value;
+	try {
+		return `${typeof value}:${String(value)}`;
+	} catch {
+		return typeof value;
+	}
+}
+
+// Active socket generations (ones that held a delivery or settled a tracked one) a delivery may go unseen
+// before its entry is dropped. The #683 timer reconnects precisely to re-stream every held delivery, so
+// one that two such generations did not re-hold has healed, been skipped past, or been superseded by a
+// new source file id — it will never be charged again and would otherwise occupy the budget for the
+// process lifetime. Sockets that die before settling anything (a peer in a restart loop, a copy the
+// watchdogs keep terminating) do not count, so an unstable link cannot reset a held delivery's clock.
+const BLOB_GAP_RETIRE_AFTER_GENERATIONS = 2;
+
+/**
+ * Cross-reconnect escalation budget for held source-blob gaps (harper-pro#432; policy in
+ * replication/DESIGN.md item 8). Lives on the persistent `NodeReplicationConnection`; charges one cycle
+ * per socket generation per delivery. Invariants the wiring relies on: exhaustion is STICKY until a
+ * successful save of that delivery (forgetting it lets two deliveries with offset phases leapfrog
+ * forever); a charge or resolve from a generation older than the newest begun is ignored (a retired
+ * socket's late settlements must not touch the live budget); live progress is never dropped for room,
+ * and every hold has a terminal bound even at capacity — the oldest exhausted entry not re-held this
+ * generation makes room, and a hold that still cannot be tracked is charged against one shared cohort
+ * entry with the same bounds (it conflates its members, which is why `maxTracked` is generous; without
+ * it, `maxTracked + 1` persistent gaps could rotate forever with no gap-free generation). Entries unseen
+ * for BLOB_GAP_RETIRE_AFTER_GENERATIONS active socket generations are retired.
+ */
+export function createBlobGapEscalationBudget(opts: {
+	maxCycles: number;
+	maxHoldMs: number;
+	maxTracked?: number;
+	now?: () => number;
+	generation?: number;
+	onCapacity?: (tracked: number) => void;
+}) {
+	const maxTracked = opts.maxTracked ?? BLOB_GAP_BUDGET_MAX_TRACKED;
+	const now = opts.now ?? (() => performance.now());
+	type Entry = { firstHeldAt: number; cycles: number; lastGeneration: number; lastEpoch: number; exhausted: boolean };
+	const held = new Map<string, Entry>();
+	let cohort: Entry | undefined;
+	let currentGeneration = opts.generation ?? 0;
+	let capacityWarnedGeneration = -1;
+	// Activity epochs: one per socket generation that held a delivery or settled a tracked one. Unrelated
+	// successful saves do not count — a socket that dies after saving other blobs but before reaching the
+	// held delivery must not look like a generation that could have re-held it.
+	let activeEpoch = 0;
+	let activeGeneration = -1;
+	const noteActivity = (generation: number) => {
+		if (generation !== activeGeneration) {
+			activeGeneration = generation;
+			activeEpoch++;
+		}
+	};
+	const isStale = (generation: number) => {
+		if (generation < currentGeneration) return true;
+		currentGeneration = generation;
+		return false;
+	};
+	const newEntry = (at: number): Entry => ({
+		firstHeldAt: at,
+		cycles: 0,
+		lastGeneration: -1,
+		lastEpoch: activeEpoch,
+		exhausted: false,
+	});
+	const advance = (entry: Entry, generation: number, at: number): BlobGapEscalation | undefined => {
+		entry.lastEpoch = activeEpoch;
+		if (entry.lastGeneration !== generation) {
+			entry.cycles++;
+			entry.lastGeneration = generation;
+		}
+		const heldMs = at - entry.firstHeldAt;
+		if (!entry.exhausted) {
+			entry.exhausted =
+				(opts.maxCycles > 0 && entry.cycles >= opts.maxCycles) || (opts.maxHoldMs > 0 && heldMs >= opts.maxHoldMs);
+		}
+		return entry.exhausted ? { cycles: entry.cycles, heldMs } : undefined;
+	};
+	// Oldest exhausted entry this socket has not re-held (Map iteration is insertion order): its record
+	// was skipped past, so dropping it touches no live progress; a re-held one keeps its stickiness.
+	const evictExhausted = (generation: number): boolean => {
+		for (const [key, entry] of held) {
+			if (entry.exhausted && entry.lastGeneration < generation) {
+				held.delete(key);
+				return true;
+			}
+		}
+		return false;
+	};
+	return {
+		beginGeneration(generation: number): void {
+			if (generation <= currentGeneration) return;
+			currentGeneration = generation;
+			const silentSince = activeEpoch - BLOB_GAP_RETIRE_AFTER_GENERATIONS;
+			for (const [key, entry] of held) {
+				if (entry.lastEpoch <= silentSince) held.delete(key);
+			}
+			if (cohort && cohort.lastEpoch <= silentSince) cohort = undefined;
+		},
+		/**
+		 * `key` is holding the cursor in socket `generation`; returns the escalation to apply once its budget
+		 * is exhausted, else undefined (keep holding).
+		 */
+		charge(key: string, generation: number): BlobGapEscalation | undefined {
+			if (isStale(generation)) return undefined;
+			noteActivity(generation);
+			const at = now();
+			let entry = held.get(key);
+			if (!entry) {
+				if (held.size >= maxTracked && !evictExhausted(generation)) {
+					if (capacityWarnedGeneration !== generation) {
+						capacityWarnedGeneration = generation;
+						try {
+							opts.onCapacity?.(held.size);
+						} catch {}
+					}
+					cohort ??= newEntry(at);
+					const escalation = advance(cohort, generation, at);
+					return escalation && { ...escalation, cohort: true };
+				}
+				entry = newEntry(at);
+				held.set(key, entry);
+			}
+			return advance(entry, generation, at);
+		},
+		/** `key` is settled (saved, or skipped past for good); a later hold of it starts a fresh budget. */
+		resolve(key: string, generation: number): void {
+			if (held.size === 0 || isStale(generation)) return;
+			if (held.delete(key)) noteActivity(generation);
+		},
+		get size(): number {
+			return held.size;
+		},
+	};
+}
+
+// A module-level factory so the budget, which outlives every socket, retains only these two strings and
+// not the allocating socket's whole replicateOverWS scope.
+function blobGapCapacityWarning(peer: string, database: string): (tracked: number) => void {
+	return (tracked) =>
+		logger.warn?.(
+			`Blob-gap escalation budget for ${peer} (db: "${database}") is tracking ${tracked} held deliveries, its capacity; ` +
+				`further held deliveries share one capacity budget until a tracked one settles (harper-pro#432)`
+		);
+}
+
+export function describeBlobGapEscalation(
+	escalation: BlobGapEscalation,
+	limits: { maxCycles: number; maxHoldMs: number }
+): string {
+	return (
+		`blob-gap escalation budget exhausted after ${escalation.cycles} reconnect cycle(s) holding it for ${Math.round(escalation.heldMs)}ms ` +
+		`(limits: ${limits.maxCycles || 'no'} cycles / ${limits.maxHoldMs || 'no'} ms` +
+		(escalation.cohort
+			? '; charged against the shared capacity budget, the connection tracks its maximum of held deliveries'
+			: '') +
+		')'
 	);
 }
 
@@ -2493,6 +2739,11 @@ export class NodeReplicationConnection extends EventEmitter {
 	// Shared-memory connection-health buffer for this outbound (db, peer) link, stashed by replicateOverWS
 	// once resolved so close()/forceReconnect() can record DOWN/error without re-resolving auditStore (W1).
 	sharedStatus?: Float64Array;
+	// Cross-reconnect escalation budget for held source-blob gaps (harper-pro#432), allocated by the first
+	// budgeted hold. `blobGapGeneration` numbers this connection's replicateOverWS instances so a retired
+	// socket's late blob settlements cannot charge or resolve the live one's budget.
+	blobGapBudget?: BlobGapEscalationBudget;
+	blobGapGeneration = 0;
 	constructor(url: string, subscription: any, databaseName: string, nodeName?: string, authorization?: string) {
 		super();
 		this.url = url;
@@ -2850,6 +3101,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let receivingDataFromNodeIds = [];
 	remoteNodeName = authorization.name;
 	if (remoteNodeName && options.connection) options.connection.nodeName = remoteNodeName;
+	const blobGapGeneration: number = options.connection ? ++options.connection.blobGapGeneration : 0;
+	options.connection?.blobGapBudget?.beginGeneration(blobGapGeneration);
 	let lastSequenceIdReceived, lastSequenceIdCommitted;
 	// Bulk-copy resume state (receiver side). While inCopyMode, each committed batch persists a cursor
 	// (copyStartTime + last committed table/key) so an interrupted copy can resume instead of restarting.
@@ -4381,8 +4634,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									// (EIO, EMFILE, timeout, 503 write-in-progress) is left UNMARKED so the receiver
 									// holds the gap and a reconnect retries. An older sender that sends neither
 									// `errorCode` nor `errorStatus` also stays unmarked — the safe (hold) default for a
-									// mixed-version cluster.
+									// mixed-version cluster. A 503 additionally carries its status so the save `.catch`
+									// can charge the cross-reconnect escalation budget (harper-pro#432).
 									if (isPermanentSourceBlobErrorCode(errorCode, errorStatus)) markSourceBlobUnavailable(blobError);
+									else markSourceBlobStatus(blobError, errorStatus);
 									stream.destroy(blobError);
 								} else if (stream.destroyed || stream.writableEnded) {
 									// The stream was torn down mid-blob and intentionally left in blobsInFlight
@@ -4561,7 +4816,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								},
 								auditStore?.rootStore,
 								(remoteBlob) => {
-									const localBlob = receiveBlobs(remoteBlob, key); // receive the blob;
+									const localBlob = receiveBlobs(remoteBlob, key, undefined, undefined, tableDecoders[tableId]?.name);
 									// track the blobs that were written in case we need to delete them if the record is not moved locally
 									if (!blobsToDelete) blobsToDelete = [];
 									blobsToDelete.push(localBlob);
@@ -5780,7 +6035,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						auditStore?.rootStore,
 						(blob) => {
 							const repairTarget = repairTargets?.[repairIndex++];
-							const localBlob = receiveBlobs(blob, id, copyFrameIndex, repairTarget);
+							const localBlob = receiveBlobs(blob, id, copyFrameIndex, repairTarget, tableDecoder.name);
 							// An in-place-repaired blob is a file a committed record already references (possibly a
 							// coalesced reuse from an earlier record in this message) — never let the decode-failure
 							// cleanup below unlink it.
@@ -6515,7 +6770,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 		}
 	}
-	function receiveBlobs(remoteBlob: Blob, id: string | number, copyFrameIndex?: number, repairTarget?: any) {
+	// A budget with nothing tracked costs one size check, so the healthy path builds no key.
+	function settleBlobGapBudget(blobId: string, id: unknown, tableName: string | undefined) {
+		const budget = options.connection?.blobGapBudget;
+		if (budget && budget.size > 0) budget.resolve(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
+	}
+	function receiveBlobs(
+		remoteBlob: Blob,
+		id: string | number,
+		copyFrameIndex?: number,
+		repairTarget?: any,
+		tableName?: string
+	) {
 		// write the blob to the blob store
 		const blobId = getFileId(remoteBlob);
 		const transferId = getBlobTransferId(remoteBlob);
@@ -6591,6 +6857,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// watermark from this frame onward while earlier frames keep banking (#699).
 			copyWatermark.trackBlob(copyFrameIndex);
 			let copyBlobGapped = false;
+			let saveFailed = false;
 			// We log the rejection via .catch() and also need the resulting promise — not the
 			// raw `finished` — to be what we hand to `Promise.all(outstandingBlobsToFinish)` in
 			// the end_txn onCommit path below. If we pushed `finished` directly, a save
@@ -6602,6 +6869,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// This .catch runs inside the same microtask chain that onCommit's
 					// `await Promise.all(outstandingBlobsToFinish)` is waiting on; we deliberately do NOT tear
 					// down here. Classify the failure to decide whether the resume cursor holds or advances.
+					saveFailed = true;
 					if (isReplicationConnectionClosedError(err)) {
 						// The connection closed mid-blob (e.g. a peer worker restart in the deploy_component
 						// lifecycle). Clamp like any transient gap so the reconnect re-requests it, but skip the
@@ -6617,6 +6885,34 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						copyBlobGapped = true;
 						return;
 					}
+					// A source-reported 503 would hold below; charge it against the connection's cross-reconnect
+					// budget first, so a delivery the origin keeps failing is reclassified as unrecoverable once
+					// its budget is spent and skipped exactly like a 404/500 (harper-pro#432). Charged here, not
+					// at the frame, because only a failed save proves the delivery holds the cursor.
+					// Budget bookkeeping must never throw into this chain: a throw here would skip both the hold
+					// and the advance-past branch, and in the `.finally` below it would leave the blob in flight
+					// for good.
+					try {
+						if (
+							BLOB_GAP_ESCALATION_ENABLED &&
+							options.connection &&
+							isBudgetedSourceBlobError(err) &&
+							!isUnrecoverableSourceBlobError(err)
+						) {
+							const budget = (options.connection.blobGapBudget ??= createBlobGapEscalationBudget({
+								maxCycles: BLOB_GAP_ESCALATION_CYCLES,
+								maxHoldMs: BLOB_GAP_ESCALATION_MS,
+								generation: options.connection.blobGapGeneration,
+								onCapacity: blobGapCapacityWarning(remoteNodeName, databaseName),
+							}));
+							const escalation = budget.charge(blobGapDeliveryKey(blobId, id, tableName), blobGapGeneration);
+							if (escalation) markSourceBlobUnavailable(err, escalation);
+						} else if (isUnrecoverableSourceBlobError(err)) {
+							settleBlobGapBudget(blobId, id, tableName);
+						}
+					} catch (budgetError) {
+						logger.warn?.(`Blob-gap escalation budget error for ${blobId} from ${remoteNodeName}`, budgetError);
+					}
 					if (isUnrecoverableSourceBlobError(err)) {
 						// The sender reported it cannot provide this blob (BLOB_CHUNK `error` marker — typically
 						// ENOENT because the blob was evicted/expired at the origin). Re-streaming on reconnect
@@ -6624,9 +6920,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// forever and block every healthy record behind it (harper-pro#403). Leave `hasBlobGap`
 						// unset so the watermark advances past it; the diverged record is left for proactive
 						// blob backfill (harper-pro#388). Recorded loudly below so the skip is never silent.
+						const escalation = getBlobGapEscalation(err);
 						logger.error?.(
-							`Blob ${blobId} for record ${id} is unrecoverable at source ${remoteNodeName} (${errorToString(err)}); ` +
-								`advancing the resume cursor past it — the record's blob stays diverged until backfilled (harper-pro#388).`
+							escalation
+								? `Blob ${blobId} for record ${id} stayed transiently unavailable at source ${remoteNodeName} (${errorToString(err)}) — ` +
+										describeBlobGapEscalation(escalation, {
+											maxCycles: BLOB_GAP_ESCALATION_CYCLES,
+											maxHoldMs: BLOB_GAP_ESCALATION_MS,
+										}) +
+										`; advancing the resume cursor past it — the record's blob stays diverged until backfilled (repair_blob_data, harper-pro#388/#432).`
+								: `Blob ${blobId} for record ${id} is unrecoverable at source ${remoteNodeName} (${errorToString(err)}); ` +
+										`advancing the resume cursor past it — the record's blob stays diverged until backfilled (harper-pro#388).`
 						);
 						// Missing is the unambiguous backfill signal. This also unlinks a damaged in-place repair
 						// target, but never healthy bytes: this branch only follows a failed write to that target.
@@ -6666,6 +6970,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				.finally(() => {
 					logger.debug?.(`Finished receiving blob stream ${blobId}`);
 					unregisterBlobReceiveInFlight(blobId, auditStore?.rootStore);
+					if (!saveFailed) {
+						try {
+							settleBlobGapBudget(blobId, id, tableName);
+						} catch (budgetError) {
+							logger.warn?.(`Blob-gap escalation budget error for ${blobId} from ${remoteNodeName}`, budgetError);
+						}
+					}
 					// Settle before flushDurableCopyCursor below so the watermark sees this blob's outcome
 					// (an unrecoverable-source skip settles un-gapped — the cursor advances past it, #403).
 					copyWatermark.settleBlob(copyFrameIndex, copyBlobGapped);
