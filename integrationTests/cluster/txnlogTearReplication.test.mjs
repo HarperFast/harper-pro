@@ -6,8 +6,15 @@
  * past a break skips one frame, and replay groups every equal-version entry into one source
  * transaction -- so a break inside such a group would commit the surviving subset of a transaction
  * that never committed that way at the source. The policy is fail-stop/quarantine instead: stop at
- * the break, discard the transaction it truncated, and report it; boundary-safe recovery waits until
- * the engine can resume at a proven transaction boundary. The oracle below therefore describes
+ * the break and report it; boundary-safe recovery waits until the engine can resume at a proven
+ * transaction boundary.
+ *
+ * The transaction discard belongs to *crash-recovery replay*, not to a live stream: replay is what
+ * groups equal-version entries into a transaction, and #2087 gates its truncated-version tracking to
+ * the replay range. A replication receiver has no such grouping -- the send path flushes network
+ * batches on its own boundaries -- so it keeps what it drained before the break and stops there.
+ * Which prefix that leaves is the re-scope's to pin against a real run; do not inherit it from this
+ * paragraph, and do not carry the discard over to the receiver. The oracle below therefore describes
  * behavior core will not produce. Rewriting it against the quarantine semantics is worth doing where
  * the signals it should assert exist -- the mid-log `error` and the `getCorruptFrameReports()`
  * registry both land with #2087 -- so the suite stays skipped until then. The re-scope is tracked
@@ -85,7 +92,6 @@ const FRAMES_AFTER_TEAR = 20;
 const CONVERGE_TIMEOUT_MS = 90_000;
 
 const SKIP_REASON = 'pending re-scope to quarantine semantics (harper#2087)';
-// The override runs the suite anyway, for anyone reproducing what a torn log does today.
 const FORCED = process.env.HARPER_TXNLOG_TEAR_FORCE === '1';
 
 suite(
