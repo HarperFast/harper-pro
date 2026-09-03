@@ -215,8 +215,10 @@ export function readConnectionTruth(
 // otherwise stamp these slots for a link the truth is not about, masking a dead subscription (the
 // reconcile up-corrects it to connected) or spuriously downing a healthy one. Only the connection that
 // owns the subscription may write them, checked inline below as `connection?.nodeSubscriptions !==
-// undefined`: it's the reliable marker, set by subscribe() and never cleared, and never set on a
-// retrieval connection (it only connect()s) or an inbound connection (no options.connection at all).
+// undefined`: it's the reliable marker, set by subscribe() and never set on a retrieval connection (it only
+// connect()s) or an inbound connection (no options.connection at all). It is cleared in exactly one place —
+// releaseSharedStatusOnUnsubscribe, when the peer leaves the cluster — which is how a departing session is
+// stopped from writing to a buffer a re-added membership will resolve.
 // Checked at write time, not via the open-time `isSubscriptionConnection` snapshot, so it holds
 // regardless of subscribe()/open ordering.
 // W1 T1 (harper-pro#431): one-line truth snapshot appended to every watchdog / reconcile-net fire log,
@@ -7213,7 +7215,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		const connectedNode = options.connection?.nodeSubscriptions?.[0];
 		receivingDataFromNodeIds = [];
-		const nodeSubscriptions = options.connection?.nodeSubscriptions.map((node: any) => {
+		const nodeSubscriptions = options.connection?.nodeSubscriptions?.map((node: any) => {
 			const tableSubs = [];
 			let { replicateByDefault } = node;
 			// Tables excluded by this node's receivesFrom config for this peer+database

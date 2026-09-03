@@ -751,21 +751,26 @@ export async function startOnMainThread(options) {
 			for (const [database, { worker, nodes }] of dbReplicationWorkers) {
 				dbReplicationWorkers.delete(database);
 				logger.warn('Node was deleted, unsubscribing from node', hostname, database, url);
-				// `clearStatus` tells the owning worker to drop its connection's view of the shared buffer, so
-				// the close that unsubscribing triggers cannot stamp DOWN + 1008 onto it afterwards. Posted
-				// BEFORE the clear below, and the clear is contained, so neither can leave the old worker
-				// still subscribed to a node that is gone. See releaseSharedStatusOnUnsubscribe.
-				worker?.postMessage({
+				// `clearStatus` has the owning session drop its claim on the shared buffer, so nothing it writes
+				// during teardown can land on the buffer a re-added membership resolves. Sent before the clear
+				// below, and the clear is contained, so neither can leave the old owner still subscribed.
+				//
+				// The `else` matters: an entry created while the HTTP pool was empty is owned by the MAIN
+				// thread (onDatabase calls subscribeToNode inline), and without it that session is never told
+				// to stop — it keeps its socket, keeps replicating with the removed peer, and keeps re-stamping
+				// the buffer the removal just zeroed. Mirrors the sibling unsubscribe site below.
+				const request = {
 					type: 'unsubscribe-from-node',
 					node: hostname,
 					nodes,
 					database,
 					url,
 					clearStatus: true,
-				});
-				// the buffer is keyed by (database, peer) and process-scoped, so a re-add
-				// inside this process resolves the SAME one and would otherwise read the departed membership's
-				// CONNECTED/liveness/error values before connecting once.
+				};
+				if (worker) worker.postMessage(request);
+				else unsubscribeFromNode(request);
+				// The buffer is keyed by (database, peer) and process-scoped, so a re-add inside this process
+				// resolves the SAME one and would otherwise read the departed membership's values.
 				try {
 					const auditStore = getAuditStoreForDatabase(database);
 					if (auditStore) clearReplicationSharedStatus(auditStore, database, hostname);
