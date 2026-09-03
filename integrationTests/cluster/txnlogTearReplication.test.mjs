@@ -1,5 +1,30 @@
 /**
- * Mid-log transaction-log tear: replication resyncs past it instead of starving behind it.
+ * Mid-log transaction-log tear: what a replication stream does when it reaches the break.
+ *
+ * SKIPPED, pending a re-scope. This suite asserts mid-log *recovery*, and recovery is no longer the
+ * intended behavior: HarperFast/harper#2087 reversed that approach on the owner's decision. Resyncing
+ * past a break skips one frame, and replay groups every equal-version entry into one source
+ * transaction -- so a break inside such a group would commit the surviving subset of a transaction
+ * that never committed that way at the source. The policy is fail-stop/quarantine instead: stop at
+ * the break and report it; boundary-safe recovery waits until the engine can resume at a proven
+ * transaction boundary.
+ *
+ * The transaction discard belongs to *crash-recovery replay*, not to a live stream: replay is what
+ * groups equal-version entries into a transaction, and #2087 gates its truncated-version tracking to
+ * the replay range. A replication receiver has no such grouping -- the send path flushes network
+ * batches on its own boundaries -- so it keeps what it drained before the break and stops there.
+ * Which prefix that leaves is the re-scope's to pin against a real run; do not inherit it from this
+ * paragraph, and do not carry the discard over to the receiver. The oracle below therefore describes
+ * behavior core will not produce. Rewriting it against the quarantine semantics is worth doing where
+ * the signals it should assert exist -- the mid-log `error` and the `getCorruptFrameReports()`
+ * registry both land with #2087 -- so the suite stays skipped until then. The re-scope is tracked
+ * by #803; refs harper#2087.
+ *
+ * It passed for as long as it did only because the engine hid it: the old gate gave up unless
+ * `@harperfast/rocksdb-js` exported `CorruptFrameError`, and 2.7.1 did not. The 2.8.0 bump exports
+ * it, so the suite began running against a core that had already decided not to recover, and has
+ * failed on every `main` run since: B holds the 39 rows it drained before the break and stops,
+ * missing the tail this oracle demands.
  *
  * End-to-end coverage for HarperFast/harper#2016 (mid-log tear silently truncates replay and
  * replication) and HarperFast/harper#2063 (the containment was per-drain, so the stall was
@@ -30,9 +55,9 @@
  * `replayLogs.ts`); the write side -- nothing here stops a tear being created, which is
  * HarperFast/rocksdb-js#748; and the *readable* tear shape, where the torn frame is still
  * yielded and its undecodable payload wedges the receiver instead (#669). Measured against this
- * same harness, the readable shape leaves B at 39/60 rows even on a fixed engine.
- *
- * Requires an engine that exports `CorruptFrameError`; skipped otherwise (see ENGINE_RESYNCS).
+ * same harness, the readable shape also leaves B at 39 of 60 rows even on a fixed engine -- the
+ * same count as the unreadable break above, reached a different way: there the receiver stops
+ * because framing ended, here because one entry will not decode.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert/strict';
@@ -69,17 +94,12 @@ const FRAMES_AFTER_TEAR = 20;
 
 const CONVERGE_TIMEOUT_MS = 90_000;
 
-// `CorruptFrameError` is the marker for an engine that reports where framing resumes; without it
-// every break still reads as end-of-log and this test would be asserting a fix that isn't there.
-// The override exists for the fails-on-base check, where failing is the expected result.
-const ENGINE_RESYNCS = await import('@harperfast/rocksdb-js')
-	.then((engine) => typeof engine.CorruptFrameError === 'function')
-	.catch(() => false);
+const SKIP_REASON = 'pending re-scope to quarantine semantics: harper-pro#803, harper#2087';
 const FORCED = process.env.HARPER_TXNLOG_TEAR_FORCE === '1';
 
 suite(
-	'Mid-log txnlog tear: replication resyncs past it',
-	{ skip: !ENGINE_RESYNCS && !FORCED, timeout: 300_000 },
+	'Mid-log txnlog tear: replication containment (re-scope pending)',
+	{ skip: FORCED ? false : SKIP_REASON, timeout: 300_000 },
 	(ctx) => {
 		before(async () => {
 			const startNode = async () => {
