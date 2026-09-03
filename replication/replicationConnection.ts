@@ -46,6 +46,16 @@ import {
 	type ThrottleState,
 } from './blobSendWarnThrottle.ts';
 import {
+	ABSENT_PEER_CAPABILITIES,
+	buildLocalCapabilities,
+	createUnknownCommandState,
+	noteUnknownCommand,
+	resolvePeerCapabilities,
+	samePeerCapabilities,
+	subscriptionSetupCapabilityFrom,
+	type ResolvedPeerCapabilities,
+} from './protocolCapabilities.ts';
+import {
 	HAS_STRUCTURE_UPDATE,
 	isMissingStructureError,
 	lastMetadata,
@@ -129,7 +139,6 @@ const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
 const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime + copy-order version
 const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
-const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -494,6 +503,21 @@ const SUBSCRIPTION_SETUP_TIMEOUT_MS = positiveMsOr(
 	Math.max(PING_TIMEOUT * 2, SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL)
 );
 const SEND_SUBSCRIPTION_SETUP_BUDGET_MS = SEND_SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL;
+// Built once and sent by reference on every handshake, so the advertised bag and the gate that reads a
+// peer's cannot drift apart.
+const LOCAL_CAPABILITIES = buildLocalCapabilities(SEND_SUBSCRIPTION_SETUP_BUDGET_MS);
+// Shared by every socket in this worker thread, so one peer cannot emit a warn line per socket per
+// window by sending a single unrecognized frame on each. Per-socket counts stay on each connection.
+const unknownCommandWarnThrottle = createThrottleState();
+// Monotonic within this worker, so a (threadId, ordinal) pair totally orders this worker's sessions for
+// the main thread's stale-update fence. A wall clock cannot: two workers can start a session in the same
+// millisecond, and an NTP step backwards would make every later session compare older.
+let nextConnectionSessionOrdinal = 0;
+const TEST_OMIT_CAPABILITIES = process.env.HARPER_TEST_OMIT_REPLICATION_CAPABILITIES === '1';
+// Only 200-255: every allocated command code is below 200, so a mis-set value cannot make a real node
+// emit a live DISCONNECT or drive its peer into copy mode.
+const TEST_UNKNOWN_COMMAND_CODE = Number(process.env.HARPER_TEST_SEND_UNKNOWN_COMMAND_CODE);
+const TEST_UNKNOWN_COMMAND_VALID = TEST_UNKNOWN_COMMAND_CODE >= 200 && TEST_UNKNOWN_COMMAND_CODE <= 255;
 // While the receive socket is paused for back-pressure the byte-silence watchdog above is stopped —
 // `ws.pause()` freezes `bytesRead`, so it can no longer tell a healthy back-pressure pause from a peer
 // that died mid-pause — and the active sendPing is exempt while `pauseReasons > 0`. That left a paused
@@ -1837,16 +1861,7 @@ export function resolveSubscriptionSetupCapability(
 	localTimeoutMs: number,
 	usePeerBudget = true
 ): { supported: boolean; timeoutMs: number } {
-	const supported = capabilities?.subscriptionSetupAck >= SUBSCRIPTION_SETUP_ACK_CAPABILITY;
-	const peerSetupBudgetMs = capabilities?.subscriptionSetupBudgetMs;
-	const maxPeerSetupBudgetMs = Math.max(localTimeoutMs * 4, 10 * 60_000);
-	return {
-		supported,
-		timeoutMs:
-			usePeerBudget && supported && Number.isFinite(peerSetupBudgetMs) && peerSetupBudgetMs > 0
-				? Math.max(localTimeoutMs, Math.min(peerSetupBudgetMs, maxPeerSetupBudgetMs))
-				: localTimeoutMs,
-	};
+	return subscriptionSetupCapabilityFrom(resolvePeerCapabilities(capabilities), localTimeoutMs, usePeerBudget);
 }
 
 export function createSubscriptionSetupWatchdog(opts: { timeoutMs: number | (() => number); onTimeout: () => void }): {
@@ -2493,6 +2508,11 @@ export class NodeReplicationConnection extends EventEmitter {
 	// Shared-memory connection-health buffer for this outbound (db, peer) link, stashed by replicateOverWS
 	// once resolved so close()/forceReconnect() can record DOWN/error without re-resolving auditStore (W1).
 	sharedStatus?: Float64Array;
+	// The current socket's frozen effective peer capabilities (harper-pro#440), replaced on every handshake.
+	// `undefined` means NOT YET LEARNED on this socket — including every reconnect window — and never "the
+	// peer does not support it": a peer that advertised nothing is the frozen defaults object. A future
+	// consumer must treat the two apart. Observability only; the socket-local resolution enforces.
+	peerCapabilities?: ResolvedPeerCapabilities;
 	constructor(url: string, subscription: any, databaseName: string, nodeName?: string, authorization?: string) {
 		super();
 		this.url = url;
@@ -2561,6 +2581,10 @@ export class NodeReplicationConnection extends EventEmitter {
 					name: this.nodeName,
 					database: this.databaseName,
 					url: this.url,
+					// This socket has learned nothing yet, so anything the main-thread entry still holds came
+					// from the socket this one replaces. Only the connect edge sets it; a reconcile
+					// up-correction replays the same path and must not blank a live socket's capabilities.
+					newSocket: true,
 				});
 			}
 			this.isConnected = true;
@@ -2804,6 +2828,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		(p ? 's:' + p : 'c:' + options.url?.slice(-4)) +
 		' ' +
 		Math.random().toString().slice(2, 3);
+	const sessionOrdinal = ++nextConnectionSessionOrdinal;
 	logger.debug?.(connectionId, 'Initializing replication connection', authorization);
 	const frame = new FrameWriter();
 	let databaseName = options.database;
@@ -3250,10 +3275,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
+	// Re-learned from every NODE_NAME and never carried across sockets: the peer may have been upgraded or
+	// downgraded between reconnects, and the persistent NodeReplicationConnection outlives the socket.
+	let peerCapabilities: ResolvedPeerCapabilities = ABSENT_PEER_CAPABILITIES;
+	// Until a NODE_NAME lands, the defaults above are an assumption, not an observation. Reporting them as
+	// one would make a peer that wedges before its handshake (the #642 failure this registry exists to make
+	// diagnosable) indistinguishable from a genuinely pre-#646 peer.
+	let peerCapabilitiesLearned = false;
+	let lastPostedPeerCapabilities: ResolvedPeerCapabilities | undefined;
 	let peerSupportsSubscriptionSetupAck = false;
 	let nextSubscriptionSetupRequestId = 0;
 	let pendingSubscriptionSetupRequestId: number | undefined;
 	let subscriptionSetupTimeoutMs = SUBSCRIPTION_SETUP_TIMEOUT_MS;
+	const unknownCommands = createUnknownCommandState();
+	// -1, not 0, so this socket's first post carries its own zero and clears whatever count the retired
+	// socket left on the main-thread entry.
+	let lastPostedUnknownCommandCount = -1;
 	// Outbound-only application setup guard (harper-pro#642). Unlike receiveWatchdog it deliberately
 	// ignores ping/pong bytes: those prove the socket is alive, not that the peer entered its replay loop.
 	let subscriptionSetupWatchdog:
@@ -3984,13 +4021,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				switch (command) {
 					case NODE_NAME: {
 						if (data) {
-							const setupCapability = resolveSubscriptionSetupCapability(
-								message[4],
+							peerCapabilities = resolvePeerCapabilities(message[4]);
+							const setupCapability = subscriptionSetupCapabilityFrom(
+								peerCapabilities,
 								SUBSCRIPTION_SETUP_TIMEOUT_MS,
 								!(TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS > 0)
 							);
 							peerSupportsSubscriptionSetupAck = setupCapability.supported;
 							subscriptionSetupTimeoutMs = setupCapability.timeoutMs;
+							peerCapabilitiesLearned = true;
+							// The slot must stay replaceable — this object outlives the socket and is re-mirrored
+							// on every handshake.
+							if (options.connection) options.connection.peerCapabilities = peerCapabilities;
 							// this is the node name
 							if (remoteNodeName) {
 								if (remoteNodeName !== data) {
@@ -4013,6 +4055,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								}
 							}
 							if (options.connection) options.connection.nodeName = remoteNodeName;
+							// After the peer is identified, so the post carries the same node name every other
+							// connected-to-node message does.
+							postConnectionMetadata();
 							// Mark the link connected as soon as the handshake identifies the peer, so the main thread's
 							// connection truth (W1 / #431) reflects an established-but-idle link immediately rather than
 							// waiting for the first post-handshake pong up to a ping interval later — otherwise a
@@ -5542,6 +5587,24 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							});
 						break;
 					}
+					default: {
+						// Counted and warned, never closed, and the resume cursor still advances past it — see
+						// the unrecognized-command contract in DESIGN.md.
+						const logCommand = noteUnknownCommand(unknownCommands, command);
+						const { emit, suppressedCount } = decideThrottledWarn(unknownCommandWarnThrottle, Date.now());
+						if (emit) {
+							// Only the code and the counts: the frame body is peer-controlled and can carry
+							// credentials (see redactOperationForLog).
+							logger.warn?.(connectionId, 'Ignoring unrecognized replication command frame', {
+								command: logCommand,
+								database: databaseName,
+								node: remoteNodeName,
+								countOnThisConnection: unknownCommands.count,
+								suppressedCount,
+							});
+						}
+						break;
+					}
 				}
 				return;
 			}
@@ -6102,16 +6165,67 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			}
 			// update the manager with latest connection information
 			if (options.isSubscriptionConnection) {
+				// A superseded socket may still receive an in-flight pong; let it refresh latency as it always
+				// has, but not speak for its replacement's protocol metadata.
+				const metadata = wsClosed || options.connection?.socket !== ws ? undefined : pendingConnectionMetadata();
 				connectedToNode({
 					name: remoteNodeName,
 					database: databaseName,
 					url: options.url,
 					latency,
+					...metadata,
 				});
+				commitConnectionMetadata(metadata);
 			}
 		}
 		lastPingTime = null;
 	});
+	/**
+	 * Builds the changed-since-last-post half of a `connected-to-node` message. Pure, because the caller
+	 * commits the watermark only once the post is actually issued.
+	 */
+	function pendingConnectionMetadata(): Record<string, unknown> | undefined {
+		const metadata: Record<string, unknown> = {};
+		let changed = false;
+		if (peerCapabilitiesLearned && !samePeerCapabilities(lastPostedPeerCapabilities, peerCapabilities)) {
+			metadata.peerCapabilities = peerCapabilities;
+			changed = true;
+		}
+		if (unknownCommands.count !== lastPostedUnknownCommandCount) {
+			metadata.unknownCommandFrames = unknownCommands.count;
+			changed = true;
+		}
+		if (!changed) return undefined;
+		metadata.threadId = threadId;
+		metadata.sessionOrdinal = sessionOrdinal;
+		return metadata;
+	}
+	function commitConnectionMetadata(metadata: Record<string, unknown> | undefined) {
+		if (!metadata) return;
+		// From what was posted, not from live state: anything that changed between building and posting
+		// must stay unposted, or it is suppressed until it changes again.
+		if (metadata.peerCapabilities !== undefined)
+			lastPostedPeerCapabilities = metadata.peerCapabilities as ResolvedPeerCapabilities;
+		if (metadata.unknownCommandFrames !== undefined)
+			lastPostedUnknownCommandCount = metadata.unknownCommandFrames as number;
+	}
+	function postConnectionMetadata() {
+		// Only a subscription connection owns the main thread's (database, peer) entry, and a socket that
+		// has already been replaced must not speak for its replacement.
+		if (!options.isSubscriptionConnection || wsClosed || options.connection?.socket !== ws) return;
+		const metadata = pendingConnectionMetadata();
+		if (!metadata) return;
+		connectedToNode({
+			name: remoteNodeName,
+			database: databaseName,
+			url: options.url,
+			// connectedToNode assigns latency unconditionally, so omitting it here would blank the
+			// cluster_status latency for this link until the next pong.
+			latency: options.connection.latency,
+			...metadata,
+		});
+		commitConnectionMetadata(metadata);
+	}
 	// Complete teardown of THIS replicateOverWS instance: every interval, watchdog, subscription,
 	// pending request, and in-flight blob it owns. Runs on the socket's real 'close' and on explicit
 	// supersession (forceReconnect retiring the previous session, or a stale watchdog fire detecting
@@ -6123,6 +6237,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (instanceRetired) return;
 		instanceRetired = true;
 		wsClosed = true;
+		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
+		if (options.connection?.peerCapabilities === peerCapabilities) options.connection.peerCapabilities = undefined;
 		pendingSubscriptionSetupRequestId = undefined;
 		clearInterval(sendPingInterval);
 		receiveWatchdog?.stop();
@@ -7145,18 +7261,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			});
 		}
 		logger.trace?.('Sending database info for node', thisNodeName, 'database name', databaseName);
-		ws.send(
-			encode([
-				NODE_NAME,
-				thisNodeName,
-				databaseName,
-				tables,
-				{
-					subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
-					subscriptionSetupBudgetMs: SEND_SUBSCRIPTION_SETUP_BUDGET_MS,
-				},
-			])
-		);
+		// Test-only: a pre-#646 peer that sends no capability element, and a peer speaking a frame code this
+		// build does not know.
+		if (TEST_OMIT_CAPABILITIES) ws.send(encode([NODE_NAME, thisNodeName, databaseName, tables]));
+		else ws.send(encode([NODE_NAME, thisNodeName, databaseName, tables, LOCAL_CAPABILITIES]));
+		if (TEST_UNKNOWN_COMMAND_VALID) ws.send(encode([TEST_UNKNOWN_COMMAND_CODE]));
 	}
 	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
 		const database = getDatabases()?.[databaseName];

@@ -10,7 +10,7 @@ Real-time, peer-to-peer replication of table data across cluster nodes via persi
 
 ---
 
-## Files (6 total, ~4200 lines)
+## Key files
 
 | File                       | Purpose                                                                                                                                                                                                               |
 | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -20,6 +20,7 @@ Real-time, peer-to-peer replication of table data across cluster nodes via persi
 | `setNode.ts`               | Cluster member operations — add/remove nodes, CSR signing, TLS certificate negotiation.                                                                                                                               |
 | `knownNodes.ts`            | Node registry (`hdb_nodes` system table) + shared-memory `Float64Array` status buffers (latency, confirmation, back-pressure).                                                                                        |
 | `clusterStatus.ts`         | Read-only status reporting for `cluster_status` operation.                                                                                                                                                            |
+| `protocolCapabilities.ts`  | The protocol capability registry: the single normalization point for the peer capability bag in `NODE_NAME[4]`.                                                                                                       |
 
 ---
 
@@ -33,22 +34,50 @@ A persistent connection to one remote node. Owns the WebSocket lifecycle, reconn
 
 The protocol decoder. Reads incoming binary commands — each is a top-level named const in the same file:
 
-| Command constant                           | Value     | Meaning                                   |
-| ------------------------------------------ | --------- | ----------------------------------------- |
-| `SUBSCRIPTION_REQUEST`                     | 129       | Client wants to subscribe to a table      |
-| `RESIDENCY_LIST`                           | 130       | Negotiate which records each node holds   |
-| `TABLE_FIXED_STRUCTURE`                    | 132       | Schema sync                               |
-| `GET_RECORD` / `GET_RECORD_RESPONSE`       | 133 / 134 | Cache-miss fetch                          |
-| `OPERATION_REQUEST` / `OPERATION_RESPONSE` | 136 / 137 | Forwarded operations                      |
-| `NODE_NAME` / `NODE_NAME_TO_ID_MAP`        | 140 / 141 | Identity exchange                         |
-| `DISCONNECT`                               | 142       | Graceful close (not used on auth failure) |
-| `SEQUENCE_ID_UPDATE`                       | 143       | Audit sequence cursor                     |
-| `COMMITTED_UPDATE`                         | 144       | Confirm-on-commit                         |
-| `DB_SCHEMA`                                | 145       | Database schema replication               |
-| `BLOB_CHUNK`                               | 146       | Blob bytes                                |
-| `SUBSCRIPTION_UPDATE`                      | 147       | Audit record forwarded to subscribers     |
+| Command constant                           | Value     | Meaning                                                                                           |
+| ------------------------------------------ | --------- | ------------------------------------------------------------------------------------------------- |
+| `SUBSCRIPTION_REQUEST`                     | 129       | Client wants to subscribe to a table                                                              |
+| `RESIDENCY_LIST`                           | 130       | Negotiate which records each node holds                                                           |
+| `TABLE_FIXED_STRUCTURE`                    | 132       | Schema sync                                                                                       |
+| `GET_RECORD` / `GET_RECORD_RESPONSE`       | 133 / 134 | Cache-miss fetch                                                                                  |
+| `OPERATION_REQUEST` / `OPERATION_RESPONSE` | 136 / 137 | Forwarded operations                                                                              |
+| `NODE_NAME` / `NODE_NAME_TO_ID_MAP`        | 140 / 141 | Identity exchange                                                                                 |
+| `DISCONNECT`                               | 142       | Graceful close (not used on auth failure)                                                         |
+| `SEQUENCE_ID_UPDATE`                       | 143       | Audit sequence cursor                                                                             |
+| `COMMITTED_UPDATE`                         | 144       | Confirm-on-commit                                                                                 |
+| `DB_SCHEMA`                                | 145       | Database schema replication                                                                       |
+| `BLOB_CHUNK`                               | 146       | Blob bytes                                                                                        |
+| `SUBSCRIPTION_UPDATE`                      | 147       | Audit record forwarded to subscribers                                                             |
+| `COPY_START`                               | 148       | Leader → follower: a bulk table copy is starting (carries `copyStartTime` + `COPY_ORDER_VERSION`) |
+| `COPY_COMPLETE`                            | 149       | Leader → follower: the bulk copy finished; the follower clears its resume cursor                  |
+
+A code this build does not know falls to the switch's `default:`, which counts it on the connection and warns through a throttle shared by every socket in that worker thread, then keeps processing. It does **not** close: an unknown code means the peer is running a NEWER build, so closing would hard-loop the link — the reconnect replays the same frame. Note the consequence: the durable resume cursor still advances past a frame this build did not understand. Sender-side gating (below) is the invariant that makes that safe.
 
 The `authorization` parameter is a **promise that may resolve asynchronously**; on rejection the socket closes without a DISCONNECT frame (relevant to JWT failure flows).
+
+### Protocol capabilities (`protocolCapabilities.ts`)
+
+`NODE_NAME[4]` is a msgpack map of capability keys, and `protocolCapabilities.ts` is the **only** place that interprets it. Nothing else in `replication/` may read the raw bag: a second reader is how two features end up with two different answers for "the peer didn't say."
+
+Each socket resolves the peer's bag once per `NODE_NAME` into a frozen object with every known key present, and consults only that. The resolution is **per socket, never cached across reconnects** — `NodeReplicationConnection` outlives the socket, and a peer can be upgraded or downgraded between them.
+
+| Key                         | Kind      | Absent ⇒          | Resolution                                                                 |
+| --------------------------- | --------- | ----------------- | -------------------------------------------------------------------------- |
+| `protocolVersion`           | version   | `1`               | `min(local, peer)`; local is `LOCAL_PROTOCOL_VERSION`                      |
+| `subscriptionSetupAck`      | level     | `0` (unsupported) | `min(local, peer)` — a level this build does not implement cannot be used  |
+| `subscriptionSetupBudgetMs` | parameter | absent            | the peer's raw value; clamped by its consumer, never against a local level |
+
+The kinds are not cosmetic. A **level** coerces (`Number(value)`), because the behavior being preserved is `capabilities?.subscriptionSetupAck >= 1`, a coercing comparison that a peer sending `true` or `'1'` passes today. A **parameter** does not coerce, because its predecessor was `Number.isFinite(raw) && raw > 0`, which already rejects `'300'`. A parameter is also never min-clamped: a millisecond budget is not a feature level.
+
+An absent bag resolves to all defaults, which is exactly the pre-registry behavior, so a pre-#646 peer that sends a four-element `NODE_NAME` needs no special case anywhere.
+
+`MINIMUM_PROTOCOL_VERSION` is **descriptive only**: it is the absent-peer default and nothing degrades or disconnects on it. Adding a version floor that closes a connection is a separate, gated decision — a floor consulted by mistake closes every link in the mesh at once, with no rollback but a redeploy.
+
+**Which one do you add?** A capability key for an additive feature, so peers can adopt it independently. `protocolVersion` only for a change to the SHAPE of the protocol. Neither for durable state: `COPY_ORDER_VERSION` stays in the copy cursor because it describes persisted cursor content, not a peer's abilities.
+
+**Sender-side gating discipline.** A sender must not emit a frame type, or a field a receiver must understand, that the peer has not advertised support for. This is the invariant that makes the unknown-frame default case safe to continue past. It is documented rather than mechanically enforced today because no existing frame has a capability key, and retroactively gating one would change mixed-version behavior. Enforcement lands with the first newly gated frame — where the frame's own semantics can say whether a receiver may advance its cursor past it.
+
+**Observability.** The frozen result is mirrored on `NodeReplicationConnection.peerCapabilities`, replaced per socket — the slot must stay replaceable, since the object outlives the socket. `undefined` there means NOT YET LEARNED on the current socket, never "the peer does not support it": a peer that advertised nothing is the frozen defaults object, and a consumer gating on a capability must tell the two apart or it will deny a healthy peer mid-reconnect. Nothing is reported before a `NODE_NAME` lands, so a peer that wedges before its handshake is not misreported as pre-#646. The result is carried to the main thread on the existing `connected-to-node` message, deduplicated by field value. `applyConnectionMetadata` fences it with a `(worker thread id, per-worker session ordinal)` pair so a message from a replaced socket cannot overwrite the live entry; a wall clock cannot serve as that fence, since two workers can open a session in the same millisecond and a clock can step backwards. `cluster_status` reports the **effective** values per `database_sockets` entry as `peerCapabilities`, omitted while the shared-memory truth reads the socket down, plus `unknownCommandFrames`, omitted when zero. All of it is observability: the socket-local frozen object is the enforcement authority.
 
 ### `Replicator extends Resource` (`replicator.ts`)
 
@@ -176,7 +205,8 @@ Most replication behavior is exercised via integration tests that spin up multi-
 | Where is the connection retry loop?       | `replicationConnection.ts → NodeReplicationConnection` (uses `INITIAL_RETRY_TIME`)                          |
 | Where is mTLS configured?                 | `replicator.ts → buildReplicationMtlsConfig`                                                                |
 | Where is a new cluster member added?      | `setNode.ts` (the whole file is one operation)                                                              |
-| Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `SUBSCRIPTION_UPDATE`)              |
+| Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `COPY_COMPLETE`)                    |
+| Where are peer capabilities interpreted?  | `protocolCapabilities.ts → resolvePeerCapabilities`; carried in `NODE_NAME[4]`                              |
 | Where is `hdb_nodes` schema?              | `knownNodes.ts → getHDBNodeTable`                                                                           |
 | What does `cluster_status` return?        | `clusterStatus.ts` (82 lines, whole file)                                                                   |
 | Where is per-route table exclusion logic? | `knownNodes.ts → getExcludedTablesForRouteEntries`; threaded via `subscriptionManager.ts → routeReplicates` |
