@@ -1597,7 +1597,6 @@ export function createBlobGapEscalationBudget(opts: {
 		return false;
 	};
 	return {
-		/** A replacement socket is live: older generations are stale, and long-silent entries are retired. */
 		beginGeneration(generation: number): void {
 			if (generation <= currentGeneration) return;
 			currentGeneration = generation;
