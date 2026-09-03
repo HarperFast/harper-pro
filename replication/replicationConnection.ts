@@ -172,6 +172,36 @@ export const CONNECTION_STATE_CONNECTED = 2;
 // Application close codes (RFC 6455 reserves 4000-4999) so a recovery close is distinguishable in
 // `lastConnectionError` and peer logs from the protocol closes (1008/1011) already in use.
 export const CLOSE_UNCONFIRMED_SEND_STALL = 4001;
+export const CLOSE_DECODE_DROP_RESYNC = 4002;
+// Minimum gap between two structure-resync closes on one connection. The resync is latched per frame,
+// but the drop that triggers it is the whole residual decode-failure bucket, not only the structure fork
+// a resubscribe can repair — a peer emitting records this build cannot decode at all (a mid-rollout
+// extension, say) would otherwise close on EVERY frame carrying that table, and a leg whose cursor has
+// aged past auditRetention upgrades each flap to a base copy. Carried on the connection, not the session,
+// so it survives the reconnect it causes. One reconnect per interval is a repair attempt; one per frame
+// is an outage.
+export const DECODE_DROP_RESYNC_INTERVAL_MS = 5 * 60_000;
+// Total structure resyncs one connection may attempt. The frequency bound alone leaves an UNREPAIRABLE
+// fault — the sender's own structures are the forked side, or a peer emits an extension this build cannot
+// decode at all — rebuilding the subscription every interval forever, aborting in-flight blobs and
+// re-scanning each time. That is worse than harper-pro#545's plain skip-and-advance, which loses one
+// record on a live leg. Past the budget the leg keeps dropping and logs that it has stopped trying.
+export const DECODE_DROP_RESYNC_BUDGET = 3;
+const decodeDropResyncByPeer = new Map<string, { lastDecodeDropResyncAt?: number; decodeDropResyncCount?: number }>();
+// Whether a structure resync may fire now, given when the last one fired on this CONNECTION. Pure so the
+// bound can be pinned without a live socket: the stamp lives on the connection, not the session, because
+// the close it triggers ends the session — a session-scoped latch would reset on the very reconnect it
+// caused and bound nothing.
+export function decodeDropResyncAllowed(
+	lastResyncAt: number,
+	resyncCount: number,
+	now: number,
+	intervalMs: number,
+	budget: number = DECODE_DROP_RESYNC_BUDGET
+): boolean {
+	if (resyncCount >= budget) return false;
+	return !(lastResyncAt > 0 && now - lastResyncAt < intervalMs);
+}
 // Longer than RECEIVE_STALL_THRESHOLD_MS (15 min), not equal to it: a receiver holding a blob gap
 // legitimately stops confirming (it clamps to its durable blob watermark) and the blob-gap escalation
 // budget works on that same 15-minute scale, so equal defaults would race rather than order. Test-only
@@ -4049,6 +4079,27 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// a session-scoped latch would reset on every new socket and bound nothing. Falls back to a session
 	// local when there is no connection object (an inbound server session, which does not receive
 	// replication frames anyway). Returns whether a resync may fire now, claiming the slot if so.
+	function mayResyncForDecodeDrop(): boolean {
+		// Keyed by (database, peer) in the module, not carried on the connection: a server-side receive
+		// session has no connection object at all, and a session-local latch resets on the very reconnect
+		// the close causes — leaving both bounds void exactly where they are needed.
+		const key = `${databaseName}\u0000${remoteNodeName}`;
+		const holder = decodeDropResyncByPeer.get(key) ?? {};
+		const last = holder.lastDecodeDropResyncAt ?? 0;
+		const count = holder.decodeDropResyncCount ?? 0;
+		const now = Date.now();
+		if (!decodeDropResyncAllowed(last, count, now, DECODE_DROP_RESYNC_INTERVAL_MS)) {
+			logger.warn?.(
+				connectionId,
+				count >= DECODE_DROP_RESYNC_BUDGET
+					? `Undecodable record in ${databaseName} from ${remoteNodeName} after ${count} structure resyncs on this connection; a resubscribe is not repairing it, so records of this table will keep being dropped`
+					: `Undecodable record in ${databaseName} from ${remoteNodeName}, but a structure resync ran ${now - last}ms ago; skipping this one and continuing to drop`
+			);
+			return false;
+		}
+		decodeDropResyncByPeer.set(key, { lastDecodeDropResyncAt: now, decodeDropResyncCount: count + 1 });
+		return true;
+	}
 	if (databaseName) {
 		setDatabase(databaseName);
 	}
@@ -6070,6 +6121,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// COPY_COMPLETE could otherwise flip copyCompleteReceived mid-body and make trailing rows fall back to
 			// the audited/resequencing path — reintroducing the O(n) copy-time work this avoids. (harper-pro#480)
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
+			let decodeDropNeedsResync = false; // harper-pro#810
 			// Copy frames get a walk position, and everything staging or blob-tagging against it is
 			// captured NOW (decode time): onCommit runs later from the apply queue, by which time a
 			// same-socket COPY_START may have replaced the pass and its copyStartTime/copyOrder — staging
@@ -6318,6 +6370,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// not this catch. Decoder dictionaries passed as objects (not eager JSON.stringify) so the
 						// format cost is paid only when the log emits.
 						recordAction(true, DECODE_DROP_METRIC, databaseName + '.' + tableDecoder.name);
+						// A value that will not decode against this connection's dictionaries is usually a structure
+						// fork, not a one-off: under an empty `typedStructs` every LATER record of this table drops
+						// the same way for the life of the connection. Latch a resubscribe so the sender re-sends
+						// TABLE_FIXED_STRUCTURE. It does NOT recover this record — the cursor advances past it below
+						// and the resume starts after it, which is harper-pro#545's skip-and-advance disposition.
+						// What it bounds is the loss AFTER this record.
+						decodeDropNeedsResync = true;
 						logger.error?.(
 							connectionId,
 							'Error decoding replication message, record id: ' + id,
@@ -6579,6 +6638,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						lastSequenceIdCommitted = sequenceIdReceived;
 					}
 					logger.debug?.('last sequence committed', new Date(lastSequenceIdCommitted), databaseName);
+					// harper-pro#810 (C). Fired here, from the frame's own commit, so the resume cursor this frame
+					// advanced is already persisted before the socket goes: a close any earlier would re-deliver
+					// records this frame applied. Copy frames are excluded — a copy stages its cursor from the last
+					// SUCCESSFULLY decoded record, so a close after a dropped copy record resumes before it and
+					// re-delivers the same poison record, which is exactly the #521 loop harper-pro#545 removed.
+					if (decodeDropNeedsResync && !isCopyFrame && !wsClosed && mayResyncForDecodeDrop()) {
+						logger.warn?.(
+							connectionId,
+							`Resubscribing to ${databaseName} from ${remoteNodeName} to resync table structures after an undecodable record; the dropped record is not re-delivered`
+						);
+						wsClosed = true;
+						close(CLOSE_DECODE_DROP_RESYNC, 'undecodable record; resubscribing to resync structures');
+					}
 				},
 			};
 			tableSubscriptionToReplicator.send(endTxnEvent);
