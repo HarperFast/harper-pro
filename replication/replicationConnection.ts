@@ -71,6 +71,7 @@ import {
 	getExcludedTablesForRouteEntries,
 	getConfigRouteReplicates,
 	routeEntriesIncludePeer,
+	qualifiesForMultiHopExclusion,
 	resolveNodeForSendAuth,
 	isGenuineNodeDeletion,
 	SEND_AUTH_UNCHANGED,
@@ -6731,13 +6732,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 
 							if (nodeName === thisNodeName || !nodeName) continue;
 
-							// Check if this node qualifies for replication
-							const qualifies =
-								node?.replicates === true ||
-								node?.replicates?.sends ||
-								node?.subscriptions?.some(
-									(sub) => (sub.database || sub.schema) === databaseName && sub.subscribe !== false
-								);
+							// Check if this node delivers to us directly, so relays of its log can be suppressed
+							const qualifies = qualifiesForMultiHopExclusion(node, thisNodeName, databaseName);
 
 							// Get current state of excluded nodes based on last sent list
 							const currentlyExcluded = lastSentExcludedNodes.includes(nodeName);
@@ -7021,13 +7017,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Collect all qualified nodes from hdb_nodes table
 			for (const hdbNode of hdbNodesTable.search([])) {
 				if (hdbNode.name && hdbNode.name !== thisNodeName) {
-					// Check if this node qualifies for replication to this database
-					const qualifies =
-						hdbNode.replicates === true ||
-						hdbNode.replicates?.sends ||
-						hdbNode.subscriptions?.some(
-							(sub) => (sub.database || sub.schema) === databaseName && sub.subscribe !== false
-						);
+					// Check if this node delivers to us directly for this database
+					const qualifies = qualifiesForMultiHopExclusion(hdbNode, thisNodeName, databaseName);
 					if (qualifies) {
 						allDirectlySubscribedNodes.push(hdbNode.name);
 					}
