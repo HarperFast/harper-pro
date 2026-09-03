@@ -8,8 +8,8 @@
  *  - R2: a remove_node + re-add inside one process reconnects with NO lastConnectionError. `unsubscribe()`
  *    closes with 1008 and nothing ever clears the error slots, so this is the field that would carry a
  *    failure the re-added link never suffered.
- *  - R3: a settled link publishes both copied link metrics, and the copied back-pressure ratio agrees with
- *    backPressurePercent, which cluster_status reads straight from the same slot.
+ *  - R3: a settled link publishes both copied link metrics. The ratio is 0 on an idle link, so its agreement
+ *    with backPressurePercent is a consistency guard; the field's presence is what proves the copy ran.
  *  - R4: a wedge-reconcile fire that happens while truth already reads down lands in the redundant bucket,
  *    visible in cluster_status and in the fire log line.
  *
@@ -306,8 +306,10 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 420000 }, (ct
 			socket.backPressureRatio >= 0 && socket.backPressureRatio <= 1,
 			`expected a back-pressure ratio in [0,1], got ${socket.backPressureRatio}`
 		);
-		// backPressurePercent is read straight from the shared slot at cluster_status time; backPressure is
-		// the copy the reconcile put on the main-thread entry. Agreement is what makes the bridge trustworthy.
+		// On an idle two-node link the ratio is 0 on both sides, so this is a consistency guard rather than
+		// proof of a non-trivial copy — the presence check above is what proves the reconcile copied at all.
+		// BACK_PRESSURE_RATIO_POSITION is only written while a session is serving subscriptions under load,
+		// which this suite does not generate.
 		ok(
 			Math.abs(socket.backPressureRatio * 100 - socket.backPressurePercent) < 1e-9,
 			`expected the copied back-pressure (${socket.backPressureRatio * 100}%) to agree with the shared slot ` +

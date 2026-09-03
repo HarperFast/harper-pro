@@ -712,15 +712,25 @@ export async function unsubscribeFromNode({ url, nodes, database, clearStatus = 
 		}
 	}
 }
-// R2 (harper-pro#431). `unsubscribe()` only starts the teardown: it closes the socket, and the close handler
-// later stamps CONNECTION_STATE_DOWN + close code 1008 through the connection's retained `sharedStatus` view,
-// gated only on `nodeSubscriptions`, which unsubscribing never clears. No CONNECTED writer ever clears the
-// error slots, so on a same-process re-add that stamp sticks on the live successor's buffer and cluster_status
-// reports a failure the new link never suffered. Take the view away here — before any close can run — so the
-// main thread's own clear in onNodeUpdate(null) is the last word. Deliberately does NOT clear: a re-add can be
+// Retire a connection's claim on the (database, peer) shared status when its node leaves the cluster.
+//
+// `unsubscribe()` only starts the teardown. The socket closes asynchronously, and until it does this session
+// keeps writing: its close handler stamps DOWN + close code 1008, and a frame or pong arriving on the still-
+// closing socket re-stamps CONNECTED and fresh liveness. Every one of those writes is gated on
+// `nodeSubscriptions !== undefined`, which unsubscribing never clears, so all of them land AFTER the main
+// thread has zeroed the buffer on removal. A same-process re-add then resolves the same buffer and inherits
+// them: cluster_status reports a failure the new link never suffered, or reports it connected before it has
+// handshaked — which also clears the down-since baseline findWedgedNodeUrls needs, so a re-added link that
+// never opens gets no wedge recovery until liveness ages out (>= 120s).
+//
+// Dropping `nodeSubscriptions` is the fix because it is the marker every owner-class write already consults,
+// including the ones that reach the buffer through replicateOverWS's own closure rather than this handle.
+// Only on the removal path: the other unsubscribe caller (replication turned off for a database) keeps its
+// entry, and its close still records DOWN. Deliberately does not clear the buffer as well — a re-add can be
 // assigned to a different HTTP worker, whose connection this one cannot see, and its CONNECTED stamp must
-// survive.
+// survive. (harper-pro#431)
 export function releaseSharedStatusOnUnsubscribe(connection) {
+	connection.nodeSubscriptions = undefined;
 	connection.sharedStatus = undefined;
 }
 
