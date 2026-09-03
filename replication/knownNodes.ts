@@ -92,25 +92,36 @@ export function getHDBNodeTable(): HdbNodeTable {
 		}) as unknown as HdbNodeTable)
 	);
 }
+// Float64 slots in the per-(database, peer) shared status buffer. Positions 0..6 are the replication status
+// fields, 7..8 the blob-divergence signals, 9..12 the W1 connection-truth fields (state/liveness/error-code/
+// error-time), 13..28 the eight R4 fire-classification counter pairs, and 29..31 headroom (see the
+// *_POSITION exports in replicationConnection.ts and the slot map in DESIGN.md). Lives here, next to the
+// allocation, so the size and the map cannot drift apart.
+export const REPLICATION_SHARED_STATUS_SLOTS = 32;
 export function getReplicationSharedStatus(
 	auditStore: any,
 	databaseName: string,
 	node_name: string,
 	callback?: () => void
 ) {
-	// 128 bytes = 16 Float64 slots. Positions 0..6 are the replication status fields, 7..8 the
-	// blob-divergence signals, and 9..12 the W1 connection-truth fields (state/liveness/error-code/
-	// error-time; see the *_POSITION exports in replicationConnection.ts); 13..15 are headroom for
-	// future metrics. This buffer is process-local shared memory (shared across this
-	// node's threads via getUserSharedBuffer, never persisted or sent across nodes), so growing it is
-	// safe: every caller goes through this function, and a node runs a single version.
+	// This buffer is process-local shared memory (shared across this node's threads via
+	// getUserSharedBuffer, never persisted or sent across nodes), so growing it is safe: every caller goes
+	// through this function, and a node runs a single version.
 	return new Float64Array(
 		auditStore.getUserSharedBuffer(
 			['replicated', databaseName, node_name],
-			new ArrayBuffer(128),
+			new ArrayBuffer(REPLICATION_SHARED_STATUS_SLOTS * 8),
 			callback && { callback }
 		)
 	);
+}
+// R2 (harper-pro#431): a node removed and re-added inside one process resolves the SAME buffer, so without
+// this the new membership inherits the old one's state, liveness, close code and fire counts. Zeroes the
+// whole buffer: every field in it describes the membership that just left.
+export function clearReplicationSharedStatus(auditStore: any, databaseName: string, node_name: string): boolean {
+	if (!auditStore || !databaseName || !node_name) return false;
+	getReplicationSharedStatus(auditStore, databaseName, node_name).fill(0);
+	return true;
 }
 // If the async iterator for hdb_nodes throws or completes, the watcher used to die silently
 // and the node lost the ability to (re)establish outbound replication subscriptions for the
