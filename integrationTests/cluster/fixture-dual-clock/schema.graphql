@@ -1,0 +1,4 @@
+type DualClock @table @export {
+	id: String @primaryKey
+	value: String
+}
