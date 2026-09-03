@@ -6,17 +6,12 @@
  * shape is fail-stop (harper#2087): the stream delivers everything before the break, stops there
  * rather than skipping the frame -- a frame is not a transaction boundary, so skipping it could
  * apply part of a source transaction -- and reports the break with the offset where framing
- * resumes. Entries behind the break stay quarantined until the log is repaired and the source
- * restarted, which revives the stream for later transactions. Measured here: it does not bring back
- * the remainder of the torn transaction, because B's resume cursor already sits at that transaction's
- * version and the resume is exclusive of it; those rows come back only with a re-clone. The test
- * therefore pins the revival and leaves that remainder unasserted rather than locking in the loss.
+ * resumes. Repairing the log and restarting the source revives later transactions, but B's resume
+ * cursor is already exclusive of the torn transaction, so its remainder needs a re-clone.
  *
- * One asymmetry the oracle locks in: B ends up with exactly the rows whose frames precede the torn
- * one, and the torn frame sits inside the 50-row source transaction, so that prefix is part of a
- * transaction B never sees the rest of. Streaming replication commits what it drained; #2087's
+ * The torn frame sits inside the 50-row source transaction, so B's exact prefix is part of a
+ * transaction it does not receive in full. Streaming replication commits what it drained; #2087's
  * atomic discard of a truncated transaction is the crash-recovery replay arm, not exercised here.
- * Boundary tracking in replication would change this expectation.
  *
  * Not covered: the readable tear shape, where the torn frame is yielded with a garbage payload and
  * wedges the receiver (harper-pro#669); a torn tail; `cluster_status` surfacing the break
@@ -183,11 +178,10 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 			`${QUARANTINE_SETTLE_MS}ms after A acknowledged a write behind the break`
 		);
 
-		// Repairing the frame and restarting A revives the stream: the write that did not arrive above
-		// now does, which also shows the non-delivery was the stop and not latency. The remainder of the
-		// torn transaction is reported, not asserted (see the file header).
+		// Repair is a positive control only after the corrupt source has stopped and B is still quarantined.
 		const brokenA = ctx.nodeA;
 		await stopNodeProcess(brokenA);
+		assertExactRows(await readRows(ctx.nodeB), beforeBreak, 'after the corrupt source stopped');
 		repairFrame(localLogPath(brokenA.dataRootDir), tear);
 		const repairedA = { name: ctx.name, harper: { dataRootDir: brokenA.dataRootDir, hostname: brokenA.hostname } };
 		await startHarper(repairedA, nodeStartOptions(brokenA.hostname));
