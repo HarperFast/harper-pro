@@ -1,5 +1,5 @@
 /**
- * Mid-log transaction-log tear: replication resyncs past it instead of starving behind it.
+ * Mid-log transaction-log tear: what a replication stream does when it reaches the break.
  *
  * SKIPPED, pending a re-scope. This suite asserts mid-log *recovery*, and recovery is no longer the
  * intended behavior: HarperFast/harper#2087 reversed that approach on the owner's decision. Resyncing
@@ -23,7 +23,8 @@
  * It passed for as long as it did only because the engine hid it: the old gate gave up unless
  * `@harperfast/rocksdb-js` exported `CorruptFrameError`, and 2.7.1 did not. The 2.8.0 bump exports
  * it, so the suite began running against a core that had already decided not to recover, and has
- * failed on every `main` run since (39 of 60 rows, missing the tail).
+ * failed on every `main` run since: B holds the 39 rows it drained before the break and stops,
+ * missing the tail this oracle demands.
  *
  * End-to-end coverage for HarperFast/harper#2016 (mid-log tear silently truncates replay and
  * replication) and HarperFast/harper#2063 (the containment was per-drain, so the stall was
@@ -54,7 +55,9 @@
  * `replayLogs.ts`); the write side -- nothing here stops a tear being created, which is
  * HarperFast/rocksdb-js#748; and the *readable* tear shape, where the torn frame is still
  * yielded and its undecodable payload wedges the receiver instead (#669). Measured against this
- * same harness, the readable shape leaves B at 39/60 rows even on a fixed engine.
+ * same harness, the readable shape also leaves B at 39 of 60 rows even on a fixed engine -- the
+ * same count as the unreadable break above, reached a different way: there the receiver stops
+ * because framing ended, here because one entry will not decode.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert/strict';
@@ -91,11 +94,11 @@ const FRAMES_AFTER_TEAR = 20;
 
 const CONVERGE_TIMEOUT_MS = 90_000;
 
-const SKIP_REASON = 'pending re-scope to quarantine semantics (harper#2087)';
+const SKIP_REASON = 'pending re-scope to quarantine semantics: harper-pro#803, harper#2087';
 const FORCED = process.env.HARPER_TXNLOG_TEAR_FORCE === '1';
 
 suite(
-	'Mid-log txnlog tear: replication resyncs past it',
+	'Mid-log txnlog tear: replication containment (re-scope pending)',
 	{ skip: FORCED ? false : SKIP_REASON, timeout: 300_000 },
 	(ctx) => {
 		before(async () => {
