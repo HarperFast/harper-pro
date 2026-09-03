@@ -1,14 +1,12 @@
 /**
- * Coverage for the removal path's retirement of a connection's claim on the (database, peer) shared status
- * (harper-pro#431). `unsubscribe()` only starts the teardown, and until the socket actually closes the session
- * keeps writing: the close handler stamps DOWN + close code 1008, and a frame or pong on the still-closing
- * socket re-stamps CONNECTED and fresh liveness. All of those are gated on `nodeSubscriptions !== undefined`,
- * which unsubscribing never clears, so they land after the main thread has zeroed the buffer and a
- * same-process re-add inherits them.
+ * Retiring a connection's claim on the (database, peer) shared status when its node leaves the cluster.
  *
- * The invariant: after the release, no owner-class write from the departing connection passes its gate.
+ * `unsubscribe()` only starts the teardown. Until the socket closes the session keeps writing: the close
+ * handler stamps DOWN + close code 1008, and a frame or pong on the still-closing socket re-stamps CONNECTED
+ * and fresh liveness. All of those are gated on `nodeSubscriptions !== undefined`, which unsubscribing never
+ * cleared, so they landed after the main thread had zeroed the buffer and a same-process re-add inherited
+ * them. The invariant: after the release, no owner-class write from the departing connection passes its gate.
  */
-
 import { expect } from 'chai';
 import { releaseSharedStatusOnUnsubscribe } from '#src/replication/replicator';
 import {
