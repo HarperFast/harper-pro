@@ -1,12 +1,12 @@
 /**
- * Coverage for R2's (harper-pro#431) removal ordering. `unsubscribe()` only starts the teardown: it closes
- * the socket, and the close handler later stamps CONNECTION_STATE_DOWN + close code 1008 + error time through
- * the connection's retained `sharedStatus` view. No CONNECTED writer ever clears the error slots, so on a
- * same-process re-add that stamp lands on the successor's buffer and stays there — cluster_status reports a
- * failure the new link never suffered.
+ * Coverage for the removal path's retirement of a connection's claim on the (database, peer) shared status
+ * (harper-pro#431). `unsubscribe()` only starts the teardown, and until the socket actually closes the session
+ * keeps writing: the close handler stamps DOWN + close code 1008, and a frame or pong on the still-closing
+ * socket re-stamps CONNECTED and fresh liveness. All of those are gated on `nodeSubscriptions !== undefined`,
+ * which unsubscribing never clears, so they land after the main thread has zeroed the buffer and a
+ * same-process re-add inherits them.
  *
- * The invariant: after the release the departing connection cannot reach the buffer at all, so its close
- * stamps are inert however late they arrive, and the main thread's clear is the last word.
+ * The invariant: after the release, no owner-class write from the departing connection passes its gate.
  */
 
 import { expect } from 'chai';
@@ -40,10 +40,23 @@ function stampCloseLikeTheCloseHandler(connection, code) {
 }
 
 describe('releaseSharedStatusOnUnsubscribe', () => {
-	it('leaves the close handler with nothing to write through', () => {
+	it('drops the owner marker every shared-status write is gated on', () => {
 		const { connection } = departingConnection();
 		releaseSharedStatusOnUnsubscribe(connection);
+		expect(connection.nodeSubscriptions).to.equal(undefined);
 		expect(connection.sharedStatus).to.equal(undefined);
+	});
+
+	it('a late CONNECTED write cannot revive the removed membership', () => {
+		const { connection, shared } = departingConnection();
+		releaseSharedStatusOnUnsubscribe(connection);
+		// The main thread has zeroed the buffer; a pong then arrives on the still-closing socket. This is the
+		// gate every CONNECTED writer applies (pong, received data, handshake).
+		if (connection.nodeSubscriptions !== undefined) {
+			shared[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+			shared[LAST_LIVENESS_TIME_POSITION] = NOW;
+		}
+		expect(deriveConnectionTruth(shared, NOW).connected).to.equal(false);
 	});
 
 	it('a late close cannot put a stale 1008 on the membership that replaced it', () => {

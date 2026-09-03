@@ -115,7 +115,7 @@ export function getReplicationSharedStatus(
 		)
 	);
 }
-// R2 (harper-pro#431): a node removed and re-added inside one process resolves the SAME buffer, so without
+// A node removed and re-added inside one process resolves the SAME buffer (harper-pro#431), so without
 // this the new membership inherits the old one's state, liveness, close code and fire counts. Zeroes the
 // whole buffer: every field in it describes the membership that just left.
 export function clearReplicationSharedStatus(auditStore: any, databaseName: string, node_name: string): boolean {
