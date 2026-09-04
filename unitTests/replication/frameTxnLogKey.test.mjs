@@ -91,7 +91,17 @@ describe('copy transaction-log key selection', () => {
 			localTime: 100,
 			additionalAuditRefs: [{ version: 200, nodeId: 1 }],
 		};
-		expect(
+		expect(getCopyTxnLogKey(entry, { get: () => undefined }, 7)).to.equal(100);
+	});
+
+	it('does not disguise a transient audit read failure as an expired head', () => {
+		const entry = {
+			key: 'ordinary',
+			version: 100,
+			localTime: 100,
+			additionalAuditRefs: [{ version: 200, nodeId: 1 }],
+		};
+		expect(() =>
 			getCopyTxnLogKey(
 				entry,
 				{
@@ -101,7 +111,7 @@ describe('copy transaction-log key selection', () => {
 				},
 				7
 			)
-		).to.equal(100);
+		).to.throw('unavailable');
 	});
 
 	it('treats an empty reference list like an ordinary snapshot row', () => {

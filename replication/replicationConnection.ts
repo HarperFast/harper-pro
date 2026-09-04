@@ -520,12 +520,16 @@ export function isValidRecordVersion(value: unknown): boolean {
 }
 export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number): number {
 	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs?.length) {
+		let readError: unknown;
 		for (const ref of entry.additionalAuditRefs) {
 			try {
 				const head = auditStore.get(ref.version, tableId, entry.key, ref.nodeId);
 				if (head?.version === entry.version) return ref.version;
-			} catch {}
+			} catch (error) {
+				readError ??= error;
+			}
 		}
+		if (readError) throw readError;
 	}
 	// Audit retention can remove a referenced head while its live record remains. A base-copy row is
 	// a snapshot, not a replayed transaction, so the bounded record clock preserves copy-apply behavior
