@@ -6056,7 +6056,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								nodeId: localSourceNodeId,
 								viaNodeId: receivingDataFromNodeIds[0],
 								residencyList,
-								timestamp: frameTxnLogKey,
+								timestamp: STORAGE_IS_ROCKSDB ? frameTxnLogKey : auditRecord.version,
 								version: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
 								user: auditRecord.user,

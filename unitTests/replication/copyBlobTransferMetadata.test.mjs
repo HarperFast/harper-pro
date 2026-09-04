@@ -140,6 +140,7 @@ describe('copy blob transfer metadata', () => {
 				})
 			)
 		);
+		patchAuditRecord.txnLogKey = stored.localTime;
 		assert.equal(patchAuditRecord.getValue(ComputedCopy.primaryStore, true), undefined);
 		const reconstructedPatch = getResidencyProjectionRecord(patchAuditRecord, ComputedCopy.primaryStore);
 		assert.equal(reconstructedPatch.id, 'record');
