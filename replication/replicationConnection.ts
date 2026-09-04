@@ -104,6 +104,7 @@ import { PassThrough } from 'node:stream';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
+import { createBackoff, type Backoff } from './backoff.ts';
 const logger = forComponent('replication').conditional as Logger;
 
 // msgpackr v2 removed the built-in `randomAccessStructure` option; that random-access
@@ -560,8 +561,13 @@ const PAUSE_STALL_THRESHOLD_MS = Math.max(
 // base-copy resync re-encodes the row against local structures), so a decode blip never de-authorizes
 // a healthy peer, while still bounding how long a revocation carried by an undecodable write can go
 // unenforced. Only reached on a genuine decode failure — a decodable row is evaluated on the first probe.
-const SEND_AUTH_REPROBE_INTERVAL_MS = 500;
-const SEND_AUTH_REPROBE_ATTEMPTS = 60;
+const SEND_AUTH_REPROBE_INITIAL_MS = 500;
+const SEND_AUTH_REPROBE_MAX_MS = 5_000;
+// The grace period is a wall-clock deadline, not a sum of sleeps: a resolver hang or event-loop stall
+// must not extend how long a revocation carried by an undecodable write can go unenforced.
+const SEND_AUTH_REPROBE_BUDGET_MS = 30_000;
+// The bound that still holds when the clock does not advance.
+const SEND_AUTH_REPROBE_ATTEMPTS = 120;
 
 /**
  * Decide whether the dynamic send-authorization watch (the per-subscriber `getHDBNodeTable().subscribe`
@@ -599,18 +605,41 @@ export async function shouldCloseSendAuthWatch(
 		isClosed: () => boolean;
 		onReprobeTimeout?: () => void;
 		resolve?: (name: string) => any;
-		sleep?: () => Promise<void>;
+		sleep?: (ms: number) => Promise<void>;
 		reprobeAttempts?: number;
+		reprobeBudgetMs?: number;
+		now?: () => number;
 	}
 ): Promise<boolean> {
 	const resolve = deps.resolve ?? resolveNodeForSendAuth;
-	const sleep = deps.sleep ?? (() => new Promise<void>((r) => setTimeout(r, SEND_AUTH_REPROBE_INTERVAL_MS).unref()));
-	const reprobeAttempts = deps.reprobeAttempts ?? SEND_AUTH_REPROBE_ATTEMPTS;
+	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref()));
 
 	let node = isGenuineNodeDeletion(event.type) ? undefined : resolve(name);
-	for (let attempt = 0; node === SEND_AUTH_UNCHANGED && attempt < reprobeAttempts && !deps.isClosed(); attempt++) {
-		await sleep();
+	// Built only once a row comes back undecodable: the ordinary decodable event never reads the clock.
+	let backoff;
+	while (node === SEND_AUTH_UNCHANGED && !deps.isClosed()) {
+		backoff ??= createBackoff({
+			initialMs: SEND_AUTH_REPROBE_INITIAL_MS,
+			maxMs: SEND_AUTH_REPROBE_MAX_MS,
+			budgetMs: deps.reprobeBudgetMs ?? SEND_AUTH_REPROBE_BUDGET_MS,
+			maxAttempts: deps.reprobeAttempts ?? SEND_AUTH_REPROBE_ATTEMPTS,
+			now: deps.now,
+		});
+		if (backoff.exhausted) break;
+		const delay = backoff.nextDelay();
+		if (delay === undefined) break;
+		await sleep(delay);
+		// Re-check before trusting the next read, not just at the top of the loop: the grace period is
+		// advertised as a deadline, so a row that only becomes decodable after an event-loop stall
+		// pushed us past it must not authorize. Fail closed on the elapsed time, not on the row.
+		if (backoff.exhausted) break;
 		node = resolve(name);
+		// resolveNodeForSendAuth reads the store synchronously, so the read itself can carry the clock
+		// past the deadline. Same rule applies to what it returned.
+		if (backoff.exhausted) {
+			node = SEND_AUTH_UNCHANGED;
+			break;
+		}
 	}
 	if (node === SEND_AUTH_UNCHANGED) {
 		if (deps.isClosed()) return false;
@@ -2701,6 +2730,9 @@ export async function createWebSocket(
 }
 
 const INITIAL_RETRY_TIME = 500;
+const MAX_RETRY_TIME = 30_000;
+const COPY_FLUSH_RETRY_INITIAL_MS = 250;
+const COPY_FLUSH_RETRY_MAX_MS = 30_000;
 /**
  * This represents a persistent connection to a node for replication, which handles
  * sockets that may be disconnected and reconnected
@@ -2708,7 +2740,9 @@ const INITIAL_RETRY_TIME = 500;
 export class NodeReplicationConnection extends EventEmitter {
 	socket: WebSocket;
 	startTime: number;
-	retryTime = INITIAL_RETRY_TIME;
+	retryBackoff: Backoff; // created on the first failure
+
+	random = Math.random; // injectable so the jittered reconnect schedule is deterministically testable
 	retries = 0;
 	isConnected = true; // we start out assuming we will be connected
 	isFinished = false;
@@ -2935,23 +2969,36 @@ export class NodeReplicationConnection extends EventEmitter {
 	scheduleReconnect() {
 		this.reconnectScheduled = true;
 		this.resetSession();
-		setTimeout(() => {
-			this.connect();
-		}, this.retryTime).unref();
-		// Double the interval each retry, capped at 30 s. The previous ~0.4%/retry
+		// Double the ceiling each retry, capped at 30 s. The previous ~0.4%/retry
 		// growth took >1000 retries to reach any meaningful delay, so rapid
 		// reconnects to a dead peer (symphony accepts the TLS handshake then drops
 		// it) would still accumulate unreleased native TLS state faster than V8 can
 		// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
-		// Doubling reaches 30 s in ~6 retries (~62 s total) and resets on success.
-		this.retryTime = Math.min(this.retryTime << 1, 30_000);
+		// Doubling reaches 30 s in ~6 retries and resets on success. The delay is drawn
+		// with full jitter so a fleet reacting to one outage does not redial in lockstep. Keep
+		// the original 500 ms lower bound from #339 while jittering the rest of the window.
+		this.retryBackoff ??= createBackoff({
+			initialMs: INITIAL_RETRY_TIME,
+			maxMs: MAX_RETRY_TIME,
+			minMs: INITIAL_RETRY_TIME,
+			random: this.random,
+		});
+		const delay = this.retryBackoff.nextDelay();
+		if (delay === undefined) return;
+		setTimeout(() => {
+			this.connect();
+		}, delay).unref();
+	}
+	/** The ceiling the next reconnect will be drawn under; the initial value means "not backed off". */
+	get retryTime(): number {
+		return this.retryBackoff?.ceiling ?? INITIAL_RETRY_TIME;
 	}
 	// Called by replicateOverWS after a frame is actually sent: real progress, so it is safe to reset the
 	// backoff. Gated on a non-zero retries so the healthy hot path (already reset) does nothing.
 	onFrameSent() {
-		if (this.retries !== 0 || this.retryTime !== INITIAL_RETRY_TIME) {
+		if (this.retries !== 0 || this.retryBackoff?.attempts) {
 			this.retries = 0;
-			this.retryTime = INITIAL_RETRY_TIME;
+			this.retryBackoff?.reset();
 		}
 	}
 	// Retire the live replicateOverWS instance: the single enforcement point for "at most one live session
@@ -3143,7 +3190,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// at ~100% CPU and flooding logs on a persistent failure. Escalating backoff + a scheduled retry paces it:
 	// transient errors self-heal, a persistent one idles until the operator (or a higher-level watchdog) acts.
 	let copyFlushBackoffUntil = 0;
-	let copyFlushRetryMs = 0;
+	let copyFlushBackoff: Backoff | undefined;
 	let copyFlushRetryTimer;
 	const COPY_CURSOR_FLUSH_BYTES = env.get('replication_copyCursorFlushBytes') ?? 64 * 1024 * 1024;
 	const COPY_CURSOR_FLUSH_INTERVAL_MS = Math.max(env.get('replication_copyCursorFlushIntervalMs') ?? 5000, 1);
@@ -3331,7 +3378,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (passAtPersist === copyWatermark.currentPass) pendingCopyCursor ??= cursor; // hold the staged cursor
 			// Escalating backoff (250ms → 30s cap) instead of an immediate re-flush, so a persistent flush
 			// failure idles rather than busy-looping; a scheduled retry drives progress without another event.
-			copyFlushRetryMs = Math.min(copyFlushRetryMs ? copyFlushRetryMs * 2 : 250, 30000);
+			// Jittered on the shared schedule so a cluster-wide I/O episode does not re-flush in lockstep,
+			// keeping 250ms as the hard floor the backoff guard below depends on.
+			copyFlushBackoff ??= createBackoff({
+				initialMs: COPY_FLUSH_RETRY_INITIAL_MS,
+				maxMs: COPY_FLUSH_RETRY_MAX_MS,
+				minMs: COPY_FLUSH_RETRY_INITIAL_MS,
+			});
+			const copyFlushRetryMs = copyFlushBackoff.nextDelay() ?? COPY_FLUSH_RETRY_INITIAL_MS;
 			copyFlushBackoffUntil = performance.now() + copyFlushRetryMs;
 			clearTimeout(copyFlushRetryTimer);
 			copyFlushRetryTimer = setTimeout(() => {
@@ -3390,7 +3444,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					if (copyFromNodeId !== undefined)
 						getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
 					copyFlushBackoffUntil = 0;
-					copyFlushRetryMs = 0; // flush succeeded; reset backoff
+					copyFlushBackoff?.reset(); // flush succeeded
 					if (copyCompleteReceived) noteCopyFinalizeProgress();
 					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
 					// A persist under a drained barrier is the connection's LAST possible progress: every
@@ -4947,7 +5001,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												onReprobeTimeout: () =>
 													logger.warn?.(
 														connectionId,
-														`hdb_nodes row for ${authorization.name} did not decode within ${SEND_AUTH_REPROBE_ATTEMPTS * SEND_AUTH_REPROBE_INTERVAL_MS}ms; failing closed so a revocation carried by an undecodable write cannot be missed`
+														`hdb_nodes row for ${authorization.name} did not decode within ${SEND_AUTH_REPROBE_BUDGET_MS}ms; failing closed so a revocation carried by an undecodable write cannot be missed`
 													),
 											});
 											if (shouldClose) {

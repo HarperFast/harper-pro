@@ -11,10 +11,38 @@
  *   - the loop restarts after the events iterable ends normally
  *   - a per-event processor throw does NOT tear down the loop (continues consuming)
  *   - the optional `maxRestarts` knob is observed (used here to bound the test)
+ *   - the restart backoff escalates on a failure cycle and only resets on a healthy run (harper-pro#327)
  */
 
 import { expect } from 'chai';
 import { runNodeUpdateWatcher } from '#src/replication/knownNodes';
+
+// The restart delay is awaited through a bare setTimeout inside the watcher, so the delays it asks for
+// are the only observable of its backoff.
+function captureTimerDelays() {
+	const realSetTimeout = globalThis.setTimeout;
+	const values = [];
+	let unrefCalls = 0;
+	globalThis.setTimeout = (fn, ms) => {
+		values.push(ms);
+		const timer = realSetTimeout(fn, ms);
+		const unref = timer.unref.bind(timer);
+		timer.unref = () => {
+			unrefCalls++;
+			return unref();
+		};
+		return timer;
+	};
+	return {
+		values,
+		get unrefCalls() {
+			return unrefCalls;
+		},
+		restore() {
+			globalThis.setTimeout = realSetTimeout;
+		},
+	};
+}
 
 function makeAsyncIterableFromArray(items) {
 	return {
@@ -93,6 +121,91 @@ describe('runNodeUpdateWatcher restart loop', () => {
 		expect(processed).to.deep.equal(['a', 'c']);
 		// the loop also restarted (subscribed twice) after the iterable ended
 		expect(subscribeCalls).to.equal(2);
+	});
+
+	// harper-pro#327: the marker used to be set the instant subscribe() resolved, so a subscription that
+	// resolved and then immediately threw counted as a success on every pass, reset the backoff, and
+	// pinned the restart at restartDelayMs forever. Against that code the delays below are [4, 4, 4, 4].
+	it('escalates when subscribe() resolves and iteration immediately throws', async () => {
+		const delays = captureTimerDelays();
+		try {
+			await runNodeUpdateWatcher(() => {}, {
+				subscribe: async () => ({
+					[Symbol.asyncIterator]: () => ({
+						next: async () => {
+							throw new Error('stream died immediately');
+						},
+					}),
+				}),
+				restartDelayMs: 4,
+				maxDelayMs: 256,
+				random: () => 0.999999,
+				maxRestarts: 5,
+			});
+		} finally {
+			delays.restore();
+		}
+
+		expect(delays.values).to.deep.equal([3, 7, 15, 31]);
+		expect(delays.unrefCalls).to.equal(4);
+	});
+
+	it('resets the backoff once an iteration survives the healthy-uptime threshold', async () => {
+		let subscribeCalls = 0;
+		let fakeNow = 0;
+		const delays = captureTimerDelays();
+		try {
+			await runNodeUpdateWatcher(() => {}, {
+				subscribe: async () => {
+					subscribeCalls++;
+					return {
+						// The clock advances while ITERATING, which is the only thing that counts as uptime.
+						[Symbol.asyncIterator]: () => ({
+							next: async () => {
+								fakeNow += 60_000;
+								return { done: true };
+							},
+						}),
+					};
+				},
+				restartDelayMs: 4,
+				maxDelayMs: 256,
+				healthyUptimeMs: 10_000,
+				now: () => fakeNow,
+				random: () => 0.999999,
+				maxRestarts: 4,
+			});
+		} finally {
+			delays.restore();
+		}
+
+		expect(subscribeCalls).to.equal(4);
+		expect(delays.values, 'a healthy run never escalates').to.deep.equal([3, 3, 3]);
+	});
+
+	// The health clock must start when the subscription goes live, not when the attempt begins: a
+	// subscribe() that blocks past the threshold and then throws was never a live watcher.
+	it('does not count time spent acquiring a subscription as uptime', async () => {
+		let fakeNow = 0;
+		const delays = captureTimerDelays();
+		try {
+			await runNodeUpdateWatcher(() => {}, {
+				subscribe: async () => {
+					fakeNow += 60_000; // a slow acquire, then a failure
+					throw new Error('subscribe timed out');
+				},
+				restartDelayMs: 4,
+				maxDelayMs: 256,
+				healthyUptimeMs: 10_000,
+				now: () => fakeNow,
+				random: () => 0.999999,
+				maxRestarts: 5,
+			});
+		} finally {
+			delays.restore();
+		}
+
+		expect(delays.values, 'a slow failed acquire still escalates').to.deep.equal([3, 7, 15, 31]);
 	});
 
 	it('forwards events to the listener via the default processEvent path', async () => {

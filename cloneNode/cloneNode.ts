@@ -40,6 +40,7 @@ import {
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
 import { cloneAttemptPath as cloneAttemptFilePath } from './cloneAttempt.ts';
+import { createBackoff } from '../replication/backoff.ts';
 import {
 	isExplicitDatabaseSubscription,
 	isReplicatedDatabase as isReplicatedDatabaseUnder,
@@ -98,6 +99,8 @@ import {
 
 const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
+const VERSION_PROBE_RETRY_DELAY_MS = 1000;
+const VERSION_PROBE_MAX_DELAY_MS = 4000;
 // Floor for the size-derived sync-wait ceiling, which guarantees the wait terminates even when data
 // keeps arriving without ever converging (arrivals slide the stall deadline).
 const MIN_MAX_CLONE_DURATION_MS = 3600000;
@@ -707,6 +710,11 @@ async function monitorSync(
 	if (!systemSocketRequired) {
 		log(`'${SYSTEM_SCHEMA_NAME}' is not in this node's replication.databases; not requiring its socket`, 'debug');
 	}
+	const versionProbeBackoff = createBackoff({
+		initialMs: VERSION_PROBE_RETRY_DELAY_MS,
+		maxMs: VERSION_PROBE_MAX_DELAY_MS,
+		minMs: VERSION_PROBE_RETRY_DELAY_MS,
+	});
 	for (let attempt = 1; systemSocketRequired && attempt <= 3; attempt++) {
 		try {
 			const registration: any = await leaderRequest({ operation: 'registration_info' });
@@ -716,7 +724,10 @@ async function monitorSync(
 			break;
 		} catch (err) {
 			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
-			if (attempt < 3) await sleep(1000);
+			if (attempt < 3) {
+				const delay = versionProbeBackoff.nextDelay();
+				if (delay !== undefined) await sleep(delay);
+			}
 		}
 	}
 
