@@ -79,12 +79,11 @@ import {
 } from './knownNodes.ts';
 import * as process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { open as openFile } from 'node:fs/promises';
-import { promises as fsPromises } from 'node:fs';
 import { isIP } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';
 import {
 	createBlob,
+	createBlobFromStoredBody,
 	decodeBlobsWithWrites,
 	decodeFromDatabase,
 	decodeWithBlobCallback,
@@ -92,15 +91,16 @@ import {
 	saveBlob,
 	getFileId,
 	findBlobsInObject,
-	getFilePathForBlob,
-	blobHeaderIndicatesIncomplete,
+	blobFileMissingOrIncompleteAsync,
+	openStoredBlobBody,
 	repairBlobFile,
 	holdBlobFile,
 	registerBlobReceiveInFlight,
 	unregisterBlobReceiveInFlight,
 	BLOB_UNAVAILABLE_STATUS,
 } from '../core/resources/blob.ts';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
+import { createInflate } from 'node:zlib';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
@@ -1013,9 +1013,6 @@ export function getBlobTransferKey(fileId: unknown, transferId: number | undefin
 }
 
 let nextCopyBlobTransferId = 1;
-const BLOB_HEADER_SIZE = 8;
-const UNCOMPRESSED_BLOB_TYPE = 0;
-const UNKNOWN_BLOB_SIZE = 0xffffffffffff;
 
 /** Core's blob codec only carries own enumerable metadata, so scope the temporary tag to one synchronous encode. */
 export function encodeWithCopyBlobTransferTags(
@@ -1075,35 +1072,37 @@ export function collectAuditRecordBlobsFromBinary(
 	return blobs;
 }
 
-export function isCompleteBlobHeader(header: Uint8Array, fileSize: number): boolean {
-	if (header.byteLength < BLOB_HEADER_SIZE || fileSize < BLOB_HEADER_SIZE) return false;
-	const value = new DataView(header.buffer, header.byteOffset, BLOB_HEADER_SIZE).getBigUint64(0);
-	const type = Number(value >> 48n);
-	const contentSize = Number(value & 0xffffffffffffn);
-	if (contentSize === UNKNOWN_BLOB_SIZE) return false;
-	// Compressed bodies cannot be proven complete from file bytes; core verifies the writer lock instead.
-	if (type !== UNCOMPRESSED_BLOB_TYPE) return false;
-	return fileSize === BLOB_HEADER_SIZE + contentSize;
+/**
+ * Inflates a stored-codec repair delivery for `repairBlobFile`, which verifies byte counts against the
+ * uncompressed descriptor and republishes uncompressed. A pipeline, not a pipe: the destroy a declined
+ * repair issues on the receive stream must settle here rather than surface as an unhandled inflater
+ * error, and the output is capped at `expectedSize` so a peer body cannot inflate without bound.
+ */
+export function createRepairInflater(stream: Readable, expectedSize: number): Readable {
+	// The output cap is the only bound on a peer-supplied deflate body, so a non-finite/negative size
+	// makes `inflatedLength > expectedSize` never true and turns the bomb guard into a no-op. The
+	// receive ladder already refuses to bind a codec announced with such a size; refuse here too so the
+	// enforcing layer cannot be handed a size that silently disables its own bound.
+	if (!Number.isSafeInteger(expectedSize) || expectedSize < 0)
+		throw new Error(`Blob repair inflater requires a valid expected size, received ${expectedSize}`);
+	let inflatedLength = 0;
+	const bounded = new Transform({
+		transform(chunk: Buffer, _encoding, callback) {
+			inflatedLength += chunk.length;
+			if (inflatedLength > expectedSize)
+				return callback(new Error(`Blob repair body inflates past its expected size of ${expectedSize}`));
+			callback(null, chunk);
+		},
+	});
+	pipeline(stream, createInflate(), bounded, () => {});
+	return bounded;
 }
 
-async function hasDurableBlobHeader(blob: Blob): Promise<boolean> {
-	const path = getFilePathForBlob(blob as any);
-	if (!path) return false;
-	let file: Awaited<ReturnType<typeof openFile>> | undefined;
-	try {
-		file = await openFile(path, 'r');
-		const header = Buffer.allocUnsafe(BLOB_HEADER_SIZE);
-		const { size } = await file.stat();
-		const { bytesRead } = await file.read(header, 0, BLOB_HEADER_SIZE, 0);
-		return bytesRead === BLOB_HEADER_SIZE && isCompleteBlobHeader(header, size);
-	} catch {
-		return false;
-	} finally {
-		if (file) await file.close().catch(() => {});
-	}
-}
-
-/** Whether every file-backed blob reachable from a stored record is durably finalized on disk. */
+/**
+ * Whether every file-backed blob reachable from a stored record is provably whole on disk — the same
+ * classification the in-place repair uses, so a compressed body ties only once it has inflated to its
+ * declared size and a torn one (which a length check cannot see) does not.
+ */
 async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	if (value == null) return false;
 	const blobs: Blob[] = [];
@@ -1113,7 +1112,7 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	// The header claimed blobs but none was reachable (e.g. one living only in a patch chain): we
 	// cannot prove the local copy is whole, so it must not tie.
 	if (blobs.length === 0) return false;
-	for (const blob of blobs) if (!(await hasDurableBlobHeader(blob))) return false;
+	for (const blob of blobs) if ((await blobFileMissingOrIncompleteAsync(blob)) !== false) return false;
 	return true;
 }
 
@@ -1723,37 +1722,6 @@ export async function collectBlobRepairTargets(
 }
 
 /**
- * Async damage probe for repair-candidate blobs: same header semantics as core's sync classifier
- * (shared `blobHeaderIndicatesIncomplete`), but on fs promises so the per-duplicate probes of a
- * resumed copy never block the receive worker's event loop. `undefined` = not a probeable file
- * blob. Lock/in-flight consultation is deliberately absent here — `repairBlobFile` re-checks
- * synchronously (including the :blob lock) immediately before writing.
- */
-export async function blobFileMissingOrIncompleteAsync(blob: any): Promise<boolean | undefined> {
-	try {
-		const filePath = getFilePathForBlob(blob);
-		if (!filePath) return undefined;
-		let handle;
-		try {
-			handle = await fsPromises.open(filePath, 'r');
-		} catch (error) {
-			return (error as { code?: string })?.code === 'ENOENT' ? true : undefined;
-		}
-		try {
-			const size = (await handle.stat()).size;
-			if (size < 8) return true;
-			const header = Buffer.allocUnsafe(8);
-			if ((await handle.read(header, 0, 8, 0)).bytesRead < 8) return true;
-			return blobHeaderIndicatesIncomplete(header, size);
-		} finally {
-			await handle.close();
-		}
-	} catch {
-		return undefined;
-	}
-}
-
-/**
  * Whether a `replicateOverWS` closure no longer owns its (peer, db) link (#683). `wsClosed` alone
  * is NOT sufficient: `forceReconnect`'s teardown of the old socket is best-effort and may never
  * fire 'close' (the #420 open-but-idle wedge), while the replacement installs a new `socket` on
@@ -2076,6 +2044,26 @@ export function isSubscriptionSetupProgressFrame(
 		frameDatabase === requestedDatabase &&
 		frameRequestId === requestId
 	);
+}
+
+/**
+ * The blob codecs this node is willing to receive in stored (compressed) form, advertised in the
+ * NODE_NAME capabilities object. A peer that sees the advertisement may stream a deflate-stored
+ * blob's raw body instead of inflating it (harper#2443); a peer that sees nothing sends today's
+ * inflated stream, so mixed-version clusters are unaffected. HARPER_REPLICATION_ACCEPT_BLOB_CODECS
+ * is the operational kill switch: set it to '0'/'false'/'none' to stop advertising (existing
+ * stored blobs are untouched; only future transfers revert to inflated form).
+ */
+export function acceptedBlobCodecs(env: NodeJS.ProcessEnv = process.env): string[] {
+	const raw = env.HARPER_REPLICATION_ACCEPT_BLOB_CODECS;
+	if (raw != null && ['0', 'false', 'none', ''].includes(raw.trim().toLowerCase())) return [];
+	return ['deflate'];
+}
+
+/** The peer's advertised stored-blob codecs, from the NODE_NAME capabilities object (message[4]). */
+export function parseAcceptedBlobCodecs(capabilities: unknown): Set<string> {
+	const codecs = (capabilities as { acceptBlobCodecs?: unknown })?.acceptBlobCodecs;
+	return new Set(Array.isArray(codecs) ? codecs.filter((codec) => typeof codec === 'string') : []);
 }
 
 export function resolveSubscriptionSetupCapability(
@@ -3504,6 +3492,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	let peerSupportsSubscriptionSetupAck = false;
+	let peerAcceptedBlobCodecs = new Set<string>();
+	const localAcceptedBlobCodecs = new Set(acceptedBlobCodecs());
 	let nextSubscriptionSetupRequestId = 0;
 	let pendingSubscriptionSetupRequestId: number | undefined;
 	let subscriptionSetupTimeoutMs = SUBSCRIPTION_SETUP_TIMEOUT_MS;
@@ -4243,6 +4233,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								!(TEST_SUBSCRIPTION_SETUP_TIMEOUT_MS > 0)
 							);
 							peerSupportsSubscriptionSetupAck = setupCapability.supported;
+							peerAcceptedBlobCodecs = parseAcceptedBlobCodecs(message[4]);
 							subscriptionSetupTimeoutMs = setupCapability.timeoutMs;
 							// this is the node name
 							if (remoteNodeName) {
@@ -4575,7 +4566,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						if (inCopyMode) noteCopyProgress(); // copy blob chunk arriving — the copy is advancing (#453)
 						// this is a blob chunk, we need to write it to the blob store
 						const blobInfo = message[1];
-						const { fileId, transferId, size, finished, error, errorCode, errorStatus } = blobInfo;
+						const { fileId, transferId, size, finished, error, errorCode, errorStatus, codec } = blobInfo;
 						const streamKey = getBlobTransferKey(fileId, transferId);
 						let stream = blobsInFlight.get(streamKey);
 						logger.debug?.(
@@ -4606,11 +4597,43 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						if (!stream) {
 							stream = createBlobReceiveStream(blobTimeout);
 							stream.fileId = fileId;
-							stream.expectedSize = size;
+							// expectedSize is set only by the validated assignment below, so an invalid first
+							// size (NaN/Infinity/negative) is never stored — a codec is then refused without a
+							// valid size rather than binding to a bad bound.
 							blobsInFlight.set(streamKey, stream);
 							registerBlobReceiveInFlight(fileId, auditStore?.rootStore);
 						}
-						if (size !== undefined) stream.expectedSize = size;
+						// Only ever store a valid size: the codec-binding guard below validates the size it
+						// binds a codec with, but a later chunk carrying a non-finite/negative size and no
+						// codec must not overwrite the good expectedSize a bound codec relies on — that would
+						// re-poison the transfer (createRepairInflater would then reject the size and the throw
+						// would ride the record-decode path into a connection close and reconnect loop).
+						if (size !== undefined && Number.isSafeInteger(size) && size >= 0) stream.expectedSize = size;
+						if (codec !== undefined && !stream.destroyed) {
+							// The codec decides the on-disk header the save stamps from its first byte, so it binds
+							// immutably to the transfer: unknown, unadvertised, changed mid-transfer, or announced
+							// after the record attached its save is a protocol violation, not something to adapt to.
+							// A valid size is required alongside it: the inflated length is the only bound on a raw
+							// body, so a non-finite/negative size (NaN, Infinity) would leave the repair inflater's
+							// output cap disabled — a compression-bomb hole — and must be rejected like a missing one.
+							const codecViolation =
+								codec !== 'deflate' || !localAcceptedBlobCodecs.has(codec)
+									? 'is not an accepted codec'
+									: !Number.isSafeInteger(size) || size < 0
+										? 'was announced without a valid size'
+										: stream.codec === undefined && stream.connectedToBlob
+											? 'arrived after the record began saving'
+											: stream.codec !== undefined && stream.codec !== codec
+												? 'changed mid-transfer'
+												: undefined;
+							if (codecViolation) {
+								stream.destroy(
+									new Error(`Blob codec '${codec}' for ${fileId} from ${remoteNodeName} ${codecViolation}`)
+								);
+							} else {
+								stream.codec = codec;
+							}
+						}
 						stream.lastChunk = Date.now();
 						const blobBody = message[2];
 						recordAction(
@@ -6503,6 +6526,39 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// error frame it produces is the honest answer for the peer.
 		const releaseBlobHold = holdBlobFile(blob);
 		if (!releaseBlobHold) logger.debug?.(`Blob ${id} is already being reclaimed; sending it will report it missing`);
+		// Announced synchronously, before the owning record's frame (DESIGN.md invariant 18); the
+		// `storedCodec` hint only prefilters — the open confirms against the local file header.
+		let storedBody: ReturnType<typeof openStoredBlobBody>;
+		if (peerAcceptedBlobCodecs.has('deflate') && (blob as Blob & { storedCodec?: string }).storedCodec === 'deflate') {
+			storedBody = openStoredBlobBody(blob);
+			if (storedBody) {
+				try {
+					ws.send(
+						encode([
+							BLOB_CHUNK,
+							{ fileId: id, transferId, size: storedBody.size, codec: storedBody.codec },
+							Buffer.alloc(0),
+						])
+					);
+				} catch (announceError) {
+					// A synchronous throw while building or sending the announcement (an encode failure, or
+					// an invalid-argument error out of ws.send) would otherwise propagate before any cleanup
+					// runs. openStoredBlobBody already closed its sniff fd, so close() here releases the
+					// stored-body hold (not a live descriptor); leaking would also strand the blob hold and
+					// the blobsBeingSent claim — the last of which blocks every later send of this blob.
+					// Release all three and stop; the peer re-requests this blob on reconnect, the same
+					// recovery the wsClosed early-returns below rely on.
+					storedBody.close();
+					releaseBlobHold?.();
+					blobsBeingSent.delete(blobSendKey);
+					logger.debug?.(
+						`Blob ${id} codec announcement send failed; releasing and deferring to reconnect`,
+						announceError
+					);
+					return;
+				}
+			}
+		}
 		// Acquire a send slot before opening the blob stream. Enforcing the cap only at the audit
 		// writer's backpressure check didn't bound concurrency: there it sat in an else-if behind the
 		// drain wait (unreachable while the socket stayed congested) and the GET_RECORD path never
@@ -6532,6 +6588,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (wsClosed) {
 				clearTimeout(parkWarnTimer);
 				blobsBeingSent.delete(blobSendKey);
+				storedBody?.close();
 				releaseBlobHold?.();
 				return;
 			}
@@ -6542,6 +6599,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				clearTimeout(parkWarnTimer);
 				warnBlobSendDeclined(id, 'worker draining for shutdown (while parked on the outstanding-sends cap)');
 				blobsBeingSent.delete(blobSendKey);
+				storedBody?.close();
 				releaseBlobHold?.();
 				return;
 			}
@@ -6563,6 +6621,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			});
 			if (wsClosed) {
 				blobsBeingSent.delete(blobSendKey);
+				storedBody?.close();
 				releaseBlobHold?.();
 				return;
 			}
@@ -6609,7 +6668,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// from the first iterator.next(), the retry (and the error frame) must still engage.
 				let iterator: AsyncIterator<Uint8Array> | undefined;
 				try {
-					iterator = blob.stream()[Symbol.asyncIterator]();
+					iterator = storedBody ? storedBody.stream()[Symbol.asyncIterator]() : blob.stream()[Symbol.asyncIterator]();
 					let lastBuffer: Buffer;
 					while (true) {
 						let result: IteratorResult<any>;
@@ -6640,11 +6699,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							ws.send(
 								encode([
 									BLOB_CHUNK,
-									{
-										fileId: id,
-										transferId,
-										size: blob.size,
-									},
+									storedBody
+										? { fileId: id, transferId, size: storedBody.size, codec: storedBody.codec }
+										: { fileId: id, transferId, size: blob.size },
 									lastBuffer,
 								])
 							);
@@ -6676,12 +6733,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					ws.send(
 						encode([
 							BLOB_CHUNK,
-							{
-								fileId: id,
-								transferId,
-								size: blob.size,
-								finished: true,
-							},
+							storedBody
+								? { fileId: id, transferId, size: storedBody.size, codec: storedBody.codec, finished: true }
+								: { fileId: id, transferId, size: blob.size, finished: true },
 							lastBuffer,
 						])
 					);
@@ -6703,7 +6757,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					try {
 						await iterator?.return?.();
 					} catch {}
-					if (shouldRetrySourceBlobRead({ error, sentAnyChunk, wsClosed, draining: isDrainingBlobSends(), attempt })) {
+					// A stored-body send never retries in place: its reader is single-use and a settled
+					// published file has no transient read faults to wait out.
+					if (
+						!storedBody &&
+						shouldRetrySourceBlobRead({ error, sentAnyChunk, wsClosed, draining: isDrainingBlobSends(), attempt })
+					) {
 						logger.debug?.(
 							'Blob read transiently unavailable; retrying before forwarding the error',
 							id,
@@ -6755,6 +6814,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		} finally {
 			if (drainToken) endBlobSend(drainToken);
 			blobsBeingSent.delete(blobSendKey);
+			storedBody?.close();
 			releaseBlobHold?.();
 			if (fileSendClaimed) {
 				fileIdsBeingSent.delete(id);
@@ -6803,7 +6863,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		stream.connectedToBlob = true;
 		stream.lastChunk = Date.now();
 		stream.recordId = id;
-		if (remoteBlob.size === undefined && stream.expectedSize) (remoteBlob as any).size = stream.expectedSize;
+		if (remoteBlob.size === undefined && stream.expectedSize !== undefined)
+			(remoteBlob as any).size = stream.expectedSize;
 		if (stream.blob && inPlaceRepairedBlobs.has(stream.blob)) return stream.blob;
 		// In-place dangling-reference repair (#699): this record is an identity-tie duplicate and
 		// `repairTarget` is the stored record's damaged blob — stream the re-delivered bytes INTO its
@@ -6815,11 +6876,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (repairTarget && !stream.blob) {
 			const sizesMatch =
 				repairTarget.size === undefined || remoteBlob.size === undefined || repairTarget.size === remoteBlob.size;
-			if (sizesMatch)
+			if (sizesMatch) {
+				// a codec-pinned stream always carries its announced size (the receive ladder requires it)
+				const repairSource = stream.codec ? createRepairInflater(stream, stream.expectedSize) : stream;
 				finished = decodeFromDatabase(
-					() => repairBlobFile(repairTarget, stream, () => stream.expectedSize ?? remoteBlob.size),
+					() => repairBlobFile(repairTarget, repairSource, () => stream.expectedSize ?? remoteBlob.size),
 					tableSubscriptionToReplicator.auditStore?.rootStore
 				);
+			}
 			if (!finished) {
 				const reason = sizesMatch ? 'repair-start-declined' : 'repair-size-mismatch';
 				repairDeclines[reason] = (repairDeclines[reason] ?? 0) + 1;
@@ -6831,7 +6895,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			inPlaceRepairedBlobs.add(repairTarget);
 		}
 		if (!localBlob) {
-			localBlob = stream.blob ?? createBlob(stream, remoteBlob);
+			// the receiver's own compression config does not apply to a stored-codec transfer (no recompress)
+			localBlob =
+				stream.blob ??
+				(stream.codec
+					? createBlobFromStoredBody(stream, {
+							type: (remoteBlob as { type?: string }).type,
+							size: (remoteBlob as { size?: number }).size,
+							codec: stream.codec,
+						})
+					: createBlob(stream, remoteBlob));
 			// start the save immediately. TODO: If we could add support for blobs to directly pass on a stream to the consumer
 			// we would skip this
 			finished = decodeFromDatabase(
@@ -7465,6 +7538,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				{
 					subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 					subscriptionSetupBudgetMs: SEND_SUBSCRIPTION_SETUP_BUDGET_MS,
+					acceptBlobCodecs: acceptedBlobCodecs(),
 				},
 			])
 		);
