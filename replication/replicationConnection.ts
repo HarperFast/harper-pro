@@ -107,7 +107,7 @@ import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
 // blob-send backpressure both need it, so the private field is declared here rather than at each read.
-export type ReplicationWebSocket = WebSocket & { _socket: Socket | null };
+type ReplicationWebSocket = WebSocket & { _socket: Socket | null };
 
 const logger = forComponent('replication').conditional as Logger;
 
