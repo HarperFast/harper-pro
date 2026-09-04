@@ -1118,6 +1118,30 @@ export function routeEntriesIncludePeer(
 }
 
 /**
+ * The multi-hop dedup exclusion qualifier: true when `node`'s registry row advertises that it
+ * delivers its own writes to `peerName` for `databaseName` — full replication, a blanket
+ * directional `sends`, a `sendsTo` entry covering peer+database, or a matching subscription.
+ * Excluding an origin that does NOT deliver to the subscriber directly drops its records
+ * entirely (the #370/#399 leading-dup-skip family), so every branch must prove direct delivery;
+ * conversely a directional peer that DOES qualify must be excluded, or every subscriber receives
+ * its writes once per mesh member and a restart replays that fan-out squared.
+ */
+export function qualifiesForMultiHopExclusion(
+	node: Partial<NodeRecord> | null | undefined,
+	peerName: string,
+	databaseName: string
+): boolean {
+	const replicates = node?.replicates;
+	if (replicates === true) return true;
+	const directional = typeof replicates === 'object' ? replicates : undefined;
+	return !!(
+		directional?.sends ||
+		routeEntriesIncludePeer(directional?.sendsTo, peerName, databaseName) ||
+		node?.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe !== false)
+	);
+}
+
+/**
  * Look up this node's local `replication.routes[]` config entry for a peer and return its
  * `replicates` value (boolean | directional object | undefined when no route is configured).
  *
