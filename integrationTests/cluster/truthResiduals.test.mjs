@@ -194,7 +194,8 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 420000 }, (ct
 	after(async () => {
 		for (const pid of Array.from(frozen)) thaw(pid);
 		if (!ctx.nodes) return;
-		await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node })));
+		// Settled, not all: one node failing to tear down must not leave the others running.
+		await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node }).catch(() => {})));
 	});
 
 	test('R1: a dead owning worker corrects connection truth within two reconcile ticks', async () => {

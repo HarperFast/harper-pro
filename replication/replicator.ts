@@ -730,6 +730,7 @@ export async function unsubscribeFromNode({ url, nodes, database, clearStatus = 
 // assigned to a different HTTP worker, whose connection this one cannot see, and its CONNECTED stamp must
 // survive. (harper-pro#431)
 export function releaseSharedStatusOnUnsubscribe(connection) {
+	if (!connection) return;
 	connection.nodeSubscriptions = undefined;
 	connection.sharedStatus = undefined;
 }
