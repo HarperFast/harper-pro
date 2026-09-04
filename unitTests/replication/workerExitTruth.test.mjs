@@ -1,0 +1,145 @@
+/**
+ * Correcting connection truth when the worker that owned a (database, peer) subscription is gone. A dead
+ * worker cannot write its own DOWN, so the buffer keeps its last CONNECTED stamp until liveness ages past
+ * LIVENESS_STALE_MS (>= 120s).
+ *
+ * Two writers share one ownership guard: `clearWorkerFromEntries`' owned-entry callback, fired from the
+ * worker 'exit' handler before the ownership reference is dropped, and `hasDeadOwner`, applied per entry on
+ * each reconcile tick. What the guard has to get right is which states are dead: a worker object missing
+ * from the pool is, and `worker: undefined` is not — that is a live main-thread subscription.
+ */
+import { expect } from 'chai';
+import {
+	stampWorkerExitDown,
+	WORKER_EXIT_ERROR_CODE,
+	CONNECTION_STATE_POSITION,
+	LAST_LIVENESS_TIME_POSITION,
+	LAST_ERROR_CODE_POSITION,
+	LAST_ERROR_TIME_POSITION,
+	CONNECTION_STATE_DOWN,
+	CONNECTION_STATE_CONNECTED,
+	deriveConnectionTruth,
+} from '#src/replication/replicationConnection';
+import { clearWorkerFromEntries, hasDeadOwner } from '#src/replication/subscriptionManager';
+import { REPLICATION_SHARED_STATUS_SLOTS } from '#src/replication/knownNodes';
+
+const NOW = 1_700_000_000_000;
+
+function connectedStatus(liveness = NOW - 1000) {
+	const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+	status[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
+	status[LAST_LIVENESS_TIME_POSITION] = liveness;
+	return status;
+}
+
+// Map<url, Map<database, entry>>, matching connectionReplicationMap's shape.
+function makeMap(spec) {
+	const map = new Map();
+	for (const [url, databases] of Object.entries(spec)) {
+		const dbMap = new Map();
+		for (const [database, { worker, nodeName }] of Object.entries(databases)) {
+			dbMap.set(database, { worker, nodes: [{ name: nodeName }] });
+		}
+		map.set(url, dbMap);
+	}
+	return map;
+}
+
+describe('stampWorkerExitDown', () => {
+	it('writes DOWN with the distinct worker-exit code and time', () => {
+		const status = connectedStatus();
+		expect(stampWorkerExitDown(status, NOW)).to.equal(true);
+		expect(status[CONNECTION_STATE_POSITION]).to.equal(CONNECTION_STATE_DOWN);
+		expect(status[LAST_ERROR_CODE_POSITION]).to.equal(WORKER_EXIT_ERROR_CODE);
+		expect(status[LAST_ERROR_TIME_POSITION]).to.equal(NOW);
+	});
+
+	it('uses a code outside the 16-bit WebSocket close-code space so it cannot collide with a real one', () => {
+		expect(WORKER_EXIT_ERROR_CODE).to.be.greaterThan(65535);
+	});
+
+	it('leaves liveness in place as the record of when the dead link was last proven alive', () => {
+		const status = connectedStatus(NOW - 5000);
+		stampWorkerExitDown(status, NOW);
+		expect(status[LAST_LIVENESS_TIME_POSITION]).to.equal(NOW - 5000);
+	});
+
+	it('makes truth read not-connected immediately, without waiting for liveness to go stale', () => {
+		const status = connectedStatus(NOW - 1000);
+		expect(deriveConnectionTruth(status, NOW).connected).to.equal(true);
+		stampWorkerExitDown(status, NOW);
+		const truth = deriveConnectionTruth(status, NOW);
+		expect(truth.connected).to.equal(false);
+		expect(truth.errorCode).to.equal(WORKER_EXIT_ERROR_CODE);
+	});
+
+	it('does not overwrite a state that is not CONNECTED, so a real close code survives', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		status[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+		status[LAST_ERROR_CODE_POSITION] = 1006;
+		expect(stampWorkerExitDown(status, NOW)).to.equal(false);
+		expect(status[LAST_ERROR_CODE_POSITION]).to.equal(1006);
+	});
+
+	it('is a no-op without a buffer', () => {
+		expect(stampWorkerExitDown(undefined, NOW)).to.equal(false);
+	});
+});
+
+describe('clearWorkerFromEntries owned-entry callback (R1 exit-handler writer)', () => {
+	it('reports every (database, peer) the dead worker owned, and nothing another worker owns', () => {
+		const dead = { id: 'dead' };
+		const live = { id: 'live' };
+		const map = makeMap({
+			'wss://a': { data: { worker: dead, nodeName: 'a' }, system: { worker: live, nodeName: 'a' } },
+			'wss://b': { data: { worker: dead, nodeName: 'b' } },
+		});
+
+		const stamped = [];
+		expect(clearWorkerFromEntries(map, dead, (database, nodeName) => stamped.push(`${database}/${nodeName}`))).to.equal(
+			true
+		);
+		expect(stamped).to.deep.equal(['data/a', 'data/b']);
+	});
+
+	it('fires the callback while the dead worker is still the recorded owner', () => {
+		const dead = { id: 'dead' };
+		const map = makeMap({ 'wss://a': { data: { worker: dead, nodeName: 'a' } } });
+		const entry = map.get('wss://a').get('data');
+
+		let ownerAtCallback;
+		clearWorkerFromEntries(map, dead, () => (ownerAtCallback = entry.worker));
+
+		expect(ownerAtCallback).to.equal(dead);
+		expect(entry.worker).to.equal(undefined);
+	});
+
+	it('is optional — the pre-existing two-argument call still clears ownership', () => {
+		const dead = { id: 'dead' };
+		const map = makeMap({ 'wss://a': { data: { worker: dead, nodeName: 'a' } } });
+		expect(clearWorkerFromEntries(map, dead)).to.equal(true);
+		expect(map.get('wss://a').get('data').worker).to.equal(undefined);
+	});
+});
+
+describe('hasDeadOwner (the reconcile-tick guard)', () => {
+	it('is true only for a worker object that has left the pool — the state this stamps', () => {
+		expect(hasDeadOwner({ worker: { id: 'dead' } }, [{ id: 'live' }])).to.equal(true);
+	});
+
+	it("is false while the entry's worker is still running", () => {
+		const live = { id: 'live' };
+		expect(hasDeadOwner({ worker: live }, [live])).to.equal(false);
+	});
+
+	it('is false for an entry with no worker, which is a LIVE main-thread subscription', () => {
+		// onDatabase calls subscribeToNode inline when no HTTP worker is available, and that main-thread
+		// session writes CONNECTED into the same buffer. Stamping it would flap a healthy link down on every
+		// tick and leave a sticky worker-exit code on it.
+		expect(hasDeadOwner({ worker: undefined }, [{ id: 'live' }])).to.equal(false);
+	});
+
+	it('is false with an empty pool, where every subscription runs on the main thread', () => {
+		expect(hasDeadOwner({ worker: undefined }, [])).to.equal(false);
+	});
+});

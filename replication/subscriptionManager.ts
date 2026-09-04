@@ -22,6 +22,7 @@ import {
 	iterateRoutes,
 	shouldReplicateFromNode,
 	getReplicationSharedStatus,
+	clearReplicationSharedStatus,
 	type Route,
 	getNodeURL,
 } from './knownNodes.ts';
@@ -30,9 +31,16 @@ import {
 	RECEIVING_STATUS_RECEIVING,
 	RECEIVED_TIME_POSITION,
 	RECEIVED_VERSION_POSITION,
-	readConnectionTruth,
+	LATENCY_POSITION,
+	BACK_PRESSURE_RATIO_POSITION,
+	deriveConnectionTruth,
 	formatTruthSnapshot,
+	stampWorkerExitDown,
+	classifyFire,
+	recordFire,
+	formatFireClassification,
 	type ConnectionTruth,
+	type FireMechanism,
 } from './replicationConnection.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import lodash from 'lodash';
@@ -47,6 +55,10 @@ type ConnectedWorkerStatus = {
 	worker: any;
 	connected?: boolean;
 	latency?: number;
+	// BACK_PRESSURE_RATIO_POSITION (harper-pro#431), copied off shared memory by the reconcile so the
+	// orchestrator has it without an IPC round trip. Nothing here routes on it; adaptive routing (W5/#218)
+	// will. Named for its unit because cluster_status publishes the same slot as `backPressurePercent`.
+	backPressureRatio?: number;
 	// Timestamp (ms) of the most recent transition to connected:false, used by the reconcile to
 	// distinguish a connection that is briefly retrying from one that is wedged. Cleared on connect.
 	disconnectedAt?: number;
@@ -124,6 +136,9 @@ const RECEIVE_STALL_THRESHOLD_MS = 15 * 60_000;
 // per-subscription registration accumulated D×P listeners on the shared worker objects and tripped
 // MaxListenersExceededWarning past ~10 databases (harper-pro#357).
 const workersWithExitHandler = new WeakSet<any>();
+// (database, peer) pairs already reported as holding status for a node that is no longer a member, so the
+// 5s reconcile logs each one once rather than on every tick.
+const reportedNonMemberStatus = new Set<string>();
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
 
 // Resolve an auditStore for a database (any table's will do — the per-(db, peer) shared-memory status
@@ -193,11 +208,20 @@ function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string }
 // Clear a dead worker from every subscription entry it owned, so findStaleNodeUrls re-binds those
 // entries on a live worker. Pure helper (like findStaleNodeUrls) so its behavior is unit-testable without
 // real worker threads. Returns whether the worker owned any entries. See harper-pro#357.
-export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationStatusMap>, worker: any): boolean {
+//
+// (harper-pro#431) `onOwnedEntry` fires for each (database, peer) this worker owned BEFORE the ownership
+// reference is dropped, so the caller's down-stamp runs while the dead worker is still provably the owner.
+// Injected rather than done here so this helper stays pure.
+export function clearWorkerFromEntries(
+	connectionMap: Map<string, DBReplicationStatusMap>,
+	worker: any,
+	onOwnedEntry?: (databaseName: string, nodeName: string | undefined) => void
+): boolean {
 	let owned = false;
 	for (const dbReplicationWorkers of connectionMap.values()) {
-		for (const entry of dbReplicationWorkers.values()) {
+		for (const [databaseName, entry] of dbReplicationWorkers) {
 			if (entry.worker === worker) {
+				onOwnedEntry?.(databaseName, entry.nodes?.[0]?.name);
 				entry.worker = undefined;
 				owned = true;
 			}
@@ -215,6 +239,18 @@ export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationS
 		}
 	}
 	return owned;
+}
+// The worker 'exit' handler is the fast path for correcting truth after an owner dies, not the correctness
+// boundary: a worker that wedges or is dropped from the pool without its 'exit' ever landing leaves entries
+// pointing at an owner that is gone. The reconcile applies this per entry so the bound is one tick either way.
+//
+// It requires a worker OBJECT that is no longer in the pool, which is provably dead. `worker: undefined` is
+// NOT that: an entry registered while the pool was empty runs its subscription on the main thread
+// (subscribeToNode is called inline in onDatabase), and that main-thread session writes CONNECTED into the
+// same buffer. Stamping it would flap a healthy link DOWN on every tick and leave a sticky worker-exit code
+// on it. findStaleNodeUrls rebinds those entries; this must not pre-empt it. (harper-pro#431)
+export function hasDeadOwner(entry: { worker?: any }, httpWorkers: any[]): boolean {
+	return Boolean(entry.worker) && !httpWorkers.includes(entry.worker);
 }
 export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatusMap>, httpWorkers: any[]): Set<string> {
 	const staleNodeUrls = new Set<string>();
@@ -304,6 +340,43 @@ export function reconcileEntryWithTruth(
 	}
 	if (entry.connected === false && truth.connected) return 'up';
 	return undefined;
+}
+// the main-thread twin of replicateOverWS's fireTelemetryForLog. Both reconcile nets
+// act on the entry that OWNS the (db, peer) subscription, so their fires are always owner-backed. Wrapped so
+// a telemetry failure can never abort a recovery pass.
+function recordMainThreadFire(
+	mechanism: FireMechanism,
+	databaseName: string,
+	nodeName: string | undefined,
+	entry: any,
+	now: number
+): string {
+	let truth: ConnectionTruth | undefined;
+	let counts: { redundant: number; loadBearing: number } | undefined;
+	let classification: ReturnType<typeof classifyFire> = 'unknown';
+	try {
+		const auditStore = nodeName ? getAuditStoreForDatabase(databaseName) : undefined;
+		const status = auditStore ? getReplicationSharedStatus(auditStore, databaseName, nodeName) : undefined;
+		truth = status && deriveConnectionTruth(status, now);
+		classification = classifyFire(truth, true);
+		counts = recordFire(status, mechanism, classification);
+	} catch (error) {
+		logger.trace?.('Failed to record recovery-fire classification for', databaseName, nodeName, error);
+	}
+	return `${databaseName}: ${formatTruthSnapshot(truth, now)} ${formatFireClassification(
+		mechanism,
+		classification,
+		counts
+	)} ${describePriorSignals(entry, now)}`;
+}
+// (harper-pro#431) `latency` is only copied when the buffer carries one: it is written on pong, so a
+// link that has not ponged yet reads 0 and copying that would replace the value connectedToNode mirrored
+// from the connect edge with a false instant reading. `backPressureRatio` is copied unconditionally — 0 is
+// its meaningful "no back-pressure" value. replicator.ts's cache-miss picker still reads the slot directly.
+export function copyLinkMetricsToEntry(entry: { latency?: number; backPressureRatio?: number }, status: Float64Array) {
+	const latency = status[LATENCY_POSITION];
+	if (latency > 0) entry.latency = latency;
+	entry.backPressureRatio = status[BACK_PRESSURE_RATIO_POSITION];
 }
 // W1 T1 (#431) fire telemetry: describe what already engaged on this entry before the current net
 // fired — the last recovery mechanism and/or the last truth correction, with ages — so a fire log
@@ -678,7 +751,32 @@ export async function startOnMainThread(options) {
 			for (const [database, { worker, nodes }] of dbReplicationWorkers) {
 				dbReplicationWorkers.delete(database);
 				logger.warn('Node was deleted, unsubscribing from node', hostname, database, url);
-				worker?.postMessage({ type: 'unsubscribe-from-node', node: hostname, nodes, database, url });
+				// `clearStatus` has the owning session drop its claim on the shared buffer, so nothing it writes
+				// during teardown can land on the buffer a re-added membership resolves. Sent before the clear
+				// below, and the clear is contained, so neither can leave the old owner still subscribed.
+				//
+				// The `else` matters: an entry created while the HTTP pool was empty is owned by the MAIN
+				// thread (onDatabase calls subscribeToNode inline), and without it that session is never told
+				// to stop — it keeps its socket, keeps replicating with the removed peer, and keeps re-stamping
+				// the buffer the removal just zeroed. Mirrors the sibling unsubscribe site below.
+				const request = {
+					type: 'unsubscribe-from-node',
+					node: hostname,
+					nodes,
+					database,
+					url,
+					clearStatus: true,
+				};
+				if (worker) worker.postMessage(request);
+				else unsubscribeFromNode(request);
+				// The buffer is keyed by (database, peer) and process-scoped, so a re-add inside this process
+				// resolves the SAME one and would otherwise read the departed membership's values.
+				try {
+					const auditStore = getAuditStoreForDatabase(database);
+					if (auditStore) clearReplicationSharedStatus(auditStore, database, hostname);
+				} catch (error) {
+					logger.warn('Error clearing replication status for removed node', hostname, database, error);
+				}
 			}
 			dbReplicationWorkers.iterator?.remove();
 			connectionReplicationMap.delete(url);
@@ -970,15 +1068,13 @@ export async function startOnMainThread(options) {
 				return;
 			}
 			const mainNode: any = existingWorkerEntry.nodes[0];
-			if (
-				!(
-					mainNode.replicates === true ||
-					mainNode.replicates?.sends ||
-					mainNode.replicates?.sendsTo?.length ||
-					mainNode.replicates?.receivesFrom?.length ||
-					mainNode.subscriptions?.length
-				)
-			) {
+			if (!(
+				mainNode.replicates === true ||
+				mainNode.replicates?.sends ||
+				mainNode.replicates?.sendsTo?.length ||
+				mainNode.replicates?.receivesFrom?.length ||
+				mainNode.subscriptions?.length
+			)) {
 				// no replication, so just return
 				return;
 			}
@@ -1123,11 +1219,41 @@ export async function startOnMainThread(options) {
 		if (!worker || workersWithExitHandler.has(worker)) return;
 		workersWithExitHandler.add(worker);
 		worker.once('exit', () => {
-			if (clearWorkerFromEntries(connectionReplicationMap, worker)) reconcileWorkers();
+			// the dead worker cannot write its own DOWN — that is the whole defect —
+			// so the main thread stamps it for every (db, peer) the worker owned, while it is still the
+			// recorded owner. Without this the buffer keeps its last CONNECTED stamp and only reads down
+			// once liveness ages past LIVENESS_STALE_MS (>= 120s); the reconcile below then corrects the
+			// entry on this same tick instead. A live successor re-stamps CONNECTED on handshake or pong.
+			if (
+				clearWorkerFromEntries(connectionReplicationMap, worker, (databaseName, nodeName) =>
+					stampWorkerExitTruth(databaseName, nodeName)
+				)
+			)
+				reconcileWorkers();
 		});
+	}
+	// Shared by both R1 writers (the exit handler above and the reconcile sweep below), so the two stamp
+	// identically. Ownership is the CALLER's guard; this only refuses to overwrite a state that is not
+	// CONNECTED. Never throws into the exit/reconcile path — a telemetry-grade failure must not stop the
+	// re-binding those paths exist to do.
+	function stampWorkerExitTruth(databaseName: string, nodeName: string | undefined): boolean {
+		if (!nodeName) return false;
+		try {
+			const auditStore = getAuditStoreForDatabase(databaseName);
+			if (!auditStore) return false;
+			return stampWorkerExitDown(getReplicationSharedStatus(auditStore, databaseName, nodeName));
+		} catch (error) {
+			logger.trace?.('Failed to stamp worker-exit connection truth for', databaseName, nodeName, error);
+			return false;
+		}
 	}
 	function reconcileWorkers() {
 		const now = Date.now();
+		const httpWorkers = workers.filter((worker) => worker.name === 'http');
+		// Diagnostics for the two lifecycle corrections below, batched into one line each so a mass worker
+		// exit does not emit one log per (database, peer). Allocated only once something is actually wrong.
+		let stampedDeadOwner: string[] | undefined;
+		let clearedNonMembers: string[] | undefined;
 		// Reconcile the inferred `connected` flag against the authoritative shared-memory truth the owning
 		// worker writes, in BOTH directions (see reconcileEntryWithTruth): down-corrections feed the wedge
 		// recovery below (findWedgedNodeUrls keys on connected:false + disconnectedAt past the threshold);
@@ -1139,9 +1265,48 @@ export async function startOnMainThread(options) {
 			for (const [databaseName, entry] of dbWorkers) {
 				const nodeName = entry.nodes?.[0]?.name;
 				if (!nodeName) continue;
-				const auditStore = getAuditStoreForDatabase(databaseName);
-				if (!auditStore) continue;
-				const truth = readConnectionTruth(auditStore, databaseName, nodeName, now);
+				// Resolving the audit store or the shared buffer can throw if a database is torn down between
+				// the lookup and the read. This runs from a setInterval and from the worker 'exit' listener's
+				// immediate reconcile, neither of which has an outer catch, so an escaping error would take
+				// the process down and would in any case abandon every entry after this one — including the
+				// wedge recovery below. Contain it per entry. (harper-pro#431)
+				let status: Float64Array;
+				try {
+					const auditStore = getAuditStoreForDatabase(databaseName);
+					if (!auditStore) continue;
+					// One buffer read serves every job on this entry: the two lifecycle corrections, the truth
+					// derivation, and the R3 metrics bridge.
+					status = getReplicationSharedStatus(auditStore, databaseName, nodeName);
+					// a tracked peer that is no longer a cluster member must read zero
+					// shared status, or a same-process re-add inherits its CONNECTED/liveness/error values.
+					// Skipped while nodeMap is empty — mid-boot, nothing has been processed yet, so every entry
+					// would falsely read as removed.
+					const key = `${databaseName}/${nodeName}`;
+					if (nodeMap.size > 0 && !nodeMap.has(nodeName)) {
+						if (status.some((slot) => slot !== 0)) {
+							status.fill(0);
+							// Reported once while the condition holds, not on every tick: a live writer that kept
+							// re-populating a buffer this keeps zeroing would otherwise log every 5s forever. The
+							// key is dropped again below when the peer is a member, so a genuine recurrence is
+							// reported afresh.
+							if (!reportedNonMemberStatus.has(key)) {
+								reportedNonMemberStatus.add(key);
+								(clearedNonMembers ??= []).push(key);
+							}
+						}
+					} else {
+						reportedNonMemberStatus.delete(key);
+						// The entry's owning worker is gone from the live pool. Stamped before the truth read below
+						// so the correction lands on this tick rather than the next one.
+						if (hasDeadOwner(entry, httpWorkers) && stampWorkerExitDown(status, now))
+							(stampedDeadOwner ??= []).push(key);
+					}
+				} catch (error) {
+					logger.warn('Error reading replication connection truth for', databaseName, nodeName, error);
+					continue;
+				}
+				const truth = deriveConnectionTruth(status, now);
+				copyLinkMetricsToEntry(entry, status);
 				const correction = reconcileEntryWithTruth(entry, truth, now);
 				if (correction) entry.lastTruthCorrection = { direction: correction, at: now };
 				if (correction && truth)
@@ -1159,8 +1324,18 @@ export async function startOnMainThread(options) {
 		// rather than a partial bit-only mirror, so latency and — under REPLICATION_FAILOVER — the
 		// failover-restore block (pull migrated subscriptions back off the failover peer) run. Passing the
 		// entry's current latency avoids clobbering it, since the shared-memory truth carries none.
+		if (stampedDeadOwner)
+			logger.warn(
+				'Marked replication connection truth down for subscriptions whose owning worker is gone:',
+				stampedDeadOwner.join(', ')
+			);
+		if (clearedNonMembers)
+			logger.warn(
+				'Cleared stale replication status for peers that are no longer cluster members (their removal ' +
+					'did not zero it):',
+				clearedNonMembers.join(', ')
+			);
 		if (upCorrections) for (const connection of upCorrections) connectedToNode(connection);
-		const httpWorkers = workers.filter((worker) => worker.name === 'http');
 		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
 		const wedgedNodeUrls = findWedgedNodeUrls(
 			connectionReplicationMap,
@@ -1250,12 +1425,8 @@ export async function startOnMainThread(options) {
 						forceReconnect: true,
 					};
 					// W1 T1 (#431): record the fire and what the truth + earlier layers said at this moment.
-					const nodeName = entry.nodes?.[0]?.name;
 					fireDetails.push(
-						`${databaseName}: ${formatTruthSnapshot(
-							readConnectionTruth(getAuditStoreForDatabase(databaseName), databaseName, nodeName, reconcileNow),
-							reconcileNow
-						)} ${describePriorSignals(entry, reconcileNow)}`
+						recordMainThreadFire('wedge-reconcile', databaseName, entry.nodes?.[0]?.name, entry, reconcileNow)
 					);
 					entry.lastRecovery = { mechanism: 'wedge-reconcile', at: reconcileNow };
 					// Stagger reconnects (RECONNECT_STAGGER_MS apart) so opening N TLS connections
@@ -1283,12 +1454,7 @@ export async function startOnMainThread(options) {
 					const nodes = entry?.nodes;
 					if (!entry || !worker || !nodes) continue;
 					// W1 T1 (#431): record the fire and what the truth + earlier layers said at this moment.
-					fireDetails.push(
-						`${databaseName}: ${formatTruthSnapshot(
-							readConnectionTruth(getAuditStoreForDatabase(databaseName), databaseName, nodes[0]?.name, now),
-							now
-						)} ${describePriorSignals(entry, now)}`
-					);
+					fireDetails.push(recordMainThreadFire('receive-stall-net', databaseName, nodes[0]?.name, entry, now));
 					entry.lastRecovery = { mechanism: 'receive-stall-net', at: now };
 					// Throttle clock so this entry is not re-kicked until the threshold elapses again.
 					entry.receiveStallReconnectAt = now;
@@ -1349,11 +1515,15 @@ export function requestClusterStatus(message?, port?) {
 			logger.info('Getting cluster status for', node_name, getNodeURL(node), 'has dbs', dbReplicationMap?.size);
 			const databases = [];
 			if (dbReplicationMap) {
-				for (const [database, { worker, connected, nodes, latency }] of dbReplicationMap) {
+				for (const [database, { worker, connected, nodes, latency, backPressureRatio }] of dbReplicationMap) {
 					databases.push({
 						database,
 						connected,
 						latency,
+						// the reconcile's copy of the owning worker's back-pressure ratio,
+						// 0..1 — the same slot clusterStatus.ts publishes as `backPressurePercent`, carried on the
+						// entry adaptive routing will read. Named for its unit so the two cannot be confused.
+						backPressureRatio,
 						threadId: worker?.threadId,
 						nodes: nodes.filter((node) => !(node.endTime < Date.now())).map((node) => node.name),
 					});
