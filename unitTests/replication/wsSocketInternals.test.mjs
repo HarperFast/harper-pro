@@ -44,7 +44,8 @@ describe('ws _socket contract (ReplicationWebSocket)', function () {
 	after(async () => {
 		client?.terminate();
 		serverSocket?.terminate();
-		await new Promise((resolve) => server.close(resolve));
+		// `before` can fail before the server exists; an unguarded close() here would mask it
+		if (server) await new Promise((resolve) => server.close(resolve));
 	});
 
 	it('is null before the handshake completes', () => {
