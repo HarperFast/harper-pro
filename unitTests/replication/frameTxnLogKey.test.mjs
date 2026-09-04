@@ -63,15 +63,38 @@ describe('copy transaction-log key selection', () => {
 			key: 'filled',
 			version: 100,
 			localTime: 100,
+			nodeId: 1,
 			additionalAuditRefs: [{ version: 200, nodeId: 1 }],
 		};
 		const auditStore = {
 			get(txnLogKey, tableId, id, nodeId) {
 				assert.deepEqual([txnLogKey, tableId, id, nodeId], [200, 7, 'filled', 1]);
-				return { version: 100 };
+				return { version: 100, nodeId: 1 };
 			},
 		};
 		expect(getCopyTxnLogKey(entry, auditStore, 7)).to.equal(200);
+	});
+
+	it('does not select an equal-version audit head from another origin', () => {
+		const entry = {
+			key: 'filled',
+			version: 100,
+			localTime: 100,
+			nodeId: 2,
+			additionalAuditRefs: [
+				{ version: 200, nodeId: 1 },
+				{ version: 300, nodeId: 2 },
+			],
+		};
+		const lookedUp = [];
+		const auditStore = {
+			get(txnLogKey, _tableId, _id, nodeId) {
+				lookedUp.push([txnLogKey, nodeId]);
+				return { version: 100, nodeId };
+			},
+		};
+		expect(getCopyTxnLogKey(entry, auditStore, 7, 2)).to.equal(300);
+		expect(lookedUp).to.deep.equal([[300, 2]]);
 	});
 
 	it('falls back to the snapshot clock when no retained audit head matches', () => {
@@ -89,6 +112,7 @@ describe('copy transaction-log key selection', () => {
 			key: 'ordinary',
 			version: 100,
 			localTime: 100,
+			nodeId: 1,
 			additionalAuditRefs: [{ version: 200, nodeId: 1 }],
 		};
 		expect(getCopyTxnLogKey(entry, { get: () => undefined }, 7)).to.equal(100);
@@ -99,6 +123,7 @@ describe('copy transaction-log key selection', () => {
 			key: 'ordinary',
 			version: 100,
 			localTime: 100,
+			nodeId: 1,
 			additionalAuditRefs: [{ version: 200, nodeId: 1 }],
 		};
 		expect(() =>
@@ -126,8 +151,9 @@ describe('copy transaction-log key selection', () => {
 			key: 'filled',
 			version: 100,
 			localTime: 100,
+			nodeId: 2,
 			additionalAuditRefs: [
-				{ version: 200, nodeId: 1 },
+				{ version: 200, nodeId: 2 },
 				{ version: 300, nodeId: 2 },
 			],
 		};
@@ -137,7 +163,7 @@ describe('copy transaction-log key selection', () => {
 				{
 					get(txnLogKey) {
 						if (txnLogKey === 200) throw new Error('unavailable');
-						return { version: 100 };
+						return { version: 100, nodeId: 2 };
 					},
 				},
 				7

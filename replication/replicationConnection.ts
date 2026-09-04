@@ -518,13 +518,14 @@ export function isValidFrameTxnLogKey(value: unknown): boolean {
 export function isValidRecordVersion(value: unknown): boolean {
 	return isValidReplicationClock(value);
 }
-export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number): number {
+export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number, recordNodeId = entry.nodeId): number {
 	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs?.length) {
 		let readError: unknown;
 		for (const ref of entry.additionalAuditRefs) {
+			if ((ref.nodeId ?? 0) !== (recordNodeId ?? 0)) continue;
 			try {
 				const head = auditStore.get(ref.version, tableId, entry.key, ref.nodeId);
-				if (head?.version === entry.version) return ref.version;
+				if (head?.version === entry.version && (head.nodeId ?? 0) === (recordNodeId ?? 0)) return ref.version;
 			} catch (error) {
 				readError ??= error;
 			}
@@ -5685,7 +5686,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// origin on the follower. `entry.nodeId` is this node's local id for that
 													// origin (undefined/0 = us) — the same id space the wire uses.
 													const recordNodeId = entry.nodeId ?? nodeId;
-													const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId);
+													const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
 													const encodeCopyRecord = () =>
 														createAuditEntry({
 															version: entry.version,
