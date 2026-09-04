@@ -149,18 +149,18 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	function getUserHitCount(sample: Sample) {
 		// if we can assign to user code or harper code, do so
 		let recordedTopSample = false;
-		for (let locationId of sample.locationId) {
+		for (let locationId of sample.locationId as number[]) {
 			let fileName = fileNameById.get(locationById.get(locationId).functionId);
 			if (userCodeFolders.some((userCodeFolder) => fileName.startsWith(userCodeFolder))) {
 				// the call frame location is in user code
-				const sampleCount = sample.value[0];
+				const sampleCount = sample.value[0] as number;
 				totalUserCount += sampleCount;
 				if (!recordedTopSample)
 					samplesByLocationId.set(locationId, (samplesByLocationId.get(locationId) ?? 0) + sampleCount);
 				return; // if the highest point in the call stack is in user code, we don't need to check the rest of the call stack, this "counts" as user execution
 			}
 			if (fileName.startsWith(PACKAGE_ROOT)) {
-				const sampleCount = sample.value[0];
+				const sampleCount = sample.value[0] as number;
 				totalHarperCount += sampleCount;
 				if (!recordedTopSample) {
 					samplesByLocationId.set(locationId, (samplesByLocationId.get(locationId) ?? 0) + sampleCount);
