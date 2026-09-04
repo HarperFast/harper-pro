@@ -33,8 +33,8 @@
 		// that flips this default (e.g. TypeScript 7) doesn't silently change results
 		"strict": false,
 		"target": "ES2022",
-		// Mirrors core/tsconfig.json: preserve the ES2022 type surface while declaring Node 22's
-		// Promise.withResolvers(), which core code (server/threads/socketRouter.ts) already calls.
+		// TypeScript's default lib for target ES2022, plus ES2024.Promise for Node 22's
+		// Promise.withResolvers() — called by pinned core code (server/threads/socketRouter.ts).
 		"lib": [
 			"ES2022",
 			"ES2024.Promise",

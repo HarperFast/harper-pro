@@ -1,26 +1,35 @@
 /**
  * Pins the `ws` internals that `ReplicationWebSocket` (replication/replicationConnection.ts) declares.
- * `_socket` and the members replication reads through it are private to `ws`, so a version bump could
- * remove or rename them with no type error and no compile failure — the keep-alive watchdog and the
- * blob-send backpressure loop would simply stop working. This test is what fails instead.
+ * `_socket` is private to `ws`, so a version bump can remove or rename it with no type error and no
+ * build failure: the keep-alive watchdog would silently fail open (replicationConnection.ts:3609) and
+ * the non-optional blob-send backpressure read (replicationConnection.ts:5294) would throw.
  */
 
 import { expect } from 'chai';
 import { WebSocket, WebSocketServer } from 'ws';
 
-describe('ws _socket contract (ReplicationWebSocket)', () => {
+// .mocharc.json sets timeout: 0, so an unsettled socket wait would hang the whole unit suite.
+const SOCKET_TIMEOUT_MS = 10_000;
+
+function onceOrFail(emitter, event) {
+	return new Promise((resolve, reject) => {
+		emitter.once(event, resolve);
+		emitter.once('error', reject);
+	});
+}
+
+describe('ws _socket contract (ReplicationWebSocket)', function () {
+	this.timeout(SOCKET_TIMEOUT_MS);
+
 	let server;
 	let client;
 	let serverSocket;
 
 	before(async () => {
 		server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
-		await new Promise((resolve) => server.once('listening', resolve));
+		await onceOrFail(server, 'listening');
 		client = new WebSocket(`ws://127.0.0.1:${server.address().port}`);
-		[serverSocket] = await Promise.all([
-			new Promise((resolve) => server.once('connection', resolve)),
-			new Promise((resolve) => client.once('open', resolve)),
-		]);
+		[serverSocket] = await Promise.all([onceOrFail(server, 'connection'), onceOrFail(client, 'open')]);
 	});
 
 	after(async () => {
@@ -54,7 +63,7 @@ describe('ws _socket contract (ReplicationWebSocket)', () => {
 		expect(client._socket.off).to.be.a('function');
 	});
 
-	it('is the same socket on both ends of an open connection', () => {
+	it('exposes _socket on the accepted server-side connection too', () => {
 		expect(serverSocket._socket).to.not.equal(null);
 		expect(serverSocket._socket.bytesRead).to.be.a('number');
 	});
