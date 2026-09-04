@@ -9,7 +9,7 @@
 
 import assert from 'node:assert';
 import { expect } from 'chai';
-import { getCopyTxnLogKey, isValidFrameTxnLogKey } from '#src/replication/replicationConnection';
+import { getCopyTxnLogKey, isValidFrameTxnLogKey, isValidRecordVersion } from '#src/replication/replicationConnection';
 
 describe('replication frame transaction-log key validation', () => {
 	it('accepts a representable date', () => {
@@ -45,6 +45,18 @@ describe('replication frame transaction-log key validation', () => {
 	});
 });
 
+describe('replication record version validation', () => {
+	it('accepts valid record clocks and rejects values that can poison ordering', () => {
+		expect(isValidRecordVersion(Date.now())).to.equal(true);
+		expect(isValidRecordVersion(1)).to.equal(true);
+		expect(isValidRecordVersion(NaN)).to.equal(false);
+		expect(isValidRecordVersion(Infinity)).to.equal(false);
+		expect(isValidRecordVersion(0)).to.equal(false);
+		expect(isValidRecordVersion(-1)).to.equal(false);
+		expect(isValidRecordVersion(8.64e15 + 1)).to.equal(false);
+	});
+});
+
 describe('copy transaction-log key selection', () => {
 	it('uses the addressable audit head when the stored version is a different clock', () => {
 		const entry = {
@@ -62,24 +74,26 @@ describe('copy transaction-log key selection', () => {
 		expect(getCopyTxnLogKey(entry, auditStore, 7)).to.equal(200);
 	});
 
-	it('uses the stored word when no audit-head reference matches', () => {
+	it('fails closed when no audit-head reference matches', () => {
 		const entry = {
 			key: 'ordinary',
 			version: 100,
 			localTime: 100,
 			additionalAuditRefs: [{ version: 90, nodeId: 1 }],
 		};
-		expect(getCopyTxnLogKey(entry, { get: () => ({ version: 90 }) }, 7)).to.equal(100);
+		expect(() => getCopyTxnLogKey(entry, { get: () => ({ version: 90 }) }, 7)).to.throw(
+			'Unable to resolve the transaction-log key'
+		);
 	});
 
-	it('uses the stored word when the audit head cannot be read', () => {
+	it('fails closed when no audit head can be read', () => {
 		const entry = {
 			key: 'ordinary',
 			version: 100,
 			localTime: 100,
 			additionalAuditRefs: [{ version: 200, nodeId: 1 }],
 		};
-		expect(
+		expect(() =>
 			getCopyTxnLogKey(
 				entry,
 				{
@@ -89,6 +103,30 @@ describe('copy transaction-log key selection', () => {
 				},
 				7
 			)
-		).to.equal(100);
+		).to.throw('unavailable');
+	});
+
+	it('can recover from a later audit head when an earlier read fails', () => {
+		const entry = {
+			key: 'filled',
+			version: 100,
+			localTime: 100,
+			additionalAuditRefs: [
+				{ version: 200, nodeId: 1 },
+				{ version: 300, nodeId: 2 },
+			],
+		};
+		expect(
+			getCopyTxnLogKey(
+				entry,
+				{
+					get(txnLogKey) {
+						if (txnLogKey === 200) throw new Error('unavailable');
+						return { version: 100 };
+					},
+				},
+				7
+			)
+		).to.equal(300);
 	});
 });

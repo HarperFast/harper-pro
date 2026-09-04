@@ -509,19 +509,27 @@ const STORAGE_IS_ROCKSDB = (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_
 // `RocksTransaction.setTimestamp`, the durable resume cursor and the status watermark, so a corrupt or
 // hostile peer's value must never get that far: the same bound core caps source-reported versions at.
 const MAX_DATE_TIMESTAMP = 8.64e15;
-export function isValidFrameTxnLogKey(value: unknown): boolean {
+function isValidReplicationClock(value: unknown): boolean {
 	return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= MAX_DATE_TIMESTAMP;
+}
+export function isValidFrameTxnLogKey(value: unknown): boolean {
+	return isValidReplicationClock(value);
+}
+export function isValidRecordVersion(value: unknown): boolean {
+	return isValidReplicationClock(value);
 }
 export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number): number {
 	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs) {
+		let readError: unknown;
 		for (const ref of entry.additionalAuditRefs) {
 			try {
 				const head = auditStore.get(ref.version, tableId, entry.key, ref.nodeId);
 				if (head?.version === entry.version) return ref.version;
-			} catch {
-				return entry.localTime;
+			} catch (error) {
+				readError ??= error;
 			}
 		}
+		throw readError ?? new Error(`Unable to resolve the transaction-log key for copied record ${entry.key}`);
 	}
 	return entry.localTime;
 }
@@ -4052,6 +4060,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		tableDecoder: any,
 		id: any,
 		incomingVersion: number,
+		incomingTxnLogKey: number,
 		sourceNodeId: number | undefined,
 		hasBlobs: boolean
 	): Promise<boolean> {
@@ -4060,7 +4069,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (sourceNodeId === undefined) return false;
 		const cursor = leadingDupCursorByNode.get(sourceNodeId);
 		if (cursor === undefined) return false; // this node has already streamed past its resume tail
-		if (incomingVersion > cursor) {
+		const incomingPosition = STORAGE_IS_ROCKSDB ? incomingTxnLogKey : incomingVersion;
+		if (incomingPosition > cursor) {
 			// This node has caught up to live data; stop treating anything from it as a leading duplicate.
 			leadingDupCursorByNode.delete(sourceNodeId);
 			return false;
@@ -5872,7 +5882,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Copy frames get a walk position, and everything staging or blob-tagging against it is
 			// captured NOW (decode time): onCommit runs later from the apply queue, by which time a
 			// same-socket COPY_START may have replaced the pass and its copyStartTime/copyOrder — staging
-			// this frame's key under those NEW values would claim keys the new walk has not delivered.
+			// this frame's key under those new values would claim keys the new walk has not delivered.
 			// Non-copy frames never touch the watermark (live replication pays no bookkeeping, #699).
 			const copyFrameIndex = messageIsCopyFrame ? copyWatermark.beginFrame() : undefined;
 			const copyFramePass = copyWatermark.currentPass;
@@ -5903,6 +5913,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				}
 				const start = decoder.position;
 				const auditRecord = readAuditEntry(body, start, start + eventLength);
+				if (!isValidRecordVersion(auditRecord.version)) {
+					recordAction(true, DECODE_HOLD_METRIC, databaseName + '.record-version');
+					logger.error?.(
+						connectionId,
+						`Replication record from ${remoteNodeName} for ${databaseName} carries an out-of-range version (${auditRecord.version}); holding and reconnecting`
+					);
+					wsClosed = true;
+					close(1011, 'invalid replication record version');
+					return;
+				}
 				const tableDecoder = tableDecoders[auditRecord.tableId];
 				if (!tableDecoder) {
 					// No structure/decoder for this table id yet. tableDecoders is populated only by a
@@ -6168,6 +6188,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							tableDecoder,
 							event.id,
 							auditRecord.version,
+							frameTxnLogKey,
 							event.nodeId,
 							!!(auditRecord.extendedType & HAS_BLOBS)
 						))
