@@ -1,8 +1,8 @@
 /**
- * Pins the `ws` internals that `ReplicationWebSocket` (replication/replicationConnection.ts) declares.
- * `_socket` is private to `ws`, so a version bump can remove or rename it with no type error and no
- * build failure: the keep-alive watchdog would silently fail open (replicationConnection.ts:3609) and
- * the non-optional blob-send backpressure read (replicationConnection.ts:5294) would throw.
+ * Pins the `ws` internals that the `ReplicationWebSocket` type in replication/replicationConnection.ts
+ * declares. `_socket` is private to `ws`, so a version bump can remove or rename it with no type error
+ * and no build failure: `noteByteActivity` would silently fail the keep-alive open, and the one
+ * non-optional read, in `sendAuditRecord`'s backpressure wait, would throw.
  */
 
 import { expect } from 'chai';
