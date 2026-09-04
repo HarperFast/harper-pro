@@ -71,4 +71,24 @@ describe('copy transaction-log key selection', () => {
 		};
 		expect(getCopyTxnLogKey(entry, { get: () => ({ version: 90 }) }, 7)).to.equal(100);
 	});
+
+	it('uses the stored word when the audit head cannot be read', () => {
+		const entry = {
+			key: 'ordinary',
+			version: 100,
+			localTime: 100,
+			additionalAuditRefs: [{ version: 200, nodeId: 1 }],
+		};
+		expect(
+			getCopyTxnLogKey(
+				entry,
+				{
+					get() {
+						throw new Error('unavailable');
+					},
+				},
+				7
+			)
+		).to.equal(100);
+	});
 });

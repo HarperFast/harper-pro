@@ -515,8 +515,12 @@ export function isValidFrameTxnLogKey(value: unknown): boolean {
 export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number): number {
 	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs) {
 		for (const ref of entry.additionalAuditRefs) {
-			const head = auditStore.get(ref.version, tableId, entry.key, ref.nodeId);
-			if (head?.version === entry.version) return ref.version;
+			try {
+				const head = auditStore.get(ref.version, tableId, entry.key, ref.nodeId);
+				if (head?.version === entry.version) return ref.version;
+			} catch {
+				return entry.localTime;
+			}
 		}
 	}
 	return entry.localTime;
@@ -5092,6 +5096,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							const txnLogKey = STORAGE_IS_ROCKSDB
 								? (auditRecord.txnLogKey ?? cursor ?? auditRecord.version)
 								: auditRecord.version;
+							const subscriptionPosition = STORAGE_IS_ROCKSDB ? txnLogKey : cursor;
 							// Force a reload the first time this connection touches each table:
 							// `primaryStore.encoder` is a process-wide singleton, so its typedStructs
 							// may have been populated to a stale length by prior activity on this
@@ -5118,8 +5123,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								(excludedNodes && timeRange === undefined) ||
 								// if it is in the list, we check the timestamps to verify it matches
 								(timeRange &&
-									(timeRange as any).startTime < txnLogKey &&
-									(!(timeRange as any).endTime || (timeRange as any).endTime > txnLogKey));
+									(timeRange as any).startTime < subscriptionPosition &&
+									(!(timeRange as any).endTime || (timeRange as any).endTime > subscriptionPosition));
 							if (!matchesSubscription) {
 								if (DEBUG_MODE)
 									logger.trace?.(
@@ -5671,7 +5676,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													const encodeCopyRecord = () =>
 														createAuditEntry({
 															version: entry.version,
-															txnLogKey: copyTxnLogKey,
 															tableId: table.tableId,
 															recordId: entry.key,
 															previousVersion: null,
