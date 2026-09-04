@@ -7,8 +7,9 @@
  * the cursor where it was, so nothing is lost when the frame was merely corrupt in transit.
  */
 
+import assert from 'node:assert';
 import { expect } from 'chai';
-import { isValidFrameTxnLogKey } from '#src/replication/replicationConnection';
+import { getCopyTxnLogKey, isValidFrameTxnLogKey } from '#src/replication/replicationConnection';
 
 describe('replication frame transaction-log key validation', () => {
 	it('accepts a representable date', () => {
@@ -41,5 +42,33 @@ describe('replication frame transaction-log key validation', () => {
 		// otherwise, so a truncated frame takes the same hold-and-reconnect path as a corrupt one rather
 		// than throwing a RangeError past it.
 		expect(isValidFrameTxnLogKey(NaN)).to.equal(false);
+	});
+});
+
+describe('copy transaction-log key selection', () => {
+	it('uses the addressable audit head when the stored version is a different clock', () => {
+		const entry = {
+			key: 'filled',
+			version: 100,
+			localTime: 100,
+			additionalAuditRefs: [{ version: 200, nodeId: 1 }],
+		};
+		const auditStore = {
+			get(txnLogKey, tableId, id, nodeId) {
+				assert.deepEqual([txnLogKey, tableId, id, nodeId], [200, 7, 'filled', 1]);
+				return { version: 100 };
+			},
+		};
+		expect(getCopyTxnLogKey(entry, auditStore, 7)).to.equal(200);
+	});
+
+	it('uses the stored word when no audit-head reference matches', () => {
+		const entry = {
+			key: 'ordinary',
+			version: 100,
+			localTime: 100,
+			additionalAuditRefs: [{ version: 90, nodeId: 1 }],
+		};
+		expect(getCopyTxnLogKey(entry, { get: () => ({ version: 90 }) }, 7)).to.equal(100);
 	});
 });

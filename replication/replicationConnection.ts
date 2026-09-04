@@ -512,6 +512,15 @@ const MAX_DATE_TIMESTAMP = 8.64e15;
 export function isValidFrameTxnLogKey(value: unknown): boolean {
 	return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= MAX_DATE_TIMESTAMP;
 }
+export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number): number {
+	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs) {
+		for (const ref of entry.additionalAuditRefs) {
+			const head = auditStore.get(ref.version, tableId, entry.key, ref.nodeId);
+			if (head?.version === entry.version) return ref.version;
+		}
+	}
+	return entry.localTime;
+}
 // The receive-side watchdog fires after this much silence on a replication WS. Both client and
 // server arm it: the client also runs an active 30s sendPing tick that should normally catch a
 // silent peer first, but if that tick is missed (event-loop stall, ws.terminate() not propagating
@@ -5080,7 +5089,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							const encoder = primaryStore.encoder;
 							// Audit scans provide the canonical origin key; copy-walk records use the cursor supplied
 							// by the primary-store iterator and pre-stage-0b producers fall back to the record version.
-							const txnLogKey = auditRecord.txnLogKey ?? cursor ?? auditRecord.version;
+							const txnLogKey = STORAGE_IS_ROCKSDB
+								? (auditRecord.txnLogKey ?? cursor ?? auditRecord.version)
+								: auditRecord.version;
 							// Force a reload the first time this connection touches each table:
 							// `primaryStore.encoder` is a process-wide singleton, so its typedStructs
 							// may have been populated to a stale length by prior activity on this
@@ -5656,9 +5667,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// origin on the follower. `entry.nodeId` is this node's local id for that
 													// origin (undefined/0 = us) — the same id space the wire uses.
 													const recordNodeId = entry.nodeId ?? nodeId;
+													const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId);
 													const encodeCopyRecord = () =>
 														createAuditEntry({
 															version: entry.version,
+															txnLogKey: copyTxnLogKey,
 															tableId: table.tableId,
 															recordId: entry.key,
 															previousVersion: null,
@@ -5691,7 +5704,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 															nodeId: recordNodeId,
 															extendedType: entry.metadataFlags,
 														},
-														entry.localTime,
+														copyTxnLogKey,
 														nodeId
 													);
 													logger.debug?.(
@@ -6192,14 +6205,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					);
 					// Mark base-copy frames so core applies them as snapshots: record + indices only, no
 					// audit/transaction-log entry and no out-of-order resequencing/dedup (harper-pro#480).
-					// Snapshot rows whose stored version predates copyStartTime. A source fill can have an
-					// older version but a later txnLogKey and therefore be redelivered by the audit replay;
-					// the full-row identity tie is idempotent, but its missing relay audit entry remains a
-					// stage-2 gap until primary records store both clocks. Strict `<` keeps the boundary audited.
-					event.isCopyApply = messageIsCopyFrame && copyApplyActive() && auditRecord.version < copyModeStartTime;
+					// Only writes before the replay boundary are audit-less snapshots. Strict `<` keeps the
+					// boundary transaction audited.
+					event.isCopyApply = messageIsCopyFrame && copyApplyActive() && frameTxnLogKey < copyModeStartTime;
 					// Record which tables actually received an audit-less snapshot row so only those get a
 					// reload marker at copy finalization (harper-pro#495). isCopyApply is exactly "invisible to
-					// live subscribers" — a copy frame with version >= copyStartTime carries a real audit entry
+					// live subscribers" — a copy frame at or after copyStartTime carries a real audit entry
 					// and already delivers per-row events, so it needs no marker and is intentionally excluded.
 					if (event.isCopyApply && event.table) copiedTablesThisPass.add(event.table);
 					if (messageIsCopyFrame && event.table) lastCopyFrameKey = { table: event.table, id: event.id };
