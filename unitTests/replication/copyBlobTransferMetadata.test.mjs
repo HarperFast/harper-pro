@@ -119,6 +119,7 @@ describe('copy blob transfer metadata', () => {
 		const projectionArgs = [];
 		const projectionAuditRecord = {
 			version: 123,
+			txnLogKey: 456,
 			recordId: 'record',
 			getValue: (...args) => {
 				projectionArgs.push(args);
@@ -126,7 +127,7 @@ describe('copy blob transfer metadata', () => {
 			},
 		};
 		assert.strictEqual(getResidencyProjectionRecord(projectionAuditRecord, ComputedCopy.primaryStore), fullRecord);
-		assert.deepEqual(projectionArgs, [[ComputedCopy.primaryStore, true, 123]]);
+		assert.deepEqual(projectionArgs, [[ComputedCopy.primaryStore, true, 456]]);
 		const patchAuditRecord = readAuditEntry(
 			Buffer.from(
 				createAuditEntry({

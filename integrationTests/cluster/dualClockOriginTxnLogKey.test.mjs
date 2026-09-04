@@ -1,6 +1,6 @@
 /**
  * A replicated source fill keeps the origin's record version on every peer, and every peer keys that
- * write in its per-origin log at the origin's log key (harper-pro#790, harper#2412 stage 0b).
+ * write in its per-origin log at the origin's transaction-log key (harper-pro#790, harper#2412 stage 0b).
  *
  * Two clocks, and until stage 0b they were conflated on RocksDB:
  *
@@ -101,7 +101,7 @@ function soleAuditEntry(clocks, label) {
  */
 function auditClocks(clocks, label) {
 	ok(clocks.audit.length > 0, `${label} must hold an audit entry for ${clocks.id}`);
-	const distinct = new Set(clocks.audit.map((entry) => `${entry.version}/${entry.localTime}`));
+	const distinct = new Set(clocks.audit.map((entry) => `${entry.version}/${entry.txnLogKey}`));
 	equal(
 		distinct.size,
 		1,
@@ -228,8 +228,8 @@ suite(
 				`O must store the backdated source version (stored ${origin.version}, request at ${before})`
 			);
 			ok(
-				originEntry.localTime > origin.version,
-				`O's log key must be its fill commit, not the source version (log key ${originEntry.localTime}, version ${origin.version})`
+				originEntry.txnLogKey > origin.version,
+				`O's log key must be its fill commit, not the source version (txnLogKey ${originEntry.txnLogKey}, version ${origin.version})`
 			);
 			equal(originEntry.version, origin.version, "O's audit entry carries the record version");
 
@@ -243,8 +243,8 @@ suite(
 				equal(peer.version, origin.version, `${label} must store the version O stored, not O's log key`);
 				equal(entry.version, originEntry.version, `${label}'s audit entry must carry the origin's record version`);
 				equal(
-					entry.localTime,
-					originEntry.localTime,
+					entry.txnLogKey,
+					originEntry.txnLogKey,
 					`${label}'s log key for O's write must be O's log key, not the source version`
 				);
 			}
@@ -274,8 +274,8 @@ suite(
 			const entry = auditClocks(afterRestart, 'T after restart');
 			equal(afterRestart.version, beforeRestart.version, 'replay must not restamp the record at its log key');
 			deepEqual(
-				{ version: entry.version, localTime: entry.localTime },
-				{ version: beforeRestart.audit[0].version, localTime: beforeRestart.audit[0].localTime },
+				{ version: entry.version, txnLogKey: entry.txnLogKey },
+				{ version: beforeRestart.audit[0].version, txnLogKey: beforeRestart.audit[0].txnLogKey },
 				'neither the replay nor the resume may change either clock'
 			);
 
@@ -291,7 +291,7 @@ suite(
 					const peerEntry = auditClocks(peer, `${label}/${id}`);
 					equal(peer.version, origin.version, `${label} must store O's version for ${id}`);
 					equal(peerEntry.version, originEntry.version, `${label} must record O's version for ${id}`);
-					equal(peerEntry.localTime, originEntry.localTime, `${label} must key ${id} at O's log key`);
+					equal(peerEntry.txnLogKey, originEntry.txnLogKey, `${label} must key ${id} at O's log key`);
 				}
 			}
 		});

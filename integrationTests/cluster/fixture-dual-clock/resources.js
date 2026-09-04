@@ -1,5 +1,5 @@
 /**
- * Fixture for dualClockOriginLogKey.test.mjs (harper-pro#790 / harper#2412 stage 0b).
+ * Fixture for dualClockOriginTxnLogKey.test.mjs (harper-pro#790 / harper#2412 stage 0b).
  *
  * `DualClock` is a cache table whose source reports a `lastModified` an hour in the past, so every
  * fill stores a record version well below the timestamp its fill transaction commits at — core #2065's
@@ -36,7 +36,7 @@ export class Clocks extends Resource {
 			audit.push({
 				type: auditRecord.type,
 				version: auditRecord.version,
-				localTime: auditRecord.localTime,
+				txnLogKey: auditRecord.txnLogKey,
 				nodeId: auditRecord.nodeId,
 			});
 		}
