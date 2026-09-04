@@ -2424,12 +2424,37 @@ export function createReceiveWatchdog(opts: {
 	// (harper-pro#460). A plain number is still accepted for the fixed-threshold callers.
 	intervalMs: number | (() => number);
 	getBytesRead: () => number;
+	// Transport-evidence gate (harper-pro#697): with a sampler supplied, a primary-silent window
+	// fires only when the sampled counter moved during it AND keeps moving through one extra
+	// confirmIntervalMs (buffered bytes can drain moments after a re-arm, so single-window movement
+	// may be stale residue). Silence on both counters, an undefined sample, or a sampler throw is
+	// never licence to fire: stand down (reporting unobservability once) and leave the state to the
+	// byte-silence watchdog. Full rationale in replication/DESIGN.md item 15(c).
+	getTransportActivity?: () => number | undefined;
+	confirmIntervalMs?: number;
+	onTransportUnobservable?: () => void;
 	onSilence: () => void;
 }): { reset: () => void; stop: () => void } {
 	let timer: NodeJS.Timeout | undefined;
 	let bytesReadAtArm = 0;
 	let lastResetAt = 0;
+	let transportAtArm = 0;
+	let transportKnown = false;
+	let transportEvidencePending = false;
+	let reportedUnobservable = false;
 	const resolveIntervalMs = () => (typeof opts.intervalMs === 'function' ? opts.intervalMs() : opts.intervalMs);
+	const snapshotTransport =
+		opts.getTransportActivity &&
+		(() => {
+			let sampled;
+			try {
+				sampled = opts.getTransportActivity();
+			} catch {
+				sampled = undefined; // a throwing sampler must degrade to "unobservable", never crash the timer
+			}
+			transportKnown = sampled !== undefined;
+			transportAtArm = sampled ?? 0;
+		});
 	// Coalesce rapid reset() calls (e.g. message frames arriving thousands of times per second
 	// during a large copy) so we do not churn setTimeout/clearTimeout per frame. Granularity loss
 	// is small relative to intervalMs — at worst the watchdog fires this much earlier or later.
@@ -2437,6 +2462,32 @@ export function createReceiveWatchdog(opts: {
 	function check() {
 		const current = opts.getBytesRead();
 		if (current === bytesReadAtArm) {
+			if (snapshotTransport) {
+				const hadBaseline = transportKnown;
+				const baseline = transportAtArm;
+				snapshotTransport();
+				const transportMoved = hadBaseline && transportKnown && transportAtArm !== baseline;
+				if (!transportMoved || !transportEvidencePending) {
+					// Either no positive evidence the peer was alive during this window (bytes frozen,
+					// or the socket unobservable at either end of it), or first-window evidence that
+					// could still be buffered residue: re-arm and hold the strike for confirmation.
+					transportEvidencePending = transportMoved;
+					if ((!hadBaseline || !transportKnown) && !reportedUnobservable) {
+						reportedUnobservable = true;
+						try {
+							opts.onTransportUnobservable?.();
+						} catch {
+							// diagnostics must never crash the timer callback
+						}
+					}
+					lastResetAt = Date.now();
+					timer = setTimeout(
+						check,
+						transportEvidencePending ? (opts.confirmIntervalMs ?? resolveIntervalMs()) : resolveIntervalMs()
+					).unref();
+					return;
+				}
+			}
 			timer = undefined;
 			opts.onSilence();
 			return;
@@ -2446,6 +2497,8 @@ export function createReceiveWatchdog(opts: {
 		// the new baseline; otherwise a throttled-reset-then-silence sequence would leave the
 		// watchdog permanently inactive (see PR #234 review).
 		bytesReadAtArm = current;
+		snapshotTransport?.();
+		transportEvidencePending = false;
 		lastResetAt = Date.now();
 		timer = setTimeout(check, resolveIntervalMs()).unref();
 	}
@@ -2456,6 +2509,8 @@ export function createReceiveWatchdog(opts: {
 			lastResetAt = now;
 			if (timer) clearTimeout(timer);
 			bytesReadAtArm = opts.getBytesRead();
+			snapshotTransport?.();
+			transportEvidencePending = false;
 			timer = setTimeout(check, resolveIntervalMs()).unref();
 		},
 		stop() {
@@ -3772,12 +3827,22 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	copyProgressWatchdog = createReceiveWatchdog({
 		intervalMs: effectiveBlobTimeoutMs,
 		getBytesRead: () => copyProgressFrames,
+		// ws.pause() freezes bytesRead, but addPauseReason stops this watchdog, so a frozen sample
+		// at check time always means a silent peer, never local back-pressure. (harper-pro#697)
+		getTransportActivity: () => ws._socket?.bytesRead,
+		// Two ping cycles: long enough for a live peer's fresh pong, far below blobTimeout.
+		confirmIntervalMs: Math.max(PING_INTERVAL * 2, 1000),
+		onTransportUnobservable: () =>
+			logger.debug?.(
+				connectionId,
+				'copy-progress watchdog cannot observe socket byte activity; standing down in favor of the byte-silence watchdogs'
+			),
 		onSilence: () => {
 			if (firingFromSupersededInstance('Copy-progress watchdog')) return;
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			logger.warn?.(
-				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${effectiveBlobTimeoutMs}ms while connected — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
+				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${effectiveBlobTimeoutMs}ms (and through a ${Math.max(PING_INTERVAL * 2, 1000)}ms confirmation) while peer bytes kept arriving — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${truthSnapshotForLog()}`
 			);
 			if (options.connection) options.connection.forceReconnect();
 			else ws.terminate();
@@ -4534,7 +4599,13 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								return;
 							}
 						}
-						logger.debug?.(connectionId, 'bulk copy starting from', remoteNodeName, new Date(copyModeStartTime));
+						logger.debug?.(
+							connectionId,
+							'bulk copy starting from',
+							remoteNodeName,
+							databaseName ? `(db: "${databaseName}")` : '',
+							new Date(copyModeStartTime)
+						);
 						break;
 					}
 					case COPY_COMPLETE:
