@@ -13,8 +13,16 @@ const SOCKET_TIMEOUT_MS = 10_000;
 
 function onceOrFail(emitter, event) {
 	return new Promise((resolve, reject) => {
-		emitter.once(event, resolve);
-		emitter.once('error', reject);
+		const onError = (error) => {
+			emitter.off(event, onEvent);
+			reject(error);
+		};
+		const onEvent = (value) => {
+			emitter.off('error', onError);
+			resolve(value);
+		};
+		emitter.once(event, onEvent);
+		emitter.once('error', onError);
 	});
 }
 
