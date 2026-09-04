@@ -74,26 +74,24 @@ describe('copy transaction-log key selection', () => {
 		expect(getCopyTxnLogKey(entry, auditStore, 7)).to.equal(200);
 	});
 
-	it('fails closed when no audit-head reference matches', () => {
+	it('falls back to the snapshot clock when no retained audit head matches', () => {
 		const entry = {
 			key: 'ordinary',
 			version: 100,
 			localTime: 100,
 			additionalAuditRefs: [{ version: 90, nodeId: 1 }],
 		};
-		expect(() => getCopyTxnLogKey(entry, { get: () => ({ version: 90 }) }, 7)).to.throw(
-			'Unable to resolve the transaction-log key'
-		);
+		expect(getCopyTxnLogKey(entry, { get: () => ({ version: 90 }) }, 7)).to.equal(100);
 	});
 
-	it('fails closed when no audit head can be read', () => {
+	it('falls back to the snapshot clock when the referenced audit head has expired', () => {
 		const entry = {
 			key: 'ordinary',
 			version: 100,
 			localTime: 100,
 			additionalAuditRefs: [{ version: 200, nodeId: 1 }],
 		};
-		expect(() =>
+		expect(
 			getCopyTxnLogKey(
 				entry,
 				{
@@ -103,7 +101,14 @@ describe('copy transaction-log key selection', () => {
 				},
 				7
 			)
-		).to.throw('unavailable');
+		).to.equal(100);
+	});
+
+	it('treats an empty reference list like an ordinary snapshot row', () => {
+		const entry = { key: 'ordinary', version: 100, localTime: 100, additionalAuditRefs: [] };
+		expect(getCopyTxnLogKey(entry, { get: () => assert.fail('must not read an empty reference list') }, 7)).to.equal(
+			100
+		);
 	});
 
 	it('can recover from a later audit head when an earlier read fails', () => {

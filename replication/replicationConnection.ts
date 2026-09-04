@@ -407,7 +407,7 @@ export function isResolverOwnedIndexedName(table: any, name: string): boolean {
 	return table.primaryStore?.encoder?.resolvedAttributeNames?.has(name) === true;
 }
 
-export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any) {
+export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any, txnLogKey = auditRecord.txnLogKey) {
 	// The third argument reconstructs the record AT the audit timestamp, so a partial (patch) entry
 	// yields the merged record rather than an undefined body. That reconstruction reads the current
 	// entry with no null guard in core, and this runs inside the synchronous send loop: a record
@@ -417,7 +417,7 @@ export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any
 	if (!primaryStore.getEntry(auditRecord.recordId)) return undefined;
 	// reconstruct at the entry's log position, the domain the audit chain is walked in; the synthetic
 	// copy-walk record has no log key and carries a full record anyway
-	return auditRecord.getValue(primaryStore, true, auditRecord.txnLogKey);
+	return auditRecord.getValue(primaryStore, true, txnLogKey);
 }
 
 /**
@@ -519,18 +519,17 @@ export function isValidRecordVersion(value: unknown): boolean {
 	return isValidReplicationClock(value);
 }
 export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number): number {
-	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs) {
-		let readError: unknown;
+	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs?.length) {
 		for (const ref of entry.additionalAuditRefs) {
 			try {
 				const head = auditStore.get(ref.version, tableId, entry.key, ref.nodeId);
 				if (head?.version === entry.version) return ref.version;
-			} catch (error) {
-				readError ??= error;
-			}
+			} catch {}
 		}
-		throw readError ?? new Error(`Unable to resolve the transaction-log key for copied record ${entry.key}`);
 	}
+	// Audit retention can remove a referenced head while its live record remains. A base-copy row is
+	// a snapshot, not a replayed transaction, so the bounded record clock preserves copy-apply behavior
+	// without making one expired reference permanently wedge bootstrap.
 	return entry.localTime;
 }
 // The receive-side watchdog fires after this much silence on a replication WS. Both client and
@@ -5192,7 +5191,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								for (const name in table.indices) {
 									if (isResolverOwnedIndexedName(table, name)) continue;
 									if (!partialRecord) {
-										fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore);
+										fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore, txnLogKey);
 										if (!fullRecord) break; // if there is no record, as is the case with a relocate, we can't send it
 										partialRecord = {};
 									}
