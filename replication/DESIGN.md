@@ -142,8 +142,8 @@ A setup is cancelled on
 unsubscribe, on node deletion, and on a same-name URL migration, all of which became reachable once a
 pending timer could live 30 s instead of 200 ms. The wedge/stall recovery kicks are owned the same way —
 one `entry.reDriveTimer` per entry, so a staggered sweep that outruns the reconcile window that started it
-replaces its predecessor instead of stacking another wave, and disarmed when the owning worker exits or the
-entry is replaced.
+keeps the already-armed attempt instead of restamping it out of existence, and disarms it when the owning
+worker exits or the entry is replaced.
 
 **A connect report cancels nothing; every report resets the pair's escalated setup delay.** Gating that reset
 on entry ownership let a chaos-restart peer's delay escalate past its reconvergence budget:

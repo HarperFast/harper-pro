@@ -5,7 +5,7 @@ import { server } from '../core/server/Server.ts';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 import type { Logger } from '../core/utility/logging/logger.ts';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { createBackoff } from './backoff.ts';
+import { createBackoff, type Backoff } from './backoff.ts';
 
 const logger = harperLogger.forComponent('blob-repair').conditional as Logger;
 
@@ -21,6 +21,25 @@ const REPAIR_PACING_BUDGET_MS = 60_000;
 // Once unpaced the per-record warn would fire at peer-RTT rate for the rest of the sweep — hundreds of
 // thousands of lines during exactly the incident where the log is the diagnostic channel. Sample it.
 const REPAIR_UNPACED_WARN_EVERY = 100;
+
+export function createRepairPacing(deps: { now?: () => number; random?: () => number } = {}) {
+	let backoff: Backoff | undefined;
+	return {
+		nextDelay() {
+			backoff ??= createBackoff({
+				initialMs: REPAIR_RETRY_INITIAL_MS,
+				maxMs: REPAIR_RETRY_MAX_MS,
+				budgetMs: REPAIR_PACING_BUDGET_MS,
+				now: deps.now,
+				random: deps.random,
+			});
+			return backoff.nextDelay();
+		},
+		reset() {
+			backoff = undefined;
+		},
+	};
+}
 
 export async function allBlobsAreComplete(
 	blobs: any[],
@@ -41,12 +60,7 @@ export async function repairBlobs(
 	let repaired = 0;
 	let failed = 0;
 	let noConnection = 0;
-	const backoff = createBackoff({
-		initialMs: REPAIR_RETRY_INITIAL_MS,
-		maxMs: REPAIR_RETRY_MAX_MS,
-		budgetMs: REPAIR_PACING_BUDGET_MS,
-		now: deps.now,
-	});
+	const pacing = createRepairPacing({ now: deps.now });
 	let pacingSpent = false;
 
 	for await (const { tableName, table, recordId } of findIncompleteBlobRefs(database, dbName)) {
@@ -95,7 +109,7 @@ export async function repairBlobs(
 		}
 
 		if (peerRepaired) {
-			backoff.reset();
+			pacing.reset();
 			pacingSpent = false;
 		} else {
 			failed++;
@@ -108,7 +122,7 @@ export async function repairBlobs(
 					'— no peer had a complete copy',
 					pacingSpent ? `(${failed} failed so far; sampling 1 in ${REPAIR_UNPACED_WARN_EVERY})` : ''
 				);
-			const delay = backoff.nextDelay();
+			const delay = pacing.nextDelay();
 			if (delay === undefined) {
 				if (!pacingSpent) {
 					pacingSpent = true;

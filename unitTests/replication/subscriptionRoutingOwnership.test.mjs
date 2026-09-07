@@ -1,5 +1,7 @@
 import assert from 'node:assert';
 import {
+	attachSelfCatchupNode,
+	claimRecovery,
 	connectReportAdvancesGeneration,
 	deriveEffectiveLeader,
 	getConfiguredRoutes,
@@ -62,5 +64,19 @@ describe('subscription routing and connection ownership', () => {
 		assert.equal(connectReportAdvancesGeneration(entry, { opened: true, reportingThreadId: 8 }), false);
 		assert.equal(connectReportAdvancesGeneration(entry, { opened: true }), true);
 		assert.equal(connectReportAdvancesGeneration({}, { opened: true, reportingThreadId: 7 }), false);
+	});
+
+	it('reattaches retained self-catchup state to a direct recovery payload', () => {
+		const nodes = [{ name: 'peer' }];
+		const selfCatchupNode = { name: 'self', startTime: 123, endTime: 456, replicates: true };
+		assert.deepEqual(attachSelfCatchupNode(nodes, selfCatchupNode), [...nodes, selfCatchupNode]);
+	});
+
+	it('preserves an armed recovery and its original ownership stamp', () => {
+		const timer = {};
+		const entry = { disconnectedAt: 100, reDriveTimer: timer };
+		assert.equal(claimRecovery(entry, 'disconnectedAt', 200), false);
+		assert.equal(entry.disconnectedAt, 100);
+		assert.strictEqual(entry.reDriveTimer, timer);
 	});
 });

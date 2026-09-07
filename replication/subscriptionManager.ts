@@ -71,14 +71,15 @@ type ConnectedWorkerStatus = {
 	// advances beyond it) — so a kick that produced no progress (already caught up / not recoverable) is not
 	// re-fired every tick. Mirrors disconnectedAt for the connected:false path. See findStalledReceivingNodeUrls.
 	receiveStallReconnectAt?: number;
+	receiveStallGraceUntil?: number;
 	// W1 T1 (#431) fire telemetry: the last main-thread recovery net that acted on this entry, and the
 	// last shared-memory truth correction applied to it. Logged with each subsequent fire so the
 	// watchdog-demotion soak can tell "sole detector" fires from ones where another layer (or the
 	// truth-driven path) had already engaged. Telemetry only — never consulted for recovery decisions.
 	// The single recovery timer the reconcile has armed for this entry (wedge re-drive or stall kick).
 	// Owned rather than fire-and-forget: with many databases a staggered sweep can outrun the reconcile
-	// window that started it, so each new decision replaces the entry's pending one instead of stacking
-	// another wave, and connect/unsubscribe/delete can disarm it.
+	// window that started it, so later reconcile ticks preserve the entry's pending attempt instead of
+	// replacing or stacking another wave, and worker exit/unsubscribe/delete can disarm it.
 	reDriveTimer?: ReturnType<typeof setTimeout>;
 	// Bumped when the owning worker reports a socket open, so a delayed stall kick cannot target its old socket.
 	connectGeneration?: number;
@@ -296,10 +297,24 @@ export function dispatchSubscriptionNodes(
 			endTime: (deps.now ?? Date.now)(),
 			replicates: true,
 		} as const);
-	const dispatchNodes = [...nodes, selfCatchupNode];
+	const dispatchNodes = attachSelfCatchupNode(nodes, selfCatchupNode);
 	deps.dispatch(dispatchNodes);
 	if (!deps.selfCatchupNode) deps.retain(selfCatchupNode);
 	if (deps.startTime !== undefined) deps.consume();
+}
+
+export function attachSelfCatchupNode(nodes: any[], selfCatchupNode?: SelfCatchupNode): any[] {
+	return selfCatchupNode && !nodes.includes(selfCatchupNode) ? [...nodes, selfCatchupNode] : nodes;
+}
+
+export function claimRecovery(
+	entry: ConnectedWorkerStatus,
+	stamp: 'disconnectedAt' | 'receiveStallReconnectAt',
+	now: number
+): boolean {
+	if (entry.reDriveTimer) return false;
+	entry[stamp] = now;
+	return true;
 }
 
 /**
@@ -611,6 +626,7 @@ export function findStalledReceivingNodeUrls(
 			// still-desired connections that have not reported a disconnect.
 			if (
 				entry.connected === false ||
+				(entry.receiveStallGraceUntil != null && now < entry.receiveStallGraceUntil) ||
 				!entry.worker ||
 				!httpWorkers.includes(entry.worker) ||
 				!isDesired(entry.nodes?.[0], database)
@@ -626,7 +642,8 @@ export function findStalledReceivingNodeUrls(
 			// stall is not reconnect-recoverable — leaves lastReceivedTime behind, and reconnecting a healthy
 			// connection every threshold would just churn it. The first detection (receiveStallReconnectAt
 			// unset) always fires. This also subsumes a time throttle: a kick still settling has not advanced
-			// lastReceivedTime, so it is not re-driven on the next tick.
+			// lastReceivedTime, so it is not re-driven on the next tick. A new socket also gets one full
+			// threshold before this old watermark is eligible again.
 			if (
 				isReceiveStalled(status, now, thresholdMs) &&
 				(entry.receiveStallReconnectAt == null || status.lastReceivedTime > entry.receiveStallReconnectAt)
@@ -1310,8 +1327,11 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		mainWorkerEntry.connected = true;
-		if (connectReportAdvancesGeneration(mainWorkerEntry, connection))
+		if (connectReportAdvancesGeneration(mainWorkerEntry, connection)) {
 			mainWorkerEntry.connectGeneration = (mainWorkerEntry.connectGeneration ?? 0) + 1;
+			mainWorkerEntry.receiveStallReconnectAt = undefined;
+			mainWorkerEntry.receiveStallGraceUntil = Date.now() + RECEIVE_STALL_THRESHOLD_MS;
+		}
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
@@ -1457,11 +1477,8 @@ export async function startOnMainThread(options) {
 			getReceiveStatus
 		);
 		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0 && stalledByUrl.size === 0) return;
-		// One armed recovery per entry: a sweep staggered across many databases can still be firing when the
-		// next reconcile decides again, and a superseded wave's timers would otherwise be retained until
-		// they no-op.
+		// A large staggered sweep can overlap later reconcile ticks; each entry keeps its pending attempt.
 		const armReDrive = (entry: any, delay: number, url: string, database: string, fire: () => void) => {
-			clearTimeout(entry.reDriveTimer);
 			const timer = setTimeout(() => {
 				entry.reDriveTimer = undefined;
 				try {
@@ -1533,24 +1550,10 @@ export async function startOnMainThread(options) {
 					// Restart the disconnect clock so this entry is not re-driven on every reconcile
 					// tick until it either connects or exceeds the threshold again. Stamping disconnectedAt
 					// also gives a never-connected entry a real "down since" for subsequent ticks.
-					entry.disconnectedAt = reconcileNow;
 					const worker = entry.worker;
 					const nodes = entry.nodes;
 					if (!worker || !nodes) continue;
-					const request = {
-						...nodes[0],
-						type: 'subscribe-to-node',
-						database: databaseName,
-						nodes,
-						// Force a reconnect rather than relying on the re-subscribe alone. subscribeToNode reuses
-						// the cached connection when isReusableConnection is true (not finished, not intentionally
-						// unsubscribed), so a never-connected wedge — connect() rejected with no socket, but the
-						// connection object is still "reusable" — would otherwise just receive subscribe() again
-						// and stay wedged. forceReconnect drives an independent reconnect (and no-ops when a retry
-						// is already pending, via its reconnectScheduled guard), keeping this backstop effective
-						// even if the connection's own retry never armed. See harper-pro#466.
-						forceReconnect: true,
-					};
+					if (!claimRecovery(entry, 'disconnectedAt', reconcileNow)) continue;
 					// W1 T1 (#431): record the fire and what the truth + earlier layers said at this moment.
 					const nodeName = entry.nodes?.[0]?.name;
 					fireDetails.push(
@@ -1571,7 +1574,16 @@ export async function startOnMainThread(options) {
 						// a connection that has already recovered or been re-driven.
 						if (entries.get(databaseName) !== entry || entry.disconnectedAt !== reconcileNow) return;
 						if (entry.unsubscribed) return; // forceReconnect would reopen work we just told the worker to drop
-						worker.postMessage(request);
+						if (entry.worker !== worker) return;
+						if (!entry.nodes?.[0]) return;
+						const requestNodes = attachSelfCatchupNode(entry.nodes, entry.selfCatchupNode);
+						worker.postMessage({
+							...requestNodes[0],
+							type: 'subscribe-to-node',
+							database: databaseName,
+							nodes: requestNodes,
+							forceReconnect: true,
+						});
 					});
 				}
 				if (reconnectCount > 0)
@@ -1592,6 +1604,9 @@ export async function startOnMainThread(options) {
 					const worker = entry?.worker;
 					const nodes = entry?.nodes;
 					if (!entry || !worker || !nodes) continue;
+					// Throttle clock so this entry is not re-kicked until the threshold elapses again. A
+					// pending attempt owns the entry even when a large staggered sweep crosses reconcile ticks.
+					if (!claimRecovery(entry, 'receiveStallReconnectAt', now)) continue;
 					// W1 T1 (#431): record the fire and what the truth + earlier layers said at this moment.
 					fireDetails.push(
 						`${databaseName}: ${formatTruthSnapshot(
@@ -1600,8 +1615,6 @@ export async function startOnMainThread(options) {
 						)} ${describePriorSignals(entry, now)}`
 					);
 					entry.lastRecovery = { mechanism: 'receive-stall-net', at: now };
-					// Throttle clock so this entry is not re-kicked until the threshold elapses again.
-					entry.receiveStallReconnectAt = now;
 					// Watermark this decision was made against, so progress arriving during the delay cancels it,
 					// and the connect generation so a reconnect inside the delay does too.
 					const stalledAtWatermark = getReceiveStatus(databaseName, nodes[0]?.name)?.lastReceivedTime;
@@ -1625,7 +1638,10 @@ export async function startOnMainThread(options) {
 							stalledAtWatermark,
 							currentWatermark: getReceiveStatus(databaseName, nodes[0]?.name)?.lastReceivedTime,
 						});
-						if (verdict.releaseThrottle) entry.receiveStallReconnectAt = undefined;
+						if (verdict.releaseThrottle) {
+							entry.receiveStallReconnectAt = undefined;
+							entry.receiveStallGraceUntil = Date.now() + RECEIVE_STALL_THRESHOLD_MS;
+						}
 						if (verdict.fire) worker.postMessage(request);
 					});
 				}
