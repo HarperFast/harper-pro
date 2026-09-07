@@ -50,7 +50,10 @@ export async function clusterStatus() {
 				auditStore = table.auditStore;
 				if (auditStore) break;
 			}
-			if (!auditStore) continue;
+			if (!auditStore) {
+				if (!socket.connected) socket.peerCapabilities = undefined;
+				continue;
+			}
 			let replicationSharedStatus = getReplicationSharedStatus(auditStore, databaseName, remoteNodeName);
 			socket.lastCommitConfirmed = asDate(replicationSharedStatus[CONFIRMATION_STATUS_POSITION]);
 			socket.lastReceivedRemoteTime = asDate(replicationSharedStatus[RECEIVED_VERSION_POSITION]);
@@ -73,6 +76,9 @@ export async function clusterStatus() {
 			const truth = readConnectionTruth(auditStore, databaseName, remoteNodeName);
 			if (truth) {
 				socket.connected = truth.connected;
+				// Capabilities belong to the live socket. Nothing clears the stored value on disconnect —
+				// that would be a second racing message to fence — so a down link omits it here instead.
+				if (!truth.connected) socket.peerCapabilities = undefined;
 				// Surface the last proof-of-life (handshake/pong/receive stamp) so an operator — and the
 				// watchdog-demotion soak (#431) — can see how fresh the truth behind `connected` is, and
 				// distinguish "connected, actively alive" from "connected, liveness nearing the stale window".

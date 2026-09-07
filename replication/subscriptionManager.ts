@@ -47,6 +47,11 @@ type ConnectedWorkerStatus = {
 	worker: any;
 	connected?: boolean;
 	latency?: number;
+	// Per-socket protocol metadata from the owning worker, with its fence. See applyConnectionMetadata.
+	peerCapabilities?: Readonly<Record<string, number | undefined>>;
+	unknownCommandFrames?: number;
+	metadataThreadId?: number;
+	metadataSessionOrdinal?: number;
 	// Timestamp (ms) of the most recent transition to connected:false, used by the reconcile to
 	// distinguish a connection that is briefly retrying from one that is wedged. Cleared on connect.
 	disconnectedAt?: number;
@@ -167,6 +172,40 @@ export function describeIdentityMismatch(
 		`planted node.hostname: localhost — see harper-pro#351). Set node.hostname to the name this node is ` +
 		`registered under in hdb_nodes, or remove it to fall back to replication.hostname.`
 	);
+}
+
+/**
+ * Apply a worker's per-socket protocol metadata (harper-pro#440) to the main-thread entry for that
+ * (database, peer). Observability only — the worker's socket-local resolution enforces.
+ *
+ * The fence is a (worker thread id, per-worker session ordinal) pair, not a timestamp: a thread id is
+ * exact and an ordinal is monotonic by construction, whereas two workers can open a session in the same
+ * millisecond and a wall clock can step backwards.
+ *
+ * This clears a retired session's capabilities when a NEW session posts without any. The connect edge
+ * (`newSocket`) closes the same gap earlier, for the window before any fenced post arrives.
+ */
+export function applyConnectionMetadata(entry: any, connection: any): boolean {
+	if (connection.peerCapabilities === undefined && connection.unknownCommandFrames === undefined) return false;
+	const owningThreadId = entry.worker?.threadId;
+	if (owningThreadId !== undefined && connection.threadId !== owningThreadId) return false;
+	// The ordinal orders sessions only within one worker, so it is consulted only when the reporting
+	// worker is the one that last reported; a reassignment restarts the sequence.
+	if (entry.metadataThreadId === connection.threadId && !(connection.sessionOrdinal >= entry.metadataSessionOrdinal))
+		return false;
+	// A post from a session this entry has not heard from before, carrying no capabilities, means the new
+	// socket has not learned any yet. Clearing is what makes the main-thread entry honor the same contract
+	// the worker mirror does: the retired session's bag must not stand in for the live one. Without this a
+	// peer that answers pings but never sends NODE_NAME reads as connected with its previous capabilities,
+	// which is the wedge class this registry exists to make visible.
+	const newSession =
+		entry.metadataThreadId !== connection.threadId || entry.metadataSessionOrdinal !== connection.sessionOrdinal;
+	entry.metadataThreadId = connection.threadId;
+	entry.metadataSessionOrdinal = connection.sessionOrdinal;
+	if (connection.peerCapabilities !== undefined) entry.peerCapabilities = connection.peerCapabilities;
+	else if (newSession) entry.peerCapabilities = undefined;
+	if (connection.unknownCommandFrames !== undefined) entry.unknownCommandFrames = connection.unknownCommandFrames;
+	return true;
 }
 
 // harper-pro#351 defense-in-depth. Emit the identity-mismatch error at most once per process: the
@@ -970,15 +1009,13 @@ export async function startOnMainThread(options) {
 				return;
 			}
 			const mainNode: any = existingWorkerEntry.nodes[0];
-			if (
-				!(
-					mainNode.replicates === true ||
-					mainNode.replicates?.sends ||
-					mainNode.replicates?.sendsTo?.length ||
-					mainNode.replicates?.receivesFrom?.length ||
-					mainNode.subscriptions?.length
-				)
-			) {
+			if (!(
+				mainNode.replicates === true ||
+				mainNode.replicates?.sends ||
+				mainNode.replicates?.sendsTo?.length ||
+				mainNode.replicates?.receivesFrom?.length ||
+				mainNode.subscriptions?.length
+			)) {
 				// no replication, so just return
 				return;
 			}
@@ -1039,6 +1076,8 @@ export async function startOnMainThread(options) {
 		mainWorkerEntry.connected = true;
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
+		if (connection.newSocket) mainWorkerEntry.peerCapabilities = undefined;
+		applyConnectionMetadata(mainWorkerEntry, connection);
 		const restoredNode = mainWorkerEntry.nodes[0];
 		if (!restoredNode) {
 			logger.warn('Newly connected node has no node subscriptions', connection.database, mainWorkerEntry);
@@ -1349,12 +1388,18 @@ export function requestClusterStatus(message?, port?) {
 			logger.info('Getting cluster status for', node_name, getNodeURL(node), 'has dbs', dbReplicationMap?.size);
 			const databases = [];
 			if (dbReplicationMap) {
-				for (const [database, { worker, connected, nodes, latency }] of dbReplicationMap) {
+				for (const [
+					database,
+					{ worker, connected, nodes, latency, peerCapabilities, unknownCommandFrames },
+				] of dbReplicationMap) {
 					databases.push({
 						database,
 						connected,
 						latency,
 						threadId: worker?.threadId,
+						peerCapabilities,
+						// Omitted on a healthy link (harper-pro#440), matching blobReplicationFailures.
+						unknownCommandFrames: unknownCommandFrames || undefined,
 						nodes: nodes.filter((node) => !(node.endTime < Date.now())).map((node) => node.name),
 					});
 				}
