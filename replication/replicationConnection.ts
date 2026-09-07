@@ -4887,12 +4887,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							blobsInFlight.set(streamKey, stream);
 							registerBlobReceiveInFlight(fileId, auditStore?.rootStore);
 						}
-						// Only ever store a valid size: the codec-binding guard below validates the size it
-						// binds a codec with, but a later chunk carrying a non-finite/negative size and no
-						// codec must not overwrite the good expectedSize a bound codec relies on — that would
-						// re-poison the transfer (createRepairInflater would then reject the size and the throw
-						// would ride the record-decode path into a connection close and reconnect loop).
-						if (size !== undefined && Number.isSafeInteger(size) && size >= 0) stream.expectedSize = size;
+						// Only ever store a valid size, and freeze it once a codec is bound: a codec-less chunk
+						// carries no codec to violate, so without the freeze a peer could announce a small size
+						// alongside the codec (passing the codec-binding guard below) and then widen it with a
+						// later codec-less chunk, disabling createRepairInflater's output cap on a compressed
+						// repair delivery.
+						if (size !== undefined && Number.isSafeInteger(size) && size >= 0 && stream.codec === undefined)
+							stream.expectedSize = size;
 						if (codec !== undefined && !stream.destroyed) {
 							// The codec decides the on-disk header the save stamps from its first byte, so it binds
 							// immutably to the transfer: unknown, unadvertised, changed mid-transfer, or announced
@@ -6918,7 +6919,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// error frame it produces is the honest answer for the peer.
 		const releaseBlobHold = holdBlobFile(blob);
 		if (!releaseBlobHold) logger.debug?.(`Blob ${id} is already being reclaimed; sending it will report it missing`);
-		// Announced synchronously, before the owning record's frame (DESIGN.md invariant 18); the
+		// Announced synchronously, before the owning record's frame (DESIGN.md invariant 19); the
 		// `storedCodec` hint only prefilters — the open confirms against the local file header.
 		let storedBody: ReturnType<typeof openStoredBlobBody>;
 		if (peerAcceptedBlobCodecs.has('deflate') && (blob as Blob & { storedCodec?: string }).storedCodec === 'deflate') {
@@ -7269,10 +7270,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const sizesMatch =
 				repairTarget.size === undefined || remoteBlob.size === undefined || repairTarget.size === remoteBlob.size;
 			if (sizesMatch) {
-				// a codec-pinned stream always carries its announced size (the receive ladder requires it)
-				const repairSource = stream.codec ? createRepairInflater(stream, stream.expectedSize) : stream;
+				// Bound the inflater by the LOCAL repair descriptor, not the peer-announced expectedSize:
+				// sizesMatch above already proves repairTarget.size and remoteBlob.size agree whenever both
+				// are known, so this is the same value without a wire-controlled path to it.
+				const repairSize = repairTarget.size ?? remoteBlob.size;
+				const repairSource = stream.codec ? createRepairInflater(stream, repairSize) : stream;
 				finished = decodeFromDatabase(
-					() => repairBlobFile(repairTarget, repairSource, () => stream.expectedSize ?? remoteBlob.size),
+					() => repairBlobFile(repairTarget, repairSource, () => repairSize),
 					tableSubscriptionToReplicator.auditStore?.rootStore
 				);
 			}
