@@ -2581,6 +2581,7 @@ export class NodeReplicationConnection extends EventEmitter {
 					name: this.nodeName,
 					database: this.databaseName,
 					url: this.url,
+					opened: true,
 				});
 			}
 			this.isConnected = true;

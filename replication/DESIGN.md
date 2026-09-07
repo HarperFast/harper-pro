@@ -132,9 +132,9 @@ message, so whatever re-drove `onNodeUpdate` amplified 1:1 into main-thread time
 WebSocket/TLS setup, and `Setting up subscription with leader` warns — ~1,400 lines/s/node in the field,
 ending in an OOM kill. The scheduler holds one armed setup per **(peer URL, database)** in its own map
 (_not_ on the `connectionReplicationMap` entry, which the stale-worker path deletes and recreates), and
-the armed setup carries the newest level-state payload — reading `entry.nodes` at fire time is _not_
-safe, because `onDatabase`'s early-return path replaces that array without running the leader/url
-enrichment (that path calls `refreshPending` instead). Self-catchup is separate one-shot state: it is
+the armed setup carries the newest level-state payload — `onDatabase`'s early-return path refreshes
+that payload without arming another timer, so a pending setup observes the latest routing, leadership,
+and exclusion state. Self-catchup is separate one-shot state: it is
 attached on a fresh array immediately before dispatch and consumed only after the worker message is
 accepted, so timer cancellation, stale dispatch, or a synchronous `postMessage` throw cannot lose it.
 A setup is cancelled on
@@ -144,15 +144,16 @@ one `entry.reDriveTimer` per entry, so a staggered sweep that outruns the reconc
 replaces its predecessor instead of stacking another wave, and disarmed when the owning worker exits or the
 entry is replaced.
 
-**A connect report cancels nothing; it only resets the escalated delay.** The main thread cannot attribute a
-report to the entry that armed the work — `connectToNextWorker` subscribes a failover peer on a worker that
-is not `entry.worker`, and a superseded worker's hung-but-open connection reports for the same pair as its
-replacement — so cancelling on it strands a just-recreated entry, and gating the _reset_ on that attribution
-is what let a chaos-restart peer's setup delay escalate past its reconvergence budget. What makes leaving
-the timers armed safe is that each re-checks live state when it fires: the setup re-reads the entry and its
-`unsubscribed` flag, the wedge kick claims its entry through the `disconnectedAt` stamp a connect clears,
-and the stall kick claims it through `connectGeneration` (a stalled connection is `connected: true` with no
-`disconnectedAt`, so the stamp cannot discriminate for it) plus the receive watermark. `shouldFireStallKick`
+**A connect report cancels nothing; every report resets the pair's escalated setup delay.** Gating that reset
+on entry ownership let a chaos-restart peer's delay escalate past its reconvergence budget:
+`connectToNextWorker` can subscribe a failover peer on a worker that is not `entry.worker`. Reports do carry
+their worker thread id, and only the owning worker's explicit socket-open edge advances
+`connectGeneration`; pongs and foreign/superseded opens still perform the pair-level reset but cannot cancel
+a stall kick. What makes leaving the timers armed safe is that each re-checks live state when it fires: the
+setup re-reads the entry and its `unsubscribed` flag, the wedge kick claims its entry through the
+`disconnectedAt` stamp a connect clears, and the stall kick claims it through `connectGeneration` (a stalled
+connection is `connected: true` with no `disconnectedAt`, so the stamp cannot discriminate for it), the
+captured worker identity, and the receive watermark. `shouldFireStallKick`
 holds that decision, because the stamp it checks is also the re-detection throttle: a kick skipped because
 the leg reconnected has to hand the stamp back, or a fresh socket that stalls too is never detected — its
 `lastReceivedTime` can never move past a stamp it never advanced.
@@ -229,6 +230,8 @@ discipline paces _retries_, and jittering a durability deadline would be activel
 16. **A bulk copy must preserve each row's true origin `nodeId` in the encoded audit entry.** The mesh is bidirectional, and a node with no resume cursor for a peer requests a full copy from it (item 13 / #426) — so when an empty node B joins, the established source A full-copies FROM B and receives its own rows echoed back. Conflict resolution (`core/resources/Table.ts → precedesExistingVersion`) skips an identity tie (same version AND same origin node) but breaks a same-version/different-node tie **alphabetically by node name**. The copy sender used to stamp its OWN id (`getThisNodeId` = 0) on every copied row, so the echo arrived attributed to B: the tie fell to the name comparison, and on the name-smaller node every echoed row WON — the source silently re-applied its entire own dataset, re-minting every blob from the peer's stream and unlinking its original files (identical bytes, so invisible — until a crash mid-echo left committed records referencing permanent PENDING stubs with the originals gone, and later re-deliveries identity-tie-skipped so the stub never healed: the QA-692 nightly failure, where the never-killed source failed its own sanity gate). The copy loop now encodes `entry.nodeId ?? getThisNodeId(...)` (origin ids are in the sender's local id space — exactly what the wire carries and `NODE_NAME_TO_ID_MAP` resolves), making the echo an identity tie the receiver skips. The audit-like record carries that origin id so `sendAuditRecord` exports its mapping before the frame; the sender id is passed separately for subscription matching, preserving `subscribedNodeIds` filtering. The copy-origin match can also reach `Table.ts`'s end_txn seq bookkeeping, but that write is dormant today because replication end_txn events carry no timestamp. The fix is not retroactive: rows persisted by a pre-fix copy retain the relay's id, so a post-upgrade full copy from the true origin can still re-apply them on the name-losing side until the rows are rewritten. Deterministic repro: `fullCopyEchoSourceIntegrity.test.mjs` snapshots the source before the natural join and requires that its blob-store file set remains unchanged.
 
 17. **Resolver output is never replicated.** No durable form of a record — copy payloads, audit entries, residency partials — carries a value under a `@computed`/`@relationship` name; core's durable projection enforces this at `recordUpdater` and on receiver materialization (HarperFast/harper#2359, harper#2368), the copy sender projects each re-encoded row to stored fields, and the residency-partial sender skips resolver-owned indexed names outright. A receiver recomputes computed values from the stored inputs it has; a non-resident peer that lacks those inputs does not index the resolved attribute. Residency-changing patches reconstruct the record at the audit timestamp (`getResidencyProjectionRecord`) so peers do not receive bodyless invalidations. Regressions: `unitTests/replication/copyBlobTransferMetadata.test.mjs` and `integrationTests/cluster/computedFullCopy.test.mjs`.
+
+18. **Config-route reload publishes atomically.** `startOnMainThread` is re-entered on component reload while the previous keyed `hdb_nodes` watcher can still deliver events. The module-level `routes` array is also the authoritative main-thread input for leader inference and `configRouteReplicates`. Clearing it before asynchronous route preparation exposed a false "no configured leader/route" state: an existing subscription could retain or lose the wrong `isLeader` value, and a directional receive gate could temporarily fall back to the peer's differently encoded registry record. Route preparation now builds a local list and replaces the shared array contents in one `splice`, preserving the reference returned by `getConfiguredRoutes()`; tentative route-node updates run only after that commit. Effective leadership is recomputed before the existing-entry fast path, with explicit persisted `false` overriding configured inference.
 
 ---
 

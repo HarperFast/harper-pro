@@ -2,15 +2,17 @@ import assert from 'node:assert';
 import { shouldFireStallKick } from '#src/replication/subscriptionManager';
 
 const ARMED_AT = 1_000;
+const WORKER = {};
 
 function makeEntry(overrides = {}) {
-	return { receiveStallReconnectAt: ARMED_AT, connectGeneration: 3, ...overrides };
+	return { receiveStallReconnectAt: ARMED_AT, connectGeneration: 3, worker: WORKER, ...overrides };
 }
 
 function verdict(entry, overrides = {}) {
 	return shouldFireStallKick({
 		current: entry,
 		armed: entry,
+		armedWorker: entry.worker,
 		armedAt: ARMED_AT,
 		armedGeneration: 3,
 		stalledAtWatermark: 500,
@@ -41,6 +43,12 @@ describe('shouldFireStallKick', () => {
 	// never moves lastReceivedTime past it — so the net never re-armed for that pair again.
 	it('releases the throttle when the leg reconnected inside the stagger window', () => {
 		assert.deepEqual(verdict(makeEntry({ connectGeneration: 4 })), { fire: false, releaseThrottle: true });
+	});
+
+	it('releases the throttle when the entry moved to another worker inside the stagger window', () => {
+		const armedWorker = {};
+		const entry = makeEntry({ worker: {} });
+		assert.deepEqual(verdict(entry, { armedWorker }), { fire: false, releaseThrottle: true });
 	});
 
 	it('treats a missing connectGeneration as generation 0', () => {

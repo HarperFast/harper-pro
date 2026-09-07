@@ -16,7 +16,7 @@ import {
 	getSubscriptionConnectionKey,
 } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
-import { parentPort } from 'worker_threads';
+import { parentPort, threadId } from 'node:worker_threads';
 import {
 	subscribeToNodeUpdates,
 	getHDBNodeTable,
@@ -72,10 +72,10 @@ type ConnectedWorkerStatus = {
 	// window that started it, so each new decision replaces the entry's pending one instead of stacking
 	// another wave, and connect/unsubscribe/delete can disarm it.
 	reDriveTimer?: ReturnType<typeof setTimeout>;
-	// Bumped on every connect report. The wedge kick claims its entry through `disconnectedAt`, which a
-	// connect clears; a stalled connection is connected:true with no `disconnectedAt`, so the stall kick
-	// needs its own claim or a leg that drops and reconnects inside its stagger window gets force-reconnected
-	// on the strength of the old socket's watermark.
+	// Bumped when the owning worker reports a socket open. The wedge kick claims its entry through
+	// `disconnectedAt`, which a connect clears; a stalled connection is connected:true with no
+	// `disconnectedAt`, so the stall kick needs its own claim or a leg that reconnects inside its stagger
+	// window gets force-reconnected on the strength of the old socket's watermark.
 	connectGeneration?: number;
 	lastRecovery?: { mechanism: string; at: number };
 	lastTruthCorrection?: { direction: 'down' | 'up'; at: number };
@@ -419,14 +419,16 @@ export function clearWorkerFromEntries(connectionMap: Map<string, DBReplicationS
 export function shouldFireStallKick(args: {
 	current: any;
 	armed: any;
+	armedWorker: any;
 	armedAt: number;
 	armedGeneration: number;
 	stalledAtWatermark?: number;
 	currentWatermark?: number;
 }): { fire: boolean; releaseThrottle: boolean } {
-	const { current, armed, armedAt, armedGeneration, stalledAtWatermark, currentWatermark } = args;
+	const { current, armed, armedWorker, armedAt, armedGeneration, stalledAtWatermark, currentWatermark } = args;
 	if (current !== armed || armed.receiveStallReconnectAt !== armedAt || armed.unsubscribed)
 		return { fire: false, releaseThrottle: false };
+	if (armed.worker !== armedWorker) return { fire: false, releaseThrottle: true };
 	if ((armed.connectGeneration ?? 0) !== armedGeneration) return { fire: false, releaseThrottle: true };
 	if (stalledAtWatermark != null && currentWatermark != null && currentWatermark > stalledAtWatermark)
 		return { fire: false, releaseThrottle: false };
@@ -656,6 +658,33 @@ const nodeMap = new Map(); // this is a map of all nodes that are available to c
 const selfCatchupOfDatabase = new Map<string, number>(); // this is a map of databases that need to catch up to themselves, and the time of the last audit entry (to start from)
 const routes: Route[] = [];
 
+export function replaceConfiguredRoutes(nextRoutes: Route[]): void {
+	routes.splice(0, routes.length, ...nextRoutes);
+}
+
+export function deriveEffectiveLeader(args: {
+	persistedIsLeader?: boolean;
+	hasExplicitLeader: boolean;
+	leaderName?: string;
+	nodeName?: string;
+}): boolean {
+	const { persistedIsLeader, hasExplicitLeader, leaderName, nodeName } = args;
+	return (
+		persistedIsLeader === true ||
+		(persistedIsLeader !== false && (!leaderName || (hasExplicitLeader && nodeName === leaderName)))
+	);
+}
+
+export function connectReportAdvancesGeneration(
+	entry: { worker?: { threadId?: number } },
+	report: { opened?: boolean; reportingThreadId?: number }
+): boolean {
+	return (
+		report.opened === true &&
+		(report.reportingThreadId === undefined || report.reportingThreadId === entry.worker?.threadId)
+	);
+}
+
 /**
  * Read a single hdb_nodes row synchronously.
  *
@@ -765,11 +794,10 @@ export async function startOnMainThread(options) {
 	// but don't await this because this start function has to finish before the threads can start
 	whenThreadsStarted.then(async () => {
 		// A deploy_component reload re-invokes startOnMainThread on this same already-resolved module
-		// instance, so this callback re-fires (whenThreadsStarted is already settled). Reset the
-		// module-level route list before repopulating so routes don't accumulate duplicates across
-		// deploys; the node-update watcher started by subscribeToNodeUpdates below is itself idempotent
-		// (it supersedes the prior watcher rather than stacking one — see knownNodes.ts). harper-pro#460.
-		routes.length = 0;
+		// instance while the prior node watcher remains live. Build the replacement separately so that
+		// watcher sees either complete route set, then preserve the exported array identity on commit.
+		const nextRoutes: Route[] = [];
+		const tentativeRouteNodes = [];
 		const nodes = [];
 		// if we are getting notified of system table updates, hdbNodes could be absent
 		for await (const node of databases.system.hdb_nodes?.search([]) || []) {
@@ -828,14 +856,15 @@ export async function startOnMainThread(options) {
 				if (replicateAll) {
 					if (route.replicates == undefined) route.replicates = true;
 				}
-				routes.push(route);
+				nextRoutes.push(route);
 				if (nodes.find((node) => node.name === route.name)) continue;
-				// just tentatively add this node to the list of nodes in memory
-				onNodeUpdate(route);
+				tentativeRouteNodes.push(route);
 			} catch (error) {
 				console.error(error);
 			}
 		}
+		replaceConfiguredRoutes(nextRoutes);
+		for (const route of tentativeRouteNodes) onNodeUpdate(route);
 		// keyed 'subscription-manager' so a deploy_component reload (which re-fires this callback)
 		// supersedes only this watcher, while the CA-monitor and replication-confirmation watchers
 		// keyed elsewhere keep running concurrently (harper-pro#460).
@@ -943,6 +972,25 @@ export async function startOnMainThread(options) {
 			dbReplicationWorkers = new Map();
 			connectionReplicationMap.set(getNodeURL(node), dbReplicationWorkers);
 		}
+		let leaderContext: { hasExplicitLeader: boolean; leaderName?: string; nodeName?: string } | undefined;
+		function getLeaderContext() {
+			if (leaderContext) return leaderContext;
+			const leaderUrl: string | undefined = cliArgs.HDB_LEADER_URL ?? process.env.HDB_LEADER_URL ?? routes[0]?.url;
+			const hasExplicitLeader = !!leaderUrl;
+			let leaderName: string | undefined;
+			if (leaderUrl) {
+				leaderName = new URL(leaderUrl).hostname;
+			} else {
+				for (const candidate of getHDBNodeTable().primaryStore.getKeys({})) {
+					if (candidate !== getThisNodeName()) {
+						leaderName = candidate;
+						break;
+					}
+				}
+			}
+			const nodeName = node.name ?? (node.url && new URL(node.url).hostname);
+			return (leaderContext = { hasExplicitLeader, leaderName, nodeName });
+		}
 		dbReplicationWorkers.iterator = forEachReplicatedDatabase(options, (database, databaseName, replicateByDefault) => {
 			if (replicateByDefault) {
 				onDatabase(databaseName, true, forceResubscribe);
@@ -998,8 +1046,17 @@ export async function startOnMainThread(options) {
 			// does for table-exclusion. undefined when no config route matches this peer. harper-pro#498.
 			const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
 			const nodes = [{ replicateByDefault: tablesReplicateByDefault, ...node, routeReplicates, configRouteReplicates }];
-			// Use the enriched payload (nodes[0]) so the receive gate sees configRouteReplicates.
-			const shouldSubscribe = shouldReplicateFromNode(nodes[0] as any, databaseName);
+			let shouldSubscribe = shouldReplicateFromNode(nodes[0] as any, databaseName);
+			if (shouldSubscribe || existingEntry?.nodes?.[0]?.isLeader) {
+				const { hasExplicitLeader, leaderName, nodeName } = getLeaderContext();
+				nodes[0].isLeader = deriveEffectiveLeader({
+					persistedIsLeader: node.isLeader,
+					hasExplicitLeader,
+					leaderName,
+					nodeName,
+				});
+				shouldSubscribe = shouldReplicateFromNode(nodes[0] as any, databaseName);
+			}
 			// Resolve the URL here rather than at the subscribe-scheduling site below: this array becomes
 			// `entry.nodes`, and the early-return path replaces it without ever reaching that site — which
 			// left the wedge re-drive posting a request with no url ("Failed to create web socket to
@@ -1023,7 +1080,6 @@ export async function startOnMainThread(options) {
 			}
 			if (existingEntry) {
 				worker = existingEntry.worker;
-				nodes[0].isLeader = nodes[0].isLeader || existingEntry.nodes?.[0]?.isLeader;
 				existingEntry.nodes = nodes;
 				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
 				// forceResubscribe for a connection that has been connected:false past the threshold: that
@@ -1063,32 +1119,7 @@ export async function startOnMainThread(options) {
 				ensureWorkerExitHandler(worker);
 			}
 			if (shouldSubscribe) {
-				let leaderUrl: string =
-					cliArgs.HDB_LEADER_URL ?? // first see if there was a leader explicitly specified
-					process.env.HDB_LEADER_URL ??
-					routes[0]?.url; // if we have routes, use the first one
-				// Track whether the leader is explicitly configured (env/cli/routes). The
-				// fallback "first other node in hdb_nodes" is only a guess and must NOT be
-				// treated as authoritative — otherwise a bidirectional add_node handshake
-				// where the responder has no leader config will incorrectly mark the
-				// requester as its leader and trigger a reverse full-table copy.
-				const hasExplicitLeader = !!leaderUrl;
-
-				let leaderName = leaderUrl
-					? new URL(leaderUrl).hostname
-					: Array.from(
-							getHDBNodeTable()
-								.primaryStore.getKeys({})
-								.filter((nodeName) => nodeName !== getThisNodeName()) // find the first node that is not this one
-						)[0]; // try to find the first node
-				const nodeName = nodes[0].name ?? (nodes[0].url && new URL(nodes[0].url).hostname);
-				// isLeader is true only if:
-				//   1. it was explicitly persisted (e.g. by add_node { isLeader: true }), OR
-				//   2. there is no leader candidate at all, OR
-				//   3. an explicitly configured leader (env/cli/routes) matches this node.
-				// We deliberately do NOT honour nodeName === leaderName when leaderName came
-				// from the "first other node in hdb_nodes" fallback — that's just a guess.
-				nodes[0].isLeader = nodes[0].isLeader || !leaderName || (hasExplicitLeader && nodeName === leaderName);
+				const { leaderName, nodeName } = getLeaderContext();
 				// Stagger the subscribe when reassigning (subscribeStagger set) so N databases on one peer
 				// don't dial N catchup connections simultaneously. See #446.
 				const staggerMs = subscribeStagger ? subscribeStagger.count++ * RECONNECT_STAGGER_MS : 0;
@@ -1252,7 +1283,8 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		mainWorkerEntry.connected = true;
-		mainWorkerEntry.connectGeneration = (mainWorkerEntry.connectGeneration ?? 0) + 1;
+		if (connectReportAdvancesGeneration(mainWorkerEntry, connection))
+			mainWorkerEntry.connectGeneration = (mainWorkerEntry.connectGeneration ?? 0) + 1;
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
@@ -1376,7 +1408,7 @@ export async function startOnMainThread(options) {
 		// rather than a partial bit-only mirror, so latency and — under REPLICATION_FAILOVER — the
 		// failover-restore block (pull migrated subscriptions back off the failover peer) run. Passing the
 		// entry's current latency avoids clobbering it, since the shared-memory truth carries none.
-		if (upCorrections) for (const connection of upCorrections) connectedToNode(connection);
+		if (upCorrections) for (const connection of upCorrections) connectedToNode({ ...connection, opened: true });
 		const httpWorkers = workers.filter((worker) => worker.name === 'http');
 		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
 		const wedgedNodeUrls = findWedgedNodeUrls(
@@ -1547,6 +1579,7 @@ export async function startOnMainThread(options) {
 					// and the connect generation so a reconnect inside the delay does too.
 					const stalledAtWatermark = getReceiveStatus(databaseName, nodes[0]?.name)?.lastReceivedTime;
 					const stalledAtGeneration = entry.connectGeneration ?? 0;
+					const stalledAtWorker = worker;
 					const request = {
 						...nodes[0],
 						type: 'force-reconnect-node',
@@ -1559,6 +1592,7 @@ export async function startOnMainThread(options) {
 						const verdict = shouldFireStallKick({
 							current: entries?.get(databaseName),
 							armed: entry,
+							armedWorker: stalledAtWorker,
 							armedAt: now,
 							armedGeneration: stalledAtGeneration,
 							stalledAtWatermark,
@@ -1760,7 +1794,7 @@ if (parentPort) {
 		parentPort.postMessage({ type: 'disconnected-from-node', ...connection });
 	};
 	connectedToNode = (connection) => {
-		parentPort.postMessage({ type: 'connected-to-node', ...connection });
+		parentPort.postMessage({ type: 'connected-to-node', ...connection, reportingThreadId: threadId });
 	};
 	onMessageByType('subscribe-to-node', (message) => {
 		// Defer until this worker has finished loading components (databases/tables + persisted hdb_nodes
