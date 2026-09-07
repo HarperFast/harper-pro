@@ -73,15 +73,18 @@ export function startAutomaticProfiling(options: Scope['options']): boolean {
 	}
 	if (profilerUnavailable()) return false;
 	if (!profilerStarted && !startProfiler()) return false;
-	scheduleCapture(capturePeriod);
+	scheduleCapture(capturePeriod, capturePeriod);
 	return true;
 }
 
-function scheduleCapture(delay: number) {
+// A capture's successor runs after the delay that capture was asked for, and is itself asked for
+// `delayAfterThat`. Automatic profiling asks the first capture for one period and every later one
+// for the shipped default, so captures land at one and two periods and then a thousand periods out.
+function scheduleCapture(delay: number, delayAfterThat = shippedRescheduleDelay()) {
 	clearTimeout(profilerTimer);
 	captureGeneration++;
 	profilerTimer = setTimeout(() => {
-		captureProfile(capturePeriod);
+		captureProfile(delayAfterThat);
 	}, delay).unref();
 }
 
@@ -118,11 +121,11 @@ let gpuAvailable = true;
 // later one stopped the profiler cannot re-arm it from its own finally.
 let captureGeneration = 0;
 
-// The cadence that ships: capturePeriod is already milliseconds, so this reschedules a thousand
-// periods out and production captures once after start and then roughly never. Kept on purpose —
-// a capture every period (a synchronous V8 profiler stop/start on every thread) at a short period
-// loses db-write analytics in integrationTests/cluster/replicatedAnalyticsUnion.test.mjs; restoring
-// per-period captures needs that interaction understood first.
+// The cadence that ships: capturePeriod is already milliseconds, so an omitted delay reschedules a
+// thousand periods out and production captures twice after start and then roughly never. Kept on
+// purpose — a capture every period (a synchronous V8 profiler stop/start on every thread) at a short
+// period loses db-write analytics in integrationTests/cluster/replicatedAnalyticsUnion.test.mjs;
+// restoring per-period captures needs that interaction understood first.
 // Capped at Node's largest timeout: past 2^31-1 ms a timer fires after 1 ms, which for
 // aggregatePeriod >= 2148 s meant a profiler stop/start every millisecond on every thread.
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
@@ -190,7 +193,7 @@ export async function captureProfile(delayToNextCapture = shippedRescheduleDelay
 		log.error?.('analytics profiler error:', error);
 	} finally {
 		if (!continuous) log.info?.('Profiling disabled');
-		else if (generation === captureGeneration) scheduleCapture(shippedRescheduleDelay());
+		else if (generation === captureGeneration) scheduleCapture(delayToNextCapture);
 	}
 	// this traverses the nodes and returns the number of sampling hits for the sample and attributes it
 	// to harper or user code (as opposed to execution of things like node internal modules or native code)
