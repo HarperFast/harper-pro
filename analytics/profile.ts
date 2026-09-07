@@ -58,27 +58,35 @@ export function handleApplication({ options }: Scope) {
 // Sampling nobody captures still costs a SIGPROF stack walk every 50ms on every worker, so a
 // non-positive aggregatePeriod leaves the profiler off; captureProfile() still starts it on demand.
 export function startAutomaticProfiling(options: Scope['options']): boolean {
-	clearTimeout(profilerTimer);
 	if (userCodeFolders.length === 0) return false;
-	if (options.get(['profiling']) === false) {
-		log.info?.('Profiling disabled by configuration');
-		return false;
-	}
 	capturePeriod = ((options.get(['aggregatePeriod']) as number) ?? 60) * 1000;
-	if (capturePeriod <= 0) {
-		log.info?.('Profiling not started: analytics.aggregatePeriod is not positive, so nothing would capture it');
+	const disabledReason =
+		options.get(['profiling']) === false
+			? 'Profiling disabled by configuration'
+			: capturePeriod <= 0
+				? 'Profiling not started: analytics.aggregatePeriod is not positive, so nothing would capture it'
+				: undefined;
+	if (disabledReason) {
+		log.info?.(disabledReason);
+		if (profilerStarted) captureProfile(-1); // an earlier automatic start is no longer consumed
 		return false;
 	}
 	if (profilerUnavailable()) return false;
 	if (!profilerStarted && !startProfiler()) return false;
-	profilerTimer = setTimeout(() => {
-		captureProfile(capturePeriod);
-	}, capturePeriod).unref();
+	scheduleCapture(capturePeriod);
 	return true;
 }
 
-// Entry and completion markers around the native calls: if a worker wedges inside one of them, the
-// entry line is the last thing it logs, so both are needed to place the wedge (see harper-pro#788).
+function scheduleCapture(delay: number) {
+	clearTimeout(profilerTimer);
+	profilerTimer = setTimeout(() => {
+		captureProfile(capturePeriod);
+	}, delay).unref();
+}
+
+// Entry and completion markers: a worker that wedges inside the native call leaves the entry line
+// as its last log line (see harper-pro#788). profilerStarted mirrors the native state after every
+// call, including a failed one.
 function startProfiler(): boolean {
 	const startedAt = performance.now();
 	log.debug?.('Profiler start requested');
@@ -87,8 +95,9 @@ function startProfiler(): boolean {
 	} catch (error) {
 		log.error?.('Profiler failed to start:', error);
 		return false;
+	} finally {
+		profilerStarted = timeProfiler.isStarted();
 	}
-	profilerStarted = true;
 	log.debug?.(`Profiler started in ${(performance.now() - startedAt).toFixed(1)}ms`);
 	return true;
 }
@@ -96,10 +105,12 @@ function startProfiler(): boolean {
 function stopProfiler(restart: boolean): Profile {
 	const startedAt = performance.now();
 	log.debug?.(`Profiler stop requested (restart=${restart})`);
-	const profile = timeProfiler.stop(restart);
-	if (!restart) profilerStarted = false;
-	log.debug?.(`Profiler stopped in ${(performance.now() - startedAt).toFixed(1)}ms (restart=${restart})`);
-	return profile;
+	try {
+		return timeProfiler.stop(restart);
+	} finally {
+		profilerStarted = timeProfiler.isStarted();
+		log.debug?.(`Profiler stop returned after ${(performance.now() - startedAt).toFixed(1)}ms (restart=${restart})`);
+	}
 }
 let lastChildCpuTime = 0;
 let gpuAvailable = true;
@@ -108,7 +119,8 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	clearTimeout(profilerTimer);
 	if (profilerUnavailable()) return;
 	if (!profilerStarted) {
-		startProfiler();
+		// A cold start has nothing to capture yet; it arms the capture the delay asks for, or nothing.
+		if (delayToNextCapture > 0 && startProfiler()) scheduleCapture(delayToNextCapture);
 		return;
 	}
 	const hitCountThreshold = 100;
@@ -163,9 +175,7 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	} finally {
 		// and start the profiler again
 		if (delayToNextCapture > 0) {
-			profilerTimer = setTimeout(() => {
-				captureProfile();
-			}, delayToNextCapture).unref();
+			scheduleCapture(delayToNextCapture);
 		} else {
 			// somehow this can later get set to a negative number which causes big problems (high-frequency restarts of the profiler)
 			log.info?.('Profiling disabled');

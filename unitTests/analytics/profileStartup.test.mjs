@@ -10,7 +10,6 @@ describe('Analytics profiler startup gate', () => {
 	before(() => {
 		userCodeFolders.push(new URL('../testApp/', import.meta.url).toString());
 	});
-	// A non-positive delay stops the real profiler for good and clears the capture timer.
 	afterEach(async () => {
 		if (timeProfiler.isStarted()) await captureProfile(-1);
 		assert.equal(timeProfiler.isStarted(), false);
@@ -32,12 +31,32 @@ describe('Analytics profiler startup gate', () => {
 		assert.equal(startAutomaticProfiling(optionsWith({})), true);
 		assert.equal(timeProfiler.isStarted(), true);
 	});
+	it('stops a running profiler when automatic profiling is disabled later', async () => {
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 60 })), true);
+		assert.equal(timeProfiler.isStarted(), true);
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: -1 })), false);
+		assert.equal(timeProfiler.isStarted(), false);
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 60 })), true);
+		assert.equal(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 60 })), false);
+		assert.equal(timeProfiler.isStarted(), false);
+	});
+	it('reconciles the started flag when a terminal stop finds the profiler already stopped', async () => {
+		await captureProfile(10000);
+		assert.equal(timeProfiler.isStarted(), true);
+		timeProfiler.stop(); // behind the module's back
+		await captureProfile(-1); // stop(true) throws, is contained, and the flag follows the real state
+		assert.equal(timeProfiler.isStarted(), false);
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 60 })), true);
+		assert.equal(timeProfiler.isStarted(), true);
+	});
 	it('an explicit capture starts a stopped profiler and a terminal capture stops it', async () => {
 		await captureProfile(10000);
 		assert.equal(timeProfiler.isStarted(), true);
 		await captureProfile(10000);
 		assert.equal(timeProfiler.isStarted(), true);
 		await captureProfile(-1);
+		assert.equal(timeProfiler.isStarted(), false);
+		await captureProfile(-1); // nothing running: neither starts nor throws
 		assert.equal(timeProfiler.isStarted(), false);
 		await captureProfile(10000);
 		assert.equal(timeProfiler.isStarted(), true);
