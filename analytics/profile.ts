@@ -123,8 +123,11 @@ let captureGeneration = 0;
 // a capture every period (a synchronous V8 profiler stop/start on every thread) at a short period
 // loses db-write analytics in integrationTests/cluster/replicatedAnalyticsUnion.test.mjs; restoring
 // per-period captures needs that interaction understood first.
+// Capped at Node's largest timeout: past 2^31-1 ms a timer fires after 1 ms, which for
+// aggregatePeriod >= 2148 s meant a profiler stop/start every millisecond on every thread.
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 function shippedRescheduleDelay(): number {
-	return (capturePeriod ?? 60) * 1000;
+	return Math.min((capturePeriod ?? 60) * 1000, MAX_TIMEOUT_MS);
 }
 
 export async function captureProfile(delayToNextCapture = shippedRescheduleDelay()): Promise<void> {
