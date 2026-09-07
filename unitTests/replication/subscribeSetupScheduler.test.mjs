@@ -10,7 +10,6 @@
  */
 
 import assert from 'node:assert';
-import sinon from 'sinon';
 import { createSubscribeSetupScheduler, dispatchSubscriptionNodes } from '#src/replication/subscriptionManager';
 
 const URL_A = 'wss://peer-a:9933';
@@ -21,27 +20,60 @@ const MAX_DELAY = 30_000;
 
 const NODES = [{ name: 'peer-a', url: URL_A }];
 
+function createManualTimers() {
+	let now = 0;
+	let nextId = 0;
+	const timers = new Map();
+	return {
+		setTimer(callback, delay) {
+			const timer = {
+				id: nextId++,
+				due: now + delay,
+				callback,
+				unref() {
+					return timer;
+				},
+			};
+			timers.set(timer.id, timer);
+			return timer;
+		},
+		clearTimer(timer) {
+			if (timer) timers.delete(timer.id);
+		},
+		tick(duration) {
+			const target = now + duration;
+			while (true) {
+				let next;
+				for (const timer of timers.values()) {
+					if (timer.due <= target && (!next || timer.due < next.due)) next = timer;
+				}
+				if (!next) break;
+				timers.delete(next.id);
+				now = next.due;
+				next.callback();
+			}
+			now = target;
+		},
+		now: () => now,
+	};
+}
+
+let timers;
+
 function makeScheduler(random) {
 	const dispatches = [];
 	const scheduler = createSubscribeSetupScheduler({
-		dispatch: (url, database, nodes) => dispatches.push({ url, database, nodes, at: Date.now() }),
+		dispatch: (url, database, nodes) => dispatches.push({ url, database, nodes, at: timers.now() }),
 		random,
+		setTimer: timers.setTimer,
+		clearTimer: timers.clearTimer,
 	});
 	return { scheduler, dispatches };
 }
 
 describe('subscription-setup scheduler (harper-pro#327)', () => {
-	let clock;
-
 	beforeEach(() => {
-		clock = sinon.useFakeTimers();
-	});
-
-	afterEach(() => {
-		// clock.restore() only — a sandbox-wide sinon.restore() here re-restores the stale
-		// globalThis.setTimeout that receiveWatchdog.test.mjs's manually-restored spy left registered,
-		// which silently breaks real timers for every file that runs after this one.
-		clock.restore();
+		timers = createManualTimers();
 	});
 
 	it('bounds a 60s re-drive storm to a handful of setups with one pending timer throughout', () => {
@@ -52,7 +84,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		for (let i = 0; i < 60_000; i++) {
 			scheduler.schedule(URL_A, 'data', NODES);
 			maxPending = Math.max(maxPending, scheduler.pendingCount());
-			clock.tick(1);
+			timers.tick(1);
 		}
 
 		// Ceilings double 400 → 30,000; each delay is 200 + 0.5 * (ceiling - 200).
@@ -72,7 +104,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 			const delay = scheduler.schedule(URL_A, 'data', NODES);
 			assert.ok(delay >= MIN_DELAY);
 			assert.ok(delay < MAX_DELAY);
-			clock.tick(delay);
+			timers.tick(delay);
 		}
 	});
 
@@ -81,7 +113,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		assert.equal(scheduler.schedule(URL_A, 'data', NODES), 300);
 		assert.equal(scheduler.schedule(URL_A, 'data', NODES), undefined, 'deduped');
 		assert.equal(scheduler.schedule(URL_A, 'data', NODES), undefined, 'still deduped');
-		clock.tick(60_000);
+		timers.tick(60_000);
 		assert.equal(dispatches.length, 1);
 	});
 
@@ -91,7 +123,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		assert.equal(scheduler.schedule(URL_A, 'other', NODES), 300);
 		assert.equal(scheduler.schedule(URL_B, 'data', NODES), 300);
 		assert.equal(scheduler.pendingCount(), 3);
-		clock.tick(300);
+		timers.tick(300);
 		assert.deepEqual(
 			dispatches.map(({ url, database, at }) => ({ url, database, at })),
 			[
@@ -103,14 +135,15 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 	});
 
 	it('decorrelates two peers failing on identical timing', () => {
-		const a = createSubscribeSetupScheduler({ dispatch: () => {}, random: () => 0.1 });
-		const b = createSubscribeSetupScheduler({ dispatch: () => {}, random: () => 0.9 });
+		const timerOptions = { setTimer: timers.setTimer, clearTimer: timers.clearTimer };
+		const a = createSubscribeSetupScheduler({ dispatch: () => {}, random: () => 0.1, ...timerOptions });
+		const b = createSubscribeSetupScheduler({ dispatch: () => {}, random: () => 0.9, ...timerOptions });
 		const aDelays = [];
 		const bDelays = [];
 		for (let attempt = 0; attempt < 5; attempt++) {
 			aDelays.push(a.schedule(URL_A, 'data', NODES));
 			bDelays.push(b.schedule(URL_A, 'data', NODES));
-			clock.tick(MAX_DELAY + MIN_DELAY);
+			timers.tick(MAX_DELAY + MIN_DELAY);
 		}
 		assert.notDeepEqual(aDelays, bDelays);
 		for (let i = 0; i < aDelays.length; i++) assert.ok(aDelays[i] < bDelays[i]);
@@ -125,7 +158,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		const second = [{ name: 'peer-a', url: URL_A, isLeader: true }];
 		scheduler.schedule(URL_A, 'data', first);
 		assert.equal(scheduler.schedule(URL_A, 'data', second), undefined);
-		clock.tick(300);
+		timers.tick(300);
 		assert.equal(dispatches.length, 1);
 		assert.equal(dispatches[0].nodes, second);
 	});
@@ -140,7 +173,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		scheduler.schedule(URL_A, 'data', armed);
 		scheduler.refreshPending(URL_A, 'data', refreshed);
 		assert.equal(scheduler.pendingCount(), 1, 'no second timer');
-		clock.tick(300);
+		timers.tick(300);
 		assert.equal(dispatches.length, 1);
 		assert.equal(dispatches[0].nodes, refreshed);
 	});
@@ -149,13 +182,26 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
 		scheduler.refreshPending(URL_A, 'data', NODES);
 		assert.equal(scheduler.pendingCount(), 0);
-		clock.tick(60_000);
+		timers.tick(60_000);
 		assert.deepEqual(dispatches, []);
 	});
 
-	it('adds the caller-supplied stagger on top of the backoff', () => {
+	it('honors a caller-supplied minimum delay above the jittered backoff', () => {
 		const { scheduler } = makeScheduler(() => 0.5);
-		assert.equal(scheduler.schedule(URL_A, 'data', NODES, 150), 450);
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES, 450), 450);
+	});
+
+	it('preserves sweep spacing when independent jitter draws would collide', () => {
+		const draws = [0.75, 0.5, 0.25, 0];
+		const { scheduler } = makeScheduler(() => draws.shift());
+		const delays = [];
+		let nextDelayFloor = 0;
+		for (let i = 0; i < 4; i++) {
+			const delay = scheduler.schedule(URL_A, `data${i}`, NODES, nextDelayFloor);
+			delays.push(delay);
+			nextDelayFloor = delay + 50;
+		}
+		assert.deepEqual(delays, [350, 400, 450, 500]);
 	});
 
 	// A connect report cannot be attributed to the entry that armed the setup (failover subscribes on a
@@ -165,13 +211,13 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 	it('noteConnected resets the escalated delay and leaves the armed setup to fire', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
 		scheduler.schedule(URL_A, 'data', NODES);
-		clock.tick(300);
+		timers.tick(300);
 		scheduler.schedule(URL_A, 'data', NODES); // second attempt: escalated to 500
 		assert.equal(scheduler.pendingCount(), 1);
 
 		scheduler.noteConnected(URL_A, 'data');
 		assert.equal(scheduler.pendingCount(), 1, 'still armed');
-		clock.tick(60_000);
+		timers.tick(60_000);
 		assert.equal(dispatches.length, 2, 'the armed setup fired');
 
 		assert.equal(scheduler.schedule(URL_A, 'data', NODES), 300, 'back to the first ceiling after success');
@@ -182,7 +228,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		const delays = [];
 		for (let cycle = 0; cycle < 5; cycle++) {
 			delays.push(scheduler.schedule(URL_A, 'data', NODES));
-			clock.tick(1000);
+			timers.tick(1000);
 			scheduler.noteConnected(URL_A, 'data');
 		}
 		assert.deepEqual(delays, [300, 300, 300, 300, 300]);
@@ -199,7 +245,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		scheduler.cancelUrl(URL_A);
 		assert.equal(scheduler.pendingCount(), 1);
 
-		clock.tick(60_000);
+		timers.tick(60_000);
 		assert.deepEqual(
 			dispatches.map(({ url, database, at }) => ({ url, database, at })),
 			[{ url: URL_B, database: 'data', at: 300 }]
@@ -212,9 +258,11 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 				throw new Error('uncloneable payload');
 			},
 			random: () => 0.5,
+			setTimer: timers.setTimer,
+			clearTimer: timers.clearTimer,
 		});
 		scheduler.schedule(URL_A, 'data', NODES);
-		assert.doesNotThrow(() => clock.tick(300));
+		assert.doesNotThrow(() => timers.tick(300));
 		assert.equal(scheduler.pendingCount(), 0, 'ownership released so the pair can be re-armed');
 		assert.equal(scheduler.schedule(URL_A, 'data', NODES), 500);
 	});
@@ -241,12 +289,14 @@ describe('self-catchup dispatch', () => {
 	it('attaches the rider on a fresh payload and consumes it only after dispatch', () => {
 		const nodes = [{ name: 'peer-a', url: URL_A, replicateByDefault: true }];
 		let consumed = 0;
+		let retained;
 		let dispatched;
 		dispatchSubscriptionNodes(nodes, {
 			startTime: 123,
 			nodeName: 'self',
 			now: () => 456,
 			dispatch: (value) => (dispatched = value),
+			retain: (value) => (retained = value),
 			consume: () => consumed++,
 		});
 
@@ -261,10 +311,27 @@ describe('self-catchup dispatch', () => {
 				replicates: true,
 			},
 		]);
+		assert.strictEqual(retained, dispatched[1]);
 		assert.equal(consumed, 1);
 	});
 
-	it('retains the rider when dispatch throws', () => {
+	it('reattaches a retained rider on recovery without consuming it again', () => {
+		const nodes = [{ name: 'peer-a', url: URL_A }];
+		const selfCatchupNode = { name: 'self', startTime: 123, endTime: 456, replicates: true };
+		let consumed = 0;
+		let dispatched;
+		dispatchSubscriptionNodes(nodes, {
+			selfCatchupNode,
+			dispatch: (value) => (dispatched = value),
+			retain: () => assert.fail('an existing rider must not be retained again'),
+			consume: () => consumed++,
+		});
+
+		assert.deepEqual(dispatched, [...nodes, selfCatchupNode]);
+		assert.equal(consumed, 0);
+	});
+
+	it('leaves the rider unclaimed when dispatch throws', () => {
 		const nodes = [{ name: 'peer-a', url: URL_A }];
 		let consumed = 0;
 		assert.throws(
@@ -275,6 +342,7 @@ describe('self-catchup dispatch', () => {
 					dispatch: () => {
 						throw new Error('postMessage failed');
 					},
+					retain: () => assert.fail('a failed dispatch must not retain the rider'),
 					consume: () => consumed++,
 				}),
 			/postMessage failed/

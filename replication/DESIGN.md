@@ -116,7 +116,7 @@ decorrelated schedule.** Pacing alone is not enough; the storm surface below nee
 
 | Site                                                                            | Schedule                                                                                                                                                                                                                                                                   | Reset signal                                                              |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `createSubscribeSetupScheduler` (`subscriptionManager.ts`) — subscription setup | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s, plus the caller's `RECONNECT_STAGGER_MS` stagger                                                                                                                                                  | `connectedToNode` (reset only; the armed setup still fires)               |
+| `createSubscribeSetupScheduler` (`subscriptionManager.ts`) — subscription setup | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s; stale-worker sweeps chain each returned delay into the next call's minimum, preserving `RECONNECT_STAGGER_MS` spacing across independent jitter draws                                             | `connectedToNode` (reset only; the armed setup still fires)               |
 | `NodeReplicationConnection.scheduleReconnect`                                   | fixed 500 ms floor, ceiling `INITIAL_RETRY_TIME` 500 ms → 30 s, full jitter; the floor preserves the hard minimum from the TLS-state incident while the remaining window decorrelates fleet redials (harper-pro#339)                                                       | `onFrameSent` — first frame actually sent, **not** socket open            |
 | `reconcileWorkers` wedge / receive-stall re-drives                              | one fixed-window draw per sweep, used as a common base under the existing `RECONNECT_STAGGER_MS` spacing (decorrelation only; the re-drives are already throttled by the `disconnectedAt` / `receiveStallReconnectAt` re-stamps), one owned `entry.reDriveTimer` per entry | n/a — disarmed on unsubscribe, delete, worker exit, and entry replacement |
 | `runNodeUpdateWatcher` (`knownNodes.ts`) — hdb_nodes watcher restart            | full-jitter ceiling 1 s → 30 s                                                                                                                                                                                                                                             | an iteration that survived `NODE_WATCHER_HEALTHY_UPTIME_MS`               |
@@ -134,9 +134,10 @@ ending in an OOM kill. The scheduler holds one armed setup per **(peer URL, data
 (_not_ on the `connectionReplicationMap` entry, which the stale-worker path deletes and recreates), and
 the armed setup carries the newest level-state payload — `onDatabase`'s early-return path refreshes
 that payload without arming another timer, so a pending setup observes the latest routing, leadership,
-and exclusion state. Self-catchup is separate one-shot state: it is
-attached on a fresh array immediately before dispatch and consumed only after the worker message is
-accepted, so timer cancellation, stale dispatch, or a synchronous `postMessage` throw cannot lose it.
+and exclusion state. Self-catchup is separate one-shot state: the first dispatch claims it for one
+connection entry, which retains and reattaches the same bounded rider on every recovery re-drive. The
+global claim is consumed only after the worker message is accepted, so timer cancellation, entry refresh,
+a long offline retry, or a synchronous `postMessage` throw cannot lose or overwrite it.
 A setup is cancelled on
 unsubscribe, on node deletion, and on a same-name URL migration, all of which became reachable once a
 pending timer could live 30 s instead of 200 ms. The wedge/stall recovery kicks are owned the same way —

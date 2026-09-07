@@ -6,7 +6,7 @@ import {
 	replaceConfiguredRoutes,
 } from '#src/replication/subscriptionManager';
 
-describe('subscription manager review fixes', () => {
+describe('subscription routing and connection ownership', () => {
 	const previousRoutes = [...getConfiguredRoutes()];
 
 	after(() => {
