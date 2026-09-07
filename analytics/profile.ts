@@ -58,7 +58,8 @@ export function handleApplication({ options }: Scope) {
 // Sampling nobody captures still costs a SIGPROF stack walk every 50ms on every worker.
 export function startAutomaticProfiling(options: Scope['options']): boolean {
 	if (userCodeFolders.length === 0) return false;
-	capturePeriod = ((options.get(['aggregatePeriod']) as number) ?? 60) * 1000;
+	const aggregatePeriod = Number(options.get(['aggregatePeriod']) ?? 60);
+	capturePeriod = Number.isFinite(aggregatePeriod) ? aggregatePeriod * 1000 : 0;
 	const disabledReason =
 		options.get(['profiling']) === false
 			? 'Profiling disabled by configuration'
