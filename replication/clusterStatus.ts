@@ -19,9 +19,16 @@ import {
 } from './replicationConnection.ts';
 import '../core/server/serverHelpers/serverUtilities.ts';
 
-let clusterStatusResolve;
-onMessageByType('cluster-status', async (message) => {
-	clusterStatusResolve(message);
+// Keyed by request id: the main thread's answer takes a bounded fan-out, so two cluster_status calls on
+// one worker can overlap, and a single resolver slot would leave the first caller pending forever.
+const clusterStatusResolvers = new Map<number, (message: any) => void>();
+let nextClusterStatusRequestId = 1;
+onMessageByType('cluster-status', (message) => {
+	const resolve = clusterStatusResolvers.get(message.requestId);
+	if (resolve) {
+		clusterStatusResolvers.delete(message.requestId);
+		resolve(message);
+	}
 });
 /**
  * Function will msg all the remote nodes in the hdbNodes table. From the replies
@@ -32,12 +39,13 @@ onMessageByType('cluster-status', async (message) => {
 export async function clusterStatus() {
 	let response;
 	if (parentPort) {
-		parentPort.postMessage({ type: 'request-cluster-status' });
+		const requestId = nextClusterStatusRequestId++;
 		response = await new Promise((resolve) => {
-			clusterStatusResolve = resolve;
+			clusterStatusResolvers.set(requestId, resolve);
+			parentPort.postMessage({ type: 'request-cluster-status', requestId });
 		});
 	} else {
-		response = requestClusterStatus();
+		response = await requestClusterStatus();
 	}
 
 	// Augment the response with replication status information

@@ -15,11 +15,19 @@ export const MINIMUM_PROTOCOL_VERSION = 1;
 /** Level at which a peer supports the correlated subscription-setup acknowledgement (harper-pro#642). */
 export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
 
+/**
+ * Level at which a peer applies replicated record-lock control entries (harper-pro#438, W9 Phase 1).
+ * The send path never forwards a control entry to a peer below it, and a peer below it in a
+ * database's replication group makes cluster-scoped `lock()` fail closed there.
+ */
+export const RECORD_LOCKS_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	protocolVersion: number;
 	subscriptionSetupAck: number;
 	subscriptionSetupBudgetMs: number | undefined;
+	recordLocks: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -41,7 +49,13 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		protocolVersion: resolveLevel(bag?.protocolVersion, LOCAL_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION),
 		subscriptionSetupAck: resolveLevel(bag?.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY, 0),
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
+		recordLocks: resolveLevel(bag?.recordLocks, RECORD_LOCKS_CAPABILITY, 0),
 	});
+}
+
+/** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
+export function peerSupportsRecordLocks(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.recordLocks >= RECORD_LOCKS_CAPABILITY;
 }
 
 /** A peer that advertised nothing — the pre-registry baseline. */
@@ -52,11 +66,16 @@ export const ABSENT_PEER_CAPABILITIES: ResolvedPeerCapabilities = resolvePeerCap
  * when `replicationConnection.ts` loads. Deriving it behind this module's import graph would let an
  * earlier importer evaluate it before config loads and silently advertise a default-derived budget.
  */
-export function buildLocalCapabilities(subscriptionSetupBudgetMs: number): Readonly<Record<string, number>> {
+export function buildLocalCapabilities(
+	subscriptionSetupBudgetMs: number,
+	recordLocksEnabled: boolean
+): Readonly<Record<string, number>> {
 	return Object.freeze({
 		protocolVersion: LOCAL_PROTOCOL_VERSION,
 		subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 		subscriptionSetupBudgetMs,
+		// A node that has not enabled cluster locks never grants, so it must not claim it would.
+		recordLocks: recordLocksEnabled ? RECORD_LOCKS_CAPABILITY : 0,
 	});
 }
 
@@ -66,7 +85,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a !== undefined &&
 		a.protocolVersion === b.protocolVersion &&
 		a.subscriptionSetupAck === b.subscriptionSetupAck &&
-		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs
+		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
+		a.recordLocks === b.recordLocks
 	);
 }
 

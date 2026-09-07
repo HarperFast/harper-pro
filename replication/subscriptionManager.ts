@@ -6,6 +6,8 @@
 import { getDatabases } from '../core/resources/databases.ts';
 import { transaction } from '../core/resources/transaction.ts';
 import { workers, onMessageByType, whenThreadsStarted } from '../core/server/threads/manageThreads.js';
+import { collectRecordLockStatus, recordLockOwnerFor } from './recordLockTransport.ts';
+import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import {
 	subscribeToNode,
@@ -571,6 +573,14 @@ export async function startOnMainThread(options) {
 	// we do all of the main management of tracking connections and subscriptions on the main thread and delegate
 	// the actual work to the worker threads
 	let nextWorkerIndex = 0;
+	// With cluster record locks enabled, every subscription for a database lives on the worker that
+	// coordinates its locks, so the coordinator applies the database's inbound control entries in order
+	// with its data; otherwise placement stays per (peer, database) round-robin.
+	function placeSubscription(databaseName: string, httpWorkers: any[]) {
+		if (CLUSTER_RECORD_LOCKS_ENABLED) return recordLockOwnerFor(databaseName, httpWorkers);
+		nextWorkerIndex = nextWorkerIndex % httpWorkers.length; // wrap around as necessary
+		return httpWorkers[nextWorkerIndex++];
+	}
 	const databases = getDatabases();
 	// find all the databases last recorded audit entry so that we can inquire from the first node for self catch-up
 	// of any records that may have been missed
@@ -864,8 +874,7 @@ export async function startOnMainThread(options) {
 					existingEntry.createdAt = Date.now();
 				}
 			} else if (shouldSubscribe) {
-				nextWorkerIndex = nextWorkerIndex % httpWorkers.length; // wrap around as necessary
-				worker = httpWorkers[nextWorkerIndex++];
+				worker = placeSubscription(databaseName, httpWorkers);
 				if (!worker) {
 					logger.warn('No http workers available to subscribe to node', node.name, getNodeURL(node));
 				}
@@ -1111,8 +1120,7 @@ export async function startOnMainThread(options) {
 	};
 	function connectToNextWorker(node: any, database: string, connectingNode = node) {
 		const httpWorkers = workers.filter((worker: any) => worker.name === 'http');
-		nextWorkerIndex = nextWorkerIndex % httpWorkers.length; // wrap around as necessary
-		const worker = httpWorkers[nextWorkerIndex++];
+		const worker = placeSubscription(database, httpWorkers);
 		// not enumerable property, we don't want this to be serialized in the postMessage
 		Object.defineProperty(node, 'worker', { value: worker, configurable: true });
 		if (worker) {
@@ -1380,7 +1388,7 @@ export async function startOnMainThread(options) {
  * @param message
  * @param port
  */
-export function requestClusterStatus(message?, port?) {
+export async function requestClusterStatus(message?, port?) {
 	const connections = [];
 	for (const [node_name, node] of nodeMap) {
 		try {
@@ -1416,11 +1424,16 @@ export function requestClusterStatus(message?, port?) {
 			logger.warn('Error getting cluster status for', node?.url, error);
 		}
 	}
+	const recordLocks = await collectRecordLockStatus();
 	port?.postMessage({
 		type: 'cluster-status',
+		// Echoed so the requesting worker can pair the answer with its own call: the fan-out above
+		// takes long enough that two cluster_status requests on one worker can overlap.
+		requestId: message?.requestId,
 		connections,
+		recordLocks,
 	});
-	return { connections };
+	return { connections, recordLocks };
 }
 
 // threadServer.js starts servers at import time on non-main workers, and job workers import this

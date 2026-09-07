@@ -26,7 +26,13 @@ import {
 	databaseSubscriptions,
 	tableUpdateListeners,
 	LATENCY_POSITION,
+	deriveConnectionTruth,
 } from './replicationConnection.ts';
+import {
+	ensureRecordLockTransport,
+	releaseRecordLockTransport,
+	setConnectionDownSinceReader,
+} from './recordLockTransport.ts';
 import { redactOperationForLog } from './logRedaction.ts';
 import { registerShutdownDrain } from '../core/components/shutdownDrain.ts';
 import { hasProgressingBlobSends, drainBlobSends } from './blobSendDrain.ts';
@@ -369,8 +375,10 @@ function assignReplicationSource(options) {
 				}
 			}
 			dbSubscriptions.delete(databaseName);
+			releaseRecordLockTransport(databaseName);
 			return;
 		}
+		ensureRecordLockTransport(databaseName);
 		for (const tableName in database) {
 			const Table = database[tableName];
 			setReplicator(databaseName, Table, options);
@@ -378,6 +386,10 @@ function assignReplicationSource(options) {
 		}
 	});
 }
+setConnectionDownSinceReader((status) => {
+	const truth = deriveConnectionTruth(status);
+	return truth.connected ? undefined : truth.errorTime;
+});
 
 /**
  * Get/create a replication resource that can be assigned as a source to tables

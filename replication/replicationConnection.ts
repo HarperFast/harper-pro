@@ -20,6 +20,7 @@ import {
 	ACTION_32_BIT,
 	auditRetention,
 	LOCAL_ONLY,
+	isLockControlType,
 } from '../core/resources/auditStore.ts';
 import {
 	exportIdMapping,
@@ -36,6 +37,8 @@ import {
 } from './replicator.ts';
 import { redactOperationForLog } from './logRedaction.ts';
 import { CopyCursorWatermark } from './copyCursorWatermark.ts';
+import { recordPeerLockCapability } from './recordLockTransport.ts';
+import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -52,6 +55,7 @@ import {
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
+	peerSupportsRecordLocks,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -531,7 +535,7 @@ const SUBSCRIPTION_SETUP_TIMEOUT_MS = positiveMsOr(
 const SEND_SUBSCRIPTION_SETUP_BUDGET_MS = SEND_SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL;
 // Built once and sent by reference on every handshake, so the advertised bag and the gate that reads a
 // peer's cannot drift apart.
-const LOCAL_CAPABILITIES = buildLocalCapabilities(SEND_SUBSCRIPTION_SETUP_BUDGET_MS);
+const LOCAL_CAPABILITIES = buildLocalCapabilities(SEND_SUBSCRIPTION_SETUP_BUDGET_MS, CLUSTER_RECORD_LOCKS_ENABLED);
 // Shared by every socket in this worker thread, so one peer cannot emit a warn line per socket per
 // window by sending a single unrecognized frame on each. Per-socket counts stay on each connection.
 const unknownCommandWarnThrottle = createThrottleState();
@@ -3914,6 +3918,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		return replicationSharedStatus;
 	}
+	// Both sides of every link write it: the record-lock owner reads the peer's answer from shared
+	// memory because an inbound-only peer's socket may live on another thread. Re-run once the
+	// database's audit store is known, since the inbound side learns the database after the bag.
+	function recordPeerLockCapabilityFromHandshake() {
+		if (!peerCapabilitiesLearned) return;
+		const status = getSharedStatus();
+		if (status) recordPeerLockCapability(status, peerSupportsRecordLocks(peerCapabilities));
+	}
 	if (databaseName) {
 		setDatabase(databaseName);
 	}
@@ -4350,6 +4362,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									return;
 								}
 							}
+							recordPeerLockCapabilityFromHandshake();
 							sendSubscriptionRequestUpdate();
 						}
 						break;
@@ -5091,6 +5104,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							if (auditRecord.extendedType & LOCAL_ONLY) {
 								return skipAuditRecord();
 							}
+							// Lock control entries (harper-pro#438) are the first capability-gated frame: a peer that
+							// has not advertised `recordLocks` would apply them as records. Skipping one can only
+							// cost the requester a 423, never a second holder.
+							if (
+								isLockControlType(auditRecord.type) &&
+								!(peerCapabilitiesLearned && peerSupportsRecordLocks(peerCapabilities))
+							) {
+								return skipAuditRecord();
+							}
 							const nodeId = auditRecord.nodeId;
 							const tableId = auditRecord.tableId;
 							let tableEntry = tableById[tableId];
@@ -5441,6 +5463,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								tableSubscriptionToReplicator = resolvedDatabaseSubscription;
 								if (closed || wsClosed) return;
 								auditStore = tableSubscriptionToReplicator.auditStore;
+								recordPeerLockCapabilityFromHandshake();
 								tableById = tableSubscriptionToReplicator.tableById.map(tableToTableEntry);
 								subscribedNodeIds = [];
 								if (excludedNodes) {
