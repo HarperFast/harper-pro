@@ -43,8 +43,8 @@ describe('Analytics profiler startup gate', () => {
 	it('reconciles the started flag when a terminal stop finds the profiler already stopped', async () => {
 		await captureProfile(10000);
 		assert.equal(timeProfiler.isStarted(), true);
-		timeProfiler.stop(); // behind the module's back
-		await captureProfile(-1); // stop(true) throws, is contained, and the flag follows the real state
+		timeProfiler.stop();
+		await captureProfile(-1);
 		assert.equal(timeProfiler.isStarted(), false);
 		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 60 })), true);
 		assert.equal(timeProfiler.isStarted(), true);
@@ -56,9 +56,16 @@ describe('Analytics profiler startup gate', () => {
 		assert.equal(timeProfiler.isStarted(), true);
 		await captureProfile(-1);
 		assert.equal(timeProfiler.isStarted(), false);
-		await captureProfile(-1); // nothing running: neither starts nor throws
+		await captureProfile(-1);
 		assert.equal(timeProfiler.isStarted(), false);
 		await captureProfile(10000);
+		assert.equal(timeProfiler.isStarted(), true);
+	});
+	it('an explicit capture with no delay stays on-demand when automatic aggregation is disabled', async () => {
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: -1 })), false);
+		await captureProfile();
+		assert.equal(timeProfiler.isStarted(), true);
+		await captureProfile();
 		assert.equal(timeProfiler.isStarted(), true);
 	});
 });

@@ -68,7 +68,7 @@ export function startAutomaticProfiling(options: Scope['options']): boolean {
 				: undefined;
 	if (disabledReason) {
 		log.info?.(disabledReason);
-		if (profilerStarted) captureProfile(-1); // an earlier automatic start is no longer consumed
+		if (profilerStarted) captureProfile(-1);
 		return false;
 	}
 	if (profilerUnavailable()) return false;
@@ -84,9 +84,8 @@ function scheduleCapture(delay: number) {
 	}, delay).unref();
 }
 
-// Entry and completion markers: a worker that wedges inside the native call leaves the entry line
-// as its last log line (see harper-pro#788). profilerStarted mirrors the native state after every
-// call, including a failed one.
+// Entry and completion markers place a wedge inside the native call (harper-pro#788); the entry
+// line can still sit in the file logger's write buffer if the thread never runs again.
 function startProfiler(): boolean {
 	const startedAt = performance.now();
 	log.debug?.('Profiler start requested');
@@ -114,13 +113,20 @@ function stopProfiler(restart: boolean): Profile {
 }
 let lastChildCpuTime = 0;
 let gpuAvailable = true;
+const DEFAULT_CAPTURE_PERIOD_MS = 60_000;
+// Bumped by every capture and lifecycle change, so a capture still awaiting GPU measurement when a
+// later one stopped the profiler cannot re-arm it from its own finally.
+let captureGeneration = 0;
 
-export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) * 1000): Promise<void> {
+export async function captureProfile(
+	delayToNextCapture = capturePeriod > 0 ? capturePeriod : DEFAULT_CAPTURE_PERIOD_MS
+): Promise<void> {
 	clearTimeout(profilerTimer);
 	if (profilerUnavailable()) return;
+	const continuous = delayToNextCapture > 0;
+	const generation = ++captureGeneration;
 	if (!profilerStarted) {
-		// A cold start has nothing to capture yet; it arms the capture the delay asks for, or nothing.
-		if (delayToNextCapture > 0 && startProfiler()) scheduleCapture(delayToNextCapture);
+		if (continuous && startProfiler()) scheduleCapture(delayToNextCapture);
 		return;
 	}
 	const hitCountThreshold = 100;
@@ -134,7 +140,7 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	// Start GPU measurement early so it runs in parallel with CPU profiling work
 	const gpuPromise = getWorkerIndex() === 0 && gpuAvailable ? getGpuUtilization() : null;
 	try {
-		const profile = stopProfiler(true);
+		const profile = stopProfiler(continuous);
 		const strings = profile.stringTable.strings;
 		for (let func of profile.function) {
 			fileNameById.set(func.id as number, strings[func.filename as number]);
@@ -173,18 +179,8 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	} catch (error) {
 		log.error?.('analytics profiler error:', error);
 	} finally {
-		// and start the profiler again
-		if (delayToNextCapture > 0) {
-			scheduleCapture(delayToNextCapture);
-		} else {
-			// somehow this can later get set to a negative number which causes big problems (high-frequency restarts of the profiler)
-			log.info?.('Profiling disabled');
-			try {
-				stopProfiler(false);
-			} catch (error) {
-				log.error?.('Profiler failed to stop:', error);
-			}
-		}
+		if (!continuous) log.info?.('Profiling disabled');
+		else if (generation === captureGeneration) scheduleCapture(delayToNextCapture);
 	}
 	// this traverses the nodes and returns the number of sampling hits for the sample and attributes it
 	// to harper or user code (as opposed to execution of things like node internal modules or native code)
