@@ -55,15 +55,14 @@ export function handleApplication({ options }: Scope) {
 	setTimeout(() => startAutomaticProfiling(options), 1000); // wait for everything to load before we start the profiler
 }
 
-// Sampling nobody captures still costs a SIGPROF stack walk every 50ms on every worker, so a
-// non-positive aggregatePeriod leaves the profiler off; captureProfile() still starts it on demand.
+// Sampling nobody captures still costs a SIGPROF stack walk every 50ms on every worker.
 export function startAutomaticProfiling(options: Scope['options']): boolean {
 	if (userCodeFolders.length === 0) return false;
 	capturePeriod = ((options.get(['aggregatePeriod']) as number) ?? 60) * 1000;
 	const disabledReason =
 		options.get(['profiling']) === false
 			? 'Profiling disabled by configuration'
-			: capturePeriod <= 0
+			: !(capturePeriod > 0)
 				? 'Profiling not started: analytics.aggregatePeriod is not positive, so nothing would capture it'
 				: undefined;
 	if (disabledReason) {
@@ -79,6 +78,7 @@ export function startAutomaticProfiling(options: Scope['options']): boolean {
 
 function scheduleCapture(delay: number) {
 	clearTimeout(profilerTimer);
+	captureGeneration++;
 	profilerTimer = setTimeout(() => {
 		captureProfile(capturePeriod);
 	}, delay).unref();

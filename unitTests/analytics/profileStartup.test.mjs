@@ -1,4 +1,5 @@
 import assert from 'node:assert';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { time as timeProfiler } from '@datadog/pprof';
 import { captureProfile, startAutomaticProfiling, userCodeFolders } from '#src/analytics/profile';
 
@@ -21,6 +22,10 @@ describe('Analytics profiler startup gate', () => {
 			assert.equal(timeProfiler.isStarted(), false);
 		});
 	}
+	it('does not start sampling when aggregatePeriod is not a number', () => {
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 'soon' })), false);
+		assert.equal(timeProfiler.isStarted(), false);
+	});
 	it('does not start sampling when profiling is disabled', () => {
 		assert.equal(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 60 })), false);
 		assert.equal(timeProfiler.isStarted(), false);
@@ -59,6 +64,15 @@ describe('Analytics profiler startup gate', () => {
 		await captureProfile(-1);
 		assert.equal(timeProfiler.isStarted(), false);
 		await captureProfile(10000);
+		assert.equal(timeProfiler.isStarted(), true);
+	});
+	it('keeps sampling across the captures its timers run', async () => {
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.02 })), true);
+		await sleep(150);
+		assert.equal(timeProfiler.isStarted(), true);
+		await captureProfile(-1);
+		await captureProfile(20);
+		await sleep(150);
 		assert.equal(timeProfiler.isStarted(), true);
 	});
 	it('an explicit capture with no delay stays on-demand when automatic aggregation is disabled', async () => {
