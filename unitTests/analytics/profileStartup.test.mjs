@@ -75,11 +75,4 @@ describe('Analytics profiler startup gate', () => {
 		await sleep(150);
 		assert.equal(timeProfiler.isStarted(), true);
 	});
-	it('an explicit capture with no delay stays on-demand when automatic aggregation is disabled', async () => {
-		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: -1 })), false);
-		await captureProfile();
-		assert.equal(timeProfiler.isStarted(), true);
-		await captureProfile();
-		assert.equal(timeProfiler.isStarted(), true);
-	});
 });

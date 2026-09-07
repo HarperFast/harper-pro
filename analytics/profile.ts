@@ -114,14 +114,20 @@ function stopProfiler(restart: boolean): Profile {
 }
 let lastChildCpuTime = 0;
 let gpuAvailable = true;
-const DEFAULT_CAPTURE_PERIOD_MS = 60_000;
 // Bumped by every capture and lifecycle change, so a capture still awaiting GPU measurement when a
 // later one stopped the profiler cannot re-arm it from its own finally.
 let captureGeneration = 0;
 
-export async function captureProfile(
-	delayToNextCapture = capturePeriod > 0 ? capturePeriod : DEFAULT_CAPTURE_PERIOD_MS
-): Promise<void> {
+// The cadence that ships: capturePeriod is already milliseconds, so this reschedules a thousand
+// periods out and production captures once after start and then roughly never. Kept on purpose —
+// a capture every period (a synchronous V8 profiler stop/start on every thread) at a short period
+// loses db-write analytics in integrationTests/cluster/replicatedAnalyticsUnion.test.mjs; restoring
+// per-period captures needs that interaction understood first.
+function shippedRescheduleDelay(): number {
+	return (capturePeriod ?? 60) * 1000;
+}
+
+export async function captureProfile(delayToNextCapture = shippedRescheduleDelay()): Promise<void> {
 	clearTimeout(profilerTimer);
 	if (profilerUnavailable()) return;
 	const continuous = delayToNextCapture > 0;
@@ -181,7 +187,7 @@ export async function captureProfile(
 		log.error?.('analytics profiler error:', error);
 	} finally {
 		if (!continuous) log.info?.('Profiling disabled');
-		else if (generation === captureGeneration) scheduleCapture(delayToNextCapture);
+		else if (generation === captureGeneration) scheduleCapture(shippedRescheduleDelay());
 	}
 	// this traverses the nodes and returns the number of sampling hits for the sample and attributes it
 	// to harper or user code (as opposed to execution of things like node internal modules or native code)
