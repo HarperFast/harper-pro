@@ -52,25 +52,56 @@ const SAMPLING_INTERVAL_IN_MICROSECONDS = 50000;
 //  which can have some impact on latency for users. However, the datadog profiler is much better than the node
 //  profiler, so we'll keep this for now.
 export function handleApplication({ options }: Scope) {
-	setTimeout(async () => {
-		if (userCodeFolders.length === 0) return;
-		if (options.get(['profiling']) === false) {
-			log.info?.('Profiling disabled by configuration');
-			return;
-		}
-		if (profilerUnavailable()) return;
-		// start the profiler
-		if (!profilerStarted) {
-			profilerStarted = true;
-			timeProfiler.start({ intervalMicros: SAMPLING_INTERVAL_IN_MICROSECONDS });
-		}
-		capturePeriod = ((options.get(['aggregatePeriod']) as number) ?? 60) * 1000;
-		if (capturePeriod > 0) {
-			profilerTimer = setTimeout(() => {
-				captureProfile(capturePeriod);
-			}, capturePeriod).unref();
-		}
-	}, 1000); // wait for everything to load before we start the profiler
+	setTimeout(() => startAutomaticProfiling(options), 1000); // wait for everything to load before we start the profiler
+}
+
+/**
+ * Start sampling and schedule the periodic capture that consumes it. Returns whether sampling is running.
+ * Sampling without a capture would cost a SIGPROF-driven stack walk every 50ms on every worker for
+ * nothing, so a non-positive aggregatePeriod leaves the profiler off; captureProfile() still starts it on demand.
+ */
+export function startAutomaticProfiling(options: Scope['options']): boolean {
+	if (userCodeFolders.length === 0) return false;
+	if (options.get(['profiling']) === false) {
+		log.info?.('Profiling disabled by configuration');
+		return false;
+	}
+	capturePeriod = ((options.get(['aggregatePeriod']) as number) ?? 60) * 1000;
+	if (capturePeriod <= 0) {
+		log.info?.('Profiling not started: analytics.aggregatePeriod is not positive, so nothing would capture it');
+		return false;
+	}
+	if (profilerUnavailable()) return false;
+	if (!profilerStarted && !startProfiler()) return false;
+	profilerTimer = setTimeout(() => {
+		captureProfile(capturePeriod);
+	}, capturePeriod).unref();
+	return true;
+}
+
+// Entry and completion markers around the native calls: if a worker wedges inside one of them, the
+// entry line is the last thing it logs, so both are needed to place the wedge (see harper-pro#788).
+function startProfiler(): boolean {
+	const startedAt = performance.now();
+	log.debug?.('Profiler start requested');
+	try {
+		timeProfiler.start({ intervalMicros: SAMPLING_INTERVAL_IN_MICROSECONDS });
+	} catch (error) {
+		log.error?.('Profiler failed to start:', error);
+		return false;
+	}
+	profilerStarted = true;
+	log.debug?.(`Profiler started in ${(performance.now() - startedAt).toFixed(1)}ms`);
+	return true;
+}
+
+function stopProfiler(restart: boolean): Profile {
+	const startedAt = performance.now();
+	log.debug?.(`Profiler stop requested (restart=${restart})`);
+	const profile = timeProfiler.stop(restart);
+	if (!restart) profilerStarted = false;
+	log.debug?.(`Profiler stopped in ${(performance.now() - startedAt).toFixed(1)}ms (restart=${restart})`);
+	return profile;
 }
 let lastChildCpuTime = 0;
 let gpuAvailable = true;
@@ -79,8 +110,7 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	clearTimeout(profilerTimer);
 	if (profilerUnavailable()) return;
 	if (!profilerStarted) {
-		profilerStarted = true;
-		timeProfiler.start({ intervalMicros: SAMPLING_INTERVAL_IN_MICROSECONDS });
+		startProfiler();
 		return;
 	}
 	const hitCountThreshold = 100;
@@ -94,7 +124,7 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 	// Start GPU measurement early so it runs in parallel with CPU profiling work
 	const gpuPromise = getWorkerIndex() === 0 && gpuAvailable ? getGpuUtilization() : null;
 	try {
-		const profile = timeProfiler.stop(true);
+		const profile = stopProfiler(true);
 		const strings = profile.stringTable.strings;
 		for (let func of profile.function) {
 			fileNameById.set(func.id as number, strings[func.filename as number]);
@@ -141,7 +171,11 @@ export async function captureProfile(delayToNextCapture = (capturePeriod ?? 60) 
 		} else {
 			// somehow this can later get set to a negative number which causes big problems (high-frequency restarts of the profiler)
 			log.info?.('Profiling disabled');
-			timeProfiler.stop();
+			try {
+				stopProfiler(false);
+			} catch (error) {
+				log.error?.('Profiler failed to stop:', error);
+			}
 		}
 	}
 	// this traverses the nodes and returns the number of sampling hits for the sample and attributes it
