@@ -407,7 +407,7 @@ export function isResolverOwnedIndexedName(table: any, name: string): boolean {
 	return table.primaryStore?.encoder?.resolvedAttributeNames?.has(name) === true;
 }
 
-export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any) {
+export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any, txnLogKey = auditRecord.txnLogKey) {
 	// The third argument reconstructs the record AT the audit timestamp, so a partial (patch) entry
 	// yields the merged record rather than an undefined body. That reconstruction reads the current
 	// entry with no null guard in core, and this runs inside the synchronous send loop: a record
@@ -415,7 +415,9 @@ export function getResidencyProjectionRecord(auditRecord: any, primaryStore: any
 	// subscription BEFORE startTime advances, and replay the same entry on reconnect — a permanent
 	// stall. No current entry -> undefined, which the caller's existing no-record break handles.
 	if (!primaryStore.getEntry(auditRecord.recordId)) return undefined;
-	return auditRecord.getValue(primaryStore, true, auditRecord.version);
+	// reconstruct at the entry's log position, the domain the audit chain is walked in; the synthetic
+	// copy-walk record has no log key and carries a full record anyway
+	return auditRecord.getValue(primaryStore, true, txnLogKey);
 }
 
 /**
@@ -498,11 +500,43 @@ const COPY_FINALIZE_DEADLINE_MULTIPLE = 4;
 // next ping; floored at 120s for the default 30s/60s case. A backpressure pause refreshes liveness in
 // sendPing so a legitimate local stall is exempt, matching shouldTerminateIdlePing's pauseReasons guard.
 export const LIVENESS_STALE_MS = Math.max(120_000, PING_TIMEOUT * 2);
-// On RocksDB the audit log is keyed by the record version directly (version === the log key), so a
-// record's `version` IS a valid resume-cursor value. On LMDB the log key is a separate local audit time
-// (`localTime`) that differs from `version` (the origin record timestamp) — and the receive side does not
-// carry `localTime` per record (readAuditEntry decodes only `version`). Mirrors core databases.ts.
+// On RocksDB a peer resumes from a position in the origin's transaction log, so a received frame's
+// log key is a valid resume-cursor value. On LMDB the receiver's own audit keys are local times it
+// assigns itself, unrelated to the sender's, so the cursor there must stay on the sender's audit
+// sequence id. Mirrors core databases.ts.
 const STORAGE_IS_ROCKSDB = (process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_PARAMS.STORAGE_ENGINE)) !== 'lmdb';
+// A replication frame's leading float64 is the origin's log key for every record in it. It reaches
+// `RocksTransaction.setTimestamp`, the durable resume cursor and the status watermark, so a corrupt or
+// hostile peer's value must never get that far: the same bound core caps source-reported versions at.
+const MAX_DATE_TIMESTAMP = 8.64e15;
+function isValidReplicationClock(value: unknown): boolean {
+	return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= MAX_DATE_TIMESTAMP;
+}
+export function isValidFrameTxnLogKey(value: unknown): boolean {
+	return isValidReplicationClock(value);
+}
+export function isValidRecordVersion(value: unknown): boolean {
+	return isValidReplicationClock(value);
+}
+export function getCopyTxnLogKey(entry: any, auditStore: any, tableId: number, recordNodeId = entry.nodeId): number {
+	if (STORAGE_IS_ROCKSDB && entry.additionalAuditRefs?.length) {
+		let readError: unknown;
+		for (const ref of entry.additionalAuditRefs) {
+			if ((ref.nodeId ?? 0) !== (recordNodeId ?? 0)) continue;
+			try {
+				const head = auditStore.get(ref.version, tableId, entry.key, ref.nodeId);
+				if (head?.version === entry.version && (head.nodeId ?? 0) === (recordNodeId ?? 0)) return ref.version;
+			} catch (error) {
+				readError ??= error;
+			}
+		}
+		if (readError) throw readError;
+	}
+	// Audit retention can remove a referenced head while its live record remains. A base-copy row is
+	// a snapshot, not a replayed transaction, so the bounded record clock preserves copy-apply behavior
+	// without making one expired reference permanently wedge bootstrap.
+	return entry.localTime;
+}
 // The receive-side watchdog fires after this much silence on a replication WS. Both client and
 // server arm it: the client also runs an active 30s sendPing tick that should normally catch a
 // silent peer first, but if that tick is missed (event-loop stall, ws.terminate() not propagating
@@ -3483,23 +3517,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (flush) await flush();
 	}
 	// Build an empty sequence-update end_txn. ONLY the RocksDB copy-apply path needs the durability flush gate:
-	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (localTime >=
+	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (seqId >=
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
 	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn exactly as before, so this
 	// adds no per-seq-update overhead and does not alter non-copyApply paths. (harper-pro#480)
-	function seqUpdateEndTxn(localTime: number): any {
-		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) {
+	function seqUpdateEndTxn(seqId: number): any {
+		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && seqId >= copyModeStartTime) {
 			return {
 				type: 'end_txn',
-				localTime,
+				localTime: seqId,
 				remoteNodeIds: receivingDataFromNodeIds,
 				async onCommit() {
 					await flushCopyRowsDurable();
 				},
 			};
 		}
-		return { type: 'end_txn', localTime, remoteNodeIds: receivingDataFromNodeIds };
+		return { type: 'end_txn', localTime: seqId, remoteNodeIds: receivingDataFromNodeIds };
 	}
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
@@ -3962,7 +3996,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// committed AND its blob (and all earlier blobs) have finished saving; the persisted replication
 	// resume cursor must never advance past that point. We track this with an ASYNC watermark rather
 	// than blocking the apply loop on blobs:
-	//   - `committedSequence` = the highest sequence id (end_txn localTime/version) the apply loop has
+	//   - `committedSequence` = the highest sequence id from an end_txn event the apply loop has
 	//     committed so far. Commit == visibility; this advances synchronously in onCommit.
 	//   - `lastDurableSequenceId` = the durable watermark = the highest committed sequence whose blobs
 	//     (and all earlier ones) are durably saved. It is what we persist as the resume cursor.
@@ -4030,6 +4064,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		tableDecoder: any,
 		id: any,
 		incomingVersion: number,
+		incomingTxnLogKey: number,
 		sourceNodeId: number | undefined,
 		hasBlobs: boolean
 	): Promise<boolean> {
@@ -4038,7 +4073,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		if (sourceNodeId === undefined) return false;
 		const cursor = leadingDupCursorByNode.get(sourceNodeId);
 		if (cursor === undefined) return false; // this node has already streamed past its resume tail
-		if (incomingVersion > cursor) {
+		const incomingPosition = STORAGE_IS_ROCKSDB ? incomingTxnLogKey : incomingVersion;
+		if (incomingPosition > cursor) {
 			// This node has caught up to live data; stop treating anything from it as a leading duplicate.
 			leadingDupCursorByNode.delete(sourceNodeId);
 			return false;
@@ -5002,7 +5038,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								return { table };
 							}
 						};
-						const currentTransaction = { txnTime: 0 };
+						const currentTransaction = { txnLogKey: 0 };
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
@@ -5020,9 +5056,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							remoteNodeName,
 							databaseName
 						);
-						const sendAuditRecord = (auditRecord, localTime, subscriptionNodeId = auditRecord.nodeId) => {
+						const sendAuditRecord = (auditRecord, cursor, subscriptionNodeId = auditRecord.nodeId) => {
 							if (auditRecord.type === 'end_txn') {
-								if (currentTransaction.txnTime) {
+								if (currentTransaction.txnLogKey) {
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
 										logger.error?.(
 											new Error('Invalid encoding of message to'),
@@ -5033,11 +5069,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									}
 									frame.writeInt(9); // replication message of nine bytes long
 									frame.writeInt(REMOTE_SEQUENCE_UPDATE); // action id
-									frame.writeFloat64((sentSequenceId = localTime)); // send the local time so we know what sequence number to start from next time.
+									frame.writeFloat64((sentSequenceId = cursor)); // send the log key so we know what sequence number to start from next time.
 									sendQueuedData();
 								}
 								frame.encodingStart = frame.position;
-								currentTransaction.txnTime = 0;
+								currentTransaction.txnLogKey = 0;
 								return; // end of transaction, nothing more to do
 							}
 							// Local-only records (e.g. a v4 bridge peer's hdb_nodes row) are never forwarded to
@@ -5069,6 +5105,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							}
 							const primaryStore = table.primaryStore;
 							const encoder = primaryStore.encoder;
+							// Audit scans provide the canonical origin key; copy-walk records use the cursor supplied
+							// by the primary-store iterator and pre-stage-0b producers fall back to the record version.
+							const txnLogKey = STORAGE_IS_ROCKSDB
+								? (auditRecord.txnLogKey ?? cursor ?? auditRecord.version)
+								: auditRecord.version;
+							const subscriptionPosition = STORAGE_IS_ROCKSDB ? txnLogKey : cursor;
 							// Force a reload the first time this connection touches each table:
 							// `primaryStore.encoder` is a process-wide singleton, so its typedStructs
 							// may have been populated to a stale length by prior activity on this
@@ -5095,8 +5137,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								(excludedNodes && timeRange === undefined) ||
 								// if it is in the list, we check the timestamps to verify it matches
 								(timeRange &&
-									(timeRange as any).startTime < localTime &&
-									(!(timeRange as any).endTime || (timeRange as any).endTime > localTime));
+									(timeRange as any).startTime < subscriptionPosition &&
+									(!(timeRange as any).endTime || (timeRange as any).endTime > subscriptionPosition));
 							if (!matchesSubscription) {
 								if (DEBUG_MODE)
 									logger.trace?.(
@@ -5127,8 +5169,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									'subscribed:',
 									subscribedNodeIds
 								);
-							const txnTime = auditRecord.version;
-
 							const residencyId = auditRecord.residencyId;
 							const residency = getResidence(residencyId, table);
 							let invalidationEntry;
@@ -5156,7 +5196,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								for (const name in table.indices) {
 									if (isResolverOwnedIndexedName(table, name)) continue;
 									if (!partialRecord) {
-										fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore);
+										fullRecord = getResidencyProjectionRecord(auditRecord, primaryStore, txnLogKey);
 										if (!fullRecord) break; // if there is no record, as is the case with a relocate, we can't send it
 										partialRecord = {};
 									}
@@ -5238,23 +5278,23 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								ws.send(encode([RESIDENCY_LIST, residency, residencyId]));
 								sentResidencyLists[residencyId] = true;
 							}
-							if (currentTransaction.txnTime !== txnTime) {
+							if (currentTransaction.txnLogKey !== txnLogKey) {
 								// send the queued transaction
-								if (currentTransaction.txnTime) {
+								if (currentTransaction.txnLogKey) {
 									if (DEBUG_MODE)
-										logger.trace?.(connectionId, 'new txn time, sending queued txn', currentTransaction.txnTime);
+										logger.trace?.(connectionId, 'new txn log key, sending queued txn', currentTransaction.txnLogKey);
 									if (frame.encodingBuffer[frame.encodingStart] !== 66) {
 										logger.error?.('Invalid encoding of message');
 									}
 									sendQueuedData();
 								}
-								currentTransaction.txnTime = txnTime;
+								currentTransaction.txnLogKey = txnLogKey;
 								frame.encodingStart = frame.position;
-								frame.writeFloat64(txnTime);
+								frame.writeFloat64(txnLogKey);
 							}
 
 							/*
-							TODO: At some point we may want some fancier logic to elide the version (which is the same as txnTime)
+						TODO: At some point we may want fancier logic to elide the version when it equals txnLogKey
 							and username from subsequent audit entries in multiple entry transactions*/
 							if (invalidationEntry) {
 								// if we have an invalidation entry to send, do that now
@@ -5465,15 +5505,14 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											let oldestRetainedTime: number | undefined;
 											// Mirror the replay scope below (single log, or all non-excluded logs) and take the
 											// first (oldest) entry; getRange yields ascending by audit-log key. Use the same key
-											// basis as the replay loop (localTime ?? version) and retention cleanup — on LMDB audit
-											// stores localTime (the log key) differs from version (the originating record timestamp).
+											// basis as the replay loop (`txnLogKey`) and retention cleanup.
 											for (const entry of auditStore.getRange({
 												start: 1,
 												log: excludedNodes ? undefined : oldestLogName,
 												excludeLogs: excludedNodes,
 												snapshot: false,
 											})) {
-												oldestRetainedTime = entry.localTime ?? entry.version;
+												oldestRetainedTime = entry.txnLogKey;
 												break;
 											}
 											if (
@@ -5619,7 +5658,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 															recordsSinceCheckpoint = 0;
 															sendQueuedData();
 															frame.encodingStart = frame.position;
-															currentTransaction.txnTime = 0;
+															currentTransaction.txnLogKey = 0;
 														}
 														await new Promise(setImmediate);
 														if (closed) return;
@@ -5647,6 +5686,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													// origin on the follower. `entry.nodeId` is this node's local id for that
 													// origin (undefined/0 = us) — the same id space the wire uses.
 													const recordNodeId = entry.nodeId ?? nodeId;
+													const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
 													const encodeCopyRecord = () =>
 														createAuditEntry({
 															version: entry.version,
@@ -5682,7 +5722,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 															nodeId: recordNodeId,
 															extendedType: entry.metadataFlags,
 														},
-														entry.localTime,
+														copyTxnLogKey,
 														nodeId
 													);
 													logger.debug?.(
@@ -5708,7 +5748,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 														copyFlushPacer.mark(Date.now());
 														sendQueuedData();
 														frame.encodingStart = frame.position;
-														currentTransaction.txnTime = 0;
+														currentTransaction.txnLogKey = 0;
 													}
 												}
 												logger.info?.('Finished copy table', tableName, remoteNodeName);
@@ -5718,10 +5758,10 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 													`Copied ${databaseName} to ${remoteNodeName} without ${withheldRecordCount} record(s) that peer originated (harper-pro#737)`
 												);
 											currentSequenceId = copyStartTime;
-											if (!currentTransaction.txnTime) {
+											if (!currentTransaction.txnLogKey) {
 												// no records pending (none sent, or the last batch landed on a checkpoint flush):
 												// force a txn so the end_txn below still carries the sequence update
-												currentTransaction.txnTime = copyStartTime;
+												currentTransaction.txnLogKey = copyStartTime;
 												frame.encodingStart = frame.position;
 												frame.writeFloat64(copyStartTime);
 											}
@@ -5759,7 +5799,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											snapshot: false, // don't want to use a snapshot, and we want to see new entries
 										});
 									for (const auditRecord of auditLogIterable) {
-										const key: number = auditRecord.localTime ?? auditRecord.version;
+										const key: number = auditRecord.txnLogKey;
 										if (closed) return;
 										logger.debug?.('sending audit record', key, auditRecord.recordId);
 										if (tables?.test)
@@ -5806,11 +5846,33 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
 			if (!(await whenSubscriptionResolved())) return;
+			// The origin's log key for every record in this body, read once. It is what the apply
+			// transaction commits under, so the destination's log for this origin keeps the origin's clock
+			// and a downstream peer's resume cursor stays comparable with it (harper-pro#790).
+			// Read only after proving the header is there: a body shorter than its own 8-byte header is
+			// malformed, and getFloat64 would throw a RangeError past every graceful path below.
+			const frameTxnLogKey = body.byteLength >= 8 ? decoder.getFloat64(0) : NaN;
+			if (!isValidFrameTxnLogKey(frameTxnLogKey)) {
+				// Hold rather than skip, as the missing-table-decoder path does: nothing durable or
+				// status-visible has moved yet, so closing leaves the cursor where it was and the peer
+				// re-sends from it. Latch inbound off BEFORE closing so queued frames cannot advance it.
+				recordAction(true, DECODE_HOLD_METRIC, databaseName + '.frame-log-key');
+				logger.error?.(
+					connectionId,
+					`Replication frame from ${remoteNodeName} for ${databaseName} carries an out-of-range transaction-log key (${frameTxnLogKey}); holding and reconnecting`
+				);
+				wsClosed = true;
+				close(1011, 'invalid replication frame log key');
+				return;
+			}
 			decoder.position = 8;
 			let beginTxn = true;
-			let event; // could also get txnTime from decoder.getFloat64(0);
+			let event;
 			let sequenceIdReceived;
-			let maxBatchVersion; // highest record version in this batch (non-copy); end_txn resume cursor when no sequence-update set lastSequenceIdReceived
+			let maxBatchTxnLogKey; // this batch's origin log key; end_txn resume cursor when no sequence-update set lastSequenceIdReceived
+			// The log key is one value for the whole body, so the cursor and watermark below are recorded
+			// on the first record that is not part of a bulk copy rather than re-derived per record.
+			let recordedFrameTxnLogKey = false;
 			// Last copy-frame key seen in this message body, applied OR skipped as an identity tie — the copy
 			// resume cursor must cover skipped keys too, or a copy whose records we all already hold would
 			// never advance it and every reconnect would restart the copy from the beginning.
@@ -5824,7 +5886,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Copy frames get a walk position, and everything staging or blob-tagging against it is
 			// captured NOW (decode time): onCommit runs later from the apply queue, by which time a
 			// same-socket COPY_START may have replaced the pass and its copyStartTime/copyOrder — staging
-			// this frame's key under those NEW values would claim keys the new walk has not delivered.
+			// this frame's key under those new values would claim keys the new walk has not delivered.
 			// Non-copy frames never touch the watermark (live replication pays no bookkeeping, #699).
 			const copyFrameIndex = messageIsCopyFrame ? copyWatermark.beginFrame() : undefined;
 			const copyFramePass = copyWatermark.currentPass;
@@ -5855,6 +5917,16 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				}
 				const start = decoder.position;
 				const auditRecord = readAuditEntry(body, start, start + eventLength);
+				if (!isValidRecordVersion(auditRecord.version)) {
+					recordAction(true, DECODE_HOLD_METRIC, databaseName + '.record-version');
+					logger.error?.(
+						connectionId,
+						`Replication record from ${remoteNodeName} for ${databaseName} carries an out-of-range version (${auditRecord.version}); holding and reconnecting`
+					);
+					wsClosed = true;
+					close(1011, 'invalid replication record version');
+					return;
+				}
 				const tableDecoder = tableDecoders[auditRecord.tableId];
 				if (!tableDecoder) {
 					// No structure/decoder for this table id yet. tableDecoders is populated only by a
@@ -6025,7 +6097,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								nodeId: localSourceNodeId,
 								viaNodeId: receivingDataFromNodeIds[0],
 								residencyList,
-								timestamp: auditRecord.version,
+								timestamp: STORAGE_IS_ROCKSDB ? frameTxnLogKey : auditRecord.version,
+								version: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
 								user: auditRecord.user,
 								beginTxn,
@@ -6093,18 +6166,18 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				// single record at the leader's latest timestamp would otherwise let checkSyncStatus mark the
 				// clone Available with rows still uncopied. The watermark is advanced to copyStartTime by the
 				// single end_txn after the whole copy (the REMOTE_SEQUENCE_UPDATE branch above).
-				if (!inCopyMode) {
+				if (!inCopyMode && !recordedFrameTxnLogKey) {
+					recordedFrameTxnLogKey = true;
 					replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
-						// ensure monotonicity
-						auditRecord.version,
+						// the sender's log position, the same domain lastSequenceIdReceived reports
+						frameTxnLogKey,
 						replicationSharedStatus[RECEIVED_VERSION_POSITION]
 					);
+					// Only on RocksDB does the receiver key this origin's log by the origin's own clock, making
+					// the frame's log key a valid resume cursor. On LMDB the cursor must stay on the sender's
+					// audit sequence id (lastSequenceIdReceived); the receiver's own audit keys are unrelated.
+					if (STORAGE_IS_ROCKSDB) maxBatchTxnLogKey = frameTxnLogKey;
 				}
-				// Only on RocksDB is `version` a valid resume-cursor value (version === audit-log key). On LMDB
-				// the cursor must stay on the sender's audit sequence id (lastSequenceIdReceived); advancing it
-				// to a record `version` could push it past the leader's actual log position and skip entries.
-				if (STORAGE_IS_ROCKSDB && !inCopyMode && auditRecord.version > (maxBatchVersion ?? 0))
-					maxBatchVersion = auditRecord.version;
 				noteReceiveLiveness();
 
 				if (event) {
@@ -6119,6 +6192,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 							tableDecoder,
 							event.id,
 							auditRecord.version,
+							frameTxnLogKey,
 							event.nodeId,
 							!!(auditRecord.extendedType & HAS_BLOBS)
 						))
@@ -6153,20 +6227,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						event.id,
 						'version',
 						new Date(auditRecord.version),
+						'logKey',
+						new Date(frameTxnLogKey),
 						'nodeId',
 						event.nodeId
 					);
 					// Mark base-copy frames so core applies them as snapshots: record + indices only, no
 					// audit/transaction-log entry and no out-of-order resequencing/dedup (harper-pro#480).
-					// Only snapshot rows OLDER than copyStartTime: the post-copy audit replay resumes from
-					// copyStartTime and re-delivers every write with version >= copyStartTime, so those rows
-					// still need a real audit entry for the redelivery to dedup (a commutative patch would
-					// otherwise double-apply). Rows older than copyStartTime are never redelivered, so the
-					// snapshot is safe and carries no audit. Strict `<` keeps the boundary row audited.
-					event.isCopyApply = messageIsCopyFrame && copyApplyActive() && auditRecord.version < copyModeStartTime;
+					// Only writes before the replay boundary are audit-less snapshots. Strict `<` keeps the
+					// boundary transaction audited.
+					event.isCopyApply = messageIsCopyFrame && copyApplyActive() && frameTxnLogKey < copyModeStartTime;
 					// Record which tables actually received an audit-less snapshot row so only those get a
 					// reload marker at copy finalization (harper-pro#495). isCopyApply is exactly "invisible to
-					// live subscribers" — a copy frame with version >= copyStartTime carries a real audit entry
+					// live subscribers" — a copy frame at or after copyStartTime carries a real audit entry
 					// and already delivers per-row events, so it needs no marker and is intentionally excluded.
 					if (event.isCopyApply && event.table) copiedTablesThisPass.add(event.table);
 					if (messageIsCopyFrame && event.table) lastCopyFrameKey = { table: event.table, id: event.id };
@@ -6224,9 +6297,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const endTxnEvent: any = {
 				type: 'end_txn',
 				localTime:
-					isCopyFrame || maxBatchVersion == null
+					isCopyFrame || maxBatchTxnLogKey == null
 						? lastSequenceIdReceived
-						: Math.max(lastSequenceIdReceived ?? 0, maxBatchVersion), // resume cursor from the batch even without a sequence-update
+						: Math.max(lastSequenceIdReceived ?? 0, maxBatchTxnLogKey), // resume cursor from the batch even without a sequence-update
 				remoteNodeIds: receivingDataFromNodeIds,
 				async onCommit() {
 					// Test-only: hold this copy commit (and so the commit-backlog pause) open — see the hook.
