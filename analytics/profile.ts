@@ -55,12 +55,10 @@ export function handleApplication({ options }: Scope) {
 	setTimeout(() => startAutomaticProfiling(options), 1000); // wait for everything to load before we start the profiler
 }
 
-/**
- * Start sampling and schedule the periodic capture that consumes it. Returns whether sampling is running.
- * Sampling without a capture would cost a SIGPROF-driven stack walk every 50ms on every worker for
- * nothing, so a non-positive aggregatePeriod leaves the profiler off; captureProfile() still starts it on demand.
- */
+// Sampling nobody captures still costs a SIGPROF stack walk every 50ms on every worker, so a
+// non-positive aggregatePeriod leaves the profiler off; captureProfile() still starts it on demand.
 export function startAutomaticProfiling(options: Scope['options']): boolean {
+	clearTimeout(profilerTimer);
 	if (userCodeFolders.length === 0) return false;
 	if (options.get(['profiling']) === false) {
 		log.info?.('Profiling disabled by configuration');

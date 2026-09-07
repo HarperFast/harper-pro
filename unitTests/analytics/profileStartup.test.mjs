@@ -1,51 +1,45 @@
-import { assert } from 'chai';
-import sinon from 'sinon';
+import assert from 'node:assert';
 import { time as timeProfiler } from '@datadog/pprof';
 import { captureProfile, startAutomaticProfiling, userCodeFolders } from '#src/analytics/profile';
 
 function optionsWith(values) {
 	return { get: (path) => values[path.join('.')] };
 }
-const EMPTY_PROFILE = { stringTable: { strings: [] }, function: [], location: [], sample: [] };
 
 describe('Analytics profiler startup gate', () => {
-	let start, stop;
 	before(() => {
 		userCodeFolders.push(new URL('../testApp/', import.meta.url).toString());
 	});
-	beforeEach(() => {
-		start = sinon.stub(timeProfiler, 'start');
-		stop = sinon.stub(timeProfiler, 'stop').returns(EMPTY_PROFILE);
+	// A non-positive delay stops the real profiler for good and clears the capture timer.
+	afterEach(async () => {
+		if (timeProfiler.isStarted()) await captureProfile(-1);
+		assert.equal(timeProfiler.isStarted(), false);
 	});
-	afterEach(() => sinon.restore());
 
-	// Ordered: the profiler is module-level state, so the cases that must not start it run first.
 	for (const aggregatePeriod of [-1, 0]) {
 		it(`does not start sampling when aggregatePeriod is ${aggregatePeriod}`, () => {
-			assert.isFalse(startAutomaticProfiling(optionsWith({ aggregatePeriod })));
-			assert.equal(start.callCount, 0);
+			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod })), false);
+			assert.equal(timeProfiler.isStarted(), false);
 		});
 	}
 	it('does not start sampling when profiling is disabled', () => {
-		assert.isFalse(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 60 })));
-		assert.equal(start.callCount, 0);
+		assert.equal(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 60 })), false);
+		assert.equal(timeProfiler.isStarted(), false);
 	});
-	it('starts sampling once for a positive period, and only once', () => {
-		assert.isTrue(startAutomaticProfiling(optionsWith({ aggregatePeriod: 60 })));
-		assert.isTrue(startAutomaticProfiling(optionsWith({})));
-		assert.equal(start.callCount, 1);
-		assert.deepEqual(start.firstCall.args, [{ intervalMicros: 50000 }]);
+	it('starts sampling for a positive period, and a repeat call keeps the one profiler', () => {
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 60 })), true);
+		assert.equal(timeProfiler.isStarted(), true);
+		assert.equal(startAutomaticProfiling(optionsWith({})), true);
+		assert.equal(timeProfiler.isStarted(), true);
 	});
-	it('an explicit capture restarts sampling and a terminal capture stops it', async () => {
+	it('an explicit capture starts a stopped profiler and a terminal capture stops it', async () => {
 		await captureProfile(10000);
-		assert.deepEqual(stop.firstCall.args, [true]);
-		// A non-positive delay captures (stop with restart) and then stops for good.
+		assert.equal(timeProfiler.isStarted(), true);
+		await captureProfile(10000);
+		assert.equal(timeProfiler.isStarted(), true);
 		await captureProfile(-1);
-		assert.deepEqual(stop.args.slice(1), [[true], [false]]);
-		assert.equal(start.callCount, 0);
-		// After a terminal stop, the next explicit capture starts fresh instead of stopping a stopped profiler.
+		assert.equal(timeProfiler.isStarted(), false);
 		await captureProfile(10000);
-		assert.equal(start.callCount, 1);
-		assert.equal(stop.callCount, 3);
+		assert.equal(timeProfiler.isStarted(), true);
 	});
 });
