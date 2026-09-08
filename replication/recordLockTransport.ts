@@ -332,7 +332,6 @@ export function recordLockOwnerFor(database: string, liveWorkers: any[] = httpWo
 	} else {
 		return undefined;
 	}
-	// `current` here is a worker that has exited (it left the live list); the notice is a no-op.
 	if (current) confer(current, database, false);
 	recordLockOwners.set(database, owner);
 	confer(owner, database, true);

@@ -114,15 +114,15 @@ function waitForCounter(nodes, id, expected) {
 	);
 }
 
-async function clusterStatusOf(node) {
-	return sendOperation(node, { operation: 'cluster_status' });
+async function clusterStatusOf(node, signal) {
+	return sendOperation(node, { operation: 'cluster_status' }, { signal });
 }
 
 /** Every node sees every other node's `data` socket connected and has learned its capabilities. */
 function waitForMesh(nodes) {
 	return waitForCondition(
-		async () => {
-			const statuses = await Promise.all(nodes.map((node) => clusterStatusOf(node).catch(() => undefined)));
+		async (signal) => {
+			const statuses = await Promise.all(nodes.map((node) => clusterStatusOf(node, signal).catch(() => undefined)));
 			return statuses.every(
 				(status) =>
 					status &&
@@ -161,7 +161,12 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 	let nodes;
 
 	before(async () => {
-		contexts.push(...(await Promise.all([startNode(ctx.name), startNode(ctx.name), startNode(ctx.name)])));
+		// allSettled, not all: one failed start must not drop the contexts of the nodes that did come up,
+		// or `after` sees an empty list and leaks their processes and ports into the rest of the run.
+		const started = await Promise.allSettled([startNode(ctx.name), startNode(ctx.name), startNode(ctx.name)]);
+		for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
+		const failed = started.find((result) => result.status === 'rejected');
+		if (failed) throw failed.reason;
 		nodes = contexts.map((c) => c.harper);
 		await connectMesh(nodes);
 	});
@@ -291,10 +296,14 @@ suite('cluster record locks: a peer without the recordLocks capability', { timeo
 		// The "legacy" node is this build with its capability bag suppressed: it negotiates as a peer that
 		// never advertised recordLocks while still running the lock machinery, which is exactly what makes
 		// the send gate observable — a grant that does reach it lets its lock() succeed.
-		[currentCtx, legacyCtx] = await Promise.all([
+		// allSettled so a single failed start does not orphan the node that did come up.
+		const started = await Promise.allSettled([
 			startNode(ctx.name),
 			startNode(ctx.name, { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' }),
 		]);
+		[currentCtx, legacyCtx] = started.map((result) => (result.status === 'fulfilled' ? result.value : undefined));
+		const failed = started.find((result) => result.status === 'rejected');
+		if (failed) throw failed.reason;
 		current = currentCtx.harper;
 		legacy = legacyCtx.harper;
 		await connectMesh([current, legacy]);
