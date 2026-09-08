@@ -3841,8 +3841,11 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// demotion soak reads this) — plus the R4 fire classification, which records the same judgement as a
 	// per-mechanism counter so the soak can read totals out of cluster_status instead of aggregating logs.
 	// Recording happens HERE rather than at each callback so every fire site is measured identically and
-	// no watchdog's internals are touched (see classifyFire for what `unknown` protects).
-	const fireTelemetryForLog = (mechanism: FireMechanism) => {
+	// no watchdog's internals are touched (see classifyFire for what `unknown` protects). It RECORDS as well
+	// as formats, which is why every call site assigns it to a local first: `logger` in this file is the
+	// conditional component logger, whose disabled-level methods are undefined, so an inlined
+	// `logger.warn?.(…, recordFireForLog(…))` would stop counting under `logging.level: error`.
+	const recordFireForLog = (mechanism: FireMechanism) => {
 		// This telemetry feeds the watchdog fire logs, emitted from the onSilence/onStall recovery
 		// callbacks immediately before forceReconnect()/ws.terminate(). getSharedStatus() and
 		// deriveConnectionTruth() read shared memory / the auditStore and can throw if that state is
@@ -3889,10 +3892,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// operators have something to grep for.
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 			const direction = options.url ? 'no activity from' : 'no ping from';
-			// Hoisted out of the log argument on purpose: `logger` here is the conditional component logger,
-			// whose disabled-level methods are undefined, so `logger.warn?.(...)` would not evaluate its arguments
-			// at all under `logging.level: error` — and the fire counter lives in that argument. (harper-pro#431)
-			const fireDetail = fireTelemetryForLog('receive-watchdog');
+			const fireDetail = recordFireForLog('receive-watchdog');
 			logger.warn?.(
 				`Receive watchdog: ${direction} ${remoteNodeName}${dbContext} for ${currentReceiveSilenceThresholdMs()}ms — terminating connection and reconnecting — ${fireDetail}`
 			);
@@ -3914,10 +3914,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		onStall: () => {
 			if (firingFromSupersededInstance('Pause-stall watchdog')) return;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
-			// Hoisted out of the log argument on purpose: `logger` here is the conditional component logger,
-			// whose disabled-level methods are undefined, so `logger.warn?.(...)` would not evaluate its arguments
-			// at all under `logging.level: error` — and the fire counter lives in that argument. (harper-pro#431)
-			const fireDetail = fireTelemetryForLog('pause-stall');
+			const fireDetail = recordFireForLog('pause-stall');
 			logger.warn?.(
 				`Receive watchdog: no consumer progress from ${remoteNodeName}${dbContext} for ${PAUSE_STALL_THRESHOLD_MS}ms while paused for back-pressure — terminating connection and reconnecting — ${fireDetail}`
 			);
@@ -3964,10 +3961,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (firingFromSupersededInstance('Copy-progress watchdog')) return;
 			if (!inCopyMode || copyCompleteReceived) return; // only act on an actively-receiving, stalled copy
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
-			// Hoisted out of the log argument on purpose: `logger` here is the conditional component logger,
-			// whose disabled-level methods are undefined, so `logger.warn?.(...)` would not evaluate its arguments
-			// at all under `logging.level: error` — and the fire counter lives in that argument. (harper-pro#431)
-			const fireDetail = fireTelemetryForLog('copy-progress');
+			const fireDetail = recordFireForLog('copy-progress');
 			logger.warn?.(
 				`Copy-progress watchdog: no base-copy progress from ${remoteNodeName}${dbContext} for ${effectiveBlobTimeoutMs}ms (and through a ${Math.max(PING_INTERVAL * 2, 1000)}ms confirmation) while peer bytes kept arriving — terminating connection and reconnecting to restart the copy (harper-pro#453) — ${fireDetail}`
 			);
@@ -3996,10 +3990,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				return;
 			}
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
-			// Hoisted out of the log argument on purpose: `logger` here is the conditional component logger,
-			// whose disabled-level methods are undefined, so `logger.warn?.(...)` would not evaluate its arguments
-			// at all under `logging.level: error` — and the fire counter lives in that argument. (harper-pro#431)
-			const fireDetail = fireTelemetryForLog('blob-gap');
+			const fireDetail = recordFireForLog('blob-gap');
 			logger.warn?.(
 				`Blob-gap watchdog: a blob gap from ${remoteNodeName}${dbContext} has pinned the resume cursor for ${blobGapReconnectMs}ms while connected — terminating connection and reconnecting to re-stream the gapped blob (harper-pro#683) — ${fireDetail}`
 			);
@@ -4021,10 +4012,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// reconnected out from under itself.
 			if (supersededOrClosed() || !inCopyMode || !copyCompleteReceived) return;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
-			// Hoisted out of the log argument on purpose: `logger` here is the conditional component logger,
-			// whose disabled-level methods are undefined, so `logger.warn?.(...)` would not evaluate its arguments
-			// at all under `logging.level: error` — and the fire counter lives in that argument. (harper-pro#431)
-			const fireDetail = fireTelemetryForLog('copy-finalize');
+			const fireDetail = recordFireForLog('copy-finalize');
 			logger.error?.(
 				`Copy-finalization watchdog: base copy from ${remoteNodeName}${dbContext} received COPY_COMPLETE but did not finalize within ${COPY_FINALIZE_TIMEOUT}ms — this node stays in copy mode and can never become available; terminating connection and reconnecting to resume the copy — stuck on {outstandingCommits: ${outstandingCommits}, outstandingBlobs: ${outstandingBlobsToFinish.length}, blobGap: ${hasBlobGap}, copyFlushInFlight: ${copyFlushInFlight}, pendingCopyCursor: ${pendingCopyCursor != null}} — ${fireDetail}`
 			);
@@ -4039,10 +4027,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			if (wsClosed || inCopyMode) return;
 			pendingSubscriptionSetupRequestId = undefined;
 			const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
-			// Hoisted out of the log argument on purpose: `logger` here is the conditional component logger,
-			// whose disabled-level methods are undefined, so `logger.warn?.(...)` would not evaluate its arguments
-			// at all under `logging.level: error` — and the fire counter lives in that argument. (harper-pro#431)
-			const fireDetail = fireTelemetryForLog('subscription-setup');
+			const fireDetail = recordFireForLog('subscription-setup');
 			logger.warn?.(
 				`Subscription-setup watchdog: no application response from ${remoteNodeName}${dbContext} for ${subscriptionSetupTimeoutMs}ms while transport remained connected — reconnecting from the durable cursor (harper-pro#642) — ${fireDetail}`
 			);
