@@ -37,8 +37,8 @@ function optionsFor(node, env) {
 	};
 }
 
-async function socketFor(node, database) {
-	const status = await sendOperation(node, { operation: 'cluster_status' }).catch(() => null);
+async function socketFor(node, database, signal) {
+	const status = await sendOperation(node, { operation: 'cluster_status' }, { signal }).catch(() => null);
 	for (const connection of status?.connections ?? []) {
 		for (const socket of connection.database_sockets ?? []) {
 			if (socket.database === database) return socket;
@@ -49,8 +49,8 @@ async function socketFor(node, database) {
 
 function waitForSocket(node, database, predicate, description) {
 	return waitForCondition(
-		async () => {
-			const socket = await socketFor(node, database);
+		async (signal) => {
+			const socket = await socketFor(node, database, signal);
 			return socket && predicate(socket) ? socket : undefined;
 		},
 		{ timeoutMs: CONVERGE_TIMEOUT_MS, description }
@@ -63,14 +63,18 @@ async function insert(node, id) {
 
 function waitForRecord(node, id) {
 	return waitForCondition(
-		async () => {
-			const result = await sendOperation(node, {
-				operation: 'search_by_id',
-				database: DB,
-				table: TABLE,
-				ids: [id],
-				get_attributes: ['id'],
-			}).catch(() => null);
+		async (signal) => {
+			const result = await sendOperation(
+				node,
+				{
+					operation: 'search_by_id',
+					database: DB,
+					table: TABLE,
+					ids: [id],
+					get_attributes: ['id'],
+				},
+				{ signal }
+			).catch(() => null);
 			return Array.isArray(result) && result.some((record) => record?.id === id);
 		},
 		{ timeoutMs: CONVERGE_TIMEOUT_MS, description: `record ${id} on ${node.hostname}` }
