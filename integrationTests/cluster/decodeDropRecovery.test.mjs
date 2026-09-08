@@ -28,7 +28,7 @@ import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog } from './clusterShared.mjs';
+import { sendOperation, readLog, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -74,18 +74,14 @@ async function waitForCount(node, target, timeoutMs = CONVERGE_TIMEOUT_MS) {
 }
 
 async function hasRow(node, id) {
-	try {
-		const res = await sendOperation(node, {
-			operation: 'search_by_hash',
-			database: 'data',
-			table: 'DecodeDropTest',
-			hash_values: [id],
-			get_attributes: ['id'],
-		});
-		return Array.isArray(res) && res.length === 1;
-	} catch {
-		return false;
-	}
+	const res = await sendOperation(node, {
+		operation: 'search_by_hash',
+		database: 'data',
+		table: 'DecodeDropTest',
+		hash_values: [id],
+		get_attributes: ['id'],
+	});
+	return Array.isArray(res) && res.length === 1;
 }
 
 suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 300_000 }, (ctx) => {
@@ -136,7 +132,10 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 	after(async () => {
 		// teardownHarper's argument must be a context: it early-returns on a falsy `ctx.harper`.
 		await Promise.all(
-			[ctx.nodeA, ctx.nodeB].filter(Boolean).map((node) => teardownHarper({ harper: node }).catch(() => {}))
+			[ctx.nodeA, ctx.nodeB].filter(Boolean).map(async (node) => {
+				await stopNodeProcess(node).catch(() => {});
+				await teardownHarper({ harper: node }).catch(() => {});
+			})
 		);
 	});
 
@@ -178,13 +177,22 @@ suite('Decode-drop recovery (harper-pro#537/#545)', { skip: !STRESS, timeout: 30
 		});
 		const deadline = Date.now() + CONVERGE_TIMEOUT_MS;
 		let live = false;
+		let lastErr;
 		while (Date.now() < deadline) {
-			if (await hasRow(ctx.nodeB, 'row-live-1')) {
-				live = true;
-				break;
+			try {
+				if (await hasRow(ctx.nodeB, 'row-live-1')) {
+					live = true;
+					break;
+				}
+				lastErr = undefined;
+			} catch (err) {
+				lastErr = err;
 			}
 			await delay(500);
 		}
-		ok(live, 'a live write after the poison must replicate to B (leg alive)');
+		ok(
+			live,
+			`a live write after the poison must replicate to B (leg alive)${lastErr ? ` (last error: ${lastErr.message})` : ''}`
+		);
 	});
 });
