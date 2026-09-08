@@ -694,22 +694,23 @@ export function subscribeToNode(request: any) {
 	}
 }
 export async function unsubscribeFromNode({ url, nodes, database, clearStatus = false }) {
-	logger.trace(
-		'Unsubscribing from node',
-		url,
-		database,
-		'nodes',
-		Array.from(getHDBNodeTable().primaryStore.getRange({}))
-	);
+	logger.trace('Unsubscribing from node', url, database);
 	const connectionKey = url + '-' + (nodes[0]?.url ?? url);
 	const dbConnections = connections.get(connectionKey);
-	if (dbConnections) {
-		const connection = dbConnections.get(database);
-		if (connection) {
-			connection.unsubscribe();
-			dbConnections.delete(database);
-			if (clearStatus) releaseSharedStatusOnUnsubscribe(connection);
-		}
+	const connection = dbConnections?.get(database);
+	if (!connection) return;
+	// Retire locally before attempting the transport close, not after: close() can throw, and a
+	// connection that keeps its cache entry and its owner marker goes on writing DOWN/1008 into the
+	// (database, peer) buffer the removal just cleared. unsubscribe() sets intentionallyUnsubscribed
+	// before it touches the socket, so a connection dropped here can never reconnect on its own.
+	dbConnections.delete(database);
+	if (clearStatus) releaseSharedStatusOnUnsubscribe(connection);
+	try {
+		connection.unsubscribe();
+	} catch (error) {
+		// Every call site is fire-and-forget, so a rejection escaping here reaches only the
+		// process-wide unhandledRejection handler, which cannot name the node that failed.
+		logger.error('Error unsubscribing from node', url, database, error);
 	}
 }
 // Retire a connection's claim on the (database, peer) shared status when its node leaves the cluster.
