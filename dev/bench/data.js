@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788768727882,
+  "lastUpdate": 1788854063112,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -4367,6 +4367,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 1670.27,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "59e000f478fbcf575f4bb0ce7acd0355f3c987d1",
+          "message": "Preserve origin record versions and transaction-log keys during replication (#812)\n\n* Apply the origin's record version and key it at the origin's log key on receive\n\nA replication frame carries two clocks and the receiver now adopts them\nseparately. The leading float64 is the origin's log key — the batch key its\nentries occupy in the origin's own transaction log — and the forwarded audit\nbytes carry the record's own version, which a cache fill sets from the source's\nlastModified rather than from its commit.\n\nThe receiver used to skip that header and put the entry's version on the apply\nevent as the transaction timestamp, so a peer filed the origin's write in its\ncopy of the origin's log at the source's clock. Leaf state looked right; a third\nnode resuming through that peer read cursors in a domain the relay's log no\nlonger used, and the receive-path resume cursor and the received-version\nwatermark were maxima over record versions rather than log positions.\n\nThe apply event now carries `timestamp` from the frame's log key and `version`\nfrom the entry, the sender frames transactions by the same log key, and both\nreceive-path cursors move with it. The frame key is validated before it can\nreach setTimestamp, a durable cursor or a status field: a value that is not a\nrepresentable date — including the sentinel a body too short to hold its own\nheader yields — closes the connection and leaves every cursor where it was.\n\nRefs #790\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01WMMWWeFsqFuKduJHNMP6ZY\n\n* Use txnLogKey for replicated log positions\n\n* Preserve RocksDB dual-clock audit heads\n\n* Keep copy replay in the log-key domain\n\n* Preserve LMDB subscription cursors\n\n* Update core dual-clock audit ref handling\n\n* Fail closed on invalid replication clocks\n\n* Update reviewed core dual-clock head\n\n* Update core after main rebase\n\n* Handle retained and expired dual-clock copy heads\n\n* Update core dual-clock identity handling\n\n* Distinguish expired copy heads from read failures\n\n* Update core origin-aware history handling\n\n* Update core after final main rebase\n\n* Update core dual-clock audit handling\n\n* Update core after formatting\n\n* Match copied audit heads by origin\n\n* Pin origin-aware audit head resolution\n\n---------\n\nCo-authored-by: Kris Zyp <kris@harperdb.io>\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>",
+          "timestamp": "2026-09-07T12:51:51Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/59e000f478fbcf575f4bb0ce7acd0355f3c987d1"
+        },
+        "date": 1788854061438,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 12067.83,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 25601.33,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 19157.72,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 10396.88,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 5356.02,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2124.72,
             "unit": "ops/sec"
           }
         ]
