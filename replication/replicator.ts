@@ -108,6 +108,13 @@ export function buildReplicationMtlsConfig(replicationOptions: any) {
  */
 export function start(options) {
 	logger.notify('Starting replication server');
+	// Installed here, not at module load: knownNodes → replicator → recordLockTransport is an import
+	// cycle, and assigning recordLockTransport's `downSinceReader` while that module is still evaluating
+	// would hit its temporal dead zone. `start()` runs after every module has finished loading.
+	setConnectionDownSinceReader((status) => {
+		const truth = deriveConnectionTruth(status);
+		return truth.connected ? undefined : truth.errorTime;
+	});
 	if (options.hostname && !env.get('node_hostname')) {
 		// for back-compat, carry this over
 		env.setProperty('node_hostname', options.hostname);
@@ -386,10 +393,6 @@ function assignReplicationSource(options) {
 		}
 	});
 }
-setConnectionDownSinceReader((status) => {
-	const truth = deriveConnectionTruth(status);
-	return truth.connected ? undefined : truth.errorTime;
-});
 
 /**
  * Get/create a replication resource that can be assigned as a source to tables
