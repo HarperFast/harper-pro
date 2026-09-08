@@ -1,4 +1,4 @@
-import * as env from '../core/utility/environment/environmentManager.js';
+import { getConfigObj } from '../core/config/configUtils.ts';
 
 /**
  * `replication.recordLocks: true` admits this node to cluster-wide record locks (harper-pro#438). It
@@ -7,7 +7,9 @@ import * as env from '../core/utility/environment/environmentManager.js';
  * single-database cluster's inbound apply work on one worker. Off, nothing about replication changes
  * and a cluster-scoped `lock()` fails closed rather than silently arbitrating on one node.
  *
- * Read once: a value that changed between threads would make one worker advertise a capability the
- * process does not honor.
+ * Read from the raw config tree, NOT `env.get`: `env.get` resolves only keys registered in core's
+ * `CONFIG_PARAM_MAP` (`knownNodes.ts` notes the same limit for other replication knobs), and this key
+ * is harper-pro's own — registering it would be a core change. Read once: a value that changed
+ * between threads would make one worker advertise a capability the process does not honor.
  */
-export const CLUSTER_RECORD_LOCKS_ENABLED: boolean = env.get('replication_recordLocks') === true;
+export const CLUSTER_RECORD_LOCKS_ENABLED: boolean = getConfigObj()?.replication?.recordLocks === true;
