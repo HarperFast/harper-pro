@@ -83,8 +83,9 @@ async function call(node, path, body, signal) {
 async function counter(node, id, signal) {
 	const response = await fetch(`${node.httpURL}/Counter/${id}`, { headers: { Accept: 'application/json' }, signal });
 	if (response.status === 404) return undefined;
-	assert.equal(response.status, 200, `GET Counter/${id} on ${node.hostname}: ${await response.text()}`);
-	return response.json();
+	const text = await response.text();
+	assert.equal(response.status, 200, `GET Counter/${id} on ${node.hostname}: ${text}`);
+	return JSON.parse(text);
 }
 
 async function putCounter(node, id, n) {
@@ -98,8 +99,9 @@ async function putCounter(node, id, n) {
 
 async function controlEntries(node) {
 	const response = await fetch(`${node.httpURL}/LockControlEntries/`, { headers: { Accept: 'application/json' } });
-	assert.equal(response.status, 200, await response.text());
-	return response.json();
+	const text = await response.text();
+	assert.equal(response.status, 200, text);
+	return JSON.parse(text);
 }
 
 function waitForCounter(nodes, id, expected) {
@@ -319,16 +321,16 @@ suite('cluster record locks: a peer without the recordLocks capability', { timeo
 		// The bag-less node sees the current node advertise recordLocks, so it runs a real round.
 		const legacyRound = await call(legacy, 'LockHold/', { id, lease: 2_000, timeout: 2_000 });
 		assert.equal(legacyRound.status, 423, `without the grant the round times out: ${JSON.stringify(legacyRound.body)}`);
-		const produced = await waitForCondition(
+		// The current node writes a grant (nodeId 0 = its own origin) in response to the peer's request,
+		// which is itself proof the request arrived and was accepted by the coordinator. Received entries
+		// are applied to the coordinator, not persisted in the receiver's log (no relay copy), so the
+		// peer's request is deliberately absent from this node's log — the grant is the observable.
+		await waitForCondition(
 			async () => {
 				const entries = await controlEntries(current);
-				return entries.some((entry) => entry.type === 'lockGrant' && entry.nodeId === 0) ? entries : undefined;
+				return entries.some((entry) => entry.type === 'lockGrant' && entry.nodeId === 0);
 			},
 			{ timeoutMs: 30_000, description: 'the current node to have written a grant for the bag-less peer' }
-		);
-		assert.ok(
-			produced.some((entry) => entry.type === 'lockRequest' && entry.nodeId !== 0),
-			'the request arrived'
 		);
 		// Data still replicates both ways past the gated entries.
 		await putCounter(legacy, id, 7);
