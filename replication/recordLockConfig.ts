@@ -1,4 +1,5 @@
 import { getConfigObj } from '../core/config/configUtils.ts';
+import * as logger from '../core/utility/logging/harper_logger.js';
 
 /**
  * `replication.recordLocks: true` admits this node to cluster-wide record locks (harper-pro#438). It
@@ -12,4 +13,12 @@ import { getConfigObj } from '../core/config/configUtils.ts';
  * is harper-pro's own — registering it would be a core change. Read once: a value that changed
  * between threads would make one worker advertise a capability the process does not honor.
  */
-export const CLUSTER_RECORD_LOCKS_ENABLED: boolean = getConfigObj()?.replication?.recordLocks === true;
+const configured: unknown = getConfigObj()?.replication?.recordLocks;
+// Only a real boolean `true` enables it; a truthy non-boolean (a YAML `1`, a quoted `"true"`) would
+// leave the node advertising `recordLocks: 0` and registering the fail-closed transport, so warn
+// rather than let an operator believe the switch is on.
+if (configured !== undefined && configured !== true && configured !== false && configured)
+	logger.warn?.(
+		`replication.recordLocks is set to ${JSON.stringify(configured)}, which is not the boolean true; cluster record locks stay disabled`
+	);
+export const CLUSTER_RECORD_LOCKS_ENABLED: boolean = configured === true;

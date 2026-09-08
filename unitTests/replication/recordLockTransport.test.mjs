@@ -21,7 +21,8 @@ import {
 	recordPeerLockCapability,
 	releaseRecordLockOwner,
 } from '#src/replication/recordLockTransport';
-import { getReplicationSharedStatus } from '#src/replication/knownNodes';
+import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
+import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
@@ -99,7 +100,7 @@ describe('isReplicationGroupMember', () => {
 
 describe('the capability slot', () => {
 	it('round-trips both answers and reads anything else as never learned', () => {
-		const status = new Float64Array(16);
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 		assert.strictEqual(readPeerLockCapability(status), LOCK_CAPABILITY_UNKNOWN);
 		recordPeerLockCapability(status, true);
 		assert.strictEqual(readPeerLockCapability(status), LOCK_CAPABILITY_SUPPORTED);
@@ -111,8 +112,10 @@ describe('the capability slot', () => {
 		assert.strictEqual(readPeerLockCapability(status), LOCK_CAPABILITY_UNKNOWN);
 	});
 
-	it('uses a slot outside the ones the connection truth and blob signals occupy', () => {
-		assert.ok(RECORD_LOCKS_CAPABILITY_POSITION >= 13 && RECORD_LOCKS_CAPABILITY_POSITION <= 15);
+	it('uses a slot outside the ones connection truth, blob signals, and the fire counters occupy', () => {
+		const fireCountersEnd = FIRE_COUNTER_BASE_POSITION + FIRE_MECHANISMS.length * 2; // exclusive
+		assert.ok(RECORD_LOCKS_CAPABILITY_POSITION >= fireCountersEnd);
+		assert.ok(RECORD_LOCKS_CAPABILITY_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
 	});
 });
 

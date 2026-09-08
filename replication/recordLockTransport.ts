@@ -45,9 +45,10 @@ import { getReplicationSharedStatus } from './knownNodes.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 
-// Slot 13 of the 16-slot per-(database, peer) status buffer (`getReplicationSharedStatus`); 0..12 are
-// taken, 13..15 were documented headroom.
-export const RECORD_LOCKS_CAPABILITY_POSITION = 13;
+// Slot 29 of the 32-slot per-(database, peer) status buffer (`getReplicationSharedStatus`); 0..28 are
+// taken (13..28 by the R4 fire-classification counters, harper-pro#431). This claims the first of the
+// 29..31 headroom slots, leaving 30..31.
+export const RECORD_LOCKS_CAPABILITY_POSITION = 29;
 export const LOCK_CAPABILITY_UNKNOWN = 0;
 export const LOCK_CAPABILITY_UNSUPPORTED = 1;
 export const LOCK_CAPABILITY_SUPPORTED = 2;
@@ -332,7 +333,6 @@ export function recordLockOwnerFor(database: string, liveWorkers: any[] = httpWo
 	} else {
 		return undefined;
 	}
-	// `current` here is a worker that has exited (it left the live list); the notice is a no-op.
 	if (current) confer(current, database, false);
 	recordLockOwners.set(database, owner);
 	confer(owner, database, true);
