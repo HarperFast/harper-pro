@@ -379,11 +379,7 @@ export function copyLinkMetricsToEntry(
 	connected: boolean
 ) {
 	const latency = status[LATENCY_POSITION];
-	// LATENCY is the one slot here written ungated by every connection sharing the (database, peer) key:
-	// replicator.ts's cache-miss picker selects a peer by the reading a RETRIEVAL connection leaves there,
-	// so the pong write cannot be owner-gated. On a link truth reports down the owner is not ponging, so a
-	// fresh reading can only be an inbound or retrieval socket's RTT — a different link. Keep the last
-	// owner-era value instead. BACK_PRESSURE_RATIO is already gated on nodeSubscriptions by its writer.
+	// Gated on truth because the LATENCY slot has more writers than the owner; see DESIGN.md.
 	if (connected && latency > 0) entry.latency = latency;
 	entry.backPressureRatio = status[BACK_PRESSURE_RATIO_POSITION];
 }
