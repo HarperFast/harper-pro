@@ -88,6 +88,68 @@ describe('shouldCloseSendAuthWatch', () => {
 		expect(timedOut).to.equal(true);
 	});
 
+	// harper-pro#327: the grace period is advertised as a 30s deadline, so a row that only becomes
+	// decodable after the loop was suspended past it must not authorize. Checking `exhausted` only at the
+	// top of the loop was not enough — the loop exits on a non-UNCHANGED row without ever consulting it.
+	it('fails closed on a row that only resolves after the budget deadline passed', async () => {
+		let clock = 0;
+		let timedOut = false;
+		let resolved = 0;
+		const shouldClose = await shouldCloseSendAuthWatch({ type: 'put' }, 'node-a', 'data', {
+			isClosed: neverClosed,
+			// An event-loop stall: the sleep returns long after the delay it was asked for.
+			sleep: async () => {
+				clock += 45_000;
+			},
+			now: () => clock,
+			reprobeBudgetMs: 30_000,
+			resolve: () => (resolved++ === 0 ? SEND_AUTH_UNCHANGED : { name: 'node-a', replicates: true }),
+			onReprobeTimeout: () => {
+				timedOut = true;
+			},
+		});
+		expect(shouldClose, 'the late authorizing row is not consulted').to.equal(true);
+		expect(timedOut).to.equal(true);
+		expect(resolved, 'no probe after the deadline').to.equal(1);
+	});
+
+	// The store read is synchronous, so it can carry the clock past the deadline by itself — the sleep is
+	// not the only thing that can overrun the advertised grace period.
+	it('fails closed when the row read itself crosses the deadline', async () => {
+		let clock = 0;
+		let timedOut = false;
+		let resolved = 0;
+		const shouldClose = await shouldCloseSendAuthWatch({ type: 'put' }, 'node-a', 'data', {
+			isClosed: neverClosed,
+			sleep: async () => {
+				clock += 29_000;
+			},
+			now: () => clock,
+			reprobeBudgetMs: 30_000,
+			resolve: () => {
+				if (resolved++ === 0) return SEND_AUTH_UNCHANGED;
+				clock += 5000; // the point read blocks past the deadline, then returns an authorizing row
+				return { name: 'node-a', replicates: true };
+			},
+			onReprobeTimeout: () => {
+				timedOut = true;
+			},
+		});
+		expect(shouldClose, 'a row that arrived after the deadline does not authorize').to.equal(true);
+		expect(timedOut).to.equal(true);
+	});
+
+	it('does not read the clock at all for an immediately decodable row', async () => {
+		const shouldClose = await shouldCloseSendAuthWatch({ type: 'put' }, 'node-a', 'data', {
+			isClosed: neverClosed,
+			now: () => {
+				throw new Error('the backoff must not be built for a decodable row');
+			},
+			resolve: () => ({ name: 'node-a', replicates: true }),
+		});
+		expect(shouldClose).to.equal(false);
+	});
+
 	it('does not close if the connection closes while the reprobe loop is still suspended', async () => {
 		let closed = false;
 		let timedOut = false;

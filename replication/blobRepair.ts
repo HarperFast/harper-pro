@@ -4,8 +4,23 @@ import { databases } from '../core/resources/databases.ts';
 import { server } from '../core/server/Server.ts';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 import type { Logger } from '../core/utility/logging/logger.ts';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { createBackoff } from './backoff.ts';
 
 const logger = harperLogger.forComponent('blob-repair').conditional as Logger;
+
+// Paces a sweep whose peers cannot serve anything: without it the per-record loop spins as fast as the
+// incomplete-blob cursor yields. Capped low (not at the 30s replication cap) because the delay is paid
+// per unrepairable record while the cursor stays open.
+const REPAIR_RETRY_INITIAL_MS = 50;
+const REPAIR_RETRY_MAX_MS = 1000;
+// Wall-clock ceiling on how long one unbroken failure run may spend *pausing*. Once spent the sweep keeps
+// scanning at full speed: pacing exists to stop a hot loop, and inferring the rest of the cursor from an
+// unrepairable prefix would silently skip records a later peer can still serve. A repair restarts it.
+const REPAIR_PACING_BUDGET_MS = 60_000;
+// Once unpaced the per-record warn would fire at peer-RTT rate for the rest of the sweep — hundreds of
+// thousands of lines during exactly the incident where the log is the diagnostic channel. Sample it.
+const REPAIR_UNPACED_WARN_EVERY = 100;
 
 export async function allBlobsAreComplete(
 	blobs: any[],
@@ -15,15 +30,24 @@ export async function allBlobsAreComplete(
 }
 
 export async function repairBlobs(
-	dbName: string
+	dbName: string,
+	deps: { sleep?: (ms: number) => Promise<unknown>; now?: () => number } = {}
 ): Promise<{ checked: number; repaired: number; failed: number; noConnection: number }> {
 	const database = (databases as any)[dbName];
 	if (!database) throw new Error(`Unknown database '${dbName}'`);
+	const pause = deps.sleep ?? sleep;
 
 	let checked = 0;
 	let repaired = 0;
 	let failed = 0;
 	let noConnection = 0;
+	const backoff = createBackoff({
+		initialMs: REPAIR_RETRY_INITIAL_MS,
+		maxMs: REPAIR_RETRY_MAX_MS,
+		budgetMs: REPAIR_PACING_BUDGET_MS,
+		now: deps.now,
+	});
+	let pacingSpent = false;
 
 	for await (const { tableName, table, recordId } of findIncompleteBlobRefs(database, dbName)) {
 		checked++;
@@ -70,9 +94,31 @@ export async function repairBlobs(
 			}
 		}
 
-		if (!peerRepaired) {
+		if (peerRepaired) {
+			backoff.reset();
+			pacingSpent = false;
+		} else {
 			failed++;
-			logger.warn?.('Could not repair blob for record', recordId, 'in', tableName, '— no peer had a complete copy');
+			if (!pacingSpent || failed % REPAIR_UNPACED_WARN_EVERY === 0)
+				logger.warn?.(
+					'Could not repair blob for record',
+					recordId,
+					'in',
+					tableName,
+					'— no peer had a complete copy',
+					pacingSpent ? `(${failed} failed so far; sampling 1 in ${REPAIR_UNPACED_WARN_EVERY})` : ''
+				);
+			const delay = backoff.nextDelay();
+			if (delay === undefined) {
+				if (!pacingSpent) {
+					pacingSpent = true;
+					logger.warn?.(
+						'Blob repair pacing budget spent for',
+						dbName,
+						`after ${REPAIR_PACING_BUDGET_MS}ms of unrepairable records; continuing the sweep unpaced`
+					);
+				}
+			} else await pause(delay);
 		}
 	}
 

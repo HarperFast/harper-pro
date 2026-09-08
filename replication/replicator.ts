@@ -547,7 +547,7 @@ function getSubscriptionConnection(
 	authorization?: string,
 	status?: { reused: boolean }
 ) {
-	const connectionKey = connectingUrl + '-' + subscriptionUrl;
+	const connectionKey = getSubscriptionConnectionKey(connectingUrl, subscriptionUrl);
 	let dbConnections = connections.get(connectionKey);
 	if (!dbConnections) {
 		dbConnections = new Map();
@@ -569,6 +569,15 @@ function getSubscriptionConnection(
 		});
 		return connection;
 	}
+}
+
+// The `connections` key, shared by subscribe, unsubscribe, force-reconnect and the worker's pre-readiness
+// admission so all four derive identical identity including the missing-nested-URL fallback. The teardown
+// sites pass the pair in the opposite order to the subscribe path; the two URLs are the same string for
+// every ordinary subscription, and differ only under failover (connectToNextWorker subscribes node B over
+// peer A's URL), where the teardown lookup has always missed.
+export function getSubscriptionConnectionKey(url: string, peerUrl?: string): string {
+	return url + '-' + (peerUrl ?? url);
 }
 const nodeNameToRetrievalConnections = new Map<string, Map<string, NodeReplicationConnection>>();
 /**
@@ -693,7 +702,7 @@ export function subscribeToNode(request: any) {
 		logger.error('Error in subscription to node', request.nodes[0]?.url, error);
 	}
 }
-export async function unsubscribeFromNode({ url, nodes, database }) {
+export function unsubscribeFromNode({ url, nodes, database }) {
 	logger.trace(
 		'Unsubscribing from node',
 		url,
@@ -701,7 +710,7 @@ export async function unsubscribeFromNode({ url, nodes, database }) {
 		'nodes',
 		Array.from(getHDBNodeTable().primaryStore.getRange({}))
 	);
-	const connectionKey = url + '-' + (nodes[0]?.url ?? url);
+	const connectionKey = getSubscriptionConnectionKey(url, nodes[0]?.url);
 	const dbConnections = connections.get(connectionKey);
 	if (dbConnections) {
 		const connection = dbConnections.get(database);
@@ -721,7 +730,7 @@ export async function unsubscribeFromNode({ url, nodes, database }) {
 // the worker-local copy-progress watchdog (harper-pro#453) did not recover it. The connection-key lookup
 // mirrors unsubscribeFromNode so it resolves the same connection the subscribe path created.
 export function forceReconnectToNode({ url, nodes, database }) {
-	const connectionKey = url + '-' + (nodes?.[0]?.url ?? url);
+	const connectionKey = getSubscriptionConnectionKey(url, nodes?.[0]?.url);
 	const connection = connections.get(connectionKey)?.get(database);
 	if (connection) connection.forceReconnect();
 }

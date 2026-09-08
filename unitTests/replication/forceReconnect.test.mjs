@@ -94,16 +94,19 @@ describe('NodeReplicationConnection.forceReconnect', () => {
 		expect(conn.socket.terminate.callCount).to.equal(0);
 	});
 
-	it('backs off the retry interval on repeated wedges (mirrors the close-handler backoff)', () => {
+	it('backs off the retry ceiling on repeated wedges (mirrors the close-handler backoff)', () => {
 		const conn = makeConnection();
+		conn.random = () => 0.999999; // pin the draw so the doubled ceiling is observable as a wait
 
-		conn.forceReconnect(); // retryTime 500 -> 1000
+		conn.forceReconnect(); // ceiling 500 -> 1000, draws 499
+		expect(conn.retryTime).to.equal(1000);
 		clock.tick(500);
 		expect(conn.connect.callCount).to.equal(1);
 
-		conn.forceReconnect(); // retryTime 1000 -> 2000
-		clock.tick(999);
-		expect(conn.connect.callCount, 'second reconnect waits the doubled interval').to.equal(1);
+		conn.forceReconnect(); // ceiling 1000 -> 2000, draws 999
+		expect(conn.retryTime).to.equal(2000);
+		clock.tick(998);
+		expect(conn.connect.callCount, 'second reconnect waits the doubled ceiling').to.equal(1);
 		clock.tick(1);
 		expect(conn.connect.callCount).to.equal(2);
 	});
