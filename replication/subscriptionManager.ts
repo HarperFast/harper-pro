@@ -341,7 +341,7 @@ export function reconcileEntryWithTruth(
 	if (entry.connected === false && truth.connected) return 'up';
 	return undefined;
 }
-// the main-thread twin of replicateOverWS's fireTelemetryForLog. Both reconcile nets
+// the main-thread twin of replicateOverWS's recordFireForLog. Both reconcile nets
 // act on the entry that OWNS the (db, peer) subscription, so their fires are always owner-backed. Wrapped so
 // a telemetry failure can never abort a recovery pass.
 function recordMainThreadFire(
@@ -373,9 +373,18 @@ function recordMainThreadFire(
 // link that has not ponged yet reads 0 and copying that would replace the value connectedToNode mirrored
 // from the connect edge with a false instant reading. `backPressureRatio` is copied unconditionally — 0 is
 // its meaningful "no back-pressure" value. replicator.ts's cache-miss picker still reads the slot directly.
-export function copyLinkMetricsToEntry(entry: { latency?: number; backPressureRatio?: number }, status: Float64Array) {
+export function copyLinkMetricsToEntry(
+	entry: { latency?: number; backPressureRatio?: number },
+	status: Float64Array,
+	connected: boolean
+) {
 	const latency = status[LATENCY_POSITION];
-	if (latency > 0) entry.latency = latency;
+	// LATENCY is the one slot here written ungated by every connection sharing the (database, peer) key:
+	// replicator.ts's cache-miss picker selects a peer by the reading a RETRIEVAL connection leaves there,
+	// so the pong write cannot be owner-gated. On a link truth reports down the owner is not ponging, so a
+	// fresh reading can only be an inbound or retrieval socket's RTT — a different link. Keep the last
+	// owner-era value instead. BACK_PRESSURE_RATIO is already gated on nodeSubscriptions by its writer.
+	if (connected && latency > 0) entry.latency = latency;
 	entry.backPressureRatio = status[BACK_PRESSURE_RATIO_POSITION];
 }
 // W1 T1 (#431) fire telemetry: describe what already engaged on this entry before the current net
@@ -1306,7 +1315,7 @@ export async function startOnMainThread(options) {
 					continue;
 				}
 				const truth = deriveConnectionTruth(status, now);
-				copyLinkMetricsToEntry(entry, status);
+				copyLinkMetricsToEntry(entry, status, truth?.connected === true);
 				const correction = reconcileEntryWithTruth(entry, truth, now);
 				if (correction) entry.lastTruthCorrection = { direction: correction, at: now };
 				if (correction && truth)

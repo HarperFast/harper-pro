@@ -708,8 +708,6 @@ export async function unsubscribeFromNode({ url, nodes, database, clearStatus = 
 	try {
 		connection.unsubscribe();
 	} catch (error) {
-		// Every call site is fire-and-forget, so a rejection escaping here reaches only the
-		// process-wide unhandledRejection handler, which cannot name the node that failed.
 		logger.error('Error unsubscribing from node', url, database, error);
 	}
 }
