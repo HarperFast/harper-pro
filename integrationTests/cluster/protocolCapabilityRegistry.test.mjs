@@ -1,7 +1,3 @@
-/**
- * What only real nodes can prove: the frame-dispatch default case is reached through the real switch, and
- * both ends of a mixed-version pair report the other through the real `cluster_status` operation.
- */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
@@ -196,9 +192,14 @@ suite('protocol capability registry', { timeout: 180000 }, (ctx) => {
 	});
 
 	test('a reconnected peer is re-learned, not carried over from the retired socket', async () => {
-		// Restart the bag-less node as a CURRENT one. Asserting the same values as before the restart would
-		// pass on a stale leftover and prove nothing; a changed bag can only have come from the new socket.
 		await stopNodeProcess(ctx.legacy);
+		const disconnected = await waitForSocket(
+			ctx.current,
+			DB,
+			(socket) => socket.connected === false && socket.peerCapabilities === undefined,
+			'the stopped peer to omit the retired socket capabilities'
+		);
+		assert.equal(disconnected.peerCapabilities, undefined);
 		await startHarper(ctx.legacyCtx, optionsFor(ctx.legacy, {}));
 		ctx.legacy = ctx.legacyCtx.harper;
 

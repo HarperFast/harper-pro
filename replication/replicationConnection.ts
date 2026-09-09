@@ -6090,7 +6090,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								database: databaseName,
 								node: remoteNodeName,
 								countOnThisConnection: unknownCommands.count,
-								suppressedCount,
+								suppressedCountOnWorker: suppressedCount,
 							});
 						}
 						break;

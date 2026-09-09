@@ -24,7 +24,12 @@ export interface ResolvedPeerCapabilities {
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
 function resolveLevel(value: unknown, localLevel: number, absentLevel: number): number {
-	const level = Number(value);
+	let level: number;
+	try {
+		level = Number(value);
+	} catch {
+		return absentLevel;
+	}
 	if (Number.isNaN(level)) return absentLevel;
 	// A level this build does not implement cannot be used.
 	return Math.min(localLevel, Math.max(absentLevel, Math.floor(level)));

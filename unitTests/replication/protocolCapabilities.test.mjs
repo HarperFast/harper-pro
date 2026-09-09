@@ -1,7 +1,3 @@
-/**
- * The load-bearing property here is that the registry reproduces `capabilities?.subscriptionSetupAck >= 1`
- * exactly for every input that comparison could see — a coercing comparison accepts more than integers.
- */
 import assert from 'node:assert';
 import { inspect } from 'node:util';
 import { decode, encode } from 'msgpackr';
@@ -82,6 +78,13 @@ describe('resolvePeerCapabilities — protocolVersion', () => {
 				`advertised ${String(advertised)}`
 			);
 		}
+	});
+
+	it('treats a value whose numeric conversion throws as absent', () => {
+		assert.strictEqual(
+			resolvePeerCapabilities({ protocolVersion: { toString: 0 } }).protocolVersion,
+			MINIMUM_PROTOCOL_VERSION
+		);
 	});
 
 	it('is the descriptive absent-default and gates nothing on its own', () => {
