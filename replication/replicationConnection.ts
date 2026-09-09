@@ -6327,10 +6327,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// wedge is structurally Rocks-only (see DESIGN.md item 10d).
 									let repairedSendRange = false;
 									let rebuildRetryInMs = 0;
+									// Whether THIS drain ended at a break — which is the condition that must gate finalizing,
+									// not whether the rebuild was allowed. A denied rebuild (or a telemetry throw) leaves the
+									// range just as broken, and publishing its end_txn would advertise a cursor past a
+									// transaction the break may have truncated exactly as before.
+									let drainStoppedAtBreak = false;
 									try {
 										const corruptFrameStop = (auditLogIterable as any)?.corruptFrameStop;
 										const breaks = corruptFrameStop?.breaks ?? 0;
 										if (breaks > 0) {
+											drainStoppedAtBreak = true;
 											// Asked on every drain once stopped, not only on a new break: a repair the interval
 											// floor declined must be retried rather than latched off.
 											const isNewBreak = breaks > sendLogBreaksSeen;
@@ -6353,7 +6359,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 									// Finalize the batch only if the range did NOT stop at a break. See above: the trailing
 									// end_txn moves the peer's durable cursor, and a break may have swallowed records behind it.
-									if (!repairedSendRange && frame.position - frame.encodingStart > 8) {
+									if (!drainStoppedAtBreak && frame.position - frame.encodingStart > 8) {
 										sendAuditRecord(
 											{
 												type: 'end_txn',
@@ -6373,8 +6379,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// another commit — which a quiet writer never sends, leaving readable rows unsent forever.
 									// Fault path only: a healthy drain sets no deadline and still parks on the commit alone.
 									if (rebuildRetryInMs > 0) {
-										const retry = new Promise((resolve) => setTimeout(resolve, rebuildRetryInMs).unref?.());
-										await Promise.race([nextTransaction, retry]);
+										// Cleared on either outcome: under a busy quarantined break this runs per commit, and an
+										// uncleared 30-minute timer per iteration is a leak measured in commits.
+										let retryTimer;
+										try {
+											await Promise.race([
+												nextTransaction,
+												new Promise((resolve) => {
+													retryTimer = setTimeout(resolve, rebuildRetryInMs);
+													retryTimer.unref?.();
+												}),
+											]);
+										} finally {
+											clearTimeout(retryTimer);
+										}
 										continue;
 									}
 									await nextTransaction;
