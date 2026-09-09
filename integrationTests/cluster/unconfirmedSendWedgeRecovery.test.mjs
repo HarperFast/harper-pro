@@ -64,15 +64,21 @@ function nodeConfig(hostname, env) {
 	};
 }
 
-async function hasRow(node, id) {
+// `signal` is waitForCondition's deadline: without forwarding it, a probe against a wedged node that
+// accepts the request and never answers outlives the deadline it was meant to bound.
+async function hasRow(node, id, signal) {
 	try {
-		const result = await sendOperation(node, {
-			operation: 'search_by_hash',
-			database: DB,
-			table: TABLE,
-			hash_values: [id],
-			get_attributes: ['id'],
-		});
+		const result = await sendOperation(
+			node,
+			{
+				operation: 'search_by_hash',
+				database: DB,
+				table: TABLE,
+				hash_values: [id],
+				get_attributes: ['id'],
+			},
+			{ signal }
+		);
 		return Array.isArray(result) && result.length === 1;
 	} catch {
 		return false;
@@ -149,7 +155,7 @@ async function startWedgedPair(ctx, name, thresholdMs, { shape = 'send-path-stop
 
 	// The base copy must land first: it is what establishes the confirmation the stall check ages, and it
 	// is the iterable created AFTER it that the injection replaces.
-	await waitForCondition(() => hasRow(subscriber, 'before-wedge'), {
+	await waitForCondition((signal) => hasRow(subscriber, 'before-wedge', signal), {
 		timeoutMs: RECOVERY_TIMEOUT_MS,
 		pollMs: POLL_MS,
 		description: 'the seed row to replicate before the wedge is armed',
@@ -211,7 +217,7 @@ suite('Unconfirmed-send wedge recovery (harper-pro#810)', { skip: !STRESS, timeo
 			shape: 'peer-not-confirming',
 		});
 		// The row itself arrives — this shape is about the acknowledgement, not the data.
-		await waitForCondition(() => hasRow(subscriber, 'after-wedge'), {
+		await waitForCondition((signal) => hasRow(subscriber, 'after-wedge', signal), {
 			timeoutMs: RECOVERY_TIMEOUT_MS,
 			pollMs: POLL_MS,
 			description: 'the row written into the wedge to be applied by the subscriber',
@@ -232,7 +238,7 @@ suite('Unconfirmed-send wedge recovery (harper-pro#810)', { skip: !STRESS, timeo
 			table: TABLE,
 			records: [{ id: 'after-not-confirming', v: 'live' }],
 		});
-		await waitForCondition(() => hasRow(subscriber, 'after-not-confirming'), {
+		await waitForCondition((signal) => hasRow(subscriber, 'after-not-confirming', signal), {
 			timeoutMs: RECOVERY_TIMEOUT_MS,
 			pollMs: POLL_MS,
 			description: 'a live write after the close to replicate over the reconnected leg',
@@ -242,7 +248,7 @@ suite('Unconfirmed-send wedge recovery (harper-pro#810)', { skip: !STRESS, timeo
 	test('the sending session closes its own socket and the peer resubscribes and converges', async () => {
 		const { source, subscriber } = await startWedgedPair(ctx, 'recovery', SHORT_THRESHOLD_MS);
 
-		await waitForCondition(() => hasRow(subscriber, 'after-wedge'), {
+		await waitForCondition((signal) => hasRow(subscriber, 'after-wedge', signal), {
 			timeoutMs: RECOVERY_TIMEOUT_MS,
 			pollMs: POLL_MS,
 			description: 'the row written into the wedge to replicate after the sender closes its sending socket',
@@ -261,7 +267,7 @@ suite('Unconfirmed-send wedge recovery (harper-pro#810)', { skip: !STRESS, timeo
 			table: TABLE,
 			records: [{ id: 'after-recovery', v: 'live' }],
 		});
-		await waitForCondition(() => hasRow(subscriber, 'after-recovery'), {
+		await waitForCondition((signal) => hasRow(subscriber, 'after-recovery', signal), {
 			timeoutMs: RECOVERY_TIMEOUT_MS,
 			pollMs: POLL_MS,
 			description: 'a live write after recovery to replicate over the reconnected leg',

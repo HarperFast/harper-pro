@@ -3,6 +3,7 @@ import { inspect } from 'node:util';
 import { decode, encode } from 'msgpackr';
 import {
 	ABSENT_PEER_CAPABILITIES,
+	BLOB_DRAIN_CONFIRM_CAPABILITY,
 	LOCAL_PROTOCOL_VERSION,
 	MINIMUM_PROTOCOL_VERSION,
 	RECORD_LOCKS_CAPABILITY,
@@ -11,6 +12,7 @@ import {
 	createUnknownCommandState,
 	noteUnknownCommand,
 	peerSupportsRecordLocks,
+	peerConfirmsBlobDrain,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -28,6 +30,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				subscriptionSetupAck: 0,
 				subscriptionSetupBudgetMs: undefined,
 				recordLocks: 0,
+				blobDrainConfirm: 0,
 			}
 		);
 	});
@@ -47,6 +50,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 	it('drops keys this build does not know instead of carrying them', () => {
 		const resolved = resolvePeerCapabilities({ subscriptionSetupAck: 1, futureThing: 3, somethingElse: 'x' });
 		assert.deepStrictEqual(Object.keys(resolved).sort(), [
+			'blobDrainConfirm',
 			'protocolVersion',
 			'recordLocks',
 			'subscriptionSetupAck',
@@ -220,6 +224,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
+				blobDrainConfirm: BLOB_DRAIN_CONFIRM_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -248,6 +253,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
+				blobDrainConfirm: BLOB_DRAIN_CONFIRM_CAPABILITY,
 			}
 		);
 	});
@@ -353,5 +359,33 @@ describe('noteUnknownCommand', () => {
 
 	it('starts a fresh connection at zero, so a reconnect can publish its own count', () => {
 		assert.strictEqual(createUnknownCommandState().count, 0);
+	});
+});
+
+describe('blobDrainConfirm — the gate on the peer-not-confirming stall shape (harper-pro#810)', () => {
+	it('reads a peer that predates the drain confirmation as unsupported', () => {
+		// Every build before this one confirms a blob-carrying commit once, clamped to its pre-blob
+		// watermark, and never revises it. `confirmed < sent` against such a peer is the ordinary state of a
+		// quiet leg, so the sender must not read it as a stall.
+		assert.strictEqual(peerConfirmsBlobDrain(ABSENT_PEER_CAPABILITIES), false);
+		assert.strictEqual(peerConfirmsBlobDrain(resolvePeerCapabilities({ subscriptionSetupAck: 1 })), false);
+	});
+
+	it('reads a current peer as supported, through its own advertised bag', () => {
+		assert.strictEqual(peerConfirmsBlobDrain(resolvePeerCapabilities(buildLocalCapabilities(90_000))), true);
+	});
+
+	it('never reports a level above the one this build implements', () => {
+		assert.strictEqual(
+			resolvePeerCapabilities({ blobDrainConfirm: 99 }).blobDrainConfirm,
+			BLOB_DRAIN_CONFIRM_CAPABILITY
+		);
+	});
+
+	it('is part of the equality the metadata bridge deduplicates on', () => {
+		const withIt = resolvePeerCapabilities(buildLocalCapabilities(90_000));
+		const withoutIt = resolvePeerCapabilities({ ...buildLocalCapabilities(90_000), blobDrainConfirm: 0 });
+		assert.strictEqual(samePeerCapabilities(withIt, withoutIt), false);
+		assert.strictEqual(samePeerCapabilities(withIt, resolvePeerCapabilities(buildLocalCapabilities(90_000))), true);
 	});
 });

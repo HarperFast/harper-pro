@@ -48,15 +48,21 @@ function nodeConfig(hostname, env) {
 	};
 }
 
-async function hasRow(node, id) {
+// `signal` is waitForCondition's deadline: without forwarding it, a probe against a wedged node that
+// accepts the request and never answers outlives the deadline it was meant to bound.
+async function hasRow(node, id, signal) {
 	try {
-		const result = await sendOperation(node, {
-			operation: 'search_by_hash',
-			database: DB,
-			table: TABLE,
-			hash_values: [id],
-			get_attributes: ['id'],
-		});
+		const result = await sendOperation(
+			node,
+			{
+				operation: 'search_by_hash',
+				database: DB,
+				table: TABLE,
+				hash_values: [id],
+				get_attributes: ['id'],
+			},
+			{ signal }
+		);
 		return Array.isArray(result) && result.length === 1;
 	} catch {
 		return false;
@@ -124,7 +130,7 @@ suite('Decode-drop structure resync (harper-pro#810)', { skip: !STRESS, timeout:
 			rejectUnauthorized: false,
 			authorization: ctx.source.admin,
 		});
-		await waitForCondition(() => hasRow(ctx.receiver, 'copied-2'), {
+		await waitForCondition((signal) => hasRow(ctx.receiver, 'copied-2', signal), {
 			timeoutMs: CONVERGE_TIMEOUT_MS,
 			pollMs: POLL_MS,
 			description: 'the base copy to land past its poison record',
@@ -156,7 +162,7 @@ suite('Decode-drop structure resync (harper-pro#810)', { skip: !STRESS, timeout:
 			table: TABLE,
 			records: [{ id: 'after-resync', v: 'live' }],
 		});
-		await waitForCondition(() => hasRow(ctx.receiver, 'after-resync'), {
+		await waitForCondition((signal) => hasRow(ctx.receiver, 'after-resync', signal), {
 			timeoutMs: CONVERGE_TIMEOUT_MS,
 			pollMs: POLL_MS,
 			description: 'a live write after the resync to replicate',
