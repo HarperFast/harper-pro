@@ -135,6 +135,15 @@ jobs:
           - name: 'decode-drop-recovery'
             file: 'integrationTests/cluster/decodeDropRecovery.test.mjs'
             env_vars: ''
+          - name: 'decode-drop-structure-resync'
+            file: 'integrationTests/cluster/decodeDropStructureResync.test.mjs'
+            env_vars: ''
+          - name: 'unconfirmed-send-wedge-recovery'
+            file: 'integrationTests/cluster/unconfirmedSendWedgeRecovery.test.mjs'
+            env_vars: ''
+          - name: 'unconfirmed-send-blob-quiet-false-fire'
+            file: 'integrationTests/cluster/unconfirmedSendBlobQuietFalseFire.test.mjs'
+            env_vars: ''
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
