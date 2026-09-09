@@ -1,13 +1,17 @@
-# Cross-model review-coverage check (report mode: informational, never blocks).
-# Parses the PR description with the dispatch human-review gate's own parser and reports
-# how many cross-model reviews it names, plus the Human-Review-Need footer state — so
-# coverage is visible at PR open/edit time, before the fleet's review runs. `edited` is a
-# trigger because reporting coverage is a description edit, which moves no commit sha.
-# Policy lives in HarperFast/dispatch (skills/pr-shepherd/SKILL.md, dispatch/lib/reviewGate.mjs);
-# the action is hosted in harper (below). Flipping to `mode: enforce` is a team policy decision.
+# PR-description checks. The action lives in HarperFast/harper, pinned by sha: GitHub does not let
+# a public repo consume an action hosted in a private one, so harper holds the public copy and every
+# other repo pins it.
+#
+# NEVER add a checkout step. On pull_request_target the workflow definition and the pinned action
+# both come from trusted refs, and the job reads only the event payload — one slip to
+# `ref: ...head.sha` would run arbitrary PR code with the base repo's token. Coverage needs no
+# working tree, so there is nothing here that wants one. Same rule as companion-check.yaml.
+#
+# format_mode is left at its default of `off`: this repo checks coverage only, so no PR-files
+# artifact is collected and no API token scope beyond the default read is needed.
 name: review-coverage
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, edited, synchronize, reopened, ready_for_review]
 permissions:
   contents: read
@@ -16,14 +20,9 @@ concurrency:
   cancel-in-progress: true
 jobs:
   coverage:
-    name: review-coverage
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # the action's public home is the harper repo (GitHub bars public repos from
-      # using private-repo actions); org policy requires full-sha pinning — renovate
-      # bumps this toward harper main and renovate.json automerges digest bumps, so `mode`
-      # is set here rather than inherited from whatever default that sha carries.
-      - uses: HarperFast/harper/.github/actions/review-coverage@b3a12113e9a7dd9aab0218d51a17fde8af1ab22e # main
+      - uses: HarperFast/harper/.github/actions/review-coverage@61c53b040a5b51a190218ee6d9bcd7751d7d9db0 # pending HarperFast/harper#2552; re-pin to the merge commit before this leaves draft
         with:
-          mode: report
+          mode: enforce
