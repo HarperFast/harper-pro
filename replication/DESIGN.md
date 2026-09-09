@@ -94,6 +94,8 @@ What harper-pro supplies is core's `ClusterLockTransport`, registered per replic
 
 **Observability.** `cluster_status` gains `recordLocks: { [database]: { ownerThreadId, held, pending, deferred, droppedOffOwner } }`, gathered by the main thread from every http worker under a one-second bound (`droppedOffOwner` is summed across workers: it counts entries applied off the owner, which the owner alone cannot see). The `cluster-status` round trip carries a `requestId` for the same reason: the fan-out makes overlapping `cluster_status` calls on one worker easy to produce.
 
+**Cost baseline.** `RECORD_LOCK_COST_BASELINE.md` records what this protocol costs on a 3-node mesh (acquisition latency, hot-key handoff throughput, log entries and bytes per acquisition, and the unlocked write path with the feature off), measured by `npm run bench:record-locks`; the replacement protocol is sized against those figures.
+
 **Not done here, by design.** A hub does not persist a relayed control entry into its per-origin log (core's sink applies without writing), so two contenders that reach each other only through a relay time out rather than coordinate — safe, because the participant set is the whole group. The right home for that copy is core's apply transaction, at the origin's log key, in commit order. Likewise a data record that is skipped as undecodable or fails a non-retryable commit is a replication divergence on its own; the lock's exclusion guarantee is unaffected and the drop is already metered (`decode-drop`).
 
 ### `Replicator extends Resource` (`replicator.ts`)
@@ -211,6 +213,7 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 | `excludeTablesReplication.test.mjs`  | Per-route `excludeTables` bridge migration (issue #239)                                                                                                    |
 | `relayedOriginResumeGap.test.mjs`    | Deterministic relayed-origin cursorless resume gap (#432): guards the #428 full copy; `HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY=1` runs its red-proof mode |
 | `recordLockCluster.test.mjs`         | Cluster record locks (#438): serialized increments across three nodes, LWW fencing, holder crash → lease hand-over, and the mixed-version gate             |
+| `recordLockCost.bench.mjs`           | Record-lock cost baseline (`npm run bench:record-locks`, not a gate): latency, hot-key throughput, log cost, and the off-path write cost                   |
 
 Most replication behavior is exercised via integration tests that spin up multi-node clusters. A few function-level invariants that don't need a cluster live in `../unitTests/replication/` (e.g. `listenerLifecycle.test.mjs`, `pingKeepalive.test.mjs`).
 
