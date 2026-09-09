@@ -13,7 +13,8 @@
  * 2. Repeat-lock latency: one node, one key, over and over (the before-figure for a protocol that
  *    would collapse this to a local key lock).
  * 3. Hot-key handoff throughput: 2 then 3 nodes contending on one key, one lock → increment → unlock
- *    request in flight per node (the request transaction's commit is the unlock).
+ *    request in flight per node (the request transaction's commit is the unlock). Lock and section
+ *    times are the node's own; the request round trip is the client's view.
  * 4. Transaction-log cost per acquisition: control entries and value bytes per node, from the log.
  * 5. Cost when off: unlocked write throughput with recordLocks off, with no transport registered at
  *    all (the database is not replicated), and with it on but unused.
@@ -98,19 +99,20 @@ async function startAll(suiteName, overridesPerNode) {
 	return contexts;
 }
 
-async function call(node, path, body) {
+async function call(node, path, body, signal) {
 	const response = await fetch(`${node.httpURL}/${path}`, {
 		method: body === undefined ? 'GET' : 'POST',
 		headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
 		body: body === undefined ? undefined : JSON.stringify(body),
+		signal,
 	});
 	const text = await response.text();
 	assert.equal(response.status, 200, `${path} on ${node.hostname}: ${response.status} ${text}`);
 	return JSON.parse(text);
 }
 
-async function counter(node, id) {
-	const response = await fetch(`${node.httpURL}/Counter/${id}`, { headers: { Accept: 'application/json' } });
+async function counter(node, id, signal) {
+	const response = await fetch(`${node.httpURL}/Counter/${id}`, { headers: { Accept: 'application/json' }, signal });
 	if (response.status === 404) return undefined;
 	const text = await response.text();
 	assert.equal(response.status, 200, `GET Counter/${id} on ${node.hostname}: ${text}`);
@@ -128,8 +130,8 @@ async function putCounter(node, id, n) {
 
 function waitForCounter(nodes, id, expected) {
 	return waitForCondition(
-		async () => {
-			const values = await Promise.all(nodes.map((node) => counter(node, id).then((record) => record?.n)));
+		async (signal) => {
+			const values = await Promise.all(nodes.map((node) => counter(node, id, signal).then((record) => record?.n)));
 			return values.every((n) => n === expected) ? values : undefined;
 		},
 		{ timeoutMs: CONVERGE_TIMEOUT_MS, description: `Counter/${id} to read ${expected} on every node` }
@@ -178,6 +180,7 @@ async function connectMesh(nodes) {
 /** One request in flight per node until the deadline: lock → increment → unlock as the request commits. */
 async function contend(node, id, durationMs) {
 	const deadline = performance.now() + durationMs;
+	const requestMs = [];
 	const sectionMs = [];
 	const lockMs = [];
 	let failures = 0;
@@ -195,11 +198,12 @@ async function contend(node, id, durationMs) {
 			continue;
 		}
 		assert.equal(response.status, 200, `LockedIncrement on ${node.hostname}: ${JSON.stringify(body)}`);
-		sectionMs.push(performance.now() - started);
+		requestMs.push(performance.now() - started);
+		sectionMs.push(body.sectionMs);
 		lockMs.push(body.lockMs);
 		lastN = body.n;
 	}
-	return { sectionMs, lockMs, failures, lastN };
+	return { requestMs, sectionMs, lockMs, failures, lastN };
 }
 
 function percentile(sorted, p) {
@@ -222,11 +226,30 @@ function distribution(samples) {
 
 const LOCK_ENTRY_TYPES = ['lockRequest', 'lockGrant', 'lockRelease'];
 
-async function logSnapshot(nodes) {
-	return Promise.all(nodes.map((node) => call(node, 'LogStats/')));
+async function logSnapshot(nodes, signal) {
+	return Promise.all(nodes.map((node) => call(node, 'LogStats/', undefined, signal)));
 }
 
-/** Per node: control entries and bytes added between two snapshots, per `acquisitions`. */
+/**
+ * unlock() returns before the release entry is durable, so a snapshot taken straight after a batch can
+ * miss its last release and carry it into the next window. Every round a node started — granted or
+ * timed out — ends in exactly one release/withdraw of its own, which is the boundary waited for here.
+ */
+async function logSnapshotAfter(nodes, before, roundsStartedPerNode) {
+	return waitForCondition(
+		async (signal) => {
+			const after = await logSnapshot(nodes, signal);
+			const settled = nodes.every(
+				(_, i) =>
+					(after[i].lockRelease?.entries ?? 0) - (before[i].lockRelease?.entries ?? 0) >= roundsStartedPerNode[i]
+			);
+			return settled ? after : undefined;
+		},
+		{ timeoutMs: 30_000, pollMs: 100, description: 'every started round to have written its release' }
+	);
+}
+
+/** Per node: control entries and bytes added between two snapshots, per round started. */
 function logDelta(before, after, acquisitions) {
 	return before.map((was, i) => {
 		const now = after[i];
@@ -278,7 +301,11 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 			const ids = Array.from({ length: UNCONTENDED_PER_NODE }, (_, k) => `uncontended-${i}-${k}-${Date.now()}`);
 			const before = await logSnapshot(nodes);
 			const { acquireMs, releaseMs } = await call(node, 'BenchLock/', { ids });
-			const after = await logSnapshot(nodes);
+			const after = await logSnapshotAfter(
+				nodes,
+				before,
+				nodes.map((_, k) => (k === i ? ids.length : 0))
+			);
 			pooledAcquire.push(...acquireMs);
 			pooledRelease.push(...releaseMs);
 			perNode.push({
@@ -312,9 +339,13 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 			const started = performance.now();
 			const answers = await Promise.all(nodes.slice(0, contenders).map((node) => contend(node, id, HOT_KEY_MS)));
 			const elapsedMs = performance.now() - started;
-			const after = await logSnapshot(nodes);
 			const sections = answers.reduce((sum, answer) => sum + answer.sectionMs.length, 0);
 			const failures = answers.reduce((sum, answer) => sum + answer.failures, 0);
+			const after = await logSnapshotAfter(
+				nodes,
+				before,
+				nodes.map((_, i) => (answers[i] ? answers[i].sectionMs.length + answers[i].failures : 0))
+			);
 			// Every critical section landed exactly once, on every node: the throughput is of correct handoffs.
 			const converged = await waitForCounter(nodes, id, sections).then(
 				() => true,
@@ -328,15 +359,21 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 				sectionsPerSecond: Math.round((sections / elapsedMs) * 1000 * 10) / 10,
 				converged,
 				finalCounter: await Promise.all(nodes.map((node) => counter(node, id).then((record) => record?.n))),
+				// Pooled over every contender's samples; the per-node distributions are kept beside them.
+				lockMs: distribution(answers.flatMap((answer) => answer.lockMs)),
+				sectionMs: distribution(answers.flatMap((answer) => answer.sectionMs)),
+				requestMs: distribution(answers.flatMap((answer) => answer.requestMs)),
 				perNode: answers.map((answer, i) => ({
 					node: i,
 					sections: answer.sectionMs.length,
 					failures: answer.failures,
 					lastN: answer.lastN,
-					sectionMs: distribution(answer.sectionMs),
 					lockMs: distribution(answer.lockMs),
+					sectionMs: distribution(answer.sectionMs),
+					requestMs: distribution(answer.requestMs),
 				})),
-				log: logDelta(before, after, sections),
+				// Per round started: a timed-out round wrote its request and withdraw too.
+				log: logDelta(before, after, sections + failures),
 			};
 			results.hotKey.push(run);
 			report(t, `hot key, ${contenders} contenders`, {
@@ -345,7 +382,9 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 				failures,
 				converged,
 				finalCounter: run.finalCounter,
-				lockMs: run.perNode.map((n) => n.lockMs),
+				lockMs: run.lockMs,
+				sectionMs: run.sectionMs,
+				requestMs: run.requestMs,
 			});
 		}
 		await save();

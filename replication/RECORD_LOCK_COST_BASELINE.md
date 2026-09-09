@@ -26,19 +26,20 @@ turn while the other two only grant. Acquire = request written durably + both gr
 
 | ms      | n   | min  | p50  | p95  | p99  | max  | mean |
 | ------- | --- | ---- | ---- | ---- | ---- | ---- | ---- |
-| acquire | 360 | 0.60 | 1.03 | 2.01 | 2.34 | 3.05 | 1.13 |
-| release | 360 | 0.05 | 0.07 | 0.15 | 0.19 | 0.34 | 0.09 |
+| acquire | 360 | 0.58 | 1.07 | 2.02 | 2.48 | 3.75 | 1.17 |
+| release | 360 | 0.05 | 0.07 | 0.15 | 0.18 | 0.24 | 0.09 |
 
-Per requester the p50 ranged 0.76–1.32 ms across the three nodes (the first-started node is the
-slowest, consistently across runs). Across three full runs the pooled p50 was 1.03–1.45 ms.
+"release" is what `unlock()` returns in; the release entry's own commit is asynchronous behind it.
+Per requester the p50 ranged 0.89–1.28 ms across the three nodes (the first-started node is the
+slowest, consistently across runs). Across four full runs the pooled p50 was 1.03–1.45 ms.
 
 ## 2. Repeat-lock latency
 
 One node locking the same key 200 times back to back. Today this is a full cluster round every time.
 
-| ms      | n   | min  | p50  | p95  | p99  | max   | mean |
-| ------- | --- | ---- | ---- | ---- | ---- | ----- | ---- |
-| acquire | 200 | 0.47 | 0.65 | 1.41 | 4.44 | 10.26 | 0.86 |
+| ms      | n   | min  | p50  | p95  | p99  | max  | mean |
+| ------- | --- | ---- | ---- | ---- | ---- | ---- | ---- |
+| acquire | 200 | 0.46 | 0.68 | 1.76 | 3.93 | 7.08 | 0.87 |
 
 Indistinguishable from (1) once the per-requester spread is taken into account (0.64–1.14 ms p50
 across runs; the tail is the same order). This is the figure a per-record delegation is meant to turn
@@ -49,35 +50,38 @@ into a local key lock.
 One key; each contending node keeps exactly one `lock → read → increment → save` request in flight for
 15 s, the request transaction's commit being the unlock (`LockedIncrement`). Successful critical
 sections per second, whole cluster. The counter converged to exactly the section count on every node
-in every run (no lost update, no failed round).
+in every run (no lost update, no failed round). Distributions are pooled over every contender's
+samples (the per-node ones, near-identical, are in the JSON). `lock` and `section` (lock through
+`save()`) are timed inside the node; `request` is the client's round trip and includes HTTP and JSON.
 
-| contenders | sections | sections/s | lock p50 / p95 / p99 (ms) | section p50 / p95 (ms) |
-| ---------- | -------- | ---------- | ------------------------- | ---------------------- |
-| 2 of 3     | 13 372   | 891        | 1.06 / 2.7 / 3.5          | 1.77 / 4.3             |
-| 3 of 3     | 14 515   | 968        | 2.01 / 4.5 / 5.6          | 2.68 / 6.0             |
+| contenders | sections | sections/s | lock p50 / p95 / p99 (ms) | section p50 / p95 (ms) | request p50 / p95 (ms) |
+| ---------- | -------- | ---------- | ------------------------- | ---------------------- | ---------------------- |
+| 2 of 3     | 13 159   | 877        | 1.05 / 2.8 / 3.5          | 1.13 / 3.0             | 1.77 / 4.4             |
+| 3 of 3     | 13 667   | 911        | 2.01 / 4.9 / 5.8          | 2.10 / 5.1             | 2.70 / 6.4             |
 
 The cluster stays a 3-participant mesh in both rows; "contenders" is how many nodes drive the key.
-A second run gave 793 and 750 sections/s for the same rows, so the aggregate rate is **noisy to
-about ±15 %** on this box and the 2-vs-3 ordering is not significant. What is stable: per-node lock
-latency roughly doubles from 2 to 3 contenders (every acquisition waits for the other two holders'
-turns), and the per-section time is lock latency + ~0.7 ms of read/write/commit.
+Earlier runs gave 891/968 and 793/750 sections/s for the same rows, so the aggregate rate is **noisy
+to about ±15 %** on this box and the 2-vs-3 ordering is not significant. What is stable: lock latency
+roughly doubles from 2 to 3 contenders (every acquisition waits for the other holders' turns), the
+read/write/save after the lock adds under 0.1 ms, and the client sees another ~0.6 ms of HTTP.
 
 ## 4. Transaction-log cost per acquisition
 
 Read from each node's own `Counter` transaction log (`auditStore.getRange`) before and after a fixed
-number of acquisitions. Bytes are the stored value per entry; the log key adds 8 bytes each.
+number of rounds, the after-snapshot taken once every started round's release is in its node's log.
+Bytes are the stored value per entry; the log key adds 8 bytes each.
 
 Uncontended (120 acquisitions, requester → grantors), per acquisition:
 
 | role               | entries | bytes | by type                                      |
 | ------------------ | ------- | ----- | -------------------------------------------- |
 | requester          | 2       | 150   | `lockRequest` 81–82 B, `lockRelease` 69–70 B |
-| each of 2 grantors | 1       | 80    | `lockGrant` 80–81 B                          |
+| each of 2 grantors | 1       | 79–80 | `lockGrant` 79–81 B                          |
 | **cluster total**  | **4**   | ~310  |                                              |
 
-Under contention (the hot-key runs above), per successful section: 1.5 entries on each of 2
-contenders + 1 on the idle node, or 1.33 on each of 3 contenders — again **4 per acquisition**, with
-entries 10 B smaller because the shorter key.
+Under contention (the hot-key runs above), per round started (no round timed out, so equal to per
+section): 1.5 entries on each of 2 contenders + 1 on the idle node, or 1.33 on each of 3 contenders —
+again **4 per acquisition**, ~88–98 B per node, entries ~10 B smaller because the key is shorter.
 
 Sanity check against the theory for P = 3: P+1 = 4 durable commits per acquisition, matched exactly
 (1 request + 2 grants + 1 release). Every entry is sent to the other P−1 nodes, so frame deliveries are
@@ -95,12 +99,14 @@ per-node counts sum to 4 and not 12.
 
 | arm  | n   | ms per 500 puts: min / p50 / p95 / max | puts/s at p50 |
 | ---- | --- | -------------------------------------- | ------------- |
-| off  | 30  | 17.5 / 19.3 / 23.2 / 31.6              | 25 900        |
-| none | 30  | 17.0 / 18.8 / 28.9 / 33.6              | 26 600        |
-| on   | 30  | 17.8 / 20.0 / 29.4 / 32.2              | 25 000        |
+| off  | 30  | 17.3 / 18.5 / 20.1 / 26.7              | 27 100        |
+| none | 30  | 17.5 / 19.1 / 23.9 / 29.0              | 26 200        |
+| on   | 30  | 17.3 / 18.6 / 26.9 / 110.9             | 26 900        |
 
-off − none = +0.5 ms per 500 puts at p50 (+2.6 %) with a batch-to-batch spread of 6–15 ms; the
-previous run had the sign reversed (off 22.1, none 23.0, on 23.4 ms). **Inside noise.** That matches
+off − none = −0.7 ms per 500 puts at p50 (−3.5 %) with a batch-to-batch spread of 9–12 ms; earlier
+runs had +0.5 ms (19.3 vs 18.8) and −0.9 ms (22.1 vs 23.0). The sign flips run to run, so the
+difference is **inside noise**. (The `on` arm's 110 ms max was one batch in one run — a stall on the
+box, not a lock cost: the arm never runs a round.) That matches
 the code: the unlocked write path never consults the transport (`getClusterLockTransport` is reached
 only from `lock()` and from the replicated-entry sink), so there is nothing for the gate to cost.
 
