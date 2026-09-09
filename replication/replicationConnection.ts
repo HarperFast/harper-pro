@@ -216,6 +216,21 @@ export const SEND_LOG_REPAIR_INTERVAL_MS = 30_000;
 // operator repairs the log, and on a merged multi-log range (`excludeLogs`) ONE origin's break silences
 // every healthy origin on that subscription too.
 export const SEND_LOG_QUARANTINE_RECHECK_MS = 30 * 60_000;
+// Whether the send range may be rebuilt now. A torn tail is walked as soon as the floor since the LAST
+// rebuild allows, because recovering it is the point. A quarantined one additionally waits out the recheck
+// window from when the break FIRST appeared, so it never rebuilds on first sight — that is the spin
+// harper#2087's fail-stop policy exists to avoid — while still looking again in case the log was repaired.
+export function mayRebuildSendRange(
+	midLogBreak: boolean,
+	breakSince: number,
+	lastRebuildAt: number,
+	now: number,
+	repairMs: number = SEND_LOG_REPAIR_INTERVAL_MS,
+	quarantineMs: number = SEND_LOG_QUARANTINE_RECHECK_MS
+): boolean {
+	const since = midLogBreak ? Math.max(breakSince, lastRebuildAt) : lastRebuildAt;
+	return !(since > 0 && now - since < (midLogBreak ? quarantineMs : repairMs));
+}
 type RecoveryCloseBound = { lastCloseAt?: number; closeCount?: number; lastEventAt?: number };
 const decodeDropResyncByPeer = new Map<string, RecoveryCloseBound>();
 // Keyed by (database, peer) in this module rather than on the session, because the close ENDS the session:
@@ -4315,12 +4330,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// longer — but it does wait, rather than never looking again.
 		const now = Date.now();
 		if (sendLogBreakSince === 0) sendLogBreakSince = now;
-		// A torn tail is walked as soon as the floor since the LAST rebuild allows, because recovering it is
-		// the point. A quarantined one additionally waits out the recheck window from when it first
-		// appeared, so it never rebuilds on first sight.
-		const floorMs = midLogBreak ? SEND_LOG_QUARANTINE_RECHECK_MS : SEND_LOG_REPAIR_INTERVAL_MS;
-		const since = midLogBreak ? Math.max(sendLogBreakSince, lastSendLogRepairAt) : lastSendLogRepairAt;
-		if (since > 0 && now - since < floorMs) return false;
+		if (!mayRebuildSendRange(midLogBreak, sendLogBreakSince, lastSendLogRepairAt, now)) return false;
 		lastSendLogRepairAt = now;
 		// Assigned before the log call: `logger.warn?.` is undefined under `logging.level: error`, so an
 		// inlined call would stop counting (harper-pro#431).
@@ -5517,7 +5527,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									frame.writeInt(REMOTE_SEQUENCE_UPDATE); // action id
 									frame.writeFloat64((sentSequenceId = cursor)); // send the log key so we know what sequence number to start from next time.
 									sendQueuedData();
-									// After the send, never before: sendQueuedData throws on an oversized frame, and a
 								}
 								frame.encodingStart = frame.position;
 								currentTransaction.txnLogKey = 0;
@@ -5670,7 +5679,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!skippedMessageSequenceUpdateTimer) {
 									skippedMessageSequenceUpdateTimer = setTimeout(() => {
 										skippedMessageSequenceUpdateTimer = null;
-										// A run of records this peer filters out is the send path WORKING, and it produces no
 										// check to see if we are too far behind, but if so, send a sequence update
 										if ((sentSequenceId || 0) + SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY / 2 < currentSequenceId) {
 											if (DEBUG_MODE)
@@ -6938,8 +6946,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							connectionId,
 							`Resubscribing to ${databaseName} from ${remoteNodeName} to resync table structures after an undecodable record${cursorBlockedByBlob() ? '; a blob holds the resume cursor behind this frame, so it is re-delivered after the structures are re-sent' : '; the dropped record is not re-delivered'}`
 						);
+						// Latch inbound off BEFORE closing so queued frames cannot advance the cursor past the held
+						// record — but UNDO it if the close did not actually happen, or the connection is live and
+						// permanently treated as closed, with nothing scheduling the resubscribe this exists to cause.
 						wsClosed = true;
-						close(CLOSE_DECODE_DROP_RESYNC, 'undecodable record; resubscribing to resync structures');
+						if (!close(CLOSE_DECODE_DROP_RESYNC, 'undecodable record; resubscribing to resync structures')) {
+							wsClosed = false;
+							logger.error?.(
+								connectionId,
+								`Could not close ${databaseName} to ${remoteNodeName} for a structure resync; the leg stays up and the next undecodable record will retry`
+							);
+						}
 					}
 				},
 			};
@@ -7092,7 +7109,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	ws.on('close', retireInstance);
 
-	function close(code?, reason?, intentional?: boolean) {
+	// Returns whether the close was actually issued. A caller that latches state on the strength of it
+	// (`wsClosed`, a resync budget slot) must not do so when `ws.close()` threw: the connection would then
+	// be live but treated as closed, with nothing scheduling a resubscribe (harper-pro#815 review).
+	function close(code?, reason?, intentional?: boolean): boolean {
 		try {
 			// Only the deliberate "we are done with this connection" call sites pass intentional=true
 			// (currently just the empty-subscription delayed close below). Everything else — auth
@@ -7105,8 +7125,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, code, reason);
 			ws.close(code, reason);
 			if (intentional) options.connection?.emit('finished'); // synchronously indicate that the connection is finished, so it is not accidentally reused
+			return true;
 		} catch (error) {
 			logger.error?.(connectionId, 'Error closing connection', error);
+			return false;
 		}
 	}
 	// Track the blobs being sent, so we can wait for them to finish before sending the next blob.
