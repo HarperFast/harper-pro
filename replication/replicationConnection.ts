@@ -4366,18 +4366,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return false;
 		}
 		lastSendLogRepairAt = now;
-		// The state transition FIRST, and the telemetry after it. Everything below is best-effort — a
-		// throwing logger or fire counter must not leave the dead iterable cached with the floor already
-		// stamped, which would suppress the next attempt too.
+		// The state transition FIRST, and the telemetry after it — contained, so neither a throwing logger
+		// nor a throwing fire counter can lose the `true` this returns. Losing it would leave the cache
+		// cleared and the floor stamped while the caller believed no repair happened.
 		auditLogIterable = undefined;
-		// Assigned before the log call: `logger.warn?.` is undefined under `logging.level: error`, so an
-		// inlined call would stop counting (harper-pro#431).
-		const fireDetail = recordFireForLog('send-log-break');
-		logger.warn?.(
-			connectionId,
-			`Replication send to ${remoteNodeName}${dbContext} stopped at a ${midLogBreak ? 'quarantined mid-log' : 'torn'} transaction-log frame (${breaks} break(s) on the cached iterable); it is latched done, so this session would send nothing further. Rebuilding the send range from ${resumeFrom}. ` +
-				fireDetail
-		);
+		try {
+			// Assigned before the log call: `logger.warn?.` is undefined under `logging.level: error`, so an
+			// inlined call would stop counting (harper-pro#431).
+			const fireDetail = recordFireForLog('send-log-break');
+			logger.warn?.(
+				connectionId,
+				`Replication send to ${remoteNodeName}${dbContext} stopped at a ${midLogBreak ? 'quarantined mid-log' : 'torn'} transaction-log frame (${breaks} break(s) on the cached iterable); it is latched done, so this session would send nothing further. Rebuilding the send range from ${resumeFrom}. ` +
+					fireDetail
+			);
+		} catch (error) {
+			logger.trace?.(connectionId, 'could not report the send-range rebuild', error);
+		}
 		return true;
 	}
 	if (databaseName) {
@@ -6337,25 +6341,30 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										const breaks = corruptFrameStop?.breaks ?? 0;
 										if (breaks > 0) {
 											drainStoppedAtBreak = true;
+											// Cancel the throttled skipped-record sequence update too. It fires on its own schedule
+											// and publishes the live `currentSequenceId`, which the receiver persists — so a long
+											// skip run inside this drain would advertise a cursor past the records the withhold
+											// below has just decided not to send, and no rewind can recall it.
+											if (skippedMessageSequenceUpdateTimer) {
+												clearTimeout(skippedMessageSequenceUpdateTimer);
+												skippedMessageSequenceUpdateTimer = null;
+											}
+											// Rewound here, before anything that can throw. `currentSequenceId` advanced per record
+											// as this drain ran, so leaving it at the truncated transaction's own key would strand
+											// the rest of that transaction behind the next scan's `exclusiveStart` — permanently,
+											// since `trackCorruptTransactions` is off and nothing can name which one was cut.
+											currentSequenceId = scanStartedAt;
 											// Asked on every drain once stopped, not only on a new break: a repair the interval
 											// floor declined must be retried rather than latched off.
 											const isNewBreak = breaks > sendLogBreaksSeen;
 											sendLogBreaksSeen = breaks;
 											// A repair replaces the iterable, so the running total starts over on the new object.
 											if (
-												repairSendLogBreak(breaks, corruptFrameStop.midLogBreak === true, isNewBreak, currentSequenceId)
+												repairSendLogBreak(breaks, corruptFrameStop.midLogBreak === true, isNewBreak, scanStartedAt)
 											) {
 												sendLogBreaksSeen = 0;
 												repairedSendRange = true;
-												currentSequenceId = scanStartedAt;
 											} else rebuildRetryInMs = sendLogRebuildRetryInMs;
-											// Rewind on ANY break, not only a repaired one. `currentSequenceId` advanced per record
-											// as this drain ran, so a denied iteration would leave it at the truncated
-											// transaction's own key — and the next scan re-snapshots `scanStartedAt` from it and
-											// opens `exclusiveStart`, so the rest of that transaction would never be sent by any
-											// later rebuild either. Several records share one `txnLogKey`, and with
-											// `trackCorruptTransactions` off nothing can name which one was truncated.
-											currentSequenceId = scanStartedAt;
 										} else {
 											// A replaced iterable starts its count over, and clears the quarantine clock with it.
 											sendLogBreaksSeen = 0;
