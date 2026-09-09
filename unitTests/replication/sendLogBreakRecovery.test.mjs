@@ -13,6 +13,9 @@
 import { expect } from 'chai';
 import {
 	claimRecoveryClose,
+	mayRebuildSendRange,
+	SEND_LOG_REPAIR_INTERVAL_MS,
+	SEND_LOG_QUARANTINE_RECHECK_MS,
 	recoveryCloseAllowed,
 	recoveryCloseEpisodeCount,
 	RECOVERY_CLOSE_EPISODE_MS,
@@ -136,5 +139,36 @@ describe('claimRecoveryClose — the interaction a denied claim used to poison',
 			at += RECOVERY_CLOSE_EPISODE_MS / 2;
 			expect(claim(bounds, at, true).allowed).to.equal(false);
 		}
+	});
+});
+
+describe('mayRebuildSendRange — when the stopped send range may be rebuilt', () => {
+	it('rebuilds a torn tail on first sight: recovering it is the point', () => {
+		expect(mayRebuildSendRange(false, NOW, 0, NOW)).to.equal(true);
+	});
+
+	it('floors repeated rebuilds of a torn tail, which is not always walkable yet', () => {
+		// Until something is written past the tear the fresh iterator stops at the same frame, so without
+		// the floor this would be a `getRange` per commit.
+		expect(mayRebuildSendRange(false, NOW, NOW, NOW + SEND_LOG_REPAIR_INTERVAL_MS - 1)).to.equal(false);
+		expect(mayRebuildSendRange(false, NOW, NOW, NOW + SEND_LOG_REPAIR_INTERVAL_MS)).to.equal(true);
+	});
+
+	it('never rebuilds a quarantined break on first sight', () => {
+		// A fresh iterator stops at the same frame, so rebuilding immediately would spin — which is the
+		// behaviour harper#2087's fail-stop policy exists to avoid.
+		expect(mayRebuildSendRange(true, NOW, 0, NOW)).to.equal(false);
+		expect(mayRebuildSendRange(true, NOW, 0, NOW + SEND_LOG_REPAIR_INTERVAL_MS)).to.equal(false);
+	});
+
+	it('re-checks a quarantined break once, long after it appeared', () => {
+		// But it must look again: never rebuilding leaves the cache latched for the life of the session even
+		// after an operator repairs the log — and on a merged multi-log range one origin's break would go on
+		// silencing every healthy origin on that subscription.
+		expect(mayRebuildSendRange(true, NOW, 0, NOW + SEND_LOG_QUARANTINE_RECHECK_MS)).to.equal(true);
+		// And the window then runs from the rebuild, not from the original sighting.
+		expect(
+			mayRebuildSendRange(true, NOW, NOW + SEND_LOG_QUARANTINE_RECHECK_MS, NOW + SEND_LOG_QUARANTINE_RECHECK_MS + 1)
+		).to.equal(false);
 	});
 });
