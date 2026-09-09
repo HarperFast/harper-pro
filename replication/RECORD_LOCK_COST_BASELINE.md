@@ -52,7 +52,8 @@ One key; each contending node keeps exactly one `lock → read → increment →
 sections per second, whole cluster. The counter converged to exactly the section count on every node
 in every run (no lost update, no failed round). Distributions are pooled over every contender's
 samples (the per-node ones, near-identical, are in the JSON). `lock` and `section` (lock through
-`save()`) are timed inside the node; `request` is the client's round trip and includes HTTP and JSON.
+`save()`) are timed inside the node; `request` is the client's round trip, which also covers the request
+transaction's commit (the unlock), HTTP and JSON.
 
 | contenders | sections | sections/s | lock p50 / p95 / p99 (ms) | section p50 / p95 (ms) | request p50 / p95 (ms) |
 | ---------- | -------- | ---------- | ------------------------- | ---------------------- | ---------------------- |
@@ -63,7 +64,8 @@ The cluster stays a 3-participant mesh in both rows; "contenders" is how many no
 Earlier runs gave 891/968 and 793/750 sections/s for the same rows, so the aggregate rate is **noisy
 to about ±15 %** on this box and the 2-vs-3 ordering is not significant. What is stable: lock latency
 roughly doubles from 2 to 3 contenders (every acquisition waits for the other holders' turns), the
-read/write/save after the lock adds under 0.1 ms, and the client sees another ~0.6 ms of HTTP.
+read/write/save after the lock adds under 0.1 ms, and the client sees another ~0.6 ms of commit plus
+request overhead.
 
 ## 4. Transaction-log cost per acquisition
 
