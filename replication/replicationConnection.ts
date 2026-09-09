@@ -7925,12 +7925,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			});
 		}
 		logger.trace?.('Sending database info for node', thisNodeName, 'database name', databaseName);
-// Test-only: a pre-#646 peer that sends no capability element, and a peer speaking a frame code this
+		// Test-only: a pre-#646 peer that sends no capability element, and a peer speaking a frame code this
 		// build does not know.
 		if (TEST_OMIT_CAPABILITIES) ws.send(encode([NODE_NAME, thisNodeName, databaseName, tables]));
 		else
 			ws.send(
-				encode([NODE_NAME, thisNodeName, databaseName, tables, { ...LOCAL_CAPABILITIES, acceptBlobCodecs: acceptedBlobCodecs() }])
+				encode([
+					NODE_NAME,
+					thisNodeName,
+					databaseName,
+					tables,
+					{ ...LOCAL_CAPABILITIES, acceptBlobCodecs: acceptedBlobCodecs() },
+				])
 			);
 		if (TEST_UNKNOWN_COMMAND_VALID) ws.send(encode([TEST_UNKNOWN_COMMAND_CODE]));
 	}
