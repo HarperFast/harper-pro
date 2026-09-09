@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788854066318,
+  "lastUpdate": 1788940281814,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -4419,6 +4419,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2124.72,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "54f49704c693c8d8f1116c78192e505c103c1d9f",
+          "message": "Make `npm run build` exit 0 by declaring the types the code already depends on (#818)\n\n* build: make `npm run build` exit 0 (type-only)\n\n`tsc --project tsconfig.json` exited 2 on a clean checkout of main with 31 errors while\nstill emitting a complete dist/, so the build's exit code was not a usable success signal.\nThree families, all declaration gaps rather than code defects:\n\n- 17 TS2339 on the `ws` library's private `_socket`, which replication's keep-alive\n  watchdog and blob-send backpressure both read. Declared once as a replication-scoped\n  `ReplicationWebSocket = WebSocket & { _socket: Socket | null }` applied at the four\n  transport ingress boundaries, so all 17 reads type without per-site casts. (A\n  `declare module 'ws'` augmentation does not work: @types/ws exports the class via\n  `export =`, so the imported type is the class instance type, which an interface\n  augmentation cannot merge into.)\n- 4 TS2339 on `error.code` / `error.isHandled` in the socket 'error' handler, fixed by\n  annotating that one listener parameter.\n- 9 TS2345/TS2365 in analytics/profile.ts, where pprof-format declares sample fields as\n  `number | bigint`; asserted `as number`, the idiom the same function already uses.\n- 1 TS2550 for `Promise.withResolvers` in pinned core code; harper-pro's tsconfig had no\n  `lib`, so it defaulted to ES2022. Mirrors core/tsconfig.json's list, which already\n  carries ES2024.Promise for this exact call. `target` is unchanged.\n\nAlso adds a unit test pinning the `ws` internals the new type declares, and declares\n@types/ws directly (production code imports `ws`, but its types arrived transitively\nthrough the dev-only `mqtt`).\n\nZero runtime change: all 1033 emitted dist/ files are byte-identical to the pre-change\nbuild except the two touched sources' .js.map, whose mappings shift because erased\n`as`/annotation syntax moves source columns.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013CwEcEqeKKoP4WcxFXWPaB\n\n* fix: address pre-push review findings\n\n- record the @types/ws root edge in package-lock.json (npm install --package-lock-only);\n  it resolved to the hoisted transitive copy, so package.json claimed a dependency the\n  lockfile's root entry did not\n- bound the ws contract test's socket waits: .mocharc.json sets timeout: 0, so a bind or\n  connect failure would have hung the whole unit suite instead of failing this file\n- correct the tsconfig comment (the lib list is TypeScript's default for target ES2022\n  plus ES2024.Promise, which is the reviewable fact; \"mirrors core\" is not) and the\n  test's header and one case title\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013CwEcEqeKKoP4WcxFXWPaB\n\n* test: drop the ws contract test's settled-wait listeners\n\nonceOrFail left its 'error' listener attached after a successful wait, so a later socket\nfailure resolved into a no-op reject instead of surfacing.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013CwEcEqeKKoP4WcxFXWPaB\n\n* refactor: keep ReplicationWebSocket file-local\n\nNothing outside replicationConnection.ts names the type, and an exported type under\nTypeStrip is a footgun: a value-shaped `import { ReplicationWebSocket }` typechecks but\nsurvives stripping and fails at runtime.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013CwEcEqeKKoP4WcxFXWPaB\n\n* docs: name the functions instead of line numbers in the ws contract test header\n\nHead-side line numbers in replicationConnection.ts rot on its next edit.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013CwEcEqeKKoP4WcxFXWPaB\n\n* docs: correct the ws contract test header's non-optional-read claim\n\n`sendAuditRecord`'s backpressure wait is not the only non-optional `_socket` read; the\nopen handlers' `unref()` are too.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013CwEcEqeKKoP4WcxFXWPaB\n\n* test: guard the ws contract test's server close\n\nIf `before` fails before the server is constructed, an unguarded close() throws a\nTypeError over the real failure.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_013CwEcEqeKKoP4WcxFXWPaB\n\n---------\n\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>",
+          "timestamp": "2026-09-09T03:56:48Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/54f49704c693c8d8f1116c78192e505c103c1d9f"
+        },
+        "date": 1788940280014,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 11523.7,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 25829.65,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 16141.25,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 9328.17,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 7498.78,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2829.63,
             "unit": "ops/sec"
           }
         ]
