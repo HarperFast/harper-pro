@@ -89,8 +89,6 @@ import {
 } from './knownNodes.ts';
 import * as process from 'node:process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { open as openFile } from 'node:fs/promises';
-import { promises as fsPromises } from 'node:fs';
 import { isIP, type Socket } from 'node:net';
 import { recordAction } from '../core/resources/analytics/write.ts';
 import {
