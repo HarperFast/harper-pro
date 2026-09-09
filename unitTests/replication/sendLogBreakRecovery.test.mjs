@@ -1,10 +1,13 @@
 /**
- * Bounds on the two recovery closes in replicationConnection.ts (harper-pro#810).
+ * The bound on the decode-drop structure resync (harper-pro#810).
  *
- * Both closes end the session that decided to make them, so neither bound can live on the session: a
- * session-scoped latch resets on the very reconnect it caused and bounds nothing. They live in a module
- * map keyed by (database, peer), and the predicates below are pure so the bounds can be pinned without a
- * live socket.
+ * That close ENDS the session that decided to make it, so its bound cannot live on the session: a
+ * session-scoped latch resets on the very reconnect it caused and bounds nothing. It lives in a module
+ * map keyed by (database, peer), and the predicates below are pure so it can be pinned without a live
+ * socket.
+ *
+ * The send-log-break repair needs none of this: it replaces a cached local rather than closing anything,
+ * so a session-local interval floor is the whole bound (`SEND_LOG_REPAIR_INTERVAL_MS`).
  */
 
 import { expect } from 'chai';
@@ -13,7 +16,6 @@ import {
 	recoveryCloseAllowed,
 	recoveryCloseEpisodeCount,
 	RECOVERY_CLOSE_EPISODE_MS,
-	SEND_LOG_BREAK_BUDGET,
 	DECODE_DROP_RESYNC_BUDGET,
 } from '#src/replication/replicationConnection';
 
@@ -22,16 +24,16 @@ const INTERVAL = 5 * 60_000;
 
 describe('recoveryCloseAllowed', () => {
 	it('allows the first close', () => {
-		expect(recoveryCloseAllowed(0, 0, NOW, INTERVAL, SEND_LOG_BREAK_BUDGET)).to.equal(true);
+		expect(recoveryCloseAllowed(0, 0, NOW, INTERVAL, DECODE_DROP_RESYNC_BUDGET)).to.equal(true);
 	});
 
 	it('suppresses a second close inside the interval', () => {
 		// One reconnect per interval is a repair attempt; one per event is an outage.
-		expect(recoveryCloseAllowed(NOW - INTERVAL + 1, 1, NOW, INTERVAL, SEND_LOG_BREAK_BUDGET)).to.equal(false);
+		expect(recoveryCloseAllowed(NOW - INTERVAL + 1, 1, NOW, INTERVAL, DECODE_DROP_RESYNC_BUDGET)).to.equal(false);
 	});
 
 	it('allows another once the interval has elapsed', () => {
-		expect(recoveryCloseAllowed(NOW - INTERVAL, 1, NOW, INTERVAL, SEND_LOG_BREAK_BUDGET)).to.equal(true);
+		expect(recoveryCloseAllowed(NOW - INTERVAL, 1, NOW, INTERVAL, DECODE_DROP_RESYNC_BUDGET)).to.equal(true);
 	});
 
 	it('stops entirely once the budget is spent, however long ago the last one was', () => {
@@ -68,8 +70,8 @@ describe('recoveryCloseEpisodeCount', () => {
 		// the leg could never recover — not even after the log was repaired. Only a NEW break feeds the
 		// bound; a re-ask consults it. Modelled here as "the last event is old": that is the state a
 		// re-asking caller leaves behind, and the budget comes back.
-		expect(recoveryCloseEpisodeCount(NOW - RECOVERY_CLOSE_EPISODE_MS, SEND_LOG_BREAK_BUDGET, NOW)).to.equal(0);
-		expect(recoveryCloseAllowed(NOW - RECOVERY_CLOSE_EPISODE_MS, 0, NOW, INTERVAL, SEND_LOG_BREAK_BUDGET)).to.equal(
+		expect(recoveryCloseEpisodeCount(NOW - RECOVERY_CLOSE_EPISODE_MS, DECODE_DROP_RESYNC_BUDGET, NOW)).to.equal(0);
+		expect(recoveryCloseAllowed(NOW - RECOVERY_CLOSE_EPISODE_MS, 0, NOW, INTERVAL, DECODE_DROP_RESYNC_BUDGET)).to.equal(
 			true
 		);
 	});
@@ -78,8 +80,7 @@ describe('recoveryCloseEpisodeCount', () => {
 		expect(recoveryCloseEpisodeCount(0, 0, NOW)).to.equal(0);
 	});
 
-	it('bounds both consumers, so neither can be left unbounded by a later edit', () => {
-		expect(SEND_LOG_BREAK_BUDGET).to.be.greaterThan(0);
+	it('is bounded, so it cannot be left unbounded by a later edit', () => {
 		expect(DECODE_DROP_RESYNC_BUDGET).to.be.greaterThan(0);
 	});
 });

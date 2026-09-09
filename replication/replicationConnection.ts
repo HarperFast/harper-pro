@@ -190,7 +190,6 @@ export const CONNECTION_STATE_CONNECTED = 2;
 export const WORKER_EXIT_ERROR_CODE = 100_001;
 // Application close codes (RFC 6455 reserves 4000-4999) so a recovery close is distinguishable in
 // `lastConnectionError` and peer logs from the protocol closes (1008/1011) already in use.
-export const CLOSE_SEND_LOG_BREAK = 4001;
 export const CLOSE_DECODE_DROP_RESYNC = 4002;
 // Minimum gap between two structure-resync closes on one connection. The resync is latched per frame,
 // but the drop that triggers it is the whole residual decode-failure bucket, not only the structure fork
@@ -209,15 +208,11 @@ export const DECODE_DROP_RESYNC_BUDGET = 3;
 // How long without an event ends the current episode and restores the budget. Well above either
 // interval, so a flap cannot walk itself back into budget one interval at a time.
 export const RECOVERY_CLOSE_EPISODE_MS = 60 * 60_000;
-// Reconnects one connection may spend on a send-log break before it stops trying. A torn tail is
-// normally repaired by the FIRST reconnect (the fresh iterator reads straight past it), so a run of
-// these means the break is not the benign kind and the reconnects are not repairing it.
-export const SEND_LOG_BREAK_INTERVAL_MS = 5 * 60_000;
-export const SEND_LOG_BREAK_BUDGET = 3;
-// Both recovery closes in this file are bounded the same way, so they share the predicates.
+// Floor between rebuilds of a send range that stopped at a torn tail. Until something is written past the
+// tear the fresh iterator stops at the same frame, and without this that would be a `getRange` per commit.
+export const SEND_LOG_REPAIR_INTERVAL_MS = 30_000;
 type RecoveryCloseBound = { lastCloseAt?: number; closeCount?: number; lastEventAt?: number };
 const decodeDropResyncByPeer = new Map<string, RecoveryCloseBound>();
-const sendLogBreakByPeer = new Map<string, RecoveryCloseBound>();
 // Keyed by (database, peer) in this module rather than on the session, because the close ENDS the session:
 // a session-scoped latch would reset on the very reconnect it caused and bound nothing. A server-side
 // receive session has no connection object to hang it on either. The predicates are pure so both bounds
@@ -3400,11 +3395,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let auditStore: any;
 	let auditLogIterable: Iterable<AuditRecord> & { removeLog?: (name: string) => void; addLog?: (name: string) => void }; // reusable iterator for a subscription
 	let replicationSharedStatus: Float64Array;
-	// harper-pro#810. Corrupt-frame stops already seen on this session's send iterable, so a NEW one is
-	// distinguishable from the running total: the loop reuses one iterable for the whole session on
-	// RocksDB, and `corruptFrameStop` accumulates on it. See noteSendLogBreak.
+	// harper-pro#810. Corrupt-frame stops already seen on the CURRENT send iterable, so a new one is
+	// distinguishable from the running total (`corruptFrameStop` accumulates on a reused object). Reset
+	// whenever the iterable is replaced. See repairSendLogBreak.
 	let sendLogBreaksSeen = 0;
-	let closingForSendLogBreak = false;
+	let lastSendLogRepairAt = 0;
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
@@ -4306,62 +4301,38 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	//   the session up: visibly degraded beats silently churning.
 	// Returns whether it closed the socket, so the send loop can stop rather than parking on the next
 	// commit with a socket that is going away.
-	function noteSendLogBreak(breaks: number, midLogBreak: boolean, isNewBreak: boolean): boolean {
-		if (closingForSendLogBreak || wsClosed) return false;
+	// harper-pro#810 (DESIGN.md item 10d). Drops the cached send iterable so the next iteration rebuilds it;
+	// the loop's `whenNextTransaction` capture precedes the scan, so no wake is lost. Returns whether it
+	// repaired, so the caller can reset its change detection against the new object.
+	function repairSendLogBreak(breaks: number, midLogBreak: boolean, isNewBreak: boolean, resumeFrom: number): boolean {
+		if (wsClosed) return false;
 		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+		// A fresh iterator stops at the same frame, so refreshing a mid-log break would spin without ever
+		// crossing it — and harper#2087 makes stopping there the intended policy.
 		if (midLogBreak) {
 			if (!isNewBreak) return false;
 			logger.error?.(
 				connectionId,
-				`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind the break are quarantined and no reconnect can cross it, so this leg will not send past it. Repair the transaction log or re-clone this node.`
+				`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind the break are quarantined and no fresh iterator can cross it, so this leg will not send past it. Repair the transaction log or re-clone this node.`
 			);
 			return false;
 		}
-		// Only a REUSED iterable needs the socket closed to be discarded, and that reuse is the whole fault:
-		// where the loop already builds a fresh range every wake (`reusableIterable` falsy — the LMDB audit
-		// store), the next wake walks past this on its own. Closing there would abort the peer's in-flight
-		// blob receives, and can latch a blob gap, for a condition that was about to clear itself.
-		if (!auditStore?.reusableIterable) {
-			if (isNewBreak)
-				logger.debug?.(
-					connectionId,
-					`Send iterable for ${remoteNodeName}${dbContext} stopped at a torn transaction-log frame; this store builds a fresh range per wake, so no reconnect is needed`
-				);
-			return false;
-		}
-		const key = `${databaseName}\u0000${remoteNodeName}`;
+		// Nothing is cached to drop where the loop already rebuilds every wake.
+		if (!auditStore?.reusableIterable) return false;
+		// A torn tail is not always walkable yet, and rebuilding on every wake would be a `getRange` per
+		// commit.
 		const now = Date.now();
-		const { allowed, count } = claimRecoveryClose(
-			sendLogBreakByPeer,
-			key,
-			now,
-			SEND_LOG_BREAK_INTERVAL_MS,
-			SEND_LOG_BREAK_BUDGET,
-			isNewBreak
-		);
-		if (!allowed) {
-			if (isNewBreak)
-				logger.warn?.(
-					connectionId,
-					`Replication send to ${remoteNodeName}${dbContext} stopped at a corrupt transaction-log frame again after ${count} reconnects in this episode; reconnecting is not clearing it, so this leg stays stopped at the break.`
-				);
-			return false;
-		}
-		closingForSendLogBreak = true;
-		// Assigned to a local before the log call for the reason every other net does it (harper-pro#431):
-		// `logger.warn?.` is undefined under `logging.level: error`, so an inlined call would stop counting.
+		if (lastSendLogRepairAt > 0 && now - lastSendLogRepairAt < SEND_LOG_REPAIR_INTERVAL_MS) return false;
+		lastSendLogRepairAt = now;
+		// Assigned before the log call: `logger.warn?.` is undefined under `logging.level: error`, so an
+		// inlined call would stop counting (harper-pro#431).
 		const fireDetail = recordFireForLog('send-log-break');
 		logger.warn?.(
 			connectionId,
-			`Replication send to ${remoteNodeName}${dbContext} stopped at a torn transaction-log frame (${breaks} break(s) on this session's iterable). The iterator is latched done and this session reuses it, so the leg would stay silent at connected:true with no further frames — closing so the peer resubscribes onto a fresh iterator. ` +
+			`Replication send to ${remoteNodeName}${dbContext} stopped at a torn transaction-log frame (${breaks} break(s) on the cached iterable); it is latched done, so this session would send nothing further. Rebuilding the send range from ${resumeFrom}. ` +
 				fireDetail
 		);
-		// Not `intentional`: the peer's normal close-handler retry path IS the recovery here. The socket is
-		// bidirectional, so this also aborts any blob RECEIVE in flight on it (retireInstance) — a cost paid
-		// on a direction that has nothing wrong with it, and the reason the budget above is small. It is the
-		// right trade only because the alternative is a leg that sends nothing at all until someone restarts
-		// the node; an aborted blob is re-streamed from the peer's durable cursor on the reconnect.
-		close(CLOSE_SEND_LOG_BREAK, 'transaction-log frame break; resubscribe onto a fresh iterator');
+		auditLogIterable = undefined;
 		return true;
 	}
 	if (databaseName) {
@@ -6302,39 +6273,24 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									// The loop has drained; ask the iterable WHY before parking on the next commit. A new break
-									// since the last drain is the only thing that distinguishes "nothing to send" from "this
-									// iterator can no longer send anything" — the two states this leg has never been able to
-									// tell apart. Counted, not latched, because the iterable is reused for the whole session
-									// and `breaks` accumulates on it. Contained: the property read is on a store object, and a
-									// telemetry throw must never take the send loop with it.
-									//
-									// A store without `corruptFrameStop` reads as 0 and this is a no-op, which is correct
-									// rather than a gap: the wedge is structurally Rocks-only. Both halves of it live on
-									// `RocksTransactionLogStore` — `endIteratorOnCorruptFrame`, which latches the iterator
-									// done, and `reusableIterable`, which is what makes the loop keep draining that same
-									// latched iterator. An LMDB audit store (`openAuditStore`'s non-Rocks branch) sets
-									// neither, so its loop builds a fresh iterable every wake and a stopped iterator cannot
-									// outlive one.
+									// The loop has drained; ask the iterable WHY before parking on the next commit — the one
+									// thing that separates "nothing to send" from "this iterator can no longer send anything".
+									// A store without `corruptFrameStop` reads 0 and this is a no-op, which is correct: the
+									// wedge is structurally Rocks-only (see DESIGN.md item 10d). Contained because a telemetry
+									// throw must never take the send loop with it.
 									try {
 										const corruptFrameStop = (auditLogIterable as any)?.corruptFrameStop;
 										const breaks = corruptFrameStop?.breaks ?? 0;
 										if (breaks > 0) {
-											// Asked on EVERY drain once stopped, not only on a new break. The iterator is latched,
-											// so it reports the same count forever; if the budget was spent and we stopped asking,
-											// the episode could never lapse and this leg could never recover — not even after the
-											// log was repaired. `isNewBreak` is what separates the two: it feeds the bound, a
-											// re-ask only consults it.
+											// Asked on every drain once stopped, not only on a new break: a repair the interval
+											// floor declined must be retried rather than latched off.
 											const isNewBreak = breaks > sendLogBreaksSeen;
 											sendLogBreaksSeen = breaks;
-											if (noteSendLogBreak(breaks, corruptFrameStop.midLogBreak === true, isNewBreak)) {
-												// End the loop rather than parking on the next commit: the socket is going away,
-												// and `closed` is otherwise only set by the subscription's own 'close' handler,
-												// which leaves this iteration waiting on `whenNextTransaction` — still holding the
-												// latched range the close exists to discard.
-												closed = true;
-												return;
-											}
+											// A repair replaces the iterable, so the running total starts over on the new object.
+											if (
+												repairSendLogBreak(breaks, corruptFrameStop.midLogBreak === true, isNewBreak, currentSequenceId)
+											)
+												sendLogBreaksSeen = 0;
 										}
 									} catch (error) {
 										logger.trace?.(connectionId, 'could not read the send iterable corrupt-frame state', error);
