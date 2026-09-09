@@ -21,6 +21,7 @@ import { expect } from 'chai';
 import {
 	unconfirmedSendStallReason,
 	withinUnconfirmedSendGrace,
+	unconfirmedSendExemptionHolds,
 	decodeDropResyncAllowed,
 	decodeDropResyncEpisodeCount,
 	UNCONFIRMED_SEND_MAX_GRACE_MS,
@@ -190,5 +191,27 @@ describe('decodeDropResyncEpisodeCount', () => {
 
 	it('leaves a peer that has never dropped a record alone', () => {
 		expect(decodeDropResyncEpisodeCount(0, 0, NOW)).to.equal(0);
+	});
+});
+
+describe('unconfirmedSendExemptionHolds', () => {
+	const GRACE = UNCONFIRMED_SEND_MAX_GRACE_MS;
+
+	it('holds with no ceiling while the send path is still moving data', () => {
+		// The case the cap got wrong: a blob big enough to outlast any fixed grace is still putting chunks
+		// on the wire, which is the healthy leg this net exists to protect. Long past the grace, still held.
+		expect(unconfirmedSendExemptionHolds(NOW - 1_000, NOW - 10 * GRACE, NOW, THRESHOLD)).to.equal(true);
+	});
+
+	it('releases once the exemption itself stops progressing and the grace is spent', () => {
+		// Blobs registered as sending that have stopped producing chunks: a wedge wearing the exemption's
+		// clothes, and the only thing the cap is meant to bound.
+		expect(unconfirmedSendExemptionHolds(NOW - THRESHOLD, NOW - GRACE, NOW, THRESHOLD)).to.equal(false);
+	});
+
+	it('falls back to the time grace when the sender has nothing to show yet', () => {
+		// The peer cannot act and this sender has not moved data either — the window the grace covers.
+		expect(unconfirmedSendExemptionHolds(0, NOW - 1_000, NOW, THRESHOLD)).to.equal(true);
+		expect(unconfirmedSendExemptionHolds(0, NOW - GRACE, NOW, THRESHOLD)).to.equal(false);
 	});
 });

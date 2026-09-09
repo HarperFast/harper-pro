@@ -265,16 +265,37 @@ export const UNSENT_WORK_PROBE_INTERVAL_MS = 5 * 60_000;
 // peer grows its store with logs this subscription excludes, and counting those would close a healthy
 // leg every threshold. It is called only after the progress clock has elapsed, so a busy or idle sender
 // never pays for it.
-// Whether the "peer cannot act yet" exemption may still hold the confirmation clock open. Bounded, and
-// the bound has to gate the EXEMPTION rather than only the clock: a session that keeps one blob in the
-// send pipeline, or never leaves back-pressure, would otherwise skip the check on every tick forever and
-// the cap would bound nothing — reinstating the very wedge this net exists to catch.
+// The time-only half of the "peer cannot act yet" exemption. Bounded, and the bound has to gate the
+// EXEMPTION rather than only the clock: a session that keeps one blob in the send pipeline, or never
+// leaves back-pressure, would otherwise skip the check on every tick forever and the cap would bound
+// nothing — reinstating the very wedge this net exists to catch.
 export function withinUnconfirmedSendGrace(
 	unconfirmedFirstOwedAt: number,
 	now: number,
 	maxGraceMs: number = UNCONFIRMED_SEND_MAX_GRACE_MS
 ): boolean {
 	return unconfirmedFirstOwedAt > 0 && now - unconfirmedFirstOwedAt < maxGraceMs;
+}
+// Whether the exemption may hold the confirmation clock open this tick.
+//
+// `sendActivityAt` is the last time the send path DEMONSTRABLY moved data — a frame, a blob chunk, a copy
+// pacer yield. While it keeps advancing there is no ceiling, because a transfer still putting chunks on
+// the wire is precisely the healthy leg this net must never close, and a blob large enough to outlast any
+// fixed cap is the case the cap would get wrong. The time-only grace is the fallback for the window where
+// the peer cannot act but this sender has nothing to show for it either.
+//
+// So the cap now bounds only an exemption that is NOT progressing — blobs registered as sending that have
+// stopped producing chunks, or a pause that never drains. That is a wedge wearing the exemption's clothes,
+// and it is the case the cap exists for.
+export function unconfirmedSendExemptionHolds(
+	sendActivityAt: number,
+	unconfirmedFirstOwedAt: number,
+	now: number,
+	thresholdMs: number,
+	maxGraceMs: number = UNCONFIRMED_SEND_MAX_GRACE_MS
+): boolean {
+	if (sendActivityAt > 0 && now - sendActivityAt < thresholdMs) return true;
+	return withinUnconfirmedSendGrace(unconfirmedFirstOwedAt, now, maxGraceMs);
 }
 // `peerConfirmsBlobDrain` is the capability gate on the FIRST shape only. A peer that does not re-confirm
 // once its blobs go durable (every build before harper-pro#810) leaves `confirmed < sent` on a healthy,
@@ -3437,6 +3458,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// forward by the "peer cannot act yet" extension, so that extension can be capped.
 	let unconfirmedFirstOwedAt = 0;
 	let lastSendProgressAt = 0;
+	// The same instant, but written ONLY by real send activity — never by the exemption branch in
+	// checkUnconfirmedSendStall, which forges `lastSendProgressAt` to suppress `send-path-stopped`.
+	let lastSendActivityAt = 0;
 	// Set by the subscription handler to re-read this peer's exact send range; see checkUnconfirmedSendStall.
 	let hasUnsentWorkForPeer: (() => boolean) | undefined;
 	// Cached answer from that re-read. A QUIET leg satisfies the progress clock forever, so without this
@@ -4295,15 +4319,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const now = Date.now();
 		// While the peer CANNOT act — its blobs are still arriving, or our own socket is congested and the
 		// send loop is parked on drain — the send path is alive by definition, and closing on the tick after
-		// the condition clears would restart the very transfer that was progressing. Bounded; see
-		// withinUnconfirmedSendGrace for why the bound has to end the exemption and not just the clock.
+		// the condition clears would restart the very transfer that was progressing. See
+		// unconfirmedSendExemptionHolds for what bounds it and what deliberately does not.
 		if (blobsBeingSent.size > 0 || isPausedForBackPressure) {
+			// The stamp this branch writes is a suppression, not an observation: a paused or blob-busy sender
+			// is not a STOPPED one, so `send-path-stopped` must not fire on it. It therefore cannot also be
+			// the evidence that the exemption is alive — reading it back would make the exemption
+			// self-justifying, since this branch refreshes it on every tick. `lastSendActivityAt` is the
+			// honest one; only real send activity writes it.
 			lastSendProgressAt = now;
-			if (unconfirmedSince > 0 && withinUnconfirmedSendGrace(unconfirmedFirstOwedAt, now)) {
+			if (unconfirmedSince === 0) return;
+			if (
+				unconfirmedSendExemptionHolds(
+					lastSendActivityAt,
+					unconfirmedFirstOwedAt,
+					now,
+					effectiveUnconfirmedSendThresholdMs()
+				)
+			) {
 				unconfirmedSince = now;
 				return;
 			}
-			if (unconfirmedSince === 0) return;
 		}
 		const reason = unconfirmedSendStallReason(
 			{
@@ -4385,7 +4421,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return Math.max(UNCONFIRMED_SEND_THRESHOLD_MS, blobGapReconnectMs + UNCONFIRMED_SEND_ORDERING_MARGIN_MS);
 	}
 	function noteSendProgress() {
-		lastSendProgressAt = Date.now();
+		lastSendActivityAt = lastSendProgressAt = Date.now();
 		unsentWorkProbeAt = 0;
 	}
 	function mayResyncForDecodeDrop(): boolean {
