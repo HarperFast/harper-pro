@@ -359,7 +359,6 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 				sectionsPerSecond: Math.round((sections / elapsedMs) * 1000 * 10) / 10,
 				converged,
 				finalCounter: await Promise.all(nodes.map((node) => counter(node, id).then((record) => record?.n))),
-				// Pooled over every contender's samples; the per-node distributions are kept beside them.
 				lockMs: distribution(answers.flatMap((answer) => answer.lockMs)),
 				sectionMs: distribution(answers.flatMap((answer) => answer.sectionMs)),
 				requestMs: distribution(answers.flatMap((answer) => answer.requestMs)),
