@@ -120,25 +120,28 @@ A `Resource` class installed as a `source` of a table. Declared inside `setRepli
 
 Per (database, remote_node) pair: an mmap-backed `Float64Array` shared across threads, used to avoid IPC for hot-path status updates. Position constants live in `replicationConnection.ts`:
 
-| Position | Constant                           |
-| -------- | ---------------------------------- |
-| 0        | `CONFIRMATION_STATUS_POSITION`     |
-| 1        | `RECEIVED_VERSION_POSITION`        |
-| 2        | `RECEIVED_TIME_POSITION`           |
-| 3        | `SENDING_TIME_POSITION`            |
-| 4        | `LATENCY_POSITION`                 |
-| 5        | `RECEIVING_STATUS_POSITION`        |
-| 6        | `BACK_PRESSURE_RATIO_POSITION`     |
-| 7        | `BLOB_FAILURE_COUNT_POSITION`      |
-| 8        | `LAST_BLOB_FAILURE_TIME_POSITION`  |
-| 9        | `CONNECTION_STATE_POSITION`        |
-| 10       | `LAST_LIVENESS_TIME_POSITION`      |
-| 11       | `LAST_ERROR_CODE_POSITION`         |
-| 12       | `LAST_ERROR_TIME_POSITION`         |
-| 13–28    | fire-classification counters       |
-| 29       | `RECORD_LOCKS_CAPABILITY_POSITION` |
+| Position | Constant                                      |
+| -------- | --------------------------------------------- |
+| 0        | `CONFIRMATION_STATUS_POSITION`                |
+| 1        | `RECEIVED_VERSION_POSITION`                   |
+| 2        | `RECEIVED_TIME_POSITION`                      |
+| 3        | `SENDING_TIME_POSITION`                       |
+| 4        | `LATENCY_POSITION`                            |
+| 5        | `RECEIVING_STATUS_POSITION`                   |
+| 6        | `BACK_PRESSURE_RATIO_POSITION`                |
+| 7        | `BLOB_FAILURE_COUNT_POSITION`                 |
+| 8        | `LAST_BLOB_FAILURE_TIME_POSITION`             |
+| 9        | `CONNECTION_STATE_POSITION`                   |
+| 10       | `LAST_LIVENESS_TIME_POSITION`                 |
+| 11       | `LAST_ERROR_CODE_POSITION`                    |
+| 12       | `LAST_ERROR_TIME_POSITION`                    |
+| 13–28    | first eight fire-classification counter pairs |
+| 29       | `RECORD_LOCKS_CAPABILITY_POSITION`            |
+| 30       | `RECORD_LOCK_HOMES_AGREEMENT_POSITION`        |
+| 31       | `RECORD_LOCK_LEVEL_POSITION`                  |
+| 32–33    | ninth fire-classification counter pair        |
 
-The buffer is 32 `Float64` slots (256 bytes), sized from `REPLICATION_SHARED_STATUS_SLOTS` in `knownNodes.ts`; 0–31 are used (30 is the record-lock home-map digest agreement tri-state, `RECORD_LOCK_HOMES_AGREEMENT_POSITION`; 31 is the peer's exact advertised `recordLocks` level, `RECORD_LOCK_LEVEL_POSITION`, both in `recordLockTransport.ts`); grow the constant for the next slot. Slots 0–12 are written concurrently by `replicationConnection.ts` without explicit synchronization (single-writer-per-field in practice) — **don't introduce read-modify-write patterns on those.** Slots 13–28 are the one deliberate exception; see the counter invariant below.
+The buffer is 34 `Float64` slots (272 bytes), sized from `REPLICATION_SHARED_STATUS_SLOTS` in `knownNodes.ts`; every slot is allocated. Slots 0–12 are written concurrently by `replicationConnection.ts` without explicit synchronization (single-writer-per-field in practice) — **don't introduce read-modify-write patterns on those.** Slots 13–28 and 32–33 are the deliberate exception; see the counter invariant below.
 
 **Connection truth (W1 / harper-pro#431).** Slots 9–12 make the owning worker thread the authoritative source for an outbound subscription's link state, rather than relying solely on the edge-triggered worker→main `postMessage` mirror (`connected-to-node` / `disconnected-from-node`), which desyncs when a terminal/idle state is reached without a `'close'` (open-but-idle wedge, #289/#233). The worker writes `CONNECTION_STATE_CONNECTED` + `LAST_LIVENESS_TIME` on pong and on received data, `CONNECTION_STATE_DOWN` + error on close/`forceReconnect`, and refreshes liveness during a backpressure pause (matching `shouldTerminateIdlePing`'s `pauseReasons` exemption). The main thread reads it via `deriveConnectionTruth` / `readConnectionTruth`: `connected` requires `CONNECTED` **and** fresh liveness (`< LIVENESS_STALE_MS`, derived from `PING_TIMEOUT`), so a worker that died/wedged without writing `DOWN` still reads down once liveness goes stale. `clusterStatus.ts` reports it (authoritative `connected` + `lastConnectionError`); `subscriptionManager.ts → reconcileWorkers` corrects the inferred flag against it, feeding the existing wedge recovery.
 
@@ -148,9 +151,9 @@ Removal zeroes the buffer from the main thread in `onNodeUpdate(null)`, via `cle
 
 **Link-metric bridge (W1 residual R3, harper-pro#431).** `reconcileWorkers` copies `LATENCY` and `BACK_PRESSURE_RATIO` off the same buffer read it derives truth from onto the main-thread entry, and `cluster_status` publishes both — this is the bridge adaptive routing (#218, W5) consumes. `LATENCY` is copied only when truth reports the link connected, because it is the one slot here that cannot be owner-gated at the writer: `replicator.ts`'s cache-miss picker chooses a peer by the reading a RETRIEVAL connection leaves there, so the pong write at `replicationConnection.ts` stays open to every connection resolving the same (database, peer) key. On a link truth reports down the owner is not ponging, so a fresh reading is some other socket's RTT; the entry keeps its last owner-era value instead. On a connected link the copied sample can still be an inbound socket's — same peer, same path, so it is a sample of the link rather than of a different one. `BACK_PRESSURE_RATIO` needs no gate: its writer already requires `nodeSubscriptions`.
 
-**Fire-classification counters (W1 residual R4, harper-pro#431).** Slots 13–28 hold one `{redundant, loadBearing}` pair per recovery mechanism, in the order of `FIRE_MECHANISMS` (`receive-watchdog`, `pause-stall`, `copy-progress`, `blob-gap`, `copy-finalize`, `subscription-setup`, `wedge-reconcile`, `receive-stall-net`), based at `FIRE_COUNTER_BASE_POSITION`. `FIRE_MECHANISMS` is **append-only**: the index picks the slot pair, so reordering or removing a name reassigns existing counters. At every fire the mechanism records whether shared-memory truth also judged the link down (`redundant`) or not (`load-bearing`); a fire records `unknown` and increments neither when it comes from a connection that does not own the (db, peer) subscription (an inbound server socket, a cache-miss retrieval connection), because that buffer describes a different link, or when truth has observed nothing at all — no liveness and no recorded error — because scoring that as `redundant` would claim a detection that never happened. `clusterStatus.ts` surfaces them as `recoveryFires`, and each fire log line carries `fire={mechanism: …, class: …}`. This is measurement only: no net is demoted, no threshold moves, and no fire predicate consults it.
+**Fire-classification counters (W1 residual R4, harper-pro#431).** Slots 13–28 and 32–33 hold one `{redundant, loadBearing}` pair per recovery mechanism, in the order of `FIRE_MECHANISMS` (`receive-watchdog`, `pause-stall`, `copy-progress`, `blob-gap`, `copy-finalize`, `subscription-setup`, `wedge-reconcile`, `receive-stall-net`, `unconfirmed-send-stall`). `FIRE_MECHANISMS` and `FIRE_COUNTER_POSITIONS` are **append-only** and positionally paired: the ninth pair is at 32–33 because record locks own 29–31, so reordering or removing a name reassigns existing counters. At every fire the mechanism records whether shared-memory truth also judged the link down (`redundant`) or not (`load-bearing`); a fire records `unknown` and increments neither when it comes from a connection that does not own the (db, peer) subscription (an inbound server socket, a cache-miss retrieval connection), because that buffer describes a different link, or when truth has observed nothing at all — no liveness and no recorded error — because scoring that as `redundant` would claim a detection that never happened. `clusterStatus.ts` surfaces them as `recoveryFires`, and each fire log line carries `fire={mechanism: …, class: …}`. This is measurement only: no net is demoted, no threshold moves, and no fire predicate consults it.
 
-> **Counter invariant.** The `+= 1` on slots 13–28 is read-modify-write on an unsynchronized shared buffer, and is safe only because **each mechanism's slot pair has one writer thread per (database, peer)** — the six worker-local watchdogs write only from the connection that owns that subscription (the `unknown` classification is what keeps every other connection out), and the two reconcile nets write only from the main thread. One exception is known and accepted: during a reassignment the departing worker's connection still holds `nodeSubscriptions` (only the removal path clears it), so two owner connections can briefly overlap. The cost is a lost increment, not corruption. No pair is shared between mechanisms; `unitTests/replication/fireCounters.test.mjs` pins that disjointness. Adding a mechanism means adding a pair, never sharing one.
+> **Counter invariant.** The `+= 1` on slots 13–28 and 32–33 is read-modify-write on an unsynchronized shared buffer, and is safe only because **each mechanism's slot pair has one writer thread per (database, peer)** — the seven worker-local watchdogs write only from the connection that owns that subscription (the `unknown` classification is what keeps every other connection out), and the two reconcile nets write only from the main thread. One exception is known and accepted: during a reassignment the departing worker's connection still holds `nodeSubscriptions` (only the removal path clears it), so two owner connections can briefly overlap. The cost is a lost increment, not corruption. No pair is shared between mechanisms; `unitTests/replication/fireCounters.test.mjs` pins that disjointness. Adding a mechanism means adding a pair, never sharing one.
 
 **Record-lock capability (harper-pro#438, W9 Phase 1).** Slot 29 (`RECORD_LOCKS_CAPABILITY_POSITION` in `recordLockTransport.ts`) holds whether the peer at the other end of this (database, node) pair advertised `recordLocks` support, so the owning worker can read a peer's capability even when that peer's socket lives on another thread. Written by `recordPeerLockCapability` on handshake, read by `readPeerLockCapability`; an absent value reads as `LOCK_CAPABILITY_UNKNOWN`.
 

@@ -355,8 +355,8 @@ export function stampWorkerExitDown(status: Float64Array | undefined, now: numbe
 // This is measurement only. No net is demoted, no threshold moves, and no fire predicate consults it — the
 // demotion decision (the byte-silence receive watchdog is the candidate) is a later, data-driven one.
 export type FireClassification = 'redundant' | 'load-bearing' | 'unknown';
-// Append only: the index into this list picks the counter slot pair, so reordering or removing a name
-// reassigns existing counters to a different mechanism.
+// Append only: each entry is paired with the same-index slot pair below, so reordering or removing a
+// name reassigns existing counters to a different mechanism.
 export const FIRE_MECHANISMS = [
 	'receive-watchdog',
 	'pause-stall',
@@ -366,16 +366,29 @@ export const FIRE_MECHANISMS = [
 	'subscription-setup',
 	'wedge-reconcile',
 	'receive-stall-net',
+	'unconfirmed-send-stall',
 ] as const;
 export type FireMechanism = (typeof FIRE_MECHANISMS)[number];
-// Two counter slots per mechanism (redundant, load-bearing) starting here — see the slot map in DESIGN.md.
+// The first eight pairs are contiguous; the ninth follows the record-lock positions at 29..31. See DESIGN.md.
 export const FIRE_COUNTER_BASE_POSITION = 13;
+const FIRE_COUNTER_POSITIONS = [
+	[13, 14],
+	[15, 16],
+	[17, 18],
+	[19, 20],
+	[21, 22],
+	[23, 24],
+	[25, 26],
+	[27, 28],
+	[32, 33],
+] as const;
 // These counters are the one read-modify-write on this buffer, safe only under the single-writer-per-slot-
 // pair invariant stated in DESIGN.md. unitTests/replication/fireCounters.test.mjs pins its disjointness half.
 export function fireCounterPositions(mechanism: string): { redundant: number; loadBearing: number } | undefined {
 	const index = (FIRE_MECHANISMS as readonly string[]).indexOf(mechanism);
-	if (index < 0) return;
-	return { redundant: FIRE_COUNTER_BASE_POSITION + index * 2, loadBearing: FIRE_COUNTER_BASE_POSITION + index * 2 + 1 };
+	const positions = FIRE_COUNTER_POSITIONS[index];
+	if (!positions) return;
+	return { redundant: positions[0], loadBearing: positions[1] };
 }
 // `isOwner` must be the same `nodeSubscriptions !== undefined` marker the truth WRITES are gated on, or a
 // fire from an inbound/retrieval socket is scored against truth describing a different link.
@@ -4297,13 +4310,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		);
 		if (!reason) return;
 		closingForUnconfirmedSendStall = true;
+		// Assigned to a local before the log call for the reason every other net does it (harper-pro#431):
+		// `logger.warn?.` is undefined under `logging.level: error`, so an inlined call would stop counting.
+		const fireDetail = recordFireForLog('unconfirmed-send-stall');
 		logger.warn?.(
 			connectionId,
 			`Closing the sending side of ${databaseName} to ${remoteNodeName} (${reason}): sent ${lastConfirmableSequenceSent}, ` +
 				`confirmed ${lastConfirmationReceived}` +
 				`${unconfirmedSince > 0 ? ` (owed for ${now - unconfirmedSince}ms)` : ' (caught up)'}, ` +
 				`send path last advanced ${now - lastSendProgressAt}ms ago. The peer will reconnect and resubscribe. ` +
-				truthSnapshotForLog()
+				fireDetail
 		);
 		// Not `intentional`: the peer's normal close-handler retry path IS the recovery here.
 		close(CLOSE_UNCONFIRMED_SEND_STALL, `replication stalled (${reason}); resubscribe`);
@@ -4370,8 +4386,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (!Number.isFinite(sequenceId) || sequenceId <= 0) return;
 		if (sequenceId > lastConfirmableSequenceSent) lastConfirmableSequenceSent = sequenceId;
 		// Start the clock when the peer first owes us something, so the grace period measures how long it
-		// has owed rather than how long the session has existed.
-		if (unconfirmedSince === 0 && lastConfirmableSequenceSent > lastConfirmationReceived) unconfirmedSince = Date.now();
+		// has owed rather than how long the session has existed. Both clocks, as in the COMMITTED_UPDATE
+		// handler: leaving `unconfirmedFirstOwedAt` at 0 for an episode that started here would fail the
+		// `> 0` guard in checkUnconfirmedSendStall and disable the "peer cannot act yet" extension
+		// entirely, so a long blob transfer or back-pressure pause would close the leg the moment it ends.
+		if (unconfirmedSince === 0 && lastConfirmableSequenceSent > lastConfirmationReceived)
+			unconfirmedSince = unconfirmedFirstOwedAt = Date.now();
 	}
 	// Separates "nothing to send this peer" from "stopped": a sender skipping every record, or streaming
 	// a multi-hour copy, is advancing while producing no confirmations.
@@ -5673,7 +5693,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// watermark ahead of what actually went out would make the peer look wedged for data
 									// it was never sent. This is the ONLY confirmable-frame site — a bare SEQUENCE_ID_UPDATE
 									// (skipAuditRecord) produces no COMMITTED_UPDATE, so it must not advance the watermark.
-									noteSequenceSent(localTime);
+									noteSequenceSent(cursor);
 								}
 								frame.encodingStart = frame.position;
 								currentTransaction.txnLogKey = 0;
@@ -7939,6 +7959,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						tableSubscriptionToReplicator.send(
 							seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
 						);
+						// And tell the SENDER, which the end_txn above does not: that is a local message to core.
+						// The COMMITTED_UPDATE for this commit went out 2ms after it (COMMITTED_UPDATE_DELAY)
+						// clamped to the pre-drain watermark, and no other site re-sends one — so a leg that goes
+						// quiet after a blob write leaves the sender holding `confirmed < sent` forever, which
+						// checkUnconfirmedSendStall reads as `peer-not-confirming` and closes a fully durable,
+						// healthy leg every threshold. Same value the timer site would now compute: the watermark
+						// never exceeds `committedSequence`, so this never claims durability we do not have.
+						if (!wsClosed && !shouldSuppressCommittedUpdateForTest(databaseName)) {
+							ws.send(encode([COMMITTED_UPDATE, lastDurableSequenceId]));
+							logger.trace?.(connectionId, 'sent blob-drain confirmation of a commit at', lastDurableSequenceId);
+						}
 					}
 					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
 					// durable: persist it (and finish the copy if COPY_COMPLETE already arrived). No-op outside
