@@ -7272,11 +7272,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (sizesMatch) {
 				// Bound the inflater by the LOCAL repair descriptor, not the peer-announced expectedSize:
 				// sizesMatch above already proves repairTarget.size and remoteBlob.size agree whenever both
-				// are known, so this is the same value without a wire-controlled path to it.
+				// are known, so this is the same value without a wire-controlled path to it. This bound must
+				// be fixed now, before any bytes reach the inflater.
 				const repairSize = repairTarget.size ?? remoteBlob.size;
 				const repairSource = stream.codec ? createRepairInflater(stream, repairSize) : stream;
+				// The verification callback below runs lazily at stream-finish (core/resources/blob.ts), by
+				// which point a record-before-chunks race (record frame processed before this transfer's own
+				// chunks) may have since populated stream.expectedSize from a later chunk. Re-read it live
+				// here rather than freezing it alongside repairSize above, or that race permanently wedges
+				// every retry of a repair whose local descriptor never carries a size (harper-pro#699).
 				finished = decodeFromDatabase(
-					() => repairBlobFile(repairTarget, repairSource, () => repairSize),
+					() => repairBlobFile(repairTarget, repairSource, () => repairSize ?? stream.expectedSize),
 					tableSubscriptionToReplicator.auditStore?.rootStore
 				);
 			}
