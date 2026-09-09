@@ -33,6 +33,17 @@
 		// that flips this default (e.g. TypeScript 7) doesn't silently change results
 		"strict": false,
 		"target": "ES2022",
+		// TypeScript's default lib for target ES2022, plus ES2024.Promise for Node 22's
+		// Promise.withResolvers() — called by pinned core code (server/threads/socketRouter.ts).
+		"lib": [
+			"ES2022",
+			"ES2024.Promise",
+			"DOM",
+			"WebWorker.ImportScripts",
+			"ScriptHost",
+			"DOM.Iterable",
+			"DOM.AsyncIterable"
+		],
 		"moduleResolution": "NodeNext",
 		"module": "NodeNext",
 		"sourceMap": true,
