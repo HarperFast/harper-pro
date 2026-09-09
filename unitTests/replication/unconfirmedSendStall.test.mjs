@@ -180,7 +180,15 @@ describe('decodeDropResyncEpisodeCount', () => {
 		expect(decodeDropResyncAllowed(NOW - DECODE_DROP_RESYNC_EPISODE_MS, 0, NOW, 5 * 60_000, 3)).to.equal(true);
 	});
 
-	it('leaves a connection that has never resynced alone', () => {
+	it('keeps a spent budget spent while the drops keep coming, however long the fault runs', () => {
+		// The episode measures DROPS, not allowed resyncs. Keyed off the last resync instead, a decode class
+		// no resubscribe repairs would have its rejected drops age the clock out and be handed three more
+		// reconnects every hour, forever — the churn the budget exists to stop.
+		expect(decodeDropResyncEpisodeCount(NOW - 1_000, 3, NOW)).to.equal(3);
+		expect(decodeDropResyncAllowed(NOW - 10 * DECODE_DROP_RESYNC_EPISODE_MS, 3, NOW, 5 * 60_000, 3)).to.equal(false);
+	});
+
+	it('leaves a peer that has never dropped a record alone', () => {
 		expect(decodeDropResyncEpisodeCount(0, 0, NOW)).to.equal(0);
 	});
 });
