@@ -52,6 +52,7 @@ import {
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
+	peerConfirmsBlobDrain,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -206,11 +207,27 @@ export const DECODE_DROP_RESYNC_INTERVAL_MS = 5 * 60_000;
 // re-scanning each time. That is worse than harper-pro#545's plain skip-and-advance, which loses one
 // record on a live leg. Past the budget the leg keeps dropping and logs that it has stopped trying.
 export const DECODE_DROP_RESYNC_BUDGET = 3;
+// How long without a resync ends the current episode and restores the budget. Well above
+// DECODE_DROP_RESYNC_INTERVAL_MS, so a flap cannot walk itself back into budget one interval at a time.
+export const DECODE_DROP_RESYNC_EPISODE_MS = 60 * 60_000;
 const decodeDropResyncByPeer = new Map<string, { lastDecodeDropResyncAt?: number; decodeDropResyncCount?: number }>();
-// Whether a structure resync may fire now, given when the last one fired on this CONNECTION. Pure so the
-// bound can be pinned without a live socket: the stamp lives on the connection, not the session, because
-// the close it triggers ends the session — a session-scoped latch would reset on the very reconnect it
-// caused and bound nothing.
+// Keyed by (database, peer) in this module rather than on the session, because the close a resync triggers
+// ENDS the session: a session-scoped latch would reset on the very reconnect it caused and bound nothing.
+// A server-side receive session has no connection object to hang it on either. The predicates below are
+// pure so both bounds can be pinned without a live socket.
+//
+// The resync budget is per EPISODE, not per process lifetime. A gap longer than `episodeMs` since the last
+// resync starts a fresh one: a run of resyncs minutes apart is a decode class a resubscribe cannot repair
+// (what the budget bounds), while three separate forks genuinely repaired over months are not, and a
+// lifetime budget would silently drop every record of that table on the fourth, forever, until a restart.
+export function decodeDropResyncEpisodeCount(
+	lastResyncAt: number,
+	resyncCount: number,
+	now: number,
+	episodeMs: number = DECODE_DROP_RESYNC_EPISODE_MS
+): number {
+	return lastResyncAt > 0 && now - lastResyncAt >= episodeMs ? 0 : resyncCount;
+}
 export function decodeDropResyncAllowed(
 	lastResyncAt: number,
 	resyncCount: number,
@@ -241,13 +258,29 @@ export const UNSENT_WORK_PROBE_INTERVAL_MS = 5 * 60_000;
 // peer grows its store with logs this subscription excludes, and counting those would close a healthy
 // leg every threshold. It is called only after the progress clock has elapsed, so a busy or idle sender
 // never pays for it.
+// Whether the "peer cannot act yet" exemption may still hold the confirmation clock open. Bounded, and
+// the bound has to gate the EXEMPTION rather than only the clock: a session that keeps one blob in the
+// send pipeline, or never leaves back-pressure, would otherwise skip the check on every tick forever and
+// the cap would bound nothing — reinstating the very wedge this net exists to catch.
+export function withinUnconfirmedSendGrace(
+	unconfirmedFirstOwedAt: number,
+	now: number,
+	maxGraceMs: number = UNCONFIRMED_SEND_MAX_GRACE_MS
+): boolean {
+	return unconfirmedFirstOwedAt > 0 && now - unconfirmedFirstOwedAt < maxGraceMs;
+}
+// `peerConfirmsBlobDrain` is the capability gate on the FIRST shape only. A peer that does not re-confirm
+// once its blobs go durable (every build before harper-pro#810) leaves `confirmed < sent` on a healthy,
+// fully durable leg after any blob write, so that comparison carries no information about it. The second
+// shape is unaffected: it is decided from this sender's own send path, not from the peer's answers.
 export function unconfirmedSendStallReason(
-	state: { unconfirmedSince: number; sendProgressAt: number },
+	state: { unconfirmedSince: number; sendProgressAt: number; peerConfirmsBlobDrain: boolean },
 	now: number,
 	thresholdMs: number,
 	hasUnsentWork: () => boolean
 ): 'peer-not-confirming' | 'send-path-stopped' | undefined {
-	if (state.unconfirmedSince > 0 && now - state.unconfirmedSince >= thresholdMs) return 'peer-not-confirming';
+	if (state.peerConfirmsBlobDrain && state.unconfirmedSince > 0 && now - state.unconfirmedSince >= thresholdMs)
+		return 'peer-not-confirming';
 	if (state.sendProgressAt > 0 && now - state.sendProgressAt >= thresholdMs && hasUnsentWork())
 		return 'send-path-stopped';
 	return undefined;
@@ -4262,16 +4295,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// catch, invisibly, because the tests use a blob-free table.
 		if (blobsBeingSent.size > 0 || isPausedForBackPressure) {
 			lastSendProgressAt = now;
-			if (
-				unconfirmedSince > 0 &&
-				unconfirmedFirstOwedAt > 0 &&
-				now - unconfirmedFirstOwedAt < UNCONFIRMED_SEND_MAX_GRACE_MS
-			)
+			// Only WHILE the grace budget lasts. Past it the check runs anyway: `blobsBeingSent` is
+			// session-wide rather than scoped to the unconfirmed range, so a send pipeline that never empties
+			// would otherwise exempt the session on every tick for the life of the connection.
+			if (unconfirmedSince > 0 && withinUnconfirmedSendGrace(unconfirmedFirstOwedAt, now)) {
 				unconfirmedSince = now;
-			return;
+				return;
+			}
+			if (unconfirmedSince === 0) return;
 		}
 		const reason = unconfirmedSendStallReason(
-			{ unconfirmedSince, sendProgressAt: lastSendProgressAt },
+			{
+				unconfirmedSince,
+				sendProgressAt: lastSendProgressAt,
+				peerConfirmsBlobDrain: peerConfirmsBlobDrain(peerCapabilities),
+			},
 			now,
 			effectiveUnconfirmedSendThresholdMs(),
 			() => hasUnsentWorkForPeer?.() ?? false
@@ -4349,10 +4387,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		lastSendProgressAt = Date.now();
 		unsentWorkProbeAt = 0;
 	}
-	// Rate-limit the decode-drop structure resync per CONNECTION so it survives the reconnect it causes;
-	// a session-scoped latch would reset on every new socket and bound nothing. Falls back to a session
-	// local when there is no connection object (an inbound server session, which does not receive
-	// replication frames anyway). Returns whether a resync may fire now, claiming the slot if so.
+	// Returns whether a decode-drop structure resync may fire now, claiming the slot if so.
 	function mayResyncForDecodeDrop(): boolean {
 		// Keyed by (database, peer) in the module, not carried on the connection: a server-side receive
 		// session has no connection object at all, and a session-local latch resets on the very reconnect
@@ -4360,8 +4395,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const key = `${databaseName}\u0000${remoteNodeName}`;
 		const holder = decodeDropResyncByPeer.get(key) ?? {};
 		const last = holder.lastDecodeDropResyncAt ?? 0;
-		const count = holder.decodeDropResyncCount ?? 0;
 		const now = Date.now();
+		const count = decodeDropResyncEpisodeCount(last, holder.decodeDropResyncCount ?? 0, now);
 		if (!decodeDropResyncAllowed(last, count, now, DECODE_DROP_RESYNC_INTERVAL_MS)) {
 			logger.warn?.(
 				connectionId,
@@ -6988,7 +7023,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// records this frame applied. Copy frames are excluded — a copy stages its cursor from the last
 					// SUCCESSFULLY decoded record, so a close after a dropped copy record resumes before it and
 					// re-delivers the same poison record, which is exactly the #521 loop harper-pro#545 removed.
-					if (decodeDropNeedsResync && !isCopyFrame && !wsClosed && mayResyncForDecodeDrop()) {
+					// ...and only while the persisted cursor is this frame's own. `endTxnEvent.localTime` above is
+					// `lastDurableSequenceId`, which is the PRE-blob watermark whenever a blob is still in flight
+					// or a gap is held — and close() aborts those in-flight receives, so the drain never catches it
+					// up. Closing then resumes BEFORE the poison record and re-delivers it: the same #521 loop copy
+					// frames are excluded for, reached by a live frame that carries a blob.
+					if (decodeDropNeedsResync && !isCopyFrame && !wsClosed && cursorBlockedByBlob())
+						logger.debug?.(
+							connectionId,
+							`Withholding the structure resync for ${databaseName} from ${remoteNodeName}: a blob still holds the resume cursor behind this frame, so reconnecting would re-deliver the dropped record`
+						);
+					else if (decodeDropNeedsResync && !isCopyFrame && !wsClosed && mayResyncForDecodeDrop()) {
 						logger.warn?.(
 							connectionId,
 							`Resubscribing to ${databaseName} from ${remoteNodeName} to resync table structures after an undecodable record; the dropped record is not re-delivered`
