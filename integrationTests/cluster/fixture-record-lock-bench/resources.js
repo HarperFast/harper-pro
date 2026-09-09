@@ -7,7 +7,7 @@ function lockOptions(data) {
 	return options;
 }
 
-/** POST { ids, lease?, timeout? }: lock+unlock each id in turn; answers per-acquisition and per-release ms. */
+/** Lock+unlock each id in turn. `releaseMs` is unlock()'s return, not the release entry's durability. */
 export class BenchLock extends Resource {
 	async post(data) {
 		const options = { ...lockOptions(data), hold: true };
@@ -25,7 +25,7 @@ export class BenchLock extends Resource {
 	}
 }
 
-/** POST { id, lease?, timeout? }: lock inside the request transaction, read, increment, save; released at commit. */
+/** Lock inside the request transaction, increment, save; the commit is the unlock. `sectionMs` ends at save(). */
 export class LockedIncrement extends Resource {
 	async post(data) {
 		const started = performance.now();
@@ -34,11 +34,11 @@ export class LockedIncrement extends Resource {
 		const n = (record.getProperty('n') ?? 0) + 1;
 		record.set('n', n);
 		await record.save();
-		return { n, lockMs };
+		return { n, lockMs, sectionMs: performance.now() - started };
 	}
 }
 
-/** POST { prefix, count }: `count` unlocked puts, one transaction each; answers the elapsed ms. */
+/** `count` unlocked puts, one transaction each. */
 export class BenchWrite extends Resource {
 	async post(data) {
 		const started = performance.now();
@@ -50,7 +50,7 @@ export class BenchWrite extends Resource {
 	}
 }
 
-/** POST { id }: what a cluster-scoped lock() answers here, to prove which enablement arm a node is in. */
+/** What a cluster-scoped lock() answers here: the observable for which enablement arm a node is in. */
 export class LockProbe extends Resource {
 	async post(data) {
 		try {
@@ -63,7 +63,7 @@ export class LockProbe extends Resource {
 	}
 }
 
-/** Entries and value bytes in this node's Counter transaction log, by entry type. */
+/** This node's Counter transaction log, by entry type: count and stored value bytes. */
 export class LogStats extends Resource {
 	async get() {
 		const byType = {};
