@@ -7,7 +7,7 @@
  * socket.
  *
  * The send-log-break repair needs none of this: it replaces a cached local rather than closing anything,
- * so a session-local interval floor is the whole bound (`SEND_LOG_REPAIR_INTERVAL_MS`).
+ * so session-local interval floors are the whole bound — `mayRebuildSendRange` below.
  */
 
 import { expect } from 'chai';

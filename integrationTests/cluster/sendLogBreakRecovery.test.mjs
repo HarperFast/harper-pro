@@ -7,24 +7,25 @@
  * subscription that stops receiving parks at `WAITING`. In the field it ran ~21h with `cluster_status`
  * green on every leg and the `system` database replicating over the same peer pair.
  *
- * The cause is the SENDER's transaction-log stream. `endIteratorOnCorruptFrame` latches an iterator done
- * when a frame is corrupt, and the send loop reuses one `auditLogIterable` for the whole session on
- * RocksDB — so every later wake drains an already-finished iterator, no frames go out, and the keepalive
- * holds the socket open. The sender does not have to infer any of this: core hangs a `corruptFrameStop`
- * on the iterable it returns, and the send loop reads it after each drain.
+ * The cause is a stale local. `endIteratorOnCorruptFrame` latches an iterator done when a frame is
+ * corrupt, and the send loop caches one `auditLogIterable` for the whole session where the store marks
+ * iterables reusable — so every later wake drains an already-finished iterator, no frames go out, and the
+ * keepalive holds the socket open. The sender does not have to infer any of this: core hangs a
+ * `corruptFrameStop` on the iterable it returns, and the send loop reads it after each drain.
  *
  * The two shapes are opposites, and each test pins one:
  *
  *   TORN TAIL — nothing was lost behind the break and the tail grows again, so a fresh iterator reads
- *   past it. The leg must close and the peer must resubscribe and converge.
+ *   past it. The cached iterable is dropped and the SAME session resumes sending; nothing is closed,
+ *   which the test asserts directly by requiring that neither side ever logs a disconnect.
  *
  *   MID-LOG BREAK — entries behind the break are unreadable and harper#2087 makes stopping there the
- *   intended policy. A reconnect stops at the same frame, so the leg must NOT close; it reports and
- *   stays up rather than looping.
+ *   intended policy. A fresh iterator stops at the same frame, so it is reported and the range is NOT
+ *   rebuilt on first sight (a much longer floor governs re-checking, far beyond this test's window).
  *
  * `HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB=<db>[:midlog]` serves the drained, corrupt-frame-stopped
- * iterable that `endIteratorOnCorruptFrame` leaves behind. It is one-shot, so the replacement session
- * converges and recovery is observed rather than merely asserted.
+ * iterable that `endIteratorOnCorruptFrame` leaves behind. It is one-shot, so the rebuilt range is a
+ * healthy one and recovery is observed rather than merely asserted.
  *
  * Stress-gated (spawns two Harper child processes) like the other cluster tests.
  */
