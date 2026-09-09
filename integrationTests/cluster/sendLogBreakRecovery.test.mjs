@@ -53,7 +53,10 @@ const RECOVERY_TIMEOUT_MS = 120_000;
 // rather than a race with the first one.
 const NO_RECOVERY_WINDOW_MS = 60_000;
 const POLL_MS = 500;
-const CLOSING = /transaction-log frame break; resubscribe|stopped at a torn transaction-log frame/;
+const REPAIRED = /Rebuilding the send range from/;
+const QUARANTINED = /stopped at a mid-log corrupt transaction-log frame/;
+// The repair must not disturb the socket: it replaces a cached local, nothing more.
+const DISCONNECTED = /Disconnected from wss:/;
 
 function nodeConfig(hostname, env) {
 	return {
@@ -181,21 +184,22 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS, timeout: 600_
 		}
 	});
 
-	test('a torn tail closes the sending socket and the peer resubscribes and converges', async () => {
+	test('a torn tail is repaired in place — the same session resumes sending', async () => {
 		const { source, subscriber } = await startWedgedPair(ctx, 'torn-tail', 'tail');
 
 		await waitForCondition((signal) => hasRow(subscriber, 'after-wedge', signal), {
 			timeoutMs: RECOVERY_TIMEOUT_MS,
 			pollMs: POLL_MS,
-			description: 'the row written into the wedge to replicate after the sender closes its socket',
+			description: 'the row written into the wedge to replicate once the send range is rebuilt',
 		});
 
 		const log = await readLog(source);
-		ok(
-			/stopped at a torn transaction-log frame/.test(log),
-			'the source should name the torn-tail shape in its fire log'
-		);
+		ok(REPAIRED.test(log), 'the source should say it rebuilt the send range');
 		ok(/fire=\{mechanism: send-log-break/.test(log), 'the fire should be classified like every other net');
+		// The whole point of repairing the cached local rather than closing: the socket is healthy and
+		// bidirectional, and tearing it down would abort the peer's in-flight blob receives for nothing.
+		equal(DISCONNECTED.test(log), false, 'repairing the send range must not disturb the socket');
+		equal(DISCONNECTED.test(await readLog(subscriber)), false, 'the peer must not see a reconnect either');
 
 		// And the leg is genuinely healthy afterwards, not merely caught up once.
 		await sendOperation(source, {
@@ -219,19 +223,20 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS, timeout: 600_
 
 		const deadline = Date.now() + NO_RECOVERY_WINDOW_MS;
 		while (Date.now() < deadline) {
-			equal(CLOSING.test(await readLog(source)), false, 'a mid-log break must not close the sending socket');
+			equal(REPAIRED.test(await readLog(source)), false, 'a mid-log break must not rebuild the send range');
 			await delay(2_000);
 		}
 
 		const log = await readLog(source);
-		ok(
-			/stopped at a mid-log corrupt transaction-log frame/.test(log),
-			'the source must report the quarantined break rather than silently doing nothing'
-		);
+		ok(QUARANTINED.test(log), 'the source must report the quarantined break rather than silently doing nothing');
+		equal(DISCONNECTED.test(log), false, 'and it must not churn the socket either');
 		// The wedge itself is unchanged — which is the point: it is visible now, not recovered.
 		equal(await hasRow(subscriber, 'after-wedge'), false, 'nothing can cross the break, so the row stays behind it');
 		const socket = await dataSocket(subscriber);
 		ok(socket, 'the subscriber should still report a data socket');
 		equal(socket.connected, true, 'the leg stays up rather than churning');
+		// Recorded honestly, because it is the operator-facing cost of the fail-stop policy: this leg is
+		// permanently one-way and every health surface still reads green. Only the error log says otherwise.
+		equal(socket.lastReceivedStatus, 'Waiting', 'and reports Waiting, which is why no reconcile net sees it');
 	});
 });
