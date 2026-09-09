@@ -211,6 +211,11 @@ export const RECOVERY_CLOSE_EPISODE_MS = 60 * 60_000;
 // Floor between rebuilds of a send range that stopped at a torn tail. Until something is written past the
 // tear the fresh iterator stops at the same frame, and without this that would be a `getRange` per commit.
 export const SEND_LOG_REPAIR_INTERVAL_MS = 30_000;
+// Mid-log breaks get a far longer floor, not `never`. Refreshing cannot cross the break, so it must not
+// spin — but never refreshing means the cache stays latched for the life of the session even after an
+// operator repairs the log, and on a merged multi-log range (`excludeLogs`) ONE origin's break silences
+// every healthy origin on that subscription too.
+export const SEND_LOG_QUARANTINE_RECHECK_MS = 30 * 60_000;
 type RecoveryCloseBound = { lastCloseAt?: number; closeCount?: number; lastEventAt?: number };
 const decodeDropResyncByPeer = new Map<string, RecoveryCloseBound>();
 // Keyed by (database, peer) in this module rather than on the session, because the close ENDS the session:
@@ -969,18 +974,6 @@ export function closeOnInboundMessageError(
 		error
 	);
 	deps.close(1011, 'Error handling incoming replication message');
-}
-
-/**
- * Whether a per-record value-decode failure is a structure fork (a resolved `tableDecoder` means the
- * offending bytes are a real record whose structures diverged from the sender's — #1163/#1453) rather
- * than transient schema propagation (an unresolved decoder for an unknown tableId).
- *
- * Has no production caller: harper-pro#545 replaced close-and-reconnect with skip-and-advance, and
- * harper-pro#810 added a post-commit resubscribe on top of that.
- */
-export function shouldCloseOnRecordDecodeFailure(tableDecoder: unknown): boolean {
-	return !!tableDecoder;
 }
 
 /**
@@ -3400,6 +3393,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// whenever the iterable is replaced. See repairSendLogBreak.
 	let sendLogBreaksSeen = 0;
 	let lastSendLogRepairAt = 0;
+	// When the CURRENT break was first seen, which is what a quarantined break waits from: it must not
+	// rebuild on first sight (that is the spin the policy avoids), only re-check long after.
+	let sendLogBreakSince = 0;
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
@@ -4307,29 +4303,31 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function repairSendLogBreak(breaks: number, midLogBreak: boolean, isNewBreak: boolean, resumeFrom: number): boolean {
 		if (wsClosed) return false;
 		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
-		// A fresh iterator stops at the same frame, so refreshing a mid-log break would spin without ever
-		// crossing it — and harper#2087 makes stopping there the intended policy.
-		if (midLogBreak) {
-			if (!isNewBreak) return false;
+		if (midLogBreak && isNewBreak)
 			logger.error?.(
 				connectionId,
 				`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind the break are quarantined and no fresh iterator can cross it, so this leg will not send past it. Repair the transaction log or re-clone this node.`
 			);
-			return false;
-		}
 		// Nothing is cached to drop where the loop already rebuilds every wake.
 		if (!auditStore?.reusableIterable) return false;
 		// A torn tail is not always walkable yet, and rebuilding on every wake would be a `getRange` per
-		// commit.
+		// commit. A quarantined break cannot be walked at all until someone repairs the log, so it waits far
+		// longer — but it does wait, rather than never looking again.
 		const now = Date.now();
-		if (lastSendLogRepairAt > 0 && now - lastSendLogRepairAt < SEND_LOG_REPAIR_INTERVAL_MS) return false;
+		if (sendLogBreakSince === 0) sendLogBreakSince = now;
+		// A torn tail is walked as soon as the floor since the LAST rebuild allows, because recovering it is
+		// the point. A quarantined one additionally waits out the recheck window from when it first
+		// appeared, so it never rebuilds on first sight.
+		const floorMs = midLogBreak ? SEND_LOG_QUARANTINE_RECHECK_MS : SEND_LOG_REPAIR_INTERVAL_MS;
+		const since = midLogBreak ? Math.max(sendLogBreakSince, lastSendLogRepairAt) : lastSendLogRepairAt;
+		if (since > 0 && now - since < floorMs) return false;
 		lastSendLogRepairAt = now;
 		// Assigned before the log call: `logger.warn?.` is undefined under `logging.level: error`, so an
 		// inlined call would stop counting (harper-pro#431).
 		const fireDetail = recordFireForLog('send-log-break');
 		logger.warn?.(
 			connectionId,
-			`Replication send to ${remoteNodeName}${dbContext} stopped at a torn transaction-log frame (${breaks} break(s) on the cached iterable); it is latched done, so this session would send nothing further. Rebuilding the send range from ${resumeFrom}. ` +
+			`Replication send to ${remoteNodeName}${dbContext} stopped at a ${midLogBreak ? 'quarantined mid-log' : 'torn'} transaction-log frame (${breaks} break(s) on the cached iterable); it is latched done, so this session would send nothing further. Rebuilding the send range from ${resumeFrom}. ` +
 				fireDetail
 		);
 		auditLogIterable = undefined;
@@ -6273,6 +6271,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
+									let repairedSendRange = false;
 									// The loop has drained; ask the iterable WHY before parking on the next commit — the one
 									// thing that separates "nothing to send" from "this iterator can no longer send anything".
 									// A store without `corruptFrameStop` reads 0 and this is a no-op, which is correct: the
@@ -6289,12 +6288,24 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// A repair replaces the iterable, so the running total starts over on the new object.
 											if (
 												repairSendLogBreak(breaks, corruptFrameStop.midLogBreak === true, isNewBreak, currentSequenceId)
-											)
+											) {
 												sendLogBreaksSeen = 0;
+												repairedSendRange = true;
+											}
+										} else {
+											// A replaced iterable starts its count over, and clears the quarantine clock with it.
+											sendLogBreaksSeen = 0;
+											sendLogBreakSince = 0;
 										}
 									} catch (error) {
 										logger.trace?.(connectionId, 'could not read the send iterable corrupt-frame state', error);
 									}
+									// `nextTransaction` was captured BEFORE this scan and resolves on the NEXT commit, so the
+									// commit that woke this iteration — the one whose rows the latched iterator failed to yield —
+									// would stay unsent until some later commit. On a quiescent source, which is the #810 field
+									// shape, that is no later commit at all. Re-scan now instead; the repair's own interval floor
+									// is what stops this from spinning if the fresh range breaks again immediately.
+									if (repairedSendRange) continue;
 									await nextTransaction;
 								} while (!closed);
 							})
