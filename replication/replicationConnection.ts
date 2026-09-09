@@ -7810,16 +7810,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// Safe: at drain with no gap, every received record (incl. blobs) through lastSequenceIdReceived
 						// is durable, and core applies this end_txn after the records already enqueued ahead of it, so
 						// the cursor never advances past an uncommitted/undurable point. max() keeps it monotonic.
-						tableSubscriptionToReplicator.send(
-							seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
-						);
+						// ONE value for both messages below. They must not drift: what we tell the sender is what
+						// we will resume from, so confirming less than we persist invites the sender to re-send
+						// data we will never ask for, and confirming more claims durability we do not have.
+						// `lastDurableSequenceId` alone is not it. While a blob is in flight both sequence-update
+						// sites clamp the end_txn they emit to the pre-blob watermark (`cursorBlockedByBlob()`),
+						// and `committedSequence` is derived from that clamped `endTxnEvent.localTime` — so at
+						// drain the watermark can sit below what we have actually received and made durable.
+						// Carrying `lastSequenceIdReceived` forward is what un-clamps it, which is why the end_txn
+						// has always done it.
+						const durableThrough = Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId);
+						tableSubscriptionToReplicator.send(seqUpdateEndTxn(durableThrough));
 						// And tell the SENDER, which the end_txn above does not: that is a local message to core.
 						// The COMMITTED_UPDATE for this commit went out 2ms after it (COMMITTED_UPDATE_DELAY)
 						// clamped to the pre-drain watermark, and no other site re-sends one — so a leg that goes
 						// quiet after a blob write leaves the sender holding `confirmed < sent` forever, which
 						// checkUnconfirmedSendStall reads as `peer-not-confirming` and closes a fully durable,
-						// healthy leg every threshold. Same value the timer site would now compute: the watermark
-						// never exceeds `committedSequence`, so this never claims durability we do not have.
+						// healthy leg every threshold.
 						// Contained: `tracked` is fire-and-forget (#426 removed the `await Promise.all` that used to
 						// consume it), so a throw here is an UNHANDLED rejection that kills the worker thread and
 						// every leg it owns. `wsClosed` is not enough — `retireInstance` runs on the async 'close'
@@ -7827,8 +7834,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// throws on it. Same containment as settleBlobGapBudget above, for the same reason.
 						if (!wsClosed && !shouldSuppressCommittedUpdateForTest(databaseName)) {
 							try {
-								ws.send(encode([COMMITTED_UPDATE, lastDurableSequenceId]));
-								logger.trace?.(connectionId, 'sent blob-drain confirmation of a commit at', lastDurableSequenceId);
+								ws.send(encode([COMMITTED_UPDATE, durableThrough]));
+								logger.trace?.(connectionId, 'sent blob-drain confirmation of a commit at', durableThrough);
 							} catch (sendError) {
 								// Losing it costs at most one threshold of a stale read: the reconnect this implies
 								// re-establishes the subscription, and the peer confirms from its durable cursor.
