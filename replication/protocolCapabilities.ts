@@ -15,20 +15,11 @@ export const MINIMUM_PROTOCOL_VERSION = 1;
 /** Level at which a peer supports the correlated subscription-setup acknowledgement (harper-pro#642). */
 export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
 
-/**
- * Level at which a peer RE-CONFIRMS a commit once its blobs become durable (harper-pro#810). A peer below
- * it confirms a blob-carrying commit exactly once, clamped to its pre-blob watermark, and never revises
- * that — so `confirmed < sent` against it is the ordinary state of a quiet leg, not evidence of a stall.
- * The `peer-not-confirming` shape must stay off such a peer or it closes healthy legs every threshold.
- */
-export const BLOB_DRAIN_CONFIRM_CAPABILITY = 1;
-
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	protocolVersion: number;
 	subscriptionSetupAck: number;
 	subscriptionSetupBudgetMs: number | undefined;
-	blobDrainConfirm: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -55,7 +46,6 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		protocolVersion: resolveLevel(bag?.protocolVersion, LOCAL_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION),
 		subscriptionSetupAck: resolveLevel(bag?.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY, 0),
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
-		blobDrainConfirm: resolveLevel(bag?.blobDrainConfirm, BLOB_DRAIN_CONFIRM_CAPABILITY, 0),
 	});
 }
 
@@ -72,7 +62,6 @@ export function buildLocalCapabilities(subscriptionSetupBudgetMs: number): Reado
 		protocolVersion: LOCAL_PROTOCOL_VERSION,
 		subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 		subscriptionSetupBudgetMs,
-		blobDrainConfirm: BLOB_DRAIN_CONFIRM_CAPABILITY,
 	});
 }
 
@@ -82,14 +71,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a !== undefined &&
 		a.protocolVersion === b.protocolVersion &&
 		a.subscriptionSetupAck === b.subscriptionSetupAck &&
-		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
-		a.blobDrainConfirm === b.blobDrainConfirm
+		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs
 	);
-}
-
-/** Whether this peer re-confirms after a blob drain, i.e. whether `confirmed < sent` can mean anything. */
-export function peerConfirmsBlobDrain(resolved: ResolvedPeerCapabilities): boolean {
-	return resolved.blobDrainConfirm >= BLOB_DRAIN_CONFIRM_CAPABILITY;
 }
 
 /**

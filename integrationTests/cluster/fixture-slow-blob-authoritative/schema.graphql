@@ -1,5 +1,0 @@
-type SlowBlob @table @export {
-	id: Long @primaryKey
-	name: String @indexed
-	payload: Blob
-}

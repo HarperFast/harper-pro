@@ -138,11 +138,8 @@ jobs:
           - name: 'decode-drop-structure-resync'
             file: 'integrationTests/cluster/decodeDropStructureResync.test.mjs'
             env_vars: ''
-          - name: 'unconfirmed-send-wedge-recovery'
-            file: 'integrationTests/cluster/unconfirmedSendWedgeRecovery.test.mjs'
-            env_vars: ''
-          - name: 'unconfirmed-send-blob-quiet-false-fire'
-            file: 'integrationTests/cluster/unconfirmedSendBlobQuietFalseFire.test.mjs'
+          - name: 'send-log-break-recovery'
+            file: 'integrationTests/cluster/sendLogBreakRecovery.test.mjs'
             env_vars: ''
     steps:
       - name: Checkout code

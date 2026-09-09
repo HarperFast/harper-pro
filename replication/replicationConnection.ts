@@ -52,7 +52,6 @@ import {
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
-	peerConfirmsBlobDrain,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -191,7 +190,7 @@ export const CONNECTION_STATE_CONNECTED = 2;
 export const WORKER_EXIT_ERROR_CODE = 100_001;
 // Application close codes (RFC 6455 reserves 4000-4999) so a recovery close is distinguishable in
 // `lastConnectionError` and peer logs from the protocol closes (1008/1011) already in use.
-export const CLOSE_UNCONFIRMED_SEND_STALL = 4001;
+export const CLOSE_SEND_LOG_BREAK = 4001;
 export const CLOSE_DECODE_DROP_RESYNC = 4002;
 // Minimum gap between two structure-resync closes on one connection. The resync is latched per frame,
 // but the drop that triggers it is the whole residual decode-failure bucket, not only the structure fork
@@ -207,111 +206,66 @@ export const DECODE_DROP_RESYNC_INTERVAL_MS = 5 * 60_000;
 // re-scanning each time. That is worse than harper-pro#545's plain skip-and-advance, which loses one
 // record on a live leg. Past the budget the leg keeps dropping and logs that it has stopped trying.
 export const DECODE_DROP_RESYNC_BUDGET = 3;
-// How long without a resync ends the current episode and restores the budget. Well above
-// DECODE_DROP_RESYNC_INTERVAL_MS, so a flap cannot walk itself back into budget one interval at a time.
-export const DECODE_DROP_RESYNC_EPISODE_MS = 60 * 60_000;
-const decodeDropResyncByPeer = new Map<
-	string,
-	{ lastDecodeDropResyncAt?: number; decodeDropResyncCount?: number; lastDecodeDropAt?: number }
->();
-// Keyed by (database, peer) in this module rather than on the session, because the close a resync triggers
-// ENDS the session: a session-scoped latch would reset on the very reconnect it caused and bound nothing.
-// A server-side receive session has no connection object to hang it on either. The predicates below are
-// pure so both bounds can be pinned without a live socket.
+// How long without an event ends the current episode and restores the budget. Well above either
+// interval, so a flap cannot walk itself back into budget one interval at a time.
+export const RECOVERY_CLOSE_EPISODE_MS = 60 * 60_000;
+// Reconnects one connection may spend on a send-log break before it stops trying. A torn tail is
+// normally repaired by the FIRST reconnect (the fresh iterator reads straight past it), so a run of
+// these means the break is not the benign kind and the reconnects are not repairing it.
+export const SEND_LOG_BREAK_INTERVAL_MS = 5 * 60_000;
+export const SEND_LOG_BREAK_BUDGET = 3;
+// Both recovery closes in this file are bounded the same way, so they share the predicates.
+type RecoveryCloseBound = { lastCloseAt?: number; closeCount?: number; lastEventAt?: number };
+const decodeDropResyncByPeer = new Map<string, RecoveryCloseBound>();
+const sendLogBreakByPeer = new Map<string, RecoveryCloseBound>();
+// Keyed by (database, peer) in this module rather than on the session, because the close ENDS the session:
+// a session-scoped latch would reset on the very reconnect it caused and bound nothing. A server-side
+// receive session has no connection object to hang it on either. The predicates are pure so both bounds
+// can be pinned without a live socket.
 //
-// The resync budget is per EPISODE, not per process lifetime: a lifetime budget silently drops every record
-// of a table forever, until a restart, once three genuinely repaired forks months apart have spent it.
+// The budget is per EPISODE, not per process lifetime: a lifetime budget silently stops recovering a
+// (database, peer) forever, until a restart, once three genuinely repaired faults months apart spend it.
 //
-// The episode is measured from the last DROP, not the last allowed resync — that distinction is the whole
-// bound. A decode class no resubscribe can repair keeps producing drops, so its episode never lapses and
-// the spent budget holds: exactly the permanent isolation the budget is for. Keying off the last resync
-// instead would let those same rejected drops age the clock out and hand back three more reconnects every
-// hour, forever, which is the churn the budget exists to stop.
-export function decodeDropResyncEpisodeCount(
-	lastDropAt: number,
-	resyncCount: number,
+// The episode is measured from the last EVENT, not the last close it allowed — that distinction is the
+// whole bound. A fault no reconnect can repair keeps producing events, so its episode never lapses and the
+// spent budget holds: exactly the permanent isolation the budget is for. Keying off the last close instead
+// would let those same rejected events age the clock out and hand back three more reconnects every hour,
+// forever, which is the churn the budget exists to stop.
+export function recoveryCloseEpisodeCount(
+	lastEventAt: number,
+	closeCount: number,
 	now: number,
-	episodeMs: number = DECODE_DROP_RESYNC_EPISODE_MS
+	episodeMs: number = RECOVERY_CLOSE_EPISODE_MS
 ): number {
-	return lastDropAt > 0 && now - lastDropAt >= episodeMs ? 0 : resyncCount;
+	return lastEventAt > 0 && now - lastEventAt >= episodeMs ? 0 : closeCount;
 }
-export function decodeDropResyncAllowed(
-	lastResyncAt: number,
-	resyncCount: number,
+export function recoveryCloseAllowed(
+	lastCloseAt: number,
+	closeCount: number,
 	now: number,
 	intervalMs: number,
-	budget: number = DECODE_DROP_RESYNC_BUDGET
+	budget: number
 ): boolean {
-	if (resyncCount >= budget) return false;
-	return !(lastResyncAt > 0 && now - lastResyncAt < intervalMs);
+	if (closeCount >= budget) return false;
+	return !(lastCloseAt > 0 && now - lastCloseAt < intervalMs);
 }
-// Longer than RECEIVE_STALL_THRESHOLD_MS (15 min), not equal to it: a receiver holding a blob gap
-// legitimately stops confirming (it clamps to its durable blob watermark) and the blob-gap escalation
-// budget works on that same 15-minute scale, so equal defaults would race rather than order. Test-only
-// override; not a config knob.
-const UNCONFIRMED_SEND_THRESHOLD_OVERRIDE_MS = Number(process.env.HARPER_TEST_UNCONFIRMED_SEND_THRESHOLD_MS) || 0;
-export const UNCONFIRMED_SEND_THRESHOLD_MS = UNCONFIRMED_SEND_THRESHOLD_OVERRIDE_MS || 20 * 60_000;
-// Ceiling on how long "the peer cannot act yet" may keep extending the confirmation clock.
-export const UNCONFIRMED_SEND_MAX_GRACE_MS = 3 * 20 * 60_000;
-// Kept between the receiver's blob-gap handling and this net, so the two order rather than race.
-export const UNCONFIRMED_SEND_ORDERING_MARGIN_MS = 5 * 60_000;
-// How long a `nothing to send` answer from the send-range re-read stays good for.
-export const UNSENT_WORK_PROBE_INTERVAL_MS = 5 * 60_000;
-// harper-pro#810: the wedge shape neither main-thread reconcile net can see (connected:true +
-// RECEIVING_STATUS_WAITING with no progress), decided from facts only the SENDING session holds.
-//
-// `hasUnsentWork` must re-read the send loop's exact range — same log scope, exclusions and cursor —
-// because "the audit log grew" is not "this peer is owed data": a node that merely receives from a third
-// peer grows its store with logs this subscription excludes, and counting those would close a healthy
-// leg every threshold. It is called only after the progress clock has elapsed, so a busy or idle sender
-// never pays for it.
-// The time-only half of the "peer cannot act yet" exemption. Bounded, and the bound has to gate the
-// EXEMPTION rather than only the clock: a session that keeps one blob in the send pipeline, or never
-// leaves back-pressure, would otherwise skip the check on every tick forever and the cap would bound
-// nothing — reinstating the very wedge this net exists to catch.
-export function withinUnconfirmedSendGrace(
-	unconfirmedFirstOwedAt: number,
+// Claims a slot in one of the bounds above if the event may act now. `key` is (database, peer); the event
+// timestamp is stamped either way, since the episode has to measure events rather than the closes they
+// were allowed to cause.
+function claimRecoveryClose(
+	bounds: Map<string, RecoveryCloseBound>,
+	key: string,
 	now: number,
-	maxGraceMs: number = UNCONFIRMED_SEND_MAX_GRACE_MS
-): boolean {
-	return unconfirmedFirstOwedAt > 0 && now - unconfirmedFirstOwedAt < maxGraceMs;
-}
-// Whether the exemption may hold the confirmation clock open this tick.
-//
-// `sendActivityAt` is the last time the send path DEMONSTRABLY moved data — a frame, a blob chunk, a copy
-// pacer yield. While it keeps advancing there is no ceiling, because a transfer still putting chunks on
-// the wire is precisely the healthy leg this net must never close, and a blob large enough to outlast any
-// fixed cap is the case the cap would get wrong. The time-only grace is the fallback for the window where
-// the peer cannot act but this sender has nothing to show for it either.
-//
-// So the cap now bounds only an exemption that is NOT progressing — blobs registered as sending that have
-// stopped producing chunks, or a pause that never drains. That is a wedge wearing the exemption's clothes,
-// and it is the case the cap exists for.
-export function unconfirmedSendExemptionHolds(
-	sendActivityAt: number,
-	unconfirmedFirstOwedAt: number,
-	now: number,
-	thresholdMs: number,
-	maxGraceMs: number = UNCONFIRMED_SEND_MAX_GRACE_MS
-): boolean {
-	if (sendActivityAt > 0 && now - sendActivityAt < thresholdMs) return true;
-	return withinUnconfirmedSendGrace(unconfirmedFirstOwedAt, now, maxGraceMs);
-}
-// `peerConfirmsBlobDrain` is the capability gate on the FIRST shape only. A peer that does not re-confirm
-// once its blobs go durable (every build before harper-pro#810) leaves `confirmed < sent` on a healthy,
-// fully durable leg after any blob write, so that comparison carries no information about it. The second
-// shape is unaffected: it is decided from this sender's own send path, not from the peer's answers.
-export function unconfirmedSendStallReason(
-	state: { unconfirmedSince: number; sendProgressAt: number; peerConfirmsBlobDrain: boolean },
-	now: number,
-	thresholdMs: number,
-	hasUnsentWork: () => boolean
-): 'peer-not-confirming' | 'send-path-stopped' | undefined {
-	if (state.peerConfirmsBlobDrain && state.unconfirmedSince > 0 && now - state.unconfirmedSince >= thresholdMs)
-		return 'peer-not-confirming';
-	if (state.sendProgressAt > 0 && now - state.sendProgressAt >= thresholdMs && hasUnsentWork())
-		return 'send-path-stopped';
-	return undefined;
+	intervalMs: number,
+	budget: number
+): { allowed: boolean; count: number; lastCloseAt: number } {
+	const holder = bounds.get(key) ?? {};
+	const lastCloseAt = holder.lastCloseAt ?? 0;
+	const count = recoveryCloseEpisodeCount(holder.lastEventAt ?? 0, holder.closeCount ?? 0, now);
+	const stamped = { ...holder, lastEventAt: now, closeCount: count };
+	const allowed = recoveryCloseAllowed(lastCloseAt, count, now, intervalMs, budget);
+	bounds.set(key, allowed ? { ...stamped, lastCloseAt: now, closeCount: count + 1 } : stamped);
+	return { allowed, count, lastCloseAt };
 }
 // LIVENESS_STALE_MS is defined below, after PING_TIMEOUT, so it can be derived from the configured
 // keepalive window rather than a fixed default.
@@ -408,7 +362,7 @@ export const FIRE_MECHANISMS = [
 	'subscription-setup',
 	'wedge-reconcile',
 	'receive-stall-net',
-	'unconfirmed-send-stall',
+	'send-log-break',
 ] as const;
 export type FireMechanism = (typeof FIRE_MECHANISMS)[number];
 // Two counter slots per mechanism (redundant, load-bearing) starting here — see the slot map in DESIGN.md.
@@ -1547,34 +1501,27 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 	return new Promise<void>(() => {}); // never resolves; the sendPing timer keeps pings flowing
 }
 
-// Test-only: the RECEIVER applies records normally but never confirms them, which is the
-// `peer-not-confirming` shape and has no natural fault that reproduces on demand. Suppression stops at
-// the first reconnect (the socket the sender closes), so the replacement session confirms and the test
-// can prove the leg converges rather than leaving a close loop running.
-const SUPPRESS_COMMITTED_UPDATE_DB_FOR_TEST = process.env.HARPER_TEST_SUPPRESS_COMMITTED_UPDATE_DB;
-let suppressCommittedUpdateForTestSpent = false;
-export function shouldSuppressCommittedUpdateForTest(databaseName?: string): boolean {
-	return (
-		!!SUPPRESS_COMMITTED_UPDATE_DB_FOR_TEST &&
-		!suppressCommittedUpdateForTestSpent &&
-		SUPPRESS_COMMITTED_UPDATE_DB_FOR_TEST === databaseName
-	);
-}
-export function spendSuppressCommittedUpdateForTest(): void {
-	if (SUPPRESS_COMMITTED_UPDATE_DB_FOR_TEST) suppressCommittedUpdateForTestSpent = true;
-}
-
-// Test-only: the first outbound subscription for this database gets a permanently-drained audit
-// iterable, which is what a transaction-log iterator stopped at a corrupt frame becomes. One-shot, so
-// the session replacing the closed one converges.
+// Test-only: the first outbound subscription for this database gets a drained audit iterable carrying a
+// corrupt-frame stop — which is exactly what `endIteratorOnCorruptFrame` leaves behind, and what the send
+// loop then reuses for the rest of the session. `HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB=<db>` reports a
+// torn TAIL (recoverable, so the leg should close and resubscribe); adding `:midlog` reports a mid-log
+// break (quarantined by harper#2087, so the leg must NOT close). One-shot, so the replacement session
+// converges rather than looping.
 let deadAuditIterableForTestArmed = false;
-const DEAD_AUDIT_ITERABLE_DB_FOR_TEST = process.env.HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB;
+const DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST = process.env.HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB;
 export function maybeDeadAuditIterableForTest<T>(databaseName: string | undefined): T | undefined {
-	if (!DEAD_AUDIT_ITERABLE_DB_FOR_TEST) return undefined;
-	if (deadAuditIterableForTestArmed || DEAD_AUDIT_ITERABLE_DB_FOR_TEST !== databaseName) return undefined;
+	if (!DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST) return undefined;
+	const [specDb, shape] = DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST.split(':');
+	if (deadAuditIterableForTestArmed || specDb !== databaseName) return undefined;
 	deadAuditIterableForTestArmed = true;
-	logger.warn?.(`[test] serving a dead (already-drained) audit iterable for db "${databaseName}" (harper-pro#810)`);
-	return { [Symbol.iterator]: () => ({ next: () => ({ done: true, value: undefined }) }) } as T;
+	const midLogBreak = shape === 'midlog';
+	logger.warn?.(
+		`[test] serving a drained audit iterable stopped at a ${midLogBreak ? 'mid-log' : 'torn-tail'} corrupt frame for db "${databaseName}" (harper-pro#810)`
+	);
+	return {
+		[Symbol.iterator]: () => ({ next: () => ({ done: true, value: undefined }) }),
+		corruptFrameStop: { breaks: 1, truncatedVersions: new Set(), midLogBreak },
+	} as T;
 }
 
 // Test-only fault injection for the copy-progress false-fire repro: when HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB
@@ -3444,32 +3391,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let auditStore: any;
 	let auditLogIterable: Iterable<AuditRecord> & { removeLog?: (name: string) => void; addLog?: (name: string) => void }; // reusable iterator for a subscription
 	let replicationSharedStatus: Float64Array;
-	// harper-pro#810 unconfirmed-send stall detection, all session-local: the highest sequence sent in a
-	// confirmable frame, the peer's latest confirmation and when it last changed, and when the send path
-	// last advanced. See checkUnconfirmedSendStall.
-	let lastConfirmableSequenceSent = 0;
 	let lastConfirmationReceived = 0;
-	// When this peer first fell behind what we had sent it, or 0 while it is caught up. NOT "when the
-	// confirmation last changed": a base copy sends no confirmable frame until COPY_COMPLETE, so a clock
-	// started at subscription setup would already be expired when the copy's final frame first makes
-	// `sent > confirmed` — tearing down a healthy multi-hour copy on the next tick.
-	let unconfirmedSince = 0;
-	// When the peer FIRST fell behind in the current episode; unlike `unconfirmedSince` it is not pushed
-	// forward by the "peer cannot act yet" extension, so that extension can be capped.
-	let unconfirmedFirstOwedAt = 0;
-	let lastSendProgressAt = 0;
-	// The same instant, but written ONLY by real send activity — never by the exemption branch in
-	// checkUnconfirmedSendStall, which forges `lastSendProgressAt` to suppress `send-path-stopped`.
-	let lastSendActivityAt = 0;
-	// Set by the subscription handler to re-read this peer's exact send range; see checkUnconfirmedSendStall.
-	let hasUnsentWorkForPeer: (() => boolean) | undefined;
-	// Cached answer from that re-read. A QUIET leg satisfies the progress clock forever, so without this
-	// it would open a fresh iterator per log every back-pressure tick for the life of the subscription. A
-	// `false` only goes stale when data appears, and data that is actually sent stamps progress (which
-	// clears this), so caching costs at most one interval of detection latency on a far longer threshold.
-	let unsentWorkProbeAt = 0;
-	let unsentWorkProbeResult = false;
-	let closingForUnconfirmedSendStall = false;
+	// harper-pro#810. Corrupt-frame stops already seen on this session's send iterable, so a NEW one is
+	// distinguishable from the running total: the loop reuses one iterable for the whole session on
+	// RocksDB, and `corruptFrameStop` accumulates on it. See noteSendLogBreak.
+	let sendLogBreaksSeen = 0;
+	let closingForSendLogBreak = false;
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
@@ -4309,77 +4236,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			lastBackPressureCheck = now;
 		}
 	}
-	// Evaluated on the back-pressure tick rather than a timer of its own: it already exists on every
-	// session and, unlike the keepalive, does not depend on options.url — which is unset on a default
-	// server-side session, where this check has to run.
-	function checkUnconfirmedSendStall() {
-		// Only a session that is SENDING to a peer can be in either stall shape; a receive-side or
-		// retrieval connection has no subscription payload and nothing to confirm.
-		if (!(nodeSubscriptions?.length > 0) || wsClosed || closingForUnconfirmedSendStall) return;
-		const now = Date.now();
-		// While the peer CANNOT act — its blobs are still arriving, or our own socket is congested and the
-		// send loop is parked on drain — the send path is alive by definition, and closing on the tick after
-		// the condition clears would restart the very transfer that was progressing. See
-		// unconfirmedSendExemptionHolds for what bounds it and what deliberately does not.
-		if (blobsBeingSent.size > 0 || isPausedForBackPressure) {
-			// The stamp this branch writes is a suppression, not an observation: a paused or blob-busy sender
-			// is not a STOPPED one, so `send-path-stopped` must not fire on it. It therefore cannot also be
-			// the evidence that the exemption is alive — reading it back would make the exemption
-			// self-justifying, since this branch refreshes it on every tick. `lastSendActivityAt` is the
-			// honest one; only real send activity writes it.
-			lastSendProgressAt = now;
-			if (unconfirmedSince === 0) return;
-			if (
-				unconfirmedSendExemptionHolds(
-					lastSendActivityAt,
-					unconfirmedFirstOwedAt,
-					now,
-					effectiveUnconfirmedSendThresholdMs()
-				)
-			) {
-				unconfirmedSince = now;
-				return;
-			}
-		}
-		const reason = unconfirmedSendStallReason(
-			{
-				unconfirmedSince,
-				sendProgressAt: lastSendProgressAt,
-				peerConfirmsBlobDrain: peerConfirmsBlobDrain(peerCapabilities),
-			},
-			now,
-			effectiveUnconfirmedSendThresholdMs(),
-			() => hasUnsentWorkForPeer?.() ?? false
-		);
-		if (!reason) return;
-		closingForUnconfirmedSendStall = true;
-		// Assigned to a local before the log call for the reason every other net does it (harper-pro#431):
-		// `logger.warn?.` is undefined under `logging.level: error`, so an inlined call would stop counting.
-		const fireDetail = recordFireForLog('unconfirmed-send-stall');
-		logger.warn?.(
-			connectionId,
-			`Closing the sending side of ${databaseName} to ${remoteNodeName} (${reason}): sent ${lastConfirmableSequenceSent}, ` +
-				`confirmed ${lastConfirmationReceived}` +
-				`${unconfirmedSince > 0 ? ` (owed for ${now - unconfirmedSince}ms)` : ' (caught up)'}, ` +
-				`send path last advanced ${now - lastSendProgressAt}ms ago. The peer will reconnect and resubscribe. ` +
-				fireDetail
-		);
-		// Not `intentional`: the peer's normal close-handler retry path IS the recovery here.
-		close(CLOSE_UNCONFIRMED_SEND_STALL, `replication stalled (${reason}); resubscribe`);
-	}
 	const backPressureInterval = setInterval(() => {
-		// Contained separately, not in one shared try: a throw out of the back-pressure math must not take
-		// the recovery check with it, and neither may reach the interval, where a throw is an uncaught
-		// exception rather than something a caller can reject.
+		// Contained: a throw here would reach the interval, where it is an uncaught exception rather than
+		// something a caller can reject.
 		try {
 			updateBackPressureRatio();
 		} catch (error) {
 			logger.warn?.(connectionId, 'Error updating replication back-pressure ratio', error);
-		}
-		try {
-			checkUnconfirmedSendStall();
-		} catch (error) {
-			logger.warn?.(connectionId, 'Error in replication unconfirmed-send stall check', error);
 		}
 	}, BACK_PRESSURE_INTERVAL).unref();
 	function getSharedStatus() {
@@ -4394,60 +4257,82 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		return replicationSharedStatus;
 	}
-	// harper-pro#810. The highest sequence this session has handed to `ws.send` in a confirmable frame —
-	// the only value the peer's COMMITTED_UPDATE can legitimately be compared against. Monotonic and
-	// finite-guarded: a regressing or malformed value would make every comparison below false and
-	// silently disable the stall check.
-	function noteSequenceSent(sequenceId: number) {
-		if (!Number.isFinite(sequenceId) || sequenceId <= 0) return;
-		if (sequenceId > lastConfirmableSequenceSent) lastConfirmableSequenceSent = sequenceId;
-		// Start the clock when the peer first owes us something, so the grace period measures how long it
-		// has owed rather than how long the session has existed. Both clocks, as in the COMMITTED_UPDATE
-		// handler: leaving `unconfirmedFirstOwedAt` at 0 for an episode that started here would fail the
-		// `> 0` guard in checkUnconfirmedSendStall and disable the "peer cannot act yet" extension
-		// entirely, so a long blob transfer or back-pressure pause would close the leg the moment it ends.
-		if (unconfirmedSince === 0 && lastConfirmableSequenceSent > lastConfirmationReceived)
-			unconfirmedSince = unconfirmedFirstOwedAt = Date.now();
-	}
-	// Separates "nothing to send this peer" from "stopped": a sender skipping every record, or streaming
-	// a multi-hour copy, is advancing while producing no confirmations.
-	// The ordering this net depends on is against an operator-tunable value: raising
-	// `replication_blobTimeout` past the fixed 20 min would put this close BEFORE the receiver's own
-	// blob-gap handling, pre-empting the behaviour the operator tuned for. Derive the floor from it.
-	function effectiveUnconfirmedSendThresholdMs(): number {
-		// A test override is taken literally; the floor exists to keep the DEFAULT ordered behind the
-		// receiver's blob-gap handling, and applying it to an override would silently ignore it.
-		if (UNCONFIRMED_SEND_THRESHOLD_OVERRIDE_MS) return UNCONFIRMED_SEND_THRESHOLD_OVERRIDE_MS;
-		return Math.max(UNCONFIRMED_SEND_THRESHOLD_MS, blobGapReconnectMs + UNCONFIRMED_SEND_ORDERING_MARGIN_MS);
-	}
-	function noteSendProgress() {
-		lastSendActivityAt = lastSendProgressAt = Date.now();
-		unsentWorkProbeAt = 0;
-	}
 	function mayResyncForDecodeDrop(): boolean {
-		// Keyed by (database, peer) in the module, not carried on the connection: a server-side receive
-		// session has no connection object at all, and a session-local latch resets on the very reconnect
-		// the close causes — leaving both bounds void exactly where they are needed.
 		const key = `${databaseName}\u0000${remoteNodeName}`;
-		const holder = decodeDropResyncByPeer.get(key) ?? {};
-		const last = holder.lastDecodeDropResyncAt ?? 0;
 		const now = Date.now();
-		const count = decodeDropResyncEpisodeCount(holder.lastDecodeDropAt ?? 0, holder.decodeDropResyncCount ?? 0, now);
-		// Stamped on every drop, allowed or not: see decodeDropResyncEpisodeCount for why the episode has to
-		// measure drops rather than resyncs.
-		const stampDrop = { ...holder, lastDecodeDropAt: now };
-		if (!decodeDropResyncAllowed(last, count, now, DECODE_DROP_RESYNC_INTERVAL_MS)) {
+		const { allowed, count, lastCloseAt } = claimRecoveryClose(
+			decodeDropResyncByPeer,
+			key,
+			now,
+			DECODE_DROP_RESYNC_INTERVAL_MS,
+			DECODE_DROP_RESYNC_BUDGET
+		);
+		if (!allowed)
 			logger.warn?.(
 				connectionId,
 				count >= DECODE_DROP_RESYNC_BUDGET
 					? `Undecodable record in ${databaseName} from ${remoteNodeName} after ${count} structure resyncs in this episode; a resubscribe is not repairing it, so records of this table will keep being dropped`
-					: `Undecodable record in ${databaseName} from ${remoteNodeName}, but a structure resync ran ${now - last}ms ago; skipping this one and continuing to drop`
+					: `Undecodable record in ${databaseName} from ${remoteNodeName}, but a structure resync ran ${now - lastCloseAt}ms ago; skipping this one and continuing to drop`
 			);
-			decodeDropResyncByPeer.set(key, stampDrop);
-			return false;
+		return allowed;
+	}
+	// harper-pro#810. Why the send loop's iterable ENDED, read from the iterable itself rather than inferred
+	// from how long it has been quiet. `corruptFrameStop.breaks` counts corrupt frames that stopped a log
+	// during this range and `midLogBreak` says whether entries were lost behind one; both are written only
+	// in the error path, so a healthy sender pays nothing to read them. (`truncatedVersions` is the field
+	// that costs per-entry bookkeeping, and its `trackCorruptTransactions` option stays off here.)
+	//
+	// The two cases are opposites and must not be treated alike:
+	//
+	//   A TORN TAIL — `breaks > 0` with `midLogBreak` false — is the designed, benign reading of a crash's
+	//   last frame. Nothing behind it was lost and the tail grows again. But `endIteratorOnCorruptFrame`
+	//   latches THIS iterator done for good, and the send loop reuses one iterable for the whole session on
+	//   RocksDB, so every later wake drains an already-finished iterator: no frames go out, the keepalive
+	//   holds the socket open, and the peer parks at connected:true / RECEIVING_STATUS_WAITING with every
+	//   health surface green. That is the wedge, and a fresh iterator reads straight past it — so close, and
+	//   let the peer resubscribe on its ordinary retry path.
+	//
+	//   A MID-LOG BREAK left intact entries unreadable behind it, and harper#2087 makes stopping there the
+	//   INTENDED policy (fail-stop / quarantine). A reconnect opens a fresh iterator that stops at the same
+	//   frame, so closing would be a reconnect loop over data no reconnect can recover. Report it and leave
+	//   the session up: visibly degraded beats silently churning.
+	function noteSendLogBreak(breaks: number, midLogBreak: boolean) {
+		if (closingForSendLogBreak || wsClosed) return;
+		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+		if (midLogBreak) {
+			logger.error?.(
+				connectionId,
+				`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind the break are quarantined and no reconnect can cross it, so this leg will not send past it. Repair the transaction log or re-clone this node.`
+			);
+			return;
 		}
-		decodeDropResyncByPeer.set(key, { ...stampDrop, lastDecodeDropResyncAt: now, decodeDropResyncCount: count + 1 });
-		return true;
+		const key = `${databaseName}\u0000${remoteNodeName}`;
+		const now = Date.now();
+		const { allowed, count } = claimRecoveryClose(
+			sendLogBreakByPeer,
+			key,
+			now,
+			SEND_LOG_BREAK_INTERVAL_MS,
+			SEND_LOG_BREAK_BUDGET
+		);
+		if (!allowed) {
+			logger.warn?.(
+				connectionId,
+				`Replication send to ${remoteNodeName}${dbContext} stopped at a corrupt transaction-log frame again after ${count} reconnects in this episode; reconnecting is not clearing it, so this leg stays stopped at the break.`
+			);
+			return;
+		}
+		closingForSendLogBreak = true;
+		// Assigned to a local before the log call for the reason every other net does it (harper-pro#431):
+		// `logger.warn?.` is undefined under `logging.level: error`, so an inlined call would stop counting.
+		const fireDetail = recordFireForLog('send-log-break');
+		logger.warn?.(
+			connectionId,
+			`Replication send to ${remoteNodeName}${dbContext} stopped at a torn transaction-log frame (${breaks} break(s) on this session's iterable). The iterator is latched done and this session reuses it, so the leg would stay silent at connected:true with no further frames — closing so the peer resubscribes onto a fresh iterator. ` +
+				fireDetail
+		);
+		// Not `intentional`: the peer's normal close-handler retry path IS the recovery here.
+		close(CLOSE_SEND_LOG_BREAK, 'transaction-log frame break; resubscribe onto a fresh iterator');
 	}
 	if (databaseName) {
 		setDatabase(databaseName);
@@ -5058,14 +4943,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// rejected — it would make every comparison below false and silently disable the check.
 						if (Number.isFinite(data) && data >= 0) {
 							getSharedStatus()[CONFIRMATION_STATUS_POSITION] = data;
-							const confirmationMoved = data !== lastConfirmationReceived;
 							lastConfirmationReceived = data;
-							// Caught up clears the clock. Still behind restarts it only when the value actually MOVED:
-							// a receiver whose durable watermark is pinned re-sends the same clamped sequence every
-							// commit, and treating that as progress would let it hold the clock open forever.
-							if (data >= lastConfirmableSequenceSent) unconfirmedSince = unconfirmedFirstOwedAt = 0;
-							else if (confirmationMoved || unconfirmedSince === 0)
-								unconfirmedSince = unconfirmedFirstOwedAt = Date.now();
 						} else
 							logger.warn?.(connectionId, 'ignoring malformed committed update', data, databaseName, remoteNodeName);
 						logger.info?.(
@@ -5613,7 +5491,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const currentTransaction = { txnLogKey: 0 };
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
-						let sendScopeLogName: string; // the log this subscription reads when it is not reading all non-excluded ones
 						let sentSequenceId; // the last sequence number we have sent
 						// Tables excluded from outgoing replication to this peer+database. Prefer this node's
 						// config-route sendsTo (the `sendRoute` resolved above), falling back to the peer's hdb_nodes
@@ -5648,7 +5525,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// watermark ahead of what actually went out would make the peer look wedged for data
 									// it was never sent. This is the ONLY confirmable-frame site — a bare SEQUENCE_ID_UPDATE
 									// (skipAuditRecord) produces no COMMITTED_UPDATE, so it must not advance the watermark.
-									noteSequenceSent(cursor);
 								}
 								frame.encodingStart = frame.position;
 								currentTransaction.txnLogKey = 0;
@@ -5805,7 +5681,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// confirmation — so without this the unconfirmed-send net would read a healthy
 										// filtering sender as stopped. Stamped from the existing throttle timer rather than
 										// per record, which is the hot skip path.
-										noteSendProgress();
 										// check to see if we are too far behind, but if so, send a sequence update
 										if ((sentSequenceId || 0) + SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY / 2 < currentSequenceId) {
 											if (DEBUG_MODE)
@@ -5957,7 +5832,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// Stamped here rather than at the confirmable-frame or copy-pacer sites: a base copy flushes
 								// from two checkpoints and a fast copy takes the count/bytes one, which never lets the time
 								// pacer come due — so a healthy multi-hour copy would have looked stopped.
-								noteSendProgress();
 								logger.debug?.(connectionId, 'Sent message, size:', frame.position - frame.encodingStart);
 								if (databaseName !== 'system') {
 									recordAction(
@@ -6072,42 +5946,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 
 								// Before the probe below, which must never see it unset.
-								sendScopeLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 								// harper-pro#810: re-read this peer's EXACT send range on demand — same log scope, same
-								// exclusions, same cursor as the loop below — so the stall check can tell a send loop
-								// with work in front of it from one with nothing to send. A fresh range, deliberately
-								// not the loop's reusable iterable: that iterable is precisely what is suspected of
-								// having stopped (a corrupt frame latches endIteratorOnCorruptFrame for good, and the
-								// loop reuses one iterable for the whole session). Contained: a store closing under
-								// the probe reads as "no work", which withholds a close rather than forcing one.
-								hasUnsentWorkForPeer = () => {
-									const probeNow = Date.now();
-									if (unsentWorkProbeAt > 0 && probeNow - unsentWorkProbeAt < UNSENT_WORK_PROBE_INTERVAL_MS)
-										return unsentWorkProbeResult;
-									unsentWorkProbeAt = probeNow;
-									unsentWorkProbeResult = false;
-									try {
-										for (const _entry of auditStore.getRange({
-											// Deliberately NO startByLog, unlike the send loop below: the store gives any log the
-											// map does not name a start of 0, so a stray log this subscription does not exclude —
-											// a decommissioned node's, or a directional-route peer that misses the excluded-list
-											// filter — would open at its oldest entry and answer "work pending" from history this
-											// peer was sent long ago, closing a healthy idle leg every threshold. A bare `start`
-											// applies the send cursor to every log that is not excluded, which is the question.
-											start: currentSequenceId || 1,
-											exclusiveStart: true,
-											exactStart: false,
-											log: excludedNodes ? undefined : sendScopeLogName,
-											excludeLogs: excludedNodes,
-											snapshot: false,
-										}))
-											return (unsentWorkProbeResult = true);
-									} catch (error) {
-										logger.trace?.(connectionId, 'could not re-read the send range for the stall check', error);
-									}
-									return false;
-								};
-								noteSendProgress();
 								let isFirst = true;
 								do {
 									// We run subscriptions as a loop where retrieve entries from the audit log, since the last entry
@@ -6281,7 +6120,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// The copy loop is alive even when this yield carries no frame — a LOCAL_ONLY or
 														// withheld-origin stretch walks records without encoding any. Without this such a
 														// walk reads as a stopped send path.
-														noteSendProgress();
 														if (frame.position - frame.encodingStart > 8) {
 															recordsSinceCheckpoint = 0;
 															sendQueuedData();
@@ -6411,7 +6249,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											currentSequenceId = copyStartTime;
 										}
 									}
-									const logName = sendScopeLogName;
+									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 									// Capture the current generation before scanning. A commit after this live scan
 									// drains must wake this iteration; subscribing afterward can miss that commit.
 									const nextTransaction = whenNextTransaction(auditStore);
@@ -6452,6 +6290,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
+									// The loop has drained; ask the iterable WHY before parking on the next commit. A new break
+									// since the last drain is the only thing that distinguishes "nothing to send" from "this
+									// iterator can no longer send anything" — the two states this leg has never been able to
+									// tell apart. Counted, not latched, because the iterable is reused for the whole session
+									// and `breaks` accumulates on it. Contained: the property read is on a store object, and a
+									// telemetry throw must never take the send loop with it.
+									try {
+										const corruptFrameStop = (auditLogIterable as any)?.corruptFrameStop;
+										const breaks = corruptFrameStop?.breaks ?? 0;
+										if (breaks > sendLogBreaksSeen) {
+											sendLogBreaksSeen = breaks;
+											noteSendLogBreak(breaks, corruptFrameStop.midLogBreak === true);
+										}
+									} catch (error) {
+										logger.trace?.(connectionId, 'could not read the send iterable corrupt-frame state', error);
+									}
 									await nextTransaction;
 								} while (!closed);
 							})
@@ -7047,7 +6901,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const confirmed = Math.min(lastSequenceIdCommitted, lastDurableSequenceId);
 							// Checked inside the timer: the frame's own resync close may have run since it was armed,
 							// and sending on a closed socket is a silent no-op that loses the confirmation.
-							if (!wsClosed && !shouldSuppressCommittedUpdateForTest(databaseName)) {
+							if (!wsClosed) {
 								ws.send(encode([COMMITTED_UPDATE, confirmed]));
 								logger.trace?.(connectionId, 'sent confirmation of a commit at', confirmed);
 							}
@@ -7180,7 +7034,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function retireInstance(code?, reasonBuffer?) {
 		if (instanceRetired) return;
 		instanceRetired = true;
-		if (code === CLOSE_UNCONFIRMED_SEND_STALL) spendSuppressCommittedUpdateForTest();
 		wsClosed = true;
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
 		if (options.connection?.peerCapabilities === peerCapabilities) options.connection.peerCapabilities = undefined;
@@ -7444,7 +7297,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							logger.debug?.('Sending blob chunk', id, 'length', lastBuffer.length);
 							// Chunks are wire progress for this peer: the send loop can be parked on drain or the
 							// outstanding-blob cap while these keep flowing, and without this that reads as stopped.
-							noteSendProgress();
 							// do the previous buffer so we know if it is the last one or not
 							ws.send(
 								encode([
@@ -7810,38 +7662,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// Safe: at drain with no gap, every received record (incl. blobs) through lastSequenceIdReceived
 						// is durable, and core applies this end_txn after the records already enqueued ahead of it, so
 						// the cursor never advances past an uncommitted/undurable point. max() keeps it monotonic.
-						// ONE value for both messages below. They must not drift: what we tell the sender is what
-						// we will resume from, so confirming less than we persist invites the sender to re-send
-						// data we will never ask for, and confirming more claims durability we do not have.
-						// `lastDurableSequenceId` alone is not it. While a blob is in flight both sequence-update
-						// sites clamp the end_txn they emit to the pre-blob watermark (`cursorBlockedByBlob()`),
-						// and `committedSequence` is derived from that clamped `endTxnEvent.localTime` — so at
-						// drain the watermark can sit below what we have actually received and made durable.
-						// Carrying `lastSequenceIdReceived` forward is what un-clamps it, which is why the end_txn
-						// has always done it.
-						const durableThrough = Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId);
-						tableSubscriptionToReplicator.send(seqUpdateEndTxn(durableThrough));
-						// And tell the SENDER, which the end_txn above does not: that is a local message to core.
-						// The COMMITTED_UPDATE for this commit went out 2ms after it (COMMITTED_UPDATE_DELAY)
-						// clamped to the pre-drain watermark, and no other site re-sends one — so a leg that goes
-						// quiet after a blob write leaves the sender holding `confirmed < sent` forever, which
-						// checkUnconfirmedSendStall reads as `peer-not-confirming` and closes a fully durable,
-						// healthy leg every threshold.
-						// Contained: `tracked` is fire-and-forget (#426 removed the `await Promise.all` that used to
-						// consume it), so a throw here is an UNHANDLED rejection that kills the worker thread and
-						// every leg it owns. `wsClosed` is not enough — `retireInstance` runs on the async 'close'
-						// event, so a socket torn down by another net is still open by this flag when `ws.send`
-						// throws on it. Same containment as settleBlobGapBudget above, for the same reason.
-						if (!wsClosed && !shouldSuppressCommittedUpdateForTest(databaseName)) {
-							try {
-								ws.send(encode([COMMITTED_UPDATE, durableThrough]));
-								logger.trace?.(connectionId, 'sent blob-drain confirmation of a commit at', durableThrough);
-							} catch (sendError) {
-								// Losing it costs at most one threshold of a stale read: the reconnect this implies
-								// re-establishes the subscription, and the peer confirms from its durable cursor.
-								logger.debug?.(connectionId, 'could not send the blob-drain confirmation', sendError);
-							}
-						}
+						tableSubscriptionToReplicator.send(
+							seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+						);
 					}
 					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
 					// durable: persist it (and finish the copy if COPY_COMPLETE already arrived). No-op outside
