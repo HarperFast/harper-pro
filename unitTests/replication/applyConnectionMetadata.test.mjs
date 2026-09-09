@@ -1,9 +1,5 @@
-/**
- * The fence exists because a socket that has already been replaced can still have a message in flight,
- * and because the entry must never keep a retired session's capabilities standing for a live one.
- */
 import assert from 'node:assert';
-import { applyConnectionMetadata } from '#src/replication/subscriptionManager';
+import { applyConnectionMetadata, canClearCapabilitiesForNewSocket } from '#src/replication/subscriptionManager';
 
 const CAPABILITIES_A = Object.freeze({
 	protocolVersion: 2,
@@ -25,6 +21,12 @@ function post(threadId, sessionOrdinal, extra) {
 }
 
 describe('applyConnectionMetadata', () => {
+	it('allows only the owning worker to clear capabilities on a new socket', () => {
+		const entry = entryOwnedBy(3);
+		assert.strictEqual(canClearCapabilitiesForNewSocket(entry, { newSocket: true, threadId: 3 }), true);
+		assert.strictEqual(canClearCapabilitiesForNewSocket(entry, { newSocket: true, threadId: 9 }), false);
+	});
+
 	it('ignores a message that carries no protocol metadata', () => {
 		const entry = entryOwnedBy(3);
 		assert.strictEqual(applyConnectionMetadata(entry, post(3, 1)), false);

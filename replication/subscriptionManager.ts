@@ -223,6 +223,13 @@ export function applyConnectionMetadata(entry: any, connection: any): boolean {
 	return true;
 }
 
+export function canClearCapabilitiesForNewSocket(entry: any, connection: any): boolean {
+	return (
+		connection.newSocket === true &&
+		(entry.worker?.threadId === undefined || connection.threadId === entry.worker.threadId)
+	);
+}
+
 // harper-pro#351 defense-in-depth. Emit the identity-mismatch error at most once per process: the
 // silent-disable decision point below runs per-database, so without this the same warning would be
 // logged once for every user database. `describeIdentityMismatch` is the gate — it returns undefined
@@ -1179,7 +1186,7 @@ export async function startOnMainThread(options) {
 		mainWorkerEntry.connected = true;
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
-		if (connection.newSocket) mainWorkerEntry.peerCapabilities = undefined;
+		if (canClearCapabilitiesForNewSocket(mainWorkerEntry, connection)) mainWorkerEntry.peerCapabilities = undefined;
 		applyConnectionMetadata(mainWorkerEntry, connection);
 		const restoredNode = mainWorkerEntry.nodes[0];
 		if (!restoredNode) {

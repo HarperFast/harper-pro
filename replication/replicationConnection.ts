@@ -3030,6 +3030,7 @@ export class NodeReplicationConnection extends EventEmitter {
 					name: this.nodeName,
 					database: this.databaseName,
 					url: this.url,
+					threadId,
 					// This socket has learned nothing yet, so anything the main-thread entry still holds came
 					// from the socket this one replaces. Only the connect edge sets it; a reconcile
 					// up-correction replays the same path and must not blank a live socket's capabilities.
