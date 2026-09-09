@@ -3025,7 +3025,7 @@ export class NodeReplicationConnection extends EventEmitter {
 			// immediately fails to send (an oversized frame throws and closes it) must keep escalating toward
 			// the 30 s cap instead of hot-looping at 500 ms and accumulating native TLS state (harper-pro#339).
 			// if we have already connected, we need to send a reconnected event
-			if (this.nodeSubscriptions) {
+			if (this.nodeSubscriptions && this.socket === socket) {
 				connectedToNode({
 					name: this.nodeName,
 					database: this.databaseName,
