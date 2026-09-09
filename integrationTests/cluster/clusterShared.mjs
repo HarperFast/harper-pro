@@ -5,13 +5,17 @@ import { setTimeout as delay } from 'node:timers/promises';
  * Send an operation to a Harper node and validate the response
  * @param {Object} node - The Harper node instance
  * @param {Object} operation - The operation to send
+ * @param {Object} [options]
+ * @param {AbortSignal} [options.signal] - aborts the request; pass `waitForCondition`'s signal so a
+ * node that accepts the connection and never answers cannot outlive the wait's deadline
  * @returns {Promise<Object>} The response data
  */
-export async function sendOperation(node, operation) {
+export async function sendOperation(node, operation, options) {
 	const response = await fetch(node.operationsAPIURL, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(operation),
+		signal: options?.signal,
 	});
 	const responseData = await response.json();
 	equal(response.status, 200, JSON.stringify(responseData));
@@ -235,6 +239,60 @@ export async function waitForCatchUp(receiver, source, opts = {}) {
 		await delay(pollMs);
 	}
 	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${receiver.hostname} to catch up to ${sourceHostname}`);
+}
+
+/**
+ * Poll `probe` until it returns a truthy value, and return that value.
+ *
+ * `probe` is handed an AbortSignal that fires at the deadline, so `timeoutMs` bounds the whole
+ * wait rather than only the gaps between polls — a node that accepts the connection but never
+ * answers fails the wait instead of outliving it. Any other probe error propagates immediately.
+ *
+ * @param {(signal: AbortSignal) => unknown} probe - truthy return = satisfied
+ * @param {Object} [opts]
+ * @param {number} [opts.timeoutMs=120000]
+ * @param {number} [opts.pollMs=500]
+ * @param {string|(() => string)} [opts.description] - what is being waited for, for the timeout
+ * message; a function is called at timeout so it can report the probe's last observation
+ * @returns {Promise<*>} the probe's first truthy value
+ */
+export async function waitForCondition(probe, opts = {}) {
+	const timeoutMs = opts.timeoutMs ?? 120000;
+	const pollMs = opts.pollMs ?? 500;
+	const controller = new AbortController();
+	const { signal } = controller;
+	const deadline = setTimeout(() => controller.abort(new Error(`deadline of ${timeoutMs}ms reached`)), timeoutMs);
+	let lastError;
+	try {
+		while (!signal.aborted) {
+			try {
+				const result = await probe(signal);
+				if (result) return result;
+			} catch (error) {
+				if (!signal.aborted) throw error;
+				lastError = error;
+			}
+			if (signal.aborted) break;
+			await delay(pollMs, undefined, { signal }).catch((error) => {
+				if (!signal.aborted) throw error;
+			});
+		}
+	} finally {
+		// aborts requests the probe left in flight, not just the deadline timer
+		controller.abort();
+		clearTimeout(deadline);
+	}
+	const { description } = opts;
+	let what = description ?? 'condition';
+	if (typeof description === 'function') {
+		// a description that throws must not replace the timeout it was meant to explain
+		try {
+			what = description();
+		} catch (error) {
+			what = `condition (description threw: ${error.message})`;
+		}
+	}
+	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: lastError ?? signal.reason });
 }
 
 /**
