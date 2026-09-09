@@ -6283,14 +6283,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// Capture the current generation before scanning. A commit after this live scan
 									// drains must wake this iteration; subscribing afterward can miss that commit.
 									const nextTransaction = whenNextTransaction(auditStore);
-									// And the cursor this scan starts from, in case it ends at a corrupt frame. A break can
-									// truncate a source TRANSACTION — that is what `corruptFrameStop.truncatedVersions`
-									// identifies, and identifying it costs per-entry bookkeeping this path deliberately does
-									// not pay (`trackCorruptTransactions`). So on repair we resume from here rather than from
-									// wherever the drain got to, which cannot skip the truncated tail of a transaction. The
-									// cost is re-delivering this batch, which is what any reconnect already does and what the
-									// receiver's version-keyed apply is built for.
-									const scanStartedAt = currentSequenceId;
 									auditLogIterable =
 										(auditStore.reusableIterable && auditLogIterable) ??
 										maybeDeadAuditIterableForTest(databaseName) ??
@@ -6319,48 +6311,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										await sendAuditRecord(auditRecord, key);
 										auditSubscription.startTime = key; // update so don't double send
 									}
-									// Ask the iterable WHY it drained BEFORE finalizing the batch. That order is the whole
-									// point: a break can swallow the rest of a source transaction, and the trailing `end_txn`
-									// below carries a REMOTE_SEQUENCE_UPDATE that moves the RECEIVER's durable cursor past it.
-									// Advertising that cursor and only then rewinding locally is not a rewind at all — a sender
-									// crash between the two loses the swallowed records for good, because the peer resumes from
-									// the cursor it was handed. So on a break we do not finalize: the peer's cursor stays where
-									// it was, and the rebuilt range re-sends the whole batch (idempotent, version-keyed).
-									//
-									// A store without `corruptFrameStop` reads 0 and this is a no-op, which is correct: the
-									// wedge is structurally Rocks-only (see DESIGN.md item 10d).
+									// Ask the iterable WHY it drained — the one thing that separates "nothing to send" from "this
+									// iterator can no longer send anything". A store without `corruptFrameStop` reads 0 and this
+									// is a no-op, which is correct: the wedge is structurally Rocks-only (see DESIGN.md item 10d).
 									let repairedSendRange = false;
 									let rebuildRetryInMs = 0;
-									// Whether THIS drain ended at a break — which is the condition that must gate finalizing,
-									// not whether the rebuild was allowed. A denied rebuild (or a telemetry throw) leaves the
-									// range just as broken, and publishing its end_txn would advertise a cursor past a
-									// transaction the break may have truncated exactly as before.
-									let drainStoppedAtBreak = false;
 									try {
 										const corruptFrameStop = (auditLogIterable as any)?.corruptFrameStop;
 										const breaks = corruptFrameStop?.breaks ?? 0;
 										if (breaks > 0) {
-											drainStoppedAtBreak = true;
-											// Cancel the throttled skipped-record sequence update too. It fires on its own schedule
-											// and publishes the live `currentSequenceId`, which the receiver persists — so a long
-											// skip run inside this drain would advertise a cursor past the records the withhold
-											// below has just decided not to send, and no rewind can recall it.
-											if (skippedMessageSequenceUpdateTimer) {
-												clearTimeout(skippedMessageSequenceUpdateTimer);
-												skippedMessageSequenceUpdateTimer = null;
-											}
-											// Rewound here, before anything that can throw. `currentSequenceId` advanced per record
-											// as this drain ran, so leaving it at the truncated transaction's own key would strand
-											// the rest of that transaction behind the next scan's `exclusiveStart` — permanently,
-											// since `trackCorruptTransactions` is off and nothing can name which one was cut.
-											currentSequenceId = scanStartedAt;
 											// Asked on every drain once stopped, not only on a new break: a repair the interval
 											// floor declined must be retried rather than latched off.
 											const isNewBreak = breaks > sendLogBreaksSeen;
 											sendLogBreaksSeen = breaks;
 											// A repair replaces the iterable, so the running total starts over on the new object.
 											if (
-												repairSendLogBreak(breaks, corruptFrameStop.midLogBreak === true, isNewBreak, scanStartedAt)
+												repairSendLogBreak(breaks, corruptFrameStop.midLogBreak === true, isNewBreak, currentSequenceId)
 											) {
 												sendLogBreaksSeen = 0;
 												repairedSendRange = true;
@@ -6373,18 +6339,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									} catch (error) {
 										logger.trace?.(connectionId, 'could not read the send iterable corrupt-frame state', error);
 									}
-									// Finalize the batch only if the range did NOT stop at a break. See above: the trailing
-									// end_txn moves the peer's durable cursor, and a break may have swallowed records behind it.
-									if (drainStoppedAtBreak) {
-										// Discard what this drain buffered instead of publishing it. The records were only
-										// buffered — `sendQueuedData()` runs from the end_txn — so withholding sends nothing and
-										// loses nothing: the rebuilt range re-sends them from `scanStartedAt`. Doing the frame
-										// reset by hand is what the withheld `sendAuditRecord({type:'end_txn'})` would otherwise
-										// have done; without it the next iteration re-encodes this prefix into the same unflushed
-										// frame and ships it doubled.
-										frame.encodingStart = frame.position;
-										currentTransaction.txnLogKey = 0;
-									} else if (frame.position - frame.encodingStart > 8) {
+									// Finalized even when the drain stopped at a break. harper#2087's fail-stop policy is that the
+									// stream DELIVERS everything before the break and stops there, and
+									// `integrationTests/cluster/txnlogTearReplication.test.mjs` pins exactly that ("B receives every
+									// entry before the torn frame, nothing behind it"). That the peer's cursor ends up exclusive of
+									// a torn transaction is the documented, accepted consequence — its remainder needs a re-clone —
+									// not something this recovery path may reinterpret.
+									if (frame.position - frame.encodingStart > 8) {
 										sendAuditRecord(
 											{
 												type: 'end_txn',
