@@ -14,6 +14,7 @@ import { expect } from 'chai';
 import {
 	claimRecoveryClose,
 	mayRebuildSendRange,
+	rebuildRetryDelayMs,
 	SEND_LOG_REPAIR_INTERVAL_MS,
 	SEND_LOG_QUARANTINE_RECHECK_MS,
 	recoveryCloseAllowed,
@@ -170,5 +171,57 @@ describe('mayRebuildSendRange — when the stopped send range may be rebuilt', (
 		expect(
 			mayRebuildSendRange(true, NOW, NOW + SEND_LOG_QUARANTINE_RECHECK_MS, NOW + SEND_LOG_QUARANTINE_RECHECK_MS + 1)
 		).to.equal(false);
+	});
+});
+
+describe('rebuildRetryDelayMs — the wake a denied rebuild needs', () => {
+	it('is zero when nothing is holding the rebuild back', () => {
+		expect(rebuildRetryDelayMs(false, 0, 0, NOW)).to.equal(0);
+	});
+
+	it('reports the remaining floor for a torn tail', () => {
+		// Without this wake the loop parks on `nextTransaction` after a denied rebuild, so the write that
+		// finally makes the tail readable can arrive inside the floor, be denied, and then need ANOTHER
+		// commit — which a quiet writer never sends. That is the original wedge, reached through the floor.
+		expect(rebuildRetryDelayMs(false, NOW, NOW, NOW + 10_000)).to.equal(SEND_LOG_REPAIR_INTERVAL_MS - 10_000);
+		expect(rebuildRetryDelayMs(false, NOW, NOW, NOW + SEND_LOG_REPAIR_INTERVAL_MS)).to.equal(0);
+	});
+
+	it('reports the remaining quarantine window for a mid-log break', () => {
+		expect(rebuildRetryDelayMs(true, NOW, 0, NOW)).to.equal(SEND_LOG_QUARANTINE_RECHECK_MS);
+	});
+
+	it('agrees with mayRebuildSendRange: zero delay exactly when a rebuild is allowed', () => {
+		for (const midLog of [false, true]) {
+			for (const elapsed of [0, 1_000, SEND_LOG_REPAIR_INTERVAL_MS, SEND_LOG_QUARANTINE_RECHECK_MS]) {
+				const at = NOW + elapsed;
+				expect(rebuildRetryDelayMs(midLog, NOW, NOW, at) === 0).to.equal(
+					mayRebuildSendRange(midLog, NOW, NOW, at),
+					`midLog=${midLog} elapsed=${elapsed}`
+				);
+			}
+		}
+	});
+});
+
+describe('claimRecoveryClose rollback — a slot spent on a close that never happened', () => {
+	it('restores the previous bound exactly', () => {
+		const bounds = new Map();
+		const KEY = 'data\u0000peer-b';
+		const first = claimRecoveryClose(bounds, KEY, NOW, INTERVAL, 3, true);
+		expect(first.allowed).to.equal(true);
+		const afterFirst = { ...bounds.get(KEY) };
+
+		const second = claimRecoveryClose(bounds, KEY, NOW + INTERVAL, 3, 3, true);
+		expect(second.allowed).to.equal(true);
+		second.rollback();
+		expect({ ...bounds.get(KEY) }).to.deep.equal(afterFirst);
+	});
+
+	it('removes the entry entirely when the claim created it', () => {
+		const bounds = new Map();
+		const KEY = 'data\u0000peer-c';
+		claimRecoveryClose(bounds, KEY, NOW, INTERVAL, 3, true).rollback();
+		expect(bounds.has(KEY)).to.equal(false);
 	});
 });
