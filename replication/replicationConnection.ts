@@ -6234,6 +6234,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// Capture the current generation before scanning. A commit after this live scan
 									// drains must wake this iteration; subscribing afterward can miss that commit.
 									const nextTransaction = whenNextTransaction(auditStore);
+									// And the cursor this scan starts from, in case it ends at a corrupt frame. A break can
+									// truncate a source TRANSACTION — that is what `corruptFrameStop.truncatedVersions`
+									// identifies, and identifying it costs per-entry bookkeeping this path deliberately does
+									// not pay (`trackCorruptTransactions`). So on repair we resume from here rather than from
+									// wherever the drain got to, which cannot skip the truncated tail of a transaction. The
+									// cost is re-delivering this batch, which is what any reconnect already does and what the
+									// receiver's version-keyed apply is built for.
+									const scanStartedAt = currentSequenceId;
 									auditLogIterable =
 										(auditStore.reusableIterable && auditLogIterable) ??
 										maybeDeadAuditIterableForTest(databaseName) ??
@@ -6291,6 +6299,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											) {
 												sendLogBreaksSeen = 0;
 												repairedSendRange = true;
+												currentSequenceId = scanStartedAt;
 											}
 										} else {
 											// A replaced iterable starts its count over, and clears the quarantine clock with it.
