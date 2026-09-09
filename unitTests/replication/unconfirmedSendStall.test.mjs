@@ -18,16 +18,24 @@
  */
 
 import { expect } from 'chai';
-import { unconfirmedSendStallReason, decodeDropResyncAllowed } from '#src/replication/replicationConnection';
+import {
+	unconfirmedSendStallReason,
+	withinUnconfirmedSendGrace,
+	decodeDropResyncAllowed,
+	decodeDropResyncEpisodeCount,
+	UNCONFIRMED_SEND_MAX_GRACE_MS,
+	DECODE_DROP_RESYNC_EPISODE_MS,
+} from '#src/replication/replicationConnection';
 
 const THRESHOLD = 20 * 60_000;
 const NOW = 1_000_000_000;
 const STALE = NOW - THRESHOLD; // exactly one threshold ago
 const FRESH = NOW - 1_000;
 
-// A healthy leg: the peer owes us nothing and the send path is current.
+// A healthy leg: the peer owes us nothing, the send path is current, and the peer is a build that
+// re-confirms once its blobs go durable.
 function healthy(overrides = {}) {
-	return { unconfirmedSince: 0, sendProgressAt: FRESH, ...overrides };
+	return { unconfirmedSince: 0, sendProgressAt: FRESH, peerConfirmsBlobDrain: true, ...overrides };
 }
 
 // `hasUnsentWork` stands in for the session's re-read of its own send range.
@@ -89,7 +97,18 @@ describe('unconfirmedSendStallReason', () => {
 	});
 
 	it('does not flag a session that has done nothing at all yet', () => {
-		expect(reason({ unconfirmedSince: 0, sendProgressAt: 0 })).to.equal(undefined);
+		expect(reason(healthy({ sendProgressAt: 0 }))).to.equal(undefined);
+	});
+
+	it('withholds the peer-side shape from a peer that never re-confirms after a blob drain', () => {
+		// Every build before harper-pro#810 confirms a blob-carrying commit once, clamped to its pre-blob
+		// watermark, and never revises it — so on a rolling upgrade an upgraded sender would read a healthy,
+		// fully durable, quiet leg as stalled and close it every threshold.
+		expect(reason(healthy({ unconfirmedSince: STALE, peerConfirmsBlobDrain: false }))).to.equal(undefined);
+	});
+
+	it('still flags a stopped send path against such a peer: that shape reads only our own send path', () => {
+		expect(reason(healthy({ sendProgressAt: STALE, peerConfirmsBlobDrain: false }))).to.equal('send-path-stopped');
 	});
 
 	it('reports the peer-side stall first when both shapes are true, without re-reading the range', () => {
@@ -97,7 +116,7 @@ describe('unconfirmedSendStallReason', () => {
 		// and the cheaper check must short-circuit the storage read.
 		let probes = 0;
 		expect(
-			reason({ unconfirmedSince: STALE, sendProgressAt: STALE }, () => {
+			reason(healthy({ unconfirmedSince: STALE, sendProgressAt: STALE }), () => {
 				probes++;
 				return true;
 			})
@@ -128,5 +147,40 @@ describe('decodeDropResyncAllowed', () => {
 		// A frequency bound alone leaves an unrepairable fault rebuilding the subscription forever, which is
 		// worse than the plain skip-and-advance it replaces.
 		expect(decodeDropResyncAllowed(NOW - 10 * INTERVAL, 3, NOW, INTERVAL, 3)).to.equal(false);
+	});
+});
+
+describe('withinUnconfirmedSendGrace', () => {
+	it('holds the clock open while the peer genuinely cannot act', () => {
+		expect(withinUnconfirmedSendGrace(NOW - 1_000, NOW)).to.equal(true);
+	});
+
+	it('releases it once the grace budget is spent, so the exemption itself is bounded', () => {
+		// The cap has to end the EXEMPTION, not only the clock: a session that keeps one blob in the send
+		// pipeline, or never leaves back-pressure, would otherwise skip the stall check on every tick for
+		// the life of the connection and the wedge this net exists to catch would be invisible again.
+		expect(withinUnconfirmedSendGrace(NOW - UNCONFIRMED_SEND_MAX_GRACE_MS, NOW)).to.equal(false);
+	});
+
+	it('is not open for an episode that never started', () => {
+		expect(withinUnconfirmedSendGrace(0, NOW)).to.equal(false);
+	});
+});
+
+describe('decodeDropResyncEpisodeCount', () => {
+	it('carries the count forward inside one episode', () => {
+		expect(decodeDropResyncEpisodeCount(NOW - DECODE_DROP_RESYNC_EPISODE_MS + 1, 3, NOW)).to.equal(3);
+	});
+
+	it('starts a fresh episode once the gap exceeds the window, restoring the budget', () => {
+		// A lifetime budget turns "this decode class is unrepairable" into "this peer can never be repaired
+		// again": three separate forks genuinely repaired over months would silently drop every record of
+		// that table on the fourth, forever, until the process restarts.
+		expect(decodeDropResyncEpisodeCount(NOW - DECODE_DROP_RESYNC_EPISODE_MS, 3, NOW)).to.equal(0);
+		expect(decodeDropResyncAllowed(NOW - DECODE_DROP_RESYNC_EPISODE_MS, 0, NOW, 5 * 60_000, 3)).to.equal(true);
+	});
+
+	it('leaves a connection that has never resynced alone', () => {
+		expect(decodeDropResyncEpisodeCount(0, 0, NOW)).to.equal(0);
 	});
 });
