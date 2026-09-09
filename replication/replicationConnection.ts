@@ -6349,6 +6349,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												repairedSendRange = true;
 												currentSequenceId = scanStartedAt;
 											} else rebuildRetryInMs = sendLogRebuildRetryInMs;
+											// Rewind on ANY break, not only a repaired one. `currentSequenceId` advanced per record
+											// as this drain ran, so a denied iteration would leave it at the truncated
+											// transaction's own key — and the next scan re-snapshots `scanStartedAt` from it and
+											// opens `exclusiveStart`, so the rest of that transaction would never be sent by any
+											// later rebuild either. Several records share one `txnLogKey`, and with
+											// `trackCorruptTransactions` off nothing can name which one was truncated.
+											currentSequenceId = scanStartedAt;
 										} else {
 											// A replaced iterable starts its count over, and clears the quarantine clock with it.
 											sendLogBreaksSeen = 0;
@@ -6359,7 +6366,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 									// Finalize the batch only if the range did NOT stop at a break. See above: the trailing
 									// end_txn moves the peer's durable cursor, and a break may have swallowed records behind it.
-									if (!drainStoppedAtBreak && frame.position - frame.encodingStart > 8) {
+									if (drainStoppedAtBreak) {
+										// Discard what this drain buffered instead of publishing it. The records were only
+										// buffered — `sendQueuedData()` runs from the end_txn — so withholding sends nothing and
+										// loses nothing: the rebuilt range re-sends them from `scanStartedAt`. Doing the frame
+										// reset by hand is what the withheld `sendAuditRecord({type:'end_txn'})` would otherwise
+										// have done; without it the next iteration re-encodes this prefix into the same unflushed
+										// frame and ships it doubled.
+										frame.encodingStart = frame.position;
+										currentTransaction.txnLogKey = 0;
+									} else if (frame.position - frame.encodingStart > 8) {
 										sendAuditRecord(
 											{
 												type: 'end_txn',
