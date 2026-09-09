@@ -220,6 +220,18 @@ export const SEND_LOG_QUARANTINE_RECHECK_MS = 30 * 60_000;
 // rebuild allows, because recovering it is the point. A quarantined one additionally waits out the recheck
 // window from when the break FIRST appeared, so it never rebuilds on first sight — that is the spin
 // harper#2087's fail-stop policy exists to avoid — while still looking again in case the log was repaired.
+export function rebuildRetryDelayMs(
+	midLogBreak: boolean,
+	breakSince: number,
+	lastRebuildAt: number,
+	now: number,
+	repairMs: number = SEND_LOG_REPAIR_INTERVAL_MS,
+	quarantineMs: number = SEND_LOG_QUARANTINE_RECHECK_MS
+): number {
+	const since = midLogBreak ? Math.max(breakSince, lastRebuildAt) : lastRebuildAt;
+	if (since <= 0) return 0;
+	return Math.max(0, (midLogBreak ? quarantineMs : repairMs) - (now - since));
+}
 export function mayRebuildSendRange(
 	midLogBreak: boolean,
 	breakSince: number,
@@ -282,14 +294,26 @@ export function claimRecoveryClose(
 	intervalMs: number,
 	budget: number,
 	isNewEvent: boolean = true
-): { allowed: boolean; count: number; lastCloseAt: number } {
+): { allowed: boolean; count: number; lastCloseAt: number; rollback: () => void } {
 	const holder = bounds.get(key) ?? {};
+	const had = bounds.has(key);
 	const lastCloseAt = holder.lastCloseAt ?? 0;
 	const count = recoveryCloseEpisodeCount(holder.lastEventAt ?? 0, holder.closeCount ?? 0, now);
 	const allowed = recoveryCloseAllowed(lastCloseAt, count, now, intervalMs, budget);
 	const stamped = { ...holder, closeCount: count, ...(isNewEvent || allowed ? { lastEventAt: now } : undefined) };
 	bounds.set(key, allowed ? { ...stamped, lastCloseAt: now, closeCount: count + 1 } : stamped);
-	return { allowed, count, lastCloseAt };
+	// The slot is claimed before the close is attempted, because the close ends this session and there is
+	// no "after" to claim it in. A close that then FAILS must give it back, or the retry the caller logs
+	// is denied by an interval it spent on a teardown that never happened.
+	return {
+		allowed,
+		count,
+		lastCloseAt,
+		rollback: () => {
+			if (had) bounds.set(key, holder);
+			else bounds.delete(key);
+		},
+	};
 }
 // LIVENESS_STALE_MS is defined below, after PING_TIMEOUT, so it can be derived from the configured
 // keepalive window rather than a fixed default.
@@ -3411,6 +3435,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// When the CURRENT break was first seen, which is what a quarantined break waits from: it must not
 	// rebuild on first sight (that is the spin the policy avoids), only re-check long after.
 	let sendLogBreakSince = 0;
+	// How long until a denied rebuild would be allowed, so the send loop can wake for it rather than
+	// waiting on a commit that a quiet writer may never send. Fault path only.
+	let sendLogRebuildRetryInMs = 0;
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
 	let subscribed = false;
@@ -4271,16 +4298,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		return replicationSharedStatus;
 	}
+	// Set by mayResyncForDecodeDrop when it claims a slot, so a close that throws can hand it back.
+	let rollbackDecodeDropClaim: (() => void) | undefined;
 	function mayResyncForDecodeDrop(): boolean {
 		const key = `${databaseName}\u0000${remoteNodeName}`;
 		const now = Date.now();
-		const { allowed, count, lastCloseAt } = claimRecoveryClose(
+		const { allowed, count, lastCloseAt, rollback } = claimRecoveryClose(
 			decodeDropResyncByPeer,
 			key,
 			now,
 			DECODE_DROP_RESYNC_INTERVAL_MS,
 			DECODE_DROP_RESYNC_BUDGET
 		);
+		if (allowed) rollbackDecodeDropClaim = rollback;
 		if (!allowed)
 			logger.warn?.(
 				connectionId,
@@ -4316,6 +4346,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// the loop's `whenNextTransaction` capture precedes the scan, so no wake is lost. Returns whether it
 	// repaired, so the caller can reset its change detection against the new object.
 	function repairSendLogBreak(breaks: number, midLogBreak: boolean, isNewBreak: boolean, resumeFrom: number): boolean {
+		sendLogRebuildRetryInMs = 0;
 		if (wsClosed) return false;
 		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 		if (midLogBreak && isNewBreak)
@@ -4330,8 +4361,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// longer — but it does wait, rather than never looking again.
 		const now = Date.now();
 		if (sendLogBreakSince === 0) sendLogBreakSince = now;
-		if (!mayRebuildSendRange(midLogBreak, sendLogBreakSince, lastSendLogRepairAt, now)) return false;
+		if (!mayRebuildSendRange(midLogBreak, sendLogBreakSince, lastSendLogRepairAt, now)) {
+			sendLogRebuildRetryInMs = rebuildRetryDelayMs(midLogBreak, sendLogBreakSince, lastSendLogRepairAt, now);
+			return false;
+		}
 		lastSendLogRepairAt = now;
+		// The state transition FIRST, and the telemetry after it. Everything below is best-effort — a
+		// throwing logger or fire counter must not leave the dead iterable cached with the floor already
+		// stamped, which would suppress the next attempt too.
+		auditLogIterable = undefined;
 		// Assigned before the log call: `logger.warn?.` is undefined under `logging.level: error`, so an
 		// inlined call would stop counting (harper-pro#431).
 		const fireDetail = recordFireForLog('send-log-break');
@@ -4340,7 +4378,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			`Replication send to ${remoteNodeName}${dbContext} stopped at a ${midLogBreak ? 'quarantined mid-log' : 'torn'} transaction-log frame (${breaks} break(s) on the cached iterable); it is latched done, so this session would send nothing further. Rebuilding the send range from ${resumeFrom}. ` +
 				fireDetail
 		);
-		auditLogIterable = undefined;
 		return true;
 	}
 	if (databaseName) {
@@ -6278,21 +6315,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										await sendAuditRecord(auditRecord, key);
 										auditSubscription.startTime = key; // update so don't double send
 									}
-									if (frame.position - frame.encodingStart > 8) {
-										sendAuditRecord(
-											{
-												type: 'end_txn',
-											},
-											currentSequenceId
-										);
-									}
-									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									let repairedSendRange = false;
-									// The loop has drained; ask the iterable WHY before parking on the next commit — the one
-									// thing that separates "nothing to send" from "this iterator can no longer send anything".
+									// Ask the iterable WHY it drained BEFORE finalizing the batch. That order is the whole
+									// point: a break can swallow the rest of a source transaction, and the trailing `end_txn`
+									// below carries a REMOTE_SEQUENCE_UPDATE that moves the RECEIVER's durable cursor past it.
+									// Advertising that cursor and only then rewinding locally is not a rewind at all — a sender
+									// crash between the two loses the swallowed records for good, because the peer resumes from
+									// the cursor it was handed. So on a break we do not finalize: the peer's cursor stays where
+									// it was, and the rebuilt range re-sends the whole batch (idempotent, version-keyed).
+									//
 									// A store without `corruptFrameStop` reads 0 and this is a no-op, which is correct: the
-									// wedge is structurally Rocks-only (see DESIGN.md item 10d). Contained because a telemetry
-									// throw must never take the send loop with it.
+									// wedge is structurally Rocks-only (see DESIGN.md item 10d).
+									let repairedSendRange = false;
+									let rebuildRetryInMs = 0;
 									try {
 										const corruptFrameStop = (auditLogIterable as any)?.corruptFrameStop;
 										const breaks = corruptFrameStop?.breaks ?? 0;
@@ -6308,7 +6342,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												sendLogBreaksSeen = 0;
 												repairedSendRange = true;
 												currentSequenceId = scanStartedAt;
-											}
+											} else rebuildRetryInMs = sendLogRebuildRetryInMs;
 										} else {
 											// A replaced iterable starts its count over, and clears the quarantine clock with it.
 											sendLogBreaksSeen = 0;
@@ -6317,12 +6351,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									} catch (error) {
 										logger.trace?.(connectionId, 'could not read the send iterable corrupt-frame state', error);
 									}
+									// Finalize the batch only if the range did NOT stop at a break. See above: the trailing
+									// end_txn moves the peer's durable cursor, and a break may have swallowed records behind it.
+									if (!repairedSendRange && frame.position - frame.encodingStart > 8) {
+										sendAuditRecord(
+											{
+												type: 'end_txn',
+											},
+											currentSequenceId
+										);
+									}
+									getSharedStatus()[SENDING_TIME_POSITION] = 0;
 									// `nextTransaction` was captured BEFORE this scan and resolves on the NEXT commit, so the
 									// commit that woke this iteration — the one whose rows the latched iterator failed to yield —
 									// would stay unsent until some later commit. On a quiescent source, which is the #810 field
 									// shape, that is no later commit at all. Re-scan now instead; the repair's own interval floor
 									// is what stops this from spinning if the fresh range breaks again immediately.
 									if (repairedSendRange) continue;
+									// A repair the floor DENIED needs its own wake. The write that finally makes the tail
+									// readable can arrive inside the floor window, be denied, and then this await would need yet
+									// another commit — which a quiet writer never sends, leaving readable rows unsent forever.
+									// Fault path only: a healthy drain sets no deadline and still parks on the commit alone.
+									if (rebuildRetryInMs > 0) {
+										const retry = new Promise((resolve) => setTimeout(resolve, rebuildRetryInMs).unref?.());
+										await Promise.race([nextTransaction, retry]);
+										continue;
+									}
 									await nextTransaction;
 								} while (!closed);
 							})
@@ -6952,11 +7006,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						wsClosed = true;
 						if (!close(CLOSE_DECODE_DROP_RESYNC, 'undecodable record; resubscribing to resync structures')) {
 							wsClosed = false;
+							// Give the budget slot back too: it was claimed for a teardown that did not happen, and
+							// without this the retry named below is denied by an interval nothing was spent on.
+							rollbackDecodeDropClaim?.();
 							logger.error?.(
 								connectionId,
 								`Could not close ${databaseName} to ${remoteNodeName} for a structure resync; the leg stays up and the next undecodable record will retry`
 							);
 						}
+						rollbackDecodeDropClaim = undefined;
 					}
 				},
 			};
