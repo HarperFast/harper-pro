@@ -54,6 +54,10 @@ describe('fire counter slot map', () => {
 		}
 	});
 
+	it('keeps the ninth pair after the record-lock layout', () => {
+		expect(fireCounterPositions('unconfirmed-send-stall')).to.deep.equal({ redundant: 32, loadBearing: 33 });
+	});
+
 	it('has no positions for an unrecognized mechanism', () => {
 		expect(fireCounterPositions('not-a-mechanism')).to.equal(undefined);
 	});
@@ -68,6 +72,7 @@ describe('fire counter slot map', () => {
 			'subscription-setup',
 			'wedge-reconcile',
 			'receive-stall-net',
+			'unconfirmed-send-stall',
 		]);
 	});
 });
