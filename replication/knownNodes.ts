@@ -1157,7 +1157,7 @@ export function qualifiesForMultiHopExclusion(
 	const authorized = !!(
 		directional?.sends ||
 		routeEntriesIncludePeer(directional?.sendsTo, peerName, databaseName) ||
-		node?.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe !== false)
+		isExplicitDatabaseSubscription(node?.subscriptions, databaseName)
 	);
 	if (!authorized) return false;
 

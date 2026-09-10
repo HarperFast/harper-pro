@@ -89,19 +89,30 @@ describe('qualifiesForMultiHopExclusion', () => {
 	});
 
 	describe('subscription rows', () => {
-		it('qualifies a subscription for the database', () => {
-			const node = { subscriptions: [{ database: DB }] };
+		it('qualifies an explicit subscription for the database', () => {
+			const node = { subscriptions: [{ database: DB, subscribe: true }] };
 			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(true);
 		});
 		it('honors the legacy schema field', () => {
-			const node = { subscriptions: [{ schema: DB }] };
+			const node = { subscriptions: [{ schema: DB, subscribe: true }] };
 			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(true);
 		});
 		it('does not qualify subscribe: false or another database', () => {
 			expect(qualifiesForMultiHopExclusion({ subscriptions: [{ database: DB, subscribe: false }] }, PEER, DB)).to.equal(
 				false
 			);
-			expect(qualifiesForMultiHopExclusion({ subscriptions: [{ database: 'redirects' }] }, PEER, DB)).to.equal(false);
+			expect(
+				qualifiesForMultiHopExclusion({ subscriptions: [{ database: 'redirects', subscribe: true }] }, PEER, DB)
+			).to.equal(false);
+		});
+		it('does not qualify an absent subscribe, matching isExplicitDatabaseSubscription', () => {
+			// The eligibility gate (shouldReplicateFromNode -> isExplicitDatabaseSubscription) requires a
+			// truthy subscribe, so a bare { database } row proves no direct subscription. Excluding on it
+			// would drop the origin from the relay with no direct path in place.
+			expect(qualifiesForMultiHopExclusion({ subscriptions: [{ database: DB }] }, PEER, DB)).to.equal(false);
+			expect(
+				qualifiesForMultiHopExclusion({ replicates: false, subscriptions: [{ database: DB }] }, PEER, DB)
+			).to.equal(false);
 		});
 	});
 
