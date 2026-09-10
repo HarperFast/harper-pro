@@ -1,6 +1,6 @@
 {
 	"name": "@harperfast/harper-pro",
-	"version": "5.2.5",
+	"version": "5.3.0-alpha.1",
 	"description": "Harper is a distributed database, caching service, streaming broker, and application development platform focused on performance and ease of use. Harper Pro includes replication, certificate management, profiling.",
 	"keywords": [
 		"database",
@@ -146,7 +146,7 @@
 		"@turf/distance": "6.5.0",
 		"@turf/helpers": "6.5.0",
 		"@turf/length": "6.5.0",
-		"alasql": "4.18.0",
+		"alasql": "4.19.0",
 		"amaro": "^1.1.8",
 		"argon2": "0.45.1",
 		"asn1js": "3.0.10",
@@ -228,6 +228,7 @@
 		"@types/sinon": "^22.0.0",
 		"@types/tar-fs": "^2.0.4",
 		"@types/tar-stream": "^3.1.4",
+		"@types/ws": "^8.18.1",
 		"@typescript-eslint/parser": "^8.48.1",
 		"axios": "1.19.0",
 		"chai": "^6.2.0",

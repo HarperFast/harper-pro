@@ -10,7 +10,7 @@ Real-time, peer-to-peer replication of table data across cluster nodes via persi
 
 ---
 
-## Files (6 total, ~4200 lines)
+## Key files
 
 | File                       | Purpose                                                                                                                                                                                                               |
 | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -20,6 +20,7 @@ Real-time, peer-to-peer replication of table data across cluster nodes via persi
 | `setNode.ts`               | Cluster member operations — add/remove nodes, CSR signing, TLS certificate negotiation.                                                                                                                               |
 | `knownNodes.ts`            | Node registry (`hdb_nodes` system table) + shared-memory `Float64Array` status buffers (latency, confirmation, back-pressure).                                                                                        |
 | `clusterStatus.ts`         | Read-only status reporting for `cluster_status` operation.                                                                                                                                                            |
+| `protocolCapabilities.ts`  | The protocol capability registry: the single normalization point for the peer capability bag in `NODE_NAME[4]`.                                                                                                       |
 
 ---
 
@@ -33,22 +34,50 @@ A persistent connection to one remote node. Owns the WebSocket lifecycle, reconn
 
 The protocol decoder. Reads incoming binary commands — each is a top-level named const in the same file:
 
-| Command constant                           | Value     | Meaning                                   |
-| ------------------------------------------ | --------- | ----------------------------------------- |
-| `SUBSCRIPTION_REQUEST`                     | 129       | Client wants to subscribe to a table      |
-| `RESIDENCY_LIST`                           | 130       | Negotiate which records each node holds   |
-| `TABLE_FIXED_STRUCTURE`                    | 132       | Schema sync                               |
-| `GET_RECORD` / `GET_RECORD_RESPONSE`       | 133 / 134 | Cache-miss fetch                          |
-| `OPERATION_REQUEST` / `OPERATION_RESPONSE` | 136 / 137 | Forwarded operations                      |
-| `NODE_NAME` / `NODE_NAME_TO_ID_MAP`        | 140 / 141 | Identity exchange                         |
-| `DISCONNECT`                               | 142       | Graceful close (not used on auth failure) |
-| `SEQUENCE_ID_UPDATE`                       | 143       | Audit sequence cursor                     |
-| `COMMITTED_UPDATE`                         | 144       | Confirm-on-commit                         |
-| `DB_SCHEMA`                                | 145       | Database schema replication               |
-| `BLOB_CHUNK`                               | 146       | Blob bytes                                |
-| `SUBSCRIPTION_UPDATE`                      | 147       | Audit record forwarded to subscribers     |
+| Command constant                           | Value     | Meaning                                                                                           |
+| ------------------------------------------ | --------- | ------------------------------------------------------------------------------------------------- |
+| `SUBSCRIPTION_REQUEST`                     | 129       | Client wants to subscribe to a table                                                              |
+| `RESIDENCY_LIST`                           | 130       | Negotiate which records each node holds                                                           |
+| `TABLE_FIXED_STRUCTURE`                    | 132       | Schema sync                                                                                       |
+| `GET_RECORD` / `GET_RECORD_RESPONSE`       | 133 / 134 | Cache-miss fetch                                                                                  |
+| `OPERATION_REQUEST` / `OPERATION_RESPONSE` | 136 / 137 | Forwarded operations                                                                              |
+| `NODE_NAME` / `NODE_NAME_TO_ID_MAP`        | 140 / 141 | Identity exchange                                                                                 |
+| `DISCONNECT`                               | 142       | Graceful close (not used on auth failure)                                                         |
+| `SEQUENCE_ID_UPDATE`                       | 143       | Audit sequence cursor                                                                             |
+| `COMMITTED_UPDATE`                         | 144       | Confirm-on-commit                                                                                 |
+| `DB_SCHEMA`                                | 145       | Database schema replication                                                                       |
+| `BLOB_CHUNK`                               | 146       | Blob bytes                                                                                        |
+| `SUBSCRIPTION_UPDATE`                      | 147       | Audit record forwarded to subscribers                                                             |
+| `COPY_START`                               | 148       | Leader → follower: a bulk table copy is starting (carries `copyStartTime` + `COPY_ORDER_VERSION`) |
+| `COPY_COMPLETE`                            | 149       | Leader → follower: the bulk copy finished; the follower clears its resume cursor                  |
+
+A code this build does not know falls to the switch's `default:`, which counts it on the connection and warns through a throttle shared by every socket in that worker thread, then keeps processing. It does **not** close: an unknown code means the peer is running a NEWER build, so closing would hard-loop the link — the reconnect replays the same frame. Note the consequence: the durable resume cursor still advances past a frame this build did not understand. Sender-side gating (below) is the invariant that makes that safe.
 
 The `authorization` parameter is a **promise that may resolve asynchronously**; on rejection the socket closes without a DISCONNECT frame (relevant to JWT failure flows).
+
+### Protocol capabilities (`protocolCapabilities.ts`)
+
+`NODE_NAME[4]` is a msgpack map of capability keys, and `protocolCapabilities.ts` is the **only** place that interprets it. Nothing else in `replication/` may read the raw bag: a second reader is how two features end up with two different answers for "the peer didn't say."
+
+Each socket resolves the peer's bag once per `NODE_NAME` into a frozen object with every known key present, and consults only that. The resolution is **per socket, never cached across reconnects** — `NodeReplicationConnection` outlives the socket, and a peer can be upgraded or downgraded between them.
+
+| Key                         | Kind      | Absent ⇒          | Resolution                                                                 |
+| --------------------------- | --------- | ----------------- | -------------------------------------------------------------------------- |
+| `protocolVersion`           | version   | `1`               | `min(local, peer)`; local is `LOCAL_PROTOCOL_VERSION`                      |
+| `subscriptionSetupAck`      | level     | `0` (unsupported) | `min(local, peer)` — a level this build does not implement cannot be used  |
+| `subscriptionSetupBudgetMs` | parameter | absent            | the peer's raw value; clamped by its consumer, never against a local level |
+
+The kinds are not cosmetic. A **level** coerces (`Number(value)`), because the behavior being preserved is `capabilities?.subscriptionSetupAck >= 1`, a coercing comparison that a peer sending `true` or `'1'` passes today. A **parameter** does not coerce, because its predecessor was `Number.isFinite(raw) && raw > 0`, which already rejects `'300'`. A parameter is also never min-clamped: a millisecond budget is not a feature level.
+
+An absent bag resolves to all defaults, which is exactly the pre-registry behavior, so a pre-#646 peer that sends a four-element `NODE_NAME` needs no special case anywhere.
+
+`MINIMUM_PROTOCOL_VERSION` is **descriptive only**: it is the absent-peer default and nothing degrades or disconnects on it. Adding a version floor that closes a connection is a separate, gated decision — a floor consulted by mistake closes every link in the mesh at once, with no rollback but a redeploy.
+
+**Which one do you add?** A capability key for an additive feature, so peers can adopt it independently. `protocolVersion` only for a change to the SHAPE of the protocol. Neither for durable state: `COPY_ORDER_VERSION` stays in the copy cursor because it describes persisted cursor content, not a peer's abilities.
+
+**Sender-side gating discipline.** A sender must not emit a frame type, or a field a receiver must understand, that the peer has not advertised support for. This is the invariant that makes the unknown-frame default case safe to continue past. It is documented rather than mechanically enforced today because no existing frame has a capability key, and retroactively gating one would change mixed-version behavior. Enforcement lands with the first newly gated frame — where the frame's own semantics can say whether a receiver may advance its cursor past it.
+
+**Observability.** The frozen result is mirrored on `NodeReplicationConnection.peerCapabilities`, replaced per socket — the slot must stay replaceable, since the object outlives the socket. `undefined` there means NOT YET LEARNED on the current socket, never "the peer does not support it": a peer that advertised nothing is the frozen defaults object, and a consumer gating on a capability must tell the two apart or it will deny a healthy peer mid-reconnect. Nothing is reported before a `NODE_NAME` lands, so a peer that wedges before its handshake is not misreported as pre-#646. The result is carried to the main thread on the existing `connected-to-node` message, deduplicated by field value. `applyConnectionMetadata` fences it with a `(worker thread id, per-worker session ordinal)` pair so a message from a replaced socket cannot overwrite the live entry; a wall clock cannot serve as that fence, since two workers can open a session in the same millisecond and a clock can step backwards. `cluster_status` reports the **effective** values per `database_sockets` entry as `peerCapabilities`, omitted while the shared-memory truth reads the socket down, plus `unknownCommandFrames`, omitted when zero. All of it is observability: the socket-local frozen object is the enforcement authority.
 
 ### `Replicator extends Resource` (`replicator.ts`)
 
@@ -73,10 +102,21 @@ Per (database, remote_node) pair: an mmap-backed `Float64Array` shared across th
 | 10       | `LAST_LIVENESS_TIME_POSITION`     |
 | 11       | `LAST_ERROR_CODE_POSITION`        |
 | 12       | `LAST_ERROR_TIME_POSITION`        |
+| 13–28    | fire-classification counters      |
 
-The buffer is 16 `Float64` slots (128 bytes); 0–12 are used, 13–15 are headroom. These are written concurrently by `replicationConnection.ts` without explicit synchronization (single-writer-per-field in practice). Don't introduce read-modify-write patterns on this buffer.
+The buffer is 32 `Float64` slots (256 bytes), sized from `REPLICATION_SHARED_STATUS_SLOTS` in `knownNodes.ts`; 0–28 are used, 29–31 are headroom. Slots 0–12 are written concurrently by `replicationConnection.ts` without explicit synchronization (single-writer-per-field in practice) — **don't introduce read-modify-write patterns on those.** Slots 13–28 are the one deliberate exception; see the counter invariant below.
 
 **Connection truth (W1 / harper-pro#431).** Slots 9–12 make the owning worker thread the authoritative source for an outbound subscription's link state, rather than relying solely on the edge-triggered worker→main `postMessage` mirror (`connected-to-node` / `disconnected-from-node`), which desyncs when a terminal/idle state is reached without a `'close'` (open-but-idle wedge, #289/#233). The worker writes `CONNECTION_STATE_CONNECTED` + `LAST_LIVENESS_TIME` on pong and on received data, `CONNECTION_STATE_DOWN` + error on close/`forceReconnect`, and refreshes liveness during a backpressure pause (matching `shouldTerminateIdlePing`'s `pauseReasons` exemption). The main thread reads it via `deriveConnectionTruth` / `readConnectionTruth`: `connected` requires `CONNECTED` **and** fresh liveness (`< LIVENESS_STALE_MS`, derived from `PING_TIMEOUT`), so a worker that died/wedged without writing `DOWN` still reads down once liveness goes stale. `clusterStatus.ts` reports it (authoritative `connected` + `lastConnectionError`); `subscriptionManager.ts → reconcileWorkers` corrects the inferred flag against it, feeding the existing wedge recovery.
+
+**Lifecycle invalidation (W1 residuals R1/R2, harper-pro#431).** A worker that dies cannot write its own `DOWN`, so the main thread stamps it: `LAST_ERROR_CODE_POSITION` takes `WORKER_EXIT_ERROR_CODE` (100001 — deliberately outside the 16-bit WebSocket close-code space, so `lastConnectionError` distinguishes "the owning worker died" from "the peer closed us") with `LAST_ERROR_TIME`, while `LAST_LIVENESS_TIME` is left as the record of when the dead link was last proven alive. Two writers stamp it under the same ownership guard — only a worker OBJECT that has left the live HTTP pool is stamped, so neither a successor nor a main-thread-owned entry (`worker: undefined`, created when the pool was empty) can be downed: the worker `'exit'` handler (via `clearWorkerFromEntries`' owned-entry callback, fired while the dead worker is still the recorded owner) and `reconcileWorkers`, per entry, via `hasDeadOwner`. The second is defense in depth and rarely reached: `manageThreads` splices a worker out of `workers` in its own `'exit'` listener, registered at creation so it runs first, and `clearWorkerFromEntries` nulls `entry.worker` in that same synchronous emit — so a tick sees "worker object present, absent from the pool" only for an entry whose worker never got an exit handler. Note what that does NOT cover: a worker that is wedged but still in `workers` is indistinguishable from a healthy one here, and its links read down only once liveness goes stale.
+
+Removal zeroes the buffer from the main thread in `onNodeUpdate(null)`, via `clearReplicationSharedStatus`. That is the only writer of the clear, and it depends on the departing connection being cut off from the buffer: `unsubscribe()` merely _starts_ the teardown, and the close it triggers stamps `DOWN` + close code 1008 through the connection's retained `sharedStatus` view — gated only on `nodeSubscriptions`, which unsubscribing never clears. Since no `CONNECTED` writer ever clears the error slots, that stamp would otherwise stick on a re-added link's buffer and `cluster_status` would report a failure the new membership never suffered. `releaseSharedStatusOnUnsubscribe` (`replicator.ts`, on the removal path only) drops that marker. `unsubscribeFromNode` retires the cache entry and that marker _before_ attempting the transport close, so a `close()` that throws cannot leave the departing connection still owning the buffer; the throw is contained in `unsubscribeFromNode` because every call site dispatches it fire-and-forget and a rejection would otherwise reach only the process-wide `unhandledRejection` handler, which cannot name the node. The two ownership branches order it differently: for a main-thread-owned entry `unsubscribeFromNode` runs inline, so the release precedes the clear; for a worker-owned one it is deferred behind the port message, so socket events already queued ahead of that message can re-stamp for one event-loop turn after the clear. That residual window is known and accepted — closing it means gating the hot-path write sites on current ownership. It deliberately does not clear as well: a same-process re-add can be assigned to a different HTTP worker, whose connection this one cannot see, and that successor's `CONNECTED` stamp must survive. `reconcileWorkers` also checks each tick for a tracked peer that is no longer in `nodeMap`, reporting each such pair once — but note it is a narrow backstop, not a general one: the removal path deletes the entry the check iterates, so the reachable case is the same-URL rename window in `onNodeUpdate`, not removal.
+
+**Link-metric bridge (W1 residual R3, harper-pro#431).** `reconcileWorkers` copies `LATENCY` and `BACK_PRESSURE_RATIO` off the same buffer read it derives truth from onto the main-thread entry, and `cluster_status` publishes both — this is the bridge adaptive routing (#218, W5) consumes. `LATENCY` is copied only when truth reports the link connected, because it is the one slot here that cannot be owner-gated at the writer: `replicator.ts`'s cache-miss picker chooses a peer by the reading a RETRIEVAL connection leaves there, so the pong write at `replicationConnection.ts` stays open to every connection resolving the same (database, peer) key. On a link truth reports down the owner is not ponging, so a fresh reading is some other socket's RTT; the entry keeps its last owner-era value instead. On a connected link the copied sample can still be an inbound socket's — same peer, same path, so it is a sample of the link rather than of a different one. `BACK_PRESSURE_RATIO` needs no gate: its writer already requires `nodeSubscriptions`.
+
+**Fire-classification counters (W1 residual R4, harper-pro#431).** Slots 13–28 hold one `{redundant, loadBearing}` pair per recovery mechanism, in the order of `FIRE_MECHANISMS` (`receive-watchdog`, `pause-stall`, `copy-progress`, `blob-gap`, `copy-finalize`, `subscription-setup`, `wedge-reconcile`, `receive-stall-net`), based at `FIRE_COUNTER_BASE_POSITION`. `FIRE_MECHANISMS` is **append-only**: the index picks the slot pair, so reordering or removing a name reassigns existing counters. At every fire the mechanism records whether shared-memory truth also judged the link down (`redundant`) or not (`load-bearing`); a fire records `unknown` and increments neither when it comes from a connection that does not own the (db, peer) subscription (an inbound server socket, a cache-miss retrieval connection), because that buffer describes a different link, or when truth has observed nothing at all — no liveness and no recorded error — because scoring that as `redundant` would claim a detection that never happened. `clusterStatus.ts` surfaces them as `recoveryFires`, and each fire log line carries `fire={mechanism: …, class: …}`. This is measurement only: no net is demoted, no threshold moves, and no fire predicate consults it.
+
+> **Counter invariant.** The `+= 1` on slots 13–28 is read-modify-write on an unsynchronized shared buffer, and is safe only because **each mechanism's slot pair has one writer thread per (database, peer)** — the six worker-local watchdogs write only from the connection that owns that subscription (the `unknown` classification is what keeps every other connection out), and the two reconcile nets write only from the main thread. One exception is known and accepted: during a reassignment the departing worker's connection still holds `nodeSubscriptions` (only the removal path clears it), so two owner connections can briefly overlap. The cost is a lost increment, not corruption. No pair is shared between mechanisms; `unitTests/replication/fireCounters.test.mjs` pins that disjointness. Adding a mechanism means adding a pair, never sharing one.
 
 ### `hdb_nodes` system table (`getHDBNodeTable` in `knownNodes.ts`)
 
@@ -185,7 +225,8 @@ Most replication behavior is exercised via integration tests that spin up multi-
 | Where is the connection retry loop?       | `replicationConnection.ts → NodeReplicationConnection` (uses `INITIAL_RETRY_TIME`)                          |
 | Where is mTLS configured?                 | `replicator.ts → buildReplicationMtlsConfig`                                                                |
 | Where is a new cluster member added?      | `setNode.ts` (the whole file is one operation)                                                              |
-| Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `SUBSCRIPTION_UPDATE`)              |
+| Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `COPY_COMPLETE`)                    |
+| Where are peer capabilities interpreted?  | `protocolCapabilities.ts → resolvePeerCapabilities`; carried in `NODE_NAME[4]`                              |
 | Where is `hdb_nodes` schema?              | `knownNodes.ts → getHDBNodeTable`                                                                           |
 | What does `cluster_status` return?        | `clusterStatus.ts` (82 lines, whole file)                                                                   |
 | Where is per-route table exclusion logic? | `knownNodes.ts → getExcludedTablesForRouteEntries`; threaded via `subscriptionManager.ts → routeReplicates` |
