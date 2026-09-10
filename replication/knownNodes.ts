@@ -1089,9 +1089,17 @@ export function getExcludedTablesForRouteEntries(
 	peerName: string,
 	databaseName: string
 ): Set<string> | null {
-	if (!entries) return null;
+	// Array.isArray, matching routeEntriesIncludePeer: entries come from unvalidated YAML routes
+	// and peer-advertised rows, and a non-array here must not throw on the subscribe/failover path.
+	if (!Array.isArray(entries)) return null;
 	let excluded: Set<string> | null = null;
 	for (const entry of entries) {
+		// Tolerate a malformed null/undefined element, exactly as routeEntriesIncludePeer does.
+		// Without this the two disagree on what a list contains: the authorization gate skips the
+		// element and keeps going, while this threw on `null.target`. Any caller that consults both
+		// on the same array then crashes on a list the other half accepted — including the send-side
+		// `sendExcludedTables` computation in replicationConnection.ts.
+		if (!entry) continue;
 		if (typeof entry === 'string') continue;
 		const entryPeer = entry.target ?? entry.source;
 		if ((!entryPeer || entryPeer === peerName) && (!entry.database || entry.database === databaseName)) {
@@ -1126,6 +1134,50 @@ export function routeEntriesIncludePeer(
 		if ((!entryPeer || entryPeer === peerName) && (!entry.database || entry.database === databaseName)) return true;
 	}
 	return false;
+}
+
+/**
+ * The ADVERTISED half of the multi-hop dedup exclusion decision: true when `node`'s registry row
+ * advertises that it delivers its own writes to `peerName` for `databaseName` (full replication, a
+ * blanket directional `sends`, or a `sendsTo` entry covering peer+database) with no advertised
+ * table exclusions on the matching entries. Subscription rows never qualify: a subscription-driven
+ * direct path carries only the listed tables, not the database log. This is one input,
+ * never the decision: the row says what the origin intends, not what this node's configuration
+ * accepts, so subscriptionManager.computeExclusionOrigins ANDs it with the effective local receive
+ * decision (shouldReplicateFromNode, config-route precedence) and the local receivesFrom coverage.
+ * Excluding an origin that does NOT deliver to the subscriber directly drops its records entirely
+ * (the #370/#399 leading-dup-skip family); conversely a directional peer that DOES qualify must be
+ * excluded, or every subscriber receives its writes once per mesh member and a restart replays that
+ * fan-out squared.
+ */
+export function qualifiesForMultiHopExclusion(
+	node: Partial<NodeRecord> | null | undefined,
+	peerName: string,
+	databaseName: string
+): boolean {
+	const replicates = node?.replicates;
+	// The boolean form carries no route entries, so there is nothing that could narrow it.
+	if (replicates === true) return true;
+	const directional = typeof replicates === 'object' ? replicates : undefined;
+
+	// Does the row authorize delivering this database to us at all? Subscription rows are
+	// deliberately NOT an authorization branch: when node.subscriptions drives the direct path,
+	// the outbound table list is built from ONLY the listed tables (replicateByDefault flips off,
+	// see the node.subscriptions branch in replicateOverWS), so a subscription-driven direct path
+	// never carries the whole database log and can never justify excluding the origin's log from
+	// a relay, whether or not an entry is table-scoped.
+	const authorized = !!(directional?.sends || routeEntriesIncludePeer(directional?.sendsTo, peerName, databaseName));
+	if (!authorized) return false;
+
+	// Authorization is not coverage. The sender skips excluded tables unconditionally, deriving
+	// the skip from its OWN config route to us first and falling back to this row's sendsTo (see
+	// sendExcludedTables in replicationConnection.ts), so the entry set it filters on is not
+	// necessarily this array; exclusions advertised here are the part we can see, and a matching
+	// entry carrying them means the direct path omits those tables however the rest of the row
+	// reads (a blanket `sends` does not cancel a separate entry's filter). Excluding the origin
+	// would drop those tables from the relay as well and they would reach us by neither path, so
+	// keep relay delivery when advertised coverage is partial.
+	return !getExcludedTablesForRouteEntries(directional?.sendsTo, peerName, databaseName);
 }
 
 /**

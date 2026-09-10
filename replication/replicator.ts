@@ -674,6 +674,10 @@ export function subscribeToNode(request: any) {
 		} else {
 			connection.nodeName = request.nodes[0].name;
 		}
+		// The main-thread-computed multi-hop exclusion set (subscriptionManager.computeExclusionOrigins).
+		// The session reads it when building SUBSCRIPTION_REQUEST's excluded list; only overwrite when the
+		// request carries one, so a re-subscribe from a path without the set keeps the last known value.
+		if (request.exclusionOrigins) connection.exclusionOrigins = request.exclusionOrigins;
 		connection.subscribe(
 			request.nodes.filter((node) => {
 				return shouldReplicateFromNode(node, request.database);
@@ -742,6 +746,18 @@ export function releaseSharedStatusOnUnsubscribe(connection) {
 // defense-in-depth fallback when a subscription is stuck connected:true / Receiving with no progress and
 // the worker-local copy-progress watchdog (harper-pro#453) did not recover it. The connection-key lookup
 // mirrors unsubscribeFromNode so it resolves the same connection the subscribe path created.
+// Apply a recomputed exclusion-origin set (an update-exclusion-origins message from the main thread's
+// subscriptionManager broadcast) to every live subscription connection for the database. Each session
+// diffs against the list it last sent, so a set that changes nothing sends nothing.
+export function updateExclusionOrigins({ database, origins }: { database: string; origins: string[] }) {
+	for (const dbConnections of connections.values()) {
+		const connection = dbConnections.get(database);
+		if (!connection) continue;
+		connection.exclusionOrigins = origins;
+		connection.emit('exclusion-origins-updated', origins);
+	}
+}
+
 export function forceReconnectToNode({ url, nodes, database }) {
 	const connectionKey = url + '-' + (nodes?.[0]?.url ?? url);
 	const connection = connections.get(connectionKey)?.get(database);
