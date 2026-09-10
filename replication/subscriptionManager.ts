@@ -652,15 +652,28 @@ function scheduleExclusionOriginsBroadcast() {
 					if (notified.has(databaseName)) continue;
 					notified.add(databaseName);
 					let origins = originsByDatabase.get(databaseName);
-					if (!origins) originsByDatabase.set(databaseName, (origins = computeExclusionOrigins(databaseName)));
+					if (!origins) {
+						try {
+							origins = computeExclusionOrigins(databaseName);
+						} catch (error) {
+							// Fail OPEN per database: pushing the empty set turns exclusions off (relay
+							// duplicates) until a later broadcast recomputes. Keeping the last-sent set
+							// instead could pin an exclusion for an origin that lost direct coverage,
+							// which is silent data loss.
+							logger.error('Error computing exclusion origins for', databaseName, error);
+							origins = [];
+						}
+						originsByDatabase.set(databaseName, origins);
+					}
 					const message = { type: 'update-exclusion-origins', database: databaseName, origins };
 					if (entry.worker) entry.worker.postMessage(message);
 					else updateExclusionOrigins(message);
 				}
 			}
 		} catch (error) {
-			// Never let a malformed registry row or a torn-down worker throw out of a main-thread
-			// timer; a missed broadcast only leaves the last-sent set in effect (duplicates at worst).
+			// Backstop for delivery failures (e.g. a torn-down worker mid-iteration); a worker that
+			// misses a broadcast this way is one whose connections are going away with it. Compute
+			// failures are handled per database above, failing open to the empty set.
 			logger.error('Error broadcasting exclusion-origin update', error);
 		}
 	}, 0);
