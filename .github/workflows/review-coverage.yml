@@ -1,14 +1,18 @@
-# PR-description checks. The action lives in HarperFast/harper, pinned by sha: GitHub does not let
-# a public repo consume an action hosted in a private one, so harper holds the public copy and every
-# other repo pins it.
+# Cross-model review-coverage check: the action parses the PR description with the dispatch
+# human-review gate's own parser, gates on how many cross-model reviews the `Review-Coverage:`
+# footer names, and reports the Human-Review-Need footer state without gating on it. Policy lives
+# in HarperFast/dispatch. The action's public copy lives in HarperFast/harper because GitHub does
+# not let a public repo consume an action hosted in a private one, so every other repo pins it by
+# sha; Renovate takes the tracked ref from the trailing `# main` and needs one bare token there,
+# skipping the pin as an unversioned reference when prose follows the sha.
 #
 # NEVER add a checkout step. On pull_request_target the workflow definition and the pinned action
 # both come from trusted refs, and the job reads only the event payload — one slip to
 # `ref: ...head.sha` would run arbitrary PR code with the base repo's token. Coverage needs no
 # working tree, so there is nothing here that wants one. Same rule as companion-check.yaml.
 #
-# format_mode is left at its default of `off`: this repo checks coverage only, so no PR-files
-# artifact is collected and no API token scope beyond the default read is needed.
+# format_mode stays off — coverage only, no PR-files artifact — and `edited` stays in the trigger
+# list because the Review-Coverage footer arrives as a description edit, which moves no sha.
 name: review-coverage
 on:
   pull_request_target:
@@ -20,9 +24,10 @@ concurrency:
   cancel-in-progress: true
 jobs:
   coverage:
+    name: review-coverage
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: HarperFast/harper/.github/actions/review-coverage@61c53b040a5b51a190218ee6d9bcd7751d7d9db0 # pending HarperFast/harper#2552; re-pin to the merge commit before this leaves draft
+      - uses: HarperFast/harper/.github/actions/review-coverage@61c53b040a5b51a190218ee6d9bcd7751d7d9db0 # main
         with:
           mode: enforce
