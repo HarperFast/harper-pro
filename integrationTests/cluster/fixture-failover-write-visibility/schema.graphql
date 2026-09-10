@@ -1,0 +1,10 @@
+# QA-651 — post-failover write-visibility divergence.
+# `writer` is indexed (used for the batched indexed-query surface and as the
+# raw-index-store dump key). `seq` is a plain (non-indexed) monotonic counter
+# so the full-table-scan surface has something to cross-check against the index.
+type Ledger @table @export {
+	id: ID @primaryKey
+	writer: String @indexed
+	seq: Int
+	payload: String
+}

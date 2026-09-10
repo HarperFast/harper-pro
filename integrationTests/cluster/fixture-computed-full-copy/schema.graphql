@@ -1,0 +1,5 @@
+type ComputedCopyRecord @table @export {
+	id: ID @primaryKey
+	source: String @indexed
+	derived: String @computed(from: "source") @indexed
+}

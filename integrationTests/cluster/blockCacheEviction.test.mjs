@@ -1,5 +1,5 @@
 /**
- * Integration test: replication must survive RocksDB `store.get()` returning a Promise.
+ * Integration test: replication recovers from a rolling restart (small RocksDB block cache).
  *
  * Background — the bug class this guards against:
  *   On RocksDB, `store.get(id)` returns a `MaybePromise`: the record SYNCHRONOUSLY when it is in the
@@ -11,28 +11,40 @@
  *   `Promise?.replicates` is `undefined`, which silently disables replication / drops a node from
  *   cluster_status / never opens a retrieval connection. The fix is `getSync(...)` at those sites.
  *
- * Why this test reproduces it:
- *   - Each node runs RocksDB with a SMALL (but viable) block cache, so system-table blocks do not stay
- *     resident under churn. (A sub-MB cache makes RocksDB hang on open, so "small" here is ~32 MB, far
- *     below the default ~25%-of-RAM — the cold restart below is what makes the miss DETERMINISTIC.)
- *   - Every node is RESTARTED, giving a COLD block cache + empty memtable, so the first post-restart read
- *     of each `hdb_nodes` record is a guaranteed cache miss (a Promise from `get()`). The startup
- *     replication paths (ensureThisNode / shouldReplicateFromNode) run exactly in that window.
- *   - We then drive the procedures that depend on those synchronous reads — a rolling restart — and assert replication stays healthy and converges.
+ * What this test is (and is NOT):
+ *   It is a SCENARIO test: a real rolling restart of a 2-node cluster on RocksDB with a small block
+ *   cache, asserting the startup replication paths (ensureThisNode / shouldReplicateFromNode /
+ *   cluster_status) bring the cluster back and a post-restart write converges.
  *
- * Pre-fix this fails: a post-restart cache miss makes shouldReplicateFromNode falsy (unsubscribe) and/or
- * flips `isFullyReplicating = false` ("Disabling replication"), so the post-restart write never converges.
- * Post-fix the synchronous reads return the real records regardless of cache state, so it converges.
+ *   It is NOT a deterministic regression guard for the `get()`-returns-a-Promise bug itself, despite
+ *   the name. That guard is `unitTests/replication/selfNodeReplicates.test.mjs` and
+ *   `unitTests/replication/readNodeRowSync.test.mjs`, which inject a Promise-returning `get()` directly
+ *   and fail deterministically when the `getSync` call sites regress. This file cannot reliably
+ *   reproduce the miss: replication startup scans the `hdb_nodes` table before these point reads run,
+ *   which can warm the rows into the cache first. Verified by mutation — reverting `selfNodeReplicates`
+ *   and `readNodeRowSync` to plain `get()` leaves this suite green while the two unit tests fail.
+ *   Reproducing a genuine point-read miss here would need `hdb_nodes` grown past the block cache, which
+ *   is what the field repro had and a 2-node test does not. Do not read a pass here as evidence that the
+ *   MaybePromise sites are still correct — this suite is a real-world rolling-restart check on top of,
+ *   not instead of, the unit tests above.
+ *
+ * What it has ACTUALLY caught, which is not the class above: the RocksDB WriteBufferManager write stall
+ *   of rocksdb-js#755. `blockCacheSize` sizes more than the block cache — Harper derives the process-wide
+ *   WriteBufferManager from it (`blockCacheSize / 3`, `allowStall` on) — so this suite's deliberately small
+ *   cache is also a deliberately small stalling write budget, and a derived memtable-history target above
+ *   that budget stalled every write to the receiving database permanently. Fixed in rocksdb-js 2.7.1 (this
+ *   repo pins `^2.7.1`). A failure here that ends at `bulk copy complete` with no following
+ *   `last sequence committed <copyStartTime>` line is that shape: check the binding version first.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog } from './clusterShared.mjs';
+import { sendOperation, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
-	import.meta.dirname ?? module.path,
+	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
 	'..',
 	'..',
 	'dist',
@@ -41,10 +53,13 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 // Small but viable RocksDB block cache: far below the default (~25% of RAM) so blocks are evicted under
-// churn, yet large enough that opening Harper's databases does not hang (a sub-MB cache does). The cold
-// restart is what makes the cache-miss deterministic; this keeps misses from being papered over by a
-// warm cache. We deliberately do NOT shrink the WriteBufferManager — a tiny WBM with allowStall stalls
-// the schema writes during startup.
+// churn rather than staying resident regardless of restart. Per the header above, the startup
+// `hdb_nodes` scan can still warm the rows before the point reads in this suite run, so this does not
+// guarantee a cache-miss Promise — it's sized this way anyway so a warm cache from a stale prior run
+// isn't what's papering over a real miss. We deliberately do NOT shrink the WriteBufferManager
+// explicitly — a tiny WBM with allowStall stalls the schema writes during startup. Note it is shrunk
+// IMPLICITLY all the same: Harper derives the WBM from the block cache (`blockCacheSize / 3`, so ~10.7MB
+// here, allowStall on), which is exactly why this suite is the one that caught rocksdb-js#755.
 const SMALL_ROCKS = { blockCacheSize: 32 * 1024 * 1024 };
 
 // Some padded records so the data table spans multiple SST blocks (cache pressure). Convergence is
@@ -82,9 +97,45 @@ async function waitForRecord(node, id, { retries = 90, intervalMs = 1000 } = {})
 	return null;
 }
 
+/**
+ * Compact cluster_status summary appended to a convergence failure so CI reports say WHY the
+ * record never arrived (peer subscribed but idle vs. peer missing entirely) without needing the
+ * uploaded server logs.
+ */
+async function describeReplication(node) {
+	try {
+		const status = await sendOperation(node, { operation: 'cluster_status' });
+		const connections = (status.connections ?? []).map((connection) => {
+			const sockets = (connection.database_sockets ?? [])
+				.map(
+					(socket) =>
+						`${socket.database}(connected=${socket.connected}, ${socket.lastReceivedStatus}, lastReceived=${socket.lastReceivedVersion ?? 'none'})`
+				)
+				.join(' ');
+			return `${connection.name ?? connection.url}[${sockets || 'no sockets'}]`;
+		});
+		return ` — ${node.hostname} cluster_status: node_name=${status.node_name}, connections: ${connections.join(' ') || 'none'}`;
+	} catch (err) {
+		return ` — cluster_status on ${node.hostname} failed: ${err.message}`;
+	}
+}
+
 suite(
-	'replication survives RocksDB get() cache-miss Promises (small block cache + restart)',
-	{ timeout: 240000 },
+	'replication recovers from a rolling restart (small block cache, cold-cache reconnect)',
+	// Sized above the test BODY's own aggregate retry budget (node:test charges only the body
+	// against this, not before()/after()), not just its typical runtime (~5s): 2x restartNode
+	// 60s + pollHealth 120s, then 2x pollHealth 120s, then waitForRecord 10s + 90s — ~700s if
+	// every retry loop actually exhausts its count. If that sum exceeds this timeout, a
+	// genuinely slow-but-working CI runner hits the suite timeout before any individual
+	// helper's own (more specific) message fires — and node:test abandons the body in place
+	// rather than aborting it, so `after()` runs concurrently with an in-flight
+	// restartNode/pollHealth and can miss killing the process that comes up after it reads a
+	// (momentarily absent) pid file, leaking a live Harper and its ports into later CI jobs.
+	// NOTE: the ~700s figure assumes each retry fails fast — `sendOperation` has no per-request
+	// timeout, so a node that accepts a connection but never answers stretches a single retry
+	// to undici's own (much longer) timeout instead of this suite's. This value reduces the
+	// race's probability; it does not close it.
+	{ timeout: 1200000 },
 	(ctx) => {
 		before(async () => {
 			const hostnameA = await getNextAvailableLoopbackAddress();
@@ -106,9 +157,17 @@ suite(
 
 			const ctxA = makeNodeCtx(hostnameA);
 			const ctxB = makeNodeCtx(hostnameB);
-			await Promise.all([startHarper(ctxA, nodeConfig(hostnameA)), startHarper(ctxB, nodeConfig(hostnameB))]);
-			ctx.nodeA = ctxA.harper;
-			ctx.nodeB = ctxB.harper;
+			// Record each node as soon as its own start resolves (rather than after Promise.all settles) so
+			// that if one start fails, the other's already-running process is still recorded and gets torn
+			// down instead of leaked.
+			await Promise.all([
+				startHarper(ctxA, nodeConfig(hostnameA)).then(() => {
+					ctx.nodeA = ctxA.harper;
+				}),
+				startHarper(ctxB, nodeConfig(hostnameB)).then(() => {
+					ctx.nodeB = ctxB.harper;
+				}),
+			]);
 
 			// Seed table + data on A, ending with a sentinel we can wait on.
 			await sendOperation(ctx.nodeA, {
@@ -142,14 +201,29 @@ suite(
 			});
 
 			const onB = await waitForRecord(ctx.nodeB, 'seed-sentinel');
-			ok(onB, 'node B should have received the seeded data (sentinel) before we start perturbing it');
+			if (!onB) {
+				// The seeding hook is where the wedge actually surfaces in CI, and a bare "sentinel never
+				// arrived" said nothing about whether B was subscribed, receiving, or stuck mid-copy.
+				ok(
+					false,
+					`node B should have received the seeded data (sentinel) before we start perturbing it${await describeReplication(ctx.nodeB)}`
+				);
+			}
 		});
 
 		after(async () => {
-			await Promise.all([
-				ctx.nodeA && teardownHarper({ harper: ctx.nodeA }),
-				ctx.nodeB && teardownHarper({ harper: ctx.nodeB }),
-			]);
+			// Both nodes are restarted by the test, so teardownHarper's spawned-child handle is stale;
+			// stop the process each node is actually running first or it outlives the suite.
+			await Promise.all(
+				[ctx.nodeA, ctx.nodeB].filter(Boolean).map(async (node) => {
+					try {
+						await stopNodeProcess(node);
+					} catch (err) {
+						console.error(`Failed to stop node process for ${node.hostname}:`, err);
+					}
+					await teardownHarper({ harper: node });
+				})
+			);
 		});
 
 		test('cold-cache restart does not silently disable replication; cluster reconverges', async () => {
@@ -157,47 +231,62 @@ suite(
 
 			// Rolling restart -> COLD block cache on each node. The startup replication paths
 			// (ensureThisNode / shouldReplicateFromNode / cluster bootstrap) now read hdb_nodes from a cold
-			// cache, which is the exact get()->Promise condition this test guards.
+			// cache — though per the header above, the preceding hdb_nodes scan warms it before these
+			// point reads run, so this does not reproduce a genuine cache-miss Promise.
+			//
+			// restartNode waits for a genuinely new process (pid change) rather than for health alone:
+			// `restart` keeps answering the operations socket from the OUTGOING process for a moment, so
+			// polling health only would let every step below run against a node that never restarted —
+			// no cold cache, and the post-restart write landing in the shutdown window instead.
 			for (const node of [nodeA, nodeB]) {
-				await sendOperation(node, { operation: 'restart' }).catch(() => {});
+				await restartNode(node);
 				await pollHealth(node);
 			}
 
-			// (1) Direct catch for the silent-disable bug: a cold-cache Promise self-row logs
-			// "Disabling replication". It must not appear.
+			// (1) Whatever the cause, a node that decides it should stop replicating logs
+			// "Disabling replication". It must not appear after a routine restart.
 			for (const node of [nodeA, nodeB]) {
 				const log = await readLog(node);
 				ok(
 					!/Disabling replication/.test(log),
-					`node ${node.hostname} logged "Disabling replication" after a cold-cache restart (get() Promise self-row)`
+					`node ${node.hostname} logged "Disabling replication" after a routine cold-cache restart`
 				);
 			}
 
-			// (2) cluster_status must still report this node's own record after the cold restart
-			// (clusterStatus reads hdb_nodes for the self record; a Promise there omits node_name).
+			// (2) cluster_status must still report this node's own record after the cold restart.
 			for (const node of [nodeA, nodeB]) {
 				const status = await pollHealth(node);
 				ok(status.node_name, `cluster_status on ${node.hostname} is missing node_name after restart`);
 			}
 
-			// (3) A write made AFTER the cold restart must converge to B. If a cold-cache get() Promise
-			// silently disabled replication / unsubscribed the peer, this never arrives.
+			// (3) A write made AFTER the cold restart must converge to B. If the restart left
+			// replication silently disabled / the peer unsubscribed, this never arrives.
 			await sendOperation(nodeA, {
 				operation: 'upsert',
 				database: 'data',
 				table: 'cache_evict_test',
 				records: [{ id: 'post-restart-1', value: 'after-cold-cache', pad: PADDING }],
 			});
+			// The write must be readable on its own node first, so a convergence failure below is
+			// unambiguously a replication failure and not a write that never landed on A.
+			const onA = await waitForRecord(nodeA, 'post-restart-1', { retries: 10 });
+			ok(onA, 'post-restart write is not readable on node A itself — the write, not replication, was lost');
+
 			const found = await waitForRecord(nodeB, 'post-restart-1');
-			ok(found, 'post-restart write did not converge to node B (replication silently disabled?)');
+			if (!found) {
+				ok(
+					false,
+					`post-restart write did not converge to node B (replication silently disabled?)${await describeReplication(nodeB)}`
+				);
+			}
 			equal(found.value, 'after-cold-cache', 'wrong value converged to node B');
 		});
 
 		// NOTE: a dedicated remove_node→add_node cycle test was dropped here. Removing a node's *leader*
 		// leaves it with a null self-record so it (correctly) disables replication and does not re-converge
-		// within the window — a remove_node re-subscription behavior orthogonal to the get() MaybePromise
-		// fix this suite guards (the cold-restart test above already exercises ensureThisNode /
-		// shouldReplicateFromNode / cluster_status on a cold cache). add_node itself is covered by the
-		// `before` hook and by replicationReconnect.test.mjs / replicationTopology.test.mjs.
+		// within the window — a remove_node re-subscription behavior orthogonal to the rolling-restart
+		// scenario this suite exercises (ensureThisNode / shouldReplicateFromNode / cluster_status on a
+		// cold cache). add_node itself is covered by the `before` hook and by
+		// replicationReconnect.test.mjs / replicationTopology.test.mjs.
 	}
 );

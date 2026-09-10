@@ -7,10 +7,11 @@ import { forEachReplicatedDatabase } from './replicator.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { replicationConfirmation } from '../core/resources/DatabaseTransaction.ts';
 import { isMainThread } from 'worker_threads';
-import { ClientError } from '../core/utility/errors/hdbError.js';
+import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
+import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -91,25 +92,36 @@ export function getHDBNodeTable(): HdbNodeTable {
 		}) as unknown as HdbNodeTable)
 	);
 }
+// Float64 slots in the per-(database, peer) shared status buffer. Positions 0..6 are the replication status
+// fields, 7..8 the blob-divergence signals, 9..12 the W1 connection-truth fields (state/liveness/error-code/
+// error-time), 13..28 the eight R4 fire-classification counter pairs, and 29..31 headroom (see the
+// *_POSITION exports in replicationConnection.ts and the slot map in DESIGN.md). Lives here, next to the
+// allocation, so the size and the map cannot drift apart.
+export const REPLICATION_SHARED_STATUS_SLOTS = 32;
 export function getReplicationSharedStatus(
 	auditStore: any,
 	databaseName: string,
 	node_name: string,
 	callback?: () => void
 ) {
-	// 128 bytes = 16 Float64 slots. Positions 0..6 are the replication status fields, 7..8 the
-	// blob-divergence signals, and 9..12 the W1 connection-truth fields (state/liveness/error-code/
-	// error-time; see the *_POSITION exports in replicationConnection.ts); 13..15 are headroom for
-	// future metrics. This buffer is process-local shared memory (shared across this
-	// node's threads via getUserSharedBuffer, never persisted or sent across nodes), so growing it is
-	// safe: every caller goes through this function, and a node runs a single version.
+	// This buffer is process-local shared memory (shared across this node's threads via
+	// getUserSharedBuffer, never persisted or sent across nodes), so growing it is safe: every caller goes
+	// through this function, and a node runs a single version.
 	return new Float64Array(
 		auditStore.getUserSharedBuffer(
 			['replicated', databaseName, node_name],
-			new ArrayBuffer(128),
+			new ArrayBuffer(REPLICATION_SHARED_STATUS_SLOTS * 8),
 			callback && { callback }
 		)
 	);
+}
+// A node removed and re-added inside one process resolves the SAME buffer (harper-pro#431), so without
+// this the new membership inherits the old one's state, liveness, close code and fire counts. Zeroes the
+// whole buffer: every field in it describes the membership that just left.
+export function clearReplicationSharedStatus(auditStore: any, databaseName: string, node_name: string): boolean {
+	if (!auditStore || !databaseName || !node_name) return false;
+	getReplicationSharedStatus(auditStore, databaseName, node_name).fill(0);
+	return true;
 }
 // If the async iterator for hdb_nodes throws or completes, the watcher used to die silently
 // and the node lost the ability to (re)establish outbound replication subscriptions for the
@@ -356,6 +368,22 @@ export function reconstructNodeFromKey(key: unknown): { name: string; replicates
 }
 
 /**
+ * Merge a decode-recovery descriptor (from reconstructNodeFromKey — key + `replicates: true`) with the
+ * last-known in-memory node record. The reconstruct only knows the key, so it defaults `replicates:
+ * true` (full mesh). When we still hold the peer's last decoded DIRECTIONAL `replicates` object, that
+ * is authoritative — otherwise a transient decode miss of a constrained peer's row would briefly widen
+ * the topology back to a full mesh (the peer's directional record says "don't connect me to everyone",
+ * but the reconstruct would re-advertise `true` until the next decodable event). A legacy boolean
+ * `replicates` on the old record is left to the reconstruct's `true`. systemdb-routing / harper-pro#460.
+ */
+export function mergeReconstructedNode(reconstructed: any, oldNode: any): any {
+	if (!oldNode) return reconstructed;
+	const merged = { ...oldNode, ...reconstructed };
+	if (oldNode.replicates && typeof oldNode.replicates === 'object') merged.replicates = oldNode.replicates;
+	return merged;
+}
+
+/**
  * Existence probe for an hdb_nodes key that prefers the RANGE/scan path. A v5-era shared-structure
  * row can transiently misread to `[]`/null through the point lookup (`doesExist`/`get`) at early
  * boot (harper-pro#352), but `getKeys` lists the key reliably because it never decodes the value.
@@ -408,7 +436,7 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			// server.nodes (and the outbound subscription fired below) still reflect the peer
 			// (harper-pro#460). A genuine delete is handled separately via isGenuineNodeDeletion.
 			let reconstructed = reconstructNodeFromKey(node_name);
-			if (reconstructed && oldNode) reconstructed = { ...oldNode, ...reconstructed };
+			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
 			// Cast: this is a deliberate partial recovery descriptor (name + replicates, plus any
 			// enriched fields from oldNode); the next decodable update supplies the rest.
 			if (reconstructed) server.nodes.push(reconstructed as any);
@@ -450,7 +478,7 @@ async function processNodeUpdateEvent(event: any, listener: (node: any, id: stri
 			// THAT instead, so the outbound subscription is (re)created; the next decodable event
 			// replaces it with the full record.
 			let reconstructed = reconstructNodeFromKey(event.id);
-			if (reconstructed && oldNode) reconstructed = { ...oldNode, ...reconstructed };
+			if (reconstructed) reconstructed = mergeReconstructedNode(reconstructed, oldNode);
 			if (reconstructed) {
 				logger.warn?.(
 					'hdb_nodes change event for',
@@ -501,6 +529,50 @@ export function probeNodeRow(store: any, key: unknown): { outcome: 'deleted' | '
 	// The point lookup returned something present (a valid record, or a misread `[]`/partial). Treat
 	// it as still-present: a valid record is used directly; an invalid-but-present value reconstructs.
 	return { outcome: 'decode-failure', record };
+}
+
+/**
+ * Sentinel returned by {@link resolveNodeForSendAuth} for an hdb_nodes event that carries no
+ * authorization decision — the watcher must leave the connection alone rather than tear it down.
+ */
+export const SEND_AUTH_UNCHANGED = Symbol('send-auth-unchanged');
+
+/**
+ * Resolve the hdb_nodes record that the dynamic send-authorization watch (replicationConnection's
+ * per-subscriber `getHDBNodeTable().subscribe(name)` loop) should evaluate for one change event.
+ *
+ * The decision must NEVER be keyed off `event.value`, because several event shapes legitimately carry
+ * no `replicates` field for a peer that is replicating perfectly well:
+ *   - a whole-table `reload` marker (emitted when a copyApply base copy back-fills hdb_nodes) is fanned
+ *     out to EVERY subscriber on the table with a null id and no value — see transactionBroadcast's
+ *     reload branch. Every node joining/cloning into a cluster base-copies the system database, so this
+ *     fired mid-formation and closed every live connection with a spurious
+ *     `1008 Unauthorized database subscription` roughly 1ms after the marker landed;
+ *   - a `patch` carries only the patched fields (`add_node`'s `{ isLeader: true }`), never `replicates`;
+ *   - a transient decode failure yields a nullish value for a row that is still present
+ *     (harper#1163 / harper-pro#352).
+ * This is the same invariant {@link processNodeUpdateEvent} already enforces on the subscription path:
+ * an event with no decodable value is not a node removal.
+ *
+ * So read the authoritative row instead: a clean tombstone (`probe` outcome `'deleted'`) de-authorizes
+ * (returns `undefined`), a present-and-valid row is evaluated as usual, and a present-but-undecodable
+ * row returns {@link SEND_AUTH_UNCHANGED} so a decode blip cannot knock a peer offline. `probe` is
+ * injected so this stays unit-testable without a live store.
+ *
+ * A genuine `delete` event is NOT resolved here — the caller short-circuits it via
+ * {@link isGenuineNodeDeletion}, because a point read can be served from a snapshot that predates the
+ * delete commit (harper#1163) and would hand back the still-authorizing row. Nor does
+ * SEND_AUTH_UNCHANGED mean "authorized forever": the caller re-probes for a bounded grace period and
+ * then fails closed, so a revocation carried by an undecodable write cannot be missed indefinitely.
+ */
+export function resolveNodeForSendAuth(
+	name: string,
+	probe: (key: unknown) => { outcome: 'deleted' | 'decode-failure'; record?: any } = (key) =>
+		probeNodeRow(getHDBNodeTable().primaryStore, key)
+): any | typeof SEND_AUTH_UNCHANGED {
+	const { outcome, record } = probe(name);
+	if (outcome === 'deleted') return undefined;
+	return isValidNodeRecord(record) ? record : SEND_AUTH_UNCHANGED;
 }
 
 /**
@@ -577,12 +649,23 @@ function rebuildKnownNodes(listener: (node: any, id: string) => void) {
 	server.shards = new Map();
 
 	scanNodesForSubscription(getHDBNodeTable().primaryStore, (node, key) => {
-		if (!node.url || node.shard === undefined) {
+		// Only a decode-miss RECONSTRUCT descriptor (reconstructNodeFromKey → no url) needs enrichment;
+		// gate strictly on `!node.url`, NOT `node.shard === undefined`. On an unsharded cluster every real,
+		// fully-decoded record has `shard === undefined`, so the looser guard would run mergeReconstructedNode
+		// over REAL records and revert their freshly-decoded `replicates` to a stale in-memory value during a
+		// copyApply base-copy reload (harper-pro#489) — dropping user-database records for a peer that just
+		// widened, or over-connecting to one that narrowed. A real record always has a url, so it skips this
+		// branch and its fresh `replicates` is honored. (PR #572 review — Chris Barber.)
+		if (!node.url) {
 			const targetName = node.name ?? key;
 			const oldNode =
 				targetName !== undefined ? oldNodes.find((n) => n && n.name !== undefined && n.name === targetName) : undefined;
-			// name + replicates from the reconstruct win; oldNode supplies url/shard/ca/etc.
-			if (oldNode) node = { ...oldNode, ...node };
+			// name from the reconstruct wins and oldNode supplies url/shard/ca/etc., but a directional
+			// `replicates` from oldNode is preserved (mergeReconstructedNode) rather than clobbered by the
+			// reconstruct's `true` — otherwise a transient decode miss during this scan would widen a
+			// constrained peer back to full mesh. Same treatment as the two processNodeUpdateEvent reconstruct
+			// sites. systemdb-routing / harper-pro#489.
+			if (oldNode) node = mergeReconstructedNode(node, oldNode);
 		}
 		// server.nodes holds PEERS, never this node itself — mirror processNodeUpdateEvent's
 		// `node_name !== getThisNodeName()` guard. The per-row event path always excluded self; the scan
@@ -641,17 +724,14 @@ export function shouldReplicateFromNode(node: Node, databaseName: string) {
 	return (
 		(peerFeedsUs &&
 			hasLocalDatabase &&
-			(!databaseReplications ||
-				databaseReplications === '*' ||
-				(Array.isArray(databaseReplications) &&
-					databaseReplications.find?.((dbReplication) => {
-						return typeof dbReplication === 'string'
-							? dbReplication === databaseName
-							: dbReplication.name === databaseName &&
-									(!dbReplication.sharded || node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD));
-					}))) &&
+			isReplicatedDatabase(
+				databaseReplications,
+				databaseName,
+				() => node.shard === env.get(CONFIG_PARAMS.REPLICATION_SHARD),
+				false
+			) &&
 			selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName())) ||
-		node.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe)
+		isExplicitDatabaseSubscription(node.subscriptions, databaseName)
 	);
 }
 
@@ -683,35 +763,206 @@ const replicationConfirmationFloat64s = new Map<string, Map<string, Float64Array
 
 type AwaitingReplication = {
 	txnTime: number;
-	onConfirm: () => void;
+	onConfirm: (nodeName: string) => void;
+	settled: boolean;
 };
-export let commitsAwaitingReplication: Map<string, AwaitingReplication[]>;
+// A Set, not an array: both settle paths (confirmed, and timed out — see createConfirmationWaiter)
+// remove their own entry the instant they settle, via `.delete(entry)`. That's an O(1) operation on a
+// Set regardless of how many other waiters are pending, unlike an array (indexOf+splice is O(n), and
+// doing that from inside a for-of over the same array is unsafe — see harper-pro#213's review history
+// below). It also means every entry's lifetime is bounded by its own settlement, never by whether some
+// unrelated later event happens to sweep it up — the earlier revisions of this fix that deferred
+// timeout cleanup to "whenever the next confirmation notification arrives" could still leak entries
+// forever against a peer that never sends another update.
+export let commitsAwaitingReplication: Map<string, Set<AwaitingReplication>>;
+
+/**
+ * The names of peers that, per their last-known replicated-time shared status, have already
+ * applied `txnTime` for `databaseName` — i.e. confirmations that landed before a waiter for this
+ * write registered. `notifyConfirmedWaiters` only fires on the NEXT status update for a peer, so
+ * a peer that already crossed `txnTime` before we start waiting will never re-cross it — its ack
+ * would otherwise be silently missed and a fully-replicated write would time out anyway
+ * (see `createConfirmationWaiter`, called with this as `alreadyConfirmedPeers`).
+ *
+ * Returns names, not a count (harper-pro#633 review): the seed and `notifyConfirmedWaiters` both
+ * feed the same per-peer `Set` on the waiter entry, so a peer whose watcher callback fires *after*
+ * this seed already counted it — a real race, since the shared-buffer write and the JS watcher
+ * callback that reacts to it are not atomic — contributes the same name twice and is naturally
+ * deduplicated by `Set.add`, instead of incrementing a bare counter twice for one peer.
+ *
+ * Takes the map explicitly (mirrors `notifyConfirmedWaiters` taking `awaiting`) so it's
+ * unit-testable without the module's live `replicationConfirmationFloat64s` state.
+ */
+export function countAlreadyConfirmedPeers(
+	confirmationsByNode: Map<string, Map<string, Float64Array>>,
+	databaseName: string,
+	txnTime: number
+): Set<string> {
+	const confirmedPeers = new Set<string>();
+	for (const [nodeName, confirmationsForNode] of confirmationsByNode) {
+		const replicatedTime = confirmationsForNode.get(databaseName);
+		if (replicatedTime && replicatedTime[0] >= txnTime) confirmedPeers.add(nodeName);
+	}
+	return confirmedPeers;
+}
+
+// How long a `replicatedConfirmation` write waits for the requested number of peer acks before
+// giving up. Without a bound, a confirmation that never arrives (e.g. `replicateTo` naming a peer
+// that never applies this specific write, a peer that drops its connection mid-wait, or any other
+// gap between the requested count and what actually gets acked) hangs the request forever — the
+// promise below had no reject path at all (harper-pro#213).
+//
+// Own default (900000ms), independent of REPLICATION_BLOBTIMEOUT: confirmation and blob transfer are
+// unrelated concerns, and this must not shrink just because an operator tunes blob timeout down for
+// reasons that have nothing to do with confirmation (e.g. failing fast on stalled blob transfers).
+// Not independently user-configurable yet — that needs a dedicated CONFIG_PARAMS entry in core
+// (getConfigValue only resolves keys registered in CONFIG_PARAM_MAP), left as a follow-up; see the
+// dispatch Findings for this fix.
+const REPLICATION_CONFIRMATION_DEFAULT_TIMEOUT_MS = 900000;
+// Still raised (never lowered) to at least the configured blob timeout: a confirmation can legitimately
+// be waiting on a large blob that is still within its own supported transfer window, and rejecting
+// sooner than that would fail a healthy, merely-slow write as if it had timed out.
+const REPLICATION_CONFIRMATION_TIMEOUT_MS = Math.max(
+	REPLICATION_CONFIRMATION_DEFAULT_TIMEOUT_MS,
+	env.get(CONFIG_PARAMS.REPLICATION_BLOBTIMEOUT) ?? 0
+);
+
+/**
+ * Fire `onConfirm(nodeName)` for every waiter in `awaiting` whose `txnTime` falls in
+ * `(lastTime, updatedTime]`. Each waiter removes itself from `awaiting` (via `Set.delete`) the
+ * moment it fully settles — see createConfirmationWaiter — so nothing here needs to compact,
+ * snapshot, or otherwise guard against mutation during iteration: deleting the *current* item
+ * mid-for-of over a Set is well-defined and safe (unlike an array, where the equivalent splice
+ * shifts later indices and skips entries).
+ *
+ * `nodeName` identifies which peer's status update this crossing came from — required so the
+ * waiter can track confirmations by peer identity rather than a bare count (harper-pro#633
+ * review: the same peer could otherwise be counted once via `alreadyConfirmedPeers` and again
+ * here for that peer's own first post-registration update, producing a false confirmation).
+ */
+export function notifyConfirmedWaiters(
+	awaiting: Set<AwaitingReplication>,
+	nodeName: string,
+	lastTime: number,
+	updatedTime: number
+): void {
+	for (const waiter of awaiting) {
+		if (waiter.txnTime > lastTime && waiter.txnTime <= updatedTime) {
+			waiter.onConfirm(nodeName);
+		}
+	}
+}
+
+/**
+ * Build the promise a `replicatedConfirmation` write awaits, and register its waiter entry in
+ * `awaiting`. Extracted from the `replicationConfirmation(...)` registration below so the
+ * settle/timeout/cleanup behavior is unit-testable directly, without going through a real commit.
+ */
+export function createConfirmationWaiter(
+	awaiting: Set<AwaitingReplication>,
+	databaseName: string,
+	txnTime: number,
+	confirmationCount: number,
+	timeoutMs: number = REPLICATION_CONFIRMATION_TIMEOUT_MS,
+	alreadyConfirmedPeers: Set<string> = new Set()
+): Promise<void> {
+	// Seeded (not just checked-and-early-returned) so the count-up-to-confirmationCount math below
+	// stays in one place. Computing alreadyConfirmedPeers and adding `entry` to `awaiting` both happen
+	// synchronously in the caller's turn — with nothing awaited between them — so no peer ack can land
+	// in the gap; this is what closes the race, not just an optimization.
+	if (alreadyConfirmedPeers.size >= confirmationCount) return Promise.resolve();
+	return new Promise((resolve, reject) => {
+		// Confirmations are tracked by peer identity, not a bare counter: the same peer's status
+		// update can otherwise be credited twice — once via the `alreadyConfirmedPeers` seed and
+		// again via its own first post-registration notifyConfirmedWaiters crossing, since the
+		// shared-buffer write and the JS watcher callback that reacts to it are not atomic
+		// (harper-pro#633 review). `Set.add` on the same name is a no-op, so a peer contributes at
+		// most once regardless of how many times it's reported confirmed.
+		const confirmed = new Set(alreadyConfirmedPeers);
+		const entry: AwaitingReplication = {
+			txnTime,
+			settled: false,
+			onConfirm: (nodeName) => {
+				if (entry.settled) return; // a peer that acks after we've already timed out is a no-op, not a double-resolve
+				confirmed.add(nodeName);
+				if (confirmed.size === confirmationCount) {
+					entry.settled = true;
+					clearTimeout(timer);
+					awaiting.delete(entry);
+					resolve();
+				}
+			},
+		};
+		const timer = setTimeout(() => {
+			if (entry.settled) return;
+			entry.settled = true;
+			// O(1) regardless of how many other waiters are pending or expiring in this same tick — an
+			// outage that times out many waiters at once costs O(n) total here, not O(n²).
+			awaiting.delete(entry);
+			reject(
+				new ServerError(
+					`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${confirmed.size})`,
+					504
+				)
+			);
+		}, timeoutMs);
+		timer.unref?.();
+		awaiting.add(entry);
+	});
+}
+
+/**
+ * Filter `nodes` down to peers this node's own self-record actually replicates `databaseName` to —
+ * the pure core of `getReplicationRecipients`, extracted (mirroring `createConfirmationWaiter`'s
+ * extraction from its registration call below) so it's unit-testable without a live server/hdb_nodes.
+ * `nodes` typed `any[]` because `server.nodes` is typed against Server.ts's own (unexported) `Node`,
+ * distinct from this module's `Node` — the same cross-module friction other replication/ call sites
+ * already route around with `as any` (see `shouldReplicateFromNode` callers).
+ */
+export function filterReplicationRecipients(nodes: any[], selfReplicates: any, databaseName: string): any[] {
+	if (selfReplicates == null || selfReplicates === true) return nodes;
+	return nodes.filter((node) => routeEntriesIncludePeer(selfReplicates.sendsTo, node.name, databaseName));
+}
+
+/**
+ * The peers this node actually replicates `databaseName` to — used to bound `replicatedConfirmation`
+ * counts to what's actually reachable, rather than every node known to the cluster. Under a directional
+ * or sharded topology, `server.nodes` can include peers this node never sends `databaseName` to at all;
+ * a confirmationCount that fits within the full node count but exceeds this node's real recipient set
+ * is guaranteed to time out (harper-pro#633 review). Falls back to the full `server.nodes` list for the
+ * legacy full-mesh self-record (`true`, or an absent/unset one) — the common, non-directional case this
+ * previously handled correctly.
+ */
+function getReplicationRecipients(databaseName: string) {
+	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
+	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
+}
 
 replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void> => {
-	if (confirmationCount > server.nodes.length) {
+	const recipients = getReplicationRecipients(databaseName);
+	if (confirmationCount > recipients.length) {
 		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
 		throw new ClientError(
-			`Cannot confirm replication to more nodes (${confirmationCount}) than are in the network (${server.nodes.length} nodes: ${server.nodes.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
+			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
 		);
 	}
 	if (!commitsAwaitingReplication) {
 		commitsAwaitingReplication = new Map();
 		startSubscriptionToReplications();
 	}
-	let awaiting: AwaitingReplication[] = commitsAwaitingReplication.get(databaseName);
+	let awaiting: Set<AwaitingReplication> = commitsAwaitingReplication.get(databaseName);
 	if (!awaiting) {
-		awaiting = [];
+		awaiting = new Set();
 		commitsAwaitingReplication.set(databaseName, awaiting);
 	}
-	return new Promise((resolve) => {
-		let count = 0;
-		awaiting.push({
-			txnTime,
-			onConfirm: () => {
-				if (++count === confirmationCount) resolve();
-			},
-		});
-	});
+	return createConfirmationWaiter(
+		awaiting,
+		databaseName,
+		txnTime,
+		confirmationCount,
+		undefined,
+		countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime)
+	);
 });
 // Per-node confirmation watchers. Previously the per-node-update callback below called
 // forEachReplicatedDatabase and discarded the returned remove handle, so every hdb_nodes
@@ -768,11 +1019,12 @@ function startSubscriptionToReplications() {
 					() => {
 						const updatedTime = replicatedTime[0];
 						const lastTime = replicatedTime.lastTime;
-						for (const { txnTime, onConfirm } of commitsAwaitingReplication.get(databaseName) || []) {
-							if (txnTime > lastTime && txnTime <= updatedTime) {
-								onConfirm();
-							}
-						}
+						notifyConfirmedWaiters(
+							commitsAwaitingReplication.get(databaseName) || new Set(),
+							nodeNameAtUpdate,
+							lastTime,
+							updatedTime
+						);
 						replicatedTime.lastTime = updatedTime;
 					}
 				);

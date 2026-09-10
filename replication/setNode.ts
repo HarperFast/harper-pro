@@ -5,7 +5,7 @@ import Joi from 'joi';
 const { pki } = require('node-forge');
 import { get } from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
-import { ensureNode } from './subscriptionManager.ts';
+import { ensureNode, computeSelfReplicates, getConfiguredRoutes } from './subscriptionManager.ts';
 import { getHDBNodeTable } from './knownNodes.ts';
 import { sendOperationToNode, urlToNodeName } from './replicator.ts';
 import { getThisNodeName, hostnameToUrl, getThisNodeUrl } from '../core/server/nodeName.ts';
@@ -26,6 +26,24 @@ const validationSchema = Joi.object({
 	isLeader: Joi.boolean(),
 });
 
+// Strict ISO 8601 with a required UTC/offset designator (Z or +/-HH:MM). `new Date(string)` also accepts
+// ambiguous forms like "01/02/2024" or a zone-less "2024-01-01T00:00:00" (parsed in the host's local
+// time), which would make a start_time cutoff host-dependent, so require an explicit zone.
+const ISO_8601_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Resolve the `replicates` value to write for THIS node's own hdb_nodes row from add_node/set_node.
+ * Preserve an existing directional record (authored from config routes by startOnMainThread on the main
+ * thread) so a registry-set operation running on any worker does not clobber a constrained topology back
+ * to full mesh; only derive from config routes (→ `true` when there are no directional routes) when no
+ * self-record exists yet. getSync forces the synchronous point read (never a Promise). systemdb-routing.
+ */
+function selfReplicatesForNodeWrite(): any {
+	const existingSelf = getHDBNodeTable().primaryStore.getSync(getThisNodeName());
+	if (existingSelf && typeof existingSelf.replicates === 'object') return existingSelf.replicates;
+	return computeSelfReplicates(getConfiguredRoutes());
+}
+
 /**
  * Can add, update or remove a node from replication
  * @param req
@@ -41,6 +59,24 @@ export async function setNode(req: any) {
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
 	}
 
+	// Normalize and validate the optional data cutoff at the boundary, and persist a number so readers see
+	// one shape. Only a strict ISO 8601 UTC string or an epoch-ms number is accepted; anything else (a typo
+	// like "yesterday", or an ambiguous host-local form) is rejected rather than accepted and silently
+	// downgraded to a full copy, which is the opposite of what start_time asks for.
+	if (req.start_time != null) {
+		let normalized: number;
+		if (typeof req.start_time === 'number') normalized = req.start_time;
+		else if (typeof req.start_time === 'string' && ISO_8601_UTC.test(req.start_time))
+			normalized = new Date(req.start_time).getTime();
+		else normalized = NaN;
+		if (!Number.isFinite(normalized)) {
+			throw new ClientError(
+				`start_time must be an ISO 8601 UTC timestamp (e.g. 2024-01-01T00:00:00Z) or epoch milliseconds, received ${JSON.stringify(req.start_time)}`
+			);
+		}
+		req.start_time = normalized;
+	}
+
 	if (req.operation === 'remove_node') {
 		if (!url && !hostname) throw new ClientError('url or hostname is required for remove_node operation');
 		const nodeRecordId = hostname;
@@ -48,11 +84,15 @@ export async function setNode(req: any) {
 		const record = await hdbNodes.get(nodeRecordId);
 		if (!record) throw new ClientError(nodeRecordId + ' does not exist');
 
+		// Revoke locally before notifying the peer: the dynamic send-authorization watch acts on this
+		// delete, so the peer's access must not outlive a round trip to that (possibly offline or
+		// unreachable) peer. The reciprocal remove_node_back below travels on its own operation
+		// connection, so it is unaffected by the teardown this delete triggers.
+		await hdbNodes.delete(nodeRecordId);
+
 		try {
-			// we delete record and req that other node also deletes record (or mark itself as non-replicating)
-			// we do not wait for the other node to respond, it may not even be online anymore
 			await sendOperationToNode(
-				{ url: record.url },
+				record,
 				{
 					operation: 'remove_node_back',
 					name:
@@ -68,8 +108,6 @@ export async function setNode(req: any) {
 				err
 			);
 		}
-
-		await hdbNodes.delete(nodeRecordId);
 
 		return `Successfully removed '${nodeRecordId}' from cluster`;
 	}
@@ -181,7 +219,11 @@ export async function setNode(req: any) {
 	if (req.hostname) nodeRecord.name = req.hostname;
 	if (req.subscriptions) nodeRecord.subscriptions = req.subscriptions;
 	else if (req.sendsTo || req.receivesFrom)
-		nodeRecord.replicates = { sends: true, sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
+		// Directional peer record. NO blanket `sends: true`: that short-circuits shouldReplicateFromNode's
+		// else-branch to "feeds every database", defeating the sendsTo allow-list. Carry sendsTo/receivesFrom
+		// through unmodified so the receive/send gates restrict by database (and target), matching the
+		// config-route shape iterateRoutes produces. harper-pro#498 / systemdb-routing.
+		nodeRecord.replicates = { sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
 	else nodeRecord.replicates = true;
 	if (req.start_time) {
 		nodeRecord.start_time = typeof req.start_time === 'string' ? new Date(req.start_time).getTime() : req.start_time;
@@ -205,7 +247,13 @@ export async function setNode(req: any) {
 		const thisNode: any = {
 			url: thisUrl,
 			ca: cert_auth,
-			replicates: true,
+			// Don't clobber a constrained (directional) self-record back to full-mesh just because
+			// add_node/set_node ran. The directional self-record is written from config routes by
+			// startOnMainThread (main thread); an operation handler may run on any worker, where the
+			// route list isn't populated, so PRESERVE an existing directional record and only derive/
+			// default (→ `true` for a node with no directional routes) when none exists yet. getSync
+			// forces the synchronous point read (never a Promise). systemdb-routing.
+			replicates: selfReplicatesForNodeWrite(),
 			subscriptions: null,
 		};
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
@@ -223,8 +271,17 @@ export async function setNode(req: any) {
 	if (req.operation === 'update_node') {
 		message = `Successfully updated '${url}'`;
 	} else message = `Successfully added '${url}' to cluster`;
-	if (targetNodeResponseError)
+	if (targetNodeResponseError) {
+		// Opt-in only, so add_node/set_node keep reporting success-with-warning for every other caller:
+		// the local peer row is written either way, but for a caller whose next step depends on the
+		// leader having accepted this node — cloneNode, which then skips setup on restart — a warning
+		// inside a success string is indistinguishable from success. requirePeerAck makes it a failure.
+		if (req.requirePeerAck) {
+			targetNodeResponseError.message = `${url} did not accept this node: ${targetNodeResponseError.message}`;
+			throw targetNodeResponseError;
+		}
 		message += ' but there was an error updating target node: ' + targetNodeResponseError.message;
+	}
 	return message;
 }
 
@@ -256,7 +313,9 @@ export async function addNodeBack(req) {
 	const nodeRecord: any = { url: req.url, ca: originCa };
 	if (req.subscriptions) nodeRecord.subscriptions = req.subscriptions;
 	else if (req.sendsTo || req.receivesFrom) {
-		nodeRecord.replicates = { sends: true, sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
+		// Mirror setNode: no blanket `sends: true` (see the note there) so the directional entries actually
+		// gate. systemdb-routing.
+		nodeRecord.replicates = { sendsTo: req.sendsTo, receivesFrom: req.receivesFrom };
 		nodeRecord.subscriptions = null;
 	} else {
 		nodeRecord.replicates = true;
@@ -272,7 +331,9 @@ export async function addNodeBack(req) {
 		const thisNode: any = {
 			url: getThisNodeUrl(),
 			ca: repCa?.certificate,
-			replicates: true,
+			// Preserve a directional self-record, not a forced `true` — mirror setNode so the responder side
+			// of the handshake also keeps a constrained topology. systemdb-routing.
+			replicates: selfReplicatesForNodeWrite(),
 			subscriptions: null,
 		};
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) {
@@ -297,11 +358,18 @@ export async function addNodeBack(req) {
  * Is called by other node when remove_node is requested and
  * system tables are not replicating
  */
-export async function removeNodeBack(req) {
-	hdbLogger.trace('removeNodeBack received request:', req);
-	const hdbNodes = getHDBNodeTable();
+export async function removeNodeBackFromTable(req, hdbNodes) {
+	const callerName = req.hdb_user?.name;
+	if (!callerName || (req.name !== callerName && req.name !== getThisNodeName())) {
+		throw new ClientError(`remove_node_back may only remove the authenticated peer or this node, not '${req.name}'`);
+	}
 	//  delete the record
 	await hdbNodes.delete(req.name);
+}
+
+export async function removeNodeBack(req) {
+	hdbLogger.trace('removeNodeBack received request:', req);
+	await removeNodeBackFromTable(req, getHDBNodeTable());
 }
 
 function reverseSubscription(subscription) {
@@ -327,7 +395,7 @@ server.registerOperation?.({
 	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],
 });
 server.registerOperation?.({
-	name: 'remove_node_back;',
+	name: 'remove_node_back',
 	execute: removeNodeBack,
 	httpMethod: 'DELETE',
 });

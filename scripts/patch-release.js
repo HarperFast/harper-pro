@@ -26,12 +26,29 @@
  *   --core-branch <name>   Core release branch (default: same as --branch; use when core RC branch has a different name, e.g. rc/X.Y.Z-core)
  *   --source <name>        Source branch (default: main)
  *   --label <name>    PR label to filter on (default: patch)
- *   --bump <type>     npm version bump: patch|minor|major (default: patch)
+ *   --bump <type>     npm version bump: patch|minor|major|prerelease (default: patch)
+ *   --version-name <slot>  CM version slot: stable|next. Defaults to `next` for a
+ *                     prerelease target and `stable` otherwise — only pass this to
+ *                     force a deliberate mismatch.
  *   --dry-run         Preview without making changes
+ *   --yes             Non-interactive: auto-confirm all prompts. CM deploy (prompt 2) defaults to
+ *                     NO in this mode — pass --cm-trigger to opt in. This is intentional: in
+ *                     interactive mode prompt 2 defaults YES on EOF, which would silently deploy;
+ *                     non-interactive mode inverts that default to be safe.
+ *   --cm-trigger      Request CM release-to-environments. Combined with --yes, auto-confirms prompt
+ *                     2 (non-interactive opt-in). Without --yes, still prompts interactively — it
+ *                     only changes the prompt's wording, never bypasses confirmation. When the
+ *                     trigger itself fails after being explicitly requested, that's a terminal
+ *                     error (nonzero exit, RESULT ok:false) even though the release itself may
+ *                     already be pushed.
+ *   --json            Print a final "RESULT: {...}" JSON line for machine parsing. Also emits on
+ *                     fatal error paths (RESULT: {"ok":false,"error":"..."}, nonzero exit) and on
+ *                     an aborted confirmation prompt (RESULT: {"ok":false,"error":"aborted",
+ *                     "aborted":true}, exit 0 — the user declined, nothing failed).
  */
 
 const { execSync, spawnSync } = require('child_process');
-const { existsSync } = require('fs');
+const { existsSync, writeSync } = require('fs');
 const path = require('path');
 const readline = require('readline');
 const semver = require('semver');
@@ -43,7 +60,18 @@ const RELEASE_BRANCH = getArg('--branch', 'v5.0');
 const CORE_RELEASE_BRANCH = getArg('--core-branch', RELEASE_BRANCH);
 const SOURCE_BRANCH = getArg('--source', 'main');
 const LABEL = getArg('--label', 'patch');
-const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major
+const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major | prerelease
+// Explicit target version (without leading 'v'), overriding the --bump computation.
+// Needed for prerelease-line transitions semver.inc can't express in one step, e.g.
+// alpha.N → beta.1 (`--set-version 5.2.0-beta.1`).
+const SET_VERSION = getArg('--set-version', null);
+const YES_MODE = argv.includes('--yes');
+const CM_TRIGGER = argv.includes('--cm-trigger');
+const JSON_OUTPUT = argv.includes('--json');
+// CM version slot. Derived from the target version when unset — a prerelease goes
+// to `next`, a stable release to `stable`. Set explicitly only to force a
+// deliberate mismatch.
+const VERSION_NAME = getArg('--version-name', null);
 
 function getArg(flag, def) {
 	const i = argv.indexOf(flag);
@@ -66,6 +94,53 @@ const warn = (m) => console.warn(C.yellow + m + C.reset);
 const err = (m) => console.error(C.red + m + C.reset);
 const info = (m) => console.log(C.cyan + m + C.reset);
 const header = (m) => log(`\n${C.bold}${C.cyan}${'━'.repeat(60)}\n  ${m}\n${'━'.repeat(60)}${C.reset}`);
+
+// A plain process.stdout.write() races process.exit(): when stdout is a pipe (the standard
+// --json/dispatch setup), the write is async and exit() can tear the process down before it
+// flushes, dropping the RESULT line. A raw fd write via fs.writeSync is synchronous, so it's
+// guaranteed to land first. `fd` is overridable so tests can assert on the exact bytes written
+// without redirecting real stdout.
+function writeResult(result, fd = 1) {
+	writeSync(fd, 'RESULT: ' + JSON.stringify(result) + '\n');
+}
+
+function die(message, code = 1, extra = {}) {
+	err(message);
+	if (JSON_OUTPUT) {
+		const cleanMessage = typeof message === 'string' ? message.trim() : message;
+		writeResult({ ok: false, error: cleanMessage, ...extra });
+	}
+	process.exit(code);
+}
+
+// Decides the CM-deploy prompt answer from flags: 'y'/'n' to auto-answer non-interactively,
+// or null to fall through to an interactive prompt. --cm-trigger alone (no --yes) always falls
+// through — it must never bypass confirmation for a human running the script by hand.
+function resolveDeployAnswer({ cmTrigger, yesMode }) {
+	if (cmTrigger && yesMode) return 'y';
+	if (!cmTrigger && yesMode) return 'n';
+	return null;
+}
+
+function buildAbortedResult() {
+	return { ok: false, error: 'aborted', aborted: true, pushed: false, cmTriggered: false };
+}
+
+// Builds the die() args for a CM-trigger failure that was explicitly requested via
+// --cm-trigger — preserves whatever state the run had already reached (e.g. pushed: true)
+// so a machine caller can tell "release pushed, deploy trigger failed" from "nothing happened".
+function buildCmFailureResult({ pushed, coreVersion, proVersion, error }) {
+	return {
+		message: `CM release-to-environments trigger failed: ${error}`,
+		extra: { pushed, cmTriggered: false, coreVersion: coreVersion ?? null, proVersion },
+	};
+}
+
+// ── Validate args ─────────────────────────────────────────────────────────────
+if (VERSION_NAME && VERSION_NAME !== 'stable' && VERSION_NAME !== 'next') {
+	err(`\n  Error: --version-name "${VERSION_NAME}" is invalid. Expected "stable" or "next".`);
+	process.exit(1);
+}
 
 // ── Shell helpers ─────────────────────────────────────────────────────────────
 function run(cmd, opts = {}) {
@@ -148,8 +223,7 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 	run('git fetch origin --tags');
 
 	if (!hasBranch(branch)) {
-		err(`  Release branch "${branch}" not found.`);
-		process.exit(1);
+		die(`  Release branch "${branch}" not found.`);
 	}
 
 	const last = getLastRelease(branch);
@@ -223,8 +297,7 @@ async function main() {
 	try {
 		run('gh --version');
 	} catch {
-		err('gh CLI not found (https://cli.github.com)');
-		process.exit(1);
+		die('gh CLI not found (https://cli.github.com)');
 	}
 
 	const harperProRoot = path.resolve(__dirname, '..');
@@ -259,7 +332,22 @@ async function main() {
 	const coreNext = semver.inc(coreCurrent, VERSION_BUMP);
 	const proNext = semver.inc(proCurrent, VERSION_BUMP);
 	const effectiveCore = coreBumping ? coreNext : coreCurrent;
-	const target = semver.compare(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
+	let target = semver.compare(effectiveCore, proNext) >= 0 ? effectiveCore : proNext;
+	if (SET_VERSION) {
+		target = semver.valid(SET_VERSION);
+		if (!target) {
+			die(`--set-version "${SET_VERSION}" is not a valid semver`);
+		}
+		if (semver.compare(target, coreCurrent) <= 0 || semver.compare(target, proCurrent) <= 0) {
+			die(`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`);
+		}
+		if (
+			runSafe(`git rev-parse -q --verify "refs/tags/v${target}"`).code === 0 ||
+			runSafe(`git -C "${corePath}" rev-parse -q --verify "refs/tags/v${target}"`).code === 0
+		) {
+			die(`--set-version "${SET_VERSION}": tag v${target} already exists`);
+		}
+	}
 
 	info(`\n  Current:  core=v${coreCurrent}  harper-pro=v${proCurrent}`);
 	info(`  Target:   v${target}`);
@@ -273,14 +361,19 @@ async function main() {
 	// ── Steps 1–5: version bump, sync, tag, push (skipped in dry-run) ────────────
 	let proVersion;
 	let coreVersion = null;
+	let pushed = false;
+	let cmTriggered = false;
 	if (DRY_RUN) {
 		warn('\n[dry-run] Skipping version bump, sync, and push.');
 		// Use a placeholder so Step 6 can still show the CM command it would run.
 		proVersion = `v${target}`;
 	} else {
-		const confirm = await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
+		const confirm = YES_MODE ? 'y' : await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
 		if (confirm.toLowerCase() !== 'y') {
 			warn('Aborted.');
+			// Exit 0 (a human/--yes declined, nothing failed) but still emit a RESULT line
+			// under --json — otherwise a caller parsing stdout for completion gets nothing.
+			if (JSON_OUTPUT) writeResult(buildAbortedResult());
 			return;
 		}
 
@@ -291,7 +384,9 @@ async function main() {
 		if (coreBumping) {
 			coreVersion = setVersion('harper (core)', target);
 		} else {
-			info(`  No new commits on core's ${CORE_RELEASE_BRANCH} since ${coreStatus.lastTag} — skipping core version bump.`);
+			info(
+				`  No new commits on core's ${CORE_RELEASE_BRANCH} since ${coreStatus.lastTag} — skipping core version bump.`
+			);
 		}
 
 		// ── Step 2: checkout harper-pro release branch ─────────────────────────
@@ -310,8 +405,7 @@ async function main() {
 				env: { ...process.env, NO_USE_GIT: 'true', IGNORE_PACKAGE_JSON_DIFF: 'true' },
 			});
 		} catch (e) {
-			err(`sync-core.sh failed (exit ${e.status})`);
-			process.exit(e.status ?? 1);
+			die(`sync-core.sh failed (exit ${e.status})`, e.status ?? 1);
 		}
 
 		// Stage core submodule ref + synced deps so they roll into the release commit
@@ -335,16 +429,40 @@ async function main() {
 		log(`  Pushing harper-pro ${RELEASE_BRANCH} ${proVersion}...`);
 		execSync(`git -C "${harperProRoot}" push origin "${RELEASE_BRANCH}" "${proVersion}"`, { stdio: 'inherit' });
 		ok('\nTags pushed.');
+		pushed = true;
 	}
 
 	// ── Step 6: trigger CM release-to-environments ─────────────────────────────
 	header('Deploy to environments (Central Manager)');
 	const plainVersion = proVersion.replace(/^v/, '');
+	// The CM slot must follow the version. `stable` is what GA clusters consume, so
+	// sending a prerelease there would put a beta in front of production traffic;
+	// prereleases belong in `next`. Derive it rather than hardcode, and let
+	// --version-name override for the rare deliberate mismatch.
+	const derivedVersionName = semver.prerelease(plainVersion) ? 'next' : 'stable';
+	const versionName = VERSION_NAME ?? derivedVersionName;
 	const cmCmd =
 		`gh workflow run release-to-environments.yaml --repo HarperFast/central-manager ` +
-		`-f version=${plainVersion} -f version_name=stable -f update_environments=all`;
+		`-f version=${plainVersion} -f version_name=${versionName} -f update_environments=all`;
 	log(`  Command: ${C.dim}${cmCmd}${C.reset}`);
-	const deploy = await prompt(`\nTrigger CM release-to-environments (version_name=stable)? [Y/n]: `);
+	if (VERSION_NAME && VERSION_NAME !== derivedVersionName) {
+		warn(`  version_name forced to "${VERSION_NAME}" via --version-name (derived would be "${derivedVersionName}").`);
+	}
+	// In --yes mode CM deploy is opt-in (pass --cm-trigger); interactive default-YES on EOF was a deploy footgun.
+	const autoDeploy = resolveDeployAnswer({ cmTrigger: CM_TRIGGER, yesMode: YES_MODE });
+	let deploy;
+	if (autoDeploy !== null) {
+		deploy = autoDeploy;
+	} else {
+		const promptText = CM_TRIGGER
+			? `\n--cm-trigger requested — trigger CM release-to-environments (version_name=${versionName})? [Y/n]: `
+			: `\nTrigger CM release-to-environments (version_name=${versionName})? [Y/n]: `;
+		deploy = await prompt(promptText);
+	}
+	// Captured rather than thrown immediately: a requested-and-failed CM dispatch must still be
+	// terminal (see below), but dying here would skip Step 7's branch restore, leaving a reused
+	// dispatch worktree stuck on the release branch. die() is deferred until after Step 7.
+	let cmFailure = null;
 	if (deploy.toLowerCase() !== 'n') {
 		log('\nTriggering CM workflow...');
 		if (DRY_RUN) {
@@ -352,30 +470,60 @@ async function main() {
 		} else {
 			try {
 				execSync(cmCmd, { stdio: 'inherit' });
+				cmTriggered = true;
 				ok('  ✅ Workflow triggered — https://github.com/HarperFast/central-manager/actions');
 			} catch (e) {
 				err('  ❌ Failed to trigger workflow: ' + e.message);
+				// A requested-but-failed dispatch must be terminal in the machine contract:
+				// otherwise `--yes --cm-trigger --json` reports ok:true with cmTriggered:false,
+				// and a dispatch caller can't distinguish "deploy skipped" from "deploy attempted
+				// and failed" — it would mark a requested deployment successful when it never started.
+				if (CM_TRIGGER) {
+					cmFailure = buildCmFailureResult({ pushed, coreVersion, proVersion, error: e.message });
+				}
 			}
 		}
 	} else {
-		warn('  Skipped. Manually trigger release-to-environments with version_name=stable when ready.');
+		warn(`  Skipped. Manually trigger release-to-environments with version_name=${versionName} when ready.`);
 	}
-	ok('\n✅ Done.');
+	if (!cmFailure) ok('\n✅ Done.');
 
 	// ── Step 7: offer to return to original branches ───────────────────────────
+	// Always runs, even after a requested CM-trigger failure above, so a reused dispatch
+	// worktree isn't left checked out on the release branch.
 	process.chdir(corePath);
 	if (coreOriginalBranch && coreOriginalBranch !== CORE_RELEASE_BRANCH) {
-		const back = await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
+		const back = YES_MODE ? 'y' : await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
 		if (back.toLowerCase() !== 'n') run(`git checkout "${coreOriginalBranch}"`);
 	}
 	process.chdir(harperProRoot);
 	if (harperProOriginalBranch && harperProOriginalBranch !== RELEASE_BRANCH) {
-		const back = await prompt(`Return harper-pro to "${harperProOriginalBranch}"? [Y/n]: `);
+		const back = YES_MODE ? 'y' : await prompt(`Return harper-pro to "${harperProOriginalBranch}"? [Y/n]: `);
 		if (back.toLowerCase() !== 'n') run(`git checkout "${harperProOriginalBranch}"`);
+	}
+
+	if (cmFailure) {
+		die(cmFailure.message, 1, cmFailure.extra);
+	}
+
+	if (JSON_OUTPUT) {
+		writeResult({
+			ok: true,
+			target: proVersion,
+			coreVersion: coreVersion ?? null,
+			proVersion,
+			coreBumped: coreVersion !== null,
+			pushed,
+			cmTriggered,
+			dryRun: DRY_RUN,
+		});
 	}
 }
 
-main().catch((e) => {
-	err('Fatal: ' + e.message);
-	process.exit(1);
-});
+if (require.main === module) {
+	main().catch((e) => {
+		die('Fatal: ' + (e?.message ?? String(e)));
+	});
+}
+
+module.exports = { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult, writeResult };

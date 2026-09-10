@@ -22,6 +22,7 @@ import {
 	NodeReplicationConnection,
 	createWebSocket,
 	replicateOverWS,
+	createPendingDatabaseSubscription,
 	databaseSubscriptions,
 	tableUpdateListeners,
 	LATENCY_POSITION,
@@ -594,6 +595,15 @@ function getRetrievalConnectionByName(nodeName, subscription, dbName): NodeRepli
 	return connection;
 }
 
+/**
+ * The url is required, not incidental: it arms the keep-alive, and without it this socket is silent
+ * for as long as the peer takes to execute (minutes, for a deploy install) and the receive watchdog
+ * terminates it at 2 x replication.pingTimeout.
+ */
+export function operationConnectionOptions(url: string): { url: string } {
+	return { url };
+}
+
 export async function sendOperationToNode(node, operation, options?) {
 	if (!options) options = {};
 	options.serverName = node.name;
@@ -602,24 +612,27 @@ export async function sendOperationToNode(node, operation, options?) {
 	// specific CA (hdb_nodes.ca) so createWebSocket trusts it, matching how the worker subscription path
 	// trusts each node's CA. Bootstrap callers (add_node/clone) pass a bare { url } node with no ca and are unaffected.
 	if (node.ca) options.nodeCA = node.ca;
-	const socket = await createWebSocket(getNodeURL(node), options);
-	const session = replicateOverWS(socket, {}, {});
+	const nodeUrl = getNodeURL(node);
+	const socket = await createWebSocket(nodeUrl, options);
+	const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), {});
 	return new Promise((resolve, reject) => {
 		socket.on('open', () => {
 			// operation may carry a secret (registry token / ssh key / password); redact before
 			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
 			if (logger.logsAtLevel('debug'))
-				logger.debug(
-					'Sending operation connection to ' + getNodeURL(node) + ' opened',
-					redactOperationForLog(operation)
-				);
-			resolve(session.sendOperation(operation));
+				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(operation));
+			// A throw inside this listener is an uncaught exception, and leaves this promise pending.
+			try {
+				resolve(session.sendOperation(operation));
+			} catch (error) {
+				reject(error);
+			}
 		});
 		socket.on('error', (error) => {
 			reject(error);
 		});
 		socket.on('close', (error) => {
-			logger.info('Sending operation connection to ' + getNodeURL(node) + ' closed', error);
+			logger.info('Sending operation connection to ' + nodeUrl + ' closed', error);
 		});
 	}).finally(() => {
 		socket.close();
@@ -642,13 +655,8 @@ export function subscribeToNode(request: any) {
 		let subscriptionToTable = databaseSubscriptions.get(request.database);
 		if (!subscriptionToTable) {
 			// Wait for it to be created
-			let ready;
-			subscriptionToTable = new Promise((resolve) => {
-				logger.info('Waiting for subscription to database ' + request.database);
-				ready = resolve;
-			});
-			subscriptionToTable.ready = ready;
-			databaseSubscriptions.set(request.database, subscriptionToTable);
+			logger.info(`Waiting for subscription to database ${request.database}`);
+			subscriptionToTable = createPendingDatabaseSubscription(request.database);
 		}
 		const connectionStatus = { reused: false };
 		const connection = getSubscriptionConnection(
@@ -685,23 +693,45 @@ export function subscribeToNode(request: any) {
 		logger.error('Error in subscription to node', request.nodes[0]?.url, error);
 	}
 }
-export async function unsubscribeFromNode({ url, nodes, database }) {
-	logger.trace(
-		'Unsubscribing from node',
-		url,
-		database,
-		'nodes',
-		Array.from(getHDBNodeTable().primaryStore.getRange({}))
-	);
+export async function unsubscribeFromNode({ url, nodes, database, clearStatus = false }) {
+	logger.trace('Unsubscribing from node', url, database);
 	const connectionKey = url + '-' + (nodes[0]?.url ?? url);
 	const dbConnections = connections.get(connectionKey);
-	if (dbConnections) {
-		const connection = dbConnections.get(database);
-		if (connection) {
-			connection.unsubscribe();
-			dbConnections.delete(database);
-		}
+	const connection = dbConnections?.get(database);
+	if (!connection) return;
+	// Retire locally before attempting the transport close, not after: close() can throw, and a
+	// connection that keeps its cache entry and its owner marker goes on writing DOWN/1008 into the
+	// (database, peer) buffer the removal just cleared. unsubscribe() sets intentionallyUnsubscribed
+	// before it touches the socket, so a connection dropped here can never reconnect on its own.
+	dbConnections.delete(database);
+	if (clearStatus) releaseSharedStatusOnUnsubscribe(connection);
+	try {
+		connection.unsubscribe();
+	} catch (error) {
+		logger.error('Error unsubscribing from node', url, database, error);
 	}
+}
+// Retire a connection's claim on the (database, peer) shared status when its node leaves the cluster.
+//
+// `unsubscribe()` only starts the teardown. The socket closes asynchronously, and until it does this session
+// keeps writing: its close handler stamps DOWN + close code 1008, and a frame or pong arriving on the still-
+// closing socket re-stamps CONNECTED and fresh liveness. Every one of those writes is gated on
+// `nodeSubscriptions !== undefined`, which unsubscribing never clears, so all of them land AFTER the main
+// thread has zeroed the buffer on removal. A same-process re-add then resolves the same buffer and inherits
+// them: cluster_status reports a failure the new link never suffered, or reports it connected before it has
+// handshaked — which also clears the down-since baseline findWedgedNodeUrls needs, so a re-added link that
+// never opens gets no wedge recovery until liveness ages out (>= 120s).
+//
+// Dropping `nodeSubscriptions` is the fix because it is the marker every owner-class write already consults,
+// including the ones that reach the buffer through replicateOverWS's own closure rather than this handle.
+// Only on the removal path: the other unsubscribe caller (replication turned off for a database) keeps its
+// entry, and its close still records DOWN. Deliberately does not clear the buffer as well — a re-add can be
+// assigned to a different HTTP worker, whose connection this one cannot see, and its CONNECTED stamp must
+// survive. (harper-pro#431)
+export function releaseSharedStatusOnUnsubscribe(connection) {
+	if (!connection) return;
+	connection.nodeSubscriptions = undefined;
+	connection.sharedStatus = undefined;
 }
 
 // Force a wedged-but-connected subscription to tear down and reconnect. Unlike unsubscribeFromNode this

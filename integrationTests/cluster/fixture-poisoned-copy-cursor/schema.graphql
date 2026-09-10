@@ -1,0 +1,4 @@
+type CopyCursorTest @table @export {
+	id: ID @primaryKey
+	val: String
+}

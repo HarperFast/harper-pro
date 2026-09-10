@@ -30,7 +30,7 @@ import {
 	getNextAvailableLoopbackAddress,
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, concurrent, readLog, getMemoryInfo, peakMemory } from './clusterShared.mjs';
+import { sendOperation, concurrent, readLog, getMemoryInfo, peakMemory, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -176,35 +176,34 @@ suite('Replication receive-side backlog memory bound', { skip: !STRESS, timeout:
 		// Poll record counts directly — unambiguous catch-up signal, no dependency on
 		// the shape of cluster_status's lastReceivedVersion fields.
 		const sourceCount = (await sendOperation(A, { operation: 'describe_table', table: 'load' })).record_count;
-		let caughtUp = false;
 		let lastReceiverCount = 0;
-		for (let r = 0; r < 360; r++) {
-			const describeB = await sendOperation(nodeCtxB.harper, { operation: 'describe_table', table: 'load' });
-			lastReceiverCount = describeB.record_count;
-			if (lastReceiverCount >= sourceCount) {
-				caughtUp = true;
-				break;
-			}
-			await delay(500);
+		try {
+			await waitForCondition(
+				async (signal) => {
+					const describeB = await sendOperation(
+						nodeCtxB.harper,
+						{ operation: 'describe_table', table: 'load' },
+						{ signal }
+					);
+					lastReceiverCount = describeB.record_count;
+					return lastReceiverCount >= sourceCount;
+				},
+				{
+					timeoutMs: 180_000,
+					description: () => `receiver record_count ${lastReceiverCount} to reach source ${sourceCount}`,
+				}
+			);
+		} finally {
+			sampling = false;
+			await sampler;
 		}
 
-		sampling = false;
-		await sampler;
-
-		// Assertion 1: catch-up actually happened.
-		ok(
-			caughtUp,
-			`catch-up did not complete: receiver record_count ${lastReceiverCount} < source ${sourceCount} after 180s`
-		);
-
-		// Assertion 2: no receive-side OOM marker in the log.
 		const log = await readLog(nodeCtxB.harper);
 		ok(
 			!log.includes('ERR_WORKER_OUT_OF_MEMORY'),
 			'ERR_WORKER_OUT_OF_MEMORY appeared in B log; receive-side memory pressure is unbounded'
 		);
 
-		// Assertion 3: peak resident-set is comfortably under the unbounded-decode regime.
 		// The wtk failure burst past 2 GB old-gen inside a single message. Anything
 		// near or under 1.5 GB means the HWM-driven pause is taking effect.
 		const { peakRss } = peakMemory(samples);

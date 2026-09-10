@@ -51,6 +51,7 @@ USER 0
 
 # Install runtime utilities Harper expects, then lay down a GID-0-writable home.
 RUN <<-EOF
+    set -e
     microdnf install --assumeyes --nodocs --refresh hostname git procps-ng zstd
     microdnf clean all
     mkdir -p /home/harperdb/harper /home/harperdb/.npm-global
@@ -63,13 +64,19 @@ WORKDIR /home/harperdb
 
 # Install Harper Pro globally from the tarball produced in the build stage.
 COPY --from=build /usr/src/harper-pro/harperfast-harper-pro-*.tgz .
+# See Dockerfile for why `set -e` and the assertion are load-bearing here.
 RUN <<-EOF
+    set -e
     npm install --global harperfast-harper-pro-*.tgz
+    harper version
     npm cache clean --force
     rm -f harperfast-harper-pro-*.tgz
     chown -R 1001:0 /home/harperdb
     chmod -R g=u /home/harperdb
 EOF
+
+# uWS is opt-in for npm consumers but remains bundled in official images.
+COPY --from=build --chown=1001:0 /usr/src/harper-pro/node_modules/uWebSockets.js /home/harperdb/.npm-global/lib/node_modules/@harperfast/harper-pro/node_modules/uWebSockets.js/
 
 # Red Hat Container Certification (RHCC) requires license files under /licenses.
 COPY LICENSE.md /licenses/LICENSE.md

@@ -16,6 +16,7 @@ import {
 	BLOB_FAILURE_COUNT_POSITION,
 	LAST_BLOB_FAILURE_TIME_POSITION,
 	readConnectionTruth,
+	readFireCounters,
 } from './replicationConnection.ts';
 import '../core/server/serverHelpers/serverUtilities.ts';
 
@@ -50,7 +51,10 @@ export async function clusterStatus() {
 				auditStore = table.auditStore;
 				if (auditStore) break;
 			}
-			if (!auditStore) continue;
+			if (!auditStore) {
+				if (!socket.connected) socket.peerCapabilities = undefined;
+				continue;
+			}
 			let replicationSharedStatus = getReplicationSharedStatus(auditStore, databaseName, remoteNodeName);
 			socket.lastCommitConfirmed = asDate(replicationSharedStatus[CONFIRMATION_STATUS_POSITION]);
 			socket.lastReceivedRemoteTime = asDate(replicationSharedStatus[RECEIVED_VERSION_POSITION]);
@@ -67,12 +71,21 @@ export async function clusterStatus() {
 			// `|| undefined` so a healthy link omits the field entirely (matching lastBlobFailure's asDate(0)).
 			socket.blobReplicationFailures = replicationSharedStatus[BLOB_FAILURE_COUNT_POSITION] || undefined;
 			socket.lastBlobFailure = asDate(replicationSharedStatus[LAST_BLOB_FAILURE_TIME_POSITION]);
+			// Per-mechanism recovery-fire counts for this link (harper-pro#431) — how often each watchdog
+			// or reconcile net fired while the shared-memory truth already read down (`redundant`) versus
+			// while it still read up (`loadBearing`, i.e. that mechanism was the only layer that saw the
+			// problem). This is the evidence the later watchdog-demotion decision is meant to rest on; nothing
+			// in the recovery paths reads it. Omitted entirely for a link where nothing has ever fired.
+			socket.recoveryFires = readFireCounters(replicationSharedStatus);
 			// W1 (harper-pro#431): the shared-memory connection truth is authoritative over the edge-triggered
 			// map mirror in requestClusterStatus, which can still read connected:true for an open-but-idle
 			// wedge that never delivered a disconnect (#289/#233). Also surface the last disconnect (#214).
 			const truth = readConnectionTruth(auditStore, databaseName, remoteNodeName);
 			if (truth) {
 				socket.connected = truth.connected;
+				// Capabilities belong to the live socket. Nothing clears the stored value on disconnect —
+				// that would be a second racing message to fence — so a down link omits it here instead.
+				if (!truth.connected) socket.peerCapabilities = undefined;
 				// Surface the last proof-of-life (handshake/pong/receive stamp) so an operator — and the
 				// watchdog-demotion soak (#431) — can see how fresh the truth behind `connected` is, and
 				// distinguish "connected, actively alive" from "connected, liveness nearing the stale window".
@@ -92,7 +105,11 @@ export async function clusterStatus() {
 	const thisNode = getHDBNodeTable().primaryStore.getSync(response.node_name);
 	if (thisNode?.shard) response.shard = thisNode.shard;
 	if (thisNode?.url) response.url = thisNode.url;
-	response.is_enabled = true; // if we have replication, replication is enabled
+	// is_enabled now reports whether this node is an active cluster member (harper-pro#217): a removed node
+	// (or one with no peers) has no connections and reports false, instead of the previous always-true that
+	// hid removal. `connections` is the per-peer list requestClusterStatus assembles from nodeMap; once a
+	// removed node's hdb_nodes delete propagates to onNodeUpdate(null) the peer is dropped and this flips.
+	response.is_enabled = response.connections.length > 0;
 
 	return response;
 }

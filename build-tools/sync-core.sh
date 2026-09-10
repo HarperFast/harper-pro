@@ -36,21 +36,36 @@ echo -e "\n📦 Copying lock file from core"
 cp core/package-lock.json ./
 
 echo -e "\n📦 Copying dependencies & devDependencies from core"
-# @datadog/pprof is a harper-pro-only dependency (used by analytics/profile.ts,
-# which does not exist in core). Capture harper-pro's pinned version so the
-# wholesale dependency copy below doesn't drop or downgrade it.
-pprof_version=$(npm pkg get 'dependencies.@datadog/pprof')
-deps=$(cd core && npm pkg get dependencies)
-npm pkg set "dependencies=${deps}" --json
-if [[ -n "$pprof_version" && "$pprof_version" != "{}" ]]; then
-  npm pkg set "dependencies.@datadog/pprof=${pprof_version}" --json
-fi
-devDeps=$(cd core && npm pkg get devDependencies)
-npm pkg set "devDependencies=${devDeps}" --json
-overrides=$(cd core && npm pkg get overrides)
-npm pkg set "overrides=${overrides}" --json
-optionalDependencies=$(cd core && npm pkg get optionalDependencies)
-npm pkg set "optionalDependencies=${optionalDependencies}" --json
+# harper-pro carries some dependencies/overrides that core doesn't know about
+# (e.g. @datadog/pprof for analytics/profile.ts, re2 for security/safeRegex.ts —
+# neither file exists in core). sync_pkg_field wholesale-copies each field from
+# core but re-adds any entry that only exists on harper-pro's side, so a sync can
+# never silently drop or downgrade a harper-pro-only dependency.
+function sync_pkg_field {
+  local field="$1"
+  local pro_before core_value merged
+  pro_before=$(npm pkg get "$field")
+  core_value=$(cd core && npm pkg get "$field")
+  merged=$(node -e '
+    const [field, proBeforeJson, coreValueJson] = process.argv.slice(1);
+    const proBefore = JSON.parse(proBeforeJson);
+    const coreValue = JSON.parse(coreValueJson);
+    const merged = { ...coreValue };
+    for (const [key, value] of Object.entries(proBefore)) {
+      if (!(key in coreValue)) {
+        merged[key] = value;
+        console.error(`  ↳ preserving harper-pro-only ${field} entry: ${key}@${value}`);
+      }
+    }
+    process.stdout.write(JSON.stringify(merged));
+  ' "$field" "$pro_before" "$core_value")
+  npm pkg set "${field}=${merged}" --json
+}
+
+sync_pkg_field dependencies
+sync_pkg_field devDependencies
+sync_pkg_field overrides
+sync_pkg_field optionalDependencies
 
 if [[ "$SKIP_INSTALL" != "true" ]]; then
   echo -e "\n📦 Installing core deps"

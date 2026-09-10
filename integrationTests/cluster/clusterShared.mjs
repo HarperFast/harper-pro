@@ -5,13 +5,17 @@ import { setTimeout as delay } from 'node:timers/promises';
  * Send an operation to a Harper node and validate the response
  * @param {Object} node - The Harper node instance
  * @param {Object} operation - The operation to send
+ * @param {Object} [options]
+ * @param {AbortSignal} [options.signal] - aborts the request; pass `waitForCondition`'s signal so a
+ * node that accepts the connection and never answers cannot outlive the wait's deadline
  * @returns {Promise<Object>} The response data
  */
-export async function sendOperation(node, operation) {
+export async function sendOperation(node, operation, options) {
 	const response = await fetch(node.operationsAPIURL, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(operation),
+		signal: options?.signal,
 	});
 	const responseData = await response.json();
 	equal(response.status, 200, JSON.stringify(responseData));
@@ -87,51 +91,160 @@ export async function readLog(node) {
 }
 
 /**
- * Poll `cluster_status` on `receiver` until it reports a `lastReceivedVersion` for
- * `source` greater than the version captured *now* on `source` itself. Returns the
- * final receiver-side version when caught up, throws on timeout.
+ * Read the pid of a node's main Harper process from its pid file.
  *
- * @param {Object} receiver - The catching-up Harper node
- * @param {Object} source - The Harper node we expect to be replicating *from*
+ * Harper writes `{rootPath}/hdb.pid` from the main process only (bin/run.ts), and the
+ * integration harness always starts nodes with `--ROOTPATH={dataRootDir}`, so this is the
+ * node's process identity. Returns `undefined` while the file is absent — the restart path
+ * unlinks it before relaunching.
+ *
+ * @param {Object} node
+ * @returns {Promise<number|undefined>}
+ */
+export async function readNodePid(node) {
+	const { readFile } = await import('node:fs/promises');
+	const { join } = await import('node:path');
+	if (!node.dataRootDir) throw new Error('node has no dataRootDir; cannot locate its pid file');
+	let contents;
+	try {
+		contents = await readFile(join(node.dataRootDir, 'hdb.pid'), 'utf8');
+	} catch (err) {
+		if (err.code === 'ENOENT') return undefined;
+		throw err;
+	}
+	const pid = Number.parseInt(contents.trim(), 10);
+	return Number.isInteger(pid) ? pid : undefined;
+}
+
+/**
+ * Issue a `restart` operation and wait until the node is genuinely a NEW process.
+ *
+ * `restart` responds immediately and then tears the node down on a timer, so the main
+ * thread keeps answering the operations socket for a moment afterwards. A test that only
+ * polls for health after issuing a restart is therefore answered by the OUTGOING process
+ * and sails straight through a restart that has not happened yet — which both makes the
+ * test vacuous (no cold cache, no reconnect) and lets subsequent writes land in the
+ * shutdown window, where they can be acknowledged and then lost.
+ *
+ * The pid file is the authoritative signal: the restart path unlinks it and the new main
+ * process writes its own pid back. Callers should still poll for readiness afterwards —
+ * the pid appears before the servers are listening.
+ *
+ * @param {Object} node
+ * @param {Object} [opts]
+ * @param {number} [opts.timeoutMs=60000]
+ * @param {number} [opts.pollMs=250]
+ * @returns {Promise<number>} the new main-process pid
+ */
+export async function restartNode(node, { timeoutMs = 60000, pollMs = 250 } = {}) {
+	const previousPid = await readNodePid(node);
+	if (previousPid === undefined) {
+		throw new Error(`node ${node.hostname} has no pid file before restart — it is not running`);
+	}
+	// The response can be lost if the socket closes first; the pid check below is what we trust.
+	await sendOperation(node, { operation: 'restart' }).catch(() => {});
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		await delay(pollMs);
+		const pid = await readNodePid(node);
+		if (pid !== undefined && pid !== previousPid) return pid;
+	}
+	throw new Error(`node ${node.hostname} did not restart within ${timeoutMs}ms (still pid ${previousPid})`);
+}
+
+/**
+ * Terminate whichever Harper process a node is running RIGHT NOW, by pid file.
+ *
+ * `teardownHarper` kills the child handle it spawned, but a node that has been through a
+ * `restart` is a different, detached process — the original handle has already exited, so
+ * teardown finds nothing to kill and the restarted node survives the suite. Any test that
+ * restarts a node must call this before `teardownHarper`, or it leaks a live Harper (and its
+ * ports) into the rest of the CI job.
+ *
+ * @param {Object} node
+ * @param {Object} [opts]
+ * @param {number} [opts.timeoutMs=15000]
+ */
+export async function stopNodeProcess(node, { timeoutMs = 15000 } = {}) {
+	const pid = await readNodePid(node);
+	if (pid === undefined) return; // no pid file: already stopped
+	const isRunning = () => {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	try {
+		process.kill(pid, 'SIGTERM');
+	} catch {
+		return; // already gone
+	}
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (!isRunning()) return;
+		await delay(100);
+	}
+	try {
+		process.kill(pid, 'SIGKILL');
+	} catch {
+		/* raced with its own exit */
+	}
+}
+
+/**
+ * Poll `probe` until it returns a truthy value, and return that value.
+ *
+ * `probe` is handed an AbortSignal that fires at the deadline, so `timeoutMs` bounds the whole
+ * wait rather than only the gaps between polls — a node that accepts the connection but never
+ * answers fails the wait instead of outliving it. Any other probe error propagates immediately.
+ *
+ * @param {(signal: AbortSignal) => unknown} probe - truthy return = satisfied
  * @param {Object} [opts]
  * @param {number} [opts.timeoutMs=120000]
  * @param {number} [opts.pollMs=500]
+ * @param {string|(() => string)} [opts.description] - what is being waited for, for the timeout
+ * message; a function is called at timeout so it can report the probe's last observation
+ * @returns {Promise<*>} the probe's first truthy value
  */
-export async function waitForCatchUp(receiver, source, opts = {}) {
+export async function waitForCondition(probe, opts = {}) {
 	const timeoutMs = opts.timeoutMs ?? 120000;
 	const pollMs = opts.pollMs ?? 500;
-	// Capture source's version threshold up front. Catch-up = receiver's lastReceived
-	// for this connection >= sourceTarget.
-	const sourceStatus = await sendOperation(source, { operation: 'cluster_status' });
-	// We want a version that's been written on `source` (i.e. its own outgoing replication
-	// state). Use the highest `lastReceivedVersion` it tracks across its connections as a
-	// proxy for "writes have flowed through" — or just stamp `Date.now()` if no peers yet.
-	let sourceTarget = 0;
-	for (const conn of sourceStatus.connections ?? []) {
-		for (const sock of conn.database_sockets ?? []) {
-			if (typeof sock.lastReceivedVersion === 'number' && sock.lastReceivedVersion > sourceTarget) {
-				sourceTarget = sock.lastReceivedVersion;
+	const controller = new AbortController();
+	const { signal } = controller;
+	const deadline = setTimeout(() => controller.abort(new Error(`deadline of ${timeoutMs}ms reached`)), timeoutMs);
+	let lastError;
+	try {
+		while (!signal.aborted) {
+			try {
+				const result = await probe(signal);
+				if (result) return result;
+			} catch (error) {
+				if (!signal.aborted) throw error;
+				lastError = error;
 			}
+			if (signal.aborted) break;
+			await delay(pollMs, undefined, { signal }).catch((error) => {
+				if (!signal.aborted) throw error;
+			});
+		}
+	} finally {
+		// aborts requests the probe left in flight, not just the deadline timer
+		controller.abort();
+		clearTimeout(deadline);
+	}
+	const { description } = opts;
+	let what = description ?? 'condition';
+	if (typeof description === 'function') {
+		// a description that throws must not replace the timeout it was meant to explain
+		try {
+			what = description();
+		} catch (error) {
+			what = `condition (description threw: ${error.message})`;
 		}
 	}
-	// If we couldn't infer one, fall back to a wall-clock-ish stamp; replication versions
-	// are timestamp-derived so this is a safe upper bound for "before the test started".
-	if (sourceTarget === 0) sourceTarget = Date.now() - 60_000;
-
-	const sourceHostname = source.hostname;
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		const receiverStatus = await sendOperation(receiver, { operation: 'cluster_status' });
-		const sourceConn = (receiverStatus.connections ?? []).find((c) => (c.url ?? c.name ?? '').includes(sourceHostname));
-		if (sourceConn) {
-			const versions = (sourceConn.database_sockets ?? [])
-				.map((s) => s.lastReceivedVersion)
-				.filter((v) => typeof v === 'number');
-			if (versions.length && Math.min(...versions) >= sourceTarget) return Math.min(...versions);
-		}
-		await delay(pollMs);
-	}
-	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${receiver.hostname} to catch up to ${sourceHostname}`);
+	throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}`, { cause: lastError ?? signal.reason });
 }
 
 /**

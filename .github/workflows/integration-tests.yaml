@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, 'v[0-9]+.[0-9]+']
   pull_request:
+  schedule:
+    - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       node-version:
@@ -17,26 +19,66 @@ on:
           - '24'
           - '26'
 
+# These workflows are dispatched by cherry-pick-patch.yml against a branch built
+# from PR commits, so they run PR-authored build/test scripts. The repo default is
+# a write-scoped token; pin it to read here.
+permissions:
+  contents: read
+
 jobs:
   generate-node-version-matrix:
     name: Generate Node Version Matrix
     runs-on: ubuntu-latest
     outputs:
       node-versions: ${{ steps.set-node-versions.outputs.node-versions }}
+      build-node-versions: ${{ steps.set-node-versions.outputs.build-node-versions }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: 'recursive'
 
       - name: Set Node versions
         id: set-node-versions
+        env:
+          NODE_VERSION_INPUT: ${{ github.event.inputs.node-version }}
         run: |
-          if [ "${{ github.event.inputs.node-version }}" == "all" ] || [ -z "${{ github.event.inputs.node-version }}" ]; then
-            echo "node-versions=[22, 24, 26]" >> $GITHUB_OUTPUT
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # Keep the full PR suites on one representative runtime, but build every supported
+            # runtime for the focused cluster regression job below.
+            echo "node-versions=[24]" >> $GITHUB_OUTPUT
+            echo 'build-node-versions=[22, 24, "26.5.0"]' >> $GITHUB_OUTPUT
+          elif [ "$NODE_VERSION_INPUT" == "all" ] || [ -z "$NODE_VERSION_INPUT" ]; then
+            # TEMPORARY: pinned to 26.5.0 instead of floating "26". The original reason
+            # (harper#2025 — an undici fetch-stall bug breaking analytics.test.mjs,
+            # addNodeLeaderNoMeshLeak.test.mjs, and the Cluster 6/6 shard on Node 26 only) is
+            # resolved upstream as of undici 8.10.0 / Node 26.8.1, and harper#2025 is closed.
+            # The pin stays for a separate, still-open reason: a second Node 26.8.x regression
+            # (mTLS/OCSP revocation checking fails open when the issuer cert is unavailable,
+            # harper#2380) was found and fixed in harper core (HarperFast/harper#2457), but
+            # harper-pro's `core` submodule pointer has not yet caught up to that fix. The
+            # OCSP/CRL/mTLS-revocation suites that exercise this path
+            # (core/integrationTests/security/{ocsp,crl}-verification.test.ts,
+            # subscription-revocation.test.ts) live in that submodule and are not run by any
+            # harper-pro CI workflow, pinned or floating — so there is currently no automated
+            # signal here either way. Bumping `core` past that fix is necessary but not
+            # sufficient: also confirm the OCSP/CRL suites pass against harper-pro's assembled
+            # binary (manually, or by wiring them into a harper-pro workflow) before removing
+            # this pin. Do not remove it on harper#2025's closure, or the core bump, alone.
+            echo "node-versions=[22, 24, \"26.5.0\"]" >> $GITHUB_OUTPUT
+            echo 'build-node-versions=[22, 24, "26.5.0"]' >> $GITHUB_OUTPUT
           else
-            echo "node-versions=[${{ github.event.inputs.node-version }}]" >> $GITHUB_OUTPUT
+            # Manual dispatch intentionally does NOT apply the 26.5.0 pin above: selecting "26"
+            # here floats to the latest 26.x release, for reproducing a suspected Node-26
+            # regression on demand. It does not run the OCSP/CRL suites (see above) — those
+            # live in the `core` submodule and aren't part of this workflow's test globs.
+            if [[ ! "$NODE_VERSION_INPUT" =~ ^(22|24|26)$ ]]; then
+              echo "::error::unsupported Node version '$NODE_VERSION_INPUT'"
+              exit 1
+            fi
+            echo "node-versions=[$NODE_VERSION_INPUT]" >> $GITHUB_OUTPUT
+            echo "build-node-versions=[$NODE_VERSION_INPUT]" >> $GITHUB_OUTPUT
           fi
 
   build:
@@ -47,22 +89,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.node-versions) }}
+        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.build-node-versions) }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: 'recursive'
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
           package-manager-cache: false
+          # A manual workflow_dispatch with node-version: '26' is meant to float to the latest
+          # 26.x release; without this, setup-node would silently prefer whatever 26.x is
+          # already in the runner's tool cache. Scoped to that one floating case so the normal
+          # pinned-version jobs (22, 24, "26.5.0") don't pay an extra manifest lookup every run.
+          check-latest: ${{ matrix.node-version == '26' }}
 
       - name: Install dependencies
-        run: npm install
+        run: .github/scripts/retry.sh "npm install" -- npm install
 
       - name: Build
         run: npm run build || true # we currently have type errors so just ignore that
@@ -79,40 +126,70 @@ jobs:
           retention-days: 1
 
   run-integration-tests:
-    name: Integration Tests ${{matrix.shard}}/4 (Node.js v${{ matrix.node-version }})
+    name: Integration Tests ${{matrix.shard}}/3 (Node.js v${{ matrix.node-version }})
     runs-on: ubuntu-latest
     needs: [generate-node-version-matrix, build]
-    timeout-minutes: 15
+    # 15 + 10: two sequential retry.sh calls (re2 rebuild, harperdb@4 install) can each
+    # burn the full 30/60/90s backoff before succeeding on the last attempt.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.node-versions) }}
-        shard: [1, 2, 3, 4]
+        # Non-cluster is the light tier (~16 single-process files); the heavy cluster
+        # tier (~40 multi-process files) runs in its own job below with more shards.
+        shard: [1, 2, 3]
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: 'recursive'
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node-version }}
           package-manager-cache: false
+          # A manual workflow_dispatch with node-version: '26' is meant to float to the latest
+          # 26.x release; without this, setup-node would silently prefer whatever 26.x is
+          # already in the runner's tool cache. Scoped to that one floating case so the normal
+          # pinned-version jobs (22, 24, "26.5.0") don't pay an extra manifest lookup every run.
+          check-latest: ${{ matrix.node-version == '26' }}
 
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: harper-build-artifacts-node-${{ matrix.node-version }}
 
+      # The artifact-restored node_modules/ already has everything resolved; this only needs to
+      # recreate node_modules/.bin symlinks, so --offline keeps it off the registry entirely.
       - name: Relink bin scripts
-        run: npm install --ignore-scripts
+        run: npm rebuild --ignore-scripts --offline
+
+      # re2 downloads its native binary from a post-install script (unlike lmdb/msgpackr/rocksdb,
+      # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
+      # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
+      - name: Build re2 native binary
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
 
       - name: Install harperdb@4 for legacy tests
         run: |
           mkdir -p /tmp/harperdb-legacy
-          npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+          .github/scripts/retry.sh "npm install harperdb@4" -- npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+
+      # A zero-match glob makes node:test's run() silently collect no tests and exit 0
+      # (a false green). Fail loudly instead if the extglob exclusion ever stops expanding.
+      - name: Guard against empty non-cluster test glob
+        env:
+          PATTERN: 'integrationTests/!(cluster)/**/*.test.*s'
+        run: |
+          count=$(node -e "console.log(require('node:fs').globSync(process.env.PATTERN).length)")
+          echo "non-cluster test files matched: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::non-cluster glob '$PATTERN' matched 0 files on $(node --version) — the extglob exclusion is not expanding, so this job would run no tests."
+            exit 1
+          fi
 
       - name: Run Integration Test Shard ${{ matrix.shard }}
         env:
@@ -123,13 +200,164 @@ jobs:
           # many run at once on CI runners, starving each other into shard timeouts.
           HARPER_INTEGRATION_TEST_CONCURRENCY: '2'
         run: |
-          npm run test:integration:all -- --shard=${{ matrix.shard }}/4
+          npm run test:integration:non-cluster -- --shard=${{ matrix.shard }}/3
 
       - name: Upload Harper server logs
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: harper-server-logs-node-${{ matrix.node-version }}-shard-${{ matrix.shard }}
+          path: /tmp/harper-integration-test-logs/
+          retention-days: 3
+          if-no-files-found: ignore
+
+  run-copy-gap-runtime-regression:
+    name: Copy-gap Runtime Regression (Node.js v${{ matrix.node-version }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [generate-node-version-matrix, build]
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.build-node-versions) }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          package-manager-cache: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harper-build-artifacts-node-${{ matrix.node-version }}
+
+      - name: Relink bin scripts
+        run: npm rebuild --ignore-scripts --offline
+
+      - name: Build re2 native binary
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
+
+      - name: Install harperdb@4 for legacy tests
+        run: |
+          mkdir -p /tmp/harperdb-legacy
+          .github/scripts/retry.sh "npm install harperdb@4" -- npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+
+      - name: Guard copy-gap regression path
+        env:
+          TEST_FILE: integrationTests/cluster/copyGapCursorBanking.test.mjs
+        run: |
+          if [ ! -f "$TEST_FILE" ]; then
+            echo "::error::copy-gap regression file '$TEST_FILE' does not exist — this job would run no tests."
+            exit 1
+          fi
+          if ! grep -Fq 'Copy-cursor banking across repeated transient blob faults (#699)' "$TEST_FILE"; then
+            echo "::error::copy-gap regression case is missing from '$TEST_FILE' — this job would run without its intended test."
+            exit 1
+          fi
+
+      - name: Run copy-gap runtime regression
+        env:
+          HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
+          HARPER_LEGACY_VERSION_PATH: /tmp/harperdb-legacy/node_modules/harperdb
+        run: npm run test:integration -- integrationTests/cluster/copyGapCursorBanking.test.mjs
+
+      - name: Upload Harper server logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harper-copy-gap-logs-node-${{ matrix.node-version }}
+          path: /tmp/harper-integration-test-logs/
+          retention-days: 3
+          if-no-files-found: ignore
+
+  run-cluster-tests:
+    name: Cluster Integration Tests ${{matrix.shard}}/6 (Node.js v${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    needs: [generate-node-version-matrix, build]
+    # 15 + 10: two sequential retry.sh calls (re2 rebuild, harperdb@4 install) can each
+    # burn the full 30/60/90s backoff before succeeding on the last attempt.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.node-versions) }}
+        # Heavy tier: ~40 files each booting 2–4 Harper processes — more shards than
+        # the non-cluster job to keep per-shard wall-clock and timeout headroom sane.
+        shard: [1, 2, 3, 4, 5, 6]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          package-manager-cache: false
+          # A manual workflow_dispatch with node-version: '26' is meant to float to the latest
+          # 26.x release; without this, setup-node would silently prefer whatever 26.x is
+          # already in the runner's tool cache. Scoped to that one floating case so the normal
+          # pinned-version jobs (22, 24, "26.5.0") don't pay an extra manifest lookup every run.
+          check-latest: ${{ matrix.node-version == '26' }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harper-build-artifacts-node-${{ matrix.node-version }}
+
+      # The artifact-restored node_modules/ already has everything resolved; this only needs to
+      # recreate node_modules/.bin symlinks, so --offline keeps it off the registry entirely.
+      - name: Relink bin scripts
+        run: npm rebuild --ignore-scripts --offline
+
+      # re2 downloads its native binary from a post-install script (unlike lmdb/msgpackr/rocksdb,
+      # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
+      # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
+      - name: Build re2 native binary
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
+
+      - name: Install harperdb@4 for legacy tests
+        run: |
+          mkdir -p /tmp/harperdb-legacy
+          .github/scripts/retry.sh "npm install harperdb@4" -- npm install --ignore-scripts --prefix /tmp/harperdb-legacy harperdb@4
+
+      - name: Guard against empty cluster test glob
+        env:
+          PATTERN: 'integrationTests/cluster/**/*.test.*s'
+        run: |
+          count=$(node -e "console.log(require('node:fs').globSync(process.env.PATTERN).length)")
+          echo "cluster test files matched: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::cluster glob '$PATTERN' matched 0 files on $(node --version) — this job would run no tests."
+            exit 1
+          fi
+
+      - name: Run Cluster Integration Test Shard ${{ matrix.shard }}
+        env:
+          HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
+          HARPER_LEGACY_VERSION_PATH: /tmp/harperdb-legacy/node_modules/harperdb
+          # Cap concurrent test files at 2: several multi-node replication suites
+          # run heavy clusters, and the default (availableParallelism/2+1) let too
+          # many run at once on CI runners, starving each other into shard timeouts.
+          HARPER_INTEGRATION_TEST_CONCURRENCY: '2'
+        run: |
+          npm run test:integration:cluster -- --shard=${{ matrix.shard }}/6
+
+      - name: Upload Harper server logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harper-cluster-server-logs-node-${{ matrix.node-version }}-shard-${{ matrix.shard }}
           path: /tmp/harper-integration-test-logs/
           retention-days: 3
           if-no-files-found: ignore

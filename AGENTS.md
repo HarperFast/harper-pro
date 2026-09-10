@@ -24,6 +24,7 @@ When that setting is absent, git treats the git data dir as its own work tree; t
 git operations for every agent until manually repaired.
 
 If `.git/modules/core/config` is ever recreated from scratch it **must** contain:
+
 ```
 [core]
     worktree = ../../../core
@@ -50,7 +51,9 @@ npm run lint:required      # quiet — for CI
 # Tests
 npm run test:unit                  # mocha unit tests (fast, no server — build first)
 npm run test:integration
-npm run test:integration:all   # all *.test.ts in integrationTests/
+npm run test:integration:all           # all *.test.ts in integrationTests/
+npm run test:integration:cluster       # only integrationTests/cluster/ (heaviest, multi-node)
+npm run test:integration:non-cluster   # everything except integrationTests/cluster/
 
 # Submodule
 npm run core:sync              # sync core submodule to its pinned commit
@@ -99,6 +102,8 @@ When a feature spans both, prefer landing as much as possible in `core/` and glu
 
 - **`integrationTests/`** — end-to-end, runs full Harper instances. `run.mjs` is the custom test harness with shard support. Subdirs mirror source (`analytics/`, `cloneNode/`, `cluster/`, `licensing/`, `security/`).
 - **`unitTests/`** — mocha unit tests (`npm run test:unit`). `testUtils.js` (mock helpers, db reset), `setupTestApp.mjs` (in-memory app scaffold), `unitTestSetup.cjs` (env bootstrap required before ESM module load).
+- **Restarting a node in an integration test**: never `restart` + poll for health. The operation returns immediately and the outgoing process keeps answering the operations socket while it tears down, so a health poll is satisfied by the node you just asked to die — the test then runs against a node that never restarted, and its writes can land in the shutdown window. Use `restartNode()` from `integrationTests/cluster/clusterShared.mjs`, which waits for the pid file to change, and pair it with `stopNodeProcess()` before `teardownHarper` (teardown only kills the child handle it spawned, which a restarted node no longer is).
+- **Waiting for replication in an integration test**: never compare two nodes' `lastReceivedVersion` values. It is a per-(database, peer) _inbound_ watermark, so a source-side value and a receiver-side value are not the same measurement, and how far one link can advance depends on which origin logs that link carries — which no operation reports. (Comparing a receiver's watermark against a _target version_ is fine and is what `cloneNode/syncMonitor.ts` does with the leader's `last_updated_record`.) For peer-to-peer catch-up, poll your own records (count, tag, key) with `waitForCondition()` from `integrationTests/cluster/clusterShared.mjs`; it bounds the whole wait, handing the probe an AbortSignal that fires at the deadline, so a node that accepts the connection and never answers fails instead of hanging. `sendOperation(node, op, { signal })` takes that signal.
 
 ### Pro non-source
 

@@ -24,6 +24,48 @@ So `bench-runner-supervisor.sh` polls each repo for a queued job targeting the
 most one job runs at a time across all repos** — strictly serial by construction, so the
 numbers stay comparable and there's no lock to manage.
 
+## Nightly fire order
+
+Four workflows across two repos share the host. Their crons are spaced an hour apart so they
+normally fire, and therefore drain, in this order:
+
+| UTC        | Repo       | Workflow                  | Measured run |
+| ---------- | ---------- | ------------------------- | ------------ |
+| `20 6`     | harper-pro | `stress-large-data`       | 11-26 min    |
+| `20 7`     | harper-pro | `ycsb-cluster-nightly`    | 22-30 min    |
+| `20 8`     | harper     | `perf-benchmarks-nightly` | 36-39 min    |
+| `20 9` Mon | harper     | `large-deploy-test`       | 2-4 min      |
+
+Rows 3 and 4 are set in `HarperFast/harper`, not here. Sized so the whole sequence is off the host before the working day: the last slot ends by
+about 10:00 UTC normally, against an 11:00 UTC deadline (05:00 MDT / 04:00 MST). The host is
+somebody's desktop, and desktop contention lands in the numbers.
+
+**The order is advisory, not enforced.** Nothing declares a dependency between these
+workflows — the spacing just exceeds each job's measured runtime by a wide margin. Three
+things can break it, all worth knowing before reading a gap in the trend data as a
+regression:
+
+- **A job overrunning its slot.** `drain_one` blocks, and each poll pass checks `harper-pro`
+  then `harper`, so harper-pro is favoured only at the _start_ of a pass: a harper job that
+  queues while a long harper-pro job is draining is picked up as soon as that drain returns,
+  before the loop comes back round to harper-pro. If `stress-large-data` were still running
+  when `perf-benchmarks-nightly` fires, the night could drain 1 → 3 → 2 → 4. That needs the
+  first slot to take over two hours against a measured ceiling of 26 minutes, so it has not
+  been observed.
+- **GitHub's scheduler delay, which is unbounded.** On 2026-08-27 every scheduled workflow in
+  harper-pro fired about 3 hours late and `ycsb-cluster-nightly` ran until 13:57 UTC. Nothing
+  in these crons defends against that.
+- **DST.** The crons are UTC and do not follow it. The bound above holds year-round, but local
+  times shift: `20 6` is 00:20 MDT and 23:20 MST, so from November through March the first
+  slot starts the previous evening, when the desktop is likelier to be in use.
+
+A reordered night still collects every trend point, just out of order. A run can be lost
+outright, though: a queued run GitHub never places is auto-cancelled after 24 hours. That is
+what happened between 2026-08-09 10:12 UTC and 2026-08-10 10:13 UTC, when the supervisor was
+down — one `ycsb-cluster-nightly` run was cancelled and the next night's `stress-large-data`
+waited 3h45 for a runner. Nothing alarms on this; check the host if a night is missing
+entirely.
+
 ## Prerequisites
 
 - Docker, and `gh` authenticated as a **repo admin on every served repo** (to mint

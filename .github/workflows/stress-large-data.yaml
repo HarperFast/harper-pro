@@ -30,8 +30,9 @@ on:
           - 'large-catchup'
           - 'large-clone'
   schedule:
-    # 06:00 UTC nightly (midnight MDT)
-    - cron: '0 6 * * *'
+    # :20 avoids GitHub's top-of-the-hour scheduler backlog. Slot order, local times and how
+    # the sequence degrades: benchmarks/ycsb/runner/README.md.
+    - cron: '20 6 * * *'
 
 # The `harper-bench` self-hosted box is shared with ycsb-cluster-nightly.yml. GitHub
 # concurrency groups are repo-scoped and matched by name across workflows, so using the
@@ -48,16 +49,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: 'recursive'
       - name: Setup Node.js ${{ inputs.node-version || '24' }}
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version || '24' }}
           package-manager-cache: false
       - name: Install dependencies
-        run: npm install
+        run: .github/scripts/retry.sh "npm install" -- npm install
       - name: Build
         run: npm run build || true
       - name: Upload build artifacts
@@ -91,11 +92,11 @@ jobs:
               name: ${{ (inputs.test-filter == 'large-catchup') && 'large-clone' || '' }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: 'recursive'
       - name: Setup Node.js ${{ inputs.node-version || '24' }}
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version || '24' }}
           package-manager-cache: false
@@ -103,8 +104,16 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: harper-large-stress-build-${{ inputs.node-version || '24' }}
+      # The artifact-restored node_modules/ already has everything resolved; this only needs to
+      # recreate node_modules/.bin symlinks, so --offline keeps it off the registry entirely
+      # (a registry 5xx here previously killed the nightly before any test ran, gh#630).
       - name: Relink bin scripts
-        run: npm install --ignore-scripts
+        run: npm rebuild --ignore-scripts --offline
+      # re2 downloads its native binary from a post-install script (unlike lmdb/msgpackr/rocksdb,
+      # which bundle prebuilds), so --ignore-scripts above leaves it absent. Materialize it here.
+      # This does touch the network (GitHub releases, not the npm registry), so retry on blips.
+      - name: Build re2 native binary
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
       - name: Run ${{ matrix.test.name }}
         env:
           HARPER_RUN_STRESS_TESTS: '1'

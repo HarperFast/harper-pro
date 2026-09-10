@@ -77,13 +77,13 @@ jobs:
           private-key: ${{ secrets.HARPERFAST_AI_APP_PRIVATE_KEY }}
 
       - name: Checkout harper-pro
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Checkout component (${{ matrix.repo }}@${{ matrix.ref }})
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ matrix.repo }}
           ref: ${{ matrix.ref }}
@@ -91,7 +91,7 @@ jobs:
           path: smokeTests/.components/${{ matrix.dir }}
 
       - name: Setup Node.js ${{ env.NODE_VERSION }}
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false

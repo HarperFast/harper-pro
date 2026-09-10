@@ -18,6 +18,7 @@
 import { expect } from 'chai';
 import {
 	abortInFlightBlobsOnClose,
+	abortLateBlobReceiveAfterClose,
 	isReplicationConnectionClosedError,
 	isUnrecoverableSourceBlobError,
 	isPermanentSourceBlobErrorCode,
@@ -32,6 +33,21 @@ const makeStream = () => {
 };
 
 describe('abortInFlightBlobsOnClose — re-request in-flight blobs on connection close', () => {
+	it('aborts a receive attached after close, but preserves live and fully buffered receives', () => {
+		const late = makeStream();
+		expect(abortLateBlobReceiveAfterClose(true, late, 'peer-node', 'blob-late')).to.equal(true);
+		expect(isReplicationConnectionClosedError(late.destroyedWith)).to.equal(true);
+
+		const live = makeStream();
+		expect(abortLateBlobReceiveAfterClose(false, live, 'peer-node', 'blob-live')).to.equal(false);
+		expect(live.destroyedWith).to.equal(undefined);
+
+		const buffered = makeStream();
+		buffered.writableEnded = true;
+		expect(abortLateBlobReceiveAfterClose(true, buffered, 'peer-node', 'blob-buffered')).to.equal(false);
+		expect(buffered.destroyedWith).to.equal(undefined);
+	});
+
 	it('destroys every in-flight stream, empties the map, and returns the count', () => {
 		const a = makeStream();
 		const b = makeStream();

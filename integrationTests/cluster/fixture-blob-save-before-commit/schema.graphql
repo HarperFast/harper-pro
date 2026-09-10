@@ -1,0 +1,5 @@
+type SbcLocation @table @export {
+	id: Long @primaryKey
+	name: String @indexed
+	image: Blob
+}
