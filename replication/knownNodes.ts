@@ -1135,13 +1135,17 @@ export function routeEntriesIncludePeer(
 }
 
 /**
- * The multi-hop dedup exclusion qualifier: true when `node`'s registry row advertises that it
- * delivers its own writes to `peerName` for `databaseName` — full replication, a blanket
- * directional `sends`, a `sendsTo` entry covering peer+database, or a matching subscription.
- * Excluding an origin that does NOT deliver to the subscriber directly drops its records
- * entirely (the #370/#399 leading-dup-skip family), so every branch must prove direct delivery;
- * conversely a directional peer that DOES qualify must be excluded, or every subscriber receives
- * its writes once per mesh member and a restart replays that fan-out squared.
+ * The ADVERTISED half of the multi-hop dedup exclusion decision: true when `node`'s registry row
+ * advertises that it delivers its own writes to `peerName` for `databaseName` (full replication, a
+ * blanket directional `sends`, a `sendsTo` entry covering peer+database, or a matching explicit
+ * subscription) with no advertised table exclusions on the matching entries. This is one input,
+ * never the decision: the row says what the origin intends, not what this node's configuration
+ * accepts, so subscriptionManager.computeExclusionOrigins ANDs it with the effective local receive
+ * decision (shouldReplicateFromNode, config-route precedence) and the local receivesFrom coverage.
+ * Excluding an origin that does NOT deliver to the subscriber directly drops its records entirely
+ * (the #370/#399 leading-dup-skip family); conversely a directional peer that DOES qualify must be
+ * excluded, or every subscriber receives its writes once per mesh member and a restart replays that
+ * fan-out squared.
  */
 export function qualifiesForMultiHopExclusion(
 	node: Partial<NodeRecord> | null | undefined,
@@ -1161,13 +1165,14 @@ export function qualifiesForMultiHopExclusion(
 	);
 	if (!authorized) return false;
 
-	// Authorization is not coverage. The sender derives its excludeTables from `sendsTo`
-	// INDEPENDENTLY of `sends` (see sendExcludedTables in replicationConnection.ts) and skips
-	// matching records unconditionally, so a matching entry carrying exclusions means the direct
-	// path omits those tables however the rest of the row reads — a blanket `sends` does not
-	// cancel a separate entry's filter. Excluding the origin would drop those tables from the
-	// relay as well and they would reach us by neither path, so keep relay delivery when coverage
-	// is partial.
+	// Authorization is not coverage. The sender skips excluded tables unconditionally, deriving
+	// the skip from its OWN config route to us first and falling back to this row's sendsTo (see
+	// sendExcludedTables in replicationConnection.ts), so the entry set it filters on is not
+	// necessarily this array; exclusions advertised here are the part we can see, and a matching
+	// entry carrying them means the direct path omits those tables however the rest of the row
+	// reads (a blanket `sends` does not cancel a separate entry's filter). Excluding the origin
+	// would drop those tables from the relay as well and they would reach us by neither path, so
+	// keep relay delivery when advertised coverage is partial.
 	return !getExcludedTablesForRouteEntries(directional?.sendsTo, peerName, databaseName);
 }
 

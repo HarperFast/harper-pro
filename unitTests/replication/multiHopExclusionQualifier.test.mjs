@@ -1,7 +1,8 @@
 /**
- * Coverage for `qualifiesForMultiHopExclusion` — the predicate behind the `SUBSCRIPTION_UPDATE
- * excludeNodes` multi-hop dedup exclusion (both the initial excluded-list build and the dynamic
- * hdb_nodes-event updater in replicationConnection.ts).
+ * Coverage for `qualifiesForMultiHopExclusion`, the ADVERTISED-intent half of the multi-hop dedup
+ * exclusion decision. The full decision is owned by subscriptionManager.computeExclusionOrigins,
+ * which ANDs this predicate with the effective local receive decision (shouldReplicateFromNode)
+ * and the local receivesFrom coverage; workers only apply the resulting set.
  *
  * Background: the qualifier previously tested only `replicates === true || replicates?.sends`, so
  * a directional peer (`{ sendsTo: [...] }`, no `.sends` — every config-route peer and add_node
