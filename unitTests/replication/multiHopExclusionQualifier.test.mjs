@@ -104,4 +104,68 @@ describe('qualifiesForMultiHopExclusion', () => {
 			expect(qualifiesForMultiHopExclusion({ subscriptions: [{ database: 'redirects' }] }, PEER, DB)).to.equal(false);
 		});
 	});
+
+	/**
+	 * Authorization is not coverage. A `sendsTo` entry authorizes a database; the sender then
+	 * derives `sendExcludedTables` from that same `sendsTo` array — independently of `sends` — and
+	 * skips matching records unconditionally. So an origin whose matching entry carries exclusions
+	 * does NOT deliver its full log to us, and excluding it would drop those tables from the relay
+	 * path too: they would arrive by neither route. Keep relay delivery when coverage is partial.
+	 */
+	describe('table coverage on the delivering entry', () => {
+		it('does not qualify a sendsTo entry that excludes tables', () => {
+			const node = { replicates: { sendsTo: [{ target: PEER, database: DB, excludeTables: ['T'] }] } };
+			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(false);
+		});
+		it('does not qualify a broadcast entry that excludes tables', () => {
+			const node = { replicates: { sendsTo: [{ database: DB, excludeTables: ['T'] }] } };
+			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(false);
+		});
+		it('a blanket sends does NOT cancel a separate entry filter', () => {
+			// The sender computes sendExcludedTables from sendsTo whether or not `sends` is set, so a
+			// blanket flag cannot be read as full coverage when an entry narrows this peer+database.
+			const node = { replicates: { sends: true, sendsTo: [{ target: PEER, database: DB, excludeTables: ['T'] }] } };
+			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(false);
+		});
+		it('a blanket sends with no entries is full coverage', () => {
+			expect(qualifiesForMultiHopExclusion({ replicates: { sends: true } }, PEER, DB)).to.equal(true);
+		});
+		it('still qualifies when a matching entry carries no exclusions', () => {
+			const node = {
+				replicates: {
+					sendsTo: [{ target: 'other-node', database: DB, excludeTables: ['T'] }, { target: PEER, database: DB }],
+				},
+			};
+			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(true);
+		});
+		it('ignores exclusions scoped to another database', () => {
+			const node = {
+				replicates: {
+					sendsTo: [{ target: PEER, database: 'redirects', excludeTables: ['T'] }, { target: PEER, database: DB }],
+				},
+			};
+			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(true);
+		});
+		it('unions exclusions across every matching entry', () => {
+			const node = {
+				replicates: { sendsTo: [{ target: PEER, database: DB }, { target: PEER, database: DB, excludeTables: ['T'] }] },
+			};
+			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(false);
+		});
+		it('does not throw on a null element beside a matching entry', () => {
+			// routeEntriesIncludePeer tolerates a malformed element and keeps going; the exclusion
+			// lookup must too, or consulting both on one array throws where the auth gate accepted it.
+			expect(qualifiesForMultiHopExclusion({ replicates: { sendsTo: [PEER, null] } }, PEER, DB)).to.equal(true);
+			expect(
+				qualifiesForMultiHopExclusion({ replicates: { sendsTo: [{ target: PEER, database: DB }, null] } }, PEER, DB)
+			).to.equal(true);
+			expect(
+				qualifiesForMultiHopExclusion(
+					{ replicates: { sendsTo: [null, { target: PEER, database: DB, excludeTables: ['T'] }] } },
+					PEER,
+					DB
+				)
+			).to.equal(false);
+		});
+	});
 });

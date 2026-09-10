@@ -1081,6 +1081,12 @@ export function getExcludedTablesForRouteEntries(
 	if (!entries) return null;
 	let excluded: Set<string> | null = null;
 	for (const entry of entries) {
+		// Tolerate a malformed null/undefined element, exactly as routeEntriesIncludePeer does.
+		// Without this the two disagree on what a list contains: the authorization gate skips the
+		// element and keeps going, while this threw on `null.target`. Any caller that consults both
+		// on the same array then crashes on a list the other half accepted — including the send-side
+		// `sendExcludedTables` computation in replicationConnection.ts.
+		if (!entry) continue;
 		if (typeof entry === 'string') continue;
 		const entryPeer = entry.target ?? entry.source;
 		if ((!entryPeer || entryPeer === peerName) && (!entry.database || entry.database === databaseName)) {
@@ -1132,13 +1138,26 @@ export function qualifiesForMultiHopExclusion(
 	databaseName: string
 ): boolean {
 	const replicates = node?.replicates;
+	// The boolean form carries no route entries, so there is nothing that could narrow it.
 	if (replicates === true) return true;
 	const directional = typeof replicates === 'object' ? replicates : undefined;
-	return !!(
+
+	// Does the row authorize delivering this database to us at all?
+	const authorized = !!(
 		directional?.sends ||
 		routeEntriesIncludePeer(directional?.sendsTo, peerName, databaseName) ||
 		node?.subscriptions?.some((sub) => (sub.database || sub.schema) === databaseName && sub.subscribe !== false)
 	);
+	if (!authorized) return false;
+
+	// Authorization is not coverage. The sender derives its excludeTables from `sendsTo`
+	// INDEPENDENTLY of `sends` (see sendExcludedTables in replicationConnection.ts) and skips
+	// matching records unconditionally, so a matching entry carrying exclusions means the direct
+	// path omits those tables however the rest of the row reads — a blanket `sends` does not
+	// cancel a separate entry's filter. Excluding the origin would drop those tables from the
+	// relay as well and they would reach us by neither path, so keep relay delivery when coverage
+	// is partial.
+	return !getExcludedTablesForRouteEntries(directional?.sendsTo, peerName, databaseName);
 }
 
 /**
