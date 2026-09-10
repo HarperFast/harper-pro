@@ -32,6 +32,14 @@ describe('qualifiesForMultiHopExclusion', () => {
 		it('qualifies a blanket directional sends', () => {
 			expect(qualifiesForMultiHopExclusion({ replicates: { sends: true } }, PEER, DB)).to.equal(true);
 		});
+		it('qualifies replicates true with leftover NATS subscriptions', () => {
+			// A row carrying both fields is treated as full replication everywhere: subscriptionManager
+			// strips subscriptions before building any subscription payload ("they are just there for
+			// NATS"), so the direct path such a row drives is the whole database log, never the
+			// subscription list. The qualifier must agree, or NATS-migrated meshes lose exclusion.
+			const node = { replicates: true, subscriptions: [{ database: DB, table: 'one-table', subscribe: true }] };
+			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(true);
+		});
 		it('does not qualify replicates false or absent', () => {
 			expect(qualifiesForMultiHopExclusion({ replicates: false }, PEER, DB)).to.equal(false);
 			expect(qualifiesForMultiHopExclusion({}, PEER, DB)).to.equal(false);
