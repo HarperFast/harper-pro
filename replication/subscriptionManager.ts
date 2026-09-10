@@ -13,6 +13,7 @@ import {
 	forEachReplicatedDatabase,
 	unsubscribeFromNode,
 	forceReconnectToNode,
+	updateExclusionOrigins,
 } from './replicator.ts';
 import { getThisNodeName, getThisNodeUrl } from '../core/server/nodeName.ts';
 import { parentPort } from 'worker_threads';
@@ -21,6 +22,8 @@ import {
 	getHDBNodeTable,
 	iterateRoutes,
 	shouldReplicateFromNode,
+	qualifiesForMultiHopExclusion,
+	getExcludedTablesForRouteEntries,
 	getReplicationSharedStatus,
 	clearReplicationSharedStatus,
 	type Route,
@@ -539,6 +542,86 @@ export function getConfiguredRoutes(): Route[] {
 }
 
 /**
+ * The origins whose logs a relay peer may be told to omit for `databaseName`: this node receives them
+ * directly, with full table coverage, so relayed copies are pure duplicates. Owned HERE because only the
+ * main thread has the effective per-origin configuration: `routes` lives in this module, and
+ * shouldReplicateFromNode gives a config route's receives/receivesFrom precedence over the origin's
+ * advertised sends/sendsTo (harper-pro#498). The http workers never decide this themselves; they apply
+ * the set carried on the subscribe-to-node payload and the update-exclusion-origins messages (see
+ * scheduleExclusionOriginsBroadcast), and with no set supplied they exclude nothing: redundant relay
+ * delivery is a duplicate, a wrong exclusion is silent data loss.
+ *
+ * An origin qualifies only when ALL of:
+ *  - the effective local receive decision accepts a direct subscription (shouldReplicateFromNode over
+ *    the payload-shaped node, configRouteReplicates attached the same way onDatabase does);
+ *  - the origin's own row advertises delivering this database to us with no table exclusions
+ *    (qualifiesForMultiHopExclusion; the sender derives its send-side skip from its own view, which we
+ *    cannot read, so its advertised row is the conservative proxy for send coverage);
+ *  - our receive-side filter drops nothing from it (routeReplicates.receivesFrom excludeTables; those
+ *    tables arrive on the direct path and are discarded, so the relay copy is the only real delivery).
+ */
+export function computeExclusionOrigins(databaseName: string): string[] {
+	const thisNodeName = getThisNodeName();
+	const origins: string[] = [];
+	if (!thisNodeName) return origins;
+	for (const node of getHDBNodeTable().search([])) {
+		if (!node.name || node.name === thisNodeName) continue;
+		const matchingRoute = routes.find((r) => r.name === node.name);
+		const routeReplicates =
+			typeof matchingRoute?.replicates === 'object'
+				? matchingRoute.replicates
+				: node.replicates && typeof node.replicates === 'object'
+					? node.replicates
+					: null;
+		const configRouteReplicates = matchingRoute ? matchingRoute.replicates : undefined;
+		if (!shouldReplicateFromNode({ ...node, routeReplicates, configRouteReplicates } as any, databaseName)) continue;
+		if (!qualifiesForMultiHopExclusion(node, thisNodeName, databaseName)) continue;
+		if (getExcludedTablesForRouteEntries(routeReplicates?.receivesFrom, node.name, databaseName)) continue;
+		origins.push(node.name);
+	}
+	return origins;
+}
+
+// Re-derive the exclusion-origin set for every database with a live subscription entry and push it to
+// the owning workers. Coalesced through a timer because one hdb_nodes write often arrives as several
+// onNodeUpdate calls (and startup replays every row); the recompute reads current state, so the last
+// broadcast wins. Worker application is a diff against the connection's last-sent list, so repeated
+// identical sets are no-ops on the wire.
+let exclusionBroadcastScheduled = false;
+function scheduleExclusionOriginsBroadcast() {
+	if (exclusionBroadcastScheduled) return;
+	exclusionBroadcastScheduled = true;
+	const timer = setTimeout(() => {
+		exclusionBroadcastScheduled = false;
+		try {
+			const originsByDatabase = new Map<string, string[]>();
+			// One message per (worker, database): application is database-wide on the worker, so
+			// entries for different peer URLs on the same worker would repeat identical work.
+			const notifiedByTarget = new Map<any, Set<string>>();
+			for (const dbReplicationWorkers of connectionReplicationMap.values()) {
+				for (const [databaseName, entry] of dbReplicationWorkers) {
+					const target = entry.worker ?? updateExclusionOrigins;
+					let notified = notifiedByTarget.get(target);
+					if (!notified) notifiedByTarget.set(target, (notified = new Set()));
+					if (notified.has(databaseName)) continue;
+					notified.add(databaseName);
+					let origins = originsByDatabase.get(databaseName);
+					if (!origins) originsByDatabase.set(databaseName, (origins = computeExclusionOrigins(databaseName)));
+					const message = { type: 'update-exclusion-origins', database: databaseName, origins };
+					if (entry.worker) entry.worker.postMessage(message);
+					else updateExclusionOrigins(message);
+				}
+			}
+		} catch (error) {
+			// Never let a malformed registry row or a torn-down worker throw out of a main-thread
+			// timer; a missed broadcast only leaves the last-sent set in effect (duplicates at worst).
+			logger.error('Error broadcasting exclusion-origin update', error);
+		}
+	}, 0);
+	timer.unref?.();
+}
+
+/**
  * Derive a node's OWN hdb_nodes `replicates` record from its config routes. Instead of a blanket
  * `replicates: true` (which advertises a full mesh), produce a DIRECTIONAL record so that when the
  * `system` database is replicated for discovery the record propagates cluster-wide and the existing
@@ -713,6 +796,10 @@ export async function startOnMainThread(options) {
 	// many databases doesn't open all their catchup connections in one tick. Only the stale-worker
 	// reconcile passes it; normal node updates leave it undefined and keep the flat NODE_SUBSCRIBE_DELAY.
 	function onNodeUpdate(node, hostname = node?.name, forceResubscribe = false, subscribeStagger?: { count: number }) {
+		// Any row change (including a delete) can flip an origin's exclusion eligibility for any
+		// database. Deferred through a timer, so it reads the map state after this call's own
+		// subscribe/unsubscribe bookkeeping has been applied.
+		scheduleExclusionOriginsBroadcast();
 		const isSelf =
 			(getThisNodeName() && hostname === getThisNodeName()) || (getThisNodeUrl() && node?.url === getThisNodeUrl());
 		if (isSelf) {
@@ -984,6 +1071,9 @@ export async function startOnMainThread(options) {
 						type: 'subscribe-to-node',
 						database: databaseName,
 						nodes,
+						// Computed at send time so the worker's initial excludeNodes list reflects the
+						// current registry, not the state when this subscribe was scheduled.
+						exclusionOrigins: computeExclusionOrigins(databaseName),
 					};
 					if (worker) {
 						worker.postMessage(request);
@@ -1177,15 +1267,17 @@ export async function startOnMainThread(options) {
 		const worker = httpWorkers[nextWorkerIndex++];
 		// not enumerable property, we don't want this to be serialized in the postMessage
 		Object.defineProperty(node, 'worker', { value: worker, configurable: true });
+		const request = {
+			url: getNodeURL(connectingNode),
+			name: connectingNode.name,
+			type: 'subscribe-to-node',
+			database,
+			nodes: [node],
+			exclusionOrigins: computeExclusionOrigins(database),
+		};
 		if (worker) {
-			worker.postMessage({
-				url: getNodeURL(connectingNode),
-				name: connectingNode.name,
-				type: 'subscribe-to-node',
-				database,
-				nodes: [node],
-			});
-		} else subscribeToNode({ url: getNodeURL(connectingNode), name: connectingNode.name, database, nodes: [node] });
+			worker.postMessage(request);
+		} else subscribeToNode(request);
 	}
 	// Read the per-(database, node) replication progress out of the process-shared status buffer the owning
 	// worker writes (the same buffer cluster_status reports from). Used by findStalledReceivingNodeUrls to
@@ -1586,6 +1678,12 @@ if (parentPort) {
 		// subscribe followed by an unsubscribe must apply in that order (else the deferred subscribe
 		// would run after the unsubscribe and re-open a connection the main thread already removed).
 		whenWorkerComponentsLoaded().then(() => unsubscribeFromNode(message));
+	});
+	onMessageByType('update-exclusion-origins', (message) => {
+		// Same component-load gate as subscribe-to-node so an update can never race ahead of the
+		// subscribe that creates the connection it targets; applying to a connection that doesn't
+		// exist yet would silently drop the set (the subscribe carries its own copy anyway).
+		whenWorkerComponentsLoaded().then(() => updateExclusionOrigins(message));
 	});
 	onMessageByType('force-reconnect-node', (message) => {
 		// Reconcile-driven recovery for a connected:true / Receiving / no-progress stall. Acts on an

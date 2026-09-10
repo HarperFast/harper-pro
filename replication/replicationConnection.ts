@@ -73,7 +73,6 @@ import {
 	getExcludedTablesForRouteEntries,
 	getConfigRouteReplicates,
 	routeEntriesIncludePeer,
-	qualifiesForMultiHopExclusion,
 	resolveNodeForSendAuth,
 	isGenuineNodeDeletion,
 	SEND_AUTH_UNCHANGED,
@@ -2886,6 +2885,10 @@ export class NodeReplicationConnection extends EventEmitter {
 	// two paths never both arm a connect() for the same drop — see forceReconnect / harper-pro#420.
 	reconnectScheduled = false;
 	nodeSubscriptions?: NodeSubscription[];
+	// Main-thread-computed multi-hop exclusion set for this database (subscriptionManager's
+	// computeExclusionOrigins), carried on subscribe-to-node and refreshed by
+	// update-exclusion-origins; the session reads it when building SUBSCRIPTION_REQUEST.
+	exclusionOrigins?: string[];
 	latency = 0;
 	replicateTablesByDefault: boolean;
 	session: any; // this is a promise that resolves to the session object, which is the object that handles the replication
@@ -3070,6 +3073,7 @@ export class NodeReplicationConnection extends EventEmitter {
 				}
 			}
 			this.removeAllListeners('subscriptions-updated');
+			this.removeAllListeners('exclusion-origins-updated');
 
 			if (intentional) {
 				this.isFinished = true;
@@ -3182,6 +3186,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		// would otherwise leak one 'subscriptions-updated' listener per recovery cycle (eventually a
 		// MaxListenersExceededWarning). The fresh connect re-registers its own. See harper-pro#420.
 		this.removeAllListeners('subscriptions-updated');
+		this.removeAllListeners('exclusion-origins-updated');
 		const socket = this.socket;
 		// Retire the superseded session now, not when the replacement socket arrives: this path recovers a
 		// wedged-but-open socket, so its keepalive would keep refreshing shared liveness (masking an
@@ -6604,7 +6609,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
-		if (hdbNodesSubscription) hdbNodesSubscription.end();
 		// Wake queued blob senders and writer waits so they observe wsClosed instead of parking forever
 		while (blobSentCallbacks.length > 0) blobSentCallbacks.shift()?.();
 		for (const callbacks of blobFileSentCallbacks.values()) {
@@ -7211,7 +7215,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		}
 		return localBlob;
 	}
-	let hdbNodesSubscription;
 	let lastSentExcludedNodes: string[] = [];
 	function sendSubscriptionRequestUpdate() {
 		// once we have received the node name, and we know the database name that this connection is for,
@@ -7220,51 +7223,31 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			subscribed = true;
 			options.connection?.on('subscriptions-updated', sendSubscriptionRequestUpdate);
 
-			// Subscribe to hdbNodesTable changes to dynamically update excluded nodes
+			// Apply recomputed exclusion-origin sets pushed from the main thread (subscriptionManager's
+			// update-exclusion-origins broadcast on hdb_nodes changes). The set is authoritative: diff it
+			// against what this session last sent and update the peer both directions. This worker never
+			// derives eligibility from hdb_nodes rows itself; it has no view of the effective per-origin
+			// config (harper-pro#498).
 			if (options.connection) {
-				getHDBNodeTable()
-					.subscribe({})
-					.then(async (subscription) => {
-						hdbNodesSubscription = subscription;
-						for await (const event of subscription) {
-							if (event.type === 'delete') {
-								// Node was removed, no action needed on excluded list
-								continue;
-							}
-
-							const node = event.value;
-							const nodeName = event.id;
-							const thisNodeName = getThisNodeName();
-
-							if (nodeName === thisNodeName || !nodeName) continue;
-
-							// Check if this node delivers to us directly, so relays of its log can be suppressed
-							const qualifies = qualifiesForMultiHopExclusion(node, thisNodeName, databaseName);
-
-							// Get current state of excluded nodes based on last sent list
-							const currentlyExcluded = lastSentExcludedNodes.includes(nodeName);
-
-							// Determine if we should exclude this node
-							const shouldExclude =
-								qualifies && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName);
-
-							if (shouldExclude && !currentlyExcluded) {
-								// Need to add to excluded list (exclude this node's log)
-								logger.debug?.(connectionId, 'sending subscription update to exclude node:', nodeName);
-								ws.send(encode([SUBSCRIPTION_UPDATE, { excludeNodes: [nodeName] }]));
-								lastSentExcludedNodes.push(nodeName);
-							} else if (!shouldExclude && currentlyExcluded) {
-								// Need to remove from excluded list (include this node's log)
-								logger.debug?.(connectionId, 'sending subscription update to include node:', nodeName);
-								ws.send(encode([SUBSCRIPTION_UPDATE, { includeNodes: [nodeName] }]));
-								const index = lastSentExcludedNodes.indexOf(nodeName);
-								if (index !== -1) lastSentExcludedNodes.splice(index, 1);
-							}
-						}
-					})
-					.catch((error) => {
-						logger.error?.(connectionId, 'Error subscribing to hdb_nodes for dynamic exclusion updates:', error);
-					});
+				options.connection.on('exclusion-origins-updated', (origins: string[]) => {
+					const shouldExclude = new Set(
+						[getThisNodeName(), ...(origins || [])].filter(
+							(nodeName) =>
+								nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
+						)
+					);
+					const excludeNodes = [...shouldExclude].filter((nodeName) => !lastSentExcludedNodes.includes(nodeName));
+					const includeNodes = lastSentExcludedNodes.filter((nodeName) => !shouldExclude.has(nodeName));
+					if (excludeNodes.length) {
+						logger.debug?.(connectionId, 'sending subscription update to exclude nodes:', excludeNodes);
+						ws.send(encode([SUBSCRIPTION_UPDATE, { excludeNodes }]));
+					}
+					if (includeNodes.length) {
+						logger.debug?.(connectionId, 'sending subscription update to include nodes:', includeNodes);
+						ws.send(encode([SUBSCRIPTION_UPDATE, { includeNodes }]));
+					}
+					if (excludeNodes.length || includeNodes.length) lastSentExcludedNodes = [...shouldExclude];
+				});
 			}
 		}
 		if (options.connection?.isFinished)
@@ -7514,26 +7497,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			};
 		});
 		let excluded: string[];
-		// Build excluded nodes list for each subscription - should include all other qualified nodes we're subscribing to
+		// Build the excluded-origins list for this subscription: our own log, plus the origins the main
+		// thread determined we receive directly with full coverage (subscriptionManager's
+		// computeExclusionOrigins, carried on the subscribe-to-node payload). This worker must not decide
+		// from hdb_nodes rows itself: the advertised sendsTo is not the effective receive decision, which
+		// needs the config routes only the main thread has (harper-pro#498). With no set supplied we
+		// exclude nothing beyond ourselves: redundant relay delivery is recoverable, a wrong exclusion
+		// silently drops the origin's records.
 		if (nodeSubscriptions) {
-			const hdbNodesTable = getHDBNodeTable();
-			const thisNodeName = getThisNodeName();
-			const allDirectlySubscribedNodes: string[] = [thisNodeName];
-
-			// Collect all qualified nodes from hdb_nodes table
-			for (const hdbNode of hdbNodesTable.search([])) {
-				if (hdbNode.name && hdbNode.name !== thisNodeName) {
-					// Check if this node delivers to us directly for this database
-					const qualifies = qualifiesForMultiHopExclusion(hdbNode, thisNodeName, databaseName);
-					if (qualifies) {
-						allDirectlySubscribedNodes.push(hdbNode.name);
-					}
-				}
-			}
-
-			// Set excluded list for each subscription (all other qualified nodes except itself)
-			excluded = allDirectlySubscribedNodes.filter(
-				(nodeName) => !nodeSubscriptions.some((subscription) => nodeName === subscription.name)
+			const exclusionOrigins: string[] = options.connection?.exclusionOrigins || [];
+			excluded = [...new Set([getThisNodeName(), ...exclusionOrigins])].filter(
+				(nodeName) => nodeName && !nodeSubscriptions.some((subscription) => nodeName === subscription.name)
 			);
 		}
 
