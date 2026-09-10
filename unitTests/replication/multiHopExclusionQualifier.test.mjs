@@ -90,26 +90,26 @@ describe('qualifiesForMultiHopExclusion', () => {
 	});
 
 	describe('subscription rows', () => {
-		it('qualifies an explicit subscription for the database', () => {
-			const node = { subscriptions: [{ database: DB, subscribe: true }] };
-			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(true);
-		});
-		it('honors the legacy schema field', () => {
-			const node = { subscriptions: [{ schema: DB, subscribe: true }] };
-			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(true);
-		});
-		it('does not qualify subscribe: false or another database', () => {
-			expect(qualifiesForMultiHopExclusion({ subscriptions: [{ database: DB, subscribe: false }] }, PEER, DB)).to.equal(
+		// A subscription-driven direct path carries ONLY the listed tables (replicateByDefault flips
+		// off when node.subscriptions is present), so no subscription row shape proves full-database
+		// direct delivery, and none may justify excluding the origin's whole log from a relay.
+		it('never qualifies a subscription row, whatever its shape', () => {
+			expect(qualifiesForMultiHopExclusion({ subscriptions: [{ database: DB, subscribe: true }] }, PEER, DB)).to.equal(
+				false
+			);
+			expect(qualifiesForMultiHopExclusion({ subscriptions: [{ schema: DB, subscribe: true }] }, PEER, DB)).to.equal(
 				false
 			);
 			expect(
-				qualifiesForMultiHopExclusion({ subscriptions: [{ database: 'redirects', subscribe: true }] }, PEER, DB)
+				qualifiesForMultiHopExclusion(
+					{ subscriptions: [{ database: DB, table: 'only-this-table', subscribe: true }] },
+					PEER,
+					DB
+				)
 			).to.equal(false);
-		});
-		it('does not qualify an absent subscribe, matching isExplicitDatabaseSubscription', () => {
-			// The eligibility gate (shouldReplicateFromNode -> isExplicitDatabaseSubscription) requires a
-			// truthy subscribe, so a bare { database } row proves no direct subscription. Excluding on it
-			// would drop the origin from the relay with no direct path in place.
+			expect(qualifiesForMultiHopExclusion({ subscriptions: [{ database: DB, subscribe: false }] }, PEER, DB)).to.equal(
+				false
+			);
 			expect(qualifiesForMultiHopExclusion({ subscriptions: [{ database: DB }] }, PEER, DB)).to.equal(false);
 			expect(
 				qualifiesForMultiHopExclusion({ replicates: false, subscriptions: [{ database: DB }] }, PEER, DB)
@@ -145,7 +145,10 @@ describe('qualifiesForMultiHopExclusion', () => {
 		it('still qualifies when a matching entry carries no exclusions', () => {
 			const node = {
 				replicates: {
-					sendsTo: [{ target: 'other-node', database: DB, excludeTables: ['T'] }, { target: PEER, database: DB }],
+					sendsTo: [
+						{ target: 'other-node', database: DB, excludeTables: ['T'] },
+						{ target: PEER, database: DB },
+					],
 				},
 			};
 			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(true);
@@ -153,16 +156,32 @@ describe('qualifiesForMultiHopExclusion', () => {
 		it('ignores exclusions scoped to another database', () => {
 			const node = {
 				replicates: {
-					sendsTo: [{ target: PEER, database: 'redirects', excludeTables: ['T'] }, { target: PEER, database: DB }],
+					sendsTo: [
+						{ target: PEER, database: 'redirects', excludeTables: ['T'] },
+						{ target: PEER, database: DB },
+					],
 				},
 			};
 			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(true);
 		});
 		it('unions exclusions across every matching entry', () => {
 			const node = {
-				replicates: { sendsTo: [{ target: PEER, database: DB }, { target: PEER, database: DB, excludeTables: ['T'] }] },
+				replicates: {
+					sendsTo: [
+						{ target: PEER, database: DB },
+						{ target: PEER, database: DB, excludeTables: ['T'] },
+					],
+				},
 			};
 			expect(qualifiesForMultiHopExclusion(node, PEER, DB)).to.equal(false);
+		});
+		it('tolerates a non-array sendsTo, matching routeEntriesIncludePeer', () => {
+			// Routes come from unvalidated YAML and rows from peers; a non-array must read as "no
+			// entries" in both helpers, not throw on the subscribe/failover path.
+			expect(
+				qualifiesForMultiHopExclusion({ replicates: { sends: true, sendsTo: { target: PEER } } }, PEER, DB)
+			).to.equal(true);
+			expect(qualifiesForMultiHopExclusion({ replicates: { sendsTo: 'not-an-array' } }, PEER, DB)).to.equal(false);
 		});
 		it('does not throw on a null element beside a matching entry', () => {
 			// routeEntriesIncludePeer tolerates a malformed element and keeps going; the exclusion

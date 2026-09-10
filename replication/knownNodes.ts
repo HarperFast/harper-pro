@@ -1089,7 +1089,9 @@ export function getExcludedTablesForRouteEntries(
 	peerName: string,
 	databaseName: string
 ): Set<string> | null {
-	if (!entries) return null;
+	// Array.isArray, matching routeEntriesIncludePeer: entries come from unvalidated YAML routes
+	// and peer-advertised rows, and a non-array here must not throw on the subscribe/failover path.
+	if (!Array.isArray(entries)) return null;
 	let excluded: Set<string> | null = null;
 	for (const entry of entries) {
 		// Tolerate a malformed null/undefined element, exactly as routeEntriesIncludePeer does.
@@ -1137,8 +1139,9 @@ export function routeEntriesIncludePeer(
 /**
  * The ADVERTISED half of the multi-hop dedup exclusion decision: true when `node`'s registry row
  * advertises that it delivers its own writes to `peerName` for `databaseName` (full replication, a
- * blanket directional `sends`, a `sendsTo` entry covering peer+database, or a matching explicit
- * subscription) with no advertised table exclusions on the matching entries. This is one input,
+ * blanket directional `sends`, or a `sendsTo` entry covering peer+database) with no advertised
+ * table exclusions on the matching entries. Subscription rows never qualify: a subscription-driven
+ * direct path carries only the listed tables, not the database log. This is one input,
  * never the decision: the row says what the origin intends, not what this node's configuration
  * accepts, so subscriptionManager.computeExclusionOrigins ANDs it with the effective local receive
  * decision (shouldReplicateFromNode, config-route precedence) and the local receivesFrom coverage.
@@ -1157,12 +1160,13 @@ export function qualifiesForMultiHopExclusion(
 	if (replicates === true) return true;
 	const directional = typeof replicates === 'object' ? replicates : undefined;
 
-	// Does the row authorize delivering this database to us at all?
-	const authorized = !!(
-		directional?.sends ||
-		routeEntriesIncludePeer(directional?.sendsTo, peerName, databaseName) ||
-		isExplicitDatabaseSubscription(node?.subscriptions, databaseName)
-	);
+	// Does the row authorize delivering this database to us at all? Subscription rows are
+	// deliberately NOT an authorization branch: when node.subscriptions drives the direct path,
+	// the outbound table list is built from ONLY the listed tables (replicateByDefault flips off,
+	// see the node.subscriptions branch in replicateOverWS), so a subscription-driven direct path
+	// never carries the whole database log and can never justify excluding the origin's log from
+	// a relay, whether or not an entry is table-scoped.
+	const authorized = !!(directional?.sends || routeEntriesIncludePeer(directional?.sendsTo, peerName, databaseName));
 	if (!authorized) return false;
 
 	// Authorization is not coverage. The sender skips excluded tables unconditionally, deriving
