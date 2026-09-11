@@ -1,13 +1,21 @@
-# Cross-model review-coverage check (report mode: informational, never blocks).
-# Parses the PR description with the dispatch human-review gate's own parser and reports
-# how many cross-model reviews it names, plus the Human-Review-Need footer state — so
-# coverage is visible at PR open/edit time, before the fleet's review runs. `edited` is a
-# trigger because reporting coverage is a description edit, which moves no commit sha.
-# Policy lives in HarperFast/dispatch (skills/pr-shepherd/SKILL.md, dispatch/lib/reviewGate.mjs);
-# the action is hosted in harper (below). Flipping to `mode: enforce` is a team policy decision.
+# Cross-model review-coverage check: the action parses the PR description with the dispatch
+# human-review gate's own parser, gates on how many cross-model reviews the `Review-Coverage:`
+# footer names, and reports the Human-Review-Need footer state without gating on it. Policy lives
+# in HarperFast/dispatch. The action's public copy lives in HarperFast/harper because GitHub does
+# not let a public repo consume an action hosted in a private one, so every other repo pins it by
+# sha; Renovate takes the tracked ref from the trailing `# main` and needs one bare token there,
+# skipping the pin as an unversioned reference when prose follows the sha.
+#
+# NEVER add a checkout step. On pull_request_target the workflow definition and the pinned action
+# both come from trusted refs, and the job reads only the event payload — one slip to
+# `ref: ...head.sha` would run arbitrary PR code with the base repo's token. Coverage needs no
+# working tree, so there is nothing here that wants one. Same rule as companion-check.yaml.
+#
+# format_mode stays off — coverage only, no PR-files artifact — and `edited` stays in the trigger
+# list because the Review-Coverage footer arrives as a description edit, which moves no sha.
 name: review-coverage
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, edited, synchronize, reopened, ready_for_review]
 permissions:
   contents: read
@@ -20,10 +28,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # the action's public home is the harper repo (GitHub bars public repos from
-      # using private-repo actions); org policy requires full-sha pinning — renovate
-      # bumps this toward harper main and renovate.json automerges digest bumps, so `mode`
-      # is set here rather than inherited from whatever default that sha carries.
-      - uses: HarperFast/harper/.github/actions/review-coverage@b3a12113e9a7dd9aab0218d51a17fde8af1ab22e # main
+      - uses: HarperFast/harper/.github/actions/review-coverage@61c53b040a5b51a190218ee6d9bcd7751d7d9db0 # main
         with:
-          mode: report
+          mode: enforce
