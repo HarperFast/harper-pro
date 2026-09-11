@@ -16,11 +16,15 @@ export const MINIMUM_PROTOCOL_VERSION = 1;
 export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
 
 /**
- * Level at which a peer applies replicated record-lock control entries (harper-pro#438, W9 Phase 1).
- * The send path never forwards a control entry to a peer below it, and a peer below it in a
- * database's replication group makes cluster-scoped `lock()` fail closed there.
+ * Cluster record locks, VERSIONED and mutually exclusive: a node advertises exactly one level, and a
+ * peer at a different level is not a lock participant at all. Level 1 was the Ricart–Agrawala rule
+ * (harper#2498 before its replacement); it never shipped enabled and no node advertises it. Level 2
+ * is amortized per-record ownership — delegation request/grant/recall over unicast operations, with
+ * only the release on the replicated log. A cluster running two levels would have two independent
+ * arbiters for one key, which is why `peerSupportsRecordLocks` requires this level exactly rather
+ * than "at least 1".
  */
-export const RECORD_LOCKS_CAPABILITY = 1;
+export const RECORD_LOCKS_CAPABILITY = 2;
 
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
@@ -38,6 +42,18 @@ function resolveLevel(value: unknown, localLevel: number, absentLevel: number): 
 	return Math.min(localLevel, Math.max(absentLevel, Math.floor(level)));
 }
 
+/**
+ * A level that is compared for EQUALITY rather than "at least": coerced and floored like a level,
+ * but never min-clamped to what this build implements. Clamping would fold a future level-3 peer
+ * down to 2 and admit it to the ring as a supported participant, defeating the mutual exclusion the
+ * `recordLocks` level exists for.
+ */
+function resolveExactLevel(value: unknown, absentLevel: number): number {
+	const level = Number(value);
+	if (Number.isNaN(level)) return absentLevel;
+	return Math.max(absentLevel, Math.floor(level));
+}
+
 /** Does NOT coerce, unlike a level, and is never min-clamped: see the kind table in DESIGN.md. */
 function resolveBudget(value: unknown): number | undefined {
 	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
@@ -49,13 +65,13 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		protocolVersion: resolveLevel(bag?.protocolVersion, LOCAL_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION),
 		subscriptionSetupAck: resolveLevel(bag?.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY, 0),
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
-		recordLocks: resolveLevel(bag?.recordLocks, RECORD_LOCKS_CAPABILITY, 0),
+		recordLocks: resolveExactLevel(bag?.recordLocks, 0),
 	});
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
 export function peerSupportsRecordLocks(resolved: ResolvedPeerCapabilities): boolean {
-	return resolved.recordLocks >= RECORD_LOCKS_CAPABILITY;
+	return resolved.recordLocks === RECORD_LOCKS_CAPABILITY;
 }
 
 /** A peer that advertised nothing — the pre-registry baseline. */
@@ -66,6 +82,18 @@ export const ABSENT_PEER_CAPABILITIES: ResolvedPeerCapabilities = resolvePeerCap
  * when `replicationConnection.ts` loads. Deriving it behind this module's import graph would let an
  * earlier importer evaluate it before config loads and silently advertise a default-derived budget.
  */
+/**
+ * The `recordLocks` level this node ADVERTISES — the only thing a peer can act on. A node whose bag
+ * is suppressed (the test's `HARPER_TEST_OMIT_REPLICATION_CAPABILITIES`, or any future path that sends
+ * no bag) advertises 0 even with the feature enabled, and must then treat itself as a non-member too:
+ * every peer will exclude it from their ring while it would still include itself, and two nodes
+ * computing different rings for one key is the two-arbiter hazard the versioned level exists to
+ * prevent. The transport's `epoch()` withholds unless this is exactly `RECORD_LOCKS_CAPABILITY`.
+ */
+export function advertisedRecordLocksLevel(recordLocksEnabled: boolean, bagOmitted: boolean): number {
+	return recordLocksEnabled && !bagOmitted ? RECORD_LOCKS_CAPABILITY : 0;
+}
+
 export function buildLocalCapabilities(
 	subscriptionSetupBudgetMs: number,
 	recordLocksEnabled: boolean
@@ -75,7 +103,7 @@ export function buildLocalCapabilities(
 		subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 		subscriptionSetupBudgetMs,
 		// A node that has not enabled cluster locks never grants, so it must not claim it would.
-		recordLocks: recordLocksEnabled ? RECORD_LOCKS_CAPABILITY : 0,
+		recordLocks: advertisedRecordLocksLevel(recordLocksEnabled, false),
 	});
 }
 

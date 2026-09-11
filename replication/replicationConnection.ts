@@ -5541,7 +5541,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 												excludeLogs: excludedNodes,
 												snapshot: false,
 											})) {
-												oldestRetainedTime = entry.localTime ?? entry.version;
+												oldestRetainedTime = entry.txnLogKey ?? entry.localTime ?? entry.version;
 												break;
 											}
 											if (
@@ -5827,7 +5827,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 											snapshot: false, // don't want to use a snapshot, and we want to see new entries
 										});
 									for (const auditRecord of auditLogIterable) {
-										const key: number = auditRecord.localTime ?? auditRecord.version;
+										const key: number = auditRecord.txnLogKey ?? auditRecord.localTime ?? auditRecord.version;
 										if (closed) return;
 										logger.debug?.('sending audit record', key, auditRecord.recordId);
 										if (tables?.test)

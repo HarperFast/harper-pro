@@ -263,9 +263,15 @@ describe('resolvePeerCapabilities — recordLocks is a level that fails closed w
 		assert.strictEqual(peerSupportsRecordLocks(registryOnly), false);
 	});
 
-	it('is supported exactly when the peer advertises at least the level this build implements', () => {
-		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: 1 })), true);
+	it('is supported exactly when the peer advertises the level this build implements, and no other', () => {
+		assert.strictEqual(
+			peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: RECORD_LOCKS_CAPABILITY })),
+			true
+		);
 		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities(buildLocalCapabilities(1, true))), true);
+		// Level 1 was Ricart–Agrawala. A peer still advertising it is a different arbiter, not a slower
+		// one, so it is not a lock participant at all — versions are mutually exclusive, not ordered.
+		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: 1 })), false);
 		for (const advertised of [0, -1, 0.5, false, '0', null, undefined, {}, 'yes', NaN]) {
 			assert.strictEqual(
 				peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: advertised })),
@@ -275,8 +281,10 @@ describe('resolvePeerCapabilities — recordLocks is a level that fails closed w
 		}
 	});
 
-	it('never reports a level above the one this build implements', () => {
-		assert.strictEqual(resolvePeerCapabilities({ recordLocks: 7 }).recordLocks, RECORD_LOCKS_CAPABILITY);
+	it('keeps a level above the one this build implements, and treats it as a different arbiter', () => {
+		// Not clamped: folding 7 down to 2 would admit a future-level peer to the ring as supported.
+		assert.strictEqual(resolvePeerCapabilities({ recordLocks: 7 }).recordLocks, 7);
+		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: 7 })), false);
 	});
 
 	it('is advertised only by a node that has enabled cluster record locks', () => {

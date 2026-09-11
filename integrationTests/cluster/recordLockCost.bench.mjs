@@ -69,7 +69,9 @@ function optionsFor(hostname, replication) {
 			threads: { count: 1 },
 			replication,
 		},
-		env: { HARPER_NO_FLUSH_ON_EXIT: true },
+		// The static epoch is withheld for six minutes after start; a freshly started bench node has no
+		// previous incarnation to protect, so lift the hold as the cluster suite does.
+		env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_RECORD_LOCK_RESTART_HOLD_MS: '0' },
 	};
 }
 

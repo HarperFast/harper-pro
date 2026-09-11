@@ -1,39 +1,57 @@
 /**
- * The harper-pro side of cluster-wide record locks (harper-pro#438, W9 Phase 1 of harper#483).
+ * The harper-pro side of cluster-wide record locks (harper-pro#438, W9 Phase 1 of harper#483), for
+ * the amortized-ownership protocol in harper `docs/record-lock-ownership.md`.
  *
- * Core owns the Ricart–Agrawala coordinator and both ends of the wire: it writes its control entries
- * to the table's own transaction log, and its replicated-event sink applies a received entry in the
- * same apply loop that commits the data records ahead of it. What core cannot know is topology, and
- * that is all this module supplies:
+ * Core owns the coordinator: the home ring, the delegation table, recall-and-drain, fencing tokens,
+ * and the one control entry (`lockRelease`) that still rides the table's own transaction log. What
+ * core cannot know is topology and the wire, and that is what this module supplies:
  *
- * - `participants(database)`: every member of the database's replication group, each with whether
- *   it advertised `recordLocks` — the mixed-version gate. Over-inclusion costs a 423 or a 503;
- *   omission is the two-holder case, so direction (send-only / receive-only) is deliberately ignored.
+ * - `epoch(database)`: the membership a key's home is derived from — every member of the database's
+ *   replication group that advertised the delegation level of `recordLocks`, plus this node, sorted.
+ *   **This is a STATIC epoch**: number 1, never advanced, not agreed. It is the first of the note's
+ *   two steps (§9 "static owner"), and it is enough for the ring to be deterministic and for one
+ *   arbiter per key to hold. What it cannot do is the note's §4: advance across a restart so a
+ *   previous incarnation's delegations are invalidated outright. Until harper-pro#825 lands the
+ *   durable, agreed epoch, that obligation (`ClusterLockTransport.epoch` in core) is met the blunt
+ *   way — `epoch()` returns undefined for `DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS` after process
+ *   start, so this node grants nothing as a home until anything it granted before could have expired.
+ *   That also blocks this node's own locks on keys homed elsewhere for the same window; it is the
+ *   cost of a static epoch, and #825 removes it.
+ * - `homeIncarnation`: a durable, monotonic counter bumped once per process start and persisted on
+ *   this node's own `hdb_nodes` row (`recordLockIncarnation`). Core orders fencing tokens on it, so a
+ *   random value would not do (§5.1). Workers read it from the `hdb_nodes` mirror; until the bump has
+ *   propagated `epoch()` withholds rather than issue tokens under an incarnation that may not exceed
+ *   the previous process's.
+ * - `requestDelegation` / `recallDelegation`: unicast operations over the existing replication
+ *   connections (`recordLockRpc.ts`).
  * - `ownsCoordination()`: whether this worker thread is the one the main thread assigned to the
  *   database. Coordinator state is per thread while the key lock it arbitrates is process-wide, so
- *   exactly one thread may run rounds, and it must be the thread whose sockets apply the database's
+ *   exactly one thread may coordinate, and it must be the thread whose sockets apply the database's
  *   inbound entries — `subscriptionManager` places every (peer, database) subscription on the owner.
- *   Ownership is conferred by message rather than derived from `workerIndex` (an overlapping
- *   replacement worker starts with the index of the worker it replaces) and moves only when the
- *   owner has exited: a live owner may still hold keys, and core's release, expiry and deferred-grant
- *   paths do not consult ownership, so revoking a live owner would leave its holds arbitrated by
- *   nobody while a fresh coordinator granted the same keys.
+ *   Ownership is conferred by message rather than derived from `workerIndex` and moves only when the
+ *   owner has exited: a live owner still holds delegations and grants.
  *
  * The capability a peer advertised is kept in the per-(database, peer) shared status buffer so the
- * owner can read it for a peer whose socket lives on another thread (an inbound-only peer), and so a
- * peer that is briefly down does not flip `lock()` between 423 and 503.
+ * owner can read it for a peer whose socket lives on another thread, and so a peer that is briefly
+ * down does not flip membership.
  *
  * With `replication.recordLocks` off (the default) every replicated database gets a transport that
  * fails closed instead, so a cluster-scoped `lock()` reports the missing enablement rather than
  * quietly arbitrating on this node alone.
  */
 import { parentPort } from 'node:worker_threads';
+import { performance } from 'node:perf_hooks';
 import { getWorkerIndex, onMessageByType, whenThreadsStarted, workers } from '../core/server/threads/manageThreads.js';
 import {
+	DELEGATION_LEASE_MS,
+	LOCK_LEASE_SKEW_MS,
 	registerClusterLockTransport,
 	unregisterClusterLockTransport,
 	type ClusterLockTransport,
-	type LockParticipant,
+	type DelegationRecall,
+	type DelegationReply,
+	type DelegationRequest,
+	type LockEpoch,
 } from '../core/resources/recordLockCoordinator.ts';
 import { getDatabases } from '../core/resources/databases.ts';
 import { server } from '../core/server/Server.ts';
@@ -41,9 +59,25 @@ import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
-import { getReplicationSharedStatus } from './knownNodes.ts';
+import { getHDBNodeTable, getReplicationSharedStatus } from './knownNodes.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { RECORD_LOCKS_CAPABILITY, advertisedRecordLocksLevel } from './protocolCapabilities.ts';
+import {
+	DELEGATE_OPERATION,
+	RECALL_OPERATION,
+	sendRecordLockOperation,
+	setRecordLockOwnershipReaders,
+} from './recordLockRpc.ts';
+import { ensureNode } from './subscriptionManager.ts';
+
+/** The static epoch's number. Never advanced; harper-pro#825 replaces the whole epoch. */
+export const STATIC_EPOCH_NUMBER = 1;
+/** How long after process start this node withholds its epoch. See the module comment. */
+export const RESTART_HOLD_MS = DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS;
+/** How long a derived epoch is reused before membership is re-read. */
+export const EPOCH_MEMO_MS = 250;
+const processStartMono = performance.now();
 
 // Slot 13 of the 16-slot per-(database, peer) status buffer (`getReplicationSharedStatus`); 0..12 are
 // taken, 13..15 were documented headroom.
@@ -94,15 +128,35 @@ export interface RecordLockTransportDeps {
 	shard(): unknown;
 	/** Any table's auditStore for the database, which is what keys the shared status buffers. */
 	auditStore(database: string): any;
-	/** When the outbound link to the peer went down per the W1 truth slots, or undefined while up. */
-	downSince(status: Float64Array): number | undefined;
 	ownsDatabase(database: string): boolean;
+	/** This node's persisted `recordLockIncarnation`, or 0 while unknown. */
+	homeIncarnation(): number;
+	/** Whether the bag this node actually sends claims the delegation level. See `advertisedRecordLocksLevel`. */
+	advertisesLevel(): boolean;
+	/** Monotonic ms since process start; `epoch()` withholds until `restartHoldMs` has elapsed. */
+	sinceStartMs(): number;
+	restartHoldMs: number;
+	send(nodeName: string, database: string, operation: any): Promise<any>;
 }
 
-/** Pure over its dependencies so the participant derivation is unit-testable without a cluster. */
+/** FNV-1a over the sorted member list, so two nodes with the same set compute the same ringVersion. */
+function ringVersionOf(members: string[]): number {
+	let hash = 0x811c9dc5;
+	for (const member of members) {
+		for (let i = 0; i < member.length; i++) {
+			hash ^= member.charCodeAt(i);
+			hash = Math.imul(hash, 0x01000193);
+		}
+		hash ^= 0xff;
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return hash >>> 0;
+}
+
+/** Pure over its dependencies so the epoch derivation is unit-testable without a cluster. */
 export function createRecordLockTransport(database: string, deps: RecordLockTransportDeps): ClusterLockTransport {
-	// The shared buffer for a (database, peer) is stable for the process, and core reads the grant
-	// set fresh on every acquire, so the views are cached rather than re-resolved per call.
+	// The shared buffer for a (database, peer) is stable for the process, and core reads the epoch
+	// fresh on every acquire, so the views are cached rather than re-resolved per call.
 	const statusViews = new Map<string, Float64Array>();
 	let statusViewsStore: any;
 	const statusFor = (auditStore: any, peer: string): Float64Array => {
@@ -114,12 +168,28 @@ export function createRecordLockTransport(database: string, deps: RecordLockTran
 		if (!status) statusViews.set(peer, (status = getReplicationSharedStatus(auditStore, database, peer)));
 		return status;
 	};
+	// core reads the epoch on every acquisition that misses a live delegation; a full hdb_nodes scan,
+	// a sort and a hash per call is the hot-path cost the design forbids. The membership is invariant
+	// between changes, so the derived epoch is reused for a short window — staleness here only delays
+	// how quickly this node notices a ring change, which the static epoch cannot make safe anyway.
+	let memo: { at: number; epoch: LockEpoch } | undefined;
 	return {
-		participants(): LockParticipant[] {
+		epoch(): LockEpoch | undefined {
+			// A previous incarnation of this process may still have delegations admitting on their
+			// holders, and a static epoch cannot invalidate them by advancing. Withhold until they could
+			// have expired. harper-pro#825 replaces this with an agreed epoch that does advance.
+			const now = deps.sinceStartMs();
+			if (now < deps.restartHoldMs) return undefined;
+			if (memo && now - memo.at < EPOCH_MEMO_MS) return memo.epoch;
+			// A node its peers exclude from their rings must not include itself in its own: it would
+			// self-home keys the peers home elsewhere, which is two arbiters for one key.
+			if (!deps.advertisesLevel()) return undefined;
+			const homeIncarnation = deps.homeIncarnation();
+			// Tokens must be orderable across restarts; an incarnation that has not yet been bumped and
+			// propagated could sit below the previous process's, so no token is issued under it.
+			if (!(homeIncarnation > 0)) return undefined;
 			const self = deps.thisNodeName();
-			// Core skips this node; listing it keeps a lone node's set non-empty so its rounds complete at
-			// once with an empty grant set instead of failing closed on "unknown participant set".
-			const participants: LockParticipant[] = [{ nodeId: self, capable: true }];
+			const members = [self];
 			const replicationDatabases = deps.replicationDatabases();
 			const shard = deps.shard();
 			const auditStore = deps.auditStore(database);
@@ -127,19 +197,42 @@ export function createRecordLockTransport(database: string, deps: RecordLockTran
 				const name = node?.name;
 				if (typeof name !== 'string' || name === self) continue;
 				if (!isReplicationGroupMember(node, database, replicationDatabases, shard)) continue;
-				const participant: LockParticipant = { nodeId: name, capable: false };
-				if (auditStore) {
-					const status = statusFor(auditStore, name);
-					// Never learned reads as unsupported: the gate fails closed until the peer has said so itself.
-					participant.capable = readPeerLockCapability(status) === LOCK_CAPABILITY_SUPPORTED;
-					participant.downSince = deps.downSince(status);
-				}
-				participants.push(participant);
+				// Never learned reads as not a member: the ring fails closed until the peer has said so
+				// itself, and a peer at another level is a different arbiter, not a slower one.
+				if (!auditStore || readPeerLockCapability(statusFor(auditStore, name)) !== LOCK_CAPABILITY_SUPPORTED) continue;
+				members.push(name);
 			}
-			return participants;
+			members.sort();
+			const epoch: LockEpoch = {
+				number: STATIC_EPOCH_NUMBER,
+				members,
+				ringVersion: ringVersionOf(members),
+				homeIncarnation,
+			};
+			memo = { at: now, epoch };
+			return epoch;
 		},
 		ownsCoordination(): boolean {
 			return deps.ownsDatabase(database);
+		},
+		requestDelegation(node: string, db: string, table: string, request: DelegationRequest): Promise<DelegationReply> {
+			return deps.send(node, db, {
+				operation: DELEGATE_OPERATION,
+				database: db,
+				table,
+				key: request.key,
+				epoch: request.epoch,
+				leaseMs: request.leaseMs,
+			});
+		},
+		async recallDelegation(node: string, db: string, table: string, recall: DelegationRecall): Promise<void> {
+			await deps.send(node, db, {
+				operation: RECALL_OPERATION,
+				database: db,
+				table,
+				key: recall.key,
+				token: recall.token,
+			});
 		},
 	};
 }
@@ -149,17 +242,20 @@ export const RECORD_LOCKS_DISABLED_MESSAGE =
 
 /**
  * Registered while `replication.recordLocks` is off: `ownsCoordination` is true so core reaches the
- * participant set, which refuses — a 503 naming the switch instead of the off-owner retry advice —
- * and a received entry is ignored as coming from no known participant, so this node never grants.
+ * epoch, which refuses — a 503 naming the switch instead of the off-owner retry advice — and a
+ * received request or entry finds no epoch, so this node never grants.
  */
 export function createDisabledRecordLockTransport(): ClusterLockTransport {
+	const disabled = () => Promise.reject(new Error(RECORD_LOCKS_DISABLED_MESSAGE));
 	return {
-		participants(): LockParticipant[] {
+		epoch(): LockEpoch | undefined {
 			throw new Error(RECORD_LOCKS_DISABLED_MESSAGE);
 		},
 		ownsCoordination(): boolean {
 			return true;
 		},
+		requestDelegation: disabled,
+		recallDelegation: disabled,
 	};
 }
 
@@ -188,13 +284,34 @@ function auditStoreFor(database: string): any {
 	return undefined;
 }
 
-let downSinceReader: (status: Float64Array) => number | undefined = () => undefined;
+/** Kept for `replicator.ts`, which installs it; the delegation transport no longer reads liveness. */
+export function setConnectionDownSinceReader(_reader: (status: Float64Array) => number | undefined): void {}
+
 /**
- * Installed by `replicator.ts`, which already imports the connection module; importing it here would
- * close a cycle through the connection module's own import of this one.
+ * This node's persisted home incarnation, read from its OWN `hdb_nodes` row. Not from `server.nodes`:
+ * that mirror deliberately excludes the local node (`knownNodes.ts` filters `getThisNodeName()` out
+ * on every path), so a read there is 0 forever and `epoch()` would be withheld for the life of the
+ * process. A point read per call until the bump has landed, then cached — the value changes only
+ * across process starts.
  */
-export function setConnectionDownSinceReader(reader: (status: Float64Array) => number | undefined): void {
-	downSinceReader = reader;
+export function readOwnIncarnation(table: { primaryStore: { getSync(key: string): any } }, self: string): number {
+	const value = table.primaryStore.getSync(self)?.recordLockIncarnation;
+	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+/**
+ * The incarnation this thread issues tokens under. On the main thread it is what `bumpHomeIncarnation`
+ * persisted; on a worker it is ONLY what main told it (`record-lock-incarnation`), never a read of the
+ * table: a worker that read the row before the bump landed would see the previous process's value and
+ * mint tokens that compare below that process's — the ordering §5.1 exists to prevent. Until main's
+ * message arrives it is 0 and `epoch()` is withheld.
+ */
+let homeIncarnation = 0;
+export function currentHomeIncarnation(): number {
+	return homeIncarnation;
+}
+/** Worker side: adopt the value main persisted. Never moves backwards. */
+export function setHomeIncarnation(value: unknown): void {
+	if (typeof value === 'number' && Number.isFinite(value) && value > homeIncarnation) homeIncarnation = value;
 }
 
 const productionDeps: RecordLockTransportDeps = {
@@ -203,9 +320,44 @@ const productionDeps: RecordLockTransportDeps = {
 	replicationDatabases: () => env.get(CONFIG_PARAMS.REPLICATION_DATABASES),
 	shard: () => env.get(CONFIG_PARAMS.REPLICATION_SHARD),
 	auditStore: auditStoreFor,
-	downSince: (status) => downSinceReader(status),
 	ownsDatabase: ownsRecordLockCoordination,
+	homeIncarnation: currentHomeIncarnation,
+	advertisesLevel: () =>
+		advertisedRecordLocksLevel(
+			CLUSTER_RECORD_LOCKS_ENABLED,
+			process.env.HARPER_TEST_OMIT_REPLICATION_CAPABILITIES === '1'
+		) === RECORD_LOCKS_CAPABILITY,
+	sinceStartMs: () => performance.now() - processStartMono,
+	// Tests lift the hold: a cluster suite cannot wait six minutes after start, and what the hold
+	// protects — a previous incarnation's delegations — does not exist for a freshly created node.
+	restartHoldMs: Number.isFinite(Number(process.env.HARPER_TEST_RECORD_LOCK_RESTART_HOLD_MS))
+		? Number(process.env.HARPER_TEST_RECORD_LOCK_RESTART_HOLD_MS)
+		: RESTART_HOLD_MS,
+	send: sendRecordLockOperation,
 };
+
+/**
+ * Main thread, once per process start: bump this node's durable home incarnation so every fencing
+ * token this process issues orders after every token the previous one did. Merged into the own
+ * `hdb_nodes` row (`ensureNode` patches), so nothing else on the row is touched.
+ */
+export async function bumpHomeIncarnation(): Promise<number> {
+	const self = getThisNodeName();
+	const table = getHDBNodeTable();
+	// A node that has never joined a mesh has no row of its own (add_node and the config routes are
+	// what write it). A url-less row that replicated would be one peers try to dial, so the counter
+	// goes on a LOCAL_ONLY self row instead: invisible to peers, and merged into the real row when
+	// add_node later patches it. Without this a lone node with the feature on would fail every
+	// cluster lock closed for the life of the process.
+	const existing = table.primaryStore.getSync(self);
+	const previous = readOwnIncarnation(table, self);
+	const next = previous + 1;
+	await ensureNode(self, { recordLockIncarnation: next }, existing ? undefined : { localOnly: true });
+	setHomeIncarnation(next);
+	for (const worker of httpWorkers()) confer(worker, 'record-lock-incarnation', next);
+	logger.info?.(`Record lock home incarnation for ${self} is now ${next}`);
+	return next;
+}
 
 /**
  * Register this thread's transport for a replicated database (idempotent; core recreates the
@@ -220,8 +372,11 @@ export function ensureRecordLockTransport(database: string): void {
 	transports.set(database, transport);
 	registerClusterLockTransport(database, transport);
 	if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
-	if (parentPort) parentPort.postMessage({ type: 'record-lock-owner-request', database });
-	else whenThreadsStarted.then(() => recordLockOwnerFor(database));
+	if (parentPort) {
+		parentPort.postMessage({ type: 'record-lock-owner-request', database });
+		// A worker that registers after main's bump would otherwise never learn the incarnation.
+		if (homeIncarnation === 0) parentPort.postMessage({ type: 'record-lock-incarnation-request' });
+	} else whenThreadsStarted.then(() => recordLockOwnerFor(database));
 }
 
 /** The database is no longer replicated here. Cluster scope keeps failing closed (core's rule). */
@@ -233,17 +388,22 @@ export function releaseRecordLockTransport(database: string): void {
 }
 
 export interface RecordLockDatabaseStats {
-	held: number;
-	pending: number;
-	deferred: number;
+	/** Delegations this node holds as a delegate. */
+	delegations: number;
+	/** Delegations this node has issued as a home. */
+	granted: number;
+	/** Live admissions across its delegations. */
+	admitted: number;
 	droppedOffOwner: number;
+	/** The epoch's member set as this thread sees it, or undefined while the epoch is withheld. */
+	members?: string[];
 }
 
 /** Summed `LockCoordinator.stats` over the database's tables on this thread. */
 export function localRecordLockStats(database: string): RecordLockDatabaseStats | undefined {
 	const tables = getDatabases()[database];
 	if (!tables) return undefined;
-	const total: RecordLockDatabaseStats = { held: 0, pending: 0, deferred: 0, droppedOffOwner: 0 };
+	const total: RecordLockDatabaseStats = { delegations: 0, granted: 0, admitted: 0, droppedOffOwner: 0 };
 	for (const tableName in tables) {
 		let stats: RecordLockDatabaseStats | undefined;
 		try {
@@ -252,16 +412,22 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 			// The getter fails closed on an unusable node identity; status reporting must not.
 		}
 		if (!stats) continue;
-		total.held += stats.held;
-		total.pending += stats.pending;
-		total.deferred += stats.deferred;
+		total.delegations += stats.delegations;
+		total.granted += stats.granted;
+		total.admitted += stats.admitted;
 		total.droppedOffOwner += stats.droppedOffOwner;
+	}
+	try {
+		total.members = transports.get(database)?.epoch(database)?.members;
+	} catch {
+		// The disabled transport throws here by design; status reporting must not.
 	}
 	return total;
 }
 
 if (parentPort) {
 	onMessageByType('record-lock-owner', (message) => setRecordLockOwnership(message.database, message.owned === true));
+	onMessageByType('record-lock-incarnation', (message) => setHomeIncarnation(message.value));
 	onMessageByType('record-lock-status-request', (message) => {
 		const status: Record<string, RecordLockDatabaseStats | undefined> = {};
 		for (const database of message.databases ?? []) status[database] = localRecordLockStats(database);
@@ -279,7 +445,20 @@ function httpWorkers(): any[] {
 	return workers.filter((worker: any) => worker.name === 'http');
 }
 
-function confer(worker: any, database: string, owned: boolean): void {
+function confer(worker: any, database: string, owned: boolean): void;
+function confer(worker: any, type: 'record-lock-incarnation', value: number): void;
+function confer(worker: any, databaseOrType: string, ownedOrValue: boolean | number): void {
+	if (databaseOrType === 'record-lock-incarnation') {
+		if (worker === MAIN_OWNER) return;
+		try {
+			worker.postMessage({ type: 'record-lock-incarnation', value: ownedOrValue });
+		} catch (error) {
+			logger.debug?.('Could not post the record lock incarnation to a worker', error);
+		}
+		return;
+	}
+	const database = databaseOrType;
+	const owned = ownedOrValue as boolean;
 	if (worker === MAIN_OWNER) {
 		setRecordLockOwnership(database, owned);
 		return;
@@ -388,9 +567,10 @@ export async function collectRecordLockStatus(
 			if (!stats) continue;
 			const entry = result[database];
 			if (recordLockOwners.get(database) === worker) {
-				entry.held = stats.held;
-				entry.pending = stats.pending;
-				entry.deferred = stats.deferred;
+				entry.delegations = stats.delegations;
+				entry.granted = stats.granted;
+				entry.admitted = stats.admitted;
+				entry.members = stats.members;
 			}
 			entry.droppedOffOwner = (entry.droppedOffOwner ?? 0) + stats.droppedOffOwner;
 		}
@@ -424,7 +604,23 @@ export async function collectRecordLockStatus(
 	return result;
 }
 
+setRecordLockOwnershipReaders({
+	ownsDatabase: ownsRecordLockCoordination,
+	ownerFor: (database) => {
+		const owner = recordLockOwners.get(database);
+		return owner === MAIN_OWNER ? undefined : owner;
+	},
+	mainOwns: (database) => recordLockOwners.get(database) === MAIN_OWNER,
+});
+
 if (!parentPort) {
+	if (CLUSTER_RECORD_LOCKS_ENABLED)
+		whenThreadsStarted.then(() =>
+			bumpHomeIncarnation().catch((error) => logger.error?.('Could not bump the record lock home incarnation', error))
+		);
+	onMessageByType('record-lock-incarnation-request', (_message, worker) => {
+		if (worker && homeIncarnation > 0) confer(worker, 'record-lock-incarnation', homeIncarnation);
+	});
 	onMessageByType('record-lock-owner-request', (message, worker) => {
 		if (!worker || typeof message?.database !== 'string') return;
 		const owner = recordLockOwnerFor(message.database);

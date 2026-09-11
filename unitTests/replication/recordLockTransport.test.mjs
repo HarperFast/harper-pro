@@ -1,6 +1,8 @@
 /**
- * The two decisions core delegates to harper-pro, checked without a cluster: who is in a database's
- * lock participant set (omission is the two-holder case), and which single thread coordinates it.
+ * The decisions core delegates to harper-pro, checked without a cluster: which membership a key's
+ * home is derived from (omission is a stale ring, over-inclusion of a wrong-level peer is a second
+ * arbiter), when that membership is withheld, how a delegation request and a recall reach the wire,
+ * and which single thread coordinates a database.
  */
 import assert from 'node:assert';
 import { setMainIsWorker } from '#js/core/server/threads/manageThreads';
@@ -10,10 +12,16 @@ import {
 	LOCK_CAPABILITY_UNSUPPORTED,
 	RECORD_LOCKS_CAPABILITY_POSITION,
 	RECORD_LOCKS_DISABLED_MESSAGE,
+	EPOCH_MEMO_MS,
+	RESTART_HOLD_MS,
+	STATIC_EPOCH_NUMBER,
 	collectRecordLockStatus,
 	createDisabledRecordLockTransport,
 	createRecordLockTransport,
 	isReplicationGroupMember,
+	readOwnIncarnation,
+	setHomeIncarnation,
+	currentHomeIncarnation,
 	ownsRecordLockCoordination,
 	readPeerLockCapability,
 	recordLockOwnerFor,
@@ -21,6 +29,7 @@ import {
 	recordPeerLockCapability,
 	releaseRecordLockOwner,
 } from '#src/replication/recordLockTransport';
+import { DELEGATE_OPERATION, RECALL_OPERATION } from '#src/replication/recordLockRpc';
 import { getReplicationSharedStatus } from '#src/replication/knownNodes';
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
@@ -61,51 +70,43 @@ function fakeWorker(threadId) {
 }
 
 describe('isReplicationGroupMember', () => {
-	const dbs = ['data', { name: 'sharded', sharded: true }];
-	it('admits a full or directional replicator for a replicated database, regardless of direction', () => {
-		assert.strictEqual(isReplicationGroupMember({ name: 'a', replicates: true }, 'data', dbs, undefined), true);
+	const databases = ['data'];
+	it('admits full and directional replicators in the shard, and explicit subscribers outside it', () => {
+		assert.strictEqual(isReplicationGroupMember({ replicates: true }, 'data', databases, undefined), true);
 		assert.strictEqual(
-			isReplicationGroupMember({ name: 'a', replicates: { sends: true } }, 'data', dbs, undefined),
-			true,
-			'a node that only sends to us can still run a round'
+			isReplicationGroupMember({ replicates: { sendsTo: ['x'] } }, 'data', databases, undefined),
+			true
 		);
 		assert.strictEqual(
-			isReplicationGroupMember({ name: 'a', replicates: { receivesFrom: [{ target: 'x' }] } }, 'data', dbs, undefined),
-			true,
-			'a node that only receives from us can still run a round'
+			isReplicationGroupMember({ replicates: { receives: true } }, 'data', databases, undefined),
+			true
+		);
+		assert.strictEqual(
+			isReplicationGroupMember(
+				{ replicates: false, subscriptions: [{ database: 'data', subscribe: true }] },
+				'data',
+				databases,
+				undefined
+			),
+			true
 		);
 	});
-
-	it('rejects a node that replicates nothing, a removed row, and a database this node does not replicate', () => {
-		assert.strictEqual(isReplicationGroupMember({ name: 'a', replicates: false }, 'data', dbs, undefined), false);
-		assert.strictEqual(isReplicationGroupMember({ name: 'a' }, 'data', dbs, undefined), false);
-		assert.strictEqual(isReplicationGroupMember({ name: 'a', replicates: {} }, 'data', dbs, undefined), false);
-		assert.strictEqual(isReplicationGroupMember(undefined, 'data', dbs, undefined), false);
-		assert.strictEqual(isReplicationGroupMember({ name: 'a', replicates: true }, 'other', dbs, undefined), false);
-	});
-
-	it('applies the shard test only to a sharded database entry', () => {
-		assert.strictEqual(isReplicationGroupMember({ name: 'a', replicates: true, shard: 1 }, 'sharded', dbs, 1), true);
-		assert.strictEqual(isReplicationGroupMember({ name: 'a', replicates: true, shard: 2 }, 'sharded', dbs, 1), false);
-		assert.strictEqual(isReplicationGroupMember({ name: 'a', replicates: true, shard: 2 }, 'data', dbs, 1), true);
-	});
-
-	it('admits an explicit subscription even when the node does not replicate by default, across shards', () => {
-		const node = { name: 'a', replicates: false, shard: 2, subscriptions: [{ database: 'sharded', subscribe: true }] };
-		assert.strictEqual(isReplicationGroupMember(node, 'sharded', dbs, 1), true);
-		assert.strictEqual(isReplicationGroupMember(node, 'data', dbs, 1), false);
+	it('excludes a node that replicates nothing, or only other databases', () => {
+		assert.strictEqual(isReplicationGroupMember({ replicates: false }, 'data', databases, undefined), false);
+		assert.strictEqual(isReplicationGroupMember({ replicates: {} }, 'data', databases, undefined), false);
+		assert.strictEqual(isReplicationGroupMember({ replicates: true }, 'other', databases, undefined), false);
 	});
 });
 
-describe('the capability slot', () => {
-	it('round-trips both answers and reads anything else as never learned', () => {
+describe('peer lock capability in the shared status buffer', () => {
+	it('records what the peer asserted and reads never-learned as unknown', () => {
 		const status = new Float64Array(16);
 		assert.strictEqual(readPeerLockCapability(status), LOCK_CAPABILITY_UNKNOWN);
 		recordPeerLockCapability(status, true);
 		assert.strictEqual(readPeerLockCapability(status), LOCK_CAPABILITY_SUPPORTED);
 		recordPeerLockCapability(status, false);
 		assert.strictEqual(readPeerLockCapability(status), LOCK_CAPABILITY_UNSUPPORTED);
-		status[RECORD_LOCKS_CAPABILITY_POSITION] = 7;
+		status[RECORD_LOCKS_CAPABILITY_POSITION] = 42;
 		assert.strictEqual(readPeerLockCapability(status), LOCK_CAPABILITY_UNKNOWN);
 		status[RECORD_LOCKS_CAPABILITY_POSITION] = NaN;
 		assert.strictEqual(readPeerLockCapability(status), LOCK_CAPABILITY_UNKNOWN);
@@ -116,16 +117,17 @@ describe('the capability slot', () => {
 	});
 });
 
-describe('createRecordLockTransport().participants', () => {
+describe('createRecordLockTransport().epoch', () => {
 	function transportFor(overrides = {}) {
 		const auditStore = fakeAuditStore();
+		const sent = [];
 		const deps = {
 			thisNodeName: () => 'self',
 			nodes: () => [
 				{ name: 'peer-supported', replicates: true },
 				{ name: 'peer-legacy', replicates: { sends: true } },
 				{ name: 'peer-unknown', replicates: true },
-				// Blanket replication off, but subscribed to this database explicitly: still a contender.
+				// Blanket replication off, but subscribed to this database explicitly: still a member.
 				{ name: 'peer-explicit', replicates: false, subscriptions: [{ database: 'data', subscribe: true }] },
 				{ name: 'bystander', replicates: false },
 				{ name: 'self', replicates: true },
@@ -134,62 +136,119 @@ describe('createRecordLockTransport().participants', () => {
 			replicationDatabases: () => ['data'],
 			shard: () => undefined,
 			auditStore: () => auditStore,
-			downSince: (status) => (status[9] === 0 && status[12] ? status[12] : undefined),
 			ownsDatabase: () => true,
+			homeIncarnation: () => 3,
+			advertisesLevel: () => true,
+			// Past the restart hold unless a test says otherwise.
+			sinceStartMs: () => RESTART_HOLD_MS + 1,
+			restartHoldMs: RESTART_HOLD_MS,
+			send: async (node, database, operation) => {
+				sent.push({ node, database, operation });
+				return overrides.reply ?? { granted: true, token: [1, 3, 1], leaseMs: 1000 };
+			},
 			...overrides,
 		};
 		recordPeerLockCapability(getReplicationSharedStatus(auditStore, 'data', 'peer-supported'), true);
 		recordPeerLockCapability(getReplicationSharedStatus(auditStore, 'data', 'peer-legacy'), false);
 		recordPeerLockCapability(getReplicationSharedStatus(auditStore, 'data', 'peer-explicit'), true);
-		return { transport: createRecordLockTransport('data', deps), auditStore };
+		return { transport: createRecordLockTransport('data', deps), auditStore, sent };
 	}
 
-	it('lists this node first and every group member with the capability its own bag asserted', () => {
+	it('names this node and every group member that advertised the delegation level, sorted', () => {
 		const { transport } = transportFor();
-		assert.deepStrictEqual(
-			transport.participants('data').map(({ nodeId, capable }) => [nodeId, capable]),
-			[
-				['self', true],
-				['peer-supported', true],
-				['peer-legacy', false],
-				['peer-unknown', false],
-				['peer-explicit', true],
-			]
-		);
+		const epoch = transport.epoch('data');
+		assert.deepStrictEqual(epoch.members, ['peer-explicit', 'peer-supported', 'self']);
+		assert.strictEqual(epoch.number, STATIC_EPOCH_NUMBER);
+		assert.strictEqual(epoch.homeIncarnation, 3);
 	});
 
-	it('reports a never-learned capability as not capable, so an unknown peer fails closed', () => {
+	it('leaves out a peer whose capability was never learned, and one at another level', () => {
+		// Never learned fails closed; a level-1 (Ricart–Agrawala) peer would be a second arbiter.
 		const { transport } = transportFor();
-		const unknown = transport.participants('data').find((participant) => participant.nodeId === 'peer-unknown');
-		assert.strictEqual(unknown.capable, false);
+		const { members } = transport.epoch('data');
+		assert.ok(!members.includes('peer-unknown'));
+		assert.ok(!members.includes('peer-legacy'));
 	});
 
-	it('carries the W1 down timestamp but never asserts a cluster-agreed DOWN', () => {
-		const { transport, auditStore } = transportFor();
-		const status = getReplicationSharedStatus(auditStore, 'data', 'peer-supported');
-		status[9] = 0; // CONNECTION_STATE_DOWN
-		status[12] = 1234; // LAST_ERROR_TIME
-		const peer = transport.participants('data').find((participant) => participant.nodeId === 'peer-supported');
-		assert.strictEqual(peer.downSince, 1234);
-		assert.strictEqual(peer.agreedDown, undefined);
+	it('derives the same ringVersion for the same member set regardless of hdb_nodes order', () => {
+		const a = transportFor().transport.epoch('data');
+		const b = transportFor({
+			nodes: () => [
+				{ name: 'self', replicates: true },
+				{ name: 'peer-explicit', replicates: false, subscriptions: [{ database: 'data', subscribe: true }] },
+				{ name: 'peer-supported', replicates: true },
+			],
+		}).transport.epoch('data');
+		assert.deepStrictEqual(a.members, b.members);
+		assert.strictEqual(a.ringVersion, b.ringVersion);
+	});
+
+	it('changes ringVersion when membership changes', () => {
+		const a = transportFor().transport.epoch('data');
+		const b = transportFor({ nodes: () => [{ name: 'self', replicates: true }] }).transport.epoch('data');
+		assert.notStrictEqual(a.ringVersion, b.ringVersion);
+	});
+
+	it('withholds the epoch during the restart hold, then serves it', () => {
+		let since = 0;
+		const { transport } = transportFor({ sinceStartMs: () => since });
+		// A previous incarnation may still have delegations admitting; a static epoch cannot invalidate
+		// them by advancing, so it must not name this node as a home until they could have expired.
+		assert.strictEqual(transport.epoch('data'), undefined);
+		since = RESTART_HOLD_MS - 1;
+		assert.strictEqual(transport.epoch('data'), undefined);
+		since = RESTART_HOLD_MS;
+		assert.ok(transport.epoch('data'));
+	});
+
+	it('withholds the epoch until the home incarnation has been bumped and propagated', () => {
+		let incarnation = 0;
+		const { transport } = transportFor({ homeIncarnation: () => incarnation });
+		// A token minted under incarnation 0 could sit below the previous process's, so none is minted.
+		assert.strictEqual(transport.epoch('data'), undefined);
+		incarnation = 1;
+		assert.strictEqual(transport.epoch('data').homeIncarnation, 1);
+	});
+
+	it('withholds the epoch when this node does not advertise the delegation level', () => {
+		// Its peers exclude it from their rings, so it must not build one that includes itself — the
+		// first cluster run of this transport had the bag-less node self-homing keys its peer homed.
+		const { transport } = transportFor({ advertisesLevel: () => false });
+		assert.strictEqual(transport.epoch('data'), undefined);
+	});
+
+	it('is a lone-node epoch when the database has no audit store yet', () => {
+		const { transport } = transportFor({ auditStore: () => undefined });
+		assert.deepStrictEqual(transport.epoch('data').members, ['self']);
+	});
+
+	it('reuses a derived epoch within the memo window and re-derives after it', () => {
+		let since = RESTART_HOLD_MS + 1;
+		const { transport, auditStore } = transportFor({ sinceStartMs: () => since });
+		const first = transport.epoch('data');
+		const lookups = auditStore.lookups;
+		since += EPOCH_MEMO_MS - 1;
+		assert.strictEqual(transport.epoch('data'), first, 'the same epoch object inside the window');
+		assert.strictEqual(auditStore.lookups, lookups, 'no membership scan inside the window');
+		since += EPOCH_MEMO_MS;
+		const later = transport.epoch('data');
+		assert.notStrictEqual(later, first, 'a fresh derivation after the window');
+		assert.deepStrictEqual(later.members, first.members);
 	});
 
 	it('resolves each peer buffer once and reuses the view on later acquisitions', () => {
-		const { transport, auditStore } = transportFor();
+		let since = RESTART_HOLD_MS + 1;
+		const { transport, auditStore } = transportFor({ sinceStartMs: () => since });
 		const before = auditStore.lookups;
-		transport.participants('data');
+		transport.epoch('data');
 		const afterFirst = auditStore.lookups;
 		assert.strictEqual(afterFirst - before, 4, 'one lookup per group member');
-		transport.participants('data');
-		transport.participants('data');
+		// Past the memo window so the membership is genuinely re-read; the buffer views must still hit.
+		since += EPOCH_MEMO_MS + 1;
+		transport.epoch('data');
+		since += EPOCH_MEMO_MS + 1;
+		transport.epoch('data');
 		assert.strictEqual(auditStore.lookups, afterFirst, 'no lookups on repeat');
-	});
-
-	it('leaves every peer not capable when the database has no audit store yet', () => {
-		const { transport } = transportFor({ auditStore: () => undefined });
-		const peers = transport.participants('data').filter((participant) => participant.nodeId !== 'self');
-		assert.strictEqual(peers.length, 4);
-		assert.ok(peers.every((participant) => participant.capable === false));
 	});
 
 	it('answers ownsCoordination from the injected ownership view', () => {
@@ -199,14 +258,93 @@ describe('createRecordLockTransport().participants', () => {
 		owned = true;
 		assert.strictEqual(transport.ownsCoordination(), true);
 	});
+
+	it('sends a delegation request as the delegate operation and returns the home’s reply verbatim', async () => {
+		const reply = { granted: false, reason: 'contended', retryAfterMs: 25 };
+		const { transport, sent } = transportFor({ reply });
+		const answer = await transport.requestDelegation('peer-supported', 'data', 'Counter', {
+			key: 'k1',
+			requester: 'self',
+			epoch: 1,
+			leaseMs: 5000,
+		});
+		assert.deepStrictEqual(answer, reply);
+		assert.deepStrictEqual(sent, [
+			{
+				node: 'peer-supported',
+				database: 'data',
+				operation: {
+					operation: DELEGATE_OPERATION,
+					database: 'data',
+					table: 'Counter',
+					key: 'k1',
+					epoch: 1,
+					leaseMs: 5000,
+				},
+			},
+		]);
+	});
+
+	it('sends a recall as the recall operation carrying the whole fencing token', async () => {
+		const { transport, sent } = transportFor({ reply: { recalled: true } });
+		await transport.recallDelegation('peer-supported', 'data', 'Counter', { key: 'k1', token: [1, 3, 7] });
+		assert.deepStrictEqual(sent[0].operation, {
+			operation: RECALL_OPERATION,
+			database: 'data',
+			table: 'Counter',
+			key: 'k1',
+			token: [1, 3, 7],
+		});
+	});
+});
+
+describe('readOwnIncarnation', () => {
+	// The production reader must go to the hdb_nodes table, not server.nodes: that mirror excludes the
+	// local node on every path, so a mirror read is 0 forever and the epoch is withheld for the life
+	// of the process — which is exactly how the first cluster run of this transport failed.
+	const tableWith = (row) => ({ primaryStore: { getSync: (key) => (key === 'self' ? row : undefined) } });
+	it('reads the persisted counter from this node’s own row', () => {
+		assert.strictEqual(readOwnIncarnation(tableWith({ name: 'self', recordLockIncarnation: 4 }), 'self'), 4);
+	});
+	it('reads 0 for a missing row, a missing field, or a value that is not a positive number', () => {
+		assert.strictEqual(readOwnIncarnation(tableWith(undefined), 'self'), 0);
+		assert.strictEqual(readOwnIncarnation(tableWith({ name: 'self' }), 'self'), 0);
+		for (const bad of [0, -1, '3', NaN, null])
+			assert.strictEqual(readOwnIncarnation(tableWith({ recordLockIncarnation: bad }), 'self'), 0);
+	});
+});
+
+describe('setHomeIncarnation (worker side)', () => {
+	it('adopts what main persisted and never moves backwards', () => {
+		// A worker only ever learns the incarnation from main; a stale or malformed value must not
+		// lower it, or the worker would mint tokens that compare below the previous process's.
+		setHomeIncarnation(5);
+		assert.strictEqual(currentHomeIncarnation(), 5);
+		setHomeIncarnation(3);
+		assert.strictEqual(currentHomeIncarnation(), 5);
+		for (const bad of ['7', NaN, null, undefined, -1]) setHomeIncarnation(bad);
+		assert.strictEqual(currentHomeIncarnation(), 5);
+		setHomeIncarnation(6);
+		assert.strictEqual(currentHomeIncarnation(), 6);
+	});
 });
 
 describe('createDisabledRecordLockTransport', () => {
-	it('owns coordination so the participant refusal is what a caller sees, and names the switch', () => {
+	it('owns coordination so the epoch refusal is what a caller sees, and names the switch', async () => {
 		const transport = createDisabledRecordLockTransport();
 		assert.strictEqual(transport.ownsCoordination(), true);
 		assert.throws(
-			() => transport.participants('data'),
+			() => transport.epoch('data'),
+			(error) => error.message === RECORD_LOCKS_DISABLED_MESSAGE
+		);
+		await assert.rejects(
+			() =>
+				transport.requestDelegation('peer', 'data', 'Counter', {
+					key: 'k',
+					requester: 'self',
+					epoch: 1,
+					leaseMs: 1000,
+				}),
 			(error) => error.message === RECORD_LOCKS_DISABLED_MESSAGE
 		);
 		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /replication\.recordLocks/);
