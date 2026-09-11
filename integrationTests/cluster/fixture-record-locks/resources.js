@@ -50,14 +50,13 @@ export class LockRelease extends Resource {
 	}
 }
 
-/** The lock control entries in this node's Counter transaction log: type and local origin id (0 = self). */
+/** The lock release entries in this node's Counter transaction log: type and local origin id (0 = self). */
 export class LockControlEntries extends Resource {
 	async get() {
 		const entries = [];
 		for (const entry of tables.Counter.auditStore.getRange({ start: 1 })) {
 			if (entry.tableId !== tables.Counter.tableId) continue;
-			if (entry.type === 'lockRequest' || entry.type === 'lockGrant' || entry.type === 'lockRelease')
-				entries.push({ type: entry.type, nodeId: entry.nodeId ?? 0 });
+			if (entry.type === 'lockRelease') entries.push({ type: entry.type, nodeId: entry.nodeId ?? 0 });
 		}
 		return entries;
 	}
