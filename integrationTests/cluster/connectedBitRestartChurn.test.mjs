@@ -6,16 +6,11 @@
  *   proven by a real data round-trip, not by the bit), and recovery still holds when the outage is
  *   held past WEDGE_RECONCILE_THRESHOLD_MS (30s) so the disruptive `findWedgedNodeUrls` net fires
  *   (asserted to fire, with #525's structured telemetry present).
- *   DOES NOT PIN: #523's actual up-correction path. `connectedToNode()` only fires on WS 'open'
- *   when `this.nodeSubscriptions` is already populated (replicationConnection.ts:1388), which is
- *   only unset for a FRESH connection object (built by wedge-reconcile's `forceResubscribe`, not a
- *   routine reconnect). The correction line "Corrected replication connection state
- *   (disconnected -> up)" was NOT observed in any run — the race window is sub-millisecond (WS
- *   handshake vs async subscribe()) and there is no fault-injection hook for it. That path's only
- *   coverage remains unitTests/replication/reconcileEntryWithTruth.test.mjs. Deterministic
- *   end-to-end coverage would need a test-only hook mirroring `armReplicationWedgeForTest` /
- *   `maybeStallCopyForTest`. The log evidence is therefore reported, never asserted — do not
- *   "strengthen" it into an assertion, it would flake.
+ *   DOES NOT PIN HERE: #523's actual up-correction path. The WS-open edge requires
+ *   `this.nodeSubscriptions` to be populated, and later metadata/pong edges normally heal the bit.
+ *   `truthResiduals.test.mjs` R5 pins the exceptional late-subscribe session deterministically
+ *   with an environment-gated hook. This stress test only reports incidental correction-log
+ *   evidence; do not make its timing-dependent count a hard assertion.
  */
 /**
  * QA-587: does the replication "connected bit" reconcile UP from shared-memory truth,
@@ -59,7 +54,7 @@
  * both nodes (to congest the follower's main-thread message queue) -- the same class of
  * race the shipped fix's commit message describes ("the connect edge was lost or never
  * processed"). This is a best-effort stress recipe, not a deterministic fault-injection
- * hook (none exists for this specific race in replicationConnection.ts); the hard,
+ * hook (deterministic coverage lives in truthResiduals R5); the hard,
  * non-blind assertions do not depend on hitting the exact race every run:
  *   1. every kill is a genuine SIGKILL (captured process exit signal) and every cycle
  *      genuinely observes connected:false via tight cluster_status polling -- proves the
@@ -108,20 +103,12 @@ const FLOOD_CONCURRENCY = 15;
 // subscription) converged in ~1.8s every cycle with ZERO up-correction log lines: the
 // automatic retry reuses the SAME long-lived NodeReplicationConnection object, whose
 // `nodeSubscriptions` was already populated by the original add_node and never gets
-// cleared across a routine reconnect -- so `connectedToNode()`'s `if (this.nodeSubscriptions)`
-// guard (replicationConnection.ts:1388) is always true and the edge fires cleanly every
-// time. That test recipe only re-covers the ALREADY-covered normal retry path
+// cleared across a routine reconnect -- so the open handler's `nodeSubscriptions` guard is always
+// true and the edge fires cleanly every time. That test recipe only re-covers the ALREADY-covered normal retry path
 // (replicationReconnect.test.mjs), not harper-pro#289's "connect edge lost" race.
-// The race requires a FRESH connection object (new `nodeSubscriptions` populated
-// asynchronously, after `connect()` -- i.e. after the WS may have already opened), which
-// only happens on: (a) the very first subscribe, or (b) the wedge-reconcile's
-// forceResubscribe path when a peer has been connected:false past
-// WEDGE_RECONCILE_THRESHOLD_MS (30_000ms) -- `replicator.isReusableConnection` may decide
-// the stale connection is not reusable and build a new one. So this pass deliberately
-// holds the leader down PAST the 30s wedge threshold before restarting, to force that
-// disruptive path to engage and (maybe) construct a fresh, race-eligible connection object
-// right as the leader comes back -- the same conditions the task's "kill a peer... while
-// subscription churn is happening" and "restart mid-catch-up" hints are gesturing at.
+// Ordinary first-subscribe scheduling populates `nodeSubscriptions` before the handshake completes;
+// truthResiduals R5 injects the exceptional late-subscribe ordering. This stress pass instead holds
+// the leader down past the wedge threshold to exercise the disruptive forceResubscribe recovery path.
 const WEDGE_RECONCILE_THRESHOLD_MS = 30000; // subscriptionManager.ts WEDGE_RECONCILE_THRESHOLD_MS
 const RECONCILE_INTERVAL_MS = 5000; // subscriptionManager.ts RECONCILE_INTERVAL_MS (the sweep period)
 // Hold the leader down long enough that the sweep CANNOT miss the threshold. 34_000 was too tight and
@@ -495,21 +482,17 @@ suite(
 				// green, genuine SIGKILL" guarantees via the connection's own fast retry -- which
 				// never gives the internal edge-vs-truth desync (harper-pro#289) a chance to occur,
 				// since `this.nodeSubscriptions` is already populated on that long-lived connection
-				// object and `connectedToNode()`'s guard (replicationConnection.ts:1388) always
-				// passes on an ordinary reconnect. The specific race this fix (#431/PR#523) exists
-				// for requires a FRESH connection object whose async `subscribe()` call races the
-				// WS 'open' event -- which this codebase only constructs via the wedge-reconcile's
-				// forceResubscribe path (findWedgedNodeUrls, WEDGE_RECONCILE_THRESHOLD_MS = 30s).
-				// So this cycle deliberately holds the leader down past that threshold to give the
-				// disruptive path -- and the narrow race inside it -- a chance to fire.
+				// object and `connectedToNode()`'s `nodeSubscriptions` guard always
+				// passes on an ordinary reconnect. This cycle deliberately holds the leader down
+				// past the wedge threshold to exercise the disruptive forceResubscribe path.
 				//
 				// A prior diagnostic run (not committed) confirmed this outage length reliably
 				// triggers the disruptive "Reconciling N wedged subscription(s)" log line, but
 				// convergence afterward is legitimately governed by the connection's own
 				// exponential retry backoff (capped at 30s) rather than a fixed bound -- so this
 				// check uses a generous window and treats the up-correction log line as
-				// informational evidence, not a hard requirement (a black-box SIGKILL cannot force
-				// the sub-millisecond IPC-vs-shared-memory race that #289 describes on demand).
+				// informational evidence, not a hard requirement. The deterministic ordering is
+				// covered separately by truthResiduals.test.mjs.
 				const cycleResult = {
 					cycle: 'long-outage',
 					signal: null,
@@ -654,8 +637,8 @@ suite(
 				console.log(
 					'[qa587] the exact internal edge-vs-truth desync (harper-pro#289, the specific race #431 fixes) was not observed this run -- ' +
 						'the stress recipe (multi-db fan-out SIGKILL, write/admin load, and deliberately crossing the 30s wedge ' +
-						'threshold to force the disruptive forceResubscribe path) did not hit the sub-millisecond IPC-vs-shared-memory ' +
-						`race window. General fix guarantees (no wedge, no false green, genuine fault every cycle including a ${WEDGE_TRIGGER_WAIT_MS / 1000}s ` +
+						'threshold to force the disruptive forceResubscribe path) did not naturally produce the subscribe-after-open ' +
+						`ordering. General fix guarantees (no wedge, no false green, genuine fault every cycle including a ${WEDGE_TRIGGER_WAIT_MS / 1000}s ` +
 						'outage past the wedge threshold) are still confirmed above.'
 				);
 			}

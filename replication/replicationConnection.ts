@@ -2865,6 +2865,11 @@ export async function createWebSocket(
 }
 
 const INITIAL_RETRY_TIME = 500;
+
+// Test-only ordering hook for harper-pro#431: hold one fresh connection's subscription until its socket
+// opens, selected at runtime and consumed once per worker.
+let holdSubscribeAfterOpenForTestArmed = false;
+
 /**
  * This represents a persistent connection to a node for replication, which handles
  * sockets that may be disconnected and reconnected
@@ -2885,6 +2890,10 @@ export class NodeReplicationConnection extends EventEmitter {
 	// two paths never both arm a connect() for the same drop — see forceReconnect / harper-pro#420.
 	reconnectScheduled = false;
 	nodeSubscriptions?: NodeSubscription[];
+	heldSubscribeAfterOpenForTest?: {
+		nodeSubscriptions: NodeSubscription[];
+		replicateTablesByDefault: boolean;
+	};
 	// Main-thread-computed multi-hop exclusion set for this database (subscriptionManager's
 	// computeExclusionOrigins), carried on subscribe-to-node and refreshed by
 	// update-exclusion-origins; the session reads it when building SUBSCRIPTION_REQUEST.
@@ -2982,6 +2991,8 @@ export class NodeReplicationConnection extends EventEmitter {
 					url: this.url,
 				});
 			}
+			const heldSubscribe =
+				this.socket === socket && this.nodeSubscriptions === undefined ? this.heldSubscribeAfterOpenForTest : undefined;
 			this.isConnected = true;
 			try {
 				session = replicateOverWS(
@@ -2995,6 +3006,14 @@ export class NodeReplicationConnection extends EventEmitter {
 					},
 					{ replicates: true } // pre-authorized, but should only make publish: true if we are allowing reverse subscriptions
 				);
+				if (heldSubscribe) {
+					// Preserve late-subscribe ordering by snapshotting a non-subscription session before applying the payload.
+					logger.warn?.(
+						`[test] socket open observed nodeSubscriptions undefined; releasing held subscribe for db "${this.databaseName}" (harper-pro#431)`
+					);
+					this.heldSubscribeAfterOpenForTest = undefined;
+					this.applySubscription(heldSubscribe.nodeSubscriptions, heldSubscribe.replicateTablesByDefault);
+				}
 				// Only the instance on the current socket is live. If this open raced a replacement, the
 				// instance is born superseded: retire it immediately rather than leave it running, and do
 				// not resolve — `sessionResolve` now belongs to the replacement attempt's promise, so
@@ -3147,12 +3166,31 @@ export class NodeReplicationConnection extends EventEmitter {
 		});
 		this.session.catch(() => {}); // suppress any unhandled errors
 	}
-	subscribe(nodeSubscriptions, replicateTablesByDefault) {
+	applySubscription(nodeSubscriptions: NodeSubscription[], replicateTablesByDefault: boolean) {
 		this.nodeSubscriptions = nodeSubscriptions;
 		this.replicateTablesByDefault = replicateTablesByDefault;
 		this.emit('subscriptions-updated', nodeSubscriptions);
 	}
+	subscribe(nodeSubscriptions: NodeSubscription[], replicateTablesByDefault: boolean) {
+		if (this.heldSubscribeAfterOpenForTest) {
+			this.heldSubscribeAfterOpenForTest = { nodeSubscriptions, replicateTablesByDefault };
+			return;
+		}
+		if (
+			this.nodeSubscriptions === undefined &&
+			!holdSubscribeAfterOpenForTestArmed &&
+			process.env.HARPER_TEST_HOLD_SUBSCRIBE_AFTER_OPEN_ONCE_DB === this.databaseName
+		) {
+			holdSubscribeAfterOpenForTestArmed = true;
+			this.heldSubscribeAfterOpenForTest = { nodeSubscriptions, replicateTablesByDefault };
+			logger.warn?.(`[test] holding subscribe until socket open for db "${this.databaseName}" (harper-pro#431)`);
+			return;
+		}
+		this.applySubscription(nodeSubscriptions, replicateTablesByDefault);
+	}
 	unsubscribe() {
+		// Do not let a later socket open revive membership removed while the payload was held.
+		this.heldSubscribeAfterOpenForTest = undefined;
 		this.intentionallyUnsubscribed = true;
 		this.socket?.close(1008, 'No longer subscribed');
 	}
@@ -7232,8 +7270,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				options.connection.on('exclusion-origins-updated', (origins: string[]) => {
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
-							(nodeName) =>
-								nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
+							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
 						)
 					);
 					const excludeNodes = [...shouldExclude].filter((nodeName) => !lastSentExcludedNodes.includes(nodeName));
