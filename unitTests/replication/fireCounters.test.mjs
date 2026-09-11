@@ -68,6 +68,7 @@ describe('fire counter slot map', () => {
 			'subscription-setup',
 			'wedge-reconcile',
 			'receive-stall-net',
+			'send-log-break',
 		]);
 	});
 });
