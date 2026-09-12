@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789113093055,
+  "lastUpdate": 1789199260988,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -4575,6 +4575,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2909.44,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "62c281155f8728b772d3628428c0f5cdb7c0c673",
+          "message": "Run harper-pro's review-coverage check in enforce mode (#827)\n\n* Enforce cross-model review coverage on AI-authored PRs\n\nharper-pro had no review-coverage check at all, so the two-cross-model-review\npolicy was only visible on harper. Pin harper's public copy of the action by\nsha and run it in enforce mode.\n\nCoverage only: format_mode stays off, so this reports and gates the\n`Review-Coverage:` footer without also gating description structure.\n\nRuns on pull_request_target with a base-ref action pin, so a PR cannot edit the\ncheck that gates it; nothing from the PR is executed.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* Keep the review-coverage check's published context and Renovate marker intact\n\nThe enforce flip rewrote this file's header and dropped two things harper-pro's\nmain has carried since #706: the job's `name:`, which is the published check\ncontext (`review-coverage` — without it the context becomes the job id,\n`coverage`), and the pin's trailing `# main` comment. Renovate's github-actions\nmanager takes the tracked ref from that comment and needs a single bare token,\nso the prose that replaced it left the pin as an unversioned reference: never\ntracked, never bumped. Both are restored.\n\nThe header keeps the new no-checkout invariant and states what the check\nactually validates, which the flip had replaced with Actions mechanics, and\nrecords why `edited` belongs in the trigger list.\n\nMerge ordering against HarperFast/harper#2552 moves to a `Depends-on:` marker in\nthe PR body, which holds the required `companion-check` status pending until the\ncompanion merges, rather than to a pin comment nothing enforces.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>",
+          "timestamp": "2026-09-11T22:01:06Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/62c281155f8728b772d3628428c0f5cdb7c0c673"
+        },
+        "date": 1789199258596,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 13905.23,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 25849.65,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 20418.05,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 9119.93,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 6001.63,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 3015.24,
             "unit": "ops/sec"
           }
         ]
