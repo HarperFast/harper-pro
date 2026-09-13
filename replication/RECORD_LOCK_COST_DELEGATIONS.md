@@ -265,11 +265,11 @@ what went wrong. It does now:
 
 - **The shortfall equals the duplicate count exactly**, in all six rounds.
 - **Every duplicate was written by two different nodes** — never the same node twice.
-- **There are no holes below the highest value written**, so no committed write vanished.
+- **There are no value-level holes below the highest value written.**
 - There were **no** non-200 responses in any of these six rounds, so nothing was rejected or retried.
 
-Two nodes computed `n + 1` from the same `n`. What that rules out is a **lost commit**: every value
-below the maximum was written, so nothing that committed vanished.
+Two nodes computed `n + 1` from the same `n`. That rules out only an absent numeric value below the
+maximum; it cannot rule out a lost commit, because an identical later write can mask it.
 
 What it does **not** on its own distinguish is _why_ two nodes read the same value — a successor
 admitted after a clean release but before applying its predecessor's write (a freshness failure), or
@@ -476,10 +476,10 @@ amortized ≈ 0.02 ms + (gap / 330 s) × 1.0 ms
 ```
 
 — about **0.05 ms at a 10 s access cadence**, against the baseline's 0.68 ms for every lock. The
-lease is load-bearing in the direction §10 says, and at 360 s it is long enough that re-acquisition
-is not the dominant term for any cadence under a minute. The 120 s row's unexplained extra lapses are
-the caveat on that conclusion: if whatever causes them also fires at the shipped lease, the
-`gap / 330` term is a floor rather than the whole cost.
+lease is load-bearing in the direction §10 says: its re-acquisition term becomes dominant over the
+0.02 ms local term above roughly a 6.6 s cadence, while remaining below the baseline. The 120 s
+row's unexplained extra lapses are the caveat on that conclusion: if whatever causes them also fires
+at the shipped lease, the `gap / 330` term is a floor rather than the whole cost.
 
 **Delegation retention, for harper#2581.** After 120 distinct keys per node, every node held exactly
 **121 delegations** in all three runs — one per distinct key it locked, retained after unlock, and
