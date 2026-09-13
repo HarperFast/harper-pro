@@ -590,8 +590,11 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 				});
 				if (elapsedMs >= runMs) break;
 			}
-			// The cheapest single cluster round measurement 1 saw, in this run, on this box.
-			const thresholdMs = results.uncontended.byHome.remoteHome.min * CLUSTER_ROUND_FLOOR;
+			// The cheapest single cluster round measurement 1 saw, in this run, on this box. Absent only if
+			// no key in measurement 1 was homed elsewhere, which leaves nothing to calibrate against.
+			const remoteHome = results.uncontended.byHome.remoteHome;
+			assert.ok(remoteHome, 'measurement 1 saw no remote-home key; cannot calibrate a cluster round');
+			const thresholdMs = remoteHome.min * CLUSTER_ROUND_FLOOR;
 			const { rounds } = classifyRounds(samples, thresholdMs);
 			// The probe's first lock is the cold acquisition every key pays once, not a lapse.
 			const servedLocally = samples.filter((sample) => sample.deltaMs < thresholdMs);

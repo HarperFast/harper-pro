@@ -266,11 +266,17 @@ what went wrong. It does now:
 - **The shortfall equals the duplicate count exactly**, in all six rounds.
 - **Every duplicate was written by two different nodes** — never the same node twice.
 - **There are no holes below the highest value written**, so no committed write vanished.
-- There were **no** non-200 responses and no 423s at all.
+- There were **no** non-200 responses in any of these six rounds, so nothing was rejected or retried.
 
-That is a successor reading a value its predecessor had committed and not yet replicated: two nodes
-computed `n + 1` from the same `n`. It is a freshness failure at the handoff boundary, not an
-exclusion failure and not a lost commit — and it is the disclosed position, not a discovery. Core
+Two nodes computed `n + 1` from the same `n`. What that rules out is a **lost commit**: every value
+below the maximum was written, so nothing that committed vanished.
+
+What it does **not** on its own distinguish is _why_ two nodes read the same value — a successor
+admitted after a clean release but before applying its predecessor's write (a freshness failure), or
+two nodes admitted at once (an exclusion failure). Both produce this signature, and separating them
+needs the holder-interval evidence this bench does not collect; core's own
+`integrationTests/resources/record-lock-concurrency` test is the one that records holder intervals.
+The reason to read it as the freshness gap is the code rather than these numbers: core
 states at `resources/recordLockCoordinator.ts:43` that the §7 successor-freshness fence is
 deliberately unimplemented and is harper#2542; §14 adds that §6 step 3 settlement is unimplemented
 too, so a recall "writes the release without waiting for a native commit already submitted to

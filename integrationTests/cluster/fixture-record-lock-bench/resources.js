@@ -105,7 +105,7 @@ export class LockProbe extends Resource {
 /** This node's coordinator counters: delegations held, grants issued, live admissions, misroutes. */
 export class LockStats extends Resource {
 	async get() {
-		return coordinatorStats() ?? {};
+		return coordinatorStats() ?? { unavailable: true };
 	}
 }
 
