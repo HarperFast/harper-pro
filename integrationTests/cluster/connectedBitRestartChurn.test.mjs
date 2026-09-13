@@ -136,12 +136,16 @@ const WEDGE_TRIGGER_WAIT_MS = WEDGE_RECONCILE_THRESHOLD_MS + 5000 + 2 * RECONCIL
 // timeout can be derived from the same budget it polls against, instead of a hand-picked
 // number that can silently fall out of sync.
 const GENEROUS_CONVERGENCE_TIMEOUT_MS = 90000;
+// The pre-kill write burst, the SIGKILL wait, the log read and the leader's own restart run inside
+// this test with no deadline of their own, so they need a budget here or the sum below understates
+// the worst case.
+const UNBUDGETED_PHASES_MS = KILL_WAIT_MS + 60000;
 // Worst case: the full outage wait, then the full convergence window, then the post-recovery
 // data-flow probe -- each of those phases can legitimately consume its entire budget before the
-// assertion that would fail fires. Without summing them the test's own { timeout } can (and did)
-// fire first, so the run reports a timeout instead of the intended false-green/wedge assertion.
+// assertion that would fail fires. Without summing them the test's own { timeout } fires first and
+// the run reports a timeout instead of the intended false-green/wedge assertion.
 const LONG_OUTAGE_TEST_TIMEOUT_MS =
-	WEDGE_TRIGGER_WAIT_MS + GENEROUS_CONVERGENCE_TIMEOUT_MS + DATA_FLOW_TIMEOUT_MS + 20000;
+	WEDGE_TRIGGER_WAIT_MS + GENEROUS_CONVERGENCE_TIMEOUT_MS + DATA_FLOW_TIMEOUT_MS + UNBUDGETED_PHASES_MS;
 
 function nodeStartOptions(node) {
 	return {
@@ -187,13 +191,15 @@ async function writeBurst(node, dbNames, count, concurrency, idPrefix) {
 	await finish();
 }
 
-// Every database is probed, and all of them share one DATA_FLOW_TIMEOUT_MS window: which of the
-// six flowed is what separates one racing subscription from a dead link, and asserting on the
-// first dry one throws that away for good -- GitHub drops the job logs days later.
+// Every database is probed before anything asserts: which of the six flowed is what separates one
+// racing subscription from a dead link. Each gets its own DATA_FLOW_TIMEOUT_MS, and `Promise.all`
+// starting them together is what makes that one window rather than six consecutive ones.
 async function probeReplicated(follower, marker) {
 	const startedAt = Date.now();
 	return Promise.all(
 		DB_NAMES.map(async (db) => {
+			// The last attempt's error only, so a rejection early in the window is not still being
+			// reported after the node recovered and simply had nothing to return.
 			let lastError;
 			try {
 				await waitForCondition(
@@ -204,8 +210,8 @@ async function probeReplicated(follower, marker) {
 							{ operation: 'search_by_id', database: db, table: 'test', ids: [marker], get_attributes: ['id'] },
 							{ signal }
 						).catch((probeError) => {
-							if (signal.aborted) throw probeError;
 							lastError = probeError;
+							if (signal.aborted) throw probeError;
 							return [];
 						});
 						return Array.isArray(res) && res.some((r) => r.id === marker);
@@ -242,7 +248,7 @@ async function assertAllReplicated(follower, peerHostname, results, what) {
 	fail(
 		`${what}: ${missing.join(', ')} did not replicate to follower within ${DATA_FLOW_TIMEOUT_MS}ms ` +
 			`(${perDb})${probeErrors.length ? `; probe errors: ${probeErrors.join(' | ')}` : ''}` +
-			`; follower sockets to peer: [${sockets.join(' | ')}]`
+			`; follower sockets to peer: ${status.error ? `unavailable (${status.error})` : `[${sockets.join(' | ')}]`}`
 	);
 }
 
