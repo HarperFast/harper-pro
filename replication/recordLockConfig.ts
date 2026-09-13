@@ -12,8 +12,19 @@ import * as logger from '../core/utility/logging/harper_logger.js';
  * `CONFIG_PARAM_MAP` (`knownNodes.ts` notes the same limit for other replication knobs), and this key
  * is harper-pro's own — registering it would be a core change. Read once: a value that changed
  * between threads would make one worker advertise a capability the process does not honor.
+ *
+ * `getConfigObj()` throws when no boot properties file exists yet (a module-loading unit-test
+ * process, unlike a real server, never boots one). Every other `getConfigObj()` call site in the
+ * codebase defers the call into a function body for exactly this reason; this one can't, because
+ * the result is a module-scoped constant read by other modules at their own import time. Treat the
+ * throw the same as "not configured": fail closed, matching this module's own default.
  */
-const configured: unknown = getConfigObj()?.replication?.recordLocks;
+let configured: unknown;
+try {
+	configured = getConfigObj()?.replication?.recordLocks;
+} catch {
+	configured = undefined;
+}
 // Only a real boolean `true` enables it; a truthy non-boolean (a YAML `1`, a quoted `"true"`) would
 // leave the node advertising `recordLocks: 0` and registering the fail-closed transport, so warn
 // rather than let an operator believe the switch is on.
