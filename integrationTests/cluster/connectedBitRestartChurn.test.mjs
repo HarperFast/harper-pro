@@ -83,7 +83,7 @@ import { ok, equal, fail } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog, concurrent } from './clusterShared.mjs';
+import { sendOperation, readLog, concurrent, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -99,6 +99,7 @@ const KILL_CYCLES = Number(process.env.HARPER_TEST_CONNECTED_BIT_KILL_CYCLES) ||
 const POLL_INTERVAL_MS = 150;
 const CONVERGENCE_TIMEOUT_MS = 25000; // well under WEDGE_RECONCILE_THRESHOLD_MS (30_000ms, subscriptionManager.ts)
 const DATA_FLOW_TIMEOUT_MS = 15000;
+const CLUSTER_STATUS_DIAGNOSTIC_TIMEOUT_MS = 5000;
 const KILL_WAIT_MS = 15000;
 const WRITE_BURST_COUNT = 150;
 const WRITE_BURST_CONCURRENCY = 20;
@@ -186,55 +187,54 @@ async function writeBurst(node, dbNames, count, concurrency, idPrefix) {
 	await finish();
 }
 
-// Poll every database for `marker` against ONE shared budget, and report all of them.
-// The per-database loops this replaces asserted inside the loop, so the first dry database aborted
-// the run and the report named only that one -- yet whether the other five flowed is exactly what
-// separates one racing subscription from a dead link, and it is unrecoverable afterwards because
-// GitHub drops the job logs. Concurrent because the databases replicate over independent
-// connections; probing them in series also silently handed database N a budget of
-// N * DATA_FLOW_TIMEOUT_MS instead of the one the constant names.
+// Every database is probed, and all of them share one DATA_FLOW_TIMEOUT_MS window: which of the
+// six flowed is what separates one racing subscription from a dead link, and asserting on the
+// first dry one throws that away for good -- GitHub drops the job logs days later.
 async function probeReplicated(follower, marker) {
-	const deadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
+	const startedAt = Date.now();
 	return Promise.all(
 		DB_NAMES.map(async (db) => {
-			const startedAt = Date.now();
-			let error;
-			while (Date.now() < deadline) {
-				const res = await sendOperation(follower, {
-					operation: 'search_by_id',
-					database: db,
-					table: 'test',
-					ids: [marker],
-					get_attributes: ['id'],
-				}).catch((probeError) => {
-					error = probeError;
-					return [];
-				});
-				if (Array.isArray(res) && res.some((r) => r.id === marker))
-					return { db, seen: true, ms: Date.now() - startedAt };
-				await delay(200);
+			let lastError;
+			try {
+				await waitForCondition(
+					async (signal) => {
+						lastError = undefined;
+						const res = await sendOperation(
+							follower,
+							{ operation: 'search_by_id', database: db, table: 'test', ids: [marker], get_attributes: ['id'] },
+							{ signal }
+						).catch((probeError) => {
+							if (signal.aborted) throw probeError;
+							lastError = probeError;
+							return [];
+						});
+						return Array.isArray(res) && res.some((r) => r.id === marker);
+					},
+					{ timeoutMs: DATA_FLOW_TIMEOUT_MS, pollMs: 200, description: () => `${marker} on ${db}` }
+				);
+				return { db, seen: true, ms: Date.now() - startedAt };
+			} catch {
+				return { db, seen: false, ms: Date.now() - startedAt, error: lastError };
 			}
-			return { db, seen: false, ms: Date.now() - startedAt, error };
 		})
 	);
 }
 
 async function assertAllReplicated(follower, peerHostname, results, what) {
 	if (results.every((r) => r.seen)) return;
-	const status = await sendOperation(follower, { operation: 'cluster_status' }).catch((error) => ({
-		error: String(error),
-	}));
+	const status = await sendOperation(
+		follower,
+		{ operation: 'cluster_status' },
+		{ signal: AbortSignal.timeout(CLUSTER_STATUS_DIAGNOSTIC_TIMEOUT_MS) }
+	).catch((error) => ({ error: String(error) }));
 	const missing = results.filter((r) => !r.seen).map((r) => r.db);
 	const perDb = results.map((r) => `${r.db}=${r.seen ? `${r.ms}ms` : 'MISS'}`).join(' ');
 	const probeErrors = results.filter((r) => r.error).map((r) => `${r.db}: ${r.error}`);
-	// The full socket objects run to several KB; these are the fields that say whether the link was
-	// live and merely behind (receiving/version advancing) or reporting connected while dead.
 	const sockets = socketsForPeer(status, peerHostname).map((s) =>
 		[
 			s.database,
 			`connected=${s.connected}`,
 			`recv=${s.lastReceivedStatus}`,
-			`version=${s.lastReceivedVersion}`,
 			`liveness=${s.lastLiveness}`,
 			`backPressure=${s.backPressurePercent}%`,
 		].join(' ')
