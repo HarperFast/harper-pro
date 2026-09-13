@@ -159,7 +159,6 @@ function waitForCounter(nodes, id, expected) {
 	);
 }
 
-/** The value every node settles on, once they agree and stop moving. */
 function waitForAgreedCounter(nodes, id) {
 	let previous;
 	let stablePolls = 0;
@@ -169,7 +168,8 @@ function waitForAgreedCounter(nodes, id) {
 			const agreed = values.every((n) => n === values[0]) ? values[0] : undefined;
 			stablePolls = agreed !== undefined && agreed === previous ? stablePolls + 1 : 0;
 			previous = agreed;
-			return stablePolls >= 2 ? agreed : undefined;
+			// Wrapped: a cluster that settles on 0 is an answer, and waitForCondition discards a falsy one.
+			return stablePolls >= 2 ? { agreed } : undefined;
 		},
 		{ timeoutMs: CONVERGE_TIMEOUT_MS, pollMs: 250, description: `Counter/${id} to settle on one value everywhere` }
 	);
@@ -261,12 +261,10 @@ function writtenValueAudit(answers, finalCounter) {
 			else repeated.push({ n, nodes: [first, node] });
 		}
 	const total = answers.reduce((sum, answer) => sum + answer.written.length, 0);
-	// Tracked in the loop rather than spread into Math.max: a 40 s round already writes 61k distinct
-	// values, and spreading that many arguments is past what V8 accepts.
+	// Not Math.max(...keys): a 40 s round writes 61k distinct values, past V8's argument limit.
 	let maxWritten = 0;
 	for (const n of seen.keys()) if (n > maxWritten) maxWritten = n;
-	// Holes BELOW the highest value written. Values above it are not holes: they are the values the
-	// run never reached because a repeat consumed them.
+	// Only below maxWritten — values above it were never reached, because a repeat consumed them.
 	const holes = [];
 	for (let n = 1; n <= maxWritten && holes.length < 20; n++) if (!seen.has(n)) holes.push(n);
 	const acrossNodes = repeated.filter((entry) => entry.nodes[0] !== entry.nodes[1]).length;
@@ -287,6 +285,7 @@ function percentile(sorted, p) {
 }
 
 function distribution(samples) {
+	if (samples.length === 0) return { n: 0 };
 	const sorted = [...samples].sort((a, b) => a - b);
 	const round = (n) => Math.round(n * 100) / 100;
 	return {
@@ -508,7 +507,7 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 			// replicated. What the nodes settle on, plus the written-value audit, is the measurement.
 			// Nodes that never agree are a result to record, not a reason to abort the remaining rounds.
 			const agreed = await waitForAgreedCounter(nodes, id).then(
-				(value) => value,
+				(settled) => settled.agreed,
 				() => undefined
 			);
 			const finalCounter = await Promise.all(nodes.map((node) => counter(node, id).then((record) => record?.n)));
@@ -605,9 +604,8 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 				const remainder = sample.elapsedMs % windowMs;
 				return Math.min(remainder, windowMs - remainder) < REACQUISITION_CADENCE_MS * 1.5;
 			}).length;
-			// DELEGATION_LEASE_MS is copied from core. If it is retuned there, lapses stop landing on
-			// multiples of the window computed here and every rate reported is against a stale
-			// prediction — so say so rather than presenting the comparison as if it still held.
+			// DELEGATION_LEASE_MS is copied from core; if it is retuned there, lapses stop landing on
+			// multiples of the window computed here and every rate below is against a stale prediction.
 			const windowLooksStale = rounds.length > 0 && atWindowMultiple === 0;
 			const run = {
 				lease,

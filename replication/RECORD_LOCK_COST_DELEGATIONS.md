@@ -61,16 +61,17 @@ sharing, over three full runs.
 | Durable commits per contended section       | 4                        | 0.023–0.054 release entries          | as predicted                  |
 | Hot-key handoff throughput                  | 877–911 sections/s       | 1 031–1 707 sections/s               | faster, but see fairness      |
 | Hot-key exact convergence                   | exact, every run         | **0.05–0.13 % lost at 3 contenders** | **not met — harper#2542**     |
-| Hot-key fairness                            | shared by turn-taking    | **100 % / 0 % in 2 of 3 runs**       | **not a §10 row; found here** |
+| Hot-key fairness                            | shared by turn-taking    | **loser starved in 2 of 3 runs**     | **not a §10 row; found here** |
 | Write throughput, feature off vs absent     | inside noise             | inside noise                         | as predicted                  |
 | Delegation re-acquisition rate              | n/a                      | `gap / (360 s − lease)`              | exact at the 60 s window      |
 | Cold-key recovery path                      | n/a                      | **unmeasurable**                     | harper#2542 not implemented   |
 
 Two results are worth a reader's attention beyond the table. The hot-key row can buy its throughput
-with **starvation** — in two runs of three at two contenders the losing node completed exactly one
-section in fifteen seconds, while in the third the identical workload split 58/42 — so this is a
-regime the protocol can enter, not one it always enters. And the convergence row is a **disclosed**
-gap being costed, not a defect found.
+with **starvation**: in two runs of three at two contenders the losing node completed **no critical
+section at all while the key was held**, and over a 40 s round it got zero sections and one
+user-visible `423`. In the third run the identical workload split 58/42, so this is a regime the
+protocol can enter rather than one it always enters. And the convergence row is a **disclosed** gap
+being costed, not a defect found.
 
 ## 1. Uncontended acquisition latency
 
@@ -187,11 +188,14 @@ Sections completed per node, same runs:
 | 2   | 3          | 13 637 / 4 003 / 3 064 | 66 / 19 / 15 % | 527 / 1 330 / 1 205      |
 | 3   | 3          | 8 428 / 2 953 / 6 886  | 46 / 16 / 38 % | 581 / 987 / 951          |
 
-**Two contenders produce one of two regimes, and the bad one is very bad.** In runs 2 and 3 the loser
-completed **exactly one section in fifteen seconds** — its single request sat on `lock()` for the
-whole window. In run 1 the identical workload split 58/42 with a worst lock of 586 ms. Same bench,
-same box, same key construction: the outcome is bistable rather than consistent, which is itself
-worth noticing, because a regime that appears in two runs out of three will appear in production.
+**Two contenders produce one of two regimes, and the bad one is total.** In runs 2 and 3 the loser
+completed **no section at all while the key was held**. Its single recorded section is an artifact of
+the measurement window closing: the loser's `lastN` is the cluster _maximum_ (25 692 against the
+winner's 25 691), so that write landed after the winner's loop ended and dropped the key, not during
+the round. Its one `lock()` call sat waiting for the whole 15 s. In run 1 the identical workload split
+58/42 with a worst lock of 586 ms. Same bench, same box, same key construction: the outcome is
+bistable rather than consistent, which is itself worth noticing, because a regime that appears in two
+runs of three will appear in production.
 
 The `lockRelease` counts separate the two regimes cleanly, and show the bad one is not simple
 monopolization — which would at least be cheap:
@@ -231,9 +235,16 @@ for 15 s, so a contender starved for the whole round still never reaches its tim
 | 2 of 3     | 40 s     | 55 062   | 1 375      | **1** / 55 061         | **1** | 0    |
 | 3 of 3     | 40 s     | 39 700   | 991        | 24 541 / 7 867 / 7 292 | 0     | 60   |
 
-The starved node completed one section in forty seconds and its next request failed with `Record is
-locked and was not released in time`. (The 3-contender row of the same run lost 60 of 39 700 sections,
-0.15 %, the highest rate seen — consistent with a longer round giving more handoffs to lose at.) So a hot key does not merely skew throughput: **a contender can
+Read the order carefully, because it is the opposite of the 15 s rows and it is the point: the
+starved node's **first** request waited out `DEFAULT_LOCK_TIMEOUT_MS` and **failed with `423 Record is
+locked and was not released in time` while the holder was still running**. Its second request then
+started at ~30 s and completed at ~40 s — a 10.0 s wait — only because the holder's loop ended there.
+Its `lastN` is again the cluster maximum (55 062 against the winner's 55 061), confirming that write
+landed after the round rather than in it.
+
+So over forty seconds of contention the starved contender got **zero** critical sections and one
+user-visible failure. (The 3-contender row of the same run lost 60 of 39 700 sections, 0.15 %, the
+highest rate seen — consistent with a longer round giving more handoffs to lose at.) So a hot key does not merely skew throughput: **a contender can
 be starved to the point of user-visible failure**, while the holder runs at full rate and the cluster
 reports no error anywhere else. That is the finding to weigh against the throughput number, and it is
 worth a decision before enablement (harper-pro#825) rather than after.
