@@ -146,6 +146,18 @@ const UNBUDGETED_PHASES_MS = KILL_WAIT_MS + 60000;
 // the run reports a timeout instead of the intended false-green/wedge assertion.
 const LONG_OUTAGE_TEST_TIMEOUT_MS =
 	WEDGE_TRIGGER_WAIT_MS + GENEROUS_CONVERGENCE_TIMEOUT_MS + DATA_FLOW_TIMEOUT_MS + UNBUDGETED_PHASES_MS;
+const SETUP_TEST_TIMEOUT_MS = 60000;
+const CHAOS_TEST_TIMEOUT_MS = 300000;
+const SUMMARY_TEST_TIMEOUT_MS = 30000;
+// The suite deadline cancels a child that is still inside its own budget, so it has to clear the
+// sum of them plus the two node starts in `before` -- otherwise the same generic timeout the
+// per-test budgets above exist to avoid arrives from one level up.
+const SUITE_TIMEOUT_MS =
+	SETUP_TEST_TIMEOUT_MS +
+	CHAOS_TEST_TIMEOUT_MS +
+	LONG_OUTAGE_TEST_TIMEOUT_MS +
+	SUMMARY_TEST_TIMEOUT_MS +
+	UNBUDGETED_PHASES_MS;
 
 function nodeStartOptions(node) {
 	return {
@@ -290,7 +302,7 @@ async function sigkillNode(node, timeoutMs = KILL_WAIT_MS) {
 
 suite(
 	'QA-587: replication connected bit never wedges stuck-false across crash-restart churn (harper-pro#431/PR#523 general guarantees)',
-	{ timeout: 480000 },
+	{ timeout: SUITE_TIMEOUT_MS },
 	(ctx) => {
 		before(async () => {
 			const hostLeader = await getNextAvailableLoopbackAddress();
@@ -337,7 +349,7 @@ suite(
 
 		test(
 			'setup: follower subscribes to leader across all databases and baseline data flows',
-			{ timeout: 60000 },
+			{ timeout: SETUP_TEST_TIMEOUT_MS },
 			async () => {
 				await sendOperation(ctx.follower, {
 					operation: 'add_node',
@@ -379,7 +391,7 @@ suite(
 
 		test(
 			'chaos: repeated genuine SIGKILL + restart under write/admin load never wedges the connected bit',
-			{ timeout: 300000 },
+			{ timeout: CHAOS_TEST_TIMEOUT_MS },
 			async () => {
 				for (let cycle = 1; cycle <= KILL_CYCLES; cycle++) {
 					const cycleResult = {
@@ -602,7 +614,7 @@ suite(
 			}
 		);
 
-		test('non-blind summary + wedge-reconcile telemetry evidence', { timeout: 30000 }, async () => {
+		test('non-blind summary + wedge-reconcile telemetry evidence', { timeout: SUMMARY_TEST_TIMEOUT_MS }, async () => {
 			ok(ctx.cycles.length === KILL_CYCLES, 'chaos cycles did not run to completion');
 			ok(ctx.longOutageCycle, 'long-outage cycle did not run to completion');
 
