@@ -79,7 +79,7 @@
  */
 
 import { suite, test, before, after } from 'node:test';
-import { ok, equal } from 'node:assert/strict';
+import { ok, equal, fail } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
@@ -135,13 +135,12 @@ const WEDGE_TRIGGER_WAIT_MS = WEDGE_RECONCILE_THRESHOLD_MS + 5000 + 2 * RECONCIL
 // timeout can be derived from the same budget it polls against, instead of a hand-picked
 // number that can silently fall out of sync.
 const GENEROUS_CONVERGENCE_TIMEOUT_MS = 90000;
-// Worst case: the full outage wait, then the full convergence window, then a sequential
-// post-recovery data-flow probe per database -- each of those phases can legitimately consume
-// its entire budget before the assertion that would fail fires. Without summing them the test's
-// own { timeout } can (and did) fire first, so the run reports a timeout instead of the
-// intended false-green/wedge assertion.
+// Worst case: the full outage wait, then the full convergence window, then the post-recovery
+// data-flow probe -- each of those phases can legitimately consume its entire budget before the
+// assertion that would fail fires. Without summing them the test's own { timeout } can (and did)
+// fire first, so the run reports a timeout instead of the intended false-green/wedge assertion.
 const LONG_OUTAGE_TEST_TIMEOUT_MS =
-	WEDGE_TRIGGER_WAIT_MS + GENEROUS_CONVERGENCE_TIMEOUT_MS + DB_NAMES.length * DATA_FLOW_TIMEOUT_MS + 20000;
+	WEDGE_TRIGGER_WAIT_MS + GENEROUS_CONVERGENCE_TIMEOUT_MS + DATA_FLOW_TIMEOUT_MS + 20000;
 
 function nodeStartOptions(node) {
 	return {
@@ -185,6 +184,66 @@ async function writeBurst(node, dbNames, count, concurrency, idPrefix) {
 	}, concurrency);
 	for (let i = 0; i < count; i++) await execute();
 	await finish();
+}
+
+// Poll every database for `marker` against ONE shared budget, and report all of them.
+// The per-database loops this replaces asserted inside the loop, so the first dry database aborted
+// the run and the report named only that one -- yet whether the other five flowed is exactly what
+// separates one racing subscription from a dead link, and it is unrecoverable afterwards because
+// GitHub drops the job logs. Concurrent because the databases replicate over independent
+// connections; probing them in series also silently handed database N a budget of
+// N * DATA_FLOW_TIMEOUT_MS instead of the one the constant names.
+async function probeReplicated(follower, marker) {
+	const deadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
+	return Promise.all(
+		DB_NAMES.map(async (db) => {
+			const startedAt = Date.now();
+			let error;
+			while (Date.now() < deadline) {
+				const res = await sendOperation(follower, {
+					operation: 'search_by_id',
+					database: db,
+					table: 'test',
+					ids: [marker],
+					get_attributes: ['id'],
+				}).catch((probeError) => {
+					error = probeError;
+					return [];
+				});
+				if (Array.isArray(res) && res.some((r) => r.id === marker))
+					return { db, seen: true, ms: Date.now() - startedAt };
+				await delay(200);
+			}
+			return { db, seen: false, ms: Date.now() - startedAt, error };
+		})
+	);
+}
+
+async function assertAllReplicated(follower, peerHostname, results, what) {
+	if (results.every((r) => r.seen)) return;
+	const status = await sendOperation(follower, { operation: 'cluster_status' }).catch((error) => ({
+		error: String(error),
+	}));
+	const missing = results.filter((r) => !r.seen).map((r) => r.db);
+	const perDb = results.map((r) => `${r.db}=${r.seen ? `${r.ms}ms` : 'MISS'}`).join(' ');
+	const probeErrors = results.filter((r) => r.error).map((r) => `${r.db}: ${r.error}`);
+	// The full socket objects run to several KB; these are the fields that say whether the link was
+	// live and merely behind (receiving/version advancing) or reporting connected while dead.
+	const sockets = socketsForPeer(status, peerHostname).map((s) =>
+		[
+			s.database,
+			`connected=${s.connected}`,
+			`recv=${s.lastReceivedStatus}`,
+			`version=${s.lastReceivedVersion}`,
+			`liveness=${s.lastLiveness}`,
+			`backPressure=${s.backPressurePercent}%`,
+		].join(' ')
+	);
+	fail(
+		`${what}: ${missing.join(', ')} did not replicate to follower within ${DATA_FLOW_TIMEOUT_MS}ms ` +
+			`(${perDb})${probeErrors.length ? `; probe errors: ${probeErrors.join(' | ')}` : ''}` +
+			`; follower sockets to peer: [${sockets.join(' | ')}]`
+	);
 }
 
 // Extra admin-API flood against `node` itself, purely to congest its own main-thread
@@ -303,25 +362,12 @@ suite(
 						records: [{ id: marker, name: 'baseline' }],
 					});
 				}
-				for (const db of DB_NAMES) {
-					let seen = false;
-					const dDeadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
-					while (Date.now() < dDeadline) {
-						const res = await sendOperation(ctx.follower, {
-							operation: 'search_by_id',
-							database: db,
-							table: 'test',
-							ids: [marker],
-							get_attributes: ['id'],
-						});
-						if (Array.isArray(res) && res.some((r) => r.id === marker)) {
-							seen = true;
-							break;
-						}
-						await delay(200);
-					}
-					ok(seen, `baseline write on ${db} did not replicate to follower`);
-				}
+				await assertAllReplicated(
+					ctx.follower,
+					ctx.leader.hostname,
+					await probeReplicated(ctx.follower, marker),
+					'baseline write'
+				);
 			}
 		);
 
@@ -424,28 +470,12 @@ suite(
 					);
 					console.log(`[qa587] cycle ${cycle}: converged in ${cycleResult.convergenceMs}ms after restart`);
 
-					for (const db of DB_NAMES) {
-						let seen = false;
-						const dDeadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
-						while (Date.now() < dDeadline) {
-							const res = await sendOperation(ctx.follower, {
-								operation: 'search_by_id',
-								database: db,
-								table: 'test',
-								ids: [inFlightMarker],
-								get_attributes: ['id'],
-							}).catch(() => []);
-							if (Array.isArray(res) && res.some((r) => r.id === inFlightMarker)) {
-								seen = true;
-								break;
-							}
-							await delay(200);
-						}
-						ok(
-							seen,
-							`cycle ${cycle}: post-restart in-flight write on ${db} did not replicate to follower (false-green connected:true)`
-						);
-					}
+					await assertAllReplicated(
+						ctx.follower,
+						ctx.leader.hostname,
+						await probeReplicated(ctx.follower, inFlightMarker),
+						`cycle ${cycle}: post-restart in-flight write (false-green connected:true)`
+					);
 
 					// Non-blind proof #2 / no-false-green check: a fresh write made AFTER convergence
 					// must actually replicate, not just flip the bit.
@@ -458,31 +488,14 @@ suite(
 							records: [{ id: marker, name: 'chaos' }],
 						});
 					}
-					let allFlowed = true;
-					for (const db of DB_NAMES) {
-						let seen = false;
-						const dDeadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
-						while (Date.now() < dDeadline) {
-							const res = await sendOperation(ctx.follower, {
-								operation: 'search_by_id',
-								database: db,
-								table: 'test',
-								ids: [marker],
-								get_attributes: ['id'],
-							}).catch(() => []);
-							if (Array.isArray(res) && res.some((r) => r.id === marker)) {
-								seen = true;
-								break;
-							}
-							await delay(200);
-						}
-						if (!seen) allFlowed = false;
-						ok(
-							seen,
-							`cycle ${cycle}: fresh post-recovery write on ${db} did not replicate to follower (false-green connected:true)`
-						);
-					}
-					cycleResult.dataFlowed = allFlowed;
+					const flowed = await probeReplicated(ctx.follower, marker);
+					cycleResult.dataFlowed = flowed.every((r) => r.seen);
+					await assertAllReplicated(
+						ctx.follower,
+						ctx.leader.hostname,
+						flowed,
+						`cycle ${cycle}: fresh post-recovery write (false-green connected:true)`
+					);
 				}
 			}
 		);
@@ -572,31 +585,14 @@ suite(
 						records: [{ id: marker, name: 'chaos' }],
 					});
 				}
-				let allFlowed = true;
-				for (const db of DB_NAMES) {
-					let seen = false;
-					const dDeadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
-					while (Date.now() < dDeadline) {
-						const res = await sendOperation(ctx.follower, {
-							operation: 'search_by_id',
-							database: db,
-							table: 'test',
-							ids: [marker],
-							get_attributes: ['id'],
-						}).catch(() => []);
-						if (Array.isArray(res) && res.some((r) => r.id === marker)) {
-							seen = true;
-							break;
-						}
-						await delay(200);
-					}
-					if (!seen) allFlowed = false;
-					ok(
-						seen,
-						`long outage: fresh post-recovery write on ${db} did not replicate to follower (false-green connected:true)`
-					);
-				}
-				cycleResult.dataFlowed = allFlowed;
+				const flowed = await probeReplicated(ctx.follower, marker);
+				cycleResult.dataFlowed = flowed.every((r) => r.seen);
+				await assertAllReplicated(
+					ctx.follower,
+					ctx.leader.hostname,
+					flowed,
+					'long outage: fresh post-recovery write (false-green connected:true)'
+				);
 			}
 		);
 
