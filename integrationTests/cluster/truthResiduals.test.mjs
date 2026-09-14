@@ -212,8 +212,8 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 420000 }, (ct
 			const beforeKill = peerSocket(await clusterStatus(subscriber), peer.hostname);
 			ok(
 				beforeKill?.lastReceivedVersion > 0,
-				'precondition: the link must have applied the r1-before record, or the surviving-buffer ' +
-					'assertion below would pass against a zeroed buffer'
+				'precondition: the link must have applied r1-before, or the surviving-buffer assertion ' +
+					'below would pass against a zeroed buffer'
 			);
 			equal(
 				beforeKill?.connected,
@@ -242,11 +242,9 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 420000 }, (ct
 			);
 			equal(corrected.connected, false);
 			equal(corrected.lastConnectionError.code, WORKER_EXIT_ERROR_CODE);
-			// The stamp alone does not prove the buffer survived the worker: the main thread would stamp a
-			// freshly zeroed one just as well. The pre-kill receive watermark is the field that can only be
-			// there if this is the SAME allocation the dead worker was writing — everything the buffer
-			// carries (link metrics, blob-failure counts, recovery-fire counters) rides on that. See the
-			// `sharedStatus` anchor in subscriptionManager.
+			// The stamp alone does not prove the buffer survived the worker — the main thread would stamp a
+			// freshly zeroed one just as well. The pre-kill watermark can only be there if this is the same
+			// allocation the dead worker was writing.
 			equal(
 				corrected.lastReceivedVersion,
 				beforeKill.lastReceivedVersion,
