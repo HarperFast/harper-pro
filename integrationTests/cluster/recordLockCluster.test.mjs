@@ -2,11 +2,12 @@
  * Cluster-wide record locks over delegations (harper-pro#438, W9 Phase 1 of harper#483).
  *
  * What only real nodes can prove: that a delegation request reaches a key's home over the real
- * replication connections and comes back granted; that serialized lock()+increment across three
- * nodes never loses an update; that a key held on one node hands over to another on release,
- * through recall; that a lock is exclusive across nodes while held; that a stale holder is fenced;
- * and that a peer without the delegation-level `recordLocks` capability is not a ring member and
- * fails a cluster lock closed.
+ * replication connections and comes back granted; that lock()+increment across three nodes stays
+ * exclusive (every admitted increment lands in range and every node converges to the same final
+ * value — NOT that no update is ever lost: harper#2542, the successor-freshness fence, is still
+ * outstanding); that a key held on one node hands over to another on release, through recall; that a
+ * lock is exclusive across nodes while held; that a stale holder is fenced; and that a peer without
+ * the delegation-level `recordLocks` capability is not a ring member and fails a cluster lock closed.
  *
  * Every node runs one http worker (`threads.count: 1`): a cluster-scoped lock() is served only by the
  * worker that coordinates the database, and a keep-alive client would otherwise pin itself to a worker
@@ -248,7 +249,7 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 		assert.equal(new Set(rings).size, 1, `nodes disagree about the ring: ${rings.join(' | ')}`);
 	});
 
-	test('N concurrent lock()+increment spread across the nodes lands exactly N on every node', async () => {
+	test('N concurrent lock()+increment spread across the nodes stay exclusive and converge', async () => {
 		const id = 'counter-' + Date.now();
 		await putCounter(nodes[0], id, 0);
 		await waitForCounter(nodes, id, 0);
@@ -258,16 +259,24 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 		);
 		const failed = results.filter((result) => result.status !== 200);
 		assert.deepEqual(failed, [], `every increment must succeed: ${JSON.stringify(failed)}`);
-		// Each increment saw every earlier one: the release that let its delegation in was applied after
-		// the previous holder's write on that holder's own stream.
-		const seen = results.map((result) => result.body.n).sort((a, b) => a - b);
-		assert.deepEqual(
-			seen,
-			Array.from({ length: N }, (_, i) => i + 1)
+		const seen = results.map((result) => result.body.n);
+		for (const n of seen) assert.ok(n >= 1 && n <= N, `n=${n} is outside the admitted range [1, ${N}]: ${seen}`);
+		// A handoff here carries exclusion but not yet successor freshness (harper#2542): a successor can
+		// read its predecessor's pre-write value, so two admitted increments can legitimately land on the
+		// same n (RECORD_LOCK_COST_DELEGATIONS.md measures 0.05-0.13% of sections at 3 contenders). What
+		// exclusion alone guarantees is that every node converges to the SAME final value — not that the
+		// value is N (a real pre-push review finding: the prior strict [1..N] assertion could flake on
+		// exactly the race this phase does not yet close).
+		const finalValues = await waitForCondition(
+			async (signal) => {
+				const values = await Promise.all(nodes.map((node) => counter(node, id, signal).then((record) => record?.n)));
+				return values.every((n) => n === values[0]) ? values : undefined;
+			},
+			{ timeoutMs: CONVERGE_TIMEOUT_MS, description: `Counter/${id} to converge to the same value on every node` }
 		);
-		assert.deepEqual(
-			await waitForCounter(nodes, id, N),
-			nodes.map(() => N)
+		assert.ok(
+			finalValues.every((n) => n >= 1 && n <= N),
+			`nodes converged outside the admitted range: ${finalValues}`
 		);
 	});
 
