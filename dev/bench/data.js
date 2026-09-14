@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789373508634,
+  "lastUpdate": 1789373510980,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -10763,6 +10763,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E insert p99 — short ranges",
             "value": 82.57,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "kriszyp",
+            "username": "kriszyp",
+            "email": "34054+kriszyp@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "f745f11fef631725841e24414e48363043259a9a",
+          "message": "feat: Sync Core",
+          "timestamp": "2026-09-13T07:17:42Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/f745f11fef631725841e24414e48363043259a9a"
+        },
+        "date": 1789373510955,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 7.2,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 11.98,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 13.96,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 67.48,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 83.67,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 54.86,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 131.88,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 55.3,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 321.09,
             "unit": "ms"
           }
         ]
