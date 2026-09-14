@@ -267,7 +267,10 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 		// check alone cannot tell that apart from no exclusion at all (every request reading the unwritten
 		// n=0 and writing 1) — a real pre-push review finding — so also require nearly every value distinct.
 		const distinctValues = new Set(seen).size;
-		assert.ok(distinctValues >= N - 2, `too many admitted increments collided, exclusion did not serialize access: ${seen}`);
+		assert.ok(
+			distinctValues >= N - 2,
+			`too many admitted increments collided, exclusion did not serialize access: ${seen}`
+		);
 		// What exclusion alone guarantees is that every node converges to the SAME final value — not that
 		// the value is N (the prior strict [1..N] convergence assertion could flake on the same race).
 		const finalValues = await waitForCondition(
