@@ -90,6 +90,13 @@ type ConnectedWorkerStatus = {
 };
 type ReplicationConnectionStatus = {
 	url?: string;
+	// The (database, peer) shared-memory status buffer, held here for its lifetime rather than read
+	// transiently. getUserSharedBuffer frees the backing allocation once every ArrayBuffer view of it is
+	// collected, and the owning HTTP worker's view is the only other durable one — so without this anchor
+	// the buffer dies with the worker whose death the truth mechanism exists to survive, and the next
+	// resolution silently hands back a zeroed one. Anchoring it on the entry ties the allocation's lifetime
+	// to the membership's. See W1 (harper-pro#431).
+	sharedStatus?: Float64Array;
 	// Explicit unsubscribe keeps the entry alive for iterator/URL cleanup, but it is no longer
 	// an active subscription and must not take the existing-entry reuse fast path.
 	unsubscribed?: boolean;
@@ -158,6 +165,20 @@ function getAuditStoreForDatabase(databaseName: string): any {
 	for (const tableName in database) {
 		const auditStore = database[tableName]?.auditStore;
 		if (auditStore) return auditStore;
+	}
+}
+
+// The (database, peer) shared status, or undefined while the database has no table with an audit store.
+// Resolved on the main thread so its subscription entry can hold the buffer for the membership's lifetime —
+// see the `sharedStatus` field. Never throws into a subscribe path: a database torn down between the
+// lookup and the read would otherwise abandon the subscription this is only decorating.
+function resolveSharedStatus(databaseName: string, nodeName: string | undefined): Float64Array | undefined {
+	if (!nodeName) return;
+	try {
+		const auditStore = getAuditStoreForDatabase(databaseName);
+		if (auditStore) return getReplicationSharedStatus(auditStore, databaseName, nodeName);
+	} catch (error) {
+		logger.warn('Error resolving replication connection truth for', databaseName, nodeName, error);
 	}
 }
 
@@ -1047,9 +1068,14 @@ export async function startOnMainThread(options) {
 			// assigned at all (all workers were down at registration time) so it gets rebound
 			// once workers come back. Without these checks, the early-return branch keeps the
 			// entry stuck and the subscription never recovers.
+			// Carried across the reassignment below rather than re-resolved: this is the dead-owner path, so
+			// dropping the outgoing entry's anchor and resolving a fresh one would let a GC in between free
+			// the buffer holding the disconnect this reassignment exists to react to.
+			let carriedSharedStatus: Float64Array | undefined;
 			if (existingEntry && httpWorkers.length > 0 && !httpWorkers.includes(existingEntry.worker as any)) {
 				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
 				dbReplicationWorkers.delete(databaseName);
+				carriedSharedStatus = existingEntry.sharedStatus;
 				existingEntry = undefined;
 			}
 			if (existingEntry) {
@@ -1087,6 +1113,11 @@ export async function startOnMainThread(options) {
 					// never reaches 'open' (so connectedToNode never clears it and disconnectedFromNode never
 					// stamps disconnectedAt) would otherwise be invisible to findWedgedNodeUrls. See harper-pro#466.
 					createdAt: Date.now(),
+					// Anchored before the subscribe is dispatched below, so the main thread holds the buffer
+					// before the worker can become its first — and otherwise only — resolver. A database with no
+					// audit store yet resolves nothing; the reconcile pass anchors it on its next tick, and a
+					// link with no audit store has no watermark to lose in the meantime.
+					sharedStatus: carriedSharedStatus ?? resolveSharedStatus(databaseName, nodes[0]?.name),
 				});
 				ensureWorkerExitHandler(worker);
 			}
@@ -1435,6 +1466,9 @@ export async function startOnMainThread(options) {
 					// One buffer read serves every job on this entry: the two lifecycle corrections, the truth
 					// derivation, and the R3 metrics bridge.
 					status = getReplicationSharedStatus(auditStore, databaseName, nodeName);
+					// Deterministic cover for an entry created before its database had an audit store: this
+					// pass runs every RECONCILE_INTERVAL_MS and has the buffer in hand already.
+					entry.sharedStatus ??= status;
 					// a tracked peer that is no longer a cluster member must read zero
 					// shared status, or a same-process re-add inherits its CONNECTED/liveness/error values.
 					// Skipped while nodeMap is empty — mid-boot, nothing has been processed yet, so every entry
