@@ -19,258 +19,238 @@ rest of §11's "still owed" list): harper#2542's freshness fence, the `lockRelea
 cross-thread relay gap, and full every-serving-thread transport registration. Real, blocking
 for *enablement*, and called out as findings — not folded in here.
 
-**Revision history.** Round 1 of the planning review (`8f2f03890502`, `better-alternative-exists`)
-found this note's first draft unsafe in four places — summarized under "What changed after
-round 1," below the design. This is the revised note; §4.3 is now a materially different,
-simpler mechanism than round 1 reviewed, so a second planning round is warranted before
-implementation despite the "adopt, no second round" default, per
-[design-alternatives.md](../../../.claude-devagent/skills/harper-engineering-guidelines/rules/design-alternatives.md)'s
-"unless the switch opens a new question" — the mechanism itself is the new question.
+**Revision history — two rounds, both `better-alternative-exists`, both adopted.**
+
+- **Round 1** (`8f2f03890502`): rejected a "trusted orchestrator collects incarnation-bound
+  acknowledgements into one canonical activation artifact" design's first cut on four
+  blockers (local-only evidence can't support a cross-node check; "acknowledge" observed
+  state without establishing quiescence; incarnation-bump ordering; storage atomicity) plus
+  several significant findings (hot-path cost, weak digest, handshake refresh, auth/replay).
+  I responded by **over-correcting**: replacing cross-node evidence collection with a purely
+  local per-node wall-clock timer — which round 2 then showed does not actually establish
+  the invariant.
+- **Round 2** (`cb288f1e9a0a`): rejected the local-timer design on four new blockers, each
+  with a concrete two-holder counterexample — staging didn't quiesce the old generation
+  immediately, so a `g` grant could still be issued right up to the drain deadline; per-node
+  receipt deadlines are not a last-node barrier under staggered delivery; `Date.now()` is not
+  a safe elapsed-time proof across a restart or clock correction; the incarnation fix was
+  attached to one caller, not the ownership-assignment invariant. Its framing section states
+  the resolution directly: **"A concretely better online approach is durable quiescence on
+  stage plus a separate operator-issued activation record after the last stage/fence and
+  drain."** — i.e., round 1's original shape, correctly.
+
+**This is round 3 of the note, not a third planning round of review.** Round 2's fixes are
+adopted here on the facts — each is a concrete, verifiable counterexample, not a judgment call
+— converging on almost exactly round 1's original suggestion. Per
+[design-alternatives.md](../../../.claude-devagent/skills/harper-engineering-guidelines/rules/design-alternatives.md),
+adopting a reviewed alternative does not require a further round "unless the switch opens a
+new question"; this one does not — it is the union of both rounds' own explicit
+recommendations, not a new mechanism. Both rounds' rejections of the "different layer" and
+"deeper cause" axes stand unchanged throughout; only "do less" and "chosen" moved, and they
+converge to the same place: an **operator-timed**, not **node-timed**, transition.
 
 ## What this branch has wrong today
 
 `replication/recordLockTransport.ts`'s `epoch()` derives `LockEpoch{number: 1, members,
 ringVersion}` **locally, from live `hdb_nodes` + capability advertisement**, on every node,
-independently — exactly the shape core's design doc now says must not exist: "no node ever
-derives, proposes or advances one from what it observes" (§4). It cannot compile against
-`homeMap()` at all, and even if it could, it still has the two-holder hole the PR's own `## For
-the human reviewer` section already disclosed.
+independently — exactly the shape core's design doc now says must not exist. It cannot compile
+against `homeMap()` at all, and has the two-holder hole the PR's own `## For the human
+reviewer` section already disclosed.
 
-`homeIncarnation` is bumped once at process start and pushed to every worker. §5.1 requires it
-to advance once per **coordination incarnation** — a process start *or* a coordinating-worker
-restart — because coordinator state is per-thread: today, if the owning HTTP worker exits and
-`recordLockOwnerFor` reassigns coordination to a fresh worker (`recordLockTransport.ts:476-491`),
-the replacement gets the *same* `homeIncarnation`, so its delegation counter restarts at zero
-under an unchanged incarnation — exactly the ordering hole §5.1 names.
+`homeIncarnation` is bumped once at process start and pushed to every worker; §5.1 requires it
+to advance once per **coordination incarnation** (a process start *or* a coordinating-worker
+restart), which today's single call site at process start does not do.
 
 ## The invariant this change enforces
 
-**At most one generation is ever live, cluster-wide, for a given database's home map — no node
-may treat a newer generation as active until every node that could still be granting under the
-generation it is displacing has had the full delegation-lease window to have stopped, whether or
-not that node is reachable to confirm it.**
+**At most one generation is ever live, cluster-wide, for a given database's home map. Before
+any node exposes generation `g+1` via `homeMap()`, every node capable of granting or honoring
+`g` must have durably stopped doing so — immediately, not after a delay measured from an event
+only that node observed — and the wait for any surviving authority to expire must be measured
+from the *last* such stop across the whole affected set, by a single external, trusted
+timekeeper, not reconstructed independently by each node from its own clock.**
 
 ## Approaches considered
 
 **Root cause:** the home map is currently *derived* (computed independently by each node from
 data that can disagree), when core's contract requires it to be *stated* (published once,
-identically, and verified to be identical before use).
+identically, and verified to be identical before use) — and, per round 2, the *transition*
+between two states of that fact must be governed by the same discipline: stated and externally
+timed, not independently inferred by each participant.
 
 | Axis | Candidate | Why not chosen / why chosen |
 |---|---|---|
-| **Different layer** | Move home-map ownership into core. | Disqualified by core's own docstring — `homeMap()` is "supplied by harper-pro; core never computes it" (`recordLockCoordinator.ts:105`) — and design-doc §4: "harper-pro owns this, because it owns topology." Round 1's framing check confirmed this axis is correctly closed. |
-| **Deeper cause** | Rebuild automatic, consensus-derived rehoming (the epoch protocol #825 originally specified). | Already rejected upstream, at the core-design level, not by me: design-doc §9 "Do more" row and §14's round-7 ruling, with a recorded disqualifier (a durable consensus subsystem is "unpaid complexity" when an operator can simply state the answer). Round 1 confirmed this axis is correctly closed too. Not reopened here. |
-| **Do less** | (a) Global hot-reloadable config, no digest check, no staged transition. (b) *Round 1's addition, adopted below in a further-reduced form*: fence/stop every affected node, wait the full delegation interval, publish the next map, restart — no online acknowledgement protocol. | (a) disqualified per round 1: skips the exact mechanism (§4.3's staged transition) core's own doc says is not optional — "a digest check is not a freshness check." (b) is the axis round 1 found missing from the first draft, and it is **chosen**, in the reduced form below: no acknowledgement round trip and no restart requirement either — see "Do less, taken further" below for why round 1's own proposal (an online ack protocol with a canonical activation artifact) is *itself* more than the invariant needs. |
-| **Chosen** | A local, per-node, wall-clock timer anchored at stage-receipt: durable per-database `{active, staged}` records (dedicated local-only table, not a shared-row blob field); an operator-driven `stage` call fanned out to every node in `homes(g) ∪ homes(g+1)`; each node **independently** promotes `staged → active` once its own `Date.now() - stagedAt ≥ DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS`, with no cross-node acknowledgement, canonical artifact, or restart required. | Satisfies the invariant without a distributed-evidence-collection step: safety comes from every affected node's own drain timer, not from any node learning what another node has done — which sidesteps round 1's blocker #2 (local-only evidence cannot support a cross-node check) entirely rather than solving it. See "Why this is still safe" below for the argument that a per-node timer is sufficient. |
+| **Different layer** | Move home-map ownership into core. | Disqualified by core's own docstring and design-doc §4 ("harper-pro owns this, because it owns topology"). Confirmed closed by both round 1 and round 2. |
+| **Deeper cause** | Rebuild automatic, consensus-derived rehoming. | Already rejected upstream at the core-design level (design-doc §9, §14 round 7), with a recorded disqualifier. Confirmed closed by both rounds. |
+| **Do less** | (a) Global hot-reloadable config, no digest, no staged transition — disqualified round 1: skips §4.3 entirely. (b) A purely local per-node timer with no cross-node evidence — **tried, disqualified round 2**: staggered delivery and non-immediate quiescence reopen the two-holder bug; a per-node clock cannot prove a cluster-wide elapsed-time fact. (c) Full affected-cluster stop/fence/wait/publish/restart, no online mechanism at all — **valid per round 2's framing section**, but costs full unavailability of every affected node for the drain window on every reconfiguration, not only the keys that moved. | (c) remains available as a documented manual fallback (an operator can always choose to stop every node instead of using `stage`) but is not the implementation: the online design below achieves the same safety without mandating a full-cluster outage, at the cost given up in "the cost of this design," below. |
+| **Chosen** | Durable per-database `{active, staged}` state, where **staging immediately and durably retracts `active`** (real quiescence, not observed-then-inferred); a **separate, explicit, operator-issued `activate`** call, timed by the operator's own external wall-clock wait from the *last* stage/fence event across the whole affected set — not by any node's local clock; digest mismatch makes the whole map unavailable, not a shrunk ring. | Directly implements round 2's framing-section recommendation. Removes every counterexample both rounds raised: quiescence is immediate and durable (round 2 blocker #1); the drain wait is anchored externally, by the operator, from the true last event, not reconstructed per node (round 2 blocker #2); no node's `Date.now()` is safety-load-bearing (round 2 blocker #3); a digest mismatch fails the whole map closed rather than admitting a shrunk, still-live ring (round 2 finding under "Security and correctness"). |
 
-### Do less, taken further: why an online acknowledgement protocol is more than the invariant needs
+## The cost of this design, stated plainly
 
-Round 1's suggested fix — a trusted orchestrator collecting incarnation-bound acknowledgements
-into one canonical activation artifact, applied idempotently everywhere — closes every blocker
-it found, but it does so by solving a harder problem than the invariant requires: it establishes
-common knowledge of *when every node has stopped*, so that activation can be timed off the *last*
-node to comply. The invariant above does not need that. It needs only that **no node exposes
-`g+1` before the delegations it could have issued under `g` are guaranteed expired**, and each
-node can guarantee that about *itself*, unconditionally, from a purely local fact: the durable
-timestamp at which *it* was told about `g+1`. Waiting `DELEGATION_LEASE_MS + skew` from that local
-timestamp is at least as conservative as waiting from a cluster-wide "last acknowledgement" instant,
-because a node cannot promote before it has itself been staged, and the moment it is staged is no
-earlier than the moment the operator's fan-out reaches it.
-
-This also removes the restart requirement from round 1's earlier draft entirely: quiescence does
-not need a process restart to be real, because "stopped granting under `g`" here is not an
-observed behavior to attest to — it is a **timer expiry**, checked identically by the grant path
-on every call, restart or not. (`homeIncarnation`'s own per-coordination-incarnation advance
-below still needs the owner-handoff fix regardless of this choice — that is a different property,
-addressed on its own.)
-
-**What this trades away**, honestly, per the design-note bar on stating costs rather than
-implying them: activation is not observable from a single node's status the instant every peer
-has actually drained — a node cannot promote *early* even if every peer happened to comply
-faster than the worst case, because it has no way to know that. The wait is always the full
-`DELEGATION_LEASE_MS + skew`, whereas an acknowledgement-driven scheme could in principle
-activate sooner when every node responds quickly. That is the same shape of cost §4.3 already
-pays for the restart quarantine core enforces on its own (`grantableAfterMono`) — a conservative
-fixed wait instead of a tighter one bought with more machinery — and this design accepts it for
-the same reason: the wait is bounded and rare (once per reconfiguration), and the machinery it
-buys back (distributed acknowledgement collection, a canonical-artifact distribution mechanism,
-restart-triggered rejoin) is the harder problem V1 does not need to solve.
-
-**The one thing this does NOT relax**: a node the operator's fan-out never reaches (down,
-partitioned) never receives a `stagedAt` and so never starts its own timer — it will keep
-granting under `g` indefinitely if it comes back later still running the old process. That is
-exactly why `record_lock_fence_external` still exists: for a node the operator cannot stage,
-the operator's own attestation that they stopped it outside Harper (§4.3, "declaring a node
-removed is not a fence; stopping it is") is what prevents it from resuming as a live `g` grantor.
-Unlike round 1's design, this attestation needs no distribution to other nodes and no runtime
-check by anyone — it is a durable audit record of an operator action whose safety is guaranteed
-by the action itself (the node is stopped), not by anything Harper verifies. It is recorded
-locally on whichever node the operator happens to be talking to, for audit history only.
+**A database's cluster record locks are fully unavailable, on every staged node, from the
+moment `stage` is durably received until the operator issues `activate`** — not narrowed to
+the keys whose home is moving. This is a real, direct consequence of "staging immediately
+retracts `active`," and it is more availability cost than round 1's first draft implied and
+more than the merged core design doc's own prose suggests is necessary (it describes
+quiescing only the nodes losing a key's ownership, implicitly). It is accepted here because
+round 2 demonstrated that anything less either reopens the two-holder bug (a local timer) or
+requires infrastructure this note is not scoped to build (a canonical, cross-node-synchronized
+partial-quiesce protocol). The operator controls the window's length by controlling how
+promptly they call `activate` after the drain elapses — there is no reason to delay it beyond
+that — so in practice the cost is bounded by `DELEGATION_LEASE_MS + skew` (the drain interval)
+plus operator latency, not by anything unbounded.
 
 ## Design
 
-### 1. Durable storage: a dedicated local-only table, not a shared-row field
+### 1. Durable storage — a dedicated local-only table, atomic per database
 
-Round 1's blocker #5: a JSON blob patched onto the operator's own `hdb_nodes` row has no
-per-database atomicity — concurrent operations for two databases can race a read-modify-write
-on the same object, and a restart can let a generation regress. **Fix: a dedicated system table**,
-`hdb_record_lock_homes`, one row per `database`, `LOCAL_ONLY` (never replicated — each node
-holds only its own copy, exactly like `recordLockIncarnation`'s existing row, but as its own
-table rather than a field grafted onto `hdb_nodes`):
+A new system table, `hdb_record_lock_homes`, one row per `database`, `LOCAL_ONLY` (defined via
+the same `table({ table: '…', database: 'system', attributes: […] })` helper `hdb_nodes` uses,
+`replication/knownNodes.ts:50-60`; written via the same low-level `_writeUpdate(…, false, {
+localOnly: true })` primitive `ensureNode` already uses — never replicated, never LWW-merged):
 
 ```ts
 interface RecordLockHomesRow {
 	database: string; // primary key
 	active?: { generation: number; homes: string[]; digest: string };
-	staged?: { generation: number; homes: string[]; digest: string; stagedAt: number }; // stagedAt: Date.now()
-	highestActedOn: number; // monotonic floor; survives active/staged being cleared
-	fenced?: { node: string; at: number; operator: string }[]; // audit only, not consulted by any grant path
+	staged?: { generation: number; homes: string[]; digest: string };
+	highestActedOn: number; // monotonic floor: max(active?.generation, staged?.generation, highestActedOn), updated atomically with every write, never only on promotion (round 2 finding — a delayed stale `stage` must not clobber a newer `staged`)
+	fenced: { node: string; operator: string; at: number }[]; // audit only; no grant path reads it
 }
 ```
 
-Writes go through the table's own transactional API (compare-and-set on `database`, not a
-whole-row patch of a shared object), so two databases' stage calls cannot race each other and a
-generation write is atomic per row.
+Every write is a compare-and-set against the row's current state, in one transaction — not a
+read-then-patch of a shared blob.
 
 ### 2. The operations API
 
-Two mutating operations, `replication/recordLockHomes.ts`, mirroring `setNode.ts`'s shape
-(Joi-validated, `super_user`-gated, idempotent, generation-bound so a stale retry cannot apply
-to the wrong transition):
+Three mutating operations, `replication/recordLockHomes.ts`, `super_user`-gated, Joi-validated,
+mirroring `setNode.ts`'s shape. `operator` on every audit-bearing field is derived from the
+authenticated principal (`request.hdb_user.name`), never a request-body field — a forgeable
+attribution was a round-2 finding.
 
 - **`record_lock_stage_generation`** `{ database, generation, homes[] }` — issued by the
   operator on every node named in `homes(g) ∪ homes(g+1)`. Canonicalizes `homes[]` (sort,
-  dedup) before storing or hashing. Refuses a `generation` at or below `highestActedOn`
-  (monotonic floor, survives a restart). Computes `digest = sha256(generation + '\0' +
-  homes.join('\0'))` and durably writes `staged = { generation, homes, digest, stagedAt:
-  Date.now() }`. Idempotent: re-issuing the identical `(generation, homes)` is a no-op success;
-  a different `homes[]` for a `generation` already staged is rejected (round 1 blocker #8).
-- **`record_lock_fence_external`** `{ database, node, operator }` — the operator's durable,
-  audit-only attestation that an unreachable node has been stopped outside Harper. Appended to
-  `fenced[]`. Not consulted by any grant-path check — see "What this does NOT relax," above.
+  dedup) before storing or hashing. Refuses `generation ≤ max(active?.generation ?? 0,
+  staged?.generation ?? 0, highestActedOn)`. On success, **atomically**: computes `digest`
+  (below), writes `staged = { generation, homes, digest }`, and **clears `active`** — the
+  durable write that makes this node stop granting under the old generation is the same write
+  that records the new one is staged, so there is no window between "told about g+1" and
+  "stopped granting under g." The HTTP response, once returned, is real quiescence evidence
+  (round 2: "a successful stage response is then real quiescence evidence"). Idempotent:
+  identical `(generation, homes)` re-issued is a no-op success; a different `homes[]` for a
+  `generation` already staged is rejected.
+- **`record_lock_fence_external`** `{ database, node }` — the operator's durable, audit-only
+  attestation that an unreachable node has been stopped outside Harper. Appended to `fenced[]`
+  on whichever node the operator is talking to. Consulted by no grant path — its safety is the
+  operator's own action (the node is stopped), not anything Harper verifies.
+- **`record_lock_activate_generation`** `{ database, generation, homes[] }` — issued by the
+  operator, once, on every node named in `homes(g) ∪ homes(g+1)` (idempotent replay across
+  nodes and across retries), **only after** the operator has, externally, in their own wall
+  time: collected a successful `stage` (or `fence_external`) response from every node in that
+  set, and then waited `DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS` from the *last* such
+  response. Refuses unless `staged` on this node matches `(generation, homes)` exactly
+  (replay/consistency check — a stale or misdirected activate for the wrong transition is
+  rejected, not silently applied). On success, atomically promotes `staged → active`, clears
+  `staged`, updates `highestActedOn`. **No node measures the drain wait itself** — round 2:
+  "cannot be proven by subtracting persisted wall times." The wait is the operator's
+  externally-observed fact; nodes only ever check *consistency* (does this match what I
+  staged?), never *elapsed time*.
 
-No separate acknowledge or activate operation. Promotion is automatic and purely local (below).
+### 3. `homeMap()` — a frozen pointer read, no hot-path cost
 
-### 3. Promotion: a local timer, not a call
+Per thread, cache one frozen `LockHomeMap | undefined` per database, updated **only** when this
+node's own `active` row changes locally (on `stage` clearing it, or `activate` setting it) —
+never derived, hashed, sorted, or read from storage inside `homeMap()` itself. With
+`replication.recordLocks` off, no table watcher or cache exists at all (round 2: preserve the
+existing disabled-transport selection unchanged).
 
-`homeMap()`'s read path, on every call: if `staged` exists and `Date.now() - staged.stagedAt ≥
-DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS`, atomically promote it (`active = staged; staged =
-undefined; highestActedOn = max(highestActedOn, active.generation)`, durably, exactly once —
-compare-and-set against the row's current state so a concurrent caller cannot double-promote)
-before reading. This is checked off the hot path (see "Caching," below) — the promotion check
-itself runs on a slow timer/on load, not on every `homeMap()` call.
+### 4. Digest mismatch fails the whole map closed, not a shrunk ring
 
-### 4. Caching — round 1 blocker #1
+**Round 2's sharpest correctness finding**: excluding a disagreeing peer from *this* node's own
+ring (what the round-1 draft did) does not prevent two arbiters — with `homes = {A,B}`, a
+digest disagreement makes A derive ring `{A}` and B derive ring `{B}`, and both self-home every
+key. **Fix:** a digest mismatch with *any* peer named in the active `homes[]` makes `homeMap()`
+return `undefined` for the whole database on the observing node — core's own existing "fails
+closed when no map is available" behavior, not a locally-recomputed smaller ring. This also
+simplifies the mechanism: there is no ring recomputation at all, only "available" or "not."
 
-`homeMap()` must be a lock-free pointer read on the hot path: core calls it before reusing even
-a live delegation. Per thread, cache one frozen `LockHomeMap | undefined`, invalidated only by
-(a) this thread's own promotion check firing, on a coarse interval (e.g. checked once per
-`EPOCH_MEMO_MS`-equivalent tick, not per call — the existing memo window the branch already
-uses for the static epoch generalizes directly), or (b) a fresh `stage`/`fence` write landing on
-this node. No per-call I/O, hashing, sorting, or allocation — the frozen object is what
-`homeMap()` returns.
+### 5. Canonical digest encoding
 
-### 5. Digest — round 1 blocker #7
+Length-prefixed, not delimiter-joined (round 2: `['A','B']` and `['A\0B']` must not collide).
+`sha256(u32be(generation) ‖ u32be(homes.length) ‖ Σ(u32be(len(home_i)) ‖ utf8(home_i)))` over
+the canonicalized (sorted, deduped) list. Validated on write: `generation` a positive safe
+integer; `homes` non-empty, bounded count, each name non-empty and bounded length.
 
-FNV-1a in one `Float64` slot is not a real agreement proof (32-bit collision risk, NUL-delimiter
-ambiguity). The full digest travels in the `NODE_NAME[4]` capability bag as a hex string
-(`recordLockHomesDigest`, per database — see "Handshake," below), compared byte-exact on the
-socket thread on receipt. Only a **tri-state match result** (unknown / match / mismatch) goes
-into the per-(database,peer) shared status buffer, at the next free slot (30) after the
-existing capability-level slot (29) — mirroring the existing `LOCK_CAPABILITY_*` enum shape
-exactly.
+### 6. Wire: a dedicated digest message, not a `NODE_NAME` resend
 
-A digest mismatch excludes that peer from this node's ring **and this node from that peer's
-ring, symmetrically** — each side independently computing its own exclusion from its own
-comparison, not one side inferring which of the two is stale (round 1 blocker #9). Steady-state
-mismatch (both nodes holding what they believe is the *same* active generation, yet computing
-different digests for it) indicates a real problem — corruption or a bug — and both sides fail
-that peer out of the ring rather than guessing which is right.
+Round 2: reusing `NODE_NAME` as a live refresh is unproven — its handler has side effects
+(`sendSubscriptionRequestUpdate()`, `replicationConnection.ts:4524-4603`). **Fix:** a new,
+minimal message type, `RECORD_LOCK_HOMES_DIGEST` (`{ database, digest }`), sent (a) once at
+initial handshake per database, alongside/replacing the capability bag's role for this data,
+and (b) standalone, on every live outbound connection for a database whose local `active`
+digest just changed (on `activate`) — with no other handshake side effect triggered. Receipt
+writes only a tri-state match/mismatch/unknown result into the per-(database,peer) shared
+status buffer (slot 30, after the existing capability-level slot 29) — the full digest itself
+travels on the wire, compared byte-exact on the socket thread, never truncated into shared
+memory.
 
-### 6. Handshake — round 1 blocker #6
+### 7. `homeIncarnation` per coordination incarnation, gated centrally
 
-`LOCAL_CAPABILITIES` is currently a process-wide constant built once at module load
-(`replicationConnection.ts:686`) and sent only in `NODE_NAME`, which is itself sent once per
-`(connection, database)` at handshake (`:7840`) — never refreshed on an already-live socket.
-Because promotion is a local timer with no distribution step, an activated node does not
-automatically push its new digest to peers it is already connected to. **Fix:** compute the
-per-database digest fresh at the `NODE_NAME` send call site (not baked into the frozen
-`LOCAL_CAPABILITIES` object), and re-send `NODE_NAME` on every live outbound connection for a
-database whose row transitions `staged → active` locally (a small, targeted re-announce, not a
-reconnect) — plus, unavoidably, on any ordinary reconnect. A peer's digest is only ever refreshed
-by receiving a fresh `NODE_NAME`; there is no separate push channel.
+Round 2: the round-1 fix (await the bump inside `watchOwnerExit` before reassigning) missed a
+second path — `subscriptionManager.ts:760-763`'s `placeSubscription` also calls
+`recordLockOwnerFor` directly. **Fix, moved into `recordLockOwnerFor` itself** (the single
+function every ownership-assignment path already funnels through) rather than patched at each
+caller: on a genuine handoff (a new owner differing from a previously-live one for that
+database), `recordLockOwnerFor` durably awaits `bumpHomeIncarnation()` before conferring live
+ownership; while the bump is in flight, the database is reported **unowned** to every caller
+(`ownsRecordLockCoordination` returns false), never assigned under a stale incarnation. A
+persistence failure leaves it unowned rather than retrying into a race. Concurrent
+reassignments across databases are serialized behind one in-flight-bump guard so the
+read-increment-write in `bumpHomeIncarnation` cannot race itself.
 
-### 7. `homeIncarnation` per coordination incarnation — round 1 blocker #4
+### 8. Wire/capability version bump
 
-`bumpHomeIncarnation()` must complete (durably persist) *before* a replacement worker is
-conferred ownership, not run concurrently with it. `watchOwnerExit`'s reassignment
-(`recordLockTransport.ts:476-491`) becomes: on a genuine handoff (the new owner differs from a
-previously-live owner for that database — not the first assignment), `await bumpHomeIncarnation()`
-before calling `recordLockOwnerFor`; if the bump fails (persistence error), coordination for that
-database stays **unowned** rather than being assigned under a stale incarnation (fail closed,
-matching the module's existing default). Concurrent reassignments across databases must not race
-the read-increment-write in `bumpHomeIncarnation` — serialize it behind a single in-flight guard.
+`RECORD_LOCKS_CAPABILITY` moves 2 → 3: the wire shape changes (`epoch` → `generation`; the new
+digest message), and per the merged design doc's mutual-exclusion rule, levels are versioned
+even though level 2 never shipped enabled.
 
-### 8. Wire/capability version bump — round 1 blocker #8
+### 9. Error containment
 
-`RECORD_LOCKS_CAPABILITY` moves from 2 to 3: the wire shape changes (`epoch` → `generation` in
-`DelegationRequest`/reply; the new digest key in the capability bag), and per the merged design
-doc's "Protocol version and mixed deployments," levels are versioned and mutually exclusive even
-though level 2 never shipped enabled — a partially-upgraded node must not misinterpret an
-old-shape payload as new.
-
-## Why this is still safe — the round-10 counterexample, re-checked
-
-`A` acknowledges (in this design: durably receives `stage(g+1)`, recording `stagedAt`), then
-restarts during the drain. Its promotion state is **durable, keyed by wall-clock `stagedAt`, not
-by anything the restart discards** — `stagedAt` is read back from the row, unaffected by the
-restart, so the drain timer is exactly where it was. A cannot promote early because of the
-restart (nothing accelerates the timer) and cannot promote late in a way that matters (a slower
-promotion is conservative, not unsafe). No re-acknowledgement is needed because there was never
-an acknowledgement to go stale — replacing "an acknowledgement, which can become stale" with "a
-durable fact, which cannot" is the core of why this design has no counterpart to round 1's
-blocker #2 at all.
+Every promotion write, socket announce, and worker-message/exit handler is wrapped so a
+rejection cannot become an unhandled rejection on the main or a worker thread — persist first,
+publish the local cache pointer only after persistence succeeds, and fail closed (leave the old
+pointer or `undefined`) on any error in between; mirrors the existing containment pattern at
+`recordLockTransport.ts:454-472,617-621` rather than inventing a new one.
 
 ## Testing
 
-- Unit: digest determinism/canonicalization; stage idempotency and the monotonic-generation
-  refusal (including across a simulated restart — a fresh row load with `staged` already past
-  its drain must promote once, not re-promote or lose the generation); promotion as a pure
-  function of `(now, stagedAt)` with an injected clock (independent per-node clocks per the
-  merged design doc §12, not a shared fake clock); `homeMap()` cache invalidation timing;
-  `homeIncarnation` bumping on a genuine owner handoff and not on first assignment, and the
-  fail-closed path when the bump fails.
-- Integration (extends `recordLockCluster.test.mjs`): stage on every node → all promote after
-  the drain interval (test-overridden, like `RESTART_HOLD_MS` already is) → `homeMap()` agrees
-  cluster-wide, including a key whose home moved; a node the stage call never reached (simulated
-  partition) does not promote and, on rejoining after `record_lock_fence_external` was recorded
-  for it, its own late-arriving `g` grants are refused by peers on generation mismatch; digest
-  mismatch excludes a peer symmetrically on both sides; a node that restarts mid-drain still
-  promotes at the original `stagedAt + drain`, not earlier or later.
+- Unit: canonical-encoding determinism (including the `['A','B']` vs `['A\0B']` non-collision);
+  `highestActedOn` refusing a delayed stale `stage` after a newer one (compared against
+  `max(active, staged, highestActedOn)`, not only post-promotion); `stage` atomically clearing
+  `active` in the same transaction (no window where both are set); `activate` refusing a
+  mismatched `(generation, homes)`; digest mismatch producing `undefined` for the whole
+  database, not a smaller `homes[]`; `recordLockOwnerFor` reporting unowned while a bump is in
+  flight, from both call sites; bump-failure leaving coordination unowned.
+- Integration (extends `recordLockCluster.test.mjs`): stage on every node (staggered arrival
+  order) → each staged node immediately refuses new grants under the old generation, verified
+  by attempting one → operator waits the (test-shortened) drain from the *last* stage response
+  → activate → `homeMap()` agrees cluster-wide including a moved key; a grant attempted between
+  stage and activate is refused everywhere, not merely delayed; a node the stage call never
+  reached does not activate and, if later reachable again still on `g`, is refused by every
+  peer on generation mismatch; digest mismatch makes both sides' `homeMap()` return `undefined`
+  for the database, not a 1-node ring; restart of the process and of only the coordinating
+  worker are both exercised independently for the incarnation-ordering fix; a persistence
+  failure injected mid-bump leaves the database unowned rather than double-owned.
 
 ## For the human reviewer (carried into the PR)
 
-- **This is a materially different §4.3 mechanism than the merged core design doc's own prose
-  describes** (stage → *quiesce/acknowledge*-or-fence → drain → activate). This note replaces
-  the acknowledge/activate steps with a per-node timer, on the argument in "Do less, taken
-  further" that the invariant does not require cross-node evidence collection. That argument is
-  the thing most worth a second, skeptical read — if it is wrong, the fix is closer to round 1's
-  original suggestion (a canonical activation artifact), not a patch on this one.
+- **Two consecutive planning rounds rejected earlier framings of the §4.3 mechanism** —
+  summarized above under "Revision history." This design is the point both rounds converged
+  on; flagging that history rather than presenting it as settled from the start.
+- **The full-database availability cost while staged** (not narrowed to moved keys) is a real,
+  stated tradeoff — see "The cost of this design" — worth a second look given it is more
+  conservative than the core design doc's own prose implies is strictly necessary.
 - Genuinely deferred, not silently dropped: the `lockRelease` cross-thread relay gap and full
   every-thread transport registration — named in the merged design doc's §11 "still owed" list
   but outside #825's redefined scope per the task owner's instruction.
-
-## What changed after round 1
-
-Round 1 (`8f2f03890502`, `better-alternative-exists`) found the first draft's transition
-mechanism unsafe: local-only acknowledgement evidence cannot support a cross-node activation
-check (blocker #2); "acknowledge" observed state without establishing real quiescence (blocker
-#3); the incarnation bump could race owner handoff (blocker #4, fixed in §7 above regardless of
-which transition mechanism was chosen); a shared-row JSON blob was not atomic per database
-(blocker #5, fixed in §1); the capability bag needed active renegotiation on activation (blocker
-#6, fixed in §6); FNV-1a was too weak an agreement proof (blocker #7, fixed in §5); the
-operations needed uniform authorization and replay binding (blocker #8, fixed in §2/§8); and the
-proposed tests didn't prove safety, including an asymmetric digest-mismatch test (blocker #9,
-fixed in §5). Round 1 also named a missing "do less" option — fence/stop/wait/restart — which
-this revision adopts in a further-reduced form that needs neither restart nor acknowledgement;
-see "Do less, taken further."
