@@ -12,8 +12,9 @@
  *    with backPressurePercent is a consistency guard; the field's presence is what proves the copy ran.
  *  - R4: a wedge-reconcile fire that happens while truth already reads down lands in the redundant bucket,
  *    visible in cluster_status and in the fire log line.
- *  - R5: a hook synthesizes a session whose subscribe payload lands after socket open, then shared-memory
- *    truth restores the retained connected:false coordinator entry exactly once on reconciliation.
+ *  - R5: a hook defers one connection's subscribe until its session resolves, so the socket opens with no
+ *    subscription and the connect edge is never posted; shared-memory truth then restores the retained
+ *    connected:false coordinator entry exactly once on reconciliation.
  *
  * NOT pinned here: owner gating. Every fire this suite provokes is a main-thread net, which always owns the
  * subscription, so the `unknown` path that keeps non-owner fires out of the evidence is unit-only
@@ -59,8 +60,10 @@ const REPLICATION_TIMEOUT_MS = 20000;
 const UP_CORRECTION_TIMEOUT_MS = 20000;
 const UP_RESTORE_PROOF_MS = 11000;
 const POLL_MS = 250;
-const SUBSCRIBE_AFTER_OPEN_MARKER =
-	'[test] socket open observed nodeSubscriptions undefined; releasing held subscribe for db "data" (harper-pro#431)';
+// The release line, not the deferral line: it is logged from the session promise's resolution, which only
+// happens inside the open handler after replicateOverWS ran — so it is the proof that the socket opened
+// with no subscription, which the deferral line alone would not give.
+const SUBSCRIBE_AFTER_OPEN_MARKER = '[test] releasing deferred subscribe for db "data" (harper-pro#431)';
 
 function nodeStartOptions(node) {
 	return {
@@ -405,7 +408,7 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ct
 		await assertReplicates(ctx.nodes[0], subscriber, 'r4-after-restart');
 	});
 
-	test('R5: shared truth corrects up when subscribe is held past socket open', async () => {
+	test('R5: shared truth corrects up when subscribe lands after socket open', async () => {
 		const [peer, subscriber] = ctx.nodes;
 		await ensureSubscribed(subscriber, peer);
 		await assertReplicates(peer, subscriber, 'r5-before');
@@ -443,7 +446,7 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ct
 			subscriber,
 			SUBSCRIBE_AFTER_OPEN_MARKER,
 			markerBaseline,
-			'the fresh connection open handler to observe nodeSubscriptions undefined'
+			'the fresh connection to open with no subscription and then release the deferred one'
 		);
 		await waitForNewLogLine(
 			subscriber,
