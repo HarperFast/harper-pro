@@ -362,7 +362,9 @@ async function releaseLateFill(ctx, id) {
 		while (lateIndex < 0 && Date.now() < deadline) {
 			const calls = ctx.origin.trial(id)?.calls ?? [];
 			if (calls.length >= 2) lateIndex = ctx.nodes.findIndex((node) => node.hostname === calls[1].node);
-			else await delay(50);
+			// yields on every miss, including an unrecognized hostname: spinning here would stall the
+			// origin's own responses on this same loop
+			if (lateIndex < 0) await delay(50);
 		}
 		if (lateIndex < 0) return false;
 		while (!staged && Date.now() < deadline) {
