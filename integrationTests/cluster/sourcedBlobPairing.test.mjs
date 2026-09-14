@@ -497,7 +497,9 @@ function sourcedBlobPairing(ctx) {
 
 	after(async () => {
 		for (const agents of ctx.agentsByNode ?? []) {
-			for (const agent of agents.values()) {
+			// a node whose pinWorkers threw leaves a hole here, and throwing on it would strand the
+			// nodes below
+			for (const agent of agents?.values() ?? []) {
 				try {
 					agent.destroy();
 				} catch {}
