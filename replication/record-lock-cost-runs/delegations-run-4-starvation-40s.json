@@ -1,0 +1,887 @@
+{
+	"machine": {
+		"cpu": "12th Gen Intel(R) Core(TM) i7-12700H",
+		"cores": 20,
+		"memoryGiB": 31,
+		"platform": "linux-x64",
+		"node": "v26.2.0"
+	},
+	"ranAt": "2026-09-13T06:22:35.221Z",
+	"uncontended": {
+		"perNode": [
+			{
+				"requester": 0,
+				"homeLocalKeys": 32,
+				"acquire": {
+					"n": 120,
+					"min": 0.03,
+					"p50": 0.34,
+					"p95": 0.72,
+					"p99": 1.6,
+					"max": 1.8,
+					"mean": 0.35
+				},
+				"byHome": {
+					"homeLocal": {
+						"n": 32,
+						"min": 0.03,
+						"p50": 0.04,
+						"p95": 0.07,
+						"p99": 0.27,
+						"max": 0.27,
+						"mean": 0.05
+					},
+					"remoteHome": {
+						"n": 88,
+						"min": 0.15,
+						"p50": 0.41,
+						"p95": 0.77,
+						"p99": 1.8,
+						"max": 1.8,
+						"mean": 0.46
+					}
+				},
+				"release": {
+					"n": 120,
+					"min": 0,
+					"p50": 0.01,
+					"p95": 0.02,
+					"p99": 0.03,
+					"max": 0.03,
+					"mean": 0.01
+				},
+				"log": [
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					}
+				]
+			},
+			{
+				"requester": 1,
+				"homeLocalKeys": 37,
+				"acquire": {
+					"n": 120,
+					"min": 0.03,
+					"p50": 0.24,
+					"p95": 0.7,
+					"p99": 0.97,
+					"max": 1.25,
+					"mean": 0.26
+				},
+				"byHome": {
+					"homeLocal": {
+						"n": 37,
+						"min": 0.03,
+						"p50": 0.04,
+						"p95": 0.08,
+						"p99": 0.2,
+						"max": 0.2,
+						"mean": 0.05
+					},
+					"remoteHome": {
+						"n": 83,
+						"min": 0.17,
+						"p50": 0.27,
+						"p95": 0.78,
+						"p99": 1.25,
+						"max": 1.25,
+						"mean": 0.35
+					}
+				},
+				"release": {
+					"n": 120,
+					"min": 0,
+					"p50": 0.01,
+					"p95": 0.04,
+					"p99": 0.04,
+					"max": 0.07,
+					"mean": 0.01
+				},
+				"log": [
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					}
+				]
+			},
+			{
+				"requester": 2,
+				"homeLocalKeys": 29,
+				"acquire": {
+					"n": 120,
+					"min": 0.03,
+					"p50": 0.23,
+					"p95": 0.68,
+					"p99": 1.82,
+					"max": 1.92,
+					"mean": 0.3
+				},
+				"byHome": {
+					"homeLocal": {
+						"n": 29,
+						"min": 0.03,
+						"p50": 0.04,
+						"p95": 0.14,
+						"p99": 0.16,
+						"max": 0.16,
+						"mean": 0.06
+					},
+					"remoteHome": {
+						"n": 91,
+						"min": 0.16,
+						"p50": 0.28,
+						"p95": 0.96,
+						"p99": 1.92,
+						"max": 1.92,
+						"mean": 0.38
+					}
+				},
+				"release": {
+					"n": 120,
+					"min": 0,
+					"p50": 0.01,
+					"p95": 0.03,
+					"p99": 0.06,
+					"max": 0.08,
+					"mean": 0.01
+				},
+				"log": [
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					}
+				]
+			}
+		],
+		"acquire": {
+			"n": 360,
+			"min": 0.03,
+			"p50": 0.26,
+			"p95": 0.72,
+			"p99": 1.6,
+			"max": 1.92,
+			"mean": 0.3
+		},
+		"byHome": {
+			"homeLocal": {
+				"n": 98,
+				"min": 0.03,
+				"p50": 0.04,
+				"p95": 0.1,
+				"p99": 0.27,
+				"max": 0.27,
+				"mean": 0.05
+			},
+			"remoteHome": {
+				"n": 262,
+				"min": 0.15,
+				"p50": 0.32,
+				"p95": 0.79,
+				"p99": 1.8,
+				"max": 1.92,
+				"mean": 0.4
+			}
+		},
+		"release": {
+			"n": 360,
+			"min": 0,
+			"p50": 0.01,
+			"p95": 0.03,
+			"p99": 0.04,
+			"max": 0.08,
+			"mean": 0.01
+		},
+		"lockStats": [
+			{
+				"delegations": 121,
+				"granted": 121,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			},
+			{
+				"delegations": 121,
+				"granted": 125,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			},
+			{
+				"delegations": 121,
+				"granted": 117,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			}
+		]
+	},
+	"repeat": {
+		"requester": 0,
+		"byHome": {
+			"local": {
+				"id": "repeat-1789280569083-0-1789280569083",
+				"firstLockMs": 0.2,
+				"repeat": {
+					"n": 200,
+					"min": 0.01,
+					"p50": 0.01,
+					"p95": 0.03,
+					"p99": 0.04,
+					"max": 0.08,
+					"mean": 0.02
+				},
+				"release": {
+					"n": 200,
+					"min": 0,
+					"p50": 0,
+					"p95": 0.01,
+					"p99": 0.01,
+					"max": 0.03,
+					"mean": 0
+				}
+			},
+			"remote": {
+				"id": "repeat-1789280569083-1-1789280569085",
+				"firstLockMs": 0.78,
+				"repeat": {
+					"n": 200,
+					"min": 0.01,
+					"p50": 0.01,
+					"p95": 0.03,
+					"p99": 0.08,
+					"max": 0.15,
+					"mean": 0.02
+				},
+				"release": {
+					"n": 200,
+					"min": 0,
+					"p50": 0,
+					"p95": 0.01,
+					"p99": 0.01,
+					"max": 0.08,
+					"mean": 0
+				}
+			}
+		},
+		"log": [
+			{
+				"entriesPerAcquisition": 0,
+				"bytesPerAcquisition": 0,
+				"byType": {}
+			},
+			{
+				"entriesPerAcquisition": 0,
+				"bytesPerAcquisition": 0,
+				"byType": {}
+			},
+			{
+				"entriesPerAcquisition": 0,
+				"bytesPerAcquisition": 0,
+				"byType": {}
+			}
+		],
+		"lockStats": [
+			{
+				"delegations": 123,
+				"granted": 122,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			},
+			{
+				"delegations": 121,
+				"granted": 126,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			},
+			{
+				"delegations": 121,
+				"granted": 117,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			}
+		]
+	},
+	"hotKey": [
+		{
+			"contenders": 2,
+			"durationMs": 40000,
+			"sections": 55062,
+			"failures": 1,
+			"sectionsPerSecond": 1375.1,
+			"agreedCounter": 55062,
+			"converged": true,
+			"lostUpdates": 0,
+			"finalCounter": [55062, 55062, 55062],
+			"lockMs": {
+				"n": 55062,
+				"min": 0.03,
+				"p50": 0.05,
+				"p95": 0.11,
+				"p99": 0.14,
+				"max": 10024.97,
+				"mean": 0.24
+			},
+			"sectionMs": {
+				"n": 55062,
+				"min": 0.09,
+				"p50": 0.14,
+				"p95": 0.32,
+				"p99": 0.38,
+				"max": 10026.69,
+				"mean": 0.36
+			},
+			"requestMs": {
+				"n": 55062,
+				"min": 0.3,
+				"p50": 0.61,
+				"p95": 1.23,
+				"p99": 1.81,
+				"max": 10030.23,
+				"mean": 0.91
+			},
+			"perNode": [
+				{
+					"node": 0,
+					"sections": 1,
+					"failures": 1,
+					"lastN": 55062,
+					"lockMs": {
+						"n": 1,
+						"min": 10024.97,
+						"p50": 10024.97,
+						"p95": 10024.97,
+						"p99": 10024.97,
+						"max": 10024.97,
+						"mean": 10024.97
+					},
+					"sectionMs": {
+						"n": 1,
+						"min": 10026.69,
+						"p50": 10026.69,
+						"p95": 10026.69,
+						"p99": 10026.69,
+						"max": 10026.69,
+						"mean": 10026.69
+					},
+					"requestMs": {
+						"n": 1,
+						"min": 10030.23,
+						"p50": 10030.23,
+						"p95": 10030.23,
+						"p99": 10030.23,
+						"max": 10030.23,
+						"mean": 10030.23
+					}
+				},
+				{
+					"node": 1,
+					"sections": 55061,
+					"failures": 0,
+					"lastN": 55061,
+					"lockMs": {
+						"n": 55061,
+						"min": 0.03,
+						"p50": 0.05,
+						"p95": 0.11,
+						"p99": 0.14,
+						"max": 0.96,
+						"mean": 0.06
+					},
+					"sectionMs": {
+						"n": 55061,
+						"min": 0.09,
+						"p50": 0.14,
+						"p95": 0.32,
+						"p99": 0.38,
+						"max": 1.51,
+						"mean": 0.17
+					},
+					"requestMs": {
+						"n": 55061,
+						"min": 0.3,
+						"p50": 0.61,
+						"p95": 1.23,
+						"p99": 1.81,
+						"max": 16.46,
+						"mean": 0.73
+					}
+				}
+			],
+			"log": [
+				{
+					"entriesPerAcquisition": 0,
+					"bytesPerAcquisition": 0,
+					"byType": {}
+				},
+				{
+					"entriesPerAcquisition": 0.03,
+					"bytesPerAcquisition": 2,
+					"byType": {
+						"lockRelease": {
+							"entries": 1589,
+							"bytes": 85677,
+							"bytesPerEntry": 54
+						}
+					}
+				},
+				{
+					"entriesPerAcquisition": 0,
+					"bytesPerAcquisition": 0,
+					"byType": {}
+				}
+			],
+			"lockStats": [
+				{
+					"delegations": 124,
+					"granted": 122,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				},
+				{
+					"delegations": 121,
+					"granted": 127,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				},
+				{
+					"delegations": 121,
+					"granted": 117,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				}
+			],
+			"audit": {
+				"distinctValues": 55062,
+				"sections": 55062,
+				"repeatedCount": 0,
+				"repeatedAcrossNodes": 0,
+				"repeatedValues": [],
+				"holes": [],
+				"maxWritten": 55062,
+				"finalCounter": [55062, 55062, 55062]
+			}
+		},
+		{
+			"contenders": 3,
+			"durationMs": 40000,
+			"sections": 39700,
+			"failures": 0,
+			"sectionsPerSecond": 991,
+			"agreedCounter": 39640,
+			"converged": false,
+			"lostUpdates": 60,
+			"finalCounter": [39640, 39640, 39640],
+			"lockMs": {
+				"n": 39700,
+				"min": 0.03,
+				"p50": 0.06,
+				"p95": 0.18,
+				"p99": 9.17,
+				"max": 1705.91,
+				"mean": 2.2
+			},
+			"sectionMs": {
+				"n": 39700,
+				"min": 0.09,
+				"p50": 0.15,
+				"p95": 0.44,
+				"p99": 9.5,
+				"max": 1706.09,
+				"mean": 2.33
+			},
+			"requestMs": {
+				"n": 39700,
+				"min": 0.31,
+				"p50": 0.64,
+				"p95": 1.75,
+				"p99": 26.1,
+				"max": 1707.27,
+				"mean": 3.02
+			},
+			"perNode": [
+				{
+					"node": 0,
+					"sections": 24541,
+					"failures": 0,
+					"lastN": 39638,
+					"lockMs": {
+						"n": 24541,
+						"min": 0.03,
+						"p50": 0.05,
+						"p95": 0.14,
+						"p99": 0.26,
+						"max": 751.74,
+						"mean": 0.85
+					},
+					"sectionMs": {
+						"n": 24541,
+						"min": 0.09,
+						"p50": 0.14,
+						"p95": 0.38,
+						"p99": 0.7,
+						"max": 751.98,
+						"mean": 0.97
+					},
+					"requestMs": {
+						"n": 24541,
+						"min": 0.31,
+						"p50": 0.6,
+						"p95": 1.63,
+						"p99": 9.3,
+						"max": 753.03,
+						"mean": 1.63
+					}
+				},
+				{
+					"node": 1,
+					"sections": 7867,
+					"failures": 0,
+					"lastN": 39639,
+					"lockMs": {
+						"n": 7867,
+						"min": 0.03,
+						"p50": 0.06,
+						"p95": 0.34,
+						"p99": 101.34,
+						"max": 1582.13,
+						"mean": 4.21
+					},
+					"sectionMs": {
+						"n": 7867,
+						"min": 0.09,
+						"p50": 0.17,
+						"p95": 0.59,
+						"p99": 101.44,
+						"max": 1582.32,
+						"mean": 4.36
+					},
+					"requestMs": {
+						"n": 7867,
+						"min": 0.32,
+						"p50": 0.73,
+						"p95": 1.96,
+						"p99": 102.27,
+						"max": 1584.52,
+						"mean": 5.09
+					}
+				},
+				{
+					"node": 2,
+					"sections": 7292,
+					"failures": 0,
+					"lastN": 39640,
+					"lockMs": {
+						"n": 7292,
+						"min": 0.04,
+						"p50": 0.06,
+						"p95": 0.37,
+						"p99": 125.76,
+						"max": 1705.91,
+						"mean": 4.6
+					},
+					"sectionMs": {
+						"n": 7292,
+						"min": 0.1,
+						"p50": 0.17,
+						"p95": 0.58,
+						"p99": 125.94,
+						"max": 1706.09,
+						"mean": 4.73
+					},
+					"requestMs": {
+						"n": 7292,
+						"min": 0.34,
+						"p50": 0.76,
+						"p95": 2.02,
+						"p99": 126.83,
+						"max": 1707.27,
+						"mean": 5.49
+					}
+				}
+			],
+			"log": [
+				{
+					"entriesPerAcquisition": 0.04,
+					"bytesPerAcquisition": 2,
+					"byType": {
+						"lockRelease": {
+							"entries": 1513,
+							"bytes": 81646,
+							"bytesPerEntry": 54
+						}
+					}
+				},
+				{
+					"entriesPerAcquisition": 0.01,
+					"bytesPerAcquisition": 1,
+					"byType": {
+						"lockRelease": {
+							"entries": 497,
+							"bytes": 26785,
+							"bytesPerEntry": 54
+						}
+					}
+				},
+				{
+					"entriesPerAcquisition": 0.01,
+					"bytesPerAcquisition": 1,
+					"byType": {
+						"lockRelease": {
+							"entries": 471,
+							"bytes": 25410,
+							"bytesPerEntry": 54
+						}
+					}
+				}
+			],
+			"lockStats": [
+				{
+					"delegations": 124,
+					"granted": 123,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				},
+				{
+					"delegations": 121,
+					"granted": 127,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				},
+				{
+					"delegations": 122,
+					"granted": 117,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				}
+			],
+			"audit": {
+				"distinctValues": 39640,
+				"sections": 39700,
+				"repeatedCount": 60,
+				"repeatedAcrossNodes": 60,
+				"repeatedValues": [
+					{
+						"n": 640,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 1461,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 9335,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 10539,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 17472,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 17854,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 24527,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 28181,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 34903,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 35512,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 1,
+						"nodes": [0, 2]
+					},
+					{
+						"n": 1259,
+						"nodes": [0, 2]
+					},
+					{
+						"n": 1507,
+						"nodes": [0, 2]
+					},
+					{
+						"n": 1570,
+						"nodes": [0, 2]
+					},
+					{
+						"n": 3729,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 13999,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 15105,
+						"nodes": [0, 2]
+					},
+					{
+						"n": 17418,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 17540,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 17541,
+						"nodes": [1, 2]
+					}
+				],
+				"holes": [],
+				"maxWritten": 39640,
+				"finalCounter": [39640, 39640, 39640]
+			}
+		}
+	],
+	"reacquisition": [
+		{
+			"lease": 300000,
+			"windowMs": 60000,
+			"cadenceMs": 5000,
+			"runMs": 5006,
+			"firstLockMs": 0.81,
+			"ticks": 1,
+			"reacquisitions": 0,
+			"measuredRate": 0,
+			"predictedRate": 0.0833,
+			"reacquiredAtMs": [],
+			"thresholdMs": 0.15,
+			"atWindowMultiple": 0,
+			"windowLooksStale": false,
+			"localReferenceMs": {
+				"n": 1,
+				"min": 0.03,
+				"p50": 0.03,
+				"p95": 0.03,
+				"p99": 0.03,
+				"max": 0.03,
+				"mean": 0.03
+			},
+			"servedLocallyDeltaMs": {
+				"n": 1,
+				"min": 0.02,
+				"p50": 0.02,
+				"p95": 0.02,
+				"p99": 0.02,
+				"max": 0.02,
+				"mean": 0.02
+			},
+			"samples": [
+				{
+					"elapsedMs": 5006,
+					"acquireMs": 0.044055000005755574,
+					"servedLocallyMs": 0.02823500000522472,
+					"deltaMs": 0.016
+				}
+			]
+		}
+	],
+	"unlockedWrites": {
+		"batchSize": 500,
+		"rounds": 30,
+		"arms": {
+			"off": {
+				"probe": {
+					"acquired": false,
+					"message": "cluster record locks are not enabled on this node (replication.recordLocks); lock with { scope: 'node' } for a node-local lock"
+				},
+				"batchMs": {
+					"n": 30,
+					"min": 19.32,
+					"p50": 21.13,
+					"p95": 29.4,
+					"p99": 30.18,
+					"max": 30.18,
+					"mean": 22.42
+				},
+				"putsPerSecond": {
+					"atP50": 23663,
+					"atP95": 17007
+				}
+			},
+			"none": {
+				"probe": {
+					"acquired": false,
+					"statusCode": 503,
+					"message": "Cluster-scoped record locks are not available on data: no record lock transport is registered"
+				},
+				"batchMs": {
+					"n": 30,
+					"min": 18.74,
+					"p50": 21.98,
+					"p95": 31.98,
+					"p99": 36.42,
+					"max": 36.42,
+					"mean": 23.16
+				},
+				"putsPerSecond": {
+					"atP50": 22748,
+					"atP95": 15635
+				}
+			},
+			"on": {
+				"probe": {
+					"acquired": true
+				},
+				"batchMs": {
+					"n": 30,
+					"min": 18.87,
+					"p50": 20.36,
+					"p95": 24.89,
+					"p99": 25.3,
+					"max": 25.3,
+					"mean": 20.93
+				},
+				"putsPerSecond": {
+					"atP50": 24558,
+					"atP95": 20088
+				}
+			}
+		}
+	}
+}

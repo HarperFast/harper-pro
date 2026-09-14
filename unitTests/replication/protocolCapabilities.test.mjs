@@ -5,10 +5,12 @@ import {
 	ABSENT_PEER_CAPABILITIES,
 	LOCAL_PROTOCOL_VERSION,
 	MINIMUM_PROTOCOL_VERSION,
+	RECORD_LOCKS_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
+	peerSupportsRecordLocks,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -25,6 +27,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				protocolVersion: MINIMUM_PROTOCOL_VERSION,
 				subscriptionSetupAck: 0,
 				subscriptionSetupBudgetMs: undefined,
+				recordLocks: 0,
 			}
 		);
 	});
@@ -42,9 +45,10 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 	});
 
 	it('drops keys this build does not know instead of carrying them', () => {
-		const resolved = resolvePeerCapabilities({ subscriptionSetupAck: 1, recordLocks: 3, somethingElse: 'x' });
+		const resolved = resolvePeerCapabilities({ subscriptionSetupAck: 1, futureThing: 3, somethingElse: 'x' });
 		assert.deepStrictEqual(Object.keys(resolved).sort(), [
 			'protocolVersion',
+			'recordLocks',
 			'subscriptionSetupAck',
 			'subscriptionSetupBudgetMs',
 		]);
@@ -150,7 +154,7 @@ describe('resolvePeerCapabilities — subscriptionSetupBudgetMs is a parameter, 
 	});
 
 	it('is not min-clamped against the local advertised budget', () => {
-		const local = buildLocalCapabilities(1000);
+		const local = buildLocalCapabilities(1000, true);
 		const resolved = resolvePeerCapabilities({ subscriptionSetupBudgetMs: 900_000 });
 		assert.ok(resolved.subscriptionSetupBudgetMs > local.subscriptionSetupBudgetMs);
 		assert.strictEqual(resolved.subscriptionSetupBudgetMs, 900_000);
@@ -208,13 +212,14 @@ describe('subscriptionSetupCapabilityFrom', () => {
 
 describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 	it('advertises exactly the registry keys, frozen', () => {
-		const local = buildLocalCapabilities(90_000);
+		const local = buildLocalCapabilities(90_000, true);
 		assert.deepStrictEqual(
 			{ ...local },
 			{
 				protocolVersion: LOCAL_PROTOCOL_VERSION,
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
+				recordLocks: RECORD_LOCKS_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -222,7 +227,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 
 	it('round-trips through this node into the pre-registry setup behavior', () => {
 		// What a current peer advertises must still enable acknowledgement and carry its budget.
-		const resolved = resolvePeerCapabilities(buildLocalCapabilities(90_000));
+		const resolved = resolvePeerCapabilities(buildLocalCapabilities(90_000, true));
 		assert.strictEqual(resolved.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY);
 		assert.strictEqual(resolved.subscriptionSetupBudgetMs, 90_000);
 		assert.strictEqual(resolved.protocolVersion, LOCAL_PROTOCOL_VERSION);
@@ -231,7 +236,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 	it('keeps the NODE_NAME frame a five-element array whose element 4 is the bag', () => {
 		// Guards the outer wire shape only. Backward compatibility is proved by the legacy-shape resolver
 		// cases above — a golden of the NEW bytes cannot show that an old reader tolerates them.
-		const frame = encode([NODE_NAME, 'this-node', 'data', [], buildLocalCapabilities(90_000)]);
+		const frame = encode([NODE_NAME, 'this-node', 'data', [], buildLocalCapabilities(90_000, true)]);
 		assert.strictEqual(frame[0] > 127, true, 'first byte must mark this a command frame');
 		const decoded = decode(frame);
 		assert.strictEqual(decoded.length, 5);
@@ -242,8 +247,56 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				protocolVersion: LOCAL_PROTOCOL_VERSION,
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
+				recordLocks: RECORD_LOCKS_CAPABILITY,
 			}
 		);
+	});
+});
+
+describe('resolvePeerCapabilities — recordLocks is a level that fails closed when absent', () => {
+	it('is absent from a bag-less peer and from a #813-shape bag that predates it', () => {
+		assert.strictEqual(ABSENT_PEER_CAPABILITIES.recordLocks, 0);
+		assert.strictEqual(peerSupportsRecordLocks(ABSENT_PEER_CAPABILITIES), false);
+		const registryOnly = resolvePeerCapabilities({
+			protocolVersion: LOCAL_PROTOCOL_VERSION,
+			subscriptionSetupAck: 1,
+			subscriptionSetupBudgetMs: 90_000,
+		});
+		assert.strictEqual(registryOnly.recordLocks, 0);
+		assert.strictEqual(peerSupportsRecordLocks(registryOnly), false);
+	});
+
+	it('is supported exactly when the peer advertises the level this build implements, and no other', () => {
+		assert.strictEqual(
+			peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: RECORD_LOCKS_CAPABILITY })),
+			true
+		);
+		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities(buildLocalCapabilities(1, true))), true);
+		// Level 1 was Ricart–Agrawala. A peer still advertising it is a different arbiter, not a slower
+		// one, so it is not a lock participant at all — versions are mutually exclusive, not ordered.
+		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: 1 })), false);
+		for (const advertised of [0, -1, 0.5, false, '0', null, undefined, {}, 'yes', NaN]) {
+			assert.strictEqual(
+				peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: advertised })),
+				false,
+				`advertised ${String(advertised)}`
+			);
+		}
+	});
+
+	it('keeps a level above the one this build implements, and treats it as a different arbiter', () => {
+		// Not clamped: folding 7 down to 2 would admit a future-level peer to the ring as supported.
+		assert.strictEqual(resolvePeerCapabilities({ recordLocks: 7 }).recordLocks, 7);
+		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: 7 })), false);
+	});
+
+	it('is advertised only by a node that has enabled cluster record locks', () => {
+		assert.strictEqual(buildLocalCapabilities(90_000, false).recordLocks, 0);
+		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities(buildLocalCapabilities(90_000, false))), false);
+	});
+
+	it('does not move the protocol version: an additive key is not a shape change', () => {
+		assert.strictEqual(LOCAL_PROTOCOL_VERSION, 2);
 	});
 });
 
@@ -257,9 +310,16 @@ describe('samePeerCapabilities', () => {
 
 	it('reports a change when the peer upgrades or downgrades', () => {
 		const legacy = resolvePeerCapabilities(undefined);
-		const current = resolvePeerCapabilities(buildLocalCapabilities(90_000));
+		const current = resolvePeerCapabilities(buildLocalCapabilities(90_000, true));
 		assert.strictEqual(samePeerCapabilities(legacy, current), false);
 		assert.strictEqual(samePeerCapabilities(current, legacy), false);
+		// A #813-era peer differs from a current one in recordLocks alone.
+		const registryOnly = resolvePeerCapabilities({
+			protocolVersion: LOCAL_PROTOCOL_VERSION,
+			subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
+			subscriptionSetupBudgetMs: 90_000,
+		});
+		assert.strictEqual(samePeerCapabilities(registryOnly, current), false);
 	});
 
 	it('treats "never posted" as a change', () => {

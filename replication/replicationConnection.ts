@@ -20,6 +20,7 @@ import {
 	ACTION_32_BIT,
 	auditRetention,
 	LOCAL_ONLY,
+	isLockControlType,
 } from '../core/resources/auditStore.ts';
 import {
 	exportIdMapping,
@@ -36,6 +37,8 @@ import {
 } from './replicator.ts';
 import { redactOperationForLog } from './logRedaction.ts';
 import { CopyCursorWatermark } from './copyCursorWatermark.ts';
+import { recordPeerLockCapability, recordPeerHomesDigest, currentHomesDigest } from './recordLockTransport.ts';
+import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -52,6 +55,7 @@ import {
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
+	peerSupportsRecordLocks,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -147,6 +151,11 @@ const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
 const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime + copy-order version
 const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
+// A dedicated message, not a `NODE_NAME` resend (harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6):
+// reusing NODE_NAME's handler for a live update would also re-run its other handshake side effects
+// (e.g. sendSubscriptionRequestUpdate). Sent at initial handshake alongside NODE_NAME, and standalone
+// whenever this node's own active home-map digest for the database changes (on activate).
+const RECORD_LOCK_HOMES_DIGEST = 150;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -679,7 +688,7 @@ const SUBSCRIPTION_SETUP_TIMEOUT_MS = positiveMsOr(
 const SEND_SUBSCRIPTION_SETUP_BUDGET_MS = SEND_SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL;
 // Built once and sent by reference on every handshake, so the advertised bag and the gate that reads a
 // peer's cannot drift apart.
-const LOCAL_CAPABILITIES = buildLocalCapabilities(SEND_SUBSCRIPTION_SETUP_BUDGET_MS);
+const LOCAL_CAPABILITIES = buildLocalCapabilities(SEND_SUBSCRIPTION_SETUP_BUDGET_MS, CLUSTER_RECORD_LOCKS_ENABLED);
 // Shared by every socket in this worker thread, so one peer cannot emit a warn line per socket per
 // window by sending a single unrecognized frame on each. Per-socket counts stay on each connection.
 const unknownCommandWarnThrottle = createThrottleState();
@@ -4139,6 +4148,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		return replicationSharedStatus;
 	}
+	// Both sides of every link write it: the record-lock owner reads the peer's answer from shared
+	// memory because an inbound-only peer's socket may live on another thread. Re-run once the
+	// database's audit store is known, since the inbound side learns the database after the bag.
+	function recordPeerLockCapabilityFromHandshake() {
+		if (!peerCapabilitiesLearned) return;
+		const status = getSharedStatus();
+		if (status) recordPeerLockCapability(status, peerSupportsRecordLocks(peerCapabilities));
+	}
 	if (databaseName) {
 		setDatabase(databaseName);
 	}
@@ -4578,6 +4595,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return;
 								}
 							}
+							recordPeerLockCapabilityFromHandshake();
+							// Now that the peer's own capabilities are known, the sender-side gate on the digest
+							// frame can finally pass — nothing else re-triggers this send once databaseName was
+							// already set before this NODE_NAME arrived.
+							sendRecordLockHomesDigestFrame();
 							sendSubscriptionRequestUpdate();
 						}
 						break;
@@ -4721,6 +4743,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							},
 							rootStore: table.primaryStore.rootStore,
 						};
+						break;
+					case RECORD_LOCK_HOMES_DIGEST:
+						// `data` (`message[1]`) is the digest; `message[2]` names the database — the same slot
+						// NODE_NAME uses for it — since one socket carries every database's traffic and the
+						// digest is per-database (harper-pro#825). Recorded centrally, keyed by (database,
+						// peer) rather than on this connection object: the mesh keeps a separate connection
+						// per direction, and our own digest can become known later, on either one.
+						if (typeof data === 'string' && typeof remoteNodeName === 'string' && message[2] === databaseName)
+							recordPeerHomesDigest(databaseName, remoteNodeName, data);
 						break;
 					case NODE_NAME_TO_ID_MAP:
 						// this is the mapping of node names to short local ids. if there is no auditStore (yet), just make an empty map, but not sure why that would happen.
@@ -5358,6 +5389,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (auditRecord.extendedType & LOCAL_ONLY) {
 								return skipAuditRecord();
 							}
+							// Lock control entries (harper-pro#438) are the first capability-gated frame: a peer that
+							// has not advertised `recordLocks` would apply them as records. Skipping one can only
+							// cost the requester a 423, never a second holder.
+							if (
+								isLockControlType(auditRecord.type) &&
+								!(peerCapabilitiesLearned && peerSupportsRecordLocks(peerCapabilities))
+							) {
+								return skipAuditRecord();
+							}
 							const nodeId = auditRecord.nodeId;
 							const tableId = auditRecord.tableId;
 							let tableEntry = tableById[tableId];
@@ -5712,6 +5752,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								tableSubscriptionToReplicator = resolvedDatabaseSubscription;
 								if (closed || wsClosed) return;
 								auditStore = tableSubscriptionToReplicator.auditStore;
+								recordPeerLockCapabilityFromHandshake();
+								sendRecordLockHomesDigestFrame();
 								tableById = tableSubscriptionToReplicator.tableById.map(tableToTableEntry);
 								subscribedNodeIds = [];
 								if (excludedNodes) {
@@ -7510,8 +7552,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				options.connection.on('exclusion-origins-updated', (origins: string[]) => {
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
-							(nodeName) =>
-								nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
+							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
 						)
 					);
 					const excludeNodes = [...shouldExclude].filter((nodeName) => !lastSentExcludedNodes.includes(nodeName));
@@ -7908,6 +7949,24 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				])
 			);
 		if (TEST_UNKNOWN_COMMAND_VALID) ws.send(encode([TEST_UNKNOWN_COMMAND_CODE]));
+		sendRecordLockHomesDigestFrame();
+	}
+	/**
+	 * This connection's database's digest, not part of `LOCAL_CAPABILITIES` (a process-wide singleton
+	 * built once at module load — harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6): the active
+	 * generation digest travels on its own, from whatever this node's transport cache currently holds.
+	 * No-op with the feature off or before this node has an active generation — the peer's fail-closed
+	 * default already covers "no digest received." Agreement itself is reconciled centrally in
+	 * `recordLockTransport.ts`, not here — this connection may not be the one that last heard from the
+	 * peer (the mesh keeps a separate connection per direction).
+	 */
+	function sendRecordLockHomesDigestFrame() {
+		if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
+		// Sender-side gating discipline (DESIGN.md, "Sender-side gating discipline"): do not emit a
+		// frame the peer has not advertised support for.
+		if (!(peerCapabilitiesLearned && peerSupportsRecordLocks(peerCapabilities))) return;
+		const digest = currentHomesDigest(databaseName);
+		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
 	}
 	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
 		const database = getDatabases()?.[databaseName];
@@ -8016,6 +8075,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return new Promise((resolve, reject) => {
 				awaitingResponse.set(requestId, { resolve, reject });
 			});
+		},
+		// A standalone re-announce for this live socket (harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6):
+		// activation does not otherwise reach an already-connected peer, since the capability bag is only
+		// sent at handshake. No-op while this node has no active generation yet — the peer's own fail-closed
+		// default (`homeMap()` unavailable, or `HOMES_AGREEMENT_UNKNOWN`) already covers that case.
+		sendRecordLockHomesDigest() {
+			sendRecordLockHomesDigestFrame();
 		},
 	};
 
