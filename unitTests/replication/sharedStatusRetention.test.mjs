@@ -19,8 +19,11 @@ import { LAST_ERROR_CODE_POSITION, WORKER_EXIT_ERROR_CODE } from '#src/replicati
 // loaded through CJS, and the two copies collide redefining the transaction-log reader's properties.
 const { RocksDatabase } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
 
+// Reset immediately: mocha runs every unitTests/**/*.test.mjs in one process, and leaving the flag on
+// would change how every later file is collected. The captured function stays callable.
 setFlagsFromString('--expose_gc');
 const collect = runInNewContext('gc');
+setFlagsFromString('--no-expose_gc');
 
 // V8 promises no collection on demand — a residual stack or register reference can keep a temporary view
 // alive — so the drop below is observed over several rounds rather than asserted after one.

@@ -242,9 +242,8 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 420000 }, (ct
 			);
 			equal(corrected.connected, false);
 			equal(corrected.lastConnectionError.code, WORKER_EXIT_ERROR_CODE);
-			// The stamp alone does not prove the buffer survived the worker — the main thread would stamp a
-			// freshly zeroed one just as well. The pre-kill watermark can only be there if this is the same
-			// allocation the dead worker was writing.
+			// The stamp alone would also pass against a re-minted buffer; the pre-kill watermark can only be
+			// there if this is the allocation the dead worker was writing.
 			equal(
 				corrected.lastReceivedVersion,
 				beforeKill.lastReceivedVersion,
