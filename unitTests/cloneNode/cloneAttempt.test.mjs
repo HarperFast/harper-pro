@@ -5,11 +5,18 @@
  * cannot name its source authorizes nothing.
  */
 
-import { expect } from 'chai';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import assert from 'node:assert';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cloneAttemptSource, cloneAttemptPath, CLONE_ATTEMPT_FILE } from '#src/cloneNode/cloneAttempt';
+import {
+	CLONE_ATTEMPT_FILE,
+	CLONE_COMPLETION_GRACE_MS,
+	cloneAttemptPath,
+	cloneAttemptSource,
+	completeCloneAttempt,
+	reusableCloneAttemptId,
+} from '#src/cloneNode/cloneAttempt';
 
 describe('clone-attempt marker (#737)', () => {
 	let rootPath;
@@ -29,32 +36,78 @@ describe('clone-attempt marker (#737)', () => {
 	});
 
 	it('has no source with no marker on disk', () => {
-		expect(cloneAttemptSource(rootPath)).to.equal(undefined);
+		assert.equal(cloneAttemptSource(rootPath), undefined);
 	});
 
 	it('reports the host being cloned from while the marker is on disk', () => {
 		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example' }));
-		expect(cloneAttemptSource(rootPath)).to.equal('leader.example');
+		assert.equal(cloneAttemptSource(rootPath), 'leader.example');
+	});
+
+	it('reports the host during the completed-at grace', () => {
+		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example', completedAt: Date.now() }));
+		assert.equal(cloneAttemptSource(rootPath), 'leader.example');
+	});
+
+	it('has no source after the completed-at grace', () => {
+		writeMarker(
+			JSON.stringify({
+				attemptId: 'abc',
+				leaderHost: 'leader.example',
+				completedAt: Date.now() - CLONE_COMPLETION_GRACE_MS,
+			})
+		);
+		assert.equal(cloneAttemptSource(rootPath), undefined);
+	});
+
+	it('has no source for a malformed completion time', () => {
+		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example', completedAt: 'recently' }));
+		assert.equal(cloneAttemptSource(rootPath), undefined);
+	});
+
+	it('marks an attempt complete without changing its identity', () => {
+		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example' }));
+		completeCloneAttempt(rootPath, 1234);
+		assert.deepEqual(JSON.parse(readFileSync(cloneAttemptPath(rootPath), 'utf8')), {
+			attemptId: 'abc',
+			leaderHost: 'leader.example',
+			completedAt: 1234,
+		});
+	});
+
+	it('reuses only an unfinished attempt for the same leader', () => {
+		assert.equal(reusableCloneAttemptId({ attemptId: 'abc', leaderHost: 'leader.example' }, 'leader.example'), 'abc');
+		assert.equal(
+			reusableCloneAttemptId(
+				{ attemptId: 'abc', leaderHost: 'leader.example', completedAt: Date.now() },
+				'leader.example'
+			),
+			undefined
+		);
+		assert.equal(
+			reusableCloneAttemptId({ attemptId: 'abc', leaderHost: 'other.example' }, 'leader.example'),
+			undefined
+		);
 	});
 
 	it('stops reporting a source the moment the marker is removed', () => {
 		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example' }));
 		rmSync(cloneAttemptPath(rootPath));
-		expect(cloneAttemptSource(rootPath)).to.equal(undefined);
+		assert.equal(cloneAttemptSource(rootPath), undefined);
 	});
 
 	it('has no source for a marker that does not name one', () => {
 		writeMarker(JSON.stringify({ attemptId: 'abc' }));
-		expect(cloneAttemptSource(rootPath)).to.equal(undefined);
+		assert.equal(cloneAttemptSource(rootPath), undefined);
 	});
 
 	it('has no source for an unreadable marker', () => {
 		writeMarker('{ not json');
-		expect(cloneAttemptSource(rootPath)).to.equal(undefined);
+		assert.equal(cloneAttemptSource(rootPath), undefined);
 	});
 
 	it('has no source when no root path is configured', () => {
-		expect(cloneAttemptSource(undefined)).to.equal(undefined);
+		assert.equal(cloneAttemptSource(undefined), undefined);
 	});
 
 	it('has no source outside a clone run, however stale the marker on disk', () => {
@@ -62,10 +115,10 @@ describe('clone-attempt marker (#737)', () => {
 		// authorize withholding for the life of the install.
 		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example' }));
 		delete process.env.HARPER_CLONE_ATTEMPT;
-		expect(cloneAttemptSource(rootPath)).to.equal(undefined);
+		assert.equal(cloneAttemptSource(rootPath), undefined);
 	});
 
 	it('places the marker in the root path', () => {
-		expect(cloneAttemptPath(rootPath)).to.equal(join(rootPath, CLONE_ATTEMPT_FILE));
+		assert.equal(cloneAttemptPath(rootPath), join(rootPath, CLONE_ATTEMPT_FILE));
 	});
 });
