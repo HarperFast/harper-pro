@@ -35,7 +35,7 @@ export class ArmSubscribeAfterOpen extends Resource {
 		if (process.env.HARPER_TEST_ALLOW_SUBSCRIBE_AFTER_OPEN_HOOK !== '1') {
 			return { armed: false, database: 'data', threadId };
 		}
-		process.env.HARPER_TEST_HOLD_SUBSCRIBE_AFTER_OPEN_ONCE_DB = 'data';
+		process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB = 'data';
 		return { armed: true, database: 'data', threadId };
 	}
 }
