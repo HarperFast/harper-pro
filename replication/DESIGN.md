@@ -67,7 +67,7 @@ Each socket resolves the peer's bag once per `NODE_NAME` into a frozen object wi
 | `protocolVersion`           | version   | `1`               | `min(local, peer)`; local is `LOCAL_PROTOCOL_VERSION`                                                                                                                                                  |
 | `subscriptionSetupAck`      | level     | `0` (unsupported) | `min(local, peer)` — a level this build does not implement cannot be used                                                                                                                              |
 | `subscriptionSetupBudgetMs` | parameter | absent            | the peer's raw value; clamped by its consumer, never against a local level                                                                                                                             |
-| `recordLocks`               | level     | `0` (unsupported) | exact level, never min-clamped — a peer at any other level (including a future higher one) is not a lock participant; advertised as `2` only while `replication.recordLocks` is on and the bag is sent |
+| `recordLocks`               | level     | `0` (unsupported) | exact level, never min-clamped — a peer at any other level (including a future higher one) is not a lock participant; advertised as `3` only while `replication.recordLocks` is on and the bag is sent |
 
 The kinds are not cosmetic. A **level** coerces (`Number(value)`), because the behavior being preserved is `capabilities?.subscriptionSetupAck >= 1`, a coercing comparison that a peer sending `true` or `'1'` passes today. A **parameter** does not coerce, because its predecessor was `Number.isFinite(raw) && raw > 0`, which already rejects `'300'`. A parameter is also never min-clamped: a millisecond budget is not a feature level.
 
@@ -244,7 +244,7 @@ position. This keeps bootstrap available without conflating clocks in the subseq
 | `replicationLoad.test.mjs`           | Concurrent-write load                                                                                                                                      |
 | `excludeTablesReplication.test.mjs`  | Per-route `excludeTables` bridge migration (issue #239)                                                                                                    |
 | `relayedOriginResumeGap.test.mjs`    | Deterministic relayed-origin cursorless resume gap (#432): guards the #428 full copy; `HARPER_TEST_DISABLE_CURSORLESS_FULL_COPY=1` runs its red-proof mode |
-| `recordLockCluster.test.mjs`         | Cluster record locks (#438): serialized increments across three nodes, LWW fencing, holder crash → lease hand-over, and the mixed-version gate             |
+| `recordLockCluster.test.mjs`         | Cluster record locks (#438): the operator-agreed home map's §4.3 stage/activate transition, serialized increments across three nodes, LWW fencing, and a peer outside the map failing closed (holder crash → lease hand-over is `test.skip`, pending harper#2542) |
 | `recordLockCost.bench.mjs`           | Record-lock cost baseline (`npm run bench:record-locks`, not a gate): latency, hot-key throughput, log cost, and the off-path write cost                   |
 
 Most replication behavior is exercised via integration tests that spin up multi-node clusters. A few function-level invariants that don't need a cluster live in `../unitTests/replication/` (e.g. `listenerLifecycle.test.mjs`, `pingKeepalive.test.mjs`).

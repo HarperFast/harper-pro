@@ -232,16 +232,15 @@ pointer or `undefined`) on any error in between; mirrors the existing containmen
   mismatched `(generation, homes)`; digest mismatch producing `undefined` for the whole
   database, not a smaller `homes[]`; `recordLockOwnerFor` reporting unowned while a bump is in
   flight, from both call sites; bump-failure leaving coordination unowned.
-- Integration (extends `recordLockCluster.test.mjs`): stage on every node (staggered arrival
-  order) → each staged node immediately refuses new grants under the old generation, verified
-  by attempting one → operator waits the (test-shortened) drain from the _last_ stage response
-  → activate → `homeMap()` agrees cluster-wide including a moved key; a grant attempted between
-  stage and activate is refused everywhere, not merely delayed; a node the stage call never
-  reached does not activate and, if later reachable again still on `g`, is refused by every
-  peer on generation mismatch; digest mismatch makes both sides' `homeMap()` return `undefined`
-  for the database, not a 1-node ring; restart of the process and of only the coordinating
-  worker are both exercised independently for the incarnation-ordering fix; a persistence
-  failure injected mid-bump leaves the database unowned rather than double-owned.
+- Integration (`recordLockCluster.test.mjs`, "the §4.3 stage/activate transition" suite, as
+  actually landed — a real pre-push review finding: this section previously described a larger
+  integration surface than the branch shipped): no active generation fails every cluster lock
+  closed; staging retracts any active generation immediately, with no window where a lock
+  succeeds mid-transition; activation is idempotent and refuses a generation that does not match
+  what is staged. Not yet covered at integration level, and worth adding: digest mismatch across
+  real nodes (the unit suite covers the pure decision, not the wire); `record_lock_fence_external`
+  (zero coverage, unit or integration); a coordinating-worker or process restart exercising the
+  incarnation-ordering fix under real IPC; a persistence failure injected mid-bump.
 
 ## For the human reviewer (carried into the PR)
 
