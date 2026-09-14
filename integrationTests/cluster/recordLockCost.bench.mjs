@@ -157,11 +157,8 @@ function waitForCounter(nodes, id, expected) {
 	);
 }
 
-// Three agreeing polls at 250 ms span only ~500 ms of stability; it does not prove convergence,
-// only that no disagreement was observed in that window. A replication batch already in flight
-// could still land after and change the counter, so `agreedCounter`/`lostUpdates` are a settled
-// snapshot, not a durability guarantee — the exact-audit fields (`writtenValueAudit`) are what the
-// document's numeric claims are actually built on.
+// A settled snapshot (three agreeing polls), not a durability proof; writtenValueAudit is the source
+// of truth for the document's numeric claims.
 function waitForAgreedCounter(nodes, id) {
 	let previous;
 	let stablePolls = 0;
@@ -594,10 +591,8 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 			}
 			// The cheapest single cluster round measurement 1 saw, in this run, on this box. Absent only if
 			// no key in measurement 1 was homed elsewhere, which leaves nothing to calibrate against.
-			// This floor is an ABSOLUTE latency (cluster round + local key lock), but it is compared below
-			// against deltaMs, which has the local key lock already subtracted — so a round landing at the
-			// floor reads as a delta below it and is undercounted as served locally. Small at the measured
-			// magnitudes (floor ~0.15 ms, local reference tail ~0.15 ms), but it biases the measured rate down.
+			// Absolute latency compared against a delta below; undercounts borderline rounds as served
+			// locally (§6 of the results document).
 			const remoteHome = results.uncontended.byHome.remoteHome;
 			assert.ok(remoteHome, 'measurement 1 saw no remote-home key; cannot calibrate a cluster round');
 			const thresholdMs = remoteHome.min;

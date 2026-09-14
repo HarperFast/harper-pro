@@ -29,12 +29,12 @@ that _are_ sensitive are measurement 1's pooled figure and measurement 5's absol
 neither carries an argument here that depends on a small difference. Re-measuring the before-figures
 on this substrate would need the Ricart–Agrawala code back, which the branch has deleted.
 
-**Which code this measures.** harper-pro#822's branch head with the `core` submodule at
-`729aefd233cd8e083803ddbc5b070b4108e40d25`, the harper#2498 head at measurement time. #822 had
-pinned `core` at a commit that a later force-push of `feat/record-lock-phase1` left unreachable, four
-commits behind — two of which change grant and delegation holding directly, which is what
-measurements 2 and 3 exist to exercise — so measuring the old pin would have measured code that is
-not going to ship.
+**Which code this measures.** harper-pro `4cd0b9d8` (harper-pro#822's branch head at measurement
+time) with the `core` submodule at `729aefd233cd8e083803ddbc5b070b4108e40d25`, the harper#2498 head
+at measurement time. #822 had pinned `core` at a commit that a later force-push of
+`feat/record-lock-phase1` left unreachable, four commits behind — two of which change grant and
+delegation holding directly, which is what measurements 2 and 3 exist to exercise — so measuring the
+old pin would have measured code that is not going to ship.
 
 **The committed `core` pointer has since moved past that, and is not currently re-runnable.** This
 branch was rebased onto `feat/record-lock-cluster-transport`, which independently re-pinned `core` to
@@ -46,8 +46,8 @@ own replacement of the membership epoch with an operator-agreed home map
 and throws otherwise. So as of this rebase, `npm run bench:record-locks` cannot start a
 `replication.recordLocks`-enabled cluster at all against the pinned `core` — the numbers above remain
 exactly what was measured at `729aefd2`, but re-running them today would require harper-pro's
-transport to be updated to `homeMap()` first. That update is out of scope here; tracked as a Finding
-on the dispatch task rather than fixed in this PR.
+transport to be updated to `homeMap()` first. Updating the transport is out of scope for this PR — it
+belongs to whatever lands harper-pro#825's durable epoch, since that is the same interface boundary.
 
 **What the protocol does not yet do, which two rows below depend on.** Core's coordinator states at
 `resources/recordLockCoordinator.ts:43` that the successor-freshness fence of §7 — the inherited
@@ -479,6 +479,14 @@ populations, run 1:
 The cut is 0.15 ms. It separates cleanly: the largest served-locally delta is 0.14 ms and the
 smallest lapsed delta is 0.35 ms, with the local reference — measured on every tick, independent of
 any classification — topping out at 0.13 ms.
+
+**The cut itself is on the wrong scale, and it is a real bias in this run's favor.** `thresholdMs` is
+`remoteHome.min`, measurement 1's cheapest remote-home lock — an absolute latency that still includes
+the local key lock. It is compared against `deltaMs`, which has the local key lock already subtracted.
+A round landing at exactly that absolute floor would read as a delta below the cut and be
+misclassified as served locally rather than a lapse. Not corrected here — doing so changes the
+threshold formula and would need the bench re-run, which the pinned `core` does not currently allow
+(see above) — so it is left as a known undercount rather than an unmeasured one.
 
 **At the 60 s window the prediction is exact, in all three runs.** Three lapses in 36 ticks, at 60 s,
 120 s and 180 s, every one of them on a window multiple: `0.0833` measured against `0.0833` predicted.
