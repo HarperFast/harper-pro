@@ -1110,7 +1110,9 @@ export async function startOnMainThread(options) {
 					// never reaches 'open' (so connectedToNode never clears it and disconnectedFromNode never
 					// stamps disconnectedAt) would otherwise be invisible to findWedgedNodeUrls. See harper-pro#466.
 					createdAt: Date.now(),
-					// Before the subscribe dispatched below, so the worker is never the only holder.
+					// Before the subscribe dispatched below. Resolves nothing for a database the main thread
+					// cannot see yet (clone/leader bootstrap), which leaves the worker sole holder until one
+					// of the re-takes above reaches it.
 					sharedStatus: resolveSharedStatus(databaseName, nodes[0]?.name) ?? carriedSharedStatus,
 				});
 				ensureWorkerExitHandler(worker);
