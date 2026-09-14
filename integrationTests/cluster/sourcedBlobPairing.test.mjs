@@ -353,16 +353,18 @@ async function waitForAllWorkers(nodes, id, agentsByNode, probeResource) {
  */
 async function releaseLateFill(ctx, id) {
 	const deadline = Date.now() + BARRIER_MS;
-	let lateIndex = -1;
-	let staged = false;
-	while (lateIndex < 0 && Date.now() < deadline) {
-		const calls = ctx.origin.trial(id)?.calls ?? [];
-		if (calls.length >= 2) lateIndex = ctx.nodes.findIndex((node) => node.hostname === calls[1].node);
-		else await delay(50);
-	}
-	if (lateIndex < 0) return false;
 	const probeAgent = new Agent({ keepAlive: true, maxSockets: 1 });
+	let staged = false;
+	// every exit releases: a second fill that arrives after this gives up would otherwise wait out a
+	// fresh barrier timer on top of the time it already spent, past its own request timeout
 	try {
+		let lateIndex = -1;
+		while (lateIndex < 0 && Date.now() < deadline) {
+			const calls = ctx.origin.trial(id)?.calls ?? [];
+			if (calls.length >= 2) lateIndex = ctx.nodes.findIndex((node) => node.hostname === calls[1].node);
+			else await delay(50);
+		}
+		if (lateIndex < 0) return false;
 		while (!staged && Date.now() < deadline) {
 			const scan = await requestJson(`${ctx.nodes[lateIndex].httpURL}/PairScanProbe/${id}`, probeAgent).catch(
 				() => null
