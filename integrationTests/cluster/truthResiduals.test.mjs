@@ -12,8 +12,8 @@
  *    with backPressurePercent is a consistency guard; the field's presence is what proves the copy ran.
  *  - R4: a wedge-reconcile fire that happens while truth already reads down lands in the redundant bucket,
  *    visible in cluster_status and in the fire log line.
- *  - R5: a fresh connection whose subscribe payload is held until after socket open loses the connect edge;
- *    its shared-memory truth restores the retained connected:false coordinator entry on the next reconcile.
+ *  - R5: a hook synthesizes a session whose subscribe payload lands after socket open, then shared-memory
+ *    truth restores the retained connected:false coordinator entry exactly once on reconciliation.
  *
  * NOT pinned here: owner gating. Every fire this suite provokes is a main-thread net, which always owns the
  * subscription, so the `unknown` path that keeps non-owner fires out of the evidence is unit-only
@@ -451,17 +451,18 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ct
 			correctionBaseline,
 			'the main-thread reconcile to correct the retained connected bit up from shared truth'
 		);
-		await delay(UP_RESTORE_PROOF_MS);
-		equal(
-			countOccurrences(await readLog(subscriber), correctionLine),
-			correctionBaseline + 1,
-			'the correction must restore the main-thread bit instead of repeating on later reconcile ticks'
-		);
-
+		const correctionObservedAt = Date.now();
 		await pollPeerSocket(subscriber, peer.hostname, (socket) => socket?.connected === true, {
 			timeoutMs: CONNECT_TIMEOUT_MS,
 			description: `${subscriber.hostname} to expose the restored connection for ${peer.hostname}`,
 		});
 		await assertReplicates(peer, subscriber, 'r5-after');
+		const remainingProofWindow = UP_RESTORE_PROOF_MS - (Date.now() - correctionObservedAt);
+		if (remainingProofWindow > 0) await delay(remainingProofWindow);
+		equal(
+			countOccurrences(await readLog(subscriber), correctionLine),
+			correctionBaseline + 1,
+			'the correction must restore the main-thread bit instead of repeating on later reconcile ticks'
+		);
 	});
 });
