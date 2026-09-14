@@ -60,9 +60,8 @@ const REPLICATION_TIMEOUT_MS = 20000;
 const UP_CORRECTION_TIMEOUT_MS = 20000;
 const UP_RESTORE_PROOF_MS = 11000;
 const POLL_MS = 250;
-// The release line, not the deferral line: it is logged from the session promise's resolution, which only
-// happens inside the open handler after replicateOverWS ran — so it is the proof that the socket opened
-// with no subscription, which the deferral line alone would not give.
+// The release line, not the deferral line: only the release proves a session opened while the subscribe was
+// still held, which is the ordering R5 needs.
 const SUBSCRIBE_AFTER_OPEN_MARKER = '[test] releasing deferred subscribe for db "data" (harper-pro#431)';
 
 function nodeStartOptions(node) {

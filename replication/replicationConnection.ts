@@ -1405,15 +1405,11 @@ export function maybeStallSubscriptionSetupForTest(databaseName?: string): Promi
 }
 
 // Test-only ordering injection for harper-pro#431. When HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB names a
-// database, the FIRST subscribe() for a connection that has none yet is deferred until that connection's
-// session resolves — so the socket opens with `nodeSubscriptions` still undefined, the open handler skips
-// connectedToNode(), and replicateOverWS snapshots `isSubscriptionConnection: false` (which also keeps the
-// pong path from posting a connect edge). That leaves the main-thread entry reading connected:false over a
-// link the worker's shared-memory truth records as connected — the harper-pro#289 desync the up-correction
-// exists for, which a black-box test cannot provoke because the real window is the sub-millisecond race
-// between the WS handshake and an async subscribe(). One-shot per worker thread, so every later subscribe
-// (including this connection's own reconnects) takes the normal path. Never arms in production: the env var
-// is set only by the regression test.
+// database, the FIRST subscribe() on a connection that has none is held until that connection opens a
+// session, so the socket opens with `nodeSubscriptions` undefined and neither the open handler nor the
+// session's pong path posts a connect edge. That is the harper-pro#289 desync the up-correction exists for,
+// and nothing black-box can provoke it: the real window is the race between the WS handshake and an async
+// subscribe(). One-shot per worker thread; never arms in production, the env var is set only by the test.
 let subscribeAfterOpenForTestArmed = false;
 export function maybeDeferSubscribeUntilSessionForTest(
 	connection: any,
@@ -1421,6 +1417,12 @@ export function maybeDeferSubscribeUntilSessionForTest(
 	replicateTablesByDefault: boolean
 ): boolean {
 	if (!process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB) return false;
+	// A later subscribe while one is held replaces the held payload rather than overtaking it: applying it
+	// would both post the edge this suppresses and leave the newer node set to be overwritten on release.
+	if (connection.deferredSubscribeForTest) {
+		connection.deferredSubscribeForTest = { nodeSubscriptions, replicateTablesByDefault };
+		return true;
+	}
 	if (
 		subscribeAfterOpenForTestArmed ||
 		connection.nodeSubscriptions !== undefined ||
@@ -1429,14 +1431,33 @@ export function maybeDeferSubscribeUntilSessionForTest(
 	)
 		return false;
 	subscribeAfterOpenForTestArmed = true;
+	connection.deferredSubscribeForTest = { nodeSubscriptions, replicateTablesByDefault };
 	logger.warn?.(`[test] deferring subscribe until session open for db "${connection.databaseName}" (harper-pro#431)`);
-	// Re-entrant, not a private apply path: the one-shot flag is already spent, so this second call takes
-	// the normal subscribe. Released on rejection too, so a failed connect cannot strand the subscription.
+	// Gated on liveSession, not on the promise settling: the promise also settles on a socket error, and
+	// connect()'s createWebSocket rejection reaches scheduleReconnect(), which installs a fresh promise and
+	// leaves this one pending for good. liveSession is assigned in the open handler right after
+	// replicateOverWS, so every failed attempt simply leaves the payload held for the next one.
 	const release = () => {
-		if (connection.intentionallyUnsubscribed) return;
+		const held = connection.deferredSubscribeForTest;
+		if (!held) return;
+		const abandoned = connection.intentionallyUnsubscribed || connection.isFinished;
+		if (!abandoned && connection.liveSession === undefined) return;
+		connection.deferredSubscribeForTest = undefined;
+		clearInterval(retry);
+		if (abandoned) return;
 		logger.warn?.(`[test] releasing deferred subscribe for db "${connection.databaseName}" (harper-pro#431)`);
-		connection.subscribe(nodeSubscriptions, replicateTablesByDefault);
+		// subscribeToNode() contains a throw from its own subscribe(); an interval callback would not.
+		try {
+			connection.subscribe(held.nodeSubscriptions, held.replicateTablesByDefault);
+		} catch (error) {
+			logger.error?.(`[test] deferred subscribe failed for db "${connection.databaseName}"`, error);
+		}
 	};
+	// The promise is the prompt trigger — it settles in the same microtask batch as the open handler's
+	// sessionResolve, so the release still lands ahead of the peer's first frame. The interval only covers
+	// the attempts that never get there.
+	const retry = setInterval(release, 250);
+	retry.unref();
 	connection.session.then(release, release);
 	return true;
 }

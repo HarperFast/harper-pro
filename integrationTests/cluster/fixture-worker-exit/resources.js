@@ -26,7 +26,8 @@ export class KillHttpWorker extends Resource {
 	}
 }
 
-// Runtime arming control for R5, unavailable unless this fixture's allow flag was set at startup.
+// Arms R5's subscribe-deferral hook at runtime rather than at startup, so R1-R4 run unperturbed and the
+// caller learns which worker armed it.
 export class ArmSubscribeAfterOpen extends Resource {
 	static loadAsInstance = false;
 
