@@ -25,9 +25,54 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = resolve(
 const FIXTURE = resolve(import.meta.dirname ?? module.path, 'fixture-sourced-blob-pairing');
 const TRIALS = Number(process.env.HARPER_645_TRIALS ?? 10);
 const WORKERS = Number(process.env.HARPER_645_WORKERS ?? 2);
+// Far enough back that the reported version is unambiguously below both nodes' local clocks, so
+// neither caps it at local time and both store exactly this version.
+const TIE_BACKDATE_MS = 3600_000;
+const BARRIER_MS = 10000;
+// Restages are budgeted for the whole suite, not per trial: one unstaged race is a scheduling
+// accident worth retrying, but a race that can never be staged must fail inside the suite timeout
+// rather than spend TRIALS x attempts x the barrier window discovering it.
+const RESTAGE_BUDGET = 3;
+// The two race shapes the convergence claim has to hold for. They reach different arbiters, so a
+// regression in one is invisible to the other: `distinct` is settled by version ordering, while
+// `tied-late` has to be settled by the cache-fill resolution itself, at an equal version.
+//
+// A third shape — both fills concurrent AND at an equal version, so each node commits its own
+// record before its peer's arrives — is deliberately absent: it does not converge on current main,
+// on either engine, and that is a product defect rather than something this regression can assert.
+// See the PR body for the reproduction.
+const SHAPES = [
+	{ id: 'distinct', stagger: false, tied: false },
+	{ id: 'tied-late', stagger: true, tied: true },
+];
+
+function respondTo(state, pending) {
+	if (pending.answered) return;
+	pending.answered = true;
+	if (pending.res.destroyed || pending.res.writableEnded) return;
+	pending.res.writeHead(200, { 'Content-Type': 'application/json' });
+	pending.res.end(JSON.stringify({ token: pending.token, lastModified: state.lastModified }));
+}
+
+function releaseTrial(state, timedOut) {
+	if (!state) return;
+	clearTimeout(state.timer);
+	state.timer = null;
+	state.released = true;
+	state.timedOut ||= timedOut;
+	for (const pending of state.calls) respondTo(state, pending);
+}
 
 function startBarrierOrigin() {
 	const trials = new Map();
+	const newTrial = (shape = {}) => ({
+		calls: [],
+		timer: null,
+		timedOut: false,
+		released: false,
+		lastModified: shape.lastModified,
+		stagger: shape.stagger === true,
+	});
 	const server = createServer((req, res) => {
 		let body = '';
 		req.on('error', () => {});
@@ -45,28 +90,17 @@ function startBarrierOrigin() {
 				if (!res.destroyed) res.writeHead(400).end();
 				return;
 			}
-			const state = trials.get(call.id) ?? { calls: [], timer: null, timedOut: false, released: false };
+			const state = trials.get(call.id) ?? newTrial();
 			trials.set(call.id, state);
 			const token = `${call.id}:${call.node}:${call.threadId}:${state.calls.length}`;
 			const pending = { ...call, token, res, answered: false };
 			state.calls.push(pending);
-			const respond = (pending) => {
-				if (pending.answered) return;
-				pending.answered = true;
-				if (pending.res.destroyed || pending.res.writableEnded) return;
-				pending.res.writeHead(200, { 'Content-Type': 'application/json' });
-				pending.res.end(JSON.stringify({ token: pending.token }));
-			};
-			const release = (timedOut) => {
-				if (state.timer) clearTimeout(state.timer);
-				state.timer = null;
-				state.released = true;
-				state.timedOut ||= timedOut;
-				for (const pending of state.calls) respond(pending);
-			};
-			if (state.released) respond(pending);
-			else if (state.calls.length >= 2) release(false);
-			else state.timer = setTimeout(() => release(true), 10000);
+			if (state.released) respondTo(state, pending);
+			// A staggered trial answers the first fill at once and parks the second for the test to
+			// release; the timer is only ever the safety valve that keeps a parked fill from hanging.
+			else if (state.stagger && state.calls.length === 1) respondTo(state, pending);
+			else if (!state.stagger && state.calls.length >= 2) releaseTrial(state, false);
+			else state.timer ??= setTimeout(() => releaseTrial(state, true), BARRIER_MS);
 		});
 	});
 
@@ -75,6 +109,8 @@ function startBarrierOrigin() {
 			const { port } = server.address();
 			resolve({
 				url: `http://127.0.0.1:${port}`,
+				stage: (id, shape) => trials.set(id, newTrial(shape)),
+				release: (id) => releaseTrial(trials.get(id), false),
 				trial: (id) => trials.get(id),
 				close: () =>
 					new Promise((resolve, reject) => {
@@ -284,7 +320,108 @@ async function waitForAllWorkers(nodes, id, agentsByNode, probeResource) {
 	);
 }
 
-suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout: 300000 }, (ctx) => {
+/**
+ * Lets the first fill's record replicate to the node whose own fill is parked at the origin, then
+ * releases it, so that fill commits against a peer record instead of an empty store. Probes on a
+ * throwaway agent: the node's pinned agents are single-socket and one of them is holding the
+ * parked fill.
+ *
+ * Returns false when the peer record never arrived, which leaves the released fill racing an empty
+ * store — the ordinary shape, not the one this trial is for.
+ */
+async function releaseLateFill(ctx, id) {
+	const deadline = Date.now() + BARRIER_MS;
+	let lateIndex = -1;
+	let staged = false;
+	while (lateIndex < 0 && Date.now() < deadline) {
+		const calls = ctx.origin.trial(id)?.calls ?? [];
+		if (calls.length >= 2) lateIndex = ctx.nodes.findIndex((node) => node.hostname === calls[1].node);
+		else await delay(50);
+	}
+	if (lateIndex < 0) return false;
+	const probeAgent = new Agent({ keepAlive: true, maxSockets: 1 });
+	try {
+		while (!staged && Date.now() < deadline) {
+			const scan = await requestJson(`${ctx.nodes[lateIndex].httpURL}/PairScanProbe/${id}`, probeAgent).catch(
+				() => null
+			);
+			if (scan?.record) staged = true;
+			else await delay(50);
+		}
+	} finally {
+		probeAgent.destroy();
+		ctx.origin.release(id);
+	}
+	return staged;
+}
+
+/**
+ * Races one key across both nodes and asserts the whole cluster settles on a single write.
+ * Returns false when the barrier never held two concurrent fills — one node learned the key by
+ * replication before issuing its own, so nothing about convergence was demonstrated.
+ */
+async function raceTrial(ctx, id, shape) {
+	ctx.origin.stage(id, shape);
+	const fillAgents = ctx.agentsByNode.map((agents) => agents.values().next().value);
+	const pendingFills = Promise.all(
+		ctx.nodes.map((node, index) => requestJson(`${node.httpURL}/PairRecord/${id}`, fillAgents[index]))
+	);
+	const lateFillRacedAPeer = shape.stagger ? await releaseLateFill(ctx, id) : true;
+	const fills = await pendingFills;
+	const originTrial = ctx.origin.trial(id);
+	ok(originTrial, `${id} performed no source fills`);
+	if (originTrial.timedOut || originTrial.calls.length < 2 || !lateFillRacedAPeer) return false;
+	equal(originTrial.calls.length, 2, `${id} must perform exactly two independent source fills`);
+	equal(
+		new Set(originTrial.calls.map((call) => call.node)).size,
+		2,
+		`${id} both source fills came from the same node — this did not race two nodes`
+	);
+	notEqual(fills[0].token, fills[1].token, `${id} source fills must be distinguishable`);
+
+	await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
+	await waitForAllWorkers(ctx.nodes, id, ctx.agentsByNode, 'PairPointProbe');
+	// waitForAllWorkers's stability check only compares version/token; capture the current
+	// node[0]/node[1] pair here for the full-record deepEqual/payloadToken checks below.
+	const scans = await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
+	deepEqual(scans[0].record, scans[1].record, `${id} raw stores must converge`);
+	equal(scans[0].record.payloadToken, scans[0].record.token, `${id} raw record/blob pairing`);
+	if (shape.tied)
+		equal(
+			scans[0].version,
+			shape.lastModified,
+			`${id} both fills reported ${shape.lastModified}, so the stored version must tie`
+		);
+
+	for (let nodeIndex = 0; nodeIndex < ctx.nodes.length; nodeIndex++) {
+		for (const [threadId, agent] of ctx.agentsByNode[nodeIndex]) {
+			const probe = await requestJsonRetrying(`${ctx.nodes[nodeIndex].httpURL}/PairPointProbe/${id}`, agent);
+			equal(probe.threadId, threadId, `${id} connection moved between workers`);
+			ok(probe.record, `${id} missing on node ${nodeIndex}, worker ${threadId}`);
+			ok(probe.raw?.record, `${id} missing raw record on node ${nodeIndex}, worker ${threadId}`);
+			equal(
+				probe.raw.record.token,
+				scans[0].record.token,
+				`${id} raw store differs on ${probe.node} worker ${threadId}: ${JSON.stringify(probe)}`
+			);
+			equal(
+				probe.record.token,
+				scans[0].record.token,
+				`${id} stale point read on ${probe.node} worker ${threadId}: ${JSON.stringify(probe)}`
+			);
+			equal(
+				probe.raw.record.payloadToken,
+				probe.raw.record.token,
+				`${id} raw blob/metadata split on worker ${threadId}`
+			);
+			equal(probe.record.payloadToken, probe.record.token, `${id} blob/metadata split on worker ${threadId}`);
+		}
+	}
+	equal(ctx.origin.trial(id).calls.length, 2, `${id} performed extra source fills during probing`);
+	return true;
+}
+
+function sourcedBlobPairing(ctx) {
 	before(async () => {
 		ctx.origin = await startBarrierOrigin();
 		const [hostnameA, hostnameB] = await Promise.all([
@@ -312,6 +449,7 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 						analytics: { aggregatePeriod: -1 },
 						logging: { colors: false, stdStreams: false, console: true },
 						replication: { securePort: `${nodeCtx.harper.hostname}:9933` },
+						storage: { engine: ctx.testLMDB ? 'lmdb' : 'rocksdb' },
 						threads: { count: WORKERS },
 					},
 					env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_ORIGIN_URL: ctx.origin.url },
@@ -339,56 +477,22 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 	});
 
 	test(`${TRIALS} two-node cache-fill races settle each record and blob from one write on every worker`, async () => {
+		let restagesLeft = RESTAGE_BUDGET;
 		for (let trial = 0; trial < TRIALS; trial++) {
-			const id = `pair-${trial}`;
-			const fillAgents = ctx.agentsByNode.map((agents) => agents.values().next().value);
-			const fills = await Promise.all(
-				ctx.nodes.map((node, index) => requestJson(`${node.httpURL}/PairRecord/${id}`, fillAgents[index]))
-			);
-			const originTrial = ctx.origin.trial(id);
-			ok(originTrial, `${id} performed no source fills`);
-			equal(originTrial.calls.length, 2, `${id} must perform exactly two independent source fills`);
-			equal(
-				new Set(originTrial.calls.map((call) => call.node)).size,
-				2,
-				`${id} both source fills came from the same node — this did not race two nodes`
-			);
-			equal(originTrial.timedOut, false, `${id} barrier timed out, so this trial is inconclusive`);
-			notEqual(fills[0].token, fills[1].token, `${id} source fills must be distinguishable`);
-
-			await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
-			await waitForAllWorkers(ctx.nodes, id, ctx.agentsByNode, 'PairPointProbe');
-			// waitForAllWorkers's stability check only compares version/token; capture the current
-			// node[0]/node[1] pair here for the full-record deepEqual/payloadToken checks below.
-			const scans = await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
-			deepEqual(scans[0].record, scans[1].record, `${id} raw stores must converge`);
-			equal(scans[0].record.payloadToken, scans[0].record.token, `${id} raw record/blob pairing`);
-
-			for (let nodeIndex = 0; nodeIndex < ctx.nodes.length; nodeIndex++) {
-				for (const [threadId, agent] of ctx.agentsByNode[nodeIndex]) {
-					const probe = await requestJsonRetrying(`${ctx.nodes[nodeIndex].httpURL}/PairPointProbe/${id}`, agent);
-					equal(probe.threadId, threadId, `${id} connection moved between workers`);
-					ok(probe.record, `${id} missing on node ${nodeIndex}, worker ${threadId}`);
-					ok(probe.raw?.record, `${id} missing raw record on node ${nodeIndex}, worker ${threadId}`);
-					equal(
-						probe.raw.record.token,
-						scans[0].record.token,
-						`${id} raw store differs on ${probe.node} worker ${threadId}: ${JSON.stringify(probe)}`
-					);
-					equal(
-						probe.record.token,
-						scans[0].record.token,
-						`${id} stale point read on ${probe.node} worker ${threadId}: ${JSON.stringify(probe)}`
-					);
-					equal(
-						probe.raw.record.payloadToken,
-						probe.raw.record.token,
-						`${id} raw blob/metadata split on worker ${threadId}`
-					);
-					equal(probe.record.payloadToken, probe.record.token, `${id} blob/metadata split on worker ${threadId}`);
-				}
+			const { id, ...rest } = SHAPES[trial % SHAPES.length];
+			const shape = { ...rest, lastModified: rest.tied ? Date.now() - TIE_BACKDATE_MS : undefined };
+			let staged = await raceTrial(ctx, `${id}-${trial}`, shape);
+			for (let restage = 1; !staged && restagesLeft > 0; restage++) {
+				restagesLeft--;
+				staged = await raceTrial(ctx, `${id}-${trial}-restage${restage}`, shape);
 			}
-			equal(ctx.origin.trial(id).calls.length, 2, `${id} performed extra source fills during probing`);
+			ok(staged, `${id}-${trial} never staged two concurrent source fills; suite restage budget exhausted`);
 		}
 	});
+}
+
+suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout: 300000 }, sourcedBlobPairing);
+suite('sourcedFrom blob/metadata pairing under competing cache fills with LMDB', { timeout: 300000 }, (ctx) => {
+	ctx.testLMDB = true;
+	sourcedBlobPairing(ctx);
 });

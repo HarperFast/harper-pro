@@ -12,7 +12,7 @@ function payloadFor(token) {
 }
 
 tables.PairRecord.sourcedFrom({
-	async get(id) {
+	async get(id, context) {
 		const response = await fetch(`${originUrl}/resolve`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
@@ -20,6 +20,10 @@ tables.PairRecord.sourcedFrom({
 		});
 		if (!response.ok) throw new Error(`Pairing origin returned ${response.status}: ${await response.text()}`);
 		const resolved = await response.json();
+		// When the origin reports a shared lastModified, both nodes mint the *same* record version,
+		// so their competing fills tie. A tie is the case cache-fill resolution cannot order by node
+		// identity, and the only one version-ordered LWW never reaches.
+		if (resolved.lastModified != null) context.lastModified = resolved.lastModified;
 		return {
 			id,
 			token: resolved.token,
