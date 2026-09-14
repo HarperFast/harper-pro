@@ -17,7 +17,7 @@ incarnation** (§5.1), the one other item genuinely part of the same `homeMap()`
 **Out of scope, deliberately** (the task owner's instruction was specifically "825," not the
 rest of §11's "still owed" list): harper#2542's freshness fence, the `lockRelease`
 cross-thread relay gap, and full every-serving-thread transport registration. Real, blocking
-for *enablement*, and called out as findings — not folded in here.
+for _enablement_, and called out as findings — not folded in here.
 
 **Revision history — two rounds, both `better-alternative-exists`, both adopted.**
 
@@ -58,7 +58,7 @@ against `homeMap()` at all, and has the two-holder hole the PR's own `## For the
 reviewer` section already disclosed.
 
 `homeIncarnation` is bumped once at process start and pushed to every worker; §5.1 requires it
-to advance once per **coordination incarnation** (a process start *or* a coordinating-worker
+to advance once per **coordination incarnation** (a process start _or_ a coordinating-worker
 restart), which today's single call site at process start does not do.
 
 ## The invariant this change enforces
@@ -67,23 +67,23 @@ restart), which today's single call site at process start does not do.
 any node exposes generation `g+1` via `homeMap()`, every node capable of granting or honoring
 `g` must have durably stopped doing so — immediately, not after a delay measured from an event
 only that node observed — and the wait for any surviving authority to expire must be measured
-from the *last* such stop across the whole affected set, by a single external, trusted
+from the _last_ such stop across the whole affected set, by a single external, trusted
 timekeeper, not reconstructed independently by each node from its own clock.**
 
 ## Approaches considered
 
-**Root cause:** the home map is currently *derived* (computed independently by each node from
-data that can disagree), when core's contract requires it to be *stated* (published once,
-identically, and verified to be identical before use) — and, per round 2, the *transition*
+**Root cause:** the home map is currently _derived_ (computed independently by each node from
+data that can disagree), when core's contract requires it to be _stated_ (published once,
+identically, and verified to be identical before use) — and, per round 2, the _transition_
 between two states of that fact must be governed by the same discipline: stated and externally
 timed, not independently inferred by each participant.
 
-| Axis | Candidate | Why not chosen / why chosen |
-|---|---|---|
-| **Different layer** | Move home-map ownership into core. | Disqualified by core's own docstring and design-doc §4 ("harper-pro owns this, because it owns topology"). Confirmed closed by both round 1 and round 2. |
-| **Deeper cause** | Rebuild automatic, consensus-derived rehoming. | Already rejected upstream at the core-design level (design-doc §9, §14 round 7), with a recorded disqualifier. Confirmed closed by both rounds. |
-| **Do less** | (a) Global hot-reloadable config, no digest, no staged transition — disqualified round 1: skips §4.3 entirely. (b) A purely local per-node timer with no cross-node evidence — **tried, disqualified round 2**: staggered delivery and non-immediate quiescence reopen the two-holder bug; a per-node clock cannot prove a cluster-wide elapsed-time fact. (c) Full affected-cluster stop/fence/wait/publish/restart, no online mechanism at all — **valid per round 2's framing section**, but costs full unavailability of every affected node for the drain window on every reconfiguration, not only the keys that moved. | (c) remains available as a documented manual fallback (an operator can always choose to stop every node instead of using `stage`) but is not the implementation: the online design below achieves the same safety without mandating a full-cluster outage, at the cost given up in "the cost of this design," below. |
-| **Chosen** | Durable per-database `{active, staged}` state, where **staging immediately and durably retracts `active`** (real quiescence, not observed-then-inferred); a **separate, explicit, operator-issued `activate`** call, timed by the operator's own external wall-clock wait from the *last* stage/fence event across the whole affected set — not by any node's local clock; digest mismatch makes the whole map unavailable, not a shrunk ring. | Directly implements round 2's framing-section recommendation. Removes every counterexample both rounds raised: quiescence is immediate and durable (round 2 blocker #1); the drain wait is anchored externally, by the operator, from the true last event, not reconstructed per node (round 2 blocker #2); no node's `Date.now()` is safety-load-bearing (round 2 blocker #3); a digest mismatch fails the whole map closed rather than admitting a shrunk, still-live ring (round 2 finding under "Security and correctness"). |
+| Axis                | Candidate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Why not chosen / why chosen                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Different layer** | Move home-map ownership into core.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Disqualified by core's own docstring and design-doc §4 ("harper-pro owns this, because it owns topology"). Confirmed closed by both round 1 and round 2.                                                                                                                                                                                                                                                                                                                                                                         |
+| **Deeper cause**    | Rebuild automatic, consensus-derived rehoming.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Already rejected upstream at the core-design level (design-doc §9, §14 round 7), with a recorded disqualifier. Confirmed closed by both rounds.                                                                                                                                                                                                                                                                                                                                                                                  |
+| **Do less**         | (a) Global hot-reloadable config, no digest, no staged transition — disqualified round 1: skips §4.3 entirely. (b) A purely local per-node timer with no cross-node evidence — **tried, disqualified round 2**: staggered delivery and non-immediate quiescence reopen the two-holder bug; a per-node clock cannot prove a cluster-wide elapsed-time fact. (c) Full affected-cluster stop/fence/wait/publish/restart, no online mechanism at all — **valid per round 2's framing section**, but costs full unavailability of every affected node for the drain window on every reconfiguration, not only the keys that moved. | (c) remains available as a documented manual fallback (an operator can always choose to stop every node instead of using `stage`) but is not the implementation: the online design below achieves the same safety without mandating a full-cluster outage, at the cost given up in "the cost of this design," below.                                                                                                                                                                                                             |
+| **Chosen**          | Durable per-database `{active, staged}` state, where **staging immediately and durably retracts `active`** (real quiescence, not observed-then-inferred); a **separate, explicit, operator-issued `activate`** call, timed by the operator's own external wall-clock wait from the _last_ stage/fence event across the whole affected set — not by any node's local clock; digest mismatch makes the whole map unavailable, not a shrunk ring.                                                                                                                                                                                | Directly implements round 2's framing-section recommendation. Removes every counterexample both rounds raised: quiescence is immediate and durable (round 2 blocker #1); the drain wait is anchored externally, by the operator, from the true last event, not reconstructed per node (round 2 blocker #2); no node's `Date.now()` is safety-load-bearing (round 2 blocker #3); a digest mismatch fails the whole map closed rather than admitting a shrunk, still-live ring (round 2 finding under "Security and correctness"). |
 
 ## The cost of this design, stated plainly
 
@@ -132,7 +132,7 @@ attribution was a round-2 finding.
 - **`record_lock_stage_generation`** `{ database, generation, homes[] }` — issued by the
   operator on every node named in `homes(g) ∪ homes(g+1)`. Canonicalizes `homes[]` (sort,
   dedup) before storing or hashing. Refuses `generation ≤ max(active?.generation ?? 0,
-  staged?.generation ?? 0, highestActedOn)`. On success, **atomically**: computes `digest`
+staged?.generation ?? 0, highestActedOn)`. On success, **atomically**: computes `digest`
   (below), writes `staged = { generation, homes, digest }`, and **clears `active`** — the
   durable write that makes this node stop granting under the old generation is the same write
   that records the new one is staged, so there is no window between "told about g+1" and
@@ -148,14 +148,14 @@ attribution was a round-2 finding.
   operator, once, on every node named in `homes(g) ∪ homes(g+1)` (idempotent replay across
   nodes and across retries), **only after** the operator has, externally, in their own wall
   time: collected a successful `stage` (or `fence_external`) response from every node in that
-  set, and then waited `DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS` from the *last* such
+  set, and then waited `DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS` from the _last_ such
   response. Refuses unless `staged` on this node matches `(generation, homes)` exactly
   (replay/consistency check — a stale or misdirected activate for the wrong transition is
   rejected, not silently applied). On success, atomically promotes `staged → active`, clears
   `staged`, updates `highestActedOn`. **No node measures the drain wait itself** — round 2:
   "cannot be proven by subtracting persisted wall times." The wait is the operator's
-  externally-observed fact; nodes only ever check *consistency* (does this match what I
-  staged?), never *elapsed time*.
+  externally-observed fact; nodes only ever check _consistency_ (does this match what I
+  staged?), never _elapsed time_.
 
 ### 3. `homeMap()` — a frozen pointer read, no hot-path cost
 
@@ -167,10 +167,10 @@ existing disabled-transport selection unchanged).
 
 ### 4. Digest mismatch fails the whole map closed, not a shrunk ring
 
-**Round 2's sharpest correctness finding**: excluding a disagreeing peer from *this* node's own
+**Round 2's sharpest correctness finding**: excluding a disagreeing peer from _this_ node's own
 ring (what the round-1 draft did) does not prevent two arbiters — with `homes = {A,B}`, a
 digest disagreement makes A derive ring `{A}` and B derive ring `{B}`, and both self-home every
-key. **Fix:** a digest mismatch with *any* peer named in the active `homes[]` makes `homeMap()`
+key. **Fix:** a digest mismatch with _any_ peer named in the active `homes[]` makes `homeMap()`
 return `undefined` for the whole database on the observing node — core's own existing "fails
 closed when no map is available" behavior, not a locally-recomputed smaller ring. This also
 simplifies the mechanism: there is no ring recomputation at all, only "available" or "not."
@@ -234,7 +234,7 @@ pointer or `undefined`) on any error in between; mirrors the existing containmen
   flight, from both call sites; bump-failure leaving coordination unowned.
 - Integration (extends `recordLockCluster.test.mjs`): stage on every node (staggered arrival
   order) → each staged node immediately refuses new grants under the old generation, verified
-  by attempting one → operator waits the (test-shortened) drain from the *last* stage response
+  by attempting one → operator waits the (test-shortened) drain from the _last_ stage response
   → activate → `homeMap()` agrees cluster-wide including a moved key; a grant attempted between
   stage and activate is refused everywhere, not merely delayed; a node the stage call never
   reached does not activate and, if later reachable again still on `g`, is refused by every
@@ -254,3 +254,24 @@ pointer or `undefined`) on any error in between; mirrors the existing containmen
 - Genuinely deferred, not silently dropped: the `lockRelease` cross-thread relay gap and full
   every-thread transport registration — named in the merged design doc's §11 "still owed" list
   but outside #825's redefined scope per the task owner's instruction.
+- **`grantableAfterMono` needs three independent recreate triggers, not one.** Core's own
+  coordinator (`#ownershipHorizon`, `recordLockCoordinator.ts`) keeps the restart-quarantine
+  waiver only if the coordinator was built already owning coordination _and_ already able to
+  read a real `homeMap()` — both facts this transport learns asynchronously, and core builds
+  its coordinator lazily off any `TableResource.lockCoordinator` access, including
+  `cluster_status` polling. `recordLockTransport.ts` now recreates the transport object (which
+  forces a fresh coordinator on next access) on each of: this node's own first-incarnation
+  status becoming known, ownership newly conferred, and the active generation newly becoming
+  available. Each is independently necessary — found by hitting the "restarted and cannot
+  grant" 503 after only the first two, then reading core's current source directly rather than
+  the interim snapshot this design was drafted against.
+- **Integration verification is honest but incomplete**, for a reason outside this PR: a full,
+  single, clean run of all 11 `recordLockCluster.test.mjs` tests together, on the current
+  pushed code, was not obtained — every attempt after the third fix above was blocked by two
+  confirmed pre-existing, external causes on the machine this ran on (this session's own
+  processes being OOM-killed by the harness, and `@harperfast/integration-testing`'s shared
+  loopback-address pool file being corrupted by a non-atomic write raced with another
+  concurrent process). What _is_ confirmed: unit tests fully green throughout every change; a
+  partial run, after the third fix, passing all 4 real tests in the hardest suite (three-node
+  mesh, including 24-way concurrent contention) before being killed moving into suite 2. Re-run
+  the suite once outside a contended shared box before relying on it as a clean pass.

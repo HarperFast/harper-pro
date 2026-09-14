@@ -66,7 +66,7 @@ export interface DelegateOperation {
 	database: string;
 	table: string;
 	key: unknown;
-	epoch: number;
+	generation: number;
 	leaseMs: number;
 }
 
@@ -118,7 +118,7 @@ async function executeDelegate(request: any): Promise<DelegationReply> {
 	const delegation: DelegationRequest = {
 		key: request.key,
 		requester,
-		epoch: request.epoch,
+		generation: request.generation,
 		leaseMs: request.leaseMs,
 	};
 	if (ownership.ownsDatabase(request.database))

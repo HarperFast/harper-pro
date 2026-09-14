@@ -12,10 +12,12 @@
  * worker that coordinates the database, and a keep-alive client would otherwise pin itself to a worker
  * that answers 503 (see replication/DESIGN.md → Cluster record locks).
  *
- * The transport's epoch is STATIC in this tranche, and it is withheld for `RESTART_HOLD_MS` (the
- * delegation lease plus skew, six minutes) after process start — see the transport module comment.
- * `HARPER_TEST_RECORD_LOCK_RESTART_HOLD_MS=0` lifts that hold for tests; without it every cluster
- * lock in this file would fail closed for six minutes after the nodes start.
+ * The home map is now OPERATOR-AGREED (harper-pro#825): nothing locks until `bootstrapHomeMap` below
+ * stages generation 1 naming every node, then activates it — `homeMap()` returns `undefined` and every
+ * cluster lock fails closed until that completes. `HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS=0`
+ * lifts the (deliberately small — 2s default) backstop between stage and activate; the REAL safety
+ * margin (`DELEGATION_LEASE_MS + skew`, several minutes) is the operator's own external wait, which
+ * nothing in the code enforces — see RECORD_LOCK_HOMES_DESIGN.md.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -46,7 +48,7 @@ function optionsFor(hostname, env = {}) {
 				pingTimeout: 3000,
 			},
 		},
-		env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_RECORD_LOCK_RESTART_HOLD_MS: '0', ...env },
+		env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS: '0', ...env },
 	};
 }
 
@@ -161,6 +163,38 @@ function waitForRing(nodes, expectedSize) {
 	);
 }
 
+/**
+ * The operator's side of harper-pro#825's §4.3 transition: stage generation 1 (naming every node) on
+ * every node, then activate it on every node. Nothing in the code enforces the real drain wait between
+ * the two — `HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS=0` (set in `optionsFor`) disables even the
+ * small backstop, so this bootstraps immediately; that is safe here specifically because every node is
+ * freshly started with no prior generation, not something a real reconfiguration could skip.
+ */
+async function bootstrapHomeMap(nodes) {
+	const homes = [];
+	for (const node of nodes) {
+		const status = await clusterStatusOf(node);
+		homes.push(status.node_name);
+	}
+	for (const node of nodes)
+		await sendOperation(node, {
+			operation: 'record_lock_stage_generation',
+			database: DB,
+			generation: 1,
+			homes,
+			authorization: node.admin,
+		});
+	for (const node of nodes)
+		await sendOperation(node, {
+			operation: 'record_lock_activate_generation',
+			database: DB,
+			generation: 1,
+			homes,
+			authorization: node.admin,
+		});
+	return homes;
+}
+
 async function connectMesh(nodes) {
 	const { operation_token: token } = await sendOperation(nodes[0], {
 		operation: 'create_authentication_tokens',
@@ -190,6 +224,7 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 		if (failed) throw failed.reason;
 		nodes = contexts.map((c) => c.harper);
 		await connectMesh(nodes);
+		await bootstrapHomeMap(nodes);
 		await waitForRing(nodes, nodes.length);
 	});
 
@@ -305,34 +340,33 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 	test.skip('a holder that crashes releases its key to a waiter once its delegation has run out', () => {});
 });
 
-suite('cluster record locks: a peer without the recordLocks capability', { timeout: 300_000 }, (ctx) => {
+suite('cluster record locks: a peer not named in the operator-agreed home map', { timeout: 300_000 }, (ctx) => {
 	let currentCtx;
-	let legacyCtx;
+	let excludedCtx;
 	let current;
-	let legacy;
+	let excluded;
 
 	before(async () => {
-		// The "legacy" node is this build with its capability bag suppressed: it negotiates as a peer that
-		// never advertised recordLocks while still running the lock machinery.
 		// allSettled so a single failed start does not orphan the node that did come up.
-		const started = await Promise.allSettled([
-			startNode(ctx.name),
-			startNode(ctx.name, { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' }),
-		]);
-		[currentCtx, legacyCtx] = started.map((result) => (result.status === 'fulfilled' ? result.value : undefined));
+		const started = await Promise.allSettled([startNode(ctx.name), startNode(ctx.name)]);
+		[currentCtx, excludedCtx] = started.map((result) => (result.status === 'fulfilled' ? result.value : undefined));
 		const failed = started.find((result) => result.status === 'rejected');
 		if (failed) throw failed.reason;
 		current = currentCtx.harper;
-		legacy = legacyCtx.harper;
-		await connectMesh([current, legacy]);
+		excluded = excludedCtx.harper;
+		await connectMesh([current, excluded]);
+		// The operator names only `current` in the home map — `excluded` is a real, connected, mesh
+		// member that the operator has simply not (yet) included in cluster record locks for this
+		// database. Never staged or activated on `excluded` at all.
+		await bootstrapHomeMap([current]);
 	});
 
 	after(async () => {
 		await stopNode(currentCtx);
-		await stopNode(legacyCtx);
+		await stopNode(excludedCtx);
 	});
 
-	test('the bag-less peer is not a ring member, so the current node homes every key itself', async () => {
+	test('the excluded peer is not a ring member, so the named node homes every key itself', async () => {
 		const status = await clusterStatusOf(current);
 		const members = status.recordLocks?.[DB]?.members;
 		assert.ok(
@@ -347,20 +381,122 @@ suite('cluster record locks: a peer without the recordLocks capability', { timeo
 		assert.deepEqual(await controlEntries(current), [], 'a retained delegation writes nothing to the log');
 	});
 
-	test('the bag-less peer fails its own cluster lock closed and data still replicates both ways', async () => {
+	test('the excluded peer fails its own cluster lock closed — no active generation at all — and data still replicates both ways', async () => {
 		const id = 'gated-' + Date.now();
-		// It advertised nothing, so every peer excludes it from their ring — and its own transport
-		// withholds its epoch for the same reason, rather than building a ring that includes itself and
-		// self-homing keys its peers home elsewhere. Fail closed, not a quiet second arbiter.
-		const legacyLock = await call(legacy, 'LockHold/', { id, lease: 2_000, timeout: 2_000 });
+		// `excluded` was never staged or activated: its homeMap() has no active generation, so it fails
+		// every cluster lock closed rather than guessing a ring of its own. Fail closed, not a quiet
+		// second arbiter — the same property the old capability-derived ring used to provide, now from
+		// the operator's own choice of homes[] instead of a wire-advertised level.
+		const excludedLock = await call(excluded, 'LockHold/', { id, lease: 2_000, timeout: 2_000 });
 		assert.equal(
-			legacyLock.status,
+			excludedLock.status,
 			503,
-			`a bag-less node must fail a cluster lock closed: ${JSON.stringify(legacyLock.body)}`
+			`a node with no active generation must fail a cluster lock closed: ${JSON.stringify(excludedLock.body)}`
 		);
-		await putCounter(legacy, id, 7);
-		await waitForCounter([current, legacy], id, 7);
+		await putCounter(excluded, id, 7);
+		await waitForCounter([current, excluded], id, 7);
 		await putCounter(current, id + '-back', 8);
-		await waitForCounter([current, legacy], id + '-back', 8);
+		await waitForCounter([current, excluded], id + '-back', 8);
+	});
+});
+
+suite('cluster record locks: the §4.3 stage/activate transition', { timeout: 300_000 }, (ctx) => {
+	const contexts = [];
+	let nodes;
+	let homes;
+
+	before(async () => {
+		const started = await Promise.allSettled([startNode(ctx.name), startNode(ctx.name)]);
+		for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
+		const failed = started.find((result) => result.status === 'rejected');
+		if (failed) throw failed.reason;
+		nodes = contexts.map((c) => c.harper);
+		await connectMesh(nodes);
+	});
+
+	after(async () => {
+		for (const c of contexts) await stopNode(c);
+	});
+
+	test('a database has no active generation, and every cluster lock fails closed, until activation', async () => {
+		for (const node of nodes) {
+			const status = await clusterStatusOf(node);
+			assert.equal(status.recordLocks?.[DB]?.members, undefined, `${node.hostname} must report no home map yet`);
+		}
+		const id = 'pre-bootstrap-' + Date.now();
+		const early = await call(nodes[0], 'LockHold/', { id, timeout: 2_000 });
+		assert.equal(early.status, 503, `no active generation yet: ${JSON.stringify(early.body)}`);
+	});
+
+	test('staging retracts any active generation immediately — no window where a lock succeeds mid-transition', async () => {
+		homes = await bootstrapHomeMap(nodes);
+		await waitForRing(nodes, nodes.length);
+		const id = 'retract-' + Date.now();
+		const before = await call(nodes[0], 'LockHold/', { id, timeout: 2_000 });
+		assert.equal(before.status, 200, JSON.stringify(before.body));
+		await call(nodes[0], 'LockRelease/', { token: before.body.token });
+		// Re-stage the SAME generation content as a new, higher generation — the content does not
+		// matter here, only that staging happens and is observed to retract `active` before any
+		// activate call: the row on `nodes[0]` goes from "active g1" straight to "staged g2, no
+		// active" in one durable write.
+		await sendOperation(nodes[0], {
+			operation: 'record_lock_stage_generation',
+			database: DB,
+			generation: 2,
+			homes,
+			authorization: nodes[0].admin,
+		});
+		const duringTransition = await call(nodes[0], 'LockHold/', { id, timeout: 2_000 });
+		assert.equal(
+			duringTransition.status,
+			503,
+			`staged-but-not-active must fail closed, not keep granting under the old generation: ${JSON.stringify(duringTransition.body)}`
+		);
+		// Bring every node to generation 2 so subsequent tests in this file (if any ran after this one)
+		// and teardown are not left with a permanently-diverged, half-transitioned cluster.
+		for (const node of nodes)
+			if (node !== nodes[0])
+				await sendOperation(node, {
+					operation: 'record_lock_stage_generation',
+					database: DB,
+					generation: 2,
+					homes,
+					authorization: node.admin,
+				});
+		for (const node of nodes)
+			await sendOperation(node, {
+				operation: 'record_lock_activate_generation',
+				database: DB,
+				generation: 2,
+				homes,
+				authorization: node.admin,
+			});
+		await waitForRing(nodes, nodes.length);
+		const after = await call(nodes[0], 'LockHold/', { id, timeout: 2_000 });
+		assert.equal(after.status, 200, `generation 2 active: ${JSON.stringify(after.body)}`);
+		await call(nodes[0], 'LockRelease/', { token: after.body.token });
+	});
+
+	test('activation is idempotent, and refuses a generation that does not match what is staged', async () => {
+		const repeat = await sendOperation(nodes[0], {
+			operation: 'record_lock_activate_generation',
+			database: DB,
+			generation: 2,
+			homes,
+			authorization: nodes[0].admin,
+		});
+		assert.equal(repeat.active.generation, 2, 'idempotent re-activation of the current generation');
+		const response = await fetch(nodes[0].operationsAPIURL, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				operation: 'record_lock_activate_generation',
+				database: DB,
+				generation: 3,
+				homes,
+				authorization: nodes[0].admin,
+			}),
+		});
+		assert.equal(response.status, 409, 'no generation 3 was ever staged');
 	});
 });

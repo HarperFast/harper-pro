@@ -19,12 +19,15 @@ export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
  * Cluster record locks, VERSIONED and mutually exclusive: a node advertises exactly one level, and a
  * peer at a different level is not a lock participant at all. Level 1 was the Ricart–Agrawala rule
  * (harper#2498 before its replacement); it never shipped enabled and no node advertises it. Level 2
- * is amortized per-record ownership — delegation request/grant/recall over unicast operations, with
- * only the release on the replicated log. A cluster running two levels would have two independent
+ * was amortized per-record ownership against core's now-superseded static-epoch/`epoch()` interface;
+ * it never shipped enabled either. Level 3 is the same protocol against core's operator-agreed
+ * `homeMap()` interface (harper-pro#825) — the wire shape changed (`epoch` → `generation` in the
+ * delegation request; a new `RECORD_LOCK_HOMES_DIGEST` message) even though no prior level ever ran
+ * in production, so the bump still applies: a cluster running two levels would have two independent
  * arbiters for one key, which is why `peerSupportsRecordLocks` requires this level exactly rather
  * than "at least 1".
  */
-export const RECORD_LOCKS_CAPABILITY = 2;
+export const RECORD_LOCKS_CAPABILITY = 3;
 
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
@@ -93,7 +96,7 @@ export const ABSENT_PEER_CAPABILITIES: ResolvedPeerCapabilities = resolvePeerCap
  * no bag) advertises 0 even with the feature enabled, and must then treat itself as a non-member too:
  * every peer will exclude it from their ring while it would still include itself, and two nodes
  * computing different rings for one key is the two-arbiter hazard the versioned level exists to
- * prevent. The transport's `epoch()` withholds unless this is exactly `RECORD_LOCKS_CAPABILITY`.
+ * prevent. The transport's `homeMap()` withholds unless this is exactly `RECORD_LOCKS_CAPABILITY`.
  */
 export function advertisedRecordLocksLevel(recordLocksEnabled: boolean, bagOmitted: boolean): number {
 	return recordLocksEnabled && !bagOmitted ? RECORD_LOCKS_CAPABILITY : 0;

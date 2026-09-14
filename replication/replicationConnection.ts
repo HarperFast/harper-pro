@@ -37,7 +37,7 @@ import {
 } from './replicator.ts';
 import { redactOperationForLog } from './logRedaction.ts';
 import { CopyCursorWatermark } from './copyCursorWatermark.ts';
-import { recordPeerLockCapability } from './recordLockTransport.ts';
+import { recordPeerLockCapability, recordPeerHomesDigest, currentHomesDigest } from './recordLockTransport.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
@@ -151,6 +151,11 @@ const BLOB_CHUNK = 146;
 const SUBSCRIPTION_UPDATE = 147;
 const COPY_START = 148; // leader -> follower: a bulk table copy is starting; carries copyStartTime + copy-order version
 const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; follower clears its resume cursor
+// A dedicated message, not a `NODE_NAME` resend (harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6):
+// reusing NODE_NAME's handler for a live update would also re-run its other handshake side effects
+// (e.g. sendSubscriptionRequestUpdate). Sent at initial handshake alongside NODE_NAME, and standalone
+// whenever this node's own active home-map digest for the database changes (on activate).
+const RECORD_LOCK_HOMES_DIGEST = 150;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -4744,6 +4749,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							rootStore: table.primaryStore.rootStore,
 						};
 						break;
+					case RECORD_LOCK_HOMES_DIGEST:
+						// `data` (`message[1]`) is the digest; `message[2]` names the database — the same slot
+						// NODE_NAME uses for it — since one socket carries every database's traffic and the
+						// digest is per-database (harper-pro#825). Recorded centrally, keyed by (database,
+						// peer) rather than on this connection object: the mesh keeps a separate connection
+						// per direction, and our own digest can become known later, on either one.
+						if (typeof data === 'string' && typeof remoteNodeName === 'string' && message[2] === databaseName)
+							recordPeerHomesDigest(databaseName, remoteNodeName, data);
+						break;
 					case NODE_NAME_TO_ID_MAP:
 						// this is the mapping of node names to short local ids. if there is no auditStore (yet), just make an empty map, but not sure why that would happen.
 						remoteShortIdToLocalId = auditStore ? remoteToLocalNodeId(data, auditStore) : new Map();
@@ -7450,8 +7464,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				options.connection.on('exclusion-origins-updated', (origins: string[]) => {
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
-							(nodeName) =>
-								nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
+							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
 						)
 					);
 					const excludeNodes = [...shouldExclude].filter((nodeName) => !lastSentExcludedNodes.includes(nodeName));
@@ -7839,6 +7852,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (TEST_OMIT_CAPABILITIES) ws.send(encode([NODE_NAME, thisNodeName, databaseName, tables]));
 		else ws.send(encode([NODE_NAME, thisNodeName, databaseName, tables, LOCAL_CAPABILITIES]));
 		if (TEST_UNKNOWN_COMMAND_VALID) ws.send(encode([TEST_UNKNOWN_COMMAND_CODE]));
+		sendRecordLockHomesDigestFrame();
+	}
+	/**
+	 * This connection's database's digest, not part of `LOCAL_CAPABILITIES` (a process-wide singleton
+	 * built once at module load — harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6): the active
+	 * generation digest travels on its own, from whatever this node's transport cache currently holds.
+	 * No-op with the feature off or before this node has an active generation — the peer's fail-closed
+	 * default already covers "no digest received." Agreement itself is reconciled centrally in
+	 * `recordLockTransport.ts`, not here — this connection may not be the one that last heard from the
+	 * peer (the mesh keeps a separate connection per direction).
+	 */
+	function sendRecordLockHomesDigestFrame() {
+		if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
+		const digest = currentHomesDigest(databaseName);
+		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
 	}
 	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
 		const database = getDatabases()?.[databaseName];
@@ -7947,6 +7975,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return new Promise((resolve, reject) => {
 				awaitingResponse.set(requestId, { resolve, reject });
 			});
+		},
+		// A standalone re-announce for this live socket (harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6):
+		// activation does not otherwise reach an already-connected peer, since the capability bag is only
+		// sent at handshake. No-op while this node has no active generation yet — the peer's own fail-closed
+		// default (`homeMap()` unavailable, or `HOMES_AGREEMENT_UNKNOWN`) already covers that case.
+		sendRecordLockHomesDigest() {
+			sendRecordLockHomesDigestFrame();
 		},
 	};
 
