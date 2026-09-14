@@ -4605,6 +4605,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 							}
 							recordPeerLockCapabilityFromHandshake();
+							// Now that the peer's own capabilities are known, the sender-side gate on the digest
+							// frame can finally pass — nothing else re-triggers this send once databaseName was
+							// already set before this NODE_NAME arrived.
+							sendRecordLockHomesDigestFrame();
 							sendSubscriptionRequestUpdate();
 						}
 						break;
@@ -5725,6 +5729,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (closed || wsClosed) return;
 								auditStore = tableSubscriptionToReplicator.auditStore;
 								recordPeerLockCapabilityFromHandshake();
+								sendRecordLockHomesDigestFrame();
 								tableById = tableSubscriptionToReplicator.tableById.map(tableToTableEntry);
 								subscribedNodeIds = [];
 								if (excludedNodes) {
@@ -7865,6 +7870,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 */
 	function sendRecordLockHomesDigestFrame() {
 		if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
+		// Sender-side gating discipline (DESIGN.md, "Sender-side gating discipline"): do not emit a
+		// frame the peer has not advertised support for.
+		if (!(peerCapabilitiesLearned && peerSupportsRecordLocks(peerCapabilities))) return;
 		const digest = currentHomesDigest(databaseName);
 		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
 	}

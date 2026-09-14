@@ -258,24 +258,87 @@ async function refreshCache(database: string): Promise<void> {
 	if (before?.generation !== after?.generation) recreateRecordLockTransport(database);
 }
 
-function broadcastHomesChanged(database: string, exclude?: any): void {
-	for (const worker of httpWorkers()) {
-		if (worker === exclude) continue;
-		try {
-			worker.postMessage({ type: 'record-lock-homes-changed', database });
-		} catch (error) {
-			logger.debug?.(`Could not notify a worker of a record lock home map change for ${database}`, error);
-		}
-	}
+const HOMES_CHANGED_ACK_TIMEOUT_MS = 2_000;
+let nextHomesChangedRequestId = 1;
+const pendingHomesChangedAcks = new Map<number, () => void>();
+
+/**
+ * Refreshes this thread's own cache and confirms it before returning — the local half of what makes
+ * a `stageGeneration`/`activateGeneration` response real quiescence evidence, not a durable write
+ * racing an unawaited refresh (a real pre-push review finding).
+ */
+async function applyHomesChanged(database: string): Promise<void> {
+	await refreshCache(database);
+	pushHomesDigestToPeers(database);
+	reconcileAllPeerHomesAgreement(database);
 }
 
-onRecordLockHomesChanged((database) => {
-	refreshCache(database).then(() => {
-		pushHomesDigestToPeers(database);
-		reconcileAllPeerHomesAgreement(database);
+/** Sends `record-lock-homes-changed` to one worker and waits for its ack, or the bound. A missing ack
+ * (dead worker, full mailbox) resolves anyway — a departed worker cannot still be granting — but is
+ * logged, since it is exactly the case where quiescence could not be confirmed. */
+function sendHomesChangedAndWaitAck(worker: any, database: string): Promise<void> {
+	return new Promise<void>((resolve) => {
+		const requestId = nextHomesChangedRequestId++;
+		const timer = setTimeout(() => {
+			pendingHomesChangedAcks.delete(requestId);
+			logger.warn?.(
+				`No record-lock-homes-changed ack from a worker for ${database} within ${HOMES_CHANGED_ACK_TIMEOUT_MS}ms`
+			);
+			resolve();
+		}, HOMES_CHANGED_ACK_TIMEOUT_MS).unref();
+		pendingHomesChangedAcks.set(requestId, () => {
+			clearTimeout(timer);
+			pendingHomesChangedAcks.delete(requestId);
+			resolve();
+		});
+		try {
+			worker.postMessage({ type: 'record-lock-homes-changed', database, requestId });
+		} catch (error) {
+			clearTimeout(timer);
+			pendingHomesChangedAcks.delete(requestId);
+			logger.debug?.(`Could not notify a worker of a record lock home map change for ${database}`, error);
+			resolve();
+		}
 	});
-	if (parentPort) parentPort.postMessage({ type: 'record-lock-homes-changed', database });
-	else broadcastHomesChanged(database);
+}
+
+/** Main thread: relay to every (non-excluded) worker and wait for all of them, bounded per worker. */
+async function broadcastHomesChangedAndWait(database: string, exclude?: any): Promise<void> {
+	await Promise.all(
+		httpWorkers()
+			.filter((worker) => worker !== exclude)
+			.map((worker) => sendHomesChangedAndWaitAck(worker, database))
+	);
+}
+
+onRecordLockHomesChanged(async (database) => {
+	await applyHomesChanged(database);
+	if (parentPort) {
+		// Ask main to relay and wait for it to confirm every thread (including main's own state and
+		// every sibling worker) has refreshed, not merely that the message was sent.
+		await new Promise<void>((resolve) => {
+			const requestId = nextHomesChangedRequestId++;
+			const timer = setTimeout(() => {
+				pendingHomesChangedAcks.delete(requestId);
+				resolve();
+			}, HOMES_CHANGED_ACK_TIMEOUT_MS).unref();
+			pendingHomesChangedAcks.set(requestId, () => {
+				clearTimeout(timer);
+				pendingHomesChangedAcks.delete(requestId);
+				resolve();
+			});
+			try {
+				parentPort!.postMessage({ type: 'record-lock-homes-changed', database, requestId });
+			} catch (error) {
+				clearTimeout(timer);
+				pendingHomesChangedAcks.delete(requestId);
+				logger.debug?.(`Could not notify main of a record lock home map change for ${database}`, error);
+				resolve();
+			}
+		});
+	} else {
+		await broadcastHomesChangedAndWait(database);
+	}
 });
 
 /** Re-announces this node's new digest on every live outbound connection for the database — an
@@ -553,12 +616,20 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 if (parentPort) {
 	onMessageByType('record-lock-owner', (message) => setRecordLockOwnership(message.database, message.owned === true));
 	onMessageByType('record-lock-incarnation', (message) => setHomeIncarnation(message.value, message.first));
-	onMessageByType('record-lock-homes-changed', (message) =>
-		refreshCache(message.database).then(() => {
-			pushHomesDigestToPeers(message.database);
-			reconcileAllPeerHomesAgreement(message.database);
-		})
-	);
+	onMessageByType('record-lock-homes-changed', (message) => {
+		applyHomesChanged(message.database)
+			.catch((error) => logger.warn?.(`Could not apply a record lock home map change for ${message.database}`, error))
+			.finally(() => {
+				try {
+					parentPort!.postMessage({ type: 'record-lock-homes-changed-ack', requestId: message.requestId });
+				} catch (error) {
+					logger.debug?.('Could not ack a record lock home map change to main', error);
+				}
+			});
+	});
+	onMessageByType('record-lock-homes-changed-ack', (message) => {
+		pendingHomesChangedAcks.get(message.requestId)?.();
+	});
 	onMessageByType('record-lock-status-request', (message) => {
 		const status: Record<string, RecordLockDatabaseStats | undefined> = {};
 		for (const database of message.databases ?? []) status[database] = localRecordLockStats(database);
@@ -820,17 +891,32 @@ if (!parentPort) {
 	});
 	onMessageByType('record-lock-homes-changed', (message, worker) => {
 		if (typeof message?.database !== 'string') return;
-		// A worker's own write: relay to every OTHER worker. Main has no active-generation cache of its
-		// own to refresh unless it is itself coordinating (single-threaded mode), which `refreshCache`
-		// below covers uniformly regardless.
-		refreshCache(message.database).then(() => {
-			pushHomesDigestToPeers(message.database);
-			reconcileAllPeerHomesAgreement(message.database);
-		});
-		broadcastHomesChanged(message.database, worker);
+		// A worker's own write: refresh main's own state (harmless when main isn't coordinating; load-
+		// bearing in single-threaded mode) and relay to every OTHER worker, waiting for all of them
+		// before acking the originator — so the originating worker's own await (above) only resolves
+		// once main and every sibling worker have genuinely refreshed, not merely been notified.
+		applyHomesChanged(message.database)
+			.catch((error) => logger.warn?.(`Could not apply a record lock home map change for ${message.database}`, error))
+			.then(() => broadcastHomesChangedAndWait(message.database, worker))
+			.finally(() => {
+				try {
+					worker?.postMessage({ type: 'record-lock-homes-changed-ack', requestId: message.requestId });
+				} catch (error) {
+					logger.debug?.('Could not ack a record lock home map change to the originating worker', error);
+				}
+			});
+	});
+	onMessageByType('record-lock-homes-changed-ack', (message) => {
+		pendingHomesChangedAcks.get(message.requestId)?.();
 	});
 	if (CLUSTER_RECORD_LOCKS_ENABLED)
 		whenThreadsStarted.then(() => {
+			// Operator-visible at the point the switch takes effect, not only in repo design docs —
+			// a real pre-push review finding: enabling this without a startup warning lets an operator
+			// follow the runbook straight into a primitive that silently loses updates until harper#2542.
+			logger.warn?.(
+				'replication.recordLocks is enabled: a cross-node delegation handoff currently guarantees exclusive admission but NOT successor freshness (harper#2542 is outstanding) — two nodes can each read the same predecessor value and both write, silently losing one update, measured at 0.05-0.15% of sections under contention (replication/RECORD_LOCK_COST_DELEGATIONS.md). Do not rely on lock() to protect a read-modify-write across nodes until that lands.'
+			);
 			const count = httpWorkers().length;
 			if (count > 1)
 				logger.warn?.(

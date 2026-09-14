@@ -59,13 +59,17 @@ export interface RecordLockHomesRow {
 
 // ---- change notification: fires only on THIS thread's own write; recordLockTransport.ts is what
 // bridges that to every other thread (it, not this generic storage module, knows the thread topology).
-const changeListeners = new Set<(database: string) => void>();
-export function onRecordLockHomesChanged(listener: (database: string) => void): () => void {
+// AWAITED by stageGeneration/activateGeneration before they return: a successful stage response must
+// be real quiescence evidence, not merely a durable write with an unawaited refresh racing behind it
+// (a real pre-push review finding — the durable write landing is not the same fact as every
+// grant-capable thread having stopped serving the old generation).
+const changeListeners = new Set<(database: string) => Promise<void>>();
+export function onRecordLockHomesChanged(listener: (database: string) => Promise<void>): () => void {
 	changeListeners.add(listener);
 	return () => changeListeners.delete(listener);
 }
-function notifyChanged(database: string): void {
-	for (const listener of changeListeners) listener(database);
+async function notifyChanged(database: string): Promise<void> {
+	await Promise.all([...changeListeners].map((listener) => listener(database)));
 }
 
 let recordLockHomesTable: any;
@@ -99,13 +103,19 @@ export function canonicalizeHomes(homes: string[]): string[] {
 /**
  * Length-prefixed, not delimiter-joined: `['A','B']` and `['A\0B']` must not collide (a real
  * gap in an earlier draft of this module — see RECORD_LOCK_HOMES_DESIGN.md §5). Big-endian
- * uint32 length prefixes on both the count and every element.
+ * uint32 length prefixes on both the count and every element. `generation` is encoded as its
+ * decimal string, length-prefixed the same way as a home name — not truncated to 32 bits (an
+ * earlier draft's `generation >>> 0` made generations 1 and 2**32+1 hash identically over the
+ * same homes, a real pre-push review finding: `validateGenerationInput` accepts any positive
+ * safe integer, not just a uint32).
  */
 export function digestOf(generation: number, homes: string[]): string {
 	const hash = createHash('sha256');
 	const u32 = Buffer.alloc(4);
-	u32.writeUInt32BE(generation >>> 0);
+	const generationBytes = Buffer.from(String(generation), 'utf8');
+	u32.writeUInt32BE(generationBytes.length);
 	hash.update(u32);
+	hash.update(generationBytes);
 	u32.writeUInt32BE(homes.length);
 	hash.update(u32);
 	for (const home of homes) {
@@ -140,6 +150,29 @@ async function writeRow(row: RecordLockHomesRow): Promise<void> {
 		await resource._writeUpdate(row.database, row, true, { localOnly: true });
 		await resource.save?.();
 	});
+}
+
+/**
+ * Serializes every stage/fence/activate call for the SAME database behind one in-process queue, so
+ * the read this call's plan decides against can never be stale by the time it writes. Without this,
+ * `readRow` (a real `await`, since the underlying store can resolve asynchronously) leaves a yield
+ * point between reading and deciding: `stage(g2)` and a concurrent `fenceExternal` can both read the
+ * same `active: g1`, and whichever writes second silently discards the other's outcome even though
+ * both report success (a real pre-push review finding — the whole-row replace with no compare-and-set
+ * against a state that changed underneath it). Different databases still run fully concurrently —
+ * only same-database calls queue behind each other, and only for the duration of one read+decide+write.
+ */
+const rowQueues = new Map<string, Promise<unknown>>();
+function withRow<T>(database: string, plan: (existing: RecordLockHomesRow | undefined) => Promise<T>): Promise<T> {
+	const prior = rowQueues.get(database) ?? Promise.resolve();
+	const run = prior.then(async () => plan(await readRow(database)));
+	// Chain the next caller behind this one regardless of outcome; a rejection here must not wedge
+	// every later caller for this database behind a promise that will never resolve.
+	rowQueues.set(
+		database,
+		run.catch(() => {})
+	);
+	return run;
 }
 
 function operatorPrincipal(request: any): string {
@@ -213,14 +246,15 @@ export async function stageGeneration(request: any): Promise<{ staged: RecordLoc
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
 	const digest = digestOf(generation, homes);
-	const existing = await readRow(database);
-	const plan = planStage(existing, database, generation, homes, digest);
-	if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
-	if (plan.action === 'noop') return { staged: plan.staged };
-	await writeRow(plan.row);
-	logger.info?.(`Record lock home map for ${database}: staged generation ${generation}, retracted active`);
-	notifyChanged(database);
-	return { staged: plan.row.staged! };
+	return withRow(database, async (existing) => {
+		const plan = planStage(existing, database, generation, homes, digest);
+		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
+		if (plan.action === 'noop') return { staged: plan.staged };
+		await writeRow(plan.row);
+		logger.info?.(`Record lock home map for ${database}: staged generation ${generation}, retracted active`);
+		await notifyChanged(database);
+		return { staged: plan.row.staged! };
+	});
 }
 
 const fenceSchema = Joi.object({
@@ -239,15 +273,16 @@ export async function fenceExternal(request: any): Promise<{ fenced: true }> {
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
 	const operator = operatorPrincipal(request);
 	const { database, node } = request;
-	const existing = await readRow(database);
-	await writeRow({
-		database,
-		active: existing?.active,
-		staged: existing?.staged,
-		highestActedOn: existing?.highestActedOn ?? 0,
-		fenced: [...(existing?.fenced ?? []), { node, operator, at: Date.now() }],
+	return withRow(database, async (existing) => {
+		await writeRow({
+			database,
+			active: existing?.active,
+			staged: existing?.staged,
+			highestActedOn: existing?.highestActedOn ?? 0,
+			fenced: [...(existing?.fenced ?? []), { node, operator, at: Date.now() }],
+		});
+		return { fenced: true };
 	});
-	return { fenced: true };
 }
 
 const activateSchema = Joi.object({
@@ -312,14 +347,15 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
 	const digest = digestOf(generation, homes);
-	const existing = await readRow(database);
-	const plan = planActivate(existing, database, generation, digest);
-	if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
-	if (plan.action === 'noop') return { active: plan.active };
-	await writeRow(plan.row);
-	logger.info?.(`Record lock home map for ${database}: activated generation ${generation}`);
-	notifyChanged(database);
-	return { active: plan.row.active! };
+	return withRow(database, async (existing) => {
+		const plan = planActivate(existing, database, generation, digest);
+		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
+		if (plan.action === 'noop') return { active: plan.active };
+		await writeRow(plan.row);
+		logger.info?.(`Record lock home map for ${database}: activated generation ${generation}`);
+		await notifyChanged(database);
+		return { active: plan.row.active! };
+	});
 }
 
 /** Current durable row, for `homeMap()` cache population and status reporting. Not the hot path. */

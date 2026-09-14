@@ -218,7 +218,14 @@ if (parentPort) {
 			logger.warn?.('record lock rpc failed on the owner worker', error);
 			reply = message.kind === 'delegate' ? NOT_HOME : undefined;
 		}
-		parentPort.postMessage({ type: 'record-lock-rpc-reply', requestId: message.requestId, reply });
+		try {
+			parentPort.postMessage({ type: 'record-lock-rpc-reply', requestId: message.requestId, reply });
+		} catch (error) {
+			// A throw here (e.g. mid-shutdown) would otherwise reject this async handler under Node's
+			// default unhandled-rejection policy and kill the worker; the relay's own timeout already
+			// covers the caller side.
+			logger.debug?.('Could not return a record lock rpc reply to the relaying worker', error);
+		}
 	});
 	onMessageByType('record-lock-rpc-reply', (message) => {
 		pendingRelays.get(message.requestId)?.(message.reply);
