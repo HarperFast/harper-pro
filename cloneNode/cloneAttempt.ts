@@ -58,6 +58,7 @@ export function cloneAttemptSource(rootPath: string = get(CONFIG_PARAMS.ROOTPATH
 			marker.completedAt !== undefined &&
 			(typeof marker.completedAt !== 'number' ||
 				!Number.isFinite(marker.completedAt) ||
+				marker.completedAt > Date.now() ||
 				marker.completedAt + CLONE_COMPLETION_GRACE_MS <= Date.now())
 		)
 			return undefined;

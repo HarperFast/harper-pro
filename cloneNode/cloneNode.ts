@@ -1499,9 +1499,7 @@ function clearCloneAttempt(expectedAttemptId?: string): void {
 		if (process.env[CLONE_ATTEMPT_ENV] !== expectedAttemptId) return;
 		try {
 			if (JSON.parse(readFileSync(cloneAttemptPath(), 'utf8'))?.attemptId !== expectedAttemptId) return;
-		} catch {
-			// Missing or unreadable state cannot authorize continued withholding.
-		}
+		} catch {}
 	}
 	delete process.env[CLONE_ATTEMPT_ENV];
 	try {

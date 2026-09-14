@@ -161,9 +161,15 @@ suite('Clone Node', (ctx) => {
 		ctx.nodes.push(cloneCtx.harper);
 
 		await waitForAvailableStatus(ctx.nodes[1]);
-		const completedAttempt = JSON.parse(readFileSync(join(ctx.nodes[1].dataRootDir, '.cloneAttempt.json'), 'utf8'));
+		let completedAttempt;
+		for (let i = 0; i < 60 && typeof completedAttempt?.completedAt !== 'number'; i++) {
+			await sleep(500);
+			try {
+				completedAttempt = JSON.parse(readFileSync(join(ctx.nodes[1].dataRootDir, '.cloneAttempt.json'), 'utf8'));
+			} catch {}
+		}
 		equal(
-			typeof completedAttempt.completedAt,
+			typeof completedAttempt?.completedAt,
 			'number',
 			'The completed clone attempt should carry its grace timestamp'
 		);

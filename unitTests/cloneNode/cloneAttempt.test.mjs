@@ -65,6 +65,13 @@ describe('clone-attempt marker (#737)', () => {
 		assert.equal(cloneAttemptSource(rootPath), undefined);
 	});
 
+	it('has no source for a future-dated completion time', () => {
+		writeMarker(
+			JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example', completedAt: Date.now() + 10 * 60_000 })
+		);
+		assert.equal(cloneAttemptSource(rootPath), undefined);
+	});
+
 	it('marks an attempt complete without changing its identity', () => {
 		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example' }));
 		assert.equal(completeCloneAttempt(rootPath, 1234), 'abc');

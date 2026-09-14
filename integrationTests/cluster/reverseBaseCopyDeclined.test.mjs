@@ -148,30 +148,35 @@ function registerReverseCopySuite({ title, completionAgeMs, withholdsSourceRecor
 			async () => {
 				const { nodeA, nodeB } = ctx;
 				const before = await readLog(nodeB);
-				const markerWrittenAt = Date.now();
-				writeFileSync(
-					ctx.cloneAttemptPath,
-					JSON.stringify({
-						attemptId: 'reverse-copy-test-attempt',
-						leaderHost: nodeA.hostname,
-						completedAt: Date.now() - completionAgeMs,
-					})
-				);
+				let markerWrittenAt;
+				const writeAttemptMarker = () => {
+					markerWrittenAt = Date.now();
+					writeFileSync(
+						ctx.cloneAttemptPath,
+						JSON.stringify({
+							attemptId: 'reverse-copy-test-attempt',
+							leaderHost: nodeA.hostname,
+							completedAt: markerWrittenAt - completionAgeMs,
+						})
+					);
+				};
+				writeAttemptMarker();
 
 				// A meets B for the first time here, so it has no resume cursor for B and asks for a base copy.
 				await joinAsFollower(nodeB, nodeA);
-				if (withholdsSourceRecords)
-					assert.ok(
-						Date.now() - markerWrittenAt < CLONE_COMPLETION_GRACE_MS,
-						'the connection must begin inside the completion-grace test precondition'
-					);
 
 				// D's record is the last thing B can ship, so its arrival marks the copy as served.
 				let after = before;
 				for (let i = 0; i < 240 && shipped(after, 'd-origin-') === shipped(before, 'd-origin-'); i++) {
+					if (withholdsSourceRecords) writeAttemptMarker();
 					await delay(500);
 					after = await readLog(nodeB);
 				}
+				if (withholdsSourceRecords)
+					assert.ok(
+						Date.now() - markerWrittenAt < CLONE_COMPLETION_GRACE_MS,
+						'the copy must be served inside the completion-grace test precondition'
+					);
 				assert.ok(
 					shipped(after, 'd-origin-') > shipped(before, 'd-origin-'),
 					'B must have served A a base copy carrying the record D originated'
