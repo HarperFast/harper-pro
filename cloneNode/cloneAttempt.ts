@@ -27,17 +27,22 @@ export function reusableCloneAttemptId(marker: CloneAttemptMarker | undefined, l
 
 export function completeCloneAttempt(rootPath: string, completedAt = Date.now()): string | undefined {
 	const path = cloneAttemptPath(rootPath);
+	let marker: CloneAttemptMarker;
 	try {
-		const marker: CloneAttemptMarker = JSON.parse(readFileSync(path, 'utf8'));
-		if (typeof marker.attemptId !== 'string') return undefined;
+		marker = JSON.parse(readFileSync(path, 'utf8'));
+	} catch (error) {
+		logger.warn?.('Could not read the clone attempt while marking it complete', error);
+		return undefined;
+	}
+	if (typeof marker.attemptId !== 'string') return undefined;
+	try {
 		const temporaryPath = `${path}.${process.pid}.tmp`;
 		writeFileSync(temporaryPath, JSON.stringify({ ...marker, completedAt }), { encoding: 'utf8', mode: 0o600 });
 		renameSync(temporaryPath, path);
-		return marker.attemptId;
 	} catch (error) {
 		logger.warn?.('Could not mark the clone attempt complete', error);
-		return undefined;
 	}
+	return marker.attemptId;
 }
 
 /**
@@ -54,14 +59,16 @@ export function cloneAttemptSource(rootPath: string = get(CONFIG_PARAMS.ROOTPATH
 		const path = cloneAttemptPath(rootPath);
 		if (!existsSync(path)) return undefined;
 		const marker: CloneAttemptMarker = JSON.parse(readFileSync(path, 'utf8'));
-		if (
-			marker.completedAt !== undefined &&
-			(typeof marker.completedAt !== 'number' ||
+		if (marker.completedAt !== undefined) {
+			const now = Date.now();
+			if (
+				typeof marker.completedAt !== 'number' ||
 				!Number.isFinite(marker.completedAt) ||
-				marker.completedAt > Date.now() ||
-				marker.completedAt + CLONE_COMPLETION_GRACE_MS <= Date.now())
-		)
-			return undefined;
+				marker.completedAt - now > CLONE_COMPLETION_GRACE_MS ||
+				marker.completedAt + CLONE_COMPLETION_GRACE_MS <= now
+			)
+				return undefined;
+		}
 		const source = marker.leaderHost;
 		return typeof source === 'string' && source ? source : undefined;
 	} catch (error) {

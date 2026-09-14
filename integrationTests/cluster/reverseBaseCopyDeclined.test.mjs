@@ -31,7 +31,7 @@ import assert from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { writeFileSync } from 'node:fs';
+import { renameSync, writeFileSync } from 'node:fs';
 import { sendOperation, readLog } from './clusterShared.mjs';
 
 const CLONE_COMPLETION_GRACE_MS = 60_000;
@@ -151,14 +151,16 @@ function registerReverseCopySuite({ title, completionAgeMs, withholdsSourceRecor
 				let markerWrittenAt;
 				const writeAttemptMarker = () => {
 					markerWrittenAt = Date.now();
+					const temporaryPath = `${ctx.cloneAttemptPath}.test.tmp`;
 					writeFileSync(
-						ctx.cloneAttemptPath,
+						temporaryPath,
 						JSON.stringify({
 							attemptId: 'reverse-copy-test-attempt',
 							leaderHost: nodeA.hostname,
 							completedAt: markerWrittenAt - completionAgeMs,
 						})
 					);
+					renameSync(temporaryPath, ctx.cloneAttemptPath);
 				};
 				writeAttemptMarker();
 

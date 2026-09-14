@@ -403,11 +403,8 @@ export async function cloneNode(): Promise<void> {
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
 	clearSyncStartedMarker();
 	const completedAttemptId = completeCloneAttempt(rootPath);
-	if (completedAttemptId) {
-		setTimeout(() => clearCloneAttempt(completedAttemptId), CLONE_COMPLETION_GRACE_MS).unref();
-	} else {
-		clearCloneAttempt();
-	}
+	if (completedAttemptId) setTimeout(() => clearCloneAttempt(completedAttemptId), CLONE_COMPLETION_GRACE_MS).unref();
+	else clearCloneAttempt();
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
@@ -1478,7 +1475,7 @@ function startCloneAttempt(): void {
 	} catch (error) {
 		log(`Could not derive the leader host from ${leaderURL}: ${error}`, 'error');
 	}
-	let attemptId = reusableCloneAttemptId(persistedMarker, leaderHost);
+	let attemptId = forceClone ? undefined : reusableCloneAttemptId(persistedMarker, leaderHost);
 	if (!attemptId) {
 		attemptId = randomBytes(16).toString('hex');
 		try {

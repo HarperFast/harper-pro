@@ -6,7 +6,7 @@
  */
 
 import assert from 'node:assert';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -65,7 +65,18 @@ describe('clone-attempt marker (#737)', () => {
 		assert.equal(cloneAttemptSource(rootPath), undefined);
 	});
 
-	it('has no source for a future-dated completion time', () => {
+	it('reports the source through a small backwards-clock correction', () => {
+		writeMarker(
+			JSON.stringify({
+				attemptId: 'abc',
+				leaderHost: 'leader.example',
+				completedAt: Date.now() + CLONE_COMPLETION_GRACE_MS,
+			})
+		);
+		assert.equal(cloneAttemptSource(rootPath), 'leader.example');
+	});
+
+	it('has no source for a completion time beyond the clock-skew bound', () => {
 		writeMarker(
 			JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example', completedAt: Date.now() + 10 * 60_000 })
 		);
@@ -82,8 +93,18 @@ describe('clone-attempt marker (#737)', () => {
 		});
 	});
 
-	it('reports a completion-stamp failure so the caller can fail open', () => {
+	it('reports a completion-marker read failure so the caller can fail open', () => {
 		assert.equal(completeCloneAttempt(rootPath, 1234), undefined);
+	});
+
+	it('retains the attempt identity when only the completion stamp fails', () => {
+		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example' }));
+		mkdirSync(`${cloneAttemptPath(rootPath)}.${process.pid}.tmp`);
+		assert.equal(completeCloneAttempt(rootPath, 1234), 'abc');
+		assert.deepEqual(JSON.parse(readFileSync(cloneAttemptPath(rootPath), 'utf8')), {
+			attemptId: 'abc',
+			leaderHost: 'leader.example',
+		});
 	});
 
 	it('reuses only an unfinished attempt for the same leader', () => {
