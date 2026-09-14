@@ -249,7 +249,15 @@ export async function stageGeneration(request: any): Promise<{ staged: RecordLoc
 	return withRow(database, async (existing) => {
 		const plan = planStage(existing, database, generation, homes, digest);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
-		if (plan.action === 'noop') return { staged: plan.staged };
+		if (plan.action === 'noop') {
+			// Idempotent retry, not a genuine transition — but the PRIOR call may have durably written
+			// this exact state and then failed to confirm every thread applied it (a relay timeout, a
+			// dead worker). Re-notifying is harmless when nothing changed and is the only way a retry
+			// ever reconciles that gap (a real pre-push review finding: a noop that skips notification
+			// leaves every unconfirmed thread stuck on the retracted generation with no bound).
+			await notifyChanged(database);
+			return { staged: plan.staged };
+		}
 		await writeRow(plan.row);
 		logger.info?.(`Record lock home map for ${database}: staged generation ${generation}, retracted active`);
 		await notifyChanged(database);
@@ -350,7 +358,12 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 	return withRow(database, async (existing) => {
 		const plan = planActivate(existing, database, generation, digest);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
-		if (plan.action === 'noop') return { active: plan.active };
+		if (plan.action === 'noop') {
+			// See the matching comment in `stageGeneration`: a retry must still reconcile threads the
+			// prior call's durable write outran.
+			await notifyChanged(database);
+			return { active: plan.active };
+		}
 		await writeRow(plan.row);
 		logger.info?.(`Record lock home map for ${database}: activated generation ${generation}`);
 		await notifyChanged(database);
