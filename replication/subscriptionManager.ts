@@ -85,9 +85,9 @@ type ConnectedWorkerStatus = {
 };
 type ReplicationConnectionStatus = {
 	url?: string;
-	// Write-only: the main thread's view of the (database, peer) status buffer, held so the allocation
-	// outlives the owning worker. RocksDB frees it when the last view is collected, and the worker holds
-	// the only other durable one, so dropping this field re-mints the buffer as zeros on worker exit.
+	// Write-only. RocksDB frees a user shared buffer once the last view of it is collected, and the owning
+	// worker holds the only other durable view, so without this field the (database, peer) status buffer is
+	// re-minted as zeros on worker exit. Assigned wherever the live buffer is resolvable.
 	sharedStatus?: Float64Array;
 	// Explicit unsubscribe keeps the entry alive for iterator/URL cleanup, but it is no longer
 	// an active subscription and must not take the existing-entry reuse fast path.
@@ -160,8 +160,7 @@ function getAuditStoreForDatabase(databaseName: string): any {
 	}
 }
 
-// Contained: this only decorates a subscription, so a database torn down between the lookup and the read
-// must not abandon the setup path.
+// Contained: this only decorates a subscription, so a database torn down mid-lookup must not abandon setup.
 function resolveSharedStatus(databaseName: string, nodeName: string | undefined): Float64Array | undefined {
 	if (!nodeName) return;
 	try {
@@ -1017,10 +1016,8 @@ export async function startOnMainThread(options) {
 			// assigned at all (all workers were down at registration time) so it gets rebound
 			// once workers come back. Without these checks, the early-return branch keeps the
 			// entry stuck and the subscription never recovers.
-			// Held across the reassignment below: this is the dead-owner path, so a GC between dropping the
-			// outgoing anchor and taking a new one would free the buffer holding the disconnect being
-			// reacted to. It is a fallback, not a preference — a peer renamed while its worker was down
-			// resolves a different buffer, and that one is the entry's.
+			// Keeps the outgoing buffer alive across the delete/recreate below; a fresh resolve still wins,
+			// since a peer renamed while its worker was down owns a different buffer.
 			let carriedSharedStatus: Float64Array | undefined;
 			if (existingEntry && httpWorkers.length > 0 && !httpWorkers.includes(existingEntry.worker as any)) {
 				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
@@ -1031,10 +1028,8 @@ export async function startOnMainThread(options) {
 			if (existingEntry) {
 				worker = existingEntry.worker;
 				existingEntry.nodes = nodes;
-				// This is the first chance to anchor an entry whose database did not exist when it was
-				// created — onDatabase runs again once the table appears — and the first chance to move the
-				// anchor onto a renamed peer's buffer. Only when something resolved: a database torn down
-				// under us must not clear an anchor that is still the live allocation.
+				// Reached again once a database that did not exist at creation appears, which is the earliest
+				// the main thread can hold its buffer. Never clears an anchor a failed resolve cannot replace.
 				const resolvedSharedStatus = resolveSharedStatus(databaseName, nodes[0]?.name);
 				if (resolvedSharedStatus) existingEntry.sharedStatus = resolvedSharedStatus;
 				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
@@ -1069,7 +1064,7 @@ export async function startOnMainThread(options) {
 					// never reaches 'open' (so connectedToNode never clears it and disconnectedFromNode never
 					// stamps disconnectedAt) would otherwise be invisible to findWedgedNodeUrls. See harper-pro#466.
 					createdAt: Date.now(),
-					// Taken before the subscribe dispatched below, so the worker can never be the only holder.
+					// Before the subscribe dispatched below, so the worker is never the only holder.
 					sharedStatus: resolveSharedStatus(databaseName, nodes[0]?.name) ?? carriedSharedStatus,
 				});
 				ensureWorkerExitHandler(worker);
@@ -1417,8 +1412,7 @@ export async function startOnMainThread(options) {
 					// One buffer read serves every job on this entry: the two lifecycle corrections, the truth
 					// derivation, and the R3 metrics bridge.
 					status = getReplicationSharedStatus(auditStore, databaseName, nodeName);
-					// Assigned every tick, not only when absent: a renamed peer or a recreated database resolves
-					// a different buffer, and keeping the first would leave the live one worker-held.
+					// Every tick: a renamed peer or recreated database resolves a different buffer here.
 					entry.sharedStatus = status;
 					// a tracked peer that is no longer a cluster member must read zero
 					// shared status, or a same-process re-add inherits its CONNECTED/liveness/error values.
