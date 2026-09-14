@@ -14,7 +14,11 @@
  */
 
 import { expect } from 'chai';
-import { getBlobTransferKey, isCompleteBlobHeader, isDurableIdentityTie } from '#src/replication/replicationConnection';
+import { readFileSync, truncateSync, writeFileSync } from 'node:fs';
+import { createBlob, getFilePathForBlob } from '#src/core/resources/blob';
+import { table } from '#src/core/resources/databases';
+import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
+import { getBlobTransferKey, isDurableIdentityTie } from '#src/replication/replicationConnection';
 
 const VERSION = 1700000000000;
 const NODE_ID = 3;
@@ -84,29 +88,49 @@ describe('isDurableIdentityTie — provably-already-applied record detection', (
 	});
 });
 
-describe('isCompleteBlobHeader — bounded copy-path durability proof', () => {
-	function header(type, size) {
-		const bytes = Buffer.alloc(8);
-		bytes.writeBigUInt64BE((BigInt(type) << 48n) | BigInt(size));
-		return bytes;
+describe('isDurableIdentityTie — the default verifier on stored blob files', () => {
+	let Records;
+	let nextId = 0;
+	before(() => {
+		setHdbBasePath(process.env.STORAGE_PATH);
+		Records = table({
+			database: 'durableTieBlobs',
+			table: 'records',
+			attributes: [
+				{ name: 'id', isPrimaryKey: true },
+				{ name: 'blob', type: 'Blob' },
+			],
+		});
+	});
+
+	async function storedRecord(payload, options) {
+		const id = `record-${nextId++}`;
+		await Records.put({ id, blob: createBlob(payload, options) });
+		const value = await Records.get(id);
+		return { value, filePath: getFilePathForBlob(value.blob) };
 	}
+	const ties = (value) => isDurableIdentityTie(entry({ value }), VERSION, NODE_ID, true);
 
-	it('requires the exact body length for an uncompressed blob', () => {
-		expect(isCompleteBlobHeader(header(0, 100), 108)).to.equal(true);
-		expect(isCompleteBlobHeader(header(0, 100), 107)).to.equal(false);
-		expect(isCompleteBlobHeader(header(0, 100), 109)).to.equal(false);
+	it('ties an intact compressed blob and refuses one torn short of its declared size', async () => {
+		const { value, filePath } = await storedRecord(Buffer.from('durable tie compressed '.repeat(2000)), {
+			compress: true,
+		});
+		const intact = readFileSync(filePath);
+		expect(intact[1]).to.equal(1, 'precondition: stored deflated');
+		expect(await ties(value)).to.equal(true);
+		// a finalized header over a short body: exactly the shape an unclean shutdown leaves, invisible to a length check
+		truncateSync(filePath, intact.length - 1);
+		expect(await ties(value)).to.equal(false);
+		writeFileSync(filePath, intact);
+		expect(await ties(value)).to.equal(true);
 	});
 
-	it('rejects compressed blobs because file bytes cannot prove completeness', () => {
-		expect(isCompleteBlobHeader(header(1, 100), 40)).to.equal(false);
-		expect(isCompleteBlobHeader(header(1, 100), 108)).to.equal(false);
-		expect(isCompleteBlobHeader(header(1, 100), 8)).to.equal(false);
-	});
-
-	it('rejects unfinished and error headers', () => {
-		expect(isCompleteBlobHeader(header(0, 0xffffffffffffn), 100)).to.equal(false);
-		expect(isCompleteBlobHeader(header(0xfe, 10), 18)).to.equal(false);
-		expect(isCompleteBlobHeader(header(0xff, 10), 18)).to.equal(false);
+	it('ties an intact uncompressed blob by length, and refuses a short one', async () => {
+		const { value, filePath } = await storedRecord(Buffer.alloc(20000, 3));
+		expect(readFileSync(filePath)[1]).to.equal(0, 'precondition: stored uncompressed');
+		expect(await ties(value)).to.equal(true);
+		truncateSync(filePath, 20000);
+		expect(await ties(value)).to.equal(false);
 	});
 });
 
