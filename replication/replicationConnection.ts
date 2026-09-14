@@ -262,9 +262,8 @@ export function stampWorkerExitDown(status: Float64Array | undefined, now: numbe
 	return true;
 }
 // CONNECTION_STATE_DOWN is 0, the same value an untouched buffer holds, so state alone cannot say
-// whether an owner ever wrote here — only the error time can. Ages rather than epoch stamps, like
-// formatTruthSnapshot: no reconnect path clears the error slots, so a close code can outlive its
-// session by hours and reads as current unless its age is on the line.
+// whether an owner ever wrote here — only the error time can. No reconnect path clears the error slots,
+// so a close code can outlive its session by hours; its age is what says whether it is this one's.
 export function describeRefusedWorkerExitStamp(status: Float64Array | undefined, now: number = Date.now()): string {
 	if (!status) return 'status=unavailable';
 	const age = (time: number) => (time > 0 ? `${Math.round((now - time) / 1000)}s ago` : 'never');

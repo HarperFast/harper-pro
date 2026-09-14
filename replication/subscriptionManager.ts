@@ -1394,7 +1394,7 @@ export async function startOnMainThread(options) {
 				})
 			)
 				reconcileWorkers();
-			reportUnstamped(unstamped);
+			reportUnstamped('worker exit', unstamped);
 		});
 	}
 	// Ownership is the CALLER's guard; this only refuses to overwrite a state that is not CONNECTED. Never
@@ -1414,12 +1414,13 @@ export async function startOnMainThread(options) {
 			return 'threw';
 		}
 	}
-	// Contained: both callers run without an outer catch — an EventEmitter listener and a setInterval — and
-	// a diagnostic must not take the process down after the re-binding it reports on has already happened.
-	function reportUnstamped(unstamped: string[] | undefined) {
+	// `writer` distinguishes the two: the exit handler reports an edge, at the moment of exit, while the
+	// sweep reports a latched level for a worker that may have died minutes earlier — which the payload
+	// alone cannot say. Contained because neither caller has an outer catch.
+	function reportUnstamped(writer: string, unstamped: string[] | undefined) {
 		if (!unstamped) return;
 		try {
-			logger.debug?.('Worker-exit truth stamp did not land:', unstamped.join(', '));
+			logger.debug?.(`Worker-exit truth stamp did not land (${writer}):`, unstamped.join(', '));
 		} catch {
 			/* a failing log sink is not worth the recovery path */
 		}
@@ -1515,7 +1516,7 @@ export async function startOnMainThread(options) {
 				'Marked replication connection truth down for subscriptions whose owning worker is gone:',
 				stampedDeadOwner.join(', ')
 			);
-		reportUnstamped(unstampedDeadOwner);
+		reportUnstamped('reconcile sweep', unstampedDeadOwner);
 		if (clearedNonMembers)
 			logger.warn(
 				'Cleared stale replication status for peers that are no longer cluster members (their removal ' +
