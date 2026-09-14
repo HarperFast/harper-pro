@@ -29,11 +29,12 @@ const WORKERS = Number(process.env.HARPER_645_WORKERS ?? 2);
 // neither caps it at local time and both store exactly this version.
 const TIE_BACKDATE_MS = 3600_000;
 const BARRIER_MS = 10000;
-// Each bootstrap phase gets one budget rather than one per attempt: retry counts times a per-request
-// timeout let a node that accepts connections without answering burn the whole 25-minute cluster job
-// (.github/workflows/integration-tests.yaml) before any phase reports its own diagnostic, and this
-// file bootstraps twice — once per storage engine.
-const BOOTSTRAP_PHASE_MS = 120000;
+// One budget per bootstrap phase, not per attempt: retry count times a per-request timeout otherwise
+// lets a node that accepts connections without answering outlast both the suite budget above and the
+// 25-minute cluster job (.github/workflows/integration-tests.yaml), reporting neither phase's own
+// diagnostic. Four phases at this budget stay inside one suite timeout, and this file bootstraps
+// twice — once per storage engine.
+const BOOTSTRAP_PHASE_MS = 60000;
 // Restages are budgeted for the whole suite, not per trial: one unstaged race is a scheduling
 // accident worth retrying, but a race that can never be staged must fail inside the suite timeout
 // rather than spend TRIALS x attempts x the barrier window discovering it.
@@ -102,15 +103,16 @@ function startBarrierOrigin() {
 			const pending = { ...call, token, res, answered: false };
 			state.calls.push(pending);
 			if (state.released) respondTo(state, pending);
-			// A staggered trial answers the first fill at once and parks the second for the test to
-			// release; the timer is only ever the safety valve that keeps a parked fill from hanging.
+			// a staggered trial parks its second fill for the test to release; the timer only ever
+			// keeps a parked fill from hanging forever
 			else if (state.stagger && state.calls.length === 1) respondTo(state, pending);
 			else if (!state.stagger && state.calls.length >= 2) releaseTrial(state, false);
 			else state.timer ??= setTimeout(() => releaseTrial(state, true), BARRIER_MS);
 		});
 	});
 
-	return new Promise((resolve) => {
+	return new Promise((resolve, reject) => {
+		server.on('error', reject);
 		server.listen(0, '127.0.0.1', () => {
 			const { port } = server.address();
 			resolve({
@@ -234,10 +236,11 @@ async function requestJsonRetrying(url, agent, options, attempts = 10, delayMs =
 
 async function pinWorkers(node) {
 	const byThread = new Map();
+	const deadline = Date.now() + BOOTSTRAP_PHASE_MS;
 	try {
-		for (let i = 0; i < 40 && byThread.size < WORKERS; i++) {
+		for (let i = 0; i < 40 && byThread.size < WORKERS && Date.now() < deadline; i++) {
 			const agent = new Agent({ keepAlive: true, maxSockets: 1 });
-			// a worker still coming up answers 5xx; keep probing rather than aborting the bootstrap
+			// a worker still warming up answers 5xx, which is worth another probe rather than a failed run
 			const probe = await requestJson(`${node.httpURL}/PairWorker/probe-${i}`, agent).catch(() => null);
 			if (!probe || byThread.has(probe.threadId)) {
 				agent.destroy();
@@ -246,8 +249,7 @@ async function pinWorkers(node) {
 		}
 		equal(byThread.size, WORKERS, `expected ${WORKERS} addressable workers on ${node.hostname}`);
 	} catch (error) {
-		// the after() hook can only destroy agents it was handed, and it is never handed these:
-		// pinWorkers runs inside a Promise.all whose rejection leaves ctx.agentsByNode unassigned.
+		// these agents are not reachable from ctx.agentsByNode yet, so after() cannot close them
 		for (const agent of byThread.values()) agent.destroy();
 		throw error;
 	}
@@ -380,8 +382,7 @@ async function raceTrial(ctx, id, shape) {
 	const pendingFills = Promise.all(
 		ctx.nodes.map((node, index) => requestJson(`${node.httpURL}/PairRecord/${id}`, fillAgents[index]))
 	);
-	// releaseLateFill awaits real I/O before this is awaited below, so a fill that rejects meanwhile
-	// would reach node as an unhandled rejection and take the runner down instead of failing a trial.
+	// releaseLateFill awaits before this is, so an unhandled rejection here would kill the runner
 	pendingFills.catch(() => {});
 	const lateFillRacedAPeer = shape.stagger ? await releaseLateFill(ctx, id) : true;
 	const fills = await pendingFills;
@@ -461,21 +462,30 @@ function sourcedBlobPairing(ctx) {
 		ctx.nodes = [];
 		await Promise.all(
 			contexts.map(async (nodeCtx, index) => {
-				await startHarper(nodeCtx, {
-					config: {
-						analytics: { aggregatePeriod: -1 },
-						logging: { colors: false, stdStreams: false, console: true },
-						replication: { securePort: `${nodeCtx.harper.hostname}:9933` },
-						storage: { engine: ctx.testLMDB ? 'lmdb' : 'rocksdb' },
-						threads: { count: WORKERS },
-					},
-					env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_ORIGIN_URL: ctx.origin.url },
-				});
-				ctx.nodes[index] = nodeCtx.harper;
+				try {
+					await startHarper(nodeCtx, {
+						config: {
+							analytics: { aggregatePeriod: -1 },
+							logging: { colors: false, stdStreams: false, console: true },
+							replication: { securePort: `${nodeCtx.harper.hostname}:9933` },
+							storage: { engine: ctx.testLMDB ? 'lmdb' : 'rocksdb' },
+							threads: { count: WORKERS },
+						},
+						env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_ORIGIN_URL: ctx.origin.url },
+					});
+				} finally {
+					// startHarper REPLACES nodeCtx.harper rather than filling it in, so the handle only
+					// exists once it returns — capture it even when it throws, or a half-started node is
+					// orphaned past after()
+					ctx.nodes[index] = nodeCtx.harper;
+				}
 			})
 		);
 		await connectNodes(...ctx.nodes);
-		ctx.agentsByNode = await Promise.all(ctx.nodes.map(pinWorkers));
+		// assigned per node rather than from Promise.all, so one node's failure does not strand the
+		// agents the other already opened
+		ctx.agentsByNode = [];
+		await Promise.all(ctx.nodes.map(async (node, index) => (ctx.agentsByNode[index] = await pinWorkers(node))));
 	});
 
 	after(async () => {
