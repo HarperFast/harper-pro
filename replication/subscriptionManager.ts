@@ -39,6 +39,7 @@ import {
 	deriveConnectionTruth,
 	formatTruthSnapshot,
 	stampWorkerExitDown,
+	describeRefusedWorkerExitStamp,
 	classifyFire,
 	recordFire,
 	formatFireClassification,
@@ -1382,27 +1383,33 @@ export async function startOnMainThread(options) {
 			// recorded owner. Without this the buffer keeps its last CONNECTED stamp and only reads down
 			// once liveness ages past LIVENESS_STALE_MS (>= 120s); the reconcile below then corrects the
 			// entry on this same tick instead. A live successor re-stamps CONNECTED on handshake or pong.
+			let refusals: string[] | undefined;
 			if (
-				clearWorkerFromEntries(connectionReplicationMap, worker, (databaseName, nodeName) =>
-					stampWorkerExitTruth(databaseName, nodeName)
-				)
+				clearWorkerFromEntries(connectionReplicationMap, worker, (databaseName, nodeName) => {
+					const refusal = stampWorkerExitTruth(databaseName, nodeName);
+					if (refusal) (refusals ??= []).push(`${databaseName}/${nodeName} ${refusal}`);
+				})
 			)
 				reconcileWorkers();
+			if (refusals) logger.debug?.('Worker-exit truth stamp refused, link already not connected:', refusals.join(', '));
 		});
 	}
 	// Shared by both R1 writers (the exit handler above and the reconcile sweep below), so the two stamp
 	// identically. Ownership is the CALLER's guard; this only refuses to overwrite a state that is not
 	// CONNECTED. Never throws into the exit/reconcile path — a telemetry-grade failure must not stop the
 	// re-binding those paths exist to do.
-	function stampWorkerExitTruth(databaseName: string, nodeName: string | undefined): boolean {
-		if (!nodeName) return false;
+	// Returns what the buffer held when the stamp was REFUSED, for the caller to log, and nothing when it
+	// stamped or had no buffer to stamp.
+	function stampWorkerExitTruth(databaseName: string, nodeName: string | undefined): string | undefined {
+		if (!nodeName) return;
 		try {
 			const auditStore = getAuditStoreForDatabase(databaseName);
-			if (!auditStore) return false;
-			return stampWorkerExitDown(getReplicationSharedStatus(auditStore, databaseName, nodeName));
+			if (!auditStore) return;
+			const status = getReplicationSharedStatus(auditStore, databaseName, nodeName);
+			if (stampWorkerExitDown(status)) return;
+			return describeRefusedWorkerExitStamp(status);
 		} catch (error) {
 			logger.trace?.('Failed to stamp worker-exit connection truth for', databaseName, nodeName, error);
-			return false;
 		}
 	}
 	function reconcileWorkers() {

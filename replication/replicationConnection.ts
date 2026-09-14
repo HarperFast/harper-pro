@@ -261,6 +261,18 @@ export function stampWorkerExitDown(status: Float64Array | undefined, now: numbe
 	status[LAST_ERROR_TIME_POSITION] = now;
 	return true;
 }
+// CONNECTION_STATE_DOWN is 0, the same value an untouched buffer holds, so state alone cannot say
+// whether an owner ever wrote here — only the error time can. Ages rather than epoch stamps, like
+// formatTruthSnapshot: no reconnect path clears the error slots, so a close code can outlive its
+// session by hours and reads as current unless its age is on the line.
+export function describeRefusedWorkerExitStamp(status: Float64Array | undefined, now: number = Date.now()): string {
+	if (!status) return 'status=unavailable';
+	const age = (time: number) => (time > 0 ? `${Math.round((now - time) / 1000)}s ago` : 'never');
+	return (
+		`state=${status[CONNECTION_STATE_POSITION]} liveness=${age(status[LAST_LIVENESS_TIME_POSITION])} ` +
+		`closeCode=${status[LAST_ERROR_CODE_POSITION] || 'none'} ${age(status[LAST_ERROR_TIME_POSITION])}`
+	);
+}
 // Fire classification (harper-pro#431). Every watchdog / recovery-net fire records whether the
 // shared-memory connection truth ALSO judged the link down at that moment:
 // - `redundant`     — truth already read down, so the truth-driven path had (or should have had) it too.
