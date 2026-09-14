@@ -1467,6 +1467,43 @@ export function maybeStallSubscriptionSetupForTest(databaseName?: string): Promi
 	return new Promise<never>(() => {});
 }
 
+// Test-only ordering injection for harper-pro#431. When HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB names a
+// database, the FIRST subscribe() for a connection that has none yet is deferred until that connection's
+// session resolves — so the socket opens with `nodeSubscriptions` still undefined, the open handler skips
+// connectedToNode(), and replicateOverWS snapshots `isSubscriptionConnection: false` (which also keeps the
+// pong path from posting a connect edge). That leaves the main-thread entry reading connected:false over a
+// link the worker's shared-memory truth records as connected — the harper-pro#289 desync the up-correction
+// exists for, which a black-box test cannot provoke because the real window is the sub-millisecond race
+// between the WS handshake and an async subscribe(). One-shot per worker thread, so every later subscribe
+// (including this connection's own reconnects) takes the normal path. Never arms in production: the env var
+// is set only by the regression test.
+let subscribeAfterOpenForTestArmed = false;
+export function maybeDeferSubscribeUntilSessionForTest(
+	connection: any,
+	nodeSubscriptions: any,
+	replicateTablesByDefault: boolean
+): boolean {
+	if (!process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB) return false;
+	if (
+		subscribeAfterOpenForTestArmed ||
+		connection.nodeSubscriptions !== undefined ||
+		!connection.session ||
+		process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB !== connection.databaseName
+	)
+		return false;
+	subscribeAfterOpenForTestArmed = true;
+	logger.warn?.(`[test] deferring subscribe until session open for db "${connection.databaseName}" (harper-pro#431)`);
+	// Re-entrant, not a private apply path: the one-shot flag is already spent, so this second call takes
+	// the normal subscribe. Released on rejection too, so a failed connect cannot strand the subscription.
+	const release = () => {
+		if (connection.intentionallyUnsubscribed) return;
+		logger.warn?.(`[test] releasing deferred subscribe for db "${connection.databaseName}" (harper-pro#431)`);
+		connection.subscribe(nodeSubscriptions, replicateTablesByDefault);
+	};
+	connection.session.then(release, release);
+	return true;
+}
+
 // Test-only fault injection for harper-pro#537 symptom characterization. When
 // HARPER_TEST_INJECT_COPY_CURSOR_JSON is set on the RECEIVER node, the subscription handshake
 // overrides the copyCursor with the JSON-parsed value — as if a prior interrupted copy had left a
@@ -2919,11 +2956,6 @@ export async function createWebSocket(
 }
 
 const INITIAL_RETRY_TIME = 500;
-
-// Test-only ordering hook for harper-pro#431: hold one fresh connection's subscription until its socket
-// opens, selected at runtime and consumed once per worker.
-let holdSubscribeAfterOpenForTestArmed = false;
-
 /**
  * This represents a persistent connection to a node for replication, which handles
  * sockets that may be disconnected and reconnected
@@ -2944,10 +2976,6 @@ export class NodeReplicationConnection extends EventEmitter {
 	// two paths never both arm a connect() for the same drop — see forceReconnect / harper-pro#420.
 	reconnectScheduled = false;
 	nodeSubscriptions?: NodeSubscription[];
-	heldSubscribeAfterOpenForTest?: {
-		nodeSubscriptions: NodeSubscription[];
-		replicateTablesByDefault: boolean;
-	};
 	// Main-thread-computed multi-hop exclusion set for this database (subscriptionManager's
 	// computeExclusionOrigins), carried on subscribe-to-node and refreshed by
 	// update-exclusion-origins; the session reads it when building SUBSCRIPTION_REQUEST.
@@ -3055,8 +3083,6 @@ export class NodeReplicationConnection extends EventEmitter {
 					newSocket: true,
 				});
 			}
-			const heldSubscribe =
-				this.socket === socket && this.nodeSubscriptions === undefined ? this.heldSubscribeAfterOpenForTest : undefined;
 			this.isConnected = true;
 			try {
 				session = replicateOverWS(
@@ -3070,13 +3096,6 @@ export class NodeReplicationConnection extends EventEmitter {
 					},
 					{ replicates: true } // pre-authorized, but should only make publish: true if we are allowing reverse subscriptions
 				);
-				if (heldSubscribe) {
-					logger.warn?.(
-						`[test] socket open observed nodeSubscriptions undefined; releasing held subscribe for db "${this.databaseName}" (harper-pro#431)`
-					);
-					this.heldSubscribeAfterOpenForTest = undefined;
-					this.applySubscription(heldSubscribe.nodeSubscriptions, heldSubscribe.replicateTablesByDefault);
-				}
 				// Only the instance on the current socket is live. If this open raced a replacement, the
 				// instance is born superseded: retire it immediately rather than leave it running, and do
 				// not resolve — `sessionResolve` now belongs to the replacement attempt's promise, so
@@ -3229,34 +3248,13 @@ export class NodeReplicationConnection extends EventEmitter {
 		});
 		this.session.catch(() => {}); // suppress any unhandled errors
 	}
-	applySubscription(nodeSubscriptions: NodeSubscription[], replicateTablesByDefault: boolean) {
+	subscribe(nodeSubscriptions, replicateTablesByDefault) {
+		if (maybeDeferSubscribeUntilSessionForTest(this, nodeSubscriptions, replicateTablesByDefault)) return;
 		this.nodeSubscriptions = nodeSubscriptions;
 		this.replicateTablesByDefault = replicateTablesByDefault;
 		this.emit('subscriptions-updated', nodeSubscriptions);
 	}
-	subscribe(nodeSubscriptions: NodeSubscription[], replicateTablesByDefault: boolean) {
-		if (this.heldSubscribeAfterOpenForTest) {
-			this.heldSubscribeAfterOpenForTest = { nodeSubscriptions, replicateTablesByDefault };
-			return;
-		}
-		const holdDatabase = process.env.HARPER_TEST_HOLD_SUBSCRIBE_AFTER_OPEN_ONCE_DB;
-		if (
-			holdDatabase &&
-			this.nodeSubscriptions === undefined &&
-			!holdSubscribeAfterOpenForTestArmed &&
-			holdDatabase === this.databaseName
-		) {
-			holdSubscribeAfterOpenForTestArmed = true;
-			process.env.HARPER_TEST_HOLD_SUBSCRIBE_AFTER_OPEN_ONCE_DB = '';
-			this.heldSubscribeAfterOpenForTest = { nodeSubscriptions, replicateTablesByDefault };
-			logger.warn?.(`[test] holding subscribe until socket open for db "${this.databaseName}" (harper-pro#431)`);
-			return;
-		}
-		this.applySubscription(nodeSubscriptions, replicateTablesByDefault);
-	}
 	unsubscribe() {
-		// Do not let a later socket open revive membership removed while the payload was held.
-		this.heldSubscribeAfterOpenForTest = undefined;
 		this.intentionallyUnsubscribed = true;
 		this.socket?.close(1008, 'No longer subscribed');
 	}
@@ -7467,7 +7465,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				options.connection.on('exclusion-origins-updated', (origins: string[]) => {
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
-							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
+							(nodeName) =>
+								nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
 						)
 					);
 					const excludeNodes = [...shouldExclude].filter((nodeName) => !lastSentExcludedNodes.includes(nodeName));
