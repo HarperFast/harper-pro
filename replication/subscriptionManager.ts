@@ -1055,6 +1055,10 @@ export async function startOnMainThread(options) {
 			if (existingEntry) {
 				worker = existingEntry.worker;
 				existingEntry.nodes = nodes;
+				// An entry created for a database that did not exist locally yet (the isLeader bootstrap
+				// below) had no audit store to anchor, and the no-op return below is the path every later
+				// update takes — so retry here, before it, rather than leaving the anchor to the reconcile.
+				retainSharedStatusForEntry(databaseName, nodes[0]?.name);
 				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
 				// forceResubscribe for a connection that has been connected:false past the threshold: that
 				// falls through to re-post subscribe-to-node on the same worker (the worker then reuses a
