@@ -1521,6 +1521,9 @@ export function maybeDeferSubscribeUntilSessionForTest(
 	// first would strand the payload.
 	let watched: Promise<unknown> | undefined;
 	const followSession = () => {
+		// Abandonment is checked here, not only in release: a connection whose every attempt fails inside
+		// createWebSocket never settles a session promise, so release is not reachable to do the cleanup.
+		if (connection.intentionallyUnsubscribed || connection.isFinished) connection.deferredSubscribeForTest = undefined;
 		if (!connection.deferredSubscribeForTest) return clearInterval(retry);
 		if (watched === connection.session) return;
 		watched = connection.session;
