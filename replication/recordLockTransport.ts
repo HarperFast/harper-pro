@@ -309,18 +309,21 @@ function waitForHomesChangedAck(requestId: number, timeoutMs: number, database: 
 	});
 }
 
-/** Sends `record-lock-homes-changed` to one worker and waits for its ack, fail-closed. */
+/**
+ * Sends `record-lock-homes-changed` to one worker and waits for its ack, fail-closed. A synchronous
+ * `postMessage` throw settles the SAME pending-ack entry `waitForHomesChangedAck` already armed
+ * (rather than deleting it and manufacturing a second, unrelated rejection) — the entry's resolver is
+ * what clears its timer; abandoning it left that timer's own rejection unhandled ~`timeoutMs` later,
+ * which Node's default policy turns into a process crash (a real pre-push review finding).
+ */
 function sendHomesChangedAndWaitAck(worker: any, database: string): Promise<void> {
 	const requestId = nextHomesChangedRequestId++;
 	const wait = waitForHomesChangedAck(requestId, HOMES_CHANGED_ACK_TIMEOUT_MS, database, 'a worker');
 	try {
 		worker.postMessage({ type: 'record-lock-homes-changed', database, requestId });
 	} catch (error) {
-		pendingHomesChangedAcks.delete(requestId);
 		logger.debug?.(`Could not notify a worker of a record lock home map change for ${database}`, error);
-		return Promise.reject(
-			new ClientError(`Could not notify a worker of a record lock home map change for ${database}`, 503)
-		);
+		pendingHomesChangedAcks.get(requestId)?.(false);
 	}
 	return wait;
 }
@@ -345,9 +348,9 @@ onRecordLockHomesChanged(async (database) => {
 		try {
 			parentPort!.postMessage({ type: 'record-lock-homes-changed', database, requestId });
 		} catch (error) {
-			pendingHomesChangedAcks.delete(requestId);
+			// Settle the already-armed entry rather than abandon it — see `sendHomesChangedAndWaitAck`.
 			logger.debug?.(`Could not notify main of a record lock home map change for ${database}`, error);
-			throw new ClientError(`Could not notify main of a record lock home map change for ${database}`, 503);
+			pendingHomesChangedAcks.get(requestId)?.(false);
 		}
 		await wait;
 	} else {
