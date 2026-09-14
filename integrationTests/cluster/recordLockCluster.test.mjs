@@ -262,11 +262,14 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 		const seen = results.map((result) => result.body.n);
 		for (const n of seen) assert.ok(n >= 1 && n <= N, `n=${n} is outside the admitted range [1, ${N}]: ${seen}`);
 		// A handoff here carries exclusion but not yet successor freshness (harper#2542): a successor can
-		// read its predecessor's pre-write value, so two admitted increments can legitimately land on the
-		// same n (RECORD_LOCK_COST_DELEGATIONS.md measures 0.05-0.13% of sections at 3 contenders). What
-		// exclusion alone guarantees is that every node converges to the SAME final value — not that the
-		// value is N (a real pre-push review finding: the prior strict [1..N] assertion could flake on
-		// exactly the race this phase does not yet close).
+		// read its predecessor's pre-write value, so a FEW admitted increments can legitimately land on the
+		// same n (RECORD_LOCK_COST_DELEGATIONS.md measures 0.05-0.13% of sections at 3 contenders). A range
+		// check alone cannot tell that apart from no exclusion at all (every request reading the unwritten
+		// n=0 and writing 1) — a real pre-push review finding — so also require nearly every value distinct.
+		const distinctValues = new Set(seen).size;
+		assert.ok(distinctValues >= N - 2, `too many admitted increments collided, exclusion did not serialize access: ${seen}`);
+		// What exclusion alone guarantees is that every node converges to the SAME final value — not that
+		// the value is N (the prior strict [1..N] convergence assertion could flake on the same race).
 		const finalValues = await waitForCondition(
 			async (signal) => {
 				const values = await Promise.all(nodes.map((node) => counter(node, id, signal).then((record) => record?.n)));
