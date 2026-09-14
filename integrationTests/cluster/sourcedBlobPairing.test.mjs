@@ -29,6 +29,11 @@ const WORKERS = Number(process.env.HARPER_645_WORKERS ?? 2);
 // neither caps it at local time and both store exactly this version.
 const TIE_BACKDATE_MS = 3600_000;
 const BARRIER_MS = 10000;
+// Each bootstrap phase gets one budget rather than one per attempt: retry counts times a per-request
+// timeout let a node that accepts connections without answering burn the whole 25-minute cluster job
+// (.github/workflows/integration-tests.yaml) before any phase reports its own diagnostic, and this
+// file bootstraps twice — once per storage engine.
+const BOOTSTRAP_PHASE_MS = 120000;
 // Restages are budgeted for the whole suite, not per trial: one unstaged race is a scheduling
 // accident worth retrying, but a race that can never be staged must fail inside the suite timeout
 // rather than spend TRIALS x attempts x the barrier window discovering it.
@@ -38,9 +43,10 @@ const RESTAGE_BUDGET = 3;
 // `tied-late` has to be settled by the cache-fill resolution itself, at an equal version.
 //
 // A third shape — both fills concurrent AND at an equal version, so each node commits its own
-// record before its peer's arrives — is deliberately absent: it does not converge on current main,
-// on either engine, and that is a product defect rather than something this regression can assert.
-// See the PR body for the reproduction.
+// record before its peer's arrives — is deliberately absent: it does not converge, on either
+// engine. The replicas settle holding each other's record at the same version, which is an open
+// defect rather than a property this regression can assert. Adding
+// `{ id: 'tied', stagger: false, tied: true }` here reproduces it.
 const SHAPES = [
 	{ id: 'distinct', stagger: false, tied: false },
 	{ id: 'tied-late', stagger: true, tied: true },
@@ -122,23 +128,18 @@ function startBarrierOrigin() {
 	});
 }
 
-async function rawOperation(node, operation) {
+async function rawOperation(node, operation, deadline) {
 	try {
 		const response = await fetch(node.operationsAPIURL, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(operation),
-			// bounds a node that accepts the connection but never answers, so a stuck attempt
-			// still frees the retry loop instead of outliving it — generous like the other
-			// cluster tests' bootstrap-operation timeouts, since add_node/create_authentication_tokens
-			// are heavier than a status probe
-			signal: AbortSignal.timeout(20000),
+			signal: AbortSignal.timeout(Math.max(1, Math.min(20000, deadline - Date.now()))),
 		});
 		return { status: response.status, body: await response.json() };
 	} catch (error) {
-		// node's fetch wraps a connection error as generic "fetch failed" and puts the actual
-		// code (ECONNREFUSED etc.) on error.cause — surface it so the retry classification below
-		// can still recognize a retryable connection error, not just an abort/timeout.
+		// node's fetch reports a connection failure as a generic "fetch failed" and puts the code on
+		// error.cause, where the retry classification below cannot see it.
 		const cause = error.cause?.code ? ` (${error.cause.code})` : '';
 		return { status: 500, body: { error: error.message + cause } };
 	}
@@ -146,31 +147,34 @@ async function rawOperation(node, operation) {
 
 async function connectNodes(nodeA, nodeB) {
 	let token;
-	for (let i = 0; i < 20 && !token; i++) {
-		const response = await rawOperation(nodeA, {
-			operation: 'create_authentication_tokens',
-			authorization: nodeA.admin,
-		});
+	let deadline = Date.now() + BOOTSTRAP_PHASE_MS;
+	while (!token && Date.now() < deadline) {
+		const response = await rawOperation(
+			nodeA,
+			{ operation: 'create_authentication_tokens', authorization: nodeA.admin },
+			deadline
+		);
 		token = response.status === 200 && response.body.operation_token;
 		if (!token) await delay(300);
 	}
 	if (!token) throw new Error('Failed to obtain replication token');
 
 	let connected = false;
-	for (let i = 0; i < 30 && !connected; i++) {
-		const response = await rawOperation(nodeB, {
-			operation: 'add_node',
-			rejectUnauthorized: false,
-			hostname: nodeA.hostname,
-			authorization: `Bearer ${token}`,
-		});
+	deadline = Date.now() + BOOTSTRAP_PHASE_MS;
+	while (!connected && Date.now() < deadline) {
+		const response = await rawOperation(
+			nodeB,
+			{ operation: 'add_node', rejectUnauthorized: false, hostname: nodeA.hostname, authorization: `Bearer ${token}` },
+			deadline
+		);
 		if (response.status === 200) connected = true;
 		else if (/ECONNREFUSED|ECONNRESET|connect |aborted|timeout/i.test(JSON.stringify(response.body))) await delay(500);
 		else throw new Error(`add_node failed (${response.status}): ${JSON.stringify(response.body)}`);
 	}
 	if (!connected) throw new Error('Timed out adding replication peer');
 
-	for (let i = 0; i < 60; i++) {
+	deadline = Date.now() + BOOTSTRAP_PHASE_MS;
+	while (Date.now() < deadline) {
 		const statuses = await Promise.all(
 			[nodeA, nodeB].map((node) =>
 				sendOperation(node, { operation: 'cluster_status' }, { signal: AbortSignal.timeout(5000) }).catch(() => null)
@@ -230,13 +234,23 @@ async function requestJsonRetrying(url, agent, options, attempts = 10, delayMs =
 
 async function pinWorkers(node) {
 	const byThread = new Map();
-	for (let i = 0; i < 40 && byThread.size < WORKERS; i++) {
-		const agent = new Agent({ keepAlive: true, maxSockets: 1 });
-		const probe = await requestJson(`${node.httpURL}/PairWorker/probe-${i}`, agent);
-		if (byThread.has(probe.threadId)) agent.destroy();
-		else byThread.set(probe.threadId, agent);
+	try {
+		for (let i = 0; i < 40 && byThread.size < WORKERS; i++) {
+			const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+			// a worker still coming up answers 5xx; keep probing rather than aborting the bootstrap
+			const probe = await requestJson(`${node.httpURL}/PairWorker/probe-${i}`, agent).catch(() => null);
+			if (!probe || byThread.has(probe.threadId)) {
+				agent.destroy();
+				if (!probe) await delay(100);
+			} else byThread.set(probe.threadId, agent);
+		}
+		equal(byThread.size, WORKERS, `expected ${WORKERS} addressable workers on ${node.hostname}`);
+	} catch (error) {
+		// the after() hook can only destroy agents it was handed, and it is never handed these:
+		// pinWorkers runs inside a Promise.all whose rejection leaves ctx.agentsByNode unassigned.
+		for (const agent of byThread.values()) agent.destroy();
+		throw error;
 	}
-	equal(byThread.size, WORKERS, `expected ${WORKERS} addressable workers on ${node.hostname}`);
 	return byThread;
 }
 
@@ -366,6 +380,9 @@ async function raceTrial(ctx, id, shape) {
 	const pendingFills = Promise.all(
 		ctx.nodes.map((node, index) => requestJson(`${node.httpURL}/PairRecord/${id}`, fillAgents[index]))
 	);
+	// releaseLateFill awaits real I/O before this is awaited below, so a fill that rejects meanwhile
+	// would reach node as an unhandled rejection and take the runner down instead of failing a trial.
+	pendingFills.catch(() => {});
 	const lateFillRacedAPeer = shape.stagger ? await releaseLateFill(ctx, id) : true;
 	const fills = await pendingFills;
 	const originTrial = ctx.origin.trial(id);
