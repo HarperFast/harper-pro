@@ -30,10 +30,10 @@ const WORKERS = Number(process.env.HARPER_645_WORKERS ?? 2);
 const TIE_BACKDATE_MS = 3600_000;
 const BARRIER_MS = 10000;
 // One budget per bootstrap phase, not per attempt: retry count times a per-request timeout otherwise
-// lets a node that accepts connections without answering outlast both the suite budget above and the
-// 25-minute cluster job (.github/workflows/integration-tests.yaml), reporting neither phase's own
-// diagnostic. Four phases at this budget stay inside one suite timeout, and this file bootstraps
-// twice — once per storage engine.
+// lets a node that accepts connections without ever answering outlast the 25-minute cluster job
+// (.github/workflows/integration-tests.yaml) without any phase reporting its own diagnostic. Four
+// phases at this budget, twice over because this file bootstraps once per storage engine, is 8
+// minutes of that budget.
 const BOOTSTRAP_PHASE_MS = 60000;
 // Restages are budgeted for the whole suite, not per trial: one unstaged race is a scheduling
 // accident worth retrying, but a race that can never be staged must fail inside the suite timeout
@@ -52,6 +52,14 @@ const SHAPES = [
 	{ id: 'distinct', stagger: false, tied: false },
 	{ id: 'tied-late', stagger: true, tied: true },
 ];
+
+// Waits for every task before rethrowing, so each one has published whatever it allocated to the
+// suite context and after() can tear all of it down.
+async function settleAll(tasks) {
+	const settled = await Promise.allSettled(tasks);
+	const failed = settled.find((result) => result.status === 'rejected');
+	if (failed) throw failed.reason;
+}
 
 function respondTo(state, pending) {
 	if (pending.answered) return;
@@ -103,8 +111,6 @@ function startBarrierOrigin() {
 			const pending = { ...call, token, res, answered: false };
 			state.calls.push(pending);
 			if (state.released) respondTo(state, pending);
-			// a staggered trial parks its second fill for the test to release; the timer only ever
-			// keeps a parked fill from hanging forever
 			else if (state.stagger && state.calls.length === 1) respondTo(state, pending);
 			else if (!state.stagger && state.calls.length >= 2) releaseTrial(state, false);
 			else state.timer ??= setTimeout(() => releaseTrial(state, true), BARRIER_MS);
@@ -460,7 +466,9 @@ function sourcedBlobPairing(ctx) {
 			{ name: ctx.name, harper: { hostname: hostnameB, dataRootDir: dataRootDirB } },
 		];
 		ctx.nodes = [];
-		await Promise.all(
+		// allSettled, not all: a rejection here runs after(), and a sibling that is still starting
+		// would publish its node afterwards — an orphaned Harper holding its ports past the run.
+		await settleAll(
 			contexts.map(async (nodeCtx, index) => {
 				try {
 					await startHarper(nodeCtx, {
@@ -474,18 +482,15 @@ function sourcedBlobPairing(ctx) {
 						env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_ORIGIN_URL: ctx.origin.url },
 					});
 				} finally {
-					// startHarper REPLACES nodeCtx.harper rather than filling it in, so the handle only
-					// exists once it returns — capture it even when it throws, or a half-started node is
-					// orphaned past after()
+					// startHarper REPLACES nodeCtx.harper, so whatever teardown gets has to be read back
+					// off nodeCtx here rather than from the object handed in
 					ctx.nodes[index] = nodeCtx.harper;
 				}
 			})
 		);
 		await connectNodes(...ctx.nodes);
-		// assigned per node rather than from Promise.all, so one node's failure does not strand the
-		// agents the other already opened
 		ctx.agentsByNode = [];
-		await Promise.all(ctx.nodes.map(async (node, index) => (ctx.agentsByNode[index] = await pinWorkers(node))));
+		await settleAll(ctx.nodes.map(async (node, index) => (ctx.agentsByNode[index] = await pinWorkers(node))));
 	});
 
 	after(async () => {
