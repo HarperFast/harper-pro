@@ -8,6 +8,7 @@ const logger = harperLogger.forComponent('replication').conditional;
 
 export const CLONE_ATTEMPT_FILE = '.cloneAttempt.json';
 export const CLONE_COMPLETION_GRACE_MS = 60_000;
+export const CLONE_COMPLETED_AT_ENV = 'HARPER_CLONE_COMPLETED_AT';
 
 type CloneAttemptMarker = {
 	attemptId?: unknown;
@@ -34,7 +35,7 @@ export function completeCloneAttempt(rootPath: string, completedAt = Date.now())
 		logger.warn?.('Could not read the clone attempt while marking it complete', error);
 		return undefined;
 	}
-	if (typeof marker.attemptId !== 'string') return undefined;
+	if (typeof marker?.attemptId !== 'string') return undefined;
 	try {
 		const temporaryPath = `${path}.${process.pid}.tmp`;
 		writeFileSync(temporaryPath, JSON.stringify({ ...marker, completedAt }), { encoding: 'utf8', mode: 0o600 });
@@ -51,7 +52,8 @@ export function completeCloneAttempt(rootPath: string, completedAt = Date.now())
  * *process* is a clone run (a plain `harper run` restart never sets it, so a marker left by a killed
  * clone authorizes nothing), and the marker proves the attempt has not been retired (clearing the variable
  * on the main thread leaves every already-running worker's inherited copy set). A completed marker remains
- * eligible only for the bounded reverse-connect grace. A marker that names no source reads as no attempt.
+ * eligible only for the bounded reverse-connect grace; an inherited completion time provides the same bound
+ * across an internal restart if stamping the marker failed. A marker that names no source reads as no attempt.
  */
 export function cloneAttemptSource(rootPath: string = get(CONFIG_PARAMS.ROOTPATH)): string | undefined {
 	try {
@@ -59,17 +61,19 @@ export function cloneAttemptSource(rootPath: string = get(CONFIG_PARAMS.ROOTPATH
 		const path = cloneAttemptPath(rootPath);
 		if (!existsSync(path)) return undefined;
 		const marker: CloneAttemptMarker = JSON.parse(readFileSync(path, 'utf8'));
-		if (marker.completedAt !== undefined) {
+		const completedAt = marker?.completedAt ?? process.env[CLONE_COMPLETED_AT_ENV];
+		if (completedAt !== undefined) {
 			const now = Date.now();
+			const parsedCompletedAt = typeof completedAt === 'string' ? Number(completedAt) : completedAt;
 			if (
-				typeof marker.completedAt !== 'number' ||
-				!Number.isFinite(marker.completedAt) ||
-				marker.completedAt - now > CLONE_COMPLETION_GRACE_MS ||
-				marker.completedAt + CLONE_COMPLETION_GRACE_MS <= now
+				typeof parsedCompletedAt !== 'number' ||
+				!Number.isFinite(parsedCompletedAt) ||
+				parsedCompletedAt - now > CLONE_COMPLETION_GRACE_MS ||
+				parsedCompletedAt + CLONE_COMPLETION_GRACE_MS <= now
 			)
 				return undefined;
 		}
-		const source = marker.leaderHost;
+		const source = marker?.leaderHost;
 		return typeof source === 'string' && source ? source : undefined;
 	} catch (error) {
 		// A marker that cannot be read disables the base-copy filter for the rest of the clone, and nothing

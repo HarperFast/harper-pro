@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import {
 	CLONE_ATTEMPT_FILE,
 	CLONE_COMPLETION_GRACE_MS,
+	CLONE_COMPLETED_AT_ENV,
 	cloneAttemptPath,
 	cloneAttemptSource,
 	completeCloneAttempt,
@@ -21,18 +22,23 @@ import {
 describe('clone-attempt marker (#737)', () => {
 	let rootPath;
 	let priorAttempt;
+	let priorCompletedAt;
 	const writeMarker = (contents) => writeFileSync(cloneAttemptPath(rootPath), contents);
 
 	beforeEach(() => {
 		rootPath = mkdtempSync(join(tmpdir(), 'harper-clone-attempt-'));
 		priorAttempt = process.env.HARPER_CLONE_ATTEMPT;
+		priorCompletedAt = process.env[CLONE_COMPLETED_AT_ENV];
 		process.env.HARPER_CLONE_ATTEMPT = 'attempt-under-test';
+		delete process.env[CLONE_COMPLETED_AT_ENV];
 	});
 
 	afterEach(() => {
 		rmSync(rootPath, { recursive: true, force: true });
 		if (priorAttempt === undefined) delete process.env.HARPER_CLONE_ATTEMPT;
 		else process.env.HARPER_CLONE_ATTEMPT = priorAttempt;
+		if (priorCompletedAt === undefined) delete process.env[CLONE_COMPLETED_AT_ENV];
+		else process.env[CLONE_COMPLETED_AT_ENV] = priorCompletedAt;
 	});
 
 	it('has no source with no marker on disk', () => {
@@ -47,6 +53,18 @@ describe('clone-attempt marker (#737)', () => {
 	it('reports the host during the completed-at grace', () => {
 		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example', completedAt: Date.now() }));
 		assert.equal(cloneAttemptSource(rootPath), 'leader.example');
+	});
+
+	it('uses the inherited completion time when the disk stamp is absent', () => {
+		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example' }));
+		process.env[CLONE_COMPLETED_AT_ENV] = String(Date.now());
+		assert.equal(cloneAttemptSource(rootPath), 'leader.example');
+	});
+
+	it('expires an unstamped marker using the inherited completion time', () => {
+		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example' }));
+		process.env[CLONE_COMPLETED_AT_ENV] = String(Date.now() - CLONE_COMPLETION_GRACE_MS);
+		assert.equal(cloneAttemptSource(rootPath), undefined);
 	});
 
 	it('has no source after the completed-at grace', () => {
@@ -95,6 +113,12 @@ describe('clone-attempt marker (#737)', () => {
 
 	it('reports a completion-marker read failure so the caller can fail open', () => {
 		assert.equal(completeCloneAttempt(rootPath, 1234), undefined);
+	});
+
+	it('fails open for a null marker during completion and source lookup', () => {
+		writeMarker('null');
+		assert.equal(completeCloneAttempt(rootPath, 1234), undefined);
+		assert.equal(cloneAttemptSource(rootPath), undefined);
 	});
 
 	it('retains the attempt identity when only the completion stamp fails', () => {

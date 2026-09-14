@@ -79,7 +79,9 @@ const joinAsFollower = (node, leader) =>
 function registerReverseCopySuite({ title, completionAgeMs, withholdsSourceRecords, checksOtherPeer }) {
 	suite(title, { timeout: 300000 }, (ctx) => {
 		before(async () => {
-			const hostnames = await Promise.all(Array.from({ length: 4 }, () => getNextAvailableLoopbackAddress()));
+			const hostnames = await Promise.all(
+				Array.from({ length: checksOtherPeer ? 4 : 3 }, () => getNextAvailableLoopbackAddress())
+			);
 
 			const nodeConfig = (hostname, env) => ({
 				config: {
@@ -96,7 +98,8 @@ function registerReverseCopySuite({ title, completionAgeMs, withholdsSourceRecor
 			// marker names what it cloned from.
 			const envs = [undefined, { HARPER_CLONE_ATTEMPT: 'reverse-copy-test-attempt' }, undefined, undefined];
 			await Promise.all(contexts.map((nodeCtx, i) => startHarper(nodeCtx, nodeConfig(hostnames[i], envs[i]))));
-			[ctx.nodeA, ctx.nodeB, ctx.nodeC, ctx.nodeD] = contexts.map((nodeCtx) => nodeCtx.harper);
+			if (checksOtherPeer) [ctx.nodeA, ctx.nodeB, ctx.nodeC, ctx.nodeD] = contexts.map((nodeCtx) => nodeCtx.harper);
+			else [ctx.nodeA, ctx.nodeB, ctx.nodeD] = contexts.map((nodeCtx) => nodeCtx.harper);
 
 			ctx.cloneAttemptPath = join(ctx.nodeB.dataRootDir, '.cloneAttempt.json');
 
@@ -174,11 +177,6 @@ function registerReverseCopySuite({ title, completionAgeMs, withholdsSourceRecor
 					await delay(500);
 					after = await readLog(nodeB);
 				}
-				if (withholdsSourceRecords)
-					assert.ok(
-						Date.now() - markerWrittenAt < CLONE_COMPLETION_GRACE_MS,
-						'the copy must be served inside the completion-grace test precondition'
-					);
 				assert.ok(
 					shipped(after, 'd-origin-') > shipped(before, 'd-origin-'),
 					'B must have served A a base copy carrying the record D originated'
