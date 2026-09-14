@@ -100,7 +100,11 @@ async function rawOperation(node, operation) {
 		});
 		return { status: response.status, body: await response.json() };
 	} catch (error) {
-		return { status: 500, body: { error: error.message } };
+		// node's fetch wraps a connection error as generic "fetch failed" and puts the actual
+		// code (ECONNREFUSED etc.) on error.cause — surface it so the retry classification below
+		// can still recognize a retryable connection error, not just an abort/timeout.
+		const cause = error.cause?.code ? ` (${error.cause.code})` : '';
+		return { status: 500, body: { error: error.message + cause } };
 	}
 }
 
@@ -354,9 +358,8 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 
 			await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 			await waitForAllWorkers(ctx.nodes, id, ctx.agentsByNode, 'PairPointProbe');
-			// waitForAllWorkers only proves every worker's raw/cached version+token match; it never
-			// captures a full record. Re-scan here to get the full per-node records the deepEqual
-			// and payloadToken checks below compare.
+			// waitForAllWorkers's stability check only compares version/token; capture the current
+			// node[0]/node[1] pair here for the full-record deepEqual/payloadToken checks below.
 			const scans = await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 			deepEqual(scans[0].record, scans[1].record, `${id} raw stores must converge`);
 			equal(scans[0].record.payloadToken, scans[0].record.token, `${id} raw record/blob pairing`);
