@@ -484,9 +484,14 @@ any classification — topping out at 0.13 ms.
 `remoteHome.min`, measurement 1's cheapest remote-home lock — an absolute latency that still includes
 the local key lock. It is compared against `deltaMs`, which has the local key lock already subtracted.
 A round landing at exactly that absolute floor would read as a delta below the cut and be
-misclassified as served locally rather than a lapse. Not corrected here — doing so changes the
-threshold formula and would need the bench re-run, which the pinned `core` does not currently allow
-(see above) — so it is left as a known undercount rather than an unmeasured one.
+misclassified as served locally rather than a lapse. Not a simple threshold lower, though: every
+tick's `deltaMs` is already in the committed JSON, so reclassification is an offline check — and
+applying the naive fix (floor minus the local reference, ≈0.10 ms) to run 1's 300 s row pulls two
+known-local ticks (40 s, delta 0.100 ms; 150 s, delta 0.118 ms — neither on a window multiple, both
+inside that row's own local-reference range) across the cut as false lapses. The floor needs a
+better basis than "measurement 1's cheapest remote-home lock minus a fixed local reference", not
+just a lower number, and that is a design change to the classifier rather than a data fix — left as
+a known undercount rather than silently changed.
 
 **At the 60 s window the prediction is exact, in all three runs.** Three lapses in 36 ticks, at 60 s,
 120 s and 180 s, every one of them on a window multiple: `0.0833` measured against `0.0833` predicted.

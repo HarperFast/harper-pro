@@ -252,8 +252,7 @@ async function contend(node, id, durationMs) {
  * section read a distinct value and a committed write did not survive.
  */
 function writtenValueAudit(answers, finalCounter) {
-	// Per value, every node that has written it — not just the first — so a node repeating its own
-	// write after another node wrote the same value is not misattributed to that other node.
+	// Per value, every node that has written it — a same-node repeat is not a cross-node duplicate.
 	const seen = new Map();
 	const repeated = [];
 	for (const [node, answer] of answers.entries())
