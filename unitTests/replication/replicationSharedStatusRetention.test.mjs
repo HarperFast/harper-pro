@@ -1,12 +1,7 @@
 /**
- * The (database, peer) status buffer is engine-owned shared memory, and the engine frees it — along with
- * any notify callback registered on it — once every ArrayBuffer view has been collected
- * (@harperfast/rocksdb-js). Readers here build throwaway views, so without a retained one the buffer is
- * reclaimed as soon as the owning worker's thread is gone and the next resolution returns zeroed memory:
- * the worker-exit close code, replication progress and the R4 fire counters silently reset (harper-pro#431).
- *
- * The fake store below models exactly that: `getUserSharedBuffer` allocates a fresh zeroed buffer on every
- * call, so anything that survives a second resolution survived only because this module retained it.
+ * The fake store models the engine's post-GC behavior (harper-pro#431): `getUserSharedBuffer` allocates a
+ * fresh zeroed buffer on every call, so anything that survives a second resolution survived only because
+ * `knownNodes.ts` retained it.
  */
 
 import { expect } from 'chai';
@@ -27,7 +22,7 @@ function fakeAuditStore() {
 	return store;
 }
 
-// Each case uses its own database name so the module-level retention of one cannot mask another.
+// Each case uses its own database name so one case's retention cannot mask another's.
 let nextDatabase = 0;
 const database = () => `retention-db-${nextDatabase++}`;
 
@@ -73,7 +68,6 @@ describe('replication shared status retention (harper-pro#431)', () => {
 
 		expect(fresh).to.not.equal(stale);
 		expect(fresh[CONNECTION_STATE_POSITION]).to.equal(0);
-		// Retention re-forms against the new store rather than being abandoned for this database.
 		expect(getReplicationSharedStatus(recreated, databaseName, 'peer-a')).to.equal(fresh);
 		expect(recreated.calls).to.deep.equal([`replicated/${databaseName}/peer-a`]);
 	});
@@ -88,8 +82,8 @@ describe('replication shared status retention (harper-pro#431)', () => {
 
 		expect(auditStore.callbacks).to.deep.equal([callback]);
 		expect(auditStore.calls).to.have.lengthOf(2);
-		// The callback-bearing view is the one retained, or the confirmation notifier's buffer would be the
-		// one the engine is free to reclaim.
+		// The callback-bearing view must be the retained one, or the notifier sits on the buffer the engine
+		// is free to reclaim.
 		expect(getReplicationSharedStatus(auditStore, databaseName, 'peer-a')).to.equal(registered);
 	});
 

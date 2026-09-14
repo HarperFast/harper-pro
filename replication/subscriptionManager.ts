@@ -1089,6 +1089,7 @@ export async function startOnMainThread(options) {
 					createdAt: Date.now(),
 				});
 				ensureWorkerExitHandler(worker);
+				retainSharedStatusForEntry(databaseName, nodes[0]?.name);
 			}
 			if (shouldSubscribe) {
 				let leaderUrl: string =
@@ -1389,6 +1390,21 @@ export async function startOnMainThread(options) {
 			)
 				reconcileWorkers();
 		});
+	}
+	// Resolve this (database, peer) buffer on the main thread as soon as the subscription entry exists,
+	// rather than waiting for the first reconcile tick up to RECONCILE_INTERVAL_MS later: the owning
+	// worker's own view is the only other thing keeping the engine allocation, so a worker that connects
+	// and exits inside that window would leave the stamp below with nothing but freshly zeroed memory to
+	// write into. Best effort — a database with no local tables yet has no audit store to resolve, and its
+	// first reconcile tick picks it up. (harper-pro#431)
+	function retainSharedStatusForEntry(databaseName: string, nodeName: string | undefined) {
+		if (!nodeName) return;
+		try {
+			const auditStore = getAuditStoreForDatabase(databaseName);
+			if (auditStore) getReplicationSharedStatus(auditStore, databaseName, nodeName);
+		} catch (error) {
+			logger.trace?.('Failed to retain replication connection truth for', databaseName, nodeName, error);
+		}
 	}
 	// Shared by both R1 writers (the exit handler above and the reconcile sweep below), so the two stamp
 	// identically. Ownership is the CALLER's guard; this only refuses to overwrite a state that is not

@@ -100,30 +100,33 @@ export function getHDBNodeTable(): HdbNodeTable {
 export const REPLICATION_SHARED_STATUS_SLOTS = 32;
 // The storage engine frees a named shared buffer — and its notify callback — once every ArrayBuffer view
 // of it has been collected (@harperfast/rocksdb-js). Every caller below builds a throwaway view, so with
-// no durable reference the buffer is reclaimed as soon as the owning worker's thread is gone, and the
-// next resolution silently hands back zeroed memory: connection truth, replication progress and the fire
+// no retained one the buffer is reclaimed as soon as the owning worker's thread is gone, and the next
+// resolution silently hands back zeroed memory: connection truth, replication progress and the fire
 // counters all reset. One view per (database, peer) is retained here so the allocation outlives worker
-// churn. Main thread only: it is the side with a defined teardown (clearReplicationSharedStatus on node
-// removal), and one live view anywhere in the process keeps the allocation, so retaining on a worker as
-// well would only defeat releaseSharedStatusOnUnsubscribe. (harper-pro#431)
-const retainedSharedStatus = new Map<string, { auditStore: any; byNode: Map<string, Float64Array> }>();
+// churn. Main thread only: one live view anywhere in the process keeps the allocation, the main thread is
+// the side with a defined release (clearReplicationSharedStatus on node removal), and retaining on a
+// worker as well would defeat releaseSharedStatusOnUnsubscribe. (harper-pro#431)
+// Weak against the audit store so a dropped database takes its retention, and the store itself, with it;
+// a recreated one is a different store over different memory and so starts empty.
+const retainedSharedStatus = new WeakMap<object, Map<string, Map<string, Float64Array>>>();
+function retainedStatusByNode(auditStore: any, databaseName: string): Map<string, Float64Array> {
+	let byDatabase = retainedSharedStatus.get(auditStore);
+	if (!byDatabase) retainedSharedStatus.set(auditStore, (byDatabase = new Map()));
+	let byNode = byDatabase.get(databaseName);
+	if (!byNode) byDatabase.set(databaseName, (byNode = new Map()));
+	return byNode;
+}
 export function getReplicationSharedStatus(
 	auditStore: any,
 	databaseName: string,
 	node_name: string,
 	callback?: () => void
 ) {
-	let retained = isMainThread ? retainedSharedStatus.get(databaseName) : undefined;
-	// A dropped-and-recreated database resolves a different audit store over different memory, so the
-	// views retained for the old one describe a buffer nothing writes any more.
-	if (retained && retained.auditStore !== auditStore) {
-		retainedSharedStatus.delete(databaseName);
-		retained = undefined;
-	}
+	const retained = isMainThread ? retainedStatusByNode(auditStore, databaseName) : undefined;
 	// A callback has to reach the engine to be registered, so a registering call always re-resolves; its
 	// view addresses the same memory and becomes the retained one.
 	if (retained && !callback) {
-		const cached = retained.byNode.get(node_name);
+		const cached = retained.get(node_name);
 		if (cached) return cached;
 	}
 	// This buffer is process-local shared memory (shared across this node's threads via
@@ -136,10 +139,7 @@ export function getReplicationSharedStatus(
 			callback && { callback }
 		)
 	);
-	if (isMainThread) {
-		if (!retained) retainedSharedStatus.set(databaseName, (retained = { auditStore, byNode: new Map() }));
-		retained.byNode.set(node_name, status);
-	}
+	retained?.set(node_name, status);
 	return status;
 }
 // A node removed and re-added inside one process resolves the SAME buffer (harper-pro#431), so without
@@ -147,10 +147,12 @@ export function getReplicationSharedStatus(
 // whole buffer: every field in it describes the membership that just left.
 export function clearReplicationSharedStatus(auditStore: any, databaseName: string, node_name: string): boolean {
 	if (!auditStore || !databaseName || !node_name) return false;
-	getReplicationSharedStatus(auditStore, databaseName, node_name).fill(0);
-	// Drop the retention above with the membership it was held for, so the engine reclaims the buffer —
-	// and the confirmation notifier registered on it — exactly when it did before that retention existed.
-	retainedSharedStatus.get(databaseName)?.byNode.delete(node_name);
+	const status = getReplicationSharedStatus(auditStore, databaseName, node_name);
+	// Released before the zeroing, not after, so the engine reclaims the departed membership's buffer — and
+	// the confirmation notifier registered on it — exactly as it did before this retention existed, even if
+	// zeroing a view the engine has already detached throws.
+	retainedSharedStatus.get(auditStore)?.get(databaseName)?.delete(node_name);
+	status.fill(0);
 	return true;
 }
 // If the async iterator for hdb_nodes throws or completes, the watcher used to die silently
