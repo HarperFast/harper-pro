@@ -15,4 +15,9 @@ Runs 1–3 are the three the document reports distributions and spread from. Run
 the hot-key round past `DEFAULT_LOCK_TIMEOUT_MS` (30 s), which is what turns the starved contender's
 wait into a 423; its measurement-6 numbers are deliberately truncated and should not be read.
 
-All four were produced by the bench as committed.
+All four were produced by the bench as committed. One exception: with both leases in
+`REACQUISITION_LEASES_MS` (300 s, 240 s) and `RECORD_LOCK_BENCH_REACQ_RUN_MS=1`, measurement 6 should
+save one `reacquisition` entry per lease — `delegations-run-4-starvation-40s.json` has only the first
+(300 s / 60 s window). The exact environment for that run was not recorded closely enough to say
+whether the second lease's iteration threw, and this is consistent with the "should not be read"
+caveat above rather than a contradiction of it.

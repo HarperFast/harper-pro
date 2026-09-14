@@ -29,11 +29,25 @@ that _are_ sensitive are measurement 1's pooled figure and measurement 5's absol
 neither carries an argument here that depends on a small difference. Re-measuring the before-figures
 on this substrate would need the Ricart–Agrawala code back, which the branch has deleted.
 
-**Which code this measures.** harper-pro#822's branch head with the `core` submodule at the current
-harper#2498 head. #822 had pinned `core` at a commit that a later force-push of
-`feat/record-lock-phase1` left unreachable, four commits behind — two of which change grant and
-delegation holding directly, which is what measurements 2 and 3 exist to exercise — so measuring the
-old pin would have measured code that is not going to ship.
+**Which code this measures.** harper-pro#822's branch head with the `core` submodule at
+`729aefd233cd8e083803ddbc5b070b4108e40d25`, the harper#2498 head at measurement time. #822 had
+pinned `core` at a commit that a later force-push of `feat/record-lock-phase1` left unreachable, four
+commits behind — two of which change grant and delegation holding directly, which is what
+measurements 2 and 3 exist to exercise — so measuring the old pin would have measured code that is
+not going to ship.
+
+**The committed `core` pointer has since moved past that, and is not currently re-runnable.** This
+branch was rebased onto `feat/record-lock-cluster-transport`, which independently re-pinned `core` to
+`71d32bf6d8cef27093e42ce6d260335e8e9ef940` — 62 commits ahead of `729aefd2`, including harper#2498's
+own replacement of the membership epoch with an operator-agreed home map
+(`ClusterLockTransport.homeMap()` instead of `.epoch()`). harper-pro's
+`replication/recordLockTransport.ts` still implements the old `.epoch()`-shaped transport; core's
+`registerClusterLockTransport` requires `homeMap()` at `resources/recordLockCoordinator.ts:1518-1524`
+and throws otherwise. So as of this rebase, `npm run bench:record-locks` cannot start a
+`replication.recordLocks`-enabled cluster at all against the pinned `core` — the numbers above remain
+exactly what was measured at `729aefd2`, but re-running them today would require harper-pro's
+transport to be updated to `homeMap()` first. That update is out of scope here; tracked as a Finding
+on the dispatch task rather than fixed in this PR.
 
 **What the protocol does not yet do, which two rows below depend on.** Core's coordinator states at
 `resources/recordLockCoordinator.ts:43` that the successor-freshness fence of §7 — the inherited
@@ -206,11 +220,11 @@ monopolization — which would at least be cheap:
   and then **won the re-grant race back**, ~596 times out of 597. The full recall machinery ran six
   hundred times and moved the key to the asking node once.
 
-**Why the holder keeps winning that race is not settled here, and it should be before enablement.**
-The plausible reason is that it races from a standing start: a recall forces the holder's own next
-lock to re-request (`#liveDelegation` refuses a recalled delegation), so it is already asking when the
-release lands, and if it is also the key's **home** its re-request is `#grantLocally`, a function
-call, against a round trip for everyone else.
+**Why the holder keeps winning that race is now well supported by data already collected, though not
+proven from a purpose-built instrument.** The plausible reason is that it races from a standing
+start: a recall forces the holder's own next lock to re-request (`#liveDelegation` refuses a recalled
+delegation), so it is already asking when the release lands, and if it is also the key's **home** its
+re-request is `#grantLocally`, a function call, against a round trip for everyone else.
 
 Two observations point that way without settling it. The winner is not a fixed node — run 3 reverses
 it — so it is a property of the key rather than of node or start order. And in a separate run where
@@ -218,12 +232,34 @@ the key was deliberately touched from all three nodes before the round, the 2-co
 from 100 % / 0 % to 66 % / 34 %, which is what one would expect if the advantage belongs to whoever
 holds first rather than to a node.
 
-An attempt to attribute the winner to the key's home directly was **abandoned rather than reported**:
-the only signal a fixture can read is the coordinator's grant gauge, and that moves only on a lock
-that mints a grant where none existed — so it answers for the first node asked and is silently false
-for every node after it, and asking at all moves the delegation and changes the round it is trying to
-describe. The instrument was removed rather than shipped with those semantics. Settling this needs a
-counter core does not currently expose.
+**The key's home for each round is derivable from data already in the committed JSON, and it settles
+most of the above.** `LockStats` exposes each node's coordinator `stats.granted`
+(`core/resources/recordLockCoordinator.ts:699-713`), which is `#grants.size` — the count of keys this
+node currently holds an outstanding home-issued delegation grant for. A fresh key's first grant moves
+it by exactly one, on exactly the home node, and every run already snapshots `lockStats` before and
+after each round (`repeat.lockStats`, `hotKey[i].lockStats`). Diffing consecutive snapshots gives the
+home without any new instrumentation:
+
+| run      | contenders | home                            | split                             |
+| -------- | ---------- | ------------------------------- | --------------------------------- |
+| 1        | 2          | node 2 (idle — not a contender) | 58 % / 42 % (9017 / 6475)         |
+| 1        | 3          | node 1                          | 66 % (12348 / 18690)              |
+| 2        | 2          | node 0                          | 100 % (25691 / 1)                 |
+| 2        | 3          | node 0                          | 66 % (13637 / 20704)              |
+| 3        | 2          | node 0                          | 100 % (24826 / 1)                 |
+| 3        | 3          | node 2                          | **second**, 38 % vs node 0's 46 % |
+| 4 (40 s) | 2          | node 1                          | 100 % (55061 / 1)                 |
+| 4 (40 s) | 3          | node 0                          | 62 % (24541 / 39700)              |
+
+In every 2-contender round where the home is one of the two contenders (runs 2, 3 and 4), the home
+wins essentially all of it (100 % / 1). Run 1's 2-contender round is the one that split close to
+evenly (58/42) — and it is also the one round where the home is **not** a contender at all: neither
+node 0 nor node 1 holds the home advantage over the other there, so a near-even split between two
+non-home nodes is exactly what the home hypothesis predicts, not an exception to it. The one
+disagreement is run 3's 3-contender round, where the home came second rather than first — recorded
+rather than smoothed over. Settling this fully (a fourth contender's start order, or a purpose-built
+home counter core does not currently expose) is still open, but "not settled here" understated what
+the existing data already shows.
 
 **The zero in the 423 column is an artifact of the measurement window, and a fourth run confirms
 it.** `DEFAULT_LOCK_TIMEOUT_MS` is 30 s (`core/resources/recordLock.ts:23`) while the rounds above run
@@ -447,13 +483,20 @@ any classification — topping out at 0.13 ms.
 **At the 60 s window the prediction is exact, in all three runs.** Three lapses in 36 ticks, at 60 s,
 120 s and 180 s, every one of them on a window multiple: `0.0833` measured against `0.0833` predicted.
 
-**At the 120 s window there is one extra lapse per run that the lease does not explain.** Two of the
-three or four land on the window (120 s, 240 s); the rest fall at 100 s, 145 s and 185 s, and they are
-real rounds by the delta measure (0.35 ms and up), not marginal classifications. Something other than
-lease expiry is occasionally dropping a delegation. `#liveDelegation` also discards a delegation whose
-token is from a superseded epoch, which is the obvious candidate and is not investigated here.
-**It should be understood before a lease value is argued from these numbers**; it inflates the 120 s
-row's rate from the predicted 0.042 to 0.058–0.077.
+**At the 120 s window there is one extra lapse per run that the lease does not explain, and its delta
+margin is run-dependent.** Two of the three or four land on the window (120 s, 240 s); the rest fall
+at 100 s, 145 s and 185 s. Run 1's off-window lapse (145 s) is a clean 0.35 ms against that run's
+0.13 ms local-reference ceiling. Runs 2 and 3 are not: their off-window deltas are 0.238 ms (run 2,
+100 s), 0.239 ms (run 3, 100 s) and 0.196 ms (run 3, 185 s), against that same row's own
+served-locally delta tail of 0.12 ms (run 2, 120 s window) and 0.153 ms (run 3, 120 s window) —
+separated, but by as little as 0.043 ms rather than run 1's 0.22 ms. At this resolution runs 2 and
+3's off-window lapses are closer to unclassifiable than to run 1's clean case; treat them as
+suggestive rather than as confirmed real rounds. If real, something other than lease expiry is
+occasionally dropping a delegation — `#liveDelegation` also discards a delegation whose token is from
+a superseded epoch, which is the obvious candidate and is not investigated here. **It should be
+understood, and the run-2/3 classification firmed up, before a lease value is argued from these
+numbers**; treating all of them as real rounds inflates the 120 s row's rate from the predicted 0.042
+to 0.058–0.077 — the true inflation from runs 2 and 3 alone may be smaller.
 
 **The rate law.** A delegation is renewed in full on re-acquisition, so for a key accessed every
 `gap` with a local-serve window `W`:

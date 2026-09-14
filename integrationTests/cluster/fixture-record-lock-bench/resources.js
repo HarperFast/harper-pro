@@ -18,8 +18,8 @@ function coordinatorStats() {
 	try {
 		return tables.Counter.lockCoordinator?.stats;
 	} catch {
-		// The getter throws on an unusable node identity. Status reporting swallows that; a measurement
-		// must not, so callers that need a real answer check for undefined rather than reading 0.
+		// Status reporting swallows this; a measurement must not, so callers needing a real answer
+		// check for undefined rather than reading 0.
 		return undefined;
 	}
 }

@@ -55,8 +55,6 @@ const REACQUISITION_LEASES_MS = process.env.RECORD_LOCK_BENCH_REACQ_LEASES_MS
 	: [300_000, 240_000];
 const REACQUISITION_CADENCE_MS = Number(process.env.RECORD_LOCK_BENCH_REACQ_CADENCE_MS) || 5_000;
 const REACQUISITION_MAX_RUN_MS = Number(process.env.RECORD_LOCK_BENCH_REACQ_RUN_MS) || 260_000;
-/** Lower bound on what one cluster round costs, as a multiple of measurement 1's cheapest remote-home lock. */
-const CLUSTER_ROUND_FLOOR = 1;
 const OUT = process.env.RECORD_LOCK_BENCH_OUT || join(tmpdir(), `record-lock-cost-${Date.now()}.json`);
 
 const results = {
@@ -159,6 +157,11 @@ function waitForCounter(nodes, id, expected) {
 	);
 }
 
+// Three agreeing polls at 250 ms span only ~500 ms of stability; it does not prove convergence,
+// only that no disagreement was observed in that window. A replication batch already in flight
+// could still land after and change the counter, so `agreedCounter`/`lostUpdates` are a settled
+// snapshot, not a durability guarantee — the exact-audit fields (`writtenValueAudit`) are what the
+// document's numeric claims are actually built on.
 function waitForAgreedCounter(nodes, id) {
 	let previous;
 	let stablePolls = 0;
@@ -252,13 +255,17 @@ async function contend(node, id, durationMs) {
  * section read a distinct value and a committed write did not survive.
  */
 function writtenValueAudit(answers, finalCounter) {
+	// Per value, every node that has written it — not just the first — so a node repeating its own
+	// write after another node wrote the same value is not misattributed to that other node.
 	const seen = new Map();
 	const repeated = [];
 	for (const [node, answer] of answers.entries())
 		for (const n of answer.written) {
-			const first = seen.get(n);
-			if (first === undefined) seen.set(n, node);
-			else repeated.push({ n, nodes: [first, node] });
+			let writers = seen.get(n);
+			if (writers === undefined) seen.set(n, (writers = new Set()));
+			if (writers.size > 0)
+				repeated.push({ n, nodes: [writers.values().next().value, node], sameNode: writers.has(node) });
+			writers.add(node);
 		}
 	const total = answers.reduce((sum, answer) => sum + answer.written.length, 0);
 	// Not Math.max(...keys): a 40 s round writes 61k distinct values, past V8's argument limit.
@@ -267,7 +274,7 @@ function writtenValueAudit(answers, finalCounter) {
 	// Only below maxWritten — values above it were never reached, because a repeat consumed them.
 	const holes = [];
 	for (let n = 1; n <= maxWritten && holes.length < 20; n++) if (!seen.has(n)) holes.push(n);
-	const acrossNodes = repeated.filter((entry) => entry.nodes[0] !== entry.nodes[1]).length;
+	const acrossNodes = repeated.filter((entry) => !entry.sameNode).length;
 	return {
 		distinctValues: seen.size,
 		sections: total,
@@ -319,7 +326,7 @@ async function lockStats(nodes, signal) {
  * can carry entries into the next window. The Ricart-Agrawala baseline waited for one release per
  * round started; a delegation writes a release only when the key actually changes hands, and an
  * uncontended repeat writes nothing at all, so that boundary never arrives here. The
- * protocol-agnostic one is the log going quiet: two consecutive polls that add nothing.
+ * protocol-agnostic one is the log going quiet: three consecutive polls that add nothing.
  */
 async function logSnapshotAfter(nodes) {
 	const totals = (snapshot) =>
@@ -393,11 +400,6 @@ function splitByHome(acquireMs, homeLocal) {
  * third lock cannot have lapsed — the second either renewed the delegation or found it live — so it
  * is a local serve taken in the same request, on the same key, microseconds apart, and the
  * difference between the two is what the second lock did beyond serving locally.
- *
- * Comparing the absolute latency against a cut instead does not work, and reporting the local
- * population as "the samples under the cut" hides that it does not: the warm local tail reaches past
- * measurement 1's cheapest remote-home lock, so ticks at 0.2-0.27 ms were counted as lapses at
- * elapsed times the lease window says must still be local.
  */
 function classifyRounds(samples, thresholdMs) {
 	return { thresholdMs, rounds: samples.filter((sample) => sample.deltaMs >= thresholdMs) };
@@ -592,11 +594,14 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 			}
 			// The cheapest single cluster round measurement 1 saw, in this run, on this box. Absent only if
 			// no key in measurement 1 was homed elsewhere, which leaves nothing to calibrate against.
+			// This floor is an ABSOLUTE latency (cluster round + local key lock), but it is compared below
+			// against deltaMs, which has the local key lock already subtracted — so a round landing at the
+			// floor reads as a delta below it and is undercounted as served locally. Small at the measured
+			// magnitudes (floor ~0.15 ms, local reference tail ~0.15 ms), but it biases the measured rate down.
 			const remoteHome = results.uncontended.byHome.remoteHome;
 			assert.ok(remoteHome, 'measurement 1 saw no remote-home key; cannot calibrate a cluster round');
-			const thresholdMs = remoteHome.min * CLUSTER_ROUND_FLOOR;
+			const thresholdMs = remoteHome.min;
 			const { rounds } = classifyRounds(samples, thresholdMs);
-			// The probe's first lock is the cold acquisition every key pays once, not a lapse.
 			const servedLocally = samples.filter((sample) => sample.deltaMs < thresholdMs);
 			// Independent of the cut: the third lock of every tick, lapsed or not.
 			const localReference = distribution(samples.map((sample) => sample.servedLocallyMs));
