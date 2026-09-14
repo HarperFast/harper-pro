@@ -8,9 +8,9 @@
  *   (asserted to fire, with #525's structured telemetry present).
  *   DOES NOT PIN HERE: #523's actual up-correction path. The WS-open edge requires
  *   `this.nodeSubscriptions` to be populated, and later metadata/pong edges normally heal the bit.
- *   `truthResiduals.test.mjs` R5 pins the exceptional late-subscribe session deterministically
- *   with an environment-gated hook. This stress test only reports incidental correction-log
- *   evidence; do not make its timing-dependent count a hard assertion.
+ *   `truthResiduals.test.mjs` R5 instead synthesizes the desync with an environment-gated hook.
+ *   This stress test only reports incidental correction-log evidence; do not make its timing-dependent
+ *   count a hard assertion.
  */
 /**
  * QA-587: does the replication "connected bit" reconcile UP from shared-memory truth,
@@ -103,11 +103,11 @@ const FLOOD_CONCURRENCY = 15;
 // subscription) converged in ~1.8s every cycle with ZERO up-correction log lines: the
 // automatic retry reuses the SAME long-lived NodeReplicationConnection object, whose
 // `nodeSubscriptions` was already populated by the original add_node and never gets
-// cleared across a routine reconnect -- so the open handler's `nodeSubscriptions` guard is always
-// true and the edge fires cleanly every time. That test recipe only re-covers the ALREADY-covered normal retry path
-// (replicationReconnect.test.mjs), not harper-pro#289's "connect edge lost" race.
+// cleared across a routine reconnect -- so the open handler's `nodeSubscriptions` guard is always true
+// and the edge fires cleanly every time. That test recipe only re-covers the ALREADY-covered normal
+// retry path (replicationReconnect.test.mjs), not harper-pro#289's "connect edge lost" race.
 // Ordinary first-subscribe scheduling populates `nodeSubscriptions` before the handshake completes;
-// truthResiduals R5 injects the exceptional late-subscribe ordering. This stress pass instead holds
+// truthResiduals R5 injects a synthetic late-subscribe ordering. This stress pass instead holds
 // the leader down past the wedge threshold to exercise the disruptive forceResubscribe recovery path.
 const WEDGE_RECONCILE_THRESHOLD_MS = 30000; // subscriptionManager.ts WEDGE_RECONCILE_THRESHOLD_MS
 const RECONCILE_INTERVAL_MS = 5000; // subscriptionManager.ts RECONCILE_INTERVAL_MS (the sweep period)
@@ -482,8 +482,8 @@ suite(
 				// green, genuine SIGKILL" guarantees via the connection's own fast retry -- which
 				// never gives the internal edge-vs-truth desync (harper-pro#289) a chance to occur,
 				// since `this.nodeSubscriptions` is already populated on that long-lived connection
-				// object and `connectedToNode()`'s `nodeSubscriptions` guard always
-				// passes on an ordinary reconnect. This cycle deliberately holds the leader down
+				// object and the open handler's guard always passes on an ordinary reconnect. This
+				// cycle deliberately holds the leader down
 				// past the wedge threshold to exercise the disruptive forceResubscribe path.
 				//
 				// A prior diagnostic run (not committed) confirmed this outage length reliably

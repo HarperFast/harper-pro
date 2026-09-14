@@ -3007,7 +3007,6 @@ export class NodeReplicationConnection extends EventEmitter {
 					{ replicates: true } // pre-authorized, but should only make publish: true if we are allowing reverse subscriptions
 				);
 				if (heldSubscribe) {
-					// Preserve late-subscribe ordering by snapshotting a non-subscription session before applying the payload.
 					logger.warn?.(
 						`[test] socket open observed nodeSubscriptions undefined; releasing held subscribe for db "${this.databaseName}" (harper-pro#431)`
 					);
@@ -3176,12 +3175,15 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.heldSubscribeAfterOpenForTest = { nodeSubscriptions, replicateTablesByDefault };
 			return;
 		}
+		const holdDatabase = process.env.HARPER_TEST_HOLD_SUBSCRIBE_AFTER_OPEN_ONCE_DB;
 		if (
+			holdDatabase &&
 			this.nodeSubscriptions === undefined &&
 			!holdSubscribeAfterOpenForTestArmed &&
-			process.env.HARPER_TEST_HOLD_SUBSCRIBE_AFTER_OPEN_ONCE_DB === this.databaseName
+			holdDatabase === this.databaseName
 		) {
 			holdSubscribeAfterOpenForTestArmed = true;
+			process.env.HARPER_TEST_HOLD_SUBSCRIBE_AFTER_OPEN_ONCE_DB = '';
 			this.heldSubscribeAfterOpenForTest = { nodeSubscriptions, replicateTablesByDefault };
 			logger.warn?.(`[test] holding subscribe until socket open for db "${this.databaseName}" (harper-pro#431)`);
 			return;
