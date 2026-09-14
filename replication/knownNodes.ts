@@ -109,7 +109,7 @@ export const REPLICATION_SHARED_STATUS_SLOTS = 32;
 // Weak against the audit store so a dropped database takes its retention, and the store itself, with it;
 // a recreated one is a different store over different memory and so starts empty.
 const retainedSharedStatus = new WeakMap<object, Map<string, Map<string, Float64Array>>>();
-function retainedStatusByNode(auditStore: any, databaseName: string): Map<string, Float64Array> {
+function retainedStatusByNode(auditStore: object, databaseName: string): Map<string, Float64Array> {
 	let byDatabase = retainedSharedStatus.get(auditStore);
 	if (!byDatabase) retainedSharedStatus.set(auditStore, (byDatabase = new Map()));
 	let byNode = byDatabase.get(databaseName);
