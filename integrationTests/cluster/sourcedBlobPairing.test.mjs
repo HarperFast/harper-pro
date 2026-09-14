@@ -92,6 +92,11 @@ async function rawOperation(node, operation) {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify(operation),
+			// bounds a node that accepts the connection but never answers, so a stuck attempt
+			// still frees the retry loop instead of outliving it — generous like the other
+			// cluster tests' bootstrap-operation timeouts, since add_node/create_authentication_tokens
+			// are heavier than a status probe
+			signal: AbortSignal.timeout(20000),
 		});
 		return { status: response.status, body: await response.json() };
 	} catch (error) {
@@ -120,14 +125,16 @@ async function connectNodes(nodeA, nodeB) {
 			authorization: `Bearer ${token}`,
 		});
 		if (response.status === 200) connected = true;
-		else if (/ECONNREFUSED|ECONNRESET|connect /.test(JSON.stringify(response.body))) await delay(500);
+		else if (/ECONNREFUSED|ECONNRESET|connect |aborted|timeout/i.test(JSON.stringify(response.body))) await delay(500);
 		else throw new Error(`add_node failed (${response.status}): ${JSON.stringify(response.body)}`);
 	}
 	if (!connected) throw new Error('Timed out adding replication peer');
 
 	for (let i = 0; i < 60; i++) {
 		const statuses = await Promise.all(
-			[nodeA, nodeB].map((node) => sendOperation(node, { operation: 'cluster_status' }).catch(() => null))
+			[nodeA, nodeB].map((node) =>
+				sendOperation(node, { operation: 'cluster_status' }, { signal: AbortSignal.timeout(5000) }).catch(() => null)
+			)
 		);
 		if (statuses.every((status) => status?.connections?.some((c) => c.database_sockets?.some((s) => s.connected))))
 			return;
@@ -164,6 +171,21 @@ function requestJson(url, agent, options = {}) {
 		req.on('error', reject);
 		req.end(requestBody);
 	});
+}
+
+// A blob mid-write or pending replication 500s transiently even after waitForAllWorkers has
+// already seen this worker stable; retry like the other probes instead of failing the trial on it.
+async function requestJsonRetrying(url, agent, options, attempts = 10, delayMs = 300) {
+	let lastError;
+	for (let i = 0; i < attempts; i++) {
+		try {
+			return await requestJson(url, agent, options);
+		} catch (error) {
+			lastError = error;
+			await delay(delayMs);
+		}
+	}
+	throw lastError;
 }
 
 async function pinWorkers(node) {
@@ -322,19 +344,26 @@ suite('sourcedFrom blob/metadata pairing under competing cache fills', { timeout
 			const originTrial = ctx.origin.trial(id);
 			ok(originTrial, `${id} performed no source fills`);
 			equal(originTrial.calls.length, 2, `${id} must perform exactly two independent source fills`);
+			equal(
+				new Set(originTrial.calls.map((call) => call.node)).size,
+				2,
+				`${id} both source fills came from the same node — this did not race two nodes`
+			);
 			equal(originTrial.timedOut, false, `${id} barrier timed out, so this trial is inconclusive`);
 			notEqual(fills[0].token, fills[1].token, `${id} source fills must be distinguishable`);
 
 			await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 			await waitForAllWorkers(ctx.nodes, id, ctx.agentsByNode, 'PairPointProbe');
-			// Recheck the raw stores after every worker has materialized the record.
+			// waitForAllWorkers only proves every worker's raw/cached version+token match; it never
+			// captures a full record. Re-scan here to get the full per-node records the deepEqual
+			// and payloadToken checks below compare.
 			const scans = await waitForConvergence(ctx.nodes, id, ctx.agentsByNode);
 			deepEqual(scans[0].record, scans[1].record, `${id} raw stores must converge`);
 			equal(scans[0].record.payloadToken, scans[0].record.token, `${id} raw record/blob pairing`);
 
 			for (let nodeIndex = 0; nodeIndex < ctx.nodes.length; nodeIndex++) {
 				for (const [threadId, agent] of ctx.agentsByNode[nodeIndex]) {
-					const probe = await requestJson(`${ctx.nodes[nodeIndex].httpURL}/PairPointProbe/${id}`, agent);
+					const probe = await requestJsonRetrying(`${ctx.nodes[nodeIndex].httpURL}/PairPointProbe/${id}`, agent);
 					equal(probe.threadId, threadId, `${id} connection moved between workers`);
 					ok(probe.record, `${id} missing on node ${nodeIndex}, worker ${threadId}`);
 					ok(probe.raw?.record, `${id} missing raw record on node ${nodeIndex}, worker ${threadId}`);

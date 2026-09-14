@@ -45,11 +45,15 @@ export class PairPointProbe extends tables.PairRecord {
 	static async get(target) {
 		const record = await super.get(target);
 		let raw;
-		for (const entry of tables.PairRecord.primaryStore.getRange({ start: null, versions: true, snapshot: false })) {
-			if (entry.key === target.id) {
-				raw = { version: entry.version, nodeId: entry.nodeId, record: await describeRecord(entry.value) };
-				break;
-			}
+		// versions:true can expose more than one row for this key; take the last (highest-version)
+		// one rather than the first, so a superseded row can never stand in for the live one.
+		for (const entry of tables.PairRecord.primaryStore.getRange({
+			start: target.id,
+			versions: true,
+			snapshot: false,
+		})) {
+			if (entry.key !== target.id) break;
+			raw = { version: entry.version, nodeId: entry.nodeId, record: await describeRecord(entry.value) };
 		}
 		return { node: server.hostname, threadId, record: await describeRecord(record), raw };
 	}
@@ -60,18 +64,25 @@ export class PairScanProbe extends Resource {
 
 	async get(target) {
 		target.checkPermission = false;
-		for (const entry of tables.PairRecord.primaryStore.getRange({ start: null, versions: true, snapshot: false })) {
-			if (entry.key === target.id) {
-				return {
-					node: server.hostname,
-					threadId,
-					version: entry.version,
-					nodeId: entry.nodeId,
-					record: await describeRecord(entry.value),
-				};
-			}
+		let match;
+		// versions:true can expose more than one row for this key; take the last (highest-version)
+		// one rather than the first, so a superseded row can never stand in for the live one.
+		for (const entry of tables.PairRecord.primaryStore.getRange({
+			start: target.id,
+			versions: true,
+			snapshot: false,
+		})) {
+			if (entry.key !== target.id) break;
+			match = entry;
 		}
-		return { node: server.hostname, threadId, record: null };
+		if (!match) return { node: server.hostname, threadId, record: null };
+		return {
+			node: server.hostname,
+			threadId,
+			version: match.version,
+			nodeId: match.nodeId,
+			record: await describeRecord(match.value),
+		};
 	}
 }
 
