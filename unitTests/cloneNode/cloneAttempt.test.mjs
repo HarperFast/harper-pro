@@ -67,12 +67,16 @@ describe('clone-attempt marker (#737)', () => {
 
 	it('marks an attempt complete without changing its identity', () => {
 		writeMarker(JSON.stringify({ attemptId: 'abc', leaderHost: 'leader.example' }));
-		completeCloneAttempt(rootPath, 1234);
+		assert.equal(completeCloneAttempt(rootPath, 1234), 'abc');
 		assert.deepEqual(JSON.parse(readFileSync(cloneAttemptPath(rootPath), 'utf8')), {
 			attemptId: 'abc',
 			leaderHost: 'leader.example',
 			completedAt: 1234,
 		});
+	});
+
+	it('reports a completion-stamp failure so the caller can fail open', () => {
+		assert.equal(completeCloneAttempt(rootPath, 1234), undefined);
 	});
 
 	it('reuses only an unfinished attempt for the same leader', () => {

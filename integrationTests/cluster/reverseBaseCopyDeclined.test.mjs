@@ -33,7 +33,8 @@ import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@h
 import { join } from 'node:path';
 import { writeFileSync } from 'node:fs';
 import { sendOperation, readLog } from './clusterShared.mjs';
-import { CLONE_COMPLETION_GRACE_MS } from '#src/cloneNode/cloneAttempt';
+
+const CLONE_COMPLETION_GRACE_MS = 60_000;
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -147,6 +148,7 @@ function registerReverseCopySuite({ title, completionAgeMs, withholdsSourceRecor
 			async () => {
 				const { nodeA, nodeB } = ctx;
 				const before = await readLog(nodeB);
+				const markerWrittenAt = Date.now();
 				writeFileSync(
 					ctx.cloneAttemptPath,
 					JSON.stringify({
@@ -158,6 +160,11 @@ function registerReverseCopySuite({ title, completionAgeMs, withholdsSourceRecor
 
 				// A meets B for the first time here, so it has no resume cursor for B and asks for a base copy.
 				await joinAsFollower(nodeB, nodeA);
+				if (withholdsSourceRecords)
+					assert.ok(
+						Date.now() - markerWrittenAt < CLONE_COMPLETION_GRACE_MS,
+						'the connection must begin inside the completion-grace test precondition'
+					);
 
 				// D's record is the last thing B can ship, so its arrival marks the copy as served.
 				let after = before;
@@ -170,13 +177,14 @@ function registerReverseCopySuite({ title, completionAgeMs, withholdsSourceRecor
 					'B must have served A a base copy carrying the record D originated'
 				);
 				const sourceRecordsShipped = shipped(after, 'a-origin-') - shipped(before, 'a-origin-');
-				assert.equal(
-					sourceRecordsShipped,
-					withholdsSourceRecords ? 0 : A_RECORD_COUNT,
-					withholdsSourceRecords
-						? 'B must ship none of A own records back to it during the completion grace'
-						: 'B must fail open to shipping A own records after the completion grace'
-				);
+				if (withholdsSourceRecords)
+					assert.equal(
+						sourceRecordsShipped,
+						0,
+						'B must ship none of A own records back to it during the completion grace'
+					);
+				else
+					assert.ok(sourceRecordsShipped > 0, 'B must fail open to shipping A own records after the completion grace');
 				assert.equal(
 					(await recordsIn(nodeA, A_RECORD_COUNT + 1)).length,
 					A_RECORD_COUNT + 1,

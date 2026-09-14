@@ -42,7 +42,6 @@ import { monitorSyncLoop } from './syncMonitor.ts';
 import {
 	CLONE_COMPLETION_GRACE_MS,
 	cloneAttemptPath as cloneAttemptFilePath,
-	cloneAttemptSource,
 	completeCloneAttempt,
 	reusableCloneAttemptId,
 } from './cloneAttempt.ts';
@@ -403,10 +402,12 @@ export async function cloneNode(): Promise<void> {
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
 	clearSyncStartedMarker();
-	completeCloneAttempt(rootPath);
-	setTimeout(() => {
-		if (!cloneAttemptSource(rootPath)) clearCloneAttempt();
-	}, CLONE_COMPLETION_GRACE_MS).unref();
+	const completedAttemptId = completeCloneAttempt(rootPath);
+	if (completedAttemptId) {
+		setTimeout(() => clearCloneAttempt(completedAttemptId), CLONE_COMPLETION_GRACE_MS).unref();
+	} else {
+		clearCloneAttempt();
+	}
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
@@ -1493,7 +1494,15 @@ function startCloneAttempt(): void {
 	process.env[CLONE_ATTEMPT_ENV] = attemptId;
 }
 
-function clearCloneAttempt(): void {
+function clearCloneAttempt(expectedAttemptId?: string): void {
+	if (expectedAttemptId) {
+		if (process.env[CLONE_ATTEMPT_ENV] !== expectedAttemptId) return;
+		try {
+			if (JSON.parse(readFileSync(cloneAttemptPath(), 'utf8'))?.attemptId !== expectedAttemptId) return;
+		} catch {
+			// Missing or unreadable state cannot authorize continued withholding.
+		}
+	}
 	delete process.env[CLONE_ATTEMPT_ENV];
 	try {
 		unlinkSync(cloneAttemptPath());

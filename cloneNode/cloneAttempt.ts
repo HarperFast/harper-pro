@@ -25,15 +25,18 @@ export function reusableCloneAttemptId(marker: CloneAttemptMarker | undefined, l
 		: undefined;
 }
 
-export function completeCloneAttempt(rootPath: string, completedAt = Date.now()): void {
+export function completeCloneAttempt(rootPath: string, completedAt = Date.now()): string | undefined {
 	const path = cloneAttemptPath(rootPath);
 	try {
 		const marker: CloneAttemptMarker = JSON.parse(readFileSync(path, 'utf8'));
+		if (typeof marker.attemptId !== 'string') return undefined;
 		const temporaryPath = `${path}.${process.pid}.tmp`;
 		writeFileSync(temporaryPath, JSON.stringify({ ...marker, completedAt }), { encoding: 'utf8', mode: 0o600 });
 		renameSync(temporaryPath, path);
+		return marker.attemptId;
 	} catch (error) {
 		logger.warn?.('Could not mark the clone attempt complete', error);
+		return undefined;
 	}
 }
 
