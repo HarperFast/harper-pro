@@ -14,10 +14,11 @@ and the §4.3 change runbook (stage → quiesce/fence → drain → activate). T
 harper-pro-side mechanism for all three, plus `homeIncarnation` advanced per **coordination
 incarnation** (§5.1), the one other item genuinely part of the same `homeMap()` contract.
 
-**Out of scope, deliberately** (the task owner's instruction was specifically "825," not the
-rest of §11's "still owed" list): harper#2542's freshness fence, the `lockRelease`
-cross-thread relay gap, and full every-serving-thread transport registration. Real, blocking
-for _enablement_, and called out as findings — not folded in here.
+**Out of scope here, deliberately** (the task owner's instruction was specifically "825," not the
+rest of §11's "still owed" list): the `lockRelease` cross-thread relay gap and full
+every-serving-thread transport registration. Real, blocking for _enablement_, and called out
+as findings — not folded in here. harper#2542's freshness fence, the third item on that list,
+landed afterwards on this same PR — see `RECORD_LOCK_FRESHNESS_DESIGN.md`.
 
 **Revision history — two rounds, both `better-alternative-exists`, both adopted.**
 

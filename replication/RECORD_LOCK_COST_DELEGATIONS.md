@@ -66,19 +66,19 @@ sharing, over three full runs.
 
 ## Summary
 
-| §10 row                                     | BEFORE (Ricart–Agrawala) | AFTER (delegations)                  | verdict                       |
-| ------------------------------------------- | ------------------------ | ------------------------------------ | ----------------------------- |
-| First lock, key homed elsewhere — 1 RTT     | 1.07 ms p50              | 0.37 ms p50                          | as predicted                  |
-| First lock, key homed here — 0 RTT          | 1.07 ms p50              | 0.04 ms p50                          | as predicted                  |
-| Steady state — local key lock, 0 messages   | 0.68 ms p50              | **0.01–0.03 ms p50**                 | as predicted, 20–60x          |
-| Durable commits per uncontended acquisition | 4 (~310 B)               | **0**                                | as predicted                  |
-| Durable commits per contended section       | 4                        | 0.023–0.054 release entries          | as predicted                  |
-| Hot-key handoff throughput                  | 877–911 sections/s       | 1 031–1 707 sections/s               | faster, but see fairness      |
-| Hot-key exact convergence                   | exact, every run         | **0.05–0.13 % lost at 3 contenders** | **not met — harper#2542**     |
-| Hot-key fairness                            | shared by turn-taking    | **loser starved in 2 of 3 runs**     | **not a §10 row; found here** |
-| Write throughput, feature off vs absent     | inside noise             | inside noise                         | as predicted                  |
-| Delegation re-acquisition rate              | n/a                      | `gap / (360 s − lease)`              | exact at the 60 s window      |
-| Cold-key recovery path                      | n/a                      | **unmeasurable**                     | harper#2542 not implemented   |
+| §10 row                                     | BEFORE (Ricart–Agrawala) | AFTER (delegations)                                                | verdict                                                                                                                                     |
+| ------------------------------------------- | ------------------------ | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| First lock, key homed elsewhere — 1 RTT     | 1.07 ms p50              | 0.37 ms p50                                                        | as predicted                                                                                                                                |
+| First lock, key homed here — 0 RTT          | 1.07 ms p50              | 0.04 ms p50                                                        | as predicted                                                                                                                                |
+| Steady state — local key lock, 0 messages   | 0.68 ms p50              | **0.01–0.03 ms p50**                                               | as predicted, 20–60x                                                                                                                        |
+| Durable commits per uncontended acquisition | 4 (~310 B)               | **0**                                                              | as predicted                                                                                                                                |
+| Durable commits per contended section       | 4                        | 0.023–0.054 release entries                                        | as predicted                                                                                                                                |
+| Hot-key handoff throughput                  | 877–911 sections/s       | 1 031–1 707 sections/s                                             | faster, but see fairness                                                                                                                    |
+| Hot-key exact convergence                   | exact, every run         | **0.05–0.13 % lost at 3 contenders** (measured before the barrier) | **closed by the barrier** (`RECORD_LOCK_FRESHNESS_DESIGN.md`); the cluster test asserts exact 1..N again; re-measure on the next bench run  |
+| Hot-key fairness                            | shared by turn-taking    | **loser starved in 2 of 3 runs**                                   | **not a §10 row; found here**                                                                                                               |
+| Write throughput, feature off vs absent     | inside noise             | inside noise                                                       | as predicted                                                                                                                                |
+| Delegation re-acquisition rate              | n/a                      | `gap / (360 s − lease)`                                            | exact at the 60 s window                                                                                                                    |
+| Cold-key recovery path                      | n/a                      | **unmeasurable** (before the barrier)                              | implemented as a `lockBarrier` probe to every member (harper#2625); one RPC + one replicated no-op + one apply per member; not yet measured |
 
 Two results are worth a reader's attention beyond the table. The hot-key row can buy its throughput
 with **starvation**: in two runs of three at two contenders the losing node completed **no critical
