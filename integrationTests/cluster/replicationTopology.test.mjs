@@ -12,6 +12,7 @@ import {
 	getNextAvailableLoopbackAddress,
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
+import { assertLegacyAuditHasNoEcho } from './legacyAuditHelpers.mjs';
 import { sendOperation } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
@@ -664,5 +665,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 				`v5 mesh broken after bridge teardown: node ${i} ${ctx.nodes[i].hostname} did not receive post-teardown write`
 			);
 		}
+		await killHarper({ harper: legacy });
+		await assertLegacyAuditHasNoEcho(legacy, ['old-data-1']);
 	});
 });
