@@ -27,23 +27,31 @@ Core bounds the call with the caller's own `lock()` deadline (`#establishFreshne
 `recordLockCoordinator.ts:1674-1712`), races it against a recall of the pending grant, and turns a
 rejection into the retryable 503 the branch already uses. The race does **not** cancel the
 transport's promise: a waiter the transport leaves behind after core has given up is the
-transport's leak, so every wait here must have its own bound and its own teardown.
+transport's leak, so every wait here has its own bound and its own teardown.
 
-**Revision history — round 1, `better-alternative-exists`, adopted.** The first cut evaluated the
-recovery marker against the position the *local inbound stream* held at grant time. The planning
-reviewer's counterexample holds: after a receiver restart `received[A] === applied[A] === 0`
-before any frame arrives, so a recovery barrier measured against the local tail passes at once
-while a reachable A holds committed writes it has not yet delivered. The reviewer also found the
-unbounded-waiter leak above, the disabled-path cost of an ungated watermark write, a
-`REMOTE_SEQUENCE_UPDATE` float that reaches `Math.max` unvalidated, and the fact that a
-per-database cursor advances across records the sender skips for a table this peer does not
-receive. All adopted below. Its prescription of `BigInt64Array` + `Atomics` for the watermark is
-**not** adoptable on the facts: `getUserSharedBuffer` returns a plain `ArrayBuffer` over native
-shared memory, not a `SharedArrayBuffer`, so `Atomics` cannot address it, and transaction-log keys
-are fractional floats (`1789480100774.2732` from a live `getTimestamp()`), so an integer slot has no
-lossless encoding. The tear-freedom requirement is met differently (below). Its "genuine do-less"
-— clean barriers now, `null` recovery rejects with 503 until a trustworthy source-head primitive
-exists — is what this note now chooses, and the recovery barrier's shape is the one open decision.
+## Revision history
+
+- **Round 1 — `better-alternative-exists`, adopted.** The first cut evaluated the recovery marker
+  against the position the *local inbound stream* held at grant time. The counterexample holds:
+  after a receiver restart `received[A] === applied[A] === 0` before any frame arrives, so a
+  recovery barrier measured against the local tail passes at once while a reachable A holds
+  committed writes it has not yet delivered. Also adopted: the unbounded-waiter leak, the
+  disabled-path cost of an ungated watermark write, an unvalidated `REMOTE_SEQUENCE_UPDATE` float,
+  and cursors that advance across records the sender skips for an unsubscribed table.
+- **Round 2 — `better-alternative-exists`, adopted.** Round 1's response kept a `(database, peer)`
+  slot, mirrored two `Float64` writes for tear detection, polled every waiter at 100 Hz, and
+  recommended a native "last appended key" for recovery. All four were wrong on the facts:
+  (i) `Atomics` **does** work on a `BigUint64Array` view over `getUserSharedBuffer()`'s native
+  mapping across worker threads — probed live on the pinned rocksdb-js 2.9.0: a worker read back
+  the exact bit pattern of `1789480100774.2732` — so the mirror scheme (which a hybrid tear can
+  defeat near a low-word rollover) is replaced by one atomic slot carrying the float's bits;
+  (ii) a peer's stream can relay other origins, so progress keyed by *peer* is not progress for
+  the *origin* named in a dependency — publication is now keyed by authenticated **origin**;
+  (iii) a 100 Hz scan over abandoned waiters can starve the very apply loop it waits on —
+  waiters are now indexed by origin and threshold and woken by the publication itself;
+  (iv) "last appended key" is not a usable target under commit-order appends (key 101 appends,
+  then key 100; a head of 100 is satisfied before 100 is applied) — the recommendation moves to
+  a marker write. Round 2 upheld the layer split and failing recovery closed.
 
 ## What harper-pro has to build on
 
@@ -51,139 +59,169 @@ exists — is what this note now chooses, and the recovery barrier's shape is th
    per-`(database, peer)` shared status buffer) is the highest origin transaction-log key seen from
    that peer. Since harper-pro#790 it is in the **transaction-log-key** domain — the same domain
    core stamps on a control entry (`Table.ts:5803-5846`, `position = txnTime`) and hands back as
-   `event.timestamp` on apply — so a dependency position and this watermark are directly comparable.
+   `event.timestamp` on apply — so a dependency position and a published position are comparable.
 2. **It is advanced at decode time, not at apply time.** `replicationConnection.ts:6505-6511` sets
    it inside the decode loop, before the event reaches the apply queue. It answers "received",
-   which is strictly weaker than the "applied and visible" core asks for.
+   which is strictly weaker than the "applied and visible" core asks for. It is telemetry, and
+   DESIGN.md's slot map says so; nothing here promotes it.
 3. **Apply-visibility is observed, but only in a closure.** The per-batch `end_txn`'s `onCommit`
    sets `committedSequence` with the comment "Commit == visibility"
    (`replicationConnection.ts:6666-6669`). Nothing publishes it outside the connection.
-4. **There is no head-read on the transaction log.** `RocksTransactionLogStore.getKeys()` is a
-   `return []` stub, so `lastTimeInAuditStore()` yields `undefined` on the v5 engine and there is no
-   reverse scan at all.
-5. **Log entries are appended in commit order, not timestamp order** (rocksdb-js
-   `docs/transaction-log.md` §"Reading The Transaction Log"): a transaction claims its key from the
-   process-wide monotonic clock at construction and is appended at commit, so a later-constructed
-   entry can precede an earlier-constructed one in the file, and therefore on the wire. A "highest
-   key seen" is not a head in append order. This rules out a forward-scan source head as well as
-   the local-tail snapshot.
-6. **A peer's slot is that peer's stream, in whatever origin domains it carries.** A relayed frame
-   carries the *origin's* log key (DESIGN.md item 18), so slot `[A]` is a maximum over every origin
-   A forwards. In the full mesh the multi-hop exclusion (DESIGN.md item 9) keeps a direct
-   subscription to A's own writes only; the barrier depends on that.
-7. **The shared buffer is a plain `ArrayBuffer`, single writer per `(database, peer)`.**
-   `NodeReplicationConnection` retires a superseded session before installing a socket (DESIGN.md
-   item 15), so exactly one apply loop writes a given peer's slots at a time. A 64-bit aligned
-   store is a single instruction on every platform Harper ships on, but the language gives no
-   tear-freedom guarantee for a plain buffer, and `Atomics` is unavailable on it (above).
+4. **Every committed frame names its origin.** A frame is one origin transaction: its leading
+   float is that origin's log key (`frameTxnLogKey`, `replicationConnection.ts:6190`) and each
+   record's `nodeId` resolves to a local id (`localSourceNodeId`, `:6388`) and from there to a
+   name through the cached inverse map (`getNodeNameForId`, `nodeIdMapping.ts:152`). Relayed
+   frames carry the *origin's* key (DESIGN.md item 18), so a stream from peer A can deliver
+   B-keyed frames; the origin is known per frame regardless of the path.
+5. **There is no head-read on the transaction log**, and **log entries are appended in commit
+   order, not timestamp order.** `RocksTransactionLogStore.getKeys()` is a `return []` stub;
+   rocksdb-js `docs/transaction-log.md` §"Reading The Transaction Log" states that a transaction
+   claims its key from the process-wide monotonic clock at construction and is appended at
+   commit, so a later-constructed entry can precede an earlier one in the file and on the wire.
+   No "highest key" or "last key" is an append-order head.
+6. **The shared buffer is native memory, one writer per stream, and `Atomics`-addressable.**
+   `getUserSharedBuffer` returns a plain `ArrayBuffer` over a native mapping shared by every
+   thread of the process; `Atomics.store`/`load` on a `BigUint64Array` view of it is an aligned
+   64-bit atomic across those threads (probed, see round 2). `NodeReplicationConnection` retires a
+   superseded session before installing a socket (DESIGN.md item 15), so one apply loop writes a
+   given stream's frames at a time; two streams can deliver the same origin (a direct
+   subscription and a relay, during a topology change), and a monotonic `max` is safe across them
+   because each delivers that origin's log as an append-order prefix from its own cursor.
 
 ## Chosen implementation
 
-**Publish the apply-visible watermark; evaluate clean lineage against it; fail recovery closed.**
+**Publish apply-visible progress per authenticated origin, atomically; evaluate clean lineage
+against it with event-driven, bounded waiters; fail recovery closed.**
 
-- **`APPLIED_VERSION_POSITION` (slot 31) and its mirror (slot 32).** Advanced only from the
-  apply loop's `end_txn` `onCommit`, after every existing commit-side step has succeeded — a copy
-  flush that rejects leaves the watermark untouched — to the received position the batch carried,
-  and only when `CLUSTER_RECORD_LOCKS_ENABLED`, so a node that never enables locks pays nothing.
-  Both the data-frame `end_txn` and every `seqUpdateEndTxn` advance it (composed, not overwritten),
-  because the empty `REMOTE_SEQUENCE_UPDATE` batches are what let `received` stay ahead of
-  `applied` across an idle period. The value is validated with the same `isValidReplicationClock`
-  predicate the frame header gets, and the slot is written twice — the mirror second. A reader
-  accepts the value only when both slots agree; a torn read is indistinguishable from "not yet
-  reached" and costs one poll interval, never an early admission. Every existing reset of the
-  received watermark (the clone-attempt zeroing, `clearReplicationSharedStatus`) zeroes both.
-  `REPLICATION_SHARED_STATUS_SLOTS` grows from 32 to 40; the buffer is process-local shared memory
-  resolved through one accessor, which the slot map already documents as safe to grow.
-- **Clean handoff.** For each `(origin, position)`: `origin === thisNode` is satisfied by definition
-  — a position in our own log is our own committed write. Otherwise the peer must be one this node
-  **receives the table from**: a buffer must already exist for `(database, origin)` (never created
-  on demand for this check — `statusFor` creates one, so the check reads the accessor's registry
-  instead), the peer must have advertised the capability level, and the table must not be excluded
-  by this node's receive route for the peer (`getExcludedTablesForRouteEntries`, the same predicate
-  the subscription uses). Any of those failing rejects at once, and core answers 503. Otherwise the
-  dependency is satisfied when `applied[origin] >= position`.
-- **Why `applied >= position` is sound under fact 5.** The holder's locked writes are committed
-  before the release entry is constructed (`#surrender` runs at `holding === 0`; core's §6 step-3
-  caveat about native settlement is core's stated weakness, not a new one), so every one of them is
-  appended before the release claims its key `P`. Any entry with key `> P` was constructed after `P`
-  was claimed, hence appended after every write `P` fences. The apply queue is FIFO per connection,
-  so once the applied maximum reaches `P`, every entry appended before the release — the whole
-  fenced set — is committed and visible. The release entry itself may still be in flight; it is
-  not data.
-- **Waiting.** Check synchronously first; a clean handoff whose predecessor released through the
-  same stream is usually already satisfied and schedules nothing. Otherwise one 10 ms timer per
-  database drives every waiter on it. Each waiter is bounded by `MAX_LOCK_LEASE_MS` — the longest
-  deadline core can have handed the caller — and is torn down when the database's transport is
-  unregistered or replaced, so an abandoned wait cannot outlive the lock that asked for it, and
-  the count of live waiters is exposed on `cluster_status.recordLocks` for the leak test to read.
-- **Recovery (`null`) rejects.** `establishLockFreshness` throws a 503 naming the reason. This is
-  deliberate scope, not an omission: no primitive on this branch can name a reachable member's
-  head in *append* order, and the two that look like one (the local received tail, a forward scan
-  to the highest key) both admit a stale read under a concrete schedule. The consequence is stated
-  plainly: after a home restart, a generation change, an expiry without a clean release, or
-  lineage eviction, every affected key answers 503 until the barrier below lands. The feature
-  stays gated off, exactly as before this change.
-- **Capability level 3 -> 4.** The release payload is now a versioned 7-tuple and admission now
-  depends on a barrier a level-3 node does not run. The levels are mutually exclusive already
-  (`protocolCapabilities.ts:82`), so bumping the constant keeps a level-3 peer out of the ring
-  rather than silently admitting without a fence. Rollout: a mixed-level cluster has no agreed home
-  map, every cluster-scoped `lock()` answers 503 naming the disagreeing peer's level, and the
-  outage ends when the last node is on the same level in either direction — there is no partial
-  state, so rollback is the same operation as upgrade.
-- **Deprecated LMDB advertises level 0.** `maxBatchTxnLogKey` is only adopted under
-  `STORAGE_IS_ROCKSDB` (`replicationConnection.ts:6515`), so on LMDB the applied watermark and the
-  received watermark are in different domains and no barrier converges. Rather than advertise a
-  capability every barrier then times out on, `replication.recordLocks: true` on LMDB logs one
-  error naming the engine and the node advertises `recordLocks: 0`, which fails cluster locks
-  closed with the existing enablement message.
+- **The applied slot is per `(database, origin)`, one atomic 64-bit word.** Slot 31 of the
+  buffer `getReplicationSharedStatus(auditStore, database, originName)` resolves — the same
+  accessor, keyed by origin rather than by the peer whose socket delivered the frame. It holds
+  the IEEE-754 bit pattern of the highest applied log key for that origin, stored and loaded
+  with `Atomics` through a `BigUint64Array` view and reinterpreted through one preallocated
+  `Float64Array`/`BigUint64Array` scratch pair; zero bits mean "nothing published". Slot 32
+  carries a publication generation, bumped by `clearReplicationSharedStatus` and the clone-attempt
+  reset alongside the received watermark, so a retired session cannot re-stamp progress after a
+  reset (DESIGN.md item 15 accepts that re-stamp for telemetry; an admission fence cannot).
+  `REPLICATION_SHARED_STATUS_SLOTS` grows from 32 to 40. Because the accessor keys a *node name*,
+  an origin that is also a direct peer shares the buffer its connection already uses — slots 31
+  and 32 belong to this feature alone, so nothing else reads or writes them.
+- **Who writes it, and when.** The apply loop's data-frame `end_txn` `onCommit`, at its end, after
+  every existing commit-side step has succeeded (a rejected copy flush publishes nothing), and only
+  when `CLUSTER_RECORD_LOCKS_ENABLED` — resolved once at connection setup into either a publisher
+  or a no-op, so a node that never enables locks pays nothing per batch. The value is the frame's
+  own `frameTxnLogKey`, already validated by `isValidFrameTxnLogKey` at decode; a frame whose key
+  failed validation never reached the apply queue. Publication is non-throwing by construction:
+  the buffer view and origin name are resolved before `onCommit` runs (the name at decode, with
+  `rebuildOnMiss`, since a dropped publication costs a barrier its convergence), and a frame whose
+  origin cannot be named publishes nothing rather than guessing. **Empty sequence updates publish
+  nothing**: `REMOTE_SEQUENCE_UPDATE` and `SEQUENCE_ID_UPDATE` name the *sender's* cursor, which
+  on a relaying stream may be another origin's key, so neither is evidence about any one origin.
+  Both forms are nevertheless validated with `isValidReplicationClock` before they touch the
+  received or committed cursors (round 1/2 finding): an `Infinity` or `NaN` from an authenticated
+  but buggy peer holds the frame and reconnects, exactly as an invalid frame header does today.
+- **Why a per-origin `applied >= position` is sound under fact 5.** The holder's locked writes
+  are committed before the release entry is constructed (`#surrender` runs at `holding === 0`;
+  core's §6 step-3 caveat about native settlement is core's stated weakness, not a new one), so
+  every fenced write is appended before the release claims its key `P` and carries a key `< P`.
+  Any entry of that origin with key `>= P` was constructed at or after `P` was claimed, hence
+  appended after every fenced write. Each stream delivers an origin's log as an append-order
+  prefix and the apply queue is FIFO, so once that origin's applied maximum reaches `P`, every
+  fenced write is committed and visible. The release entry itself carries key `P` and is streamed
+  to every capability-level peer, so the barrier converges without relying on sequence updates.
+- **Clean handoff.** For each `(origin, position)`: `origin === thisNode` is satisfied by
+  definition. Otherwise the origin must be a member of this database's `homeMap().homes` (core
+  filters to it already; the transport refuses anything else outright), it must have advertised
+  the current capability level, and this node must **subscribe to the table from some stream**:
+  the receive route for the database must authorize replication from a peer (`routeEntriesIncludePeer`)
+  and not exclude the table (`getExcludedTablesForRouteEntries`, which returns `null` for both
+  "covered" and "no matching entry" — so it is consulted only after the authorization predicate
+  says an entry matched). Any of those failing rejects at once with a 503 naming which one; core
+  reports it. Otherwise the dependency is satisfied when the origin's atomic slot decodes to a
+  value `>= position`. The stream that delivers the origin need not be the origin's own socket.
+- **Waiting is event-driven.** Each database's transport keeps, per origin, a min-heap of
+  `(threshold, waiter)`; a publication for that origin on the owner thread pops every waiter whose
+  threshold it satisfies. A stream applying off the owner thread (the `droppedOffOwner` case)
+  still publishes to shared memory but cannot wake in-thread waiters, so one coarse fallback
+  timer per database (250 ms, armed only while waiters exist) re-checks heap heads — O(origins),
+  never O(waiters). Every waiter also sits in one deadline heap bounded by `MAX_LOCK_LEASE_MS`,
+  the longest deadline core can have handed the caller; it settles exactly once, with a
+  `ClientError(503)` on the bound or on transport unregister/replacement, and both heaps release
+  it in `finally`. Live waiter and rejection counts are exposed on `cluster_status.recordLocks`.
+  Core does not pass the caller's deadline; a `deadlineMs` argument on `establishLockFreshness`
+  is a one-line core addition that would remove the gap between "abandoned" and "bounded", and is
+  proposed with whichever core change the open decision below lands.
+- **Recovery (`null`) rejects.** `establishLockFreshness` throws a 503 naming the reason and
+  increments a `recoveryRejected` counter on `cluster_status.recordLocks`. No primitive on this
+  branch names a reachable member's progress in append order (fact 5), and the three that look
+  like one — the local received tail, a forward scan to the highest key, a native last-appended
+  key — each admit a stale read under a concrete schedule. Consequence, stated as a release
+  limitation and not only here: after a home restart, a generation change, an expiry without a
+  clean release, or lineage eviction, every affected key answers 503 until the barrier below
+  lands. The feature stays default-off.
+- **Capability level 3 -> 4, exact level recorded.** The release payload is now a versioned
+  7-tuple and admission depends on a barrier a level-3 node does not run; the levels are mutually
+  exclusive (`protocolCapabilities.ts:82`). The per-peer slot 29 records the peer's **exact
+  advertised level** (0 for none) instead of a tri-state, so the 503 a mixed cluster answers can
+  name the disagreeing peer's level. Rollout: a mixed-level cluster has no agreed home map, every
+  cluster-scoped `lock()` answers 503, and the outage ends when the last node is on one level in
+  either direction — no partial state, so rollback is the same operation as upgrade.
+- **Deprecated LMDB selects the disabled transport.** `maxBatchTxnLogKey` is only adopted under
+  `STORAGE_IS_ROCKSDB` (`replicationConnection.ts:6515`), so on LMDB nothing publishes in the
+  key domain and no barrier converges — and a single-node LMDB home would otherwise receive an
+  empty virgin set, skip the barrier, and lock successfully on a capability it cannot honor.
+  `CLUSTER_RECORD_LOCKS_ENABLED` therefore resolves to `false` on LMDB with one error line naming
+  the engine: the node advertises level 0, registers the fail-closed transport, and keeps default
+  subscription placement. A `lock()` there answers the existing enablement 503.
 
 ## The open decision: the recovery barrier
 
 Core's §7.2 recovery is "drain from every reachable member to the position each held at grant
-time". On this branch nothing can name that position in append order (facts 4 and 5). Three
-candidates, each a real change and none improvised here:
+time". Under fact 5 that position must be an **append-order** fence, and nothing on this branch
+can name one. Candidates:
 
 | Candidate | Where it lives | What it buys | What it costs |
 | --- | --- | --- | --- |
-| **(a) A native append-order head.** rocksdb-js exposes the last *appended* entry's key per log (it already tracks `_getLastCommittedPosition` as a byte offset); core's `RocksTransactionLogStore` surfaces it; harper-pro adds an authenticated `record_lock_head` operation and drains to the answer. | rocksdb-js + core + harper-pro | The barrier §7.2 literally describes: every write a reachable member had committed at probe time. Cheap per probe. | Three repositories in sequence; the head must be defined as "no earlier-appended entry has a larger key" to be a valid target under fact 5, which is a rocksdb-js invariant to state and test. |
-| **(b) An in-stream marker.** The probed member's outbound sender, on request, emits a marker frame after it has read its log to end-of-file *at a moment after the probe*; the receiver pushes it through the apply queue and treats its commit as the barrier. | harper-pro (+ a small core hook) | No new head primitive; terminates on an idle peer; ordered by construction. | Correct only if "read to EOF" observes every entry committed before the probe. The sender consumes core's broadcast queue, which is notified from `setImmediate`, so a commit can be durable and not yet notified; closing that window needs a synchronous drain hook in core's `transactionBroadcast`. |
-| **(c) A marker write.** The probed member commits a replicated no-op entry in the database and returns its key. | core (a `lockBarrier` control type) + harper-pro | Trivially ordered after every prior commit; terminates. | One replicated log entry per probed member per recovery, on a path §10 already calls expensive; needs a new control-entry type in core. |
+| **(c) A marker write — recommended.** The probed member commits a replicated no-op `lockBarrier` control entry in the database, constructed after the probe arrived, and returns its key; the receiver drains that origin to it. Probes are coalesced per database. | core (a new control-entry type, ~the size of `lockRelease`) + harper-pro (an authenticated `record_lock_barrier` operation) | Trivially ordered after every commit the member had made before the probe — it is appended after them — and it is exactly the thing the per-origin applied slot already converges on. Terminates on an idle member. | One replicated log entry per probed member per coalesced recovery, on a path §10 already calls expensive. |
+| **(a) An append ordinal.** rocksdb-js carries a per-log append ordinal through the wire and apply path, and the head is the last ordinal. | rocksdb-js + core + harper-pro | The literal §7.2 primitive with no write. | Three repositories; a wire-format change on every frame for a rare path. |
+| **(b) An in-stream marker.** The probed member's outbound sender emits a marker after reading its log to end-of-file at a moment after the probe. | harper-pro + a core drain hook | No log write. | Sound only if "read to EOF" observes every entry committed before the probe; the sender consumes core's `setImmediate`-notified broadcast, so closing that window needs a synchronous drain in `transactionBroadcast`, and the marker then has to be ordered per origin on a relaying stream. |
 
-**Recommendation: (a).** It is the only candidate whose guarantee is exactly the one §7.2
-states, it is the cheapest per recovery, and the rocksdb-js half is small. Until it lands,
-recovery fails closed here. (b) is the fallback if the rocksdb-js change is unwelcome; (c) is
-listed for completeness and not recommended.
+Until one lands, recovery fails closed here.
 
 ## Approaches considered
 
 | Axis | Candidate | Ruling |
 | --- | --- | --- |
-| **Different layer** | Keep the barrier in core, and expose only the raw watermark to it. | Rejected. The watermark is per-`(database, peer)` shared memory owned by replication, and "receives the table from this peer" is a replication fact (a subscription exists, is applying, and is not route-excluded), not a coordinator fact. Core's own note puts the boundary here for the same reason: "The transport does own the stream-specific apply-visible wait." Round 1 upheld this ruling. |
-| **Deeper cause** | Implement the recovery barrier now against a source head derived from what exists: the local received tail (round 0), or a forward scan to the highest key on the member (the first response to round 1). | Rejected — both are unsound. The local tail is zero after a receiver restart while a reachable member holds undelivered commits (round 1's blocker). The highest key is not an append-order head (fact 5): with `T1` claimed at 100 and `T2` at 101, `T2` can commit first, a probe answers 101, and the receiver's maximum reaches 101 before `T1` — committed before the probe — is applied. The genuine deeper-cause fix is candidate (a), which needs a rocksdb-js primitive and is the open decision, not something to approximate here. |
-| **Do less** | Reuse `RECEIVED_VERSION_POSITION` as the clean fence and skip the applied slot. | Rejected. Received is not applied: the entry is in the decode loop's hands, not the store's, so a successor can pass the barrier and then read the predecessor's pre-write value — the exact hazard §7.1 exists to close. |
-| **Chosen** | Publish an apply-visible watermark per `(database, peer)`; evaluate clean lineage against it with the table-completeness, capability and bounded-wait guards; reject recovery markers with 503 until the append-order head exists. | Implements the half whose correctness is provable on this branch, with every guard round 1 named, and refuses — rather than approximates — the half that is not. It preserves core's retry contract, keeps the feature gated off, and leaves one decision, stated with its options and a recommendation. |
+| **Different layer** | Keep the barrier in core, and expose only the raw watermark to it. | Rejected. The watermark is shared memory owned by replication, and "this node receives the table, from an authorized route, and this frame's origin is X" are replication facts, not coordinator facts. Core's own note puts the boundary here: "The transport does own the stream-specific apply-visible wait." Upheld in rounds 1 and 2. |
+| **Deeper cause** | Implement recovery now against a source head derived from what exists: the local received tail (round 0), a forward scan to the highest key (round 1), or a native last-appended key (round 2). | Rejected — all three are unsound under commit-order appends or a restarted receiver; the counterexamples are in the revision history. The genuine deeper-cause fix is a new fence primitive (the open decision), not an approximation. |
+| **Do less** | Reuse `RECEIVED_VERSION_POSITION` as the clean fence and skip the applied slot; or key the applied slot by peer and assume origin-pure streams. | Rejected. Received is not applied (the entry is in the decode loop's hands, not the store's). Peer-keyed progress admits on a relayed unrelated key (round 2's counterexample: A relays B; B's `Q > P` commits before A's `P`; `applied[A] >= P` passes with A's write absent). |
+| **Chosen** | Per-origin, atomic, apply-time publication; event-driven bounded waiters; route/table/capability guards; recovery rejects. | Implements the half whose correctness is provable on this branch with every guard three rounds named, and refuses — rather than approximates — the half that is not. Preserves core's retry contract, keeps the feature gated off, and leaves one decision with a recommendation. |
 
 ## Testing
 
 - Unit (`unitTests/replication/recordLockFreshness.test.mjs`): clean handoff satisfied
-  synchronously; satisfied after the applied slot advances; a torn (mirror-disagreeing) read
-  waits rather than admits; self-origin needs no peer; an origin with no buffer, no capability, or
-  a route-excluded table rejects at once; a wait past its bound rejects and leaves no waiter; an
-  unregister tears every waiter down; recovery (`null`) rejects with 503; an empty set is a no-op.
+  synchronously; satisfied after an origin publication wakes the heap; a publication for a
+  different origin wakes nothing; self-origin needs no peer; a non-member origin, a missing
+  capability, an unauthorized route, and a route-excluded table each reject at once with the
+  reason named; a waiter past its bound settles once with 503 and both heaps are empty; unregister
+  settles every waiter; recovery (`null`) rejects and increments the counter; an empty set is a
+  no-op; a torn-looking value cannot occur (the slot is one atomic word — the test stores from a
+  worker thread and loads on main, the round-2 probe as a test).
 - Unit (`unitTests/replication/replicationConnection` scope, where the harness allows): the
-  applied slot advances from a data `end_txn` and from an empty sequence update, only after
-  `onCommit`'s existing work, never on a rejected copy flush, and not at all with locks disabled.
+  origin slot advances from a data `end_txn` after `onCommit`'s existing work, never on a rejected
+  copy flush, never from either sequence-update form, never with locks disabled; an `Infinity`
+  or `NaN` in either sequence-update form holds the frame and leaves received/committed/durable
+  cursors unchanged; a reset bumps the generation and a stale session's publish is ignored.
 - Unit (`unitTests/replication/recordLockTransport.test.mjs`): slot positions and the grown
-  buffer; the disabled transport rejects `establishLockFreshness` with the enablement message; the
-  LMDB refusal advertises level 0.
+  buffer; exact-level recording; the disabled transport rejects `establishLockFreshness` with the
+  enablement message; LMDB resolves the gate to `false`.
 - Unit (`unitTests/replication/protocolCapabilities.test.mjs`): level 4 advertised, level 3 refused.
-- End-to-end (`integrationTests/cluster/recordLockCluster.test.mjs`): the concurrent-increment
-  assertion goes back to **exact** convergence — `sorted(seen) === [1..N]` and every node
-  converging to `N`, not merely to one another. It was weakened in this PR's round 4/5 precisely
-  because a handoff carried exclusion but not freshness; that is what this change restores.
-  Deterministic coverage the reviewer asked for and this note commits to where the harness
-  permits: a held apply (`HARPER_TEST_COPY_COMMIT_DELAY_ONCE_DB`-style hook) proving a clean
-  handoff waits and the successor then reads the predecessor's value; a route-excluded table
-  answering 503 immediately; a mixed-level pair answering 503 with the level named. Recovery
-  cases stay `test.skip` naming this note's open decision, as the crash-recovery test already
-  does for harper#2498.
+- End-to-end (`integrationTests/cluster/recordLockCluster.test.mjs`): exact convergence restored
+  (`sorted(seen) === [1..N]`, every node at `N`) — probabilistic, so alongside it a deterministic
+  case: hold a data apply on the successor's node (the existing one-shot commit-delay hook
+  pattern), request the lock there, observe `cluster_status.recordLocks.waiters > 0` while the
+  request is pending, release the hold, and assert the successor read the predecessor's value;
+  a route-excluded table answering 503 immediately; a mixed-level pair answering 503 with the level
+  named; a single-node LMDB `lock()` answering 503; a generation change (stage + activate a new
+  generation) proving core surfaces recovery as 503 and the counter increments. A relayed
+  mixed-origin case is added if the cluster fixture can express a relay topology; otherwise it is
+  the unit test's guarded origin-keyed publication plus a stated gap.
