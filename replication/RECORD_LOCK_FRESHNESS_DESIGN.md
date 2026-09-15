@@ -16,10 +16,10 @@ establishLockFreshness(
 at that branch's head, and the two merge core-first per `dev/CLAUDE.md`.) The method is
 **required**, so harper-pro does not compile against core until it exists.
 
-| `dependencies` | Meaning | Obligation |
-| --- | --- | --- |
-| an array | exact clean-handoff lineage | every named `(origin, position)` must be **applied and visible** locally before this call resolves; the return value is ignored |
-| `null` | recovery marker (no retained lineage) | drain from **every** home-map member to a fence each produces on request, and **return** the positions established |
+| `dependencies` | Meaning                               | Obligation                                                                                                                      |
+| -------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| an array       | exact clean-handoff lineage           | every named `(origin, position)` must be **applied and visible** locally before this call resolves; the return value is ignored |
+| `null`         | recovery marker (no retained lineage) | drain from **every** home-map member to a fence each produces on request, and **return** the positions established              |
 
 Core races the call against the lock deadline but cannot cancel it; `deadlineMs` is the remaining
 wait, and every wait here is bounded by it.
@@ -43,7 +43,7 @@ exact entry — matched on `(origin, position, nonce)` — to commit locally. No
   by key — probed on the pinned rocksdb-js 2.9.0 with timestamps appended as `100, 200, 101, 300`:
   `query({start: 50})` yields `100, 200, 101, 300`. A barrier appended after the fenced write is
   therefore delivered after it, on the live tail and on a resume alike. The one case a resume
-  changes is an entry whose key is *below* the subscriber's cursor (`start: 150` yields
+  changes is an entry whose key is _below_ the subscriber's cursor (`start: 150` yields
   `200, 300`): it is never delivered, the barrier never arrives, and the wait fails closed. That
   skip is a pre-existing replication hazard on clock rollback, not a lock defect, and is filed as
   harper#2629 (a persisted clock floor in rocksdb-js closes it).
@@ -70,7 +70,7 @@ dependency are the mechanism. The task owner chose full soundness over documente
 (2026-09-15), which is why harper#2628 exists.
 
 **Round 6 — resolved by the author, not cleared.** Its headline blocker claimed replay yields a
-post-rollback barrier (key 101) *before* an earlier inherited write (key 200) because the sender
+post-rollback barrier (key 101) _before_ an earlier inherited write (key 200) because the sender
 reads by key. The probe above disproves it: per-log reads are append-ordered. Its framing — an
 incarnation-qualified append sequence in core's log identity, a wire/storage migration — is
 therefore not required for this invariant; the residual resume skip is harper#2629. Every other
@@ -118,7 +118,7 @@ is allocated or `writeLockBarrier` is called; and the zero-cost claim gets an ex
   core checks only finite and `>= 0`):
   - `origin === thisNode`: satisfied iff the database has **never been recloned** — the local log
     is intact and the write at `position` is this node's own committed history. harper-pro persists
-    an **ever-recloned** flag in the database's `dbis` store when a clone attempt *starts* (before
+    an **ever-recloned** flag in the database's `dbis` store when a clone attempt _starts_ (before
     any copied row lands, so a crash mid-clone leaves the flag, never the ambiguity); with it set,
     every self-origin dependency rejects with 503 until the operator reclones the peers instead or
     the origin incarnation reaches the wire (a core follow-up, not this PR).
@@ -142,7 +142,7 @@ is allocated or `writeLockBarrier` is called; and the zero-cost claim gets an ex
   are mutually trusted, so a collision-resistant random suffices and is documented as such) is
   registered in the database's **outstanding barrier table** before the request is sent;
   concurrent callers for the same `(database, table, origin)` whose deadlines allow share one
-  request *and one nonce*; the table is bounded by `MAX_OUTSTANDING_BARRIERS` per database (excess
+  request _and one nonce_; the table is bounded by `MAX_OUTSTANDING_BARRIERS` per database (excess
   rejects 503) and every entry carries its deadline.
 - **Observing the entry.** In the decode loop, a record that `isLockControlType` already flags and
   whose type is `lockBarrier` has its origin id, frame key and nonce captured; at that frame's
@@ -178,7 +178,7 @@ is allocated or `writeLockBarrier` is called; and the zero-cost claim gets an ex
   `registerReplicatedApplyFailureListener` (harper#2628) the transport registers the fail-closed
   variant and logs why, so the feature cannot be enabled against a core that leaves holes
   unreported. **Rollback runbook**: disable `replication.recordLocks` on every node and restart
-  (drains admissions and stops barrier writes) *before* downgrading; retained `lockBarrier`
+  (drains admissions and stops barrier writes) _before_ downgrading; retained `lockBarrier`
   entries then replay into a level-3 node's sink as "malformed control entry" warnings —
   harmless, named here so they are not read as corruption.
 - **Blob-bearing locked writes**: the barrier commits after the record; the record value is
@@ -193,15 +193,15 @@ is allocated or `writeLockBarrier` is called; and the zero-cost claim gets an ex
 
 ## Approaches considered
 
-| Axis | Candidate | Ruling |
-| --- | --- | --- |
-| **Different layer** | Keep the barrier in core; expose a raw watermark. | Rejected — "this stream dropped nothing for this table", "this entry committed here", and "this caller is a current member" are replication facts. Upheld in every round. |
-| **Different layer** | Fail-stop the replicated source at the first terminal apply failure (core). | Rejected — one poison record would wedge replication from that peer forever; the lock invariant needs the skip *observable*, not fatal. harper#2628 exposes it instead. |
-| **Deeper cause** | An incarnation-qualified append sequence in core's log identity, carried in dependencies and barriers (round 6's framing). | Not required — the premise that replay reorders a log by key is false on this checkout (probe above); the residual resume skip is harper#2629 and fails closed here. A wire/storage migration for a defect that does not exist is not adopted. |
-| **Deeper cause** | A per-origin apply-visible fence word (CAS max, generation-keyed, bootstrapped) admitting without a probe. | Rejected — a numeric key is not an append-order proof and a restart reissues keys (clock-rollback counterexample); every variant (rounds 2–5) admitted stale data under a concrete schedule. |
-| **Deeper cause** | Carry an origin incarnation in dependencies so self-origin lineage across a reclone is decidable. | Deferred — a core wire change for one edge; the ever-recloned flag gives a fail-closed answer locally. |
-| **Do less** | Document the hole classes instead of poisoning; clear poison on `COPY_COMPLETE`. | Rejected by the task owner (2026-09-15, option 1 over 2); and a base copy cannot re-deliver an absence (fact 3). |
-| **Chosen** | Exact same-table nonce barriers for every unsatisfied cross-origin dependency and for recovery; permanent durable per-`(origin, table)` poison from every drop and from core's failure hook; self-origin decided by the ever-recloned flag; bounded, authorized, client-coalesced requests. | Every admission rests on an entry the origin appended after the write in question and this node committed, over a stream with no recorded hole for that table; nothing rests on a key comparison, a cursor, or a timeout. |
+| Axis                | Candidate                                                                                                                                                                                                                                                                                   | Ruling                                                                                                                                                                                                                                         |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Different layer** | Keep the barrier in core; expose a raw watermark.                                                                                                                                                                                                                                           | Rejected — "this stream dropped nothing for this table", "this entry committed here", and "this caller is a current member" are replication facts. Upheld in every round.                                                                      |
+| **Different layer** | Fail-stop the replicated source at the first terminal apply failure (core).                                                                                                                                                                                                                 | Rejected — one poison record would wedge replication from that peer forever; the lock invariant needs the skip _observable_, not fatal. harper#2628 exposes it instead.                                                                        |
+| **Deeper cause**    | An incarnation-qualified append sequence in core's log identity, carried in dependencies and barriers (round 6's framing).                                                                                                                                                                  | Not required — the premise that replay reorders a log by key is false on this checkout (probe above); the residual resume skip is harper#2629 and fails closed here. A wire/storage migration for a defect that does not exist is not adopted. |
+| **Deeper cause**    | A per-origin apply-visible fence word (CAS max, generation-keyed, bootstrapped) admitting without a probe.                                                                                                                                                                                  | Rejected — a numeric key is not an append-order proof and a restart reissues keys (clock-rollback counterexample); every variant (rounds 2–5) admitted stale data under a concrete schedule.                                                   |
+| **Deeper cause**    | Carry an origin incarnation in dependencies so self-origin lineage across a reclone is decidable.                                                                                                                                                                                           | Deferred — a core wire change for one edge; the ever-recloned flag gives a fail-closed answer locally.                                                                                                                                         |
+| **Do less**         | Document the hole classes instead of poisoning; clear poison on `COPY_COMPLETE`.                                                                                                                                                                                                            | Rejected by the task owner (2026-09-15, option 1 over 2); and a base copy cannot re-deliver an absence (fact 3).                                                                                                                               |
+| **Chosen**          | Exact same-table nonce barriers for every unsatisfied cross-origin dependency and for recovery; permanent durable per-`(origin, table)` poison from every drop and from core's failure hook; self-origin decided by the ever-recloned flag; bounded, authorized, client-coalesced requests. | Every admission rests on an entry the origin appended after the write in question and this node committed, over a stream with no recorded hole for that table; nothing rests on a key comparison, a cursor, or a timeout.                      |
 
 ## Testing
 

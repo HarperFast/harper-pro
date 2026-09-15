@@ -3,9 +3,9 @@
  *
  * What only real nodes can prove: that a delegation request reaches a key's home over the real
  * replication connections and comes back granted; that lock()+increment across three nodes stays
- * exclusive (every admitted increment lands in range and every node converges to the same final
- * value — NOT that no update is ever lost: harper#2542, the successor-freshness fence, is still
- * outstanding); that a key held on one node hands over to another on release, through recall; that a
+ * exclusive AND fresh (the N admitted increments are exactly 1..N and every node converges to N —
+ * harper#2613's successor-freshness lineage plus this transport's `lockBarrier` proof, harper#2625);
+ * that a key held on one node hands over to another on release, through recall; that a
  * lock is exclusive across nodes while held; that a stale holder is fenced; and that a peer without
  * the delegation-level `recordLocks` capability is not a ring member and fails a cluster lock closed.
  *
@@ -260,19 +260,14 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 		const failed = results.filter((result) => result.status !== 200);
 		assert.deepEqual(failed, [], `every increment must succeed: ${JSON.stringify(failed)}`);
 		const seen = results.map((result) => result.body.n);
-		for (const n of seen) assert.ok(n >= 1 && n <= N, `n=${n} is outside the admitted range [1, ${N}]: ${seen}`);
-		// A handoff here carries exclusion but not yet successor freshness (harper#2542): a successor can
-		// read its predecessor's pre-write value, so a FEW admitted increments can legitimately land on the
-		// same n (RECORD_LOCK_COST_DELEGATIONS.md measures 0.05-0.13% of sections at 3 contenders). A range
-		// check alone cannot tell that apart from no exclusion at all (every request reading the unwritten
-		// n=0 and writing 1) — a real pre-push review finding — so also require nearly every value distinct.
-		const distinctValues = new Set(seen).size;
-		assert.ok(
-			distinctValues >= N - 2,
-			`too many admitted increments collided, exclusion did not serialize access: ${seen}`
+		// Exclusion plus successor freshness (harper#2613 + this transport's barrier): every admitted
+		// critical section read its predecessor's write, so the N increments are exactly 1..N. A collision
+		// here is a freshness failure, not noise.
+		assert.deepEqual(
+			[...seen].sort((a, b) => a - b),
+			Array.from({ length: N }, (_, i) => i + 1),
+			`admitted increments are not exactly 1..${N}: ${seen}`
 		);
-		// What exclusion alone guarantees is that every node converges to the SAME final value — not that
-		// the value is N (the prior strict [1..N] convergence assertion could flake on the same race).
 		const finalValues = await waitForCondition(
 			async (signal) => {
 				const values = await Promise.all(nodes.map((node) => counter(node, id, signal).then((record) => record?.n)));
@@ -281,8 +276,8 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 			{ timeoutMs: CONVERGE_TIMEOUT_MS, description: `Counter/${id} to converge to the same value on every node` }
 		);
 		assert.ok(
-			finalValues.every((n) => n >= 1 && n <= N),
-			`nodes converged outside the admitted range: ${finalValues}`
+			finalValues.every((n) => n === N),
+			`nodes did not converge to ${N}: ${finalValues}`
 		);
 	});
 

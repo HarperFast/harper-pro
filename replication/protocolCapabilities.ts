@@ -25,9 +25,12 @@ export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
  * delegation request; a new `RECORD_LOCK_HOMES_DIGEST` message) even though no prior level ever ran
  * in production, so the bump still applies: a cluster running two levels would have two independent
  * arbiters for one key, which is why `peerSupportsRecordLocks` requires this level exactly rather
- * than "at least 1".
+ * than "at least 1". Level 4 adds successor freshness (harper#2613, harper#2625): the release payload
+ * is a versioned tuple carrying lineage, a `lockBarrier` control entry rides the table log, and a
+ * level-4 node admits a handoff only after that barrier has applied — a level-3 peer would admit
+ * without the fence, so the levels stay mutually exclusive.
  */
-export const RECORD_LOCKS_CAPABILITY = 3;
+export const RECORD_LOCKS_CAPABILITY = 4;
 
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {

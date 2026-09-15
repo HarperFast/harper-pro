@@ -18,6 +18,9 @@ import {
 	RECORD_LOCK_HOMES_AGREEMENT_POSITION,
 	RECORD_LOCKS_CAPABILITY_POSITION,
 	RECORD_LOCKS_DISABLED_MESSAGE,
+	RECORD_LOCK_LEVEL_POSITION,
+	readPeerLockLevel,
+	recordPeerLockLevel,
 	collectRecordLockStatus,
 	createDisabledRecordLockTransport,
 	createRecordLockTransport,
@@ -108,6 +111,19 @@ describe('peer home-map digest agreement in the shared status buffer', () => {
 	it('uses the slot right after the capability-level flag, still inside headroom', () => {
 		assert.strictEqual(RECORD_LOCK_HOMES_AGREEMENT_POSITION, RECORD_LOCKS_CAPABILITY_POSITION + 1);
 		assert.ok(RECORD_LOCK_HOMES_AGREEMENT_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
+	});
+
+	it('records the exact advertised level in the last slot, reading garbage as 0', () => {
+		assert.strictEqual(RECORD_LOCK_LEVEL_POSITION, RECORD_LOCK_HOMES_AGREEMENT_POSITION + 1);
+		assert.ok(RECORD_LOCK_LEVEL_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		assert.strictEqual(readPeerLockLevel(status), 0);
+		recordPeerLockLevel(status, 4);
+		assert.strictEqual(readPeerLockLevel(status), 4);
+		recordPeerLockLevel(status, -1);
+		assert.strictEqual(readPeerLockLevel(status), 0);
+		status[RECORD_LOCK_LEVEL_POSITION] = 2.5;
+		assert.strictEqual(readPeerLockLevel(status), 0);
 	});
 });
 
@@ -315,6 +331,10 @@ describe('createDisabledRecordLockTransport', () => {
 				}),
 			(error) => error.message === RECORD_LOCKS_DISABLED_MESSAGE && error.statusCode === 503
 		);
+		await assert.rejects(
+			() => transport.establishLockFreshness('data', 'Counter', 'k', [['peer', 5]], 1000),
+			(error) => error.message === RECORD_LOCKS_DISABLED_MESSAGE && error.statusCode === 503
+		);
 		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /replication\.recordLocks/);
 		assert.match(RECORD_LOCKS_DISABLED_MESSAGE, /scope: 'node'/);
 	});
@@ -513,5 +533,46 @@ describe('collectRecordLockStatus (main thread)', () => {
 		} finally {
 			setMainIsWorker(false);
 		}
+	});
+});
+
+describe('createRecordLockTransport().establishLockFreshness', () => {
+	it('builds the barrier once, over its own homeMap(), and forwards the dependency set and deadline', async () => {
+		const calls = [];
+		const barrier = {
+			establish(table, dependencies, deadlineMs) {
+				calls.push({ table, dependencies, deadlineMs });
+				return Promise.resolve();
+			},
+			noteBarrierApplied: () => false,
+			stats: () => ({ outstanding: 0, applied: 0, timeouts: 0, rejected: {} }),
+			close() {},
+		};
+		let built = 0;
+		let homeMapReader;
+		const deps = {
+			thisNodeName: () => 'self',
+			auditStore: () => undefined,
+			ownsDatabase: () => true,
+			homeIncarnation: () => 1,
+			send: () => Promise.reject(new Error('no wire in this test')),
+			isFirstIncarnation: () => false,
+			monotonicNow: () => 0,
+			freshness(database, homeMap) {
+				built++;
+				assert.strictEqual(database, 'data');
+				homeMapReader = homeMap;
+				return barrier;
+			},
+		};
+		const transport = createRecordLockTransport('data', deps, () => undefined);
+		await transport.establishLockFreshness('data', 'Counter', 'k', [['peer', 5]], 250);
+		await transport.establishLockFreshness('data', 'Counter', 'k', null, 300);
+		assert.strictEqual(built, 1);
+		assert.deepStrictEqual(calls, [
+			{ table: 'Counter', dependencies: [['peer', 5]], deadlineMs: 250 },
+			{ table: 'Counter', dependencies: null, deadlineMs: 300 },
+		]);
+		assert.strictEqual(homeMapReader(), undefined, 'the barrier reads the map the transport itself would answer');
 	});
 });

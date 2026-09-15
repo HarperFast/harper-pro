@@ -54,11 +54,14 @@ import { ClientError } from '../core/utility/errors/hdbError.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { currentRow, onRecordLockHomesChanged, type RecordLockGenerationState } from './recordLockHomes.ts';
 import {
+	BARRIER_OPERATION,
 	DELEGATE_OPERATION,
 	RECALL_OPERATION,
 	sendRecordLockOperation,
 	setRecordLockOwnershipReaders,
 } from './recordLockRpc.ts';
+import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
+import { everRecloned, isPoisoned, poisonedPairs } from './recordLockPoison.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 
@@ -98,6 +101,65 @@ export function readPeerHomesAgreement(status: Float64Array): number {
 	return value === HOMES_AGREEMENT_MATCH || value === HOMES_AGREEMENT_MISMATCH ? value : HOMES_AGREEMENT_UNKNOWN;
 }
 
+/** Slot 31: the peer's exact advertised `recordLocks` level, so a refusal can name it. 0 while unknown. */
+export const RECORD_LOCK_LEVEL_POSITION = 31;
+
+export function recordPeerLockLevel(status: Float64Array, level: number): void {
+	status[RECORD_LOCK_LEVEL_POSITION] = Number.isSafeInteger(level) && level >= 0 ? level : 0;
+}
+
+export function readPeerLockLevel(status: Float64Array): number {
+	const value = status[RECORD_LOCK_LEVEL_POSITION];
+	return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+// ---- successor-freshness barriers, one per registered database on the coordinating thread --------
+
+const freshnessBarriers = new Map<string, FreshnessBarrier>();
+
+function installFreshnessBarrier(database: string, barrier: FreshnessBarrier): void {
+	freshnessBarriers.get(database)?.close();
+	freshnessBarriers.set(database, barrier);
+}
+
+function closeFreshnessBarrier(database: string): void {
+	freshnessBarriers.get(database)?.close();
+	freshnessBarriers.delete(database);
+}
+
+/**
+ * A `lockBarrier` entry committed on this thread (`replicationConnection.ts`, from the frame's
+ * onCommit). The waiter lives on the database's coordinating thread; a stream applying elsewhere
+ * hands it through main, which knows the owner, on the existing record-lock message path.
+ */
+export function recordLockBarrierApplied(database: string, origin: string, position: number, nonce: number): void {
+	if (ownsRecordLockCoordination(database)) {
+		freshnessBarriers.get(database)?.noteBarrierApplied(origin, position, nonce);
+		return;
+	}
+	const message = { type: 'record-lock-barrier-applied', database, origin, position, nonce };
+	try {
+		if (parentPort) parentPort.postMessage(message);
+		else routeBarrierAppliedFromMain(message);
+	} catch (error) {
+		logger.debug?.('Could not relay an applied record lock barrier', error);
+	}
+}
+
+function routeBarrierAppliedFromMain(message: any): void {
+	const owner = recordLockOwners.get(message.database);
+	if (owner === MAIN_OWNER) {
+		freshnessBarriers.get(message.database)?.noteBarrierApplied(message.origin, message.position, message.nonce);
+		return;
+	}
+	if (!owner || owner === PENDING_BUMP) return;
+	try {
+		owner.postMessage(message);
+	} catch (error) {
+		logger.debug?.('Could not forward an applied record lock barrier to the owner worker', error);
+	}
+}
+
 export interface RecordLockTransportDeps {
 	thisNodeName(): string;
 	/** Any table's auditStore for the database, which is what keys the shared status buffers. */
@@ -117,6 +179,8 @@ export interface RecordLockTransportDeps {
 	isFirstIncarnation(): boolean;
 	/** Monotonic ms, for `grantableAfterMono` — the same clock `performance.now()` reads elsewhere. */
 	monotonicNow(): number;
+	/** The successor-freshness barrier for the database, built over this transport's own `homeMap()`. */
+	freshness(database: string, homeMap: () => LockHomeMap | undefined): FreshnessBarrier;
 }
 
 /**
@@ -148,8 +212,13 @@ export function createRecordLockTransport(
 	// waived outright. A genuine restart (a prior incarnation existed) leaves this undefined, so core's
 	// own default quarantine applies — that is the correct, safe default core already enforces.
 	const grantableAfterMono = deps.isFirstIncarnation() ? deps.monotonicNow() : undefined;
-	return {
+	let freshness: FreshnessBarrier | undefined;
+	const transport: ClusterLockTransport = {
 		grantableAfterMono,
+		establishLockFreshness(db: string, table: string, _key: unknown, dependencies, deadlineMs: number) {
+			freshness ??= deps.freshness(db, () => transport.homeMap(db));
+			return freshness.establish(table, dependencies, deadlineMs);
+		},
 		homeMap(): LockHomeMap | undefined {
 			const active = cacheFor();
 			if (!active) return undefined;
@@ -196,6 +265,7 @@ export function createRecordLockTransport(
 			});
 		},
 	};
+	return transport;
 }
 
 export const RECORD_LOCKS_DISABLED_MESSAGE =
@@ -217,6 +287,7 @@ export function createDisabledRecordLockTransport(): ClusterLockTransport {
 		},
 		requestDelegation: disabled,
 		recallDelegation: disabled,
+		establishLockFreshness: disabled,
 	};
 }
 
@@ -512,6 +583,31 @@ const productionDeps: RecordLockTransportDeps = {
 	send: sendRecordLockOperation,
 	isFirstIncarnation,
 	monotonicNow: () => performance.now(),
+	freshness(database, homeMap) {
+		const barrier = createFreshnessBarrier(database, {
+			thisNodeName: getThisNodeName,
+			homeMap,
+			peerLevel: (peer) => {
+				const auditStore = auditStoreFor(database);
+				return auditStore ? readPeerLockLevel(getReplicationSharedStatus(auditStore, database, peer)) : 0;
+			},
+			tableReplicates: (table) => tableReplicates(database, table),
+			isPoisoned: (origin, table) => isPoisoned(database, origin, table),
+			everRecloned: () => everRecloned(database),
+			async requestBarrier(origin, table, nonce) {
+				const reply = await sendRecordLockOperation(origin, database, {
+					operation: BARRIER_OPERATION,
+					database,
+					table,
+					nonce,
+				});
+				return reply?.position;
+			},
+			monotonicNow: () => performance.now(),
+		});
+		installFreshnessBarrier(database, barrier);
+		return barrier;
+	},
 };
 
 /**
@@ -587,6 +683,7 @@ function recreateRecordLockTransport(database: string): void {
 export function releaseRecordLockTransport(database: string): void {
 	if (!transports.delete(database)) return;
 	unregisterClusterLockTransport(database);
+	closeFreshnessBarrier(database);
 	ownedDatabases.delete(database);
 	activeCache.delete(database);
 	if (!parentPort) releaseRecordLockOwner(database);
@@ -602,6 +699,10 @@ export interface RecordLockDatabaseStats {
 	droppedOffOwner: number;
 	/** The home map's member set as this thread sees it, or undefined while the map is withheld. */
 	members?: string[];
+	/** Successor-freshness barrier counters, from the coordinating thread only. */
+	freshness?: FreshnessStats;
+	/** `origin:table` pairs with a recorded replication hole; cluster locks fail closed on them. */
+	poisoned?: string[];
 }
 
 /** Summed `LockCoordinator.stats` over the database's tables on this thread. */
@@ -624,6 +725,12 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 	}
 	try {
 		total.members = transports.get(database)?.homeMap(database)?.homes;
+		total.freshness = freshnessBarriers.get(database)?.stats();
+		try {
+			total.poisoned = poisonedPairs(database);
+		} catch {
+			// A store that cannot be read is reported as nothing rather than failing status.
+		}
 	} catch {
 		// The disabled transport throws here by design; status reporting must not.
 	}
@@ -651,6 +758,9 @@ if (parentPort) {
 	});
 	onMessageByType('record-lock-homes-changed-ack', (message) => {
 		pendingHomesChangedAcks.get(message.requestId)?.(message.ok === true);
+	});
+	onMessageByType('record-lock-barrier-applied', (message) => {
+		freshnessBarriers.get(message.database)?.noteBarrierApplied(message.origin, message.position, message.nonce);
 	});
 	onMessageByType('record-lock-status-request', (message) => {
 		const status: Record<string, RecordLockDatabaseStats | undefined> = {};
@@ -851,6 +961,8 @@ export async function collectRecordLockStatus(
 				entry.granted = stats.granted;
 				entry.admitted = stats.admitted;
 				entry.members = stats.members;
+				entry.freshness = stats.freshness;
+				entry.poisoned = stats.poisoned;
 			}
 			entry.droppedOffOwner = (entry.droppedOffOwner ?? 0) + stats.droppedOffOwner;
 		}
@@ -891,7 +1003,18 @@ setRecordLockOwnershipReaders({
 		return owner === MAIN_OWNER || owner === PENDING_BUMP ? undefined : owner;
 	},
 	mainOwns: (database) => recordLockOwners.get(database) === MAIN_OWNER,
+	isMember: (database, node) => transports.get(database)?.homeMap(database)?.homes.includes(node) === true,
+	peerLevel: (database, node) => {
+		const auditStore = auditStoreFor(database);
+		return auditStore ? readPeerLockLevel(getReplicationSharedStatus(auditStore, database, node)) : 0;
+	},
+	tableReplicates: (database, table) => tableReplicates(database, table),
 });
+
+function tableReplicates(database: string, table: string): boolean {
+	const definition = getDatabases()[database]?.[table];
+	return definition !== undefined && definition.replicate !== false;
+}
 
 if (!parentPort) {
 	if (CLUSTER_RECORD_LOCKS_ENABLED)
@@ -910,6 +1033,10 @@ if (!parentPort) {
 	});
 	onMessageByType('record-lock-status', (message) => {
 		pendingStatusRequests.get(message.requestId)?.(message.status ?? {});
+	});
+	onMessageByType('record-lock-barrier-applied', (message) => {
+		if (typeof message?.database !== 'string' || typeof message?.origin !== 'string') return;
+		routeBarrierAppliedFromMain(message);
 	});
 	onMessageByType('record-lock-homes-changed', (message, worker) => {
 		if (typeof message?.database !== 'string') return;

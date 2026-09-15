@@ -27,19 +27,29 @@ import * as logger from '../core/utility/logging/harper_logger.js';
 import {
 	deliverDelegationRecall,
 	deliverDelegationRequest,
+	writeLockBarrier,
 	type DelegationRecall,
 	type DelegationReply,
 	type DelegationRequest,
 } from '../core/resources/recordLockCoordinator.ts';
 import { getRepairConnectionsForDB, sendOperationToNode } from './replicator.ts';
+import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
 
 export const DELEGATE_OPERATION = 'record_lock_delegate';
 export const RECALL_OPERATION = 'record_lock_recall';
+export const BARRIER_OPERATION = 'record_lock_barrier';
 
 /** Bound on a relay through the main thread to the owner worker. */
 const RELAY_TIMEOUT_MS = 5_000;
 const NOT_HOME: DelegationReply = { granted: false, reason: 'not-home' };
 const RECALLED = Object.freeze({ recalled: true as const });
+/**
+ * A barrier is a replicated write a peer can make this node perform, so each caller gets a token
+ * bucket per database: enough for every cold handoff a busy table can produce, far below what would
+ * let one member turn a request loop into cluster-wide log and apply work.
+ */
+export const BARRIER_RATE_PER_SECOND = 200;
+export const BARRIER_BURST = 400;
 
 // ---- ownership readers, installed by recordLockTransport.ts so this module never imports it -----
 
@@ -49,6 +59,11 @@ interface OwnershipReaders {
 	ownerFor(database: string): any;
 	/** Main thread only: whether the main thread itself owns the database. */
 	mainOwns(database: string): boolean;
+	/** Whether `node` is in the database's current agreed home map, at this node's own level. */
+	isMember?(database: string, node: string): boolean;
+	/** The peer's exact advertised `recordLocks` level, 0 while unknown. */
+	peerLevel?(database: string, node: string): number;
+	tableReplicates?(database: string, table: string): boolean;
 }
 let ownership: OwnershipReaders = {
 	ownsDatabase: () => false,
@@ -78,6 +93,13 @@ export interface RecallOperation {
 	token: DelegationRecall['token'];
 }
 
+export interface BarrierOperation {
+	operation: typeof BARRIER_OPERATION;
+	database: string;
+	table: string;
+	nonce: number;
+}
+
 /**
  * Send a lock operation to `nodeName`, preferring this worker's live outbound subscription session
  * for the database. The `sendOperationToNode` fallback opens a connection per call; it exists so a
@@ -86,7 +108,7 @@ export interface RecallOperation {
 export async function sendRecordLockOperation(
 	nodeName: string,
 	database: string,
-	operation: DelegateOperation | RecallOperation
+	operation: DelegateOperation | RecallOperation | BarrierOperation
 ): Promise<any> {
 	for (const connection of getRepairConnectionsForDB(database)) {
 		if (connection.nodeName !== nodeName) continue;
@@ -146,6 +168,49 @@ async function executeRecall(request: any): Promise<{ recalled: true }> {
 	if (answer?.recalled !== true)
 		throw new ClientError('record lock recall did not reach the coordinating worker in time', 503);
 	return RECALLED;
+}
+
+// ---- the recovery / freshness fence: a lockBarrier written on request -------------------------
+
+const barrierBuckets = new Map<string, { tokens: number; refilledAt: number }>();
+
+function admitBarrierRequest(caller: string, database: string, now = Date.now()): boolean {
+	const key = `${caller} ${database}`;
+	let bucket = barrierBuckets.get(key);
+	if (!bucket) barrierBuckets.set(key, (bucket = { tokens: BARRIER_BURST, refilledAt: now }));
+	const refill = ((now - bucket.refilledAt) / 1_000) * BARRIER_RATE_PER_SECOND;
+	if (refill > 0) {
+		bucket.tokens = Math.min(BARRIER_BURST, bucket.tokens + refill);
+		bucket.refilledAt = now;
+	}
+	if (bucket.tokens < 1) return false;
+	bucket.tokens -= 1;
+	return true;
+}
+
+/**
+ * Every check runs before any state is touched or a write is made: a departed-but-known node, or one
+ * at another level, must not be able to make this node commit replicated entries. One entry per
+ * request, never merged across callers — a caller matches the entry on its own nonce, so a shared
+ * write would answer one of them with an entry that never carries its nonce.
+ */
+async function executeBarrier(request: any): Promise<{ position: number }> {
+	const caller = principalNodeName(request);
+	if (!caller) throw new ClientError('record lock barriers are written for cluster nodes only', 403);
+	if (typeof request.database !== 'string' || typeof request.table !== 'string')
+		throw new ClientError('database and table are required', 400);
+	if (!ownership.isMember?.(request.database, caller))
+		throw new ClientError(`${caller} is not a member of the record lock home map for ${request.database}`, 403);
+	if (ownership.peerLevel?.(request.database, caller) !== RECORD_LOCKS_CAPABILITY)
+		throw new ClientError(`${caller} does not advertise record lock capability level ${RECORD_LOCKS_CAPABILITY}`, 403);
+	if (!ownership.tableReplicates?.(request.database, request.table))
+		throw new ClientError(`${request.database}.${request.table} does not replicate`, 400);
+	if (!Number.isSafeInteger(request.nonce) || request.nonce < 0)
+		throw new ClientError('a barrier nonce must be a non-negative integer', 400);
+	if (!admitBarrierRequest(caller, request.database))
+		throw new ClientError(`too many record lock barrier requests from ${caller} for ${request.database}`, 429);
+	const position = await writeLockBarrier(request.database, request.table, request.nonce);
+	return { position };
 }
 
 // ---- relay through the main thread to the owner worker -----------------------------------------
@@ -256,3 +321,4 @@ if (parentPort) {
 
 server.registerOperation?.({ name: DELEGATE_OPERATION, execute: executeDelegate, httpMethod: 'POST' });
 server.registerOperation?.({ name: RECALL_OPERATION, execute: executeRecall, httpMethod: 'POST' });
+server.registerOperation?.({ name: BARRIER_OPERATION, execute: executeBarrier, httpMethod: 'POST' });

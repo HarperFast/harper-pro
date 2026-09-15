@@ -25,6 +25,7 @@ import {
 import {
 	exportIdMapping,
 	getIdOfRemoteNode,
+	getNodeNameForId,
 	remoteToLocalNodeId,
 	getThisNodeId,
 } from '../core/resources/nodeIdMapping.ts';
@@ -37,7 +38,15 @@ import {
 } from './replicator.ts';
 import { redactOperationForLog } from './logRedaction.ts';
 import { CopyCursorWatermark } from './copyCursorWatermark.ts';
-import { recordPeerLockCapability, recordPeerHomesDigest, currentHomesDigest } from './recordLockTransport.ts';
+import {
+	recordPeerLockCapability,
+	recordPeerLockLevel,
+	recordPeerHomesDigest,
+	currentHomesDigest,
+	recordLockBarrierApplied,
+} from './recordLockTransport.ts';
+import { markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
+import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
@@ -4154,7 +4163,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function recordPeerLockCapabilityFromHandshake() {
 		if (!peerCapabilitiesLearned) return;
 		const status = getSharedStatus();
-		if (status) recordPeerLockCapability(status, peerSupportsRecordLocks(peerCapabilities));
+		if (status) {
+			recordPeerLockCapability(status, peerSupportsRecordLocks(peerCapabilities));
+			recordPeerLockLevel(status, peerCapabilities.recordLocks);
+		}
 	}
 	if (databaseName) {
 		setDatabase(databaseName);
@@ -4825,6 +4837,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
 						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
+						if (cloneAttempt && databaseName) {
+							// Durable before the first copied row: a clone replaces this node's own history with
+							// rows that carry no local log entry, and the record-lock barrier must know that.
+							try {
+								await markRecloned(databaseName);
+							} catch (error) {
+								logger.error?.(connectionId, 'failed to record the clone for record locks', databaseName, error);
+								close(1011, 'Failed to record the clone for record locks');
+								return;
+							}
+						}
 						if (cloneAttempt && copyFromNodeId !== undefined) {
 							try {
 								getDatabaseStores().dbisDB?.remove([Symbol.for('cloneCopyComplete'), copyFromNodeId]);
@@ -6209,6 +6232,24 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// The log key is one value for the whole body, so the cursor and watermark below are recorded
 			// on the first record that is not part of a bulk copy rather than re-derived per record.
 			let recordedFrameTxnLogKey = false;
+			// `lockBarrier` control records in this body, reported as applied from the frame's onCommit —
+			// the successor-freshness proof (recordLockFreshness.ts) is the committed entry, never the frame.
+			let frameBarriers: { originId: number | undefined; nonce: number }[] | undefined;
+			// A record this node will not apply is a hole in that origin's stream for that table. It is
+			// recorded durably BEFORE the drop completes, so no later barrier can certify past it; a store
+			// that cannot take the row holds the frame instead of advancing the cursor over an unrecorded hole.
+			const recordReplicationHole = async (originId: number | undefined, tableName: string, reason: string) => {
+				const origin = getNodeNameForId(auditStore, originId, true);
+				try {
+					await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
+					return true;
+				} catch (error) {
+					logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error);
+					wsClosed = true;
+					close(1011, 'could not record a replication hole; reconnecting');
+					return false;
+				}
+			};
 			// Last copy-frame key seen in this message body, applied OR skipped as an identity tie — the copy
 			// resume cursor must cover skipped keys too, or a copy whose records we all already hold would
 			// never advance it and every reconnect would restart the copy from the beginning.
@@ -6310,6 +6351,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						'from',
 						remoteNodeName
 					);
+					if (
+						!(await recordReplicationHole(
+							remoteShortIdToLocalId.get(auditRecord.nodeId),
+							tableDecoder.name,
+							'table excluded by the receive route'
+						))
+					)
+						return;
 					decoder.position = start + eventLength;
 					continue;
 				}
@@ -6386,6 +6435,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// record's blob callback is installed re-enters the callback on the stored record's own blob
 				// references (unbounded recursion).
 				const localSourceNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
+				if (auditRecord.type === 'lockBarrier') {
+					// Captured now, reported from this frame's onCommit: a barrier is proof only once committed.
+					let barrier;
+					try {
+						barrier = decodeLockControlPayload('lockBarrier', auditRecord.getValue(tableDecoder));
+					} catch {
+						barrier = undefined;
+					}
+					if (barrier?.type === 'lockBarrier')
+						(frameBarriers ??= []).push({ originId: localSourceNodeId, nonce: barrier.nonce });
+				}
 				let repairTargets: any[] | null = null;
 				if (
 					auditRecord.extendedType & HAS_BLOBS &&
@@ -6492,6 +6552,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 					}
 				}
+				if (!event && !(await recordReplicationHole(localSourceNodeId, tableDecoder.name, 'undecodable record')))
+					return;
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
 					// a window to complete, then unlink the files. (mirrors the pattern at the relocate path above.)
@@ -6735,6 +6797,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						lastSequenceIdCommitted = sequenceIdReceived;
 					}
 					logger.debug?.('last sequence committed', new Date(lastSequenceIdCommitted), databaseName);
+					if (frameBarriers && isValidFrameTxnLogKey(frameTxnLogKey)) {
+						for (const { originId, nonce } of frameBarriers) {
+							const origin = getNodeNameForId(auditStore, originId, true);
+							if (origin) recordLockBarrierApplied(databaseName, origin, frameTxnLogKey, nonce);
+						}
+					}
 				},
 			};
 			tableSubscriptionToReplicator.send(endTxnEvent);

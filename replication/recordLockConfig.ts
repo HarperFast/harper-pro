@@ -1,4 +1,6 @@
 import { getConfigObj } from '../core/config/configUtils.ts';
+import * as env from '../core/utility/environment/environmentManager.js';
+import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 
 /**
@@ -32,4 +34,18 @@ if (configured !== undefined && configured !== true && configured !== false && c
 	logger.warn?.(
 		`replication.recordLocks is set to ${JSON.stringify(configured)}, which is not the boolean true; cluster record locks stay disabled`
 	);
-export const CLUSTER_RECORD_LOCKS_ENABLED: boolean = configured === true;
+// Successor freshness is proven in the transaction-log-key domain the RocksDB receiver adopts
+// (harper-pro#790); the deprecated LMDB engine keys replicated writes by its own local clock, so no
+// barrier would ever match there. Refuse the switch outright rather than advertise a level every
+// handoff then times out on.
+let engineSupported = true;
+if (configured === true) {
+	const engine = process.env.HARPER_STORAGE_ENGINE || env.get(CONFIG_PARAMS.STORAGE_ENGINE);
+	if (engine === 'lmdb') {
+		engineSupported = false;
+		logger.error?.(
+			'replication.recordLocks requires the RocksDB storage engine; cluster record locks stay disabled on this LMDB node'
+		);
+	}
+}
+export const CLUSTER_RECORD_LOCKS_ENABLED: boolean = configured === true && engineSupported;
