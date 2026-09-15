@@ -36,6 +36,7 @@ import {
 } from './replicator.ts';
 import { redactOperationForLog } from './logRedaction.ts';
 import { CopyCursorWatermark } from './copyCursorWatermark.ts';
+import { isLegacyCopyPeer, verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -4681,7 +4682,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 						break;
 					case OPERATION_RESPONSE:
-						const { resolve, reject } = awaitingResponse.get(data.requestId);
+						const operationWaiter = awaitingResponse.get(data.requestId);
+						if (!operationWaiter) break;
+						const { resolve, reject } = operationWaiter;
 						logger.debug?.('Received completed operation request', remoteNodeName, data);
 						if (data.error) reject(new Error(data.error));
 						else resolve(data);
@@ -5805,6 +5808,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											}
 										}
 										if (currentSequenceId === 0) {
+											const legacyCopy = !peerCapabilities.safeCopyAudit && (await getLegacyCopyPeer());
+											if (legacyCopy) copyResume = undefined;
+											if (closed || wsClosed) return;
 											logger.info?.('Replicating all tables to', remoteNodeName);
 											// Capture the resume point BEFORE iterating. The bulk copy walks the primary store in
 											// key order (snapshot: false), but the follower resumes replication from the audit log in
@@ -5815,6 +5821,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// the post-copy resume point stays anchored to when the copy first began (see safety note).
 											const copyStartTime = copyResume?.copyStartTime ?? Date.now();
 											const nodeId = getThisNodeId(auditStore);
+											if (legacyCopy) {
+												// Legacy no-op puts can corrupt the receiver's audit log.
+												await verifyLegacyCopyBaseline({
+													peerName: remoteNodeName,
+													databaseName,
+													tables: Object.fromEntries(
+														Object.entries(tables ?? {}).filter(
+															([name, table]) => !sendExcludedTables?.has(name) && tableToTableEntry(table)
+														)
+													),
+													request: (operation) => sendOperation(operation, 30_000),
+													isClosed: () => closed || wsClosed,
+												});
+												if (closed || wsClosed) return;
+											}
 											// Tell the follower a bulk copy is starting, its anchor time, and the copy-order version,
 											// so it tracks a resume cursor that a later leader can validate before trusting the skip.
 											ws.send(encode([COPY_START, copyStartTime, COPY_ORDER_VERSION]));
@@ -5874,7 +5895,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											let withheldOriginNodeId: number | undefined;
 											let withheldRecordCount = 0;
 											try {
-												const peerNodeRow = getHDBNodeTable().primaryStore.getSync(remoteNodeName);
+												const peerNodeRow = !legacyCopy && getHDBNodeTable().primaryStore.getSync(remoteNodeName);
 												if (
 													shouldWithholdPeerOwnRecords({
 														cloneSource: cloneAttemptSource(),
@@ -5903,7 +5924,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													error
 												);
 											}
-											for (const tableName of orderedTableNames) {
+											for (const tableName of legacyCopy ? [] : orderedTableNames) {
 												const table = tables[tableName];
 												if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
 												if (!reachedResumeTable) {
@@ -7510,8 +7531,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				options.connection.on('exclusion-origins-updated', (origins: string[]) => {
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
-							(nodeName) =>
-								nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
+							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
 						)
 					);
 					const excludeNodes = [...shouldExclude].filter((nodeName) => !lastSentExcludedNodes.includes(nodeName));
@@ -7963,6 +7983,40 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	).unref();
 
 	let nextId = 1;
+	let legacyCopyPeer: Promise<boolean>;
+	function getLegacyCopyPeer() {
+		return (legacyCopyPeer ??= sendOperation({ operation: 'registration_info' }, 30_000).then(isLegacyCopyPeer));
+	}
+
+	function sendOperation(operation, timeoutMs?: number): Promise<any> {
+		const requestId = nextId++;
+		return new Promise((resolve, reject) => {
+			const timer = timeoutMs
+				? setTimeout(() => {
+						awaitingResponse.delete(requestId);
+						reject(new Error('Timed out waiting for peer operation response'));
+					}, timeoutMs).unref()
+				: undefined;
+			awaitingResponse.set(requestId, {
+				resolve(result) {
+					clearTimeout(timer);
+					resolve(result);
+				},
+				reject(error) {
+					clearTimeout(timer);
+					reject(error);
+				},
+			});
+			try {
+				if (wsClosed) throw new Error('Connection closed before operation request');
+				ws.send(encode([OPERATION_REQUEST, { ...operation, requestId }]));
+			} catch (error) {
+				awaitingResponse.delete(requestId);
+				clearTimeout(timer);
+				reject(error);
+			}
+		});
+	}
 	const sentTableNames = [];
 	return {
 		end() {
@@ -8009,14 +8063,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		 * Send an operation request to the remote node, returning a promise for the result
 		 * @param operation
 		 */
-		sendOperation(operation) {
-			const requestId = nextId++;
-			operation.requestId = requestId;
-			ws.send(encode([OPERATION_REQUEST, operation]));
-			return new Promise((resolve, reject) => {
-				awaitingResponse.set(requestId, { resolve, reject });
-			});
-		},
+		sendOperation,
 	};
 
 	function checkExcessMessageSize(messageSize) {
