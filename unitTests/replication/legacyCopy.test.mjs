@@ -3,26 +3,13 @@ import { isLegacyCopyPeer, verifyLegacyCopyBaseline } from '#src/replication/leg
 import { LOCAL_ONLY } from '../../dist/core/resources/auditStore.js';
 
 describe('legacy copy peer identification', () => {
-	it('uses the latest installation stamp, including an upgraded v4 database', () => {
-		assert.strictEqual(isLegacyCopyPeer({ results: [{ info_id: 1, hdb_version_num: '4.7.36' }] }), true);
-		assert.strictEqual(
-			isLegacyCopyPeer({
-				results: [
-					{ info_id: 2, hdb_version_num: '5.3.0-alpha.1' },
-					{ info_id: 1, hdb_version_num: '4.7.36' },
-				],
-			}),
-			false
-		);
+	it('recognizes the standard registration_info version response', () => {
+		assert.strictEqual(isLegacyCopyPeer({ version: '4.7.36' }), true);
+		assert.strictEqual(isLegacyCopyPeer({ version: 'v4.3.7' }), true);
+		assert.strictEqual(isLegacyCopyPeer({ version: '5.3.0-alpha.1' }), false);
 	});
-	it('does not interpret a failed or malformed probe as a safe v5 peer', () => {
-		for (const response of [
-			{ error: 'not found' },
-			{ results: [] },
-			{ results: [{ info_id: 1, hdb_version_num: 5 }] },
-			{ results: [{ info_id: 1, hdb_version_num: '3.3.0' }] },
-			{ results: [{ info_id: '1', hdb_version_num: '5.3.0' }] },
-		])
+	it('does not interpret a failed or malformed probe as a v5 peer', () => {
+		for (const response of [{ error: 'not found' }, {}, { version: 5 }, { version: '3.3.0' }, { version: 'invalid' }])
 			assert.throws(() => isLegacyCopyPeer(response));
 	});
 });
@@ -37,8 +24,8 @@ function fixture(entries, remoteEntries = entries) {
 		tables: {
 			test: {
 				primaryStore: {
-					getRange() {
-						return entries.values();
+					getRange({ snapshot }) {
+						return (snapshot ? entries.slice() : entries).values();
 					},
 					getEntry(key) {
 						return entries.find((entry) => entry.key === key);
@@ -75,6 +62,22 @@ describe('legacy existing-baseline verification', () => {
 		await verifyLegacyCopyBaseline(options);
 		assert.strictEqual(requests.filter((operation) => operation.operation === 'search_by_id').length, 3);
 		assert.strictEqual(requests.flatMap((operation) => operation.ids ?? []).length, 600);
+	});
+	it('pins later tables before a peer request can race concurrent inserts and updates', async () => {
+		const entries = [{ key: 'old', version: 10 }];
+		const { options, requests } = fixture(entries);
+		options.tables.later = options.tables.test;
+		const request = options.request;
+		options.request = async (operation) => {
+			entries[0] = { key: 'old', version: 20 };
+			entries.push({ key: 'concurrent', version: 30 });
+			return request(operation);
+		};
+		await verifyLegacyCopyBaseline(options);
+		assert.deepStrictEqual(
+			requests.filter((request) => request.ids).map((request) => request.ids),
+			[['old'], ['old']]
+		);
 	});
 	it('rejects missing, older and unverifiable versions instead of acknowledging an incomplete baseline', async () => {
 		for (const remote of [[], [{ key: 'k', version: 9 }], [{ key: 'k', version: NaN }]]) {

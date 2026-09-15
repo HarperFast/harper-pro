@@ -2,6 +2,20 @@ import assert from 'node:assert';
 import { join } from 'node:path';
 import { open } from 'lmdb';
 
+export async function resetLegacyReplicationCursors(stoppedNode) {
+	const db = open({ path: join(stoppedNode.dataRootDir, 'database/data.mdb') });
+	try {
+		const metadata = db.openDB({ name: '__dbis__' });
+		const keys = Array.from(
+			metadata.getKeys({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([255])] })
+		);
+		assert.ok(keys.length, 'legacy node must have committed a replication cursor before the reset');
+		for (const key of keys) await metadata.remove(key);
+	} finally {
+		await db.close();
+	}
+}
+
 export async function assertLegacyAuditHasNoEcho(stoppedNode, sourceKeys) {
 	const db = open({ path: join(stoppedNode.dataRootDir, 'database/data.mdb'), readOnly: true });
 	try {
