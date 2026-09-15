@@ -61,7 +61,9 @@ import {
 	setRecordLockOwnershipReaders,
 } from './recordLockRpc.ts';
 import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
-import { everRecloned, isPoisoned, poisonedPairs } from './recordLockPoison.ts';
+import { everRecloned, isPoisoned, poison, poisonedPairs } from './recordLockPoison.ts';
+import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
+import * as tableModule from '../core/resources/Table.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 
@@ -125,6 +127,30 @@ function installFreshnessBarrier(database: string, barrier: FreshnessBarrier): v
 function closeFreshnessBarrier(database: string): void {
 	freshnessBarriers.get(database)?.close();
 	freshnessBarriers.delete(database);
+}
+
+const applyFailureListeners = new Set<string>();
+
+/**
+ * A replicated transaction core skipped after a terminal apply failure is a hole no barrier can see
+ * (harper#2628 adds the listener core awaits before it continues). Until that core lands, the hook is
+ * absent and this is the one hole class left unrecorded — `RECORD_LOCK_FRESHNESS_DESIGN.md`.
+ */
+function listenForApplyFailures(database: string): void {
+	if (applyFailureListeners.has(database)) return;
+	const register = (tableModule as any).registerReplicatedApplyFailureListener;
+	if (typeof register !== 'function') return;
+	applyFailureListeners.add(database);
+	register(database, async (failure: any) => {
+		const auditStore = auditStoreFor(database);
+		const origin = getNodeNameForId(auditStore, failure?.nodeId, true) ?? `node#${failure?.nodeId}`;
+		await poison(
+			database,
+			origin,
+			typeof failure?.table === 'string' ? failure.table : '*',
+			`terminal apply failure at ${failure?.position}: ${failure?.error?.message ?? failure?.error}`
+		);
+	});
 }
 
 /**
@@ -659,6 +685,7 @@ export function ensureRecordLockTransport(database: string): void {
 	transports.set(database, transport);
 	registerClusterLockTransport(database, transport);
 	if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
+	listenForApplyFailures(database);
 	refreshCache(database);
 	if (parentPort) {
 		parentPort.postMessage({ type: 'record-lock-owner-request', database });
