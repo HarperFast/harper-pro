@@ -1,5 +1,6 @@
-// Test-only component for harper-pro#431 R1: terminate the HTTP worker thread that owns a replication
-// subscription, without the connection ever getting to record its own disconnect.
+// Test-only component for harper-pro#431 connection-truth cases. It can terminate the HTTP worker thread
+// that owns a replication subscription without the connection recording its own disconnect, and it can
+// arm the one-shot subscribe-after-open ordering hook on that same worker.
 //
 // Exiting a worker thread stops THAT THREAD, not the process, and it stops it hard — no 'close' on the
 // replication socket, no shared-status DOWN write. That is exactly the fault the worker-exit truth stamp
@@ -22,5 +23,20 @@ export class KillHttpWorker extends Resource {
 		// Exit after the response is on the wire, so the caller learns which thread it killed.
 		setTimeout(() => (process._realExit ? process._realExit(0) : process.exit(0)), 100).unref();
 		return { armed: true, threadId };
+	}
+}
+
+// Arms R5's subscribe-deferral hook at runtime rather than at startup, so R1-R4 run unperturbed and the
+// caller learns which worker armed it.
+export class ArmSubscribeAfterOpen extends Resource {
+	static loadAsInstance = false;
+
+	async get(target) {
+		target.checkPermission = false;
+		if (process.env.HARPER_TEST_ALLOW_SUBSCRIBE_AFTER_OPEN_HOOK !== '1') {
+			return { armed: false, database: 'data', threadId };
+		}
+		process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB = 'data';
+		return { armed: true, database: 'data', threadId };
 	}
 }

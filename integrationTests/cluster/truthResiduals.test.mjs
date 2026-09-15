@@ -12,6 +12,9 @@
  *    with backPressurePercent is a consistency guard; the field's presence is what proves the copy ran.
  *  - R4: a wedge-reconcile fire that happens while truth already reads down lands in the redundant bucket,
  *    visible in cluster_status and in the fire log line.
+ *  - R5: a hook defers one connection's subscribe until its session resolves, so the socket opens with no
+ *    subscription and the connect edge is never posted; shared-memory truth then restores the retained
+ *    connected:false coordinator entry exactly once on reconciliation.
  *
  * NOT pinned here: owner gating. Every fire this suite provokes is a main-thread net, which always owns the
  * subscription, so the `unknown` path that keeps non-owner fires out of the evidence is unit-only
@@ -27,6 +30,7 @@ import {
 	getNextAvailableLoopbackAddress,
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { sendOperation, readLog, readNodePid, waitForCondition, fetchWithRetry } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
@@ -53,7 +57,12 @@ const CONNECT_TIMEOUT_MS = 30000;
 // the worst case is a full cycle plus a boot. Bounded separately so a slow box does not read as a defect.
 const RECONNECT_AFTER_RESTART_MS = 120000;
 const REPLICATION_TIMEOUT_MS = 20000;
+const UP_CORRECTION_TIMEOUT_MS = 20000;
+const UP_RESTORE_PROOF_MS = 11000;
 const POLL_MS = 250;
+// The release line, not the deferral line: only the release proves a session opened while the subscribe was
+// still held, which is the ordering R5 needs.
+const SUBSCRIBE_AFTER_OPEN_MARKER = '[test] releasing deferred subscribe for db "data" (harper-pro#431)';
 
 function nodeStartOptions(node) {
 	return {
@@ -126,6 +135,36 @@ async function killOwningWorker(node) {
 	return response.json();
 }
 
+async function armSubscribeAfterOpen(node) {
+	const response = await fetchWithRetry(`${node.httpURL}/ArmSubscribeAfterOpen/`, { retries: 5 });
+	return response.json();
+}
+
+const countOccurrences = (text, needle) => text.split(needle).length - 1;
+
+async function waitForNewLogLine(node, needle, baseline, description) {
+	let lastCount = baseline;
+	await waitForCondition(
+		async () => {
+			lastCount = countOccurrences(await readLog(node), needle);
+			return lastCount > baseline;
+		},
+		{
+			timeoutMs: UP_CORRECTION_TIMEOUT_MS,
+			pollMs: POLL_MS,
+			description: () => `${description} (baseline ${baseline}, last count ${lastCount})`,
+		}
+	);
+}
+
+const setPeerReplicates = (node, peerName, replicates) =>
+	sendOperation(node, {
+		operation: 'update',
+		database: 'system',
+		table: 'hdb_nodes',
+		records: [{ name: peerName, replicates }],
+	});
+
 // Proves a link is genuinely carrying data, so `connected: true` is never taken on its own.
 async function assertReplicates(from, to, id) {
 	await sendOperation(from, { operation: 'insert', table: 'test', records: [{ id, name: id }] });
@@ -142,7 +181,7 @@ async function assertReplicates(from, to, id) {
 	);
 }
 
-suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 420000 }, (ctx) => {
+suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ctx) => {
 	// Every SIGSTOP is registered here so a failed assertion can never leave a frozen process behind for
 	// teardownHarper to wait on.
 	const frozen = new Set();
@@ -173,7 +212,10 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 420000 }, (ct
 		subscriberOptions.config.threads = { count: 1 };
 		await setupHarperWithFixture(subscriberCtx, join(import.meta.dirname, 'fixture-worker-exit'), {
 			...subscriberOptions,
-			env: { HARPER_TEST_KILL_HTTP_WORKER: '1' },
+			env: {
+				HARPER_TEST_KILL_HTTP_WORKER: '1',
+				HARPER_TEST_ALLOW_SUBSCRIBE_AFTER_OPEN_HOOK: '1',
+			},
 		});
 		ctx.nodes = [peerCtx.harper, subscriberCtx.harper];
 		await Promise.all(
@@ -375,5 +417,66 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 420000 }, (ct
 		});
 		// Counters are telemetry: they must not have changed whether or how the link recovers.
 		await assertReplicates(ctx.nodes[0], subscriber, 'r4-after-restart');
+	});
+
+	test('R5: shared truth corrects up when subscribe lands after socket open', async () => {
+		const [peer, subscriber] = ctx.nodes;
+		await ensureSubscribed(subscriber, peer);
+		await assertReplicates(peer, subscriber, 'r5-before');
+
+		const initialLog = await readLog(subscriber);
+		equal(
+			countOccurrences(initialLog, SUBSCRIBE_AFTER_OPEN_MARKER),
+			0,
+			'the normal connection must stay inert while the hook environment variable is unset'
+		);
+
+		// Turning this local peer row off takes the ordinary intentional-unsubscribe path: it keeps the
+		// coordinator entry, records a real connected:false edge when the socket closes, and evicts the
+		// worker connection cache so turning it back on must construct a fresh connection object.
+		await setPeerReplicates(subscriber, peer.hostname, false);
+		const down = await pollPeerSocket(subscriber, peer.hostname, (socket) => socket?.connected === false, {
+			timeoutMs: CONNECT_TIMEOUT_MS,
+			description: `${subscriber.hostname} to retain a disconnected entry for ${peer.hostname}`,
+		});
+
+		const armed = await armSubscribeAfterOpen(subscriber);
+		equal(armed.armed, true, 'the runtime control must arm the subscribe-after-open hook');
+		equal(armed.database, 'data');
+		equal(armed.threadId, down.threadId, 'the sole HTTP worker arming the hook must be the subscription-owning worker');
+
+		const beforeReconnectLog = await readLog(subscriber);
+		const markerBaseline = countOccurrences(beforeReconnectLog, SUBSCRIBE_AFTER_OPEN_MARKER);
+		const correctionLine =
+			`Corrected replication connection state (disconnected -> up) from shared-memory truth for data from ` +
+			peer.hostname;
+		const correctionBaseline = countOccurrences(beforeReconnectLog, correctionLine);
+
+		await setPeerReplicates(subscriber, peer.hostname, true);
+		await waitForNewLogLine(
+			subscriber,
+			SUBSCRIBE_AFTER_OPEN_MARKER,
+			markerBaseline,
+			'the fresh connection to open with no subscription and then release the deferred one'
+		);
+		await waitForNewLogLine(
+			subscriber,
+			correctionLine,
+			correctionBaseline,
+			'the main-thread reconcile to correct the retained connected bit up from shared truth'
+		);
+		const correctionObservedAt = Date.now();
+		await pollPeerSocket(subscriber, peer.hostname, (socket) => socket?.connected === true, {
+			timeoutMs: CONNECT_TIMEOUT_MS,
+			description: `${subscriber.hostname} to expose the restored connection for ${peer.hostname}`,
+		});
+		await assertReplicates(peer, subscriber, 'r5-after');
+		const remainingProofWindow = UP_RESTORE_PROOF_MS - (Date.now() - correctionObservedAt);
+		if (remainingProofWindow > 0) await delay(remainingProofWindow);
+		equal(
+			countOccurrences(await readLog(subscriber), correctionLine),
+			correctionBaseline + 1,
+			'the correction must restore the main-thread bit instead of repeating on later reconcile ticks'
+		);
 	});
 });
