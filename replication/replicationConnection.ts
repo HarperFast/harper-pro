@@ -4157,6 +4157,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		return replicationSharedStatus;
 	}
+	// A record this node will not apply is a hole in that origin's stream for that table. It is
+	// recorded durably BEFORE the drop completes, so no later barrier can certify past it; a store
+	// that cannot take the row holds the frame instead of advancing the cursor over an unrecorded hole.
+	// One closure per connection, not per frame: an ordinary frame never touches it.
+	async function recordReplicationHole(originId: number | undefined, tableName: string, reason: string) {
+		const origin = getNodeNameForId(auditStore, originId, true);
+		try {
+			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
+			return true;
+		} catch (error) {
+			logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error);
+			wsClosed = true;
+			close(1011, 'could not record a replication hole; reconnecting');
+			return false;
+		}
+	}
 	// Both sides of every link write it: the record-lock owner reads the peer's answer from shared
 	// memory because an inbound-only peer's socket may live on another thread. Re-run once the
 	// database's audit store is known, since the inbound side learns the database after the bag.
@@ -6235,21 +6251,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// `lockBarrier` control records in this body, reported as applied from the frame's onCommit —
 			// the successor-freshness proof (recordLockFreshness.ts) is the committed entry, never the frame.
 			let frameBarriers: { originId: number | undefined; nonce: number }[] | undefined;
-			// A record this node will not apply is a hole in that origin's stream for that table. It is
-			// recorded durably BEFORE the drop completes, so no later barrier can certify past it; a store
-			// that cannot take the row holds the frame instead of advancing the cursor over an unrecorded hole.
-			const recordReplicationHole = async (originId: number | undefined, tableName: string, reason: string) => {
-				const origin = getNodeNameForId(auditStore, originId, true);
-				try {
-					await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
-					return true;
-				} catch (error) {
-					logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error);
-					wsClosed = true;
-					close(1011, 'could not record a replication hole; reconnecting');
-					return false;
-				}
-			};
 			// Last copy-frame key seen in this message body, applied OR skipped as an identity tie — the copy
 			// resume cursor must cover skipped keys too, or a copy whose records we all already hold would
 			// never advance it and every reconnect would restart the copy from the beginning.

@@ -61,15 +61,24 @@ import {
 	setRecordLockOwnershipReaders,
 } from './recordLockRpc.ts';
 import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
-import { everRecloned, isPoisoned, poison, poisonedPairs } from './recordLockPoison.ts';
+import {
+	everRecloned,
+	forgetPoisonState,
+	isPoisoned,
+	notePoisonAnnounced,
+	poison,
+	poisonedPairs,
+	setPoisonBroadcast,
+} from './recordLockPoison.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
 import * as tableModule from '../core/resources/Table.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 
-// Slots 29 and 30 of the 32-slot per-(database, peer) status buffer (`getReplicationSharedStatus`);
+// Slots 29..31 of the 32-slot per-(database, peer) status buffer (`getReplicationSharedStatus`);
 // 0..28 are taken (13..28 by the R4 fire-classification counters, harper-pro#431). 29 is the
-// capability level flag; 30 is the home-map digest agreement tri-state. 31 remains headroom.
+// capability support flag; 30 is the home-map digest agreement tri-state; 31 is the exact
+// advertised level (below). The buffer is full — grow `REPLICATION_SHARED_STATUS_SLOTS` for the next.
 export const RECORD_LOCKS_CAPABILITY_POSITION = 29;
 export const LOCK_CAPABILITY_UNKNOWN = 0;
 export const LOCK_CAPABILITY_UNSUPPORTED = 1;
@@ -701,6 +710,8 @@ export function ensureRecordLockTransport(database: string): void {
  * transport OBJECT is replaced, not this thread's owned/cache state. */
 function recreateRecordLockTransport(database: string): void {
 	if (!CLUSTER_RECORD_LOCKS_ENABLED || !transports.has(database)) return;
+	// The old transport's waits belong to a coordinator core is about to rebuild; settle them now.
+	closeFreshnessBarrier(database);
 	const transport = createRecordLockTransport(database, productionDeps, () => cacheForDatabase(database));
 	transports.set(database, transport);
 	registerClusterLockTransport(database, transport);
@@ -711,6 +722,7 @@ export function releaseRecordLockTransport(database: string): void {
 	if (!transports.delete(database)) return;
 	unregisterClusterLockTransport(database);
 	closeFreshnessBarrier(database);
+	forgetPoisonState(database);
 	ownedDatabases.delete(database);
 	activeCache.delete(database);
 	if (!parentPort) releaseRecordLockOwner(database);
@@ -788,6 +800,14 @@ if (parentPort) {
 	});
 	onMessageByType('record-lock-barrier-applied', (message) => {
 		freshnessBarriers.get(message.database)?.noteBarrierApplied(message.origin, message.position, message.nonce);
+	});
+	onMessageByType('record-lock-poison', (message) => {
+		if (
+			typeof message?.database === 'string' &&
+			typeof message?.origin === 'string' &&
+			typeof message?.table === 'string'
+		)
+			notePoisonAnnounced(message.database, message.origin, message.table);
 	});
 	onMessageByType('record-lock-status-request', (message) => {
 		const status: Record<string, RecordLockDatabaseStats | undefined> = {};
@@ -1023,6 +1043,30 @@ export async function collectRecordLockStatus(
 	return result;
 }
 
+// A hole is recorded on the thread holding the socket; the barrier that must refuse it waits on the
+// coordinating thread. Main fans a durable row out to every worker, and marks it itself.
+setPoisonBroadcast((database, origin, table) => {
+	const message = { type: 'record-lock-poison', database, origin, table };
+	try {
+		if (parentPort) parentPort.postMessage(message);
+		else fanOutPoison(message, undefined);
+	} catch (error) {
+		logger.debug?.('Could not announce a record lock poison row', error);
+	}
+});
+
+function fanOutPoison(message: any, from: any): void {
+	notePoisonAnnounced(message.database, message.origin, message.table);
+	for (const worker of httpWorkers()) {
+		if (worker === from) continue;
+		try {
+			worker.postMessage(message);
+		} catch (error) {
+			logger.debug?.('Could not forward a record lock poison row to a worker', error);
+		}
+	}
+}
+
 setRecordLockOwnershipReaders({
 	ownsDatabase: ownsRecordLockCoordination,
 	ownerFor: (database) => {
@@ -1064,6 +1108,14 @@ if (!parentPort) {
 	onMessageByType('record-lock-barrier-applied', (message) => {
 		if (typeof message?.database !== 'string' || typeof message?.origin !== 'string') return;
 		routeBarrierAppliedFromMain(message);
+	});
+	onMessageByType('record-lock-poison', (message, worker) => {
+		if (
+			typeof message?.database === 'string' &&
+			typeof message?.origin === 'string' &&
+			typeof message?.table === 'string'
+		)
+			fanOutPoison(message, worker);
 	});
 	onMessageByType('record-lock-homes-changed', (message, worker) => {
 		if (typeof message?.database !== 'string') return;

@@ -175,7 +175,7 @@ async function executeRecall(request: any): Promise<{ recalled: true }> {
 const barrierBuckets = new Map<string, { tokens: number; refilledAt: number }>();
 
 function admitBarrierRequest(caller: string, database: string, now = Date.now()): boolean {
-	const key = `${caller} ${database}`;
+	const key = JSON.stringify([caller, database]);
 	let bucket = barrierBuckets.get(key);
 	if (!bucket) barrierBuckets.set(key, (bucket = { tokens: BARRIER_BURST, refilledAt: now }));
 	const refill = ((now - bucket.refilledAt) / 1_000) * BARRIER_RATE_PER_SECOND;

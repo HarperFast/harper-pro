@@ -268,3 +268,26 @@ describe('isValidLogPosition', () => {
 		assert.strictEqual(isValidLogPosition(1789480100774.2732), true);
 	});
 });
+
+describe('createFreshnessBarrier: a hole recorded while the barrier is in flight', () => {
+	it('fails the wait at settle time even though the entry matched, in either arrival order', async () => {
+		let poisoned = false;
+		const first = harness({ isPoisoned: () => poisoned });
+		const wait = first.barrier.establish('t', [['a', 5]], 1_000);
+		first.requests[0].resolve(700);
+		await Promise.resolve();
+		poisoned = true;
+		assert.strictEqual(first.barrier.noteBarrierApplied('a', 700, 1), true);
+		assert.match((await rejection(wait)).message, /replication hole while its barrier was in flight/);
+		assert.strictEqual(first.barrier.stats().rejected.poisoned, 1);
+		assert.strictEqual(first.barrier.stats().applied, 0);
+
+		poisoned = false;
+		const second = harness({ isPoisoned: () => poisoned });
+		const wait2 = second.barrier.establish('t', [['a', 5]], 1_000);
+		second.barrier.noteBarrierApplied('a', 700, 1);
+		poisoned = true;
+		second.requests[0].resolve(700);
+		assert.match((await rejection(wait2)).message, /replication hole while its barrier was in flight/);
+	});
+});

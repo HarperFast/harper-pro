@@ -173,6 +173,16 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				}
 				entry.position = position;
 				if (entry.appliedPosition === position) {
+					if (deps.isPoisoned(origin, table)) {
+						rejected.poisoned = (rejected.poisoned ?? 0) + 1;
+						settleEntry(
+							entry,
+							unavailable(
+								`${database}.${table} from ${origin} recorded a replication hole while its barrier was in flight`
+							)
+						);
+						return;
+					}
 					applied++;
 					settleEntry(entry);
 				} else if (entry.appliedPosition !== undefined) {
@@ -245,6 +255,17 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			entry.appliedPosition = position;
 			if (entry.position === undefined) return true;
 			if (entry.position === position) {
+				// A hole recorded while the request was in flight sits before this entry.
+				if (deps.isPoisoned(origin, entry.table)) {
+					rejected.poisoned = (rejected.poisoned ?? 0) + 1;
+					settleEntry(
+						entry,
+						unavailable(
+							`${database}.${entry.table} from ${origin} recorded a replication hole while its barrier was in flight`
+						)
+					);
+					return true;
+				}
 				applied++;
 				settleEntry(entry);
 			} else {
