@@ -5,16 +5,7 @@ const BATCH_SIZE = 256;
 const failedCopies = new Map<string, { tableName: string; key: any }>();
 
 export function isLegacyCopyPeer(response: any): boolean {
-	if (!Array.isArray(response?.results) || !response.results.length)
-		throw new Error('Cannot determine peer version for replication base copy');
-	let latest;
-	for (const row of response.results) {
-		if (!Number.isSafeInteger(row.info_id) || row.info_id < 0)
-			throw new Error('Invalid peer version record for replication base copy');
-		if (!latest || row.info_id > latest.info_id) latest = row;
-	}
-	const match =
-		typeof latest.hdb_version_num === 'string' && /^(\d+)\.\d+\.\d+(?:[-+].*)?$/.exec(latest.hdb_version_num);
+	const match = typeof response?.version === 'string' && /^v?(\d+)\.\d+\.\d+(?:[-+].*)?$/.exec(response.version);
 	if (!match || Number(match[1]) < 4) throw new Error('Unsupported peer version for replication base copy');
 	return Number(match[1]) === 4;
 }
@@ -80,27 +71,51 @@ export async function verifyLegacyCopyBaseline({
 			}
 		}
 	}
-	const previousFailure = failedCopies.get(cacheKey);
-	if (previousFailure) {
-		const table = tables[previousFailure.tableName];
-		const entry = await table?.primaryStore.getEntry(previousFailure.key);
-		checkOpen();
-		if (entry && !(entry.metadataFlags & LOCAL_ONLY))
-			await verifyBatch(previousFailure.tableName, [{ key: previousFailure.key, version: entry.version }]);
-		failedCopies.delete(cacheKey);
-	}
-	for (const [tableName, table] of Object.entries(tables)) {
-		let entries: Array<{ key: any; version: number }> = [];
-		for (const entry of table.primaryStore.getRange({ snapshot: false, versions: true })) {
-			checkOpen();
-			if (entry.metadataFlags & LOCAL_ONLY) continue;
-			entries.push({ key: Buffer.isBuffer(entry.key) ? Buffer.from(entry.key) : entry.key, version: entry.version });
-			if (entries.length === BATCH_SIZE) {
-				await verifyBatch(tableName, entries);
-				entries = [];
-			}
+	const cursors: Array<{ tableName: string; iterator: Iterator<any>; first?: IteratorResult<any> }> = [];
+	try {
+		// Pin every table before the first peer RPC; concurrent writes belong to post-copy audit replay.
+		for (const [tableName, table] of Object.entries(tables)) {
+			const cursor = {
+				tableName,
+				iterator: table.primaryStore.getRange({ snapshot: true, versions: true })[Symbol.iterator](),
+			};
+			cursors.push(cursor);
+			const first = cursor.iterator.next();
+			cursors[cursors.length - 1].first = first.done ? first : { done: false, value: copyEntry(first.value) };
 		}
-		if (entries.length) await verifyBatch(tableName, entries);
+		const previousFailure = failedCopies.get(cacheKey);
+		if (previousFailure) {
+			const table = tables[previousFailure.tableName];
+			const entry = await table?.primaryStore.getEntry(previousFailure.key);
+			checkOpen();
+			if (entry && !(entry.metadataFlags & LOCAL_ONLY))
+				await verifyBatch(previousFailure.tableName, [{ key: previousFailure.key, version: entry.version }]);
+			failedCopies.delete(cacheKey);
+		}
+		for (const { tableName, iterator, first } of cursors) {
+			let entries: Array<{ key: any; version: number }> = [];
+			for (let next = first; !next.done; next = iterator.next()) {
+				checkOpen();
+				const entry = next.value;
+				if (entry.metadataFlags & LOCAL_ONLY) continue;
+				entries.push(copyEntry(entry));
+				if (entries.length === BATCH_SIZE) {
+					await verifyBatch(tableName, entries);
+					entries = [];
+				}
+			}
+			if (entries.length) await verifyBatch(tableName, entries);
+		}
+		failedCopies.delete(cacheKey);
+	} finally {
+		for (const { iterator } of cursors) iterator.return?.();
 	}
-	failedCopies.delete(cacheKey);
+}
+
+function copyEntry(entry) {
+	return {
+		key: Buffer.isBuffer(entry.key) ? Buffer.from(entry.key) : entry.key,
+		version: entry.version,
+		metadataFlags: entry.metadataFlags,
+	};
 }
