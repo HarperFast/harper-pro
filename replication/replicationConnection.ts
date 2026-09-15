@@ -48,6 +48,7 @@ import {
 import { ANY_TABLE, markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
 import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { isLegacyCopyPeer, verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -5888,6 +5889,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											}
 										}
 										if (currentSequenceId === 0) {
+											const legacyCopy = !peerCapabilities.safeCopyAudit && (await getLegacyCopyPeer());
+											if (legacyCopy) copyResume = undefined;
+											if (closed || wsClosed) return;
 											logger.info?.('Replicating all tables to', remoteNodeName);
 											// Capture the resume point BEFORE iterating. The bulk copy walks the primary store in
 											// key order (snapshot: false), but the follower resumes replication from the audit log in
@@ -5898,6 +5902,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// the post-copy resume point stays anchored to when the copy first began (see safety note).
 											const copyStartTime = copyResume?.copyStartTime ?? Date.now();
 											const nodeId = getThisNodeId(auditStore);
+											if (legacyCopy) {
+												// A legacy no-op put can corrupt its audit log. Verify an existing baseline without writing it back.
+												await verifyLegacyCopyBaseline({
+													peerName: remoteNodeName,
+													databaseName,
+													tables: Object.fromEntries(
+														Object.entries(tables ?? {}).filter(
+															([name, table]) => !sendExcludedTables?.has(name) && tableToTableEntry(table)
+														)
+													),
+													request: (operation) => sendOperation(operation, 30_000),
+													isClosed: () => closed || wsClosed,
+												});
+												if (closed || wsClosed) return;
+											}
 											// Tell the follower a bulk copy is starting, its anchor time, and the copy-order version,
 											// so it tracks a resume cursor that a later leader can validate before trusting the skip.
 											ws.send(encode([COPY_START, copyStartTime, COPY_ORDER_VERSION]));
@@ -5986,7 +6005,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													error
 												);
 											}
-											for (const tableName of orderedTableNames) {
+											for (const tableName of legacyCopy ? [] : orderedTableNames) {
 												const table = tables[tableName];
 												if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
 												if (!reachedResumeTable) {
@@ -8101,6 +8120,52 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	).unref();
 
 	let nextId = 1;
+	let legacyCopyPeer: Promise<boolean>;
+	function getLegacyCopyPeer() {
+		return (legacyCopyPeer ??= sendOperation(
+			{
+				operation: 'search_by_value',
+				database: 'system',
+				table: 'hdb_info',
+				search_attribute: 'info_id',
+				search_value: '*',
+				get_attributes: ['info_id', 'hdb_version_num'],
+			},
+			30_000
+		).then(isLegacyCopyPeer));
+	}
+	function sendOperation(operation, timeoutMs?: number): Promise<any> {
+		const requestId = nextId++;
+		return new Promise((resolve, reject) => {
+			// Retire the entry ourselves: a peer that never answers must not pin it (and the caller) for
+			// the life of the socket. Guard the delete: a response that already resolved this request
+			// must not also reject it.
+			const timer = timeoutMs
+				? setTimeout(() => {
+						if (awaitingResponse.delete(requestId))
+							reject(new Error(`${operation.operation} to ${remoteNodeName} did not answer within ${timeoutMs}ms`));
+					}, timeoutMs).unref()
+				: undefined;
+			awaitingResponse.set(requestId, {
+				resolve(result) {
+					clearTimeout(timer);
+					resolve(result);
+				},
+				reject(error) {
+					clearTimeout(timer);
+					reject(error);
+				},
+			});
+			try {
+				if (wsClosed) throw new Error('Connection closed before operation request');
+				ws.send(encode([OPERATION_REQUEST, { ...operation, requestId }]));
+			} catch (error) {
+				awaitingResponse.delete(requestId);
+				clearTimeout(timer);
+				reject(error);
+			}
+		});
+	}
 	const sentTableNames = [];
 	return {
 		end() {
@@ -8147,33 +8212,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		 * Send an operation request to the remote node, returning a promise for the result
 		 * @param operation
 		 */
-		sendOperation(operation, timeoutMs?: number) {
-			const requestId = nextId++;
-			operation.requestId = requestId;
-			ws.send(encode([OPERATION_REQUEST, operation]));
-			return new Promise((resolve, reject) => {
-				if (timeoutMs === undefined) {
-					awaitingResponse.set(requestId, { resolve, reject });
-					return;
-				}
-				// Retire the entry ourselves: a peer that never answers must not pin it (and the caller) for
-				// the life of the socket.
-				const timer = setTimeout(() => {
-					if (awaitingResponse.delete(requestId))
-						reject(new Error(`${operation.operation} to ${remoteNodeName} did not answer within ${timeoutMs}ms`));
-				}, timeoutMs).unref();
-				awaitingResponse.set(requestId, {
-					resolve: (value: any) => {
-						clearTimeout(timer);
-						resolve(value);
-					},
-					reject: (error: any) => {
-						clearTimeout(timer);
-						reject(error);
-					},
-				});
-			});
-		},
+		sendOperation,
 		// A standalone re-announce for this live socket (harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6):
 		// activation does not otherwise reach an already-connected peer, since the capability bag is only
 		// sent at handshake. No-op while this node has no active generation yet — the peer's own fail-closed
