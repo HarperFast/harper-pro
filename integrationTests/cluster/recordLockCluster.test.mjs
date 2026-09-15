@@ -275,6 +275,15 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 			},
 			{ timeoutMs: CONVERGE_TIMEOUT_MS, description: `Counter/${id} to converge to the same value on every node` }
 		);
+		// The proof that freshness ran, not only that the numbers came out: at least one handoff crossed
+		// nodes, so at least one lockBarrier was requested and observed applied, and nothing poisoned.
+		let barriersApplied = 0;
+		for (const node of nodes) {
+			const locks = (await clusterStatusOf(node)).recordLocks?.[DB];
+			barriersApplied += locks?.freshness?.applied ?? 0;
+			assert.deepEqual(locks?.poisoned ?? [], [], `${node.hostname} reports a replication hole: ${locks?.poisoned}`);
+		}
+		assert.ok(barriersApplied >= 1, 'no successor-freshness barrier was applied during the cross-node handoffs');
 		assert.ok(
 			finalValues.every((n) => n === N),
 			`nodes did not converge to ${N}: ${finalValues}`
