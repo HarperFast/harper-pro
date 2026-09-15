@@ -5892,14 +5892,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													withheldOriginNodeId = peerOriginNodeId === nodeId ? undefined : peerOriginNodeId;
 													logger.warn?.(
 														withheldOriginNodeId === undefined
-															? `Copying ${databaseName} to ${remoteNodeName} in full: this node is mid-clone from that peer, but holds no record attributed to it (harper-pro#737).`
-															: `Copying ${databaseName} to ${remoteNodeName} without the records that peer originated: this node is mid-clone from it (harper-pro#737).`
+															? `Copying ${databaseName} to ${remoteNodeName} in full: the clone-source gate is active for that peer, but this node holds no record attributed to it (harper-pro#737).`
+															: `Copying ${databaseName} to ${remoteNodeName} without the records that peer originated: the clone-source gate is active for it (harper-pro#737).`
 													);
 												}
 											} catch (error) {
 												withheldOriginNodeId = undefined;
 												logger.warn?.(
-													`Could not determine whether ${remoteNodeName} is the peer this node is cloning from; copying ${databaseName} in full`,
+													`Could not determine whether ${remoteNodeName} is this node's clone source; copying ${databaseName} in full`,
 													error
 												);
 											}
@@ -7510,8 +7510,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				options.connection.on('exclusion-origins-updated', (origins: string[]) => {
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
-							(nodeName) =>
-								nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
+							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
 						)
 					);
 					const excludeNodes = [...shouldExclude].filter((nodeName) => !lastSentExcludedNodes.includes(nodeName));

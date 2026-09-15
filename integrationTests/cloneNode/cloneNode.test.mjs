@@ -1,6 +1,7 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -106,7 +107,6 @@ suite('Clone Node', (ctx) => {
 		// This creates the component on disk without a config entry and without triggering
 		// loadComponent validation, which exercises the new cloneApplications() path in cloneNode.
 		const fixtureDir = join(import.meta.dirname, 'fixture', 'test-app');
-		const { readFileSync } = await import('node:fs');
 		for (const file of ['config.yaml', 'resources.js', 'schema.graphql']) {
 			await sendOperation(nodeCtx.harper, {
 				operation: 'set_component_file',
@@ -161,6 +161,18 @@ suite('Clone Node', (ctx) => {
 		ctx.nodes.push(cloneCtx.harper);
 
 		await waitForAvailableStatus(ctx.nodes[1]);
+		let completedAttempt;
+		for (let i = 0; i < 60 && typeof completedAttempt?.completedAt !== 'number'; i++) {
+			await sleep(500);
+			try {
+				completedAttempt = JSON.parse(readFileSync(join(ctx.nodes[1].dataRootDir, '.cloneAttempt.json'), 'utf8'));
+			} catch {}
+		}
+		equal(
+			typeof completedAttempt?.completedAt,
+			'number',
+			'The completed clone attempt should carry its grace timestamp'
+		);
 
 		// Verify that configuration was cloned successfully by checking the operations API of the clone node
 		const responseClone = await sendOperation(ctx.nodes[1], {
