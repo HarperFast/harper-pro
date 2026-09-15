@@ -11,6 +11,7 @@
 import { expect } from 'chai';
 import {
 	stampWorkerExitDown,
+	describeRefusedWorkerExitStamp,
 	WORKER_EXIT_ERROR_CODE,
 	CONNECTION_STATE_POSITION,
 	LAST_LIVENESS_TIME_POSITION,
@@ -83,6 +84,32 @@ describe('stampWorkerExitDown', () => {
 
 	it('is a no-op without a buffer', () => {
 		expect(stampWorkerExitDown(undefined, NOW)).to.equal(false);
+	});
+});
+
+describe('describeRefusedWorkerExitStamp', () => {
+	it('separates a buffer an owner wrote DOWN from one no owner ever reached, which share state 0', () => {
+		const written = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		written[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+		written[LAST_LIVENESS_TIME_POSITION] = NOW - 1000;
+		written[LAST_ERROR_TIME_POSITION] = NOW;
+		const untouched = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		expect(untouched[CONNECTION_STATE_POSITION]).to.equal(written[CONNECTION_STATE_POSITION]);
+		expect(describeRefusedWorkerExitStamp(untouched, NOW)).to.equal('state=0 liveness=never closeCode=none never');
+		expect(describeRefusedWorkerExitStamp(written, NOW)).to.not.equal(describeRefusedWorkerExitStamp(untouched, NOW));
+	});
+
+	it('ages the close code, so one left behind by an earlier session cannot read as current', () => {
+		const stale = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		stale[CONNECTION_STATE_POSITION] = CONNECTION_STATE_DOWN;
+		stale[LAST_ERROR_CODE_POSITION] = 1006;
+		stale[LAST_ERROR_TIME_POSITION] = NOW - 300_000;
+		expect(stampWorkerExitDown(stale, NOW)).to.equal(false);
+		expect(describeRefusedWorkerExitStamp(stale, NOW)).to.contain('closeCode=1006 300s ago');
+	});
+
+	it('never throws without a buffer, since it runs inside the exit handler', () => {
+		expect(describeRefusedWorkerExitStamp(undefined)).to.equal('status=unavailable');
 	});
 });
 

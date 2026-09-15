@@ -39,6 +39,7 @@ import {
 	deriveConnectionTruth,
 	formatTruthSnapshot,
 	stampWorkerExitDown,
+	describeRefusedWorkerExitStamp,
 	classifyFire,
 	recordFire,
 	formatFireClassification,
@@ -151,6 +152,9 @@ const workersWithExitHandler = new WeakSet<any>();
 // (database, peer) pairs already reported as holding status for a node that is no longer a member, so the
 // 5s reconcile logs each one once rather than on every tick.
 const reportedNonMemberStatus = new Set<string>();
+// Same latching reason as reportedNonMemberStatus: a dead owner whose stamp keeps being refused is a
+// level, not an edge, and the 5s reconcile would otherwise report it forever.
+const reportedUnstampedDeadOwner = new Set<string>();
 const connectionReplicationMap = new Map<string, DBReplicationStatusMap>();
 
 // Resolve an auditStore for a database (any table's will do — the per-(db, peer) shared-memory status
@@ -1409,27 +1413,43 @@ export async function startOnMainThread(options) {
 			// recorded owner. Without this the buffer keeps its last CONNECTED stamp and only reads down
 			// once liveness ages past LIVENESS_STALE_MS (>= 120s); the reconcile below then corrects the
 			// entry on this same tick instead. A live successor re-stamps CONNECTED on handshake or pong.
+			let unstamped: string[] | undefined;
 			if (
-				clearWorkerFromEntries(connectionReplicationMap, worker, (databaseName, nodeName) =>
-					stampWorkerExitTruth(databaseName, nodeName)
-				)
+				clearWorkerFromEntries(connectionReplicationMap, worker, (databaseName, nodeName) => {
+					const reason = stampWorkerExitTruth(databaseName, nodeName);
+					if (reason) (unstamped ??= []).push(`${databaseName}/${nodeName} ${reason}`);
+				})
 			)
 				reconcileWorkers();
+			reportUnstamped('worker exit', unstamped);
 		});
 	}
-	// Shared by both R1 writers (the exit handler above and the reconcile sweep below), so the two stamp
-	// identically. Ownership is the CALLER's guard; this only refuses to overwrite a state that is not
-	// CONNECTED. Never throws into the exit/reconcile path — a telemetry-grade failure must not stop the
-	// re-binding those paths exist to do.
-	function stampWorkerExitTruth(databaseName: string, nodeName: string | undefined): boolean {
-		if (!nodeName) return false;
+	// Ownership is the CALLER's guard; this only refuses to overwrite a state that is not CONNECTED. Never
+	// throws into the exit/reconcile path — a telemetry-grade failure must not stop the re-binding those
+	// paths exist to do. Every way of NOT stamping returns its own reason, so an absent line means the
+	// stamp landed and cannot also mean the buffer was never reached.
+	function stampWorkerExitTruth(databaseName: string, nodeName: string | undefined): string | undefined {
+		if (!nodeName) return 'no peer name';
 		try {
 			const auditStore = getAuditStoreForDatabase(databaseName);
-			if (!auditStore) return false;
-			return stampWorkerExitDown(getReplicationSharedStatus(auditStore, databaseName, nodeName));
+			if (!auditStore) return 'no audit store';
+			const status = getReplicationSharedStatus(auditStore, databaseName, nodeName);
+			if (stampWorkerExitDown(status)) return;
+			return describeRefusedWorkerExitStamp(status);
 		} catch (error) {
 			logger.trace?.('Failed to stamp worker-exit connection truth for', databaseName, nodeName, error);
-			return false;
+			return 'threw';
+		}
+	}
+	// `writer` distinguishes the two: the exit handler reports an edge, at the moment of exit, while the
+	// sweep reports a latched level for a worker that may have died minutes earlier — which the payload
+	// alone cannot say. Contained because neither caller has an outer catch.
+	function reportUnstamped(writer: string, unstamped: string[] | undefined) {
+		if (!unstamped) return;
+		try {
+			logger.debug?.(`Worker-exit truth stamp did not land (${writer}):`, unstamped.join(', '));
+		} catch {
+			/* a failing log sink is not worth the recovery path */
 		}
 	}
 	function reconcileWorkers() {
@@ -1438,6 +1458,7 @@ export async function startOnMainThread(options) {
 		// Diagnostics for the two lifecycle corrections below, batched into one line each so a mass worker
 		// exit does not emit one log per (database, peer). Allocated only once something is actually wrong.
 		let stampedDeadOwner: string[] | undefined;
+		let unstampedDeadOwner: string[] | undefined;
 		let clearedNonMembers: string[] | undefined;
 		// Reconcile the inferred `connected` flag against the authoritative shared-memory truth the owning
 		// worker writes, in BOTH directions (see reconcileEntryWithTruth): down-corrections feed the wedge
@@ -1485,8 +1506,16 @@ export async function startOnMainThread(options) {
 						reportedNonMemberStatus.delete(key);
 						// The entry's owning worker is gone from the live pool. Stamped before the truth read below
 						// so the correction lands on this tick rather than the next one.
-						if (hasDeadOwner(entry, httpWorkers) && stampWorkerExitDown(status, now))
+						if (!hasDeadOwner(entry, httpWorkers)) reportedUnstampedDeadOwner.delete(key);
+						else if (stampWorkerExitDown(status, now)) {
 							(stampedDeadOwner ??= []).push(key);
+							reportedUnstampedDeadOwner.delete(key);
+						} else if (!reportedUnstampedDeadOwner.has(key)) {
+							// This sweep is the backstop for a worker dropped from the pool without ever firing
+							// 'exit', so a refusal here is the only record of that half (harper-pro#357).
+							reportedUnstampedDeadOwner.add(key);
+							(unstampedDeadOwner ??= []).push(`${key} ${describeRefusedWorkerExitStamp(status, now)}`);
+						}
 					}
 				} catch (error) {
 					logger.warn('Error reading replication connection truth for', databaseName, nodeName, error);
@@ -1516,6 +1545,7 @@ export async function startOnMainThread(options) {
 				'Marked replication connection truth down for subscriptions whose owning worker is gone:',
 				stampedDeadOwner.join(', ')
 			);
+		reportUnstamped('reconcile sweep', unstampedDeadOwner);
 		if (clearedNonMembers)
 			logger.warn(
 				'Cleared stale replication status for peers that are no longer cluster members (their removal ' +
