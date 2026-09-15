@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789458951424,
+  "lastUpdate": 1789458954213,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -10882,6 +10882,73 @@ window.BENCHMARK_DATA = {
           {
             "name": "E scan p99 — short ranges",
             "value": 321.09,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "b03baa41b1ff75dc004770688b0582777fee3c15",
+          "message": "Anchor the replication shared-status buffer so it survives its owning worker (#845)\n\n* Anchor the replication shared-status buffer so it survives its owning worker\n\ngetUserSharedBuffer frees its backing allocation once every ArrayBuffer view of\nit is garbage collected. The per-(database, peer) replication status buffer was\nread transiently everywhere on the main thread, so the owning HTTP worker held\nthe only durable view — the thread whose death the W1 connection truth\n(harper-pro#431) exists to survive. When that worker exited, the main thread\nstamped WORKER_EXIT_ERROR_CODE into a buffer nothing retained and dropped its\nview; the next GC freed it, and the next resolution returned a fresh zeroed\nbuffer. cluster_status then reported the link with no lastConnectionError and a\nzero receive watermark, back-pressure ratio, blob-failure count and recovery-fire\ncounters.\n\nThe main thread now anchors the buffer on the subscription entry, so the\nallocation's lifetime is the membership's: acquired at entry creation before the\nsubscribe is dispatched (so no worker can be its only resolver), topped up by\nreconcileWorkers for an entry created before its database had an audit store,\ncarried across a dead-owner reassignment rather than re-resolved, and released\nwith the entry.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* Re-anchor every reconcile tick, and stop the retention test failing on GC timing\n\nReview follow-ups:\n- The reconcile now assigns entry.sharedStatus unconditionally. connectionReplicationMap\n  is keyed by URL, so a renamed peer (existingEntry.nodes is replaced in place) or a\n  dropped-and-recreated database resolves a different buffer; anchoring only when absent\n  left the entry pinning a dead allocation while the live buffer had only the worker's\n  view. The view is allocated on that line either way, so this costs nothing.\n- The unit test observes the unanchored drop over several collection rounds and skips\n  rather than fails when V8 keeps the temporary alive, and covers database separation as\n  well as peer separation. Its header records that the freeing behavior is RocksDB's;\n  LMDB keeps user shared buffers on the env for its lifetime.\n- Trimmed the added comments back to the invariants.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* Anchor on the existing-entry path too, and prefer a fresh resolve over the carried one\n\nTwo gaps the previous round left:\n\n- A subscription created for a database that is not local yet (the leader/clone\n  bootstrap at onDatabase) anchored nothing, so the worker that receives DB_SCHEMA and\n  creates the audit store became the buffer's only holder until the next 5s reconcile\n  tick. A worker death in that window freed the allocation, and stampWorkerExitDown then\n  declined to stamp the re-minted buffer because its state no longer reads CONNECTED —\n  losing the exit code as well as the watermark cloneNode/syncMonitor reads for copy\n  completion and its stall deadline. onDatabase now anchors on the existing-entry path,\n  which runs again as soon as the table appears.\n- The dead-owner reassignment preferred the carried anchor over a fresh resolve, so a\n  peer renamed while its worker was down anchored the old name's buffer. The carried\n  reference is now the fallback: it still keeps the outgoing allocation alive across the\n  gap, while the resolve decides which buffer the entry owns.\n\nAlso scopes the unit test's --expose_gc flag back off after capturing the collector, so\nthe rest of the mocha process is unaffected.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* Trim the added comments to the contract they state\n\nThird review round's remaining item. Keeps the one non-obvious fact per site — the\nengine frees a user shared buffer when its last view goes, so the field is what keeps\nit — and drops the narration of the statements below it.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n* Stop the acquisition comment claiming a guarantee the code does not make\n\nThe comment said the worker is never the sole holder; it is, for a database the main\nthread cannot see yet. Names that case instead.\n\nCo-Authored-By: Claude Opus 5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>",
+          "timestamp": "2026-09-15T03:49:32Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/b03baa41b1ff75dc004770688b0582777fee3c15"
+        },
+        "date": 1789458954182,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "C read p99 — read only",
+            "value": 5.36,
+            "unit": "ms"
+          },
+          {
+            "name": "B read p99 — read mostly",
+            "value": 18.81,
+            "unit": "ms"
+          },
+          {
+            "name": "B update p99 — read mostly",
+            "value": 21.7,
+            "unit": "ms"
+          },
+          {
+            "name": "A update p99 — update heavy",
+            "value": 49.96,
+            "unit": "ms"
+          },
+          {
+            "name": "A read p99 — update heavy",
+            "value": 48.27,
+            "unit": "ms"
+          },
+          {
+            "name": "F read p99 — read-modify-write",
+            "value": 48.4,
+            "unit": "ms"
+          },
+          {
+            "name": "F rmw p99 — read-modify-write",
+            "value": 101.24,
+            "unit": "ms"
+          },
+          {
+            "name": "E scan p99 — short ranges",
+            "value": 144.73,
+            "unit": "ms"
+          },
+          {
+            "name": "E insert p99 — short ranges",
+            "value": 54.19,
             "unit": "ms"
           }
         ]
