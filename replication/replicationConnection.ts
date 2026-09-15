@@ -5822,7 +5822,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											const copyStartTime = copyResume?.copyStartTime ?? Date.now();
 											const nodeId = getThisNodeId(auditStore);
 											if (legacyCopy) {
-												// A legacy no-op put can corrupt its audit log. Verify an existing baseline without writing it back.
+												// Legacy no-op puts can corrupt the receiver's audit log.
 												await verifyLegacyCopyBaseline({
 													peerName: remoteNodeName,
 													databaseName,
@@ -5895,7 +5895,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											let withheldOriginNodeId: number | undefined;
 											let withheldRecordCount = 0;
 											try {
-												const peerNodeRow = getHDBNodeTable().primaryStore.getSync(remoteNodeName);
+												const peerNodeRow = !legacyCopy && getHDBNodeTable().primaryStore.getSync(remoteNodeName);
 												if (
 													shouldWithholdPeerOwnRecords({
 														cloneSource: cloneAttemptSource(),
@@ -7985,25 +7985,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let nextId = 1;
 	let legacyCopyPeer: Promise<boolean>;
 	function getLegacyCopyPeer() {
-		return (legacyCopyPeer ??= sendOperation(
-			{
-				operation: 'search_by_value',
-				database: 'system',
-				table: 'hdb_info',
-				search_attribute: 'info_id',
-				search_value: '*',
-				get_attributes: ['info_id', 'hdb_version_num'],
-			},
-			30_000
-		).then(isLegacyCopyPeer));
+		return (legacyCopyPeer ??= sendOperation({ operation: 'registration_info' }, 30_000).then(isLegacyCopyPeer));
 	}
+
 	function sendOperation(operation, timeoutMs?: number): Promise<any> {
 		const requestId = nextId++;
 		return new Promise((resolve, reject) => {
 			const timer = timeoutMs
 				? setTimeout(() => {
 						awaitingResponse.delete(requestId);
-						reject(new Error('Timed out verifying peer replication baseline'));
+						reject(new Error('Timed out waiting for peer operation response'));
 					}, timeoutMs).unref()
 				: undefined;
 			awaitingResponse.set(requestId, {
