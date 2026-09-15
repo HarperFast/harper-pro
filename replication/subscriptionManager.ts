@@ -90,6 +90,10 @@ type ConnectedWorkerStatus = {
 };
 type ReplicationConnectionStatus = {
 	url?: string;
+	// Write-only. RocksDB frees a user shared buffer once the last view of it is collected, and the owning
+	// worker holds the only other durable view, so without this field the (database, peer) status buffer is
+	// re-minted as zeros on worker exit. Assigned wherever the live buffer is resolvable.
+	sharedStatus?: Float64Array;
 	// Explicit unsubscribe keeps the entry alive for iterator/URL cleanup, but it is no longer
 	// an active subscription and must not take the existing-entry reuse fast path.
 	unsubscribed?: boolean;
@@ -158,6 +162,17 @@ function getAuditStoreForDatabase(databaseName: string): any {
 	for (const tableName in database) {
 		const auditStore = database[tableName]?.auditStore;
 		if (auditStore) return auditStore;
+	}
+}
+
+// Contained: this only decorates a subscription, so a database torn down mid-lookup must not abandon setup.
+function resolveSharedStatus(databaseName: string, nodeName: string | undefined): Float64Array | undefined {
+	if (!nodeName) return;
+	try {
+		const auditStore = getAuditStoreForDatabase(databaseName);
+		if (auditStore) return getReplicationSharedStatus(auditStore, databaseName, nodeName);
+	} catch (error) {
+		logger.warn('Error resolving replication connection truth for', databaseName, nodeName, error);
 	}
 }
 
@@ -1047,14 +1062,22 @@ export async function startOnMainThread(options) {
 			// assigned at all (all workers were down at registration time) so it gets rebound
 			// once workers come back. Without these checks, the early-return branch keeps the
 			// entry stuck and the subscription never recovers.
+			// Keeps the outgoing buffer alive across the delete/recreate below; a fresh resolve still wins,
+			// since a peer renamed while its worker was down owns a different buffer.
+			let carriedSharedStatus: Float64Array | undefined;
 			if (existingEntry && httpWorkers.length > 0 && !httpWorkers.includes(existingEntry.worker as any)) {
 				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
 				dbReplicationWorkers.delete(databaseName);
+				carriedSharedStatus = existingEntry.sharedStatus;
 				existingEntry = undefined;
 			}
 			if (existingEntry) {
 				worker = existingEntry.worker;
 				existingEntry.nodes = nodes;
+				// Reached again once a database that did not exist at creation appears, which is the earliest
+				// the main thread can hold its buffer. Never clears an anchor a failed resolve cannot replace.
+				const resolvedSharedStatus = resolveSharedStatus(databaseName, nodes[0]?.name);
+				if (resolvedSharedStatus) existingEntry.sharedStatus = resolvedSharedStatus;
 				// Normally an existing subscribed entry is left alone. Only the wedge reconcile passes
 				// forceResubscribe for a connection that has been connected:false past the threshold: that
 				// falls through to re-post subscribe-to-node on the same worker (the worker then reuses a
@@ -1087,6 +1110,10 @@ export async function startOnMainThread(options) {
 					// never reaches 'open' (so connectedToNode never clears it and disconnectedFromNode never
 					// stamps disconnectedAt) would otherwise be invisible to findWedgedNodeUrls. See harper-pro#466.
 					createdAt: Date.now(),
+					// Before the subscribe dispatched below. Resolves nothing for a database the main thread
+					// cannot see yet (clone/leader bootstrap), which leaves the worker sole holder until one
+					// of the re-takes above reaches it.
+					sharedStatus: resolveSharedStatus(databaseName, nodes[0]?.name) ?? carriedSharedStatus,
 				});
 				ensureWorkerExitHandler(worker);
 			}
@@ -1435,6 +1462,8 @@ export async function startOnMainThread(options) {
 					// One buffer read serves every job on this entry: the two lifecycle corrections, the truth
 					// derivation, and the R3 metrics bridge.
 					status = getReplicationSharedStatus(auditStore, databaseName, nodeName);
+					// Every tick: a renamed peer or recreated database resolves a different buffer here.
+					entry.sharedStatus = status;
 					// a tracked peer that is no longer a cluster member must read zero
 					// shared status, or a same-process re-add inherits its CONNECTED/liveness/error values.
 					// Skipped while nodeMap is empty — mid-boot, nothing has been processed yet, so every entry
