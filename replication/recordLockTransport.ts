@@ -61,15 +61,7 @@ import {
 	setRecordLockOwnershipReaders,
 } from './recordLockRpc.ts';
 import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
-import {
-	everRecloned,
-	forgetPoisonState,
-	isPoisoned,
-	notePoisonAnnounced,
-	poison,
-	poisonedPairs,
-	setPoisonBroadcast,
-} from './recordLockPoison.ts';
+import { ANY_TABLE, everRecloned, forgetPoisonState, isPoisoned, poison, poisonedPairs } from './recordLockPoison.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
 import * as tableModule from '../core/resources/Table.ts';
 import { ensureNode } from './subscriptionManager.ts';
@@ -156,7 +148,7 @@ function listenForApplyFailures(database: string): void {
 		await poison(
 			database,
 			origin,
-			typeof failure?.table === 'string' ? failure.table : '*',
+			typeof failure?.table === 'string' ? failure.table : ANY_TABLE,
 			`terminal apply failure at ${failure?.position}: ${failure?.error?.message ?? failure?.error}`
 		);
 	});
@@ -801,14 +793,6 @@ if (parentPort) {
 	onMessageByType('record-lock-barrier-applied', (message) => {
 		freshnessBarriers.get(message.database)?.noteBarrierApplied(message.origin, message.position, message.nonce);
 	});
-	onMessageByType('record-lock-poison', (message) => {
-		if (
-			typeof message?.database === 'string' &&
-			typeof message?.origin === 'string' &&
-			typeof message?.table === 'string'
-		)
-			notePoisonAnnounced(message.database, message.origin, message.table);
-	});
 	onMessageByType('record-lock-status-request', (message) => {
 		const status: Record<string, RecordLockDatabaseStats | undefined> = {};
 		for (const database of message.databases ?? []) status[database] = localRecordLockStats(database);
@@ -1043,30 +1027,6 @@ export async function collectRecordLockStatus(
 	return result;
 }
 
-// A hole is recorded on the thread holding the socket; the barrier that must refuse it waits on the
-// coordinating thread. Main fans a durable row out to every worker, and marks it itself.
-setPoisonBroadcast((database, origin, table) => {
-	const message = { type: 'record-lock-poison', database, origin, table };
-	try {
-		if (parentPort) parentPort.postMessage(message);
-		else fanOutPoison(message, undefined);
-	} catch (error) {
-		logger.debug?.('Could not announce a record lock poison row', error);
-	}
-});
-
-function fanOutPoison(message: any, from: any): void {
-	notePoisonAnnounced(message.database, message.origin, message.table);
-	for (const worker of httpWorkers()) {
-		if (worker === from) continue;
-		try {
-			worker.postMessage(message);
-		} catch (error) {
-			logger.debug?.('Could not forward a record lock poison row to a worker', error);
-		}
-	}
-}
-
 setRecordLockOwnershipReaders({
 	ownsDatabase: ownsRecordLockCoordination,
 	ownerFor: (database) => {
@@ -1108,14 +1068,6 @@ if (!parentPort) {
 	onMessageByType('record-lock-barrier-applied', (message) => {
 		if (typeof message?.database !== 'string' || typeof message?.origin !== 'string') return;
 		routeBarrierAppliedFromMain(message);
-	});
-	onMessageByType('record-lock-poison', (message, worker) => {
-		if (
-			typeof message?.database === 'string' &&
-			typeof message?.origin === 'string' &&
-			typeof message?.table === 'string'
-		)
-			fanOutPoison(message, worker);
 	});
 	onMessageByType('record-lock-homes-changed', (message, worker) => {
 		if (typeof message?.database !== 'string') return;

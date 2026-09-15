@@ -164,7 +164,7 @@ is allocated or `writeLockBarrier` is called; and the zero-cost claim gets an ex
   poisoned in memory and **holds the frame and reconnects** (the receive loop's existing
   hold-and-reconnect path), so the cursor cannot advance past an unrecorded hole; it cannot escape
   as an unhandled rejection. One warning names the record and the consequence;
-  `cluster_status.recordLocks` lists poisoned pairs. A poisoned pair rejects every dependency and
+  `cluster_status.recordLocks` lists poisoned pairs. The barrier checks poison and the reclone flag by reading the store on the cold path — never a per-thread cache — because the hole is recorded on the socket's thread while the barrier waits on the coordinating thread, and the drop completes only after the row is durable. A poisoned pair rejects every dependency and
   every barrier request for it, permanently: a base copy cannot repair it (fact 3), so the only
   clearance is a fresh clone of this node's database, which discards the `dbis` store with it.
 - **Waiting.** Per database: the outstanding barrier table (keyed by nonce, each with origin,

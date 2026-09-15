@@ -6375,6 +6375,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						'from',
 						remoteNodeName
 					);
+					if (
+						tableDecoder?.name &&
+						!(await recordReplicationHole(
+							remoteShortIdToLocalId.get(auditRecord.nodeId),
+							tableDecoder.name,
+							'local-only record forwarded by the peer'
+						))
+					)
+						return;
 					decoder.position = start + eventLength;
 					continue;
 				}
