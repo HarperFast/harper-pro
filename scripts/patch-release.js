@@ -292,6 +292,20 @@ function setVersion(repoLabel, targetVersion) {
 	return newVersion;
 }
 
+function buildSuccessResult({ target, coreVersion, proVersion, coreBumping, pushed, cmTriggered, dryRun }) {
+	const reportedCoreVersion = dryRun && coreBumping ? `v${target}` : coreVersion ?? null;
+	return {
+		ok: true,
+		target: proVersion,
+		coreVersion: reportedCoreVersion,
+		proVersion,
+		coreBumped: reportedCoreVersion !== null,
+		pushed,
+		cmTriggered,
+		dryRun,
+	};
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
 	try {
@@ -507,16 +521,15 @@ async function main() {
 	}
 
 	if (JSON_OUTPUT) {
-		writeResult({
-			ok: true,
-			target: proVersion,
-			coreVersion: coreVersion ?? null,
+		writeResult(buildSuccessResult({
+			target,
+			coreVersion,
 			proVersion,
-			coreBumped: coreVersion !== null,
+			coreBumping,
 			pushed,
 			cmTriggered,
 			dryRun: DRY_RUN,
-		});
+		}));
 	}
 }
 
@@ -526,4 +539,10 @@ if (require.main === module) {
 	});
 }
 
-module.exports = { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult, writeResult };
+module.exports = {
+	resolveDeployAnswer,
+	buildAbortedResult,
+	buildCmFailureResult,
+	buildSuccessResult,
+	writeResult,
+};

@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 
 const require = createRequire(import.meta.url);
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
-const { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult, writeResult } = require(
+const { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult, buildSuccessResult, writeResult } = require(
 	join(root, 'scripts/patch-release.js')
 );
 
@@ -79,6 +79,46 @@ describe('patch-release.js non-interactive contract', function () {
 				error: 'network error',
 			});
 			assert.equal(extra.coreVersion, null);
+		});
+	});
+
+	describe('buildSuccessResult', function () {
+		it('reports the projected core version and bump in a core-bumping dry run', function () {
+			assert.deepEqual(
+				buildSuccessResult({
+					target: '5.0.33',
+					coreVersion: null,
+					proVersion: 'v5.0.33',
+					coreBumping: true,
+					pushed: false,
+					cmTriggered: false,
+					dryRun: true,
+				}),
+				{
+					ok: true,
+					target: 'v5.0.33',
+					coreVersion: 'v5.0.33',
+					proVersion: 'v5.0.33',
+					coreBumped: true,
+					pushed: false,
+					cmTriggered: false,
+					dryRun: true,
+				}
+			);
+		});
+
+		it('leaves core null and unbumped in a non-core-bumping dry run', function () {
+			const result = buildSuccessResult({
+				target: '5.1.28',
+				coreVersion: null,
+				proVersion: 'v5.1.28',
+				coreBumping: false,
+				pushed: false,
+				cmTriggered: false,
+				dryRun: true,
+			});
+			assert.equal(result.coreVersion, null);
+			assert.equal(result.coreBumped, false);
 		});
 	});
 
