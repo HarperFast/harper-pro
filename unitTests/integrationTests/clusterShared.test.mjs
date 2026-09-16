@@ -1,7 +1,8 @@
 import { expect } from 'chai';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { sendOperation, waitForCondition } from '../../integrationTests/cluster/clusterShared.mjs';
+import { text } from 'node:stream/consumers';
+import { sendOperation, ensureTableExists, waitForCondition } from '../../integrationTests/cluster/clusterShared.mjs';
 
 async function startStub(handler) {
 	const server = createServer(handler);
@@ -167,6 +168,72 @@ describe('cluster test helpers — waitForCondition', () => {
 				{ pollMs: 1, timeoutMs: 5000, description: () => `record_count ${last} to reach 15` }
 			);
 			expect(caughtUp).to.equal(15);
+		} finally {
+			await stub.close();
+		}
+	});
+});
+
+describe('cluster test helpers — ensureTableExists', () => {
+	const definition = {
+		database: 'flowdb2',
+		table: 'filtered',
+		primary_key: 'id',
+		attributes: [{ name: 'id', type: 'ID' }],
+	};
+
+	it('accepts the duplicate a peer\u2019s replicated definition produced', async () => {
+		const seen = [];
+		const stub = await startStub(async (request, response) => {
+			const body = JSON.parse(await text(request));
+			seen.push(body);
+			if (seen.length === 1) {
+				response.writeHead(200, { 'Content-Type': 'application/json' });
+				response.end(JSON.stringify({ message: "table 'flowdb2.filtered' successfully created." }));
+			} else {
+				response.writeHead(400, { 'Content-Type': 'application/json' });
+				response.end(JSON.stringify({ error: "Table 'filtered' already exists in 'flowdb2'" }));
+			}
+		});
+		try {
+			await ensureTableExists(stub.node, definition);
+			const duplicate = await ensureTableExists(stub.node, definition);
+			expect(duplicate.error).to.equal("Table 'filtered' already exists in 'flowdb2'");
+			expect(seen).to.have.length(2);
+			expect(seen[0].operation).to.equal('create_table');
+			expect(seen[0].primary_key).to.equal('id');
+		} finally {
+			await stub.close();
+		}
+	});
+
+	it('still fails on a 400 that names a different table', async () => {
+		const stub = await startStub((request, response) => {
+			response.writeHead(400, { 'Content-Type': 'application/json' });
+			response.end(JSON.stringify({ error: "Table 'covered' already exists in 'flowdb2'" }));
+		});
+		try {
+			const error = await ensureTableExists(stub.node, definition).then(
+				() => undefined,
+				(error) => error
+			);
+			expect(error?.message).to.contain("Table 'covered' already exists in 'flowdb2'");
+		} finally {
+			await stub.close();
+		}
+	});
+
+	it('still fails on an unrelated rejection', async () => {
+		const stub = await startStub((request, response) => {
+			response.writeHead(400, { 'Content-Type': 'application/json' });
+			response.end(JSON.stringify({ error: "'primary_key' is required" }));
+		});
+		try {
+			const error = await ensureTableExists(stub.node, definition).then(
+				() => undefined,
+				(error) => error
+			);
+			expect(error?.message).to.contain("'primary_key' is required");
 		} finally {
 			await stub.close();
 		}

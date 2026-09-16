@@ -24,7 +24,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { inflateSync } from 'node:zlib';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, ensureTableExists } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -186,8 +186,7 @@ suite('replication preserves the blob codec (harper#2443)', { timeout: 300000 },
 
 		await Promise.all(
 			[ctx.nodeB, ctx.nodeC].map((node) =>
-				sendOperation(node, {
-					operation: 'create_table',
+				ensureTableExists(node, {
 					database: DB,
 					table: TABLE,
 					primary_key: 'id',
