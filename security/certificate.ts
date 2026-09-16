@@ -223,12 +223,9 @@ interface CertRecord {
 }
 
 /**
- * Find a private key file on disk matching `x509Cert`, searching only the key files that
- * certificate records already name. The keys directory also holds env-secret custody and JWT
- * material, and a key no record references would become the new record's sole reference — which
- * is what makes `removeCertificate` unlink it.
- *
- * @returns The matching key's file name, or undefined when none matches.
+ * Find a private key file on disk matching `x509Cert`, among the key files that certificate
+ * records name. Other files in the keys directory are excluded: a key no record references would
+ * become the new record's sole reference, which is what makes `removeCertificate` unlink it.
  */
 async function findCertificateKeyOnDisk(x509Cert: X509Certificate): Promise<string | undefined> {
 	const hdbKeysDir = join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME);
@@ -301,12 +298,17 @@ async function addCertificate(req: AddCertificateRequest) {
 			}
 		}
 	} else {
-		// No key provided — search existing keys to see if one matches this cert.
+		// No key provided — search existing keys to see if one matches this cert. An entry that
+		// cannot be parsed must not mask a key that matches.
 		for (const [keyName, key] of privateKeys) {
-			if (x509Cert.checkPrivateKey(createPrivateKey(key))) {
-				matchingKeyFound = true;
-				existingPrivateKeyName = keyName;
-				break;
+			try {
+				if (x509Cert.checkPrivateKey(createPrivateKey(key))) {
+					matchingKeyFound = true;
+					existingPrivateKeyName = keyName;
+					break;
+				}
+			} catch (error) {
+				logger.debug?.('Skipping stored private key that could not be parsed', keyName, error);
 			}
 		}
 

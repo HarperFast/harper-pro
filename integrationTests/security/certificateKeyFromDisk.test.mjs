@@ -1,8 +1,7 @@
 /**
- * harper-pro#858: add_certificate must resolve a private key that is on disk but absent from the
- * in-memory privateKeys map, which holds config-referenced keys only. The restart is what makes
- * the miss real — after it, a key added through add_certificate is on disk and named by its
- * certificate record, but nothing put it back in the map.
+ * add_certificate must resolve a private key that is on disk and named by a certificate record but
+ * absent from the in-memory privateKeys map, which a restart repopulates from config-referenced
+ * paths and secret-custody keys only.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
@@ -39,8 +38,7 @@ async function sendOperationOk(node, operation) {
 	return body;
 }
 
-// A new certificate for a key the node already holds — the shape create_csr + sign_certificate
-// produces, and the shape #858 was reported against.
+// A new certificate for a key the node already holds, as create_csr + sign_certificate produce.
 function reissueCertificate(privateKeyPem, commonName) {
 	const privateKey = forge.pki.privateKeyFromPem(privateKeyPem);
 	const cert = forge.pki.createCertificate();
@@ -78,7 +76,6 @@ suite('Certificate key resolved from disk', (ctx) => {
 		const brokenCertificate = await createCert({ ...certOptions, domains: ['broken-key.test'] });
 		const missingCertificate = await createCert({ ...certOptions, domains: ['missing-key.test'] });
 
-		// The key this suite resolves from disk after the restart.
 		await sendOperationOk(ctx.harper, {
 			operation: 'add_certificate',
 			name: OWNER_CERT_NAME,
@@ -87,8 +84,7 @@ suite('Certificate key resolved from disk', (ctx) => {
 			is_authority: false,
 		});
 
-		// Two candidates that must not abort the search: one whose key file is not a parseable key,
-		// one whose key file is gone.
+		// Candidates that must not abort the search: an unparseable key file, and a missing one.
 		await sendOperationOk(ctx.harper, {
 			operation: 'add_certificate',
 			name: 'broken-key-holder',
@@ -108,9 +104,8 @@ suite('Certificate key resolved from disk', (ctx) => {
 
 		ok(existsSync(join(keysDir, OWNER_KEY_FILE)), `${OWNER_KEY_FILE} should have been written to disk`);
 
-		// Restart on the same data dir: the privateKeys map is rebuilt from config-referenced paths
-		// only, so the keys added above are on disk and named by certificate records but no longer
-		// in the map.
+		// Restart on the same data dir: the keys added above stay on disk, named by their records,
+		// but are no longer in the map.
 		await killHarper(ctx);
 		await startHarper(ctx);
 	});
