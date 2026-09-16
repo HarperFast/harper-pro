@@ -321,6 +321,21 @@ two arbiters, produced by following the operation's own advice. A departing node
 staged or `record_lock_fence_external`'d and drained; `quiesce` names exactly that set, and a
 warning names the leaving nodes explicitly.
 
+Two further limits are stated in the response rather than left for an operator to discover, both
+raised in review against the first cut:
+
+- **`quiesce` is only as complete as the node that answered.** It unions this node's own `active`
+  and `staged` rings, so a node that has neither — never bootstrapped, or already staged, since
+  staging retracts `active` — cannot name a ring the rest of the cluster is serving, and the union
+  silently omits it. The response warns when this node has no `active` generation and says to ask a
+  node that holds it and union the proposals. This is inherent to a single-node read, not a defect
+  to be patched: a proposal that reached across nodes to find the old ring would be the
+  cross-node agreement step §4.3 deliberately leaves with the operator.
+- **A staged departing node stays unable to lock.** It is never activated, because it is not in
+  `homes`; it holds `staged` with no `active` and refuses every cluster lock. That is what leaving
+  the ring means, and the warning says so, so it is not mistaken for a stuck transition. Bringing
+  such a node back is an ordinary later generation that names it again.
+
 That is the list-assembly step of the §4.3 runbook and only that: the operator captures one
 canonical list instead of typing it, then passes that exact list to `record_lock_stage_generation`
 and `record_lock_activate_generation` on every node, unchanged. The returned digest is what lets a
