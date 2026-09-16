@@ -452,6 +452,16 @@ export function setHomesMembershipReaders(readers: MembershipReaders): void {
 let drainReader: (database: string, deadlineMs: number) => Promise<QuiesceResult | { error: string }> = async () => ({
 	error: 'no record lock drain is wired on this node',
 });
+/**
+ * An orchestrator may skip the drain interval for a node ONLY on this: a drain that both completed
+ * and found nothing. `complete` is core's statement that the sweep could have seen everything —
+ * coordinators are built lazily, so an empty `outstanding` alone is not a proof (harper-pro#856).
+ */
+export function provesQuiescence(quiesced: QuiesceResult | { error: string } | undefined): boolean {
+	return (
+		!!quiesced && !('error' in quiesced) && quiesced.complete === true && (quiesced.outstanding?.length ?? 0) === 0
+	);
+}
 export function setHomesDrainReader(reader: typeof drainReader): void {
 	drainReader = reader;
 }

@@ -8,6 +8,7 @@ import assert from 'node:assert';
 import {
 	STAGE_DRAIN_BUDGET_MS,
 	canonicalizeHomes,
+	provesQuiescence,
 	setHomesDrainReader,
 	digestOf,
 	planActivate,
@@ -356,6 +357,18 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 		});
 		assert.ok(quiesced.error, 'an unwired drain must not read as an empty outstanding list');
 		assert.strictEqual(quiesced.outstanding, undefined);
+	});
+
+	it('only an empty AND complete drain lets an orchestrator skip the interval', () => {
+		assert.strictEqual(provesQuiescence({ complete: true, surrendered: 0, recalled: 0, outstanding: [] }), true);
+		// Empty but not complete: a lazily-unbuilt coordinator, or a process that restarted recently.
+		assert.strictEqual(provesQuiescence({ complete: false, surrendered: 0, recalled: 0, outstanding: [] }), false);
+		assert.strictEqual(
+			provesQuiescence({ complete: true, surrendered: 0, recalled: 0, outstanding: [{ table: 'T' }] }),
+			false
+		);
+		assert.strictEqual(provesQuiescence({ error: 'the drain did not reach the coordinating worker' }), false);
+		assert.strictEqual(provesQuiescence(undefined), false);
 	});
 
 	it('has a reporting budget far below the interval it replaces', () => {
