@@ -108,17 +108,27 @@ describe('patch-release.js non-interactive contract', function () {
 		});
 
 		it('leaves core null and unbumped in a non-core-bumping dry run', function () {
-			const result = buildSuccessResult({
-				target: '5.1.28',
-				coreVersion: null,
-				proVersion: 'v5.1.28',
-				coreBumping: false,
-				pushed: false,
-				cmTriggered: false,
-				dryRun: true,
-			});
-			assert.equal(result.coreVersion, null);
-			assert.equal(result.coreBumped, false);
+			assert.deepEqual(
+				buildSuccessResult({
+					target: '5.1.28',
+					coreVersion: null,
+					proVersion: 'v5.1.28',
+					coreBumping: false,
+					pushed: false,
+					cmTriggered: false,
+					dryRun: true,
+				}),
+				{
+					ok: true,
+					target: 'v5.1.28',
+					coreVersion: null,
+					proVersion: 'v5.1.28',
+					coreBumped: false,
+					pushed: false,
+					cmTriggered: false,
+					dryRun: true,
+				}
+			);
 		});
 	});
 
