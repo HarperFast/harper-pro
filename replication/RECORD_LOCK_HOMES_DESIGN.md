@@ -276,65 +276,58 @@ pointer or `undefined`) on any error in between; mirrors the existing containmen
   mesh, including 24-way concurrent contention) before being killed moving into suite 2. Re-run
   the suite once outside a contended shared box before relying on it as a clean pass.
 
-## Bootstrapping generation 1: `record_lock_bootstrap_generation`
+## Assembling a home map: `record_lock_propose_homes`
 
-Added after the freshness work landed, on the task owner's request (2026-09-16). The three
-transition operations all require the operator to pass `homes[]` explicitly and to call each of
-them on every node, because the row is `LOCAL_ONLY`. For the _first_ generation on a new cluster
-that is pure ceremony: there is nothing to quiesce, and the list the operator types is the one
-already sitting in `hdb_nodes`. This operation removes the typing, not the agreement.
+Added on the task owner's request (2026-09-16), after the planning review **rejected the operation
+originally proposed** — a `record_lock_bootstrap_generation` that would derive `homes` from
+`hdb_nodes` and write `active` for generation 1 directly, skipping stage/drain/activate on the
+grounds that the node had never had a home map. Both halves of that were wrong, and both are easy
+to re-propose, so the counterexamples are recorded here rather than only in a review artifact.
 
-### What it does
+### Why deriving per node cannot be made safe by the digest check
 
-`record_lock_bootstrap_generation { database, homes? }`, `requiresSuperUser`, local to the node it
-is called on. It writes `active` for generation 1 **directly** — no `staged`, no drain — and
-notifies this node's threads exactly as `activateGeneration` does.
+The rejected design rested on "if two nodes derive different sets their digests differ, so
+`homeMap()` is withheld on both." That is false. `homeMap()` iterates its **own** `active.homes`
+(`recordLockTransport.ts`), so a node whose derived set is `[A]` has no peers to check, skips the
+loop entirely, and serves its ring immediately. A and B with disjoint or merely incomplete views
+each get a usable map and both arbitrate the same key. **A digest cannot detect a participant
+omitted from the set being digested** — which is exactly what §4.1 means by stated rather than
+derived, and the reason that rule is about the _set_, not about the hash.
 
-It refuses unless the row is genuinely untouched: no `active`, no `staged`, and
-`highestActedOn === 0`. That triple is the whole safety argument. It means `homeMap()` has never
-returned anything on this node, so core has never issued or accepted a delegation here, so there is
-no grant to quiesce and the §4.3 stage → drain → activate sequence has nothing to do. Any other
-state is a 409 naming what it found and pointing at the normal transition.
+### Why no local guard can authorize a direct activation
 
-`homes` defaults to this node plus every `hdb_nodes` row that `shouldReplicateFromNode(row,
-database)` accepts — the existing, tested _receive_ predicate, not a new one — canonicalized by the
-same `canonicalizeHomes` the other operations use, so two nodes that agree on the set produce the
-same digest whatever order they observed it in. An explicit `homes` in the request is used verbatim
-instead; that is the recommended form for anything larger than a handful of nodes, because it lets a
-script compute the set once and apply the identical list everywhere.
+The rejected design's other half was a fresh-state guard: no `active`, no `staged`,
+`highestActedOn === 0`, therefore "this node has never granted, so there is nothing to quiesce."
+True but insufficient — it proves a fact about _this_ node and says nothing about the cluster. A
+node newly added to a cluster already active at generation 2 has an untouched row, passes the
+guard, and activates its own generation 1 while every other node serves 2. Losing or deleting a
+node's `LOCAL_ONLY` row reproduces the same false proof on a node that _had_ acted. Establishing
+"no prior authority exists anywhere" is single-decree agreement — the thing harper-pro#825 deleted.
 
-### Why deriving from `hdb_nodes` here does not violate §4.1
+### What was built instead
 
-§4.1 forbids a node **acting unilaterally on its own view** of membership. It is not violated by a
-node _reading_ that view, because reading is not what makes a ring authoritative — agreement is.
-If two nodes derive different sets, their digests differ, every peer's agreement check fails, and
-`homeMap()` is withheld on **both**; the result is 503 everywhere, never two arbiters for one key.
-The operator re-runs once the topology has settled. The digest is the enforcement, and it is
-unchanged by this operation.
+`record_lock_propose_homes { database }`, `requiresSuperUser`, **read-only**. It returns the home
+set this node's `hdb_nodes` view suggests (this node plus every row `shouldReplicateFromNode(row,
+database)` accepts, canonicalized), the generation one past whatever this node has acted on, the
+digest that pair would produce, the current `active`/`staged`, and warnings. It writes nothing and
+notifies nothing.
 
-The corollary is worth stating because it is the failure an operator will actually hit: a node whose
-`hdb_nodes` has not caught up yet derives a _too small_ set and disagrees with its peers. That is
-loud (every lock 503s) rather than silent, and the fix is to re-run, or to pass `homes` explicitly.
-A node that bootstraps alone — `homes: [self]` — is legal and is the correct answer for a genuine
-single-node deployment; a cluster that reaches that state by accident replaces it with an ordinary
-generation-2 transition.
+That is the list-assembly step of the §4.3 runbook and only that: the operator captures one
+canonical list instead of typing it, then passes that exact list to `record_lock_stage_generation`
+and `record_lock_activate_generation` on every node, unchanged. The returned digest is what lets a
+script confirm every node agrees before it activates. Because it is a read, none of the blockers
+above apply to it — a suggestion that is wrong costs an operator a re-run, not two arbiters.
 
-### What it deliberately does not do
-
-**It does not fan out.** One call does one node. The three existing operations are
-`requiresSuperUser`, and a replication connection authenticates as a _node_ principal, not a
-super_user, so a node-to-node fan-out would need credential delegation this design has no reason to
-invent. The operator loops, exactly as `bootstrapHomeMap` does in the cluster test.
-
-**It does not relax the per-isolate `withRow` limitation.** It queues on the same per-database queue
-as the other three and inherits the same multi-worker gap, which is tracked separately rather than
-patched here.
+The generation it returns is one past this node's own floor, so the same operation serves a
+topology change as well as a first bootstrap. It is still only this node's view; agreement remains
+the operator's act.
 
 ### Approaches considered
 
-| Axis                | Candidate                                                                                                                   | Ruling                                                                                                                                                                                                                                                                                                                        |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Different layer** | Derive the ring inside `homeMap()` when no row exists, so nothing has to be called at all.                                  | Rejected — this is exactly §4.1's two-arbiter bug: two nodes with different `hdb_nodes` views would each believe they home the same key, with no operator action to blame and no digest round to catch it before the first grant. The operation exists so the derivation is an explicit, auditable act with a durable record. |
-| **Deeper cause**    | One orchestrating call that fans stage → wait → activate out to every node.                                                 | Deferred — needs credential delegation for a `requiresSuperUser` operation across nodes, plus partial-failure semantics (what is the cluster's state when node 3 of 5 fails?). Real work, no safety benefit over a loop, and it would be the same shape for _every_ generation rather than just the first.                    |
-| **Do less**         | Keep the three operations and publish a documented script.                                                                  | Rejected on the ask, but it is close: the operation is that script, with the fresh-state guard enforced durably instead of assumed. The guard is the part a script cannot do safely.                                                                                                                                          |
-| **Chosen**          | A local, fresh-state-only generation-1 write that derives `homes` from `hdb_nodes` by default and accepts an explicit list. | Removes the ceremony from the one case where the ceremony is provably unnecessary, keeps the digest as the agreement mechanism, and leaves every later transition on the unchanged §4.3 path.                                                                                                                                 |
+| Axis                | Candidate                                                                                                                        | Ruling                                                                                                                                                                                                                                      |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Different layer** | Derive the ring inside `homeMap()` when no row exists, so nothing has to be called.                                              | Rejected — §4.1's two-arbiter bug, and now with a concrete mechanism: the agreement loop cannot see a node it was never told about.                                                                                                         |
+| **Deeper cause**    | A mutating bootstrap that writes `active` for generation 1 behind a fresh-state guard.                                           | Rejected in planning review on the two counterexamples above. Making it safe would require asking every derived peer whether it already has authority and failing closed on any unreachable one — single-decree agreement, deleted by #825. |
+| **Deeper cause**    | One orchestrating call that fans stage → wait → activate out to every node.                                                      | Deferred — needs credential delegation for a `requiresSuperUser` operation across nodes plus partial-failure semantics, and would be the same shape for every generation, not just the first. Tracked with the default-on work.             |
+| **Do less**         | Document a script that reads `cluster_status` on each node and assembles the list.                                               | Close, and what an operator can do today; the operation adds canonicalization, the digest, the current state and the bounds validation in one authenticated call, with no new authority.                                                    |
+| **Chosen**          | A read-only proposal: derive, canonicalize, hash, report — the operator still stages and activates the returned list everywhere. | Removes the typing, which was the actual ask, while leaving every authority-bearing step exactly where §4.3 already put it.                                                                                                                 |

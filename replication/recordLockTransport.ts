@@ -49,10 +49,15 @@ import {
 import { getDatabases } from '../core/resources/databases.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
-import { getHDBNodeTable, getReplicationSharedStatus } from './knownNodes.ts';
+import { getHDBNodeTable, getReplicationSharedStatus, shouldReplicateFromNode } from './knownNodes.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
-import { currentRow, onRecordLockHomesChanged, type RecordLockGenerationState } from './recordLockHomes.ts';
+import {
+	currentRow,
+	onRecordLockHomesChanged,
+	setHomesMembershipReaders,
+	type RecordLockGenerationState,
+} from './recordLockHomes.ts';
 import {
 	BARRIER_OPERATION,
 	DELEGATE_OPERATION,
@@ -1037,6 +1042,19 @@ export async function collectRecordLockStatus(
 	await Promise.all(answers);
 	return result;
 }
+
+setHomesMembershipReaders({
+	thisNodeName: getThisNodeName,
+	replicatingPeers(database) {
+		const self = getThisNodeName();
+		const peers: string[] = [];
+		for (const node of getHDBNodeTable().search([])) {
+			if (!node?.name || node.name === self) continue;
+			if (shouldReplicateFromNode(node as any, database)) peers.push(node.name);
+		}
+		return peers;
+	},
+});
 
 setRecordLockOwnershipReaders({
 	ownsDatabase: ownsRecordLockCoordination,

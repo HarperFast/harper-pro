@@ -9,6 +9,7 @@ import {
 	canonicalizeHomes,
 	digestOf,
 	planActivate,
+	planProposal,
 	planStage,
 	validateGenerationInput,
 } from '#src/replication/recordLockHomes';
@@ -221,5 +222,55 @@ describe('planActivate', () => {
 		};
 		const plan = planActivate(existing, 'db', 1, digest1, T, MIN_DRAIN);
 		assert.strictEqual(plan.action, 'write');
+	});
+});
+
+describe('planProposal', () => {
+	const row = (over = {}) => ({ database: 'data', highestActedOn: 0, fenced: [], ...over });
+
+	it('includes this node, sorts and dedupes, and starts at generation 1 on an untouched row', () => {
+		const plan = planProposal('b', ['c', 'a', 'c'], undefined, 'data');
+		assert.deepStrictEqual(plan.homes, ['a', 'b', 'c']);
+		assert.strictEqual(plan.generation, 1);
+		assert.strictEqual(plan.digest, digestOf(1, ['a', 'b', 'c']));
+	});
+
+	it('proposes one past the floor, so it serves a topology change too', () => {
+		assert.strictEqual(planProposal('a', ['b'], row({ highestActedOn: 4 }), 'data').generation, 5);
+		assert.strictEqual(
+			planProposal('a', ['b'], row({ active: { generation: 7, homes: ['a'], digest: 'x' }, highestActedOn: 7 }), 'data')
+				.generation,
+			8
+		);
+		assert.strictEqual(
+			planProposal('a', ['b'], row({ staged: { generation: 9, homes: ['a'], digest: 'x' }, highestActedOn: 9 }), 'data')
+				.generation,
+			10
+		);
+	});
+
+	it("always warns that one node's view is not agreement", () => {
+		const plan = planProposal('a', ['b'], undefined, 'data');
+		assert.ok(
+			plan.warnings.some((warning) => /not agreement/.test(warning)),
+			plan.warnings.join(' | ')
+		);
+	});
+
+	it('warns when this node sees no peers, since that would home every key on itself', () => {
+		const alone = planProposal('a', [], undefined, 'data');
+		assert.deepStrictEqual(alone.homes, ['a']);
+		assert.ok(alone.warnings.some((warning) => /no replicating peers/.test(warning)));
+		assert.ok(!planProposal('a', ['b'], undefined, 'data').warnings.some((w) => /no replicating peers/.test(w)));
+	});
+
+	it('warns when a generation is already staged here', () => {
+		const staged = planProposal('a', ['b'], row({ staged: { generation: 3, homes: ['a'], digest: 'x' } }), 'data');
+		assert.ok(staged.warnings.some((warning) => /already staged/.test(warning)));
+	});
+
+	it('rejects a set larger than the bound, through the shared validator', () => {
+		const many = Array.from({ length: 300 }, (_, i) => `n${i}`);
+		assert.throws(() => planProposal('a', many, undefined, 'data'), /homes must be/);
 	});
 });

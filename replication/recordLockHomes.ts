@@ -376,8 +376,119 @@ export async function currentRow(database: string): Promise<RecordLockHomesRow |
 	return readRow(database);
 }
 
+/**
+ * Read-only: the home set this node's own view of `hdb_nodes` suggests for `database`, plus the
+ * generation and digest that would go with it. **Writes nothing, and is not agreement** — it is the
+ * list-assembly step of the §4.3 runbook, so an operator can capture one canonical list instead of
+ * typing it, then pass that exact list to `record_lock_stage_generation` and
+ * `record_lock_activate_generation` on every node.
+ *
+ * It deliberately does not stage, activate, or fan out. A mutating version was designed and rejected
+ * during planning review, on two counts worth keeping here because both are easy to re-propose:
+ *
+ * - **Per-node derivation cannot be made safe by the digest check.** `homeMap()` iterates its OWN
+ *   `active.homes` (`recordLockTransport.ts`), so a node that derived `[A]` checks no peers at all and
+ *   serves its map immediately. Two nodes with disjoint or incomplete views each get a usable ring and
+ *   both arbitrate the same key. A digest cannot detect a participant omitted from the set being
+ *   digested — which is precisely why §4.1 says the map is stated, not derived.
+ * - **No local state proves the absence of prior authority.** A node newly added to a cluster already
+ *   active at generation 2 has an untouched row, so any "this node has never acted" guard passes and
+ *   it would activate its own generation 1 while the rest of the cluster serves 2.
+ *
+ * So the derivation here is a *suggestion to a human*, never an authority: whatever this returns still
+ * has to be applied identically on every node through the operations that already exist.
+ */
+// ---- membership readers, installed by recordLockTransport.ts so this module never imports
+// knownNodes/subscriptionManager: they import back through recordLockTransport, and a static edge
+// here puts this module's own `changeListeners` in the TDZ when it is loaded first.
+
+interface MembershipReaders {
+	thisNodeName(): string | undefined;
+	/** Peers this node's `hdb_nodes` view says replicate `database` — never this node itself. */
+	replicatingPeers(database: string): string[];
+}
+let membership: MembershipReaders = {
+	thisNodeName: () => undefined,
+	replicatingPeers: () => [],
+};
+export function setHomesMembershipReaders(readers: MembershipReaders): void {
+	membership = readers;
+}
+
+export interface HomesProposal {
+	generation: number;
+	homes: string[];
+	digest: string;
+	warnings: string[];
+}
+
+/**
+ * Pure decision behind `record_lock_propose_homes`, mirroring `planStage`/`planActivate` so the
+ * generation floor, the canonicalization and every warning are unit-testable without a table.
+ * `peers` is whatever the caller's view of `hdb_nodes` accepted for this database.
+ */
+export function planProposal(
+	self: string,
+	peers: string[],
+	existing: RecordLockHomesRow | undefined,
+	database: string
+): HomesProposal {
+	const homes = canonicalizeHomes([self, ...peers]);
+	// One past whatever this node has already acted on, so the proposal serves a topology change as
+	// well as a first bootstrap; the operator still has to agree it with every other node.
+	const generation =
+		Math.max(existing?.active?.generation ?? 0, existing?.staged?.generation ?? 0, existing?.highestActedOn ?? 0) + 1;
+	validateGenerationInput(generation, homes);
+	const warnings: string[] = [];
+	if (canonicalizeHomes(peers).length === 0)
+		warnings.push(
+			`no replicating peers for ${database} are visible from ${self}; this proposal would home every key on ${self} alone`
+		);
+	if (existing?.staged)
+		warnings.push(
+			`generation ${existing.staged.generation} is already staged on ${self} and would have to be resolved first`
+		);
+	warnings.push(
+		"this is one node's view, not agreement: stage and activate this exact list on every node named in it, and compare digests across nodes before activating"
+	);
+	return { generation, homes, digest: digestOf(generation, homes), warnings };
+}
+
+export async function proposeHomes(request: any): Promise<
+	HomesProposal & {
+		database: string;
+		source: 'hdb_nodes';
+		current: { active?: RecordLockGenerationState; staged?: RecordLockGenerationState };
+	}
+> {
+	const validation = validateBySchema(request, proposeSchema);
+	if (validation)
+		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
+	const { database } = request;
+	const self = membership.thisNodeName();
+	if (!self) throw new ClientError('this node has no resolved node name', 503);
+	const peers = membership.replicatingPeers(database);
+	const existing = await readRow(database);
+	return {
+		database,
+		...planProposal(self, peers, existing, database),
+		source: 'hdb_nodes',
+		current: { active: existing?.active, staged: existing?.staged },
+	};
+}
+
+const proposeSchema = Joi.object({
+	database: Joi.string().required(),
+});
+
 export const DELEGATION_DRAIN_MS = DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS;
 
+server.registerOperation?.({
+	name: 'record_lock_propose_homes',
+	execute: proposeHomes,
+	httpMethod: 'POST',
+	requiresSuperUser: true,
+});
 server.registerOperation?.({
 	name: 'record_lock_stage_generation',
 	execute: stageGeneration,
