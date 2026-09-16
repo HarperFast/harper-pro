@@ -6,6 +6,7 @@
  */
 import assert from 'node:assert';
 import {
+	STAGE_DRAIN_BUDGET_MS,
 	canonicalizeHomes,
 	digestOf,
 	planActivate,
@@ -312,5 +313,18 @@ describe('planProposal', () => {
 	it('rejects a set larger than the bound, through the shared validator', () => {
 		const many = Array.from({ length: 300 }, (_, i) => `n${i}`);
 		assert.throws(() => planProposal('a', many, undefined, 'data'), /homes must be/);
+	});
+});
+
+describe('stage drains instead of waiting out the lease (harper-pro#856)', () => {
+	it('has a reporting budget far below the interval it replaces', () => {
+		// The budget bounds how long `stage` spends DRAINING before it reports what is left; it is not a
+		// safety interval. It must be well under DELEGATION_DRAIN_MS, or reporting would cost as much as
+		// the wait the drain exists to avoid.
+		assert.ok(STAGE_DRAIN_BUDGET_MS > 0);
+		assert.ok(
+			STAGE_DRAIN_BUDGET_MS < 365_000,
+			`the drain budget (${STAGE_DRAIN_BUDGET_MS}ms) must be shorter than the drain interval it replaces`
+		);
 	});
 });

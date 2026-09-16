@@ -26,7 +26,12 @@ import { createHash } from 'node:crypto';
 import Joi from 'joi';
 import { table } from '../core/resources/databases.ts';
 import { transaction } from '../core/resources/transaction.ts';
-import { DELEGATION_LEASE_MS, LOCK_LEASE_SKEW_MS } from '../core/resources/recordLockCoordinator.ts';
+import {
+	DELEGATION_LEASE_MS,
+	LOCK_LEASE_SKEW_MS,
+	quiesceDelegations,
+	type QuiesceResult,
+} from '../core/resources/recordLockCoordinator.ts';
 import { validateBySchema } from '../core/validation/validationWrapper.js';
 import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/hdbError.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -237,7 +242,23 @@ export function planStage(
 	};
 }
 
-export async function stageGeneration(request: any): Promise<{ staged: RecordLockGenerationState }> {
+/**
+ * Never throws: a stage that durably landed must not report failure because the drain did, or the
+ * operator retries a transition that already happened. A drain that cannot run at all is reported as
+ * unknown, which reads to an orchestrator exactly like outstanding work — fall back to the timer.
+ */
+async function drainForStage(database: string): Promise<QuiesceResult | { error: string }> {
+	try {
+		return await quiesceDelegations(database, STAGE_DRAIN_BUDGET_MS);
+	} catch (error) {
+		logger.warn?.(`Record lock quiesce for ${database} could not complete; fall back to the drain interval`, error);
+		return { error: (error as Error)?.message ?? String(error) };
+	}
+}
+
+export async function stageGeneration(
+	request: any
+): Promise<{ staged: RecordLockGenerationState; quiesced: QuiesceResult | { error: string } }> {
 	const validation = validateBySchema(request, stageSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
@@ -256,12 +277,15 @@ export async function stageGeneration(request: any): Promise<{ staged: RecordLoc
 			// ever reconciles that gap (a real pre-push review finding: a noop that skips notification
 			// leaves every unconfirmed thread stuck on the retracted generation with no bound).
 			await notifyChanged(database);
-			return { staged: plan.staged };
+			return { staged: plan.staged, quiesced: await drainForStage(database) };
 		}
 		await writeRow(plan.row);
 		logger.info?.(`Record lock home map for ${database}: staged generation ${generation}, retracted active`);
 		await notifyChanged(database);
-		return { staged: plan.row.staged! };
+		// The write above stops this node issuing NEW grants; authority already outstanding still admits
+		// until its lease runs out, which is the whole reason §4.3 waits. Drain it instead: everything
+		// confirmed here is time the operator does not have to wait before activating (harper-pro#856).
+		return { staged: plan.row.staged!, quiesced: await drainForStage(database) };
 	});
 }
 
@@ -506,6 +530,15 @@ const proposeSchema = Joi.object({
 });
 
 export const DELEGATION_DRAIN_MS = DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS;
+/**
+ * How long `stage` spends draining before it reports what is left (harper-pro#856). A drain waits on
+ * live critical sections, which are milliseconds in the normal case and bounded by the caller's own
+ * lock lease; this is a reporting bound, not a safety one — whatever is still outstanding is returned,
+ * and the operator falls back to `DELEGATION_DRAIN_MS` for those nodes.
+ */
+export const STAGE_DRAIN_BUDGET_MS = Number.isFinite(Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS))
+	? Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS)
+	: 10_000;
 
 server.registerOperation?.({
 	name: 'record_lock_propose_homes',
