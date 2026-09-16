@@ -96,11 +96,7 @@ is allocated or `writeLockBarrier` is called; and the zero-cost claim gets an ex
    and continues past a non-retryable commit failure (`Table.ts` ~1277-1288) and past any
    per-event throw (~1372-1373); the cursor then advances on the next success. harper#2628 adds
    `registerReplicatedApplyFailureListener(database, listener)`, awaited with the failed event's
-   origin id and position before the next event is pulled. This PR consumes it feature-detected
-   (`listenForApplyFailures`, `recordLockTransport.ts`), so it activates the moment that core
-   lands; against the pinned core the hook is absent and a terminal apply failure inside core is
-   **the one hole class left unrecorded** — stated in the PR as the remaining limitation, and the
-   reason the feature stays default-off until harper#2628 merges.
+   origin id and position before the next event is pulled. harper#2628 merged (harper PR #2630); this PR consumes it directly (`listenForApplyFailures`, `recordLockTransport.ts`), so every hole class this design names is recorded.
 3. **A base copy is not an authoritative replacement.** The copy walks current rows and emits
    `put` snapshots (`:5948-6045`); an absence (a dropped delete) is not transmitted. Only a fresh
    clone of the database is.
@@ -177,10 +173,7 @@ is allocated or `writeLockBarrier` is called; and the zero-cost claim gets an ex
   applied, timeouts, rejections by reason, poisoned pairs.
 - **Capability level 3 -> 4, exact level recorded**; a mixed cluster's 503 names the disagreeing
   peer's level. **LMDB resolves the feature gate to `false`** with one error line (level 0, the
-  fail-closed transport, default placement). **The core hook is consumed when present**:
-  `registerReplicatedApplyFailureListener` (harper#2628) is looked up at registration and, when
-  absent, terminal apply failures inside core stay unrecorded — the remaining limitation named
-  in the PR, closed by merging harper#2628. **Rollback runbook**: disable `replication.recordLocks` on every node and restart
+  fail-closed transport, default placement). **Core's apply-failure listener** (`registerReplicatedApplyFailureListener`, harper#2628, merged) is registered with the transport and unregistered on release. **Rollback runbook**: disable `replication.recordLocks` on every node and restart
   (drains admissions and stops barrier writes) _before_ downgrading; retained `lockBarrier`
   entries then replay into a level-3 node's sink as "malformed control entry" warnings —
   harmless, named here so they are not read as corruption.

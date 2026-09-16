@@ -63,7 +63,11 @@ import {
 import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
 import { ANY_TABLE, everRecloned, forgetPoisonState, isPoisoned, poison, poisonedPairs } from './recordLockPoison.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
-import * as tableModule from '../core/resources/Table.ts';
+import {
+	registerReplicatedApplyFailureListener,
+	unregisterReplicatedApplyFailureListener,
+	type ReplicatedApplyFailureListener,
+} from '../core/resources/replicatedApplyFailure.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 
@@ -130,28 +134,34 @@ function closeFreshnessBarrier(database: string): void {
 	freshnessBarriers.delete(database);
 }
 
-const applyFailureListeners = new Set<string>();
+const applyFailureListeners = new Map<string, ReplicatedApplyFailureListener>();
 
 /**
- * A replicated transaction core skipped after a terminal apply failure is a hole no barrier can see
- * (harper#2628 adds the listener core awaits before it continues). Until that core lands, the hook is
- * absent and this is the one hole class left unrecorded — `RECORD_LOCK_FRESHNESS_DESIGN.md`.
+ * A replicated transaction core skipped after a terminal apply failure is a hole no barrier can see;
+ * core awaits this listener before it consumes the next event (harper#2628), so the poison row is
+ * durable before any later frame can advance the cursor past the hole.
  */
 function listenForApplyFailures(database: string): void {
 	if (applyFailureListeners.has(database)) return;
-	const register = (tableModule as any).registerReplicatedApplyFailureListener;
-	if (typeof register !== 'function') return;
-	applyFailureListeners.add(database);
-	register(database, async (failure: any) => {
+	const listener: ReplicatedApplyFailureListener = async (failure) => {
 		const auditStore = auditStoreFor(database);
-		const origin = getNodeNameForId(auditStore, failure?.nodeId, true) ?? `node#${failure?.nodeId}`;
+		const origin = getNodeNameForId(auditStore, failure.nodeId, true) ?? `node#${failure.nodeId}`;
 		await poison(
 			database,
 			origin,
-			typeof failure?.table === 'string' ? failure.table : ANY_TABLE,
-			`terminal apply failure at ${failure?.position}: ${failure?.error?.message ?? failure?.error}`
+			typeof failure.table === 'string' ? failure.table : ANY_TABLE,
+			`terminal apply failure at ${failure.position}: ${(failure.error as Error)?.message ?? failure.error}`
 		);
-	});
+	};
+	applyFailureListeners.set(database, listener);
+	registerReplicatedApplyFailureListener(database, listener);
+}
+
+function stopListeningForApplyFailures(database: string): void {
+	const listener = applyFailureListeners.get(database);
+	if (!listener) return;
+	applyFailureListeners.delete(database);
+	unregisterReplicatedApplyFailureListener(database, listener);
 }
 
 /**
@@ -714,6 +724,7 @@ export function releaseRecordLockTransport(database: string): void {
 	if (!transports.delete(database)) return;
 	unregisterClusterLockTransport(database);
 	closeFreshnessBarrier(database);
+	stopListeningForApplyFailures(database);
 	forgetPoisonState(database);
 	ownedDatabases.delete(database);
 	activeCache.delete(database);
