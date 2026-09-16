@@ -29,14 +29,9 @@ async function postOperation(node, operation, options) {
 /**
  * create_table whose post-condition is only that the table exists — a connected peer's definition
  * may have created it first. Guarantees existence, not that the supplied definition was applied.
- * @param {Object} node - The Harper node instance
- * @param {Object} definition - create_table payload without `operation`; `database` is required
- * @param {Object} [options]
- * @param {AbortSignal} [options.signal]
- * @returns {Promise<Object>} The response data
  */
 export async function ensureTableExists(node, definition, options) {
-	const { status, body } = await postOperation(node, { operation: 'create_table', ...definition }, options);
+	const { status, body } = await postOperation(node, { ...definition, operation: 'create_table' }, options);
 	if (status === 400 && body?.error === `Table '${definition.table}' already exists in '${definition.database}'`)
 		return body;
 	equal(status, 200, JSON.stringify(body));
