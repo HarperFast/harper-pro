@@ -8,10 +8,12 @@ import assert from 'node:assert';
 import {
 	STAGE_DRAIN_BUDGET_MS,
 	canonicalizeHomes,
+	setHomesDrainReader,
 	digestOf,
 	planActivate,
 	planProposal,
 	planStage,
+	stageGeneration,
 	validateGenerationInput,
 } from '#src/replication/recordLockHomes';
 
@@ -317,6 +319,45 @@ describe('planProposal', () => {
 });
 
 describe('stage drains instead of waiting out the lease (harper-pro#856)', () => {
+	afterEach(() => setHomesDrainReader(async () => ({ error: 'no record lock drain is wired on this node' })));
+
+	it('reports whatever the coordinating thread found, unchanged', async () => {
+		const drained = { surrendered: 2, recalled: 3, outstanding: [] };
+		let asked;
+		setHomesDrainReader(async (database, deadlineMs) => {
+			asked = { database, deadlineMs };
+			return drained;
+		});
+		const { quiesced } = await stageGeneration({
+			database: 'drain1',
+			generation: 1,
+			homes: ['a'],
+			hdb_user: { name: 'op' },
+		});
+		assert.deepStrictEqual(quiesced, drained);
+		assert.deepStrictEqual(asked, { database: 'drain1', deadlineMs: STAGE_DRAIN_BUDGET_MS });
+	});
+
+	it('a drain that throws becomes {error} and never fails a stage that already landed', async () => {
+		setHomesDrainReader(async () => {
+			throw new Error('the drain did not reach the coordinating worker');
+		});
+		const result = await stageGeneration({ database: 'drain2', generation: 1, homes: ['a'], hdb_user: { name: 'op' } });
+		assert.strictEqual(result.staged.generation, 1, 'the stage itself still succeeded');
+		assert.match(result.quiesced.error, /did not reach the coordinating worker/);
+	});
+
+	it('defaults to refusing rather than reporting a clean drain it never performed', async () => {
+		const { quiesced } = await stageGeneration({
+			database: 'drain3',
+			generation: 1,
+			homes: ['a'],
+			hdb_user: { name: 'op' },
+		});
+		assert.ok(quiesced.error, 'an unwired drain must not read as an empty outstanding list');
+		assert.strictEqual(quiesced.outstanding, undefined);
+	});
+
 	it('has a reporting budget far below the interval it replaces', () => {
 		// The budget bounds how long `stage` spends DRAINING before it reports what is left; it is not a
 		// safety interval. It must be well under DELEGATION_DRAIN_MS, or reporting would cost as much as

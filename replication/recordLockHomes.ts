@@ -29,7 +29,6 @@ import { transaction } from '../core/resources/transaction.ts';
 import {
 	DELEGATION_LEASE_MS,
 	LOCK_LEASE_SKEW_MS,
-	quiesceDelegations,
 	type QuiesceResult,
 } from '../core/resources/recordLockCoordinator.ts';
 import { validateBySchema } from '../core/validation/validationWrapper.js';
@@ -249,7 +248,7 @@ export function planStage(
  */
 async function drainForStage(database: string): Promise<QuiesceResult | { error: string }> {
 	try {
-		return await quiesceDelegations(database, STAGE_DRAIN_BUDGET_MS);
+		return await drainReader(database, STAGE_DRAIN_BUDGET_MS);
 	} catch (error) {
 		logger.warn?.(`Record lock quiesce for ${database} could not complete; fall back to the drain interval`, error);
 		return { error: (error as Error)?.message ?? String(error) };
@@ -259,6 +258,15 @@ async function drainForStage(database: string): Promise<QuiesceResult | { error:
 export async function stageGeneration(
 	request: any
 ): Promise<{ staged: RecordLockGenerationState; quiesced: QuiesceResult | { error: string } }> {
+	const staged = await stageRow(request);
+	// Deliberately OUTSIDE `withRow`: the drain waits on live critical sections, and holding the
+	// database's transition queue for that would block every other stage, fence and activate on this
+	// node behind it. The row write already retracted `active`, so nothing new can be granted while
+	// this runs, and a concurrent transition is free to proceed.
+	return { ...staged, quiesced: await drainForStage(request.database) };
+}
+
+async function stageRow(request: any): Promise<{ staged: RecordLockGenerationState }> {
 	const validation = validateBySchema(request, stageSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
@@ -277,15 +285,12 @@ export async function stageGeneration(
 			// ever reconciles that gap (a real pre-push review finding: a noop that skips notification
 			// leaves every unconfirmed thread stuck on the retracted generation with no bound).
 			await notifyChanged(database);
-			return { staged: plan.staged, quiesced: await drainForStage(database) };
+			return { staged: plan.staged };
 		}
 		await writeRow(plan.row);
 		logger.info?.(`Record lock home map for ${database}: staged generation ${generation}, retracted active`);
 		await notifyChanged(database);
-		// The write above stops this node issuing NEW grants; authority already outstanding still admits
-		// until its lease runs out, which is the whole reason §4.3 waits. Drain it instead: everything
-		// confirmed here is time the operator does not have to wait before activating (harper-pro#856).
-		return { staged: plan.row.staged!, quiesced: await drainForStage(database) };
+		return { staged: plan.row.staged! };
 	});
 }
 
@@ -437,6 +442,18 @@ let membership: MembershipReaders = {
 };
 export function setHomesMembershipReaders(readers: MembershipReaders): void {
 	membership = readers;
+}
+
+/**
+ * Installed by `recordLockTransport.ts`: drain on the thread that coordinates the database, not on
+ * whichever one answered the operation. Defaults to refusing rather than reporting a clean drain it
+ * never performed.
+ */
+let drainReader: (database: string, deadlineMs: number) => Promise<QuiesceResult | { error: string }> = async () => ({
+	error: 'no record lock drain is wired on this node',
+});
+export function setHomesDrainReader(reader: typeof drainReader): void {
+	drainReader = reader;
 }
 
 export interface HomesProposal {
