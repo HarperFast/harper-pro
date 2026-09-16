@@ -419,6 +419,13 @@ export interface HomesProposal {
 	generation: number;
 	homes: string[];
 	digest: string;
+	/**
+	 * §4.3's `homes(g) ∪ homes(g+1)`: every node that must be staged (or `record_lock_fence_external`'d)
+	 * and drained before this generation is activated anywhere. It is NOT `homes` — on a shrink a node
+	 * being removed is absent from the new list, and staging only the new list leaves it serving the old
+	 * generation while the new ring serves too, which is two arbiters for the same keys.
+	 */
+	quiesce: string[];
 	warnings: string[];
 }
 
@@ -439,6 +446,7 @@ export function planProposal(
 	const generation =
 		Math.max(existing?.active?.generation ?? 0, existing?.staged?.generation ?? 0, existing?.highestActedOn ?? 0) + 1;
 	validateGenerationInput(generation, homes);
+	const quiesce = canonicalizeHomes([...homes, ...(existing?.active?.homes ?? []), ...(existing?.staged?.homes ?? [])]);
 	const warnings: string[] = [];
 	if (canonicalizeHomes(peers).length === 0)
 		warnings.push(
@@ -448,10 +456,15 @@ export function planProposal(
 		warnings.push(
 			`generation ${existing.staged.generation} is already staged on ${self} and would have to be resolved first`
 		);
+	const leaving = quiesce.filter((node) => !homes.includes(node));
+	if (leaving.length > 0)
+		warnings.push(
+			`${leaving.join(', ')} leave the ring in this proposal and are not in homes, but MUST still be staged or fenced and drained before activation, or they keep granting under the old generation`
+		);
 	warnings.push(
-		"this is one node's view, not agreement: stage and activate this exact list on every node named in it, and compare digests across nodes before activating"
+		"this is one node's view, not agreement: stage (or fence) and drain every node in `quiesce`, then activate this exact list on every node in `homes`, and compare digests across nodes before activating"
 	);
-	return { generation, homes, digest: digestOf(generation, homes), warnings };
+	return { generation, homes, digest: digestOf(generation, homes), quiesce, warnings };
 }
 
 export async function proposeHomes(request: any): Promise<

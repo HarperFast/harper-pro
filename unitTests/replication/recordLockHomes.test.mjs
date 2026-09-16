@@ -269,6 +269,27 @@ describe('planProposal', () => {
 		assert.ok(staged.warnings.some((warning) => /already staged/.test(warning)));
 	});
 
+	it('quiesce is the union with the current ring, so a shrink still drains the node leaving', () => {
+		const shrink = planProposal(
+			'a',
+			['b'],
+			row({ active: { generation: 2, homes: ['a', 'b', 'c'], digest: 'x' }, highestActedOn: 2 }),
+			'data'
+		);
+		assert.deepStrictEqual(shrink.homes, ['a', 'b']);
+		assert.deepStrictEqual(shrink.quiesce, ['a', 'b', 'c'], 'c is leaving but must still be staged and drained');
+		assert.ok(
+			shrink.warnings.some((warning) => /^c leave(s)? the ring|c leave the ring/.test(warning)),
+			shrink.warnings.join(' | ')
+		);
+	});
+
+	it('quiesce equals homes when nothing is leaving, and covers a staged ring too', () => {
+		assert.deepStrictEqual(planProposal('a', ['b'], undefined, 'data').quiesce, ['a', 'b']);
+		const staged = planProposal('a', ['b'], row({ staged: { generation: 3, homes: ['a', 'z'], digest: 'x' } }), 'data');
+		assert.deepStrictEqual(staged.quiesce, ['a', 'b', 'z']);
+	});
+
 	it('rejects a set larger than the bound, through the shared validator', () => {
 		const many = Array.from({ length: 300 }, (_, i) => `n${i}`);
 		assert.throws(() => planProposal('a', many, undefined, 'data'), /homes must be/);

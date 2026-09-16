@@ -309,8 +309,17 @@ node's `LOCAL_ONLY` row reproduces the same false proof on a node that _had_ act
 `record_lock_propose_homes { database }`, `requiresSuperUser`, **read-only**. It returns the home
 set this node's `hdb_nodes` view suggests (this node plus every row `shouldReplicateFromNode(row,
 database)` accepts, canonicalized), the generation one past whatever this node has acted on, the
-digest that pair would produce, the current `active`/`staged`, and warnings. It writes nothing and
-notifies nothing.
+digest that pair would produce, the current `active`/`staged`, `quiesce`, and warnings. It writes
+nothing and notifies nothing.
+
+`quiesce` is §4.3's `homes(g) ∪ homes(g+1)` — the union of the proposal with this node's current
+active and staged rings — and it is returned as a field rather than described in prose because the
+first draft of this operation got it wrong in a way worth recording: its warning said to stage "on
+every node named in [`homes`]", which on a **shrink** omits the node being removed. That node is
+never staged, keeps its old active generation, and keeps granting while the new ring grants too —
+two arbiters, produced by following the operation's own advice. A departing node must still be
+staged or `record_lock_fence_external`'d and drained; `quiesce` names exactly that set, and a
+warning names the leaving nodes explicitly.
 
 That is the list-assembly step of the §4.3 runbook and only that: the operator captures one
 canonical list instead of typing it, then passes that exact list to `record_lock_stage_generation`
