@@ -275,3 +275,66 @@ pointer or `undefined`) on any error in between; mirrors the existing containmen
   partial run, after the third fix, passing all 4 real tests in the hardest suite (three-node
   mesh, including 24-way concurrent contention) before being killed moving into suite 2. Re-run
   the suite once outside a contended shared box before relying on it as a clean pass.
+
+## Bootstrapping generation 1: `record_lock_bootstrap_generation`
+
+Added after the freshness work landed, on the task owner's request (2026-09-16). The three
+transition operations all require the operator to pass `homes[]` explicitly and to call each of
+them on every node, because the row is `LOCAL_ONLY`. For the _first_ generation on a new cluster
+that is pure ceremony: there is nothing to quiesce, and the list the operator types is the one
+already sitting in `hdb_nodes`. This operation removes the typing, not the agreement.
+
+### What it does
+
+`record_lock_bootstrap_generation { database, homes? }`, `requiresSuperUser`, local to the node it
+is called on. It writes `active` for generation 1 **directly** — no `staged`, no drain — and
+notifies this node's threads exactly as `activateGeneration` does.
+
+It refuses unless the row is genuinely untouched: no `active`, no `staged`, and
+`highestActedOn === 0`. That triple is the whole safety argument. It means `homeMap()` has never
+returned anything on this node, so core has never issued or accepted a delegation here, so there is
+no grant to quiesce and the §4.3 stage → drain → activate sequence has nothing to do. Any other
+state is a 409 naming what it found and pointing at the normal transition.
+
+`homes` defaults to this node plus every `hdb_nodes` row that `shouldReplicateFromNode(row,
+database)` accepts — the existing, tested _receive_ predicate, not a new one — canonicalized by the
+same `canonicalizeHomes` the other operations use, so two nodes that agree on the set produce the
+same digest whatever order they observed it in. An explicit `homes` in the request is used verbatim
+instead; that is the recommended form for anything larger than a handful of nodes, because it lets a
+script compute the set once and apply the identical list everywhere.
+
+### Why deriving from `hdb_nodes` here does not violate §4.1
+
+§4.1 forbids a node **acting unilaterally on its own view** of membership. It is not violated by a
+node _reading_ that view, because reading is not what makes a ring authoritative — agreement is.
+If two nodes derive different sets, their digests differ, every peer's agreement check fails, and
+`homeMap()` is withheld on **both**; the result is 503 everywhere, never two arbiters for one key.
+The operator re-runs once the topology has settled. The digest is the enforcement, and it is
+unchanged by this operation.
+
+The corollary is worth stating because it is the failure an operator will actually hit: a node whose
+`hdb_nodes` has not caught up yet derives a _too small_ set and disagrees with its peers. That is
+loud (every lock 503s) rather than silent, and the fix is to re-run, or to pass `homes` explicitly.
+A node that bootstraps alone — `homes: [self]` — is legal and is the correct answer for a genuine
+single-node deployment; a cluster that reaches that state by accident replaces it with an ordinary
+generation-2 transition.
+
+### What it deliberately does not do
+
+**It does not fan out.** One call does one node. The three existing operations are
+`requiresSuperUser`, and a replication connection authenticates as a _node_ principal, not a
+super_user, so a node-to-node fan-out would need credential delegation this design has no reason to
+invent. The operator loops, exactly as `bootstrapHomeMap` does in the cluster test.
+
+**It does not relax the per-isolate `withRow` limitation.** It queues on the same per-database queue
+as the other three and inherits the same multi-worker gap, which is tracked separately rather than
+patched here.
+
+### Approaches considered
+
+| Axis                | Candidate                                                                                                                   | Ruling                                                                                                                                                                                                                                                                                                                        |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Different layer** | Derive the ring inside `homeMap()` when no row exists, so nothing has to be called at all.                                  | Rejected — this is exactly §4.1's two-arbiter bug: two nodes with different `hdb_nodes` views would each believe they home the same key, with no operator action to blame and no digest round to catch it before the first grant. The operation exists so the derivation is an explicit, auditable act with a durable record. |
+| **Deeper cause**    | One orchestrating call that fans stage → wait → activate out to every node.                                                 | Deferred — needs credential delegation for a `requiresSuperUser` operation across nodes, plus partial-failure semantics (what is the cluster's state when node 3 of 5 fails?). Real work, no safety benefit over a loop, and it would be the same shape for _every_ generation rather than just the first.                    |
+| **Do less**         | Keep the three operations and publish a documented script.                                                                  | Rejected on the ask, but it is close: the operation is that script, with the fresh-state guard enforced durably instead of assumed. The guard is the part a script cannot do safely.                                                                                                                                          |
+| **Chosen**          | A local, fresh-state-only generation-1 write that derives `homes` from `hdb_nodes` by default and accepts an explicit list. | Removes the ceremony from the one case where the ceremony is provably unnecessary, keeps the digest as the agreement mechanism, and leaves every later transition on the unchanged §4.3 path.                                                                                                                                 |
