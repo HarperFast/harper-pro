@@ -45,18 +45,35 @@ function hasRow(dbisDB: any, origin: string, table: string): boolean {
 	return dbisDB.getSync([POISON, origin, table]) !== undefined;
 }
 
+/**
+ * Fails closed: a database whose store cannot be consulted, or whose read throws, is reported as
+ * poisoned — the barrier's answer to "unknown" is a 503, never an admission.
+ */
 export function isPoisoned(database: string, origin: string, table: string): boolean {
 	const pending = unwritten.get(database);
 	if (pending && (pending.has(pairKey(origin, table)) || pending.has(pairKey(origin, ANY_TABLE)))) return true;
-	const dbisDB = dbisFor(database);
-	// No store to consult is no evidence either way; the barrier's other refusals still apply.
-	if (!dbisDB) return false;
-	return hasRow(dbisDB, origin, table) || hasRow(dbisDB, origin, ANY_TABLE);
+	try {
+		const dbisDB = dbisFor(database);
+		if (!dbisDB) return true;
+		return hasRow(dbisDB, origin, table) || hasRow(dbisDB, origin, ANY_TABLE);
+	} catch (error) {
+		logger.warn?.(
+			`Record locks: could not read the poison state for ${database}; treating ${origin} as poisoned`,
+			error
+		);
+		return true;
+	}
 }
 
+/** Fails closed the same way: no readable store means this node's own lineage is not provable. */
 export function everRecloned(database: string): boolean {
-	const dbisDB = dbisFor(database);
-	return dbisDB ? dbisDB.getSync([RECLONED]) === true : false;
+	try {
+		const dbisDB = dbisFor(database);
+		return dbisDB ? dbisDB.getSync([RECLONED]) === true : true;
+	} catch (error) {
+		logger.warn?.(`Record locks: could not read the reclone state for ${database}; treating it as recloned`, error);
+		return true;
+	}
 }
 
 /**

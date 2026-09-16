@@ -95,6 +95,15 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 	let sweep: unknown;
 	let closed = false;
 
+	// A check that throws is answered as poisoned: a settlement callback must end in a 503, never escape.
+	const poisonedPair = (origin: string, table: string): boolean => {
+		try {
+			return deps.isPoisoned(origin, table);
+		} catch {
+			return true;
+		}
+	};
+
 	const reject = (reason: string, message: string): never => {
 		rejected[reason] = (rejected[reason] ?? 0) + 1;
 		throw unavailable(message);
@@ -173,7 +182,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 				}
 				entry.position = position;
 				if (entry.appliedPosition === position) {
-					if (deps.isPoisoned(origin, table)) {
+					if (poisonedPair(origin, table)) {
 						rejected.poisoned = (rejected.poisoned ?? 0) + 1;
 						settleEntry(
 							entry,
@@ -209,7 +218,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			reject('not-member', `${origin} is not a member of the record lock home map for ${database}`);
 		if (deps.peerLevel(origin) !== RECORD_LOCKS_CAPABILITY)
 			reject('level', `${origin} does not advertise record lock capability level ${RECORD_LOCKS_CAPABILITY}`);
-		if (deps.isPoisoned(origin, table))
+		if (poisonedPair(origin, table))
 			reject(
 				'poisoned',
 				`${database}.${table} from ${origin} has a recorded replication hole on this node; record locks cannot prove freshness for it until this node is recloned`
@@ -256,7 +265,7 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			if (entry.position === undefined) return true;
 			if (entry.position === position) {
 				// A hole recorded while the request was in flight sits before this entry.
-				if (deps.isPoisoned(origin, entry.table)) {
+				if (poisonedPair(origin, entry.table)) {
 					rejected.poisoned = (rejected.poisoned ?? 0) + 1;
 					settleEntry(
 						entry,

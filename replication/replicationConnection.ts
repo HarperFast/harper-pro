@@ -45,7 +45,7 @@ import {
 	currentHomesDigest,
 	recordLockBarrierApplied,
 } from './recordLockTransport.ts';
-import { markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
+import { ANY_TABLE, markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
 import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
@@ -6376,10 +6376,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						remoteNodeName
 					);
 					if (
-						tableDecoder?.name &&
 						!(await recordReplicationHole(
 							remoteShortIdToLocalId.get(auditRecord.nodeId),
-							tableDecoder.name,
+							tableDecoder?.name ?? ANY_TABLE,
 							'local-only record forwarded by the peer'
 						))
 					)

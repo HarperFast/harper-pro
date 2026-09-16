@@ -291,3 +291,28 @@ describe('createFreshnessBarrier: a hole recorded while the barrier is in flight
 		assert.match((await rejection(wait2)).message, /replication hole while its barrier was in flight/);
 	});
 });
+
+describe('createFreshnessBarrier: a poison check that throws', () => {
+	it('is answered as poisoned — refused up front, and settled with 503 rather than escaping', async () => {
+		const upFront = harness({
+			isPoisoned() {
+				throw new Error('store unavailable');
+			},
+		});
+		assert.match((await rejection(upFront.barrier.establish('t', [['a', 5]], 1_000))).message, /replication hole/);
+		let throwing = false;
+		const atSettle = harness({
+			isPoisoned() {
+				if (throwing) throw new Error('store unavailable');
+				return false;
+			},
+		});
+		const wait = atSettle.barrier.establish('t', [['a', 5]], 1_000);
+		atSettle.requests[0].resolve(700);
+		await Promise.resolve();
+		throwing = true;
+		assert.strictEqual(atSettle.barrier.noteBarrierApplied('a', 700, 1), true);
+		const error = await rejection(wait);
+		assert.strictEqual(error.statusCode, 503);
+	});
+});
