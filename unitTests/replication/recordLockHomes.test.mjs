@@ -290,6 +290,25 @@ describe('planProposal', () => {
 		assert.deepStrictEqual(staged.quiesce, ['a', 'b', 'z']);
 	});
 
+	it('warns that quiesce is incomplete when this node has no active ring', () => {
+		const fresh = planProposal('a', ['b'], undefined, 'data');
+		assert.ok(
+			fresh.warnings.some((warning) => /no active generation/.test(warning)),
+			fresh.warnings.join(' | ')
+		);
+		// A node that HAS the ring can name it, so the caveat does not apply.
+		const holder = planProposal('a', ['b'], row({ active: { generation: 2, homes: ['a', 'b'], digest: 'x' } }), 'data');
+		assert.ok(!holder.warnings.some((warning) => /no active generation/.test(warning)));
+	});
+
+	it('says a departing node stays unable to lock, so that is not mistaken for a stuck transition', () => {
+		const shrink = planProposal('a', [], row({ active: { generation: 2, homes: ['a', 'b'], digest: 'x' } }), 'data');
+		assert.ok(
+			shrink.warnings.some((warning) => /stays unable to lock/.test(warning)),
+			shrink.warnings.join(' | ')
+		);
+	});
+
 	it('rejects a set larger than the bound, through the shared validator', () => {
 		const many = Array.from({ length: 300 }, (_, i) => `n${i}`);
 		assert.throws(() => planProposal('a', many, undefined, 'data'), /homes must be/);

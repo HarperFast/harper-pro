@@ -424,6 +424,10 @@ export interface HomesProposal {
 	 * and drained before this generation is activated anywhere. It is NOT `homes` — on a shrink a node
 	 * being removed is absent from the new list, and staging only the new list leaves it serving the old
 	 * generation while the new ring serves too, which is two arbiters for the same keys.
+	 *
+	 * Only as complete as the node that answered: it unions this node's own `active` and `staged` rings,
+	 * so a node that has neither cannot name a ring the rest of the cluster is serving. Ask a node that
+	 * holds the current generation, or union the proposals from several.
 	 */
 	quiesce: string[];
 	warnings: string[];
@@ -459,7 +463,14 @@ export function planProposal(
 	const leaving = quiesce.filter((node) => !homes.includes(node));
 	if (leaving.length > 0)
 		warnings.push(
-			`${leaving.join(', ')} leave the ring in this proposal and are not in homes, but MUST still be staged or fenced and drained before activation, or they keep granting under the old generation`
+			`${leaving.join(', ')} leave the ring in this proposal and are not in homes, but MUST still be staged or fenced and drained before activation, or they keep granting under the old generation; a staged departing node is never activated, so it stays unable to lock until it is given its own generation, which is what leaving the ring means`
+		);
+	// `quiesce` is only as complete as the node that answered: it is built from THIS node's row, so a
+	// node with no active ring (never bootstrapped, or already staged — staging retracts `active`)
+	// cannot contribute the ring the cluster is actually serving, and the union silently omits it.
+	if (!existing?.active)
+		warnings.push(
+			`${self} has no active generation for ${database}, so quiesce carries only this proposal: if the cluster IS serving a generation, ask a node that has it and union the results before staging anything`
 		);
 	warnings.push(
 		"this is one node's view, not agreement: stage (or fence) and drain every node in `quiesce`, then activate this exact list on every node in `homes`, and compare digests across nodes before activating"
