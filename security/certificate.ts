@@ -223,6 +223,30 @@ interface CertRecord {
 }
 
 /**
+ * Find a private key file on disk matching `x509Cert`, searching only the key files that
+ * certificate records already name. The keys directory also holds env-secret custody and JWT
+ * material, and a key no record references would become the new record's sole reference — which
+ * is what makes `removeCertificate` unlink it.
+ *
+ * @returns The matching key's file name, or undefined when none matches.
+ */
+async function findCertificateKeyOnDisk(x509Cert: X509Certificate): Promise<string | undefined> {
+	const hdbKeysDir = join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME);
+	const checked = new Set<string>();
+	for await (const cert of getCertTable().search([])) {
+		const keyName: string | undefined = cert.private_key_name;
+		if (!keyName || checked.has(keyName)) continue;
+		checked.add(keyName);
+		try {
+			const key = await readFile(join(hdbKeysDir, keyName));
+			if (x509Cert.checkPrivateKey(createPrivateKey(key))) return keyName;
+		} catch (error) {
+			logger.debug?.('Skipping private key that could not be read or parsed', keyName, error);
+		}
+	}
+}
+
+/**
  * Adds or updates a certificate in the hdbCertificate table.
  *
  * If `private_key` is provided, it will be written to disk (as `<name>.pem`) rather than
@@ -284,6 +308,11 @@ async function addCertificate(req: AddCertificateRequest) {
 				existingPrivateKeyName = keyName;
 				break;
 			}
+		}
+
+		if (!matchingKeyFound && !is_authority) {
+			existingPrivateKeyName = await findCertificateKeyOnDisk(x509Cert);
+			matchingKeyFound = existingPrivateKeyName !== undefined;
 		}
 	}
 
