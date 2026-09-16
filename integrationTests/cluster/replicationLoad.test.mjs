@@ -7,7 +7,7 @@ import { equal, ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, fetchWithRetry, concurrent } from './clusterShared.mjs';
+import { sendOperation, ensureTableExists, fetchWithRetry, concurrent } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -147,8 +147,7 @@ suite('Replication Load Testing', { timeout: 300000 }, (ctx) => {
 			// create a table on each node
 			await Promise.all(
 				ctx.nodes.map(async (node) => {
-					await sendOperation(node, {
-						operation: 'create_table',
+					await ensureTableExists(node, {
 						database: db,
 						table: 'test',
 						primary_key: 'id',
