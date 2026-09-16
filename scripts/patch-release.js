@@ -293,7 +293,7 @@ function setVersion(repoLabel, targetVersion) {
 }
 
 function buildSuccessResult({ target, coreVersion, proVersion, coreBumping, pushed, cmTriggered, dryRun }) {
-	const reportedCoreVersion = dryRun && coreBumping ? `v${target}` : coreVersion ?? null;
+	const reportedCoreVersion = dryRun && coreBumping ? `v${target}` : (coreVersion ?? null);
 	return {
 		ok: true,
 		target: proVersion,
@@ -521,15 +521,17 @@ async function main() {
 	}
 
 	if (JSON_OUTPUT) {
-		writeResult(buildSuccessResult({
-			target,
-			coreVersion,
-			proVersion,
-			coreBumping,
-			pushed,
-			cmTriggered,
-			dryRun: DRY_RUN,
-		}));
+		writeResult(
+			buildSuccessResult({
+				target,
+				coreVersion,
+				proVersion,
+				coreBumping,
+				pushed,
+				cmTriggered,
+				dryRun: DRY_RUN,
+			})
+		);
 	}
 }
 
