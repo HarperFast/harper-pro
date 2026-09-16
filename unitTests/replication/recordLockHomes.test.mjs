@@ -369,6 +369,11 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 		);
 		assert.strictEqual(provesQuiescence({ error: 'the drain did not reach the coordinating worker' }), false);
 		assert.strictEqual(provesQuiescence(undefined), false);
+		// A malformed reply crossing a worker boundary must read as "not proven", not slip through on a
+		// missing `length`.
+		assert.strictEqual(provesQuiescence({ complete: true, outstanding: {} }), false);
+		assert.strictEqual(provesQuiescence({ complete: true }), false);
+		assert.strictEqual(provesQuiescence({ complete: 'yes', outstanding: [] }), false);
 	});
 
 	it('has a reporting budget far below the interval it replaces', () => {

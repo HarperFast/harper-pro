@@ -449,7 +449,7 @@ export function setHomesMembershipReaders(readers: MembershipReaders): void {
  * whichever one answered the operation. Defaults to refusing rather than reporting a clean drain it
  * never performed.
  */
-let drainReader: (database: string, deadlineMs: number) => Promise<QuiesceResult | { error: string }> = async () => ({
+let drainReader: (database: string, budgetMs: number) => Promise<QuiesceResult | { error: string }> = async () => ({
 	error: 'no record lock drain is wired on this node',
 });
 /**
@@ -458,8 +458,14 @@ let drainReader: (database: string, deadlineMs: number) => Promise<QuiesceResult
  * coordinators are built lazily, so an empty `outstanding` alone is not a proof (harper-pro#856).
  */
 export function provesQuiescence(quiesced: QuiesceResult | { error: string } | undefined): boolean {
+	// Every field is checked positively: this value crosses a worker boundary, so a malformed reply must
+	// read as "not proven" rather than slipping through on a missing `length`.
 	return (
-		!!quiesced && !('error' in quiesced) && quiesced.complete === true && (quiesced.outstanding?.length ?? 0) === 0
+		!!quiesced &&
+		!('error' in quiesced) &&
+		quiesced.complete === true &&
+		Array.isArray(quiesced.outstanding) &&
+		quiesced.outstanding.length === 0
 	);
 }
 export function setHomesDrainReader(reader: typeof drainReader): void {
