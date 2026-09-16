@@ -54,6 +54,11 @@ export function completeCloneAttempt(rootPath: string, completedAt = Date.now())
  * on the main thread leaves every already-running worker's inherited copy set). A completed marker remains
  * eligible only for the bounded reverse-connect grace; an inherited completion time provides the same bound
  * across an internal restart if stamping the marker failed. A marker that names no source reads as no attempt.
+ *
+ * The inherited completion time is not keyed to an attempt id, so it is only sound while `cloneNode()` runs
+ * at most once per process (`bin/harper.js`): a second attempt in one process could leave a worker forked
+ * under the first carrying that attempt's stamp, which would then bound the new in-flight marker. Relaxing
+ * that means keying the variable to `attemptId` and checking it against the marker here.
  */
 export function cloneAttemptSource(rootPath: string = get(CONFIG_PARAMS.ROOTPATH)): string | undefined {
 	try {

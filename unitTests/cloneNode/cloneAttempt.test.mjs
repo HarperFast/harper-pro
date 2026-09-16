@@ -5,7 +5,7 @@
  * cannot name its source authorizes nothing.
  */
 
-import assert from 'node:assert';
+import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

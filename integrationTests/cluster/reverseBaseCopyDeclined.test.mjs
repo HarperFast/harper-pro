@@ -27,7 +27,7 @@
  * full one.
  */
 import { suite, test, before, after } from 'node:test';
-import assert from 'node:assert';
+import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
