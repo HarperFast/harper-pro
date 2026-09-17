@@ -20,18 +20,24 @@
  * exist for peers, and a human with `super_user` must not be able to mint or clear a delegation.
  */
 import { parentPort } from 'node:worker_threads';
-import { onMessageByType } from '../core/server/threads/manageThreads.js';
+import { performance } from 'node:perf_hooks';
+import { randomBytes } from 'node:crypto';
+import { onMessageByType, onThreadExit, sendToThread } from '../core/server/threads/manageThreads.js';
 import { server } from '../core/server/Server.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import {
+	acquireForRelay,
 	deliverDelegationRecall,
 	deliverDelegationRequest,
 	quiesceDelegations,
+	releaseForRelay,
+	revokeRelayedAdmission,
 	writeLockBarrier,
 	type DelegationRecall,
 	type DelegationReply,
 	type DelegationRequest,
+	type LockRound,
 } from '../core/resources/recordLockCoordinator.ts';
 import { getRepairConnectionsForDB, sendOperationToNode } from './replicator.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
@@ -61,6 +67,8 @@ interface OwnershipReaders {
 	ownerFor(database: string): any;
 	/** Main thread only: whether the main thread itself owns the database. */
 	mainOwns(database: string): boolean;
+	/** The thread id of the worker that coordinates `database`, or undefined when not yet known here. */
+	ownerThreadId?(database: string): number | undefined;
 	/** Whether `node` is in the database's current agreed home map, at this node's own level. */
 	isMember?(database: string, node: string): boolean;
 	/** The peer's exact advertised `recordLocks` level, 0 while unknown. */
@@ -339,6 +347,382 @@ if (parentPort) {
 		pendingRelays.get(message.requestId)?.(message.reply);
 	});
 }
+
+// ---- harper-pro#852: relay a local lock() to the owner worker (see replication/DESIGN.md) --------
+// The ADMISSION crosses the worker-to-worker port mesh, never the handle: the owner does not write the
+// delegation release until this worker acknowledges the fence, the handle's lease elapses, or this
+// worker exits — see DESIGN.md's `ownsCoordination()` entry for why an exit is safe to count here
+// (the native key lock is process-wide, so a later caller on this node cannot overlap it).
+
+const ACQUIRE_REQUEST = 'record-lock-acquire';
+const ACQUIRE_REPLY = 'record-lock-acquire-reply';
+const RELEASE_REQUEST = 'record-lock-release';
+const REVOKE_REQUEST = 'record-lock-revoke';
+const REVOKE_ACK = 'record-lock-revoke-ack';
+
+/**
+ * This owner thread's identity for the life of the process, defence-in-depth against a release that
+ * outlived the owner that granted it. The primary guard is elsewhere: when the coordinating thread for
+ * a database changes, every caller fences and forgets its relayed handles for it
+ * (`fenceRelayedAdmissionsForDatabase`), so a stale release is not produced across a handoff. The
+ * session catches the residue — a release already in flight when the owner changed carries the old
+ * owner's session, and an owner ignores anything not stamped with its own. Within one thread the
+ * admission-id sequence never restarts under it (a transport rebuild adopts the coordinator, carrying
+ * the counter), so no same-thread reuse can collide.
+ */
+const OWNER_SESSION = randomBytes(8).toString('hex');
+
+/**
+ * What a relayed acquire reserves, out of the wait it was given, for the two thread hops. Core already
+ * subtracted its own allowance before calling, so this wait is a budget to spend, never one to add to:
+ * the caller holds the native key throughout, so overshooting blocks every other worker on that key.
+ * The owner is therefore asked for the wait minus this margin, and answers inside the caller's budget.
+ */
+const ACQUIRE_HOP_MS = 250;
+
+// ---- caller side: obtain / release an admission from the owner worker ---------------------------
+
+interface PendingAcquire {
+	resolve: (answer: { round?: LockRound; session?: string; error?: { message: string; statusCode?: number } }) => void;
+	timer: ReturnType<typeof setTimeout>;
+	settled: boolean;
+	ownerThreadId: number;
+	database: string;
+	table: string;
+	key: unknown;
+}
+let nextAcquireId = 1;
+const pendingAcquires = new Map<number, PendingAcquire>();
+/** Owner session per relayed admission this worker holds, so a release/ack names the right owner. */
+const remoteAdmissionSessions = new Map<string, string>();
+const KEY_SEP = String.fromCharCode(0);
+const admissionSessionKey = (database: string, table: string, admissionId: number) =>
+	`${database}${KEY_SEP}${table}${KEY_SEP}${admissionId}`;
+
+/** Called by the transport (core's `acquireOnOwner`). Resolves with the owner-minted round. */
+export async function acquireOnOwnerRelay(
+	database: string,
+	table: string,
+	key: unknown,
+	leaseMs: number,
+	waitMs: number
+): Promise<LockRound> {
+	const ownerThreadId = ownership.ownerThreadId?.(database);
+	if (ownerThreadId === undefined)
+		throw new ClientError(
+			`No record lock coordinating worker is known yet for ${database}; retry once the owner is assigned`,
+			503
+		);
+	const requestId = nextAcquireId++;
+	const answer = await new Promise<{
+		round?: LockRound;
+		session?: string;
+		error?: { message: string; statusCode?: number };
+	}>((resolve) => {
+		const timer = setTimeout(() => {
+			const pending = pendingAcquires.get(requestId);
+			if (!pending || pending.settled) return;
+			pending.settled = true;
+			pendingAcquires.delete(requestId);
+			resolve({
+				error: { message: 'the record lock acquire did not reach the coordinating worker in time', statusCode: 503 },
+			});
+		}, waitMs).unref();
+		pendingAcquires.set(requestId, { resolve, timer, settled: false, ownerThreadId, database, table, key });
+		const unreachable = () => {
+			const pending = pendingAcquires.get(requestId);
+			if (!pending || pending.settled) return;
+			pending.settled = true;
+			clearTimeout(timer);
+			pendingAcquires.delete(requestId);
+			resolve({ error: { message: `the record lock owner worker for ${database} is not reachable`, statusCode: 503 } });
+		};
+		// No origin field: the owner reads the sender identity from the port the harness stamped. A throw
+		// here (an exited or unknown thread id — the cached owner can be stale across a handoff) must
+		// settle as a retryable 503, never escape the executor and reject with a bare Error while leaking
+		// the pending entry and its timer.
+		let sent = false;
+		try {
+			sent = sendToThread(ownerThreadId, {
+				type: ACQUIRE_REQUEST,
+				requestId,
+				database,
+				table,
+				key,
+				leaseMs,
+				// The owner gets the wait minus the hop margin, so its answer lands before the timer above.
+				waitMs: Math.max(0, waitMs - ACQUIRE_HOP_MS),
+			});
+		} catch (error) {
+			logger.debug?.(`could not send a record lock acquire to the owner worker for ${database}`, error);
+		}
+		if (!sent) unreachable();
+	});
+	if (answer.error) throw new ClientError(answer.error.message, answer.error.statusCode ?? 503);
+	if (!answer.round || !answer.session)
+		throw new ClientError(`the record lock owner worker for ${database} returned no usable admission`, 503);
+	remoteAdmissionSessions.set(admissionSessionKey(database, table, answer.round.admissionId), answer.session);
+	return answer.round;
+}
+
+/** Called by the transport (core's `releaseOnOwner`). Fire-and-forget; the owner also has a lease. */
+export function releaseOnOwnerRelay(database: string, table: string, key: unknown, admissionId: number): void {
+	const sessionKey = admissionSessionKey(database, table, admissionId);
+	const session = remoteAdmissionSessions.get(sessionKey);
+	remoteAdmissionSessions.delete(sessionKey);
+	const ownerThreadId = ownership.ownerThreadId?.(database);
+	if (ownerThreadId === undefined || session === undefined) return;
+	try {
+		sendToThread(ownerThreadId, { type: RELEASE_REQUEST, database, table, key, admissionId, session });
+	} catch (error) {
+		logger.debug?.(`could not send a record lock release to the owner worker for ${database}`, error);
+	}
+}
+
+/** Drop this worker's cached owner sessions for a database whose coordinating thread changed, so a
+ * later release cannot carry a session that named a departed owner (harper-pro#852). */
+export function clearRelaySessionsForDatabase(database: string): void {
+	const prefix = `${database}${KEY_SEP}`;
+	for (const sessionKey of remoteAdmissionSessions.keys())
+		if (sessionKey.startsWith(prefix)) remoteAdmissionSessions.delete(sessionKey);
+}
+
+/** Fail every in-flight acquire for a database whose coordinating thread changed, with a retryable
+ * 503, so a `lock()` sent to a now-departed owner retries against the successor immediately rather
+ * than waiting out its whole timeout (harper-pro#852). */
+export function failRelayAcquiresForDatabase(database: string): void {
+	for (const [requestId, pending] of pendingAcquires) {
+		if (pending.database !== database || pending.settled) continue;
+		pending.settled = true;
+		clearTimeout(pending.timer);
+		pendingAcquires.delete(requestId);
+		pending.resolve({
+			error: { message: `the record lock owner for ${database} changed; retry against the successor`, statusCode: 503 },
+		});
+	}
+}
+
+// A relayed acquire reply, and a revoke, arrive from the owner over its own port; the ack goes back on
+// that same port so it cannot be misrouted after an ownership change.
+onMessageByType(ACQUIRE_REPLY, (message: any, port: any) => {
+	const pending = pendingAcquires.get(message.requestId);
+	// A grant from a thread that no longer coordinates the database (the owner changed while this
+	// acquire was in flight) is stale — the delegation behind it died with that owner. Hand it back and
+	// let the caller retry against the new owner, rather than install a handle no delegation backs.
+	const staleOwner =
+		message.round && port?.threadId !== undefined && port.threadId !== ownership.ownerThreadId?.(message.database);
+	if (!pending || pending.settled || staleOwner) {
+		// The caller already timed out, or the owner changed: the owner minted an admission nobody will
+		// use — hand it back to the GRANTING owner (this reply's source thread and session), not the
+		// current owner, so it actually drops rather than being rejected on a session mismatch.
+		if (message.round && message.session && port?.threadId !== undefined) {
+			try {
+				sendToThread(port.threadId, {
+					type: RELEASE_REQUEST,
+					database: message.database,
+					table: message.table,
+					key: message.key,
+					admissionId: message.round.admissionId,
+					session: message.session,
+				});
+			} catch (error) {
+				logger.debug?.('could not hand a stale record lock grant back to its owner', error);
+			}
+		}
+		if (pending && !pending.settled && staleOwner) {
+			pending.settled = true;
+			clearTimeout(pending.timer);
+			pendingAcquires.delete(message.requestId);
+			pending.resolve({
+				error: { message: `the record lock owner for ${message.database} changed during the acquire`, statusCode: 503 },
+			});
+		}
+		return;
+	}
+	pending.settled = true;
+	clearTimeout(pending.timer);
+	pendingAcquires.delete(message.requestId);
+	pending.resolve({ round: message.round, session: message.session, error: message.error });
+});
+
+onMessageByType(REVOKE_REQUEST, (message: any, port: any) => {
+	// A revoke from a thread that no longer coordinates the database is from a departed owner; the
+	// handles it granted were already fenced fail-closed when this worker learned the owner changed
+	// (`fenceRelayedAdmissionsForDatabase`), so honoring it now would only risk latching a spurious
+	// revoke against the NEW owner's independently-minted id. Drop it.
+	if (port?.threadId !== undefined && port.threadId !== ownership.ownerThreadId?.(message.database)) return;
+	// Fence this worker's handle for the named admission and acknowledge ONLY once it is provably
+	// fenced (revokeRelayedAdmission resolves at the real revokeLease, latching a revoke that raced the
+	// handle's install). A throw or rejection means the fence is not proven, so no ack is sent — the
+	// owner falls back to its own lease bound rather than being told a fence that did not happen.
+	// Runs on whichever worker took the lock; the coordinator resolves the admission by owner id.
+	// `Promise.resolve().then(...)` so a SYNCHRONOUS throw from `revokeRelayedAdmission` (e.g. a table
+	// dropped or reloaded between acquire and revoke) becomes a rejection rather than escaping this
+	// handler — an unhandled throw here would take the worker down mid-transition.
+	Promise.resolve()
+		.then(() => revokeRelayedAdmission(message.database, message.table, message.admissionId))
+		.then(
+			() => {
+				// The admission is fenced and done; drop its cached session so revoked handles do not leak a
+				// map entry for the life of the process.
+				remoteAdmissionSessions.delete(admissionSessionKey(message.database, message.table, message.admissionId));
+				try {
+					port.postMessage({ type: REVOKE_ACK, revokeId: message.revokeId });
+				} catch (error) {
+					logger.debug?.('could not acknowledge a record lock revoke to the owner worker', error);
+				}
+			},
+			(error) => logger.warn?.('a relayed record lock handle did not confirm its fence', error)
+		);
+});
+
+// ---- owner side: mint / release an admission for a peer worker, and drive revocation ------------
+
+interface OwnerAdmission {
+	origin: number;
+	database: string;
+	table: string;
+	key: unknown;
+	admissionId: number;
+	port: any;
+}
+/** Relayed admissions this thread minted as owner, keyed by (database, table, admissionId). */
+const ownerAdmissions = new Map<string, OwnerAdmission>();
+let nextRevokeId = 1;
+const pendingRevokeAcks = new Map<number, () => void>();
+
+function releaseOwnerAdmission(admission: OwnerAdmission): void {
+	try {
+		const released = releaseForRelay(admission.database, admission.table, admission.key, admission.admissionId);
+		if (released && typeof (released as Promise<void>).then === 'function')
+			(released as Promise<void>).catch((error) =>
+				logger.warn?.('failed to release a relayed record lock admission', error)
+			);
+	} catch (error) {
+		logger.warn?.('failed to release a relayed record lock admission', error);
+	}
+}
+
+onMessageByType(ACQUIRE_REQUEST, async (message: any, port: any) => {
+	const { requestId, database, table, key, leaseMs, waitMs } = message;
+	// The origin is the sender thread, taken from the port the harness stamped — never a payload field,
+	// so a malformed worker cannot claim another's identity or target another's handle. A message with
+	// no port has no way back and no verifiable origin; drop it rather than reject this async handler
+	// (an unhandled rejection would take the worker down).
+	if (port?.threadId === undefined) return;
+	const origin = port.threadId;
+	const reply = (payload: any) => {
+		try {
+			port.postMessage({ type: ACQUIRE_REPLY, requestId, database, table, key, ...payload });
+			return true;
+		} catch (error) {
+			logger.debug?.('could not return a record lock acquire reply to the origin worker', error);
+			return false;
+		}
+	};
+	// This thread must actually coordinate the database. A misrouted request (an ownership change the
+	// caller had not yet learned) fails closed rather than relaying onward into a loop.
+	if (!ownership.ownsDatabase(database))
+		return reply({ error: { message: `this worker does not coordinate ${database}`, statusCode: 503 } });
+	try {
+		const round = await acquireForRelay(database, table, key, leaseMs, waitMs, (grantedRound: LockRound) => {
+			ownerAdmissions.set(admissionSessionKey(database, table, grantedRound.admissionId), {
+				origin,
+				database,
+				table,
+				key,
+				admissionId: grantedRound.admissionId,
+				port,
+			});
+			return () => revokeRemoteHandle(database, table, grantedRound, leaseMs, port);
+		});
+		// If the grant reply cannot be delivered, the caller will never install or release this admission —
+		// release it here rather than let the owner hold it to its lease against a ghost the caller cannot name.
+		if (!reply({ round, session: OWNER_SESSION })) {
+			const admission = ownerAdmissions.get(admissionSessionKey(database, table, round.admissionId));
+			if (admission) {
+				ownerAdmissions.delete(admissionSessionKey(database, table, round.admissionId));
+				releaseOwnerAdmission(admission);
+			}
+		}
+	} catch (error: any) {
+		reply({ error: { message: error?.message ?? 'record lock acquire failed', statusCode: error?.statusCode ?? 503 } });
+	}
+});
+
+onMessageByType(RELEASE_REQUEST, (message: any) => {
+	const { database, table, admissionId, session } = message;
+	// Ignore a release stamped with another owner's session: it names an admission a departed owner
+	// minted, not one this thread holds.
+	if (session !== OWNER_SESSION) return;
+	const admission = ownerAdmissions.get(admissionSessionKey(database, table, admissionId));
+	if (!admission) return;
+	ownerAdmissions.delete(admissionSessionKey(database, table, admissionId));
+	releaseOwnerAdmission(admission);
+});
+
+onMessageByType(REVOKE_ACK, (message: any) => {
+	pendingRevokeAcks.get(message.revokeId)?.();
+});
+
+/**
+ * Fence a relayed handle on the worker that holds it, and resolve once it acknowledges — or once the
+ * handle's own lease has elapsed, past which it fences itself. Core awaits this before it writes the
+ * delegation release, so the successor can only be admitted after this handle can no longer commit.
+ * The wait is bounded by the handle's REMAINING lease (`leaseMs` from the acquire that minted it),
+ * so a dead or wedged caller delays the release only until the handle would have expired anyway.
+ *
+ * This is the fence promise core awaits, and it is deliberately RESOLVE-ONLY: it never rejects and
+ * always settles (on the ack, or on the lease timer). That is the contract `#revokeAllAndSettle`
+ * relies on — a rejecting or never-settling revoker is what would let the home re-grant against an
+ * unfenced handle, and this side guarantees neither happens.
+ */
+function revokeRemoteHandle(
+	database: string,
+	table: string,
+	round: LockRound,
+	leaseMs: number,
+	port: any
+): Promise<void> {
+	ownerAdmissions.delete(admissionSessionKey(database, table, round.admissionId));
+	const revokeId = nextRevokeId++;
+	const remainingLease = Math.max(0, round.mintedMono + leaseMs - performance.now());
+	return new Promise<void>((resolve) => {
+		let settled = false;
+		const done = () => {
+			if (settled) return;
+			settled = true;
+			pendingRevokeAcks.delete(revokeId);
+			clearTimeout(timer);
+			resolve();
+		};
+		const timer = setTimeout(done, remainingLease).unref();
+		pendingRevokeAcks.set(revokeId, done);
+		try {
+			// The caller's own port, captured at acquire; a fence on the thread that holds the handle.
+			port.postMessage({ type: REVOKE_REQUEST, revokeId, database, table, admissionId: round.admissionId });
+		} catch (error) {
+			// The port is gone: the handle went with its worker. The lease bound resolves it.
+			logger.debug?.('could not send a record lock revoke to the holding worker', error);
+			if (!(remainingLease > 0)) done();
+		}
+	});
+}
+
+/**
+ * On a caller worker's exit, forget the bookkeeping for the relayed admissions it held here, but do
+ * NOT release them early: an ungraceful exit (a graceful one has already unlocked its handles before
+ * exiting) may leave a write the dead worker handed to the storage layer still flushing, and releasing
+ * now would let another node be admitted against a write that has not landed. The admission's own lease
+ * is the crash backstop the rest of the design relies on, so let the owner's coordinator expire it on
+ * schedule (harper-pro#852). Only the local map entry is dropped, to keep it from leaking.
+ */
+onThreadExit((threadId: number) => {
+	for (const [admissionKey, admission] of ownerAdmissions) {
+		if (admission.origin !== threadId) continue;
+		ownerAdmissions.delete(admissionKey);
+	}
+});
 
 server.registerOperation?.({ name: DELEGATE_OPERATION, execute: executeDelegate, httpMethod: 'POST' });
 server.registerOperation?.({ name: RECALL_OPERATION, execute: executeRecall, httpMethod: 'POST' });

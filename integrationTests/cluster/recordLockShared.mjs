@@ -1,7 +1,7 @@
 /**
  * Fixture, node lifecycle and operator helpers shared by the cluster record-lock suites
  * (`recordLockCluster.test.mjs`, `recordLockApplyHomes.test.mjs`). See the header of the former for
- * what these suites prove and why every node runs one http worker.
+ * what these suites prove and why nodes default to one http worker.
  */
 import assert from 'node:assert/strict';
 import { cp, mkdtemp } from 'node:fs/promises';
@@ -15,12 +15,12 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 const FIXTURE = join(import.meta.dirname, 'fixture-record-locks');
 export const DB = 'data';
 export const CONVERGE_TIMEOUT_MS = 90_000;
-function optionsFor(hostname, env = {}) {
+function optionsFor(hostname, env = {}, threadsCount = 1) {
 	return {
 		config: {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
-			threads: { count: 1 },
+			threads: { count: threadsCount },
 			replication: {
 				securePort: hostname + ':9933',
 				databases: [DB, 'system'],
@@ -33,13 +33,15 @@ function optionsFor(hostname, env = {}) {
 	};
 }
 
-/** A node with the fixture pre-installed, bound to a pre-allocated address (see cacheReplicationSource). */
-export async function startNode(suiteName, env) {
+/** A node with the fixture pre-installed, bound to a pre-allocated address (see cacheReplicationSource).
+ * `threadsCount > 1` runs several http workers, so a cluster lock() served on a non-owner worker relays
+ * its admission to the coordinating worker (harper-pro#852). */
+export async function startNode(suiteName, env, threadsCount = 1) {
 	const hostname = await getNextAvailableLoopbackAddress();
 	const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
 	await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true, dereference: true });
 	const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
-	await startHarper(ctx, optionsFor(hostname, env));
+	await startHarper(ctx, optionsFor(hostname, env, threadsCount));
 	return ctx;
 }
 

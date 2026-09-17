@@ -26,6 +26,7 @@ import {
 	createRecordLockTransport,
 	readOwnIncarnation,
 	setHomeIncarnation,
+	isFirstIncarnation,
 	currentHomeIncarnation,
 	ownsRecordLockCoordination,
 	readPeerHomesAgreement,
@@ -67,9 +68,17 @@ function fakeWorker(threadId) {
 		posted,
 		postMessage(message) {
 			posted.push(message);
+			// The real fence ack is a worker->main message this harness does not route; a worker confirms
+			// the ownerless fence by resolving `broadcastOwnerlessAndWait`'s per-worker wait, which it does
+			// on the worker's `exit` listener too. Fire it so a handoff's fence gate completes in the test.
+			if (message?.type === 'record-lock-owner-thread' && message.requestId !== undefined)
+				queueMicrotask(() => listeners.get('exit')?.());
 		},
 		once(event, listener) {
 			listeners.set(event, listener);
+		},
+		removeListener(event, listener) {
+			if (listeners.get(event) === listener) listeners.delete(event);
 		},
 		exit() {
 			listeners.get('exit')?.();
@@ -309,6 +318,19 @@ describe('setHomeIncarnation (worker side)', () => {
 		setHomeIncarnation(6);
 		assert.strictEqual(currentHomeIncarnation(), 6);
 	});
+
+	it('clears the first-incarnation quarantine waiver on the first handoff bump', () => {
+		// The waiver lets a fresh node's successor coordinator grant immediately. But once ownership
+		// has changed hands at least once (main bumps the incarnation with first=false), a departed
+		// worker's relayed handle could still be in flight, so the waiver MUST drop or we get a
+		// two-writer window. The true->false transition is one-way: it never re-waives afterward.
+		setHomeIncarnation(10, true);
+		assert.strictEqual(isFirstIncarnation(), true);
+		setHomeIncarnation(11, false);
+		assert.strictEqual(isFirstIncarnation(), false);
+		setHomeIncarnation(12, true);
+		assert.strictEqual(isFirstIncarnation(), false);
+	});
 });
 
 describe('createDisabledRecordLockTransport', () => {
@@ -387,11 +409,10 @@ describe('recordLockOwnerFor (main thread)', () => {
 		const duringHandoff = recordLockOwnerFor('owner-d', [live], bump);
 		assert.strictEqual(duringHandoff, undefined, 'unowned while the bump is in flight, not yet live');
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-d'], undefined);
-		assert.strictEqual(live.posted.length, 0, 'not conferred yet');
+		// It may already have received the ownerless fence request, but not the ownership conferral.
+		assert.ok(!live.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'not conferred yet');
 		resolveBump(1);
-		await Promise.resolve()
-			.then(() => {})
-			.then(() => {}); // let the bump's .then() run
+		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-d'], 32);
 		assert.deepStrictEqual(live.posted.at(-1), { type: 'record-lock-owner', database: 'owner-d', owned: true });
 		releaseRecordLockOwner('owner-d');
@@ -419,7 +440,7 @@ describe('recordLockOwnerFor (main thread)', () => {
 		recordLockOwnerFor('owner-f', [live], bump);
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-f'], undefined);
-		assert.strictEqual(live.posted.length, 0);
+		assert.ok(!live.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'never conferred');
 		// Unowned, not stuck: a later call may retry the handoff — and it must still be gated on a
 		// fresh bump (`dead` could have granted under the current incarnation before it left), not
 		// treated as a first assignment just because the failed attempt cleared the live owner map.
@@ -495,7 +516,7 @@ describe('recordLockOwnerFor (main thread)', () => {
 		resolveBump(1);
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-j'], undefined, 'the release superseded the pending handoff');
-		assert.strictEqual(live.posted.length, 0);
+		assert.ok(!live.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'never conferred');
 	});
 });
 

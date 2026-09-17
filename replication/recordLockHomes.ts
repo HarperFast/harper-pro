@@ -25,7 +25,6 @@
 import { createHash } from 'node:crypto';
 import Joi from 'joi';
 import { table } from '../core/resources/databases.ts';
-import { transaction } from '../core/resources/transaction.ts';
 import {
 	DELEGATION_LEASE_MS,
 	LOCK_LEASE_SKEW_MS,
@@ -151,30 +150,72 @@ async function readRow(database: string): Promise<RecordLockHomesRow | undefined
 	return getRecordLockHomesTable().primaryStore.get(database);
 }
 
-async function writeRow(row: RecordLockHomesRow): Promise<void> {
-	const writeContext: any = {};
-	await transaction(writeContext, async (txn) => {
-		const context = (txn as any).getContext();
-		const resource: any = await getRecordLockHomesTable().getResource(row.database, context, { async: true });
-		await resource._writeUpdate(row.database, row, true, { localOnly: true });
-		await resource.save?.();
-	});
+/**
+ * Write the row THROUGH the node-scoped lock `withRow` holds (`locked`), not a fresh transaction, so
+ * the write carries the lock handle and core's commit-time lease fence rejects it (409) if the lease
+ * elapsed between the read this plan decided against and this write — the compare-and-set the
+ * cross-isolate guard needs (harper-pro#852). A rejected write commits nothing; the operator retries
+ * and re-reads. `localOnly` is defensive: every `system`-database table is already non-replicating
+ * (`databases.ts` sets `replicate = false`), so the row never leaves this node regardless.
+ */
+async function writeRow(locked: any, row: RecordLockHomesRow): Promise<void> {
+	await locked._writeUpdate(row.database, row, true, { localOnly: true });
+	await locked.save?.();
 }
 
+/** How long a home-map transition may hold the row lock, and how long it waits to take it. The
+ * critical section is a read, a pure decision and one write — sub-millisecond — so the lease is only
+ * a backstop against a storage stall, and the commit fence in `writeRow` catches a stall that outran
+ * it rather than letting a stale plan land. */
+const ROW_LOCK_LEASE_MS = 30_000;
+const ROW_LOCK_TIMEOUT_MS = 30_000;
+
 /**
- * Serializes every stage/fence/activate call for the SAME database behind one in-process queue, so
- * the read this call's plan decides against can never be stale by the time it writes. Without this,
- * `readRow` (a real `await`, since the underlying store can resolve asynchronously) leaves a yield
- * point between reading and deciding: `stage(g2)` and a concurrent `fenceExternal` can both read the
- * same `active: g1`, and whichever writes second silently discards the other's outcome even though
- * both report success (a real pre-push review finding — the whole-row replace with no compare-and-set
- * against a state that changed underneath it). Different databases still run fully concurrently —
- * only same-database calls queue behind each other, and only for the duration of one read+decide+write.
+ * Runs one stage/fence/activate critical section for a database under exclusion that holds ACROSS
+ * worker isolates, closing the gap the previous per-isolate promise queue left (harper-pro#852): a
+ * process-wide, node-scoped hold lock on the `hdb_record_lock_homes` row itself (core's Phase 0
+ * native key lock, which is cross-thread). The read this plan decides against and the write that
+ * replaces the row happen under one lock, so no other worker can interleave; the write goes through
+ * the same locked handle (`writeRow(locked, ...)`) so a lease lost to a storage stall fails the write
+ * rather than letting a stale plan overwrite a concurrent transition.
+ *
+ * A plan's own `notifyChanged` fan-out runs while the lock is still held. That is deliberate: its
+ * cross-thread ack is bounded (`HOMES_CHANGED_RELAY_TIMEOUT_MS`, a few seconds) far below the row
+ * lease, it only makes other threads RE-READ the durable row (none of them takes this lock, so there
+ * is no re-entrancy or deadlock), and serializing a transition's fan-out with the next transition's
+ * decision is the point — a later stage must not decide against a row whose fan-out has not landed.
+ *
+ * The per-isolate promise queue is kept as well: it serializes same-isolate callers so each isolate
+ * presents one contender for the row lock, rather than a second same-isolate `lock()` coalescing
+ * re-entrantly and defeating the exclusion.
  */
 const rowQueues = new Map<string, Promise<unknown>>();
-function withRow<T>(database: string, plan: (existing: RecordLockHomesRow | undefined) => Promise<T>): Promise<T> {
+function withRow<T>(
+	database: string,
+	plan: (existing: RecordLockHomesRow | undefined, write: (row: RecordLockHomesRow) => Promise<void>) => Promise<T>
+): Promise<T> {
 	const prior = rowQueues.get(database) ?? Promise.resolve();
-	const run = prior.then(async () => plan(await readRow(database)));
+	const run = prior.then(async () => {
+		const locked: any = await getRecordLockHomesTable().lock(database, {
+			scope: 'node',
+			hold: true,
+			lease: ROW_LOCK_LEASE_MS,
+			timeout: ROW_LOCK_TIMEOUT_MS,
+		});
+		try {
+			const existing = await readRow(database);
+			return await plan(existing, (row) => writeRow(locked, row));
+		} finally {
+			// Never let an unlock failure replace the real outcome: if the write failed 409 because the row
+			// lease was lost to a storage stall, `unlock()` on the expired handle throws too, and the
+			// operator must still see the conflict that tells them to re-read and retry, not an unlock error.
+			try {
+				await locked.unlock();
+			} catch (error) {
+				logger.warn?.(`Record lock home map row unlock for ${database} failed`, error);
+			}
+		}
+	});
 	// Chain the next caller behind this one regardless of outcome; a rejection here must not wedge
 	// every later caller for this database behind a promise that will never resolve.
 	rowQueues.set(
@@ -306,7 +347,7 @@ async function stageRow(request: any): Promise<{ staged: RecordLockGenerationSta
 	const digest = digestOf(generation, homes);
 	validateGenerationInput(generation, request.quiesce);
 	const quiesce = canonicalizeHomes([...request.quiesce, ...homes]);
-	return withRow(database, async (existing) => {
+	return withRow(database, async (existing, write) => {
 		const plan = planStage(existing, database, generation, homes, digest, Date.now(), quiesce);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
 		if (plan.action === 'noop') {
@@ -318,7 +359,7 @@ async function stageRow(request: any): Promise<{ staged: RecordLockGenerationSta
 			await notifyChanged(database);
 			return { staged: plan.staged };
 		}
-		await writeRow(plan.row);
+		await write(plan.row);
 		logger.info?.(`Record lock home map for ${database}: staged generation ${generation}, retracted active`);
 		await notifyChanged(database);
 		return { staged: plan.row.staged! };
@@ -341,8 +382,8 @@ export async function fenceExternal(request: any): Promise<{ fenced: true }> {
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
 	const operator = operatorPrincipal(request);
 	const { database, node } = request;
-	return withRow(database, async (existing) => {
-		await writeRow({
+	return withRow(database, async (existing, write) => {
+		await write({
 			database,
 			active: existing?.active,
 			staged: existing?.staged,
@@ -415,7 +456,7 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
 	const digest = digestOf(generation, homes);
-	return withRow(database, async (existing) => {
+	return withRow(database, async (existing, write) => {
 		const plan = planActivate(existing, database, generation, digest);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
 		if (plan.action === 'noop') {
@@ -424,7 +465,7 @@ export async function activateGeneration(request: any): Promise<{ active: Record
 			await notifyChanged(database);
 			return { active: plan.active };
 		}
-		await writeRow(plan.row);
+		await write(plan.row);
 		logger.info?.(`Record lock home map for ${database}: activated generation ${generation}`);
 		await notifyChanged(database);
 		return { active: plan.row.active! };

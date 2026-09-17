@@ -9,9 +9,10 @@
  * lock is exclusive across nodes while held; that a stale holder is fenced; and that a peer without
  * the delegation-level `recordLocks` capability is not a ring member and fails a cluster lock closed.
  *
- * Every node runs one http worker (`threads.count: 1`): a cluster-scoped lock() is served only by the
- * worker that coordinates the database, and a keep-alive client would otherwise pin itself to a worker
- * that answers 503 (see replication/DESIGN.md → Cluster record locks).
+ * Most suites run one http worker per node (`threads.count: 1`) to keep the cross-node behavior the
+ * focus. The final suite runs one node at `threads.count: 3` beside a single-worker peer, so a lock()
+ * served on a non-owner worker relays its admission to the coordinating one and a real cross-node
+ * recall fences a relayed handle (harper-pro#852) — the discriminating path a lone node cannot reach.
  *
  * The home map is now OPERATOR-AGREED (harper-pro#825): nothing locks until `bootstrapHomeMap` below
  * stages generation 1 naming every node, then activates it — `homeMap()` returns `undefined` and every
@@ -347,5 +348,105 @@ suite('cluster record locks: the §4.3 stage/activate transition', { timeout: 30
 			}),
 		});
 		assert.equal(response.status, 409, 'no generation 3 was ever staged');
+	});
+});
+
+suite('cluster record locks at threads.count > 1 (harper-pro#852)', { timeout: 420_000 }, (ctx) => {
+	const contexts = [];
+	let multi; // one node running several http workers
+	let peer; // a single-worker peer, so a cross-node recall fences a relayed handle on a non-owner worker
+	let nodes;
+
+	before(async () => {
+		// `multi` runs 3 http workers: a cluster lock() served on any of them must succeed, the ones that
+		// do not coordinate `data` relaying to the one that does. `peer` gives a real cross-node handoff,
+		// the path a single node cannot exercise (no peer to recall a relayed hold).
+		const started = await Promise.allSettled([startNode(ctx.name, {}, 3), startNode(ctx.name, {}, 1)]);
+		for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
+		const failed = started.find((result) => result.status === 'rejected');
+		if (failed) throw failed.reason;
+		[multi, peer] = contexts.map((c) => c.harper);
+		nodes = [multi, peer];
+		await connectMesh(nodes);
+		await bootstrapHomeMap(nodes);
+		await waitForRing(nodes, nodes.length);
+	});
+
+	after(async () => {
+		for (const c of contexts) await stopNode(c);
+	});
+
+	test('a cluster lock() served on a non-owner worker relays to the coordinating one', async () => {
+		// `lock_probe` is a registered operation, so the ops-API dispatcher routes each call to one of
+		// `multi`'s http workers — often NOT the one coordinating `data`. Every call must still take the
+		// lock: before harper-pro#852 a call routed to a non-owner worker answered 503. The reply names
+		// the serving thread, so we can prove a non-owner served one (only possible via the relay).
+		const ownerThreadId = (await clusterStatusOf(multi)).recordLocks?.[DB]?.ownerThreadId;
+		// Which worker the dispatcher picks is its own business, so a fixed batch could in principle land
+		// entirely on the owner and prove nothing. Keep issuing batches until a non-owner has served one,
+		// which is what makes the assertion below about the relay rather than about routing luck.
+		const probes = [];
+		const threads = new Set();
+		for (let round = 0; round < 8 && ![...threads].some((t) => t !== ownerThreadId); round++) {
+			const batch = await Promise.all(
+				Array.from({ length: 12 }, (_, i) =>
+					sendOperation(multi, {
+						operation: 'lock_probe',
+						id: `probe-${Date.now()}-${round}-${i}`,
+						authorization: multi.admin,
+					})
+				)
+			);
+			for (const probe of batch) {
+				probes.push(probe);
+				threads.add(probe.threadId);
+			}
+		}
+		assert.ok(
+			probes.every((p) => p.locked === true),
+			`every probe must take the lock on whatever worker served it: ${JSON.stringify(probes)}`
+		);
+		const offOwner = [...threads].filter((t) => t !== ownerThreadId);
+		assert.ok(
+			offOwner.length >= 1,
+			`after ${probes.length} probes the dispatcher never left the coordinating worker (${ownerThreadId}); threads seen: ${[...threads]}`
+		);
+		const locks = (await clusterStatusOf(multi)).recordLocks?.[DB];
+		assert.ok(
+			(locks?.relayedAdmissions ?? 0) >= 1,
+			`a non-owner worker served a lock but none relayed: ${JSON.stringify(locks)}`
+		);
+	});
+
+	test('cross-node increments stay exclusive with the multi-worker node relaying', async () => {
+		// The discriminating test: a single node's native key lock alone would serialize its own workers,
+		// so exclusion must be proven across the node boundary. N increments from `multi` (spread across
+		// its 3 workers, each relaying to the owner) interleaved with N from `peer` must total exactly
+		// 1..2N with no collision — a broken relay would either 503 (a failed increment) or admit two of
+		// `multi`'s workers at once against `peer` (a duplicated value).
+		const id = 'xnode-' + Date.now();
+		await putCounter(multi, id, 0);
+		await waitForCounter(nodes, id, 0);
+		const N = 16;
+		const results = await Promise.all(
+			Array.from({ length: 2 * N }, (_, i) => call(i % 2 === 0 ? multi : peer, 'LockedIncrement/', { id }))
+		);
+		const failed = results.filter((r) => r.status !== 200);
+		assert.deepEqual(failed, [], `every increment must succeed on every node and worker: ${JSON.stringify(failed)}`);
+		const seen = results.map((r) => r.body.n).sort((a, b) => a - b);
+		assert.deepEqual(
+			seen,
+			Array.from({ length: 2 * N }, (_, i) => i + 1),
+			`admitted increments are not exactly 1..${2 * N}: ${seen}`
+		);
+		const finalValues = await waitForCounter(nodes, id, 2 * N);
+		assert.ok(
+			finalValues.every((n) => n === 2 * N),
+			`nodes did not converge to ${2 * N}: ${finalValues}`
+		);
+		// Note: that `multi`'s off-owner workers relay (rather than 503) is proven deterministically by
+		// the preceding test's 24 ops-API probes. We do not assert a relayedAdmissions delta here: the
+		// REST client can keep-alive-pin all of `multi`'s increments to a single worker, so whether any
+		// land off the owner is routing-dependent. Exclusion across the node boundary is the real proof.
 	});
 });
