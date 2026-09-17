@@ -51,6 +51,13 @@ export interface RecordLockGenerationState {
 	digest: string;
 	/** Set only on `staged`. Backstop only — see `MIN_DRAIN_BACKSTOP_MS` below. */
 	stagedAt?: number;
+	/**
+	 * Set only on `staged`, when the stage named it: §4.3's `homes(g) ∪ homes(g+1)`, the full set this
+	 * transition must quiesce. Staging retracts `active`, so once a node is staged its row no longer
+	 * names the old ring; this is what still does, so a later survey can refuse a list that omits a
+	 * participant (harper-pro#862).
+	 */
+	quiesce?: string[];
 }
 
 export interface RecordLockHomesRow {
@@ -192,6 +199,7 @@ const stageSchema = Joi.object({
 	database: Joi.string().required(),
 	generation: Joi.number().required(),
 	homes: Joi.array().required(),
+	quiesce: Joi.array().optional(),
 });
 
 /**
@@ -216,7 +224,8 @@ export function planStage(
 	generation: number,
 	homes: string[],
 	digest: string,
-	now: number = Date.now()
+	now: number = Date.now(),
+	quiesce?: string[]
 ): StagePlan {
 	const floor = Math.max(
 		existing?.active?.generation ?? 0,
@@ -229,6 +238,7 @@ export function planStage(
 	}
 	if (generation <= floor) return { action: 'reject', reason: `generation ${generation} is not greater than ${floor}` };
 	const staged: RecordLockGenerationState = { generation, homes, digest, stagedAt: now };
+	if (quiesce) staged.quiesce = quiesce;
 	return {
 		action: 'write',
 		row: {
@@ -275,8 +285,13 @@ async function stageRow(request: any): Promise<{ staged: RecordLockGenerationSta
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
 	const digest = digestOf(generation, homes);
+	let quiesce: string[] | undefined;
+	if (request.quiesce !== undefined) {
+		validateGenerationInput(generation, request.quiesce);
+		quiesce = canonicalizeHomes([...request.quiesce, ...homes]);
+	}
 	return withRow(database, async (existing) => {
-		const plan = planStage(existing, database, generation, homes, digest);
+		const plan = planStage(existing, database, generation, homes, digest, Date.now(), quiesce);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
 		if (plan.action === 'noop') {
 			// Idempotent retry, not a genuine transition — but the PRIOR call may have durably written
