@@ -7,7 +7,7 @@
  * review).
  */
 import assert from 'node:assert';
-import { setMainIsWorker } from '#js/core/server/threads/manageThreads';
+import { notifyThreadExit, setMainIsWorker } from '#js/core/server/threads/manageThreads';
 import {
 	HOMES_AGREEMENT_MATCH,
 	HOMES_AGREEMENT_MISMATCH,
@@ -520,6 +520,24 @@ describe('recordLockOwnerFor (main thread)', () => {
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-j'], undefined, 'the release superseded the pending handoff');
 		assert.ok(!live.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'never conferred');
+	});
+
+	it('does not confer ownership on a successor that exited during the fence wait', async () => {
+		const departing = fakeWorker(91);
+		const successor = fakeWorker(92);
+		recordLockOwnerFor('owner-k', [departing]);
+		let resolveBump;
+		const bump = () => new Promise((resolve) => (resolveBump = resolve));
+		recordLockOwnerFor('owner-k', [successor], bump);
+		notifyThreadExit(92);
+		resolveBump(1);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['owner-k'],
+			undefined,
+			'no database is left pointing at a thread whose exit handler can no longer fire'
+		);
+		assert.ok(!successor.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'never conferred');
 	});
 });
 

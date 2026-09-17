@@ -36,7 +36,13 @@
  */
 import { parentPort } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
-import { getWorkerIndex, onMessageByType, whenThreadsStarted, workers } from '../core/server/threads/manageThreads.js';
+import {
+	getWorkerIndex,
+	hasThreadExited,
+	onMessageByType,
+	whenThreadsStarted,
+	workers,
+} from '../core/server/threads/manageThreads.js';
 import {
 	fenceRelayedAdmissions,
 	registerClusterLockTransport,
@@ -1149,13 +1155,21 @@ export function recordLockOwnerFor(
 		.then(() => {
 			// Superseded while the fence/bump was in flight (another reassignment, a release) — abandon.
 			if (recordLockOwners.get(database) !== PENDING_BUMP) return;
+			// The successor was chosen before a wait that runs as long as OWNER_FENCE_ACK_TIMEOUT_MS and
+			// that treats a worker's own exit as a completed fence, so it can resolve on the successor
+			// dying. Conferring then would point every relayed `lock()` at a dead thread with no exit
+			// handler left to clear the entry — `watchOwnerExit` only attaches inside `assignOwner`, past
+			// the point the exit could still fire. Fail closed into the retry below instead.
+			if (owner !== MAIN_OWNER && hasThreadExited(owner.threadId))
+				throw new Error(`the successor worker exited during the record lock fence wait for ${database}`);
 			assignOwner(database, owner);
 		})
 		.catch((error) => {
-			// The bump failed to persist, or a live worker did not confirm it fenced its relayed handles.
-			// Either way, leave the database unowned (fail closed — a cluster lock 503s) rather than confer
-			// ownership while a stale incarnation or an unfenced handle could overlap the successor. Retry
-			// shortly: a wedged worker will have been restarted by then, and its exit resolves the fence.
+			// The bump failed to persist, a live worker did not confirm it fenced its relayed handles, or
+			// the successor itself exited. Either way, leave the database unowned (fail closed — a cluster
+			// lock 503s) rather than confer ownership while a stale incarnation, an unfenced handle or a
+			// dead thread could take it. Retry shortly: a wedged or restarting worker will be back by then,
+			// and a wedged one's exit resolves the fence.
 			if (recordLockOwners.get(database) === PENDING_BUMP) recordLockOwners.delete(database);
 			logger.warn?.(`Deferring record lock owner reassignment for ${database}`, error);
 			setTimeout(() => {
