@@ -504,7 +504,7 @@ export function failRelayAcquiresForDatabase(database: string): void {
 
 // A relayed acquire reply, and a revoke, arrive from the owner over its own port; the ack goes back on
 // that same port so it cannot be misrouted after an ownership change.
-onMessageByType(ACQUIRE_REPLY, (message: any, port: any) => {
+export function handleAcquireReply(message: any, port: any): void {
 	const pending = pendingAcquires.get(message.requestId);
 	// A grant from a thread that no longer coordinates the database (the owner changed while this
 	// acquire was in flight) is stale — the delegation behind it died with that owner. Hand it back and
@@ -543,7 +543,8 @@ onMessageByType(ACQUIRE_REPLY, (message: any, port: any) => {
 	clearTimeout(pending.timer);
 	pendingAcquires.delete(message.requestId);
 	pending.resolve({ round: message.round, session: message.session, error: message.error });
-});
+}
+onMessageByType(ACQUIRE_REPLY, handleAcquireReply);
 
 onMessageByType(REVOKE_REQUEST, (message: any, port: any) => {
 	// A revoke from a thread that no longer coordinates the database is from a departed owner; the

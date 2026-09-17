@@ -233,9 +233,9 @@ export interface RecordLockTransportDeps {
 	/** The successor-freshness barrier for the database, built over this transport's own `homeMap()`. */
 	freshness(database: string, homeMap: () => LockHomeMap | undefined): FreshnessBarrier;
 	/** harper-pro#852: obtain an admission from the owner worker for an off-owner `lock()`. */
-	acquireOnOwner(database: string, table: string, key: any, leaseMs: number, waitMs: number): Promise<LockRound>;
+	acquireOnOwner(database: string, table: string, key: unknown, leaseMs: number, waitMs: number): Promise<LockRound>;
 	/** harper-pro#852: release a relayed admission on the owner worker. */
-	releaseOnOwner(database: string, table: string, key: any, admissionId: number): void;
+	releaseOnOwner(database: string, table: string, key: unknown, admissionId: number): void;
 }
 
 /**
@@ -322,10 +322,10 @@ export function createRecordLockTransport(
 		// harper-pro#852: a `lock()` served on a non-owner worker gets its admission from the owner
 		// worker over the port mesh. Core installs the returned round as a remote admission and drives
 		// the release/revoke through these.
-		acquireOnOwner(db: string, table: string, key: any, leaseMs: number, waitMs: number): Promise<LockRound> {
+		acquireOnOwner(db: string, table: string, key: unknown, leaseMs: number, waitMs: number): Promise<LockRound> {
 			return deps.acquireOnOwner(db, table, key, leaseMs, waitMs);
 		},
-		releaseOnOwner(db: string, table: string, key: any, admissionId: number): void {
+		releaseOnOwner(db: string, table: string, key: unknown, admissionId: number): void {
 			deps.releaseOnOwner(db, table, key, admissionId);
 		},
 	};
@@ -1044,11 +1044,9 @@ const pendingOwnerFenceAcks = new Map<number, () => void>();
  * whose closed port neither throws on post nor fires `exit` again, stalling the wait to its timeout.
  *
  * A worker that EXITS is resolved as fenced even though an in-flight async write it submitted could
- * still land: that is safe because the SUCCESSOR does not grant immediately — a handoff bump clears the
- * first-incarnation waiver (`setHomeIncarnation`), so the successor coordinator applies its restart
- * quarantine (`DELEGATION_LEASE_MS`, which exceeds the maximum lock lease), and any outstanding
- * admission's lease elapses before it can grant the key to a peer. Main fences its own relayed handles
- * synchronously first. Main thread only.
+ * still land. What makes that safe is the process-wide native key lock, NOT the successor's restart
+ * quarantine — the argument and its one residual window are at the `onExit` handler below, and in
+ * `replication/DESIGN.md`. Main fences its own relayed handles synchronously first. Main thread only.
  */
 function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorkers()): Promise<void> {
 	updateOwnerThread(database, undefined);

@@ -378,9 +378,12 @@ describe('recordLockOwnerFor (main thread)', () => {
 	});
 
 	it('never moves a database off a live owner, even when other workers are offered', () => {
-		const owner = fakeWorker(21);
-		const other = fakeWorker(22);
-		assert.strictEqual(recordLockOwnerFor('owner-c', [owner, other]), owner);
+		const first = fakeWorker(21);
+		const second = fakeWorker(22);
+		// Which of the two the round robin lands on depends on how many databases were assigned before
+		// this test; what must hold is that the second call does not move the database off it.
+		const owner = recordLockOwnerFor('owner-c', [first, second]);
+		const other = owner === first ? second : first;
 		assert.strictEqual(recordLockOwnerFor('owner-c', [other, owner]), owner);
 		assert.strictEqual(other.posted.length, 0);
 		releaseRecordLockOwner('owner-c');
