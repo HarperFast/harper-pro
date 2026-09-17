@@ -529,7 +529,11 @@ describe('recordLockOwnerFor (main thread)', () => {
 		let resolveBump;
 		const bump = () => new Promise((resolve) => (resolveBump = resolve));
 		recordLockOwnerFor('owner-k', [successor], bump);
-		notifyThreadExit(92);
+		// A real Worker reports `threadId` -1 from the moment it exits, so the tombstone keeps the id
+		// `manageThreads` captured while it was live. Model both, or this passes against a check that
+		// reads the worker's id after the fact and never matches.
+		notifyThreadExit(successor.threadId);
+		successor.threadId = -1;
 		resolveBump(1);
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(

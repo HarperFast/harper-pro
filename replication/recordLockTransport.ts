@@ -1146,6 +1146,10 @@ export function recordLockOwnerFor(
 		assignOwner(database, owner);
 		return owner === MAIN_OWNER ? undefined : owner;
 	}
+	// Read here, not after the wait: a Worker's own `threadId` is already -1 by the time its `exit`
+	// fires, so the id the thread tombstone is keyed by survives only if it is captured while the worker
+	// is live — `manageThreads.addPort` captures it the same way, for the same reason.
+	const ownerThreadId = owner === MAIN_OWNER ? undefined : owner.threadId;
 	recordLockOwners.set(database, PENDING_BUMP);
 	// Before the successor may grant, BOTH must complete: the incarnation bump (so it cannot re-mint a
 	// token) AND every surviving worker confirming it has fenced the departed owner's relayed handles (so
@@ -1156,11 +1160,10 @@ export function recordLockOwnerFor(
 			// Superseded while the fence/bump was in flight (another reassignment, a release) — abandon.
 			if (recordLockOwners.get(database) !== PENDING_BUMP) return;
 			// The successor was chosen before a wait that runs as long as OWNER_FENCE_ACK_TIMEOUT_MS and
-			// that treats a worker's own exit as a completed fence, so it can resolve on the successor
-			// dying. Conferring then would point every relayed `lock()` at a dead thread with no exit
-			// handler left to clear the entry — `watchOwnerExit` only attaches inside `assignOwner`, past
-			// the point the exit could still fire. Fail closed into the retry below instead.
-			if (owner !== MAIN_OWNER && hasThreadExited(owner.threadId))
+			// that counts a worker's own exit as a completed fence, so the wait can resolve on the
+			// successor dying. Conferring then strands the database on a dead thread: `watchOwnerExit`
+			// attaches inside `assignOwner`, past the point the exit it waits for could still fire.
+			if (ownerThreadId !== undefined && hasThreadExited(ownerThreadId))
 				throw new Error(`the successor worker exited during the record lock fence wait for ${database}`);
 			assignOwner(database, owner);
 		})
