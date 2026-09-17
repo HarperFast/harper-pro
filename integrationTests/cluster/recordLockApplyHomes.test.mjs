@@ -1,16 +1,9 @@
 /**
- * `record_lock_apply_homes` (harper-pro#862) on real nodes: one operator call drives the whole §4.3
- * transition over the node-principal hop, given the explicit node list.
- *
- * What only real nodes can prove: that the relay reaches every named node over the replication
- * connections and each node's own row, not the payload, decides; that a fresh cluster bootstraps in
- * one call with no per-node loop once its coordinators can prove a drain; and that every refusal
- * happens before anything is staged. Core lets a coordinator prove a drain only after it has owned
- * for a full delegation lease (~6 minutes; `unprovenOwnershipMs`), so this suite waits that out once
- * in `before` — setup, not the outage. The retry contract and the topology change live in
- * `recordLockApplyRetry.test.mjs` so the two lease waits shard separately.
- *
- * Same fixture and node shape as `recordLockCluster.test.mjs` (`threads.count: 1`, drain backstop 0).
+ * `record_lock_apply_homes` (harper-pro#862) on real nodes: a one-call bootstrap and the refusals that
+ * happen before anything is staged. Core lets a coordinator prove a drain only after it has owned for
+ * a full delegation lease (~6 minutes, `unprovenOwnershipMs`), so the suite waits that out once in
+ * `before`. The retry contract and the topology change live in `recordLockApplyRetry.test.mjs` so the
+ * two lease waits shard separately. Same fixture as `recordLockCluster.test.mjs`.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -112,7 +105,7 @@ suite('record_lock_apply_homes: bootstrap and refusals on a three-node cluster',
 			database: DB,
 			generation: 2,
 			homes: [names[0]],
-			quiesce: [names[0]],
+			quiesce: names,
 			authorization: nodes[0].admin,
 		});
 		const { status, body } = await operation(nodes[1], {

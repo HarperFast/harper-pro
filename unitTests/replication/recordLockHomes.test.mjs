@@ -90,10 +90,16 @@ describe('planStage', () => {
 			highestActedOn: 1,
 			fenced: [],
 		};
-		const plan = planStage(existing, 'db', 2, ['a', 'c'], digest2, T);
+		const plan = planStage(existing, 'db', 2, ['a', 'c'], digest2, T, ['a', 'c']);
 		assert.strictEqual(plan.action, 'write');
 		assert.strictEqual(plan.row.active, undefined, 'staging retracts active in the same write');
-		assert.deepStrictEqual(plan.row.staged, { generation: 2, homes: ['a', 'c'], digest: digest2, stagedAt: T });
+		assert.deepStrictEqual(plan.row.staged, {
+			generation: 2,
+			homes: ['a', 'c'],
+			digest: digest2,
+			stagedAt: T,
+			quiesce: ['a', 'c'],
+		});
 	});
 
 	it('is idempotent for an identical re-stage — the original stagedAt is not the identity, digest and generation are', () => {
@@ -146,6 +152,34 @@ describe('planStage', () => {
 
 describe('planStage: the participant set', () => {
 	const T = 1_700_000_000_000;
+	it('must cover every ring the row still remembers, or the node it omits becomes invisible to a later survey', () => {
+		const active = {
+			database: 'db',
+			active: { generation: 1, homes: ['a', 'b', 'c'], digest: 'x' },
+			highestActedOn: 1,
+			fenced: [],
+		};
+		const short = planStage(active, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T, ['a', 'b']);
+		assert.strictEqual(short.action, 'reject');
+		assert.match(short.reason, /quiesce must include every node in the ring this node is retracting; missing c/);
+		assert.strictEqual(
+			planStage(active, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T, ['a', 'b', 'c']).action,
+			'write'
+		);
+		// A previous, still-staged transition's participants count too: they may still serve the ring it retracted.
+		const staged = {
+			database: 'db',
+			staged: { generation: 2, homes: ['a', 'b'], digest: digestOf(2, ['a', 'b']), quiesce: ['a', 'b', 'c'] },
+			highestActedOn: 2,
+			fenced: [],
+		};
+		const forgetful = planStage(staged, 'db', 3, ['a'], digestOf(3, ['a']), T, ['a']);
+		assert.strictEqual(forgetful.action, 'reject');
+		assert.match(forgetful.reason, /missing b, c/);
+		assert.strictEqual(planStage(staged, 'db', 3, ['a'], digestOf(3, ['a']), T, ['a', 'b', 'c']).action, 'write');
+		// No participant set at all is never enough once the row names a ring.
+		assert.strictEqual(planStage(active, 'db', 2, ['a', 'b', 'c'], digestOf(2, ['a', 'b', 'c']), T).action, 'reject');
+	});
 	it('is stored with the staged state, and a matching re-stage backfills a row that lacks one', () => {
 		const first = planStage(undefined, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T, ['a', 'b', 'c']);
 		assert.strictEqual(first.action, 'write');

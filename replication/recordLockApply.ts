@@ -1,10 +1,7 @@
 /**
- * One operator call that applies a record-lock home map across the whole cluster (harper-pro#862),
- * given an explicitly supplied node list: survey every named node, refuse on any incompleteness,
- * stage everywhere, activate when every node proves its drain, report per node. The list is stated,
- * never derived — `homeMap()` iterates its own `active.homes`, so an omitted participant is two
- * arbiters, not a refusal — and every hop is `record_lock_transition`, accepted from a node principal
- * only and re-validated by the receiving node. RECORD_LOCK_HOMES_DESIGN.md → "Applying a home map".
+ * `record_lock_apply_homes` (harper-pro#862): one operator call that drives the §4.3 transition across
+ * an explicitly supplied node list, over the node-principal hop `record_lock_transition`. See
+ * RECORD_LOCK_HOMES_DESIGN.md → "Applying a home map across the cluster".
  */
 import Joi from 'joi';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -96,12 +93,7 @@ export interface ApplyReport {
 	quiesce: string[];
 	generation?: number;
 	digest?: string;
-	/**
-	 * `refused`: nothing was written. `incomplete`: a hop failed after staging began; re-run the same
-	 * call. `staged`: every node is staged and refusing locks but not every one proved quiescence;
-	 * wait `retryAfterMs` from receiving this response, then re-run with `generation` and
-	 * `drained: true`. `activated`: done.
-	 */
+	/** `staged`: every node is staged and refusing locks; wait `retryAfterMs`, then re-run with `generation` and `drained: true`. */
 	outcome: 'refused' | 'incomplete' | 'staged' | 'activated';
 	reason?: string;
 	/** The drain interval, measured by the operator from receiving this response, never from a node clock. */
@@ -319,7 +311,6 @@ async function forEachNode(nodes: string[], task: (node: string) => Promise<void
 /** One apply at a time per database on this worker; the per-node planners keep a concurrent apply elsewhere safe. */
 const applyQueues = new Map<string, Promise<unknown>>();
 
-/** Test hook: fail after every node is staged and before any is activated. */
 const FAIL_BEFORE_ACTIVATE = process.env.HARPER_TEST_RECORD_LOCK_APPLY_FAIL_BEFORE_ACTIVATE === '1';
 
 export async function applyHomes(

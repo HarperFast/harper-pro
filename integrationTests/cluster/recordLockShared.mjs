@@ -193,8 +193,6 @@ export async function connectMesh(nodes) {
 	return waitForMesh(nodes);
 }
 
-// ---- record_lock_apply_homes helpers (harper-pro#862) ----
-
 /** POST an operation; resolves { status, body } so a refusal's body can be inspected. */
 export async function operation(node, body) {
 	const response = await fetch(node.operationsAPIURL, {

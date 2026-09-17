@@ -644,7 +644,7 @@ export async function sendOperationToNode(node, operation, options?) {
 				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(operation));
 			// A throw inside this listener is an uncaught exception, and leaves this promise pending.
 			try {
-				resolve(session.sendOperation(operation));
+				resolve(session.sendOperation(operation, options.timeoutMs));
 			} catch (error) {
 				reject(error);
 			}

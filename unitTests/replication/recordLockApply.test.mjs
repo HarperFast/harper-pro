@@ -1,9 +1,4 @@
-/**
- * The decisions behind `record_lock_apply_homes` (harper-pro#862), checked without a cluster: which
- * survey results refuse before anything is staged, when a drain result licenses activating without the
- * interval, what the orchestrator sends to which node in each outcome, and that the peer-callable hop
- * accepts only a node principal and re-validates the relayed proposal against its own row.
- */
+/** The decisions behind `record_lock_apply_homes` (harper-pro#862), checked without a cluster. */
 import assert from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 // The transport is the module that wires (and must load before) recordLockRpc; entering the graph

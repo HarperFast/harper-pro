@@ -243,6 +243,19 @@ export function planStage(
 		return { action: 'noop', staged: existing.staged };
 	}
 	if (generation <= floor) return { action: 'reject', reason: `generation ${generation} is not greater than ${floor}` };
+	// This write erases every ring the row still names, so the transition's participant set must cover
+	// them all, or a node still serving one of them becomes invisible to a later survey.
+	const remembered = [
+		...(existing?.active?.homes ?? []),
+		...(existing?.staged?.homes ?? []),
+		...(existing?.staged?.quiesce ?? []),
+	];
+	const uncovered = remembered.filter((node) => !quiesce?.includes(node));
+	if (uncovered.length > 0)
+		return {
+			action: 'reject',
+			reason: `quiesce must include every node in the ring this node is retracting; missing ${[...new Set(uncovered)].join(', ')}`,
+		};
 	const staged: RecordLockGenerationState = { generation, homes, digest, stagedAt: now };
 	if (quiesce) staged.quiesce = quiesce;
 	return {

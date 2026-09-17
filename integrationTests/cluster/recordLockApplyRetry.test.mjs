@@ -1,15 +1,8 @@
 /**
- * `record_lock_apply_homes` (harper-pro#862): the retry contract and the topology change, on two
- * real nodes. The second node carries the test hook that fails an apply it coordinates between stage
- * and activate; it answers the hop from the first node normally.
- *
- * What only real nodes can prove here: that a cluster whose drain cannot prove is left staged and
- * refusing locks with a relative wait; that the attested second call activates only what was already
- * staged; that an injected failure between the phases leaves the documented safe state and the same
- * call from another node completes it; that the hop refuses an operator caller; and that a shrink
- * activates in seconds once every node can prove its drain, with the departing node staged and never
- * activated. The one ~6 minute wait (core's lease, see `recordLockApplyHomes.test.mjs`) is paid before
- * the shrink, while every node serves the current generation.
+ * `record_lock_apply_homes` (harper-pro#862): the retry contract and a shrink, on two real nodes. The
+ * second node carries the hook that fails an apply it coordinates between stage and activate; it
+ * answers the hop from the first node normally. The one ~6 minute lease wait is paid before the
+ * shrink, while every node serves the current generation.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
