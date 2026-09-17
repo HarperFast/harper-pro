@@ -1067,6 +1067,17 @@ let nextOwnerFenceId = 1;
 const pendingOwnerFenceAcks = new Map<number, () => void>();
 
 /**
+ * A worker's confirmation that it fenced its relayed handles, resolving that worker's arm of
+ * `broadcastOwnerlessAndWait`. Named and exported for the same reason `recordLockRpc`'s
+ * `handleAcquireReply` is: `manageThreads` offers no way to raise a worker->main message, so the
+ * fixture could otherwise only reach the wait's EXIT arm, and a regression that dropped this route —
+ * leaving every handoff to time out — passed the suite. Main thread only.
+ */
+export function handleOwnerThreadAck(message: { requestId: number }): void {
+	pendingOwnerFenceAcks.get(message.requestId)?.();
+}
+
+/**
  * Tell every LIVE http worker the database is now ownerless and WAIT for each to confirm it has fenced
  * the relayed handles it held, before the successor is assigned. Resolves once every worker has acked
  * OR exited; REJECTS if a live worker fails to ack within the timeout (handoff fails, database stays
@@ -1397,9 +1408,7 @@ if (!parentPort) {
 			logger.debug?.(`Could not answer a record lock owner-thread request for ${message.database}`, error);
 		}
 	});
-	onMessageByType('record-lock-owner-thread-ack', (message) => {
-		pendingOwnerFenceAcks.get(message.requestId)?.();
-	});
+	onMessageByType('record-lock-owner-thread-ack', handleOwnerThreadAck);
 	onMessageByType('record-lock-status', (message) => {
 		pendingStatusRequests.get(message.requestId)?.(message.status ?? {});
 	});

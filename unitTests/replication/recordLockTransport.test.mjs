@@ -24,6 +24,7 @@ import {
 	collectRecordLockStatus,
 	createDisabledRecordLockTransport,
 	createRecordLockTransport,
+	handleOwnerThreadAck,
 	readOwnIncarnation,
 	setHomeIncarnation,
 	isFirstIncarnation,
@@ -61,32 +62,58 @@ function fakeAuditStore() {
 
 function fakeWorker(threadId) {
 	const posted = [];
+	// A LIST per event, as `EventEmitter.once` gives: two overlapping handoff attempts register their
+	// own `exit` listener on the same worker, and a last-one-wins map silently drops the first — which
+	// leaves its arm of `broadcastOwnerlessAndWait` pending until the 10s timeout, a fixture artifact
+	// that has nothing to do with the code under test.
 	const listeners = new Map();
+	const fire = (event) => {
+		const registered = listeners.get(event);
+		if (!registered) return;
+		listeners.delete(event); // `once`
+		for (const listener of registered) listener();
+	};
 	return {
 		name: 'http',
 		threadId,
 		posted,
 		postMessage(message) {
 			posted.push(message);
-			// The real fence ack is a worker->main message, dispatched by `manageThreads` off a registered
-			// port's own 'message' event, which this harness has no way to raise. A worker resolves
-			// `broadcastOwnerlessAndWait`'s per-worker wait on `exit` as well, so fire that to complete a
-			// handoff's fence gate — every handoff below therefore travels the EXIT arm of that wait. The
-			// live `record-lock-owner-thread-ack` arm has no coverage; routing it would need a test-only
-			// entry point into main's message dispatch.
+			// A worker resolves `broadcastOwnerlessAndWait`'s per-worker wait on `exit` as well as on an
+			// ack, so fire that to complete a handoff's fence gate — every handoff below therefore travels
+			// the EXIT arm of that wait. `fenceAckWorker` is the same worker holding its ack back, for the
+			// tests that drive the live ack arm instead.
 			if (message?.type === 'record-lock-owner-thread' && message.requestId !== undefined)
-				queueMicrotask(() => listeners.get('exit')?.());
+				queueMicrotask(() => fire('exit'));
 		},
 		once(event, listener) {
-			listeners.set(event, listener);
+			const registered = listeners.get(event);
+			if (registered) registered.push(listener);
+			else listeners.set(event, [listener]);
 		},
 		removeListener(event, listener) {
-			if (listeners.get(event) === listener) listeners.delete(event);
+			const registered = listeners.get(event);
+			const index = registered?.indexOf(listener) ?? -1;
+			if (index !== -1) registered.splice(index, 1);
 		},
 		exit() {
-			listeners.get('exit')?.();
+			fire('exit');
 		},
 	};
+}
+
+/**
+ * A live worker that does NOT exit: it holds its fence ack back so a test can deliver it through main's
+ * own route (`handleOwnerThreadAck`). Without this, every handoff resolves on the exit arm and the ack
+ * arm — the one a real running worker uses — is never exercised.
+ */
+function fenceAckWorker(threadId) {
+	const worker = fakeWorker(threadId);
+	worker.postMessage = (message) => worker.posted.push(message);
+	worker.fenceRequestId = () =>
+		worker.posted.findLast((message) => message.type === 'record-lock-owner-thread' && message.requestId !== undefined)
+			?.requestId;
+	return worker;
 }
 
 describe('peer lock capability in the shared status buffer', () => {
@@ -568,6 +595,39 @@ describe('recordLockOwnerFor (main thread)', () => {
 			'no database is left pointing at a thread whose exit handler can no longer fire'
 		);
 		assert.ok(!successor.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'never conferred');
+	});
+
+	it('withholds the successor until a live worker acks its fence, and confers on that ack', async () => {
+		// The gate in both directions, on the arm a real running worker uses: a live worker that has not
+		// answered must NOT be conferred on (the ack is main's only evidence the departed owner's relayed
+		// handles can no longer commit), and the ack is what releases the handoff. The exit arm every
+		// other test here travels cannot show either — it resolves whether or not the route exists.
+		const departing = fakeWorker(101);
+		const successor = fenceAckWorker(102);
+		recordLockOwnerFor('owner-ack', [departing]);
+		assert.strictEqual(
+			recordLockOwnerFor('owner-ack', [successor], async () => 1),
+			undefined
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['owner-ack'],
+			undefined,
+			'the bump resolved, but an unfenced live worker still holds the handoff'
+		);
+		const requestId = successor.fenceRequestId();
+		assert.ok(requestId !== undefined, 'the successor was asked to fence before it could be conferred');
+		handleOwnerThreadAck({ requestId: requestId + 1000 });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['owner-ack'],
+			undefined,
+			'an ack for another request does not settle this one'
+		);
+		handleOwnerThreadAck({ requestId });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(recordLockOwnerThreadIds()['owner-ack'], 102, 'the ack is what releases the handoff');
+		releaseRecordLockOwner('owner-ack');
 	});
 });
 
