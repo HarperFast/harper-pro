@@ -22,6 +22,7 @@ import {
 	call,
 	clusterStatusOf,
 	connectMesh,
+	currentRow,
 	lockStatus,
 	nodeNames,
 	operation,
@@ -97,7 +98,12 @@ suite('record_lock_apply_homes: bootstrap and refusals on a three-node cluster',
 			assert.equal(body.nodes[name].stage, undefined, 'nothing was staged');
 		}
 		assert.equal(body.nodes[names[2]], undefined, 'only the listed nodes were asked');
-		await assertLocks(nodes, 200, 'generation 1 must still be active everywhere after a refusal');
+		for (const node of nodes) {
+			const row = await currentRow(node);
+			assert.equal(row.active?.generation, 1, `${node.hostname}: generation 1 must still be active after a refusal`);
+			assert.equal(row.staged, undefined, `${node.hostname}: nothing was staged`);
+		}
+		await assertLocks(nodes, 200, 'generation 1 still serves everywhere');
 	});
 
 	test('refuses before staging when a node already holds a different set at the target generation', async () => {
@@ -118,7 +124,13 @@ suite('record_lock_apply_homes: bootstrap and refusals on a three-node cluster',
 		assert.match(body.error, /already staged with a different home set/);
 		assert.equal(body.nodes[names[0]].survey.staged.generation, 2);
 		for (const name of names) assert.equal(body.nodes[name].stage, undefined);
-		await assertLocks(nodes.slice(1), 200, 'the untouched nodes still serve generation 1');
+		// The refusal wrote nothing: the other two rows still hold generation 1 and nothing staged. (A
+		// lock on them is not the check — a key homed on the stray-staged node is correctly 503 there.)
+		for (const node of nodes.slice(1)) {
+			const row = await currentRow(node);
+			assert.equal(row.active?.generation, 1, `${node.hostname}: untouched`);
+			assert.equal(row.staged, undefined, `${node.hostname}: nothing was staged`);
+		}
 		assert.equal(
 			await lockStatus(nodes[0], 'stray-' + Date.now()),
 			503,
@@ -151,10 +163,8 @@ suite('record_lock_apply_homes: bootstrap and refusals on a three-node cluster',
 		assert.match(body.error, /not every named node answered/);
 		assert.ok(body.nodes[names[2]].survey.error, JSON.stringify(body.nodes[names[2]]));
 		for (const name of names) assert.equal(body.nodes[name].stage, undefined, 'nothing was staged');
-		assert.equal(
-			await lockStatus(nodes[1], 'unreachable-' + Date.now()),
-			200,
-			'the live node still serves generation 1'
-		);
+		const row = await currentRow(nodes[1]);
+		assert.equal(row.active?.generation, 1, 'the live node still holds generation 1');
+		assert.equal(row.staged, undefined);
 	});
 });

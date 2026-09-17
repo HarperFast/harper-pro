@@ -241,3 +241,13 @@ export function waitForProvableDrain(nodes) {
 		{ timeoutMs: 420_000, pollMs: 5_000, description: 'every node to be able to prove a drain' }
 	);
 }
+
+/** This node's own durable row, as `record_lock_propose_homes` reports it: what a stage or activate wrote here. */
+export async function currentRow(node) {
+	const proposal = await sendOperation(node, {
+		operation: 'record_lock_propose_homes',
+		database: DB,
+		authorization: node.admin,
+	});
+	return proposal.current;
+}
