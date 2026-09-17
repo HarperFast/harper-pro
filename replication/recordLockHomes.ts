@@ -51,6 +51,11 @@ export interface RecordLockGenerationState {
 	digest: string;
 	/** Set only on `staged`. Backstop only — see `MIN_DRAIN_BACKSTOP_MS` below. */
 	stagedAt?: number;
+	/**
+	 * Set only on `staged`: §4.3's `homes(g) ∪ homes(g+1)`. Staging retracts `active`, so this is the
+	 * only place a staged row still names the ring it stopped serving (harper-pro#862).
+	 */
+	quiesce?: string[];
 }
 
 export interface RecordLockHomesRow {
@@ -192,6 +197,7 @@ const stageSchema = Joi.object({
 	database: Joi.string().required(),
 	generation: Joi.number().required(),
 	homes: Joi.array().required(),
+	quiesce: Joi.array().required(),
 });
 
 /**
@@ -216,7 +222,8 @@ export function planStage(
 	generation: number,
 	homes: string[],
 	digest: string,
-	now: number = Date.now()
+	now: number = Date.now(),
+	quiesce?: string[]
 ): StagePlan {
 	const floor = Math.max(
 		existing?.active?.generation ?? 0,
@@ -224,11 +231,33 @@ export function planStage(
 		existing?.highestActedOn ?? 0
 	);
 	if (existing?.staged?.generation === generation) {
-		if (existing.staged.digest === digest) return { action: 'noop', staged: existing.staged };
-		return { action: 'reject', reason: `generation ${generation} is already staged with a different home set` };
+		if (existing.staged.digest !== digest)
+			return { action: 'reject', reason: `generation ${generation} is already staged with a different home set` };
+		// A row staged before `quiesce` was recorded learns its participant set from a matching re-stage;
+		// `stagedAt` is kept, since nothing about when this node stopped granting has changed.
+		if (quiesce && !existing.staged.quiesce)
+			return {
+				action: 'write',
+				row: { ...existing, staged: { ...existing.staged, quiesce }, highestActedOn: Math.max(floor, generation) },
+			};
+		return { action: 'noop', staged: existing.staged };
 	}
 	if (generation <= floor) return { action: 'reject', reason: `generation ${generation} is not greater than ${floor}` };
+	// This write erases every ring the row still names, so the transition's participant set must cover
+	// them all, or a node still serving one of them becomes invisible to a later survey.
+	const remembered = [
+		...(existing?.active?.homes ?? []),
+		...(existing?.staged?.homes ?? []),
+		...(existing?.staged?.quiesce ?? []),
+	];
+	const uncovered = remembered.filter((node) => !quiesce?.includes(node));
+	if (uncovered.length > 0)
+		return {
+			action: 'reject',
+			reason: `quiesce must include every node in the ring this node is retracting; missing ${[...new Set(uncovered)].join(', ')}`,
+		};
 	const staged: RecordLockGenerationState = { generation, homes, digest, stagedAt: now };
+	if (quiesce) staged.quiesce = quiesce;
 	return {
 		action: 'write',
 		row: {
@@ -275,8 +304,10 @@ async function stageRow(request: any): Promise<{ staged: RecordLockGenerationSta
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
 	const digest = digestOf(generation, homes);
+	validateGenerationInput(generation, request.quiesce);
+	const quiesce = canonicalizeHomes([...request.quiesce, ...homes]);
 	return withRow(database, async (existing) => {
-		const plan = planStage(existing, database, generation, homes, digest);
+		const plan = planStage(existing, database, generation, homes, digest, Date.now(), quiesce);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);
 		if (plan.action === 'noop') {
 			// Idempotent retry, not a genuine transition — but the PRIOR call may have durably written

@@ -77,6 +77,7 @@ import {
 } from '../core/resources/replicatedApplyFailure.ts';
 import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
+import './recordLockApply.ts';
 
 // Slots 29..31 of the 32-slot per-(database, peer) status buffer (`getReplicationSharedStatus`);
 // 0..28 are taken (13..28 by the R4 fire-classification counters, harper-pro#431). 29 is the
@@ -752,6 +753,11 @@ export interface RecordLockDatabaseStats {
 	freshness?: FreshnessStats;
 	/** `origin:table` pairs with a recorded replication hole; cluster locks fail closed on them. */
 	poisoned?: string[];
+	/**
+	 * Milliseconds until every coordinator on the coordinating thread can prove a drain (core's
+	 * `unprovenOwnershipMs`), 0 once it can; absent while the database has no coordinator to attest from.
+	 */
+	unprovenMs?: number;
 }
 
 /** Summed `LockCoordinator.stats` over the database's tables on this thread. */
@@ -761,11 +767,15 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 	const total: RecordLockDatabaseStats = { delegations: 0, granted: 0, admitted: 0, droppedOffOwner: 0 };
 	for (const tableName in tables) {
 		let stats: RecordLockDatabaseStats | undefined;
+		let unproven: number | undefined;
 		try {
-			stats = tables[tableName]?.lockCoordinator?.stats;
+			const coordinator = tables[tableName]?.lockCoordinator;
+			stats = coordinator?.stats;
+			unproven = coordinator?.unprovenOwnershipMs?.();
 		} catch {
 			// The getter fails closed on an unusable node identity; status reporting must not.
 		}
+		if (typeof unproven === 'number') total.unprovenMs = Math.max(total.unprovenMs ?? 0, unproven);
 		if (!stats) continue;
 		total.delegations += stats.delegations;
 		total.granted += stats.granted;
@@ -1012,6 +1022,7 @@ export async function collectRecordLockStatus(
 				entry.members = stats.members;
 				entry.freshness = stats.freshness;
 				entry.poisoned = stats.poisoned;
+				entry.unprovenMs = stats.unprovenMs;
 			}
 			entry.droppedOffOwner = (entry.droppedOffOwner ?? 0) + stats.droppedOffOwner;
 		}

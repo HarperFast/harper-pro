@@ -130,8 +130,10 @@ mirroring `setNode.ts`'s shape. `operator` on every audit-bearing field is deriv
 authenticated principal (`request.hdb_user.name`), never a request-body field — a forgeable
 attribution was a round-2 finding.
 
-- **`record_lock_stage_generation`** `{ database, generation, homes[] }` — issued by the
-  operator on every node named in `homes(g) ∪ homes(g+1)`. Canonicalizes `homes[]` (sort,
+- **`record_lock_stage_generation`** `{ database, generation, homes[], quiesce[] }` — issued by the
+  operator on every node named in `homes(g) ∪ homes(g+1)`, which is what `quiesce` names (required
+  since harper-pro#862: it is persisted on the staged row, and a matching re-stage backfills it on a
+  row that lacks one). Canonicalizes `homes[]` (sort,
   dedup) before storing or hashing. Refuses `generation ≤ max(active?.generation ?? 0,
 staged?.generation ?? 0, highestActedOn)`. On success, **atomically**: computes `digest`
   (below), writes `staged = { generation, homes, digest }`, and **clears `active`** — the
@@ -355,3 +357,200 @@ the operator's act.
 | **Deeper cause**    | One orchestrating call that fans stage → wait → activate out to every node.                                                      | Deferred — needs credential delegation for a `requiresSuperUser` operation across nodes plus partial-failure semantics, and would be the same shape for every generation, not just the first. Tracked with the default-on work.             |
 | **Do less**         | Document a script that reads `cluster_status` on each node and assembles the list.                                               | Close, and what an operator can do today; the operation adds canonicalization, the digest, the current state and the bounds validation in one authenticated call, with no new authority.                                                    |
 | **Chosen**          | A read-only proposal: derive, canonicalize, hash, report — the operator still stages and activates the returned list everywhere. | Removes the typing, which was the actual ask, while leaving every authority-bearing step exactly where §4.3 already put it.                                                                                                                 |
+
+## Applying a home map across the cluster: `record_lock_apply_homes` (harper-pro#862)
+
+`record_lock_propose_homes` removed assembling the list by hand; it did not remove the N×2 loop of
+`record_lock_stage_generation` on every node in `homes(g) ∪ homes(g+1)` followed by
+`record_lock_activate_generation` on every node in `homes(g+1)`, with the operator carrying one
+identical list to each and deciding when the drain is done. This section adds the single
+operator-facing call that drives that §4.3 transition, **given an explicitly supplied list of
+expected nodes**. Everything the two rejections above established still holds: the list is stated,
+never derived, and this operation orchestrates without ever authorizing policy.
+
+**Revision history.** The planning review of the first draft returned `better-alternative-exists`,
+proposing a "manifest-backed transition" — persist `{generation, digest, homes, quiesce,
+transitionId}` on stage, return a receipt with a relative wait, and refuse an attested retry that
+stages any new participant. Adopted in part, on four concrete counterexamples against the draft
+(each recorded where the design now closes it): the attestation covering a node the same call had
+just staged; a retry with a defaulted `quiesce` losing the old ring once staging had erased `active`;
+an absolute `activateAfter` assembled from peers' clocks; and immediate activation running into the
+per-node 2 s backstop. Overruled: the `transitionId` and receipt. `(generation, digest)` already
+identifies a transition exactly — `planStage` refuses a different set at a staged generation and
+`planActivate` refuses anything but the exact staged pair — so a second identity would be one the
+planners do not check; the one field the row genuinely lacked is `quiesce`, and that is what is now
+persisted. The reviewer's self-hop objection was already met in code (the initiating node dispatches
+to itself locally; the note now says so).
+
+### The invariant this change enforces
+
+**No node stages or activates a generation this call did not verify against every node the operator
+named, and no node activates `g+1` while any node in `homes(g) ∪ homes(g+1)` is unreachable, has not
+staged it, or has neither proven quiescence nor been covered by an operator-attested drain wait that
+began after that node was staged.** The failure direction of every partial outcome is refusal: a
+half-applied call leaves some nodes quiesced (their cluster locks 503) and none double-granting.
+
+### Why the explicit list is what makes orchestration safe
+
+The rejected bootstrap derived the ring per node, and the digest check cannot save that: `homeMap()`
+iterates its own `active.homes`, so a node whose derived set is `[A]` checks no peers and serves its
+ring immediately — a digest cannot detect a participant omitted from the set being digested. When the
+operator states the set there is nothing to omit, so "ask every named node, refuse if any does not
+answer" becomes a _complete_ check, and unreachable becomes a hard failure rather than a skipped
+peer. That is the whole difference between this operation and the rejected one.
+
+### The operation
+
+`record_lock_apply_homes { database, homes[], quiesce?[], generation?, drained? }`, `requiresSuperUser`,
+`replication/recordLockApply.ts`. One apply runs at a time per database on the worker that takes the
+call (a second worker or node racing it is kept safe by the row-level planners, and the loser's retry
+succeeds by naming a higher generation); hops fan out at most 16 at a time, each under a deadline
+that also retires the pending request on the wire — the live session drops its response entry and
+the fallback connection closes its socket — so a peer that accepts and never answers cannot pin a
+socket per apply.
+
+- `homes` is the new ring, `homes(g+1)`. `quiesce` is §4.3's `homes(g) ∪ homes(g+1)` — the full set of
+  nodes that must stop granting before anything activates — and defaults to `homes`. It must be a
+  superset of `homes`; the shape is exactly what `record_lock_propose_homes` returns, so its output can
+  be passed straight in. A node in `quiesce` but not `homes` is **departing**: it is staged (so it stops
+  granting) and deliberately never activated, so it stays unable to lock, which is what leaving the
+  ring means.
+- `generation` is optional on a first call: one past the highest generation any surveyed node has acted
+  on — unless the node at that highest generation holds exactly the requested set, in which case that
+  generation is resumed, so a retry of an interrupted call continues the same transition rather than
+  opening a new one. (The list is never derived; only the number is.) It is **required** with `drained`.
+- `drained` is the operator's attestation that the drain interval has elapsed (see "Activation").
+
+**Phase 1 — survey (reads only).** Ask every node in `quiesce` for its row (`active`, `staged`,
+`highestActedOn`) and its own name; the initiating node answers itself locally, and when it is not
+itself in `quiesce` its own row is read too (reported as `initiator`, never written) — a ring the
+node taking the call serves is as much a participant as a peer's. Refuse, before anything is
+written, if:
+
+| Condition                                                                                                                               | Why it refuses                                                                                                                                                                                                                                                                                                                                                                     |
+| --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| any named node does not answer, or answers under a different name                                                                       | completeness is the point of the list; a misrouted `hdb_nodes` URL is an unanswered node. A peer too old to have `record_lock_transition` fails here, before any stage                                                                                                                                                                                                             |
+| any node reports a ring member not in `quiesce` — in `active.homes`, `staged.homes`, or the `quiesce` its `staged` row was written with | "you forgot a node that is still granting" — the residue of the second #822 objection. Staging retracts `active`, so a staged node's row no longer names the old ring; the `quiesce` persisted on stage (the adopted review point) is what still does, which is what makes a retry with a shorter list refusable                                                                   |
+| a surveyed `staged` row has no recorded `quiesce`                                                                                       | it was staged by a stage that did not name its participants (a row from before this change), so the ring it stopped serving cannot be checked against the list; the operator re-stages the same generation and set with `quiesce` on that node, which backfills it                                                                                                                 |
+| nodes disagree about `active` (two distinct `(generation, digest)`)                                                                     | two rings are being served; §4's whole-map-fails-closed rule already withholds locks on such nodes. A disagreement about `staged` is not refused here: it is judged by the next row, so an explicit higher generation supersedes two sets that two racing operators staged (otherwise the cluster would stay quiesced until someone used the per-node operations — a review point) |
+| `planStage` would reject the target on a node that is not already active at it                                                          | a staged different set for the same generation, or a generation below that node's floor; the same pure decision the per-node operation makes, run as a dry run                                                                                                                                                                                                                     |
+
+A node already `active` at exactly the target `(generation, digest)` is past the transition: it is not
+staged again (`planStage` would refuse a generation at its floor) and its activate is the idempotent
+noop. This is what lets a call interrupted between two activations be re-run unchanged.
+
+**Phase 2 — stage everywhere.** Every node in `quiesce` that is not already active at the target
+stages `(generation, homes)` with `quiesce`, which `record_lock_stage_generation` now requires and
+persists on the staged row. Each answer is that operation's result: the staged state plus `quiesced`, the drain from
+harper-pro#856. Idempotent on retry (`planStage`'s noop branch), and the noop still drains, so a retry
+re-collects evidence. A hop that fails leaves the other stages in place — more staged nodes only move
+the cluster further toward refusal — and the call reports every node's state with a 503 rather than
+activating anything.
+
+**Phase 3 — activation.** Only when every node in `quiesce` has staged the target (or was already
+active at it). `provesQuiescence()` — the drain reached the coordinating thread, was complete, and found
+nothing outstanding — is the only predicate that licenses skipping the interval, and it is checked per
+node. If it holds for every freshly staged node, the call waits out `MIN_DRAIN_BACKSTOP_MS` from the last
+stage response (the per-node backstop would otherwise refuse an activate that lands within 2 s of that
+node's own stage — a review point) and activates `homes`. Otherwise it does **not** activate: it returns
+`outcome: 'staged'`, the per-node drain results, and `retryAfterMs` — the drain interval, to be measured
+by the operator from receiving the response and never assembled from node clocks (a review point: an
+absolute time from a node whose clock is behind is already past). The second call carries the reported
+`generation` and `drained: true`. It re-surveys, re-stages (noops that drain again), and then activates
+whether or not the drain proves — **but only for nodes that were already staged at the target when
+this call surveyed them.** A node this call had to stage has had no interval at all, so the attestation
+cannot cover it (the reviewer's counterexample: A and B staged, C's stage failed, the wait passes, the
+retry stages C, and C may still hold an old delegation); the call reports `staged` with a fresh
+`retryAfterMs` instead. The attestation is not a new authority: it is exactly the external wall-clock
+wait §4.3 always made the operator's job, carried on the call — and it has to exist, because the
+fallback is otherwise unreachable through this operation. Core's `unprovenOwnershipMs`
+(`recordLockCoordinator.ts`) makes a freshly built coordinator unable to prove anything for a full
+lease, and a database nothing has locked has no coordinator to attest from at all. A single HTTP
+request never holds for the interval.
+
+**Retry contract.** The same call, unchanged (plus `generation` and `drained: true` after a wait), is
+safe to repeat from any state this operation can leave behind, and completes the transition:
+
+| State after an interrupted call        | What the retry does                                                                                                                            |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| nothing staged (refused at survey)     | nothing was written; fix the list and call again                                                                                               |
+| some nodes staged, some not            | survey allows it (staged rows all equal the target); stages the rest; noops re-drain the first; an attestation does not cover the newly staged |
+| all staged, none active                | noops everywhere, then activates if proven or attested                                                                                         |
+| some active at the target, some staged | already-active nodes skip the stage and noop the activate; the rest complete                                                                   |
+| all active                             | every phase noops; `outcome: 'activated'`                                                                                                      |
+
+Every response and every error body carries `nodes`, one entry per node in `quiesce`, with what each
+phase found or did on it (`survey`, `stage`, `activate`, each with its own `error` when the hop failed) —
+never a bare boolean. Refusals are 409 (policy) or 503 (unreachable, or a hop failed after staging began);
+the error body is the same report. Two operators applying concurrently from different nodes cannot
+double-grant: each node's `planStage` refuses a second set at the same generation, so one of them
+reports `incomplete` and re-runs.
+
+### Auth for the hop
+
+`sendOperationToNode` and the live subscription session both connect with mTLS, so a peer authenticates
+the caller as a **node principal**, not as `super_user`. The operator's credentials are never forwarded.
+Instead a peer-callable operation, `record_lock_transition { database, action: survey | stage |
+activate, generation, homes, quiesce, digest }`, is accepted only from a node principal — the same
+`principalNodeName` gate `record_lock_delegate` / `record_lock_recall` / `record_lock_barrier` use — and
+its handler **re-validates locally before writing**: the generation and sets through the shared
+validator, the digest by recomputing it and refusing a mismatch, its own place in the transition (it
+stages only as a node named in `quiesce`, activates only as a member of `homes` — so a misdirected
+activate can never turn a departing node back into a granter), and its own row through the same
+`planStage` / `planActivate` decisions the per-node operations run. The principal relays a proposal
+each node independently verifies; it never authorizes policy.
+
+One fact found while tracing this, worth recording because it changes what the gate is _for_:
+`replicationConnection.ts` dispatches an inbound operation as `server.operation(data, { user },
+!isAuthorizedNode)`, and a caller with an `hdb_nodes` row bypasses `verifyPerms` entirely — so a node
+principal could already invoke the `requiresSuperUser` per-node operations over the wire. The
+peer-callable operation is therefore not what lets a peer write; it is what keeps a `super_user` HTTP
+caller from driving the relay under a node's name (`principalNodeName` refuses anyone not in
+`server.nodes`), and its local re-validation is what keeps a peer from pushing a set this node did not
+verify. A departed-but-still-known node principal keeps that pre-existing authority; this operation
+neither widens nor narrows it, and the dispatcher's node-wide bypass is reported as a finding rather
+than changed here.
+
+### Approaches considered
+
+| Axis                       | Candidate                                                                                                                                                                                                                                                                                                                         | Ruling                                                                                                                                                                                                                                                                                                                                 |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Different layer**        | Orchestrate outside Harper: a script or CLI that authenticates to every node and drives the per-node operations, with a read-only survey added.                                                                                                                                                                                   | Valid as a manual fallback, and the per-node operations stay for exactly that. Not chosen because it cannot express "unreachable is a hard failure" for a node the script's credentials cannot reach, cannot persist the participant set anywhere the survey can find it again, and carries the operator's secret to N nodes per call. |
+| **Deeper cause**           | Derive the set (from `hdb_nodes`, or by agreement), so no list is needed.                                                                                                                                                                                                                                                         | Rejected twice already, above, with the mechanism recorded: a digest cannot detect an omitted participant, and no local state proves the absence of prior authority. Not reopened.                                                                                                                                                     |
+| **Do less**                | Forward the operator's credentials per hop and reuse the existing `requiresSuperUser` operations unchanged.                                                                                                                                                                                                                       | Rejected: the operator's secret in flight to N peers per call is a new exposure for no gain, and — the fact above — the hop is authenticated as a node principal anyway, so what actually has to exist is the receiving node's own re-validation, not a forwarded permission.                                                          |
+| **Do less**                | Stage-and-activate in one call with a fixed wait, no drain evidence.                                                                                                                                                                                                                                                              | Rejected: holds an HTTP request for ~6 minutes, and the drain (#856/#861) already exists to make that wait unnecessary in the planned case.                                                                                                                                                                                            |
+| **Reviewer's alternative** | A manifest-backed transition: persist `{generation, digest, homes, quiesce, transitionId}`, return a receipt, refuse an attested retry that staged anything new.                                                                                                                                                                  | Adopted except the identifier (see the revision history): `quiesce` is persisted on the staged row, the wait is relative, the attestation covers only nodes already staged at survey. A `transitionId` would be a second identity `planStage`/`planActivate` never check; `(generation, digest)` is already exact.                     |
+| **Chosen**                 | One `super_user` call: survey → refuse on any incompleteness → stage everywhere (persisting `quiesce`) → activate immediately on proof, else report a relative wait and let an attested second call finish what was already staged. A node-principal peer operation that re-validates, including its own place in the transition. | The only shape that makes "unreachable is a hard failure" expressible while keeping every authority-bearing decision on the node that owns the row.                                                                                                                                                                                    |
+
+### Not in scope
+
+A survey-only dry run (`plan: true`) is cheap — phase 1 is already factored as a pure decision over
+the survey — but it changes the operation's contract and is left for the task owner to rule on.
+Narrowing the outage to only the keys whose home moves remains the open lever on harper-pro#856.
+`record_lock_propose_homes` stays the read-only helper that suggests a list. `homeMap()`, the
+freshness barrier and the poison rules are untouched; nothing here runs on a lock path.
+
+### Testing
+
+- Unit (`recordLockApply.test.mjs`): the survey decision — unreachable, wrong self-name, an unlisted
+  ring member including one only a staged row's persisted `quiesce` still names or one the initiating
+  node's own row names, a staged row with no recorded participants, active disagreement, two raced
+  staged sets superseded by an explicit generation, resume of an in-flight generation, already-active
+  nodes skipping the stage; a hop that never answers failing at its deadline; the activation decision — proof on every node activates, one
+  unproven node withholds with a relative wait, the attestation covers only nodes already staged at
+  survey; the orchestrator over fake peers — no stage is sent after a refusal, departing nodes are
+  staged and never activated, a hop failure mid-stage or mid-activate reports every node and the retry
+  completes, an attested call that staged a node itself reports `staged` again; the peer operation —
+  403 without a node principal, a digest mismatch refuses, a node not named in `quiesce` refuses to
+  stage and one outside `homes` refuses to activate, and the write goes through the per-node planners.
+- Cluster integration, two files so each shards on its own (both wait out core's lease once, ~6
+  minutes, to reach a provable drain; the wait is setup, not the outage). `recordLockApplyHomes.test.mjs`:
+  one call, no attestation, bootstraps generation 1 on a fresh three-node cluster whose coordinators
+  can prove, and locks work with no per-node loop; refusal before staging on an unlisted ring member,
+  a staged mismatch, and a stopped node. `recordLockApplyRetry.test.mjs`: a call without `drained` on a
+  cluster that cannot prove reports `staged` with `retryAfterMs` and locks are 503 until the attested
+  call; a failure injected between stage and activate leaves every node staged and refusing, and the
+  same call from another node completes it; an attested call that had to stage a node itself reports
+  `staged` again; the peer hop refuses an operator caller; a topology change activates in seconds once
+  every node proves, with the departing node staged and never activated; a list that omits the node
+  taking the call, or the ring a staged node was drained for, is refused.

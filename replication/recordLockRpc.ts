@@ -35,6 +35,7 @@ import {
 } from '../core/resources/recordLockCoordinator.ts';
 import { getRepairConnectionsForDB, sendOperationToNode } from './replicator.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
+import type { TransitionOperation } from './recordLockApply.ts';
 
 export const DELEGATE_OPERATION = 'record_lock_delegate';
 export const RECALL_OPERATION = 'record_lock_recall';
@@ -109,21 +110,22 @@ export interface BarrierOperation {
 export async function sendRecordLockOperation(
 	nodeName: string,
 	database: string,
-	operation: DelegateOperation | RecallOperation | BarrierOperation
+	operation: DelegateOperation | RecallOperation | BarrierOperation | TransitionOperation,
+	timeoutMs?: number
 ): Promise<any> {
 	for (const connection of getRepairConnectionsForDB(database)) {
 		if (connection.nodeName !== nodeName) continue;
 		const session = connection.liveSession;
-		if (session?.sendOperation) return session.sendOperation({ ...operation });
+		if (session?.sendOperation) return session.sendOperation({ ...operation }, timeoutMs);
 	}
 	const node = (server.nodes ?? []).find((candidate: any) => candidate?.name === nodeName);
 	if (!node?.url) throw new Error(`no connection or hdb_nodes row for ${nodeName}`);
-	return sendOperationToNode(node, { ...operation });
+	return sendOperationToNode(node, { ...operation }, timeoutMs === undefined ? undefined : { timeoutMs });
 }
 
 // ---- receive side ------------------------------------------------------------------------------
 
-function principalNodeName(request: any): string | undefined {
+export function principalNodeName(request: any): string | undefined {
 	// `hdb_user` is the principal the connection's authentication resolved and the operation
 	// dispatcher attached. Nothing else on the request is trusted for identity: a body field such as
 	// `user` is caller-supplied and would let anyone name a known node and mint or clear delegations.

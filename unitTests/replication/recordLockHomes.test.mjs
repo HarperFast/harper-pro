@@ -90,10 +90,16 @@ describe('planStage', () => {
 			highestActedOn: 1,
 			fenced: [],
 		};
-		const plan = planStage(existing, 'db', 2, ['a', 'c'], digest2, T);
+		const plan = planStage(existing, 'db', 2, ['a', 'c'], digest2, T, ['a', 'c']);
 		assert.strictEqual(plan.action, 'write');
 		assert.strictEqual(plan.row.active, undefined, 'staging retracts active in the same write');
-		assert.deepStrictEqual(plan.row.staged, { generation: 2, homes: ['a', 'c'], digest: digest2, stagedAt: T });
+		assert.deepStrictEqual(plan.row.staged, {
+			generation: 2,
+			homes: ['a', 'c'],
+			digest: digest2,
+			stagedAt: T,
+			quiesce: ['a', 'c'],
+		});
 	});
 
 	it('is idempotent for an identical re-stage — the original stagedAt is not the identity, digest and generation are', () => {
@@ -141,6 +147,57 @@ describe('planStage', () => {
 		};
 		const plan = planStage(existing, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']));
 		assert.strictEqual(plan.action, 'reject');
+	});
+});
+
+describe('planStage: the participant set', () => {
+	const T = 1_700_000_000_000;
+	it('must cover every ring the row still remembers, or the node it omits becomes invisible to a later survey', () => {
+		const active = {
+			database: 'db',
+			active: { generation: 1, homes: ['a', 'b', 'c'], digest: 'x' },
+			highestActedOn: 1,
+			fenced: [],
+		};
+		const short = planStage(active, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T, ['a', 'b']);
+		assert.strictEqual(short.action, 'reject');
+		assert.match(short.reason, /quiesce must include every node in the ring this node is retracting; missing c/);
+		assert.strictEqual(
+			planStage(active, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T, ['a', 'b', 'c']).action,
+			'write'
+		);
+		// A previous, still-staged transition's participants count too: they may still serve the ring it retracted.
+		const staged = {
+			database: 'db',
+			staged: { generation: 2, homes: ['a', 'b'], digest: digestOf(2, ['a', 'b']), quiesce: ['a', 'b', 'c'] },
+			highestActedOn: 2,
+			fenced: [],
+		};
+		const forgetful = planStage(staged, 'db', 3, ['a'], digestOf(3, ['a']), T, ['a']);
+		assert.strictEqual(forgetful.action, 'reject');
+		assert.match(forgetful.reason, /missing b, c/);
+		assert.strictEqual(planStage(staged, 'db', 3, ['a'], digestOf(3, ['a']), T, ['a', 'b', 'c']).action, 'write');
+		// No participant set at all is never enough once the row names a ring.
+		assert.strictEqual(planStage(active, 'db', 2, ['a', 'b', 'c'], digestOf(2, ['a', 'b', 'c']), T).action, 'reject');
+	});
+	it('is stored with the staged state, and a matching re-stage backfills a row that lacks one', () => {
+		const first = planStage(undefined, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T, ['a', 'b', 'c']);
+		assert.strictEqual(first.action, 'write');
+		assert.deepStrictEqual(first.row.staged.quiesce, ['a', 'b', 'c']);
+		const legacy = {
+			database: 'db',
+			staged: { generation: 2, homes: ['a', 'b'], digest: digestOf(2, ['a', 'b']), stagedAt: T },
+			highestActedOn: 2,
+			fenced: [],
+		};
+		const backfilled = planStage(legacy, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T + 5, ['a', 'b', 'c']);
+		assert.strictEqual(backfilled.action, 'write');
+		assert.deepStrictEqual(backfilled.row.staged, { ...legacy.staged, quiesce: ['a', 'b', 'c'] }, 'stagedAt is kept');
+		// Once recorded, the same re-stage is the idempotent noop again.
+		assert.strictEqual(
+			planStage(backfilled.row, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T + 9, ['a', 'b', 'c']).action,
+			'noop'
+		);
 	});
 });
 
@@ -333,6 +390,7 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 			database: 'drain1',
 			generation: 1,
 			homes: ['a'],
+			quiesce: ['a'],
 			hdb_user: { name: 'op' },
 		});
 		assert.deepStrictEqual(quiesced, drained);
@@ -343,7 +401,13 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 		setHomesDrainReader(async () => {
 			throw new Error('the drain did not reach the coordinating worker');
 		});
-		const result = await stageGeneration({ database: 'drain2', generation: 1, homes: ['a'], hdb_user: { name: 'op' } });
+		const result = await stageGeneration({
+			database: 'drain2',
+			generation: 1,
+			homes: ['a'],
+			quiesce: ['a'],
+			hdb_user: { name: 'op' },
+		});
 		assert.strictEqual(result.staged.generation, 1, 'the stage itself still succeeded');
 		assert.match(result.quiesced.error, /did not reach the coordinating worker/);
 	});
@@ -353,6 +417,7 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 			database: 'drain3',
 			generation: 1,
 			homes: ['a'],
+			quiesce: ['a'],
 			hdb_user: { name: 'op' },
 		});
 		assert.ok(quiesced.error, 'an unwired drain must not read as an empty outstanding list');
