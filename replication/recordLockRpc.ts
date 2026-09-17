@@ -516,18 +516,26 @@ export function failRelayAcquiresForDatabase(database: string): void {
 // that same port so it cannot be misrouted after an ownership change.
 export function handleAcquireReply(message: any, port: any): void {
 	const pending = pendingAcquires.get(message.requestId);
+	const senderThreadId = port?.threadId;
+	// Only the thread the request was sent to can answer it. Request ids are a plain per-worker
+	// sequence and a worker reaches the ports it holds, so without this a sibling could settle another
+	// worker's acquire with a round no cluster admission backs.
+	const wrongSender = pending !== undefined && senderThreadId !== undefined && senderThreadId !== pending.ownerThreadId;
 	// A grant from a thread that no longer coordinates the database (the owner changed while this
 	// acquire was in flight) is stale — the delegation behind it died with that owner. Hand it back and
-	// let the caller retry against the new owner, rather than install a handle no delegation backs.
+	// let the caller retry against the new owner, rather than install a handle no delegation backs. The
+	// database is the one the request named, never the reply payload the sender controls.
 	const staleOwner =
-		message.round && port?.threadId !== undefined && port.threadId !== ownership.ownerThreadId?.(message.database);
-	if (!pending || pending.settled || staleOwner) {
+		message.round &&
+		senderThreadId !== undefined &&
+		senderThreadId !== ownership.ownerThreadId?.(pending ? pending.database : message.database);
+	if (!pending || pending.settled || wrongSender || staleOwner) {
 		// The caller already timed out, or the owner changed: the owner minted an admission nobody will
 		// use — hand it back to the GRANTING owner (this reply's source thread and session), not the
 		// current owner, so it actually drops rather than being rejected on a session mismatch.
-		if (message.round && message.session && port?.threadId !== undefined) {
+		if (message.round && message.session && senderThreadId !== undefined) {
 			try {
-				sendToThread(port.threadId, {
+				sendToThread(senderThreadId, {
 					type: RELEASE_REQUEST,
 					database: message.database,
 					table: message.table,
@@ -539,12 +547,12 @@ export function handleAcquireReply(message: any, port: any): void {
 				logger.debug?.('could not hand a stale record lock grant back to its owner', error);
 			}
 		}
-		if (pending && !pending.settled && staleOwner) {
+		if (pending && !pending.settled && !wrongSender && staleOwner) {
 			pending.settled = true;
 			clearTimeout(pending.timer);
 			pendingAcquires.delete(message.requestId);
 			pending.resolve({
-				error: { message: `the record lock owner for ${message.database} changed during the acquire`, statusCode: 503 },
+				error: { message: `the record lock owner for ${pending.database} changed during the acquire`, statusCode: 503 },
 			});
 		}
 		return;

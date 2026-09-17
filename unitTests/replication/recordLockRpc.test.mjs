@@ -27,6 +27,7 @@ import {
 } from '#src/replication/recordLockRpc';
 
 const OWNER_THREAD = 8101;
+const SIBLING_THREAD = 8102;
 /**
  * Far beyond what these tests need to settle, so a settle is always a guard's doing — but short
  * enough that a regression which drops a guard fails on the acquire's own timeout instead of hanging.
@@ -34,11 +35,11 @@ const OWNER_THREAD = 8101;
 const WAIT_MS = 2_000;
 
 /** Main's handle on the owner worker: enough of one for `confer` and the owner-exit watch. */
-function fakeOwnerWorker() {
+function fakeOwnerWorker(threadId = OWNER_THREAD) {
 	const listeners = new Map();
 	return {
 		name: 'http',
-		threadId: OWNER_THREAD,
+		threadId,
 		postMessage() {},
 		once(event, listener) {
 			listeners.set(event, listener);
@@ -50,10 +51,10 @@ function fakeOwnerWorker() {
 }
 
 /** This thread's mesh port to the owner worker, as `sendToThread` resolves it. */
-function fakeOwnerPort() {
+function fakeOwnerPort(threadId = OWNER_THREAD) {
 	const posted = [];
 	return {
-		threadId: OWNER_THREAD,
+		threadId,
 		posted,
 		postMessage(message) {
 			posted.push(message);
@@ -126,6 +127,53 @@ describe('relaying a lock() to the coordinating worker', () => {
 			'granting-owner',
 			'stamped with the GRANTING session, so it drops rather than being rejected by the successor'
 		);
+	});
+
+	it('ignores a grant from a thread the acquire was not sent to', async () => {
+		const { acquiring, request } = acquireAgainstOwner('rpc-forged');
+		// A sibling that coordinates its OWN database, so only the request's owner id can tell the two
+		// apart: the reply names a database this sender does legitimately own.
+		const sibling = fakeOwnerPort(SIBLING_THREAD);
+		globalThis.threads.push(sibling);
+		recordLockOwnerFor('rpc-forged-sibling', [fakeOwnerWorker(SIBLING_THREAD)]);
+		try {
+			handleAcquireReply(
+				{
+					requestId: request.requestId,
+					database: 'rpc-forged-sibling',
+					table: 'Counter',
+					key: 'k',
+					round: { admissionId: 99, mintedMono: 0 },
+					session: 'sibling-session',
+				},
+				sibling
+			);
+			assert.strictEqual(
+				sibling.releases().at(-1)?.admissionId,
+				99,
+				'the grant is handed straight back to the sibling that minted it'
+			);
+			handleAcquireReply(
+				{
+					requestId: request.requestId,
+					database: 'rpc-forged',
+					table: 'Counter',
+					key: 'k',
+					round: { admissionId: 12, mintedMono: 0 },
+					session: 'owner-session',
+				},
+				port
+			);
+			assert.strictEqual(
+				(await acquiring).admissionId,
+				12,
+				"the acquire stays live for the owner it addressed, and settles on that owner's round"
+			);
+		} finally {
+			releaseRecordLockOwner('rpc-forged-sibling');
+			const index = globalThis.threads.indexOf(sibling);
+			if (index !== -1) globalThis.threads.splice(index, 1);
+		}
 	});
 
 	it('stamps a release with the session the owner minted the admission under', async () => {
