@@ -662,14 +662,19 @@ export async function handleAcquireRequest(message: any, port: any): Promise<voi
 			});
 			return () => revokeRemoteHandle(database, table, grantedRound, leaseMs, port, origin);
 		});
-		// If the grant reply cannot be delivered, the caller will never install or release this admission —
-		// release it here rather than let the owner hold it to its lease against a ghost the caller cannot name.
-		if (!reply({ round, session: OWNER_SESSION })) {
+		// Ownership can be given up across the await, after `forgetOwnerAdmissionsForDatabase` already swept.
+		// The successor's coordinator starts empty, so this grant backs nothing and must not reach the
+		// caller. Disposed exactly like an undeliverable reply: if the caller will never install or release
+		// this admission, release it here rather than hold it to its lease against a ghost.
+		const lostOwnership = !ownership.ownsDatabase(database);
+		if (lostOwnership || !reply({ round, session: OWNER_SESSION })) {
 			const admission = ownerAdmissions.get(admissionSessionKey(database, table, round.admissionId));
 			if (admission) {
 				ownerAdmissions.delete(admissionSessionKey(database, table, round.admissionId));
 				releaseOwnerAdmission(admission);
 			}
+			if (lostOwnership)
+				reply({ error: { message: `this worker no longer coordinates ${database}`, statusCode: 503 } });
 		}
 	} catch (error: any) {
 		reply({ error: { message: error?.message ?? 'record lock acquire failed', statusCode: error?.statusCode ?? 503 } });

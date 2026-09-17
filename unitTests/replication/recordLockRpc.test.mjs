@@ -298,6 +298,27 @@ describe('the owner side will only take an admission from the worker it belongs 
 		assert.deepStrictEqual(released, [], 'the bookkeeping went with the ownership rather than leaking');
 	});
 
+	it('grants nothing once ownership is lost while the admission is being minted', async () => {
+		ownedDatabase = 'owner-side-lost-mid-acquire';
+		setMainIsWorker(true);
+		recordLockOwnerFor(ownedDatabase, []);
+		const granting = coordinator.acquireForRelay;
+		coordinator.acquireForRelay = async (...args) => {
+			releaseRecordLockOwner('owner-side-lost-mid-acquire');
+			return granting(...args);
+		};
+		const posted = [];
+		await handleAcquireRequest(
+			{ requestId: 1, database: ownedDatabase, table: 'Counter', key: 'k', leaseMs: 60_000, waitMs: 1_000 },
+			{ threadId: HOLDER, postMessage: (message) => posted.push(message) }
+		);
+		ownedDatabase = undefined;
+		const reply = posted.find((message) => message.type === 'record-lock-acquire-reply');
+		assert.strictEqual(reply?.round, undefined, 'a grant from a thread that stopped coordinating is not handed out');
+		assert.strictEqual(reply?.error?.statusCode, 503, 'the caller retries against the successor');
+		assert.deepStrictEqual(released, [55], 'and the admission is released rather than held to its lease');
+	});
+
 	it('ignores a revoke ack from a thread that does not hold the handle', async () => {
 		const { posted } = await admissionHeldByHolder('owner-side-revoke');
 		let fenced = false;
