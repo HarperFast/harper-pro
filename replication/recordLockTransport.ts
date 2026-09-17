@@ -74,7 +74,7 @@ import {
 	acquireOnOwnerRelay,
 	clearRelaySessionsForDatabase,
 	failRelayAcquiresForDatabase,
-	forgetOwnerAdmissionsForDatabase,
+	onRecordLockOwnershipLost,
 	quiesceOnOwner,
 	releaseOnOwnerRelay,
 	sendRecordLockOperation,
@@ -628,7 +628,7 @@ export function setRecordLockOwnership(database: string, owned: boolean): void {
 	// fresh coordinator to build, this time with `ownsCoordination()` already true from its first
 	// instant — matching the one case that keeps the waiver.
 	if (owned && !wasOwned) recreateRecordLockTransport(database);
-	else if (!owned && wasOwned) forgetOwnerAdmissionsForDatabase(database);
+	else if (!owned && wasOwned) onRecordLockOwnershipLost(database);
 }
 
 function auditStoreFor(database: string): any {

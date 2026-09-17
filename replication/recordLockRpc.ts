@@ -607,6 +607,8 @@ interface OwnerAdmission {
 }
 /** Relayed admissions this thread minted as owner, keyed by (database, table, admissionId). */
 const ownerAdmissions = new Map<string, OwnerAdmission>();
+const ownershipGenerations = new Map<string, number>();
+const ownershipGeneration = (database: string) => ownershipGenerations.get(database) ?? 0;
 let nextRevokeId = 1;
 const pendingRevokeAcks = new Map<number, { threadId: number; settle: () => void }>();
 
@@ -635,6 +637,7 @@ export async function handleAcquireRequest(message: any, port: any): Promise<voi
 	// (an unhandled rejection would take the worker down).
 	if (port?.threadId === undefined) return;
 	const origin = port.threadId;
+	const generation = ownershipGeneration(database);
 	const reply = (payload: any) => {
 		try {
 			port.postMessage({ type: ACQUIRE_REPLY, requestId, database, table, key, ...payload });
@@ -662,11 +665,13 @@ export async function handleAcquireRequest(message: any, port: any): Promise<voi
 			});
 			return () => revokeRemoteHandle(database, table, grantedRound, leaseMs, port, origin);
 		});
-		// Ownership can be given up across the await, after `forgetOwnerAdmissionsForDatabase` already swept.
-		// The successor's coordinator starts empty, so this grant backs nothing and must not reach the
-		// caller. Disposed exactly like an undeliverable reply: if the caller will never install or release
-		// this admission, release it here rather than hold it to its lease against a ghost.
-		const lostOwnership = !ownership.ownsDatabase(database);
+		// Ownership can be given up across the await, after `onRecordLockOwnershipLost` already swept. The
+		// coordinator that replaces this one starts empty, so this grant backs nothing and must not reach
+		// the caller. The generation, not the boolean, is what makes that check sound: a lose→regain cycle
+		// hands the database back to THIS thread with a fresh coordinator, and the caller cannot tell the
+		// two apart — same thread id, same process-wide session. Disposed exactly like an undeliverable
+		// reply: release the admission rather than hold it to its lease against a ghost.
+		const lostOwnership = !ownership.ownsDatabase(database) || ownershipGeneration(database) !== generation;
 		if (lostOwnership || !reply({ round, session: OWNER_SESSION })) {
 			const admission = ownerAdmissions.get(admissionSessionKey(database, table, round.admissionId));
 			if (admission) {
@@ -770,12 +775,15 @@ onThreadExit((threadId: number) => {
 });
 
 /**
- * This thread is no longer the coordinating worker for a database, without having exited. Same rule as
- * the exit path above: forget the bookkeeping, do not release — the callers fenced their handles and
- * dropped their owner sessions when they learned the owner changed, so no release will ever arrive to
- * collect these entries, and the coordinator's lease is what retires the admission itself.
+ * This thread is no longer the coordinating worker for a database, without having exited. Forget the
+ * bookkeeping, do not release — the callers fenced their handles and dropped their owner sessions when
+ * they learned the owner changed, so no release will ever arrive to collect these entries, and the
+ * coordinator's lease is what retires the admission itself. The generation bump is what a lose→regain
+ * cycle leaves behind: the thread id and `OWNER_SESSION` are identical across it, so it is the only
+ * thing either side can use to tell one coordinator's grants from its successor's.
  */
-export function forgetOwnerAdmissionsForDatabase(database: string): void {
+export function onRecordLockOwnershipLost(database: string): void {
+	ownershipGenerations.set(database, ownershipGeneration(database) + 1);
 	for (const [admissionKey, admission] of ownerAdmissions) {
 		if (admission.database !== database) continue;
 		ownerAdmissions.delete(admissionKey);

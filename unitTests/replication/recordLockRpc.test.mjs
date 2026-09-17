@@ -15,7 +15,11 @@ import { performance } from 'node:perf_hooks';
 // recordLockTransport first, as every production load order does: it installs recordLockRpc's
 // ownership readers at module scope, and reaching recordLockRpc first walks the replicator cycle back
 // into that install before this module's own state exists.
-import { recordLockOwnerFor, releaseRecordLockOwner } from '#src/replication/recordLockTransport';
+import {
+	recordLockOwnerFor,
+	releaseRecordLockOwner,
+	setRecordLockOwnership,
+} from '#src/replication/recordLockTransport';
 import { setMainIsWorker } from '#js/core/server/threads/manageThreads';
 import {
 	acquireOnOwnerRelay,
@@ -298,13 +302,17 @@ describe('the owner side will only take an admission from the worker it belongs 
 		assert.deepStrictEqual(released, [], 'the bookkeeping went with the ownership rather than leaking');
 	});
 
-	it('grants nothing once ownership is lost while the admission is being minted', async () => {
+	it('grants nothing once the coordinator is replaced while the admission is being minted', async () => {
 		ownedDatabase = 'owner-side-lost-mid-acquire';
 		setMainIsWorker(true);
 		recordLockOwnerFor(ownedDatabase, []);
 		const granting = coordinator.acquireForRelay;
 		coordinator.acquireForRelay = async (...args) => {
-			releaseRecordLockOwner('owner-side-lost-mid-acquire');
+			// Lose AND regain: the round-robin can hand the database straight back to this thread, and the
+			// caller sees the same thread id and the same process-wide session either way, so only the
+			// coordinator generation distinguishes a grant from the coordinator that is gone.
+			setRecordLockOwnership('owner-side-lost-mid-acquire', false);
+			setRecordLockOwnership('owner-side-lost-mid-acquire', true);
 			return granting(...args);
 		};
 		const posted = [];
@@ -312,9 +320,14 @@ describe('the owner side will only take an admission from the worker it belongs 
 			{ requestId: 1, database: ownedDatabase, table: 'Counter', key: 'k', leaseMs: 60_000, waitMs: 1_000 },
 			{ threadId: HOLDER, postMessage: (message) => posted.push(message) }
 		);
-		ownedDatabase = undefined;
+		// The regain above left this thread owning it again, outside what the harness releases.
+		setRecordLockOwnership('owner-side-lost-mid-acquire', false);
 		const reply = posted.find((message) => message.type === 'record-lock-acquire-reply');
-		assert.strictEqual(reply?.round, undefined, 'a grant from a thread that stopped coordinating is not handed out');
+		assert.strictEqual(
+			reply?.round,
+			undefined,
+			'a grant minted under a coordinator that has since been replaced is not handed out'
+		);
 		assert.strictEqual(reply?.error?.statusCode, 503, 'the caller retries against the successor');
 		assert.deepStrictEqual(released, [55], 'and the admission is released rather than held to its lease');
 	});
