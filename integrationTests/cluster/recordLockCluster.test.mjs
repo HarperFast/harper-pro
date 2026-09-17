@@ -10,9 +10,13 @@
  * the delegation-level `recordLocks` capability is not a ring member and fails a cluster lock closed.
  *
  * Most suites run one http worker per node (`threads.count: 1`) to keep the cross-node behavior the
- * focus. The final suite runs one node at `threads.count: 3` beside a single-worker peer, so a lock()
- * served on a non-owner worker relays its admission to the coordinating one and a real cross-node
- * recall fences a relayed handle (harper-pro#852) — the discriminating path a lone node cannot reach.
+ * focus. The final suite runs one node at `threads.count: 3` beside a single-worker peer, and proves
+ * two things a lone node cannot: that a lock() served on a non-owner worker relays its admission to the
+ * coordinating one rather than answering 503, and that exclusion still holds across the node boundary
+ * while it does (harper-pro#852). It does NOT prove that a cross-node recall fenced a RELAYED handle in
+ * particular — which worker serves any given REST increment is routing-dependent, so the recall may
+ * only ever reach a handle the coordinating worker held itself. That end-to-end fence is an open
+ * coverage gap, not something these tests establish.
  *
  * The home map is now OPERATOR-AGREED (harper-pro#825): nothing locks until `bootstrapHomeMap` below
  * stages generation 1 naming every node, then activates it — `homeMap()` returns `undefined` and every

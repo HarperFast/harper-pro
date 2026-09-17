@@ -567,22 +567,29 @@ const ownerThreadByDatabase = new Map<string, number>();
 /** Fail-closed fence for every relayed handle this thread holds for a database whose coordinating
  * thread just changed (its old owner exited). Runs across the database's tables, drops the caller's
  * cached owner sessions, and fails any in-flight acquire sent to the departed owner so `lock()` retries
- * against the successor instead of waiting out its whole timeout. */
-function fenceRelayedAdmissionsForDatabase(database: string): void {
+ * against the successor instead of waiting out its whole timeout.
+ *
+ * Returns whether EVERY table fenced. A table that threw leaves a relayed handle live, and the answer is
+ * what keeps the fence ack honest: acking a partial fence would let main confer the successor over a
+ * handle that can still commit, which is the two-writer this gate exists to prevent. */
+function fenceRelayedAdmissionsForDatabase(database: string): boolean {
 	const tables = getDatabases()[database];
 	// Guard each table: resolving a table's lock coordinator can throw (an unusable node identity, or the
 	// disabled transport, which throws by design), and one throw must not abort the loop and leave the
 	// remaining tables' relayed handles live — nor escape a fence-ack path or an exit callback.
+	let fenced = true;
 	if (tables)
 		for (const tableName in tables) {
 			try {
 				fenceRelayedAdmissions(database, tableName);
 			} catch (error) {
+				fenced = false;
 				logger.warn?.(`Could not fence relayed record locks for ${database}.${tableName}`, error);
 			}
 		}
 	clearRelaySessionsForDatabase(database);
 	failRelayAcquiresForDatabase(database);
+	return fenced;
 }
 
 /**
@@ -592,11 +599,12 @@ function fenceRelayedAdmissionsForDatabase(database: string): void {
  * worker is — main is a serving thread for relayed locks too. A first assignment (no previous owner)
  * grants nothing to fence.
  */
-function updateOwnerThread(database: string, next: number | undefined): void {
+function updateOwnerThread(database: string, next: number | undefined): boolean {
 	const previous = ownerThreadByDatabase.get(database);
 	if (next === undefined) ownerThreadByDatabase.delete(database);
 	else ownerThreadByDatabase.set(database, next);
-	if (previous !== undefined && previous !== next) fenceRelayedAdmissionsForDatabase(database);
+	if (previous === undefined || previous === next) return true;
+	return fenceRelayedAdmissionsForDatabase(database);
 }
 
 export function ownsRecordLockCoordination(database: string): boolean {
@@ -885,10 +893,15 @@ if (parentPort) {
 	// can reach the owner directly. `undefined` clears it (no owner, or owner in an in-flight handoff).
 	onMessageByType('record-lock-owner-thread', (message) => {
 		if (typeof message?.database !== 'string') return;
-		updateOwnerThread(message.database, typeof message.threadId === 'number' ? message.threadId : undefined);
+		const fenced = updateOwnerThread(
+			message.database,
+			typeof message.threadId === 'number' ? message.threadId : undefined
+		);
 		// A requestId means main is waiting for this worker to confirm it has fenced its relayed handles
-		// before it lets the successor grant (harper-pro#852). The fence ran synchronously above, so ack now.
-		if (message.requestId !== undefined) {
+		// before it lets the successor grant (harper-pro#852). The fence ran synchronously above, so ack
+		// now — but only if it fenced everything: withholding the ack is what makes main's wait time out
+		// and fail the handoff closed rather than granting over a handle this worker could not fence.
+		if (message.requestId !== undefined && fenced) {
 			try {
 				parentPort!.postMessage({ type: 'record-lock-owner-thread-ack', requestId: message.requestId });
 			} catch (error) {
@@ -973,6 +986,19 @@ function confer(worker: any, databaseOrType: string, ownedOrValue: boolean | num
 	}
 }
 
+/**
+ * One counter per database, bumped by every handoff attempt and by an explicit release, so a settlement
+ * arriving late can tell whether it is still the current attempt. The PENDING_BUMP marker cannot answer
+ * that on its own: a release clears it and the next attempt re-sets it, so a stale settlement reading
+ * the marker alone acts on another attempt's state.
+ */
+const ownerHandoffAttempts = new Map<string, number>();
+function nextOwnerHandoffAttempt(database: string): number {
+	const attempt = (ownerHandoffAttempts.get(database) ?? 0) + 1;
+	ownerHandoffAttempts.set(database, attempt);
+	return attempt;
+}
+
 const ownersWithExitHandler = new WeakSet<object>();
 function watchOwnerExit(worker: any): void {
 	if (worker === MAIN_OWNER || ownersWithExitHandler.has(worker)) return;
@@ -1052,10 +1078,12 @@ const pendingOwnerFenceAcks = new Map<number, () => void>();
  * A worker that EXITS is resolved as fenced even though an in-flight async write it submitted could
  * still land. What makes that safe is the process-wide native key lock, NOT the successor's restart
  * quarantine — the argument and its one residual window are at the `onExit` handler below, and in
- * `replication/DESIGN.md`. Main fences its own relayed handles synchronously first. Main thread only.
+ * `replication/DESIGN.md`. Main fences its own relayed handles synchronously first, and a fence it could
+ * not complete fails the handoff for the same reason a worker's does. Main thread only.
  */
 function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorkers()): Promise<void> {
-	updateOwnerThread(database, undefined);
+	if (!updateOwnerThread(database, undefined))
+		return Promise.reject(new Error(`could not fence main's own relayed record lock handles for ${database}`));
 	if (workers.length === 0) return Promise.resolve();
 	return Promise.all(
 		workers.map(
@@ -1151,6 +1179,7 @@ export function recordLockOwnerFor(
 	// is live — `manageThreads.addPort` captures it the same way, for the same reason.
 	const ownerThreadId = owner === MAIN_OWNER ? undefined : owner.threadId;
 	recordLockOwners.set(database, PENDING_BUMP);
+	const attempt = nextOwnerHandoffAttempt(database);
 	// Before the successor may grant, BOTH must complete: the incarnation bump (so it cannot re-mint a
 	// token) AND every surviving worker confirming it has fenced the departed owner's relayed handles (so
 	// none can overlap the successor's first grant). Run them concurrently — the bump is a durable write,
@@ -1158,7 +1187,9 @@ export function recordLockOwnerFor(
 	Promise.all([bump(), broadcastOwnerlessAndWait(database, liveWorkers)])
 		.then(() => {
 			// Superseded while the fence/bump was in flight (another reassignment, a release) — abandon.
-			if (recordLockOwners.get(database) !== PENDING_BUMP) return;
+			// Checked by attempt rather than by the PENDING_BUMP marker, which a LATER attempt may have
+			// re-set: this one's successor was chosen against a worker set that is no longer current.
+			if (ownerHandoffAttempts.get(database) !== attempt) return;
 			// The successor was chosen before a wait that runs as long as OWNER_FENCE_ACK_TIMEOUT_MS and
 			// that counts a worker's own exit as a completed fence, so the wait can resolve on the
 			// successor dying. Conferring then strands the database on a dead thread: `watchOwnerExit`
@@ -1168,6 +1199,11 @@ export function recordLockOwnerFor(
 			assignOwner(database, owner);
 		})
 		.catch((error) => {
+			// Same supersede check as the fulfilled path, and for a sharper reason: a rejection that lands
+			// after `releaseRecordLockOwner` gave the database up would otherwise delete a newer attempt's
+			// PENDING_BUMP and then schedule a retry whose "unowned but everHadOwner" test re-assigns an
+			// owner to a database ownership was explicitly released for.
+			if (ownerHandoffAttempts.get(database) !== attempt) return;
 			// The bump failed to persist, a live worker did not confirm it fenced its relayed handles, or
 			// the successor itself exited. Either way, leave the database unowned (fail closed — a cluster
 			// lock 503s) rather than confer ownership while a stale incarnation, an unfenced handle or a
@@ -1186,6 +1222,9 @@ export function releaseRecordLockOwner(database: string): void {
 	const owner = recordLockOwners.get(database);
 	if (!owner) return;
 	recordLockOwners.delete(database);
+	// Supersede any handoff still in flight, so neither its settlement nor its retry can hand this
+	// database back an owner after it was given up on.
+	nextOwnerHandoffAttempt(database);
 	// A release racing an in-flight handoff bump: deleting the entry (rather than leaving
 	// PENDING_BUMP) is what makes the bump's own completion check see itself superseded and abandon.
 	if (owner === PENDING_BUMP) return;
@@ -1401,8 +1440,5 @@ if (!parentPort) {
 			logger.warn?.(
 				'replication.recordLocks is enabled: a cross-node delegation handoff currently guarantees exclusive admission but NOT successor freshness (harper#2542 is outstanding) — two nodes can each read the same predecessor value and both write, silently losing one update, measured at 0.05-0.15% of sections under contention (replication/RECORD_LOCK_COST_DELEGATIONS.md). Do not rely on lock() to protect a read-modify-write across nodes until that lands.'
 			);
-			// harper-pro#852 removed the former "run one http worker" warning: a cluster-scoped lock() now
-			// works uniformly on every http worker, the off-owner ones relaying their admission to the
-			// coordinating worker. `cluster_status.recordLocks[db].relayedAdmissions` reports that relay.
 		});
 }

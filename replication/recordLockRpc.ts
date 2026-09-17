@@ -379,8 +379,16 @@ const OWNER_SESSION = randomBytes(8).toString('hex');
  * subtracted its own allowance before calling, so this wait is a budget to spend, never one to add to:
  * the caller holds the native key throughout, so overshooting blocks every other worker on that key.
  * The owner is therefore asked for the wait minus this margin, and answers inside the caller's budget.
+ *
+ * The margin is capped at a QUARTER of the budget, because a flat subtraction turns a short wait into
+ * no wait at all: a `lock(id, { timeout: 200 })`, or any lock that spent most of a longer timeout on the
+ * native key first, would reach the owner with `waitMs: 0` and fail on the first contention it met —
+ * off-owner only, which is exactly the uniformity this relay exists to provide. A margin too small for
+ * the hop costs nothing new: the caller's own timer settles it as the same retryable 503, and a grant
+ * that lands after it is handed back.
  */
 const ACQUIRE_HOP_MS = 250;
+const hopMargin = (waitMs: number) => Math.min(ACQUIRE_HOP_MS, Math.floor(waitMs / 4));
 
 // ---- caller side: obtain / release an admission from the owner worker ---------------------------
 
@@ -453,7 +461,7 @@ export async function acquireOnOwnerRelay(
 				key,
 				leaseMs,
 				// The owner gets the wait minus the hop margin, so its answer lands before the timer above.
-				waitMs: Math.max(0, waitMs - ACQUIRE_HOP_MS),
+				waitMs: Math.max(0, waitMs - hopMargin(waitMs)),
 			});
 		} catch (error) {
 			logger.debug?.(`could not send a record lock acquire to the owner worker for ${database}`, error);

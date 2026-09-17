@@ -68,9 +68,12 @@ function fakeWorker(threadId) {
 		posted,
 		postMessage(message) {
 			posted.push(message);
-			// The real fence ack is a worker->main message this harness does not route; a worker confirms
-			// the ownerless fence by resolving `broadcastOwnerlessAndWait`'s per-worker wait, which it does
-			// on the worker's `exit` listener too. Fire it so a handoff's fence gate completes in the test.
+			// The real fence ack is a worker->main message, dispatched by `manageThreads` off a registered
+			// port's own 'message' event, which this harness has no way to raise. A worker resolves
+			// `broadcastOwnerlessAndWait`'s per-worker wait on `exit` as well, so fire that to complete a
+			// handoff's fence gate — every handoff below therefore travels the EXIT arm of that wait. The
+			// live `record-lock-owner-thread-ack` arm has no coverage; routing it would need a test-only
+			// entry point into main's message dispatch.
 			if (message?.type === 'record-lock-owner-thread' && message.requestId !== undefined)
 				queueMicrotask(() => listeners.get('exit')?.());
 		},
@@ -452,6 +455,29 @@ describe('recordLockOwnerFor (main thread)', () => {
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-f'], 36, 'the retried bump succeeded');
 		releaseRecordLockOwner('owner-f');
+	});
+
+	it('a handoff that fails after a release superseded it leaves the attempt that replaced it alone', async () => {
+		const dead = fakeWorker(45);
+		const live = fakeWorker(46);
+		let failSuperseded;
+		const supersededBump = () => new Promise((_, reject) => (failSuperseded = reject));
+		let resolveCurrent;
+		const currentBump = () => new Promise((resolve) => (resolveCurrent = resolve));
+		recordLockOwnerFor('owner-superseded', [dead], supersededBump);
+		recordLockOwnerFor('owner-superseded', [live], supersededBump);
+		// The database is given up on mid-handoff, then claimed again: the second attempt is the live one.
+		releaseRecordLockOwner('owner-superseded');
+		recordLockOwnerFor('owner-superseded', [live], currentBump);
+		failSuperseded(new Error('persistence failed'));
+		await new Promise((resolve) => setImmediate(resolve));
+		resolveCurrent(2);
+		await new Promise((resolve) => setImmediate(resolve));
+		// Without the per-attempt token the first rejection deletes the second attempt's PENDING_BUMP,
+		// which makes the second attempt read itself as superseded and abandon — the database ends up
+		// unowned, and only the failed attempt's 10s retry recovers it.
+		assert.strictEqual(recordLockOwnerThreadIds()['owner-superseded'], 46, 'the current attempt still lands');
+		releaseRecordLockOwner('owner-superseded');
 	});
 
 	it('moves a database off a worker that has left the live set, telling the old owner and the new one, once the bump resolves', async () => {

@@ -163,10 +163,11 @@ async function writeRow(locked: any, row: RecordLockHomesRow): Promise<void> {
 	await locked.save?.();
 }
 
-/** How long a home-map transition may hold the row lock, and how long it waits to take it. The
- * critical section is a read, a pure decision and one write — sub-millisecond — so the lease is only
- * a backstop against a storage stall, and the commit fence in `writeRow` catches a stall that outran
- * it rather than letting a stale plan land. */
+/** How long a home-map transition may hold the row lock, and how long it waits to take it. The read,
+ * the decision and the write are sub-millisecond; what sizes the lease is the `notifyChanged` fan-out
+ * that runs inside the lock (see `withRow`), bounded by `HOMES_CHANGED_RELAY_TIMEOUT_MS` — seconds, an
+ * order below this. The commit fence in `writeRow` catches a stall that outran the lease anyway, rather
+ * than letting a stale plan land. */
 const ROW_LOCK_LEASE_MS = 30_000;
 const ROW_LOCK_TIMEOUT_MS = 30_000;
 
