@@ -617,14 +617,21 @@ describe('recordLockOwnerFor (main thread)', () => {
 		);
 		const requestId = successor.fenceRequestId();
 		assert.ok(requestId !== undefined, 'the successor was asked to fence before it could be conferred');
-		handleOwnerThreadAck({ requestId: requestId + 1000 });
+		handleOwnerThreadAck({ requestId: requestId + 1000 }, { threadId: 102 });
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(
 			recordLockOwnerThreadIds()['owner-ack'],
 			undefined,
 			'an ack for another request does not settle this one'
 		);
-		handleOwnerThreadAck({ requestId });
+		handleOwnerThreadAck({ requestId }, { threadId: 999 });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['owner-ack'],
+			undefined,
+			'a thread that is not the one asked to fence cannot answer for it, even with the right request id'
+		);
+		handleOwnerThreadAck({ requestId }, { threadId: 102 });
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-ack'], 102, 'the ack is what releases the handoff');
 		releaseRecordLockOwner('owner-ack');

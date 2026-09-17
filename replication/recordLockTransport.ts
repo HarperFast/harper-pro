@@ -1064,17 +1064,22 @@ function broadcastOwnerThread(database: string): void {
  */
 const OWNER_FENCE_ACK_TIMEOUT_MS = 10_000;
 let nextOwnerFenceId = 1;
-const pendingOwnerFenceAcks = new Map<number, () => void>();
+const pendingOwnerFenceAcks = new Map<number, { threadId: number; settle: () => void }>();
 
 /**
  * A worker's confirmation that it fenced its relayed handles, resolving that worker's arm of
- * `broadcastOwnerlessAndWait`. Named and exported for the same reason `recordLockRpc`'s
- * `handleAcquireReply` is: `manageThreads` offers no way to raise a worker->main message, so the
- * fixture could otherwise only reach the wait's EXIT arm, and a regression that dropped this route —
- * leaving every handoff to time out — passed the suite. Main thread only.
+ * `broadcastOwnerlessAndWait`. Main thread only.
+ *
+ * The acker's identity comes from the port the harness stamped, never from the payload — the same
+ * rule `recordLockRpc`'s acquire handler follows, and for the same reason. Request ids are a plain
+ * sequence, so without this any thread that can post to main (application code reaches its own
+ * `parentPort`) could guess one and release the gate for a worker that never fenced, admitting the
+ * successor over a still-committable handle: the exact two-writer this gate exists to prevent.
  */
-export function handleOwnerThreadAck(message: { requestId: number }): void {
-	pendingOwnerFenceAcks.get(message.requestId)?.();
+export function handleOwnerThreadAck(message: { requestId: number }, port?: { threadId?: number }): void {
+	const pending = pendingOwnerFenceAcks.get(message.requestId);
+	if (!pending || port?.threadId !== pending.threadId) return;
+	pending.settle();
 }
 
 /**
@@ -1132,7 +1137,8 @@ function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorker
 						OWNER_FENCE_ACK_TIMEOUT_MS
 					).unref();
 					worker.once?.('exit', onExit);
-					pendingOwnerFenceAcks.set(requestId, () => done(resolve));
+					// The id captured while the worker is live: its own `threadId` reads -1 once it exits.
+					pendingOwnerFenceAcks.set(requestId, { threadId: worker.threadId, settle: () => done(resolve) });
 					try {
 						worker.postMessage({ type: 'record-lock-owner-thread', database, threadId: undefined, requestId });
 					} catch {
