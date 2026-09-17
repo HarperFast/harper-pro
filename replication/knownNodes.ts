@@ -94,7 +94,7 @@ export function getHDBNodeTable(): HdbNodeTable {
 }
 // Float64 slots in the per-(database, peer) shared status buffer. Positions 0..6 are the replication status
 // fields, 7..8 the blob-divergence signals, 9..12 the W1 connection-truth fields (state/liveness/error-code/
-// error-time), 13..28 the eight R4 fire-classification counter pairs, and 29..31 headroom (see the
+// error-time), 13..30 the nine R4 fire-classification counter pairs, and 31 headroom (see the
 // *_POSITION exports in replicationConnection.ts and the slot map in DESIGN.md). Lives here, next to the
 // allocation, so the size and the map cannot drift apart.
 export const REPLICATION_SHARED_STATUS_SLOTS = 32;
