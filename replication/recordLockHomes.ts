@@ -52,10 +52,8 @@ export interface RecordLockGenerationState {
 	/** Set only on `staged`. Backstop only — see `MIN_DRAIN_BACKSTOP_MS` below. */
 	stagedAt?: number;
 	/**
-	 * Set only on `staged`, when the stage named it: §4.3's `homes(g) ∪ homes(g+1)`, the full set this
-	 * transition must quiesce. Staging retracts `active`, so once a node is staged its row no longer
-	 * names the old ring; this is what still does, so a later survey can refuse a list that omits a
-	 * participant (harper-pro#862).
+	 * Set only on `staged`: §4.3's `homes(g) ∪ homes(g+1)`. Staging retracts `active`, so this is the
+	 * only place a staged row still names the ring it stopped serving (harper-pro#862).
 	 */
 	quiesce?: string[];
 }
@@ -199,7 +197,7 @@ const stageSchema = Joi.object({
 	database: Joi.string().required(),
 	generation: Joi.number().required(),
 	homes: Joi.array().required(),
-	quiesce: Joi.array().optional(),
+	quiesce: Joi.array().required(),
 });
 
 /**
@@ -233,8 +231,16 @@ export function planStage(
 		existing?.highestActedOn ?? 0
 	);
 	if (existing?.staged?.generation === generation) {
-		if (existing.staged.digest === digest) return { action: 'noop', staged: existing.staged };
-		return { action: 'reject', reason: `generation ${generation} is already staged with a different home set` };
+		if (existing.staged.digest !== digest)
+			return { action: 'reject', reason: `generation ${generation} is already staged with a different home set` };
+		// A row staged before `quiesce` was recorded learns its participant set from a matching re-stage;
+		// `stagedAt` is kept, since nothing about when this node stopped granting has changed.
+		if (quiesce && !existing.staged.quiesce)
+			return {
+				action: 'write',
+				row: { ...existing, staged: { ...existing.staged, quiesce }, highestActedOn: Math.max(floor, generation) },
+			};
+		return { action: 'noop', staged: existing.staged };
 	}
 	if (generation <= floor) return { action: 'reject', reason: `generation ${generation} is not greater than ${floor}` };
 	const staged: RecordLockGenerationState = { generation, homes, digest, stagedAt: now };
@@ -285,11 +291,8 @@ async function stageRow(request: any): Promise<{ staged: RecordLockGenerationSta
 	const homes = canonicalizeHomes(request.homes);
 	const generation = request.generation;
 	const digest = digestOf(generation, homes);
-	let quiesce: string[] | undefined;
-	if (request.quiesce !== undefined) {
-		validateGenerationInput(generation, request.quiesce);
-		quiesce = canonicalizeHomes([...request.quiesce, ...homes]);
-	}
+	validateGenerationInput(generation, request.quiesce);
+	const quiesce = canonicalizeHomes([...request.quiesce, ...homes]);
 	return withRow(database, async (existing) => {
 		const plan = planStage(existing, database, generation, homes, digest, Date.now(), quiesce);
 		if (plan.action === 'reject') throw new ClientError(plan.reason, 409);

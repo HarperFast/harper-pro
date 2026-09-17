@@ -110,16 +110,17 @@ export interface BarrierOperation {
 export async function sendRecordLockOperation(
 	nodeName: string,
 	database: string,
-	operation: DelegateOperation | RecallOperation | BarrierOperation | TransitionOperation
+	operation: DelegateOperation | RecallOperation | BarrierOperation | TransitionOperation,
+	timeoutMs?: number
 ): Promise<any> {
 	for (const connection of getRepairConnectionsForDB(database)) {
 		if (connection.nodeName !== nodeName) continue;
 		const session = connection.liveSession;
-		if (session?.sendOperation) return session.sendOperation({ ...operation });
+		if (session?.sendOperation) return session.sendOperation({ ...operation }, timeoutMs);
 	}
 	const node = (server.nodes ?? []).find((candidate: any) => candidate?.name === nodeName);
 	if (!node?.url) throw new Error(`no connection or hdb_nodes row for ${nodeName}`);
-	return sendOperationToNode(node, { ...operation });
+	return sendOperationToNode(node, { ...operation }, timeoutMs === undefined ? undefined : { timeoutMs });
 }
 
 // ---- receive side ------------------------------------------------------------------------------

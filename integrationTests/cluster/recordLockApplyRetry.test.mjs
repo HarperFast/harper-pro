@@ -182,5 +182,23 @@ suite(
 			);
 			assert.equal((await clusterStatusOf(nodes[1])).recordLocks?.[DB]?.members, undefined);
 		});
+
+		test('a list that omits the node taking the call, or the ring a staged node was drained for, is refused', async () => {
+			// From the ring node, name only the departed node: its own active ring [keep] and the departed
+			// node's persisted quiesce [keep, departing] both name a node this list does not cover.
+			const [keep, departing] = names;
+			const { status, body } = await operation(nodes[0], {
+				operation: 'record_lock_apply_homes',
+				database: DB,
+				homes: [departing],
+			});
+			assert.equal(status, 409, JSON.stringify(body));
+			assert.match(body.error, new RegExp(`${keep} \\(in ${keep}'s ring, the node taking this call\\)`));
+			assert.match(body.error, new RegExp(`${keep} \\(in ${departing}'s ring\\)`));
+			assert.equal(body.initiator.node, keep);
+			assert.equal(body.initiator.survey.active.generation, 4);
+			assert.equal(body.nodes[departing].stage, undefined, 'nothing was staged');
+			assert.equal(await lockStatus(nodes[0], 'still-' + Date.now()), 200, 'the ring still serves generation 4');
+		});
 	}
 );

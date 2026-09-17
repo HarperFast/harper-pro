@@ -630,7 +630,13 @@ export async function sendOperationToNode(node, operation, options?) {
 	const nodeUrl = getNodeURL(node);
 	const socket = await createWebSocket(nodeUrl, options);
 	const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), {});
+	let timer: NodeJS.Timeout | undefined;
 	return new Promise((resolve, reject) => {
+		if (options.timeoutMs)
+			timer = setTimeout(
+				() => reject(new Error(`operation to ${nodeUrl} did not answer within ${options.timeoutMs}ms`)),
+				options.timeoutMs
+			).unref();
 		socket.on('open', () => {
 			// operation may carry a secret (registry token / ssh key / password); redact before
 			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
@@ -650,6 +656,7 @@ export async function sendOperationToNode(node, operation, options?) {
 			logger.info('Sending operation connection to ' + nodeUrl + ' closed', error);
 		});
 	}).finally(() => {
+		clearTimeout(timer);
 		socket.close();
 	});
 }

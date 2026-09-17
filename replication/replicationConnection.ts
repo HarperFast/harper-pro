@@ -4730,13 +4730,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							);
 						}
 						break;
-					case OPERATION_RESPONSE:
-						const { resolve, reject } = awaitingResponse.get(data.requestId);
+					case OPERATION_RESPONSE: {
+						const pending = awaitingResponse.get(data.requestId);
 						logger.debug?.('Received completed operation request', remoteNodeName, data);
-						if (data.error) reject(new Error(data.error));
-						else resolve(data);
+						if (!pending) break;
+						if (data.error) pending.reject(new Error(data.error));
+						else pending.resolve(data);
 						awaitingResponse.delete(data.requestId);
 						break;
+					}
 					case TABLE_FIXED_STRUCTURE:
 						const tableName = message[3];
 						if (!tables) {
@@ -8145,12 +8147,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		 * Send an operation request to the remote node, returning a promise for the result
 		 * @param operation
 		 */
-		sendOperation(operation) {
+		sendOperation(operation, timeoutMs?: number) {
 			const requestId = nextId++;
 			operation.requestId = requestId;
 			ws.send(encode([OPERATION_REQUEST, operation]));
 			return new Promise((resolve, reject) => {
 				awaitingResponse.set(requestId, { resolve, reject });
+				if (timeoutMs === undefined) return;
+				// Retire the entry ourselves: a peer that never answers must not pin it (and the caller) for
+				// the life of the socket.
+				setTimeout(() => {
+					if (awaitingResponse.delete(requestId))
+						reject(new Error(`${operation.operation} to ${remoteNodeName} did not answer within ${timeoutMs}ms`));
+				}, timeoutMs).unref();
 			});
 		},
 		// A standalone re-announce for this live socket (harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6):

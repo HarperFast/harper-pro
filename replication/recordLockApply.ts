@@ -1,17 +1,10 @@
 /**
  * One operator call that applies a record-lock home map across the whole cluster (harper-pro#862),
- * given an explicitly supplied list of expected nodes: survey every named node, refuse on any
- * incompleteness, stage everywhere, activate immediately when every node proves quiescence, and
- * report per node. See RECORD_LOCK_HOMES_DESIGN.md → "Applying a home map across the cluster".
- *
- * The list is stated, never derived: `homeMap()` iterates its own `active.homes`, so a set with a
- * participant missing is two arbiters rather than a refusal, and no digest can detect the omission.
- * Naming the set is what turns "ask every node" into a complete check and unreachable into a hard
- * failure — which is why this may orchestrate where the rejected per-node derivation could not.
- *
- * Every hop to a peer is `record_lock_transition`, accepted from a node principal only and
- * re-validated on the receiving node before it writes; the operator's credentials never leave the
- * node they were presented to, and the relaying node never authorizes policy.
+ * given an explicitly supplied node list: survey every named node, refuse on any incompleteness,
+ * stage everywhere, activate when every node proves its drain, report per node. The list is stated,
+ * never derived — `homeMap()` iterates its own `active.homes`, so an omitted participant is two
+ * arbiters, not a refusal — and every hop is `record_lock_transition`, accepted from a node principal
+ * only and re-validated by the receiving node. RECORD_LOCK_HOMES_DESIGN.md → "Applying a home map".
  */
 import Joi from 'joi';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -42,10 +35,14 @@ const { HTTP_STATUS_CODES } = hdbErrors;
 export const APPLY_OPERATION = 'record_lock_apply_homes';
 export const TRANSITION_OPERATION = 'record_lock_transition';
 
-/** A survey or activate is one row read or write on the peer; a stage also runs the #856 drain. */
-export const HOP_TIMEOUT_MS = 15_000;
-export const STAGE_HOP_TIMEOUT_MS = STAGE_DRAIN_BUDGET_MS + HOP_TIMEOUT_MS;
-/** Hops in flight at once per phase; `quiesce` may name 256 nodes and each hop may open a socket. */
+export interface HopTimeouts {
+	/** A survey or activate is one row read or write on the peer. */
+	hopMs: number;
+	/** A stage also runs the #856 drain on the peer. */
+	stageMs: number;
+}
+export const DEFAULT_HOP_TIMEOUTS: HopTimeouts = { hopMs: 15_000, stageMs: STAGE_DRAIN_BUDGET_MS + 15_000 };
+/** `quiesce` may name 256 nodes and each hop may open a socket. */
 export const HOP_CONCURRENCY = 16;
 
 export type TransitionAction = 'survey' | 'stage' | 'activate';
@@ -74,14 +71,16 @@ export interface ActivateReply {
 	active: RecordLockGenerationState;
 }
 
+export interface NodeSurvey {
+	active?: RecordLockGenerationState;
+	staged?: RecordLockGenerationState;
+	highestActedOn?: number;
+	error?: string;
+}
+
 export interface NodeReport {
 	role: 'home' | 'departing';
-	survey?: {
-		active?: RecordLockGenerationState;
-		staged?: RecordLockGenerationState;
-		highestActedOn?: number;
-		error?: string;
-	};
+	survey?: NodeSurvey;
 	stage?: {
 		action: 'already-active' | 'noop' | 'staged' | 'failed';
 		quiesced?: QuiesceResult | { error: string };
@@ -105,12 +104,14 @@ export interface ApplyReport {
 	 */
 	outcome: 'refused' | 'incomplete' | 'staged' | 'activated';
 	reason?: string;
-	/** The drain interval, measured by the operator from receiving this response; never a node's clock. */
+	/** The drain interval, measured by the operator from receiving this response, never from a node clock. */
 	retryAfterMs?: number;
 	nodes: Record<string, NodeReport>;
+	/** The node that took this call, when it is not itself in `quiesce`: read, never written. */
+	initiator?: { node: string; survey: NodeSurvey };
 }
 
-/** A refusal still carries the whole report: the operations API sends an object `http_resp_msg` verbatim. */
+/** The operations API sends an object `http_resp_msg` as the body, so a refusal still reports every node. */
 export class ApplyRefusedError extends Error {
 	statusCode: number;
 	http_resp_msg: ApplyReport & { error: string };
@@ -120,8 +121,6 @@ export class ApplyRefusedError extends Error {
 		this.http_resp_msg = { error: this.message, ...report };
 	}
 }
-
-// ---- the survey decision -------------------------------------------------------------------------
 
 export type SurveyPlan =
 	| { action: 'refuse'; status: number; reason: string }
@@ -143,23 +142,39 @@ function sameSet(a: string[], b: string[]): boolean {
 	return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
-function stateKey(state: RecordLockGenerationState | undefined): string | undefined {
-	return state && `${state.generation}:${state.digest}`;
+function ringMembers(reply: SurveyReply): string[] {
+	return [...(reply.active?.homes ?? []), ...(reply.staged?.homes ?? []), ...(reply.staged?.quiesce ?? [])];
 }
 
+/**
+ * Pure over the survey replies. `observer` is the initiating node's own row when that node is not in
+ * `quiesce`: it is never written, but a ring it serves that the list does not cover is the same
+ * omission as a peer's.
+ */
 export function planSurvey(
 	database: string,
 	homes: string[],
 	quiesce: string[],
 	requestedGeneration: number | undefined,
-	replies: Map<string, SurveyReply | { error: string }>
+	replies: Map<string, SurveyReply | { error: string }>,
+	observer?: { node: string; reply: SurveyReply | { error: string } }
 ): SurveyPlan {
 	const unreachable: string[] = [];
 	const misnamed: string[] = [];
 	const unlisted: string[] = [];
+	const unrecorded: string[] = [];
 	const activeStates = new Map<string, string[]>();
-	const stagedStates = new Map<string, string[]>();
 	const rows = new Map<string, SurveyReply>();
+	if (observer) {
+		if ('error' in observer.reply)
+			return {
+				action: 'refuse',
+				status: 503,
+				reason: `${observer.node} could not read its own row: ${observer.reply.error}`,
+			};
+		for (const member of ringMembers(observer.reply))
+			if (!quiesce.includes(member)) unlisted.push(`${member} (in ${observer.node}'s ring, the node taking this call)`);
+	}
 	for (const node of quiesce) {
 		const reply = replies.get(node);
 		if (!reply || 'error' in reply) {
@@ -171,13 +186,11 @@ export function planSurvey(
 			continue;
 		}
 		rows.set(node, reply);
-		// A staged row no longer names the old ring (staging retracts `active`); its `quiesce` does.
-		const members = [...(reply.active?.homes ?? []), ...(reply.staged?.homes ?? []), ...(reply.staged?.quiesce ?? [])];
-		for (const member of members) if (!quiesce.includes(member)) unlisted.push(`${member} (in ${node}'s ring)`);
-		const active = stateKey(reply.active);
+		if (reply.staged && !reply.staged.quiesce) unrecorded.push(node);
+		for (const member of ringMembers(reply))
+			if (!quiesce.includes(member)) unlisted.push(`${member} (in ${node}'s ring)`);
+		const active = reply.active && `${reply.active.generation}:${reply.active.digest}`;
 		if (active) activeStates.set(active, [...(activeStates.get(active) ?? []), node]);
-		const staged = stateKey(reply.staged);
-		if (staged) stagedStates.set(staged, [...(stagedStates.get(staged) ?? []), node]);
 	}
 	if (unreachable.length > 0)
 		return { action: 'refuse', status: 503, reason: `not every named node answered: ${unreachable.join(', ')}` };
@@ -187,33 +200,30 @@ export function planSurvey(
 			status: 409,
 			reason: `a named node answered under another name: ${misnamed.join(', ')}`,
 		};
+	if (unrecorded.length > 0)
+		return {
+			action: 'refuse',
+			status: 409,
+			reason: `${unrecorded.join(', ')} hold a staged generation with no recorded participant set, so the ring they stopped serving cannot be checked against this list; re-stage the same generation and homes on them with quiesce (record_lock_stage_generation) first`,
+		};
 	if (unlisted.length > 0)
 		return {
 			action: 'refuse',
 			status: 409,
 			reason: `nodes not in quiesce are members of a current ring and may still be granting: ${[...new Set(unlisted)].join(', ')}`,
 		};
-	const disagreement = (label: string, states: Map<string, string[]>) =>
-		[...states].map(([state, nodes]) => `${label} ${state.replace(':', ' digest ')} on ${nodes.join(', ')}`).join('; ');
 	if (activeStates.size > 1)
 		return {
 			action: 'refuse',
 			status: 409,
-			reason: `nodes disagree about the active generation: ${disagreement('active', activeStates)}`,
-		};
-	if (stagedStates.size > 1)
-		return {
-			action: 'refuse',
-			status: 409,
-			reason: `nodes disagree about the staged generation: ${disagreement('staged', stagedStates)}`,
+			reason: `nodes disagree about the active generation: ${[...activeStates].map(([state, nodes]) => `${state.replace(':', ' digest ')} on ${nodes.join(', ')}`).join('; ')}`,
 		};
 
 	let floor = 0;
 	for (const reply of rows.values()) floor = Math.max(floor, floorOf(reply));
 	let generation = requestedGeneration;
 	if (generation === undefined) {
-		// Resume an interrupted transition to this exact set rather than opening a new generation past
-		// it; otherwise one past whatever any node has acted on. Only the number is derived here.
+		// Resume an interrupted transition to this exact set rather than opening a new generation past it.
 		let resumable = false;
 		for (const reply of rows.values())
 			for (const state of [reply.active, reply.staged])
@@ -235,7 +245,7 @@ export function planSurvey(
 			highestActedOn: reply.highestActedOn ?? 0,
 			fenced: [],
 		};
-		const plan = planStage(row, database, generation, homes, digest);
+		const plan = planStage(row, database, generation, homes, digest, Date.now(), quiesce);
 		if (plan.action === 'reject')
 			return { action: 'refuse', status: 409, reason: `${node} would refuse to stage: ${plan.reason}` };
 		if (plan.action === 'noop') alreadyStaged.add(node);
@@ -243,17 +253,14 @@ export function planSurvey(
 	return { action: 'proceed', generation, digest, alreadyActive, alreadyStaged };
 }
 
-// ---- the activation decision ---------------------------------------------------------------------
-
 export type ActivationPlan =
 	{ activate: true; attested: string[] } | { activate: false; reason: string; retryAfterMs: number };
 
 /**
  * `provesQuiescence` on every freshly staged node is the only thing that licenses activating without
- * the interval. `drained` is the operator's attestation that the interval has elapsed since the
- * response that reported these nodes staged — so it can only cover a node that was already staged
- * when this call surveyed it, never one this call staged: that node's authority under the old
- * generation has had no interval at all.
+ * the interval. `drained` attests that the interval has elapsed since the response that reported the
+ * nodes staged, so it can cover only a node already staged when this call surveyed it — never one this
+ * call staged, whose old authority has had no interval at all.
  */
 export function planActivation(nodes: Record<string, NodeReport>, drained: boolean): ActivationPlan {
 	const unproven: string[] = [];
@@ -276,10 +283,10 @@ export function planActivation(nodes: Record<string, NodeReport>, drained: boole
 	};
 }
 
-// ---- the orchestrator ----------------------------------------------------------------------------
-
 export interface TransitionPeers {
-	send(node: string, operation: TransitionOperation): Promise<any>;
+	self(): string | undefined;
+	/** Runs `operation` on `node`, locally for this node, and must settle within `timeoutMs`. */
+	send(node: string, operation: TransitionOperation, timeoutMs: number): Promise<any>;
 }
 
 const applySchema = Joi.object({
@@ -309,13 +316,17 @@ async function forEachNode(nodes: string[], task: (node: string) => Promise<void
 	await Promise.all(lanes);
 }
 
-/** One apply at a time per database on this node; a second caller queues rather than racing the first's phases. */
+/** One apply at a time per database on this worker; the per-node planners keep a concurrent apply elsewhere safe. */
 const applyQueues = new Map<string, Promise<unknown>>();
 
-/** A test hook: fail after every node is staged and before any is activated, to exercise the retry contract. */
+/** Test hook: fail after every node is staged and before any is activated. */
 const FAIL_BEFORE_ACTIVATE = process.env.HARPER_TEST_RECORD_LOCK_APPLY_FAIL_BEFORE_ACTIVATE === '1';
 
-export async function applyHomes(request: any, peers: TransitionPeers = productionPeers): Promise<ApplyReport> {
+export async function applyHomes(
+	request: any,
+	peers: TransitionPeers = productionPeers,
+	timeouts: HopTimeouts = DEFAULT_HOP_TIMEOUTS
+): Promise<ApplyReport> {
 	const validation = validateBySchema(request, applySchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
@@ -336,11 +347,13 @@ export async function applyHomes(request: any, peers: TransitionPeers = producti
 			throw new ClientError(`quiesce must include every node in homes; missing ${missing.join(', ')}`, 400);
 	}
 	const prior = applyQueues.get(database) ?? Promise.resolve();
-	const run = prior.then(() => runApply(request, database, homes, quiesce, peers));
-	applyQueues.set(
-		database,
-		run.catch(() => {})
-	);
+	const run = prior.then(() => runApply(request, database, homes, quiesce, peers, timeouts));
+	const queued = run
+		.catch(() => {})
+		.finally(() => {
+			if (applyQueues.get(database) === queued) applyQueues.delete(database);
+		});
+	applyQueues.set(database, queued);
 	return run;
 }
 
@@ -349,59 +362,61 @@ async function runApply(
 	database: string,
 	homes: string[],
 	quiesce: string[],
-	peers: TransitionPeers
+	peers: TransitionPeers,
+	timeouts: HopTimeouts
 ): Promise<ApplyReport> {
 	const report: ApplyReport = { database, homes, quiesce, outcome: 'refused', nodes: {} };
 	for (const node of quiesce) report.nodes[node] = { role: homes.includes(node) ? 'home' : 'departing' };
+	const hop = (node: string, operation: TransitionOperation, ms: number) =>
+		withHopDeadline(peers.send(node, operation, ms), ms, `${node} ${operation.action}`);
+	const survey = async (node: string): Promise<SurveyReply | { error: string }> => {
+		try {
+			return await hop(node, { operation: TRANSITION_OPERATION, database, action: 'survey' }, timeouts.hopMs);
+		} catch (error) {
+			return { error: hopError(error) };
+		}
+	};
+	const surveyed = (reply: SurveyReply | { error: string }): NodeSurvey =>
+		'error' in reply
+			? { error: reply.error }
+			: { active: reply.active, staged: reply.staged, highestActedOn: reply.highestActedOn };
 
 	const replies = new Map<string, SurveyReply | { error: string }>();
 	await forEachNode(quiesce, async (node) => {
-		try {
-			const reply = await withHopDeadline(
-				peers.send(node, { operation: TRANSITION_OPERATION, database, action: 'survey' }),
-				HOP_TIMEOUT_MS,
-				`${node} survey`
-			);
-			replies.set(node, reply);
-			report.nodes[node].survey = { active: reply.active, staged: reply.staged, highestActedOn: reply.highestActedOn };
-		} catch (error) {
-			const message = hopError(error);
-			replies.set(node, { error: message });
-			report.nodes[node].survey = { error: message };
-		}
+		const reply = await survey(node);
+		replies.set(node, reply);
+		report.nodes[node].survey = surveyed(reply);
 	});
-	const survey = planSurvey(database, homes, quiesce, request.generation, replies);
-	if (survey.action === 'refuse') {
-		report.reason = survey.reason;
-		throw new ApplyRefusedError(report, survey.status);
+	const self = peers.self();
+	let observer: { node: string; reply: SurveyReply | { error: string } } | undefined;
+	if (self && !quiesce.includes(self)) {
+		observer = { node: self, reply: await survey(self) };
+		report.initiator = { node: self, survey: surveyed(observer.reply) };
 	}
-	const { generation, digest } = survey;
+	const plan = planSurvey(database, homes, quiesce, request.generation, replies, observer);
+	if (plan.action === 'refuse') {
+		report.reason = plan.reason;
+		throw new ApplyRefusedError(report, plan.status);
+	}
+	const { generation, digest } = plan;
 	report.generation = generation;
 	report.digest = digest;
 
 	let failed = false;
 	await forEachNode(quiesce, async (node) => {
 		const entry = report.nodes[node];
-		if (survey.alreadyActive.has(node)) {
+		if (plan.alreadyActive.has(node)) {
 			entry.stage = { action: 'already-active' };
 			return;
 		}
 		try {
-			const reply: StageReply = await withHopDeadline(
-				peers.send(node, {
-					operation: TRANSITION_OPERATION,
-					database,
-					action: 'stage',
-					generation,
-					homes,
-					quiesce,
-					digest,
-				}),
-				STAGE_HOP_TIMEOUT_MS,
-				`${node} stage`
+			const reply: StageReply = await hop(
+				node,
+				{ operation: TRANSITION_OPERATION, database, action: 'stage', generation, homes, quiesce, digest },
+				timeouts.stageMs
 			);
 			entry.stage = {
-				action: survey.alreadyStaged.has(node) ? 'noop' : 'staged',
+				action: plan.alreadyStaged.has(node) ? 'noop' : 'staged',
 				quiesced: reply.quiesced,
 				proven: provesQuiescence(reply.quiesced),
 			};
@@ -432,9 +447,7 @@ async function runApply(
 		logger.warn?.(
 			`Record lock home map for ${database}: activating generation ${generation} on the operator's attestation that the drain interval elapsed; ${activation.attested.join(', ')} could not prove quiescence`
 		);
-	// `planActivate` refuses an activate that lands within `MIN_DRAIN_BACKSTOP_MS` of that node's own
-	// stage; a proven drain on an idle node returns well inside it. Measured here from the last stage
-	// response, which is after every node's own `stagedAt`.
+	// `planActivate` refuses an activate within MIN_DRAIN_BACKSTOP_MS of that node's own stage.
 	if (Object.values(report.nodes).some((entry) => entry.stage?.action === 'staged')) await delay(MIN_DRAIN_BACKSTOP_MS);
 	await forEachNode(quiesce, async (node) => {
 		const entry = report.nodes[node];
@@ -443,10 +456,10 @@ async function runApply(
 			return;
 		}
 		try {
-			await withHopDeadline(
-				peers.send(node, { operation: TRANSITION_OPERATION, database, action: 'activate', generation, homes, digest }),
-				HOP_TIMEOUT_MS,
-				`${node} activate`
+			await hop(
+				node,
+				{ operation: TRANSITION_OPERATION, database, action: 'activate', generation, homes, digest },
+				timeouts.hopMs
 			);
 			entry.activate = { action: entry.stage?.action === 'already-active' ? 'noop' : 'activated' };
 		} catch (error) {
@@ -464,8 +477,6 @@ async function runApply(
 	return report;
 }
 
-// ---- the peer-callable hop ---------------------------------------------------------------------
-
 const transitionSchema = Joi.object({
 	database: Joi.string().required(),
 	action: Joi.string().valid('survey', 'stage', 'activate').required(),
@@ -477,9 +488,8 @@ const transitionSchema = Joi.object({
 
 /**
  * The relayed proposal is checked against this node's own facts before anything is written: the
- * generation and sets through the shared validator, the digest by recomputing it, this node's place in
- * the transition (staged only as a named participant, activated only as a member of the new ring), and
- * its own row through the same `planStage` / `planActivate` decisions the per-node operator calls run.
+ * digest is recomputed, this node must be named in `quiesce` to stage and in `homes` to activate, and
+ * the per-node planners decide against its own row.
  */
 export async function executeTransitionLocally(request: any): Promise<SurveyReply | StageReply | ActivateReply> {
 	const validation = validateBySchema(request, transitionSchema);
@@ -517,9 +527,10 @@ export async function executeTransition(request: any) {
 }
 
 const productionPeers: TransitionPeers = {
-	send(node, operation) {
+	self: getThisNodeName,
+	send(node, operation, timeoutMs) {
 		if (node === getThisNodeName()) return executeTransitionLocally(operation);
-		return sendRecordLockOperation(node, operation.database, operation);
+		return sendRecordLockOperation(node, operation.database, operation, timeoutMs);
 	},
 };
 

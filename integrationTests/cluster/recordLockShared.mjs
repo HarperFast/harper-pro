@@ -163,6 +163,7 @@ export async function bootstrapHomeMap(nodes) {
 			database: DB,
 			generation: 1,
 			homes,
+			quiesce: homes,
 			authorization: node.admin,
 		});
 	for (const node of nodes)

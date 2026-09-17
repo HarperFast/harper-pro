@@ -130,8 +130,10 @@ mirroring `setNode.ts`'s shape. `operator` on every audit-bearing field is deriv
 authenticated principal (`request.hdb_user.name`), never a request-body field — a forgeable
 attribution was a round-2 finding.
 
-- **`record_lock_stage_generation`** `{ database, generation, homes[] }` — issued by the
-  operator on every node named in `homes(g) ∪ homes(g+1)`. Canonicalizes `homes[]` (sort,
+- **`record_lock_stage_generation`** `{ database, generation, homes[], quiesce[] }` — issued by the
+  operator on every node named in `homes(g) ∪ homes(g+1)`, which is what `quiesce` names (required
+  since harper-pro#862: it is persisted on the staged row, and a matching re-stage backfills it on a
+  row that lacks one). Canonicalizes `homes[]` (sort,
   dedup) before storing or hashing. Refuses `generation ≤ max(active?.generation ?? 0,
 staged?.generation ?? 0, highestActedOn)`. On success, **atomically**: computes `digest`
   (below), writes `staged = { generation, homes, digest }`, and **clears `active`** — the
@@ -400,8 +402,12 @@ peer. That is the whole difference between this operation and the rejected one.
 ### The operation
 
 `record_lock_apply_homes { database, homes[], quiesce?[], generation?, drained? }`, `requiresSuperUser`,
-`replication/recordLockApply.ts`. One apply runs at a time per database on the node that takes the
-call; hops fan out at most 16 at a time.
+`replication/recordLockApply.ts`. One apply runs at a time per database on the worker that takes the
+call (a second worker or node racing it is kept safe by the row-level planners, and the loser's retry
+succeeds by naming a higher generation); hops fan out at most 16 at a time, each under a deadline
+that also retires the pending request on the wire — the live session drops its response entry and
+the fallback connection closes its socket — so a peer that accepts and never answers cannot pin a
+socket per apply.
 
 - `homes` is the new ring, `homes(g+1)`. `quiesce` is §4.3's `homes(g) ∪ homes(g+1)` — the full set of
   nodes that must stop granting before anything activates — and defaults to `homes`. It must be a
@@ -416,23 +422,26 @@ call; hops fan out at most 16 at a time.
 - `drained` is the operator's attestation that the drain interval has elapsed (see "Activation").
 
 **Phase 1 — survey (reads only).** Ask every node in `quiesce` for its row (`active`, `staged`,
-`highestActedOn`) and its own name; the initiating node answers itself locally. Refuse, before
-anything is written, if:
+`highestActedOn`) and its own name; the initiating node answers itself locally, and when it is not
+itself in `quiesce` its own row is read too (reported as `initiator`, never written) — a ring the
+node taking the call serves is as much a participant as a peer's. Refuse, before anything is
+written, if:
 
-| Condition                                                                                                                               | Why it refuses                                                                                                                                                                                                                                                                                                   |
-| --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| any named node does not answer, or answers under a different name                                                                       | completeness is the point of the list; a misrouted `hdb_nodes` URL is an unanswered node. A peer too old to have `record_lock_transition` fails here, before any stage                                                                                                                                           |
-| any node reports a ring member not in `quiesce` — in `active.homes`, `staged.homes`, or the `quiesce` its `staged` row was written with | "you forgot a node that is still granting" — the residue of the second #822 objection. Staging retracts `active`, so a staged node's row no longer names the old ring; the `quiesce` persisted on stage (the adopted review point) is what still does, which is what makes a retry with a shorter list refusable |
-| nodes disagree about `active` (two distinct `(generation, digest)`), or about `staged`                                                  | the cluster is not in one state this call can transition from; §4's whole-map-fails-closed rule already withholds locks on such nodes                                                                                                                                                                            |
-| `planStage` would reject the target on a node that is not already active at it                                                          | a staged different set for the same generation, or a generation below that node's floor; the same pure decision the per-node operation makes, run as a dry run                                                                                                                                                   |
+| Condition                                                                                                                               | Why it refuses                                                                                                                                                                                                                                                                                                                                                                     |
+| --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| any named node does not answer, or answers under a different name                                                                       | completeness is the point of the list; a misrouted `hdb_nodes` URL is an unanswered node. A peer too old to have `record_lock_transition` fails here, before any stage                                                                                                                                                                                                             |
+| any node reports a ring member not in `quiesce` — in `active.homes`, `staged.homes`, or the `quiesce` its `staged` row was written with | "you forgot a node that is still granting" — the residue of the second #822 objection. Staging retracts `active`, so a staged node's row no longer names the old ring; the `quiesce` persisted on stage (the adopted review point) is what still does, which is what makes a retry with a shorter list refusable                                                                   |
+| a surveyed `staged` row has no recorded `quiesce`                                                                                       | it was staged by a stage that did not name its participants (a row from before this change), so the ring it stopped serving cannot be checked against the list; the operator re-stages the same generation and set with `quiesce` on that node, which backfills it                                                                                                                 |
+| nodes disagree about `active` (two distinct `(generation, digest)`)                                                                     | two rings are being served; §4's whole-map-fails-closed rule already withholds locks on such nodes. A disagreement about `staged` is not refused here: it is judged by the next row, so an explicit higher generation supersedes two sets that two racing operators staged (otherwise the cluster would stay quiesced until someone used the per-node operations — a review point) |
+| `planStage` would reject the target on a node that is not already active at it                                                          | a staged different set for the same generation, or a generation below that node's floor; the same pure decision the per-node operation makes, run as a dry run                                                                                                                                                                                                                     |
 
 A node already `active` at exactly the target `(generation, digest)` is past the transition: it is not
 staged again (`planStage` would refuse a generation at its floor) and its activate is the idempotent
 noop. This is what lets a call interrupted between two activations be re-run unchanged.
 
 **Phase 2 — stage everywhere.** Every node in `quiesce` that is not already active at the target
-stages `(generation, homes)` with `quiesce`, which `record_lock_stage_generation` now persists on the
-staged row. Each answer is that operation's result: the staged state plus `quiesced`, the drain from
+stages `(generation, homes)` with `quiesce`, which `record_lock_stage_generation` now requires and
+persists on the staged row. Each answer is that operation's result: the staged state plus `quiesced`, the drain from
 harper-pro#856. Idempotent on retry (`planStage`'s noop branch), and the noop still drains, so a retry
 re-collects evidence. A hop that fails leaves the other stages in place — more staged nodes only move
 the cluster further toward refusal — and the call reports every node's state with a 503 rather than
@@ -524,9 +533,10 @@ freshness barrier and the poison rules are untouched; nothing here runs on a loc
 ### Testing
 
 - Unit (`recordLockApply.test.mjs`): the survey decision — unreachable, wrong self-name, an unlisted
-  ring member including one only a staged row's persisted `quiesce` still names, active/staged
-  disagreement, a staged set that differs for the same generation, resume of an in-flight generation,
-  already-active nodes skipping the stage; the activation decision — proof on every node activates, one
+  ring member including one only a staged row's persisted `quiesce` still names or one the initiating
+  node's own row names, a staged row with no recorded participants, active disagreement, two raced
+  staged sets superseded by an explicit generation, resume of an in-flight generation, already-active
+  nodes skipping the stage; a hop that never answers failing at its deadline; the activation decision — proof on every node activates, one
   unproven node withholds with a relative wait, the attestation covers only nodes already staged at
   survey; the orchestrator over fake peers — no stage is sent after a refusal, departing nodes are
   staged and never activated, a hop failure mid-stage or mid-activate reports every node and the retry
@@ -542,4 +552,5 @@ freshness barrier and the poison rules are untouched; nothing here runs on a loc
   call; a failure injected between stage and activate leaves every node staged and refusing, and the
   same call from another node completes it; an attested call that had to stage a node itself reports
   `staged` again; the peer hop refuses an operator caller; a topology change activates in seconds once
-  every node proves, with the departing node staged and never activated.
+  every node proves, with the departing node staged and never activated; a list that omits the node
+  taking the call, or the ring a staged node was drained for, is refused.

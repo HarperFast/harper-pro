@@ -291,6 +291,7 @@ suite('cluster record locks: the §4.3 stage/activate transition', { timeout: 30
 			database: DB,
 			generation: 2,
 			homes,
+			quiesce: homes,
 			authorization: nodes[0].admin,
 		});
 		const duringTransition = await call(nodes[0], 'LockHold/', { id, timeout: 2_000 });
@@ -308,6 +309,7 @@ suite('cluster record locks: the §4.3 stage/activate transition', { timeout: 30
 					database: DB,
 					generation: 2,
 					homes,
+					quiesce: homes,
 					authorization: node.admin,
 				});
 		for (const node of nodes)

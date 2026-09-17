@@ -85,7 +85,10 @@ describe('planSurvey: what refuses before anything is staged', () => {
 			['a', 'b'],
 			['a', 'b'],
 			undefined,
-			replies({ a: reply('a'), b: reply('b', { staged: state(2, ['b', 'd']), highestActedOn: 2 }) })
+			replies({
+				a: reply('a'),
+				b: reply('b', { staged: state(2, ['b', 'd'], { quiesce: ['b', 'd'] }), highestActedOn: 2 }),
+			})
 		);
 		assert.strictEqual(staged.action, 'refuse');
 		assert.match(staged.reason, /d \(in b's ring\)/);
@@ -120,19 +123,56 @@ describe('planSurvey: what refuses before anything is staged', () => {
 		);
 		assert.strictEqual(active.action, 'refuse');
 		assert.match(active.reason, /disagree about the active generation/);
-		const staged = planSurvey(
+		// Two different sets staged at the same generation (two operators raced): the derived generation
+		// resumes 2 for the matching set and the dry run refuses on the other node, naming it; an explicit
+		// higher generation supersedes both and proceeds, so the cluster is never wedged.
+		const q = ['a', 'b', 'c'];
+		const raced = replies({
+			a: reply('a', { staged: state(2, homes, { quiesce: q }), highestActedOn: 2 }),
+			b: reply('b', { staged: state(2, ['a', 'b'], { quiesce: q }), highestActedOn: 2 }),
+			c: reply('c'),
+		});
+		const resumed = planSurvey('db', homes, homes, undefined, raced);
+		assert.strictEqual(resumed.action, 'refuse');
+		assert.match(resumed.reason, /^b would refuse to stage: generation 2 is already staged with a different home set/);
+		const superseded = planSurvey('db', homes, homes, 3, raced);
+		assert.strictEqual(superseded.action, 'proceed');
+		assert.strictEqual(superseded.generation, 3);
+		assert.deepStrictEqual([...superseded.alreadyStaged], []);
+	});
+
+	it('a staged row with no recorded participant set is refused: the ring it stopped serving cannot be checked', () => {
+		const plan = planSurvey(
 			'db',
-			homes,
-			homes,
+			['a', 'b'],
+			['a', 'b'],
 			undefined,
-			replies({
-				a: reply('a', { staged: state(2, homes), highestActedOn: 2 }),
-				b: reply('b', { staged: state(2, ['a', 'b']), highestActedOn: 2 }),
-				c: reply('c'),
-			})
+			replies({ a: reply('a', { staged: state(2, ['a', 'b']), highestActedOn: 2 }), b: reply('b') })
 		);
-		assert.strictEqual(staged.action, 'refuse');
-		assert.match(staged.reason, /disagree about the staged generation/);
+		assert.strictEqual(plan.action, 'refuse');
+		assert.match(plan.reason, /^a hold a staged generation with no recorded participant set/);
+		assert.match(plan.reason, /re-stage the same generation and homes on them with quiesce/);
+	});
+
+	it('the node taking the call is read too: a ring it serves that the list omits refuses, and its unreadable row refuses', () => {
+		const fresh = replies({ d: reply('d') });
+		const omitted = planSurvey('db', ['d'], ['d'], undefined, fresh, {
+			node: 'b',
+			reply: reply('b', { active: state(1, ['a', 'b', 'c']), highestActedOn: 1 }),
+		});
+		assert.strictEqual(omitted.action, 'refuse');
+		assert.match(omitted.reason, /a \(in b's ring, the node taking this call\)/);
+		const unreadable = planSurvey('db', ['d'], ['d'], undefined, fresh, {
+			node: 'b',
+			reply: { error: 'store closed' },
+		});
+		assert.strictEqual(unreadable.action, 'refuse');
+		assert.strictEqual(unreadable.status, 503);
+		// An initiator with no row of its own, or one whose rings the list covers, does not interfere.
+		assert.strictEqual(
+			planSurvey('db', ['d'], ['d'], undefined, fresh, { node: 'b', reply: reply('b') }).action,
+			'proceed'
+		);
 	});
 
 	it('runs planStage as a dry run: a generation at or below a floor, or a different set at a staged generation, refuses', () => {
@@ -150,7 +190,11 @@ describe('planSurvey: what refuses before anything is staged', () => {
 			homes,
 			homes,
 			2,
-			replies({ a: reply('a', { staged: state(2, ['a']), highestActedOn: 2 }), b: reply('b'), c: reply('c') })
+			replies({
+				a: reply('a', { staged: state(2, ['a'], { quiesce: ['a'] }), highestActedOn: 2 }),
+				b: reply('b'),
+				c: reply('c'),
+			})
 		);
 		assert.strictEqual(different.action, 'refuse');
 		assert.match(different.reason, /already staged with a different home set/);
@@ -188,9 +232,9 @@ describe('planSurvey: what refuses before anything is staged', () => {
 			homes,
 			undefined,
 			replies({
-				a: reply('a', { staged: state(2, homes), highestActedOn: 2 }),
-				b: reply('b', { staged: state(2, homes), highestActedOn: 2 }),
-				c: reply('c', { staged: state(2, homes), highestActedOn: 2 }),
+				a: reply('a', { staged: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
+				b: reply('b', { staged: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
+				c: reply('c', { staged: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
 			})
 		);
 		assert.strictEqual(allStaged.action, 'proceed');
@@ -203,9 +247,9 @@ describe('planSurvey: what refuses before anything is staged', () => {
 			homes,
 			undefined,
 			replies({
-				a: reply('a', { active: state(2, homes), highestActedOn: 2 }),
-				b: reply('b', { staged: state(2, homes), highestActedOn: 2 }),
-				c: reply('c', { staged: state(2, homes), highestActedOn: 2 }),
+				a: reply('a', { active: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
+				b: reply('b', { staged: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
+				c: reply('c', { staged: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
 			})
 		);
 		assert.strictEqual(partial.action, 'proceed');
@@ -221,7 +265,7 @@ describe('planSurvey: what refuses before anything is staged', () => {
 			undefined,
 			replies({
 				a: reply('a', { active: state(2, homes), highestActedOn: 2 }),
-				b: reply('b', { staged: state(2, homes), highestActedOn: 2 }),
+				b: reply('b', { staged: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
 				c: reply('c', { active: state(1, homes), highestActedOn: 1 }),
 			})
 		);
@@ -233,9 +277,9 @@ describe('planSurvey: what refuses before anything is staged', () => {
 			homes,
 			undefined,
 			replies({
-				a: reply('a', { staged: state(2, homes), highestActedOn: 2 }),
-				b: reply('b', { staged: state(2, homes), highestActedOn: 2 }),
-				c: reply('c', { staged: state(2, homes), highestActedOn: 2 }),
+				a: reply('a', { staged: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
+				b: reply('b', { staged: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
+				c: reply('c', { staged: state(2, homes, { quiesce: homes }), highestActedOn: 2 }),
 			})
 		);
 		assert.strictEqual(other.generation, 3);
@@ -302,20 +346,22 @@ describe('planActivation: only a proof on every freshly staged node skips the in
  * Peers as the orchestrator sees them: each holds a row driven by the same pure planners the real
  * per-node operations use, answers with an injectable drain result, and can be made to fail a hop.
  */
-function fakeCluster(rowsByNode, { quiesced = {}, fail = {} } = {}) {
+function fakeCluster(rowsByNode, { quiesced = {}, fail = {}, hang = [], self } = {}) {
 	const rows = new Map(Object.entries(rowsByNode));
 	const calls = [];
 	return {
 		rows,
 		calls,
 		peers: {
+			self: () => self,
 			async send(node, operation) {
 				calls.push(`${operation.action}:${node}`);
 				const failure = fail[`${operation.action}:${node}`];
 				if (failure) throw new Error(failure);
+				if (hang.includes(`${operation.action}:${node}`)) return new Promise(() => {});
 				const row = rows.get(node);
 				if (operation.action === 'survey') {
-					if (!rows.has(node)) throw new Error('no route to ' + node);
+					if (!rows.has(node) && node !== self) throw new Error('no route to ' + node);
 					return { node, active: row?.active, staged: row?.staged, highestActedOn: row?.highestActedOn ?? 0 };
 				}
 				const { generation, homes, quiesce, digest } = operation;
@@ -473,6 +519,30 @@ describe('applyHomes over fake peers', function () {
 		assert.deepStrictEqual(report.nodes.a.activate, { action: 'noop' });
 		assert.strictEqual(report.nodes.b.stage.action, 'noop');
 		assert.deepStrictEqual(report.nodes.b.activate, { action: 'activated' });
+	});
+
+	it('a hop that never answers is failed at its deadline, and the report says so', async () => {
+		const cluster = fakeCluster({ a: undefined, b: undefined }, { hang: ['stage:b'] });
+		const timeouts = { hopMs: 200, stageMs: 300 };
+		const error = await refused(applyHomes({ database: 'db', homes: ['a', 'b'] }, cluster.peers, timeouts));
+		assert.strictEqual(error.http_resp_msg.outcome, 'incomplete');
+		assert.match(error.http_resp_msg.nodes.b.stage.error, /b stage did not answer within 300ms/);
+		assert.strictEqual(error.http_resp_msg.nodes.a.stage.action, 'staged');
+		const survey = fakeCluster({ a: undefined }, { hang: ['survey:a'] });
+		const refusal = await refused(applyHomes({ database: 'db', homes: ['a'] }, survey.peers, timeouts));
+		assert.strictEqual(refusal.statusCode, 503);
+		assert.match(refusal.http_resp_msg.nodes.a.survey.error, /a survey did not answer within 200ms/);
+	});
+
+	it("reads the initiating node's own row and reports it, refusing a list that omits a ring it serves", async () => {
+		const cluster = fakeCluster({ ...activeCluster(['a', 'b', 'c']), d: undefined }, { self: 'b' });
+		const error = await refused(applyHomes({ database: 'db', homes: ['d'] }, cluster.peers));
+		assert.strictEqual(error.statusCode, 409);
+		assert.match(error.http_resp_msg.error, /a \(in b's ring, the node taking this call\)/);
+		assert.strictEqual(error.http_resp_msg.initiator.node, 'b');
+		assert.strictEqual(error.http_resp_msg.initiator.survey.active.generation, 1);
+		assert.deepStrictEqual(cluster.calls.sort(), ['survey:b', 'survey:d']);
+		assert.strictEqual(cluster.rows.get('d'), undefined, 'nothing was staged');
 	});
 
 	it('rejects a quiesce that omits a home, and malformed input, before asking anyone', async () => {

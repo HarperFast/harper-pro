@@ -144,6 +144,29 @@ describe('planStage', () => {
 	});
 });
 
+describe('planStage: the participant set', () => {
+	const T = 1_700_000_000_000;
+	it('is stored with the staged state, and a matching re-stage backfills a row that lacks one', () => {
+		const first = planStage(undefined, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T, ['a', 'b', 'c']);
+		assert.strictEqual(first.action, 'write');
+		assert.deepStrictEqual(first.row.staged.quiesce, ['a', 'b', 'c']);
+		const legacy = {
+			database: 'db',
+			staged: { generation: 2, homes: ['a', 'b'], digest: digestOf(2, ['a', 'b']), stagedAt: T },
+			highestActedOn: 2,
+			fenced: [],
+		};
+		const backfilled = planStage(legacy, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T + 5, ['a', 'b', 'c']);
+		assert.strictEqual(backfilled.action, 'write');
+		assert.deepStrictEqual(backfilled.row.staged, { ...legacy.staged, quiesce: ['a', 'b', 'c'] }, 'stagedAt is kept');
+		// Once recorded, the same re-stage is the idempotent noop again.
+		assert.strictEqual(
+			planStage(backfilled.row, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T + 9, ['a', 'b', 'c']).action,
+			'noop'
+		);
+	});
+});
+
 describe('planActivate', () => {
 	const digest1 = digestOf(1, ['a', 'b']);
 	const T = 1_000_000;
@@ -333,6 +356,7 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 			database: 'drain1',
 			generation: 1,
 			homes: ['a'],
+			quiesce: ['a'],
 			hdb_user: { name: 'op' },
 		});
 		assert.deepStrictEqual(quiesced, drained);
@@ -343,7 +367,13 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 		setHomesDrainReader(async () => {
 			throw new Error('the drain did not reach the coordinating worker');
 		});
-		const result = await stageGeneration({ database: 'drain2', generation: 1, homes: ['a'], hdb_user: { name: 'op' } });
+		const result = await stageGeneration({
+			database: 'drain2',
+			generation: 1,
+			homes: ['a'],
+			quiesce: ['a'],
+			hdb_user: { name: 'op' },
+		});
 		assert.strictEqual(result.staged.generation, 1, 'the stage itself still succeeded');
 		assert.match(result.quiesced.error, /did not reach the coordinating worker/);
 	});
@@ -353,6 +383,7 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 			database: 'drain3',
 			generation: 1,
 			homes: ['a'],
+			quiesce: ['a'],
 			hdb_user: { name: 'op' },
 		});
 		assert.ok(quiesced.error, 'an unwired drain must not read as an empty outstanding list');

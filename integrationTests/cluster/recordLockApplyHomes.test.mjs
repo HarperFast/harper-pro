@@ -112,6 +112,7 @@ suite('record_lock_apply_homes: bootstrap and refusals on a three-node cluster',
 			database: DB,
 			generation: 2,
 			homes: [names[0]],
+			quiesce: [names[0]],
 			authorization: nodes[0].admin,
 		});
 		const { status, body } = await operation(nodes[1], {
