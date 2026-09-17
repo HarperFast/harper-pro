@@ -350,9 +350,11 @@ if (parentPort) {
 
 // ---- harper-pro#852: relay a local lock() to the owner worker (see replication/DESIGN.md) --------
 // The ADMISSION crosses the worker-to-worker port mesh, never the handle: the owner does not write the
-// delegation release until this worker acknowledges the fence, the handle's lease elapses, or this
-// worker exits — see DESIGN.md's `ownsCoordination()` entry for why an exit is safe to count here
-// (the native key lock is process-wide, so a later caller on this node cannot overlap it).
+// delegation release until this worker acknowledges the fence or the handle's lease elapses. A caller
+// worker's exit is NOT a fence on this path — `onThreadExit` below keeps its admission to the lease for
+// exactly that reason — because the next holder here is a PEER node, which a process-wide native key
+// lock says nothing about. Exit-counts-as-fenced belongs to main's ownerless handoff
+// (`broadcastOwnerlessAndWait`), where the departed and admitted threads are both on this node.
 
 const ACQUIRE_REQUEST = 'record-lock-acquire';
 const ACQUIRE_REPLY = 'record-lock-acquire-reply';
