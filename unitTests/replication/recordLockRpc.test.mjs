@@ -11,6 +11,7 @@
  */
 import assert from 'node:assert';
 import { createRequire } from 'node:module';
+import { performance } from 'node:perf_hooks';
 // recordLockTransport first, as every production load order does: it installs recordLockRpc's
 // ownership readers at module scope, and reaching recordLockRpc first walks the replicator cycle back
 // into that install before this module's own state exists.
@@ -193,7 +194,11 @@ describe('the owner side will only take an admission from the worker it belongs 
 		released = [];
 		revokers = [];
 		coordinator.acquireForRelay = async (database, table, key, leaseMs, waitMs, onGranted) => {
-			const round = { admissionId: 55, mintedMono: 0 };
+			// Minted NOW, not 0: `revokeRemoteHandle` derives the fence's fallback timer from
+			// `mintedMono + leaseMs - performance.now()`, which is ms since PROCESS start. A literal 0 arms
+			// that timer at 0ms once the suite has run longer than `leaseMs`, which is a second way for the
+			// fence to settle and is not the one the wrong-thread assertion below is testing.
+			const round = { admissionId: 55, mintedMono: performance.now() };
 			revokers.push(onGranted(round));
 			return round;
 		};
