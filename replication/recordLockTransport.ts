@@ -599,12 +599,11 @@ function fenceRelayedAdmissionsForDatabase(database: string): boolean {
  * worker is — main is a serving thread for relayed locks too. A first assignment (no previous owner)
  * grants nothing to fence.
  */
-function updateOwnerThread(database: string, next: number | undefined): boolean {
+function updateOwnerThread(database: string, next: number | undefined): void {
 	const previous = ownerThreadByDatabase.get(database);
 	if (next === undefined) ownerThreadByDatabase.delete(database);
 	else ownerThreadByDatabase.set(database, next);
-	if (previous === undefined || previous === next) return true;
-	return fenceRelayedAdmissionsForDatabase(database);
+	if (previous !== undefined && previous !== next) fenceRelayedAdmissionsForDatabase(database);
 }
 
 export function ownsRecordLockCoordination(database: string): boolean {
@@ -893,15 +892,15 @@ if (parentPort) {
 	// can reach the owner directly. `undefined` clears it (no owner, or owner in an in-flight handoff).
 	onMessageByType('record-lock-owner-thread', (message) => {
 		if (typeof message?.database !== 'string') return;
-		const fenced = updateOwnerThread(
-			message.database,
-			typeof message.threadId === 'number' ? message.threadId : undefined
-		);
+		updateOwnerThread(message.database, typeof message.threadId === 'number' ? message.threadId : undefined);
 		// A requestId means main is waiting for this worker to confirm it has fenced its relayed handles
-		// before it lets the successor grant (harper-pro#852). The fence ran synchronously above, so ack
-		// now — but only if it fenced everything: withholding the ack is what makes main's wait time out
-		// and fail the handoff closed rather than granting over a handle this worker could not fence.
-		if (message.requestId !== undefined && fenced) {
+		// before it lets the successor grant (harper-pro#852). Fence again here rather than rely on what
+		// the line above did: an owner's EXIT broadcasts ownerless twice — `watchOwnerExit` first, then
+		// the waited broadcast that carries this request — so by this message the thread is already
+		// unowned, `updateOwnerThread` fences nothing, and a failure the first message hit would be acked
+		// as a success. The fence is idempotent, and only a complete one may be acked: withholding the ack
+		// is what makes main's wait time out and fail the handoff closed.
+		if (message.requestId !== undefined && fenceRelayedAdmissionsForDatabase(message.database)) {
 			try {
 				parentPort!.postMessage({ type: 'record-lock-owner-thread-ack', requestId: message.requestId });
 			} catch (error) {
@@ -1082,7 +1081,11 @@ const pendingOwnerFenceAcks = new Map<number, () => void>();
  * not complete fails the handoff for the same reason a worker's does. Main thread only.
  */
 function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorkers()): Promise<void> {
-	if (!updateOwnerThread(database, undefined))
+	updateOwnerThread(database, undefined);
+	// Main's own fence, run explicitly for the same reason the worker handler re-runs it: on the
+	// owner-exit path `broadcastOwnerThread` already cleared main's owner, so the call above fences
+	// nothing here either.
+	if (!fenceRelayedAdmissionsForDatabase(database))
 		return Promise.reject(new Error(`could not fence main's own relayed record lock handles for ${database}`));
 	if (workers.length === 0) return Promise.resolve();
 	return Promise.all(
@@ -1212,6 +1215,7 @@ export function recordLockOwnerFor(
 			if (recordLockOwners.get(database) === PENDING_BUMP) recordLockOwners.delete(database);
 			logger.warn?.(`Deferring record lock owner reassignment for ${database}`, error);
 			setTimeout(() => {
+				if (ownerHandoffAttempts.get(database) !== attempt) return;
 				if (!recordLockOwners.has(database) && everHadOwner.has(database)) recordLockOwnerFor(database);
 			}, OWNER_FENCE_ACK_TIMEOUT_MS).unref();
 		});
@@ -1219,12 +1223,14 @@ export function recordLockOwnerFor(
 }
 
 export function releaseRecordLockOwner(database: string): void {
+	// Before the no-owner exit: a FAILED handoff leaves the map empty with a retry already armed, so a
+	// release arriving then records nothing to delete and must still supersede that timer. Otherwise it
+	// fires ten seconds later, sees "unowned but everHadOwner", and confers an owner on a database
+	// ownership was given up on.
+	nextOwnerHandoffAttempt(database);
 	const owner = recordLockOwners.get(database);
 	if (!owner) return;
 	recordLockOwners.delete(database);
-	// Supersede any handoff still in flight, so neither its settlement nor its retry can hand this
-	// database back an owner after it was given up on.
-	nextOwnerHandoffAttempt(database);
 	// A release racing an in-flight handoff bump: deleting the entry (rather than leaving
 	// PENDING_BUMP) is what makes the bump's own completion check see itself superseded and abandon.
 	if (owner === PENDING_BUMP) return;
