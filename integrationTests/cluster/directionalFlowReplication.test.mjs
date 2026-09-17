@@ -21,7 +21,7 @@ import { ok } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, ensureTableExists } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -99,8 +99,7 @@ suite('directional flow replication (harper-pro#498)', { timeout: 120000 }, (ctx
 		// Create the replicated table on both nodes.
 		await Promise.all(
 			[ctx.nodeA, ctx.nodeB].map((node) =>
-				sendOperation(node, {
-					operation: 'create_table',
+				ensureTableExists(node, {
 					database: DB,
 					table: TABLE,
 					primary_key: 'id',

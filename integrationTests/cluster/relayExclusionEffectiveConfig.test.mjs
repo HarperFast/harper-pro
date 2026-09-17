@@ -36,7 +36,7 @@ import {
 	getNextAvailableLoopbackAddress,
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, ensureTableExists } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -165,8 +165,7 @@ suite('relay exclusion follows effective receive config', { timeout: 240000 }, (
 		await Promise.all(
 			[ctx.nodeA, ctx.nodeB, ctx.nodeC].flatMap((node) =>
 				tableDefs.map(([database, table]) =>
-					sendOperation(node, {
-						operation: 'create_table',
+					ensureTableExists(node, {
 						database,
 						table,
 						primary_key: 'id',

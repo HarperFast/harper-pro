@@ -11,15 +11,31 @@ import { setTimeout as delay } from 'node:timers/promises';
  * @returns {Promise<Object>} The response data
  */
 export async function sendOperation(node, operation, options) {
+	const { status, body } = await postOperation(node, operation, options);
+	equal(status, 200, JSON.stringify(body));
+	return body;
+}
+
+async function postOperation(node, operation, options) {
 	const response = await fetch(node.operationsAPIURL, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(operation),
 		signal: options?.signal,
 	});
-	const responseData = await response.json();
-	equal(response.status, 200, JSON.stringify(responseData));
-	return responseData;
+	return { status: response.status, body: await response.json() };
+}
+
+/**
+ * create_table whose post-condition is only that the table exists — a connected peer's definition
+ * may have created it first. Guarantees existence, not that the supplied definition was applied.
+ */
+export async function ensureTableExists(node, definition, options) {
+	const { status, body } = await postOperation(node, { ...definition, operation: 'create_table' }, options);
+	if (status === 400 && body?.error === `Table '${definition.table}' already exists in '${definition.database}'`)
+		return body;
+	equal(status, 200, JSON.stringify(body));
+	return body;
 }
 
 /**
