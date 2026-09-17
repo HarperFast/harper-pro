@@ -600,7 +600,7 @@ interface OwnerAdmission {
 /** Relayed admissions this thread minted as owner, keyed by (database, table, admissionId). */
 const ownerAdmissions = new Map<string, OwnerAdmission>();
 let nextRevokeId = 1;
-const pendingRevokeAcks = new Map<number, () => void>();
+const pendingRevokeAcks = new Map<number, { threadId: number; settle: () => void }>();
 
 function releaseOwnerAdmission(admission: OwnerAdmission): void {
 	try {
@@ -645,7 +645,7 @@ onMessageByType(ACQUIRE_REQUEST, async (message: any, port: any) => {
 				admissionId: grantedRound.admissionId,
 				port,
 			});
-			return () => revokeRemoteHandle(database, table, grantedRound, leaseMs, port);
+			return () => revokeRemoteHandle(database, table, grantedRound, leaseMs, port, origin);
 		});
 		// If the grant reply cannot be delivered, the caller will never install or release this admission —
 		// release it here rather than let the owner hold it to its lease against a ghost the caller cannot name.
@@ -661,19 +661,29 @@ onMessageByType(ACQUIRE_REQUEST, async (message: any, port: any) => {
 	}
 });
 
-onMessageByType(RELEASE_REQUEST, (message: any) => {
+onMessageByType(RELEASE_REQUEST, (message: any, port: any) => {
 	const { database, table, admissionId, session } = message;
 	// Ignore a release stamped with another owner's session: it names an admission a departed owner
 	// minted, not one this thread holds.
 	if (session !== OWNER_SESSION) return;
 	const admission = ownerAdmissions.get(admissionSessionKey(database, table, admissionId));
 	if (!admission) return;
+	// Only the worker the admission was minted for may release it. The session is shared across this
+	// owner's admissions and admission ids are a plain sequence, so the session alone lets any thread
+	// that learned it drop a SIBLING's admission while that sibling's handle can still commit — which
+	// admits a peer node concurrently. The origin is the id captured from the stamped port at acquire.
+	if (port?.threadId !== admission.origin) return;
 	ownerAdmissions.delete(admissionSessionKey(database, table, admissionId));
 	releaseOwnerAdmission(admission);
 });
 
-onMessageByType(REVOKE_ACK, (message: any) => {
-	pendingRevokeAcks.get(message.revokeId)?.();
+onMessageByType(REVOKE_ACK, (message: any, port: any) => {
+	const pending = pendingRevokeAcks.get(message.revokeId);
+	// Same rule, and the sharper consequence: this ack is what tells the owner the handle is fenced, so
+	// an ack from anyone but the holder makes it write `lockRelease` while the real holder can still
+	// commit — the cross-node two-writer the fence exists to close.
+	if (!pending || port?.threadId !== pending.threadId) return;
+	pending.settle();
 });
 
 /**
@@ -693,7 +703,8 @@ function revokeRemoteHandle(
 	table: string,
 	round: LockRound,
 	leaseMs: number,
-	port: any
+	port: any,
+	origin: number
 ): Promise<void> {
 	ownerAdmissions.delete(admissionSessionKey(database, table, round.admissionId));
 	const revokeId = nextRevokeId++;
@@ -708,7 +719,7 @@ function revokeRemoteHandle(
 			resolve();
 		};
 		const timer = setTimeout(done, remainingLease).unref();
-		pendingRevokeAcks.set(revokeId, done);
+		pendingRevokeAcks.set(revokeId, { threadId: origin, settle: done });
 		try {
 			// The caller's own port, captured at acquire; a fence on the thread that holds the handle.
 			port.postMessage({ type: REVOKE_REQUEST, revokeId, database, table, admissionId: round.admissionId });
