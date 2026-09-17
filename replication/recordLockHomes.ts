@@ -26,7 +26,11 @@ import { createHash } from 'node:crypto';
 import Joi from 'joi';
 import { table } from '../core/resources/databases.ts';
 import { transaction } from '../core/resources/transaction.ts';
-import { DELEGATION_LEASE_MS, LOCK_LEASE_SKEW_MS } from '../core/resources/recordLockCoordinator.ts';
+import {
+	DELEGATION_LEASE_MS,
+	LOCK_LEASE_SKEW_MS,
+	type QuiesceResult,
+} from '../core/resources/recordLockCoordinator.ts';
 import { validateBySchema } from '../core/validation/validationWrapper.js';
 import { handleHDBError, hdbErrors, ClientError } from '../core/utility/errors/hdbError.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -237,7 +241,32 @@ export function planStage(
 	};
 }
 
-export async function stageGeneration(request: any): Promise<{ staged: RecordLockGenerationState }> {
+/**
+ * Never throws: a stage that durably landed must not report failure because the drain did, or the
+ * operator retries a transition that already happened. A drain that cannot run at all is reported as
+ * unknown, which reads to an orchestrator exactly like outstanding work — fall back to the timer.
+ */
+async function drainForStage(database: string): Promise<QuiesceResult | { error: string }> {
+	try {
+		return await drainReader(database, STAGE_DRAIN_BUDGET_MS);
+	} catch (error) {
+		logger.warn?.(`Record lock quiesce for ${database} could not complete; fall back to the drain interval`, error);
+		return { error: (error as Error)?.message ?? String(error) };
+	}
+}
+
+export async function stageGeneration(
+	request: any
+): Promise<{ staged: RecordLockGenerationState; quiesced: QuiesceResult | { error: string } }> {
+	const staged = await stageRow(request);
+	// Deliberately OUTSIDE `withRow`: the drain waits on live critical sections, and holding the
+	// database's transition queue for that would block every other stage, fence and activate on this
+	// node behind it. The row write already retracted `active`, so nothing new can be granted while
+	// this runs, and a concurrent transition is free to proceed.
+	return { ...staged, quiesced: await drainForStage(request.database) };
+}
+
+async function stageRow(request: any): Promise<{ staged: RecordLockGenerationState }> {
 	const validation = validateBySchema(request, stageSchema);
 	if (validation)
 		throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
@@ -415,6 +444,34 @@ export function setHomesMembershipReaders(readers: MembershipReaders): void {
 	membership = readers;
 }
 
+/**
+ * Installed by `recordLockTransport.ts`: drain on the thread that coordinates the database, not on
+ * whichever one answered the operation. Defaults to refusing rather than reporting a clean drain it
+ * never performed.
+ */
+let drainReader: (database: string, budgetMs: number) => Promise<QuiesceResult | { error: string }> = async () => ({
+	error: 'no record lock drain is wired on this node',
+});
+/**
+ * An orchestrator may skip the drain interval for a node ONLY on this: a drain that both completed
+ * and found nothing. `complete` is core's statement that the sweep could have seen everything —
+ * coordinators are built lazily, so an empty `outstanding` alone is not a proof (harper-pro#856).
+ */
+export function provesQuiescence(quiesced: QuiesceResult | { error: string } | undefined): boolean {
+	// Every field is checked positively: this value crosses a worker boundary, so a malformed reply must
+	// read as "not proven" rather than slipping through on a missing `length`.
+	return (
+		!!quiesced &&
+		!('error' in quiesced) &&
+		quiesced.complete === true &&
+		Array.isArray(quiesced.outstanding) &&
+		quiesced.outstanding.length === 0
+	);
+}
+export function setHomesDrainReader(reader: typeof drainReader): void {
+	drainReader = reader;
+}
+
 export interface HomesProposal {
 	generation: number;
 	homes: string[];
@@ -506,6 +563,15 @@ const proposeSchema = Joi.object({
 });
 
 export const DELEGATION_DRAIN_MS = DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS;
+/**
+ * How long `stage` spends draining before it reports what is left (harper-pro#856). A drain waits on
+ * live critical sections, which are milliseconds in the normal case and bounded by the caller's own
+ * lock lease; this is a reporting bound, not a safety one — whatever is still outstanding is returned,
+ * and the operator falls back to `DELEGATION_DRAIN_MS` for those nodes.
+ */
+export const STAGE_DRAIN_BUDGET_MS = Number.isFinite(Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS))
+	? Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS)
+	: 10_000;
 
 server.registerOperation?.({
 	name: 'record_lock_propose_homes',

@@ -55,6 +55,7 @@ import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import {
 	currentRow,
 	onRecordLockHomesChanged,
+	setHomesDrainReader,
 	setHomesMembershipReaders,
 	type RecordLockGenerationState,
 } from './recordLockHomes.ts';
@@ -62,6 +63,7 @@ import {
 	BARRIER_OPERATION,
 	DELEGATE_OPERATION,
 	RECALL_OPERATION,
+	quiesceOnOwner,
 	sendRecordLockOperation,
 	setRecordLockOwnershipReaders,
 } from './recordLockRpc.ts';
@@ -1042,6 +1044,8 @@ export async function collectRecordLockStatus(
 	await Promise.all(answers);
 	return result;
 }
+
+setHomesDrainReader((database, deadlineMs) => quiesceOnOwner(database, deadlineMs));
 
 setHomesMembershipReaders({
 	thisNodeName: getThisNodeName,

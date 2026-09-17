@@ -27,6 +27,7 @@ import * as logger from '../core/utility/logging/harper_logger.js';
 import {
 	deliverDelegationRecall,
 	deliverDelegationRequest,
+	quiesceDelegations,
 	writeLockBarrier,
 	type DelegationRecall,
 	type DelegationReply,
@@ -215,7 +216,7 @@ async function executeBarrier(request: any): Promise<{ position: number }> {
 
 // ---- relay through the main thread to the owner worker -----------------------------------------
 
-type RelayKind = 'delegate' | 'recall';
+type RelayKind = 'delegate' | 'recall' | 'quiesce';
 let nextRelayId = 1;
 const pendingRelays = new Map<number, (reply: any) => void>();
 
@@ -248,8 +249,26 @@ async function relay(kind: RelayKind, database: string, table: string, payload: 
 
 async function executeLocally(kind: RelayKind, database: string, table: string, payload: any): Promise<any> {
 	if (kind === 'delegate') return deliverDelegationRequest(database, table, payload);
+	if (kind === 'quiesce') return quiesceDelegations(database, payload?.deadlineMs);
 	await deliverDelegationRecall(database, table, payload);
 	return RECALLED;
+}
+
+/**
+ * Drain this database's delegations on the thread that actually coordinates them (harper-pro#856).
+ *
+ * The operations API answers on whichever thread took the request, and coordinator state is
+ * per-thread: calling `quiesceDelegations` here would sweep an empty registry and report "nothing
+ * outstanding" while the owner thread still holds every grant — a drain claimed but not performed,
+ * which is the one thing this must never do. A relay that cannot reach the owner reports that as an
+ * error rather than an empty result, so the operator falls back to the drain interval.
+ */
+export async function quiesceOnOwner(database: string, deadlineMs: number): Promise<any> {
+	if (ownership.ownsDatabase(database)) return quiesceDelegations(database, deadlineMs);
+	const answer = await relay('quiesce', database, '', { deadlineMs });
+	if (!answer || typeof answer !== 'object' || !Array.isArray(answer.outstanding))
+		throw new ClientError('the record lock drain did not reach the coordinating worker in time', 503);
+	return answer;
 }
 
 /**

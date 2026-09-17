@@ -6,11 +6,15 @@
  */
 import assert from 'node:assert';
 import {
+	STAGE_DRAIN_BUDGET_MS,
 	canonicalizeHomes,
+	provesQuiescence,
+	setHomesDrainReader,
 	digestOf,
 	planActivate,
 	planProposal,
 	planStage,
+	stageGeneration,
 	validateGenerationInput,
 } from '#src/replication/recordLockHomes';
 
@@ -312,5 +316,74 @@ describe('planProposal', () => {
 	it('rejects a set larger than the bound, through the shared validator', () => {
 		const many = Array.from({ length: 300 }, (_, i) => `n${i}`);
 		assert.throws(() => planProposal('a', many, undefined, 'data'), /homes must be/);
+	});
+});
+
+describe('stage drains instead of waiting out the lease (harper-pro#856)', () => {
+	afterEach(() => setHomesDrainReader(async () => ({ error: 'no record lock drain is wired on this node' })));
+
+	it('reports whatever the coordinating thread found, unchanged', async () => {
+		const drained = { surrendered: 2, recalled: 3, outstanding: [] };
+		let asked;
+		setHomesDrainReader(async (database, deadlineMs) => {
+			asked = { database, deadlineMs };
+			return drained;
+		});
+		const { quiesced } = await stageGeneration({
+			database: 'drain1',
+			generation: 1,
+			homes: ['a'],
+			hdb_user: { name: 'op' },
+		});
+		assert.deepStrictEqual(quiesced, drained);
+		assert.deepStrictEqual(asked, { database: 'drain1', deadlineMs: STAGE_DRAIN_BUDGET_MS });
+	});
+
+	it('a drain that throws becomes {error} and never fails a stage that already landed', async () => {
+		setHomesDrainReader(async () => {
+			throw new Error('the drain did not reach the coordinating worker');
+		});
+		const result = await stageGeneration({ database: 'drain2', generation: 1, homes: ['a'], hdb_user: { name: 'op' } });
+		assert.strictEqual(result.staged.generation, 1, 'the stage itself still succeeded');
+		assert.match(result.quiesced.error, /did not reach the coordinating worker/);
+	});
+
+	it('defaults to refusing rather than reporting a clean drain it never performed', async () => {
+		const { quiesced } = await stageGeneration({
+			database: 'drain3',
+			generation: 1,
+			homes: ['a'],
+			hdb_user: { name: 'op' },
+		});
+		assert.ok(quiesced.error, 'an unwired drain must not read as an empty outstanding list');
+		assert.strictEqual(quiesced.outstanding, undefined);
+	});
+
+	it('only an empty AND complete drain lets an orchestrator skip the interval', () => {
+		assert.strictEqual(provesQuiescence({ complete: true, surrendered: 0, recalled: 0, outstanding: [] }), true);
+		// Empty but not complete: a lazily-unbuilt coordinator, or a process that restarted recently.
+		assert.strictEqual(provesQuiescence({ complete: false, surrendered: 0, recalled: 0, outstanding: [] }), false);
+		assert.strictEqual(
+			provesQuiescence({ complete: true, surrendered: 0, recalled: 0, outstanding: [{ table: 'T' }] }),
+			false
+		);
+		assert.strictEqual(provesQuiescence({ error: 'the drain did not reach the coordinating worker' }), false);
+		assert.strictEqual(provesQuiescence(undefined), false);
+		// A malformed reply crossing a worker boundary must read as "not proven", not slip through on a
+		// missing `length`.
+		assert.strictEqual(provesQuiescence({ complete: true, outstanding: {} }), false);
+		assert.strictEqual(provesQuiescence({ complete: true }), false);
+		assert.strictEqual(provesQuiescence({ complete: 'yes', outstanding: [] }), false);
+	});
+
+	it('has a reporting budget far below the interval it replaces', () => {
+		// The budget bounds how long `stage` spends DRAINING before it reports what is left; it is not a
+		// safety interval. It must be well under DELEGATION_DRAIN_MS, or reporting would cost as much as
+		// the wait the drain exists to avoid.
+		assert.ok(STAGE_DRAIN_BUDGET_MS > 0);
+		assert.ok(
+			STAGE_DRAIN_BUDGET_MS < 365_000,
+			`the drain budget (${STAGE_DRAIN_BUDGET_MS}ms) must be shorter than the drain interval it replaces`
+		);
 	});
 });
