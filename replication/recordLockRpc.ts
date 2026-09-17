@@ -764,6 +764,19 @@ onThreadExit((threadId: number) => {
 	}
 });
 
+/**
+ * This thread is no longer the coordinating worker for a database, without having exited. Same rule as
+ * the exit path above: forget the bookkeeping, do not release — the callers fenced their handles and
+ * dropped their owner sessions when they learned the owner changed, so no release will ever arrive to
+ * collect these entries, and the coordinator's lease is what retires the admission itself.
+ */
+export function forgetOwnerAdmissionsForDatabase(database: string): void {
+	for (const [admissionKey, admission] of ownerAdmissions) {
+		if (admission.database !== database) continue;
+		ownerAdmissions.delete(admissionKey);
+	}
+}
+
 server.registerOperation?.({ name: DELEGATE_OPERATION, execute: executeDelegate, httpMethod: 'POST' });
 server.registerOperation?.({ name: RECALL_OPERATION, execute: executeRecall, httpMethod: 'POST' });
 server.registerOperation?.({ name: BARRIER_OPERATION, execute: executeBarrier, httpMethod: 'POST' });

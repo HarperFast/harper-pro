@@ -286,6 +286,18 @@ describe('the owner side will only take an admission from the worker it belongs 
 		assert.deepStrictEqual(released, [55], 'the worker it was minted for still releases it');
 	});
 
+	it('forgets a relayed admission when this thread stops coordinating the database', async () => {
+		// The callers fenced their handles and dropped their owner sessions the moment they learned the
+		// owner changed, so nothing will ever release these entries; only this thread can retire them.
+		// The positive control is the release test above: the same call with the same session and thread
+		// releases 55 while this thread still owns the database.
+		const { session } = await admissionHeldByHolder('owner-side-unowned');
+		releaseRecordLockOwner('owner-side-unowned');
+		ownedDatabase = undefined;
+		handleRelease({ database: 'owner-side-unowned', table: 'Counter', admissionId: 55, session }, { threadId: HOLDER });
+		assert.deepStrictEqual(released, [], 'the bookkeeping went with the ownership rather than leaking');
+	});
+
 	it('ignores a revoke ack from a thread that does not hold the handle', async () => {
 		const { posted } = await admissionHeldByHolder('owner-side-revoke');
 		let fenced = false;
