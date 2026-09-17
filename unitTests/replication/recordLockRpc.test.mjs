@@ -10,11 +10,20 @@
  * the mesh is a fake port registered in the thread port list `sendToThread` searches.
  */
 import assert from 'node:assert';
+import { createRequire } from 'node:module';
 // recordLockTransport first, as every production load order does: it installs recordLockRpc's
 // ownership readers at module scope, and reaching recordLockRpc first walks the replicator cycle back
 // into that install before this module's own state exists.
 import { recordLockOwnerFor, releaseRecordLockOwner } from '#src/replication/recordLockTransport';
-import { acquireOnOwnerRelay, handleAcquireReply, releaseOnOwnerRelay } from '#src/replication/recordLockRpc';
+import { setMainIsWorker } from '#js/core/server/threads/manageThreads';
+import {
+	acquireOnOwnerRelay,
+	handleAcquireReply,
+	handleAcquireRequest,
+	handleRelease,
+	handleRevokeAck,
+	releaseOnOwnerRelay,
+} from '#src/replication/recordLockRpc';
 
 const OWNER_THREAD = 8101;
 /**
@@ -156,5 +165,87 @@ describe('relaying a lock() to the coordinating worker', () => {
 		port.posted.length = 0;
 		releaseOnOwnerRelay('rpc-orphan-release', 'Counter', 'k', 9);
 		assert.deepStrictEqual(port.posted, [], 'nothing addresses an admission the departed owner minted');
+	});
+});
+
+/**
+ * The OWNER side of the relay: who is allowed to release an admission, and who is allowed to say a
+ * handle is fenced. Both gates are the same rule the acquire handler states — identity comes from the
+ * port the harness stamped, never the payload — and both were missing until cb1kenobi's review.
+ *
+ * The coordinator is stubbed rather than driven: `acquireForRelay` only has to invoke the grant
+ * callback (which is what mints the `OwnerAdmission` and builds the revoker) and hand back a round, so
+ * no table registry or storage is involved.
+ */
+describe('the owner side will only take an admission from the worker it belongs to', () => {
+	const coordinator = createRequire(import.meta.url)('#js/core/resources/recordLockCoordinator');
+	const HOLDER = 8202;
+	const OTHER = 8203;
+	let saved;
+	let released;
+	let revokers;
+	// A distinct database per test: once one has had an owner, re-claiming it takes the handoff path
+	// (PENDING_BUMP) and this thread would not coordinate it synchronously.
+	let ownedDatabase;
+
+	beforeEach(() => {
+		saved = { acquireForRelay: coordinator.acquireForRelay, releaseForRelay: coordinator.releaseForRelay };
+		released = [];
+		revokers = [];
+		coordinator.acquireForRelay = async (database, table, key, leaseMs, waitMs, onGranted) => {
+			const round = { admissionId: 55, mintedMono: 0 };
+			revokers.push(onGranted(round));
+			return round;
+		};
+		coordinator.releaseForRelay = (database, table, key, admissionId) => released.push(admissionId);
+	});
+
+	afterEach(() => {
+		Object.assign(coordinator, saved);
+		if (ownedDatabase) releaseRecordLockOwner(ownedDatabase);
+		ownedDatabase = undefined;
+		setMainIsWorker(false);
+	});
+
+	/** One minted admission, held by thread HOLDER, with its grant reply captured. */
+	async function admissionHeldByHolder(database) {
+		// This thread must coordinate the database, or the acquire fails closed before minting anything.
+		ownedDatabase = database;
+		setMainIsWorker(true);
+		recordLockOwnerFor(database, []);
+		const posted = [];
+		const port = { threadId: HOLDER, postMessage: (message) => posted.push(message) };
+		await handleAcquireRequest(
+			{ requestId: 1, database, table: 'Counter', key: 'k', leaseMs: 60_000, waitMs: 1_000 },
+			port
+		);
+		const reply = posted.find((message) => message.type === 'record-lock-acquire-reply');
+		assert.ok(reply?.round, 'the acquire minted an admission for the holder');
+		return { posted, session: reply.session };
+	}
+
+	it('ignores a release from a thread the admission was not minted for', async () => {
+		const { session } = await admissionHeldByHolder('owner-side-release');
+		const release = { database: 'owner-side-release', table: 'Counter', admissionId: 55, session };
+		handleRelease(release, { threadId: OTHER });
+		assert.deepStrictEqual(released, [], 'the session alone must not let a sibling drop this admission');
+		handleRelease(release, { threadId: HOLDER });
+		assert.deepStrictEqual(released, [55], 'the worker it was minted for still releases it');
+	});
+
+	it('ignores a revoke ack from a thread that does not hold the handle', async () => {
+		const { posted } = await admissionHeldByHolder('owner-side-revoke');
+		let fenced = false;
+		revokers[0]().then(() => (fenced = true));
+		// The id the owner actually minted for this revoke, not a guess: `nextRevokeId` is module-global.
+		const revokeId = posted.findLast((message) => message.type === 'record-lock-revoke')?.revokeId;
+		assert.ok(revokeId !== undefined, 'the holder was asked to fence over its own port');
+		const ack = { revokeId };
+		handleRevokeAck(ack, { threadId: OTHER });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(fenced, false, 'only the holder can tell the owner its handle is fenced');
+		handleRevokeAck(ack, { threadId: HOLDER });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(fenced, true, 'the holder settles the fence core awaits before lockRelease');
 	});
 });

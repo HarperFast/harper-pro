@@ -614,7 +614,12 @@ function releaseOwnerAdmission(admission: OwnerAdmission): void {
 	}
 }
 
-onMessageByType(ACQUIRE_REQUEST, async (message: any, port: any) => {
+/**
+ * Owner side: mint an admission for a peer worker's `lock()`. Named and exported so the deny paths
+ * below can be tested — `manageThreads` offers no way to raise a worker->worker message, the same
+ * reason `handleAcquireReply` is exported.
+ */
+export async function handleAcquireRequest(message: any, port: any): Promise<void> {
 	const { requestId, database, table, key, leaseMs, waitMs } = message;
 	// The origin is the sender thread, taken from the port the harness stamped — never a payload field,
 	// so a malformed worker cannot claim another's identity or target another's handle. A message with
@@ -633,8 +638,10 @@ onMessageByType(ACQUIRE_REQUEST, async (message: any, port: any) => {
 	};
 	// This thread must actually coordinate the database. A misrouted request (an ownership change the
 	// caller had not yet learned) fails closed rather than relaying onward into a loop.
-	if (!ownership.ownsDatabase(database))
-		return reply({ error: { message: `this worker does not coordinate ${database}`, statusCode: 503 } });
+	if (!ownership.ownsDatabase(database)) {
+		reply({ error: { message: `this worker does not coordinate ${database}`, statusCode: 503 } });
+		return;
+	}
 	try {
 		const round = await acquireForRelay(database, table, key, leaseMs, waitMs, (grantedRound: LockRound) => {
 			ownerAdmissions.set(admissionSessionKey(database, table, grantedRound.admissionId), {
@@ -659,9 +666,10 @@ onMessageByType(ACQUIRE_REQUEST, async (message: any, port: any) => {
 	} catch (error: any) {
 		reply({ error: { message: error?.message ?? 'record lock acquire failed', statusCode: error?.statusCode ?? 503 } });
 	}
-});
+}
+onMessageByType(ACQUIRE_REQUEST, handleAcquireRequest);
 
-onMessageByType(RELEASE_REQUEST, (message: any, port: any) => {
+export function handleRelease(message: any, port: any): void {
 	const { database, table, admissionId, session } = message;
 	// Ignore a release stamped with another owner's session: it names an admission a departed owner
 	// minted, not one this thread holds.
@@ -675,16 +683,18 @@ onMessageByType(RELEASE_REQUEST, (message: any, port: any) => {
 	if (port?.threadId !== admission.origin) return;
 	ownerAdmissions.delete(admissionSessionKey(database, table, admissionId));
 	releaseOwnerAdmission(admission);
-});
+}
+onMessageByType(RELEASE_REQUEST, handleRelease);
 
-onMessageByType(REVOKE_ACK, (message: any, port: any) => {
+export function handleRevokeAck(message: any, port: any): void {
 	const pending = pendingRevokeAcks.get(message.revokeId);
 	// Same rule, and the sharper consequence: this ack is what tells the owner the handle is fenced, so
 	// an ack from anyone but the holder makes it write `lockRelease` while the real holder can still
 	// commit — the cross-node two-writer the fence exists to close.
 	if (!pending || port?.threadId !== pending.threadId) return;
 	pending.settle();
-});
+}
+onMessageByType(REVOKE_ACK, handleRevokeAck);
 
 /**
  * Fence a relayed handle on the worker that holds it, and resolve once it acknowledges — or once the
