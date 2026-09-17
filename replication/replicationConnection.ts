@@ -5233,6 +5233,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (configSendDecision === false) {
 								// Our config route to this peer does not authorize sending to them for this database;
 								// reject up front rather than optimistically wiring up the send path.
+								logger.warn?.(
+									connectionId,
+									`Config route does not authorize sending ${databaseName} to ${authorization.name}; closing the subscription`
+								);
 								closed = true;
 								close(1008, `Unauthorized database subscription to ${databaseName}`);
 								return;
@@ -5290,6 +5294,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									});
 							}
 						} else if (!(authorization?.role?.permission?.super_user || authorization.replicates)) {
+							logger.warn?.(
+								connectionId,
+								`${remoteNodeName ?? 'peer'} is not authorized to subscribe to ${databaseName}: no super_user permission and no replicates grant; closing the subscription`
+							);
 							ws.send(encode([DISCONNECT]));
 							close(1008, `Unauthorized database subscription to ${databaseName}`);
 							return;
