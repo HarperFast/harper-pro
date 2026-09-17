@@ -99,10 +99,13 @@ suite(
 		});
 
 		test('a failure between stage and activate leaves every node staged and refusing, and the same call from another node completes it', async () => {
+			// Generation 2 explicitly: with every node active at 1 for this same set, an unnumbered call is
+			// the idempotent re-apply (every phase noops) and there would be nothing to interrupt.
 			const { status, body } = await operation(nodes[1], {
 				operation: 'record_lock_apply_homes',
 				database: DB,
 				homes: names,
+				generation: 2,
 			});
 			assert.equal(status, 503, JSON.stringify(body));
 			assert.equal(body.outcome, 'incomplete');
