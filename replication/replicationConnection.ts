@@ -8152,14 +8152,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			operation.requestId = requestId;
 			ws.send(encode([OPERATION_REQUEST, operation]));
 			return new Promise((resolve, reject) => {
-				awaitingResponse.set(requestId, { resolve, reject });
-				if (timeoutMs === undefined) return;
+				if (timeoutMs === undefined) {
+					awaitingResponse.set(requestId, { resolve, reject });
+					return;
+				}
 				// Retire the entry ourselves: a peer that never answers must not pin it (and the caller) for
 				// the life of the socket.
-				setTimeout(() => {
+				const timer = setTimeout(() => {
 					if (awaitingResponse.delete(requestId))
 						reject(new Error(`${operation.operation} to ${remoteNodeName} did not answer within ${timeoutMs}ms`));
 				}, timeoutMs).unref();
+				awaitingResponse.set(requestId, {
+					resolve: (value: any) => {
+						clearTimeout(timer);
+						resolve(value);
+					},
+					reject: (error: any) => {
+						clearTimeout(timer);
+						reject(error);
+					},
+				});
 			});
 		},
 		// A standalone re-announce for this live socket (harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6):
