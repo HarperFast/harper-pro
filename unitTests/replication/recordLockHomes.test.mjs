@@ -2,12 +2,16 @@
  * The pure decision logic behind the operator-agreed home map (harper-pro#825): canonicalization
  * and digest determinism, and the stage/activate state machine as a function of the row's current
  * state — checked without a real table, per RECORD_LOCK_HOMES_DESIGN.md's testing section (the
- * storage I/O around these functions is exercised by the cluster integration suite instead).
+ * storage I/O around these functions is exercised by the cluster integration suite instead). The
+ * exceptions are the `stageGeneration` cases at the bottom, which drive the real row: the drain
+ * reporting contract, and the exclusion `withRow` takes on the row itself.
  */
 import assert from 'node:assert';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
 	STAGE_DRAIN_BUDGET_MS,
 	canonicalizeHomes,
+	getRecordLockHomesTable,
 	provesQuiescence,
 	setHomesDrainReader,
 	digestOf,
@@ -450,5 +454,47 @@ describe('stage drains instead of waiting out the lease (harper-pro#856)', () =>
 			STAGE_DRAIN_BUDGET_MS < 365_000,
 			`the drain budget (${STAGE_DRAIN_BUDGET_MS}ms) must be shorter than the drain interval it replaces`
 		);
+	});
+});
+
+describe('withRow serializes on the row lock, not only on its per-isolate queue (harper-pro#852)', () => {
+	it('a transition waits for a node-scoped hold on its row taken outside withRow', async () => {
+		// The exclusion a stage/fence/activate needs is between HTTP WORKERS, so the old per-isolate
+		// promise queue could not supply it: two workers each read `active: g1`, and whichever wrote
+		// second discarded the other's transition while both reported success. `withRow` now takes core's
+		// node-scoped hold lock on the `hdb_record_lock_homes` row, which is process-wide.
+		//
+		// A holder that `withRow`'s own queue knows nothing about is what this asserts against, and it is
+		// the assertion an isolate-local queue cannot pass: with the queue alone the stage below runs
+		// straight through. That the lock ALSO excludes across threads is core's property, not this
+		// test's — one isolate cannot demonstrate it.
+		const database = 'row-lock-exclusion';
+		const held = await getRecordLockHomesTable().lock(database, {
+			scope: 'node',
+			hold: true,
+			lease: 30_000,
+			timeout: 30_000,
+		});
+		let settled;
+		const stage = stageGeneration({
+			database,
+			generation: 1,
+			homes: ['a'],
+			quiesce: ['a'],
+			hdb_user: { name: 'op' },
+		}).then(
+			(value) => ((settled = 'fulfilled'), value),
+			(error) => ((settled = 'rejected'), Promise.reject(error))
+		);
+		// Never leave the row locked for the rest of the run: an unlock skipped by a failed assertion
+		// would wedge every later test that touches this database behind a 30s lease.
+		try {
+			await delay(300);
+			assert.strictEqual(settled, undefined, `the stage did not wait for the row lock (${settled})`);
+		} finally {
+			await held.unlock();
+		}
+		const { staged } = await stage;
+		assert.strictEqual(staged.generation, 1, 'and it completes once the holder releases');
 	});
 });
