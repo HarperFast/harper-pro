@@ -8129,8 +8129,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const requestId = nextId++;
 		return new Promise((resolve, reject) => {
 			// Retire the entry ourselves: a peer that never answers must not pin it (and the caller) for
-			// the life of the socket. Guard the delete: a response that already resolved this request
-			// must not also reject it.
+			// the life of the socket.
 			const timer = timeoutMs
 				? setTimeout(() => {
 						if (awaitingResponse.delete(requestId))
