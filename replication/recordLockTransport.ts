@@ -1093,8 +1093,9 @@ export function handleOwnerThreadAck(message: { requestId: number }, port?: { th
  * whose closed port neither throws on post nor fires `exit` again, stalling the wait to its timeout.
  *
  * A worker that EXITS is resolved as fenced even though an in-flight async write it submitted could
- * still land. What makes that safe is the process-wide native key lock, NOT the successor's restart
- * quarantine — the argument and its one residual window are at the `onExit` handler below, and in
+ * still land, and an abandoned commit is NOT cancelled by its thread's death. What holds the case is
+ * the storage engine's submission ordering, not the native key lock and not the successor's restart
+ * quarantine — the argument and what is still open are at the `onExit` handler below, and in
  * `replication/DESIGN.md`. Main fences its own relayed handles synchronously first, and a fence it could
  * not complete fails the handoff for the same reason a worker's does. Main thread only.
  */
@@ -1123,16 +1124,23 @@ function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorker
 					// A worker that exits before acking counts as fenced; a live worker that never acks is
 					// wedged, so that rejects and the handoff fails closed.
 					//
-					// What makes the exit case safe is NOT the coordinator's restart quarantine: that is
-					// read only where this node is the key's home, so a peer-homed key renews straight back
-					// to this node and never consults it. It is the native key lock, which `lock()` takes
-					// before the cluster admission and which is process-wide. Both the departed worker and
-					// any new caller admitted afterwards are on THIS node, and they cannot both hold the
-					// native key for one key, so a second writer cannot start while the first still holds it.
-					// The residual window is narrower than a protocol gap: the departed worker's native
-					// handle would have to disappear on thread teardown while a commit it already handed to
-					// the storage engine is still in flight. That is a rocksdb-js teardown question
-					// (rocksdb-js#865), not something this handoff can close.
+					// Two arguments for the exit case do NOT hold, and both were believed here before.
+					// The coordinator's restart quarantine is read only where this node is the key's home,
+					// so a peer-homed key renews straight back to this node and never consults it. And the
+					// native key lock only stops two callers being INSIDE a critical section at once: a
+					// caller that staged a write and then unlocked has already returned the key while its
+					// write can still commit, which is the whole reason `revokeLease()` fences capability
+					// rather than admission. So the window needs no teardown anomaly — any commit in flight
+					// when the worker exits reaches it.
+					//
+					// What does hold is the engine's submission ordering. An abandoned commit is not
+					// cancelled by its thread's death (measured: 40 000/40 000 still landed), but it keeps
+					// the order it was submitted in (0/40 000 inversions against a successor writing the
+					// same key), so a successor admitted after the exit cannot be overwritten by the
+					// departed worker. `benchmarks/recordLockExitCommit/` is that probe;
+					// `replication/RECORD_LOCK_RELAY_TRANSPORT.md` records it. What is still open in
+					// rocksdb-js#865 is whether that ordering is GUARANTEED across threads and across
+					// separate handles, or is an artefact of one write queue on this build.
 					const onExit = () => done(resolve);
 					const timer = setTimeout(
 						() => done(() => reject(new Error(`worker did not confirm record lock fencing for ${database}`))),
@@ -1144,7 +1152,8 @@ function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorker
 					try {
 						worker.postMessage({ type: 'record-lock-owner-thread', database, threadId: undefined, requestId });
 					} catch {
-						// The port is already gone: the worker exited, so its handles are fenced by definition.
+						// The port is already gone: the worker exited, which is the case the `onExit` comment
+						// above argues, on the engine's submission ordering rather than on the key lock.
 						done(resolve);
 					}
 				})
