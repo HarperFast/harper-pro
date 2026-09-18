@@ -39,9 +39,9 @@ const { HTTP_STATUS_CODES } = hdbErrors;
 const MAX_HOMES = 256;
 /** See `planActivate`'s comment: a backstop, not the safety mechanism. Overridable so a test that
  * deliberately exercises "activate arrived too soon" does not need to wait even this long. */
-export const MIN_DRAIN_BACKSTOP_MS = Number.isFinite(Number(process.env.HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS))
-	? Number(process.env.HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS)
-	: 2_000;
+const configuredMinDrainMs = Number(process.env.HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS);
+export const MIN_DRAIN_BACKSTOP_MS =
+	Number.isFinite(configuredMinDrainMs) && configuredMinDrainMs >= 0 ? configuredMinDrainMs : 2_000;
 const MAX_NODE_NAME_LENGTH = 256;
 
 export interface RecordLockGenerationState {
