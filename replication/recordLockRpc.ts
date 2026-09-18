@@ -562,12 +562,18 @@ export function handleAcquireReply(message: any, port: any): void {
 }
 onMessageByType(ACQUIRE_REPLY, handleAcquireReply);
 
-onMessageByType(REVOKE_REQUEST, (message: any, port: any) => {
+/** Caller side: fence this worker's handle for an admission the owner is recalling. Named and
+ * exported so its sender gate can be tested, the same reason `handleAcquireReply` is. */
+export function handleRevokeRequest(message: any, port: any): void {
+	// An unstamped port has no verifiable origin, and during a handoff's ownerless window the expected
+	// owner is undefined too, so the comparison alone would let the two match. Reject the unstamped
+	// sender outright, as every other identity gate in this file does.
+	if (port?.threadId === undefined) return;
 	// A revoke from a thread that no longer coordinates the database is from a departed owner; the
 	// handles it granted were already fenced fail-closed when this worker learned the owner changed
 	// (`fenceRelayedAdmissionsForDatabase`), so honoring it now would only risk latching a spurious
 	// revoke against the NEW owner's independently-minted id. Drop it.
-	if (port?.threadId !== ownership.ownerThreadId?.(message.database)) return;
+	if (port.threadId !== ownership.ownerThreadId?.(message.database)) return;
 	// Fence this worker's handle for the named admission and acknowledge ONLY once it is provably
 	// fenced (revokeRelayedAdmission resolves at the real revokeLease, latching a revoke that raced the
 	// handle's install). A throw or rejection means the fence is not proven, so no ack is sent — the
@@ -591,7 +597,8 @@ onMessageByType(REVOKE_REQUEST, (message: any, port: any) => {
 			},
 			(error) => logger.warn?.('a relayed record lock handle did not confirm its fence', error)
 		);
-});
+}
+onMessageByType(REVOKE_REQUEST, handleRevokeRequest);
 
 // ---- owner side: mint / release an admission for a peer worker, and drive revocation ------------
 

@@ -27,6 +27,7 @@ import {
 	handleAcquireRequest,
 	handleRelease,
 	handleRevokeAck,
+	handleRevokeRequest,
 	releaseOnOwnerRelay,
 } from '#src/replication/recordLockRpc';
 
@@ -198,6 +199,22 @@ describe('relaying a lock() to the coordinating worker', () => {
 			12,
 			'an unauthenticated sender cannot settle the acquire; only the stamped owner port does'
 		);
+	});
+
+	it('fences nothing for a revoke on an unstamped port while the database is ownerless', async () => {
+		// Both sides of the owner comparison are `undefined` during a handoff's ownerless window, so the
+		// comparison alone matches; the unstamped sender has to be rejected outright.
+		const coordinator = createRequire(import.meta.url)('#js/core/resources/recordLockCoordinator');
+		const revoking = coordinator.revokeRelayedAdmission;
+		const revoked = [];
+		coordinator.revokeRelayedAdmission = async (database, table, admissionId) => revoked.push(admissionId);
+		try {
+			handleRevokeRequest({ database: 'rpc-ownerless', table: 'Counter', admissionId: 31, revokeId: 1 }, {});
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.deepStrictEqual(revoked, [], 'an unauthenticated revoke cannot fence a live handle');
+		} finally {
+			coordinator.revokeRelayedAdmission = revoking;
+		}
 	});
 
 	it('stamps a release with the session the owner minted the admission under', async () => {
