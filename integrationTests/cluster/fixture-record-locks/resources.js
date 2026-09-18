@@ -1,7 +1,20 @@
 // Endpoints the cluster record-lock tests drive. Every error keeps its statusCode so the test sees
 // core's 423 / 503 / 409 as the HTTP status.
+import { threadId } from 'node:worker_threads';
+
 const holds = new Map();
 let nextToken = 1;
+
+// Runs on whichever http worker the ops API routes it to, and reports that thread, so a test can tell
+// a non-owner worker served the lock (harper-pro#852).
+server.registerOperation?.({
+	name: 'lock_probe',
+	execute: async function lockProbe(data) {
+		const record = await tables.Counter.lock(data.id, { hold: true, lease: 5_000, timeout: 10_000 });
+		await record.unlock();
+		return { locked: true, threadId };
+	},
+});
 
 function lockOptions(data) {
 	const options = {};

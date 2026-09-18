@@ -7,7 +7,7 @@
  * review).
  */
 import assert from 'node:assert';
-import { setMainIsWorker } from '#js/core/server/threads/manageThreads';
+import { notifyThreadExit, setMainIsWorker } from '#js/core/server/threads/manageThreads';
 import {
 	HOMES_AGREEMENT_MATCH,
 	HOMES_AGREEMENT_MISMATCH,
@@ -24,8 +24,10 @@ import {
 	collectRecordLockStatus,
 	createDisabledRecordLockTransport,
 	createRecordLockTransport,
+	handleOwnerThreadAck,
 	readOwnIncarnation,
 	setHomeIncarnation,
+	isFirstIncarnation,
 	currentHomeIncarnation,
 	ownsRecordLockCoordination,
 	readPeerHomesAgreement,
@@ -60,21 +62,58 @@ function fakeAuditStore() {
 
 function fakeWorker(threadId) {
 	const posted = [];
+	// A LIST per event, as `EventEmitter.once` gives: two overlapping handoff attempts register their
+	// own `exit` listener on the same worker, and a last-one-wins map silently drops the first — which
+	// leaves its arm of `broadcastOwnerlessAndWait` pending until the 10s timeout, a fixture artifact
+	// that has nothing to do with the code under test.
 	const listeners = new Map();
+	const fire = (event) => {
+		const registered = listeners.get(event);
+		if (!registered) return;
+		listeners.delete(event); // `once`
+		for (const listener of registered) listener();
+	};
 	return {
 		name: 'http',
 		threadId,
 		posted,
 		postMessage(message) {
 			posted.push(message);
+			// A worker resolves `broadcastOwnerlessAndWait`'s per-worker wait on `exit` as well as on an
+			// ack, so fire that to complete a handoff's fence gate — every handoff below therefore travels
+			// the EXIT arm of that wait. `fenceAckWorker` is the same worker holding its ack back, for the
+			// tests that drive the live ack arm instead.
+			if (message?.type === 'record-lock-owner-thread' && message.requestId !== undefined)
+				queueMicrotask(() => fire('exit'));
 		},
 		once(event, listener) {
-			listeners.set(event, listener);
+			const registered = listeners.get(event);
+			if (registered) registered.push(listener);
+			else listeners.set(event, [listener]);
+		},
+		removeListener(event, listener) {
+			const registered = listeners.get(event);
+			const index = registered?.indexOf(listener) ?? -1;
+			if (index !== -1) registered.splice(index, 1);
 		},
 		exit() {
-			listeners.get('exit')?.();
+			fire('exit');
 		},
 	};
+}
+
+/**
+ * A live worker that does NOT exit: it holds its fence ack back so a test can deliver it through main's
+ * own route (`handleOwnerThreadAck`). Without this, every handoff resolves on the exit arm and the ack
+ * arm — the one a real running worker uses — is never exercised.
+ */
+function fenceAckWorker(threadId) {
+	const worker = fakeWorker(threadId);
+	worker.postMessage = (message) => worker.posted.push(message);
+	worker.fenceRequestId = () =>
+		worker.posted.findLast((message) => message.type === 'record-lock-owner-thread' && message.requestId !== undefined)
+			?.requestId;
+	return worker;
 }
 
 describe('peer lock capability in the shared status buffer', () => {
@@ -309,6 +348,19 @@ describe('setHomeIncarnation (worker side)', () => {
 		setHomeIncarnation(6);
 		assert.strictEqual(currentHomeIncarnation(), 6);
 	});
+
+	it('clears the first-incarnation quarantine waiver on the first handoff bump', () => {
+		// The waiver lets a fresh node's successor coordinator grant immediately. But once ownership
+		// has changed hands at least once (main bumps the incarnation with first=false), a departed
+		// worker's relayed handle could still be in flight, so the waiver MUST drop or we get a
+		// two-writer window. The true->false transition is one-way: it never re-waives afterward.
+		setHomeIncarnation(10, true);
+		assert.strictEqual(isFirstIncarnation(), true);
+		setHomeIncarnation(11, false);
+		assert.strictEqual(isFirstIncarnation(), false);
+		setHomeIncarnation(12, true);
+		assert.strictEqual(isFirstIncarnation(), false);
+	});
 });
 
 describe('createDisabledRecordLockTransport', () => {
@@ -356,9 +408,12 @@ describe('recordLockOwnerFor (main thread)', () => {
 	});
 
 	it('never moves a database off a live owner, even when other workers are offered', () => {
-		const owner = fakeWorker(21);
-		const other = fakeWorker(22);
-		assert.strictEqual(recordLockOwnerFor('owner-c', [owner, other]), owner);
+		const first = fakeWorker(21);
+		const second = fakeWorker(22);
+		// Which of the two the round robin lands on depends on how many databases were assigned before
+		// this test; what must hold is that the second call does not move the database off it.
+		const owner = recordLockOwnerFor('owner-c', [first, second]);
+		const other = owner === first ? second : first;
 		assert.strictEqual(recordLockOwnerFor('owner-c', [other, owner]), owner);
 		assert.strictEqual(other.posted.length, 0);
 		releaseRecordLockOwner('owner-c');
@@ -387,11 +442,10 @@ describe('recordLockOwnerFor (main thread)', () => {
 		const duringHandoff = recordLockOwnerFor('owner-d', [live], bump);
 		assert.strictEqual(duringHandoff, undefined, 'unowned while the bump is in flight, not yet live');
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-d'], undefined);
-		assert.strictEqual(live.posted.length, 0, 'not conferred yet');
+		// It may already have received the ownerless fence request, but not the ownership conferral.
+		assert.ok(!live.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'not conferred yet');
 		resolveBump(1);
-		await Promise.resolve()
-			.then(() => {})
-			.then(() => {}); // let the bump's .then() run
+		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-d'], 32);
 		assert.deepStrictEqual(live.posted.at(-1), { type: 'record-lock-owner', database: 'owner-d', owned: true });
 		releaseRecordLockOwner('owner-d');
@@ -419,7 +473,7 @@ describe('recordLockOwnerFor (main thread)', () => {
 		recordLockOwnerFor('owner-f', [live], bump);
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-f'], undefined);
-		assert.strictEqual(live.posted.length, 0);
+		assert.ok(!live.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'never conferred');
 		// Unowned, not stuck: a later call may retry the handoff — and it must still be gated on a
 		// fresh bump (`dead` could have granted under the current incarnation before it left), not
 		// treated as a first assignment just because the failed attempt cleared the live owner map.
@@ -428,6 +482,29 @@ describe('recordLockOwnerFor (main thread)', () => {
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-f'], 36, 'the retried bump succeeded');
 		releaseRecordLockOwner('owner-f');
+	});
+
+	it('a handoff that fails after a release superseded it leaves the attempt that replaced it alone', async () => {
+		const dead = fakeWorker(45);
+		const live = fakeWorker(46);
+		let failSuperseded;
+		const supersededBump = () => new Promise((_, reject) => (failSuperseded = reject));
+		let resolveCurrent;
+		const currentBump = () => new Promise((resolve) => (resolveCurrent = resolve));
+		recordLockOwnerFor('owner-superseded', [dead], supersededBump);
+		recordLockOwnerFor('owner-superseded', [live], supersededBump);
+		// The database is given up on mid-handoff, then claimed again: the second attempt is the live one.
+		releaseRecordLockOwner('owner-superseded');
+		recordLockOwnerFor('owner-superseded', [live], currentBump);
+		failSuperseded(new Error('persistence failed'));
+		await new Promise((resolve) => setImmediate(resolve));
+		resolveCurrent(2);
+		await new Promise((resolve) => setImmediate(resolve));
+		// Without the per-attempt token the first rejection deletes the second attempt's PENDING_BUMP,
+		// which makes the second attempt read itself as superseded and abandon — the database ends up
+		// unowned, and only the failed attempt's 10s retry recovers it.
+		assert.strictEqual(recordLockOwnerThreadIds()['owner-superseded'], 46, 'the current attempt still lands');
+		releaseRecordLockOwner('owner-superseded');
 	});
 
 	it('moves a database off a worker that has left the live set, telling the old owner and the new one, once the bump resolves', async () => {
@@ -495,7 +572,69 @@ describe('recordLockOwnerFor (main thread)', () => {
 		resolveBump(1);
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-j'], undefined, 'the release superseded the pending handoff');
-		assert.strictEqual(live.posted.length, 0);
+		assert.ok(!live.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'never conferred');
+	});
+
+	it('does not confer ownership on a successor that exited during the fence wait', async () => {
+		const departing = fakeWorker(91);
+		const successor = fakeWorker(92);
+		recordLockOwnerFor('owner-k', [departing]);
+		let resolveBump;
+		const bump = () => new Promise((resolve) => (resolveBump = resolve));
+		recordLockOwnerFor('owner-k', [successor], bump);
+		// A real Worker reports `threadId` -1 from the moment it exits, so the tombstone keeps the id
+		// `manageThreads` captured while it was live. Model both, or this passes against a check that
+		// reads the worker's id after the fact and never matches.
+		notifyThreadExit(successor.threadId);
+		successor.threadId = -1;
+		resolveBump(1);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['owner-k'],
+			undefined,
+			'no database is left pointing at a thread whose exit handler can no longer fire'
+		);
+		assert.ok(!successor.posted.some((m) => m.type === 'record-lock-owner' && m.owned === true), 'never conferred');
+	});
+
+	it('withholds the successor until a live worker acks its fence, and confers on that ack', async () => {
+		// The gate in both directions, on the arm a real running worker uses: a live worker that has not
+		// answered must NOT be conferred on (the ack is main's only evidence the departed owner's relayed
+		// handles can no longer commit), and the ack is what releases the handoff. The exit arm every
+		// other test here travels cannot show either — it resolves whether or not the route exists.
+		const departing = fakeWorker(101);
+		const successor = fenceAckWorker(102);
+		recordLockOwnerFor('owner-ack', [departing]);
+		assert.strictEqual(
+			recordLockOwnerFor('owner-ack', [successor], async () => 1),
+			undefined
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['owner-ack'],
+			undefined,
+			'the bump resolved, but an unfenced live worker still holds the handoff'
+		);
+		const requestId = successor.fenceRequestId();
+		assert.ok(requestId !== undefined, 'the successor was asked to fence before it could be conferred');
+		handleOwnerThreadAck({ requestId: requestId + 1000 }, { threadId: 102 });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['owner-ack'],
+			undefined,
+			'an ack for another request does not settle this one'
+		);
+		handleOwnerThreadAck({ requestId }, { threadId: 999 });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['owner-ack'],
+			undefined,
+			'a thread that is not the one asked to fence cannot answer for it, even with the right request id'
+		);
+		handleOwnerThreadAck({ requestId }, { threadId: 102 });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(recordLockOwnerThreadIds()['owner-ack'], 102, 'the ack is what releases the handoff');
+		releaseRecordLockOwner('owner-ack');
 	});
 });
 
