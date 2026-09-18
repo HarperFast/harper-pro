@@ -520,15 +520,13 @@ export function handleAcquireReply(message: any, port: any): void {
 	// Only the thread the request was sent to can answer it. Request ids are a plain per-worker
 	// sequence and a worker reaches the ports it holds, so without this a sibling could settle another
 	// worker's acquire with a round no cluster admission backs.
-	const wrongSender = pending !== undefined && senderThreadId !== undefined && senderThreadId !== pending.ownerThreadId;
+	const wrongSender = pending !== undefined && senderThreadId !== pending.ownerThreadId;
 	// A grant from a thread that no longer coordinates the database (the owner changed while this
 	// acquire was in flight) is stale — the delegation behind it died with that owner. Hand it back and
 	// let the caller retry against the new owner, rather than install a handle no delegation backs. The
 	// database is the one the request named, never the reply payload the sender controls.
 	const staleOwner =
-		message.round &&
-		senderThreadId !== undefined &&
-		senderThreadId !== ownership.ownerThreadId?.(pending ? pending.database : message.database);
+		message.round && senderThreadId !== ownership.ownerThreadId?.(pending ? pending.database : message.database);
 	if (!pending || pending.settled || wrongSender || staleOwner) {
 		// The caller already timed out, or the owner changed: the owner minted an admission nobody will
 		// use — hand it back to the GRANTING owner (this reply's source thread and session), not the
@@ -569,7 +567,7 @@ onMessageByType(REVOKE_REQUEST, (message: any, port: any) => {
 	// handles it granted were already fenced fail-closed when this worker learned the owner changed
 	// (`fenceRelayedAdmissionsForDatabase`), so honoring it now would only risk latching a spurious
 	// revoke against the NEW owner's independently-minted id. Drop it.
-	if (port?.threadId !== undefined && port.threadId !== ownership.ownerThreadId?.(message.database)) return;
+	if (port?.threadId !== ownership.ownerThreadId?.(message.database)) return;
 	// Fence this worker's handle for the named admission and acknowledge ONLY once it is provably
 	// fenced (revokeRelayedAdmission resolves at the real revokeLease, latching a revoke that raced the
 	// handle's install). A throw or rejection means the fence is not proven, so no ack is sent — the

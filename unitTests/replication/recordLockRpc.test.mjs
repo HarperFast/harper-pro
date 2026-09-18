@@ -180,6 +180,26 @@ describe('relaying a lock() to the coordinating worker', () => {
 		}
 	});
 
+	it('ignores a grant on a port the harness never stamped', async () => {
+		const { acquiring, request } = acquireAgainstOwner('rpc-unstamped');
+		const reply = {
+			requestId: request.requestId,
+			database: 'rpc-unstamped',
+			table: 'Counter',
+			key: 'k',
+			round: { admissionId: 71, mintedMono: 0 },
+			session: 'unstamped-session',
+		};
+		handleAcquireReply(reply, {});
+		handleAcquireReply(reply, undefined);
+		handleAcquireReply({ ...reply, round: { admissionId: 12, mintedMono: 0 }, session: 'owner-session' }, port);
+		assert.strictEqual(
+			(await acquiring).admissionId,
+			12,
+			'an unauthenticated sender cannot settle the acquire; only the stamped owner port does'
+		);
+	});
+
 	it('stamps a release with the session the owner minted the admission under', async () => {
 		const { acquiring, request } = acquireAgainstOwner('rpc-release');
 		handleAcquireReply(
