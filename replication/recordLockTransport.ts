@@ -1474,5 +1474,11 @@ if (!parentPort) {
 			logger.warn?.(
 				`replication.recordLocks is enabled: every cluster-scoped lock() for a database answers 503 until an operator applies a home map for it (record_lock_apply_homes), and every peer advertises record lock capability level ${RECORD_LOCKS_CAPABILITY} — a peer at any other level is not a participant and withholds the map on both sides.`
 			);
+			// The second line is the accepted-known caveat, not a runbook step, so it is said separately
+			// and only here: a design note nobody reads before flipping a switch is not where a production
+			// prerequisite belongs (RECORD_LOCK_HOMES_DESIGN.md, "Auth for the hop").
+			logger.warn?.(
+				'replication.recordLocks is enabled: a home map transition is authorized by node identity alone — any principal a peer resolves as a cluster node can apply one, with no proof an operator asked for it (harper-pro#869). Accepted while this feature is opt-in; treat an operator-delegated proof as a prerequisite before relying on cluster record locks in production.'
+			);
 		});
 }
