@@ -189,12 +189,12 @@ suite('Clone from legacy v4 leader', { timeout: 240000 }, (ctx) => {
 			legacyLog = await readLog(legacy);
 		}
 		if (/Requesting full copy of database data/.test(legacyLog)) {
-			// The clone can withhold its source records or explicitly reject an unverifiable v4 baseline.
+			// The clone can withhold its source records or explicitly reject an unverifiable baseline.
 			// These tables have no assigned update timestamp, so the new verification gate rejects the reverse copy.
 			let gated = false;
 			for (let i = 0; i < 20 && !gated; i++) {
 				gated =
-					/harper-pro#737|Cannot verify v4 baseline without numeric update timestamps|Historical restoration from v5 to v4 is unsupported/.test(
+					/harper-pro#737|Cannot verify replication baseline without numeric update timestamps|Historical restoration into an unverified peer is unsupported/.test(
 						await readLog(cloneCtx.harper)
 					);
 				if (!gated) await delay(500);

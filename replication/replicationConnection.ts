@@ -48,7 +48,7 @@ import {
 import { ANY_TABLE, markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
 import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
-import { isLegacyCopyPeer, verifyLegacyCopyBaseline } from './legacyCopy.ts';
+import { verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -537,6 +537,17 @@ export function hostnameFromNodeUrl(url: unknown): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+// A WebSocket close reason is capped at 123 UTF-8 bytes (RFC 6455: 125-byte control frame minus the
+// 2-byte status code). `ws.close()` throws instead of closing when this is exceeded, which would leave
+// a caller's `closed = true` state set without ever actually closing the socket. Slicing on bytes can
+// split a multi-byte character; `Buffer#toString('utf8')` renders the truncated tail as U+FFFD rather
+// than throwing, which is an acceptable cosmetic cost for a diagnostic string.
+export function truncateCloseReason(reason: unknown): string | undefined {
+	if (typeof reason !== 'string') return undefined;
+	if (Buffer.byteLength(reason, 'utf8') <= 123) return reason;
+	return Buffer.from(reason, 'utf8').subarray(0, 123).toString('utf8');
 }
 
 /**
@@ -5889,7 +5900,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											}
 										}
 										if (currentSequenceId === 0) {
-											const legacyCopy = !peerCapabilities.safeCopyAudit && (await getLegacyCopyPeer());
+											// Absent capability means unverified, full stop: a peer's major version alone cannot
+											// certify its audit writer is safe, since the same LMDB no-op-write hole predates this
+											// capability existing at all (see DESIGN.md's v5+LMDB note).
+											const legacyCopy = !peerCapabilities.safeCopyAudit;
 											if (legacyCopy) copyResume = undefined;
 											if (closed || wsClosed) return;
 											logger.info?.('Replicating all tables to', remoteNodeName);
@@ -6994,7 +7008,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// worker's connections map).
 			if (intentional && options.connection) options.connection.intentionallyUnsubscribed = true;
 			logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, code, reason);
-			ws.close(code, reason);
+			ws.close(code, truncateCloseReason(reason));
 			if (intentional) options.connection?.emit('finished'); // synchronously indicate that the connection is finished, so it is not accidentally reused
 		} catch (error) {
 			logger.error?.(connectionId, 'Error closing connection', error);
@@ -8120,11 +8134,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	).unref();
 
 	let nextId = 1;
-	let legacyCopyPeer: Promise<boolean>;
-	function getLegacyCopyPeer() {
-		return (legacyCopyPeer ??= sendOperation({ operation: 'registration_info' }, 30_000).then(isLegacyCopyPeer));
-	}
-
 	function sendOperation(operation, timeoutMs?: number): Promise<any> {
 		const requestId = nextId++;
 		return new Promise((resolve, reject) => {

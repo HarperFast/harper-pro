@@ -4,12 +4,6 @@ import { LOCAL_ONLY } from '../core/resources/auditStore.ts';
 const BATCH_SIZE = 256;
 const failedCopies = new Map<string, { tableName: string; key: any }>();
 
-export function isLegacyCopyPeer(response: any): boolean {
-	const match = typeof response?.version === 'string' && /^v?(\d+)\.\d+\.\d+(?:[-+].*)?$/.exec(response.version);
-	if (!match || Number(match[1]) < 4) throw new Error('Unsupported peer version for replication base copy');
-	return Number(match[1]) === 4;
-}
-
 export async function verifyLegacyCopyBaseline({
 	peerName,
 	databaseName,
@@ -37,14 +31,16 @@ export async function verifyLegacyCopyBaseline({
 			const timestamps = remote.attributes?.filter(
 				(attribute) => attribute.assigned_updated_time || attribute.attribute === '__updatedtime__'
 			);
+			// `hash_attribute` is a legacy v4 describe_table field; current describe_table reports `primary_key`.
+			const primaryKey = remote.hash_attribute ?? remote.primary_key;
 			if (
-				typeof remote.hash_attribute !== 'string' ||
+				typeof primaryKey !== 'string' ||
 				timestamps?.length !== 1 ||
 				timestamps[0].computed ||
 				['Date', 'String'].includes(timestamps[0].type)
 			)
-				throw new Error('Cannot verify v4 baseline without numeric update timestamps');
-			description = { primaryKey: remote.hash_attribute, updatedTime: timestamps[0].attribute };
+				throw new Error('Cannot verify replication baseline without numeric update timestamps');
+			description = { primaryKey, updatedTime: timestamps[0].attribute };
 			descriptions.set(tableName, description);
 		}
 		const response = await request({
@@ -68,7 +64,7 @@ export async function verifyLegacyCopyBaseline({
 				if (failedCopies.size >= 256) failedCopies.delete(failedCopies.keys().next().value);
 				failedCopies.set(cacheKey, { tableName, key: entry.key });
 				throw new Error(
-					`Historical restoration from v5 to v4 is unsupported (${databaseName}.${tableName} key ${String(entry.key)})`
+					`Historical restoration into an unverified peer is unsupported (${databaseName}.${tableName} key ${String(entry.key)})`
 				);
 			}
 		}

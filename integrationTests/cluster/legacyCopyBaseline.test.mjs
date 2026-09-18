@@ -133,7 +133,8 @@ for (const engine of ['rocksdb', 'lmdb'])
 				});
 				await connect(missing);
 				await waitForCondition(
-					async () => (await readLog(current)).includes('Historical restoration from v5 to v4 is unsupported'),
+					async () =>
+						(await readLog(current)).includes('Historical restoration into an unverified peer is unsupported'),
 					{
 						timeoutMs: 30_000,
 						pollMs: 100,
@@ -164,3 +165,93 @@ for (const engine of ['rocksdb', 'lmdb'])
 			});
 		}
 	);
+
+test(
+	'a v5 peer without the safeCopyAudit capability is gated the same as a legacy v4 peer',
+	{ timeout: 60_000 },
+	async (t) => {
+		const contexts = [];
+		async function start(env) {
+			const context = {
+				name: 'legacy-copy-baseline-capless',
+				harper: { hostname: await getNextAvailableLoopbackAddress() },
+			};
+			contexts.push(context);
+			await startHarper(context, {
+				env,
+				config: {
+					analytics: { aggregatePeriod: -1 },
+					logging: { colors: false, stdStreams: true, console: true },
+					replication: { securePort: context.harper.hostname + ':9933', databases: ['data'] },
+				},
+			});
+			return context.harper;
+		}
+		t.after(async () => {
+			await Promise.all(
+				contexts.filter((context) => context.harper?.process).map((context) => teardownHarper(context))
+			);
+		});
+		// current: an ordinary build advertising safeCopyAudit normally.
+		const current = await start({});
+		// capless: also current code, but its NODE_NAME frame omits the capability bag entirely — simulating
+		// a v5 peer that predates safeCopyAudit, without needing a real legacy binary.
+		const capless = await start({ HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' });
+		await sendOperation(current, { operation: 'create_database', database: 'data' });
+		await sendOperation(current, { operation: 'create_table', database: 'data', table: 'orders', primary_key: 'id' });
+		await sendOperation(current, {
+			operation: 'upsert',
+			database: 'data',
+			table: 'orders',
+			records: [{ id: 'preexisting', name: 'already on current' }],
+		});
+		await sendOperation(capless, { operation: 'create_database', database: 'data' });
+		await sendOperation(capless, { operation: 'create_table', database: 'data', table: 'orders', primary_key: 'id' });
+		await sendOperation(current, {
+			operation: 'add_node',
+			hostname: capless.hostname,
+			rejectUnauthorized: false,
+			authorization: current.admin,
+		});
+		// The major-version alone must not certify capless as safe: current has a row capless lacks, so
+		// verification runs against it exactly as it would against a real v4 peer, and refuses.
+		await waitForCondition(
+			async () => (await readLog(current)).includes('Historical restoration into an unverified peer is unsupported'),
+			{
+				timeoutMs: 30_000,
+				pollMs: 100,
+				description: 'explicit unsupported historical restoration error for the capability-less v5 peer',
+			}
+		);
+		const rows = await sendOperation(capless, {
+			operation: 'search_by_id',
+			database: 'data',
+			table: 'orders',
+			ids: ['preexisting'],
+			get_attributes: ['id'],
+		});
+		assert.deepStrictEqual(rows, [], 'no unverified historical put reached the capability-less peer');
+		// The stuck direction is current -> capless (its unverifiable historical row blocks that base copy
+		// forever). A fresh write on capless itself has nothing to verify and should still flow normally,
+		// same as "forward migration continues" for a real v4 peer above.
+		await sendOperation(capless, {
+			operation: 'upsert',
+			database: 'data',
+			table: 'orders',
+			records: [{ id: 'forward-write', name: 'after refusal' }],
+		});
+		await waitForCondition(
+			async () => {
+				const forwardRows = await sendOperation(current, {
+					operation: 'search_by_id',
+					database: 'data',
+					table: 'orders',
+					ids: ['forward-write'],
+					get_attributes: ['id'],
+				});
+				return forwardRows.length === 1;
+			},
+			{ timeoutMs: 30_000, pollMs: 100, description: 'forward write from the capability-less peer reaches current' }
+		);
+	}
+);
