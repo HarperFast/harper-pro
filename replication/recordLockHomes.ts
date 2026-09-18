@@ -652,10 +652,9 @@ export const DELEGATION_DRAIN_MS = DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS;
  * lock lease; this is a reporting bound, not a safety one — whatever is still outstanding is returned,
  * and the operator falls back to `DELEGATION_DRAIN_MS` for those nodes.
  */
+const configuredStageDrainMs = Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS);
 export const STAGE_DRAIN_BUDGET_MS =
-	Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS) > 0
-		? Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS)
-		: 10_000;
+	Number.isFinite(configuredStageDrainMs) && configuredStageDrainMs > 0 ? configuredStageDrainMs : 10_000;
 
 server.registerOperation?.({
 	name: 'record_lock_propose_homes',
