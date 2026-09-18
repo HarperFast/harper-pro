@@ -55,14 +55,20 @@ const RELAY_TIMEOUT_MS = 5_000;
  * `deadlineMs` sweeping before it answers. A flat 5s here would discard a drain that legitimately
  * took longer and did succeed, sending the operator back to the full `DELEGATION_DRAIN_MS` wait
  * `stage`'s drain exists to avoid, so the relay outlives the sweep it is carrying.
+ *
+ * The two hops are nested, not parallel: the caller's wait starts before main forwards, so equal
+ * bounds would make the OUTER one fire first by however long main took to route, answering the
+ * fallback while the owner's sweep was still inside its own budget — the same discarded drain, moved
+ * one hop out. Only the forward hop is sized to the sweep; the caller's wait gets a second slack term.
  */
 const RELAY_SLACK_MS = 2_000;
 const MAX_RELAY_TIMEOUT_MS = 120_000;
-export function relayTimeoutFor(kind: RelayKind, payload: any): number {
+export function relayTimeoutFor(kind: RelayKind, payload: any, hop: 'caller' | 'forward' = 'forward'): number {
 	if (kind !== 'quiesce') return RELAY_TIMEOUT_MS;
 	const deadlineMs = Number(payload?.deadlineMs);
 	if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) return RELAY_TIMEOUT_MS;
-	return Math.min(deadlineMs + RELAY_SLACK_MS, MAX_RELAY_TIMEOUT_MS);
+	const slack = hop === 'caller' ? RELAY_SLACK_MS * 2 : RELAY_SLACK_MS;
+	return Math.min(deadlineMs, MAX_RELAY_TIMEOUT_MS) + slack;
 }
 const NOT_HOME: DelegationReply = { granted: false, reason: 'not-home' };
 const RECALLED = Object.freeze({ recalled: true as const });
@@ -270,7 +276,7 @@ async function relay(kind: RelayKind, database: string, table: string, payload: 
 	const requestId = nextRelayId++;
 	const message = { type: 'record-lock-rpc', requestId, kind, database, table, payload };
 	if (parentPort) {
-		const answer = awaitRelay(requestId, fallback, relayTimeoutFor(kind, payload));
+		const answer = awaitRelay(requestId, fallback, relayTimeoutFor(kind, payload, 'caller'));
 		parentPort.postMessage(message);
 		return answer;
 	}

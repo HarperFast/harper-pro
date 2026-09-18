@@ -613,7 +613,7 @@ export function planProposal(
 			`${self} has no active generation for ${database}, so quiesce carries only this proposal: if the cluster IS serving a generation, ask a node that has it and union the results before staging anything`
 		);
 	warnings.push(
-		"this is one node's view, not agreement: stage (or fence) and drain every node in `quiesce`, then activate this exact list on every node in `homes`, and compare digests across nodes before activating"
+		"this is one node's view, not agreement: stage (or fence) and drain every node in `quiesce`, then activate this exact list on every node in `homes`. Compare `homes` across the nodes you ask, not `digest` — the digest is taken over (generation, homes) and every node proposes its own floor plus one, so two nodes that agree on membership still differ here whenever their floors do. Pass the HIGHEST generation you are shown to every node; the digest they then agree on is the one computed from that single list."
 	);
 	return { generation, homes, digest: digestOf(generation, homes), quiesce, warnings };
 }
@@ -652,9 +652,10 @@ export const DELEGATION_DRAIN_MS = DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS;
  * lock lease; this is a reporting bound, not a safety one — whatever is still outstanding is returned,
  * and the operator falls back to `DELEGATION_DRAIN_MS` for those nodes.
  */
-export const STAGE_DRAIN_BUDGET_MS = Number.isFinite(Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS))
-	? Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS)
-	: 10_000;
+export const STAGE_DRAIN_BUDGET_MS =
+	Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS) > 0
+		? Number(process.env.HARPER_TEST_RECORD_LOCK_STAGE_DRAIN_MS)
+		: 10_000;
 
 server.registerOperation?.({
 	name: 'record_lock_propose_homes',

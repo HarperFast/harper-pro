@@ -413,10 +413,20 @@ describe('bounding a relay through the main thread', () => {
 			assert.strictEqual(relayTimeoutFor('quiesce', payload), flat, `no budget in ${JSON.stringify(payload)}`);
 	});
 
-	it('caps a quiesce hop so an absurd budget cannot pin the relay entry', () => {
+	it("gives the caller's outer wait more than the forward hop, since the two are nested", () => {
+		const payload = { deadlineMs: 10_000 };
 		assert.ok(
-			relayTimeoutFor('quiesce', { deadlineMs: Number.MAX_SAFE_INTEGER }) <= 120_000,
-			'a relay entry is held for the wait, so the bound is capped rather than trusted'
+			relayTimeoutFor('quiesce', payload, 'caller') > relayTimeoutFor('quiesce', payload, 'forward'),
+			'the outer wait starts first, so an equal bound would fire before the sweep it is waiting on'
+		);
+	});
+
+	it('caps a quiesce hop so an absurd budget cannot pin the relay entry', () => {
+		const absurd = relayTimeoutFor('quiesce', { deadlineMs: Number.MAX_SAFE_INTEGER }, 'caller');
+		assert.ok(absurd < 10 * 60_000, `a relay entry is held for the wait, so the bound is capped: ${absurd}ms`);
+		assert.ok(
+			absurd > relayTimeoutFor('quiesce', { deadlineMs: Number.MAX_SAFE_INTEGER }, 'forward'),
+			'and the nesting order survives the cap'
 		);
 	});
 });
