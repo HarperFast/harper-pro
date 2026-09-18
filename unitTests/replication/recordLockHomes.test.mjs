@@ -385,12 +385,15 @@ describe('planProposal', () => {
 		assert.ok(!holder.warnings.some((warning) => /no active generation/.test(warning)));
 	});
 
-	it('says a departing node stays unable to lock, so that is not mistaken for a stuck transition', () => {
+	it('tells the operator a departing node rejoins by a later agreed generation, never one of its own', () => {
 		const shrink = planProposal('a', [], row({ active: { generation: 2, homes: ['a', 'b'], digest: 'x' } }), 'data');
-		assert.ok(
-			shrink.warnings.some((warning) => /stays unable to lock/.test(warning)),
-			shrink.warnings.join(' | ')
-		);
+		const leaving = shrink.warnings.find((warning) => /leave the ring/.test(warning));
+		assert.ok(leaving, shrink.warnings.join(' | '));
+		// Not a stuck transition — but the remedy has to be the agreed one: a singleton generation on
+		// the departing node makes its own `homeMap()` home every key it is asked for, alongside the
+		// ring that just took them over.
+		assert.match(leaving, /serves no cluster lock/);
+		assert.match(leaving, /never a generation of its own/);
 	});
 
 	it('rejects a set larger than the bound, through the shared validator', () => {

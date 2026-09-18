@@ -603,7 +603,7 @@ export function planProposal(
 	const leaving = quiesce.filter((node) => !homes.includes(node));
 	if (leaving.length > 0)
 		warnings.push(
-			`${leaving.join(', ')} leave the ring in this proposal and are not in homes, but MUST still be staged or fenced and drained before activation, or they keep granting under the old generation; a staged departing node is never activated, so it stays unable to lock until it is given its own generation, which is what leaving the ring means`
+			`${leaving.join(', ')} leave the ring in this proposal and are not in homes, but MUST still be staged or fenced and drained before activation, or they keep granting under the old generation; record_lock_apply_homes does not activate a departing node, so it serves no cluster lock for ${database} until a LATER generation that includes it is agreed and activated on every node — never a generation of its own, which would home the same keys twice`
 		);
 	// `quiesce` is only as complete as the node that answered: it is built from THIS node's row, so a
 	// node with no active ring (never bootstrapped, or already staged — staging retracts `active`)

@@ -88,15 +88,11 @@ function optionsFor(hostname, replication) {
 			threads: { count: 1 },
 			replication,
 		},
-		// Grants are withheld for several minutes after start; a freshly started bench node has no
-		// previous incarnation to protect, so lift the hold as the cluster suite does. The drain
-		// backstop goes with it: `bootstrapHomeMap` stages and activates back to back, which is safe
-		// only because nothing has ever been delegated on a node this new.
-		env: {
-			HARPER_NO_FLUSH_ON_EXIT: true,
-			HARPER_TEST_RECORD_LOCK_RESTART_HOLD_MS: '0',
-			HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS: '0',
-		},
+		// `bootstrapHomeMap` stages and activates back to back, so the drain backstop has to go, as it
+		// does in the cluster suite: safe only because nothing has ever been delegated on a node this
+		// new. Core's restart quarantine needs no override — the transport waives it for a node whose
+		// own incarnation is provably first-ever (`isFirstIncarnation`), which a fresh bench node is.
+		env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS: '0' },
 	};
 }
 
