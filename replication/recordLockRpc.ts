@@ -50,6 +50,20 @@ export const BARRIER_OPERATION = 'record_lock_barrier';
 
 /** Bound on a relay through the main thread to the owner worker. */
 const RELAY_TIMEOUT_MS = 5_000;
+/**
+ * A `quiesce` relay is the one kind whose work has its own bound: the owner spends up to
+ * `deadlineMs` sweeping before it answers. A flat 5s here would discard a drain that legitimately
+ * took longer and did succeed, sending the operator back to the full `DELEGATION_DRAIN_MS` wait
+ * `stage`'s drain exists to avoid, so the relay outlives the sweep it is carrying.
+ */
+const RELAY_SLACK_MS = 2_000;
+const MAX_RELAY_TIMEOUT_MS = 120_000;
+export function relayTimeoutFor(kind: RelayKind, payload: any): number {
+	if (kind !== 'quiesce') return RELAY_TIMEOUT_MS;
+	const deadlineMs = Number(payload?.deadlineMs);
+	if (!Number.isFinite(deadlineMs) || deadlineMs <= 0) return RELAY_TIMEOUT_MS;
+	return Math.min(deadlineMs + RELAY_SLACK_MS, MAX_RELAY_TIMEOUT_MS);
+}
 const NOT_HOME: DelegationReply = { granted: false, reason: 'not-home' };
 const RECALLED = Object.freeze({ recalled: true as const });
 /**
@@ -237,12 +251,12 @@ type RelayKind = 'delegate' | 'recall' | 'quiesce';
 let nextRelayId = 1;
 const pendingRelays = new Map<number, (reply: any) => void>();
 
-function awaitRelay(requestId: number, fallback: any): Promise<any> {
+function awaitRelay(requestId: number, fallback: any, timeoutMs: number = RELAY_TIMEOUT_MS): Promise<any> {
 	return new Promise((resolve) => {
 		const timer = setTimeout(() => {
 			pendingRelays.delete(requestId);
 			resolve(fallback);
-		}, RELAY_TIMEOUT_MS).unref();
+		}, timeoutMs).unref();
 		pendingRelays.set(requestId, (reply) => {
 			clearTimeout(timer);
 			pendingRelays.delete(requestId);
@@ -256,7 +270,7 @@ async function relay(kind: RelayKind, database: string, table: string, payload: 
 	const requestId = nextRelayId++;
 	const message = { type: 'record-lock-rpc', requestId, kind, database, table, payload };
 	if (parentPort) {
-		const answer = awaitRelay(requestId, fallback);
+		const answer = awaitRelay(requestId, fallback, relayTimeoutFor(kind, payload));
 		parentPort.postMessage(message);
 		return answer;
 	}
@@ -299,7 +313,7 @@ async function routeFromMain(message: any, fallback: any): Promise<any> {
 	const owner = ownership.ownerFor(database);
 	if (!owner) return fallback;
 	const hopId = nextRelayId++;
-	const answer = awaitRelay(hopId, fallback);
+	const answer = awaitRelay(hopId, fallback, relayTimeoutFor(kind, payload));
 	try {
 		owner.postMessage({ type: 'record-lock-rpc', requestId: hopId, kind, database, table, payload });
 	} catch (error) {

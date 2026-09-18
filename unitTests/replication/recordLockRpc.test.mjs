@@ -28,6 +28,7 @@ import {
 	handleRelease,
 	handleRevokeAck,
 	handleRevokeRequest,
+	relayTimeoutFor,
 	releaseOnOwnerRelay,
 } from '#src/replication/recordLockRpc';
 
@@ -390,5 +391,32 @@ describe('the owner side will only take an admission from the worker it belongs 
 		handleRevokeAck(ack, { threadId: HOLDER });
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(fenced, true, 'the holder settles the fence core awaits before lockRelease');
+	});
+});
+
+/**
+ * The main-thread relay's bound (`record-lock-rpc`), distinct from the worker mesh above. A `quiesce`
+ * hop carries the owner's own sweep budget, so a flat 5s would time the relay out while a legitimate
+ * drain was still running and throw away its result — sending the operator back to the full
+ * `DELEGATION_DRAIN_MS` wait that `stage`'s drain exists to avoid.
+ */
+describe('bounding a relay through the main thread', () => {
+	it('gives a quiesce hop longer than its own drain budget, and every other kind the flat bound', () => {
+		const flat = relayTimeoutFor('delegate', undefined);
+		assert.strictEqual(relayTimeoutFor('recall', { deadlineMs: 10_000 }), flat, 'only quiesce carries a budget');
+		assert.ok(relayTimeoutFor('quiesce', { deadlineMs: 10_000 }) > 10_000, 'the relay outlives the sweep it carries');
+	});
+
+	it('falls back to the flat bound when a quiesce hop names no usable budget', () => {
+		const flat = relayTimeoutFor('delegate', undefined);
+		for (const payload of [undefined, {}, { deadlineMs: 0 }, { deadlineMs: -1 }, { deadlineMs: 'soon' }])
+			assert.strictEqual(relayTimeoutFor('quiesce', payload), flat, `no budget in ${JSON.stringify(payload)}`);
+	});
+
+	it('caps a quiesce hop so an absurd budget cannot pin the relay entry', () => {
+		assert.ok(
+			relayTimeoutFor('quiesce', { deadlineMs: Number.MAX_SAFE_INTEGER }) <= 120_000,
+			'a relay entry is held for the wait, so the bound is capped rather than trusted'
+		);
 	});
 });
