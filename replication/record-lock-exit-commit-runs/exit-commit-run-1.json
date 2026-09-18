@@ -1,0 +1,105 @@
+{
+	"machine": {
+		"cpu": "12th Gen Intel(R) Core(TM) i7-12700H",
+		"cores": 20,
+		"memoryGiB": 31,
+		"platform": "linux-x64",
+		"node": "v26.2.0"
+	},
+	"ranAt": "2026-09-18T01:52:41.611Z",
+	"keysPerTrial": 4000,
+	"valueBytes": 131072,
+	"awaitTerminate": false,
+	"trials": [
+		{
+			"mode": "put",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 60.753
+		},
+		{
+			"mode": "put",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 57.763
+		},
+		{
+			"mode": "put",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 48.759
+		},
+		{
+			"mode": "put",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 51.518
+		},
+		{
+			"mode": "put",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 48.126
+		},
+		{
+			"mode": "transaction",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 48.352
+		},
+		{
+			"mode": "transaction",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 53.976
+		},
+		{
+			"mode": "transaction",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 48.223
+		},
+		{
+			"mode": "transaction",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 48.028
+		},
+		{
+			"mode": "transaction",
+			"handedOff": 4000,
+			"stalledAtHandoff": false,
+			"survivedTerminate": 4000,
+			"doomedWonTheKey": 0,
+			"successorWon": 4000,
+			"successorCommitMs": 54.93
+		}
+	]
+}
