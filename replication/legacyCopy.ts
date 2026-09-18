@@ -67,7 +67,9 @@ export async function verifyLegacyCopyBaseline({
 				failedCopies.delete(cacheKey);
 				if (failedCopies.size >= 256) failedCopies.delete(failedCopies.keys().next().value);
 				failedCopies.set(cacheKey, { tableName, key: entry.key });
-				throw new Error('Historical restoration from v5 to v4 is unsupported');
+				throw new Error(
+					`Historical restoration from v5 to v4 is unsupported (${databaseName}.${tableName} key ${String(entry.key)})`
+				);
 			}
 		}
 	}
