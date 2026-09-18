@@ -30,7 +30,7 @@ try {
 // Only a real boolean `true` enables it; a truthy non-boolean (a YAML `1`, a quoted `"true"`) would
 // leave the node advertising `recordLocks: 0` and registering the fail-closed transport, so warn
 // rather than let an operator believe the switch is on.
-if (configured !== undefined && configured !== true && configured !== false && configured)
+if (configured && typeof configured !== 'boolean')
 	logger.warn?.(
 		`replication.recordLocks is set to ${JSON.stringify(configured)}, which is not the boolean true; cluster record locks stay disabled`
 	);

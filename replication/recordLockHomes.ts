@@ -275,12 +275,22 @@ export function planStage(
 	if (existing?.staged?.generation === generation) {
 		if (existing.staged.digest !== digest)
 			return { action: 'reject', reason: `generation ${generation} is already staged with a different home set` };
-		// A row staged before `quiesce` was recorded learns its participant set from a matching re-stage;
-		// `stagedAt` is kept, since nothing about when this node stopped granting has changed.
-		if (quiesce && !existing.staged.quiesce)
+		// A matching re-stage may be the first call that names the participant set (a row staged before
+		// `quiesce` was recorded), or may name MORE of it than the first call did. Widen to the union
+		// either way and never shrink: this row is the only durable record of the ring this node stopped
+		// serving, and a later transition's coverage check (`uncovered` below, and `planSurvey`'s
+		// `unlisted`) is only as complete as it. Silently keeping the narrower set would let a node
+		// omitted from the first call go unnamed by every later survey while it still grants under the
+		// old generation. `stagedAt` is kept — nothing about when this node stopped granting has changed.
+		const widened = quiesce && canonicalizeHomes([...(existing.staged.quiesce ?? []), ...quiesce]);
+		if (widened && widened.length !== (existing.staged.quiesce?.length ?? 0))
 			return {
 				action: 'write',
-				row: { ...existing, staged: { ...existing.staged, quiesce }, highestActedOn: Math.max(floor, generation) },
+				row: {
+					...existing,
+					staged: { ...existing.staged, quiesce: widened },
+					highestActedOn: Math.max(floor, generation),
+				},
 			};
 		return { action: 'noop', staged: existing.staged };
 	}

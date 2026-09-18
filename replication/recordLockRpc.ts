@@ -41,6 +41,7 @@ import {
 } from '../core/resources/recordLockCoordinator.ts';
 import { getRepairConnectionsForDB, sendOperationToNode } from './replicator.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
+import { MAX_OUTSTANDING_BARRIERS } from './recordLockFreshness.ts';
 import type { TransitionOperation } from './recordLockApply.ts';
 
 export const DELEGATE_OPERATION = 'record_lock_delegate';
@@ -53,11 +54,17 @@ const NOT_HOME: DelegationReply = { granted: false, reason: 'not-home' };
 const RECALLED = Object.freeze({ recalled: true as const });
 /**
  * A barrier is a replicated write a peer can make this node perform, so each caller gets a token
- * bucket per database: enough for every cold handoff a busy table can produce, far below what would
- * let one member turn a request loop into cluster-wide log and apply work.
+ * bucket per database. One barrier is written per WAIT — nothing is merged across callers, since a
+ * caller matches the entry on its own nonce — so the burst is sized at exactly what one honest peer
+ * can have in flight for a database at all: its own `MAX_OUTSTANDING_BARRIERS` client-side cap. Below
+ * that a legitimate wave of concurrent cold handoffs would be refused by this node's rate bound
+ * rather than by the peer's own, turning otherwise-valid locks into 503s; above it the bound would
+ * stop describing anything. The refill is the sustained ceiling, far above the cold-handoff rate the
+ * measured protocol can drive (`RECORD_LOCK_COST_DELEGATIONS.md`) and far below what would let one
+ * member turn a request loop into cluster-wide log and apply work.
  */
-export const BARRIER_RATE_PER_SECOND = 200;
-export const BARRIER_BURST = 400;
+export const BARRIER_RATE_PER_SECOND = 2_000;
+export const BARRIER_BURST = MAX_OUTSTANDING_BARRIERS;
 
 // ---- ownership readers, installed by recordLockTransport.ts so this module never imports it -----
 

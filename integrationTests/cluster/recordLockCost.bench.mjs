@@ -16,8 +16,9 @@
  * 3. Hot-key handoff throughput: 2 then 3 nodes contending on one key, one lock → increment → unlock
  *    request in flight per node (the request transaction's commit is the unlock). Lock and section
  *    times are the node's own; the request round trip is the client's view. Every section's written
- *    value is audited, because a handoff here does not yet carry successor freshness (harper#2542,
- *    and §6 step 3 settlement) and the counter does not reach the section count.
+ *    value is audited and the counter is expected to reach the section count — a handoff now carries
+ *    successor freshness (harper#2613, the `lockBarrier` fence) as well as exclusion — but this is a
+ *    measurement, so a shortfall is recorded rather than asserted.
  * 4. Transaction-log cost per acquisition: control entries and value bytes per node, from the log.
  * 5. Cost when off: unlocked write throughput with recordLocks off, with no transport registered at
  *    all (the database is not replicated), and with it on but unused.
@@ -32,6 +33,7 @@ import { cpus, tmpdir, totalmem } from 'node:os';
 import { basename, join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { sendOperation, stopNodeProcess, waitForCondition } from './clusterShared.mjs';
+import { bootstrapHomeMap, waitForRing } from './recordLockShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -86,9 +88,15 @@ function optionsFor(hostname, replication) {
 			threads: { count: 1 },
 			replication,
 		},
-		// The static epoch is withheld for six minutes after start; a freshly started bench node has no
-		// previous incarnation to protect, so lift the hold as the cluster suite does.
-		env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_RECORD_LOCK_RESTART_HOLD_MS: '0' },
+		// Grants are withheld for several minutes after start; a freshly started bench node has no
+		// previous incarnation to protect, so lift the hold as the cluster suite does. The drain
+		// backstop goes with it: `bootstrapHomeMap` stages and activates back to back, which is safe
+		// only because nothing has ever been delegated on a node this new.
+		env: {
+			HARPER_NO_FLUSH_ON_EXIT: true,
+			HARPER_TEST_RECORD_LOCK_RESTART_HOLD_MS: '0',
+			HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS: '0',
+		},
 	};
 }
 
@@ -417,6 +425,10 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 		contexts = await startAll(ctx.name, [{ recordLocks: true }, { recordLocks: true }, { recordLocks: true }]);
 		nodes = contexts.map((c) => c.harper);
 		await connectMesh(nodes);
+		// The home map is operator-stated, never derived (harper-pro#825): without this every
+		// `BenchLock` below answers 503 and there is nothing to measure.
+		await bootstrapHomeMap(nodes);
+		await waitForRing(nodes, nodes.length);
 		// One round per node before measuring, so participant views and the coordinator are warm.
 		for (const node of nodes) await call(node, 'BenchLock/', { ids: ['warm-' + node.hostname] });
 	});
@@ -499,11 +511,11 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 			const sections = answers.reduce((sum, answer) => sum + answer.sectionMs.length, 0);
 			const failures = answers.reduce((sum, answer) => sum + answer.failures, 0);
 			const after = await logSnapshotAfter(nodes);
-			// Not asserted to equal the section count: core implements neither the successor-freshness
-			// fence (harper#2542) nor §6 step 3 settlement, so a handoff carries exclusion but not
-			// freshness and a successor can read a value its predecessor committed and has not yet
-			// replicated. What the nodes settle on, plus the written-value audit, is the measurement.
-			// Nodes that never agree are a result to record, not a reason to abort the remaining rounds.
+			// Recorded, not asserted: a handoff now carries successor freshness as well as exclusion
+			// (harper#2613's `lockBarrier` fence, established before core admits), so this should equal
+			// the section count — but this file is a measurement and `recordLockCluster.test.mjs` is the
+			// gate that asserts it. Nodes that never agree are a result to record, not a reason to abort
+			// the remaining rounds.
 			const agreed = await waitForAgreedCounter(nodes, id).then(
 				(settled) => settled.agreed,
 				() => undefined
@@ -662,6 +674,12 @@ suite('record lock cost: unlocked write throughput by enablement arm', { timeout
 		);
 		for (const [i, arm] of arms.entries()) {
 			arm.node = contexts[i].harper;
+			// Only the enabled arm has a transport that asks for a home map, and a lone node's ring is
+			// itself; the other two arms must answer their refusal without one.
+			if (arm.name === 'on') {
+				await bootstrapHomeMap([arm.node]);
+				await waitForRing([arm.node], 1);
+			}
 			// Prove the arm: what a cluster-scoped lock() answers is the observable for which path is wired.
 			const probe = await call(arm.node, 'LockProbe/', { id: 'probe' });
 			if (arm.expectedProbe)

@@ -36,8 +36,14 @@ export interface FreshnessDeps {
 	tableReplicates(table: string): boolean;
 	isPoisoned(origin: string, table: string): boolean;
 	everRecloned(): boolean;
-	/** Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position. */
-	requestBarrier(origin: string, table: string, nonce: number): Promise<number>;
+	/**
+	 * Ask `origin` to commit a barrier for the table; resolves to the entry's origin-log position.
+	 * `timeoutMs` is what is left of the lock's own deadline: the deadline sweep below only settles the
+	 * WAIT, so without bounding the request too, a member that accepts the connection and never answers
+	 * leaves a response waiter (and, on the per-call fallback connection, a socket) pinned for the life
+	 * of that connection — one per failed handoff.
+	 */
+	requestBarrier(origin: string, table: string, nonce: number, timeoutMs: number): Promise<number>;
 	monotonicNow(): number;
 	nonce?(): number;
 	setTimer?(callback: () => void, ms: number): unknown;
@@ -171,7 +177,9 @@ export function createFreshnessBarrier(database: string, deps: FreshnessDeps): F
 			});
 		});
 		armSweep();
-		deps.requestBarrier(origin, table, entry.nonce).then(
+		// At least 1ms: `sendOperation` reads 0 as "no bound" on the fallback path, and a wait whose
+		// deadline has already elapsed is the sweep's business, not an unbounded request's.
+		deps.requestBarrier(origin, table, entry.nonce, Math.max(1, deadlineMono - deps.monotonicNow())).then(
 			(position) => {
 				if (!isValidLogPosition(position)) {
 					settleEntry(

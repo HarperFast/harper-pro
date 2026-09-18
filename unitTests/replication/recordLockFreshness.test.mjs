@@ -24,8 +24,8 @@ function harness(overrides = {}) {
 		tableReplicates: () => true,
 		isPoisoned: () => false,
 		everRecloned: () => false,
-		requestBarrier(origin, table, nonce) {
-			return new Promise((resolve, reject) => requests.push({ origin, table, nonce, resolve, reject }));
+		requestBarrier(origin, table, nonce, timeoutMs) {
+			return new Promise((resolve, reject) => requests.push({ origin, table, nonce, timeoutMs, resolve, reject }));
 		},
 		monotonicNow: () => now,
 		nonce: () => nextNonce++,
@@ -252,6 +252,20 @@ describe('createFreshnessBarrier: every wait ends exactly once', () => {
 		assert.match((await rejection(wait)).message, /closed while waiting on a/);
 		assert.strictEqual(h.timers.size, 0);
 		assert.match((await rejection(h.barrier.establish('t', [['a', 5]], 1_000))).message, /is closed/);
+	});
+	it('the request itself is bounded by what is left of the lock deadline, never unbounded', async () => {
+		// The sweep settles the WAIT; only this bound retires the response waiter and closes the
+		// per-call fallback socket when a member accepts the connection and never answers.
+		const h = harness();
+		h.barrier.establish('t', [['a', 5]], 1_000).catch(() => {});
+		assert.strictEqual(h.requests[0].timeoutMs, 1_000);
+		// Clamped to the longest lease, and never zero — `sendOperation` reads 0 as "no bound".
+		const capped = harness();
+		capped.barrier.establish('t', [['a', 5]], Number.MAX_SAFE_INTEGER).catch(() => {});
+		assert.strictEqual(capped.requests[0].timeoutMs, 300_000);
+		const elapsed = harness();
+		elapsed.barrier.establish('t', [['a', 5]], 0).catch(() => {});
+		assert.strictEqual(elapsed.requests[0].timeoutMs, 1);
 	});
 	it('the wait bound never exceeds the longest lock lease', () => {
 		const h = harness();

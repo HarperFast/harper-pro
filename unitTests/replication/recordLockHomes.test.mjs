@@ -203,6 +203,25 @@ describe('planStage: the participant set', () => {
 			'noop'
 		);
 	});
+	it('a matching re-stage widens a recorded participant set to the union, and never shrinks it', () => {
+		// The row is the only durable record of the ring this node stopped serving, so a re-stage that
+		// names MORE of it must not take the idempotent path and leave the narrower set behind: a later
+		// survey's coverage check reads this set, and `d` would go unnamed while it still granted.
+		const partial = {
+			database: 'db',
+			staged: { generation: 2, homes: ['a', 'b'], digest: digestOf(2, ['a', 'b']), stagedAt: T, quiesce: ['a', 'b'] },
+			highestActedOn: 2,
+			fenced: [],
+		};
+		const widened = planStage(partial, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T + 5, ['a', 'b', 'd']);
+		assert.strictEqual(widened.action, 'write');
+		assert.deepStrictEqual(widened.row.staged.quiesce, ['a', 'b', 'd']);
+		assert.strictEqual(widened.row.staged.stagedAt, T, 'nothing about when this node stopped granting changed');
+		// A narrower set is absorbed, not applied — and it is a noop, since the union did not change.
+		const narrower = planStage(widened.row, 'db', 2, ['a', 'b'], digestOf(2, ['a', 'b']), T + 9, ['a', 'b']);
+		assert.strictEqual(narrower.action, 'noop');
+		assert.deepStrictEqual(narrower.staged.quiesce, ['a', 'b', 'd']);
+	});
 });
 
 describe('planActivate', () => {

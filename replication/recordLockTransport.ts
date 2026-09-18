@@ -81,6 +81,7 @@ import {
 	setRecordLockOwnershipReaders,
 } from './recordLockRpc.ts';
 import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
+import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
 import { ANY_TABLE, everRecloned, forgetPoisonState, isPoisoned, poison, poisonedPairs } from './recordLockPoison.ts';
 import { getNodeNameForId } from '../core/resources/nodeIdMapping.ts';
 import {
@@ -719,13 +720,13 @@ const productionDeps: RecordLockTransportDeps = {
 			tableReplicates: (table) => tableReplicates(database, table),
 			isPoisoned: (origin, table) => isPoisoned(database, origin, table),
 			everRecloned: () => everRecloned(database),
-			async requestBarrier(origin, table, nonce) {
-				const reply = await sendRecordLockOperation(origin, database, {
-					operation: BARRIER_OPERATION,
+			async requestBarrier(origin, table, nonce, timeoutMs) {
+				const reply = await sendRecordLockOperation(
+					origin,
 					database,
-					table,
-					nonce,
-				});
+					{ operation: BARRIER_OPERATION, database, table, nonce },
+					timeoutMs
+				);
 				return reply?.position;
 			},
 			monotonicNow: () => performance.now(),
@@ -1466,11 +1467,12 @@ if (!parentPort) {
 	});
 	if (CLUSTER_RECORD_LOCKS_ENABLED)
 		whenThreadsStarted.then(() => {
-			// Operator-visible at the point the switch takes effect, not only in repo design docs —
-			// a real pre-push review finding: enabling this without a startup warning lets an operator
-			// follow the runbook straight into a primitive that silently loses updates until harper#2542.
+			// Operator-visible at the point the switch takes effect, not only in repo design docs. The
+			// switch alone grants nothing: the home map is stated by an operator, never derived here
+			// (RECORD_LOCK_HOMES_DESIGN.md §4.1), so without this line the first cluster lock() answers
+			// 503 with no indication that a step of the runbook is simply missing.
 			logger.warn?.(
-				'replication.recordLocks is enabled: a cross-node delegation handoff currently guarantees exclusive admission but NOT successor freshness (harper#2542 is outstanding) — two nodes can each read the same predecessor value and both write, silently losing one update, measured at 0.05-0.15% of sections under contention (replication/RECORD_LOCK_COST_DELEGATIONS.md). Do not rely on lock() to protect a read-modify-write across nodes until that lands.'
+				`replication.recordLocks is enabled: every cluster-scoped lock() for a database answers 503 until an operator applies a home map for it (record_lock_apply_homes), and every peer advertises record lock capability level ${RECORD_LOCKS_CAPABILITY} — a peer at any other level is not a participant and withholds the map on both sides.`
 			);
 		});
 }
