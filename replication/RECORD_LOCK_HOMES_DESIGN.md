@@ -355,8 +355,11 @@ raised in review against the first cut:
 That is the list-assembly step of the §4.3 runbook and only that: the operator captures one
 canonical list instead of typing it, then passes that exact list to `record_lock_stage_generation`
 on every node in `quiesce` and to `record_lock_activate_generation` on every node in `homes`,
-unchanged. The returned digest is what lets a
-script confirm every node agrees before it activates. Because it is a read, none of the blockers
+unchanged. What a script compares across nodes is `homes`, **not** the returned `digest`: the digest
+is taken over `(generation, homes)` and every node proposes its own floor plus one, so two nodes that
+agree on membership still differ here whenever their floors do. Pass the highest `generation` returned
+to every node; the digest they then agree on is the one computed from that single list, and that is
+the one `stage` and `activate` check. Because this operation is a read, none of the blockers
 above apply to it — a suggestion that is wrong costs an operator a re-run, not two arbiters.
 
 The generation it returns is one past this node's own floor, so the same operation serves a

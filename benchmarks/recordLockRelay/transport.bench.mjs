@@ -155,6 +155,14 @@ const HOLDERS = 5;
 const sharedSlotKey = ['record-lock', DATABASE, TABLE, KEY];
 const holderBit = 1 << 3;
 
+/**
+ * NOT a shape to copy into the real fast path as written: `expiry` is shared across threads while
+ * `performance.now()` is per-thread — every worker has its own `performance.timeOrigin`, so the
+ * comparison below is only meaningful because this bench seeds and reads the slot within one origin.
+ * A production slot has to carry `Date.now()`, or a monotonic value offset to one agreed origin,
+ * or it would reject live leases and admit expired ones depending on thread start order. The row
+ * this measures is the COST of an atomic slot read, which that correction does not change.
+ */
 function admitLocally(words, expiry) {
 	const live =
 		Atomics.load(words, RECALLED) === 0 &&
