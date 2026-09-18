@@ -39,7 +39,13 @@ import {
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
-import { cloneAttemptPath as cloneAttemptFilePath } from './cloneAttempt.ts';
+import {
+	CLONE_COMPLETION_GRACE_MS,
+	CLONE_COMPLETED_AT_ENV,
+	cloneAttemptPath as cloneAttemptFilePath,
+	completeCloneAttempt,
+	reusableCloneAttemptId,
+} from './cloneAttempt.ts';
 import {
 	isExplicitDatabaseSubscription,
 	isReplicatedDatabase as isReplicatedDatabaseUnder,
@@ -397,7 +403,11 @@ export async function cloneNode(): Promise<void> {
 	// Set a config value to indicate that this node has been cloned, which can be used by other processes to check clone status and prevent duplicate cloning
 	updateConfigValue(CONFIG_PARAMS.CLONED, true);
 	clearSyncStartedMarker();
-	clearCloneAttempt();
+	const completedAt = Date.now();
+	process.env[CLONE_COMPLETED_AT_ENV] = String(completedAt);
+	const completedAttemptId = completeCloneAttempt(rootPath, completedAt);
+	if (completedAttemptId) setTimeout(() => clearCloneAttempt(completedAttemptId), CLONE_COMPLETION_GRACE_MS).unref();
+	else clearCloneAttempt();
 
 	log(`Clone from leader node ${leaderURL} complete`);
 }
@@ -1445,14 +1455,14 @@ function cloneAttemptPath(): string {
 }
 
 function startCloneAttempt(): void {
+	delete process.env[CLONE_COMPLETED_AT_ENV];
 	const path = cloneAttemptPath();
-	let attemptId: string | undefined;
+	let persistedMarker: { attemptId?: unknown; leaderHost?: unknown; completedAt?: unknown } | undefined;
 	let persistedLeaderHost: string | undefined;
 	if (pathExists(path)) {
 		try {
-			const persisted = JSON.parse(readFileSync(path, 'utf8'));
-			if (typeof persisted?.attemptId === 'string') attemptId = persisted.attemptId;
-			if (typeof persisted?.leaderHost === 'string') persistedLeaderHost = persisted.leaderHost;
+			persistedMarker = JSON.parse(readFileSync(path, 'utf8'));
+			if (typeof persistedMarker?.leaderHost === 'string') persistedLeaderHost = persistedMarker.leaderHost;
 		} catch (error) {
 			log(`Could not read persisted clone attempt at ${path}: ${error}`, 'error');
 		}
@@ -1469,8 +1479,9 @@ function startCloneAttempt(): void {
 	} catch (error) {
 		log(`Could not derive the leader host from ${leaderURL}: ${error}`, 'error');
 	}
-	if (!attemptId || leaderHost !== persistedLeaderHost) {
-		attemptId ??= randomBytes(16).toString('hex');
+	let attemptId = forceClone ? undefined : reusableCloneAttemptId(persistedMarker, leaderHost);
+	if (!attemptId) {
+		attemptId = randomBytes(16).toString('hex');
 		try {
 			const temporaryPath = `${path}.${process.pid}.tmp`;
 			mkdirSync(dirname(path), { recursive: true });
@@ -1484,8 +1495,17 @@ function startCloneAttempt(): void {
 	process.env[CLONE_ATTEMPT_ENV] = attemptId;
 }
 
-function clearCloneAttempt(): void {
+function clearCloneAttempt(expectedAttemptId?: string): void {
+	if (expectedAttemptId) {
+		if (process.env[CLONE_ATTEMPT_ENV] !== expectedAttemptId) return;
+		try {
+			if (JSON.parse(readFileSync(cloneAttemptPath(), 'utf8'))?.attemptId !== expectedAttemptId) return;
+		} catch {
+			return;
+		}
+	}
 	delete process.env[CLONE_ATTEMPT_ENV];
+	delete process.env[CLONE_COMPLETED_AT_ENV];
 	try {
 		unlinkSync(cloneAttemptPath());
 	} catch (error: any) {
