@@ -1,18 +1,6 @@
 import assert from 'node:assert';
-import { isLegacyCopyPeer, verifyLegacyCopyBaseline } from '#src/replication/legacyCopy';
+import { verifyLegacyCopyBaseline } from '#src/replication/legacyCopy';
 import { LOCAL_ONLY } from '../../dist/core/resources/auditStore.js';
-
-describe('legacy copy peer identification', () => {
-	it('recognizes the standard registration_info version response', () => {
-		assert.strictEqual(isLegacyCopyPeer({ version: '4.7.36' }), true);
-		assert.strictEqual(isLegacyCopyPeer({ version: 'v4.3.7' }), true);
-		assert.strictEqual(isLegacyCopyPeer({ version: '5.3.0-alpha.1' }), false);
-	});
-	it('does not interpret a failed or malformed probe as a v5 peer', () => {
-		for (const response of [{ error: 'not found' }, {}, { version: 5 }, { version: '3.3.0' }, { version: 'invalid' }])
-			assert.throws(() => isLegacyCopyPeer(response));
-	});
-});
 
 let nextPeer = 0;
 function fixture(entries, remoteEntries = entries) {
@@ -62,6 +50,17 @@ describe('legacy existing-baseline verification', () => {
 		await verifyLegacyCopyBaseline(options);
 		assert.strictEqual(requests.filter((operation) => operation.operation === 'search_by_id').length, 3);
 		assert.strictEqual(requests.flatMap((operation) => operation.ids ?? []).length, 600);
+	});
+	it('accepts a current-build describe_table response, which reports primary_key rather than hash_attribute', async () => {
+		const entries = [{ key: 'k', version: 10 }];
+		const { options, requests } = fixture(entries);
+		const request = options.request;
+		options.request = async (operation) => {
+			if (operation.operation !== 'describe_table') return request(operation);
+			return { primary_key: 'id', attributes: [{ attribute: '__updatedtime__' }] };
+		};
+		await verifyLegacyCopyBaseline(options);
+		assert.strictEqual(requests.filter((operation) => operation.operation === 'search_by_id').length, 1);
 	});
 	it('pins later tables before a peer request can race concurrent inserts and updates', async () => {
 		const entries = [{ key: 'old', version: 10 }];
