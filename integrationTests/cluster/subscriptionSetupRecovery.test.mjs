@@ -85,7 +85,8 @@ async function replicationDiagnostics(node) {
 
 /**
  * A probe error is recorded rather than rethrown so that a node answering 500 while replication is
- * healthy stays distinguishable from non-convergence.
+ * healthy stays distinguishable from non-convergence. The deadline aborts the probe in flight, and
+ * that rejection is the timeout itself — recording it would overwrite the last real one.
  */
 async function waitForConvergence(node, probe, description, timeoutMs = RECOVERY_TIMEOUT_MS) {
 	let lastProbeError;
@@ -95,7 +96,7 @@ async function waitForConvergence(node, probe, description, timeoutMs = RECOVERY
 				try {
 					return await probe(signal);
 				} catch (error) {
-					lastProbeError = error;
+					if (!signal.aborted) lastProbeError = error;
 					return false;
 				}
 			},
@@ -258,20 +259,24 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			}
 		);
 
+		let polls = 0;
 		await assert.rejects(
 			waitForConvergence(
 				ctx.receiver,
-				() => {
-					throw new Error('probe exploded');
+				(signal) => {
+					if (polls++ === 0) throw new Error('probe exploded');
+					return new Promise((resolve, reject) =>
+						signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+					);
 				},
-				'a condition whose probe fails',
+				'a condition whose probe fails and then hangs',
 				1000
 			),
 			({ message }) => {
 				assert.match(
 					message,
 					/last probe error: probe exploded/,
-					'a broken oracle must be distinguishable from non-convergence'
+					'a broken oracle must stay distinguishable from non-convergence, and the deadline abort must not overwrite it'
 				);
 				return true;
 			}
