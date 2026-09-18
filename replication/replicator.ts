@@ -26,7 +26,13 @@ import {
 	databaseSubscriptions,
 	tableUpdateListeners,
 	LATENCY_POSITION,
+	deriveConnectionTruth,
 } from './replicationConnection.ts';
+import {
+	ensureRecordLockTransport,
+	releaseRecordLockTransport,
+	setConnectionDownSinceReader,
+} from './recordLockTransport.ts';
 import { redactOperationForLog } from './logRedaction.ts';
 import { registerShutdownDrain } from '../core/components/shutdownDrain.ts';
 import { hasProgressingBlobSends, drainBlobSends } from './blobSendDrain.ts';
@@ -102,6 +108,13 @@ export function buildReplicationMtlsConfig(replicationOptions: any) {
  */
 export function start(options) {
 	logger.notify('Starting replication server');
+	// Installed here, not at module load: knownNodes → replicator → recordLockTransport is an import
+	// cycle, and assigning recordLockTransport's `downSinceReader` while that module is still evaluating
+	// would hit its temporal dead zone. `start()` runs after every module has finished loading.
+	setConnectionDownSinceReader((status) => {
+		const truth = deriveConnectionTruth(status);
+		return truth.connected ? undefined : truth.errorTime;
+	});
 	if (options.hostname && !env.get('node_hostname')) {
 		// for back-compat, carry this over
 		env.setProperty('node_hostname', options.hostname);
@@ -369,8 +382,10 @@ function assignReplicationSource(options) {
 				}
 			}
 			dbSubscriptions.delete(databaseName);
+			releaseRecordLockTransport(databaseName);
 			return;
 		}
+		ensureRecordLockTransport(databaseName);
 		for (const tableName in database) {
 			const Table = database[tableName];
 			setReplicator(databaseName, Table, options);
@@ -615,7 +630,13 @@ export async function sendOperationToNode(node, operation, options?) {
 	const nodeUrl = getNodeURL(node);
 	const socket = await createWebSocket(nodeUrl, options);
 	const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), {});
+	let timer: NodeJS.Timeout | undefined;
 	return new Promise((resolve, reject) => {
+		if (options.timeoutMs)
+			timer = setTimeout(
+				() => reject(new Error(`operation to ${nodeUrl} did not answer within ${options.timeoutMs}ms`)),
+				options.timeoutMs
+			).unref();
 		socket.on('open', () => {
 			// operation may carry a secret (registry token / ssh key / password); redact before
 			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
@@ -623,7 +644,7 @@ export async function sendOperationToNode(node, operation, options?) {
 				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(operation));
 			// A throw inside this listener is an uncaught exception, and leaves this promise pending.
 			try {
-				resolve(session.sendOperation(operation));
+				resolve(session.sendOperation(operation, options.timeoutMs));
 			} catch (error) {
 				reject(error);
 			}
@@ -635,6 +656,7 @@ export async function sendOperationToNode(node, operation, options?) {
 			logger.info('Sending operation connection to ' + nodeUrl + ' closed', error);
 		});
 	}).finally(() => {
+		clearTimeout(timer);
 		socket.close();
 	});
 }
