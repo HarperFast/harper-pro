@@ -49,8 +49,7 @@ async function hasRecord(node, id, signal) {
 /**
  * `cluster_status` returns the peer's whole hdb_nodes record, keeping a retained `authorization`
  * credential, so the snapshot names the replication fields rather than serializing the response.
- * `?? null` on each: `JSON.stringify` drops undefined keys, and a field silently missing from the
- * snapshot is indistinguishable from one the reader forgot to look for.
+ * A field the reader came for must never be silently absent, so each is filled rather than dropped.
  */
 async function replicationDiagnostics(node) {
 	const controller = new AbortController();
@@ -243,8 +242,12 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			waitForConvergence(ctx.receiver, () => false, 'a condition that never holds', 1000),
 			({ message }) => {
 				assert.match(message, /Timed out after 1000ms waiting for a condition that never holds/);
-				assert.match(message, /"lastReceivedStatus":/, 'the snapshot must carry the receive state');
-				assert.match(message, /"recoveryFires":|"connected":/, 'the snapshot must carry the link truth');
+				assert.match(
+					message,
+					/"lastReceivedStatus":"(Receiving|Waiting)"/,
+					'the snapshot must carry the receive state, not just the key'
+				);
+				assert.match(message, /"connected":(true|false)/, 'the snapshot must carry the link truth');
 				assert.doesNotMatch(
 					message,
 					/authorization/i,
