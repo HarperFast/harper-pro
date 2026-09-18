@@ -212,6 +212,13 @@ describe('relaying a lock() to the coordinating worker', () => {
 			handleRevokeRequest({ database: 'rpc-ownerless', table: 'Counter', admissionId: 31, revokeId: 1 }, {});
 			await new Promise((resolve) => setImmediate(resolve));
 			assert.deepStrictEqual(revoked, [], 'an unauthenticated revoke cannot fence a live handle');
+			// Positive control: the same message from the stamped owner port does reach the fence, so the
+			// negative above is the gate's doing and not a stub that was never wired.
+			database = 'rpc-ownerless';
+			recordLockOwnerFor(database, [fakeOwnerWorker()]);
+			handleRevokeRequest({ database, table: 'Counter', admissionId: 31, revokeId: 1 }, port);
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.deepStrictEqual(revoked, [31], 'the coordinating owner still fences over its own port');
 		} finally {
 			coordinator.revokeRelayedAdmission = revoking;
 		}
