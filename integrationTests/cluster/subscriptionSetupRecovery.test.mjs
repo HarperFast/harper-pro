@@ -47,10 +47,10 @@ async function hasRecord(node, id, signal) {
 }
 
 /**
- * `cluster_status` returns the peer's whole hdb_nodes record minus `ca` and the timestamps, so it
- * can carry a retained `authorization` credential (setNode.ts:231) — project, never serialize it.
- * Bounded separately and never throwing: collecting evidence must not replace the failure it is
- * evidence for.
+ * `cluster_status` returns the peer's whole hdb_nodes record, keeping a retained `authorization`
+ * credential, so the snapshot names the replication fields rather than serializing the response.
+ * `?? null` on each: `JSON.stringify` drops undefined keys, and a field silently missing from the
+ * snapshot is indistinguishable from one the reader forgot to look for.
  */
 async function replicationDiagnostics(node) {
 	const controller = new AbortController();
@@ -61,19 +61,19 @@ async function replicationDiagnostics(node) {
 	try {
 		const status = await sendOperation(node, { operation: 'cluster_status' }, { signal: controller.signal });
 		return JSON.stringify(
-			status.connections?.map((connection) => ({
-				name: connection.name,
-				database_sockets: connection.database_sockets?.map((socket) => ({
-					database: socket.database,
-					connected: socket.connected,
-					lastReceivedStatus: socket.lastReceivedStatus,
-					lastReceivedVersion: socket.lastReceivedVersion,
-					lastReceivedLocalTime: socket.lastReceivedLocalTime,
-					lastLiveness: socket.lastLiveness,
-					sendingMessage: socket.sendingMessage,
-					backPressurePercent: socket.backPressurePercent,
-					recoveryFires: socket.recoveryFires,
-					lastConnectionError: socket.lastConnectionError,
+			(status?.connections ?? []).map((connection) => ({
+				name: connection.name ?? null,
+				database_sockets: (connection.database_sockets ?? []).map((socket) => ({
+					database: socket.database ?? null,
+					connected: socket.connected ?? null,
+					lastReceivedStatus: socket.lastReceivedStatus ?? null,
+					lastReceivedVersion: socket.lastReceivedVersion ?? null,
+					lastReceivedLocalTime: socket.lastReceivedLocalTime ?? null,
+					lastLiveness: socket.lastLiveness ?? null,
+					sendingMessage: socket.sendingMessage ?? null,
+					backPressurePercent: socket.backPressurePercent ?? null,
+					recoveryFires: socket.recoveryFires ?? null,
+					lastConnectionError: socket.lastConnectionError ?? null,
 				})),
 			}))
 		);
@@ -85,8 +85,8 @@ async function replicationDiagnostics(node) {
 }
 
 /**
- * A probe error is recorded rather than rethrown, and reported beside the snapshot: a node
- * answering 500 while replication is healthy must stay distinguishable from non-convergence.
+ * A probe error is recorded rather than rethrown so that a node answering 500 while replication is
+ * healthy stays distinguishable from non-convergence.
  */
 async function waitForConvergence(node, probe, description, timeoutMs = RECOVERY_TIMEOUT_MS) {
 	let lastProbeError;
@@ -140,7 +140,7 @@ function countSetupWatchdogWarnings(log, database = DB) {
 
 async function socketConnected(node, database, signal) {
 	const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
-	return status.connections.some((connection) =>
+	return status?.connections?.some((connection) =>
 		connection.database_sockets?.some((socket) => socket.database === database && socket.connected === true)
 	);
 }
@@ -239,40 +239,39 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 	});
 
 	test('a convergence timeout reports the replication state it was waiting on', async () => {
-		const neverConverges = await waitForConvergence(
-			ctx.receiver,
-			() => false,
-			'a condition that never holds',
-			1000
-		).then(
-			() => undefined,
-			(error) => error
+		await assert.rejects(
+			waitForConvergence(ctx.receiver, () => false, 'a condition that never holds', 1000),
+			({ message }) => {
+				assert.match(message, /Timed out after 1000ms waiting for a condition that never holds/);
+				assert.match(message, /"lastReceivedStatus":/, 'the snapshot must carry the receive state');
+				assert.match(message, /"recoveryFires":|"connected":/, 'the snapshot must carry the link truth');
+				assert.doesNotMatch(
+					message,
+					/authorization/i,
+					'the snapshot must project replication fields, never the whole hdb_nodes record'
+				);
+				assert.match(message, /last probe error: none/);
+				return true;
+			}
 		);
-		assert.match(neverConverges.message, /Timed out after 1000ms waiting for a condition that never holds/);
-		assert.match(neverConverges.message, /"lastReceivedStatus":/, 'the snapshot must carry the receive state');
-		assert.match(neverConverges.message, /"recoveryFires"|"connected":/, 'the snapshot must carry the link truth');
-		assert.doesNotMatch(
-			neverConverges.message,
-			/authorization/i,
-			'the snapshot must project replication fields, never the whole hdb_nodes record'
-		);
-		assert.match(neverConverges.message, /last probe error: none/);
 
-		const probeThrew = await waitForConvergence(
-			ctx.receiver,
-			() => {
-				throw new Error('probe exploded');
-			},
-			'a condition whose probe fails',
-			1000
-		).then(
-			() => undefined,
-			(error) => error
-		);
-		assert.match(
-			probeThrew.message,
-			/last probe error: probe exploded/,
-			'a broken oracle must be distinguishable from non-convergence'
+		await assert.rejects(
+			waitForConvergence(
+				ctx.receiver,
+				() => {
+					throw new Error('probe exploded');
+				},
+				'a condition whose probe fails',
+				1000
+			),
+			({ message }) => {
+				assert.match(
+					message,
+					/last probe error: probe exploded/,
+					'a broken oracle must be distinguishable from non-convergence'
+				);
+				return true;
+			}
 		);
 
 		const unreachable = { ...ctx.receiver, operationsAPIURL: 'http://127.0.0.1:1/' };
