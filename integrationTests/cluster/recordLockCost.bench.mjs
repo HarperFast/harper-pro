@@ -310,7 +310,11 @@ function distribution(samples) {
 	};
 }
 
-const LOCK_ENTRY_TYPES = ['lockRequest', 'lockGrant', 'lockRelease'];
+// Core's whole `LockControlType` set (`core/resources/recordLockCoordinator.ts`). `lockBarrier` is
+// what every cold handoff now costs, so leaving it out both understated measurement 4 and let the
+// quiet detector below call a window finished while barriers were still landing. The level-1
+// `lockRequest`/`lockGrant` pair the first baseline counted no longer exists.
+const LOCK_ENTRY_TYPES = ['lockRelease', 'lockBarrier'];
 
 async function logSnapshot(nodes, signal) {
 	return Promise.all(nodes.map((node) => call(node, 'LogStats/', undefined, signal)));
