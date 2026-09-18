@@ -148,10 +148,11 @@ staged?.generation ?? 0, highestActedOn)`. On success, **atomically**: computes 
   on whichever node the operator is talking to. Consulted by no grant path — its safety is the
   operator's own action (the node is stopped), not anything Harper verifies.
 - **`record_lock_activate_generation`** `{ database, generation, homes[] }` — issued by the
-  operator, once, on every node named in `homes(g) ∪ homes(g+1)` (idempotent replay across
-  nodes and across retries), **only after** the operator has, externally, in their own wall
-  time: collected a successful `stage` (or `fence_external`) response from every node in that
-  set, and then waited `DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS` from the _last_ such
+  operator, once, on every node in `homes(g+1)` (idempotent replay across nodes and across
+  retries), **only after** the operator has, externally, in their own wall time: collected a
+  successful `stage` (or `fence_external`) response from every node in `homes(g) ∪ homes(g+1)`
+  — the whole `quiesce` set, which is wider than the set being activated — and then waited
+  `DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS` from the _last_ such
   response. Refuses unless `staged` on this node matches `(generation, homes)` exactly
   (replay/consistency check — a stale or misdirected activate for the wrong transition is
   rejected, not silently applied). On success, atomically promotes `staged → active`, clears
@@ -159,6 +160,19 @@ staged?.generation ?? 0, highestActedOn)`. On success, **atomically**: computes 
   "cannot be proven by subtracting persisted wall times." The wait is the operator's
   externally-observed fact; nodes only ever check _consistency_ (does this match what I
   staged?), never _elapsed time_.
+
+  **Do not activate a departing node** — one in `quiesce` but not in `homes(g+1)`. Nothing stops
+  you mechanically: `planActivate` never looks at membership and `homeMap()` does not require
+  `self ∈ homes`, so the call succeeds and the leaver ends up with a defined home map naming the
+  ring that replaced it. It still cannot lock. Every barrier it would need is refused by the new
+  members, because `record_lock_barrier` admits only callers in the answering node's own home map
+  (`recordLockRpc.ts` `executeBarrier`, `isMember`), and a generation change puts the leaver's
+  next acquire on the recovery path, which asks **every** member for one
+  (`recordLockFreshness.ts`, `dependencies === null`). So the lock fails 503 either way, and
+  activating only moves the refusal from "no agreed home map" to a barrier the peers reject — the
+  same outcome, reported worse. `record_lock_apply_homes` is the behavior to match: it marks such
+  a node `role: 'departing'`, skips its activate, and `record_lock_transition` refuses a
+  misdirected relay with a 409.
 
 ### 3. `homeMap()` — a frozen pointer read, no hot-path cost
 
@@ -340,7 +354,8 @@ raised in review against the first cut:
 
 That is the list-assembly step of the §4.3 runbook and only that: the operator captures one
 canonical list instead of typing it, then passes that exact list to `record_lock_stage_generation`
-and `record_lock_activate_generation` on every node, unchanged. The returned digest is what lets a
+on every node in `quiesce` and to `record_lock_activate_generation` on every node in `homes`,
+unchanged. The returned digest is what lets a
 script confirm every node agrees before it activates. Because it is a read, none of the blockers
 above apply to it — a suggestion that is wrong costs an operator a re-run, not two arbiters.
 
@@ -414,7 +429,9 @@ socket per apply.
   superset of `homes`; the shape is exactly what `record_lock_propose_homes` returns, so its output can
   be passed straight in. A node in `quiesce` but not `homes` is **departing**: it is staged (so it stops
   granting) and deliberately never activated, so it stays unable to lock, which is what leaving the
-  ring means.
+  ring means. The manual `record_lock_activate_generation` would _accept_ an activate on such a node —
+  §2 says why you should still not send one: it does not restore the node's ability to lock, it only
+  changes which refusal the operator sees.
 - `generation` is optional on a first call: one past the highest generation any surveyed node has acted
   on — unless the node at that highest generation holds exactly the requested set, in which case that
   generation is resumed, so a retry of an interrupted call continues the same transition rather than
