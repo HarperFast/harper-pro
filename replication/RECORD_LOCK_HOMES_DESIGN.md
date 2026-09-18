@@ -528,8 +528,40 @@ peer-callable operation is therefore not what lets a peer write; it is what keep
 caller from driving the relay under a node's name (`principalNodeName` refuses anyone not in
 `server.nodes`), and its local re-validation is what keeps a peer from pushing a set this node did not
 verify. A departed-but-still-known node principal keeps that pre-existing authority; this operation
-neither widens nor narrows it, and the dispatcher's node-wide bypass is reported as a finding rather
-than changed here.
+neither widens nor narrows it.
+
+#### What that admits, stated plainly, and why it is accepted here
+
+The honest reading of the paragraph above is that **a home-map transition is authorized by node
+identity alone**. Nothing on the wire proves an operator asked for it. So any principal a peer
+resolves through `principalNodeName` — a compromised cluster node, or a `super_user` on any single
+node exploiting the same "authenticated user named like a node" gap that `record_lock_delegate`
+already has — can stage and then activate a map of its choosing on a peer.
+
+That is not a small consequence: the map decides which node arbitrates which key, and two nodes
+serving different maps is precisely the two-arbiter failure §4 exists to prevent. The digest check
+narrows the blast radius rather than closing it — `homeMap()` iterates its **own** `active.homes`, so
+a node rewritten to a singleton skips the peer loop and serves immediately, and a peer fails closed
+only once the changed digest reaches it over a live connection.
+
+It is accepted for this release, by the task owner's ruling on #822, on three facts:
+
+1. **A cluster node principal is already trusted to write replicated data on every peer.** The relay
+   extends that existing trust to home-map policy; it does not open a new channel.
+2. **This operation does not widen the authority.** The per-node operations were reachable by a node
+   principal through the dispatcher bypass before harper-pro#862 added the relay. What the relay adds
+   is the local re-validation above — strictly more checking than the direct call it replaced.
+3. **Nothing shipped is exposed.** `replication.recordLocks` is off by default and grants nothing
+   until an operator stages and activates a generation, so reaching this needs an operator to have
+   enabled and activated the feature _and_ an attacker to hold a node principal.
+
+What would close it is an operator-delegated proof carried on the transition — a short-lived
+capability or signed manifest minted by the `record_lock_apply_homes` caller's own `super_user`
+session, covering `(database, generation, digest, quiesce)` and an expiry, verified by each receiving
+node before it writes — with the node-principal gate kept as transport authentication. That is filed
+as harper-pro#869 and is a prerequisite for recommending this feature in production, and for #853's
+default-on question. The dispatcher's node-wide `verifyPerms` bypass is wider than record locks and
+wants its own assessment; #869 says so rather than folding it in.
 
 ### Approaches considered
 
