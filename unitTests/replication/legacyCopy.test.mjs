@@ -4,6 +4,9 @@ import { LOCAL_ONLY } from '../../dist/core/resources/auditStore.js';
 
 let nextPeer = 0;
 function fixture(entries, remoteEntries = entries) {
+	// Real getRange({ versions: true }) reports a live row's value; only a tombstone omits it.
+	// Fill that in by default so a test only has to say `value: null` when it means a tombstone.
+	entries = entries.map((entry) => ({ value: 'v', ...entry }));
 	const rows = new Map(remoteEntries.map((entry) => [entry.key, entry.version]));
 	const requests = [];
 	const options = {
@@ -100,6 +103,23 @@ describe('legacy existing-baseline verification', () => {
 		const { options, requests } = fixture([{ key: 'private', version: 10, metadataFlags: LOCAL_ONLY }], []);
 		await verifyLegacyCopyBaseline(options);
 		assert.strictEqual(requests.length, 0);
+	});
+	it('does not verify delete tombstones: both sides already agree the row is gone', async () => {
+		const { options, requests } = fixture([{ key: 'deleted', version: 10, value: null }], []);
+		await verifyLegacyCopyBaseline(options);
+		assert.strictEqual(requests.length, 0);
+	});
+	it('skips a tombstone as the first entry of a table without misreading it as ineligible forever', async () => {
+		const entries = [
+			{ key: 'deleted', version: 10, value: null },
+			{ key: 'live', version: 10 },
+		];
+		const { options, requests } = fixture(entries);
+		await verifyLegacyCopyBaseline(options);
+		assert.deepStrictEqual(
+			requests.filter((request) => request.ids).flatMap((request) => request.ids),
+			['live']
+		);
 	});
 	it('stops verification when the connection closes during a request', async () => {
 		const { options, requests } = fixture([{ key: 'k', version: 10 }]);
