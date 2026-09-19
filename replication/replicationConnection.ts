@@ -539,15 +539,18 @@ export function hostnameFromNodeUrl(url: unknown): string | undefined {
 	}
 }
 
-// A WebSocket close reason is capped at 123 UTF-8 bytes (RFC 6455: 125-byte control frame minus the
-// 2-byte status code). `ws.close()` throws instead of closing when this is exceeded, which would leave
-// a caller's `closed = true` state set without ever actually closing the socket. Slicing on bytes can
-// split a multi-byte character; `Buffer#toString('utf8')` renders the truncated tail as U+FFFD rather
-// than throwing, which is an acceptable cosmetic cost for a diagnostic string.
+// WS close reasons are capped at 123 UTF-8 bytes (RFC 6455) or ws.close() throws. A raw byte cut can
+// split a character; decoding the split tail as U+FFFD can then re-encode past 123 again, so shrink
+// until what decoding produced actually re-encodes within the limit.
 export function truncateCloseReason(reason: unknown): string | undefined {
 	if (typeof reason !== 'string') return undefined;
-	if (Buffer.byteLength(reason, 'utf8') <= 123) return reason;
-	return Buffer.from(reason, 'utf8').subarray(0, 123).toString('utf8');
+	const buffer = Buffer.from(reason, 'utf8');
+	let end = buffer.byteLength;
+	if (end <= 123) return reason;
+	end = 123;
+	let truncated = buffer.subarray(0, end).toString('utf8');
+	while (Buffer.byteLength(truncated, 'utf8') > 123) truncated = buffer.subarray(0, --end).toString('utf8');
+	return truncated;
 }
 
 /**
@@ -5900,9 +5903,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											}
 										}
 										if (currentSequenceId === 0) {
-											// Absent capability means unverified, full stop: a peer's major version alone cannot
-											// certify its audit writer is safe, since the same LMDB no-op-write hole predates this
-											// capability existing at all (see DESIGN.md's v5+LMDB note).
+											// Capability-only gate, never version: the LMDB no-op-write hole predates this
+											// capability existing at all (DESIGN.md's v5+LMDB note).
 											const legacyCopy = !peerCapabilities.safeCopyAudit;
 											if (legacyCopy) copyResume = undefined;
 											if (closed || wsClosed) return;

@@ -69,6 +69,13 @@ export async function verifyLegacyCopyBaseline({
 			}
 		}
 	}
+	// A deleted key stays in the primary store as a tombstone (value === null) until audit cleanup
+	// removes it. It isn't a row the peer needs, live or historical, so skip it exactly like a
+	// LOCAL_ONLY row rather than requiring the peer to prove it holds a row that no longer exists.
+	function eligibleEntry(entry) {
+		if (entry.metadataFlags & LOCAL_ONLY || !entry.value) return undefined;
+		return copyEntry(entry);
+	}
 	const cursors: Array<{ tableName: string; iterator: Iterator<any>; first?: IteratorResult<any> }> = [];
 	try {
 		// Pin every table before the first peer RPC; concurrent writes belong to post-copy audit replay.
@@ -78,8 +85,10 @@ export async function verifyLegacyCopyBaseline({
 				iterator: table.primaryStore.getRange({ snapshot: true, versions: true })[Symbol.iterator](),
 			};
 			cursors.push(cursor);
-			const first = cursor.iterator.next();
-			cursors[cursors.length - 1].first = first.done ? first : { done: false, value: copyEntry(first.value) };
+			let raw = cursor.iterator.next();
+			let eligible;
+			while (!raw.done && !(eligible = eligibleEntry(raw.value))) raw = cursor.iterator.next();
+			cursors[cursors.length - 1].first = raw.done ? raw : { done: false, value: eligible };
 		}
 		const previousFailure = failedCopies.get(cacheKey);
 		if (previousFailure) {
@@ -94,9 +103,10 @@ export async function verifyLegacyCopyBaseline({
 			let entries: Array<{ key: any; version: number }> = [];
 			for (let next = first; !next.done; next = iterator.next()) {
 				checkOpen();
-				const entry = next.value;
-				if (entry.metadataFlags & LOCAL_ONLY) continue;
-				entries.push(copyEntry(entry));
+				// `first` is already a validated, copied entry; every later `next` is a fresh raw one.
+				const entry = next === first ? next.value : eligibleEntry(next.value);
+				if (!entry) continue;
+				entries.push(entry);
 				if (entries.length === BATCH_SIZE) {
 					await verifyBatch(tableName, entries);
 					entries = [];

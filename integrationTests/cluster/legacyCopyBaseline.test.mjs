@@ -192,10 +192,8 @@ test(
 				contexts.filter((context) => context.harper?.process).map((context) => teardownHarper(context))
 			);
 		});
-		// current: an ordinary build advertising safeCopyAudit normally.
 		const current = await start({});
-		// capless: also current code, but its NODE_NAME frame omits the capability bag entirely — simulating
-		// a v5 peer that predates safeCopyAudit, without needing a real legacy binary.
+		// Omitting the capability bag simulates a pre-safeCopyAudit v5 peer without a real legacy binary.
 		const capless = await start({ HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' });
 		await sendOperation(current, { operation: 'create_database', database: 'data' });
 		await sendOperation(current, { operation: 'create_table', database: 'data', table: 'orders', primary_key: 'id' });
@@ -213,8 +211,6 @@ test(
 			rejectUnauthorized: false,
 			authorization: current.admin,
 		});
-		// The major-version alone must not certify capless as safe: current has a row capless lacks, so
-		// verification runs against it exactly as it would against a real v4 peer, and refuses.
 		await waitForCondition(
 			async () => (await readLog(current)).includes('Historical restoration into an unverified peer is unsupported'),
 			{
@@ -231,9 +227,8 @@ test(
 			get_attributes: ['id'],
 		});
 		assert.deepStrictEqual(rows, [], 'no unverified historical put reached the capability-less peer');
-		// The stuck direction is current -> capless (its unverifiable historical row blocks that base copy
-		// forever). A fresh write on capless itself has nothing to verify and should still flow normally,
-		// same as "forward migration continues" for a real v4 peer above.
+		// current -> capless stays blocked; capless's own new write has nothing to verify and should
+		// still flow forward, same as the real-v4 case above.
 		await sendOperation(capless, {
 			operation: 'upsert',
 			database: 'data',
