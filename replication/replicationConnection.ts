@@ -1484,6 +1484,74 @@ export function maybeStallSubscriptionSetupForTest(databaseName?: string): Promi
 	return new Promise<never>(() => {});
 }
 
+// Test-only ordering injection for harper-pro#431, holding one connection's first subscribe until its
+// socket has opened. That leaves a live link whose connect edge was never posted — the harper-pro#289
+// desync the up-correction exists for, and not reachable black-box: the real window is the race between
+// the WS handshake and an async subscribe(). Never arms in production, the env var is set only by the test.
+let subscribeAfterOpenForTestArmed = false;
+export function maybeDeferSubscribeUntilSessionForTest(
+	connection: any,
+	nodeSubscriptions: any,
+	replicateTablesByDefault: boolean
+): boolean {
+	if (!process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB) return false;
+	// Replaces rather than overtakes: applying it would post the edge this suppresses, and leave the newer
+	// node set to be overwritten on release.
+	if (connection.deferredSubscribeForTest) {
+		connection.deferredSubscribeForTest = { nodeSubscriptions, replicateTablesByDefault };
+		return true;
+	}
+	if (
+		subscribeAfterOpenForTestArmed ||
+		connection.nodeSubscriptions !== undefined ||
+		!connection.session ||
+		process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB !== connection.databaseName
+	)
+		return false;
+	subscribeAfterOpenForTestArmed = true;
+	connection.deferredSubscribeForTest = { nodeSubscriptions, replicateTablesByDefault };
+	logger.warn?.(`[test] deferring subscribe until session open for db "${connection.databaseName}" (harper-pro#431)`);
+	// liveSession, not the promise settling, is the proof a socket opened: the promise also settles on a
+	// socket error. Assigned in the open handler right after replicateOverWS, which is the ordering the
+	// test needs.
+	const release = () => {
+		const held = connection.deferredSubscribeForTest;
+		if (!held) return;
+		const abandoned = connection.intentionallyUnsubscribed || connection.isFinished;
+		if (!abandoned && connection.liveSession === undefined) return;
+		connection.deferredSubscribeForTest = undefined;
+		clearInterval(retry);
+		if (abandoned) return;
+		logger.warn?.(`[test] releasing deferred subscribe for db "${connection.databaseName}" (harper-pro#431)`);
+		// subscribeToNode() contains a throw from its own subscribe(); a promise callback would not.
+		try {
+			connection.subscribe(held.nodeSubscriptions, held.replicateTablesByDefault);
+		} catch (error) {
+			logger.error?.(`[test] deferred subscribe failed for db "${connection.databaseName}"`, error);
+		}
+	};
+	// Release has to land in the same microtask batch as the open handler's sessionResolve, ahead of the
+	// peer's first frame: the handshake's shared-truth CONNECTED stamp is gated on nodeSubscriptions, and
+	// missing it leaves nothing to write CONNECTED until a pong up to a ping interval later. So follow the
+	// session promise, and re-follow it whenever a failed attempt replaces it — resetSession() abandons the
+	// old one (connect()'s createWebSocket rejection leaves it pending for good), so watching only the
+	// first would strand the payload.
+	let watched: Promise<unknown> | undefined;
+	const followSession = () => {
+		// Abandonment is checked here, not only in release: a connection whose every attempt fails inside
+		// createWebSocket never settles a session promise, so release is not reachable to do the cleanup.
+		if (connection.intentionallyUnsubscribed || connection.isFinished) connection.deferredSubscribeForTest = undefined;
+		if (!connection.deferredSubscribeForTest) return clearInterval(retry);
+		if (watched === connection.session) return;
+		watched = connection.session;
+		connection.session.then(release, release);
+	};
+	const retry = setInterval(followSession, 250);
+	retry.unref();
+	followSession();
+	return true;
+}
+
 // Test-only fault injection for harper-pro#537 symptom characterization. When
 // HARPER_TEST_INJECT_COPY_CURSOR_JSON is set on the RECEIVER node, the subscription handshake
 // overrides the copyCursor with the JSON-parsed value — as if a prior interrupted copy had left a
@@ -3218,6 +3286,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.session.catch(() => {}); // suppress any unhandled errors
 	}
 	subscribe(nodeSubscriptions, replicateTablesByDefault) {
+		if (maybeDeferSubscribeUntilSessionForTest(this, nodeSubscriptions, replicateTablesByDefault)) return;
 		this.nodeSubscriptions = nodeSubscriptions;
 		this.replicateTablesByDefault = replicateTablesByDefault;
 		this.emit('subscriptions-updated', nodeSubscriptions);
