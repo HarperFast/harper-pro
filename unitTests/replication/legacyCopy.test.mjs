@@ -6,7 +6,9 @@ let nextPeer = 0;
 function fixture(entries, remoteEntries = entries) {
 	// Real getRange({ versions: true }) reports a live row's value; only a tombstone omits it.
 	// Fill that in by default so a test only has to say `value: null` when it means a tombstone.
-	entries = entries.map((entry) => ({ value: 'v', ...entry }));
+	// Mutated in place (not replaced) so a test that mutates its own `entries` array — simulating a
+	// concurrent write racing the verification RPCs — stays visible to the fixture's live store.
+	for (const entry of entries) if (!('value' in entry)) entry.value = 'v';
 	const rows = new Map(remoteEntries.map((entry) => [entry.key, entry.version]));
 	const requests = [];
 	const options = {
@@ -104,22 +106,47 @@ describe('legacy existing-baseline verification', () => {
 		await verifyLegacyCopyBaseline(options);
 		assert.strictEqual(requests.length, 0);
 	});
-	it('does not verify delete tombstones: both sides already agree the row is gone', async () => {
+	it('passes a tombstone when the peer already lacks the row: both sides agree it is gone', async () => {
 		const { options, requests } = fixture([{ key: 'deleted', version: 10, value: null }], []);
 		await verifyLegacyCopyBaseline(options);
-		assert.strictEqual(requests.length, 0);
+		assert.deepStrictEqual(
+			requests.filter((request) => request.ids).flatMap((request) => request.ids),
+			['deleted']
+		);
 	});
-	it('skips a tombstone as the first entry of a table without misreading it as ineligible forever', async () => {
+	it('passes a tombstone when the peer already caught up to or past the delete', async () => {
+		const { options } = fixture([{ key: 'deleted', version: 10, value: null }], [{ key: 'deleted', version: 15 }]);
+		await verifyLegacyCopyBaseline(options);
+	});
+	it('fails closed on a tombstone when the peer still holds an older live copy: it never received the delete', async () => {
+		await assert.rejects(
+			verifyLegacyCopyBaseline(
+				fixture([{ key: 'deleted', version: 10, value: null }], [{ key: 'deleted', version: 5 }]).options
+			),
+			/Historical restoration/
+		);
+	});
+	it('does not misread a tombstone as ineligible when it is the first entry of a table', async () => {
 		const entries = [
 			{ key: 'deleted', version: 10, value: null },
 			{ key: 'live', version: 10 },
 		];
-		const { options, requests } = fixture(entries);
+		const { options, requests } = fixture(entries, [{ key: 'live', version: 10 }]);
 		await verifyLegacyCopyBaseline(options);
 		assert.deepStrictEqual(
-			requests.filter((request) => request.ids).flatMap((request) => request.ids),
-			['live']
+			requests
+				.filter((request) => request.ids)
+				.flatMap((request) => request.ids)
+				.sort(),
+			['deleted', 'live']
 		);
+	});
+	it('routes the failed-key memo recheck through the same tombstone rule as the main scan', async () => {
+		const entries = [{ key: 'deleted', version: 10, value: null }];
+		const { options, rows } = fixture(entries, [{ key: 'deleted', version: 5 }]);
+		await assert.rejects(verifyLegacyCopyBaseline(options), /Historical restoration/);
+		rows.set('deleted', 15);
+		await verifyLegacyCopyBaseline(options);
 	});
 	it('stops verification when the connection closes during a request', async () => {
 		const { options, requests } = fixture([{ key: 'k', version: 10 }]);
