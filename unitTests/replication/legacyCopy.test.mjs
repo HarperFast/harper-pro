@@ -126,6 +126,15 @@ describe('legacy existing-baseline verification', () => {
 			/Historical restoration/
 		);
 	});
+	it('fails closed on a tombstone when the peer has a row but its timestamp is unusable', async () => {
+		const { options } = fixture([{ key: 'deleted', version: 10, value: null }], []);
+		options.request = async (operation) => {
+			if (operation.operation === 'describe_table')
+				return { hash_attribute: 'id', attributes: [{ attribute: '__updatedtime__' }] };
+			return { results: [{ id: 'deleted', __updatedtime__: NaN }] };
+		};
+		await assert.rejects(verifyLegacyCopyBaseline(options), /Historical restoration/);
+	});
 	it('does not misread a tombstone as ineligible when it is the first entry of a table', async () => {
 		const entries = [
 			{ key: 'deleted', version: 10, value: null },

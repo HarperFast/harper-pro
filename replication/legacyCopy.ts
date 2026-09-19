@@ -65,9 +65,13 @@ export async function verifyLegacyCopyBaseline({
 			if (key !== undefined) versions.set(toBufferKey(key).toString('hex'), row[description.updatedTime]);
 		}
 		for (const entry of entries) {
-			const remoteVersion = versions.get(toBufferKey(entry.key).toString('hex'));
-			const remotePresent = Number.isFinite(remoteVersion);
-			const remoteBehind = remotePresent && remoteVersion < entry.version;
+			const remoteKey = toBufferKey(entry.key).toString('hex');
+			// Presence comes from the row being in the response at all, not from its timestamp parsing:
+			// a present row with a garbled timestamp is not proof the peer is caught up, so it must fail
+			// closed the same as an older one — never be silently read as "peer doesn't have it".
+			const remotePresent = versions.has(remoteKey);
+			const remoteVersion = versions.get(remoteKey);
+			const remoteBehind = remotePresent && !(Number.isFinite(remoteVersion) && remoteVersion >= entry.version);
 			// A tombstone passes if the peer lacks the row or is already caught up — it must not be
 			// required to hold a row that no longer exists. An OLDER live peer row means it never got
 			// the delete, so fail closed exactly as a live row would; leaving would strand it forever.
@@ -114,7 +118,6 @@ export async function verifyLegacyCopyBaseline({
 			let entries: VerifyEntry[] = [];
 			for (let next = first; !next.done; next = iterator.next()) {
 				checkOpen();
-				// `first` is already a validated, copied entry; every later `next` is a fresh raw one.
 				const entry = next === first ? next.value : eligibleEntry(next.value);
 				if (!entry) continue;
 				entries.push(entry);
