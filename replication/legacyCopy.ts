@@ -4,6 +4,13 @@ import { LOCAL_ONLY } from '../core/resources/auditStore.ts';
 const BATCH_SIZE = 256;
 const failedCopies = new Map<string, { tableName: string; key: any }>();
 
+interface VerifyEntry {
+	key: any;
+	version: number;
+	metadataFlags?: number;
+	isTombstone: boolean;
+}
+
 export async function verifyLegacyCopyBaseline({
 	peerName,
 	databaseName,
@@ -22,7 +29,7 @@ export async function verifyLegacyCopyBaseline({
 	function checkOpen() {
 		if (isClosed()) throw new Error('Connection closed during legacy copy verification');
 	}
-	async function verifyBatch(tableName: string, entries: Array<{ key: any; version: number }>) {
+	async function verifyBatch(tableName: string, entries: VerifyEntry[]) {
 		checkOpen();
 		let description = descriptions.get(tableName);
 		if (!description) {
@@ -59,7 +66,14 @@ export async function verifyLegacyCopyBaseline({
 		}
 		for (const entry of entries) {
 			const remoteVersion = versions.get(toBufferKey(entry.key).toString('hex'));
-			if (!Number.isFinite(entry.version) || !Number.isFinite(remoteVersion) || remoteVersion < entry.version) {
+			const remotePresent = Number.isFinite(remoteVersion);
+			const remoteBehind = remotePresent && remoteVersion < entry.version;
+			// A tombstone passes if the peer lacks the row or is already caught up — it must not be
+			// required to hold a row that no longer exists. An OLDER live peer row means it never got
+			// the delete, so fail closed exactly as a live row would; leaving would strand it forever.
+			const failed =
+				!Number.isFinite(entry.version) || (entry.isTombstone ? remoteBehind : !remotePresent || remoteBehind);
+			if (failed) {
 				failedCopies.delete(cacheKey);
 				if (failedCopies.size >= 256) failedCopies.delete(failedCopies.keys().next().value);
 				failedCopies.set(cacheKey, { tableName, key: entry.key });
@@ -69,11 +83,8 @@ export async function verifyLegacyCopyBaseline({
 			}
 		}
 	}
-	// A deleted key stays in the primary store as a tombstone (value === null) until audit cleanup
-	// removes it. It isn't a row the peer needs, live or historical, so skip it exactly like a
-	// LOCAL_ONLY row rather than requiring the peer to prove it holds a row that no longer exists.
 	function eligibleEntry(entry) {
-		if (entry.metadataFlags & LOCAL_ONLY || !entry.value) return undefined;
+		if (entry.metadataFlags & LOCAL_ONLY) return undefined;
 		return copyEntry(entry);
 	}
 	const cursors: Array<{ tableName: string; iterator: Iterator<any>; first?: IteratorResult<any> }> = [];
@@ -93,14 +104,14 @@ export async function verifyLegacyCopyBaseline({
 		const previousFailure = failedCopies.get(cacheKey);
 		if (previousFailure) {
 			const table = tables[previousFailure.tableName];
-			const entry = await table?.primaryStore.getEntry(previousFailure.key);
+			const rawEntry = await table?.primaryStore.getEntry(previousFailure.key);
 			checkOpen();
-			if (entry && !(entry.metadataFlags & LOCAL_ONLY))
-				await verifyBatch(previousFailure.tableName, [{ key: previousFailure.key, version: entry.version }]);
+			const eligible = rawEntry && eligibleEntry(rawEntry);
+			if (eligible) await verifyBatch(previousFailure.tableName, [eligible]);
 			failedCopies.delete(cacheKey);
 		}
 		for (const { tableName, iterator, first } of cursors) {
-			let entries: Array<{ key: any; version: number }> = [];
+			let entries: VerifyEntry[] = [];
 			for (let next = first; !next.done; next = iterator.next()) {
 				checkOpen();
 				// `first` is already a validated, copied entry; every later `next` is a fresh raw one.
@@ -125,5 +136,8 @@ function copyEntry(entry) {
 		key: Buffer.isBuffer(entry.key) ? Buffer.from(entry.key) : entry.key,
 		version: entry.version,
 		metadataFlags: entry.metadataFlags,
+		// A deleted key stays in the primary store as a tombstone (value === null) until audit cleanup
+		// removes it.
+		isTombstone: !entry.value,
 	};
 }
