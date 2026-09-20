@@ -274,7 +274,10 @@ function readFrames(buffer) {
  * this log carries a row, though: `add_node`'s base copy can commit a record-less `copyBarrier`
  * control entry into this same local log before either batch is inserted (harper-pro#876), so the
  * oracle filters to frames that actually carry one of this test's rows rather than assuming
- * position alone -- a corrupted or missing row still fails the count check below.
+ * position alone -- a corrupted or missing row still fails the count check below. The filter alone
+ * would also hide a barrier-per-retry proliferation (the reconnect-loop risk `DESIGN.md` names as
+ * the reason fail-closed was withdrawn), so the non-row count is separately bounded to the one
+ * barrier this test's single `add_node` can produce.
  */
 function tearFrame(logPath, framesFromEnd) {
 	const buffer = readFileSync(logPath);
@@ -284,6 +287,11 @@ function tearFrame(logPath, framesFromEnd) {
 		buffer.subarray(position + ENTRY_HEADER_SIZE, position + ENTRY_HEADER_SIZE + length);
 	const frames = allFrames.filter((frame) =>
 		rowIds(0, TOTAL).some((id) => framePayload(frame).includes(payloadFor(id)))
+	);
+	const nonRowFrameCount = allFrames.length - frames.length;
+	ok(
+		nonRowFrameCount <= 1,
+		`${logPath} holds ${nonRowFrameCount} non-row frame(s), expected at most the one base-copy barrier this test's single add_node can write; a reconnect minting one marker per retry would show up here`
 	);
 	ok(
 		frames.length === TOTAL,
