@@ -6065,8 +6065,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											const copyStartTime = copyResume?.copyStartTime ?? barrierKey ?? Date.now();
 											// A resumed copy is only barrier-anchored if its anchor still NAMES a barrier; anything else —
 											// a pre-#876 wall-clock anchor, a purged barrier, a log that cannot be read — keeps the timestamp
-											// resume every build before this one used for every cursor.
-											if (canResumePastBarrier && (barrierKey !== undefined || resumeAnchorKind === 'barrier')) {
+											// resume every build before this one used for every cursor. `resumeAnchorKind` describes the
+											// ORIGINAL copyResume, so it is only trustworthy while that copyResume is still live; the
+											// guards above can null it out, and this must not answer for a resume that no longer exists.
+											if (
+												canResumePastBarrier &&
+												(barrierKey !== undefined || (copyResume && resumeAnchorKind === 'barrier'))
+											) {
 												// Built before the walk: getRange resolves the boundary's position and maps the log file
 												// eagerly, so the barrier stays reachable for the whole copy. The options must match the ones
 												// the tail would build for itself, because it reuses this iterable — a single-log range here
