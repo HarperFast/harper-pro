@@ -270,18 +270,27 @@ function readFrames(buffer) {
  * consumer can tell it is garbage (harper-pro#669).
  *
  * The oracle maps frame k to row k, so that mapping is checked here against the bytes of every
- * frame rather than assumed: one frame per acknowledged row, in write order.
+ * frame rather than assumed: one frame per acknowledged row, in write order. Not every frame in
+ * this log carries a row, though: `add_node`'s base copy can commit a record-less `copyBarrier`
+ * control entry into this same local log before either batch is inserted (harper-pro#876), so the
+ * oracle filters to frames that actually carry one of this test's rows rather than assuming
+ * position alone -- a corrupted or missing row still fails the count check below.
  */
 function tearFrame(logPath, framesFromEnd) {
 	const buffer = readFileSync(logPath);
 	ok(buffer.subarray(0, 4).toString() === LOG_FILE_MAGIC, `${logPath} is not a transaction log`);
-	const frames = readFrames(buffer);
+	const allFrames = readFrames(buffer);
+	const framePayload = ({ position, length }) =>
+		buffer.subarray(position + ENTRY_HEADER_SIZE, position + ENTRY_HEADER_SIZE + length);
+	const frames = allFrames.filter((frame) =>
+		rowIds(0, TOTAL).some((id) => framePayload(frame).includes(payloadFor(id)))
+	);
 	ok(
 		frames.length === TOTAL,
-		`${logPath} holds ${frames.length} frames for ${TOTAL} rows; the oracle maps frame k to row k and needs one frame per row`
+		`${logPath} holds ${frames.length} row frame(s) for ${TOTAL} rows (${allFrames.length} frame(s) total); the oracle maps frame k to row k and needs one row frame per row`
 	);
-	frames.forEach(({ position, length }, index) => {
-		const payload = buffer.subarray(position + ENTRY_HEADER_SIZE, position + ENTRY_HEADER_SIZE + length);
+	frames.forEach((frame, index) => {
+		const payload = framePayload(frame);
 		ok(payload.includes(payloadFor(rowId(index))), `frame ${index} does not carry ${rowId(index)}`);
 	});
 	const index = frames.length - 1 - framesFromEnd;
