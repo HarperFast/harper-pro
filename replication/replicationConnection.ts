@@ -6047,12 +6047,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												copyResume || !canResumePastBarrier
 													? undefined
 													: findCopyBarrierTable(tables, orderedTableNames);
-											const copyStartTime =
-												copyResume?.copyStartTime ?? (await barrierTable?.writeCopyBarrier()) ?? Date.now();
+											let barrierKey: number | undefined;
+											if (barrierTable) {
+												try {
+													barrierKey = await barrierTable.writeCopyBarrier();
+												} catch (error) {
+													// findCopyBarrierTable duck-types the method, so a table that has it can still refuse it at
+													// call time — e.g. STORAGE_IS_ROCKSDB is a config snapshot that can disagree with this
+													// table's actual engine. Same outcome as no table being found: degrade to the wall-clock
+													// anchor every build before #876 used, rather than losing the connection over it.
+													logger.warn?.(
+														`Could not write a base-copy barrier for ${databaseName}; falling back to wall-clock anchoring`,
+														error
+													);
+												}
+											}
+											const copyStartTime = copyResume?.copyStartTime ?? barrierKey ?? Date.now();
 											// A resumed copy is only barrier-anchored if its anchor still NAMES a barrier; anything else —
 											// a pre-#876 wall-clock anchor, a purged barrier, a log that cannot be read — keeps the timestamp
 											// resume every build before this one used for every cursor.
-											if (canResumePastBarrier && (barrierTable || resumeAnchorKind === 'barrier')) {
+											if (canResumePastBarrier && (barrierKey !== undefined || resumeAnchorKind === 'barrier')) {
 												// Built before the walk: getRange resolves the boundary's position and maps the log file
 												// eagerly, so the barrier stays reachable for the whole copy. The options must match the ones
 												// the tail would build for itself, because it reuses this iterable — a single-log range here
