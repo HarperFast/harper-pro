@@ -276,8 +276,12 @@ function readFrames(buffer) {
  * oracle filters to frames that actually carry one of this test's rows rather than assuming
  * position alone -- a corrupted or missing row still fails the count check below. The filter alone
  * would also hide a barrier-per-retry proliferation (the reconnect-loop risk `DESIGN.md` names as
- * the reason fail-closed was withdrawn), so the non-row count is separately bounded to the one
- * barrier this test's single `add_node` can produce.
+ * the reason fail-closed was withdrawn), so the non-row count is separately bounded below --
+ * loosely, since a legitimate reconnect between `add_node` and B's first cursor can legitimately
+ * mint a second barrier (harper-pro#876's own retry-per-reconnect behavior), and true proliferation
+ * (a wedged retry loop) would blow well past this bound rather than land just past it. The row-count
+ * check runs FIRST so a corrupted/missing row -- which also depresses the row-frame count and so
+ * also trips the non-row bound -- is diagnosed as itself rather than as barrier proliferation.
  */
 function tearFrame(logPath, framesFromEnd) {
 	const buffer = readFileSync(logPath);
@@ -288,14 +292,14 @@ function tearFrame(logPath, framesFromEnd) {
 	const frames = allFrames.filter((frame) =>
 		rowIds(0, TOTAL).some((id) => framePayload(frame).includes(payloadFor(id)))
 	);
-	const nonRowFrameCount = allFrames.length - frames.length;
-	ok(
-		nonRowFrameCount <= 1,
-		`${logPath} holds ${nonRowFrameCount} non-row frame(s), expected at most the one base-copy barrier this test's single add_node can write; a reconnect minting one marker per retry would show up here`
-	);
 	ok(
 		frames.length === TOTAL,
 		`${logPath} holds ${frames.length} row frame(s) for ${TOTAL} rows (${allFrames.length} frame(s) total); the oracle maps frame k to row k and needs one row frame per row`
+	);
+	const nonRowFrameCount = allFrames.length - frames.length;
+	ok(
+		nonRowFrameCount <= 3,
+		`${logPath} holds ${nonRowFrameCount} non-row frame(s); a wedged base-copy retry loop mints one barrier per attempt (harper-pro#876) and would blow well past the few a legitimate early reconnect can produce`
 	);
 	frames.forEach((frame, index) => {
 		const payload = framePayload(frame);
