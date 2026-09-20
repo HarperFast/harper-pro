@@ -68,7 +68,7 @@ async function hasRecord(node, id, signal) {
 	return Array.isArray(result) && result.some((r) => r?.id === id);
 }
 
-function waitForRecord(node, id, { timeoutMs = 30000, description }) {
+function waitForRecord(node, id, { timeoutMs = 30000, description } = {}) {
 	return waitForCondition((signal) => hasRecord(node, id, signal), { timeoutMs, pollMs: 300, description });
 }
 
@@ -91,21 +91,17 @@ suite('directional flow replication (harper-pro#498)', { timeout: 180000 }, (ctx
 			env: { HARPER_NO_FLUSH_ON_EXIT: true },
 		});
 
-		// edge A sends upstream to core B, does not receive from it
 		const ctxA = { name: ctx.name, harper: { hostname: hostnameA } };
 		await startHarper(ctxA, optionsFor(hostnameA, hostnameB, { sends: true, receives: false }));
 		ctx.nodeA = ctxA.harper;
 		await ensureTableExists(ctx.nodeA, TABLE_DEFINITION);
 
-		// Seed before the core exists. The core's base copy anchors its resume cursor at a wall-clock
-		// instant captured when the copy starts, and a transaction's log key is fixed when it stages its
-		// first write — so a write still in flight at that instant is reported by neither the copy nor the
-		// audit tail resuming from the anchor. A record already durable here cannot land in that window,
-		// which makes its arrival a readiness signal the test can trust.
+		// Seeded before the core exists. The core's base copy anchors its resume cursor at the wall-clock
+		// instant the copy starts, and a transaction's log key is fixed when it stages its first write, so a
+		// write still in flight at that instant reaches neither the copy nor the audit tail behind it.
 		ctx.seedId = 'seed-' + Date.now();
 		await insertRecord(ctx.nodeA, ctx.seedId);
 
-		// core B receives from edge A, does not send back down
 		const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
 		await startHarper(ctxB, optionsFor(hostnameB, hostnameA, { sends: false, receives: true }));
 		ctx.nodeB = ctxB.harper;
@@ -122,10 +118,9 @@ suite('directional flow replication (harper-pro#498)', { timeout: 180000 }, (ctx
 	test('upstream writes flow edge -> core, but core writes never flow back downstream', async () => {
 		const { nodeA, nodeB } = ctx;
 
-		// 1. Forward flow must work: an edge (A) write reaches core (B). harper uses a single
-		//    receiver-initiated socket, so we assert on data flow rather than on cluster_status topology —
-		//    first on the pre-start seed, whose arrival means the channel is live, then on a write issued
-		//    after it. A generous timeout absorbs connection/TLS/catch-up setup.
+		// 1. Forward flow must work. harper uses a single receiver-initiated socket, so readiness is proven
+		//    by data arriving rather than by cluster_status: first the pre-start seed the base copy carries,
+		//    then a write issued after it, which can only reach the core over the live audit tail.
 		await waitForRecord(nodeB, ctx.seedId, {
 			timeoutMs: 60000,
 			description: `pre-start edge write '${ctx.seedId}' to reach core (sends: true)`,
@@ -133,7 +128,10 @@ suite('directional flow replication (harper-pro#498)', { timeout: 180000 }, (ctx
 
 		const fwd1 = 'fwd-' + Date.now();
 		await insertRecord(nodeA, fwd1);
-		await waitForRecord(nodeB, fwd1, { description: `edge write '${fwd1}' to replicate to core (sends: true)` });
+		await waitForRecord(nodeB, fwd1, {
+			timeoutMs: 60000,
+			description: `edge write '${fwd1}' to replicate to core (sends: true)`,
+		});
 
 		// 2. Reverse flow must be blocked: a core (B) write must NEVER reach the edge (A), because A's
 		//    config route sets receives:false (A never subscribes to B) and B's sets sends:false.
