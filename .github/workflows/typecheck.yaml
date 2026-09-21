@@ -1,0 +1,33 @@
+name: Typecheck
+
+# `npm run build` emits JavaScript even when tsc reports errors, so a green build
+# proves nothing about types. This job runs `tsc --noEmit` instead, which exits
+# non-zero on the first error.
+#
+# No `paths:` filter, for the same reason as `validate-caller-workflows.yml`: a
+# required status check that only fires on some PRs stays permanently pending on
+# the rest.
+#
+# Make this `typecheck` job a REQUIRED status check on `main`.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      # tsconfig.json includes core/**, so the submodule must be present.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          package-manager-cache: false
+      # Type-only check: no native postinstall output is read, so skip the scripts.
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
