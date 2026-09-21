@@ -48,9 +48,9 @@ npm run lint:fix
 npm run format:write       # prettier
 npm run lint:required      # quiet — for CI
 
-# Typecheck (CI gate — `npm run build` emits JS even when tsc errors)
-npm run typecheck          # tsc --noEmit
-npm run typecheck:fast     # same check via tsgo — faster, not the CI gate
+# Typecheck (CI gate — the build workflows all run `npm run build || true`)
+npm run typecheck          # tsc --noEmit — what CI runs
+npm run typecheck:fast     # tsgo (TypeScript 7 preview) — faster, can disagree with the gate
 
 # Tests
 npm run test:unit                  # mocha unit tests (fast, no server — build first)
