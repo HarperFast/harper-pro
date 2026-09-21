@@ -1,8 +1,7 @@
 name: Typecheck
 
 # Eight workflows build with `npm run build || true`, which discards tsc's exit
-# code, so a type error has never failed a check. This job runs `tsc --noEmit`,
-# whose only product is that exit code.
+# code. This job runs `tsc --noEmit`, whose only product is that exit code.
 #
 # No `paths:` filter, for the same reason as `validate-caller-workflows.yml`: a
 # required status check that only fires on some PRs stays permanently pending on
@@ -18,8 +17,8 @@ on:
   pull_request:
   workflow_dispatch:
 
-# The typecheck step runs a PR-authored `package.json` script. The repo default is
-# a write-scoped token; pin it to read here, as `integration-tests.yaml` does.
+# The typecheck step runs a PR-authored `package.json` script, and the repo's
+# default token is write-scoped.
 permissions:
   contents: read
 
@@ -35,6 +34,6 @@ jobs:
         with:
           package-manager-cache: false
       # Type-only check: no native postinstall output is read, so skip the scripts.
-      # Retried like the other workflows' installs — a registry blip must not red a required check.
+      # A registry blip must not red a required check.
       - run: .github/scripts/retry.sh "npm ci" -- npm ci --ignore-scripts
       - run: npm run typecheck
