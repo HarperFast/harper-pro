@@ -101,6 +101,14 @@ describe('claimRecoveryClose — the interaction a denied claim used to poison',
 		expect(claim(bounds, NOW + 1_000).allowed).to.equal(false);
 	});
 
+	it('keeps the last successful close when a claim is denied', () => {
+		const bounds = new Map();
+		expect(claim(bounds, NOW).allowed).to.equal(true);
+		expect(claim(bounds, NOW + 1_000).allowed).to.equal(false);
+		expect(bounds.get(KEY).lastCloseAt).to.equal(NOW);
+		expect(claim(bounds, NOW + INTERVAL_MS - 1).allowed).to.equal(false);
+	});
+
 	it('keeps a spent budget spent while NEW events keep arriving', () => {
 		// The other half: a fault that keeps producing breaks must stay isolated rather than being handed a
 		// fresh budget every quiet hour.
@@ -206,6 +214,14 @@ describe('claimRecoveryCloseInSharedStatus', () => {
 		expect(claimRecoveryCloseInSharedStatus(firstWorker, NOW + INTERVAL, INTERVAL, 3).allowed).to.equal(true);
 		expect(claimRecoveryCloseInSharedStatus(secondWorker, NOW + 2 * INTERVAL, INTERVAL, 3).allowed).to.equal(true);
 		expect(claimRecoveryCloseInSharedStatus(secondWorker, NOW + 3 * INTERVAL, INTERVAL, 3).allowed).to.equal(false);
+	});
+
+	it('keeps the shared close floor when a worker is denied', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		expect(claimRecoveryCloseInSharedStatus(status, NOW, INTERVAL, 3).allowed).to.equal(true);
+		expect(claimRecoveryCloseInSharedStatus(status, NOW + 1_000, INTERVAL, 3).allowed).to.equal(false);
+		expect(status[DECODE_DROP_LAST_CLOSE_POSITION]).to.equal(NOW);
+		expect(claimRecoveryCloseInSharedStatus(status, NOW + INTERVAL - 1, INTERVAL, 3).allowed).to.equal(false);
 	});
 
 	it('rolls back all three shared-status slots exactly', () => {
