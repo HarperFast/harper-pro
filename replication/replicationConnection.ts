@@ -7165,15 +7165,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								connectionId,
 								`Could not close or terminate ${databaseName} to ${remoteNodeName} for a structure resync`
 							);
-							// The close budget is deliberately spent even if a broken socket cannot be closed: restoring a
-							// shared-status snapshot could erase another worker's newer claim. Keep this socket live,
-							// and record any blob-held skipped records before their cursor can advance later.
-							wsClosed = false;
-							if (replayingPendingHole && pendingReplicationHoles) {
-								for (const hole of pendingReplicationHoles) {
-									if (await recordReplicationHole(hole.originId, hole.tableName, hole.reason)) continue;
-									throw new Error('could not record a replication hole after a failed structure resync close');
-								}
+							// Do not re-open inbound processing after any queued frames were skipped for this resync:
+							// a later cursor could otherwise make those frames permanently unrecoverable. The close
+							// claim stays spent; a raw-socket destroy is the final best-effort teardown path.
+							try {
+								ws._socket?.destroy();
+							} catch (error) {
+								logger.error?.(connectionId, 'Error destroying connection after close and terminate failed', error);
 							}
 						}
 					}
