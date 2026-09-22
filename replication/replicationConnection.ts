@@ -6399,6 +6399,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 										boundaryLogName = undefined;
 										auditLogIterable = undefined;
+										// Retry now, not on the next commit: whatever this boundary failed to deliver needs an
+										// ordinary range rebuilt from currentSequenceId, not a wait for unrelated future activity
+										// that may never come on an otherwise-idle database.
+										continue;
 									}
 									if (frame.position - frame.encodingStart > 8) {
 										sendAuditRecord(
