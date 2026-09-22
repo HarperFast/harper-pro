@@ -1,10 +1,7 @@
 /**
- * The unit-test root must outlive every database opened inside it: 'exit' listeners fire in
- * registration order, so a root removed from unitTestSetup.cjs's own preload-time listener is gone
- * before RocksTransactionLogStore's shutdown() flushes into it, and rocksdb-js turns that into a
- * throw out of an exit listener — exit 7 with every test passing.
- *
- * Neither the ordering nor the removal is observable from inside a run, so this drives a child run.
+ * The unit-test root must outlive every database opened inside it, and must still be removed.
+ * Neither half is observable from inside a run, so this drives a child run and reads its exit
+ * status and leftover root.
  */
 
 import assert from 'node:assert';
@@ -30,9 +27,10 @@ describe('unit-test storage root lifecycle', function () {
 			],
 			{
 				cwd: root,
-				// RocksDB is the only engine that registers the flush-on-exit listener this covers, so
-				// an inherited HARPER_STORAGE_ENGINE=lmdb would leave the child testing nothing.
-				env: { ...process.env, HARPER_STORAGE_ENGINE: 'rocksdb' },
+				// Both overrides suppress the flush-on-exit listener whose ordering this covers, and
+				// either one inherited from the caller would leave the child asserting nothing.
+				// spawn drops undefined values, so this unsets rather than forwards.
+				env: { ...process.env, HARPER_STORAGE_ENGINE: 'rocksdb', HARPER_NO_FLUSH_ON_EXIT: undefined },
 				stdio: ['ignore', 'pipe', 'pipe'],
 			}
 		);
