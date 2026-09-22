@@ -7189,7 +7189,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 						rollbackDecodeDropClaim = undefined;
 					}
-					}
 				},
 			};
 			tableSubscriptionToReplicator.send(endTxnEvent);
