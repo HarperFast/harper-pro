@@ -2490,9 +2490,10 @@ export function findCopyBarrierTable(
 /**
  * What `anchor` names in `logName`, which decides whether an append-order resume past it is possible.
  *
- * `unreadable` is deliberately not folded into `other`: collapsing them lets a cursor that WAS
- * barrier-derived degrade silently to the timestamp range the barrier exists to replace. Callers fail
- * closed on it. Read once per copy, never per entry.
+ * `unreadable` stays distinct from `other` so a caller can tell "provably not a barrier" apart
+ * from "could not tell" — today's one caller treats them the same, degrading to the pre-#876
+ * timestamp anchor rather than failing closed, same as every other unformed boundary here. Read
+ * once per copy, never per entry.
  */
 export function classifyResumeAnchor(
 	auditStore: any,
