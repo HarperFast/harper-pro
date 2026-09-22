@@ -11,6 +11,12 @@ const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-unit-tests-'));
 process.env.STORAGE_PATH = testDir;
 process.env._DISABLE_NATS = 'true';
 process.env.LOGGING_STDSTREAMS = 'false';
+// The whole unit-test run is one process, so RocksTransactionLogStore's own `exit` listener
+// (registered the first time any test imports it) fires AFTER this one and tries to flush
+// every still-known RocksDB log into a directory this listener already removed. Unit tests
+// close their own databases explicitly; the exit-time safety flush is for crash/replay
+// coverage (see integrationTests), which this suite doesn't exercise.
+process.env.HARPER_NO_FLUSH_ON_EXIT = 'true';
 
 function removeTestDir() {
 	try {
