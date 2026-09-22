@@ -6091,7 +6091,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												let unusable: unknown;
 												try {
 													const probe: any = auditStore.getRange(boundaryRange);
-													probe[Symbol.iterator]().next();
+													const probeIterator = probe[Symbol.iterator]();
+													try {
+														probeIterator.next();
+													} finally {
+														// Single-pull probe: release the underlying log iterator now rather than leaving
+														// it for GC. `return` is wired through for exactly this on the single-log path;
+														// a no-op where it isn't (the multi-log aggregate has no teardown hook at all).
+														probeIterator.return?.();
+													}
 													unusable =
 														probe.exactStartFailures?.size > 0 ||
 														probe.failedLogs?.size > 0 ||
