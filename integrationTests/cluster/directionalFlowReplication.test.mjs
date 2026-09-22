@@ -21,7 +21,7 @@ import { ok } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, ensureTableExists } from './clusterShared.mjs';
+import { sendOperation, ensureTableExists, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -34,6 +34,15 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 
 const DB = 'data';
 const TABLE = 'flow';
+const TABLE_DEFINITION = {
+	database: DB,
+	table: TABLE,
+	primary_key: 'id',
+	attributes: [
+		{ name: 'id', type: 'ID' },
+		{ name: 'name', type: 'String' },
+	],
+};
 
 async function insertRecord(node, id) {
 	return sendOperation(node, {
@@ -44,27 +53,26 @@ async function insertRecord(node, id) {
 	});
 }
 
-async function hasRecord(node, id) {
-	const result = await sendOperation(node, {
-		operation: 'search_by_id',
-		database: DB,
-		table: TABLE,
-		ids: [id],
-		get_attributes: ['id'],
-	}).catch(() => null);
+async function hasRecord(node, id, signal) {
+	const result = await sendOperation(
+		node,
+		{
+			operation: 'search_by_id',
+			database: DB,
+			table: TABLE,
+			ids: [id],
+			get_attributes: ['id'],
+		},
+		{ signal }
+	);
 	return Array.isArray(result) && result.some((r) => r?.id === id);
 }
 
-async function waitForRecord(node, id, { timeoutMs = 30000, pollMs = 300 } = {}) {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await hasRecord(node, id)) return true;
-		await delay(pollMs);
-	}
-	return false;
+function waitForRecord(node, id, { timeoutMs = 30000, description } = {}) {
+	return waitForCondition((signal) => hasRecord(node, id, signal), { timeoutMs, pollMs: 300, description });
 }
 
-suite('directional flow replication (harper-pro#498)', { timeout: 120000 }, (ctx) => {
+suite('directional flow replication (harper-pro#498)', { timeout: 180000 }, (ctx) => {
 	before(async () => {
 		const hostnameA = await getNextAvailableLoopbackAddress(); // edge
 		const hostnameB = await getNextAvailableLoopbackAddress(); // core
@@ -84,32 +92,20 @@ suite('directional flow replication (harper-pro#498)', { timeout: 120000 }, (ctx
 		});
 
 		const ctxA = { name: ctx.name, harper: { hostname: hostnameA } };
-		const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
-
-		await Promise.all([
-			// edge A sends upstream to core B, does not receive from it
-			startHarper(ctxA, optionsFor(hostnameA, hostnameB, { sends: true, receives: false })),
-			// core B receives from edge A, does not send back down
-			startHarper(ctxB, optionsFor(hostnameB, hostnameA, { sends: false, receives: true })),
-		]);
-
+		await startHarper(ctxA, optionsFor(hostnameA, hostnameB, { sends: true, receives: false }));
 		ctx.nodeA = ctxA.harper;
-		ctx.nodeB = ctxB.harper;
+		await ensureTableExists(ctx.nodeA, TABLE_DEFINITION);
 
-		// Create the replicated table on both nodes.
-		await Promise.all(
-			[ctx.nodeA, ctx.nodeB].map((node) =>
-				ensureTableExists(node, {
-					database: DB,
-					table: TABLE,
-					primary_key: 'id',
-					attributes: [
-						{ name: 'id', type: 'ID' },
-						{ name: 'name', type: 'String' },
-					],
-				})
-			)
-		);
+		// Seeded before the core exists. The core's base copy anchors its resume cursor at the wall-clock
+		// instant the copy starts, and a transaction's log key is fixed when it stages its first write, so a
+		// write still in flight at that instant reaches neither the copy nor the audit tail behind it.
+		ctx.seedId = 'seed-' + Date.now();
+		await insertRecord(ctx.nodeA, ctx.seedId);
+
+		const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
+		await startHarper(ctxB, optionsFor(hostnameB, hostnameA, { sends: false, receives: true }));
+		ctx.nodeB = ctxB.harper;
+		await ensureTableExists(ctx.nodeB, TABLE_DEFINITION);
 	});
 
 	after(async () => {
@@ -122,16 +118,20 @@ suite('directional flow replication (harper-pro#498)', { timeout: 120000 }, (ctx
 	test('upstream writes flow edge -> core, but core writes never flow back downstream', async () => {
 		const { nodeA, nodeB } = ctx;
 
-		// 1. Forward flow must work: an edge (A) write reaches core (B). The arrival of this probe is the
-		//    readiness signal (the directional channel is live); harper uses a single receiver-initiated
-		//    socket, so we assert on data flow rather than on cluster_status topology. A generous timeout
-		//    absorbs connection/TLS/catch-up setup.
+		// 1. Forward flow must work. harper uses a single receiver-initiated socket, so readiness is proven
+		//    by data arriving rather than by cluster_status: first the pre-start seed the base copy carries,
+		//    then a write issued after it, which can only reach the core over the live audit tail.
+		await waitForRecord(nodeB, ctx.seedId, {
+			timeoutMs: 60000,
+			description: `pre-start edge write '${ctx.seedId}' to reach core (sends: true)`,
+		});
+
 		const fwd1 = 'fwd-' + Date.now();
 		await insertRecord(nodeA, fwd1);
-		ok(
-			await waitForRecord(nodeB, fwd1, { timeoutMs: 60000 }),
-			`edge write '${fwd1}' should replicate to core (sends: true)`
-		);
+		await waitForRecord(nodeB, fwd1, {
+			timeoutMs: 60000,
+			description: `edge write '${fwd1}' to replicate to core (sends: true)`,
+		});
 
 		// 2. Reverse flow must be blocked: a core (B) write must NEVER reach the edge (A), because A's
 		//    config route sets receives:false (A never subscribes to B) and B's sets sends:false.
@@ -143,7 +143,7 @@ suite('directional flow replication (harper-pro#498)', { timeout: 120000 }, (ctx
 		// time to arrive — making the absence check below a reliable signal, not just a short sleep.
 		const fwd2 = 'fwd2-' + Date.now();
 		await insertRecord(nodeA, fwd2);
-		ok(await waitForRecord(nodeB, fwd2), `second edge write '${fwd2}' should replicate to core`);
+		await waitForRecord(nodeB, fwd2, { description: `second edge write '${fwd2}' to replicate to core` });
 		// Small additional settle margin.
 		await delay(1500);
 
