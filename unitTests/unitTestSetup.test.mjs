@@ -1,21 +1,21 @@
 /**
- * The unit-test root (unitTestSetup.cjs) must outlive every database opened inside it: 'exit'
- * listeners fire in registration order, so a root removed from the preload's own listener is gone
- * before RocksTransactionLogStore's shutdown() flushes into it, and rocksdb-js reports that as
- * "Failed to flush database during close: IO error ... 000NNN.log" — a throw out of an exit
- * listener, which exits the run 7 with every test passing (harper-pro main at e98500b54).
+ * The unit-test root must outlive every database opened inside it: 'exit' listeners fire in
+ * registration order, so a root removed from unitTestSetup.cjs's own preload-time listener is gone
+ * before RocksTransactionLogStore's shutdown() flushes into it, and rocksdb-js turns that into a
+ * throw out of an exit listener — exit 7 with every test passing.
  *
- * Neither half of that is observable from inside a run, so this drives a child run: exit 0 proves
- * the flush found its files, and the removed root proves the cleanup still happens at all.
+ * Neither the ordering nor the removal is observable from inside a run, so this drives a child run.
  */
 
 import assert from 'node:assert';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const mochaBin = createRequire(import.meta.url).resolve('mocha/bin/mocha.js');
 
 describe('unit-test storage root lifecycle', function () {
 	it('removes the root, and only once the databases opened inside it have been flushed', async function () {
@@ -23,12 +23,18 @@ describe('unit-test storage root lifecycle', function () {
 		const child = spawn(
 			process.execPath,
 			[
-				join(root, 'node_modules/mocha/bin/mocha.js'),
+				mochaBin,
 				'--require',
 				join(root, 'unitTests/unitTestSetup.cjs'),
 				join(root, 'unitTests/fixtures/unit-test-setup/opensADatabase.mjs'),
 			],
-			{ cwd: root, stdio: ['ignore', 'pipe', 'pipe'] }
+			{
+				cwd: root,
+				// RocksDB is the only engine that registers the flush-on-exit listener this covers, so
+				// an inherited HARPER_STORAGE_ENGINE=lmdb would leave the child testing nothing.
+				env: { ...process.env, HARPER_STORAGE_ENGINE: 'rocksdb' },
+				stdio: ['ignore', 'pipe', 'pipe'],
+			}
 		);
 
 		let stdout = '';

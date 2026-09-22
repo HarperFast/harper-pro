@@ -1,7 +1,7 @@
 /**
- * Spec for the child run in unitTests/unitTestSetup.test.mjs. The test root is only at risk while a
- * database holds files open under it, so this opens one and writes through it; without that the
- * parent's assertions would pass against a harness that never loads the data layer at all.
+ * Spec for the child run in unitTests/unitTestSetup.test.mjs. It must open a real database: the
+ * test root is only at risk while one holds files under it, and RocksTransactionLogStore registers
+ * the shutdown listener this is about only when the data layer loads.
  */
 
 import { createBlob } from '#src/core/resources/blob';

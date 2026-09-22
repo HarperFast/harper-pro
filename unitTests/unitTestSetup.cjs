@@ -6,11 +6,7 @@ const fs = require('node:fs');
 // Minimal environment setup required before Harper modules are loaded.
 // Harper's auth and database modules initialize storage at import time,
 // so these env vars must be set before the ESM test files are evaluated.
-const testDir = path.join(os.tmpdir(), `harper-unit-tests-${process.pid}`);
-// A run killed before its afterAll hook leaves this root behind, and PIDs are reused, so a run
-// that inherited one would open a dead run's databases.
-fs.rmSync(testDir, { recursive: true, force: true });
-fs.mkdirSync(testDir, { recursive: true });
+const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harper-unit-tests-'));
 
 process.env.STORAGE_PATH = testDir;
 process.env._DISABLE_NATS = 'true';
@@ -20,9 +16,11 @@ function removeTestDir() {
 	try {
 		fs.rmSync(testDir, { recursive: true, force: true });
 	} catch (error) {
-		// Never throw from an 'exit' listener: it replaces the run's real result with an opaque
-		// non-zero exit. The next run clears this root before it creates one.
-		fs.writeSync(2, `could not remove the unit-test root ${testDir}: ${error.message}\n`);
+		// Nothing below may throw either: an exception out of an 'exit' listener replaces the run's
+		// real result with an opaque non-zero exit, which is what moving this hook avoids.
+		try {
+			fs.writeSync(2, `could not remove the unit-test root ${testDir}: ${error.message}\n`);
+		} catch {}
 	}
 }
 
