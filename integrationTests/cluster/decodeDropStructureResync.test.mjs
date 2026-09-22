@@ -170,7 +170,10 @@ suite('Decode-drop structure resync (harper-pro#810)', { skip: !STRESS, timeout:
 
 		const log = await readLog(ctx.receiver);
 		equal(await hasRow(ctx.receiver, POISON_PREFIX + 'live'), false, 'the dropped record is not re-delivered');
-		ok(resyncCount(log) <= 2, `at most one resubscribe per dropped frame, saw ${resyncCount(log)}`);
+		ok(
+			resyncCount(log) <= 2,
+			`at most two resubscribes for one dropped frame (one can be an ownership overlap), saw ${resyncCount(log)}`
+		);
 		// The recovery must be the resubscribe, not a crash: same process throughout, and nothing escaped
 		// the decode path as an unhandled error.
 		equal(await readNodePid(ctx.receiver), receiverPidBefore, 'the receiver must not have restarted');
