@@ -17,6 +17,12 @@ const mochaBin = createRequire(import.meta.url).resolve('mocha/bin/mocha.js');
 describe('unit-test storage root lifecycle', function () {
 	it('removes the root, and only once the databases opened inside it have been flushed', async function () {
 		this.timeout(120_000);
+		// Under lmdb there is no open RocksDB database for shutdown() to flush, and
+		// HARPER_NO_FLUSH_ON_EXIT skips the flush outright; inheriting either leaves the child with
+		// nothing to order against, and passing through as the string 'undefined' would read as set.
+		const childEnv = { ...process.env, HARPER_STORAGE_ENGINE: 'rocksdb' };
+		delete childEnv.HARPER_NO_FLUSH_ON_EXIT;
+
 		const child = spawn(
 			process.execPath,
 			[
@@ -25,14 +31,7 @@ describe('unit-test storage root lifecycle', function () {
 				join(root, 'unitTests/unitTestSetup.cjs'),
 				join(root, 'unitTests/fixtures/unit-test-setup/opensADatabase.mjs'),
 			],
-			{
-				cwd: root,
-				// Under lmdb there is no open RocksDB database for shutdown() to flush, and
-				// HARPER_NO_FLUSH_ON_EXIT skips the flush outright; inheriting either leaves the child
-				// with nothing to order against. spawn ignores an env value of undefined.
-				env: { ...process.env, HARPER_STORAGE_ENGINE: 'rocksdb', HARPER_NO_FLUSH_ON_EXIT: undefined },
-				stdio: ['ignore', 'pipe', 'pipe'],
-			}
+			{ cwd: root, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] }
 		);
 
 		let stdout = '';
