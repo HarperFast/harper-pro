@@ -47,6 +47,9 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 );
 
 const STRESS = process.env.HARPER_RUN_STRESS_TESTS === '1';
+// The injected stopped iterable models RocksTransactionLogStore's reusable range. LMDB creates a fresh
+// range for each drain and cannot enter this cached-iterator wedge.
+const ROCKSDB = process.env.HARPER_STORAGE_ENGINE !== 'lmdb';
 const DB = 'data';
 const TABLE = 'WedgeTest';
 const RECOVERY_TIMEOUT_MS = 120_000;
@@ -173,7 +176,7 @@ async function startWedgedPair(ctx, name, shape) {
 	return { source, subscriber };
 }
 
-suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS, timeout: 600_000 }, (ctx) => {
+suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS || !ROCKSDB, timeout: 600_000 }, (ctx) => {
 	before(() => {
 		ctx.nodes = [];
 	});

@@ -124,7 +124,6 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.protocolVersion === b.protocolVersion &&
 		a.subscriptionSetupAck === b.subscriptionSetupAck &&
 		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
-		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
 		a.recordLocks === b.recordLocks
 	);
 }
