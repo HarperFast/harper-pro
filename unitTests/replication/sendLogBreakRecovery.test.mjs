@@ -2,8 +2,8 @@
  * The bound on the decode-drop structure resync (harper-pro#810).
  *
  * That close ENDS the session that decided to make it, so its bound cannot live on the session: a
- * session-scoped latch resets on the very reconnect it caused and bounds nothing. It lives in a module
- * map keyed by (database, peer), and the predicates below are pure so it can be pinned without a live
+ * session-scoped latch resets on the very reconnect it caused and bounds nothing. It lives in the shared
+ * (database, peer) status buffer, and the predicates below are pure so they can be pinned without a live
  * socket.
  *
  * The send-log-break repair needs none of this: it replaces a cached local rather than closing anything,
@@ -13,6 +13,10 @@
 import { expect } from 'chai';
 import {
 	claimRecoveryClose,
+	claimRecoveryCloseInSharedStatus,
+	DECODE_DROP_CLOSE_COUNT_POSITION,
+	DECODE_DROP_LAST_CLOSE_POSITION,
+	DECODE_DROP_LAST_EVENT_POSITION,
 	mayRebuildSendRange,
 	rebuildRetryDelayMs,
 	SEND_LOG_REPAIR_INTERVAL_MS,
@@ -22,6 +26,7 @@ import {
 	RECOVERY_CLOSE_EPISODE_MS,
 	DECODE_DROP_RESYNC_BUDGET,
 } from '#src/replication/replicationConnection';
+import { REPLICATION_SHARED_STATUS_SLOTS } from '#src/replication/knownNodes';
 
 const NOW = 1_000_000_000;
 const INTERVAL = 5 * 60_000;
@@ -68,12 +73,7 @@ describe('recoveryCloseEpisodeCount', () => {
 		expect(recoveryCloseAllowed(NOW - 10 * RECOVERY_CLOSE_EPISODE_MS, 3, NOW, INTERVAL, 3)).to.equal(false);
 	});
 
-	it('lets a spent budget lapse when the caller only RE-ASKS about a condition it already reported', () => {
-		// A latched send iterable reports the same `breaks` on every wake. If those re-asks stamped
-		// `lastEventAt`, the episode could never lapse, so a budget once spent would never be restored and
-		// the leg could never recover — not even after the log was repaired. Only a NEW break feeds the
-		// bound; a re-ask consults it. Modelled here as "the last event is old": that is the state a
-		// re-asking caller leaves behind, and the budget comes back.
+	it('lets a spent budget lapse after an idle episode', () => {
 		expect(recoveryCloseEpisodeCount(NOW - RECOVERY_CLOSE_EPISODE_MS, DECODE_DROP_RESYNC_BUDGET, NOW)).to.equal(0);
 		expect(recoveryCloseAllowed(NOW - RECOVERY_CLOSE_EPISODE_MS, 0, NOW, INTERVAL, DECODE_DROP_RESYNC_BUDGET)).to.equal(
 			true
@@ -93,52 +93,23 @@ describe('claimRecoveryClose — the interaction a denied claim used to poison',
 	const KEY = 'data\u0000peer-a';
 	const INTERVAL_MS = 5 * 60_000;
 	const BUDGET = 3;
-	const claim = (bounds, now, isNewEvent) => claimRecoveryClose(bounds, KEY, now, INTERVAL_MS, BUDGET, isNewEvent);
+	const claim = (bounds, now) => claimRecoveryClose(bounds, KEY, now, INTERVAL_MS, BUDGET);
 
 	it('allows the first claim and denies a second inside the interval', () => {
 		const bounds = new Map();
-		expect(claim(bounds, NOW, true).allowed).to.equal(true);
-		expect(claim(bounds, NOW + 1_000, true).allowed).to.equal(false);
-	});
-
-	it('re-asking about a condition already reported does NOT hold the episode open', () => {
-		// The defect this pins: a latched send iterable reports the same `breaks` forever, so the caller has
-		// to keep asking. If those re-asks stamped the episode, a spent budget could never lapse and the leg
-		// would sit silent at connected:true/WAITING for the life of the session — the exact wedge this net
-		// exists to end, reached through its own bound.
-		const bounds = new Map();
-		for (let i = 0; i < BUDGET; i++) claim(bounds, NOW + i * INTERVAL_MS, true);
-		expect(claim(bounds, NOW + BUDGET * INTERVAL_MS, true).allowed).to.equal(false);
-
-		const lastNewEventAt = bounds.get(KEY).lastEventAt;
-		// Re-asks INSIDE the episode are denied and must not move the episode clock, or it never lapses.
-		for (let i = 1; i <= 10; i++) {
-			const at = lastNewEventAt + i * (RECOVERY_CLOSE_EPISODE_MS / 20);
-			expect(claim(bounds, at, false).allowed).to.equal(false);
-			expect(bounds.get(KEY).lastEventAt).to.equal(lastNewEventAt);
-		}
-
-		// Once it lapses, the next re-ask is allowed: the escape hatch is reachable without a new event.
-		expect(claim(bounds, lastNewEventAt + RECOVERY_CLOSE_EPISODE_MS, false).allowed).to.equal(true);
-		// And that close anchors the episode to itself, so the restored budget is a real budget again rather
-		// than one close per interval forever: the three it allows put the caller back into the spent state.
-		const armedAt = lastNewEventAt + RECOVERY_CLOSE_EPISODE_MS;
-		expect(bounds.get(KEY).lastEventAt).to.equal(armedAt);
-		expect(claim(bounds, armedAt + INTERVAL_MS / 2, false).allowed).to.equal(false);
-		expect(claim(bounds, armedAt + INTERVAL_MS, false).allowed).to.equal(true);
-		expect(claim(bounds, armedAt + 2 * INTERVAL_MS, false).allowed).to.equal(true);
-		expect(claim(bounds, armedAt + 3 * INTERVAL_MS, false).allowed).to.equal(false);
+		expect(claim(bounds, NOW).allowed).to.equal(true);
+		expect(claim(bounds, NOW + 1_000).allowed).to.equal(false);
 	});
 
 	it('keeps a spent budget spent while NEW events keep arriving', () => {
 		// The other half: a fault that keeps producing breaks must stay isolated rather than being handed a
 		// fresh budget every quiet hour.
 		const bounds = new Map();
-		for (let i = 0; i < BUDGET; i++) claim(bounds, NOW + i * INTERVAL_MS, true);
+		for (let i = 0; i < BUDGET; i++) claim(bounds, NOW + i * INTERVAL_MS);
 		let at = NOW + BUDGET * INTERVAL_MS;
 		for (let i = 0; i < 20; i++) {
 			at += RECOVERY_CLOSE_EPISODE_MS / 2;
-			expect(claim(bounds, at, true).allowed).to.equal(false);
+			expect(claim(bounds, at).allowed).to.equal(false);
 		}
 	});
 });
@@ -208,11 +179,11 @@ describe('claimRecoveryClose rollback — a slot spent on a close that never hap
 	it('restores the previous bound exactly', () => {
 		const bounds = new Map();
 		const KEY = 'data\u0000peer-b';
-		const first = claimRecoveryClose(bounds, KEY, NOW, INTERVAL, 3, true);
+		const first = claimRecoveryClose(bounds, KEY, NOW, INTERVAL, 3);
 		expect(first.allowed).to.equal(true);
 		const afterFirst = { ...bounds.get(KEY) };
 
-		const second = claimRecoveryClose(bounds, KEY, NOW + INTERVAL, 3, 3, true);
+		const second = claimRecoveryClose(bounds, KEY, NOW + INTERVAL, 3, 3);
 		expect(second.allowed).to.equal(true);
 		second.rollback();
 		expect({ ...bounds.get(KEY) }).to.deep.equal(afterFirst);
@@ -221,7 +192,39 @@ describe('claimRecoveryClose rollback — a slot spent on a close that never hap
 	it('removes the entry entirely when the claim created it', () => {
 		const bounds = new Map();
 		const KEY = 'data\u0000peer-c';
-		claimRecoveryClose(bounds, KEY, NOW, INTERVAL, 3, true).rollback();
+		claimRecoveryClose(bounds, KEY, NOW, INTERVAL, 3).rollback();
 		expect(bounds.has(KEY)).to.equal(false);
+	});
+});
+
+describe('claimRecoveryCloseInSharedStatus', () => {
+	it('shares the episode budget across status views', () => {
+		const buffer = new ArrayBuffer(REPLICATION_SHARED_STATUS_SLOTS * Float64Array.BYTES_PER_ELEMENT);
+		const firstWorker = new Float64Array(buffer);
+		const secondWorker = new Float64Array(buffer);
+		expect(claimRecoveryCloseInSharedStatus(firstWorker, NOW, INTERVAL, 3).allowed).to.equal(true);
+		expect(claimRecoveryCloseInSharedStatus(firstWorker, NOW + INTERVAL, INTERVAL, 3).allowed).to.equal(true);
+		expect(claimRecoveryCloseInSharedStatus(secondWorker, NOW + 2 * INTERVAL, INTERVAL, 3).allowed).to.equal(true);
+		expect(claimRecoveryCloseInSharedStatus(secondWorker, NOW + 3 * INTERVAL, INTERVAL, 3).allowed).to.equal(false);
+	});
+
+	it('rolls back all three shared-status slots exactly', () => {
+		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
+		status[DECODE_DROP_LAST_CLOSE_POSITION] = NOW - INTERVAL;
+		status[DECODE_DROP_CLOSE_COUNT_POSITION] = 1;
+		status[DECODE_DROP_LAST_EVENT_POSITION] = NOW - INTERVAL;
+		const before = [
+			status[DECODE_DROP_LAST_CLOSE_POSITION],
+			status[DECODE_DROP_CLOSE_COUNT_POSITION],
+			status[DECODE_DROP_LAST_EVENT_POSITION],
+		];
+		const claim = claimRecoveryCloseInSharedStatus(status, NOW, INTERVAL, 3);
+		expect(claim.allowed).to.equal(true);
+		claim.rollback();
+		expect([
+			status[DECODE_DROP_LAST_CLOSE_POSITION],
+			status[DECODE_DROP_CLOSE_COUNT_POSITION],
+			status[DECODE_DROP_LAST_EVENT_POSITION],
+		]).to.deep.equal(before);
 	});
 });

@@ -263,20 +263,13 @@ export function mayRebuildSendRange(
 	return !(since > 0 && now - since < (midLogBreak ? quarantineMs : repairMs));
 }
 type RecoveryCloseBound = { lastCloseAt?: number; closeCount?: number; lastEventAt?: number };
-const decodeDropResyncByPeer = new Map<string, RecoveryCloseBound>();
-// Keyed by (database, peer) in this module rather than on the session, because the close ENDS the session:
-// a session-scoped latch would reset on the very reconnect it caused and bound nothing. A server-side
-// receive session has no connection object to hang it on either. The predicates are pure so both bounds
-// can be pinned without a live socket.
-//
-// The budget is per EPISODE, not per process lifetime: a lifetime budget silently stops recovering a
-// (database, peer) forever, until a restart, once three genuinely repaired faults months apart spend it.
-//
-// The episode is measured from the last EVENT, not the last close it allowed — that distinction is the
-// whole bound. A fault no reconnect can repair keeps producing events, so its episode never lapses and the
-// spent budget holds: exactly the permanent isolation the budget is for. Keying off the last close instead
-// would let those same rejected events age the clock out and hand back three more reconnects every hour,
-// forever, which is the churn the budget exists to stop.
+// A decode-drop close can land on any HTTP worker after reconnecting, so its budget belongs in the
+// process-shared (database, peer) status buffer rather than in a worker-local map. These are deliberately
+// after the record-lock and fire-counter slots; the one read-modify-write race can cost one extra close but
+// cannot corrupt the cursor, just like the fire counters.
+export const DECODE_DROP_LAST_CLOSE_POSITION = 34;
+export const DECODE_DROP_CLOSE_COUNT_POSITION = 35;
+export const DECODE_DROP_LAST_EVENT_POSITION = 36;
 export function recoveryCloseEpisodeCount(
 	lastEventAt: number,
 	closeCount: number,
@@ -295,42 +288,83 @@ export function recoveryCloseAllowed(
 	if (closeCount >= budget) return false;
 	return !(lastCloseAt > 0 && now - lastCloseAt < intervalMs);
 }
-// Claims a slot in one of the bounds above if the event may act now. `key` is (database, peer).
-//
-// `isNewEvent` is load-bearing, and so is what it does NOT cover. A caller may have to re-ask about a
-// condition that produced no new event — a latched send iterable reports the same `breaks` on every wake.
-// Stamping those re-asks would hold the episode open forever, so a budget once spent could never lapse
-// and the recovery could never resume even after the fault was repaired. A DENIED re-ask therefore
-// consults the bound without feeding it.
-//
-// An ALLOWED claim always stamps, re-ask or not: a close is itself an event, and anchoring the episode to
-// it is what stops a permanently latched caller from being handed one close per interval forever once the
-// episode has lapsed.
+function calculateRecoveryCloseClaim(
+	holder: RecoveryCloseBound,
+	now: number,
+	intervalMs: number,
+	budget: number
+): { allowed: boolean; count: number; lastCloseAt: number; next: RecoveryCloseBound } {
+	const lastCloseAt = holder.lastCloseAt ?? 0;
+	const count = recoveryCloseEpisodeCount(holder.lastEventAt ?? 0, holder.closeCount ?? 0, now);
+	const allowed = recoveryCloseAllowed(lastCloseAt, count, now, intervalMs, budget);
+	return {
+		allowed,
+		count,
+		lastCloseAt,
+		next: {
+			lastEventAt: now,
+			closeCount: allowed ? count + 1 : count,
+			...(allowed ? { lastCloseAt: now } : undefined),
+		},
+	};
+}
+
+// Map-backed for the pure unit tests. Production uses claimRecoveryCloseInSharedStatus below, because a
+// resubscribe may be accepted by a different worker than the socket that spent the previous attempt.
 export function claimRecoveryClose(
 	bounds: Map<string, RecoveryCloseBound>,
 	key: string,
 	now: number,
 	intervalMs: number,
-	budget: number,
-	isNewEvent: boolean = true
+	budget: number
 ): { allowed: boolean; count: number; lastCloseAt: number; rollback: () => void } {
 	const holder = bounds.get(key) ?? {};
 	const had = bounds.has(key);
-	const lastCloseAt = holder.lastCloseAt ?? 0;
-	const count = recoveryCloseEpisodeCount(holder.lastEventAt ?? 0, holder.closeCount ?? 0, now);
-	const allowed = recoveryCloseAllowed(lastCloseAt, count, now, intervalMs, budget);
-	const stamped = { ...holder, closeCount: count, ...(isNewEvent || allowed ? { lastEventAt: now } : undefined) };
-	bounds.set(key, allowed ? { ...stamped, lastCloseAt: now, closeCount: count + 1 } : stamped);
-	// The slot is claimed before the close is attempted, because the close ends this session and there is
-	// no "after" to claim it in. A close that then FAILS must give it back, or the retry the caller logs
-	// is denied by an interval it spent on a teardown that never happened.
+	const claim = calculateRecoveryCloseClaim(holder, now, intervalMs, budget);
+	bounds.set(key, claim.next);
 	return {
-		allowed,
-		count,
-		lastCloseAt,
+		allowed: claim.allowed,
+		count: claim.count,
+		lastCloseAt: claim.lastCloseAt,
 		rollback: () => {
 			if (had) bounds.set(key, holder);
 			else bounds.delete(key);
+		},
+	};
+}
+
+export function claimRecoveryCloseInSharedStatus(
+	status: Float64Array,
+	now: number,
+	intervalMs: number,
+	budget: number
+): { allowed: boolean; count: number; lastCloseAt: number; rollback: () => void } {
+	const previous = [
+		status[DECODE_DROP_LAST_CLOSE_POSITION],
+		status[DECODE_DROP_CLOSE_COUNT_POSITION],
+		status[DECODE_DROP_LAST_EVENT_POSITION],
+	];
+	const claim = calculateRecoveryCloseClaim(
+		{
+			lastCloseAt: previous[0] || undefined,
+			closeCount: previous[1] || undefined,
+			lastEventAt: previous[2] || undefined,
+		},
+		now,
+		intervalMs,
+		budget
+	);
+	status[DECODE_DROP_LAST_CLOSE_POSITION] = claim.next.lastCloseAt ?? 0;
+	status[DECODE_DROP_CLOSE_COUNT_POSITION] = claim.next.closeCount ?? 0;
+	status[DECODE_DROP_LAST_EVENT_POSITION] = claim.next.lastEventAt ?? 0;
+	return {
+		allowed: claim.allowed,
+		count: claim.count,
+		lastCloseAt: claim.lastCloseAt,
+		rollback: () => {
+			status[DECODE_DROP_LAST_CLOSE_POSITION] = previous[0];
+			status[DECODE_DROP_CLOSE_COUNT_POSITION] = previous[1];
+			status[DECODE_DROP_LAST_EVENT_POSITION] = previous[2];
 		},
 	};
 }
@@ -1570,9 +1604,8 @@ export function maybeStallCopyForTest(databaseName?: string): Promise<void> | un
 // Test-only: the first outbound subscription for this database gets a drained audit iterable carrying a
 // corrupt-frame stop — which is exactly what `endIteratorOnCorruptFrame` leaves behind, and what the send
 // loop then reuses for the rest of the session. `HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB=<db>` reports a
-// torn TAIL (recoverable, so the leg should close and resubscribe); adding `:midlog` reports a mid-log
-// break (quarantined by harper#2087, so the leg must NOT close). One-shot, so the replacement session
-// converges rather than looping.
+// torn tail (recoverable by replacing the cached range); adding `:midlog` reports a mid-log break
+// (quarantined by harper#2087). One-shot, so the replacement range converges rather than looping.
 let deadAuditIterableForTestArmed = false;
 const DEAD_AUDIT_ITERABLE_SPEC_FOR_TEST = process.env.HARPER_TEST_DEAD_AUDIT_ITERABLE_ONCE_DB;
 export function maybeDeadAuditIterableForTest<T>(databaseName: string | undefined): T | undefined {
@@ -3465,8 +3498,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// When the CURRENT break was first seen, which is what a quarantined break waits from: it must not
 	// rebuild on first sight (that is the spin the policy avoids), only re-check long after.
 	let sendLogBreakSince = 0;
-	// How long until a denied rebuild would be allowed, so the send loop can wake for it rather than
-	// waiting on a commit that a quiet writer may never send. Fault path only.
+	let sendLogBreakIsMidLog = false;
+	// The remaining floor after a denied rebuild. Torn tails wait for a new commit before starting this
+	// timer; a quiet broken tail therefore keeps one wait rather than repeatedly rebuilding itself.
 	let sendLogRebuildRetryInMs = 0;
 	// this is the subscription that the local table makes to this replicator, and incoming messages
 	// are sent to this subscription queue:
@@ -4330,10 +4364,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		return replicationSharedStatus;
 	}
-	// A record this node will not apply is a hole in that origin's stream for that table. It is
-	// recorded durably BEFORE the drop completes, so no later barrier can certify past it; a store
-	// that cannot take the row holds the frame instead of advancing the cursor over an unrecorded hole.
-	// One closure per connection, not per frame: an ordinary frame never touches it.
+	// A record this node will not apply is a hole in that origin's stream for that table. The caller records
+	// it before completing the cursor commit; a resync frame may defer that decision until it knows whether
+	// a blob keeps the cursor behind the record for replay.
 	async function recordReplicationHole(originId: number | undefined, tableName: string, reason: string) {
 		const origin = getNodeNameForId(auditStore, originId, true);
 		try {
@@ -4360,11 +4393,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// Set by mayResyncForDecodeDrop when it claims a slot, so a close that throws can hand it back.
 	let rollbackDecodeDropClaim: (() => void) | undefined;
 	function mayResyncForDecodeDrop(): boolean {
-		const key = `${databaseName}\u0000${remoteNodeName}`;
+		const status = getSharedStatus();
+		// A server-side receive can be accepted by any worker. Without the shared status buffer there is no
+		// cross-session budget, so retain #545's skip-and-advance behavior rather than allowing unbounded
+		// reconnects on each new socket.
+		if (!status) return false;
 		const now = Date.now();
-		const { allowed, count, lastCloseAt, rollback } = claimRecoveryClose(
-			decodeDropResyncByPeer,
-			key,
+		const { allowed, count, lastCloseAt, rollback } = claimRecoveryCloseInSharedStatus(
+			status,
 			now,
 			DECODE_DROP_RESYNC_INTERVAL_MS,
 			DECODE_DROP_RESYNC_BUDGET
@@ -4379,33 +4415,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			);
 		return allowed;
 	}
-	// harper-pro#810. Why the send loop's iterable ENDED, read from the iterable itself rather than inferred
-	// from how long it has been quiet. `corruptFrameStop.breaks` counts corrupt frames that stopped a log
-	// during this range and `midLogBreak` says whether entries were lost behind one; both are written only
-	// in the error path, so a healthy sender pays nothing to read them. (`truncatedVersions` is the field
-	// that costs per-entry bookkeeping, and its `trackCorruptTransactions` option stays off here.)
-	//
-	// The two cases are opposites and must not be treated alike:
-	//
-	//   A TORN TAIL — `breaks > 0` with `midLogBreak` false — is the designed, benign reading of a crash's
-	//   last frame. Nothing behind it was lost and the tail grows again. But `endIteratorOnCorruptFrame`
-	//   latches THIS iterator done for good, and the send loop reuses one iterable for the whole session on
-	//   RocksDB, so every later wake drains an already-finished iterator: no frames go out, the keepalive
-	//   holds the socket open, and the peer parks at connected:true / RECEIVING_STATUS_WAITING with every
-	//   health surface green. That is the wedge, and a fresh iterator reads straight past it — so close, and
-	//   let the peer resubscribe on its ordinary retry path.
-	//
-	//   A MID-LOG BREAK left intact entries unreadable behind it, and harper#2087 makes stopping there the
-	//   INTENDED policy (fail-stop / quarantine). A reconnect opens a fresh iterator that stops at the same
-	//   frame, so closing would be a reconnect loop over data no reconnect can recover. Report it and leave
-	//   the session up: visibly degraded beats silently churning.
-	// Returns whether it closed the socket, so the send loop can stop rather than parking on the next
-	// commit with a socket that is going away.
-	// harper-pro#810 (DESIGN.md item 10d). Drops the cached send iterable so the next iteration rebuilds it;
-	// the loop's `whenNextTransaction` capture precedes the scan, so no wake is lost. Returns whether it
-	// repaired, so the caller can reset its change detection against the new object.
+	// A torn tail latches this reusable iterable but a fresh range can read beyond it; a mid-log break is
+	// quarantined and must remain visible without reconnect churn. The return value tells the send loop
+	// whether it replaced the cached range.
 	function repairSendLogBreak(breaks: number, midLogBreak: boolean, isNewBreak: boolean, resumeFrom: number): boolean {
 		sendLogRebuildRetryInMs = 0;
+		sendLogBreakIsMidLog = midLogBreak;
 		if (wsClosed) return false;
 		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
 		if (midLogBreak && isNewBreak)
@@ -6491,25 +6506,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// shape, that is no later commit at all. Re-scan now instead; the repair's own interval floor
 									// is what stops this from spinning if the fresh range breaks again immediately.
 									if (repairedSendRange) continue;
-									// A repair the floor DENIED needs its own wake. The write that finally makes the tail
-									// readable can arrive inside the floor window, be denied, and then this await would need yet
-									// another commit — which a quiet writer never sends, leaving readable rows unsent forever.
-									// Fault path only: a healthy drain sets no deadline and still parks on the commit alone.
+									// A torn tail cannot become readable without a new commit. Wait for that commit before
+									// starting its remaining floor, so a quiet source has one pending waiter instead of a
+									// periodic rebuild. A mid-log quarantine may be repaired without a commit, so it keeps
+									// its periodic recheck.
 									if (rebuildRetryInMs > 0) {
-										// Cleared on either outcome: under a busy quarantined break this runs per commit, and an
-										// uncleared 30-minute timer per iteration is a leak measured in commits.
-										let retryTimer;
-										try {
-											await Promise.race([
-												nextTransaction,
-												new Promise((resolve) => {
-													retryTimer = setTimeout(resolve, rebuildRetryInMs);
-													retryTimer.unref?.();
-												}),
-											]);
-										} finally {
-											clearTimeout(retryTimer);
+										if (!sendLogBreakIsMidLog) {
+											await nextTransaction;
+											rebuildRetryInMs = rebuildRetryDelayMs(false, sendLogBreakSince, lastSendLogRepairAt, Date.now());
 										}
+										if (rebuildRetryInMs > 0)
+											await new Promise<void>((resolve) => {
+												const retryTimer = setTimeout(resolve, rebuildRetryInMs);
+												retryTimer.unref?.();
+											});
 										continue;
 									}
 									await nextTransaction;
@@ -6593,7 +6603,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// COPY_COMPLETE could otherwise flip copyCompleteReceived mid-body and make trailing rows fall back to
 			// the audited/resequencing path — reintroducing the O(n) copy-time work this avoids. (harper-pro#480)
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
-			let decodeDropNeedsResync = false; // harper-pro#810
+			// A live decode drop stops later bodies immediately, but this body's close remains in onCommit so
+			// its cursor has the same durability ordering as every other applied frame.
+			let decodeDropResyncClosePending = false;
+			let pendingReplicationHoles: { originId: number | undefined; tableName: string; reason: string }[] | undefined;
 			// Copy frames get a walk position, and everything staging or blob-tagging against it is
 			// captured NOW (decode time): onCommit runs later from the apply queue, by which time a
 			// same-socket COPY_START may have replaced the pass and its copyStartTime/copyOrder — staging
@@ -6880,13 +6893,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// not this catch. Decoder dictionaries passed as objects (not eager JSON.stringify) so the
 						// format cost is paid only when the log emits.
 						recordAction(true, DECODE_DROP_METRIC, databaseName + '.' + tableDecoder.name);
-						// A value that will not decode against this connection's dictionaries is usually a structure
-						// fork, not a one-off: under an empty `typedStructs` every LATER record of this table drops
-						// the same way for the life of the connection. Latch a resubscribe so the sender re-sends
-						// TABLE_FIXED_STRUCTURE. It does NOT recover this record — the cursor advances past it below
-						// and the resume starts after it, which is harper-pro#545's skip-and-advance disposition.
-						// What it bounds is the loss AFTER this record.
-						decodeDropNeedsResync = true;
+						if (!messageIsCopyFrame && !decodeDropResyncClosePending && mayResyncForDecodeDrop()) {
+							decodeDropResyncClosePending = true;
+							// Do this before returning to the message queue. onCommit still owns the actual close so
+							// this frame's cursor is persisted first, but later queued bodies cannot advance past it.
+							wsClosed = true;
+						}
 						logger.error?.(
 							connectionId,
 							'Error decoding replication message, record id: ' + id,
@@ -6901,8 +6913,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 					}
 				}
-				if (!event && !(await recordReplicationHole(localSourceNodeId, tableDecoder.name, 'undecodable record')))
-					return;
+				if (!event)
+					(pendingReplicationHoles ??= []).push({
+						originId: localSourceNodeId,
+						tableName: tableDecoder.name,
+						reason: 'undecodable record',
+					});
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
 					// a window to complete, then unlink the files. (mirrors the pattern at the relocate path above.)
@@ -7092,6 +7108,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// failed blob — preserving the no-data-loss guarantee — while the apply loop never blocks.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
 					endTxnEvent.localTime = lastDurableSequenceId;
+					// A lock-hole poison is durable evidence that this frame's cursor will remain past the
+					// dropped record. If an in-flight blob holds that cursor and the pending resync closes, the
+					// frame is replayed after structures refresh instead, so poison only after that decision.
+					const replayingPendingHole = decodeDropResyncClosePending && cursorBlockedByBlob();
+					if (!replayingPendingHole && pendingReplicationHoles) {
+						for (const hole of pendingReplicationHoles) {
+							if (await recordReplicationHole(hole.originId, hole.tableName, hole.reason)) continue;
+							// A hole-recording failure closes through its own 1011 path, not the claimed structure
+							// resync, so do not spend this recovery attempt on that different teardown.
+							rollbackDecodeDropClaim?.();
+							rollbackDecodeDropClaim = undefined;
+							return;
+						}
+					}
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
 					// (version < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
 					// core persists [seq] = copyStartTime. Otherwise a small copy that finished before the cadence
@@ -7156,32 +7186,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (origin) recordLockBarrierApplied(databaseName, origin, frameTxnLogKey, nonce);
 						}
 					}
-					// harper-pro#810 (C). Fired here, from the frame's own commit, so the resume cursor this frame
-					// advanced is already persisted before the socket goes: a close any earlier would re-deliver
-					// records this frame applied. Copy frames are excluded — a copy stages its cursor from the last
-					// SUCCESSFULLY decoded record, so a close after a dropped copy record resumes before it and
-					// re-delivers the same poison record, which is exactly the #521 loop harper-pro#545 removed.
-					// One case where it does NOT: a frame carrying a blob that is still saving. `endTxnEvent.localTime`
-					// above is then the PRE-blob watermark, and close() aborts the in-flight receive, so the reconnect
-					// resumes before this frame and re-delivers it — at the cost of one re-streamed blob. That is not
-					// the copy shape: the resubscribe re-sends TABLE_FIXED_STRUCTURE first, so the re-delivered record
-					// may now decode (recovering it rather than losing it), and the interval plus the episode budget
-					// bound it either way. Withholding the resync instead would leave the fork unrepaired until the
-					// next drop, which costs another record.
-					if (decodeDropNeedsResync && !isCopyFrame && !wsClosed && mayResyncForDecodeDrop()) {
+					if (decodeDropResyncClosePending && !isCopyFrame) {
 						logger.warn?.(
 							connectionId,
-							`Resubscribing to ${databaseName} from ${remoteNodeName} to resync table structures after an undecodable record${cursorBlockedByBlob() ? '; a blob holds the resume cursor behind this frame, so it is re-delivered after the structures are re-sent' : '; the dropped record is not re-delivered'}`
+							`Resubscribing to ${databaseName} from ${remoteNodeName} to resync table structures after an undecodable record${replayingPendingHole ? '; a blob holds the resume cursor behind this frame, so it is re-delivered after the structures are re-sent' : '; the dropped record is not re-delivered'}`
 						);
-						// Latch inbound off BEFORE closing so queued frames cannot advance the cursor past the held
-						// record — but UNDO it if the close did not actually happen, or the connection is live and
-						// permanently treated as closed, with nothing scheduling the resubscribe this exists to cause.
-						wsClosed = true;
 						if (!close(CLOSE_DECODE_DROP_RESYNC, 'undecodable record; resubscribing to resync structures')) {
 							wsClosed = false;
-							// Give the budget slot back too: it was claimed for a teardown that did not happen, and
-							// without this the retry named below is denied by an interval nothing was spent on.
 							rollbackDecodeDropClaim?.();
+							// The close did not happen, so the frame will persist and must retain its lock-hole
+							// evidence even if a blob had temporarily held the cursor behind it.
+							if (replayingPendingHole && pendingReplicationHoles) {
+								for (const hole of pendingReplicationHoles)
+									if (!(await recordReplicationHole(hole.originId, hole.tableName, hole.reason))) return;
+							}
 							logger.error?.(
 								connectionId,
 								`Could not close ${databaseName} to ${remoteNodeName} for a structure resync; the leg stays up and the next undecodable record will retry`
@@ -7339,9 +7357,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	ws.on('close', retireInstance);
 
-	// Returns whether the close was actually issued. A caller that latches state on the strength of it
-	// (`wsClosed`, a resync budget slot) must not do so when `ws.close()` threw: the connection would then
-	// be live but treated as closed, with nothing scheduling a resubscribe (harper-pro#815 review).
+	// Returns whether the close was actually issued so callers can undo latches and budget claims when
+	// `ws.close()` throws.
 	function close(code?, reason?, intentional?: boolean): boolean {
 		try {
 			// Only the deliberate "we are done with this connection" call sites pass intentional=true

@@ -40,7 +40,13 @@ import {
 } from '#src/replication/recordLockTransport';
 import { DELEGATE_OPERATION, RECALL_OPERATION } from '#src/replication/recordLockRpc';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
-import { FIRE_MECHANISMS, fireCounterPositions } from '#src/replication/replicationConnection';
+import {
+	FIRE_MECHANISMS,
+	fireCounterPositions,
+	DECODE_DROP_LAST_CLOSE_POSITION,
+	DECODE_DROP_CLOSE_COUNT_POSITION,
+	DECODE_DROP_LAST_EVENT_POSITION,
+} from '#src/replication/replicationConnection';
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
@@ -143,6 +149,15 @@ describe('peer lock capability in the shared status buffer', () => {
 			RECORD_LOCK_LEVEL_POSITION,
 		]) {
 			assert.ok(!fireCounterSlots.has(position));
+			assert.ok(position < REPLICATION_SHARED_STATUS_SLOTS);
+		}
+		for (const position of [
+			DECODE_DROP_LAST_CLOSE_POSITION,
+			DECODE_DROP_CLOSE_COUNT_POSITION,
+			DECODE_DROP_LAST_EVENT_POSITION,
+		]) {
+			assert.ok(!fireCounterSlots.has(position));
+			assert.ok(position > RECORD_LOCK_LEVEL_POSITION);
 			assert.ok(position < REPLICATION_SHARED_STATUS_SLOTS);
 		}
 	});

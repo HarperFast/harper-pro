@@ -24,6 +24,9 @@ import {
 	readFireCounters,
 	formatFireClassification,
 	LAST_ERROR_TIME_POSITION,
+	DECODE_DROP_LAST_CLOSE_POSITION,
+	DECODE_DROP_CLOSE_COUNT_POSITION,
+	DECODE_DROP_LAST_EVENT_POSITION,
 } from '#src/replication/replicationConnection';
 import { REPLICATION_SHARED_STATUS_SLOTS } from '#src/replication/knownNodes';
 
@@ -56,6 +59,23 @@ describe('fire counter slot map', () => {
 
 	it('keeps the ninth pair after the record-lock layout', () => {
 		expect(fireCounterPositions('send-log-break')).to.deep.equal({ redundant: 32, loadBearing: 33 });
+	});
+
+	it('keeps recovery-budget slots after every fire counter', () => {
+		const fireSlots = new Set(
+			FIRE_MECHANISMS.flatMap((mechanism) => {
+				const positions = fireCounterPositions(mechanism);
+				return positions ? [positions.redundant, positions.loadBearing] : [];
+			})
+		);
+		for (const slot of [
+			DECODE_DROP_LAST_CLOSE_POSITION,
+			DECODE_DROP_CLOSE_COUNT_POSITION,
+			DECODE_DROP_LAST_EVENT_POSITION,
+		]) {
+			expect(fireSlots.has(slot)).to.equal(false);
+			expect(slot).to.be.lessThan(REPLICATION_SHARED_STATUS_SLOTS);
+		}
 	});
 
 	it('has no positions for an unrecognized mechanism', () => {
