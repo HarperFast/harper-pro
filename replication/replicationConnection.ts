@@ -5307,7 +5307,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// reject up front rather than optimistically wiring up the send path.
 								logger.warn?.(
 									connectionId,
-									`Config route does not authorize sending ${databaseName} to ${authorization.name}; closing the subscription`
+									`Config route does not authorize sending ${JSON.stringify(String(databaseName))} to declared peer ${JSON.stringify(String(remoteNodeName))} (authenticated as ${JSON.stringify(String(authorization.name))}); closing the subscription`
 								);
 								closed = true;
 								close(1008, `Unauthorized database subscription to ${databaseName}`);
@@ -5368,7 +5368,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						} else if (!(authorization?.role?.permission?.super_user || authorization.replicates)) {
 							logger.warn?.(
 								connectionId,
-								`${remoteNodeName ?? 'peer'} is not authorized to subscribe to ${databaseName}: no super_user permission and no replicates grant; closing the subscription`
+								`Credential ${JSON.stringify(String(authorization.username ?? '<unknown>'))} is not authorized to subscribe to ${JSON.stringify(String(databaseName))}: no super_user permission and no replicates grant; closing the subscription`
 							);
 							ws.send(encode([DISCONNECT]));
 							close(1008, `Unauthorized database subscription to ${databaseName}`);
