@@ -86,6 +86,7 @@ import harperLogger from '../core/utility/logging/harper_logger.js';
 const { forComponent, errorToString } = harperLogger;
 import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptionManager.ts';
 import { materializeOperationResponse } from './materializeOperationResponse.ts';
+import { deferSubscribeUntilSessionForTest, subscribeDeferralAllowedForTest } from './subscribeDeferralForTest.ts';
 import { EventEmitter } from 'events';
 import { createTLSSelector } from '../core/security/keys.js';
 import * as tls from 'node:tls';
@@ -3218,6 +3219,11 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.session.catch(() => {}); // suppress any unhandled errors
 	}
 	subscribe(nodeSubscriptions, replicateTablesByDefault) {
+		if (
+			subscribeDeferralAllowedForTest &&
+			deferSubscribeUntilSessionForTest(this, nodeSubscriptions, replicateTablesByDefault)
+		)
+			return;
 		this.nodeSubscriptions = nodeSubscriptions;
 		this.replicateTablesByDefault = replicateTablesByDefault;
 		this.emit('subscriptions-updated', nodeSubscriptions);
