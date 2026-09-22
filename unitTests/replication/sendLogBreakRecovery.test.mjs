@@ -12,7 +12,6 @@
 
 import { expect } from 'chai';
 import {
-	claimRecoveryClose,
 	claimRecoveryCloseInSharedStatus,
 	DECODE_DROP_CLOSE_COUNT_POSITION,
 	DECODE_DROP_LAST_CLOSE_POSITION,
@@ -89,39 +88,6 @@ describe('recoveryCloseEpisodeCount', () => {
 	});
 });
 
-describe('claimRecoveryClose — the interaction a denied claim used to poison', () => {
-	const KEY = 'data\u0000peer-a';
-	const INTERVAL_MS = 5 * 60_000;
-	const BUDGET = 3;
-	const claim = (bounds, now) => claimRecoveryClose(bounds, KEY, now, INTERVAL_MS, BUDGET);
-
-	it('allows the first claim and denies a second inside the interval', () => {
-		const bounds = new Map();
-		expect(claim(bounds, NOW).allowed).to.equal(true);
-		expect(claim(bounds, NOW + 1_000).allowed).to.equal(false);
-	});
-
-	it('keeps the last successful close when a claim is denied', () => {
-		const bounds = new Map();
-		expect(claim(bounds, NOW).allowed).to.equal(true);
-		expect(claim(bounds, NOW + 1_000).allowed).to.equal(false);
-		expect(bounds.get(KEY).lastCloseAt).to.equal(NOW);
-		expect(claim(bounds, NOW + INTERVAL_MS - 1).allowed).to.equal(false);
-	});
-
-	it('keeps a spent budget spent while NEW events keep arriving', () => {
-		// The other half: a fault that keeps producing breaks must stay isolated rather than being handed a
-		// fresh budget every quiet hour.
-		const bounds = new Map();
-		for (let i = 0; i < BUDGET; i++) claim(bounds, NOW + i * INTERVAL_MS);
-		let at = NOW + BUDGET * INTERVAL_MS;
-		for (let i = 0; i < 20; i++) {
-			at += RECOVERY_CLOSE_EPISODE_MS / 2;
-			expect(claim(bounds, at).allowed).to.equal(false);
-		}
-	});
-});
-
 describe('mayRebuildSendRange — when the stopped send range may be rebuilt', () => {
 	it('rebuilds a torn tail on first sight: recovering it is the point', () => {
 		expect(mayRebuildSendRange(false, NOW, 0, NOW)).to.equal(true);
@@ -183,28 +149,6 @@ describe('rebuildRetryDelayMs — the wake a denied rebuild needs', () => {
 	});
 });
 
-describe('claimRecoveryClose rollback — a slot spent on a close that never happened', () => {
-	it('restores the previous bound exactly', () => {
-		const bounds = new Map();
-		const KEY = 'data\u0000peer-b';
-		const first = claimRecoveryClose(bounds, KEY, NOW, INTERVAL, 3);
-		expect(first.allowed).to.equal(true);
-		const afterFirst = { ...bounds.get(KEY) };
-
-		const second = claimRecoveryClose(bounds, KEY, NOW + INTERVAL, 3, 3);
-		expect(second.allowed).to.equal(true);
-		second.rollback();
-		expect({ ...bounds.get(KEY) }).to.deep.equal(afterFirst);
-	});
-
-	it('removes the entry entirely when the claim created it', () => {
-		const bounds = new Map();
-		const KEY = 'data\u0000peer-c';
-		claimRecoveryClose(bounds, KEY, NOW, INTERVAL, 3).rollback();
-		expect(bounds.has(KEY)).to.equal(false);
-	});
-});
-
 describe('claimRecoveryCloseInSharedStatus', () => {
 	it('shares the episode budget across status views', () => {
 		const buffer = new ArrayBuffer(REPLICATION_SHARED_STATUS_SLOTS * Float64Array.BYTES_PER_ELEMENT);
@@ -224,23 +168,15 @@ describe('claimRecoveryCloseInSharedStatus', () => {
 		expect(claimRecoveryCloseInSharedStatus(status, NOW + INTERVAL - 1, INTERVAL, 3).allowed).to.equal(false);
 	});
 
-	it('rolls back all three shared-status slots exactly', () => {
+	it('retains a granted claim after a worker cannot close its socket', () => {
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 		status[DECODE_DROP_LAST_CLOSE_POSITION] = NOW - INTERVAL;
 		status[DECODE_DROP_CLOSE_COUNT_POSITION] = 1;
 		status[DECODE_DROP_LAST_EVENT_POSITION] = NOW - INTERVAL;
-		const before = [
-			status[DECODE_DROP_LAST_CLOSE_POSITION],
-			status[DECODE_DROP_CLOSE_COUNT_POSITION],
-			status[DECODE_DROP_LAST_EVENT_POSITION],
-		];
 		const claim = claimRecoveryCloseInSharedStatus(status, NOW, INTERVAL, 3);
 		expect(claim.allowed).to.equal(true);
-		claim.rollback();
-		expect([
-			status[DECODE_DROP_LAST_CLOSE_POSITION],
-			status[DECODE_DROP_CLOSE_COUNT_POSITION],
-			status[DECODE_DROP_LAST_EVENT_POSITION],
-		]).to.deep.equal(before);
+		expect(status[DECODE_DROP_LAST_CLOSE_POSITION]).to.equal(NOW);
+		expect(status[DECODE_DROP_CLOSE_COUNT_POSITION]).to.equal(2);
+		expect(status[DECODE_DROP_LAST_EVENT_POSITION]).to.equal(NOW);
 	});
 });
