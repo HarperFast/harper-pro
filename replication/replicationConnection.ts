@@ -128,6 +128,11 @@ import { createInflate } from 'node:zlib';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
+import {
+	registerReplicatedApplyFailureListener,
+	unregisterReplicatedApplyFailureListener,
+	type ReplicatedApplyFailureListener,
+} from '../core/resources/replicatedApplyFailure.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
 // blob-send backpressure both need it, so the private field is declared here rather than at each read.
@@ -304,7 +309,7 @@ function calculateRecoveryCloseClaim(
 		next: {
 			lastEventAt: now,
 			closeCount: allowed ? count + 1 : count,
-			...(allowed ? { lastCloseAt: now } : undefined),
+			lastCloseAt: allowed ? now : lastCloseAt,
 		},
 	};
 }
@@ -1028,38 +1033,7 @@ export function keepaliveArmsOnOpen(readyState: number): boolean {
 	return readyState === WebSocket.CONNECTING;
 }
 
-/**
- * Handle an error that escaped `onWSMessage` (the inbound handler in `replicateOverWS`).
- *
- * Historically this was logged and swallowed. That silently dropped the rest of the failed frame
- * while later frames kept applying and confirming ever-higher sequence ids — a permanent,
- * undetected `[error, head]` gap on the receiver (epic harper-pro#430 Theme B; workstream
- * harper-pro#440). Recovery instead rides the established transient-close path:
- *
- *   1. `markInboundClosed` FIRST — frames already queued behind this one on the
- *      `messageProcessing` chain must not apply (they would commit past the hole), and after
- *      `ws.close()` the peer can still deliver frames until the close handshake completes.
- *   2. `close(1011)` (internal error — distinct from the 1008 policy closes) WITHOUT the
- *      `intentional` flag, so `NodeReplicationConnection`'s normal retry path reconnects with
- *      backoff and resumes from the last durable cursor, re-streaming everything past it.
- *      Records applied before the error redeliver idempotently (version dedup).
- *
- * A deterministic error (e.g. a genuinely undecodable frame) becomes a visible, backed-off
- * reconnect loop instead of silent loss; bounding that with an escalation budget is W2
- * (harper-pro#432) territory.
- *
- * Coverage: FRAME-level errors (header/command decode, audit-entry structure, unexpected rejections
- * from awaited handler work) reach the outer catch directly. A per-record VALUE decode failure is
- * caught first by the inner catch around `decodeBlobsWithWrites` — which logs the decoder's structures
- * and the offending bytes for diagnosis, then RE-THROWS (only when the table decoder resolved) so it
- * rides this same close path instead of skip-and-logging while the resume cursor advances past the
- * hole. That closes the #1163/#1453 structure-fork silent-gap class: the reconnect rebuilds the table
- * decoder from the peer's re-sent structures, healing the fork on resume. An unknown tableId (decoder
- * unresolved — a transient schema-propagation case, not a fork) stays skip-and-log.
- *
- * Exported for unit tests (`closeOnInboundMessageError.test.mjs`); the production caller is the
- * catch in `onWSMessage`.
- */
+/** Close after an error escapes an inbound frame so later queued frames cannot advance past it. */
 export function closeOnInboundMessageError(
 	error: unknown,
 	deps: {
@@ -4375,7 +4349,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		} catch (error) {
 			logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error);
 			wsClosed = true;
-			close(1011, 'could not record a replication hole; reconnecting');
+			closeOrTerminate(1011, 'could not record a replication hole; reconnecting');
 			return false;
 		}
 	}
@@ -4414,6 +4388,25 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					: `Undecodable record in ${databaseName} from ${remoteNodeName}, but a structure resync ran ${now - lastCloseAt}ms ago; skipping this one and continuing to drop`
 			);
 		return allowed;
+	}
+	function stopDecodeDropResyncApplyFailureListener() {
+		if (!decodeDropResyncApplyFailureListener) return;
+		unregisterReplicatedApplyFailureListener(databaseName, decodeDropResyncApplyFailureListener);
+		decodeDropResyncApplyFailureListener = undefined;
+	}
+	function startDecodeDropResync() {
+		decodeDropResyncPending = true;
+		const listener: ReplicatedApplyFailureListener = async () => {
+			if (!decodeDropResyncPending) return;
+			decodeDropResyncPending = false;
+			stopDecodeDropResyncApplyFailureListener();
+			rollbackDecodeDropClaim?.();
+			rollbackDecodeDropClaim = undefined;
+			wsClosed = true;
+			closeOrTerminate(1011, 'replicated apply failed while structure resync was pending');
+		};
+		decodeDropResyncApplyFailureListener = listener;
+		registerReplicatedApplyFailureListener(databaseName, listener);
 	}
 	// A torn tail latches this reusable iterable but a fresh range can read beyond it; a mid-log break is
 	// quarantined and must remain visible without reconnect churn. The return value tells the send loop
@@ -4536,6 +4529,24 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
 	let wsClosed = false;
+	let resolveInstanceRetired: () => void = () => {};
+	const instanceRetiredSignal = new Promise<void>((resolve) => (resolveInstanceRetired = resolve));
+	let decodeDropResyncPending = false;
+	let decodeDropResyncApplyFailureListener: ReplicatedApplyFailureListener | undefined;
+	async function waitForSessionEndOrTransaction(nextTransaction: Promise<unknown>) {
+		await Promise.race([nextTransaction, instanceRetiredSignal]);
+	}
+	async function waitForSessionEndOrRetry(ms: number) {
+		let resolveRetry: () => void = () => {};
+		const retry = new Promise<void>((resolve) => (resolveRetry = resolve));
+		const retryTimer = setTimeout(resolveRetry, ms);
+		retryTimer.unref?.();
+		try {
+			await Promise.race([retry, instanceRetiredSignal]);
+		} finally {
+			clearTimeout(retryTimer);
+		}
+	}
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
 	// watchdog's reconnect) after losing ownership would act against the replacement's state.
 	const connectionSuperseded = () => isConnectionSuperseded(wsClosed, options.connection, ws);
@@ -4697,7 +4708,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const queuedBytes = body.byteLength;
 		const processThenSettle = async () => {
 			try {
-				if (!wsClosed) await onWSMessage(body);
+				if (!wsClosed && !decodeDropResyncPending) await onWSMessage(body);
 			} finally {
 				try {
 					// A settled frame is consumer progress made WHILE the socket is paused — tick it or the
@@ -6512,17 +6523,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// its periodic recheck.
 									if (rebuildRetryInMs > 0) {
 										if (!sendLogBreakIsMidLog) {
-											await nextTransaction;
+											await waitForSessionEndOrTransaction(nextTransaction);
+											if (closed || wsClosed) return;
 											rebuildRetryInMs = rebuildRetryDelayMs(false, sendLogBreakSince, lastSendLogRepairAt, Date.now());
 										}
-										if (rebuildRetryInMs > 0)
-											await new Promise<void>((resolve) => {
-												const retryTimer = setTimeout(resolve, rebuildRetryInMs);
-												retryTimer.unref?.();
-											});
+										if (rebuildRetryInMs > 0) await waitForSessionEndOrRetry(rebuildRetryInMs);
+										if (closed || wsClosed) return;
 										continue;
 									}
-									await nextTransaction;
+									await waitForSessionEndOrTransaction(nextTransaction);
+									if (closed || wsClosed) return;
 								} while (!closed);
 							})
 							.catch((error) => {
@@ -6603,9 +6613,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// COPY_COMPLETE could otherwise flip copyCompleteReceived mid-body and make trailing rows fall back to
 			// the audited/resequencing path — reintroducing the O(n) copy-time work this avoids. (harper-pro#480)
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
-			// A live decode drop stops later bodies immediately, but this body's close remains in onCommit so
-			// its cursor has the same durability ordering as every other applied frame.
-			let decodeDropResyncClosePending = false;
+			let decodeDropResyncClaimAttempted = false;
 			let pendingReplicationHoles: { originId: number | undefined; tableName: string; reason: string }[] | undefined;
 			// Copy frames get a walk position, and everything staging or blob-tagging against it is
 			// captured NOW (decode time): onCommit runs later from the apply queue, by which time a
@@ -6893,11 +6901,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// not this catch. Decoder dictionaries passed as objects (not eager JSON.stringify) so the
 						// format cost is paid only when the log emits.
 						recordAction(true, DECODE_DROP_METRIC, databaseName + '.' + tableDecoder.name);
-						if (!messageIsCopyFrame && !decodeDropResyncClosePending && mayResyncForDecodeDrop()) {
-							decodeDropResyncClosePending = true;
-							// Do this before returning to the message queue. onCommit still owns the actual close so
-							// this frame's cursor is persisted first, but later queued bodies cannot advance past it.
-							wsClosed = true;
+						if (!messageIsCopyFrame && !decodeDropResyncClaimAttempted) {
+							decodeDropResyncClaimAttempted = true;
+							if (!decodeDropResyncPending && mayResyncForDecodeDrop()) startDecodeDropResync();
 						}
 						logger.error?.(
 							connectionId,
@@ -7111,15 +7117,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// A lock-hole poison is durable evidence that this frame's cursor will remain past the
 					// dropped record. If an in-flight blob holds that cursor and the pending resync closes, the
 					// frame is replayed after structures refresh instead, so poison only after that decision.
-					const replayingPendingHole = decodeDropResyncClosePending && cursorBlockedByBlob();
+					const replayingPendingHole = decodeDropResyncPending && cursorBlockedByBlob();
 					if (!replayingPendingHole && pendingReplicationHoles) {
 						for (const hole of pendingReplicationHoles) {
 							if (await recordReplicationHole(hole.originId, hole.tableName, hole.reason)) continue;
-							// A hole-recording failure closes through its own 1011 path, not the claimed structure
-							// resync, so do not spend this recovery attempt on that different teardown.
+							decodeDropResyncPending = false;
+							stopDecodeDropResyncApplyFailureListener();
 							rollbackDecodeDropClaim?.();
 							rollbackDecodeDropClaim = undefined;
-							return;
+							throw new Error('could not record a replication hole before advancing the receive cursor');
 						}
 					}
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
@@ -7186,23 +7192,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (origin) recordLockBarrierApplied(databaseName, origin, frameTxnLogKey, nonce);
 						}
 					}
-					if (decodeDropResyncClosePending && !isCopyFrame) {
+					if (decodeDropResyncPending && !isCopyFrame) {
 						logger.warn?.(
 							connectionId,
 							`Resubscribing to ${databaseName} from ${remoteNodeName} to resync table structures after an undecodable record${replayingPendingHole ? '; a blob holds the resume cursor behind this frame, so it is re-delivered after the structures are re-sent' : '; the dropped record is not re-delivered'}`
 						);
-						if (!close(CLOSE_DECODE_DROP_RESYNC, 'undecodable record; resubscribing to resync structures')) {
-							wsClosed = false;
-							rollbackDecodeDropClaim?.();
-							// The close did not happen, so the frame will persist and must retain its lock-hole
-							// evidence even if a blob had temporarily held the cursor behind it.
-							if (replayingPendingHole && pendingReplicationHoles) {
-								for (const hole of pendingReplicationHoles)
-									if (!(await recordReplicationHole(hole.originId, hole.tableName, hole.reason))) return;
-							}
+						decodeDropResyncPending = false;
+						stopDecodeDropResyncApplyFailureListener();
+						wsClosed = true;
+						if (!closeOrTerminate(CLOSE_DECODE_DROP_RESYNC, 'undecodable record; resubscribing to resync structures')) {
 							logger.error?.(
 								connectionId,
-								`Could not close ${databaseName} to ${remoteNodeName} for a structure resync; the leg stays up and the next undecodable record will retry`
+								`Could not close or terminate ${databaseName} to ${remoteNodeName} for a structure resync`
 							);
 						}
 						rollbackDecodeDropClaim = undefined;
@@ -7310,6 +7311,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (instanceRetired) return;
 		instanceRetired = true;
 		wsClosed = true;
+		resolveInstanceRetired();
+		stopDecodeDropResyncApplyFailureListener();
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
 		if (options.connection?.peerCapabilities === peerCapabilities) options.connection.peerCapabilities = undefined;
 		pendingSubscriptionSetupRequestId = undefined;
@@ -7375,6 +7378,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return true;
 		} catch (error) {
 			logger.error?.(connectionId, 'Error closing connection', error);
+			return false;
+		}
+	}
+	function closeOrTerminate(code: number, reason: string): boolean {
+		if (close(code, reason)) return true;
+		try {
+			ws.terminate();
+			return true;
+		} catch (error) {
+			logger.error?.(connectionId, 'Error terminating connection after close failed', error);
 			return false;
 		}
 	}
