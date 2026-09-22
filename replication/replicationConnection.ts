@@ -63,7 +63,7 @@ import harperLogger from '../core/utility/logging/harper_logger.js';
 const { forComponent, errorToString } = harperLogger;
 import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptionManager.ts';
 import { materializeOperationResponse } from './materializeOperationResponse.ts';
-import { deferSubscribeUntilSessionForTest } from './subscribeDeferralForTest.ts';
+import { deferSubscribeUntilSessionForTest, subscribeDeferralAllowedForTest } from './subscribeDeferralForTest.ts';
 import { EventEmitter } from 'events';
 import { createTLSSelector } from '../core/security/keys.js';
 import * as tls from 'node:tls';
@@ -3149,11 +3149,9 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.session.catch(() => {}); // suppress any unhandled errors
 	}
 	subscribe(nodeSubscriptions, replicateTablesByDefault) {
-		// Test-only ordering injection for harper-pro#431; only the regression test sets the variable.
-		const deferralDatabase = process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB;
 		if (
-			deferralDatabase &&
-			deferSubscribeUntilSessionForTest(this, deferralDatabase, nodeSubscriptions, replicateTablesByDefault)
+			subscribeDeferralAllowedForTest &&
+			deferSubscribeUntilSessionForTest(this, nodeSubscriptions, replicateTablesByDefault)
 		)
 			return;
 		this.nodeSubscriptions = nodeSubscriptions;
