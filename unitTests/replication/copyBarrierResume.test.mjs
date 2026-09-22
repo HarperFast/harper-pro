@@ -168,7 +168,7 @@ describe('classifyResumeAnchor', () => {
 		);
 	});
 
-	it('is unreadable when the log throws, so the caller can fail closed', () => {
+	it("is unreadable when the log throws, distinct from other even though today's caller treats them the same", () => {
 		const throwing = {
 			getRange() {
 				throw new Error('log unavailable');
