@@ -1,22 +1,26 @@
 /**
  * Test-only subscribe/open ordering injection for harper-pro#431.
  *
- * `NodeReplicationConnection.subscribe()` calls in here only while
- * `HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB` names a database; with the variable unset the connection
- * never reaches this module. The first subscribe on a fresh connection for that database is then held
- * until the connection opens a session, so the socket opens with `nodeSubscriptions` still undefined and
- * no connect edge is ever posted — a live link the main thread still reads as disconnected, which is the
- * harper-pro#289 desync the shared-truth up-correction exists for. Nothing black-box can produce it: the
- * real window is the race between the WS handshake and an async subscribe().
+ * Holding a connection's first subscribe until its socket has opened leaves a live link whose connect
+ * edge was never posted — the harper-pro#289 desync the shared-truth up-correction exists for, which
+ * nothing black-box can produce because the real window is the race between the WS handshake and an
+ * async subscribe(). Covered by integrationTests/cluster/truthResiduals.test.mjs R5.
  *
- * One-shot per worker thread (module state is per-worker), so the reconnects that follow, and every other
- * connection, take the normal path. Covered by integrationTests/cluster/truthResiduals.test.mjs R5.
+ * Two variables, because the arming has to be late: the process must opt in at startup, and only then
+ * may the suite name a database at runtime — arming at startup instead would perturb the other cases in
+ * that suite. Module state is per worker thread, so the one-shot is too.
  */
 import harperLogger from '../core/utility/logging/harper_logger.js';
 import type { Logger } from '../core/utility/logging/logger.ts';
 const { forComponent } = harperLogger;
 
 const logger = forComponent('replication').conditional as Logger;
+
+/**
+ * Read once at load so the production subscribe path tests a constant instead of `process.env`. Only a
+ * process the suite started with this set can ever arm.
+ */
+export const subscribeDeferralAllowedForTest = process.env.HARPER_TEST_ALLOW_SUBSCRIBE_AFTER_OPEN_HOOK === '1';
 
 let armed = false;
 
@@ -26,7 +30,6 @@ let armed = false;
  */
 export function deferSubscribeUntilSessionForTest(
 	connection: any,
-	deferralDatabase: string,
 	nodeSubscriptions: any,
 	replicateTablesByDefault: boolean
 ): boolean {
@@ -37,7 +40,7 @@ export function deferSubscribeUntilSessionForTest(
 		return true;
 	}
 	if (armed || connection.nodeSubscriptions !== undefined || !connection.session) return false;
-	if (deferralDatabase !== connection.databaseName) return false;
+	if (process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB !== connection.databaseName) return false;
 	armed = true;
 	connection.deferredSubscribeForTest = { nodeSubscriptions, replicateTablesByDefault };
 	logger.warn?.(`[test] deferring subscribe until session open for db "${connection.databaseName}" (harper-pro#431)`);
