@@ -434,6 +434,15 @@ const COPY_FLUSH_BYTES = Math.floor(MAX_PAYLOAD * 0.9);
 export function exceedsMaxPayload(messageSize: number, maxPayload: number = MAX_PAYLOAD): boolean {
 	return messageSize > maxPayload;
 }
+/**
+ * Whether a delete's frame bytes repeat, byte for byte, the delete written immediately before it in the
+ * frame being built. Such a copy deletes an already-deleted key on every receiver. A log that already
+ * holds an echoed run of one delete (harper-pro#826) would otherwise ship the whole run as one frame,
+ * which exceeds the payload cap and wedges the leg until retention purges the run.
+ */
+export function repeatsQueuedDelete(queuedDelete: Uint8Array | undefined, entryBytes: Uint8Array): boolean {
+	return queuedDelete !== undefined && Buffer.compare(queuedDelete, entryBytes) === 0;
+}
 // Throttle the oversized-send error: it closes and reconnects the leg, so it would otherwise re-log on
 // every reconnect cycle. Module-level so the throttle survives across the per-cycle connection instances.
 const oversizedSendWarnThrottle = createThrottleState();
@@ -5579,7 +5588,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								return { table };
 							}
 						};
-						const currentTransaction = { txnLogKey: 0 };
+						const currentTransaction: { txnLogKey: number; queuedDelete?: Uint8Array } = { txnLogKey: 0 };
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
@@ -5841,9 +5850,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									sendQueuedData();
 								}
 								currentTransaction.txnLogKey = txnLogKey;
+								currentTransaction.queuedDelete = undefined;
 								frame.encodingStart = frame.position;
 								frame.writeFloat64(txnLogKey);
 							}
+							if (auditRecord.type === 'delete') {
+								const encoded = auditRecord.encoded;
+								const entryBytes = encoded[0] === 66 ? encoded.subarray(8) : encoded;
+								// Not skipAuditRecord(): its timer can send a sequence update for this frame's key before
+								// the frame itself is flushed.
+								if (repeatsQueuedDelete(currentTransaction.queuedDelete, entryBytes)) return new Promise(setImmediate);
+								// a copy: a range read may hand back the same buffer for the next entry
+								currentTransaction.queuedDelete = entryBytes.slice();
+							} else currentTransaction.queuedDelete = undefined;
 
 							/*
 						TODO: At some point we may want fancier logic to elide the version when it equals txnLogKey
