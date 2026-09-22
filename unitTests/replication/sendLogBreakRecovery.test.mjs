@@ -168,7 +168,7 @@ describe('claimRecoveryCloseInSharedStatus', () => {
 		expect(claimRecoveryCloseInSharedStatus(status, NOW + INTERVAL - 1, INTERVAL, 3).allowed).to.equal(false);
 	});
 
-	it('retains a granted claim after a worker cannot close its socket', () => {
+	it('retains a granted claim after WebSocket close calls fail', () => {
 		const status = new Float64Array(REPLICATION_SHARED_STATUS_SLOTS);
 		status[DECODE_DROP_LAST_CLOSE_POSITION] = NOW - INTERVAL;
 		status[DECODE_DROP_CLOSE_COUNT_POSITION] = 1;
