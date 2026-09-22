@@ -293,6 +293,13 @@ export function recoveryCloseAllowed(
 	if (closeCount >= budget) return false;
 	return !(lastCloseAt > 0 && now - lastCloseAt < intervalMs);
 }
+export function decodeDropResyncDisposition(
+	claimedByFrame: boolean,
+	cursorBlocked: boolean
+): 'none' | 'poison' | 'replay' {
+	if (!claimedByFrame) return 'none';
+	return cursorBlocked ? 'replay' : 'poison';
+}
 function calculateRecoveryCloseClaim(
 	holder: RecoveryCloseBound,
 	now: number,
@@ -6570,6 +6577,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// the audited/resequencing path — reintroducing the O(n) copy-time work this avoids. (harper-pro#480)
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
 			let decodeDropResyncClaimAttempted = false;
+			let decodeDropResyncClaimedByFrame = false;
 			let pendingReplicationHoles: { originId: number | undefined; tableName: string; reason: string }[] | undefined;
 			// Copy frames get a walk position, and everything staging or blob-tagging against it is
 			// captured NOW (decode time): onCommit runs later from the apply queue, by which time a
@@ -6859,7 +6867,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						recordAction(true, DECODE_DROP_METRIC, databaseName + '.' + tableDecoder.name);
 						if (!messageIsCopyFrame && !decodeDropResyncClaimAttempted) {
 							decodeDropResyncClaimAttempted = true;
-							if (!decodeDropResyncPending && mayResyncForDecodeDrop()) startDecodeDropResync();
+							if (!decodeDropResyncPending && mayResyncForDecodeDrop()) {
+								startDecodeDropResync();
+								decodeDropResyncClaimedByFrame = true;
+							}
 						}
 						logger.error?.(
 							connectionId,
@@ -6881,10 +6892,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						tableName: tableDecoder.name,
 						reason: 'undecodable record',
 					};
-					// A claimed structure resync replays a blob-held cursor, so defer its poison only until we
-					// know whether this frame is replayed. Every other dropped record must be durable before a
-					// later frame can commit a cursor beyond it.
-					if (decodeDropResyncPending) (pendingReplicationHoles ??= []).push(hole);
+					// Only the claiming frame may defer its holes for replay.
+					if (decodeDropResyncClaimedByFrame) (pendingReplicationHoles ??= []).push(hole);
 					else if (!(await recordReplicationHole(hole.originId, hole.tableName, hole.reason))) return;
 				}
 				if (!event && receivedBlobs) {
@@ -7076,10 +7085,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// failed blob — preserving the no-data-loss guarantee — while the apply loop never blocks.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
 					endTxnEvent.localTime = lastDurableSequenceId;
-					// A lock-hole poison is durable evidence that this frame's cursor will remain past the
-					// dropped record. If an in-flight blob holds that cursor and the pending resync closes, the
-					// frame is replayed after structures refresh instead, so poison only after that decision.
-					const replayingPendingHole = decodeDropResyncPending && cursorBlockedByBlob();
+					const decodeDropResync = decodeDropResyncDisposition(decodeDropResyncClaimedByFrame, cursorBlockedByBlob());
+					const replayingPendingHole = decodeDropResync === 'replay';
+					if (replayingPendingHole) hasBlobGap = true;
 					if (!replayingPendingHole && pendingReplicationHoles) {
 						for (const hole of pendingReplicationHoles) {
 							if (await recordReplicationHole(hole.originId, hole.tableName, hole.reason)) continue;
@@ -7152,7 +7160,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (origin) recordLockBarrierApplied(databaseName, origin, frameTxnLogKey, nonce);
 						}
 					}
-					if (decodeDropResyncPending && !isCopyFrame) {
+					if (decodeDropResync !== 'none') {
 						logger.warn?.(
 							connectionId,
 							`Resubscribing to ${databaseName} from ${remoteNodeName} to resync table structures after an undecodable record${replayingPendingHole ? '; a blob holds the resume cursor behind this frame, so it is re-delivered after the structures are re-sent' : '; the dropped record is not re-delivered'}`

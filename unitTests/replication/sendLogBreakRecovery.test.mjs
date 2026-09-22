@@ -16,6 +16,7 @@ import {
 	DECODE_DROP_CLOSE_COUNT_POSITION,
 	DECODE_DROP_LAST_CLOSE_POSITION,
 	DECODE_DROP_LAST_EVENT_POSITION,
+	decodeDropResyncDisposition,
 	mayRebuildSendRange,
 	rebuildRetryDelayMs,
 	SEND_LOG_REPAIR_INTERVAL_MS,
@@ -48,6 +49,17 @@ describe('recoveryCloseAllowed', () => {
 		// A frequency bound alone leaves an unrepairable fault rebuilding the subscription forever. The
 		// episode below is what keeps that from being permanent.
 		expect(recoveryCloseAllowed(NOW - 10 * INTERVAL, 3, NOW, INTERVAL, 3)).to.equal(false);
+	});
+});
+
+describe('decodeDropResyncDisposition', () => {
+	it('leaves an earlier frame unowned while a later frame gates the session', () => {
+		expect(decodeDropResyncDisposition(false, true)).to.equal('none');
+	});
+
+	it('replays only a claiming frame whose cursor is held by a blob', () => {
+		expect(decodeDropResyncDisposition(true, true)).to.equal('replay');
+		expect(decodeDropResyncDisposition(true, false)).to.equal('poison');
 	});
 });
 
