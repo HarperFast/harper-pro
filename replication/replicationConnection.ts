@@ -314,46 +314,17 @@ function calculateRecoveryCloseClaim(
 	};
 }
 
-// Map-backed for the pure unit tests. Production uses claimRecoveryCloseInSharedStatus below, because a
-// resubscribe may be accepted by a different worker than the socket that spent the previous attempt.
-export function claimRecoveryClose(
-	bounds: Map<string, RecoveryCloseBound>,
-	key: string,
-	now: number,
-	intervalMs: number,
-	budget: number
-): { allowed: boolean; count: number; lastCloseAt: number; rollback: () => void } {
-	const holder = bounds.get(key) ?? {};
-	const had = bounds.has(key);
-	const claim = calculateRecoveryCloseClaim(holder, now, intervalMs, budget);
-	bounds.set(key, claim.next);
-	return {
-		allowed: claim.allowed,
-		count: claim.count,
-		lastCloseAt: claim.lastCloseAt,
-		rollback: () => {
-			if (had) bounds.set(key, holder);
-			else bounds.delete(key);
-		},
-	};
-}
-
 export function claimRecoveryCloseInSharedStatus(
 	status: Float64Array,
 	now: number,
 	intervalMs: number,
 	budget: number
-): { allowed: boolean; count: number; lastCloseAt: number; rollback: () => void } {
-	const previous = [
-		status[DECODE_DROP_LAST_CLOSE_POSITION],
-		status[DECODE_DROP_CLOSE_COUNT_POSITION],
-		status[DECODE_DROP_LAST_EVENT_POSITION],
-	];
+): { allowed: boolean; count: number; lastCloseAt: number } {
 	const claim = calculateRecoveryCloseClaim(
 		{
-			lastCloseAt: previous[0] || undefined,
-			closeCount: previous[1] || undefined,
-			lastEventAt: previous[2] || undefined,
+			lastCloseAt: status[DECODE_DROP_LAST_CLOSE_POSITION] || undefined,
+			closeCount: status[DECODE_DROP_CLOSE_COUNT_POSITION] || undefined,
+			lastEventAt: status[DECODE_DROP_LAST_EVENT_POSITION] || undefined,
 		},
 		now,
 		intervalMs,
@@ -366,11 +337,6 @@ export function claimRecoveryCloseInSharedStatus(
 		allowed: claim.allowed,
 		count: claim.count,
 		lastCloseAt: claim.lastCloseAt,
-		rollback: () => {
-			status[DECODE_DROP_LAST_CLOSE_POSITION] = previous[0];
-			status[DECODE_DROP_CLOSE_COUNT_POSITION] = previous[1];
-			status[DECODE_DROP_LAST_EVENT_POSITION] = previous[2];
-		},
 	};
 }
 // LIVENESS_STALE_MS is defined below, after PING_TIMEOUT, so it can be derived from the configured
@@ -4317,15 +4283,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			lastBackPressureCheck = now;
 		}
 	}
-	const backPressureInterval = setInterval(() => {
-		// Contained: a throw here would reach the interval, where it is an uncaught exception rather than
-		// something a caller can reject.
-		try {
-			updateBackPressureRatio();
-		} catch (error) {
-			logger.warn?.(connectionId, 'Error updating replication back-pressure ratio', error);
-		}
-	}, BACK_PRESSURE_INTERVAL).unref();
+	const backPressureInterval = setInterval(updateBackPressureRatio, BACK_PRESSURE_INTERVAL).unref();
 	function getSharedStatus() {
 		if (!remoteNodeName || !databaseName || !auditStore) {
 			return;
@@ -4364,8 +4322,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			recordPeerLockLevel(status, peerCapabilities.recordLocks);
 		}
 	}
-	// Set by mayResyncForDecodeDrop when it claims a slot, so a close that throws can hand it back.
-	let rollbackDecodeDropClaim: (() => void) | undefined;
 	function mayResyncForDecodeDrop(): boolean {
 		const status = getSharedStatus();
 		// A server-side receive can be accepted by any worker. Without the shared status buffer there is no
@@ -4373,13 +4329,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// reconnects on each new socket.
 		if (!status) return false;
 		const now = Date.now();
-		const { allowed, count, lastCloseAt, rollback } = claimRecoveryCloseInSharedStatus(
+		const { allowed, count, lastCloseAt } = claimRecoveryCloseInSharedStatus(
 			status,
 			now,
 			DECODE_DROP_RESYNC_INTERVAL_MS,
 			DECODE_DROP_RESYNC_BUDGET
 		);
-		if (allowed) rollbackDecodeDropClaim = rollback;
 		if (!allowed)
 			logger.warn?.(
 				connectionId,
@@ -4400,8 +4355,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (!decodeDropResyncPending) return;
 			decodeDropResyncPending = false;
 			stopDecodeDropResyncApplyFailureListener();
-			rollbackDecodeDropClaim?.();
-			rollbackDecodeDropClaim = undefined;
 			wsClosed = true;
 			closeOrTerminate(1011, 'replicated apply failed while structure resync was pending');
 		};
@@ -4529,22 +4482,35 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// share the consumer queue and defeat the per-record backpressure below.
 	let messageProcessing: Promise<void> = Promise.resolve();
 	let wsClosed = false;
-	let resolveInstanceRetired: () => void = () => {};
-	const instanceRetiredSignal = new Promise<void>((resolve) => (resolveInstanceRetired = resolve));
+	let wakeSendLoop: (() => void) | undefined;
 	let decodeDropResyncPending = false;
 	let decodeDropResyncApplyFailureListener: ReplicatedApplyFailureListener | undefined;
 	async function waitForSessionEndOrTransaction(nextTransaction: Promise<unknown>) {
-		await Promise.race([nextTransaction, instanceRetiredSignal]);
+		await new Promise<void>((resolve) => {
+			const wake = () => {
+				if (wakeSendLoop === wake) wakeSendLoop = undefined;
+				resolve();
+			};
+			wakeSendLoop = wake;
+			void nextTransaction.then(wake, wake);
+			if (instanceRetired) wake();
+		});
 	}
 	async function waitForSessionEndOrRetry(ms: number) {
-		let resolveRetry: () => void = () => {};
-		const retry = new Promise<void>((resolve) => (resolveRetry = resolve));
-		const retryTimer = setTimeout(resolveRetry, ms);
-		retryTimer.unref?.();
+		let retryTimer: NodeJS.Timeout | undefined;
 		try {
-			await Promise.race([retry, instanceRetiredSignal]);
+			await new Promise<void>((resolve) => {
+				const wake = () => {
+					if (wakeSendLoop === wake) wakeSendLoop = undefined;
+					resolve();
+				};
+				wakeSendLoop = wake;
+				retryTimer = setTimeout(wake, ms);
+				retryTimer.unref?.();
+				if (instanceRetired) wake();
+			});
 		} finally {
-			clearTimeout(retryTimer);
+			if (retryTimer) clearTimeout(retryTimer);
 		}
 	}
 	// Anything this closure persists (copy cursors, their removal) or forces (the blob-gap
@@ -5084,17 +5050,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						break;
 					case COMMITTED_UPDATE:
 						// we need to record the sequence number that the remote node has received
-						// Validated, but NOT clamped monotonic: this slot is `lastCommitConfirmed` in cluster_status,
-						// and a peer that was re-cloned or restored from an older snapshot legitimately confirms a
-						// lower sequence — pinning the high-water mark would keep reporting the pre-rollback value
-						// to the operator. A NaN/Infinity would reach cluster_status as-is, so that much is rejected.
-						// 0 is a legitimate confirmation, not a malformed one: a receiver holding nothing durable
-						// clamps to min(lastSequenceIdCommitted, lastDurableSequenceId). Only a non-finite or
-						// negative value is rejected.
-						if (Number.isFinite(data) && data >= 0) {
-							getSharedStatus()[CONFIRMATION_STATUS_POSITION] = data;
-						} else
-							logger.warn?.(connectionId, 'ignoring malformed committed update', data, databaseName, remoteNodeName);
+						getSharedStatus()[CONFIRMATION_STATUS_POSITION] = data;
 						logger.info?.(
 							connectionId,
 							'received and broadcasting committed update',
@@ -6919,12 +6875,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 					}
 				}
-				if (!event)
-					(pendingReplicationHoles ??= []).push({
+				if (!event) {
+					const hole = {
 						originId: localSourceNodeId,
 						tableName: tableDecoder.name,
 						reason: 'undecodable record',
-					});
+					};
+					// A claimed structure resync replays a blob-held cursor, so defer its poison only until we
+					// know whether this frame is replayed. Every other dropped record must be durable before a
+					// later frame can commit a cursor beyond it.
+					if (decodeDropResyncPending) (pendingReplicationHoles ??= []).push(hole);
+					else if (!(await recordReplicationHole(hole.originId, hole.tableName, hole.reason))) return;
+				}
 				if (!event && receivedBlobs) {
 					// decode failed mid-message; the blobs that were already accepted will never be referenced. Give in-flight reads
 					// a window to complete, then unlink the files. (mirrors the pattern at the relocate path above.)
@@ -7123,8 +7085,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (await recordReplicationHole(hole.originId, hole.tableName, hole.reason)) continue;
 							decodeDropResyncPending = false;
 							stopDecodeDropResyncApplyFailureListener();
-							rollbackDecodeDropClaim?.();
-							rollbackDecodeDropClaim = undefined;
 							throw new Error('could not record a replication hole before advancing the receive cursor');
 						}
 					}
@@ -7205,8 +7165,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								connectionId,
 								`Could not close or terminate ${databaseName} to ${remoteNodeName} for a structure resync`
 							);
+							// The close budget is deliberately spent even if a broken socket cannot be closed: restoring a
+							// shared-status snapshot could erase another worker's newer claim. Keep this socket live,
+							// and record any blob-held skipped records before their cursor can advance later.
+							wsClosed = false;
+							if (replayingPendingHole && pendingReplicationHoles) {
+								for (const hole of pendingReplicationHoles) {
+									if (await recordReplicationHole(hole.originId, hole.tableName, hole.reason)) continue;
+									throw new Error('could not record a replication hole after a failed structure resync close');
+								}
+							}
 						}
-						rollbackDecodeDropClaim = undefined;
 					}
 				},
 			};
@@ -7311,7 +7280,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (instanceRetired) return;
 		instanceRetired = true;
 		wsClosed = true;
-		resolveInstanceRetired();
+		wakeSendLoop?.();
 		stopDecodeDropResyncApplyFailureListener();
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
 		if (options.connection?.peerCapabilities === peerCapabilities) options.connection.peerCapabilities = undefined;
