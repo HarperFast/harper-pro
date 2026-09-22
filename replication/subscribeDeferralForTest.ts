@@ -16,10 +16,7 @@ const { forComponent } = harperLogger;
 
 const logger = forComponent('replication').conditional as Logger;
 
-/**
- * Read once at load so the production subscribe path tests a constant instead of `process.env`. Only a
- * process the suite started with this set can ever arm.
- */
+/** Only a process started with this can ever arm, and the production subscribe path tests a constant. */
 export const subscribeDeferralAllowedForTest = process.env.HARPER_TEST_ALLOW_SUBSCRIBE_AFTER_OPEN_HOOK === '1';
 
 let armed = false;
@@ -40,7 +37,11 @@ export function deferSubscribeUntilSessionForTest(
 		return true;
 	}
 	if (armed || connection.nodeSubscriptions !== undefined || !connection.session) return false;
-	if (process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB !== connection.databaseName) return false;
+	// Guard the unset variable before comparing, or a connection whose own databaseName is undefined
+	// matches undefined !== undefined and burns the one-shot before the suite has named a database —
+	// the same trap the wedge hook documents in replicationConnection.ts.
+	const deferralDatabase = process.env.HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB;
+	if (!deferralDatabase || deferralDatabase !== connection.databaseName) return false;
 	armed = true;
 	connection.deferredSubscribeForTest = { nodeSubscriptions, replicateTablesByDefault };
 	logger.warn?.(`[test] deferring subscribe until session open for db "${connection.databaseName}" (harper-pro#431)`);
