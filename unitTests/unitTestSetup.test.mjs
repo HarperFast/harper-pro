@@ -27,9 +27,9 @@ describe('unit-test storage root lifecycle', function () {
 			],
 			{
 				cwd: root,
-				// Both overrides suppress the flush-on-exit listener whose ordering this covers, and
-				// either one inherited from the caller would leave the child asserting nothing.
-				// spawn drops undefined values, so this unsets rather than forwards.
+				// A caller running under lmdb, or exporting HARPER_NO_FLUSH_ON_EXIT, has no flush-on-exit
+				// listener for the child to order against, and the child would assert nothing. Force the
+				// engine and drop the variable — spawn ignores an env value of undefined.
 				env: { ...process.env, HARPER_STORAGE_ENGINE: 'rocksdb', HARPER_NO_FLUSH_ON_EXIT: undefined },
 				stdio: ['ignore', 'pipe', 'pipe'],
 			}

@@ -17,7 +17,7 @@ function removeTestDir() {
 		fs.rmSync(testDir, { recursive: true, force: true });
 	} catch (error) {
 		// Nothing below may throw either: an exception out of an 'exit' listener replaces the run's
-		// real result with an opaque non-zero exit, which is what moving this hook avoids.
+		// real result with an opaque non-zero exit.
 		try {
 			fs.writeSync(2, `could not remove the unit-test root ${testDir}: ${error.message}\n`);
 		} catch {}
