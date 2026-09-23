@@ -106,7 +106,7 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 		const seedLogPath = localLogPath(ctx.nodeA.dataRootDir);
 		const seedLogKey = await waitForCondition(() => readSeedLogKey(seedLogPath), {
 			timeoutMs: OPERATION_TIMEOUT_MS,
-			description: () => `the seed frame in ${seedLogPath}`,
+			description: () => `the first frame of ${seedLogPath} to carry the seed record`,
 		});
 
 		await sendOperation(
@@ -279,12 +279,9 @@ function frameCarries(buffer, { position, length }, id) {
 	return buffer.subarray(position + ENTRY_HEADER_SIZE, position + ENTRY_HEADER_SIZE + length).includes(payloadFor(id));
 }
 
-/**
- * The seed frame's header timestamp, read from A's live log. It is the entry's log key, the value A's
- * sender compares a requested start against: the retention base-copy upgrade fires only below the
- * oldest retained key, and replay starts exclusive of the requested one, so joining at exactly this
- * key streams every later write and never the seed.
- */
+// The header timestamp is the entry's log key. A's sender upgrades a start to a base copy only below
+// its oldest retained key and replays exclusive of the start, so this exact key streams every later
+// write and never the seed.
 function readSeedLogKey(logPath) {
 	let buffer;
 	try {
@@ -294,9 +291,7 @@ function readSeedLogKey(logPath) {
 		throw error;
 	}
 	const [seedFrame] = readFrames(buffer);
-	if (!seedFrame) return;
-	ok(frameCarries(buffer, seedFrame, SEED_ID), `the first frame of ${logPath} does not carry the seed record`);
-	return seedFrame.timestamp;
+	if (seedFrame && frameCarries(buffer, seedFrame, SEED_ID)) return seedFrame.timestamp;
 }
 
 /**
@@ -388,8 +383,7 @@ function assertExactRows(rows, expectedIds, when) {
 	}
 }
 
-// Every base-copy path walks each table of the database, so the seed on B means B was served A's
-// tables rather than A's log.
+// Every base-copy path walks every table of the database, the seed's included.
 async function assertNeverCopied(node, when) {
 	const seedRows = await readRows(node, undefined, SEED_TABLE);
 	ok(
