@@ -154,7 +154,6 @@ suite('writes in the pre-crash window still replicate', { timeout: 600000 }, (ct
 		// restarted, so the harness's child handle is still its running process.
 		await killHarper({ harper: nodeB });
 
-		// Now crash A: restart it, then keep writing until it stops answering.
 		const pidA = await readNodePid(nodeA);
 		await sendOperation(nodeA, { operation: 'restart' }).catch(() => {});
 
@@ -163,15 +162,19 @@ suite('writes in the pre-crash window still replicate', { timeout: 600000 }, (ct
 		for (let i = 0; Date.now() < deadline; i++) {
 			const id = `window-${String(i).padStart(4, '0')}`;
 			try {
-				await sendOperation(nodeA, {
-					operation: 'upsert',
-					database: 'data',
-					table: 'crash_window_test',
-					records: [{ id, value: 'in-window', pad: PADDING }],
-				});
+				await sendOperation(
+					nodeA,
+					{
+						operation: 'upsert',
+						database: 'data',
+						table: 'crash_window_test',
+						records: [{ id, value: 'in-window', pad: PADDING }],
+					},
+					{ signal: AbortSignal.timeout(WRITE_WINDOW_MS) }
+				);
 				accepted.push(id);
 			} catch {
-				break; // node is down
+				break; // node is down, or stalled going down
 			}
 		}
 		ok(accepted.length > 0, 'no writes were accepted before A shut down; the window closed too fast');

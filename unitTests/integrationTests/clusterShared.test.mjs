@@ -293,6 +293,17 @@ describe('cluster test helpers — restart identity and teardown', () => {
 		expect(error?.message).to.equal('node test-node did not restart within 50ms (still pid 111)');
 	});
 
+	it('waitForNewPid times out saying the pid file is gone when no replacement wrote one', async () => {
+		const error = await waitForNewPid({ hostname: 'test-node', dataRootDir: root }, 111, {
+			pollMs: 5,
+			timeoutMs: 50,
+		}).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.message).to.equal('node test-node did not restart within 50ms (no pid file)');
+	});
+
 	it('waitForNewPid refuses a missing previous pid rather than passing on the old process', async () => {
 		await writeFile(join(root, 'hdb.pid'), '111');
 		const error = await waitForNewPid({ hostname: 'test-node', dataRootDir: root }, undefined).then(

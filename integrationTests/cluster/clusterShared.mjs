@@ -178,12 +178,14 @@ export async function waitForNewPid(node, previousPid, { timeoutMs = 60000, poll
 		throw new TypeError(`waitForNewPid needs the pid ${node.hostname} had before restart, got ${previousPid}`);
 	}
 	const deadline = Date.now() + timeoutMs;
+	let pid;
 	while (Date.now() < deadline) {
 		await delay(pollMs);
-		const pid = await readNodePid(node);
+		pid = await readNodePid(node);
 		if (pid !== undefined && pid !== previousPid) return pid;
 	}
-	throw new Error(`node ${node.hostname} did not restart within ${timeoutMs}ms (still pid ${previousPid})`);
+	const state = pid === undefined ? 'no pid file' : `still pid ${previousPid}`;
+	throw new Error(`node ${node.hostname} did not restart within ${timeoutMs}ms (${state})`);
 }
 
 /**
@@ -229,23 +231,18 @@ export async function stopNodeProcess(node, { timeoutMs = 15000 } = {}) {
 
 /**
  * `after()` for a suite that restarts nodes: `stopNodeProcess` then `teardownHarper` on each node.
- * Every node is attempted, and any failure is rethrown so a surviving Harper fails the suite rather
- * than holding its ports into the next one.
+ * Every step is attempted on every node, and every error is rethrown together rather than logged.
  *
  * @param {Array<Object|undefined>} nodes - unstarted (undefined) entries are skipped
  */
 export async function stopAndTeardownNodes(nodes) {
-	const results = await Promise.allSettled(
+	const failures = [];
+	await Promise.all(
 		nodes.filter(Boolean).map(async (node) => {
-			try {
-				// a node whose start failed before it had a root has no pid file to read
-				if (node.dataRootDir) await stopNodeProcess(node);
-			} finally {
-				await teardownHarper({ harper: node });
-			}
+			if (node.dataRootDir) await stopNodeProcess(node).catch((error) => failures.push(error));
+			await teardownHarper({ harper: node }).catch((error) => failures.push(error));
 		})
 	);
-	const failures = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
 	if (failures.length) throw new AggregateError(failures, 'Failed to stop or tear down a Harper node');
 }
 

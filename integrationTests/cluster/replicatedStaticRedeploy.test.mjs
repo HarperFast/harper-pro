@@ -280,7 +280,6 @@ suite('replicated redeploy of a static-file component (gh#1935 regression anchor
 			if (!ctx.snapshots?.origin) return; // test 2 didn't set snapshots — its own failure already surfaces the issue
 			const before = ctx.snapshots;
 
-			// Restart node 1 (replica) only.
 			await restartNode(ctx.nodes[1]);
 			await pollHealth(ctx.nodes[1]);
 
