@@ -1,12 +1,7 @@
 /**
- * An echoed delete run (harper-pro#826) must neither wedge the sender nor re-log on the receiver.
- *
- * Before the fix, a replicated delete re-delivered onto its own tombstone re-applied and appended a new
- * entry at its origin log key, so a mesh echoed one delete into millions of copies under one key. The
- * sender ships everything under one key as one frame, so the run outgrew `replication_maxPayload` and
- * the leg closed and resumed into the same frame forever.
- *
- * The fixture plants that log state on A while B is offline, so B resumes from a cursor below both runs:
+ * An echoed delete run (harper-pro#826; replication/DESIGN.md item 20) must neither wedge the sender nor
+ * re-log on the receiver. The fixture plants the log state older releases left on A while B is offline,
+ * so B resumes from a cursor below both runs — a connected B's cursor would already be past them:
  *  - `z` × 20,000 under z's delete key: byte-identical copies, far above A's 256 KiB cap. The sender must
  *    collapse them; otherwise the later marker write never reaches B.
  *  - `[x, y]` × 40 under their shared delete key: alternating, so the sender cannot collapse them and B
@@ -66,12 +61,16 @@ async function hasRecord(node, id, signal) {
 		node,
 		{ operation: 'search_by_id', database: 'data', table: TABLE, ids: [id], get_attributes: ['id'] },
 		{ signal }
-	).catch((error) => {
-		if (signal?.aborted) throw error;
-		return [];
-	});
+	);
 	return rows.length > 0;
 }
+
+// while a node is still coming up, an unanswered probe means "not yet"
+const eventuallyHasRecord = (node, id) => (signal) =>
+	hasRecord(node, id, signal).catch((error) => {
+		if (signal.aborted) throw error;
+		return false;
+	});
 
 suite(
 	'An echoed delete run neither wedges the sender nor re-logs on the receiver (harper-pro#826)',
@@ -106,7 +105,8 @@ suite(
 				records: ['x', 'y', 'z'].map((id) => ({ id, name: id })),
 			});
 			await waitForCondition(
-				async (signal) => (await hasRecord(ctx.B, 'z', signal)) && (await hasRecord(ctx.B, 'x', signal)),
+				async (signal) =>
+					(await eventuallyHasRecord(ctx.B, 'z')(signal)) && (await eventuallyHasRecord(ctx.B, 'x')(signal)),
 				{
 					timeoutMs: 90000,
 					description: 'the seed rows reach B',
@@ -144,7 +144,7 @@ suite(
 
 			ctx.B = (await startHarper({ harper: ctx.B }, nodeConfig(ctx.B.hostname))).harper;
 			const { B } = ctx;
-			await waitForCondition((signal) => hasRecord(B, 'marker', signal), {
+			await waitForCondition(eventuallyHasRecord(B, 'marker'), {
 				timeoutMs: 90000,
 				description: 'the write after the runs reaches B',
 			});

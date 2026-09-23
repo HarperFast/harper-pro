@@ -435,10 +435,8 @@ export function exceedsMaxPayload(messageSize: number, maxPayload: number = MAX_
 	return messageSize > maxPayload;
 }
 /**
- * Whether a delete's frame bytes repeat, byte for byte, the delete written immediately before it in the
- * frame being built. Such a copy deletes an already-deleted key on every receiver. A log that already
- * holds an echoed run of one delete (harper-pro#826) would otherwise ship the whole run as one frame,
- * which exceeds the payload cap and wedges the leg until retention purges the run.
+ * Whether a delete's frame bytes repeat the delete written immediately before it in the frame being
+ * built — a copy that deletes an already-deleted key on every receiver (replication/DESIGN.md).
  */
 export function repeatsQueuedDelete(queuedDelete: Uint8Array | undefined, entryBytes: Uint8Array): boolean {
 	return queuedDelete !== undefined && Buffer.compare(queuedDelete, entryBytes) === 0;
@@ -5854,14 +5852,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								frame.encodingStart = frame.position;
 								frame.writeFloat64(txnLogKey);
 							}
+							const encoded = invalidationEntry ? undefined : auditRecord.encoded;
+							// If it starts with the previous local time, we omit that
+							const start = encoded?.[0] === 66 ? 8 : 0;
 							if (auditRecord.type === 'delete') {
-								const encoded = auditRecord.encoded;
-								const entryBytes = encoded[0] === 66 ? encoded.subarray(8) : encoded;
+								const wireBytes = invalidationEntry ?? (start ? encoded.subarray(start) : encoded);
 								// Not skipAuditRecord(): its timer can send a sequence update for this frame's key before
 								// the frame itself is flushed.
-								if (repeatsQueuedDelete(currentTransaction.queuedDelete, entryBytes)) return new Promise(setImmediate);
-								// a copy: a range read may hand back the same buffer for the next entry
-								currentTransaction.queuedDelete = entryBytes.slice();
+								if (repeatsQueuedDelete(currentTransaction.queuedDelete, wireBytes)) return new Promise(setImmediate);
+								currentTransaction.queuedDelete = Buffer.from(wireBytes); // a copy; Buffer#slice would be a view
 							} else currentTransaction.queuedDelete = undefined;
 
 							/*
@@ -5873,7 +5872,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								frame.writeBytes(invalidationEntry);
 							} else {
 								// directly write the audit record.
-								const encoded = auditRecord.encoded;
 								if (auditRecord.extendedType & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
 									decodeWithBlobCallback(
@@ -5882,8 +5880,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										primaryStore.rootStore
 									);
 								}
-								// If it starts with the previous local time, we omit that
-								const start = encoded[0] === 66 ? 8 : 0;
 								frame.writeInt(encoded.length - start);
 								frame.writeBytes(encoded, start);
 								logger.debug?.(

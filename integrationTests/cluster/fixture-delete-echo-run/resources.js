@@ -1,11 +1,6 @@
 /**
- * Fixture for deleteEchoRun.test.mjs (harper-pro#826).
- *
- * `PlantDeleteRun` writes the log state an echo storm left behind on releases before the fix: copies of
- * existing delete entries appended under the delete's own log key. POST `{ ids, copies }` finds each id's
- * latest delete (they must share one log key) and appends the sequence `ids` that many times.
- *
- * `DeleteEntries/<id>` counts the delete entries this node's logs hold for one record.
+ * Fixture for deleteEchoRun.test.mjs. `PlantDeleteRun` POST `{ ids, copies }` appends the sequence `ids`
+ * `copies` times under the shared log key of those ids' latest deletes — the run an echo left behind.
  */
 
 function deleteEntries(id) {

@@ -6,6 +6,7 @@ describe('repeatsQueuedDelete (harper-pro#826)', () => {
 
 	it('matches a byte-identical delete', () => {
 		expect(repeatsQueuedDelete(entry.slice(), entry)).to.equal(true);
+		expect(repeatsQueuedDelete(Buffer.from(entry), Buffer.from(entry))).to.equal(true);
 	});
 
 	it('never matches when no delete is queued in this frame', () => {
