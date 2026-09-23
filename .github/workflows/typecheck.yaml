@@ -1,0 +1,39 @@
+name: Typecheck
+
+# Eight workflows build with `npm run build || true`, which discards tsc's exit
+# code. This job runs `tsc --noEmit`, whose only product is that exit code.
+#
+# No `paths:` filter, for the same reason as `validate-caller-workflows.yml`: a
+# required status check that only fires on some PRs stays permanently pending on
+# the rest.
+#
+# Enforcement lives in branch protection, not here: this file only produces the
+# `typecheck` status, which has to be a required check on `main` to block a merge.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+# The typecheck step runs a PR-authored `package.json` script, and the repo's
+# default token is write-scoped.
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      # tsconfig.json includes core/**, so the submodule must be present.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          package-manager-cache: false
+      # Type-only check: no native postinstall output is read, so skip the scripts.
+      # A registry blip must not red a required check.
+      - run: .github/scripts/retry.sh "npm ci" -- npm ci --ignore-scripts
+      - run: npm run typecheck
