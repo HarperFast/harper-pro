@@ -445,7 +445,9 @@ export function repeatsQueuedDelete(
 	entryStart: number
 ): boolean {
 	return (
-		queuedLength === entry.length - entryStart && queued.compare(entry, entryStart, entry.length, 0, queuedLength) === 0
+		queuedLength >= 0 &&
+		queuedLength === entry.length - entryStart &&
+		queued.compare(entry, entryStart, entry.length, 0, queuedLength) === 0
 	);
 }
 // Throttle the oversized-send error: it closes and reconnects the leg, so it would otherwise re-log on
@@ -5872,7 +5874,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return new Promise(setImmediate);
 								const length = wire.length - wireStart;
 								if (length > queuedDelete.length) queuedDelete = Buffer.allocUnsafe(length);
-								// copied, not referenced: a range read may reuse the buffer it handed back
+								// copied rather than held: nothing guarantees the entry's buffer outlives the next read
 								Buffer.prototype.copy.call(wire, queuedDelete, 0, wireStart);
 								currentTransaction.queuedDeleteLength = length;
 							} else currentTransaction.queuedDeleteLength = -1;
