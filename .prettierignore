@@ -1,0 +1,3 @@
+# core is a separate repo (github.com/HarperFast/harper), vendored as a git
+# submodule; it owns its own formatting and CI. Never format it from here.
+core/

@@ -52,7 +52,12 @@ import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
-import { startHarper, teardownHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import {
+	startHarper,
+	teardownHarper,
+	killHarper,
+	getNextAvailableLoopbackAddress,
+} from '@harperfast/integration-testing';
 import {
 	stressEnabled,
 	sendOperation,
@@ -275,7 +280,10 @@ if (!stressEnabled()) {
 					await killHarper({ harper: target });
 					await delay(1000);
 					const restartCtx = { name: ctx.name, harper: { dataRootDir: target.dataRootDir, hostname: target.hostname } };
-					await startHarper(restartCtx, { config: baseConfig(target.hostname), env: { HARPER_NO_FLUSH_ON_EXIT: true } });
+					await startHarper(restartCtx, {
+						config: baseConfig(target.hostname),
+						env: { HARPER_NO_FLUSH_ON_EXIT: true },
+					});
 					// Record the new incarnation's log location for the end-of-run scan, then update the
 					// SAME `target` object in place. ctx.nodes/survivors and the metrics sampler all hold
 					// `target`, so Object.assign transitions them to the restarted node's port/creds/log
@@ -317,7 +325,11 @@ if (!stressEnabled()) {
 			// dataRootDir/log/hdb.log — aren't scanned twice.
 			const seenLogPaths = new Set();
 			const scanned = incarnations.filter((n) => {
-				const path = n.logDir ? join(n.logDir, 'hdb.log') : n.dataRootDir ? join(n.dataRootDir, 'log', 'hdb.log') : null;
+				const path = n.logDir
+					? join(n.logDir, 'hdb.log')
+					: n.dataRootDir
+						? join(n.dataRootDir, 'log', 'hdb.log')
+						: null;
 				if (!path || seenLogPaths.has(path)) return false;
 				seenLogPaths.add(path);
 				return true;
@@ -352,7 +364,10 @@ if (!stressEnabled()) {
 			for (let i = 0; i < survivors.length; i++) {
 				const peakMb = summaries[i].peakRss / 1024 / 1024;
 				console.log(`[wedge] ${survivors[i].hostname}: peakRss=${mb(summaries[i].peakRss)}`);
-				ok(peakMb < RSS_CAP_MB, `${survivors[i].hostname} peak RSS ${peakMb.toFixed(0)} MB exceeded cap ${RSS_CAP_MB} MB`);
+				ok(
+					peakMb < RSS_CAP_MB,
+					`${survivors[i].hostname} peak RSS ${peakMb.toFixed(0)} MB exceeded cap ${RSS_CAP_MB} MB`
+				);
 			}
 
 			// (4) Final mesh + convergence among survivors. Poll for convergence rather than
