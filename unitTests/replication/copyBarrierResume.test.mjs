@@ -112,16 +112,14 @@ describe('the base-copy resume boundary, against a real transaction log', () => 
 });
 
 describe('isCopyResumeOrderCompatible', () => {
-	it("rejects a cursor whose copyOrder wasn't built under the leader's current version", () => {
+	// This gates the copy-table-ORDER skip-loop (#421), unrelated to the barrier/timestamp anchor
+	// below: harper-pro#876 leaves COPY_ORDER_VERSION at 1, so a pre-#876 leader's cursor is
+	// `(1, 1)` here — accepted, same as any other leader on today's order version. `undefined`
+	// is a leader from before #421 existed at all (no `copyOrder` field), not a "pre-barrier" one.
+	it('rejects a cursor whose copyOrder is absent or from a different table-order version', () => {
 		expect(isCopyResumeOrderCompatible(1, 2)).to.equal(false);
 		expect(isCopyResumeOrderCompatible(undefined, 2)).to.equal(false);
 		expect(isCopyResumeOrderCompatible(2, 2)).to.equal(true);
-	});
-
-	// COPY_ORDER_VERSION is still 1 (harper-pro#876 didn't bump it), so a real pre-barrier
-	// leader's cursor is the `undefined` case above, not a `1` vs `2` mismatch.
-	it("rejects a real pre-barrier leader's cursor, so its timestamp anchor is discarded with it", () => {
-		expect(isCopyResumeOrderCompatible(undefined, 1)).to.equal(false);
 	});
 });
 
