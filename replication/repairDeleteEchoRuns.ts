@@ -132,6 +132,8 @@ function readVarint(data: Buffer, cursor: { position: number }): number | undefi
  * Mirrors the field layout RocksTransactionLogStore.getRange and core's readAuditEntry read; returns
  * undefined for anything that does not decode, which the caller keeps verbatim.
  */
+const cursor = { position: 0 };
+
 export function decodeEntry(data: Buffer): DecodedEntry | undefined {
 	if (data.length < 4) return;
 	const prelude = data.readUInt32BE(0);
@@ -140,7 +142,7 @@ export function decodeEntry(data: Buffer): DecodedEntry | undefined {
 	if (prelude & HAS_PREVIOUS_VERSION) position += 8;
 	const replicatedStart = position;
 	if (data[position] === PREVIOUS_VERSION_FIRST_BYTE) position += 8;
-	const cursor = { position };
+	cursor.position = position;
 	const action = readVarint(data, cursor);
 	const nodeId = readVarint(data, cursor);
 	const tableId = readVarint(data, cursor);
@@ -780,7 +782,8 @@ async function planDatabase(
 		report.logs = stores.map(toReport);
 		return { report, stores };
 	} catch (error) {
-		if (!(error instanceof RepairRefusedError)) throw error;
+		// retention on a running node can delete a file mid-listing
+		if (!(error instanceof RepairRefusedError) && error.code !== 'ENOENT') throw error;
 		report.refused = error.message;
 		return { report };
 	}
@@ -1093,15 +1096,23 @@ function restoreHeld(backupDir: string, databasePath: string, manifest: Manifest
 			assertPlain(target, false);
 			const current = existsSync(target) ? sha256File(target) : undefined;
 			if (current !== replaced.originalSha256 && current !== replaced.sha256) throw moved(target);
+			if (current === replaced.originalSha256) continue;
 			const original = join(backupDir, entry.name, replaced.file);
 			// checked again, through the descriptor it copies from, by copyOriginal
-			if (current !== replaced.originalSha256 && (!lstatSync(original).isFile() || lstatSync(original).nlink !== 1))
-				throw new RepairRefusedError(`${original} is not a singly linked file`);
+			const stats = existsSync(original) ? lstatSync(original) : undefined;
+			if (!stats?.isFile() || stats.nlink !== 1 || sha256File(original) !== replaced.originalSha256)
+				throw new RepairRefusedError(`${original} is missing, linked or changed; it cannot be restored from`);
 		}
 	}
 	for (const entry of manifest.logs) {
 		const storeDir = join(databasePath, 'transaction_logs', entry.name);
 		const stagingDir = join(backupDir, entry.name);
+		// the same rewind the repair published under, so no swap in between can leave an offset mid-entry
+		if (entry.txnState)
+			renameSync(
+				writeTxnState(stagingDir, storeDir, { offset: FILE_HEADER_SIZE, sequence: entry.txnState.original.sequence }),
+				join(storeDir, TXN_STATE)
+			);
 		for (const name of entry.created) rmSync(join(storeDir, name), { force: true });
 		for (const replaced of entry.replaced) {
 			const target = join(storeDir, replaced.file);
@@ -1125,12 +1136,12 @@ export interface DatabaseEntry {
 	refused?: string;
 }
 
-/** The RocksDB databases under `<root>/database`. */
 export function listDatabases(root: string): DatabaseEntry[] {
 	if (process.platform === 'win32' || endianness() !== 'LE')
 		throw new RepairRefusedError('supported on little-endian POSIX platforms only');
 	const storageRoot = join(root, 'database');
-	if (!existsSync(storageRoot)) throw new RepairRefusedError(`${storageRoot} does not exist`);
+	if (!existsSync(storageRoot) || !statSync(storageRoot).isDirectory())
+		throw new RepairRefusedError(`${storageRoot} is not a directory`);
 	const databases: DatabaseEntry[] = [];
 	for (const entry of readdirSync(storageRoot, { withFileTypes: true })) {
 		const path = join(storageRoot, entry.name);

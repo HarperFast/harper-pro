@@ -702,13 +702,14 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			expect(existsSync(backupDir)).to.equal(false);
 		});
 
-		it('refuses a restore source that is a link before changing anything', async () => {
+		it('refuses a restore source that is linked or changed before changing anything', async () => {
 			for (const replace of [
 				(original) => {
 					rmSync(original);
 					symlinkSync(join(root, 'elsewhere'), original);
 				},
 				(original) => linkSync(original, join(root, `extra-link${counter++}`)),
+				(original) => appendFileSync(original, Buffer.alloc(1)),
 			]) {
 				const databasePath = await pristine();
 				await repairDatabase(databasePath, { apply: true });

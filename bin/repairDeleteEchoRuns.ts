@@ -1,4 +1,4 @@
-import { statSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
@@ -54,16 +54,21 @@ function printReport(report: DatabaseReport, apply: boolean): void {
  */
 function runAsOwnerOf(paths: string[]): void {
 	if (process.getuid?.() !== 0) return;
-	const owners = new Map(paths.map((path) => [statSync(path).uid, statSync(path).gid]));
+	const owners = new Set<string>();
+	for (const path of paths) {
+		if (!existsSync(path)) throw new RepairRefusedError(`${path} does not exist`);
+		const { uid, gid } = statSync(path);
+		owners.add(`${uid}:${gid}`);
+	}
 	if (owners.size > 1)
-		throw new RepairRefusedError(
-			`the databases have different owners (uids ${[...owners.keys()].join(', ')}); run as each`
-		);
+		throw new RepairRefusedError(`the databases have different owners (${[...owners].join(', ')}); run as each`);
 	const [owner] = owners;
-	if (!owner || owner[0] === 0) return;
-	process.setgroups([owner[1]]);
-	process.setgid(owner[1]);
-	process.setuid(owner[0]);
+	if (!owner) return;
+	const [uid, gid] = owner.split(':').map(Number);
+	if (uid === 0) return;
+	process.setgroups([gid]);
+	process.setgid(gid);
+	process.setuid(uid);
 }
 
 async function main(): Promise<number> {
