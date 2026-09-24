@@ -6080,6 +6080,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// original anchor — a later one would lose everything committed between the two. (harper-pro#876)
 											const anchorKey =
 												copyResume || !canResumePastAnchor ? undefined : findLastCommittedLogKey(auditStore, logName);
+											// An empty log (anchorKey 0) still sends the wall clock, never a sentinel below every key: the
+											// follower persists it, and shouldForceBaseCopyForRetention reads such a cursor as purged history.
 											const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
 											// A resumed copy resumes in append order only if its anchor still NAMES an entry of the log;
 											// anything else — a pre-#876 wall-clock anchor, a purged entry, a log that cannot be read — keeps

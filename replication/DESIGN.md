@@ -202,8 +202,9 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
    excluded it while the key-order walk had already passed its row. Permanent loss, and the same
    reasoning `RECORD_LOCK_FRESHNESS_DESIGN.md` records for fences: _nothing numeric is a fence_.
 
-   The leader anchors on **the key of the last committed entry in its `local` log**, read just before
-   `COPY_START` (`findLastCommittedLogKey`, scanning from the last flushed position). The log yields
+   The leader anchors on **the key of the latest committed entry in its `local` log**, read just before
+   `COPY_START` (`findLastCommittedLogKey`, which bisects on key with one pulled entry per probe — a
+   range seeks through the log's running-max index, so no probe reads history). The log yields
    entries only up to its committed watermark, which rocksdb-js advances past a transaction only after
    its RocksDB commit succeeds, and only across a contiguous prefix — so everything up to the anchor
    is visible to the walk, and everything still in flight appends after it. The copy's tail resumes
@@ -215,12 +216,18 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
    `auditStore.reusableIterable` (the RocksDB log store), not the `STORAGE_IS_ROCKSDB` config
    snapshot, which can misreport the engine in a worker.
 
-   A resumed copy tries the anchor as an exact entry first (`classifyResumeAnchor`) and resumes in
-   append order when it names one; otherwise — a pre-#876 `Date.now()` cursor, a purged entry — it
-   keeps the timestamp resume. Nothing is written to anchor a copy, so there is no new entry type.
+   An empty log needs no anchor entry: everything it will yield commits later, so the tail is an
+   ordinary range from its start. The follower is still sent `Date.now()`, not a sentinel below every
+   key, because `shouldForceBaseCopyForRetention` would read such a cursor as purged history and
+   recopy an idle follower on every reconnect.
 
-   **Every failure degrades to the pre-#876 behaviour and says so**, rather than failing closed: no
-   entry committed since the last flush, an unformable boundary, an unreadable anchor, or a resumed
+   A resumed copy tries the anchor as an exact entry first (`classifyResumeAnchor`) and resumes in
+   append order when it names one; otherwise — a pre-#876 `Date.now()` cursor, an empty-log copy, a
+   purged entry — it keeps the timestamp resume. Nothing is written to anchor a copy, so there is no
+   new entry type.
+
+   **Every failure degrades to the pre-#876 behaviour and says so**, rather than failing closed: an
+   unreadable log, an unformable boundary, an unreadable anchor, or a resumed
    cursor that names no entry all fall back to the timestamp range with a `warn`/`error` line naming
    the database. Fail-closed was tried and withdrawn — it turned a storage hiccup into a reconnect
    loop copying nothing, and rejected the leader's own fallback cursors. The cursor
