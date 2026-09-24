@@ -36,7 +36,7 @@ jobs:
         run: npm rebuild re2
 
       - name: Build
-        run: npm run build || true
+        run: npm run build
 
       - name: Run unit tests
         run: npm run test:unit
