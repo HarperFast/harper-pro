@@ -45,9 +45,8 @@ const BLOB_RECORDS = 40; // /LargeLocation/{n} on A — each a deterministic ~50
 const BLOB_BYTES = 50 * 1024;
 // Records 14 and 30 are damaged in the initial pass; the resumed walk's in-place repair of record
 // 30 fails after that walk has advanced beyond the first gap. Selected by record, not by save
-// ordinal: the leader's post-walk log tail can re-deliver records the walk already copied
-// (harper-pro#878), and those extra saves shifted an ordinal schedule's last fault out of the
-// resumed pass (CI at ae7f0017).
+// ordinal: the copy's post-walk log tail can re-deliver records the walk already copied, which
+// an ordinal schedule counts as walk saves.
 const FAIL_SAVES = ['14:1', '30:1', '30:repair'];
 const INITIAL_DAMAGED_RECORDS = 2;
 const BLOB_SLOW_MS = 400; // every save held in flight, so the pre-#699 snapshot instant never occurs
@@ -128,8 +127,8 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 		// Seed with count-verified retries: under load the deploy restart can race the first GETs, so
 		// re-request every id until describe_table confirms the full set (GETs are idempotent).
 		// Sequential, so A's log is appended in key order: a transaction created before but committed
-		// after a later one is re-delivered by the copy's post-walk tail (harper-pro#878), which would
-		// give a faulted record a second fresh save the schedule below does not account for.
+		// after a later one is re-delivered by the copy's post-walk tail, which would give a faulted
+		// record a second fresh save the schedule above does not account for.
 		for (let attempt = 0; attempt < 20; attempt++) {
 			for (let id = 0; id < BLOB_RECORDS; id++) {
 				await fetchWithRetry(ctx.nodes[0].httpURL + '/LargeLocation/' + id).catch(() => null);

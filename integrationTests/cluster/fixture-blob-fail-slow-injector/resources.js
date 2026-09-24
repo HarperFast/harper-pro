@@ -8,12 +8,12 @@
 // copyGapCursorBanking.test.mjs (harper-pro#699) needs: fast local saves drain between frames,
 // which lets a copy bank by luck through blob-quiescent instants that never occur in production.
 //
-// Faults are selected by record, not by a global save ordinal: the leader's post-walk log tail can
-// re-deliver records the walk already copied (harper-pro#878 resumes it in append order), and those
-// extra saves shifted an ordinal schedule's last fault out of the resumed pass (CI at ae7f0017).
-// A record is only identifiable from its payload, whose first byte arrives on the stream's second
-// write, so the header write is held back until then and the failure is raised before any byte
-// reaches the file.
+// Faults are selected by record, not by a global save ordinal: the base copy's post-walk log tail
+// can re-deliver records the walk already copied, and an ordinal schedule cannot tell those extra
+// saves from the walk's. A record is only identifiable from its payload, whose first byte arrives on
+// the stream's second write (core's writeBlobWithStream writes the 8-byte size header first, then
+// pipes the body), so the header write is held back until then and a failure is raised before any
+// byte reaches the file.
 //
 // Patches the CJS module object via `createRequire` (ESM namespaces are frozen); Harper's dist
 // code resolves `createWriteStream` off the live module object at call time.
@@ -38,14 +38,24 @@ if (failSaves.size > 0 || (Number.isFinite(slowMs) && slowMs > 0)) {
 			// Return the REAL stream (saveBlob reads fd/bytesWritten off it) with only write() patched.
 			const real = realCreateWriteStream.apply(this, arguments);
 			const realWrite = real.write.bind(real);
+			const realEnd = real.end.bind(real);
 			let writes = 0;
 			let header;
 			let recordSeed = -1;
+			const flushHeader = () => {
+				if (!header) return;
+				realWrite(...header);
+				header = undefined;
+			};
+			real.end = function () {
+				flushHeader();
+				return realEnd(...arguments);
+			};
 			real.write = function (chunk, enc, cb) {
 				writes++;
 				if (writes === 1) {
-					// saveBlob's 8-byte size header: held until the record is known, so a failed save
-					// leaves an empty file (the receiver stamps it PENDING), never a partial one.
+					// The size header: held until the record is known, so a failed save leaves an empty
+					// file (the receiver stamps it PENDING), never a partial one.
 					header = [chunk, enc, cb];
 					return false;
 				}
@@ -59,23 +69,28 @@ if (failSaves.size > 0 || (Number.isFinite(slowMs) && slowMs > 0)) {
 						: `${recordSeed}:${++counters.fresh}`;
 					if (attempt && failSaves.has(attempt)) {
 						console.log('[blob-fail-slow-injector] failing save ' + attempt + ' ' + path);
+						const err = new Error("ENOENT: no such file or directory, open '" + path + "'");
+						err.code = 'ENOENT';
+						err.errno = -2;
+						err.syscall = 'open';
+						err.path = path;
+						const heldHeaderCallback = header[2];
+						header = undefined;
 						process.nextTick(() => {
-							const err = new Error("ENOENT: no such file or directory, open '" + path + "'");
-							err.code = 'ENOENT';
-							err.errno = -2;
-							err.syscall = 'open';
-							err.path = path;
 							real.emit('error', err);
+							heldHeaderCallback?.(err);
+							cb?.(err);
 						});
 						return false;
 					}
 					console.log('[blob-save-start] ' + path + ' record=' + recordSeed);
-					realWrite(...header);
-					header = undefined;
-					// The first chunk reports backpressure and releases a manual 'drain' after slowMs, so
-					// every save is held in flight across frames without reordering data.
-					if (slowMs > 0) setTimeout(() => real.emit('drain'), slowMs);
-					return realWrite(chunk, enc, cb);
+					flushHeader();
+					const accepted = realWrite(chunk, enc, cb);
+					if (slowMs <= 0) return accepted;
+					// The first payload chunk reports backpressure and a manual 'drain' releases the pipe
+					// after slowMs, so every save is held in flight across frames without reordering data.
+					setTimeout(() => real.emit('drain'), slowMs);
+					return false;
 				}
 				return realWrite(chunk, enc, cb);
 			};
