@@ -2469,37 +2469,54 @@ export function isCopyResumeOrderCompatible(copyOrder: number | undefined, order
 	return copyOrder === orderVersion;
 }
 
-const LAST_ENTRY_SEARCH_WINDOWS_MS = [1_000, 60_000, 3_600_000, 86_400_000, Infinity];
-
 /**
- * The key of the last committed transaction in `logName`, for anchoring a base copy (harper-pro#876).
+ * The key of the latest committed transaction in `logName`, for anchoring a base copy (harper-pro#876).
  * The log yields entries only up to its committed watermark, which advances past a transaction only
  * once its RocksDB commit has succeeded, and only across a contiguous prefix. So every entry up to
  * and including the one returned is visible to the copy's reads, and every transaction still in
  * flight appends after it, whatever its key.
  *
- * The log can only be read forward, so this scans the entries keyed within a widening window back
- * from `now`, stopping at the first window holding any. Any committed entry is a sound anchor; the
- * latest one only minimizes what the tail replays, so missing a later, older-keyed entry is harmless.
+ * The log reads only forward, but a range seeks by key and its first entry sits at the seek position,
+ * so this bisects for the largest committed key one pulled entry per probe, never scanning history.
+ * Any committed entry would be a sound anchor; the latest only minimizes what the tail replays.
  *
  * 0 when the log holds no committed entry at all. Undefined when it could not be read cleanly, which
  * leaves the caller on the wall-clock anchor.
  */
 export function findLastCommittedLogKey(auditStore: any, logName: string, now = Date.now()): number | undefined {
-	try {
-		for (const window of LAST_ENTRY_SEARCH_WINDOWS_MS) {
-			const range: any = auditStore.getRange({ log: logName, start: Math.max(0, now - window), snapshot: false });
-			let lastKey: number | undefined;
-			for (const entry of range) lastKey = entry.txnLogKey;
-			// A failed iterator or a corrupt frame ends the scan short of the watermark.
-			if (range.failedLogs?.size > 0 || range.corruptFrameStop?.breaks > 0) return undefined;
-			if (lastKey !== undefined) return isValidFrameTxnLogKey(lastKey) ? lastKey : undefined;
+	const firstKeyFrom = (start: number): number | undefined => {
+		const range: any = auditStore.getRange({ log: logName, start, snapshot: false });
+		for (const entry of range) return entry.txnLogKey;
+		// An empty pull is only "no such entry" if the read itself was clean.
+		if (range.failedLogs?.size > 0 || range.corruptFrameStop?.breaks > 0) {
+			throw new Error(`transaction log ${logName} could not be read cleanly`);
 		}
+		return undefined;
+	};
+	try {
+		let key = firstKeyFrom(now);
+		if (key === undefined) {
+			key = firstKeyFrom(0);
+			if (key === undefined) return 0;
+			// An entry is keyed at or after `low`, and none at or after `high`.
+			let low = key;
+			let high = now;
+			while (high - low > 1) {
+				const middle = (low + high) / 2;
+				const found = firstKeyFrom(middle);
+				if (found === undefined) {
+					high = middle;
+				} else {
+					low = middle;
+					key = found;
+				}
+			}
+		}
+		return isValidFrameTxnLogKey(key) ? key : undefined;
 	} catch (error) {
 		logger.warn?.('could not read the last committed log entry', logName, error);
 		return undefined;
 	}
-	return 0;
 }
 
 /**

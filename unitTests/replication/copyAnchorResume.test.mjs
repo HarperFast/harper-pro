@@ -37,7 +37,7 @@ async function withDatabase(run) {
 }
 
 const payloads = (log, options) => [...log.query(options)].map((entry) => Buffer.from(entry.data).toString());
-// The slice of the audit store's getRange that findLastCommittedLogKey reads, over a real log.
+// The slice of the audit store's getRange the anchor helpers read, over a real log.
 const storeOver = (log) => ({
 	getRange: (options) => [...log.query(options)].map((entry) => ({ txnLogKey: entry.timestamp })),
 });
@@ -143,47 +143,41 @@ describe('isCopyResumeOrderCompatible', () => {
 });
 
 describe('findLastCommittedLogKey', () => {
-	const rangeOf = (keys, flags = {}) =>
-		Object.assign(
-			keys.map((txnLogKey) => ({ txnLogKey })),
-			flags
-		);
+	// Models the log's range: entries in append order, filtered to keys at or after `start`.
+	const logOf = (keys, flags = {}) => {
+		const store = {
+			probes: 0,
+			getRange({ start }) {
+				store.probes++;
+				return Object.assign(
+					keys.filter((key) => key >= start).map((txnLogKey) => ({ txnLogKey })),
+					flags
+				);
+			},
+		};
+		return store;
+	};
 	const now = 10_000_000;
 
-	it('is the last key the log yields, in append order rather than the largest', () => {
-		const store = { getRange: () => rangeOf([now - 10, now - 500, now - 20]) };
-		expect(findLastCommittedLogKey(store, 'local', now)).to.equal(now - 20);
+	it('is the committed entry with the largest key, found in a bounded number of single-entry probes', () => {
+		const store = logOf([now - 9_000_000, now - 5_000, now - 7_000_000]);
+		expect(findLastCommittedLogKey(store, 'local', now)).to.equal(now - 5_000);
+		expect(store.probes).to.be.below(30);
 	});
 
-	it('widens its window back from now until one holds an entry', () => {
-		const starts = [];
-		const store = {
-			getRange({ start }) {
-				starts.push(start);
-				return rangeOf([now - 1_000_000].filter((key) => key >= start));
-			},
-		};
-		expect(findLastCommittedLogKey(store, 'local', now)).to.equal(now - 1_000_000);
-		expect(starts).to.deep.equal([now - 1_000, now - 60_000, now - 3_600_000]);
+	it('takes an entry keyed at or after now without searching', () => {
+		const store = logOf([now - 5_000, now + 3]);
+		expect(findLastCommittedLogKey(store, 'local', now)).to.equal(now + 3);
+		expect(store.probes).to.equal(1);
 	});
 
-	it('is 0 for a log with no committed entry, having finally scanned it from its start', () => {
-		const starts = [];
-		const store = {
-			getRange({ start }) {
-				starts.push(start);
-				return rangeOf([]);
-			},
-		};
-		expect(findLastCommittedLogKey(store, 'local', now)).to.equal(0);
-		expect(starts.at(-1)).to.equal(0);
+	it('is 0 for a log with no committed entry', () => {
+		expect(findLastCommittedLogKey(logOf([]), 'local', now)).to.equal(0);
 	});
 
-	it('is undefined when the scan ended short of the watermark', () => {
-		const failed = rangeOf([now], { failedLogs: new Set(['local']) });
-		expect(findLastCommittedLogKey({ getRange: () => failed }, 'local', now)).to.equal(undefined);
-		const corrupt = rangeOf([], { corruptFrameStop: { breaks: 1 } });
-		expect(findLastCommittedLogKey({ getRange: () => corrupt }, 'local', now)).to.equal(undefined);
+	it('is undefined when an empty pull was not a clean read', () => {
+		expect(findLastCommittedLogKey(logOf([], { failedLogs: new Set(['local']) }), 'local', now)).to.equal(undefined);
+		expect(findLastCommittedLogKey(logOf([], { corruptFrameStop: { breaks: 1 } }), 'local', now)).to.equal(undefined);
 	});
 
 	it('is undefined when the log throws', () => {
