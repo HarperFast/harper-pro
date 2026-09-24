@@ -127,10 +127,7 @@ describe('copy blob transfer metadata', () => {
 			},
 		};
 		assert.strictEqual(getResidencyProjectionRecord(projectionAuditRecord, ComputedCopy.primaryStore), fullRecord);
-		assert.strictEqual(
-			getResidencyProjectionRecord(projectionAuditRecord, ComputedCopy.primaryStore, 789),
-			fullRecord
-		);
+		assert.strictEqual(getResidencyProjectionRecord(projectionAuditRecord, ComputedCopy.primaryStore, 789), fullRecord);
 		assert.deepEqual(projectionArgs, [
 			[ComputedCopy.primaryStore, true, 456],
 			[ComputedCopy.primaryStore, true, 789],

@@ -226,7 +226,9 @@ suite('add_node start_time does not filter the system database', { timeout: 1800
 				}).catch(() => [])) ?? []
 			).map((r) => r.id);
 		const preroleReplicated = async () =>
-			((await sendOperation(nodeB, { operation: 'list_roles' }).catch(() => [])) ?? []).some((r) => r.role === 'prerole');
+			((await sendOperation(nodeB, { operation: 'list_roles' }).catch(() => [])) ?? []).some(
+				(r) => r.role === 'prerole'
+			);
 
 		let ids = [];
 		let hasPrerole = false;
@@ -240,6 +242,9 @@ suite('add_node start_time does not filter the system database', { timeout: 1800
 
 		equal(ids.filter((id) => id.startsWith('post-')).length, POST_COUNT, 'post-start_time user rows must arrive');
 		equal(ids.filter((id) => id.startsWith('pre-')).length, 0, 'pre-start_time user rows must be filtered');
-		ok(await preroleReplicated(), 'a role created before start_time must still replicate (system db is never filtered)');
+		ok(
+			await preroleReplicated(),
+			'a role created before start_time must still replicate (system db is never filtered)'
+		);
 	});
 });

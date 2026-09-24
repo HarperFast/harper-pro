@@ -161,7 +161,7 @@ if (!stressEnabled()) {
 
 			const writeSecs = (Date.now() - writeStart) / 1000;
 			const writtenRecords = Math.min(batchIndex * BATCH_SIZE, TOTAL_RECORDS);
-			const writeMBps = (writtenRecords * PAYLOAD_SIZE / 1024 / 1024) / writeSecs;
+			const writeMBps = (writtenRecords * PAYLOAD_SIZE) / 1024 / 1024 / writeSecs;
 			console.log(
 				`[large-clone] write done: ${writtenRecords}/${TOTAL_RECORDS} records in ${writeSecs.toFixed(1)}s (${writeMBps.toFixed(1)} MB/s)`
 			);
@@ -191,87 +191,94 @@ if (!stressEnabled()) {
 			// it here so we get coverage from the moment the process is alive.
 			const cloneStart = Date.now();
 			try {
+				await startHarper(cloneCtx, {
+					config: {
+						analytics: { aggregatePeriod: -1 },
+						logging: { colors: false, console: true, level: 'warn' },
+						replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
+						storage: { rocks: fabricRocksConfig() },
+						threads: { count: 4 },
+					},
+					env: {
+						HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
+						HDB_LEADER_TOKEN: tokenResp.operation_token,
+						ALLOW_SELF_SIGNED: true,
+						HARPER_NO_FLUSH_ON_EXIT: true,
+					},
+				});
 
-			await startHarper(cloneCtx, {
-				config: {
-					analytics: { aggregatePeriod: -1 },
-					logging: { colors: false, console: true, level: 'warn' },
-					replication: { port: cloneCtx.harper.hostname + ':9933', securePort: null },
-					storage: { rocks: fabricRocksConfig() },
-					threads: { count: 4 },
-				},
-				env: {
-					HDB_LEADER_URL: `http://${ctx.leader.hostname}:9925`,
-					HDB_LEADER_TOKEN: tokenResp.operation_token,
-					ALLOW_SELF_SIGNED: true,
-					HARPER_NO_FLUSH_ON_EXIT: true,
-				},
-			});
+				// Log progress while waiting.
+				let available = false;
+				const deadline = Date.now() + CLONE_BUDGET_SECS * 1000;
+				while (Date.now() < deadline && !available) {
+					try {
+						const resp = await trySendOperation(cloneCtx.harper, { operation: 'get_status', id: 'availability' });
+						if (resp?.status === 'Available') {
+							available = true;
+							break;
+						}
+						const countResp = await trySendOperation(cloneCtx.harper, {
+							operation: 'describe_table',
+							table: 'large',
+							exact_count: true,
+						});
+						const count = countResp?.record_count ?? -1;
+						const remaining = Math.ceil((deadline - Date.now()) / 1000);
+						console.log(
+							`[large-clone] clone progress: count=${count}/${ctx.leaderRecordCount} status=${resp?.status ?? 'unknown'} (${remaining}s remaining)`
+						);
+					} catch {}
+					await delay(5_000);
+				}
 
-			// Log progress while waiting.
-			let available = false;
-			const deadline = Date.now() + CLONE_BUDGET_SECS * 1000;
-			while (Date.now() < deadline && !available) {
-				try {
-					const resp = await trySendOperation(cloneCtx.harper, { operation: 'get_status', id: 'availability' });
-					if (resp?.status === 'Available') {
-						available = true;
-						break;
-					}
-					const countResp = await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large', exact_count: true });
-					const count = countResp?.record_count ?? -1;
-					const remaining = Math.ceil((deadline - Date.now()) / 1000);
-					console.log(
-						`[large-clone] clone progress: count=${count}/${ctx.leaderRecordCount} status=${resp?.status ?? 'unknown'} (${remaining}s remaining)`
-					);
-				} catch {}
-				await delay(5_000);
-			}
+				const cloneSecs = (Date.now() - cloneStart) / 1000;
+				const cloneMBps = available ? (TARGET_GB * 1024) / cloneSecs : 0;
+				const cloneSummary = summariseSamples(cloneSampler.stop());
 
-			const cloneSecs = (Date.now() - cloneStart) / 1000;
-			const cloneMBps = available ? (TARGET_GB * 1024) / cloneSecs : 0;
-			const cloneSummary = summariseSamples(cloneSampler.stop());
+				console.log(
+					`[large-clone] result: clone=${available ? cloneSecs.toFixed(1) + 's' : 'TIMEOUT'} ` +
+						`throughput=${cloneMBps.toFixed(1)} MB/s ` +
+						`clone_peakRSS=${mb(cloneSummary.peakRss)}`
+				);
+				// Container-level cgroup breakdown: anon = genuine/unreclaimable; file = reclaimable
+				// page cache (incl. the mmap'd txn log read during the clone copy); dirty = pending writeback.
+				console.log(
+					`[large-clone] cgroup peaks: current=${mb(cloneSummary.peakCgroupCurrent)} ` +
+						`anon=${mb(cloneSummary.peakCgroupAnon)} file=${mb(cloneSummary.peakCgroupFile)} ` +
+						`dirty=${mb(cloneSummary.peakCgroupDirty)}`
+				);
 
-			console.log(
-				`[large-clone] result: clone=${available ? cloneSecs.toFixed(1) + 's' : 'TIMEOUT'} ` +
-					`throughput=${cloneMBps.toFixed(1)} MB/s ` +
-					`clone_peakRSS=${mb(cloneSummary.peakRss)}`
-			);
-			// Container-level cgroup breakdown: anon = genuine/unreclaimable; file = reclaimable
-			// page cache (incl. the mmap'd txn log read during the clone copy); dirty = pending writeback.
-			console.log(
-				`[large-clone] cgroup peaks: current=${mb(cloneSummary.peakCgroupCurrent)} ` +
-					`anon=${mb(cloneSummary.peakCgroupAnon)} file=${mb(cloneSummary.peakCgroupFile)} ` +
-					`dirty=${mb(cloneSummary.peakCgroupDirty)}`
-			);
+				const cloneLog = await readLog(cloneCtx.harper);
+				const oomRe = /JavaScript heap out of memory|FATAL ERROR.*Allocation failed/g;
+				const uncaughtRe = /\[error\]: uncaughtException/g;
 
-			const cloneLog = await readLog(cloneCtx.harper);
-			const oomRe = /JavaScript heap out of memory|FATAL ERROR.*Allocation failed/g;
-			const uncaughtRe = /\[error\]: uncaughtException/g;
+				ok(available, `Clone did not reach Available within ${CLONE_BUDGET_SECS}s`);
+				const peakMb = cloneSummary.peakRss / 1024 / 1024;
+				ok(peakMb < RSS_CAP_MB, `Clone peak RSS ${peakMb.toFixed(0)} MB exceeded ceiling ${RSS_CAP_MB} MB`);
+				ok((cloneLog.match(oomRe) ?? []).length === 0, 'clone logged OOM');
+				ok((cloneLog.match(uncaughtRe) ?? []).length === 0, 'clone logged uncaughtException');
+				// Tight guard on genuine memory: cgroup anon. 0 when cgroup v2 unavailable — skip.
+				const anonMb = cloneSummary.peakCgroupAnon / 1024 / 1024;
+				if (anonMb > 0)
+					ok(anonMb < ANON_CAP_MB, `clone peak anon ${anonMb.toFixed(0)} MB exceeded cap ${ANON_CAP_MB} MB`);
 
-			ok(available, `Clone did not reach Available within ${CLONE_BUDGET_SECS}s`);
-			const peakMb = cloneSummary.peakRss / 1024 / 1024;
-			ok(peakMb < RSS_CAP_MB, `Clone peak RSS ${peakMb.toFixed(0)} MB exceeded ceiling ${RSS_CAP_MB} MB`);
-			ok((cloneLog.match(oomRe) ?? []).length === 0, 'clone logged OOM');
-			ok((cloneLog.match(uncaughtRe) ?? []).length === 0, 'clone logged uncaughtException');
-			// Tight guard on genuine memory: cgroup anon. 0 when cgroup v2 unavailable — skip.
-			const anonMb = cloneSummary.peakCgroupAnon / 1024 / 1024;
-			if (anonMb > 0)
-				ok(anonMb < ANON_CAP_MB, `clone peak anon ${anonMb.toFixed(0)} MB exceeded cap ${ANON_CAP_MB} MB`);
-
-			// Verify exact row count matches after clone completes.
-			// Use describe_table with exact_count rather than the default
-			// record_count — the latter is a rounded RocksDB estimate that diverges
-			// between nodes during bulk copy. The exact_count flag forces a full
-			// value scan (no extrapolation short-circuit), giving a precise count.
-			let finalCount = -1;
-			for (let i = 0; i < 30; i++) {
-				const rows = await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large', exact_count: true });
-				finalCount = rows?.record_count ?? -1;
-				if (finalCount >= ctx.leaderRecordCount) break;
-				await delay(2_000);
-			}
-			equal(finalCount, ctx.leaderRecordCount, `Clone row count ${finalCount} != leader ${ctx.leaderRecordCount}`);
+				// Verify exact row count matches after clone completes.
+				// Use describe_table with exact_count rather than the default
+				// record_count — the latter is a rounded RocksDB estimate that diverges
+				// between nodes during bulk copy. The exact_count flag forces a full
+				// value scan (no extrapolation short-circuit), giving a precise count.
+				let finalCount = -1;
+				for (let i = 0; i < 30; i++) {
+					const rows = await trySendOperation(cloneCtx.harper, {
+						operation: 'describe_table',
+						table: 'large',
+						exact_count: true,
+					});
+					finalCount = rows?.record_count ?? -1;
+					if (finalCount >= ctx.leaderRecordCount) break;
+					await delay(2_000);
+				}
+				equal(finalCount, ctx.leaderRecordCount, `Clone row count ${finalCount} != leader ${ctx.leaderRecordCount}`);
 			} finally {
 				// Always stop the sampler so its timer doesn't keep the event loop
 				// alive after an early exit (e.g. startHarper throws).

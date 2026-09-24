@@ -231,9 +231,7 @@ suite('ACL Connect Cross-Node Delivery', { timeout: 180_000 }, (ctx) => {
 		}
 		let retries = 0;
 		while (true) {
-			const responses = await Promise.all(
-				ctx.nodes.map((n) => sendOperation(n, { operation: 'cluster_status' }))
-			);
+			const responses = await Promise.all(ctx.nodes.map((n) => sendOperation(n, { operation: 'cluster_status' })));
 			const allConnected = responses.every(
 				(r) =>
 					r.connections.length === NODE_COUNT - 1 &&
@@ -306,10 +304,7 @@ suite('ACL Connect Cross-Node Delivery', { timeout: 180_000 }, (ctx) => {
 				{ timeoutMs: 15_000 }
 			);
 			obs.stop();
-			ok(
-				arrived,
-				`expected marker ${marker} on ${topic} cross-node; subscriber saw: ${JSON.stringify(obs.messages)}`
-			);
+			ok(arrived, `expected marker ${marker} on ${topic} cross-node; subscriber saw: ${JSON.stringify(obs.messages)}`);
 		} finally {
 			await endQuiet(pubClient);
 			await endQuiet(subClient);

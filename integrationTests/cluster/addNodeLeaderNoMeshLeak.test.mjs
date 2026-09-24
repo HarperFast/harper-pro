@@ -250,15 +250,14 @@ suite('add_node isLeader does not leak source node to mesh', { timeout: 180000 }
 		let deltaOnM = [];
 		for (let i = 0; i < 60 && deltaOnM.length === 0; i++) {
 			await delay(500);
-			deltaOnM = (
-				await sendOperation(nodeM, {
+			deltaOnM =
+				(await sendOperation(nodeM, {
 					operation: 'search_by_id',
 					database: 'data',
 					table: 'bridge_src',
 					ids: ['post-update-1'],
 					get_attributes: ['id'],
-				}).catch(() => [])
-			) ?? [];
+				}).catch(() => [])) ?? [];
 		}
 		equal(deltaOnM.length, 1, 'post-update delta from L should still reach M via the bridge');
 		await assertLNeverLeaks('after re-add without isLeader');
