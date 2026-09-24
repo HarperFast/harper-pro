@@ -18,4 +18,6 @@ jobs:
           package-manager-cache: false
       - run: npm i
       - run: npm run lint:required
+      # .prettierignore excludes the core submodule, which isn't checked out here anyway.
+      - run: npx prettier --check .
       - run: node build-tools/companion-check.test.mjs
