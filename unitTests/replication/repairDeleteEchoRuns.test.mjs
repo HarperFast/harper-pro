@@ -15,7 +15,7 @@ import {
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { symlinkSync } from 'node:fs';
+import { symlinkSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -354,6 +354,44 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			expect(report.logs[0].refused.map(({ file }) => file)).to.deep.equal(['2.txnlog']);
 		});
 
+		it('refuses a dangling database symlink without abandoning the other databases', async () => {
+			const target = newDatabase();
+			await writeTransactions(target, [
+				[T, [firstDelete('z')]],
+				[T, [echoedDelete('z')]],
+			]);
+			const harperRootPath = mkdtempSync(join(root, 'harper-'));
+			mkdirSync(join(harperRootPath, 'database'));
+			symlinkSync(join(root, 'missing'), join(harperRootPath, 'database', 'broken'));
+			symlinkSync(target, join(harperRootPath, 'database', 'data'));
+			const reports = await repairHarperRoot(harperRootPath, { apply: true });
+			expect(reports.find(({ path }) => path.endsWith('broken')).refused).to.match(/cannot be resolved/);
+			expect(reports.find(({ path }) => path === target).applied).to.equal(true);
+		});
+
+		it('keeps an untouched file older than the log retention through the repair', async () => {
+			const databasePath = newDatabase();
+			await writeTransactions(databasePath, [
+				[T - 10, [putOf('p', T - 10)]],
+				[T, [firstDelete('z')]],
+				[T, [echoedDelete('z')]],
+			]);
+			const dir = logDir(databasePath);
+			const bytes = readFileSync(join(dir, '1.txnlog'));
+			const [, second] = entryOffsets(join(dir, '1.txnlog'));
+			writeFileSync(join(dir, '1.txnlog'), bytes.subarray(0, second));
+			writeFileSync(join(dir, '2.txnlog'), Buffer.concat([bytes.subarray(0, 13), bytes.subarray(second)]));
+			const state = Buffer.alloc(8);
+			state.writeUInt32LE(13, 0);
+			state.writeUInt32LE(2, 4);
+			writeFileSync(join(dir, 'txn.state'), state);
+			const fourDaysAgo = (Date.now() - 4 * 86400000) / 1000;
+			utimesSync(join(dir, '1.txnlog'), fourDaysAgo, fourDaysAgo);
+			const report = await repairDatabase(databasePath, { apply: true });
+			expect(report.applied).to.equal(true);
+			expect(existsSync(join(dir, '1.txnlog'))).to.equal(true);
+		});
+
 		it('repairs a symlinked database directory at its target', async () => {
 			const target = newDatabase();
 			await writeTransactions(target, [
@@ -662,6 +700,23 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			await restoreRepair(backupDir);
 			expect(snapshot(databasePath)).to.deep.equal(original);
 			expect(existsSync(backupDir)).to.equal(false);
+		});
+
+		it('refuses a restore source that is a link before changing anything', async () => {
+			for (const replace of [
+				(original) => {
+					rmSync(original);
+					symlinkSync(join(root, 'elsewhere'), original);
+				},
+				(original) => linkSync(original, join(root, `extra-link${counter++}`)),
+			]) {
+				const databasePath = await pristine();
+				await repairDatabase(databasePath, { apply: true });
+				const repaired = snapshot(databasePath);
+				replace(join(backupOf(databasePath), 'local', '1.txnlog'));
+				expect(await rejection(restoreRepair(backupOf(databasePath)))).to.be.instanceOf(RepairRefusedError);
+				expect(snapshot(databasePath)).to.deep.equal(repaired);
+			}
 		});
 
 		it('refuses to restore once Harper has written to the repaired store', async () => {

@@ -1,7 +1,8 @@
 import { statSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
+	listDatabases,
 	repairHarperRoot,
 	restoreRepair,
 	RepairRefusedError,
@@ -48,16 +49,21 @@ function printReport(report: DatabaseReport, apply: boolean): void {
 }
 
 /**
- * Started as root, become the owner of the files before touching them: every file a repair writes, RocksDB's
- * own included, then belongs to that user, and no path-based chown can be redirected through a link.
+ * Started as root, become the owner of the databases before touching them: every file a repair writes,
+ * RocksDB's own included, then belongs to that user, and no path-based chown can be redirected through a link.
  */
-function runAsOwnerOf(path: string): void {
+function runAsOwnerOf(paths: string[]): void {
 	if (process.getuid?.() !== 0) return;
-	const { uid, gid } = statSync(path);
-	if (uid === 0) return;
-	process.setgroups([gid]);
-	process.setgid(gid);
-	process.setuid(uid);
+	const owners = new Map(paths.map((path) => [statSync(path).uid, statSync(path).gid]));
+	if (owners.size > 1)
+		throw new RepairRefusedError(
+			`the databases have different owners (uids ${[...owners.keys()].join(', ')}); run as each`
+		);
+	const [owner] = owners;
+	if (!owner || owner[0] === 0) return;
+	process.setgroups([owner[1]]);
+	process.setgid(owner[1]);
+	process.setuid(owner[0]);
 }
 
 async function main(): Promise<number> {
@@ -74,13 +80,13 @@ async function main(): Promise<number> {
 		return values.help ? 0 : 2;
 	}
 	if (values.restore !== undefined) {
-		runAsOwnerOf(dirname(values.restore));
+		runAsOwnerOf([dirname(resolve(values.restore))]);
 		await restoreRepair(values.restore);
 		console.log(`restored the originals recorded in ${values.restore}`);
 		return 0;
 	}
 	const root = positionals[0];
-	if (values.apply) runAsOwnerOf(join(root, 'database'));
+	if (values.apply) runAsOwnerOf(listDatabases(root).flatMap(({ path, refused }) => (refused ? [] : [path])));
 	const reports = await repairHarperRoot(root, { apply: values.apply });
 	for (const report of reports) printReport(report, values.apply);
 	if (reports.length === 0) console.log(`no RocksDB databases with transaction logs under ${root}/database`);

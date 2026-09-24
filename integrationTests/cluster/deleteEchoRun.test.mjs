@@ -1,5 +1,3 @@
-// B is offline while A gains both runs, so it resumes from a cursor below them. The [x, y] run is planted after
-// the repair and below the cap, so B receives every copy and must log one delete per record (harper-pro#826).
 import { suite, test, before, after } from 'node:test';
 import { equal, match } from 'node:assert/strict';
 import { cp, mkdtemp } from 'node:fs/promises';

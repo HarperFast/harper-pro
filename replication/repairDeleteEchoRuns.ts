@@ -1,8 +1,5 @@
-/**
- * Offline repair of RocksDB transaction logs that releases before harper#2761 filled with echoed copies of
- * a replicated delete (replication/DESIGN.md item 20). Imports only `node:` built-ins and rocksdb-js:
- * Harper's runtime modules initialize configuration, logging and storage when loaded.
- */
+// replication/DESIGN.md item 20. Imports only `node:` built-ins and rocksdb-js: Harper's runtime modules
+// initialize configuration, logging and storage when loaded.
 import {
 	closeSync,
 	constants as fsConstants,
@@ -688,6 +685,7 @@ function readManifest(backupDir: string): Manifest {
  */
 async function withDatabaseHeld<T>(databasePath: string, action: () => T | Promise<T>): Promise<T> {
 	// the writable open rewrites RocksDB's MANIFEST, CURRENT and OPTIONS, which Harper must still be able to read
+	if (!existsSync(databasePath)) throw new RepairRefusedError(`${databasePath} does not exist`);
 	const owner = statSync(databasePath).uid;
 	if (process.getuid && process.getuid() !== owner)
 		throw new RepairRefusedError(`${databasePath} is owned by uid ${owner}; run as that user`);
@@ -1095,6 +1093,10 @@ function restoreHeld(backupDir: string, databasePath: string, manifest: Manifest
 			assertPlain(target, false);
 			const current = existsSync(target) ? sha256File(target) : undefined;
 			if (current !== replaced.originalSha256 && current !== replaced.sha256) throw moved(target);
+			const original = join(backupDir, entry.name, replaced.file);
+			// checked again, through the descriptor it copies from, by copyOriginal
+			if (current !== replaced.originalSha256 && (!lstatSync(original).isFile() || lstatSync(original).nlink !== 1))
+				throw new RepairRefusedError(`${original} is not a singly linked file`);
 		}
 	}
 	for (const entry of manifest.logs) {
@@ -1117,25 +1119,48 @@ function restoreHeld(backupDir: string, databasePath: string, manifest: Manifest
 	rmSync(backupDir, { recursive: true });
 }
 
-export async function repairHarperRoot(root: string, options: RepairOptions = {}): Promise<DatabaseReport[]> {
+export interface DatabaseEntry {
+	/** Real path, links resolved: the backup directory belongs beside the files it links to. */
+	path: string;
+	refused?: string;
+}
+
+/** The RocksDB databases under `<root>/database`. */
+export function listDatabases(root: string): DatabaseEntry[] {
 	if (process.platform === 'win32' || endianness() !== 'LE')
 		throw new RepairRefusedError('supported on little-endian POSIX platforms only');
 	const storageRoot = join(root, 'database');
 	if (!existsSync(storageRoot)) throw new RepairRefusedError(`${storageRoot} does not exist`);
-	const reports: DatabaseReport[] = [];
+	const databases: DatabaseEntry[] = [];
 	for (const entry of readdirSync(storageRoot, { withFileTypes: true })) {
-		const databasePath = join(storageRoot, entry.name);
+		const path = join(storageRoot, entry.name);
+		if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+		try {
+			const real = realpathSync(path);
+			if (!statSync(real).isDirectory() || !existsSync(join(real, 'transaction_logs'))) continue;
+			databases.push(
+				lstatSync(join(real, 'transaction_logs')).isSymbolicLink()
+					? { path: real, refused: 'transaction_logs is a symbolic link' }
+					: { path: real }
+			);
+		} catch (error) {
+			databases.push({ path, refused: `cannot be resolved: ${asError(error).message}` });
+		}
+	}
+	return databases;
+}
+
+export async function repairHarperRoot(root: string, options: RepairOptions = {}): Promise<DatabaseReport[]> {
+	const reports: DatabaseReport[] = [];
+	for (const { path, refused } of listDatabases(root)) {
 		const refuse = (reason: string) =>
-			reports.push({ path: databasePath, logs: [], removedBackups: [], applied: false, refused: reason });
-		if (!(entry.isDirectory() || (entry.isSymbolicLink() && statSync(databasePath).isDirectory()))) continue;
-		if (!existsSync(join(databasePath, 'transaction_logs'))) continue;
-		if (lstatSync(join(databasePath, 'transaction_logs')).isSymbolicLink()) {
-			refuse('transaction_logs is a symbolic link');
+			reports.push({ path, logs: [], removedBackups: [], applied: false, refused: reason });
+		if (refused) {
+			refuse(refused);
 			continue;
 		}
 		try {
-			// the backup directory belongs beside the files it holds links to
-			reports.push(await repairDatabase(realpathSync(databasePath), options));
+			reports.push(await repairDatabase(path, options));
 		} catch (error) {
 			refuse(error instanceof RepairRefusedError ? error.message : (asError(error).stack ?? String(error)));
 		}
