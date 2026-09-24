@@ -1,3 +1,5 @@
+import { statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
 	repairHarperRoot,
@@ -45,6 +47,19 @@ function printReport(report: DatabaseReport, apply: boolean): void {
 		);
 }
 
+/**
+ * Started as root, become the owner of the files before touching them: every file a repair writes, RocksDB's
+ * own included, then belongs to that user, and no path-based chown can be redirected through a link.
+ */
+function runAsOwnerOf(path: string): void {
+	if (process.getuid?.() !== 0) return;
+	const { uid, gid } = statSync(path);
+	if (uid === 0) return;
+	process.setgroups([gid]);
+	process.setgid(gid);
+	process.setuid(uid);
+}
+
 async function main(): Promise<number> {
 	const { values, positionals } = parseArgs({
 		allowPositionals: true,
@@ -59,11 +74,13 @@ async function main(): Promise<number> {
 		return values.help ? 0 : 2;
 	}
 	if (values.restore !== undefined) {
+		runAsOwnerOf(dirname(values.restore));
 		await restoreRepair(values.restore);
 		console.log(`restored the originals recorded in ${values.restore}`);
 		return 0;
 	}
 	const root = positionals[0];
+	if (values.apply) runAsOwnerOf(join(root, 'database'));
 	const reports = await repairHarperRoot(root, { apply: values.apply });
 	for (const report of reports) printReport(report, values.apply);
 	if (reports.length === 0) console.log(`no RocksDB databases with transaction logs under ${root}/database`);

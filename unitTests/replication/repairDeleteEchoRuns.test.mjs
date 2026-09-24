@@ -71,7 +71,6 @@ async function rejection(promise) {
 	throw new Error('expected a rejection');
 }
 
-/** A separate process holding the database open, as a running Harper would. */
 async function holdInChild(databasePath) {
 	const child = spawn(
 		process.execPath,
@@ -119,7 +118,6 @@ async function withDatabase(databasePath, callback) {
 	}
 }
 
-/** Writes each transaction `[timestamp, records]` through core's own audit-entry writer. */
 function writeTransactions(databasePath, transactions) {
 	return withDatabase(databasePath, async (db, store) => {
 		for (const [timestamp, records] of transactions) {
@@ -356,12 +354,19 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			expect(report.logs[0].refused.map(({ file }) => file)).to.deep.equal(['2.txnlog']);
 		});
 
-		it('refuses a symlinked database directory rather than skipping it', async () => {
+		it('repairs a symlinked database directory at its target', async () => {
+			const target = newDatabase();
+			await writeTransactions(target, [
+				[T, [firstDelete('z')]],
+				[T, [echoedDelete('z')]],
+			]);
 			const harperRootPath = mkdtempSync(join(root, 'harper-'));
 			mkdirSync(join(harperRootPath, 'database'));
-			symlinkSync(await (async () => newDatabase())(), join(harperRootPath, 'database', 'data'));
-			const [report] = await repairHarperRoot(harperRootPath);
-			expect(report.refused).to.match(/symbolic link/);
+			symlinkSync(target, join(harperRootPath, 'database', 'data'));
+			const [report] = await repairHarperRoot(harperRootPath, { apply: true });
+			expect(report.path).to.equal(target);
+			expect(report.applied).to.equal(true);
+			expect(report.backupDir.startsWith(target)).to.equal(true);
 		});
 
 		it('refuses a file whose run needs more state than the budget to compare', async () => {
@@ -479,7 +484,7 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			const release = await holdInChild(databasePath);
 			try {
 				expect((await rejection(repairDatabase(databasePath, { apply: true }))).message).to.match(
-					/could not be opened exclusively/
+					/is open in another process/
 				);
 			} finally {
 				await release();

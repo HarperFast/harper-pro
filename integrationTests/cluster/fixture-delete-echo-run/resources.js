@@ -1,5 +1,3 @@
-/** `PlantDeleteRun` POST `{ ids, copies }` appends `copies` echoes of those ids' latest deletes under their log key. */
-
 function deleteEntries(id) {
 	const table = tables.EchoTarget;
 	const entries = [];

@@ -4,12 +4,9 @@
  * Harper's runtime modules initialize configuration, logging and storage when loaded.
  */
 import {
-	chmodSync,
-	chownSync,
 	closeSync,
 	constants as fsConstants,
 	fchmodSync,
-	fchownSync,
 	fstatSync,
 	fsyncSync,
 	linkSync,
@@ -21,11 +18,14 @@ import {
 	readFileSync,
 	readSync,
 	renameSync,
+	realpathSync,
 	rmSync,
+	statSync,
 	writeSync,
 	existsSync,
 	type Stats,
 } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { createHash, type Hash } from 'node:crypto';
 import { endianness, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -78,7 +78,6 @@ export interface FileScan {
 	endsUnclosed: boolean;
 	/** The larger of the file header's timestamp and every entry's. */
 	latestTimestamp: number;
-	/** The run the file ends in, for the next file to continue. */
 	trailing: SpanCarry;
 	/** Where `flushedOffset` lands in the output, when it is an entry boundary of the input. */
 	mappedFlushedOffset?: number;
@@ -384,7 +383,7 @@ export interface DatabaseReport {
 	logs: LogReport[];
 	refused?: string;
 	backupDir?: string;
-	/** Backup directories of repairs interrupted before their manifest, so before the store was touched. */
+	/** Backups of repairs that stopped while still `preparing`, so before the store was touched. */
 	removedBackups: string[];
 	applied: boolean;
 }
@@ -423,8 +422,9 @@ function fsyncPath(path: string): void {
 }
 
 function writeDurably(path: string, bytes: Buffer, mode: number): void {
-	const fd = openSync(path, 'wx', mode);
+	const fd = openSync(path, 'wx', 0o600);
 	try {
+		fchmodSync(fd, mode);
 		let written = 0;
 		while (written < bytes.length) written += writeSync(fd, bytes, written, bytes.length - written);
 		fsyncSync(fd);
@@ -516,30 +516,34 @@ async function planStore(store: LogStore, maxSpanBytes: number): Promise<void> {
 		return;
 	}
 	const last = store.files.at(-1);
-	let previous: FileScan | undefined;
+	let previous: LogFile | undefined;
+	// a carried map can be as large as the budget, so none outlives the file that continues it
+	const chainTo = (next: LogFile | undefined) => {
+		if (previous?.scan) previous.scan.trailing = undefined;
+		previous = next;
+	};
 	for (const file of store.files) {
 		const result = validation.files.find((candidate) => candidate.file === file.name);
 		if (!result?.valid || result.warnings.length > 0 || result.validBytes !== file.stats.size) {
 			file.refused = `failed strict validation: ${[...(result?.errors ?? ['not validated']), ...(result?.warnings ?? [])].join('; ')}`;
-			previous = undefined;
+			chainTo(undefined);
 			continue;
 		}
 		if (file.boundary !== 0) {
 			file.refused = `has a retired append boundary (${file.boundary})`;
-			previous = undefined;
+			chainTo(undefined);
 			continue;
 		}
 		try {
-			file.scan = compactLogFile(file.path, scanOptions(store, file, previous, maxSpanBytes));
+			file.scan = compactLogFile(file.path, scanOptions(store, file, previous, previous?.scan, maxSpanBytes));
 		} catch (error) {
 			// retention on a running node can delete a file between the listing and the scan
 			if (!(error instanceof RepairRefusedError) && error.code !== 'ENOENT') throw error;
 			file.refused = error.message;
-			previous = undefined;
+			chainTo(undefined);
 			continue;
 		}
-		if (previous) previous.trailing = undefined;
-		previous = file.scan;
+		chainTo(file);
 		if (file.scan.dropped === 0) continue;
 		const flushedOffset = store.txnState?.sequence === file.sequence ? store.txnState.offset : undefined;
 		if (flushedOffset !== undefined && file.scan.mappedFlushedOffset === undefined)
@@ -548,11 +552,13 @@ async function planStore(store: LogStore, maxSpanBytes: number): Promise<void> {
 		else if (file === last && file.scan.endsUnclosed)
 			file.refused = 'ends with an unclosed transaction; start and stop Harper once so it is recovered, then re-run';
 	}
+	chainTo(undefined);
 }
 
 function scanOptions(
 	store: LogStore,
 	file: LogFile,
+	previousFile: LogFile | undefined,
 	previous: FileScan | undefined,
 	maxSpanBytes: number,
 	output?: number
@@ -567,6 +573,8 @@ function scanOptions(
 			// a transaction split across the boundary must keep an entry in each file for its last flag
 			records: previous.endsUnclosed ? new Map() : trailing.records,
 			bytes: previous.endsUnclosed ? 0 : trailing.bytes,
+			// a refused file is not rewritten, so its part of the run keeps its original size
+			sizeOut: previousFile?.refused ? trailing.sizeIn : trailing.sizeOut,
 		},
 	};
 }
@@ -590,12 +598,15 @@ function toReport(store: LogStore): LogReport {
 		if (!scan) continue;
 		report.entries += scan.entries;
 		report.largestSpanBefore = Math.max(report.largestSpanBefore, scan.largestSpanIn);
+		report.largestSpanAfter = Math.max(
+			report.largestSpanAfter,
+			file.refused ? scan.largestSpanIn : scan.largestSpanOut
+		);
 		if (isTarget(file)) {
 			report.rewritten.push(file.name);
 			report.dropped += scan.dropped;
 			report.bytesReclaimed += scan.bytesIn - scan.bytesOut;
-			report.largestSpanAfter = Math.max(report.largestSpanAfter, scan.largestSpanOut);
-		} else report.largestSpanAfter = Math.max(report.largestSpanAfter, scan.largestSpanIn);
+		}
 	}
 	return report;
 }
@@ -676,6 +687,10 @@ function readManifest(backupDir: string): Manifest {
  * opens on the database shares the holder's view of them.
  */
 async function withDatabaseHeld<T>(databasePath: string, action: () => T | Promise<T>): Promise<T> {
+	// the writable open rewrites RocksDB's MANIFEST, CURRENT and OPTIONS, which Harper must still be able to read
+	const owner = statSync(databasePath).uid;
+	if (process.getuid && process.getuid() !== owner)
+		throw new RepairRefusedError(`${databasePath} is owned by uid ${owner}; run as that user`);
 	const holderLogs = mkdtempSync(join(tmpdir(), 'repair-delete-echo-runs-'));
 	const holder = new RocksDatabase(databasePath, { transactionLogsPath: holderLogs });
 	try {
@@ -683,7 +698,9 @@ async function withDatabaseHeld<T>(databasePath: string, action: () => T | Promi
 			holder.open();
 		} catch (error) {
 			throw new RepairRefusedError(
-				`${databasePath} could not be opened exclusively (${error.message}); stop Harper, and any supervisor that restarts it, first`
+				/\block\b/i.test(error.message)
+					? `${databasePath} is open in another process (${error.message}); stop Harper, and any supervisor that restarts it, first`
+					: `${databasePath} could not be opened: ${error.message}`
 			);
 		}
 		try {
@@ -714,17 +731,13 @@ function unfinishedRepairMessage(backupDir: string): string {
 	);
 }
 
-function matchOwnership(path: string, original: Stats): void {
-	chmodSync(path, original.mode & 0o7777);
-	if (process.getuid?.() === 0) chownSync(path, original.uid, original.gid);
-}
-
+// Files are never re-owned: the replacements must already belong to the user the originals do.
 function assertOwnable(store: LogStore): void {
 	const uid = process.getuid?.();
-	if (uid === undefined || uid === 0) return;
+	if (uid === undefined) return;
 	for (const file of store.files) {
 		if (isTarget(file) && file.stats.uid !== uid)
-			throw new RepairRefusedError(`${file.path} is owned by uid ${file.stats.uid}; run as that user or as root`);
+			throw new RepairRefusedError(`${file.path} is owned by uid ${file.stats.uid}; run as that user`);
 	}
 }
 
@@ -733,15 +746,6 @@ export async function repairDatabase(path: string, options: RepairOptions = {}):
 	if (!options.apply) return (await planDatabase(databasePath, options)).report;
 	const applied = await withDatabaseHeld(databasePath, () => applyDatabase(databasePath, options));
 	if (!applied.manifest) return applied.report;
-	try {
-		readBack(databasePath, applied.stores, applied.manifest);
-		applied.manifest.state = 'complete';
-		writeManifest(applied.report.backupDir, applied.manifest);
-	} catch (error) {
-		const failure = asError(error);
-		failure.message = `${failure.message}\nThe repair of ${databasePath} did not finish; ${unfinishedRepairMessage(applied.report.backupDir)}`;
-		throw failure;
-	}
 	applied.report.applied = true;
 	for (const log of applied.report.logs) {
 		const entry = applied.manifest.logs.find((candidate) => candidate.name === log.name);
@@ -817,10 +821,13 @@ async function applyDatabase(
 			const entry = manifest.logs.find((candidate) => candidate.name === store.name);
 			publishStore(store, entry, join(backupDir, store.name), (name) => step(`${store.name}: ${name}`));
 		}
-		await verifyWritten(backupDir, stores, manifest);
 		manifest.state = 'applied';
 		writeManifest(backupDir, manifest);
 		step('applied');
+		await verifyWritten(backupDir, stores, manifest);
+		readBack(databasePath, stores, manifest);
+		manifest.state = 'complete';
+		writeManifest(backupDir, manifest);
 	} catch (error) {
 		const failure = asError(error);
 		failure.message = `${failure.message}\nThe repair of ${databasePath} did not finish; ${unfinishedRepairMessage(backupDir)}`;
@@ -833,15 +840,17 @@ function stageStore(store: LogStore, stagingDir: string, options: RepairOptions)
 	mkdirSync(stagingDir, { mode: 0o700 });
 	const entry: ManifestLog = { name: store.name, replaced: [], created: [] };
 	const maxSpanBytes = options.maxSpanBytes ?? MAX_SPAN_BYTES;
+	let previousFile: LogFile | undefined;
 	let previous: FileScan | undefined;
 	// the same chain planning ran, so every carried run reaches the target files it did then
 	for (const file of store.files) {
 		if (!file.scan) {
-			previous = undefined;
+			previousFile = previous = undefined;
 			continue;
 		}
 		if (!isTarget(file)) {
-			previous = compactLogFile(file.path, scanOptions(store, file, previous, maxSpanBytes));
+			previous = compactLogFile(file.path, scanOptions(store, file, previousFile, previous, maxSpanBytes));
+			previousFile = file;
 			continue;
 		}
 		const staged = join(stagingDir, file.name + '.new');
@@ -849,15 +858,16 @@ function stageStore(store: LogStore, stagingDir: string, options: RepairOptions)
 		const fd = openSync(staged, 'wx', 0o600);
 		let scan: FileScan;
 		try {
-			scan = compactLogFile(file.path, scanOptions(store, file, previous, maxSpanBytes, fd));
+			fchmodSync(fd, file.stats.mode & 0o7777);
+			scan = compactLogFile(file.path, scanOptions(store, file, previousFile, previous, maxSpanBytes, fd));
+			fsyncSync(fd);
 		} finally {
 			closeSync(fd);
 		}
+		previousFile = file;
 		previous = scan;
 		if (scan.inputSha256 !== file.scan.inputSha256 || scan.outputSha256 !== file.scan.outputSha256)
 			throw new RepairRefusedError(`${file.path} changed while being repaired; is Harper running?`);
-		matchOwnership(staged, file.stats);
-		fsyncPath(staged);
 		linkSync(file.path, join(stagingDir, file.name));
 		entry.replaced.push({
 			file: file.name,
@@ -888,9 +898,7 @@ function stageStore(store: LogStore, stagingDir: string, options: RepairOptions)
 		// so an older header would send every query for an existing entry past the files that hold it.
 		header.writeDoubleBE(last.scan.latestTimestamp, FILE_TIMESTAMP_OFFSET);
 		const staged = join(stagingDir, tailName + '.new');
-		writeDurably(staged, header, 0o600);
-		matchOwnership(staged, last.stats);
-		fsyncPath(staged);
+		writeDurably(staged, header, last.stats.mode & 0o7777);
 		entry.created.push(tailName);
 	}
 	fsyncPath(stagingDir);
@@ -929,12 +937,8 @@ function publishStore(store: LogStore, entry: ManifestLog, stagingDir: string, s
 function writeTxnState(stagingDir: string, storeDir: string, position: LogPosition): string {
 	const temporary = join(stagingDir, TXN_STATE + '.new');
 	rmSync(temporary, { force: true });
-	writeDurably(temporary, encodeTxnState(position), 0o600);
 	const live = join(storeDir, TXN_STATE);
-	if (existsSync(live)) {
-		matchOwnership(temporary, lstatSync(live));
-		fsyncPath(temporary);
-	}
+	writeDurably(temporary, encodeTxnState(position), existsSync(live) ? lstatSync(live).mode & 0o7777 : 0o644);
 	return temporary;
 }
 
@@ -964,27 +968,54 @@ async function verifyWritten(backupDir: string, stores: LogStore[], manifest: Ma
 	}
 }
 
-/** Through rocksdb-js's own reader, which also enforces append boundaries; only once the holder has closed. */
+const READ_BACK_SCRIPT = `
+const [rocksdb, databasePath, names] = process.argv.slice(1);
+const { RocksDatabase } = require(rocksdb);
+const database = new RocksDatabase(databasePath, { readOnly: true });
+database.open();
+const counts = {};
+for (const name of JSON.parse(names)) {
+	const entries = database.useLog(name).query({ start: 0 });
+	let count = 0;
+	while (!entries.next().done) count++;
+	counts[name] = count;
+}
+database.close();
+process.stdout.write('\\n' + JSON.stringify(counts));
+`;
+
+/**
+ * Through rocksdb-js's own reader, which also enforces append boundaries. In a child process: every handle
+ * this one opens shares the holder's empty log directory, and a read-only open takes no lock.
+ */
 function readBack(databasePath: string, stores: LogStore[], manifest: Manifest): void {
-	const database = new RocksDatabase(databasePath, { readOnly: true });
-	database.open();
-	try {
-		for (const entry of manifest.logs) {
-			const store = stores.find((candidate) => candidate.name === entry.name);
-			// a refused file may hold a tail the reader stops at, so only fully planned logs have a known count
-			if (store.files.some((file) => !file.scan)) continue;
-			const expected = store.files.reduce(
-				(sum, file) => sum + (isTarget(file) ? file.scan.kept : file.scan.entries),
-				0
-			);
-			const entries = database.useLog(entry.name).query({ start: 0 });
-			let count = 0;
-			while (!entries.next().done) count++;
-			if (count !== expected)
-				throw new Error(`log ${entry.name} of ${databasePath} reads back ${count} entries, expected ${expected}`);
-		}
-	} finally {
-		database.close();
+	const expected: Record<string, number> = {};
+	for (const entry of manifest.logs) {
+		const store = stores.find((candidate) => candidate.name === entry.name);
+		// a refused file may hold a tail the reader stops at, so only fully planned logs have a known count
+		if (store.files.some((file) => !file.scan)) continue;
+		expected[entry.name] = store.files.reduce(
+			(sum, file) => sum + (isTarget(file) ? file.scan.kept : file.scan.entries),
+			0
+		);
+	}
+	if (Object.keys(expected).length === 0) return;
+	const result = spawnSync(
+		process.execPath,
+		[
+			'-e',
+			READ_BACK_SCRIPT,
+			require.resolve('@harperfast/rocksdb-js'),
+			databasePath,
+			JSON.stringify(Object.keys(expected)),
+		],
+		{ encoding: 'utf8' }
+	);
+	if (result.status !== 0) throw new Error(`reading back ${databasePath} failed: ${result.stderr || result.error}`);
+	const counts = JSON.parse(result.stdout.slice(result.stdout.lastIndexOf('\n') + 1));
+	for (const [name, count] of Object.entries(expected)) {
+		if (counts[name] !== count)
+			throw new Error(`log ${name} of ${databasePath} reads back ${counts[name]} entries, expected ${count}`);
 	}
 }
 
@@ -1028,7 +1059,6 @@ function copyOriginal(source: string, target: string, sha256: string): void {
 				position += bytes;
 			}
 			fchmodSync(output, stats.mode & 0o7777);
-			if (process.getuid?.() === 0) fchownSync(output, stats.uid, stats.gid);
 			fsyncSync(output);
 		} finally {
 			closeSync(output);
@@ -1097,20 +1127,17 @@ export async function repairHarperRoot(root: string, options: RepairOptions = {}
 		const databasePath = join(storageRoot, entry.name);
 		const refuse = (reason: string) =>
 			reports.push({ path: databasePath, logs: [], removedBackups: [], applied: false, refused: reason });
-		if (entry.isSymbolicLink()) {
-			refuse('is a symbolic link; run the repair against the directory it points to');
-			continue;
-		}
-		if (!entry.isDirectory() || !existsSync(join(databasePath, 'transaction_logs'))) continue;
+		if (!(entry.isDirectory() || (entry.isSymbolicLink() && statSync(databasePath).isDirectory()))) continue;
+		if (!existsSync(join(databasePath, 'transaction_logs'))) continue;
 		if (lstatSync(join(databasePath, 'transaction_logs')).isSymbolicLink()) {
 			refuse('transaction_logs is a symbolic link');
 			continue;
 		}
 		try {
-			reports.push(await repairDatabase(databasePath, options));
+			// the backup directory belongs beside the files it holds links to
+			reports.push(await repairDatabase(realpathSync(databasePath), options));
 		} catch (error) {
-			// one database's failure must not hide what was already done to the others
-			refuse(asError(error).message);
+			refuse(error instanceof RepairRefusedError ? error.message : (asError(error).stack ?? String(error)));
 		}
 	}
 	return reports;
