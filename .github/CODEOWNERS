@@ -2,10 +2,10 @@
 # Review the docs before modifying: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 # Importantly, **the last matching pattern takes precedence**
 
-# By default, reviews default to kriszyp
+# Fallback owner for paths without a later rule
 *          @kriszyp
 
-# Otherwise, certain paths may require other reviewers as well
+# These paths replace the fallback owner with team review
 /.github/  @HarperFast/developers @HarperFast/devops
 /build-tools/ @HarperFast/developers @HarperFast/devops
 
