@@ -1,6 +1,5 @@
 import { parseArgs } from 'node:util';
 import {
-	assertDatabaseClosed,
 	repairHarperRoot,
 	restoreRepair,
 	RepairRefusedError,
@@ -13,23 +12,18 @@ const USAGE = `Compacts echoed replicated-delete runs (harper-pro#826) out of a 
   node dist/bin/repairDeleteEchoRuns.js <harper-root> --apply    repair (Harper and its supervisor stopped)
   node dist/bin/repairDeleteEchoRuns.js --restore <backup-dir>   put back the originals a repair replaced
 
-Run it only after every node in the cluster has the fix that stops new runs.`;
+--apply and --restore hold the database open for their whole run, so they refuse while Harper has it open and
+Harper cannot start until they finish. A report taken while Harper runs is advisory. Run it only after every
+node in the cluster has the fix that stops new runs.`;
 
 function formatBytes(bytes: number): string {
 	return bytes >= 1 << 20 ? `${(bytes / (1 << 20)).toFixed(1)} MiB` : `${bytes} B`;
 }
 
-function printReport(report: DatabaseReport, apply: boolean, root: string): void {
+function printReport(report: DatabaseReport, apply: boolean): void {
 	console.log(`${report.path}`);
 	for (const backupDir of report.removedBackups)
 		console.log(`  removed ${backupDir}: a repair stopped before touching the database left it behind`);
-	if (!apply) {
-		try {
-			assertDatabaseClosed(report.path, root);
-		} catch (error) {
-			console.log(`  warning: ${error.message}; this report is advisory only`);
-		}
-	}
 	if (report.refused) {
 		console.log(`  refused: ${report.refused}`);
 		return;
@@ -65,13 +59,13 @@ async function main(): Promise<number> {
 		return values.help ? 0 : 2;
 	}
 	if (values.restore !== undefined) {
-		restoreRepair(values.restore);
+		await restoreRepair(values.restore);
 		console.log(`restored the originals recorded in ${values.restore}`);
 		return 0;
 	}
 	const root = positionals[0];
 	const reports = await repairHarperRoot(root, { apply: values.apply });
-	for (const report of reports) printReport(report, values.apply, root);
+	for (const report of reports) printReport(report, values.apply);
 	if (reports.length === 0) console.log(`no RocksDB databases with transaction logs under ${root}/database`);
 	// a refused file may still hold the run that wedges replication
 	return reports.some((report) => report.refused || report.logs.some((log) => log.refused.length > 0)) ? 1 : 0;

@@ -13,16 +13,17 @@ import {
 	writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import {
-	assertDatabaseClosed,
-	assertHarperStopped,
 	compactLogFile,
 	decodeEntry,
 	repairDatabase,
+	repairHarperRoot,
 	restoreRepair,
 	RepairRefusedError,
 } from '#src/replication/repairDeleteEchoRuns';
@@ -30,9 +31,7 @@ import { RocksTransactionLogStore } from '#src/core/resources/RocksTransactionLo
 
 // Required, not imported: the ESM entry would evaluate a second copy of the package beside the one the
 // data layer already loaded through CJS.
-const { RocksDatabase, validateTransactionLogStore, tryFileLock, fileLockRelease } = createRequire(import.meta.url)(
-	'@harperfast/rocksdb-js'
-);
+const { RocksDatabase, validateTransactionLogStore } = createRequire(import.meta.url)('@harperfast/rocksdb-js');
 
 const TABLE_ID = 7;
 const NODE_ID = 3;
@@ -62,6 +61,38 @@ const putOf = (id, version, extra) => ({
 // the first application links the record's real previous version; every echoed copy links the delete itself
 const firstDelete = (id, extra) => deleteOf(id, { previousVersion: T - 5000, ...extra });
 const echoedDelete = (id, extra) => deleteOf(id, { previousVersion: T, ...extra });
+
+async function rejection(promise) {
+	try {
+		await promise;
+	} catch (error) {
+		return error;
+	}
+	throw new Error('expected a rejection');
+}
+
+/** A separate process holding the database open, as a running Harper would. */
+async function holdInChild(databasePath) {
+	const child = spawn(
+		process.execPath,
+		[
+			'-e',
+			`const { RocksDatabase } = require('@harperfast/rocksdb-js');
+			const db = new RocksDatabase(${JSON.stringify(databasePath)});
+			db.open();
+			console.log('open');
+			process.stdin.on('end', () => { db.close(); process.exit(0); });
+			process.stdin.resume();`,
+		],
+		{ stdio: ['pipe', 'pipe', 'inherit'] }
+	);
+	const [chunk] = await once(child.stdout, 'data');
+	expect(String(chunk)).to.match(/open/);
+	return async () => {
+		child.stdin.end();
+		await once(child, 'exit');
+	};
+}
 
 const sha256 = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
 const logDir = (databasePath) => join(databasePath, 'transaction_logs', 'local');
@@ -290,6 +321,49 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			expect((await validateTransactionLogStore(dir, { strict: true })).valid).to.equal(true);
 		});
 
+		it('drops copies in a later file that continue a run the previous file closed', async () => {
+			const databasePath = newDatabase();
+			await writeTransactions(databasePath, [
+				[T, [firstDelete('z')]],
+				[T, [echoedDelete('z')]],
+			]);
+			const dir = logDir(databasePath);
+			const bytes = readFileSync(join(dir, '1.txnlog'));
+			const [first, second] = entryOffsets(join(dir, '1.txnlog'));
+			writeFileSync(join(dir, '1.txnlog'), bytes.subarray(0, second));
+			writeFileSync(join(dir, '2.txnlog'), Buffer.concat([bytes.subarray(0, 13), bytes.subarray(second)]));
+			rmSync(join(dir, 'txn.state'), { force: true });
+			const report = await repairDatabase(databasePath, { apply: true });
+			expect(report.logs[0].dropped).to.equal(1);
+			expect(report.logs[0].largestSpanBefore).to.equal(bytes.length - 13);
+			expect(report.logs[0].largestSpanAfter).to.equal(second - first);
+			expect((await readBack(databasePath)).map(({ id }) => id)).to.deep.equal(['z']);
+		});
+
+		it('repairs an older file beside a newest one it refuses for a torn tail', async () => {
+			const databasePath = newDatabase();
+			await writeTransactions(databasePath, [
+				[T, [firstDelete('z')]],
+				[T, [echoedDelete('z')]],
+			]);
+			const dir = logDir(databasePath);
+			const header = readFileSync(join(dir, '1.txnlog')).subarray(0, 13);
+			writeFileSync(join(dir, '2.txnlog'), Buffer.concat([header, Buffer.from([1, 2, 3])]));
+			rmSync(join(dir, 'txn.state'), { force: true });
+			const report = await repairDatabase(databasePath, { apply: true });
+			expect(report.applied).to.equal(true);
+			expect(report.logs[0].rewritten).to.deep.equal(['1.txnlog']);
+			expect(report.logs[0].refused.map(({ file }) => file)).to.deep.equal(['2.txnlog']);
+		});
+
+		it('refuses a symlinked database directory rather than skipping it', async () => {
+			const harperRootPath = mkdtempSync(join(root, 'harper-'));
+			mkdirSync(join(harperRootPath, 'database'));
+			symlinkSync(await (async () => newDatabase())(), join(harperRootPath, 'database', 'data'));
+			const [report] = await repairHarperRoot(harperRootPath);
+			expect(report.refused).to.match(/symbolic link/);
+		});
+
 		it('refuses a file whose run needs more state than the budget to compare', async () => {
 			const databasePath = newDatabase();
 			await writeTransactions(databasePath, [
@@ -399,35 +473,18 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			expect(report.refused).to.match(/hard links/);
 		});
 
-		it('a running Harper, by its pid file', () => {
-			const harperRoot = mkdtempSync(join(root, 'root-'));
-			writeFileSync(join(harperRoot, 'hdb.pid'), String(process.pid));
-			expect(() => assertHarperStopped(harperRoot)).to.throw(RepairRefusedError, /running/);
-			writeFileSync(join(harperRoot, 'hdb.pid'), 'not a pid');
-			expect(() => assertHarperStopped(harperRoot)).to.throw(RepairRefusedError, /process id/);
-			writeFileSync(join(harperRoot, 'hdb.pid'), String(spawnSync(process.execPath, ['-e', '']).pid));
-			expect(() => assertHarperStopped(harperRoot)).to.not.throw();
-			rmSync(join(harperRoot, 'hdb.pid'));
-			expect(() => assertHarperStopped(harperRoot)).to.not.throw();
-		});
-
 		it('a database another process has open, by its RocksDB lock', async () => {
 			const databasePath = await runDatabase();
-			const db = new RocksDatabase(databasePath);
-			db.open();
+			const before = snapshot(databasePath);
+			const release = await holdInChild(databasePath);
 			try {
-				expect(() => assertDatabaseClosed(databasePath)).to.throw(RepairRefusedError, /LOCK is held/);
-				let error;
-				try {
-					await repairDatabase(databasePath, { apply: true });
-				} catch (caught) {
-					error = caught;
-				}
-				expect(error?.message).to.match(/LOCK is held/);
+				expect((await rejection(repairDatabase(databasePath, { apply: true }))).message).to.match(
+					/could not be opened exclusively/
+				);
 			} finally {
-				db.close();
+				await release();
 			}
-			expect(() => assertDatabaseClosed(databasePath)).to.not.throw();
+			expect(snapshot(databasePath)).to.deep.equal(before);
 		});
 
 		it('a store Harper wrote to while it was being repaired', async () => {
@@ -436,7 +493,9 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			try {
 				await repairDatabase(databasePath, {
 					apply: true,
-					assertStopped: () => appendFileSync(join(logDir(databasePath), '1.txnlog'), Buffer.alloc(1)),
+					afterStep: (step) => {
+						if (step === 'preparing') appendFileSync(join(logDir(databasePath), '1.txnlog'), Buffer.alloc(1));
+					},
 				});
 			} catch (caught) {
 				error = caught;
@@ -500,7 +559,7 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 				expect(replayed, crashAt).to.include('put');
 				const again = await repairDatabase(databasePath, { apply: true });
 				expect(again.refused, crashAt).to.match(/did not finish/);
-				restoreRepair(backupOf(databasePath));
+				await restoreRepair(backupOf(databasePath));
 				expect(snapshot(databasePath), crashAt).to.deep.equal(original);
 				const redo = await repairDatabase(databasePath, { apply: true });
 				expect(redo.applied, crashAt).to.equal(true);
@@ -552,22 +611,6 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			expect(error?.message).to.match(/written to during the repair/);
 		});
 
-		it('refuses a concurrent repair', async () => {
-			const databasePath = await pristine();
-			const token = tryFileLock(join(databasePath, 'transaction_logs.repair.lock'));
-			try {
-				let error;
-				try {
-					await repairDatabase(databasePath, { apply: true });
-				} catch (caught) {
-					error = caught;
-				}
-				expect(error?.message).to.match(/another repair or restore/);
-			} finally {
-				fileLockRelease(token);
-			}
-		});
-
 		it('refuses a manifest naming a path outside the database', async () => {
 			const databasePath = await pristine();
 			const backupDir = join(databasePath, 'transaction_logs.repair-crafted');
@@ -576,7 +619,7 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 				join(backupDir, 'manifest.json'),
 				JSON.stringify({ format: 1, state: 'applied', logs: [{ name: '../../x', replaced: [], created: [] }] })
 			);
-			expect(() => restoreRepair(backupDir)).to.throw(RepairRefusedError, /invalid manifest/);
+			expect(await rejection(restoreRepair(backupDir))).to.be.instanceOf(RepairRefusedError);
 		});
 
 		it('names both ways out of an unfinished repair', async () => {
@@ -600,7 +643,7 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			const repaired = snapshot(databasePath);
 			const copy = join(root, `copy${counter++}`);
 			cpSync(databasePath, copy, { recursive: true });
-			restoreRepair(backupOf(copy));
+			await restoreRepair(backupOf(copy));
 			expect(sha256(join(logDir(copy), '1.txnlog'))).to.equal(original);
 			expect(snapshot(databasePath)).to.deep.equal(repaired);
 		});
@@ -611,7 +654,7 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			await repairDatabase(databasePath, { apply: true });
 			expect(existsSync(join(logDir(databasePath), '2.txnlog'))).to.equal(true);
 			const backupDir = backupOf(databasePath);
-			restoreRepair(backupDir);
+			await restoreRepair(backupDir);
 			expect(snapshot(databasePath)).to.deep.equal(original);
 			expect(existsSync(backupDir)).to.equal(false);
 		});
@@ -620,7 +663,7 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 			const databasePath = await pristine();
 			await repairDatabase(databasePath, { apply: true });
 			await writeTransactions(databasePath, [[T + 2, [putOf('later', T + 2)]]]);
-			expect(() => restoreRepair(backupOf(databasePath))).to.throw(RepairRefusedError, /written to since/);
+			expect((await rejection(restoreRepair(backupOf(databasePath)))).message).to.match(/written to since/);
 		});
 	});
 
