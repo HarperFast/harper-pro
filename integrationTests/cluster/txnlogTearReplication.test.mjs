@@ -270,39 +270,18 @@ function readFrames(buffer) {
  * consumer can tell it is garbage (harper-pro#669).
  *
  * The oracle maps frame k to row k, so that mapping is checked here against the bytes of every
- * frame rather than assumed: one frame per acknowledged row, in write order. Not every frame in
- * this log carries a row, though: `add_node`'s base copy can commit a record-less `copyBarrier`
- * control entry into this same local log before either batch is inserted (harper-pro#876), so the
- * oracle filters to frames that actually carry one of this test's rows rather than assuming
- * position alone -- a corrupted or missing row still fails the count check below. The filter alone
- * would also hide a barrier-per-retry proliferation (the reconnect-loop risk `DESIGN.md` names as
- * the reason fail-closed was withdrawn), so the non-row count is separately bounded below --
- * loosely, since a legitimate reconnect between `add_node` and B's first cursor can legitimately
- * mint a second barrier (harper-pro#876's own retry-per-reconnect behavior), and true proliferation
- * (a wedged retry loop) would blow well past this bound rather than land just past it. The row-count
- * check runs FIRST so a corrupted/missing row -- which also depresses the row-frame count and so
- * also trips the non-row bound -- is diagnosed as itself rather than as barrier proliferation.
+ * frame rather than assumed: one frame per acknowledged row, in write order.
  */
 function tearFrame(logPath, framesFromEnd) {
 	const buffer = readFileSync(logPath);
 	ok(buffer.subarray(0, 4).toString() === LOG_FILE_MAGIC, `${logPath} is not a transaction log`);
-	const allFrames = readFrames(buffer);
-	const framePayload = ({ position, length }) =>
-		buffer.subarray(position + ENTRY_HEADER_SIZE, position + ENTRY_HEADER_SIZE + length);
-	const frames = allFrames.filter((frame) =>
-		rowIds(0, TOTAL).some((id) => framePayload(frame).includes(payloadFor(id)))
-	);
+	const frames = readFrames(buffer);
 	ok(
 		frames.length === TOTAL,
-		`${logPath} holds ${frames.length} row frame(s) for ${TOTAL} rows (${allFrames.length} frame(s) total); the oracle maps frame k to row k and needs one row frame per row`
+		`${logPath} holds ${frames.length} frames for ${TOTAL} rows; the oracle maps frame k to row k and needs one frame per row`
 	);
-	const nonRowFrameCount = allFrames.length - frames.length;
-	ok(
-		nonRowFrameCount <= 3,
-		`${logPath} holds ${nonRowFrameCount} non-row frame(s); a wedged base-copy retry loop mints one barrier per attempt (harper-pro#876) and would blow well past the few a legitimate early reconnect can produce`
-	);
-	frames.forEach((frame, index) => {
-		const payload = framePayload(frame);
+	frames.forEach(({ position, length }, index) => {
+		const payload = buffer.subarray(position + ENTRY_HEADER_SIZE, position + ENTRY_HEADER_SIZE + length);
 		ok(payload.includes(payloadFor(rowId(index))), `frame ${index} does not carry ${rowId(index)}`);
 	});
 	const index = frames.length - 1 - framesFromEnd;

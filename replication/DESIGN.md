@@ -190,6 +190,8 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 
 7. **The initial bulk clone copy is resumable (PK cursor).** When a follower requests a full copy (`startTime: 0`), the leader sends `COPY_START{copyStartTime}`, walks each table's primary store in key order, flushes a checkpoint transaction every `COPY_CHECKPOINT_RECORDS` (timed at `copyStartTime` so the persisted `seqId` stays pinned there, never a record's `localTime`), and sends `COPY_COMPLETE` at the end. The follower persists a cursor `{copyStartTime, currentTable, afterKey}` under `dbisDB` key `Symbol.for('copyCursor')` — but only in the `end_txn` `onCommit`, **after** the batch commits, so the cursor can never get ahead of committed data (a resume re-copies a few records idempotently but never skips). On reconnect, `sendSubscriptionRequestUpdate` reads the cursor and sends it as `copyResume` on the subscription request (overriding the persisted `seqId`, which alone would skip the un-copied tables); the leader skips tables before `currentTable` (stable iteration order ⇒ already committed) and resumes `currentTable` after `afterKey`. `COPY_COMPLETE` clears the cursor so subsequent connections resume normally from `seqId`. Before this, an interrupted copy restarted from zero and never converged for a large table (issue #241).
 
+   **A base copy never returns the requesting peer's own records while we are cloning from it (harper-pro#737).** While a clone attempt is in flight, and for a bounded 60-second grace after synchronization completes, `cloneNode/cloneAttempt.ts` reads BOTH `HARPER_CLONE_ATTEMPT` in this process and the `.cloneAttempt.json` marker on disk. Each covers the other's failure mode: worker threads copy the environment at spawn, and a plain `harper run` restart never enters the clone path, so a marker left by a killed process authorizes nothing. A completed marker carries `completedAt`; the reader fails open after the grace even if its best-effort cleanup fails, and a later clone mints a new attempt id instead of reusing completed state. During that window, a base copy to the peer this node holds `isLeader` for, and whose host the marker records as the clone source, skips every record that peer originated (`entry.nodeId`, the same origin the copy stamps). It already has them, and each redundant apply back on a legacy v4 leader mints an audit entry v4 cannot decode: v4's apply passes `previousVersion = 1`, lmdb-js's instructed-write substitution writes `2.0`, and the field's only presence signal is a leading `0x42` byte (a float64 in the ms-timestamp range), so every reader skips the 8 bytes and parses the entry offset; v4's own forwarding then reads `recordId` out of the misaligned region and throws `BigInt(non-integer)`, closing the subscription 1008 in a reconnect loop. v4 asks for this copy on its own: its leader heuristic is ungated (`isLeader = !leaderCandidate || nodeName === leaderCandidate`, the candidate falling back to "the first other node in hdb_nodes"), so during a v4 → v5 clone it concludes the clone is _its_ leader. harper-pro stopped guessing that in #254; the legacy peer cannot be fixed, so the filter lives on the serving side, the only place a v4 peer can still be answered. Filtering by origin rather than skipping the copy is what keeps it lossless: records this node authored or received from a third node are still copied, so the trailer never claims a copy completed while rows the peer lacks were withheld. Leadership is read from the authenticated peer's local `hdb_nodes` row, never the peer-controlled subscription payload. The window is narrow in practice for a reason worth knowing, and it also bounds what can be tested: a peer only asks for a base copy when it has no resume cursor for this node, and the first record of ANY origin that reaches it from us gives it one — so the reverse copy is reachable only before the clone has sent the leader anything, and no integration test can seed a differing-origin row into the clone without also disarming the path under test. Three gaps are knowingly left: a v4 leader whose reverse connection lands after the completion grace still receives a full copy (including a reconnect whose earlier attempt was withheld, since v4 cannot resume a copy and the gate is re-read per copy); an outside restart inside the grace loses it, because the config already reads `cloned: true` so the new process skips the clone path and never sets `HARPER_CLONE_ATTEMPT` (the stamped marker alone does not authorize withholding); and a v4 _cluster_ leader still receives back rows a third v4 node originated (the wedge trigger is a redundant apply of anything the peer already holds, which the copy protocol cannot know). The same latent format hole also exists in core's `createAuditEntry`/`readAuditEntry` for a v5+LMDB audit store.
+
    **The anchor is a position in the log's append order, not a timestamp (harper-pro#876).** A
    transaction's log key is fixed when the transaction is **created**; its log batch is appended when it
    **commits**. The log is therefore written out of key order — measured at 47 inversions per 1000
@@ -200,29 +202,37 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
    excluded it while the key-order walk had already passed its row. Permanent loss, and the same
    reasoning `RECORD_LOCK_FRESHNESS_DESIGN.md` records for fences: _nothing numeric is a fence_.
 
-   The leader now commits a record-less `LOCAL_ONLY` `copyBarrier` entry (core's
-   `Table.writeCopyBarrier()`) immediately before `COPY_START` and anchors on **its transaction key**.
-   Everything still in flight commits — and so appends — after it, and the copy's tail resumes with
-   `exactStart` + `resumeAfterExactStart`, after which the predicate stops consulting the key at all.
-   That range is built **before** the walk, because `getRange` resolves the position and maps the log
-   file eagerly, and it is validated by pulling a throwaway copy of the same range — `exactStartFailures`
-   is filled during `next()`, so an unpulled iterable cannot answer. `exactStart` is scoped to `local`
-   by `startByLog`, so the other logs in the aggregate are untouched.
+   The leader anchors on **the key of the last committed entry in its `local` log**, read just before
+   `COPY_START` (`findLastCommittedLogKey`, scanning from the last flushed position). The log yields
+   entries only up to its committed watermark, which rocksdb-js advances past a transaction only after
+   its RocksDB commit succeeds, and only across a contiguous prefix — so everything up to the anchor
+   is visible to the walk, and everything still in flight appends after it. The copy's tail resumes
+   with `exactStart` + `resumeAfterExactStart`, after which the predicate stops consulting the key at
+   all. That range is built **before** the walk, because `getRange` resolves the position and maps the
+   log file eagerly, and it is validated by pulling a throwaway copy of the same range —
+   `exactStartFailures` is filled during `next()`, so an unpulled iterable cannot answer. `exactStart`
+   is scoped to `local` by `startByLog`, so the other logs in the aggregate are untouched. Gated on
+   `auditStore.reusableIterable` (the RocksDB log store), not the `STORAGE_IS_ROCKSDB` config
+   snapshot, which can misreport the engine in a worker.
 
-   **Every failure degrades to the pre-#876 behaviour and says so**, rather than failing closed: an
-   unformable boundary, an unreadable anchor, or a resumed cursor that no longer names a barrier all
-   fall back to the timestamp range with a `warn`/`error` line naming the database. Fail-closed was
-   tried and withdrawn — it turned a storage hiccup into a reconnect loop that minted one unused
-   barrier per retry while copying nothing, and rejected the leader's own fallback cursors. The cursor
+   A resumed copy tries the anchor as an exact entry first (`classifyResumeAnchor`) and resumes in
+   append order when it names one; otherwise — a pre-#876 `Date.now()` cursor, a purged entry — it
+   keeps the timestamp resume. Nothing is written to anchor a copy, so there is no new entry type.
+
+   **Every failure degrades to the pre-#876 behaviour and says so**, rather than failing closed: no
+   entry committed since the last flush, an unformable boundary, an unreadable anchor, or a resumed
+   cursor that names no entry all fall back to the timestamp range with a `warn`/`error` line naming
+   the database. Fail-closed was tried and withdrawn — it turned a storage hiccup into a reconnect
+   loop copying nothing, and rejected the leader's own fallback cursors. The cursor
    version is therefore unchanged: what the anchor means is decided by _reading_ it
    (`classifyResumeAnchor`), not by negotiating a version.
 
    The sender's cursor and `SENDING_TIME_POSITION` are clamped to climb only, since append order is not
    key order.
 
-   Not covered, and both needing the same durable-cursor work: a **relayed origin's log**, where the
-   barrier does not exist; and a **reconnect**, where the subscription resumes with `startTime` at the
-   barrier key and `matchesSubscription` requires that `startTime` to be BELOW an entry's key — so an
+   Not covered, and both needing the same durable-cursor work: a **relayed origin's log**, which is
+   not anchored; and a **reconnect**, where the subscription resumes with `startTime` at the
+   anchor key and `matchesSubscription` requires that `startTime` to be BELOW an entry's key — so an
    append-order range would be overruled by the subscription predicate anyway. The in-connection window
    is closed; carrying append-order mode across a reconnect needs it persisted in the cursor AND
    honoured by that predicate.

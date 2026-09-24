@@ -2469,59 +2469,74 @@ export function isCopyResumeOrderCompatible(copyOrder: number | undefined, order
 	return copyOrder === orderVersion;
 }
 
+const LAST_ENTRY_SEARCH_WINDOWS_MS = [1_000, 60_000, 3_600_000, 86_400_000, Infinity];
+
 /**
- * The table whose log the base copy commits its boundary marker to. Any table of the database works:
- * per-origin logs are shared by every table, so the entry lands in the same `local` log the tail
- * reads. First in copy order, so a resumed copy would choose the same one. Undefined when no table
- * can write one — an empty database, or a core submodule predating `writeCopyBarrier` — which leaves
- * the caller on the old timestamp anchor. (harper-pro#876)
+ * The key of the last committed transaction in `logName`, for anchoring a base copy (harper-pro#876).
+ * The log yields entries only up to its committed watermark, which advances past a transaction only
+ * once its RocksDB commit has succeeded, and only across a contiguous prefix. So every entry up to
+ * and including the one returned is visible to the copy's reads, and every transaction still in
+ * flight appends after it, whatever its key.
+ *
+ * The log can only be read forward, so this scans the entries keyed within a widening window back
+ * from `now`, stopping at the first window holding any. Any committed entry is a sound anchor; the
+ * latest one only minimizes what the tail replays, so missing a later, older-keyed entry is harmless.
+ *
+ * 0 when the log holds no committed entry at all. Undefined when it could not be read cleanly, which
+ * leaves the caller on the wall-clock anchor.
  */
-export function findCopyBarrierTable(
-	tables: Record<string, any> | undefined,
-	orderedTableNames: string[]
-): { writeCopyBarrier(): Promise<number> } | undefined {
-	for (const tableName of orderedTableNames) {
-		const table = tables?.[tableName];
-		if (typeof table?.writeCopyBarrier === 'function') return table;
+export function findLastCommittedLogKey(auditStore: any, logName: string, now = Date.now()): number | undefined {
+	try {
+		for (const window of LAST_ENTRY_SEARCH_WINDOWS_MS) {
+			const range: any = auditStore.getRange({ log: logName, start: Math.max(0, now - window), snapshot: false });
+			let lastKey: number | undefined;
+			for (const entry of range) lastKey = entry.txnLogKey;
+			// A failed iterator or a corrupt frame ends the scan short of the watermark.
+			if (range.failedLogs?.size > 0 || range.corruptFrameStop?.breaks > 0) return undefined;
+			if (lastKey !== undefined) return isValidFrameTxnLogKey(lastKey) ? lastKey : undefined;
+		}
+	} catch (error) {
+		logger.warn?.('could not read the last committed log entry', logName, error);
+		return undefined;
 	}
-	return undefined;
+	return 0;
 }
 
 /**
- * What `anchor` names in `logName`, which decides whether an append-order resume past it is possible.
+ * Whether `anchor` names an entry of `logName`, which decides whether an append-order resume past it
+ * is possible. A pre-#876 `Date.now()` cursor, a wall-clock fallback, or a purged entry names nothing
+ * and keeps the timestamp resume.
  *
- * `unreadable` stays distinct from `other` so a caller can tell "provably not a barrier" apart
- * from "could not tell" — today's one caller treats them the same, degrading to the pre-#876
- * timestamp anchor rather than failing closed, same as every other unformed boundary here. Read
- * once per copy, never per entry.
+ * `unreadable` stays distinct from `absent` so a caller can tell "provably not there" apart from
+ * "could not tell" — today's one caller treats them the same, degrading to the timestamp resume
+ * rather than failing closed, same as every other unformed boundary here. Read once per copy, never
+ * per entry.
  */
 export function classifyResumeAnchor(
 	auditStore: any,
 	anchor: number,
 	logName: string
-): 'barrier' | 'other' | 'unreadable' {
-	if (!isValidFrameTxnLogKey(anchor)) return 'other';
+): 'entry' | 'absent' | 'unreadable' {
+	if (!isValidFrameTxnLogKey(anchor)) return 'absent';
 	let range: any;
 	try {
 		range = auditStore.getRange({ start: anchor, exactStart: true, log: logName, snapshot: false });
 		for (const entry of range) {
-			// Prove it is the entry AT the anchor, not merely the first one the range offered: a
-			// classification that trusts position alone would read a later barrier as this anchor's and
-			// resume past it, skipping everything in between.
-			return entry.txnLogKey === anchor && entry.type === 'copyBarrier' ? 'barrier' : 'other';
+			// Prove it is the entry AT the anchor, not merely the first one the range offered.
+			return entry.txnLogKey === anchor ? 'entry' : 'absent';
 		}
 	} catch (error) {
 		logger.warn?.('could not read the resume anchor entry', logName, anchor, error);
 		return 'unreadable';
 	}
-	// Empty. That is only `other` — purged, or a key from a log this node never had — if the read
+	// Empty. That is only `absent` — purged, or a key from a log this node never had — if the read
 	// itself was clean. These flags are populated during the pull above, never at construction, so a
 	// failed iterator or a corrupt frame looks exactly like an absent entry until they are consulted.
 	if (range?.failedLogs?.size > 0 || range?.corruptFrameStop?.breaks > 0) {
 		logger.warn?.('the resume anchor entry could not be read cleanly', logName, anchor);
 		return 'unreadable';
 	}
-	return 'other';
+	return 'absent';
 }
 
 // Metric fired when a received replication record can't be decoded because its shared structure is
@@ -5984,19 +5999,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 										if (currentSequenceId === 0) {
 											logger.info?.('Replicating all tables to', remoteNodeName);
-											// A barrier only ever exists in this node's own `local` log. It does NOT depend on the tail being
-											// single-log: `excluded` is always an array here, so the range below is normally the multi-log
-											// aggregate, and that aggregate applies `exactStart` only to the logs named in `startByLog`.
+											// Anchored in this node's own `local` log only. It does NOT depend on the tail being single-log:
+											// `excluded` is always an array here, so the range below is normally the multi-log aggregate, and
+											// that aggregate applies `exactStart` only to the logs named in `startByLog`. Gated on the store
+											// itself, not STORAGE_IS_ROCKSDB: that is a config snapshot that can misreport the engine in a
+											// worker, and an LMDB audit store would read these range options as a scan from its start.
 											const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
-											const canResumePastBarrier = STORAGE_IS_ROCKSDB && logName === 'local';
+											const canResumePastAnchor = auditStore.reusableIterable === true && logName === 'local';
 											// If resuming, the follower already committed every table before currentTable (records commit
 											// in stable iteration order), so skip to currentTable and continue after its last committed key.
 											let reachedResumeTable = !copyResume;
-											let anchoredOnBarrier = false;
+											let anchoredInLogOrder = false;
 											const resumeAnchorKind =
-												copyResume && canResumePastBarrier
+												copyResume && canResumePastAnchor
 													? classifyResumeAnchor(auditStore, copyResume.copyStartTime, logName)
-													: 'other';
+													: 'absent';
 											// Validated before the anchor is read below, because a cursor that cannot be honoured must
 											// surrender its ANCHOR as well as its walk position.
 											// currentTable must be one the loop below will actually visit (present in `tables` AND passing
@@ -6042,39 +6059,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											const orderedTableNames = orderTablesForCopy(tables ? Object.keys(tables) : []);
 											// A position in the log's APPEND order, not a timestamp: a transaction's key is fixed when it is
 											// created but its batch is appended when it commits, so every transaction in flight here appends
-											// AFTER this barrier while sorting before it numerically. A resumed copy keeps its original
-											// barrier — a second one would lose everything committed between the two. (harper-pro#876)
-											const barrierTable =
-												copyResume || !canResumePastBarrier
-													? undefined
-													: findCopyBarrierTable(tables, orderedTableNames);
-											let barrierKey: number | undefined;
-											if (barrierTable) {
-												try {
-													barrierKey = await barrierTable.writeCopyBarrier();
-												} catch (error) {
-													// findCopyBarrierTable duck-types the method, so a table that has it can still refuse it at
-													// call time — e.g. STORAGE_IS_ROCKSDB is a config snapshot that can disagree with this
-													// table's actual engine. Same outcome as no table being found: degrade to the wall-clock
-													// anchor every build before #876 used, rather than losing the connection over it.
-													logger.warn?.(
-														`Could not write a base-copy barrier for ${databaseName}; falling back to wall-clock anchoring`,
-														error
-													);
-												}
-											}
-											const copyStartTime = copyResume?.copyStartTime ?? barrierKey ?? Date.now();
-											// A resumed copy is only barrier-anchored if its anchor still NAMES a barrier; anything else —
-											// a pre-#876 wall-clock anchor, a purged barrier, a log that cannot be read — keeps the timestamp
-											// resume every build before this one used for every cursor. `resumeAnchorKind` describes the
-											// ORIGINAL copyResume, so it is only trustworthy while that copyResume is still live; the
-											// guards above can null it out, and this must not answer for a resume that no longer exists.
-											if (
-												canResumePastBarrier &&
-												(barrierKey !== undefined || (copyResume && resumeAnchorKind === 'barrier'))
+											// AFTER the last committed entry while it may sort before it numerically. A resumed copy keeps its
+											// original anchor — a later one would lose everything committed between the two. (harper-pro#876)
+											const anchorKey =
+												copyResume || !canResumePastAnchor ? undefined : findLastCommittedLogKey(auditStore, logName);
+											const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
+											// A resumed copy resumes in append order only if its anchor still NAMES an entry of the log;
+											// anything else — a pre-#876 wall-clock anchor, a purged entry, a log that cannot be read — keeps
+											// the timestamp resume every build before this one used for every cursor. `resumeAnchorKind`
+											// describes the ORIGINAL copyResume, so it is only trustworthy while that copyResume is still live;
+											// the guards above can null it out, and this must not answer for a resume that no longer exists.
+											if (anchorKey === 0) {
+												// An empty log: everything it will ever yield commits after this point, so an ordinary range from
+												// its start is already the boundary.
+												auditLogIterable = auditStore.getRange({
+													start: 0,
+													log: excludedNodes ? undefined : logName,
+													excludeLogs: excludedNodes,
+													snapshot: false,
+												});
+												anchoredInLogOrder = true;
+											} else if (
+												canResumePastAnchor &&
+												(anchorKey !== undefined || (copyResume && resumeAnchorKind === 'entry'))
 											) {
 												// Built before the walk: getRange resolves the boundary's position and maps the log file
-												// eagerly, so the barrier stays reachable for the whole copy. The options must match the ones
+												// eagerly, so the anchor stays reachable for the whole copy. The options must match the ones
 												// the tail would build for itself, because it reuses this iterable — a single-log range here
 												// would silently stop tailing every peer's log.
 												const boundaryRange = {
@@ -6106,30 +6116,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														probe.failedLogs?.size > 0 ||
 														probe.corruptFrameStop?.breaks > 0;
 												} catch (error) {
-													// A throw here is the same outcome as a recorded failure and must not escape: the barrier is
-													// already committed, so the outer catch would close, reconnect, mint another barrier and fail
-													// identically — one unused marker per retry, copying nothing.
+													// A throw here is the same outcome as a recorded failure and must not escape into the outer
+													// catch, which would close and reconnect into the same failing boundary, copying nothing.
 													unusable = error;
 												}
 												if (unusable) {
-													// Degrade rather than refuse. Refusing here throws into the outer catch, and the reconnect
-													// mints another barrier and fails again — one unused marker per retry for a whole retention
-													// window, copying nothing. This path is what every build before #876 does for every copy,
-													// and it says so.
+													// Degrade rather than refuse, for the same reason. The anchor stays the entry's key, which
+													// under the timestamp range still replays everything keyed after it.
 													logger.error?.(
-														`Base copy of ${databaseName} could not form a resume boundary at ${copyStartTime}; falling back to wall-clock anchoring, so a transaction in flight now can be missed`,
+														`Base copy of ${databaseName} could not form a resume boundary at ${copyStartTime}; falling back to a timestamp resume, so a transaction in flight now can be missed`,
 														unusable instanceof Error ? unusable : undefined
 													);
 												} else {
 													auditLogIterable = auditStore.getRange(boundaryRange);
 													boundaryLogName = logName;
-													anchoredOnBarrier = true;
+													anchoredInLogOrder = true;
 												}
 											}
-											if (!anchoredOnBarrier && (copyResume || orderedTableNames.length > 0)) {
-												// A degraded anchor is otherwise indistinguishable from a barrier-backed one in the logs.
+											if (!anchoredInLogOrder && (copyResume || orderedTableNames.length > 0)) {
+												// A degraded anchor is otherwise indistinguishable from a log-order one in the logs.
 												logger.warn?.(
-													`Base copy of ${databaseName} to ${remoteNodeName} is anchored on wall-clock time, not a log-order barrier; a transaction in flight now can be missed`
+													`Base copy of ${databaseName} to ${remoteNodeName} is anchored on a timestamp, not a log-order position; a transaction in flight now can be missed`
 												);
 											}
 											const nodeId = getThisNodeId(auditStore);
@@ -6343,7 +6350,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									const nextTransaction = whenNextTransaction(auditStore);
 									if (!(auditStore.reusableIterable && auditLogIterable)) {
 										// No append-order resume here — only the copy's own pre-positioned range above does that. A
-										// reconnect resumes with the subscription's startTime at the barrier key, and
+										// reconnect resumes with the subscription's startTime at the anchor key, and
 										// `matchesSubscription` below requires that startTime to be BELOW an entry's key, so an
 										// older-keyed entry this range would correctly yield is dropped by the subscription predicate
 										// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
@@ -6393,7 +6400,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									) {
 										logger.error?.(
 											connectionId,
-											'the resume boundary failed while tailing; falling back to wall-clock anchoring',
+											'the resume boundary failed while tailing; falling back to a timestamp resume',
 											databaseName,
 											boundaryLogName
 										);
