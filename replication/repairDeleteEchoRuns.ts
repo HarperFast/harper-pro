@@ -128,12 +128,12 @@ function readVarint(data: Buffer, cursor: { position: number }): number | undefi
 	return data.readUInt32BE(position + 1);
 }
 
+const cursor = { position: 0 };
+
 /**
  * Mirrors the field layout RocksTransactionLogStore.getRange and core's readAuditEntry read; returns
  * undefined for anything that does not decode, which the caller keeps verbatim.
  */
-const cursor = { position: 0 };
-
 export function decodeEntry(data: Buffer): DecodedEntry | undefined {
 	if (data.length < 4) return;
 	const prelude = data.readUInt32BE(0);
@@ -244,7 +244,7 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 		let pendingLength = 0;
 		let pendingOpensBatch = false;
 		const carry = options.carry;
-		let spanRecords = carry?.records ?? new Map<string, Buffer | null>();
+		const spanRecords = carry?.records ?? new Map<string, Buffer | null>();
 		let spanBytes = carry?.bytes ?? 0;
 		let spanTimestamp = carry?.timestamp;
 		let spanIn = carry?.sizeIn ?? 0;
@@ -280,7 +280,7 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 				scan.largestSpanIn = Math.max(scan.largestSpanIn, spanIn);
 				scan.largestSpanOut = Math.max(scan.largestSpanOut, spanOut);
 				spanTimestamp = timestamp;
-				spanRecords = new Map();
+				spanRecords.clear();
 				spanBytes = 0;
 				spanIn = 0;
 				spanOut = 0;
@@ -1108,11 +1108,13 @@ function restoreHeld(backupDir: string, databasePath: string, manifest: Manifest
 		const storeDir = join(databasePath, 'transaction_logs', entry.name);
 		const stagingDir = join(backupDir, entry.name);
 		// the same rewind the repair published under, so no swap in between can leave an offset mid-entry
-		if (entry.txnState)
+		if (entry.txnState) {
 			renameSync(
 				writeTxnState(stagingDir, storeDir, { offset: FILE_HEADER_SIZE, sequence: entry.txnState.original.sequence }),
 				join(storeDir, TXN_STATE)
 			);
+			fsyncPath(storeDir);
+		}
 		for (const name of entry.created) rmSync(join(storeDir, name), { force: true });
 		for (const replaced of entry.replaced) {
 			const target = join(storeDir, replaced.file);
