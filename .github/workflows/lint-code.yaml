@@ -8,6 +8,11 @@ on:
     - cron: '17 14 * * 1-5' # Run M-F at 2:17pm UTC (7:17am MST / 8:17am MDT)
   workflow_dispatch:
 
+# This job runs PR-authored package.json scripts, and the repo's default token is
+# write-scoped (see typecheck.yaml).
+permissions:
+  contents: read
+
 jobs:
   runLinter:
     runs-on: ubuntu-latest
@@ -18,6 +23,5 @@ jobs:
           package-manager-cache: false
       - run: npm i
       - run: npm run lint:required
-      # .prettierignore excludes the core submodule, which isn't checked out here anyway.
-      - run: npx prettier --check .
+      - run: npm run format -- --check
       - run: node build-tools/companion-check.test.mjs
