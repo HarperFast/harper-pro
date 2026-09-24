@@ -1,9 +1,9 @@
 name: Typecheck
 
-# The eight test/build workflows now fail their own build step on tsc errors too,
-# but most don't run on every pull_request (schedule- or workflow_dispatch-only)
-# and the ones that do run a full test suite. This job runs `tsc --noEmit`, whose
-# only product is that exit code, as a fast check that fires on every PR.
+# Most of the eight test/build workflows don't run on every pull_request
+# (schedule- or workflow_dispatch-only), and the ones that do run a full test
+# suite. This job runs `tsc --noEmit`, whose only product is that exit code,
+# as a fast check that fires on every PR.
 #
 # No `paths:` filter, for the same reason as `validate-caller-workflows.yml`: a
 # required status check that only fires on some PRs stays permanently pending on
