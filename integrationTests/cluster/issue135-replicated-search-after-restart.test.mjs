@@ -12,9 +12,9 @@
 import { suite, test, before, after } from 'node:test';
 import { equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { startHarper, teardownHarper, targz, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
+import { startHarper, targz, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
+import { sendOperation, fetchWithRetry, restartNode, stopAndTeardownNodes } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -112,7 +112,7 @@ suite(
 
 		after(async () => {
 			if (!ctx.nodes) return;
-			await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node })));
+			await stopAndTeardownNodes(ctx.nodes);
 		});
 
 		test('Resource SDK search on receiving node returns full row set after restart', async () => {
@@ -148,8 +148,7 @@ suite(
 
 			// Restart node 1 (the receiving node). The data on node 1 came from replication,
 			// not from a local write — this is the case where the bug is hypothesized to live.
-			await sendOperation(ctx.nodes[1], { operation: 'restart' }).catch(() => {});
-			await delay(5000);
+			await restartNode(ctx.nodes[1]);
 			await pollHealth(ctx.nodes[1], { retries: 60, intervalMs: 2000 });
 
 			// Ops API on node 1 (oracle).

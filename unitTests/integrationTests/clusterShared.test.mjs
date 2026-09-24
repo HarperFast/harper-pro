@@ -2,7 +2,19 @@ import { expect } from 'chai';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { text } from 'node:stream/consumers';
-import { sendOperation, ensureTableExists, waitForCondition } from '../../integrationTests/cluster/clusterShared.mjs';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { mkdtemp, mkdir, rm, unlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import {
+	sendOperation,
+	ensureTableExists,
+	waitForCondition,
+	waitForNewPid,
+	stopAndTeardownNodes,
+} from '../../integrationTests/cluster/clusterShared.mjs';
 
 async function startStub(handler) {
 	const server = createServer(handler);
@@ -237,5 +249,99 @@ describe('cluster test helpers — ensureTableExists', () => {
 		} finally {
 			await stub.close();
 		}
+	});
+});
+
+describe('cluster test helpers — restart identity and teardown', () => {
+	let root;
+	beforeEach(async () => {
+		root = await mkdtemp(join(tmpdir(), 'cluster-shared-'));
+	});
+	afterEach(async () => {
+		await rm(root, { recursive: true, force: true });
+	});
+
+	async function startSleeper() {
+		const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+		await once(child, 'spawn');
+		return child;
+	}
+
+	it('waitForNewPid waits through the unlinked pid file for the replacement pid', async () => {
+		const node = { hostname: 'test-node', dataRootDir: root };
+		await writeFile(join(root, 'hdb.pid'), '111');
+		const replaced = (async () => {
+			await delay(30);
+			await unlink(join(root, 'hdb.pid'));
+			await delay(30);
+			await writeFile(join(root, 'hdb.pid'), '222');
+		})();
+		const pid = await waitForNewPid(node, 111, { pollMs: 5, timeoutMs: 5000 });
+		await replaced;
+		expect(pid).to.equal(222);
+	});
+
+	it('waitForNewPid times out naming the pid that never changed', async () => {
+		await writeFile(join(root, 'hdb.pid'), '111');
+		const error = await waitForNewPid({ hostname: 'test-node', dataRootDir: root }, 111, {
+			pollMs: 5,
+			timeoutMs: 50,
+		}).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.message).to.equal('node test-node did not restart within 50ms (still pid 111)');
+	});
+
+	it('waitForNewPid times out saying the pid file is gone when no replacement wrote one', async () => {
+		const error = await waitForNewPid({ hostname: 'test-node', dataRootDir: root }, 111, {
+			pollMs: 5,
+			timeoutMs: 50,
+		}).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error?.message).to.equal('node test-node did not restart within 50ms (no pid file)');
+	});
+
+	it('waitForNewPid refuses a missing previous pid rather than passing on the old process', async () => {
+		await writeFile(join(root, 'hdb.pid'), '111');
+		const error = await waitForNewPid({ hostname: 'test-node', dataRootDir: root }, undefined).then(
+			() => undefined,
+			(error) => error
+		);
+		expect(error).to.be.instanceOf(TypeError);
+	});
+
+	it('stopAndTeardownNodes stops the process in the pid file and removes the root', async () => {
+		const child = await startSleeper();
+		const nodeRoot = join(root, 'node');
+		await mkdir(nodeRoot);
+		await writeFile(join(nodeRoot, 'hdb.pid'), String(child.pid));
+		const exited = once(child, 'exit');
+		await stopAndTeardownNodes([undefined, { dataRootDir: nodeRoot }]);
+		await exited;
+		expect(existsSync(nodeRoot)).to.equal(false);
+	});
+
+	it('stopAndTeardownNodes tears down every node and rethrows a failure', async () => {
+		const child = await startSleeper();
+		const brokenRoot = join(root, 'broken');
+		const healthyRoot = join(root, 'healthy');
+		// a directory where the pid file should be makes the pid read fail with EISDIR
+		await mkdir(join(brokenRoot, 'hdb.pid'), { recursive: true });
+		await mkdir(healthyRoot);
+		await writeFile(join(healthyRoot, 'hdb.pid'), String(child.pid));
+		const exited = once(child, 'exit');
+		const error = await stopAndTeardownNodes([{ dataRootDir: brokenRoot }, { dataRootDir: healthyRoot }]).then(
+			() => undefined,
+			(error) => error
+		);
+		await exited;
+		expect(error).to.be.instanceOf(AggregateError);
+		expect(error.errors).to.have.length(1);
+		expect(error.errors[0].code).to.equal('EISDIR');
+		expect(existsSync(brokenRoot)).to.equal(false);
+		expect(existsSync(healthyRoot)).to.equal(false);
 	});
 });

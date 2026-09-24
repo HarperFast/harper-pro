@@ -1,5 +1,6 @@
 import { equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
+import { teardownHarper } from '@harperfast/integration-testing';
 
 /**
  * Send an operation to a Harper node and validate the response
@@ -142,30 +143,49 @@ export async function readNodePid(node) {
  * test vacuous (no cold cache, no reconnect) and lets subsequent writes land in the
  * shutdown window, where they can be acknowledged and then lost.
  *
+ * @param {Object} node
+ * @param {Object} [opts] - see `waitForNewPid`
+ * @returns {Promise<number>} the new main-process pid
+ */
+export async function restartNode(node, opts) {
+	const previousPid = await readNodePid(node);
+	if (previousPid === undefined) {
+		throw new Error(`node ${node.hostname} has no pid file before restart — it is not running`);
+	}
+	// The response can be lost if the socket closes first; the pid check is what we trust.
+	await sendOperation(node, { operation: 'restart' }).catch(() => {});
+	return waitForNewPid(node, previousPid, opts);
+}
+
+/**
+ * Wait until a node's main process is no longer `previousPid` — for a caller that issues `restart`
+ * itself because it must act inside the shutdown window (`restartNode` otherwise).
+ *
  * The pid file is the authoritative signal: the restart path unlinks it and the new main
  * process writes its own pid back. Callers should still poll for readiness afterwards —
  * the pid appears before the servers are listening.
  *
  * @param {Object} node
+ * @param {number} previousPid - `readNodePid(node)` from BEFORE the restart was issued
  * @param {Object} [opts]
  * @param {number} [opts.timeoutMs=60000]
  * @param {number} [opts.pollMs=250]
  * @returns {Promise<number>} the new main-process pid
  */
-export async function restartNode(node, { timeoutMs = 60000, pollMs = 250 } = {}) {
-	const previousPid = await readNodePid(node);
-	if (previousPid === undefined) {
-		throw new Error(`node ${node.hostname} has no pid file before restart — it is not running`);
+export async function waitForNewPid(node, previousPid, { timeoutMs = 60000, pollMs = 250 } = {}) {
+	// any pid differs from a missing one, so without this the wait would pass on the old process
+	if (!Number.isInteger(previousPid)) {
+		throw new TypeError(`waitForNewPid needs the pid ${node.hostname} had before restart, got ${previousPid}`);
 	}
-	// The response can be lost if the socket closes first; the pid check below is what we trust.
-	await sendOperation(node, { operation: 'restart' }).catch(() => {});
 	const deadline = Date.now() + timeoutMs;
+	let pid;
 	while (Date.now() < deadline) {
 		await delay(pollMs);
-		const pid = await readNodePid(node);
+		pid = await readNodePid(node);
 		if (pid !== undefined && pid !== previousPid) return pid;
 	}
-	throw new Error(`node ${node.hostname} did not restart within ${timeoutMs}ms (still pid ${previousPid})`);
+	const state = pid === undefined ? 'no pid file' : `still pid ${previousPid}`;
+	throw new Error(`node ${node.hostname} did not restart within ${timeoutMs}ms (${state})`);
 }
 
 /**
@@ -207,6 +227,23 @@ export async function stopNodeProcess(node, { timeoutMs = 15000 } = {}) {
 	} catch {
 		/* raced with its own exit */
 	}
+}
+
+/**
+ * `after()` for a suite that restarts nodes: `stopNodeProcess` then `teardownHarper` on each node.
+ * Every step is attempted on every node, and every error is rethrown together rather than logged.
+ *
+ * @param {Array<Object|undefined>} nodes - unstarted (undefined) entries are skipped
+ */
+export async function stopAndTeardownNodes(nodes) {
+	const failures = [];
+	await Promise.all(
+		nodes.filter(Boolean).map(async (node) => {
+			if (node.dataRootDir) await stopNodeProcess(node).catch((error) => failures.push(error));
+			await teardownHarper({ harper: node }).catch((error) => failures.push(error));
+		})
+	);
+	if (failures.length) throw new AggregateError(failures, 'Failed to stop or tear down a Harper node');
 }
 
 /**

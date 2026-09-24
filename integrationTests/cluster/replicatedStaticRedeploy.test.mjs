@@ -36,9 +36,9 @@
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
+import { startHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, restartNode, stopAndTeardownNodes } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -111,7 +111,7 @@ suite('replicated redeploy of a static-file component (gh#1935 regression anchor
 	after(
 		async () => {
 			if (!ctx.nodes) return;
-			await Promise.all(ctx.nodes.filter(Boolean).map((node) => teardownHarper({ harper: node })));
+			await stopAndTeardownNodes(ctx.nodes);
 		},
 		{ timeout: 60_000 }
 	);
@@ -272,18 +272,15 @@ suite('replicated redeploy of a static-file component (gh#1935 regression anchor
 
 	test(
 		'restart:true on the replica only fixes that node; origin unaffected',
-		// delay(5000) + a single pollHealth call (up to ~120s) + two snapshotPages calls
+		// restartNode (up to 60s) + a single pollHealth call (up to ~120s) + two snapshotPages calls
 		// (up to ~20s each) — this ceiling has to clear that combined budget.
-		{ timeout: 200_000 },
+		{ timeout: 240_000 },
 		async () => {
 			console.log('[QA-710] pre-restart snapshots:', JSON.stringify(ctx.snapshots));
 			if (!ctx.snapshots?.origin) return; // test 2 didn't set snapshots — its own failure already surfaces the issue
 			const before = ctx.snapshots;
 
-			// Restart node 1 (replica) only. `restart` drops the HTTP connection, so the request
-			// itself may reject/timeout — that's expected, not a failure.
-			await sendOperation(ctx.nodes[1], { operation: 'restart' }).catch(() => {});
-			await delay(5000);
+			await restartNode(ctx.nodes[1]);
 			await pollHealth(ctx.nodes[1]);
 
 			const replicaAfter = await snapshotPages(ctx.nodes[1], ['existing.html', 'new.html']);
