@@ -1,9 +1,6 @@
-/**
- * Operator CLI for replication/repairDeleteEchoRuns.ts (harper-pro#826). Dry run by default.
- */
 import { parseArgs } from 'node:util';
 import {
-	assertHarperStopped,
+	assertDatabaseClosed,
 	repairHarperRoot,
 	restoreRepair,
 	RepairRefusedError,
@@ -22,8 +19,17 @@ function formatBytes(bytes: number): string {
 	return bytes >= 1 << 20 ? `${(bytes / (1 << 20)).toFixed(1)} MiB` : `${bytes} B`;
 }
 
-function printReport(report: DatabaseReport, apply: boolean): void {
+function printReport(report: DatabaseReport, apply: boolean, root: string): void {
 	console.log(`${report.path}`);
+	for (const backupDir of report.removedBackups)
+		console.log(`  removed ${backupDir}: a repair stopped before touching the database left it behind`);
+	if (!apply) {
+		try {
+			assertDatabaseClosed(report.path, root);
+		} catch (error) {
+			console.log(`  warning: ${error.message}; this report is advisory only`);
+		}
+	}
 	if (report.refused) {
 		console.log(`  refused: ${report.refused}`);
 		return;
@@ -66,17 +72,11 @@ async function main(): Promise<number> {
 		return 0;
 	}
 	const root = positionals[0];
-	if (!values.apply) {
-		try {
-			assertHarperStopped(root);
-		} catch (error) {
-			console.log(`warning: ${error.message}; a report on a running node is advisory only`);
-		}
-	}
 	const reports = await repairHarperRoot(root, { apply: values.apply });
-	for (const report of reports) printReport(report, values.apply);
+	for (const report of reports) printReport(report, values.apply, root);
 	if (reports.length === 0) console.log(`no RocksDB databases with transaction logs under ${root}/database`);
-	return reports.some((report) => report.refused) ? 1 : 0;
+	// a refused file may still hold the run that wedges replication
+	return reports.some((report) => report.refused || report.logs.some((log) => log.refused.length > 0)) ? 1 : 0;
 }
 
 main().then(

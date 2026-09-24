@@ -1,11 +1,7 @@
 /**
- * An echoed delete run (harper-pro#826; replication/DESIGN.md item 20) is repaired offline and no longer
- * re-logs on the receiver. The fixture plants the log state older releases left on A while B is offline,
- * so B resumes from a cursor below both runs — a connected B's cursor would already be past them:
- *  - `z` × 20,000 under z's delete key, far above A's 256 KiB cap: one frame no sender can ship. A is
- *    stopped and repaired with dist/bin/repairDeleteEchoRuns.js; otherwise the later marker never reaches B.
- *  - `[x, y]` × 40 under their shared delete key, planted after the repair and below the cap, so B receives
- *    all 82 in one frame. B's apply must log one delete per record.
+ * harper-pro#826 (replication/DESIGN.md item 20). B is offline while A gains both runs, so B resumes from a
+ * cursor below them. The `z` run exceeds A's cap until the repair tool compacts it; the `[x, y]` run is planted
+ * after the repair, below the cap, so B receives every copy and must log one delete per record.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, match } from 'node:assert/strict';

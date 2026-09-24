@@ -1,7 +1,4 @@
-/**
- * Fixture for deleteEchoRun.test.mjs. `PlantDeleteRun` POST `{ ids, copies }` appends the sequence `ids`
- * `copies` times under the shared log key of those ids' latest deletes — the run an echo left behind.
- */
+/** `PlantDeleteRun` POST `{ ids, copies }` appends `copies` echoes of those ids' latest deletes under their log key. */
 
 function deleteEntries(id) {
 	const table = tables.EchoTarget;

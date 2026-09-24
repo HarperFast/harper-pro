@@ -1,17 +1,7 @@
 /**
- * Offline repair for RocksDB transaction logs that releases before harper#2761 filled with echoed copies
- * of a replicated delete (harper-pro#826; replication/DESIGN.md item 20). Every copy carries the origin
- * transaction's timestamp, and the replication sender frames consecutive entries of one timestamp as one
- * message, so a run above `replication_maxPayload` closes the leg on every reconnect.
- *
- * A delete is dropped only when its replicated bytes (everything after Harper's local prelude) equal a
- * delete of the same record kept earlier in the same run of one timestamp in the same file, with no other
- * entry for that record in between. Everything else is copied verbatim, in order. Harper must be stopped:
- * outputs are staged and originals hard-linked into a backup directory, a manifest is written, and only
- * then is the store touched, one atomic rename at a time. `restoreRepair` puts the originals back.
- *
- * Only `node:` built-ins and rocksdb-js are imported: Harper's runtime modules initialize configuration,
- * logging and storage when loaded.
+ * Offline repair of RocksDB transaction logs that releases before harper#2761 filled with echoed copies of
+ * a replicated delete (replication/DESIGN.md item 20). Imports only `node:` built-ins and rocksdb-js:
+ * Harper's runtime modules initialize configuration, logging and storage when loaded.
  */
 import {
 	chmodSync,
@@ -30,13 +20,14 @@ import {
 	readSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeSync,
 	existsSync,
 	type Stats,
 } from 'node:fs';
 import { createHash, type Hash } from 'node:crypto';
 import { endianness } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { constants as rocksConstants, RocksDatabase, validateTransactionLogStore } from '@harperfast/rocksdb-js';
 
 const FILE_HEADER_SIZE = 13;
@@ -55,8 +46,9 @@ const HAS_PREVIOUS_RESIDENCY_ID = 0x40000000;
 const HAS_PREVIOUS_VERSION = 0x20000000;
 const PREVIOUS_VERSION_FIRST_BYTE = 0x42;
 const DELETE_ACTION = 2;
-/** Distinct records tracked per same-timestamp run before that run is copied without deduplication. */
-export const MAX_SPAN_RECORDS = 1_000_000;
+/** Span state one same-timestamp run may retain before the rest of that run is copied without deduplication. */
+export const MAX_SPAN_BYTES = 256 * 1024 * 1024;
+const SPAN_ENTRY_OVERHEAD = 64;
 const BACKUP_PREFIX = 'transaction_logs.repair-';
 const MANIFEST = 'manifest.json';
 const LOG_FILE_PATTERN = /^([1-9]\d*)\.txnlog$/;
@@ -78,7 +70,7 @@ export interface FileScan {
 	/** Largest run of one timestamp, in bytes: what the sender would frame as one message. */
 	largestSpanIn: number;
 	largestSpanOut: number;
-	/** Runs with more distinct records than `maxSpanRecords`, copied from that point without deduplication. */
+	/** Runs whose state outgrew `maxSpanBytes`, copied from that point without deduplication. */
 	saturatedSpans: number;
 	/** The last entry does not close its transaction. */
 	endsUnclosed: boolean;
@@ -94,7 +86,7 @@ export interface CompactOptions {
 	/** Descriptor to write the compacted file to; omitted for a dry run. */
 	output?: number;
 	flushedOffset?: number;
-	maxSpanRecords?: number;
+	maxSpanBytes?: number;
 }
 
 interface DecodedEntry {
@@ -204,12 +196,11 @@ class OutputWriter {
 }
 
 /**
- * Streams one `.txnlog` file, deciding which entries to keep; writes the kept entries to
- * `options.output` when given. Span state resets at every file start, so a file's first entry is always
- * kept and a transaction continued from the previous file keeps an entry here to carry its last flag.
+ * Span state resets at every file start, so a file's first entry is always kept and a transaction continued
+ * from the previous file keeps an entry in this one to carry its last flag.
  */
 export function compactLogFile(path: string, options: CompactOptions = {}): FileScan {
-	const maxSpanRecords = options.maxSpanRecords ?? MAX_SPAN_RECORDS;
+	const maxSpanBytes = options.maxSpanBytes ?? MAX_SPAN_BYTES;
 	const fd = openSync(path, 'r');
 	try {
 		const size = fstatSync(fd).size;
@@ -236,11 +227,11 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 			outputSha256: '',
 		};
 		let entry = Buffer.allocUnsafe(64 * 1024);
-		// The last kept entry is held back so a dropped copy that closed the transaction can move its last flag here.
 		let pending = Buffer.allocUnsafe(64 * 1024);
 		let pendingLength = 0;
 		let pendingOpensBatch = false;
 		const spanRecords = new Map<string, Buffer | null>();
+		let spanBytes = 0;
 		let spanTimestamp: number | undefined;
 		let spanSaturated = false;
 		let spanIn = 0;
@@ -275,6 +266,7 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 				scan.largestSpanOut = Math.max(scan.largestSpanOut, spanOut);
 				spanTimestamp = timestamp;
 				spanRecords.clear();
+				spanBytes = 0;
 				spanSaturated = false;
 				spanIn = 0;
 				spanOut = 0;
@@ -284,22 +276,30 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 			if (!spanSaturated) {
 				const data = bytes.subarray(ENTRY_HEADER_SIZE);
 				const decoded = decodeEntry(data);
-				if (!decoded) spanRecords.clear();
-				else {
+				if (!decoded) {
+					spanRecords.clear();
+					spanBytes = 0;
+				} else {
 					const replicated = data.subarray(decoded.replicatedStart);
 					const previous = spanRecords.get(decoded.recordKey);
 					if (decoded.isDelete && previous?.equals(replicated)) drop = true;
-					else if (previous === undefined && spanRecords.size >= maxSpanRecords) {
-						spanSaturated = true;
-						spanRecords.clear();
-						scan.saturatedSpans++;
-					} else spanRecords.set(decoded.recordKey, decoded.isDelete ? Buffer.from(replicated) : null);
+					else {
+						spanBytes +=
+							(decoded.isDelete ? replicated.length : 0) -
+							(previous?.length ?? 0) +
+							(previous === undefined ? decoded.recordKey.length + SPAN_ENTRY_OVERHEAD : 0);
+						if (spanBytes > maxSpanBytes) {
+							spanSaturated = true;
+							spanRecords.clear();
+							spanBytes = 0;
+							scan.saturatedSpans++;
+						} else spanRecords.set(decoded.recordKey, decoded.isDelete ? Buffer.from(replicated) : null);
+					}
 				}
 			}
 			if (drop) {
 				scan.dropped++;
 				if (flags & LAST_FLAG) {
-					// no kept entry of this transaction in this file means every entry was a copy: it goes whole
 					if (pendingOpensBatch) pending[ENTRY_FLAGS_OFFSET] |= LAST_FLAG;
 					pendingOpensBatch = false;
 				}
@@ -364,20 +364,35 @@ export interface DatabaseReport {
 	logs: LogReport[];
 	refused?: string;
 	backupDir?: string;
+	/** Backup directories of repairs interrupted before their manifest, so before the store was touched. */
+	removedBackups: string[];
 	applied: boolean;
 }
 
 export interface RepairOptions {
 	apply?: boolean;
-	maxSpanRecords?: number;
-	/** Throws when Harper is running; called before the store is first touched and before every rename. */
+	maxSpanBytes?: number;
+	/** Throws while the database is open; called before the store is first touched and before every rename. */
 	assertStopped?: () => void;
 	/** Test seam for crash injection: called after each durable step of an apply. */
 	afterStep?: (step: string) => void;
 }
 
 function sha256File(path: string): string {
-	return createHash('sha256').update(readFileSync(path)).digest('hex');
+	const hash = createHash('sha256');
+	const buffer = Buffer.allocUnsafe(1 << 20);
+	const fd = openSync(path, 'r');
+	try {
+		let position = 0;
+		let bytes: number;
+		while ((bytes = readSync(fd, buffer, 0, buffer.length, position)) > 0) {
+			hash.update(buffer.subarray(0, bytes));
+			position += bytes;
+		}
+	} finally {
+		closeSync(fd);
+	}
+	return hash.digest('hex');
 }
 
 function fsyncPath(path: string): void {
@@ -433,10 +448,7 @@ function readBoundary(path: string): number {
 	return bytes.readUInt32BE(4);
 }
 
-/**
- * Lists the log stores of one database, refusing anything the tool does not recognize: an unknown side
- * file could hold byte positions this rewrite would invalidate.
- */
+/** Refuses anything unrecognized: an unknown side file could hold byte positions a rewrite would invalidate. */
 function inventory(databasePath: string): LogStore[] {
 	const logsDir = join(databasePath, 'transaction_logs');
 	const boundaryRoot = join(logsDir, BOUNDARY_DIR);
@@ -479,7 +491,7 @@ function inventory(databasePath: string): LogStore[] {
 	return stores;
 }
 
-async function planStore(store: LogStore, maxSpanRecords: number): Promise<void> {
+async function planStore(store: LogStore, maxSpanBytes: number): Promise<void> {
 	const validation = await validateTransactionLogStore(store.dir, { strict: true });
 	if (validation.errors.length > 0) {
 		store.refused = `failed strict validation: ${validation.errors.join('; ')}`;
@@ -498,9 +510,10 @@ async function planStore(store: LogStore, maxSpanRecords: number): Promise<void>
 		}
 		const flushedOffset = store.txnState?.sequence === file.sequence ? store.txnState.offset : undefined;
 		try {
-			file.scan = compactLogFile(file.path, { flushedOffset, maxSpanRecords });
+			file.scan = compactLogFile(file.path, { flushedOffset, maxSpanBytes });
 		} catch (error) {
-			if (!(error instanceof RepairRefusedError)) throw error;
+			// retention on a running node can delete a file between the listing and the scan
+			if (!(error instanceof RepairRefusedError) && error.code !== 'ENOENT') throw error;
 			file.refused = error.message;
 			continue;
 		}
@@ -557,7 +570,6 @@ interface ManifestLog {
 
 interface Manifest {
 	format: 1;
-	database: string;
 	state: 'staged' | 'applied' | 'complete';
 	logs: ManifestLog[];
 }
@@ -577,21 +589,20 @@ function readManifest(backupDir: string): Manifest {
 	return manifest;
 }
 
-function unfinishedRepairs(databasePath: string): string[] {
+function backupDirs(databasePath: string): string[] {
 	return readdirSync(databasePath)
-		.filter((name) => name.startsWith(BACKUP_PREFIX) && existsSync(join(databasePath, name, MANIFEST)))
-		.map((name) => join(databasePath, name))
-		.filter((backupDir) => {
-			const { state } = readManifest(backupDir);
-			return state === 'staged' || state === 'applied';
-		});
+		.filter((name) => name.startsWith(BACKUP_PREFIX))
+		.map((name) => join(databasePath, name));
 }
 
-function restoreCommand(backupDir: string): string {
-	return `node dist/bin/repairDeleteEchoRuns.js --restore ${backupDir}`;
+function unfinishedRepairMessage(backupDir: string): string {
+	return (
+		`restore it with: node dist/bin/repairDeleteEchoRuns.js --restore ${backupDir}\n` +
+		`or, if Harper has run on this database since, keep the database as it is (each file is wholly original or ` +
+		`wholly repaired) by deleting ${backupDir}`
+	);
 }
 
-/** Makes a staged file match the original's mode and owner before it replaces the original. */
 function matchOwnership(path: string, original: Stats): void {
 	chmodSync(path, original.mode & 0o7777);
 	if (process.getuid?.() === 0) chownSync(path, original.uid, original.gid);
@@ -606,16 +617,20 @@ function assertOwnable(store: LogStore): void {
 	}
 }
 
-/**
- * Scans (and with `apply`, repairs) every transaction log of one RocksDB database directory.
- */
 export async function repairDatabase(path: string, options: RepairOptions = {}): Promise<DatabaseReport> {
 	const databasePath = resolve(path);
-	const report: DatabaseReport = { path: databasePath, logs: [], applied: false };
-	const unfinished = unfinishedRepairs(databasePath);
-	if (unfinished.length > 0) {
-		report.refused = `an earlier repair did not finish; restore it first: ${unfinished.map(restoreCommand).join(' ; ')}`;
-		return report;
+	const report: DatabaseReport = { path: databasePath, logs: [], removedBackups: [], applied: false };
+	for (const backupDir of backupDirs(databasePath)) {
+		if (!existsSync(join(backupDir, MANIFEST))) {
+			// its links to the live originals would otherwise make every later inventory refuse them
+			if (options.apply) {
+				rmSync(backupDir, { recursive: true, force: true });
+				report.removedBackups.push(backupDir);
+			}
+		} else if (readManifest(backupDir).state !== 'complete') {
+			report.refused = `an earlier repair did not finish; ${unfinishedRepairMessage(backupDir)}`;
+			return report;
+		}
 	}
 	let stores: LogStore[];
 	try {
@@ -625,16 +640,17 @@ export async function repairDatabase(path: string, options: RepairOptions = {}):
 		report.refused = error.message;
 		return report;
 	}
-	for (const store of stores) await planStore(store, options.maxSpanRecords ?? MAX_SPAN_RECORDS);
+	for (const store of stores) await planStore(store, options.maxSpanBytes ?? MAX_SPAN_BYTES);
 	report.logs = stores.map(toReport);
 	const targets = stores.filter((store) => store.files.some(isTarget));
 	if (!options.apply || targets.length === 0) return report;
 	for (const store of targets) assertOwnable(store);
-	options.assertStopped?.();
+	const assertStopped = options.assertStopped ?? (() => assertDatabaseClosed(databasePath));
+	assertStopped();
 	const backupDir = join(databasePath, BACKUP_PREFIX + new Date().toISOString().replace(/[:.]/g, '-'));
 	report.backupDir = backupDir;
 	mkdirSync(backupDir, { mode: 0o700 });
-	const manifest: Manifest = { format: 1, database: databasePath, state: 'staged', logs: [] };
+	const manifest: Manifest = { format: 1, state: 'staged', logs: [] };
 	try {
 		for (const store of targets) manifest.logs.push(stageStore(store, join(backupDir, store.name), options));
 		fsyncPath(backupDir);
@@ -651,7 +667,7 @@ export async function repairDatabase(path: string, options: RepairOptions = {}):
 		step('staged');
 		for (const store of targets) {
 			const entry = manifest.logs.find((candidate) => candidate.name === store.name);
-			publishStore(store, entry, join(backupDir, store.name), options, (name) => step(`${store.name}: ${name}`));
+			publishStore(store, entry, join(backupDir, store.name), assertStopped, (name) => step(`${store.name}: ${name}`));
 		}
 		manifest.state = 'applied';
 		writeManifest(backupDir, manifest);
@@ -660,7 +676,7 @@ export async function repairDatabase(path: string, options: RepairOptions = {}):
 		manifest.state = 'complete';
 		writeManifest(backupDir, manifest);
 	} catch (error) {
-		error.message = `${error.message}\nThe repair of ${databasePath} did not finish; restore the originals with: ${restoreCommand(backupDir)}`;
+		error.message = `${error.message}\nThe repair of ${databasePath} did not finish; ${unfinishedRepairMessage(backupDir)}`;
 		throw error;
 	}
 	report.applied = true;
@@ -671,7 +687,6 @@ export async function repairDatabase(path: string, options: RepairOptions = {}):
 	return report;
 }
 
-/** Writes every compacted file of one log store into `stagingDir` and hard-links the originals beside them. */
 function stageStore(store: LogStore, stagingDir: string, options: RepairOptions): ManifestLog {
 	mkdirSync(stagingDir, { mode: 0o700 });
 	const entry: ManifestLog = { name: store.name, replaced: [], created: [] };
@@ -681,14 +696,14 @@ function stageStore(store: LogStore, stagingDir: string, options: RepairOptions)
 		const fd = openSync(staged, 'wx', 0o600);
 		let scan: FileScan;
 		try {
-			scan = compactLogFile(file.path, { output: fd, flushedOffset, maxSpanRecords: options.maxSpanRecords });
-			fsyncSync(fd);
+			scan = compactLogFile(file.path, { output: fd, flushedOffset, maxSpanBytes: options.maxSpanBytes });
 		} finally {
 			closeSync(fd);
 		}
 		if (scan.inputSha256 !== file.scan.inputSha256)
 			throw new RepairRefusedError(`${file.path} changed while being repaired; is Harper running?`);
 		matchOwnership(staged, file.stats);
+		fsyncPath(staged);
 		linkSync(file.path, join(stagingDir, file.name));
 		entry.replaced.push({
 			file: file.name,
@@ -721,36 +736,33 @@ function stageStore(store: LogStore, stagingDir: string, options: RepairOptions)
 		const staged = join(stagingDir, tailName + '.new');
 		writeDurably(staged, header, 0o600);
 		matchOwnership(staged, last.stats);
+		fsyncPath(staged);
 		entry.created.push(tailName);
 	}
-	if (entry.txnState) copyFileSync(join(store.dir, TXN_STATE), join(stagingDir, TXN_STATE), fsConstants.COPYFILE_EXCL);
 	fsyncPath(stagingDir);
 	return entry;
 }
 
-/** Moves one store's staged files into place, keeping every intermediate state safe to boot from. */
+/** Every intermediate state is one Harper can boot from: each file is wholly original or wholly repaired. */
 function publishStore(
 	store: LogStore,
 	entry: ManifestLog,
 	stagingDir: string,
-	options: RepairOptions,
+	assertStopped: () => void,
 	step: (name: string) => void
 ): void {
 	const publish = (staged: string, name: string) => {
-		options.assertStopped?.();
+		assertStopped();
 		renameSync(staged, join(store.dir, name));
 		fsyncPath(store.dir);
-	};
-	const writeState = (position: LogPosition, suffix: string) => {
-		const temporary = join(stagingDir, TXN_STATE + suffix);
-		writeDurably(temporary, encodeTxnState(position), 0o600);
-		matchOwnership(temporary, lstatSync(join(store.dir, TXN_STATE)));
-		publish(temporary, TXN_STATE);
 	};
 	if (entry.txnState) {
 		// Replay from the start of the file while it is being swapped: rewinding re-applies already flushed
 		// writes, which replay tolerates, where a stale offset could skip unflushed ones.
-		writeState({ offset: FILE_HEADER_SIZE, sequence: entry.txnState.original.sequence }, '.rewind');
+		publish(
+			writeTxnState(stagingDir, store.dir, { offset: FILE_HEADER_SIZE, sequence: entry.txnState.original.sequence }),
+			TXN_STATE
+		);
 		step('rewound txn.state');
 	}
 	for (const name of entry.created) {
@@ -762,9 +774,22 @@ function publishStore(
 		step(`replaced ${file}`);
 	}
 	if (entry.txnState) {
-		writeState(entry.txnState.final, '.final');
+		publish(writeTxnState(stagingDir, store.dir, entry.txnState.final), TXN_STATE);
 		step('remapped txn.state');
 	}
+}
+
+/** Writes `position` durably beside the store, owned like the store's `txn.state`, ready to rename over it. */
+function writeTxnState(stagingDir: string, storeDir: string, position: LogPosition): string {
+	const temporary = join(stagingDir, TXN_STATE + '.new');
+	rmSync(temporary, { force: true });
+	writeDurably(temporary, encodeTxnState(position), 0o600);
+	const live = join(storeDir, TXN_STATE);
+	if (existsSync(live)) {
+		matchOwnership(temporary, lstatSync(live));
+		fsyncPath(temporary);
+	}
+	return temporary;
 }
 
 async function verifyApplied(databasePath: string, stores: LogStore[], manifest: Manifest): Promise<void> {
@@ -803,32 +828,36 @@ async function verifyApplied(databasePath: string, stores: LogStore[], manifest:
 	}
 }
 
-/**
- * Puts back every file a repair replaced, removes the files it created, restores `txn.state`, then removes
- * the backup directory.
- */
+/** Afterwards removes the backup directory, whose links to the restored originals would refuse a re-run. */
 export function restoreRepair(path: string, options: Pick<RepairOptions, 'assertStopped'> = {}): void {
 	const backupDir = resolve(path);
+	// derived from where the backup lives, never recorded: a root that was moved or copied restores in place
+	const databasePath = dirname(backupDir);
+	if (!basename(backupDir).startsWith(BACKUP_PREFIX))
+		throw new RepairRefusedError(`${backupDir} is not a repair backup directory`);
 	const manifest = readManifest(backupDir);
-	const assertStopped = options.assertStopped ?? (() => assertHarperStopped(join(manifest.database, '..', '..')));
+	const assertStopped =
+		options.assertStopped ?? (() => assertDatabaseClosed(databasePath, dirname(dirname(databasePath))));
 	assertStopped();
 	// Anything but the original or the repaired bytes means Harper wrote to the store since: restoring would lose it.
+	const moved = (target: string) =>
+		new RepairRefusedError(
+			`${target} has been written to since the repair, so restoring would lose those writes; keep the database as it is by deleting ${backupDir}`
+		);
 	for (const entry of manifest.logs) {
-		const storeDir = join(manifest.database, 'transaction_logs', entry.name);
+		const storeDir = join(databasePath, 'transaction_logs', entry.name);
 		for (const name of entry.created) {
 			const created = join(storeDir, name);
-			if (existsSync(created) && lstatSync(created).size !== FILE_HEADER_SIZE)
-				throw new RepairRefusedError(`${created} has been written to since the repair; it cannot be restored`);
+			if (existsSync(created) && lstatSync(created).size !== FILE_HEADER_SIZE) throw moved(created);
 		}
 		for (const replaced of entry.replaced) {
 			const target = join(storeDir, replaced.file);
 			const current = existsSync(target) ? sha256File(target) : undefined;
-			if (current !== replaced.originalSha256 && current !== replaced.sha256)
-				throw new RepairRefusedError(`${target} has changed since the repair; it cannot be restored`);
+			if (current !== replaced.originalSha256 && current !== replaced.sha256) throw moved(target);
 		}
 	}
 	for (const entry of manifest.logs) {
-		const storeDir = join(manifest.database, 'transaction_logs', entry.name);
+		const storeDir = join(databasePath, 'transaction_logs', entry.name);
 		const stagingDir = join(backupDir, entry.name);
 		for (const name of entry.created) {
 			assertStopped();
@@ -843,28 +872,66 @@ export function restoreRepair(path: string, options: Pick<RepairOptions, 'assert
 			const temporary = original + '.restore';
 			rmSync(temporary, { force: true });
 			copyFileSync(original, temporary, fsConstants.COPYFILE_EXCL);
-			fsyncPath(temporary);
 			matchOwnership(temporary, lstatSync(original));
+			fsyncPath(temporary);
 			assertStopped();
 			renameSync(temporary, target);
 		}
 		if (entry.txnState) {
-			const temporary = join(stagingDir, TXN_STATE + '.restore');
-			rmSync(temporary, { force: true });
-			writeDurably(temporary, readFileSync(join(stagingDir, TXN_STATE)), 0o600);
-			matchOwnership(temporary, lstatSync(join(stagingDir, TXN_STATE)));
+			const temporary = writeTxnState(stagingDir, storeDir, entry.txnState.original);
 			assertStopped();
 			renameSync(temporary, join(storeDir, TXN_STATE));
 		}
 		fsyncPath(storeDir);
 	}
-	// every original is back in the store, and the backup's own links would otherwise count against it
 	rmSync(backupDir, { recursive: true });
 }
 
+/** Whether a process holds a POSIX lock on `path`, per Linux's /proc/locks; undefined where that is unavailable. */
+function isLockHeld(path: string): boolean | undefined {
+	let locks: string;
+	try {
+		locks = readFileSync('/proc/locks', 'utf8');
+	} catch {
+		return;
+	}
+	let stats: ReturnType<typeof statSync>;
+	try {
+		stats = statSync(path, { bigint: true });
+	} catch (error) {
+		if (error.code === 'ENOENT') return false;
+		throw error;
+	}
+	const dev = BigInt(stats.dev);
+	// glibc's dev_t layout, which /proc/locks prints as hex major:minor
+	const major = ((dev >> 8n) & 0xfffn) | ((dev >> 32n) & ~0xfffn);
+	const minor = (dev & 0xffn) | ((dev >> 12n) & ~0xffn);
+	for (const line of locks.split('\n')) {
+		const id = line.split(/\s+/).find((field) => /^[0-9a-f]+:[0-9a-f]+:\d+$/.test(field));
+		if (!id) continue;
+		const [lockMajor, lockMinor, inode] = id.split(':');
+		if (BigInt('0x' + lockMajor) === major && BigInt('0x' + lockMinor) === minor && BigInt(inode) === stats.ino)
+			return true;
+	}
+	return false;
+}
+
 /**
- * Throws unless `<root>/hdb.pid` is absent or names a process that no longer exists.
+ * RocksDB locks `<db>/LOCK` for as long as any process has the database open, in any pid namespace. Only
+ * where that lock cannot be observed does this fall back to `<harperRoot>/hdb.pid`.
  */
+export function assertDatabaseClosed(databasePath: string, harperRoot?: string): void {
+	const held = isLockHeld(join(databasePath, 'LOCK'));
+	if (held === undefined) {
+		if (harperRoot !== undefined) assertHarperStopped(harperRoot);
+		return;
+	}
+	if (held)
+		throw new RepairRefusedError(
+			`${databasePath} is open in another process (its RocksDB LOCK is held); stop Harper, and any supervisor that restarts it, first`
+		);
+}
+
 export function assertHarperStopped(root: string): void {
 	const pidFile = join(root, 'hdb.pid');
 	if (!existsSync(pidFile)) return;
@@ -881,24 +948,26 @@ export function assertHarperStopped(root: string): void {
 	);
 }
 
-/**
- * Scans (and with `apply`, repairs) every RocksDB database under `<root>/database`.
- */
 export async function repairHarperRoot(root: string, options: RepairOptions = {}): Promise<DatabaseReport[]> {
 	if (process.platform === 'win32' || endianness() !== 'LE')
 		throw new RepairRefusedError('supported on little-endian POSIX platforms only');
 	const storageRoot = join(root, 'database');
 	if (!existsSync(storageRoot)) throw new RepairRefusedError(`${storageRoot} does not exist`);
-	const assertStopped = () => assertHarperStopped(root);
-	if (options.apply) assertStopped();
 	const reports: DatabaseReport[] = [];
 	for (const entry of readdirSync(storageRoot, { withFileTypes: true })) {
 		const databasePath = join(storageRoot, entry.name);
 		if (!entry.isDirectory() || !existsSync(join(databasePath, 'transaction_logs'))) continue;
 		if (lstatSync(join(databasePath, 'transaction_logs')).isSymbolicLink()) {
-			reports.push({ path: databasePath, logs: [], applied: false, refused: 'transaction_logs is a symbolic link' });
+			reports.push({
+				path: databasePath,
+				logs: [],
+				removedBackups: [],
+				applied: false,
+				refused: 'transaction_logs is a symbolic link',
+			});
 			continue;
 		}
+		const assertStopped = () => assertDatabaseClosed(databasePath, root);
 		reports.push(await repairDatabase(databasePath, { ...options, assertStopped }));
 	}
 	return reports;
