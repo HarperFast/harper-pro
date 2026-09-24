@@ -24,6 +24,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 		assert.deepStrictEqual(
 			{ ...resolvePeerCapabilities(undefined) },
 			{
+				safeCopyAudit: 0,
 				protocolVersion: MINIMUM_PROTOCOL_VERSION,
 				subscriptionSetupAck: 0,
 				subscriptionSetupBudgetMs: undefined,
@@ -49,6 +50,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 		assert.deepStrictEqual(Object.keys(resolved).sort(), [
 			'protocolVersion',
 			'recordLocks',
+			'safeCopyAudit',
 			'subscriptionSetupAck',
 			'subscriptionSetupBudgetMs',
 		]);
@@ -216,6 +218,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 		assert.deepStrictEqual(
 			{ ...local },
 			{
+				safeCopyAudit: 1,
 				protocolVersion: LOCAL_PROTOCOL_VERSION,
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
@@ -244,6 +247,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 		assert.deepStrictEqual(
 			{ ...decoded[4] },
 			{
+				safeCopyAudit: 1,
 				protocolVersion: LOCAL_PROTOCOL_VERSION,
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
@@ -353,5 +357,17 @@ describe('noteUnknownCommand', () => {
 
 	it('starts a fresh connection at zero, so a reconnect can publish its own count', () => {
 		assert.strictEqual(createUnknownCommandState().count, 0);
+	});
+});
+
+describe('safeCopyAudit', () => {
+	it('requires the exact advertised safety level', () => {
+		for (const value of [undefined, null, true, '1', 0, 2, NaN])
+			assert.strictEqual(resolvePeerCapabilities({ safeCopyAudit: value }).safeCopyAudit, 0);
+		assert.strictEqual(resolvePeerCapabilities({ safeCopyAudit: 1 }).safeCopyAudit, 1);
+		assert.strictEqual(
+			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ safeCopyAudit: 1 })),
+			false
+		);
 	});
 });
