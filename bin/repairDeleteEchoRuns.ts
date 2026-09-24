@@ -41,8 +41,6 @@ function printReport(report: DatabaseReport, apply: boolean, root: string): void
 				`(${formatBytes(log.bytesReclaimed)}) from ${log.rewritten.length} files; largest single-timestamp run ` +
 				`${formatBytes(log.largestSpanBefore)} -> ${formatBytes(log.largestSpanAfter)}`
 		);
-		if (log.saturatedSpans > 0)
-			console.log(`    ${log.saturatedSpans} runs held too many distinct records to deduplicate in full`);
 		if (log.createdTailFile)
 			console.log(`    started ${log.createdTailFile} so no stale derived-index coverage matches`);
 		for (const { file, reason } of log.refused) console.log(`    not repaired ${file}: ${reason}`);

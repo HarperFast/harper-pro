@@ -28,7 +28,13 @@ import {
 import { createHash, type Hash } from 'node:crypto';
 import { endianness } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import { constants as rocksConstants, RocksDatabase, validateTransactionLogStore } from '@harperfast/rocksdb-js';
+import {
+	constants as rocksConstants,
+	fileLockRelease,
+	RocksDatabase,
+	tryFileLock,
+	validateTransactionLogStore,
+} from '@harperfast/rocksdb-js';
 
 const FILE_HEADER_SIZE = 13;
 const FILE_TIMESTAMP_OFFSET = 5;
@@ -46,11 +52,15 @@ const HAS_PREVIOUS_RESIDENCY_ID = 0x40000000;
 const HAS_PREVIOUS_VERSION = 0x20000000;
 const PREVIOUS_VERSION_FIRST_BYTE = 0x42;
 const DELETE_ACTION = 2;
-/** Span state one same-timestamp run may retain before the rest of that run is copied without deduplication. */
+/** A file whose one-timestamp run needs more state than this, or holds a larger entry, is refused. */
 export const MAX_SPAN_BYTES = 256 * 1024 * 1024;
+export const MAX_ENTRY_BYTES = 512 * 1024 * 1024;
 const SPAN_ENTRY_OVERHEAD = 64;
 const BACKUP_PREFIX = 'transaction_logs.repair-';
+const REPAIR_LOCK = 'transaction_logs.repair.lock';
 const MANIFEST = 'manifest.json';
+const LOG_NAME_PATTERN = /^(?!\.\.?$)[^/\\\0]+$/;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const LOG_FILE_PATTERN = /^([1-9]\d*)\.txnlog$/;
 const BOUNDARY_FILE_PATTERN = /^([1-9]\d*)\.txnlog\.boundary$/;
 
@@ -70,8 +80,6 @@ export interface FileScan {
 	/** Largest run of one timestamp, in bytes: what the sender would frame as one message. */
 	largestSpanIn: number;
 	largestSpanOut: number;
-	/** Runs whose state outgrew `maxSpanBytes`, copied from that point without deduplication. */
-	saturatedSpans: number;
 	/** The last entry does not close its transaction. */
 	endsUnclosed: boolean;
 	/** The larger of the file header's timestamp and every entry's. */
@@ -87,6 +95,7 @@ export interface CompactOptions {
 	output?: number;
 	flushedOffset?: number;
 	maxSpanBytes?: number;
+	maxEntryBytes?: number;
 }
 
 interface DecodedEntry {
@@ -201,6 +210,7 @@ class OutputWriter {
  */
 export function compactLogFile(path: string, options: CompactOptions = {}): FileScan {
 	const maxSpanBytes = options.maxSpanBytes ?? MAX_SPAN_BYTES;
+	const maxEntryBytes = options.maxEntryBytes ?? MAX_ENTRY_BYTES;
 	const fd = openSync(path, 'r');
 	try {
 		const size = fstatSync(fd).size;
@@ -220,7 +230,6 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 			bytesOut: 0,
 			largestSpanIn: 0,
 			largestSpanOut: 0,
-			saturatedSpans: 0,
 			endsUnclosed: false,
 			latestTimestamp: fileHeader.readDoubleBE(FILE_TIMESTAMP_OFFSET),
 			inputSha256: '',
@@ -233,7 +242,6 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 		const spanRecords = new Map<string, Buffer | null>();
 		let spanBytes = 0;
 		let spanTimestamp: number | undefined;
-		let spanSaturated = false;
 		let spanIn = 0;
 		let spanOut = 0;
 		let offset = FILE_HEADER_SIZE;
@@ -248,6 +256,8 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 			const entrySize = ENTRY_HEADER_SIZE + length;
 			if (timestamp === 0 || offset + entrySize > size)
 				throw new RepairRefusedError(`${path} has a torn entry at ${offset}`);
+			if (length > maxEntryBytes)
+				throw new RepairRefusedError(`${path} holds a ${length}-byte entry at ${offset}, above ${maxEntryBytes}`);
 			if (entrySize > entry.length) {
 				const larger = Buffer.allocUnsafe(entrySize);
 				entry.copy(larger, 0, 0, ENTRY_HEADER_SIZE);
@@ -267,34 +277,31 @@ export function compactLogFile(path: string, options: CompactOptions = {}): File
 				spanTimestamp = timestamp;
 				spanRecords.clear();
 				spanBytes = 0;
-				spanSaturated = false;
 				spanIn = 0;
 				spanOut = 0;
 			}
 			spanIn += entrySize;
 			let drop = false;
-			if (!spanSaturated) {
-				const data = bytes.subarray(ENTRY_HEADER_SIZE);
-				const decoded = decodeEntry(data);
-				if (!decoded) {
-					spanRecords.clear();
-					spanBytes = 0;
-				} else {
-					const replicated = data.subarray(decoded.replicatedStart);
-					const previous = spanRecords.get(decoded.recordKey);
-					if (decoded.isDelete && previous?.equals(replicated)) drop = true;
-					else {
-						spanBytes +=
-							(decoded.isDelete ? replicated.length : 0) -
-							(previous?.length ?? 0) +
-							(previous === undefined ? decoded.recordKey.length + SPAN_ENTRY_OVERHEAD : 0);
-						if (spanBytes > maxSpanBytes) {
-							spanSaturated = true;
-							spanRecords.clear();
-							spanBytes = 0;
-							scan.saturatedSpans++;
-						} else spanRecords.set(decoded.recordKey, decoded.isDelete ? Buffer.from(replicated) : null);
-					}
+			const data = bytes.subarray(ENTRY_HEADER_SIZE);
+			const decoded = decodeEntry(data);
+			if (!decoded) {
+				spanRecords.clear();
+				spanBytes = 0;
+			} else {
+				const replicated = data.subarray(decoded.replicatedStart);
+				const previous = spanRecords.get(decoded.recordKey);
+				if (decoded.isDelete && previous?.equals(replicated)) drop = true;
+				else {
+					spanBytes +=
+						(decoded.isDelete ? replicated.length : 0) -
+						(previous?.length ?? 0) +
+						(previous === undefined ? decoded.recordKey.length + SPAN_ENTRY_OVERHEAD : 0);
+					// stopping deduplication here instead could leave the run above the payload cap
+					if (spanBytes > maxSpanBytes)
+						throw new RepairRefusedError(
+							`${path} has a run of one timestamp at ${offset} whose records need more than ${maxSpanBytes} bytes to compare`
+						);
+					spanRecords.set(decoded.recordKey, decoded.isDelete ? Buffer.from(replicated) : null);
 				}
 			}
 			if (drop) {
@@ -355,7 +362,6 @@ export interface LogReport {
 	bytesReclaimed: number;
 	largestSpanBefore: number;
 	largestSpanAfter: number;
-	saturatedSpans: number;
 	createdTailFile?: string;
 }
 
@@ -537,7 +543,6 @@ function toReport(store: LogStore): LogReport {
 		bytesReclaimed: 0,
 		largestSpanBefore: 0,
 		largestSpanAfter: 0,
-		saturatedSpans: 0,
 	};
 	if (store.refused) report.refused.push({ file: '*', reason: store.refused });
 	for (const file of store.files) {
@@ -546,7 +551,6 @@ function toReport(store: LogStore): LogReport {
 		if (!scan) continue;
 		report.entries += scan.entries;
 		report.largestSpanBefore = Math.max(report.largestSpanBefore, scan.largestSpanIn);
-		report.saturatedSpans += scan.saturatedSpans;
 		if (isTarget(file)) {
 			report.rewritten.push(file.name);
 			report.dropped += scan.dropped;
@@ -570,7 +574,8 @@ interface ManifestLog {
 
 interface Manifest {
 	format: 1;
-	state: 'staged' | 'applied' | 'complete';
+	/** `preparing` precedes every store mutation; `staged` onward, the store may have been changed. */
+	state: 'preparing' | 'staged' | 'applied' | 'complete';
 	logs: ManifestLog[];
 }
 
@@ -583,10 +588,65 @@ function writeManifest(backupDir: string, manifest: Manifest): void {
 	fsyncPath(backupDir);
 }
 
+function isPosition(position: any): boolean {
+	return (
+		Number.isInteger(position?.offset) &&
+		Number.isInteger(position?.sequence) &&
+		position.offset >= 0 &&
+		position.offset <= 0xffffffff &&
+		position.sequence >= 0 &&
+		position.sequence <= 0xffffffff
+	);
+}
+
+// restore may run as root, so every name it will write through is checked, not trusted
 function readManifest(backupDir: string): Manifest {
-	const manifest = JSON.parse(readFileSync(join(backupDir, MANIFEST), 'utf8')) as Manifest;
-	if (manifest.format !== 1) throw new RepairRefusedError(`${backupDir} has an unsupported manifest`);
+	let manifest: any;
+	try {
+		manifest = JSON.parse(readFileSync(join(backupDir, MANIFEST), 'utf8'));
+	} catch (error) {
+		throw new RepairRefusedError(`${backupDir} has an unreadable manifest: ${error.message}`);
+	}
+	const valid =
+		manifest?.format === 1 &&
+		['preparing', 'staged', 'applied', 'complete'].includes(manifest.state) &&
+		Array.isArray(manifest.logs) &&
+		manifest.logs.every(
+			(log: any) =>
+				typeof log?.name === 'string' &&
+				LOG_NAME_PATTERN.test(log.name) &&
+				Array.isArray(log.replaced) &&
+				log.replaced.every(
+					(replaced: any) =>
+						LOG_FILE_PATTERN.test(replaced?.file) &&
+						SHA256_PATTERN.test(replaced.originalSha256) &&
+						SHA256_PATTERN.test(replaced.sha256)
+				) &&
+				Array.isArray(log.created) &&
+				log.created.every((name: any) => LOG_FILE_PATTERN.test(name)) &&
+				(log.txnState === undefined || (isPosition(log.txnState.original) && isPosition(log.txnState.final)))
+		);
+	if (!valid) throw new RepairRefusedError(`${backupDir} has an invalid manifest`);
 	return manifest;
+}
+
+function withRepairLock<T>(databasePath: string, action: () => T): T {
+	const token = tryFileLock(join(databasePath, REPAIR_LOCK));
+	if (!token) throw new RepairRefusedError(`another repair or restore of ${databasePath} is running`);
+	let result: T;
+	try {
+		result = action();
+	} catch (error) {
+		fileLockRelease(token);
+		throw error;
+	}
+	if (result instanceof Promise) return result.finally(() => fileLockRelease(token)) as T;
+	fileLockRelease(token);
+	return result;
+}
+
+function asError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error));
 }
 
 function backupDirs(databasePath: string): string[] {
@@ -617,52 +677,72 @@ function assertOwnable(store: LogStore): void {
 	}
 }
 
-export async function repairDatabase(path: string, options: RepairOptions = {}): Promise<DatabaseReport> {
+export function repairDatabase(path: string, options: RepairOptions = {}): Promise<DatabaseReport> {
 	const databasePath = resolve(path);
+	if (!options.apply) return planDatabase(databasePath, options).then(({ report }) => report);
+	return withRepairLock(databasePath, () => applyDatabase(databasePath, options));
+}
+
+async function planDatabase(
+	databasePath: string,
+	options: RepairOptions
+): Promise<{ report: DatabaseReport; stores?: LogStore[] }> {
 	const report: DatabaseReport = { path: databasePath, logs: [], removedBackups: [], applied: false };
-	for (const backupDir of backupDirs(databasePath)) {
-		if (!existsSync(join(backupDir, MANIFEST))) {
-			// its links to the live originals would otherwise make every later inventory refuse them
-			if (options.apply) {
+	try {
+		for (const backupDir of backupDirs(databasePath)) {
+			const state = existsSync(join(backupDir, MANIFEST)) ? readManifest(backupDir).state : undefined;
+			if (state === 'complete') continue;
+			if (state === 'preparing' && options.apply) {
+				// interrupted before the store was touched; its links to live originals would refuse every inventory
 				rmSync(backupDir, { recursive: true, force: true });
 				report.removedBackups.push(backupDir);
+				continue;
 			}
-		} else if (readManifest(backupDir).state !== 'complete') {
-			report.refused = `an earlier repair did not finish; ${unfinishedRepairMessage(backupDir)}`;
-			return report;
+			report.refused =
+				state === undefined
+					? `${backupDir} is not a repair this tool recorded; remove it if it is not needed`
+					: state === 'preparing'
+						? `${backupDir} is left from a repair interrupted before it changed anything; --apply removes it`
+						: `an earlier repair did not finish; ${unfinishedRepairMessage(backupDir)}`;
+			return { report };
 		}
-	}
-	let stores: LogStore[];
-	try {
-		stores = inventory(databasePath);
+		const stores = inventory(databasePath);
+		for (const store of stores) await planStore(store, options.maxSpanBytes ?? MAX_SPAN_BYTES);
+		report.logs = stores.map(toReport);
+		return { report, stores };
 	} catch (error) {
 		if (!(error instanceof RepairRefusedError)) throw error;
 		report.refused = error.message;
-		return report;
+		return { report };
 	}
-	for (const store of stores) await planStore(store, options.maxSpanBytes ?? MAX_SPAN_BYTES);
-	report.logs = stores.map(toReport);
-	const targets = stores.filter((store) => store.files.some(isTarget));
-	if (!options.apply || targets.length === 0) return report;
+}
+
+async function applyDatabase(databasePath: string, options: RepairOptions): Promise<DatabaseReport> {
+	const { report, stores } = await planDatabase(databasePath, options);
+	const targets = stores?.filter((store) => store.files.some(isTarget)) ?? [];
+	if (targets.length === 0) return report;
 	for (const store of targets) assertOwnable(store);
 	const assertStopped = options.assertStopped ?? (() => assertDatabaseClosed(databasePath));
 	assertStopped();
+	const step = (name: string) => options.afterStep?.(name);
 	const backupDir = join(databasePath, BACKUP_PREFIX + new Date().toISOString().replace(/[:.]/g, '-'));
 	report.backupDir = backupDir;
 	mkdirSync(backupDir, { mode: 0o700 });
-	const manifest: Manifest = { format: 1, state: 'staged', logs: [] };
+	const manifest: Manifest = { format: 1, state: 'preparing', logs: [] };
+	writeManifest(backupDir, manifest);
+	fsyncPath(databasePath);
+	step('preparing');
 	try {
 		for (const store of targets) manifest.logs.push(stageStore(store, join(backupDir, store.name), options));
 		fsyncPath(backupDir);
-		fsyncPath(databasePath);
+		manifest.state = 'staged';
 		writeManifest(backupDir, manifest);
 	} catch (error) {
-		// the store is untouched, and without a manifest nothing refers to the backup directory
 		rmSync(backupDir, { recursive: true, force: true });
-		error.message = `${error.message}\nNo changes were made to ${databasePath}.`;
-		throw error;
+		const failure = asError(error);
+		failure.message = `${failure.message}\nNo changes were made to ${databasePath}.`;
+		throw failure;
 	}
-	const step = (name: string) => options.afterStep?.(name);
 	try {
 		step('staged');
 		for (const store of targets) {
@@ -672,12 +752,13 @@ export async function repairDatabase(path: string, options: RepairOptions = {}):
 		manifest.state = 'applied';
 		writeManifest(backupDir, manifest);
 		step('applied');
-		await verifyApplied(databasePath, stores, manifest);
+		await verifyApplied(databasePath, backupDir, stores, manifest);
 		manifest.state = 'complete';
 		writeManifest(backupDir, manifest);
 	} catch (error) {
-		error.message = `${error.message}\nThe repair of ${databasePath} did not finish; ${unfinishedRepairMessage(backupDir)}`;
-		throw error;
+		const failure = asError(error);
+		failure.message = `${failure.message}\nThe repair of ${databasePath} did not finish; ${unfinishedRepairMessage(backupDir)}`;
+		throw failure;
 	}
 	report.applied = true;
 	for (const log of report.logs) {
@@ -792,12 +873,22 @@ function writeTxnState(stagingDir: string, storeDir: string, position: LogPositi
 	return temporary;
 }
 
-async function verifyApplied(databasePath: string, stores: LogStore[], manifest: Manifest): Promise<void> {
+async function verifyApplied(
+	databasePath: string,
+	backupDir: string,
+	stores: LogStore[],
+	manifest: Manifest
+): Promise<void> {
 	for (const entry of manifest.logs) {
 		const store = stores.find((candidate) => candidate.name === entry.name);
 		for (const replaced of entry.replaced) {
 			if (sha256File(join(store.dir, replaced.file)) !== replaced.sha256)
 				throw new Error(`${join(store.dir, replaced.file)} does not hold the staged output`);
+			// the backup is the replaced inode itself: a process that opened the store mid-repair appended there
+			if (sha256File(join(backupDir, entry.name, replaced.file)) !== replaced.originalSha256)
+				throw new Error(
+					`${join(store.dir, replaced.file)} was written to during the repair; a process opened the database while it ran`
+				);
 		}
 		const validation = await validateTransactionLogStore(store.dir, { strict: true });
 		if (!validation.valid)
@@ -839,6 +930,22 @@ export function restoreRepair(path: string, options: Pick<RepairOptions, 'assert
 	const assertStopped =
 		options.assertStopped ?? (() => assertDatabaseClosed(databasePath, dirname(dirname(databasePath))));
 	assertStopped();
+	withRepairLock(databasePath, () => restoreUnderLock(backupDir, databasePath, manifest, assertStopped));
+}
+
+function restoreUnderLock(
+	backupDir: string,
+	databasePath: string,
+	manifest: Manifest,
+	assertStopped: () => void
+): void {
+	const notSymlink = (path: string, isDirectory: boolean) => {
+		if (!existsSync(path)) return;
+		const stats = lstatSync(path);
+		if (isDirectory ? !stats.isDirectory() : !stats.isFile())
+			throw new RepairRefusedError(`${path} is not a regular ${isDirectory ? 'directory' : 'file'}`);
+	};
+	notSymlink(join(databasePath, 'transaction_logs'), true);
 	// Anything but the original or the repaired bytes means Harper wrote to the store since: restoring would lose it.
 	const moved = (target: string) =>
 		new RepairRefusedError(
@@ -846,12 +953,16 @@ export function restoreRepair(path: string, options: Pick<RepairOptions, 'assert
 		);
 	for (const entry of manifest.logs) {
 		const storeDir = join(databasePath, 'transaction_logs', entry.name);
+		notSymlink(storeDir, true);
+		notSymlink(join(storeDir, TXN_STATE), false);
 		for (const name of entry.created) {
 			const created = join(storeDir, name);
+			notSymlink(created, false);
 			if (existsSync(created) && lstatSync(created).size !== FILE_HEADER_SIZE) throw moved(created);
 		}
 		for (const replaced of entry.replaced) {
 			const target = join(storeDir, replaced.file);
+			notSymlink(target, false);
 			const current = existsSync(target) ? sha256File(target) : undefined;
 			if (current !== replaced.originalSha256 && current !== replaced.sha256) throw moved(target);
 		}
