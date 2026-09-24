@@ -434,22 +434,6 @@ const COPY_FLUSH_BYTES = Math.floor(MAX_PAYLOAD * 0.9);
 export function exceedsMaxPayload(messageSize: number, maxPayload: number = MAX_PAYLOAD): boolean {
 	return messageSize > maxPayload;
 }
-/**
- * Whether `entry` from `entryStart` repeats the `queuedLength` bytes held in `queued` — the delete written
- * immediately before it in the frame being built (replication/DESIGN.md). A negative length holds nothing.
- */
-export function repeatsQueuedDelete(
-	queued: Buffer,
-	queuedLength: number,
-	entry: Uint8Array,
-	entryStart: number
-): boolean {
-	return (
-		queuedLength >= 0 &&
-		queuedLength === entry.length - entryStart &&
-		queued.compare(entry, entryStart, entry.length, 0, queuedLength) === 0
-	);
-}
 // Throttle the oversized-send error: it closes and reconnects the leg, so it would otherwise re-log on
 // every reconnect cycle. Module-level so the throttle survives across the per-cycle connection instances.
 const oversizedSendWarnThrottle = createThrottleState();
@@ -5595,8 +5579,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								return { table };
 							}
 						};
-						const currentTransaction = { txnLogKey: 0, queuedDeleteLength: -1 };
-						let queuedDelete = Buffer.allocUnsafe(256);
+						const currentTransaction = { txnLogKey: 0 };
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
@@ -5858,26 +5841,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									sendQueuedData();
 								}
 								currentTransaction.txnLogKey = txnLogKey;
-								currentTransaction.queuedDeleteLength = -1;
 								frame.encodingStart = frame.position;
 								frame.writeFloat64(txnLogKey);
 							}
-							const encoded = invalidationEntry ? undefined : auditRecord.encoded;
-							// If it starts with the previous local time, we omit that
-							const start = encoded?.[0] === 66 ? 8 : 0;
-							if (auditRecord.type === 'delete') {
-								const wire = invalidationEntry ?? encoded;
-								const wireStart = invalidationEntry ? 0 : start;
-								// Not skipAuditRecord(): its timer can send a sequence update for this frame's key before
-								// the frame itself is flushed.
-								if (repeatsQueuedDelete(queuedDelete, currentTransaction.queuedDeleteLength, wire, wireStart))
-									return new Promise(setImmediate);
-								const length = wire.length - wireStart;
-								if (length > queuedDelete.length) queuedDelete = Buffer.allocUnsafe(length);
-								// copied rather than held: nothing guarantees the entry's buffer outlives the next read
-								Buffer.prototype.copy.call(wire, queuedDelete, 0, wireStart);
-								currentTransaction.queuedDeleteLength = length;
-							} else currentTransaction.queuedDeleteLength = -1;
 
 							/*
 						TODO: At some point we may want fancier logic to elide the version when it equals txnLogKey
@@ -5888,6 +5854,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								frame.writeBytes(invalidationEntry);
 							} else {
 								// directly write the audit record.
+								const encoded = auditRecord.encoded;
 								if (auditRecord.extendedType & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
 									decodeWithBlobCallback(
@@ -5896,6 +5863,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										primaryStore.rootStore
 									);
 								}
+								// If it starts with the previous local time, we omit that
+								const start = encoded[0] === 66 ? 8 : 0;
 								frame.writeInt(encoded.length - start);
 								frame.writeBytes(encoded, start);
 								logger.debug?.(

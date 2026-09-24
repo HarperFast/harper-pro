@@ -1,17 +1,18 @@
 /**
- * An echoed delete run (harper-pro#826; replication/DESIGN.md item 20) must neither wedge the sender nor
- * re-log on the receiver. The fixture plants the log state older releases left on A while B is offline,
+ * An echoed delete run (harper-pro#826; replication/DESIGN.md item 20) is repaired offline and no longer
+ * re-logs on the receiver. The fixture plants the log state older releases left on A while B is offline,
  * so B resumes from a cursor below both runs — a connected B's cursor would already be past them:
- *  - `z` × 20,000 under z's delete key: byte-identical copies, far above A's 256 KiB cap. The sender must
- *    collapse them; otherwise the later marker write never reaches B.
- *  - `[x, y]` × 40 under their shared delete key: alternating, so the sender cannot collapse them and B
- *    receives all 82 in one frame. B's apply must log one delete per record.
+ *  - `z` × 20,000 under z's delete key, far above A's 256 KiB cap: one frame no sender can ship. A is
+ *    stopped and repaired with dist/bin/repairDeleteEchoRuns.js; otherwise the later marker never reaches B.
+ *  - `[x, y]` × 40 under their shared delete key, planted after the repair and below the cap, so B receives
+ *    all 82 in one frame. B's apply must log one delete per record.
  */
 import { suite, test, before, after } from 'node:test';
-import { equal } from 'node:assert/strict';
+import { equal, match } from 'node:assert/strict';
 import { cp, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, basename } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
 	killHarper,
 	startHarper,
@@ -30,6 +31,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = resolve(
 );
 
 const FIXTURE = resolve(import.meta.dirname ?? module.path, 'fixture-delete-echo-run');
+const REPAIR_TOOL = resolve(import.meta.dirname ?? module.path, '..', '..', 'dist', 'bin', 'repairDeleteEchoRuns.js');
 const TABLE = 'EchoTarget';
 const MAX_PAYLOAD = 256 * 1024;
 const Z_COPIES = 20_000;
@@ -55,6 +57,12 @@ async function fixtureRequest(node, path, init) {
 }
 
 const deleteEntryCount = async (node, id) => (await fixtureRequest(node, `DeleteEntries/${id}`)).count;
+
+function runRepairTool(...args) {
+	const result = spawnSync(process.execPath, [REPAIR_TOOL, ...args], { encoding: 'utf8', timeout: 120000 });
+	equal(result.status, 0, `repair tool ${args.join(' ')} failed:\n${result.stdout}\n${result.stderr}`);
+	return result.stdout;
+}
 
 async function hasRecord(node, id, signal) {
 	const rows = await sendOperation(
@@ -90,6 +98,7 @@ suite(
 			}));
 			await Promise.all(contexts.map((nodeCtx, i) => startHarper(nodeCtx, nodeConfig(hostnames[i]))));
 			[ctx.A, ctx.B] = contexts.map((nodeCtx) => nodeCtx.harper);
+			ctx.rootOfA = dataRootDirs[0];
 
 			await sendOperation(ctx.B, {
 				operation: 'add_node',
@@ -119,19 +128,28 @@ suite(
 		});
 
 		test('B catches up past both runs and logs one delete per record', async () => {
-			const { A } = ctx;
 			await killHarper({ harper: ctx.B });
 
 			// Each delete is planted straight after it commits, so its copies follow it under the same key.
+			await sendOperation(ctx.A, { operation: 'delete', database: 'data', table: TABLE, ids: ['z'] });
+			await fixtureRequest(ctx.A, 'PlantDeleteRun', {
+				method: 'POST',
+				body: JSON.stringify({ ids: ['z'], copies: Z_COPIES }),
+			});
+			equal(await deleteEntryCount(ctx.A, 'z'), Z_COPIES + 1, 'premise: A holds the planted run');
+
+			await killHarper({ harper: ctx.A });
+			match(runRepairTool(ctx.rootOfA), new RegExp(`log local: .* would drop ${Z_COPIES} echoed deletes`));
+			match(runRepairTool(ctx.rootOfA, '--apply'), new RegExp(`log local: .* dropped ${Z_COPIES} echoed deletes`));
+			ctx.A = (await startHarper({ harper: ctx.A }, nodeConfig(ctx.A.hostname))).harper;
+			const { A } = ctx;
+			equal(await deleteEntryCount(A, 'z'), 1, 'the repair kept one z delete');
+			equal(await hasRecord(A, 'z'), false, 'z is still deleted on A after the repair and restart');
+
 			await sendOperation(A, { operation: 'delete', database: 'data', table: TABLE, ids: ['x', 'y'] });
 			await fixtureRequest(A, 'PlantDeleteRun', {
 				method: 'POST',
 				body: JSON.stringify({ ids: ['x', 'y'], copies: XY_ROUNDS }),
-			});
-			await sendOperation(A, { operation: 'delete', database: 'data', table: TABLE, ids: ['z'] });
-			await fixtureRequest(A, 'PlantDeleteRun', {
-				method: 'POST',
-				body: JSON.stringify({ ids: ['z'], copies: Z_COPIES }),
 			});
 			await sendOperation(A, {
 				operation: 'upsert',
@@ -139,7 +157,6 @@ suite(
 				table: TABLE,
 				records: [{ id: 'marker', name: 'marker' }],
 			});
-			equal(await deleteEntryCount(A, 'z'), Z_COPIES + 1, 'premise: A holds the planted run');
 			equal(await deleteEntryCount(A, 'x'), XY_ROUNDS + 1, 'premise: A holds the planted run');
 
 			ctx.B = (await startHarper({ harper: ctx.B }, nodeConfig(ctx.B.hostname))).harper;

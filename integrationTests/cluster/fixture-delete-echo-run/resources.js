@@ -22,22 +22,18 @@ export class PlantDeleteRun extends Resource {
 		const latest = ids.map((id) => deleteEntries(id).at(-1));
 		const txnLogKey = latest[0].txnLogKey;
 		if (latest.some((entry) => entry.txnLogKey !== txnLogKey)) throw new Error('the deletes must share a log key');
-		const records = latest.map((entry) => ({
-			version: entry.version,
-			tableId: entry.tableId,
-			recordId: entry.recordId,
-			previousVersion: entry.previousVersion,
-			nodeId: entry.nodeId,
-			user: entry.user,
-			type: 'delete',
-			// the action lives in the low byte; the encoder derives it from `type`
-			extendedType: entry.extendedType & ~0xff,
-			structureVersion: entry.structureVersion,
-		}));
+		// Each copy repeats the delete's replicated bytes exactly — what a re-applied echo writes — behind a
+		// prelude with no previous-version link. Written to the log directly: `aftercommit` listeners expect
+		// decoded records, not raw entries.
+		const copiesOf = latest.map((entry) => {
+			const prelude = Buffer.alloc(4);
+			prelude.writeUInt32BE(entry.structureVersion ?? 0);
+			return Buffer.concat([prelude, entry.encoded]);
+		});
 		await store.transaction((transaction) => {
 			transaction.setTimestamp(txnLogKey);
 			for (let i = 0; i < copies; i++) {
-				for (const record of records) auditStore.put(0, { ...record }, { transaction, nodeId: 0 });
+				for (const copy of copiesOf) auditStore.log.addEntry(copy, transaction.id);
 			}
 		});
 		return { txnLogKey, planted: copies * ids.length };
