@@ -1,5 +1,3 @@
-// A key the clone can't fetch or its add_ssh_key refuses is skipped by name without stopping the rest;
-// with the real add_ssh_key, see unitTests/security/sshKeyOperations.test.mjs.
 import assert from 'node:assert/strict';
 import { cloneSSHKeysFromLeader } from '#src/cloneNode/sshKeyClone';
 
