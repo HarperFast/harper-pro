@@ -5702,6 +5702,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 
 							// when we can skip an audit record, we still need to occasionally send a sequence update:
+							// every skip branch in sendAuditRecord must return this call — its contract is the
+							// trailing yield below, not the logging (see the !tableEntry skip's rationale above, #536).
 							function skipAuditRecord() {
 								logger.trace?.(connectionId, 'skipping audit record', auditRecord.recordId);
 								if (!skippedMessageSequenceUpdateTimer) {
