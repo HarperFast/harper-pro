@@ -317,6 +317,9 @@ describe('sshKeyOperations sealing', () => {
 			['re-spaced', '\tIdentitiesOnly    yes'],
 			['lower-cased', '\tidentitiesonly yes'],
 			['written with `=`', '\tIdentitiesOnly = Yes'],
+			['double-quoted', '\tIdentitiesOnly "yes"'],
+			['single-quoted', "\tIdentitiesOnly 'yes'"],
+			['given a trailing comment', '\tIdentitiesOnly yes # deploy key'],
 		]) {
 			it(`delete_ssh_key still ends a block at its closing line when that line was ${edit}`, async () => {
 				const unmanaged = 'Host other\n\tHostName example.net';

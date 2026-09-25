@@ -405,14 +405,11 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 
 	const configContents: string | null = (await exists(configFile)) ? await readFile(configFile, 'utf8') : null;
 	const results: { name: string; host?: string; hostname?: string }[] = [];
-	for (const entry of await readdir(sshDir, { withFileTypes: true })) {
-		const name = basename(entry.name, '.key');
-		if (!entry.name.endsWith('.key') || !SSH_KEY_NAME_REGEX.test(name)) continue;
-		// `get_ssh_key` reads through a symlink, so one whose target is a regular file is a key too
-		const isKeyFile =
-			entry.isFile() ||
-			(entry.isSymbolicLink() && (await stat(join(sshDir, entry.name)).catch(() => undefined))?.isFile());
-		if (!isKeyFile) continue;
+	for (const file of await readdir(sshDir)) {
+		const name = basename(file, '.key');
+		if (!file.endsWith('.key') || !SSH_KEY_NAME_REGEX.test(name)) continue;
+		// `stat` follows a symlink the way `get_ssh_key`'s readFile does, so a link to a key file counts too
+		if (!(await stat(join(sshDir, file)).catch(() => undefined))?.isFile()) continue;
 
 		const result: { name: string; host?: string; hostname?: string } = { name };
 		if (configContents) {
@@ -426,15 +423,16 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 }
 
 const SSH_CONFIG_KEY_COMMENT = /^[ \t]*#([a-zA-Z0-9-_]+)[ \t]*$/;
-const SSH_CONFIG_IDENTITIES_ONLY_YES = /^[ \t]*IdentitiesOnly(?:[ \t]*=[ \t]*|[ \t]+)yes[ \t]*$/i;
+const SSH_CONFIG_IDENTITIES_ONLY_YES =
+	/^[ \t]*IdentitiesOnly(?:[ \t]*=[ \t]*|[ \t]+)(?:yes|"yes"|'yes')(?:[ \t]+#.*|[ \t]*)$/i;
 
 /**
  * Where each SSH config block `addSSHKey` wrote for `name` sits in `config`, as `[start, end)`
  * offsets that include the block's final line break. A block opens at a comment line that is exactly
  * `#name` (blanks aside — matched as a prefix, `#repo` would claim `#repo-2`'s block) and closes after
- * its `IdentitiesOnly yes` line, spelled any way OpenSSH accepts. If that line was removed or mangled
- * by hand, the block ends at the next key's comment line, or the end of the file, so it never takes in
- * a sibling key's block.
+ * its `IdentitiesOnly yes` line, in any case, with blanks or `=` before a value that may be quoted, and
+ * an optional trailing comment. If that line is missing or written some other way, the block ends at
+ * the next key's comment line, or the end of the file, so it never takes in a sibling key's block.
  */
 function findSSHConfigBlocks(config: string, name: string): [number, number][] {
 	const blocks: [number, number][] = [];
