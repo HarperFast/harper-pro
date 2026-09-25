@@ -233,20 +233,26 @@ export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
 // when we receive messages from other nodes, we then forward them on to as a notification on these subscriptions
 export const databaseSubscriptions = new Map();
-const lastFrameTurn = new WeakMap<object, Promise<void>>();
+const frameTurns = new WeakMap<object, { held: boolean; waiting: Array<() => void> }>();
 /**
- * Wait until every frame queued earlier on `subscription` has been fully queued, then return the function
- * that ends this frame's turn. All connections on a thread deliver to one subscription per database, and core
- * applies it with a single transaction in progress, so a frame that another connection's frame starts inside
- * gets its remaining records applied in that transaction (harper#1162).
+ * Take the turn to queue transaction events on `subscription`, returning the function that ends it (or a
+ * promise of it while another connection holds the turn). All connections on a thread deliver to one
+ * subscription per database, and core applies it with a single transaction in progress, so events queued by
+ * another connection in the middle of a frame land inside that frame's transaction (harper#1162).
  */
-export async function takeFrameTurn(subscription: object): Promise<() => void> {
-	const previous = lastFrameTurn.get(subscription);
-	let endTurn: () => void;
-	const turn = new Promise<void>((resolve) => (endTurn = resolve));
-	lastFrameTurn.set(subscription, previous ? previous.then(() => turn) : turn);
-	await previous;
-	return endTurn;
+export function takeFrameTurn(subscription: object): (() => void) | Promise<() => void> {
+	let turns = frameTurns.get(subscription);
+	if (!turns) frameTurns.set(subscription, (turns = { held: false, waiting: [] }));
+	const endTurn = () => {
+		const next = turns.waiting.shift();
+		if (next) next();
+		else turns.held = false;
+	};
+	if (!turns.held) {
+		turns.held = true;
+		return endTurn;
+	}
+	return new Promise((resolve) => turns.waiting.push(() => resolve(endTurn)));
 }
 const DEBUG_MODE = true;
 // when we skip messages (usually because we aren't the originating node), we still need to occassionally send a sequence update
@@ -1696,6 +1702,17 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
 	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn exactly as before, so this
 	// adds no per-seq-update overhead and does not alter non-copyApply paths. (harper-pro#480)
+	function sendEndTxnOutsideFrame(endTxn: any): void {
+		const turn = takeFrameTurn(tableSubscriptionToReplicator);
+		if (typeof turn === 'function') {
+			tableSubscriptionToReplicator.send(endTxn);
+			turn();
+		} else
+			turn.then((endTurn) => {
+				tableSubscriptionToReplicator.send(endTxn);
+				endTurn();
+			});
+	}
 	function seqUpdateEndTxn(localTime: number): any {
 		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) {
 			return {
@@ -2469,7 +2486,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// Clamp: a sequence-id update carries no commit/blob-durability gate, so while any blob is not
 						// yet durable it must not push the resume cursor past the last fully-durable point (same as the
 						// inline REMOTE_SEQUENCE_UPDATE branch below). seqUpdateEndTxn also gates copy-apply durability.
-						tableSubscriptionToReplicator.send(
+						sendEndTxnOutsideFrame(
 							seqUpdateEndTxn(cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived)
 						);
 						getSharedStatus();
@@ -3577,9 +3594,19 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
 			if (!(await whenSubscriptionResolved())) return;
-			endFrameTurn = await takeFrameTurn(tableSubscriptionToReplicator);
+			const turn = takeFrameTurn(tableSubscriptionToReplicator);
+			if (typeof turn === 'function') endFrameTurn = turn;
+			else {
+				addPauseReason();
+				try {
+					endFrameTurn = await turn;
+				} finally {
+					removePauseReason();
+				}
+			}
 			decoder.position = 8;
 			let beginTxn = true;
+			let txnNodeId: number;
 			let event; // could also get txnTime from decoder.getFloat64(0);
 			let sequenceIdReceived;
 			let maxBatchVersion; // highest record version in this batch (non-copy); end_txn resume cursor when no sequence-update set lastSequenceIdReceived
@@ -3669,6 +3696,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					);
 				}
 				const id = auditRecord.recordId;
+				const originNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
 				try {
@@ -3678,13 +3706,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								table: tableDecoder.name,
 								id: auditRecord.recordId,
 								type: auditRecord.type,
-								nodeId: remoteShortIdToLocalId.get(auditRecord.nodeId),
+								nodeId: originNodeId,
 								viaNodeId: receivingDataFromNodeIds[0],
 								residencyList,
 								timestamp: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
 								user: auditRecord.user,
-								beginTxn,
+								// A transaction binds to one origin's log. A frame holds every record at one log key from
+								// all of the sender's logs, so it can span origins; each origin gets its own transaction.
+								beginTxn: beginTxn || originNodeId !== txnNodeId,
 								expiresAt: auditRecord.expiresAt,
 							};
 						},
@@ -3768,6 +3798,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						continue;
 					}
 					beginTxn = false;
+					txnNodeId = originNodeId;
 					// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
 					logger.debug?.(
 						connectionId,
@@ -4373,9 +4404,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// Safe: at drain with no gap, every received record (incl. blobs) through lastSequenceIdReceived
 						// is durable, and core applies this end_txn after the records already enqueued ahead of it, so
 						// the cursor never advances past an uncommitted/undurable point. max() keeps it monotonic.
-						tableSubscriptionToReplicator.send(
-							seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
-						);
+						sendEndTxnOutsideFrame(seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId)));
 					}
 					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
 					// durable: persist it (and finish the copy if COPY_COMPLETE already arrived). No-op outside

@@ -1,16 +1,13 @@
 /**
- * A replication frame carries a single origin (harper#1162).
+ * A replicated transaction carries a single origin (harper#1162).
  *
- * A sender walks all of its transaction logs merged by key (every subscription sends an exclusion list, so
- * the all-logs walk is the normal send path), and a node can hold entries at the same key in two origin logs:
- * a 5.1.x base copy re-stamps copied rows with the copier's id at the original version, and a receiver can
- * give a write another transaction's timestamp. If those entries go out as one frame, the receiver applies
- * them as one transaction, which RocksDB can only bind to one log, and every re-delivery fails with
- * `Transaction N is already bound to the log store`.
+ * A sender's frame holds every record at one log key from all of its logs, so it can span origins: a node
+ * can hold entries at the same key in two origin logs (a 5.1.x base copy re-stamps copied rows with the
+ * copier's id at the original version). RocksDB binds a transaction to one log, so applying such a frame as
+ * one transaction failed with `already bound to the log store` on every re-delivery.
  *
- * Setup: B holds one transaction in its `local` log and one in a removed origin's (`ghost-origin`) log, both
- * at one timestamp. A also has a `ghost-origin` log, as a node that received from that origin directly
- * would. A is down while B writes them, so on restart B sends both from its merged walk.
+ * B holds one transaction in its `local` log and one in a removed origin's (`ghost-origin`) log at one
+ * timestamp; A also has a `ghost-origin` log. A is down while B writes them, so B sends both in one frame.
  */
 import { suite, test, before, after } from 'node:test';
 import { deepEqual } from 'node:assert';

@@ -27,11 +27,16 @@ describe('takeFrameTurn', () => {
 		expect(order).to.deep.equal(['second', 'third']);
 	});
 
-	it('does not order frames of different subscriptions', async () => {
-		await takeFrameTurn({}); // never ended
-		let started = false;
-		takeFrameTurn({}).then(() => (started = true));
-		await settle();
-		expect(started).to.equal(true);
+	it('returns the end function synchronously when no frame holds the turn', () => {
+		const subscription = {};
+		const endTurn = takeFrameTurn(subscription);
+		expect(endTurn).to.be.a('function');
+		endTurn();
+		expect(takeFrameTurn(subscription)).to.be.a('function');
+	});
+
+	it('does not order frames of different subscriptions', () => {
+		takeFrameTurn({}); // never ended
+		expect(takeFrameTurn({})).to.be.a('function');
 	});
 });
