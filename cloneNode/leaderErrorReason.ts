@@ -3,12 +3,7 @@ import { decode as cborDecode } from 'cbor-x';
 export const LEADER_ERROR_REASON_MAX_CHARS = 500;
 const MAX_STRUCTURED_BODY_BYTES = 64 * 1024;
 
-/**
- * Extracts the leader's reason from a failed operations-API reply, for appending to the clone's
- * error message. Callers classify on this text (cloneEnvSecretsKeys matches "Key not found"), and
- * the operations server sends it only in the body, as `{ error }` encoded per the request's Accept
- * header. Never throws, so a malformed body cannot mask the HTTP failure it describes.
- */
+/** Never throws: a malformed reply must not replace the HTTP failure it describes. */
 export function leaderErrorReason(contentType: string, body: Buffer): string {
 	let decoded: unknown;
 	if (body.length <= MAX_STRUCTURED_BODY_BYTES) {
