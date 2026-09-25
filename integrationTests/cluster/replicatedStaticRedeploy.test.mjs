@@ -61,7 +61,8 @@ const REDEPLOY_TEST_TIMEOUT_MS = 150_000;
 const RESTART_TEST_TIMEOUT_MS = 240_000;
 // The suite deadline cancels a child that is still inside its own budget, so it has to clear
 // the sum of every hook/test timeout below it -- otherwise the same generic timeout the
-// per-step budgets exist to avoid arrives from one level up instead.
+// per-step budgets exist to avoid arrives from one level up instead. A new hook/test needs
+// its own timeout added to this sum, or it reintroduces the premature suite kill.
 const SUITE_TIMEOUT_MS =
 	BEFORE_ALL_TIMEOUT_MS +
 	AFTER_ALL_TIMEOUT_MS +
