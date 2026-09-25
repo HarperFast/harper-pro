@@ -155,8 +155,6 @@ suite('update_node is a registered, dispatchable operation', { timeout: 120000 }
 			deepEqual(after.subscriptions, before.subscriptions, 'a metadata-only update_node must not change subscriptions');
 			ok(after.revoked_certificates?.includes('deadbeef'), 'revoked_certificates must still be applied locally');
 
-			// start_time is a FIELDS_REQUIRING_FULL_SETNODE field: it routes through setNode()'s full
-			// flow, which must not treat the still-omitted subscriptions as "reset to full mesh".
 			await sendOperation(nodeB, {
 				operation: 'update_node',
 				hostname: nodeD.hostname,

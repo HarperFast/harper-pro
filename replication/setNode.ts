@@ -392,22 +392,18 @@ async function findExistingNodeRecord(hostname: string, url: string) {
 	return undefined;
 }
 
-// Fields setNode() applies that the local metadata patch below does not -- a request naming one of
-// these needs setNode()'s peer round-trip (a URL/address move, a leader promotion's full-copy
-// request, a CSR re-sign, stored reconnect credentials) and so falls through to it below.
+// Fields only setNode()'s peer-handshake flow applies.
 const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization', 'start_time', 'force_signing'];
 
 /**
- * revoked_certificates and shard are both read from THIS node's own hdb_nodes row, so a request
- * limited to those (plus hostname) patches the existing row locally, with no peer contact.
- * A request naming a FIELDS_REQUIRING_FULL_SETNODE field still needs setNode()'s full flow, but that
- * flow treats an omitted subscriptions/sendsTo/receivesFrom/subscribe/publish as "reset to full
- * mesh" -- carried forward explicitly here so an unrelated field on an existing selective node
- * doesn't silently widen it. A brand-new node, or a request that already specifies topology itself,
- * proceeds unmodified.
+ * revoked_certificates and shard are read from THIS node's own hdb_nodes row, so a request limited
+ * to those (plus hostname) patches the existing row locally, with no peer contact. A request naming
+ * a FIELDS_REQUIRING_FULL_SETNODE field still needs setNode(), which resets omitted topology to full
+ * mesh and derives a default url from THIS node's own port when none is given -- both carried
+ * forward from the existing row here first.
  */
 async function updateNode(req: any) {
-	const hostname = req.hostname || req.node_name || req.name;
+	const hostname = req.hostname || req.node_name || req.name || (req.url ? urlToNodeName(req.url) : undefined);
 	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
 	const requestHasTopology = Boolean(
 		req.subscriptions || req.sendsTo || req.receivesFrom || req.subscribe !== undefined || req.publish !== undefined
@@ -434,11 +430,15 @@ async function updateNode(req: any) {
 				await ensureNode(found.name, patch);
 				return `Successfully updated '${found.record.url}'`;
 			}
+			req.url ??= found.record.url;
+			const directional = found.record.replicates;
+			const hasDirectionalArrays =
+				directional && typeof directional === 'object' && (directional.sendsTo || directional.receivesFrom);
 			if (Array.isArray(found.record.subscriptions)) req.subscriptions = found.record.subscriptions;
-			else if (found.record.replicates && typeof found.record.replicates === 'object') {
-				req.sendsTo = found.record.replicates.sendsTo;
-				req.receivesFrom = found.record.replicates.receivesFrom;
-			} else if (found.record.replicates !== true) {
+			else if (hasDirectionalArrays) {
+				req.sendsTo = directional.sendsTo;
+				req.receivesFrom = directional.receivesFrom;
+			} else if (directional !== true) {
 				throw new ClientError(
 					`update_node cannot apply this change to '${hostname}' without also carrying its existing replication topology forward, and that topology cannot be re-expressed automatically; use set_node to change topology and metadata together`
 				);
