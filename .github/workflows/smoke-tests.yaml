@@ -97,7 +97,7 @@ jobs:
         run: npm ci
 
       - name: Build
-        run: npm run build || true # known type errors are ignored here, same as integration-tests
+        run: npm run build
 
       - name: Install k6
         run: |
