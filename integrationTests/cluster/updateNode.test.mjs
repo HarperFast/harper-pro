@@ -1,6 +1,3 @@
-/**
- * A metadata-only update_node against an existing node must not alter its replication topology.
- */
 import { suite, test, before, after } from 'node:test';
 import { match, ok, deepEqual } from 'node:assert/strict';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';

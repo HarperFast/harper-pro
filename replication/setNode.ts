@@ -404,7 +404,7 @@ async function updateNode(req: any) {
 	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
 	if (req.replicates !== undefined) {
 		throw new ClientError(
-			`update_node does not support 'replicates' (setNode() never applies it either); use 'subscriptions'/'sendsTo'/'receivesFrom' to change topology, or set_node to reset to full replication`
+			`update_node does not support 'replicates'; use 'subscriptions'/'sendsTo'/'receivesFrom' to change topology, or set_node to reset to full replication`
 		);
 	}
 	if ((req.subscribe !== undefined || req.publish !== undefined) && !req.subscriptions) {
@@ -414,40 +414,45 @@ async function updateNode(req: any) {
 	}
 	const requestHasTopology = Boolean(req.subscriptions || req.sendsTo || req.receivesFrom);
 
-	if (hostname && !requestHasTopology) {
+	if (hostname) {
 		const found = await findExistingNodeRecord(hostname, url);
 		if (found) {
-			if (!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined)) {
-				const validation = validateBySchema(req, validationSchema);
-				if (validation) {
-					throw handleHDBError(
-						validation,
-						validation.message,
-						HTTP_STATUS_CODES.BAD_REQUEST,
-						undefined,
-						undefined,
-						true
+			// Normalize to the row's own identity regardless of which path runs below, so an alias or a
+			// custom port/scheme a caller used to reach the peer is never mistaken for a change to apply.
+			req.hostname = found.name;
+			req.url ??= found.record.url;
+
+			if (!requestHasTopology) {
+				if (!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined)) {
+					const validation = validateBySchema(req, validationSchema);
+					if (validation) {
+						throw handleHDBError(
+							validation,
+							validation.message,
+							HTTP_STATUS_CODES.BAD_REQUEST,
+							undefined,
+							undefined,
+							true
+						);
+					}
+					const patch: any = {};
+					if (req.revoked_certificates) patch.revoked_certificates = req.revoked_certificates;
+					if (req.shard !== undefined) patch.shard = req.shard;
+					await ensureNode(found.name, patch);
+					return `Successfully updated '${found.record.url}'`;
+				}
+				const directional = found.record.replicates;
+				const hasDirectionalArrays =
+					directional && typeof directional === 'object' && (directional.sendsTo || directional.receivesFrom);
+				if (Array.isArray(found.record.subscriptions)) req.subscriptions = found.record.subscriptions;
+				else if (hasDirectionalArrays) {
+					req.sendsTo = directional.sendsTo;
+					req.receivesFrom = directional.receivesFrom;
+				} else if (directional !== true) {
+					throw new ClientError(
+						`update_node cannot apply this change to '${hostname}' without also carrying its existing replication topology forward, and that topology cannot be re-expressed automatically; use set_node to change topology and metadata together`
 					);
 				}
-				const patch: any = {};
-				if (req.revoked_certificates) patch.revoked_certificates = req.revoked_certificates;
-				if (req.shard !== undefined) patch.shard = req.shard;
-				await ensureNode(found.name, patch);
-				return `Successfully updated '${found.record.url}'`;
-			}
-			req.url ??= found.record.url;
-			req.hostname = found.name;
-			const directional = found.record.replicates;
-			const hasDirectionalArrays =
-				directional && typeof directional === 'object' && (directional.sendsTo || directional.receivesFrom);
-			if (Array.isArray(found.record.subscriptions)) req.subscriptions = found.record.subscriptions;
-			else if (hasDirectionalArrays) {
-				req.sendsTo = directional.sendsTo;
-				req.receivesFrom = directional.receivesFrom;
-			} else if (directional !== true) {
-				throw new ClientError(
-					`update_node cannot apply this change to '${hostname}' without also carrying its existing replication topology forward, and that topology cannot be re-expressed automatically; use set_node to change topology and metadata together`
-				);
 			}
 		}
 	}
