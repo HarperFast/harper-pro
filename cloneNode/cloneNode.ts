@@ -1366,7 +1366,13 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 	});
 
 	if (statusCode < 200 || statusCode >= 300) {
-		throw new Error(`Leader request failed: ${statusCode} ${statusMessage}`);
+		let reason: unknown = responseBody.toString('utf8');
+		try {
+			reason =
+				(contentType.includes('cbor') ? cborDecode(responseBody) : JSON.parse(reason as string))?.error ?? reason;
+		} catch {}
+		reason = String(reason).replace(/\s+/g, ' ').trim().slice(0, 500);
+		throw new Error(`Leader request failed: ${statusCode} ${statusMessage}${reason ? `: ${reason}` : ''}`);
 	}
 
 	if (contentType.includes('application/cbor')) {
