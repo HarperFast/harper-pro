@@ -6759,6 +6759,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						continue;
 					}
 				}
+				const isCopyApply = messageIsCopyFrame && copyApplyActive() && frameTxnLogKey < copyModeStartTime;
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
 				// Dangling-blob repair pairing (#699): computed only for blob-carrying records in the windows
@@ -6833,8 +6834,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								version: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
 								user: auditRecord.user,
-								// a frame can hold several origins' transactions (replication/DESIGN.md)
-								beginTxn: beginTxn || (STORAGE_IS_ROCKSDB && localSourceNodeId !== txnNodeId),
+								// a frame can hold several origins' transactions (replication/DESIGN.md); copy-apply rows write
+								// no log entry, so they never split one
+								beginTxn: beginTxn || (STORAGE_IS_ROCKSDB && !isCopyApply && localSourceNodeId !== txnNodeId),
 								txnStream,
 								expiresAt: auditRecord.expiresAt,
 							};
@@ -6954,7 +6956,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						continue;
 					}
 					beginTxn = false;
-					txnNodeId = localSourceNodeId;
+					if (!isCopyApply) txnNodeId = localSourceNodeId;
 					// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
 					logger.debug?.(
 						connectionId,
@@ -6973,7 +6975,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// audit/transaction-log entry and no out-of-order resequencing/dedup (harper-pro#480).
 					// Only writes before the replay boundary are audit-less snapshots. Strict `<` keeps the
 					// boundary transaction audited.
-					event.isCopyApply = messageIsCopyFrame && copyApplyActive() && frameTxnLogKey < copyModeStartTime;
+					event.isCopyApply = isCopyApply;
 					// Record which tables actually received an audit-less snapshot row so only those get a
 					// reload marker at copy finalization (harper-pro#495). isCopyApply is exactly "invisible to
 					// live subscribers" — a copy frame at or after copyStartTime carries a real audit entry

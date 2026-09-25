@@ -84,6 +84,7 @@ export async function postToFixture(node, resource, body) {
 			});
 			if (response.ok) return response.json();
 			if (Date.now() > deadline) throw new Error(`${resource} ${response.status}: ${await response.text()}`);
+			await response.body?.cancel();
 		} catch (error) {
 			if (Date.now() > deadline) throw error;
 		}
