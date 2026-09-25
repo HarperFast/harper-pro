@@ -101,6 +101,7 @@ When a feature spans both, prefer landing as much as possible in `core/` and glu
 - **`licensing/`** — usage license validation and enforcement. `usageLicensing.ts` (lifecycle, usage aggregation) and `validation.ts` (EdDSA signature verification).
 - **`analytics/`** — CPU profiling via Datadog pprof. `profile.ts` is the entry. **Not the same as core's `resources/analytics/`** (which records request-level telemetry).
 - **`security/`** — Pro-specific cryptography: `certificate.ts` (TLS signing/validation), `sshKeyOperations.ts`, `keyService.ts` (JWT + private-key resolution). **Core PKI lives in `core/security/`** — don't confuse them.
+  - `sshKeyValidation.ts` decides which SSH keys and `Host`/`HostName` values `add_ssh_key`/`update_ssh_key` accept. It mirrors OpenSSH's own loader (`sshkey.c`) rather than Studio's client-side checks, so a change to what it refuses should be re-verified against real `ssh-keygen -y`/`ssh -G` — its unit tests do that wherever they exist, and CI's Ubuntu runners have them.
 
 ### Pro tests
 

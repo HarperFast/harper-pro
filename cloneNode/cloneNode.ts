@@ -38,6 +38,7 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
+import { cloneSSHKeysFromLeader } from './sshKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
 import {
 	CLONE_COMPLETION_GRACE_MS,
@@ -923,25 +924,7 @@ async function cloneSSHKeys() {
 	if (skipSSHKeys) return;
 
 	const { addSSHKey } = await import('../security/sshKeyOperations.js');
-	try {
-		const keys: any = await leaderRequest({ operation: 'list_ssh_keys' });
-		if (!keys?.length) {
-			log('No SSH keys found on leader node to clone');
-			return;
-		}
-
-		for (const keyName of keys) {
-			log('Cloning SSH key:', keyName.name);
-			const keyData: any = await leaderRequest({
-				operation: 'get_ssh_key',
-				name: keyName.name,
-			});
-
-			await addSSHKey(keyData);
-		}
-	} catch (err) {
-		log(`Error cloning SSH keys: ${err}`, 'error');
-	}
+	await cloneSSHKeysFromLeader(leaderRequest, addSSHKey, log);
 }
 
 /**
