@@ -1,11 +1,10 @@
 /**
  * `update_node` must be dispatchable (regression: it was never registered), must add a node it
- * doesn't already know about (documented add-if-absent), must succeed against an existing
- * full-mesh node, and must refuse -- not silently widen -- a metadata-only call against a node
- * with a restricted replication topology.
+ * doesn't already know about (documented add-if-absent), and a metadata-only call against an
+ * existing node must not touch -- and so cannot widen -- its replication topology.
  */
 import { suite, test, before, after } from 'node:test';
-import { match, equal, ok, deepEqual } from 'node:assert/strict';
+import { match, ok, deepEqual } from 'node:assert/strict';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
 import { sendOperation, ensureTableExists } from './clusterShared.mjs';
@@ -96,11 +95,14 @@ suite('update_node is a registered, dispatchable operation', { timeout: 120000 }
 			});
 			match(response.message, UPDATE_SUCCESS, `unexpected message: ${JSON.stringify(response.message)}`);
 		} finally {
+			// The loopback pool can hand this address to a later test once C is torn down; remove_node
+			// clears B's own hdb_nodes row for it so that test doesn't inherit this full-mesh add.
+			await sendOperation(nodeB, { operation: 'remove_node', hostname: hostnameC }).catch(() => {});
 			await teardownHarper({ harper: ctxC.harper });
 		}
 	});
 
-	test('update_node with no topology fields against a selectively-replicating node is refused, not widened', async (t) => {
+	test('a metadata-only update_node leaves an existing selective subscription untouched', async (t) => {
 		const { nodeB } = ctx;
 		const database = 'data';
 		const table = 'update_node_selective_test';
@@ -127,7 +129,7 @@ suite('update_node is a registered, dispatchable operation', { timeout: 120000 }
 						table: 'hdb_nodes',
 						search_attribute: 'name',
 						search_value: nodeD.hostname,
-						get_attributes: ['name', 'subscriptions', 'replicates'],
+						get_attributes: ['name', 'subscriptions', 'replicates', 'revoked_certificates'],
 					})
 				)[0];
 
@@ -136,23 +138,24 @@ suite('update_node is a registered, dispatchable operation', { timeout: 120000 }
 				Array.isArray(before?.subscriptions) && before.subscriptions.length > 0,
 				'precondition: selective link established'
 			);
+			ok(
+				before.replicates !== true,
+				'precondition: not already full-mesh (a contaminated baseline would hide the bug)'
+			);
 
-			const res = await fetch(nodeB.operationsAPIURL, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					operation: 'update_node',
-					hostname: nodeD.hostname,
-					rejectUnauthorized: false,
-					revoked_certificates: [],
-					authorization: nodeD.admin,
-				}),
+			const response = await sendOperation(nodeB, {
+				operation: 'update_node',
+				hostname: nodeD.hostname,
+				rejectUnauthorized: false,
+				revoked_certificates: ['deadbeef'],
+				authorization: nodeD.admin,
 			});
-			equal(res.status, 400, `expected a topology-ambiguous update_node to be refused, got ${res.status}`);
+			match(response.message, UPDATE_SUCCESS, `unexpected message: ${JSON.stringify(response.message)}`);
 
 			const after = await readNodeDRecordOnB();
-			equal(after.replicates, before.replicates, 'the refused call must not have changed replicates at all');
-			deepEqual(after.subscriptions, before.subscriptions, 'the selective subscription must be unchanged');
+			deepEqual(after.replicates, before.replicates, 'a metadata-only update_node must not change replicates');
+			deepEqual(after.subscriptions, before.subscriptions, 'a metadata-only update_node must not change subscriptions');
+			ok(after.revoked_certificates?.includes('deadbeef'), 'revoked_certificates must still be applied locally');
 		} finally {
 			await teardownHarper({ harper: ctxD.harper });
 		}

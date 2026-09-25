@@ -378,26 +378,49 @@ function reverseSubscription(subscription) {
 }
 
 /**
- * setNode()'s only topology inputs are `subscriptions` / `sendsTo` / `receivesFrom`; omitting all
- * three always means "full replication" to it, with no way to ask it to leave an existing
- * restricted topology alone. Reconstructing the existing shape to re-supply it is not viable: it
- * would have to cover every encoding (a `subscriptions` array, `{sendsTo,receivesFrom}`,
- * `{sends,receives}`, or `replicates:false`) and still couldn't tell an omitted field from an
- * explicit `subscriptions: null` revoke. So a metadata-only update_node (e.g. rotating
- * revoked_certificates) against a node with a restricted topology is refused instead of guessed at
- * -- update_node's own docs frame it as modifying an existing node, unlike add_node/set_node's
- * "configure this node" framing. A brand-new node, or one already at plain full mesh, has nothing
- * ambiguous to lose and proceeds through setNode()'s normal add-style default.
+ * Direct primary-key lookup first (the common case: `hostname` is the row's own key) via the same
+ * `hdbNodes.get()` the remove_node branch above uses to check existence -- NOT `primaryStore.getSync`,
+ * which can miss a row this same request sequence just wrote (observed: `add_node` completing and
+ * returning 200, immediately followed by `update_node` against the row it just created, intermittently
+ * read back as absent). Falls back to a table scan matching on `url` because `setNode()` stores a row
+ * under the PEER-reported name (:265), which can differ from the hostname/address a caller used to
+ * reach it. The table is small and this only runs on a metadata-only update_node, an admin-only path.
+ */
+async function findExistingNodeRecord(hostname: string, url: string) {
+	const hdbNodes = getHDBNodeTable();
+	const direct = await hdbNodes.get(hostname);
+	if (direct) return { name: hostname, record: direct };
+	for await (const node of hdbNodes.search({})) {
+		if (node?.url === url) return { name: node.name ?? hostname, record: node };
+	}
+	return undefined;
+}
+
+/**
+ * `revoked_certificates` enforcement and `shard` assignment are both read from THIS node's own
+ * hdb_nodes row, not the peer's, so a metadata-only update_node (no subscriptions/sendsTo/
+ * receivesFrom) needs neither the peer round-trip nor the CSR/CA handshake setNode()'s add-style
+ * path always performs -- it patches the existing row locally instead. This works uniformly
+ * whatever the existing topology looks like (full mesh, selective, directional, replication-off):
+ * the patch never touches `subscriptions`/`replicates`, so there is nothing to reconstruct, guess
+ * at, or race a concurrent topology change against. A brand-new node, or a request that DOES
+ * specify topology, falls through to setNode()'s normal add-style flow.
  */
 async function updateNode(req: any) {
-	const hostname = req.hostname || req.node_name || req.name || (req.url ? urlToNodeName(req.url) : undefined);
+	const hostname = req.hostname || req.node_name || req.name;
+	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
 	if (hostname && !req.subscriptions && !req.sendsTo && !req.receivesFrom) {
-		const existing = getHDBNodeTable().primaryStore.getSync(hostname);
-		const alreadyFullMesh = existing && existing.replicates === true && !existing.subscriptions;
-		if (existing && !alreadyFullMesh) {
-			throw new ClientError(
-				`update_node cannot change '${hostname}' without affecting its existing restricted replication topology; specify subscriptions, sendsTo, or receivesFrom explicitly, or use set_node to reset it to full replication`
-			);
+		const validation = validateBySchema(req, validationSchema);
+		if (validation) {
+			throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
+		}
+		const found = await findExistingNodeRecord(hostname, url);
+		if (found) {
+			const patch: any = { url: found.record.url ?? url };
+			if (req.revoked_certificates) patch.revoked_certificates = req.revoked_certificates;
+			if (req.shard !== undefined) patch.shard = req.shard;
+			await ensureNode(found.name, patch);
+			return `Successfully updated '${patch.url}'`;
 		}
 	}
 	return setNode(req);
