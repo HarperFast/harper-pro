@@ -11,7 +11,12 @@ export class OriginLogWrite extends Resource {
 		auditStore.ensureLogExists(data.ghost);
 		const ghostNodeId = nodeLogs.indexOf(auditStore.logByName.get(data.ghost));
 		for (const { id, fromGhost } of data.records ?? []) {
-			const options = { nodeId: fromGhost ? ghostNodeId : undefined, isNotification: true, ensureLoaded: false, async: true };
+			const options = {
+				nodeId: fromGhost ? ghostNodeId : undefined,
+				isNotification: true,
+				ensureLoaded: false,
+				async: true,
+			};
 			const context = { timestamp: data.version };
 			await transaction(context, async () => {
 				const resource = await Table.getResource(id, context, options);

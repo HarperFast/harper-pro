@@ -49,7 +49,7 @@ async function originLogWrite(node, body) {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json',
-					Authorization: 'Basic ' + Buffer.from(`${node.admin.username}:${node.admin.password}`).toString('base64'),
+					'Authorization': 'Basic ' + Buffer.from(`${node.admin.username}:${node.admin.password}`).toString('base64'),
 				},
 				body: JSON.stringify({ ghost: GHOST, ...body }),
 			});
@@ -89,7 +89,10 @@ suite('Replication frame carries a single origin', { timeout: 180000 }, (ctx) =>
 	before(async () => {
 		const [nodeA, nodeB] = await Promise.all(
 			['A', 'B'].map(async (suffix) => {
-				const nodeCtx = { name: ctx.name + '-' + suffix, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+				const nodeCtx = {
+					name: ctx.name + '-' + suffix,
+					harper: { hostname: await getNextAvailableLoopbackAddress() },
+				};
 				await startHarper(nodeCtx, startOptions(nodeCtx.harper.hostname));
 				return nodeCtx.harper;
 			})
@@ -121,9 +124,7 @@ suite('Replication frame carries a single origin', { timeout: 180000 }, (ctx) =>
 	});
 
 	after(async () => {
-		await Promise.all(
-			[ctx.nodeA, ctx.nodeB].map((node) => node && teardownHarper({ harper: node }).catch(() => null))
-		);
+		await Promise.all([ctx.nodeA, ctx.nodeB].map((node) => node && teardownHarper({ harper: node }).catch(() => null)));
 	});
 
 	test('entries at one key in two origin logs are applied as two transactions', async () => {

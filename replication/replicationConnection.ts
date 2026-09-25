@@ -233,6 +233,21 @@ export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
 // when we receive messages from other nodes, we then forward them on to as a notification on these subscriptions
 export const databaseSubscriptions = new Map();
+const lastFrameTurn = new WeakMap<object, Promise<void>>();
+/**
+ * Wait until every frame queued earlier on `subscription` has been fully queued, then return the function
+ * that ends this frame's turn. All connections on a thread deliver to one subscription per database, and core
+ * applies it with a single transaction in progress, so a frame that another connection's frame starts inside
+ * gets its remaining records applied in that transaction (harper#1162).
+ */
+export async function takeFrameTurn(subscription: object): Promise<() => void> {
+	const previous = lastFrameTurn.get(subscription);
+	let endTurn: () => void;
+	const turn = new Promise<void>((resolve) => (endTurn = resolve));
+	lastFrameTurn.set(subscription, previous ? previous.then(() => turn) : turn);
+	await previous;
+	return endTurn;
+}
 const DEBUG_MODE = true;
 // when we skip messages (usually because we aren't the originating node), we still need to occassionally send a sequence update
 // so that catchup occurs more quickly
@@ -2187,6 +2202,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// A replication header should begin with either a transaction timestamp or messagepack message of
 		// of an array that begins with the command code
 		lastMessageTime = performance.now();
+		let endFrameTurn: () => void;
 		try {
 			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
 			if (body[0] > 127) {
@@ -2812,13 +2828,15 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 										subscriptionToHdbNodes = subscription;
 										for await (const event of subscriptionToHdbNodes) {
 											const node = event.value;
-											if (!(
-												node?.replicates === true ||
-												node?.replicates?.receives ||
-												node?.replicates?.receivesFrom?.some(
-													(sub) => sub.source === getThisNodeName() && sub.database === databaseName
+											if (
+												!(
+													node?.replicates === true ||
+													node?.replicates?.receives ||
+													node?.replicates?.receivesFrom?.some(
+														(sub) => sub.source === getThisNodeName() && sub.database === databaseName
+													)
 												)
-											)) {
+											) {
 												closed = true;
 												close(1008, `Unauthorized database subscription to ${databaseName}`);
 												return;
@@ -3563,6 +3581,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
 			if (!(await whenSubscriptionResolved())) return;
+			endFrameTurn = await takeFrameTurn(tableSubscriptionToReplicator);
 			decoder.position = 8;
 			let beginTxn = true;
 			let event; // could also get txnTime from decoder.getFloat64(0);
@@ -3929,6 +3948,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			tableSubscriptionToReplicator.send(endTxnEvent);
 		} catch (error) {
 			logger.error?.(connectionId, 'Error handling incoming replication message', error);
+		} finally {
+			endFrameTurn?.();
 		}
 	}
 	ws.on('ping', resetPingTimer);
