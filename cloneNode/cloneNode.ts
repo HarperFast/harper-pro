@@ -38,7 +38,6 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
-import { leaderErrorReason } from './leaderErrorReason.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
 import {
 	CLONE_COMPLETION_GRACE_MS,
@@ -1367,7 +1366,12 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 	});
 
 	if (statusCode < 200 || statusCode >= 300) {
-		const reason = leaderErrorReason(contentType, responseBody);
+		let reason: unknown = responseBody.toString('utf8');
+		try {
+			reason =
+				(contentType.includes('cbor') ? cborDecode(responseBody) : JSON.parse(reason as string))?.error ?? reason;
+		} catch {}
+		reason = String(reason).replace(/\s+/g, ' ').trim().slice(0, 500);
 		throw new Error(`Leader request failed: ${statusCode} ${statusMessage}${reason ? `: ${reason}` : ''}`);
 	}
 
