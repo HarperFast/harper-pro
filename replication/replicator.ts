@@ -619,6 +619,13 @@ export function operationConnectionOptions(url: string): { url: string } {
 	return { url };
 }
 
+// setTimeout fires at once when given a longer delay.
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/**
+ * Settles with the node's answer, or rejects on a socket error, on the connection closing first, or at
+ * `options.timeoutMs`. A rejection says nothing about whether the operation ran there.
+ */
 export async function sendOperationToNode(node, operation, options?) {
 	if (!options) options = {};
 	options.serverName = node.name;
@@ -628,23 +635,40 @@ export async function sendOperationToNode(node, operation, options?) {
 	// trusts each node's CA. Bootstrap callers (add_node/clone) pass a bare { url } node with no ca and are unaffected.
 	if (node.ca) options.nodeCA = node.ca;
 	const nodeUrl = getNodeURL(node);
+	// The receiver runs a forwarded operation as the connection's node, replacing hdb_user with that
+	// identity, so the sender's user record — and its refresh_token — is never needed there.
+	let forwarded = operation;
+	if (operation.hdb_user !== undefined) {
+		forwarded = { ...operation };
+		delete forwarded.hdb_user;
+	}
+	const timeoutMs =
+		Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+			? Math.min(options.timeoutMs, MAX_TIMER_DELAY_MS)
+			: undefined;
 	const socket = await createWebSocket(nodeUrl, options);
 	const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), {});
 	let timer: NodeJS.Timeout | undefined;
 	return new Promise((resolve, reject) => {
-		if (options.timeoutMs)
+		if (timeoutMs)
 			timer = setTimeout(
-				() => reject(new Error(`operation to ${nodeUrl} did not answer within ${options.timeoutMs}ms`)),
-				options.timeoutMs
+				() =>
+					reject(
+						new Error(
+							`${forwarded.operation} to ${nodeUrl} did not answer within ${timeoutMs}ms; its outcome there is unknown`
+						)
+					),
+				timeoutMs
 			).unref();
 		socket.on('open', () => {
 			// operation may carry a secret (registry token / ssh key / password); redact before
 			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
 			if (logger.logsAtLevel('debug'))
-				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(operation));
+				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(forwarded));
 			// A throw inside this listener is an uncaught exception, and leaves this promise pending.
 			try {
-				resolve(session.sendOperation(operation, options.timeoutMs));
+				// Not `resolve(promise)`: adopting the session's promise would disarm the deadline and close below.
+				session.sendOperation(forwarded).then(resolve, reject);
 			} catch (error) {
 				reject(error);
 			}
@@ -652,8 +676,13 @@ export async function sendOperationToNode(node, operation, options?) {
 		socket.on('error', (error) => {
 			reject(error);
 		});
-		socket.on('close', (error) => {
-			logger.info('Sending operation connection to ' + nodeUrl + ' closed', error);
+		socket.on('close', (code, reason) => {
+			logger.info('Sending operation connection to ' + nodeUrl + ' closed', code);
+			reject(
+				new Error(
+					`The connection to ${nodeUrl} closed (${code}${reason?.length ? ` ${reason}` : ''}) before ${forwarded.operation} was answered; its outcome there is unknown`
+				)
+			);
 		});
 	}).finally(() => {
 		clearTimeout(timer);
@@ -864,7 +893,7 @@ function hasExplicitlyReplicatedTable(databaseName) {
 	}
 }
 
-export async function replicateOperation(req, options?: { onPeerResult?: (result: any) => void }) {
+export async function replicateOperation(req, options?: { onPeerResult?: (result: any) => void; timeoutMs?: number }) {
 	const response: { message: string; replicated?: any[] } = { message: '' };
 	if (req.replicated !== false) {
 		req.replicated = false; // don't send a replicated flag to the nodes we are sending to
@@ -879,18 +908,23 @@ export async function replicateOperation(req, options?: { onPeerResult?: (result
 		// each peer settles — letting callers surface per-peer progress in real time
 		// rather than waiting for the aggregate at the end.
 		const onPeerResult = options?.onPeerResult;
+		const timeoutMs = options?.timeoutMs;
 		const perPeer = server.nodes.map((node) =>
-			sendOperationToNode(node, req)
+			sendOperationToNode(node, req, timeoutMs === undefined ? undefined : { timeoutMs })
 				.then((value: any) => {
 					const result: any = value && typeof value === 'object' ? value : { value };
 					result.node = node.name;
 					return result;
 				})
-				.catch((reason) => ({
-					status: 'failed',
-					reason: reason?.toString?.() ?? String(reason),
-					node: node.name,
-				}))
+				.catch((reason) => {
+					// Only the operation's name: its body can carry secrets the redaction lists do not know yet.
+					logger.warn(`Replicating ${req.operation} to ${node.name} failed:`, reason?.message ?? String(reason));
+					return {
+						status: 'failed',
+						reason: reason?.toString?.() ?? String(reason),
+						node: node.name,
+					};
+				})
 				.then((result) => {
 					if (onPeerResult) {
 						try {

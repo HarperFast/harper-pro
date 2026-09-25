@@ -4802,43 +4802,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// single replication message can be encoded — see materializeOperationResponse.
 										response = await materializeOperationResponse(response);
 										response.requestId = data.requestId;
-										ws.send(encode([OPERATION_RESPONSE, response]));
+										answerOperation(data, response);
 									} catch (error) {
 										logger.debug?.('Failed encoding operation response for', remoteNodeName, error);
-										ws.send(
-											encode([
-												OPERATION_RESPONSE,
-												{
-													requestId: data.requestId,
-													error: errorToString(error),
-												},
-											])
-										);
+										answerOperation(data, { requestId: data.requestId, error: errorToString(error) });
 									}
 								},
 								(error) => {
 									logger.debug?.('Failed requested operation from', remoteNodeName, error);
-									ws.send(
-										encode([
-											OPERATION_RESPONSE,
-											{
-												requestId: data.requestId,
-												error: errorToString(error),
-											},
-										])
-									);
+									answerOperation(data, { requestId: data.requestId, error: errorToString(error) });
 								}
 							);
 						} catch (error) {
-							ws.send(
-								encode([
-									OPERATION_RESPONSE,
-									{
-										requestId: data.requestId,
-										error: errorToString(error),
-									},
-								])
-							);
+							answerOperation(data, { requestId: data.requestId, error: errorToString(error) });
 						}
 						break;
 					case OPERATION_RESPONSE: {
@@ -7237,6 +7213,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		} catch (error) {
 			logger.error?.(connectionId, 'Error closing connection', error);
 		}
+	}
+	// The requester stops waiting at its own deadline or when it restarts, and this node's work goes on,
+	// so an answer can be ready after its connection is gone. A send then drops it without a trace.
+	function answerOperation(request, answer) {
+		if (ws.readyState !== WebSocket.OPEN) {
+			logger.warn?.(
+				`${request.operation} requested by ${remoteNodeName ?? authorization?.name} finished after its connection closed; the answer was not delivered`
+			);
+			return;
+		}
+		ws.send(encode([OPERATION_RESPONSE, answer]));
 	}
 	// Track the blobs being sent, so we can wait for them to finish before sending the next blob.
 	// The same blobs can't be sent concurrently of the packets will get mixed up. The receiving

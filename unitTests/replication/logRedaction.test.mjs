@@ -6,6 +6,7 @@
 
 import { expect } from 'chai';
 import { redactOperationForLog } from '#src/replication/logRedaction';
+import { UNLOGGABLE_OPERATION_FIELDS } from '#src/core/server/serverHelpers/serverUtilities';
 
 describe('redactOperationForLog', () => {
 	it('masks ssh key contents, passwords, and auth headers', () => {
@@ -87,5 +88,29 @@ describe('redactOperationForLog', () => {
 		expect(redactOperationForLog(undefined)).to.equal(undefined);
 		expect(redactOperationForLog(null)).to.equal(null);
 		expect(redactOperationForLog('insert')).to.equal('insert');
+	});
+
+	it("masks the requesting user's record, which carries its refresh_token", () => {
+		const out = redactOperationForLog({
+			operation: 'deploy_component',
+			project: 'harper',
+			hdb_user: { username: 'admin', refresh_token: 'a-30-day-credential', role: { role: 'super_user' } },
+		});
+		expect(out.hdb_user).to.equal('[redacted]');
+		expect(out.project).to.equal('harper');
+		expect(JSON.stringify(out)).to.not.include('a-30-day-credential');
+	});
+
+	// The operations log and this one print the same request bodies. `credentials` is the one deliberate
+	// difference: references stay visible here, and only a literal token inside an entry is masked.
+	it("masks every field core's operation log refuses to print", () => {
+		const operation = { operation: 'set_secret' };
+		for (const field of UNLOGGABLE_OPERATION_FIELDS) {
+			if (field !== 'credentials') operation[field] = `secret-${field}`;
+		}
+		const out = redactOperationForLog(operation);
+		for (const field of UNLOGGABLE_OPERATION_FIELDS) {
+			if (field !== 'credentials') expect(out[field], field).to.equal('[redacted]');
+		}
 	});
 });
