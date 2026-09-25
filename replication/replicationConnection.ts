@@ -6059,7 +6059,12 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			const turn = takeFrameTurn(tableSubscriptionToReplicator);
 			if (typeof turn === 'function') endFrameTurn = turn;
 			else {
-				addPauseReason();
+				try {
+					addPauseReason();
+				} catch (error) {
+					turn.then((endTurn) => endTurn());
+					throw error;
+				}
 				try {
 					endFrameTurn = await turn;
 				} finally {
@@ -6229,6 +6234,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						continue;
 					}
 				}
+				const isCopyApply = messageIsCopyFrame && copyApplyActive() && auditRecord.version < copyModeStartTime;
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
 				// Dangling-blob repair pairing (#699): computed only for blob-carrying records in the windows
@@ -6290,9 +6296,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								timestamp: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
 								user: auditRecord.user,
-								// A frame holds every entry at one log key across the sender's logs, which can be several
-								// origins' transactions; RocksDB binds a transaction to one origin's log.
-								beginTxn: beginTxn || (STORAGE_IS_ROCKSDB && localSourceNodeId !== txnNodeId),
+								// A frame can hold several origins' transactions and RocksDB binds a transaction to one origin's
+								// log; copy-apply rows write no log entry, so they never split a frame.
+								beginTxn: beginTxn || (STORAGE_IS_ROCKSDB && !isCopyApply && localSourceNodeId !== txnNodeId),
 								expiresAt: auditRecord.expiresAt,
 							};
 						},
@@ -6408,7 +6414,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						continue;
 					}
 					beginTxn = false;
-					txnNodeId = localSourceNodeId;
+					if (!isCopyApply) txnNodeId = localSourceNodeId;
 					// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
 					logger.debug?.(
 						connectionId,
@@ -6428,7 +6434,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// still need a real audit entry for the redelivery to dedup (a commutative patch would
 					// otherwise double-apply). Rows older than copyStartTime are never redelivered, so the
 					// snapshot is safe and carries no audit. Strict `<` keeps the boundary row audited.
-					event.isCopyApply = messageIsCopyFrame && copyApplyActive() && auditRecord.version < copyModeStartTime;
+					event.isCopyApply = isCopyApply;
 					// Record which tables actually received an audit-less snapshot row so only those get a
 					// reload marker at copy finalization (harper-pro#495). isCopyApply is exactly "invisible to
 					// live subscribers" — a copy frame with version >= copyStartTime carries a real audit entry
