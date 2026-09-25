@@ -1,14 +1,9 @@
 /**
- * `add_ssh_key` / `update_ssh_key` refuse a key ssh couldn't authenticate with, because nothing else
- * reads a stored key before ssh loads it for a git deploy — where it fails as a generic auth error.
- * These tests pin both halves of that contract: every key ssh loads and signs with is accepted (a
- * false refusal would lock out a working deploy key), and each way a key fails is refused with a
- * message that names the mistake.
- *
- * The oracle suites compare verdicts with the host's real `ssh-keygen` (`-y` to load, `-Y sign` to
- * sign) and `ssh -G`, wherever they exist (CI's Linux images, macOS). Two verdicts are policy rather
- * than ssh behavior, and are asserted as such: DSA is refused though OpenSSH before 10 still loads
- * it, and Ed25519 in PKCS#8 is accepted though only OpenSSL builds of OpenSSH load it.
+ * Both halves of the contract: every key ssh loads and signs with is accepted, and every other is
+ * refused with a message naming the mistake. The oracle suites check that against the host's real
+ * `ssh-keygen` and `ssh -G` where they exist (CI's Ubuntu runners). Policy rather than ssh behavior,
+ * asserted as such: DSA is refused though OpenSSH before 10 loads it, and Ed25519 in PKCS#8 is
+ * accepted though only OpenSSL builds of OpenSSH load it.
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -95,6 +90,12 @@ describe('SSH private key validation', () => {
 				const spaced = key.replace(/\n([A-Za-z0-9+/]{10})/g, '\n$1 \t');
 				assert.equal(describeSSHPrivateKeyProblem(spaced), undefined);
 			}
+		});
+
+		it("a comment ending in a NUL, which OpenSSH's string reader allows", () => {
+			const key = openSSHPrivateKey({ comment: 'c\0' });
+			assert.equal(describeSSHPrivateKeyProblem(key), undefined);
+			if (hasSSHKeygen) assert.ok(sshKeygenSigns(key), 'ssh signs with it too');
 		});
 
 		it('an OpenSSH private section already block-aligned, with no padding at all', () => {
@@ -454,6 +455,7 @@ describe('SSH private key validation', () => {
 					]),
 					fields: ed25519,
 				}),
+				// a NUL is allowed only as a string's last byte (`sshbuf_get_cstring`)
 				'a NUL inside its comment': openSSHKeyBytes({ comment: 'a\0b' }),
 				'an ECDSA point in compressed form': openSSHKeyBytes({
 					keyType: 'ecdsa-sha2-nistp256',

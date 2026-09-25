@@ -1,12 +1,7 @@
 import { createPrivateKey, createPublicKey, sign, verify, type KeyObject, type webcrypto } from 'node:crypto';
 
-/*
- * Nothing reads a stored SSH key until ssh loads it as the IdentityFile of a git deploy, where a key
- * it can't load fails as a generic auth error. So a supplied key is refused here when that load would
- * fail: the checks mirror OpenSSH's own loader (sshkey.c — `sshkey_parse_private2` for its format,
- * `sshkey_parse_private_pem_fileblob` for PEM), and the messages name the mistakes Harper Studio
- * names for the same keys.
- */
+// Mirrors OpenSSH's loader (sshkey.c: `sshkey_parse_private2`, `sshkey_parse_private_pem_fileblob`),
+// plus a signing check: refuse only a key ssh can't load, or can't authenticate with.
 
 /** Far above any real private key (an RSA-16384 key is about 13 KB), and a bound on the work below. */
 export const MAX_SSH_PRIVATE_KEY_LENGTH = 64 * 1024;
@@ -66,10 +61,9 @@ const unsupported = (what: string, name: string | undefined) =>
 	`Use an Ed25519, ECDSA or RSA key${FOR_EXAMPLE_A_NEW_KEY}`;
 
 /**
- * `key` as ssh needs it in a file: every line trimmed, blank lines dropped, and a final newline. ssh
- * finds its format's BEGIN and END lines only at the start of a line and only newline-terminated,
- * and libcrypto rejects a PEM body with a blank line in it; none of that whitespace is ever part of
- * a key.
+ * None of the whitespace this drops is ever part of a key, and ssh refuses a key that has it: OpenSSH
+ * finds BEGIN and END only at a line start and newline-terminated, and libcrypto refuses a blank line
+ * inside a PEM body.
  */
 export function normalizeSSHPrivateKey(key: string): string {
 	return splitKeyLines(key).join('\n') + '\n';
@@ -83,8 +77,8 @@ function splitKeyLines(key: string): string[] {
 }
 
 /**
- * Explains why ssh couldn't load `key` — plaintext, as sent — as a private key once it is stored in
- * its normalized form, or returns undefined when it could.
+ * Explains why ssh couldn't load `key` — plaintext, as sent — or authenticate with it once it is stored
+ * in its normalized form, or returns undefined when it could.
  *
  * Ed25519 in PKCS#8 is accepted though only OpenSSH built against OpenSSL loads it (LibreSSL builds,
  * such as macOS's, don't): that's the build Harper's Linux hosts run.
@@ -467,12 +461,9 @@ const SSH_CONFIG_FIELDS = {
 };
 
 /**
- * Explains why `value` can't be written as the `Host` (`host`) or `HostName` (`hostname`) of an ssh
- * config block, or returns undefined when it can. The config is shared by every key on the node, so
- * each refusal is a value that would break ssh's parse of the whole file (a second argument — which
- * OpenSSH before 8.7 also splits at "=" —, an unbalanced quote, a line break, or a leading "#"), make
- * its block also apply to other keys' aliases (a pattern), or can never be connected to (a leading
- * dash).
+ * The config is shared by every key on the node, so each refusal is a value that breaks ssh's parse of
+ * the whole file (OpenSSH before 8.7 also splits an argument at "="), makes its block apply to other
+ * keys' aliases (a pattern), or can never connect (a leading dash).
  */
 export function describeSSHConfigValueProblem(field: 'host' | 'hostname', value: string): string | undefined {
 	const { value: noun, example } = SSH_CONFIG_FIELDS[field];
