@@ -396,18 +396,19 @@ async function findExistingNodeRecord(hostname: string, url: string) {
 const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization', 'start_time', 'force_signing'];
 
 /**
- * revoked_certificates and shard are read from THIS node's own hdb_nodes row, so a request limited
- * to those (plus hostname) patches the existing row locally, with no peer contact. A request naming
- * a FIELDS_REQUIRING_FULL_SETNODE field still needs setNode(), which resets omitted topology to full
- * mesh and derives a default url from THIS node's own port when none is given -- both carried
- * forward from the existing row here first.
+ * revoked_certificates/shard are read from THIS node's own row, so those patch it locally with no
+ * peer contact. Anything else needs setNode(), which resets omitted topology to full mesh and
+ * derives a default url from this node's own port -- both carried forward from the existing row.
  */
 async function updateNode(req: any) {
 	const hostname = req.hostname || req.node_name || req.name || (req.url ? urlToNodeName(req.url) : undefined);
 	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
-	const requestHasTopology = Boolean(
-		req.subscriptions || req.sendsTo || req.receivesFrom || req.subscribe !== undefined || req.publish !== undefined
-	);
+	if ((req.subscribe !== undefined || req.publish !== undefined) && !req.subscriptions) {
+		throw new ClientError(
+			`update_node does not support top-level 'subscribe'/'publish' without 'subscriptions'; supply a subscriptions array, or use set_node`
+		);
+	}
+	const requestHasTopology = Boolean(req.subscriptions || req.sendsTo || req.receivesFrom);
 
 	if (hostname && !requestHasTopology) {
 		const found = await findExistingNodeRecord(hostname, url);
@@ -431,6 +432,7 @@ async function updateNode(req: any) {
 				return `Successfully updated '${found.record.url}'`;
 			}
 			req.url ??= found.record.url;
+			req.hostname = found.name;
 			const directional = found.record.replicates;
 			const hasDirectionalArrays =
 				directional && typeof directional === 'object' && (directional.sendsTo || directional.receivesFrom);
