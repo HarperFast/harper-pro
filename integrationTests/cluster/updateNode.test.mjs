@@ -1,12 +1,13 @@
 /**
- * Integration test: `update_node` is a registered, dispatchable operation, and (per docs) adds
- * the node when it doesn't already exist.
+ * `update_node` must be dispatchable (regression: it was never registered), must add a node it
+ * doesn't already know about (documented add-if-absent), and must not silently widen an existing
+ * selective replication relationship when the request omits topology fields.
  */
 import { suite, test, before, after } from 'node:test';
-import { match } from 'node:assert/strict';
+import { match, equal, ok, deepEqual } from 'node:assert/strict';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, ensureTableExists } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -17,10 +18,10 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	'harper.js'
 );
 
-// Anchored at both ends so it does NOT match the success-with-warning variant setNode() returns
-// when the peer rejects/errors ("Successfully updated '<url>' but there was an error ..."):
-// a peer-rejected update_node must fail this test, not pass it.
+// Anchored at both ends: excludes setNode()'s success-with-warning suffix (a rejected/unreachable peer).
 const UPDATE_SUCCESS = /^Successfully updated '[^']+'$/;
+const SELECTIVE_DATABASE = 'data';
+const SELECTIVE_TABLE = 'update_node_selective_test';
 
 suite('update_node is a registered, dispatchable operation', { timeout: 120000 }, (ctx) => {
 	before(async () => {
@@ -39,9 +40,7 @@ suite('update_node is a registered, dispatchable operation', { timeout: 120000 }
 
 		const ctxA = makeNodeCtx(hostnameA);
 		const ctxB = makeNodeCtx(hostnameB);
-		// Assign as each node starts (not after Promise.all resolves) so `after` can tear down
-		// whichever one succeeded if the other's startHarper rejects.
-		await Promise.all([
+		const results = await Promise.allSettled([
 			startHarper(ctxA, commonConfig(hostnameA)).then(() => {
 				ctx.nodeA = ctxA.harper;
 			}),
@@ -49,11 +48,18 @@ suite('update_node is a registered, dispatchable operation', { timeout: 120000 }
 				ctx.nodeB = ctxB.harper;
 			}),
 		]);
+		const rejected = results.find((r) => r.status === 'rejected');
+		if (rejected) throw rejected.reason;
 
+		// A SELECTIVE (not full-mesh) link from the start: `ensureNode` patches, so a later call that
+		// omits `replicates` cannot clear an already-full-mesh record -- the relationship has to be
+		// selective from its first registration for test 3 below to mean anything.
+		await ensureTableExists(ctx.nodeA, { database: SELECTIVE_DATABASE, table: SELECTIVE_TABLE, primary_key: 'id' });
 		await sendOperation(ctx.nodeB, {
 			operation: 'add_node',
 			hostname: ctx.nodeA.hostname,
 			rejectUnauthorized: false,
+			subscriptions: [{ database: SELECTIVE_DATABASE, table: SELECTIVE_TABLE, subscribe: true, publish: false }],
 			authorization: ctx.nodeA.admin,
 		});
 	});
@@ -104,5 +110,48 @@ suite('update_node is a registered, dispatchable operation', { timeout: 120000 }
 		} finally {
 			await teardownHarper({ harper: ctxC.harper });
 		}
+	});
+
+	test('update_node with no topology fields preserves an existing selective subscription', async () => {
+		const { nodeA, nodeB } = ctx;
+
+		const readNodeARecordOnB = async () =>
+			(
+				await sendOperation(nodeB, {
+					operation: 'search_by_value',
+					database: 'system',
+					table: 'hdb_nodes',
+					search_attribute: 'name',
+					search_value: nodeA.hostname,
+					get_attributes: ['name', 'subscriptions', 'replicates'],
+				})
+			)[0];
+
+		const before = await readNodeARecordOnB();
+		ok(
+			Array.isArray(before?.subscriptions) && before.subscriptions.length > 0,
+			'precondition: selective link established in before()'
+		);
+		ok(before.replicates !== true, 'precondition: not full replication before the update');
+
+		await sendOperation(nodeB, {
+			operation: 'update_node',
+			hostname: nodeA.hostname,
+			rejectUnauthorized: false,
+			revoked_certificates: [],
+			authorization: nodeA.admin,
+		});
+
+		const after = await readNodeARecordOnB();
+		equal(
+			after.replicates,
+			before.replicates,
+			'update_node must not widen replicates when topology fields are omitted'
+		);
+		deepEqual(
+			after.subscriptions,
+			before.subscriptions,
+			'update_node must preserve the existing selective subscription'
+		);
 	});
 });

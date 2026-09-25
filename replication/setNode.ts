@@ -376,6 +376,29 @@ function reverseSubscription(subscription) {
 	const { subscribe, publish } = subscription;
 	return { ...subscription, subscribe: publish, publish: subscribe };
 }
+
+/**
+ * update_node documents itself as modifying an EXISTING node, unlike add_node/set_node (whose
+ * default-to-full-replication on an omitted `subscriptions` is safe -- there's no prior topology
+ * to clobber). Without this, the documented `{ operation: 'update_node', hostname }` shape (e.g.
+ * to rotate revoked_certificates) would fall through to setNode()'s add-style default and silently
+ * widen an existing selective replication link to full mesh on both sides. Re-supplying the
+ * existing topology when the request specifies none reduces to a no-op re-application of the
+ * current state, matching setNode()'s own add-if-absent behavior when there is no existing record.
+ */
+async function updateNode(req: any) {
+	const hostname = req.hostname || req.node_name || req.name || (req.url ? urlToNodeName(req.url) : undefined);
+	if (hostname && !req.subscriptions && !req.sendsTo && !req.receivesFrom) {
+		const existing = getHDBNodeTable().primaryStore.getSync(hostname);
+		if (existing?.subscriptions) req.subscriptions = existing.subscriptions;
+		else if (existing?.replicates && typeof existing.replicates === 'object') {
+			req.sendsTo = existing.replicates.sendsTo;
+			req.receivesFrom = existing.replicates.receivesFrom;
+		}
+	}
+	return setNode(req);
+}
+
 server.registerOperation?.({
 	name: 'set_node',
 	execute: setNode,
@@ -390,7 +413,7 @@ server.registerOperation?.({
 });
 server.registerOperation?.({
 	name: 'update_node',
-	execute: setNode,
+	execute: updateNode,
 	httpMethod: 'PUT',
 	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],
 });
