@@ -16,6 +16,11 @@ describe('leaderErrorReason', () => {
 		);
 	});
 
+	it('matches the media type case-insensitively', () => {
+		const body = Buffer.from('b90001656572726f726d4b6579206e6f7420666f756e64', 'hex');
+		assert.strictEqual(leaderErrorReason('Application/CBOR', body), 'Key not found');
+	});
+
 	it('uses a bare string reply as the reason', () => {
 		assert.strictEqual(leaderErrorReason('application/cbor', cborEncode('Key not found')), 'Key not found');
 	});

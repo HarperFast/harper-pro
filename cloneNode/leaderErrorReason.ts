@@ -6,10 +6,11 @@ const MAX_STRUCTURED_BODY_BYTES = 64 * 1024;
 /** Never throws: a malformed reply must not replace the HTTP failure it describes. */
 export function leaderErrorReason(contentType: string, body: Buffer): string {
 	let decoded: unknown;
+	const mediaType = contentType.toLowerCase();
 	if (body.length <= MAX_STRUCTURED_BODY_BYTES) {
 		try {
-			if (contentType.includes('application/cbor')) decoded = cborDecode(body);
-			else if (contentType.includes('application/json')) decoded = JSON.parse(body.toString('utf8'));
+			if (mediaType.includes('application/cbor')) decoded = cborDecode(body);
+			else if (mediaType.includes('application/json')) decoded = JSON.parse(body.toString('utf8'));
 		} catch {}
 	}
 	const field = (decoded as { error?: unknown } | null | undefined)?.error;
