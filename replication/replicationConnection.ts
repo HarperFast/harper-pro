@@ -7324,7 +7324,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function answerOperation(request, answer) {
 		if (ws.readyState !== WebSocket.OPEN) {
 			logger.warn?.(
-				`${request?.operation} requested by ${remoteNodeName ?? authorization?.name} finished after its connection closed; the answer was not delivered`
+				`${request?.operation ?? 'An operation'} requested by ${remoteNodeName ?? authorization?.name} finished after its connection closed; the answer was not delivered`
 			);
 			return;
 		}
