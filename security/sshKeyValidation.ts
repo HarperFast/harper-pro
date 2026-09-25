@@ -80,8 +80,8 @@ function splitKeyLines(key: string): string[] {
  * Explains why ssh couldn't load `key` — plaintext, as sent — or authenticate with it once it is stored
  * in its normalized form, or returns undefined when it could.
  *
- * Ed25519 in PKCS#8 is accepted though only OpenSSH built against OpenSSL loads it (LibreSSL builds,
- * such as macOS's, don't): that's the build Harper's Linux hosts run.
+ * Ed25519 in PKCS#8 is accepted: OpenSSH 10 built against OpenSSL, as in Harper's Debian image, loads
+ * it, though OpenSSH 9 (Ubuntu 24.04) and LibreSSL builds (macOS) don't.
  */
 export function describeSSHPrivateKeyProblem(key: string): string | undefined {
 	if (key.length > MAX_SSH_PRIVATE_KEY_LENGTH) {
@@ -156,6 +156,9 @@ function describePEMKeyProblem(label: string, der: Buffer): string | undefined {
 		case 'rsa': {
 			const bits = key.asymmetricKeyDetails?.modulusLength ?? 0;
 			if (bits < MIN_RSA_BITS) return rsaTooShort(bits);
+			const { n, p, q } = key.export({ format: 'jwk' });
+			const [modulus, primeP, primeQ] = [n, p, q].map((value) => Buffer.from(value, 'base64url'));
+			if (!primesMakeModulus(modulus, primeP, primeQ)) return DAMAGED;
 			break;
 		}
 		case 'ec': {
@@ -312,6 +315,7 @@ const rsaFormat: OpenSSHKeyFormat = {
 		if (!modulus || !exponent || !privateExponent || !iqmp || !p || !q) return DAMAGED;
 		const tooShort = rsaModulusProblem(modulus);
 		if (tooShort) return tooShort;
+		if (!primesMakeModulus(modulus, p, q)) return DAMAGED;
 		// OpenSSH derives these on load too; a factor under 2 makes that throw here as it fails there
 		const [d, primeP, primeQ] = [privateExponent, p, q].map(toBigInt);
 		return {
@@ -331,6 +335,14 @@ const rsaFormat: OpenSSHKeyFormat = {
 	},
 	publicKey: ([exponent, modulus]) => jwkPublicKey({ kty: 'RSA', n: base64url(modulus), e: base64url(exponent) }),
 };
+
+/**
+ * A damaged key, though OpenSSL's CRT fault fallback can still sign with one. Checked here so every
+ * Node version gives the same verdict: Node 26 refuses such a key on import, and older Node doesn't.
+ */
+function primesMakeModulus(modulus: Buffer, p: Buffer, q: Buffer): boolean {
+	return toBigInt(p) * toBigInt(q) === toBigInt(modulus);
+}
 
 function rsaModulusProblem(modulus: Buffer): string | undefined {
 	const bits = bitLength(modulus);

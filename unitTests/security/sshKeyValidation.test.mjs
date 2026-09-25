@@ -2,8 +2,9 @@
  * Both halves of the contract: every key ssh loads and signs with is accepted, and every other is
  * refused with a message naming the mistake. The oracle suites check that against the host's real
  * `ssh-keygen` and `ssh -G` where they exist (CI's Ubuntu runners). Policy rather than ssh behavior,
- * asserted as such: DSA is refused though OpenSSH before 10 loads it, and Ed25519 in PKCS#8 is
- * accepted though only OpenSSL builds of OpenSSH load it.
+ * asserted as such: DSA is refused though OpenSSH before 10 loads it; Ed25519 in PKCS#8 is accepted
+ * though only OpenSSH 10 on OpenSSL loads it; and a key whose stored components disagree is refused
+ * though some builds still sign with it.
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -22,6 +23,7 @@ import {
 	openSSHPrivateKey,
 	padTo,
 	pemPrivateKey,
+	pkcs1Der,
 	sshKeygenLoads,
 	sshKeygenSigns,
 	sshString,
@@ -70,7 +72,7 @@ describe('SSH private key validation', () => {
 			}
 		});
 
-		it('an Ed25519 key in PKCS#8, which OpenSSL builds of OpenSSH (Linux) load', () => {
+		it("an Ed25519 key in PKCS#8, which OpenSSH 10 on OpenSSL (Harper's Debian image) loads", () => {
 			assert.equal(describeSSHPrivateKeyProblem(pemPrivateKey('ed25519', 'pkcs8')), undefined);
 		});
 
@@ -523,9 +525,12 @@ describe('SSH private key validation', () => {
 			const [ecdsa, otherECDSA] = [openSSHKeyFields('ecdsa-sha2-nistp256'), openSSHKeyFields('ecdsa-sha2-nistp256')];
 			// an RSA private section opens with its copy of n and e
 			const rsaPublicCopy = (fields) => 8 + fields.readUInt32BE(0) + fields.readUInt32BE(4 + fields.readUInt32BE(0));
+			// a P-256 SEC1 key is a fixed 121 bytes ending in its 65-byte public point; Node 26 refuses to
+			// build a mismatched pair from a JWK, so splice one key's point onto the other's private scalar
 			const [own, other] = [0, 1].map(() =>
-				generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey.export({ format: 'jwk' })
+				generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey.export({ type: 'sec1', format: 'der' })
 			);
+			assert.deepEqual([own.length, other.length], [121, 121]);
 			return {
 				"an OpenSSH Ed25519 key whose seed is another key's": openSSHPrivateKey({
 					fields: {
@@ -556,10 +561,10 @@ describe('SSH private key validation', () => {
 						]),
 					},
 				}),
-				"a SEC1 EC key whose embedded public key is another key's": createPrivateKey({
-					key: { ...other, d: own.d },
-					format: 'jwk',
-				}).export({ type: 'sec1', format: 'pem' }),
+				"a SEC1 EC key whose embedded public key is another key's": armor(
+					'EC PRIVATE KEY',
+					Buffer.concat([own.subarray(0, 121 - 65), other.subarray(121 - 65)])
+				),
 			};
 		};
 
@@ -630,6 +635,22 @@ describe('SSH private key validation', () => {
 		it('as ssh-keygen does', function () {
 			if (!hasSSHKeygen) this.skip();
 			for (const [what, key] of Object.entries(refusedOnLoad())) assert.ok(!sshKeygenLoads(key), what);
+		});
+	});
+
+	describe('refuses a key whose stored components disagree, which some builds still sign with', () => {
+		// OpenSSL's CRT fault fallback signs with an RSA key whose primes don't make its modulus; LibreSSL
+		// builds, and Node 26 on import, refuse one, so it is refused everywhere for one verdict
+		it("an RSA key whose primes don't multiply to its modulus, in either format", () => {
+			const jwk = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'jwk' });
+			const q = Buffer.from(jwk.q, 'base64url');
+			q[q.length - 1] ^= 2;
+			const openSSH = openSSHPrivateKey({
+				keyType: 'ssh-rsa',
+				fields: openSSHKeyFields('ssh-rsa', { rsaPrivate: { q } }),
+			});
+			const pem = armor('RSA PRIVATE KEY', pkcs1Der({ ...jwk, q: q.toString('base64url') }));
+			for (const key of [openSSH, pem]) assert.equal(describeSSHPrivateKeyProblem(key), DAMAGED);
 		});
 	});
 
