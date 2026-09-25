@@ -40,6 +40,10 @@ async function rejection(promise) {
 
 const unanswered = () => new Promise(() => {});
 
+// Not the default sandbox: restoring that one replays other files' stale fakes, such as a spy on a fake
+// setTimeout, and leaves a dead clock installed for every file after this one.
+const sandbox = sinon.createSandbox();
+
 // Mocha runs these without a timeout; a guard that regresses must fail here, not hang the run.
 const CASE_TIMEOUT_MS = 5_000;
 
@@ -50,13 +54,13 @@ describe('sendOperationToNode', function () {
 
 	beforeEach(() => {
 		socket = new FakeSocket();
-		session = { sendOperation: sinon.stub() };
-		sinon.stub(replicationConnection, 'createWebSocket').resolves(socket);
-		sinon.stub(replicationConnection, 'replicateOverWS').returns(session);
+		session = { sendOperation: sandbox.stub() };
+		sandbox.stub(replicationConnection, 'createWebSocket').resolves(socket);
+		sandbox.stub(replicationConnection, 'replicateOverWS').returns(session);
 	});
 
 	afterEach(() => {
-		sinon.restore();
+		sandbox.restore();
 	});
 
 	it("resolves with the peer's answer and closes the connection", async () => {
@@ -141,21 +145,21 @@ describe('replicateOperation', function () {
 
 	beforeEach(() => {
 		sockets = [];
-		session = { sendOperation: sinon.stub() };
-		sinon.stub(replicationConnection, 'createWebSocket').callsFake(async () => {
+		session = { sendOperation: sandbox.stub() };
+		sandbox.stub(replicationConnection, 'createWebSocket').callsFake(async () => {
 			const socket = new FakeSocket();
 			sockets.push(socket);
 			return socket;
 		});
-		sinon.stub(replicationConnection, 'replicateOverWS').returns(session);
-		sinon.stub(logger, 'warn');
+		sandbox.stub(replicationConnection, 'replicateOverWS').returns(session);
+		sandbox.stub(logger, 'warn');
 		priorNodes = server.nodes;
 		server.nodes = [PEER];
 	});
 
 	afterEach(() => {
 		server.nodes = priorNodes;
-		sinon.restore();
+		sandbox.restore();
 	});
 
 	async function openAll() {
@@ -165,7 +169,7 @@ describe('replicateOperation', function () {
 
 	it('bounds each peer by timeoutMs and reports the peer that did not answer at warn', async () => {
 		session.sendOperation.returns(unanswered());
-		const onPeerResult = sinon.stub();
+		const onPeerResult = sandbox.stub();
 		const response = replicateOperation(
 			{ operation: 'deploy_component', project: 'app' },
 			{ onPeerResult, timeoutMs: 20 }
