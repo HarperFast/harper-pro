@@ -423,47 +423,42 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 }
 
 const SSH_CONFIG_KEY_COMMENT = /^[ \t]*#([a-zA-Z0-9-_]+)[ \t]*$/;
-const SSH_CONFIG_IDENTITIES_ONLY_YES =
-	/^[ \t]*IdentitiesOnly(?:[ \t]*=[ \t]*|[ \t]+)(?:yes|"yes"|'yes')(?:[ \t]+#.*|[ \t]*)$/i;
 const SSH_CONFIG_SECTION_START = /^[ \t]*(?:Host|Match)(?:[ \t]*=|[ \t]+)/i;
+const SSH_CONFIG_BLANK_OR_COMMENT = /^[ \t]*(?:#.*)?$/;
 
 /**
  * Where each SSH config block `addSSHKey` wrote for `name` sits in `config`, as `[start, end)`
- * offsets that include the block's final line break. A block opens at a comment line that is exactly
- * `#name` (blanks aside — matched as a prefix, `#repo` would claim `#repo-2`'s block) and closes after
- * its `IdentitiesOnly yes` line, in any case, with blanks or `=` before a value that may be quoted, and
- * an optional trailing comment. If that line is missing or written some other way, the block ends
- * where the next section starts — the next key's comment line, the next `Host` or `Match` line after
- * its own, or the end of the file — so it never takes in a sibling key's block or an unmanaged section.
+ * offsets. A block is the key's comment line — exactly `#name`, blanks aside, since matched as a
+ * prefix `#repo` would claim `#repo-2`'s block — plus the `Host` section it heads, which, as OpenSSH
+ * scopes it, runs to the next `Host` or `Match` line. It also stops at the next key's header, a
+ * `#name` line whose next directive is `Host` or `Match`, so a hand-edited block never takes in a
+ * sibling key's block or an unmanaged section.
  */
 function findSSHConfigBlocks(config: string, name: string): [number, number][] {
-	const blocks: [number, number][] = [];
-	let openedAt: number | undefined;
-	let sawOwnSection = false;
-	for (let lineStart = 0; lineStart < config.length;) {
-		const newline = config.indexOf('\n', lineStart);
-		const lineEnd = newline === -1 ? config.length : newline + 1;
-		const line = config.slice(lineStart, newline === -1 ? config.length : newline).replace(/\r$/, '');
-		const commentName = SSH_CONFIG_KEY_COMMENT.exec(line)?.[1];
-		const startsSection = SSH_CONFIG_SECTION_START.test(line);
-		if (openedAt !== undefined && (commentName !== undefined || (startsSection && sawOwnSection))) {
-			blocks.push([openedAt, lineStart]);
-			openedAt = undefined;
-		}
-		if (commentName === name) {
-			openedAt = lineStart;
-			sawOwnSection = false;
-		} else if (openedAt !== undefined) {
-			if (startsSection) {
-				sawOwnSection = true;
-			} else if (SSH_CONFIG_IDENTITIES_ONLY_YES.test(line)) {
-				blocks.push([openedAt, lineEnd]);
-				openedAt = undefined;
-			}
-		}
-		lineStart = lineEnd;
+	const lines: { start: number; text: string }[] = [];
+	for (let start = 0; start < config.length;) {
+		const newline = config.indexOf('\n', start);
+		const end = newline === -1 ? config.length : newline;
+		lines.push({ start, text: config.slice(start, end).replace(/\r$/, '') });
+		start = end + 1;
 	}
-	if (openedAt !== undefined) blocks.push([openedAt, config.length]);
+	const startsSection = (index: number) => index < lines.length && SSH_CONFIG_SECTION_START.test(lines[index].text);
+	const nextDirective = (index: number) => {
+		let next = index + 1;
+		while (next < lines.length && SSH_CONFIG_BLANK_OR_COMMENT.test(lines[next].text)) next++;
+		return next;
+	};
+	const isKeyHeader = (index: number) =>
+		SSH_CONFIG_KEY_COMMENT.test(lines[index].text) && startsSection(nextDirective(index));
+
+	const blocks: [number, number][] = [];
+	for (let index = 0; index < lines.length; index++) {
+		if (SSH_CONFIG_KEY_COMMENT.exec(lines[index].text)?.[1] !== name) continue;
+		let end = startsSection(nextDirective(index)) ? nextDirective(index) + 1 : index + 1;
+		while (end < lines.length && !startsSection(end) && !isKeyHeader(end)) end++;
+		blocks.push([lines[index].start, end < lines.length ? lines[end].start : config.length]);
+		index = end - 1;
+	}
 	return blocks;
 }
 

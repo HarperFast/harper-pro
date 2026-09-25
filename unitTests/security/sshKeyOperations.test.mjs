@@ -313,43 +313,45 @@ describe('sshKeyOperations sealing', () => {
 			});
 		});
 
-		for (const [edit, closingLine] of [
-			['re-spaced', '\tIdentitiesOnly    yes'],
-			['lower-cased', '\tidentitiesonly yes'],
-			['written with `=`', '\tIdentitiesOnly = Yes'],
-			['double-quoted', '\tIdentitiesOnly "yes"'],
-			['single-quoted', "\tIdentitiesOnly 'yes'"],
-			['given a trailing comment', '\tIdentitiesOnly yes # deploy key'],
+		for (const [edit, identitiesOnlyLine] of [
+			['re-spaced', '\tIdentitiesOnly    yes\n'],
+			['removed', ''],
 		]) {
-			it(`delete_ssh_key still ends a block at its closing line when that line was ${edit}`, async () => {
-				const unmanaged = 'Host other\n\tHostName example.net';
+			it(`delete_ssh_key stops at the next key's block when a block's IdentitiesOnly line was ${edit}`, async () => {
 				for (const name of ['first', 'second']) await addKey(name);
 				writeFileSync(
 					configPath(),
-					readFileSync(configPath(), 'utf8').replace('\tIdentitiesOnly yes\n', `${closingLine}\n${unmanaged}\n`)
+					readFileSync(configPath(), 'utf8').replace('\tIdentitiesOnly yes\n', identitiesOnlyLine)
 				);
 
 				await ops.deleteSSHKey({ name: 'first' });
-				assert.equal(readFileSync(configPath(), 'utf8'), `${unmanaged}\n${blockFor('second')}`);
+				assert.equal(readFileSync(configPath(), 'utf8'), blockFor('second'));
 			});
 		}
 
-		it("delete_ssh_key stops at the next key's block when a block's closing line was removed", async () => {
+		it('delete_ssh_key removes a hand-edited block whole and stops at the next Host section', async () => {
+			const unmanaged = 'Host other\n\tHostName example.net';
 			for (const name of ['first', 'second']) await addKey(name);
-			writeFileSync(configPath(), readFileSync(configPath(), 'utf8').replace('\tIdentitiesOnly yes\n', ''));
+			writeFileSync(
+				configPath(),
+				readFileSync(configPath(), 'utf8')
+					.replace('Host first.alias\n', 'Host first.alias\n#staging\n')
+					.replace('\tIdentitiesOnly yes\n', `\tIdentitiesOnly no\n\tUser deploy\n${unmanaged}\n`)
+			);
 
 			await ops.deleteSSHKey({ name: 'first' });
-			assert.equal(readFileSync(configPath(), 'utf8'), blockFor('second'));
+			assert.equal(readFileSync(configPath(), 'utf8'), `${unmanaged}\n${blockFor('second')}`);
 		});
 
-		it('delete_ssh_key stops at the next Host section when a block has no closing `IdentitiesOnly yes`', async () => {
+		it('delete_ssh_key stops at the first Host section when a block lost its own Host line', async () => {
 			const unmanaged = 'Host other\n\tHostName example.net';
 			await addKey('first');
 			writeFileSync(
 				configPath(),
-				`${readFileSync(configPath(), 'utf8').replace('\tIdentitiesOnly yes', '\tIdentitiesOnly no')}\n${unmanaged}`
+				`${readFileSync(configPath(), 'utf8').replace('Host first.alias\n', '')}\n${unmanaged}`
 			);
 
+			assert.equal((await ops.getSSHKey({ name: 'first' })).host, undefined);
 			await ops.deleteSSHKey({ name: 'first' });
 			assert.equal(readFileSync(configPath(), 'utf8'), unmanaged);
 		});
