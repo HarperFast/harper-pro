@@ -560,6 +560,33 @@ export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
 // when we receive messages from other nodes, we then forward them on to as a notification on these subscriptions
 export const databaseSubscriptions = new Map();
+type FrameTurns = { held: boolean; waiting: Array<() => void>; endTurn: () => void };
+const frameTurns = new WeakMap<object, FrameTurns>();
+/**
+ * Core applies a subscription with one transaction in progress, and every connection on a thread feeds the same
+ * subscription, so a connection must hold the turn from the first event it queues until the end_txn that closes
+ * its transaction. Returns the function that ends the turn, or a promise of it while another connection holds it.
+ */
+export function takeFrameTurn(subscription: object): (() => void) | Promise<() => void> {
+	let turns = frameTurns.get(subscription);
+	if (!turns) {
+		const newTurns: FrameTurns = {
+			held: false,
+			waiting: [],
+			endTurn() {
+				const next = newTurns.waiting.shift();
+				if (next) next();
+				else newTurns.held = false;
+			},
+		};
+		frameTurns.set(subscription, (turns = newTurns));
+	}
+	if (!turns.held) {
+		turns.held = true;
+		return turns.endTurn;
+	}
+	return new Promise((resolve) => turns.waiting.push(() => resolve(turns.endTurn)));
+}
 const DEBUG_MODE = true;
 // when we skip messages (usually because we aren't the originating node), we still need to occassionally send a sequence update
 // so that catchup occurs more quickly
@@ -3658,6 +3685,21 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		const flush = copyStoreFlush();
 		if (flush) await flush();
 	}
+	function sendEndTxnOutsideFrame(endTxn: any): void {
+		const send = (endTurn: () => void) => {
+			try {
+				tableSubscriptionToReplicator.send(endTxn);
+			} finally {
+				endTurn();
+			}
+		};
+		const turn = takeFrameTurn(tableSubscriptionToReplicator);
+		if (typeof turn === 'function') send(turn);
+		else
+			turn.then(send).catch((error) => {
+				logger.error?.(connectionId, 'Error queuing replication sequence update', error);
+			});
+	}
 	// Build an empty sequence-update end_txn. ONLY the RocksDB copy-apply path needs the durability flush gate:
 	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (localTime >=
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
@@ -4429,6 +4471,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		// A replication header should begin with either a transaction timestamp or messagepack message of
 		// of an array that begins with the command code
 		lastMessageTime = performance.now();
+		let endFrameTurn: () => void;
 		try {
 			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
 			if (body[0] > 127) {
@@ -4765,7 +4808,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// Clamp: a sequence-id update carries no commit/blob-durability gate, so while any blob is not
 						// yet durable it must not push the resume cursor past the last fully-durable point (same as the
 						// inline REMOTE_SEQUENCE_UPDATE branch below). seqUpdateEndTxn also gates copy-apply durability.
-						tableSubscriptionToReplicator.send(
+						sendEndTxnOutsideFrame(
 							seqUpdateEndTxn(cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived)
 						);
 						getSharedStatus();
@@ -6013,8 +6056,25 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 			// Every record in this body is delivered with `tableSubscriptionToReplicator.send()`, so resolve the
 			// subscription before decoding any of it rather than throwing per record (harper-pro#622).
 			if (!(await whenSubscriptionResolved())) return;
+			const turn = takeFrameTurn(tableSubscriptionToReplicator);
+			if (typeof turn === 'function') endFrameTurn = turn;
+			else {
+				try {
+					addPauseReason();
+				} catch (error) {
+					turn.then((endTurn) => endTurn());
+					throw error;
+				}
+				try {
+					endFrameTurn = await turn;
+				} finally {
+					removePauseReason();
+				}
+				if (wsClosed) return;
+			}
 			decoder.position = 8;
 			let beginTxn = true;
+			let txnNodeId: number;
 			let event; // could also get txnTime from decoder.getFloat64(0);
 			let sequenceIdReceived;
 			let maxBatchVersion; // highest record version in this batch (non-copy); end_txn resume cursor when no sequence-update set lastSequenceIdReceived
@@ -6174,6 +6234,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						continue;
 					}
 				}
+				const isCopyApply = messageIsCopyFrame && copyApplyActive() && auditRecord.version < copyModeStartTime;
 				event = undefined; // reset before each decode attempt
 				let receivedBlobs: any[] | undefined;
 				// Dangling-blob repair pairing (#699): computed only for blob-carrying records in the windows
@@ -6235,7 +6296,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								timestamp: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
 								user: auditRecord.user,
-								beginTxn,
+								// A frame can hold several origins' transactions and RocksDB binds a transaction to one origin's
+								// log; copy-apply rows write no log entry, so they never split a frame.
+								beginTxn: beginTxn || (STORAGE_IS_ROCKSDB && !isCopyApply && localSourceNodeId !== txnNodeId),
 								expiresAt: auditRecord.expiresAt,
 							};
 						},
@@ -6351,6 +6414,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						continue;
 					}
 					beginTxn = false;
+					if (!isCopyApply) txnNodeId = localSourceNodeId;
 					// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
 					logger.debug?.(
 						connectionId,
@@ -6370,7 +6434,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 					// still need a real audit entry for the redelivery to dedup (a commutative patch would
 					// otherwise double-apply). Rows older than copyStartTime are never redelivered, so the
 					// snapshot is safe and carries no audit. Strict `<` keeps the boundary row audited.
-					event.isCopyApply = messageIsCopyFrame && copyApplyActive() && auditRecord.version < copyModeStartTime;
+					event.isCopyApply = isCopyApply;
 					// Record which tables actually received an audit-less snapshot row so only those get a
 					// reload marker at copy finalization (harper-pro#495). isCopyApply is exactly "invisible to
 					// live subscribers" — a copy frame with version >= copyStartTime carries a real audit entry
@@ -6543,6 +6607,8 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				markInboundClosed: () => (wsClosed = true),
 				close,
 			});
+		} finally {
+			endFrameTurn?.();
 		}
 	}
 	ws.on('ping', resetPingTimer);
@@ -7207,9 +7273,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 						// Safe: at drain with no gap, every received record (incl. blobs) through lastSequenceIdReceived
 						// is durable, and core applies this end_txn after the records already enqueued ahead of it, so
 						// the cursor never advances past an uncommitted/undurable point. max() keeps it monotonic.
-						tableSubscriptionToReplicator.send(
-							seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
-						);
+						sendEndTxnOutsideFrame(seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId)));
 					}
 					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
 					// durable: persist it (and finish the copy if COPY_COMPLETE already arrived). No-op outside
@@ -7238,8 +7302,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				options.connection.on('exclusion-origins-updated', (origins: string[]) => {
 					const shouldExclude = new Set(
 						[getThisNodeName(), ...(origins || [])].filter(
-							(nodeName) =>
-								nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
+							(nodeName) => nodeName && !options.connection?.nodeSubscriptions?.some((sub) => sub.name === nodeName)
 						)
 					);
 					const excludeNodes = [...shouldExclude].filter((nodeName) => !lastSentExcludedNodes.includes(nodeName));
