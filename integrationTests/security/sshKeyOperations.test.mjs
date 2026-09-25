@@ -255,6 +255,29 @@ suite('SSH Key Operations', (ctx) => {
 		deepEqual(data, []);
 	});
 
+	test('get_ssh_key and delete_ssh_key act on their own config block, not one whose name extends theirs', async () => {
+		for (const name of ['testkey-prefix-2', 'testkey-prefix']) {
+			await sendOperation(ctx.harper, {
+				operation: 'add_ssh_key',
+				name,
+				key: 'random\nstring',
+				host: `${name}.gitlab.com`,
+				hostname: 'gitlab.com',
+			});
+		}
+
+		let { status, data } = await sendOperation(ctx.harper, { operation: 'get_ssh_key', name: 'testkey-prefix' });
+		equal(status, 200);
+		equal(data.host, 'testkey-prefix.gitlab.com');
+
+		({ status, data } = await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey-prefix' }));
+		equal(status, 200);
+
+		({ status, data } = await sendOperation(ctx.harper, { operation: 'list_ssh_keys' }));
+		equal(status, 200);
+		deepEqual(data, [{ host: 'testkey-prefix-2.gitlab.com', hostname: 'gitlab.com', name: 'testkey-prefix-2' }]);
+	});
+
 	test('add_ssh_key with duplicate name returns error', async () => {
 		await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',

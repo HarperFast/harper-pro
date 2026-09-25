@@ -349,7 +349,7 @@ export async function updateSSHKey(req: {
  * @param req.name - The name of the SSH key to delete.
  * @returns An object containing a success message and optional replication results.
  */
-async function deleteSSHKey(req: { name: string }): Promise<{ message: string; replicated?: unknown[] }> {
+export async function deleteSSHKey(req: { name: string }): Promise<{ message: string; replicated?: unknown[] }> {
 	const validation = validateBySchema(req, deleteSSHKeyValidationSchema);
 	if (validation) throw new ClientError(validation.message);
 
@@ -362,9 +362,7 @@ async function deleteSSHKey(req: { name: string }): Promise<{ message: string; r
 	}
 
 	if (await exists(configFile)) {
-		const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-		const configBlockRegex = new RegExp(`#${escapedName}[\\S\\s]*?IdentitiesOnly yes`, 'g');
-		const fileContents = (await readFile(configFile, 'utf8')).replace(configBlockRegex, '').trim();
+		const fileContents = (await readFile(configFile, 'utf8')).replace(sshConfigBlockRegex(name), '').trim();
 		await writeFileEnsureDir(configFile, fileContents);
 	}
 
@@ -406,6 +404,16 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 }
 
 /**
+ * Matches every SSH config block `addSSHKey` wrote for `name`: from its `#name` comment line through
+ * the block's closing `IdentitiesOnly yes`. The comment must be the whole line — matched as a prefix,
+ * `#repo` would also match the block of a key named `repo-2`.
+ */
+function sshConfigBlockRegex(name: string): RegExp {
+	const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	return new RegExp(`^#${escapedName}\\r?\\n[\\S\\s]*?IdentitiesOnly yes`, 'gm');
+}
+
+/**
  * Extracts the Host and HostName values from an SSH config block matching
  * the given key name. Config blocks are identified by a leading comment
  * in the format `#keyName`.
@@ -416,9 +424,7 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
  * the matching config block, or an empty object if no match is found.
  */
 function extractMatchingHostAndHostname(configContents: string, name: string): { host?: string; hostname?: string } {
-	const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	const configBlockRegex = new RegExp(`#${escapedName}[\\S\\s]*?IdentitiesOnly yes`, 'g');
-	const match = configContents.match(configBlockRegex);
+	const match = configContents.match(sshConfigBlockRegex(name));
 
 	if (!match?.[0]) return {};
 
