@@ -2873,7 +2873,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								return { table };
 							}
 						};
-						const currentTransaction = { txnTime: 0, nodeId: undefined as number };
+						const currentTransaction = { txnTime: 0 };
 						let tableById;
 						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
 						let sentSequenceId; // the last sequence number we have sent
@@ -3108,10 +3108,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								ws.send(encode([RESIDENCY_LIST, residency, residencyId]));
 								sentResidencyLists[residencyId] = true;
 							}
-							// The receiver applies a frame as one transaction, which binds to one origin's log, so a frame
-							// must not span origins. The all-logs walk puts entries from different origin logs that share a
-							// version next to each other (harper#1162).
-							if (currentTransaction.txnTime !== txnTime || currentTransaction.nodeId !== nodeId) {
+							if (currentTransaction.txnTime !== txnTime) {
 								// send the queued transaction
 								if (currentTransaction.txnTime) {
 									if (DEBUG_MODE)
@@ -3122,7 +3119,6 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 									sendQueuedData();
 								}
 								currentTransaction.txnTime = txnTime;
-								currentTransaction.nodeId = nodeId;
 								encodingStart = position;
 								writeFloat64(txnTime);
 							}
