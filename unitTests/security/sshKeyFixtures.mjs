@@ -25,6 +25,27 @@ export function mpint(bytes) {
 
 const jwkBytes = (value) => Buffer.from(value, 'base64url');
 
+function derInteger(bytes) {
+	const value = bytes.length && bytes[0] & 0x80 ? Buffer.concat([Buffer.from([0]), bytes]) : bytes;
+	return Buffer.concat([Buffer.from([0x02]), derLength(value.length), value]);
+}
+
+function derLength(length) {
+	if (length < 0x80) return Buffer.from([length]);
+	const bytes = [];
+	for (let remaining = length; remaining > 0; remaining >>= 8) bytes.unshift(remaining & 0xff);
+	return Buffer.from([0x80 | bytes.length, ...bytes]);
+}
+
+/** A PKCS#1 RSAPrivateKey from JWK components, which may disagree with each other (Node 26 won't import those). */
+export function pkcs1Der({ n, e, d, p, q, dp, dq, qi }) {
+	const fields = Buffer.concat([
+		Buffer.from([0x02, 0x01, 0x00]),
+		...[n, e, d, p, q, dp, dq, qi].map((value) => derInteger(Buffer.from(value, 'base64url'))),
+	]);
+	return Buffer.concat([Buffer.from([0x30]), derLength(fields.length), fields]);
+}
+
 export function armor(label, bytes) {
 	const width = label === OPENSSH_LABEL ? 70 : 64;
 	const lines = bytes.toString('base64').match(new RegExp(`.{1,${width}}`, 'g')) ?? [];
