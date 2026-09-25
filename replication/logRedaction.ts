@@ -1,16 +1,30 @@
 // Some replicated/forwarded operations carry secrets — SSH private keys (add_ssh_key /
-// update_ssh_key), user passwords (add_user), and auth headers — that must never reach the
-// debug/trace logs emitted by the replication send/receive paths. Return a shallow copy of the
-// operation with those fields masked. Only invoke this when the target log level is active so the
-// copy stays off the hot path; when no sensitive field is present the original object is returned
-// unchanged (no allocation), keeping the common data-replication case cheap.
+// update_ssh_key), user passwords (add_user), auth headers, and the requesting user's record with its
+// refresh_token (hdb_user, which a sender before the forwarding strip still includes) — that must never
+// reach the debug/trace logs emitted by the replication send/receive paths. The list covers every field
+// core's operation log drops (UNLOGGABLE_OPERATION_FIELDS), which a unit test holds it to. Return a
+// shallow copy of the operation with those fields masked. Only invoke this when the target log level is
+// active so the copy stays off the hot path; when no sensitive field is present the original object is
+// returned unchanged (no allocation), keeping the common data-replication case cheap.
 //
 // deploy_component credentials: with core's hdb_secret-backed registry auth, a provided token is
 // sealed into the secrets store and only a non-secret REFERENCE ({ registry, secret, scope }) is
 // replicated — those pass through un-redacted (a secret name is a pointer, not a credential). A
 // literal token appears only on the no-custody transient fallback and is stripped before
 // replicating, so the per-entry token mask below is defense-in-depth for any forwarding path.
-const SENSITIVE_OPERATION_FIELDS = ['token', 'key', 'password', 'hdbAuthHeader'];
+const SENSITIVE_OPERATION_FIELDS = [
+	'token',
+	'key',
+	'password',
+	'hdbAuthHeader',
+	'hdb_user',
+	'refresh_token',
+	'payload',
+	'registryAuth',
+	'value',
+	'values',
+	'envelope',
+];
 
 export function redactOperationForLog(operation: any): any {
 	if (!operation || typeof operation !== 'object') return operation;
