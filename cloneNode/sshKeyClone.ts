@@ -1,7 +1,6 @@
 /**
- * Copies the leader's SSH keys one key at a time, so a key that can't be fetched, or that this node's
- * `add_ssh_key` refuses (a leader can hold keys stored before `add_ssh_key` validated them), costs
- * only itself. A skipped key is logged by name, never with its material.
+ * Key by key, since a leader can hold keys stored before `add_ssh_key` validated them, and one this node
+ * refuses must not cost the rest. A skipped key is logged by name, never with its material.
  */
 export async function cloneSSHKeysFromLeader(
 	requestLeader: (operation: { operation: string; name?: string }) => Promise<any>,

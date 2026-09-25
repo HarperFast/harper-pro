@@ -83,10 +83,8 @@ function sealSSHKey(name: string, key: string): string {
 }
 
 /**
- * A supplied key as it should be stored: normalized to the form ssh reads, or refused when ssh
- * couldn't load it (see `sshKeyValidation.ts`). An `enc:v1:` envelope passes through untouched — it
- * can't be inspected without decrypting it, which forwarding a key must never require — for
- * `sealSSHKey` to vet.
+ * An `enc:v1:` envelope passes through for `sealSSHKey` to vet: it can't be inspected without
+ * decrypting it, which forwarding a key must never require.
  */
 function vetSSHPrivateKey(key: string): string {
 	if (key.startsWith(ENV_ENCRYPTED_PREFIX)) return key;

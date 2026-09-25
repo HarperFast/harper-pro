@@ -1,10 +1,5 @@
-/**
- * A cloning node copies the leader's SSH keys through its own `add_ssh_key`, which refuses a key ssh
- * couldn't load — and a leader can hold such keys from before that check existed. Each key is
- * therefore cloned on its own: one that can't be fetched or is refused is logged by name and
- * skipped, and never stops the keys after it. (With a real `add_ssh_key`, see
- * `unitTests/security/sshKeyOperations.test.mjs`.)
- */
+// A key the clone can't fetch or its add_ssh_key refuses is skipped by name without stopping the rest;
+// with the real add_ssh_key, see unitTests/security/sshKeyOperations.test.mjs.
 import assert from 'node:assert/strict';
 import { cloneSSHKeysFromLeader } from '#src/cloneNode/sshKeyClone';
 

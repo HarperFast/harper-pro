@@ -1,9 +1,5 @@
-/**
- * SSH private keys for tests, built at runtime from freshly generated keypairs so that no key-shaped
- * block sits in the repo for a secret scanner to flag. `openSSHPrivateKey` lays out a real
- * openssh-key-v1 container (PROTOCOL.key in the OpenSSH source) and takes overrides for every field,
- * so a test can damage exactly one of them.
- */
+// Built at runtime from fresh keypairs, so that no key-shaped block sits in the repo for a secret
+// scanner to flag. Every openssh-key-v1 field can be overridden, to damage exactly one.
 import { execFileSync } from 'node:child_process';
 import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
