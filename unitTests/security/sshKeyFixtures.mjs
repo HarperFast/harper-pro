@@ -54,7 +54,8 @@ export function armor(label, bytes) {
 
 /**
  * The type-specific public and private fields of a freshly generated key, as OpenSSH lays them out.
- * `rsaPrivate` replaces RSA private components (`d`, `qi`, `p`, `q`) by name.
+ * `rsaPrivate` replaces RSA private components (`d`, `qi`, `p`, `q`) by name, or is a function from the
+ * generated components to the replacements.
  */
 export function openSSHKeyFields(keyType, { bits = 2048, rsaPrivate = {} } = {}) {
 	if (keyType === 'ssh-ed25519') {
@@ -70,7 +71,8 @@ export function openSSHKeyFields(keyType, { bits = 2048, rsaPrivate = {} } = {})
 			format: 'jwk',
 		});
 		const [modulus, exponent] = [n, e].map(jwkBytes);
-		const parts = { d: jwkBytes(d), qi: jwkBytes(qi), p: jwkBytes(p), q: jwkBytes(q), ...rsaPrivate };
+		const generated = { d: jwkBytes(d), qi: jwkBytes(qi), p: jwkBytes(p), q: jwkBytes(q) };
+		const parts = { ...generated, ...(typeof rsaPrivate === 'function' ? rsaPrivate(generated) : rsaPrivate) };
 		return {
 			publicFields: Buffer.concat([mpint(exponent), mpint(modulus)]),
 			privateFields: Buffer.concat([

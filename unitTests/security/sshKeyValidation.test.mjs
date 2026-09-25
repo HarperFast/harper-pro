@@ -639,18 +639,35 @@ describe('SSH private key validation', () => {
 	});
 
 	describe('refuses a key whose stored components disagree, which some builds still sign with', () => {
-		// OpenSSL's CRT fault fallback signs with an RSA key whose primes don't make its modulus; LibreSSL
-		// builds, and Node 26 on import, refuse one, so it is refused everywhere for one verdict
-		it("an RSA key whose primes don't multiply to its modulus, in either format", () => {
+		// OpenSSL's CRT fault fallback signs with an RSA key whose primes or CRT values are wrong; LibreSSL
+		// builds, and Node 26 on import for some, refuse one, so it is refused everywhere for one verdict
+		const changed = (bytes) => {
+			const copy = Buffer.from(bytes);
+			copy[copy.length - 1] ^= 2;
+			return copy;
+		};
+
+		it('a PEM RSA key with a changed prime or CRT value', () => {
 			const jwk = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'jwk' });
-			const q = Buffer.from(jwk.q, 'base64url');
-			q[q.length - 1] ^= 2;
-			const openSSH = openSSHPrivateKey({
-				keyType: 'ssh-rsa',
-				fields: openSSHKeyFields('ssh-rsa', { rsaPrivate: { q } }),
-			});
-			const pem = armor('RSA PRIVATE KEY', pkcs1Der({ ...jwk, q: q.toString('base64url') }));
-			for (const key of [openSSH, pem]) assert.equal(describeSSHPrivateKeyProblem(key), DAMAGED);
+			for (const field of ['p', 'q', 'dp', 'dq', 'qi']) {
+				const value = changed(Buffer.from(jwk[field], 'base64url')).toString('base64url');
+				const key = armor('RSA PRIVATE KEY', pkcs1Der({ ...jwk, [field]: value }));
+				assert.equal(describeSSHPrivateKeyProblem(key), DAMAGED, field);
+			}
+		});
+
+		it('an OpenSSH RSA key whose primes and iqmp agree with each other but not with its modulus', () => {
+			const other = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'jwk' });
+			const [p, q, qi] = [other.p, other.q, other.qi].map((value) => Buffer.from(value, 'base64url'));
+			const fields = openSSHKeyFields('ssh-rsa', { rsaPrivate: { p, q, qi } });
+			assert.equal(describeSSHPrivateKeyProblem(openSSHPrivateKey({ keyType: 'ssh-rsa', fields })), DAMAGED);
+		});
+
+		it('an OpenSSH RSA key with a changed prime or iqmp (it stores no dp or dq)', () => {
+			for (const field of ['p', 'q', 'qi']) {
+				const fields = openSSHKeyFields('ssh-rsa', { rsaPrivate: (parts) => ({ [field]: changed(parts[field]) }) });
+				assert.equal(describeSSHPrivateKeyProblem(openSSHPrivateKey({ keyType: 'ssh-rsa', fields })), DAMAGED, field);
+			}
 		});
 	});
 

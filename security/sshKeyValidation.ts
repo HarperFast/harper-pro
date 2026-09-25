@@ -156,9 +156,12 @@ function describePEMKeyProblem(label: string, der: Buffer): string | undefined {
 		case 'rsa': {
 			const bits = key.asymmetricKeyDetails?.modulusLength ?? 0;
 			if (bits < MIN_RSA_BITS) return rsaTooShort(bits);
-			const { n, p, q } = key.export({ format: 'jwk' });
-			const [modulus, primeP, primeQ] = [n, p, q].map((value) => Buffer.from(value, 'base64url'));
-			if (!primesMakeModulus(modulus, primeP, primeQ)) return DAMAGED;
+			const { n, d, p, q, dp, dq, qi } = key.export({ format: 'jwk' });
+			const [modulus, exponent, primeP, primeQ, crtP, crtQ, coefficient] = [n, d, p, q, dp, dq, qi].map((value) =>
+				toBigInt(Buffer.from(value ?? '', 'base64url'))
+			);
+			const agree = rsaComponentsAgree(modulus, exponent, primeP, primeQ, coefficient);
+			if (!agree || crtP !== exponent % (primeP - 1n) || crtQ !== exponent % (primeQ - 1n)) return DAMAGED;
 			break;
 		}
 		case 'ec': {
@@ -315,9 +318,8 @@ const rsaFormat: OpenSSHKeyFormat = {
 		if (!modulus || !exponent || !privateExponent || !iqmp || !p || !q) return DAMAGED;
 		const tooShort = rsaModulusProblem(modulus);
 		if (tooShort) return tooShort;
-		if (!primesMakeModulus(modulus, p, q)) return DAMAGED;
-		// OpenSSH derives these on load too; a factor under 2 makes that throw here as it fails there
-		const [d, primeP, primeQ] = [privateExponent, p, q].map(toBigInt);
+		const [n, d, primeP, primeQ, coefficient] = [modulus, privateExponent, p, q, iqmp].map(toBigInt);
+		if (!rsaComponentsAgree(n, d, primeP, primeQ, coefficient)) return DAMAGED;
 		return {
 			publicParts: [exponent, modulus],
 			privateKey: jwkPrivateKey({
@@ -337,11 +339,13 @@ const rsaFormat: OpenSSHKeyFormat = {
 };
 
 /**
- * A damaged key, though OpenSSL's CRT fault fallback can still sign with one. Checked here so every
- * Node version gives the same verdict: Node 26 refuses such a key on import, and older Node doesn't.
+ * Whether an RSA key's stored components agree, as in any key a tool writes. One whose don't is
+ * damaged, though OpenSSL's CRT fault fallback can still sign with it; checking here, rather than
+ * leaving it to import, gives every Node version one verdict (Node 26 refuses some such keys on
+ * import, older Node none). A factor under 2 also fails OpenSSH's own CRT derivation on load.
  */
-function primesMakeModulus(modulus: Buffer, p: Buffer, q: Buffer): boolean {
-	return toBigInt(p) * toBigInt(q) === toBigInt(modulus);
+function rsaComponentsAgree(n: bigint, d: bigint, p: bigint, q: bigint, coefficient: bigint): boolean {
+	return p > 1n && q > 1n && p * q === n && d > 0n && (coefficient * q) % p === 1n;
 }
 
 function rsaModulusProblem(modulus: Buffer): string | undefined {
