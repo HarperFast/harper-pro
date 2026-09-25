@@ -4871,16 +4871,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										answerOperation(data, response);
 									} catch (error) {
 										logger.debug?.('Failed encoding operation response for', remoteNodeName, error);
-										answerOperation(data, { requestId: data.requestId, error: errorToString(error) });
+										answerOperation(data, { requestId: data?.requestId, error: errorToString(error) });
 									}
 								},
 								(error) => {
 									logger.debug?.('Failed requested operation from', remoteNodeName, error);
-									answerOperation(data, { requestId: data.requestId, error: errorToString(error) });
+									answerOperation(data, { requestId: data?.requestId, error: errorToString(error) });
 								}
 							);
 						} catch (error) {
-							answerOperation(data, { requestId: data.requestId, error: errorToString(error) });
+							answerOperation(data, { requestId: data?.requestId, error: errorToString(error) });
 						}
 						break;
 					case OPERATION_RESPONSE: {
@@ -7324,7 +7324,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	function answerOperation(request, answer) {
 		if (ws.readyState !== WebSocket.OPEN) {
 			logger.warn?.(
-				`${request.operation} requested by ${remoteNodeName ?? authorization?.name} finished after its connection closed; the answer was not delivered`
+				`${request?.operation} requested by ${remoteNodeName ?? authorization?.name} finished after its connection closed; the answer was not delivered`
 			);
 			return;
 		}
