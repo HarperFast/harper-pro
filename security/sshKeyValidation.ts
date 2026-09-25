@@ -1,4 +1,4 @@
-import { createPrivateKey, ECDH, type KeyObject } from 'node:crypto';
+import { createPrivateKey, createPublicKey, sign, verify, type KeyObject, type webcrypto } from 'node:crypto';
 
 /*
  * Nothing reads a stored SSH key until ssh loads it as the IdentityFile of a git deploy, where a key
@@ -32,7 +32,8 @@ const SSH2_PUBLIC_KEY_BEGIN = '---- BEGIN SSH2 PUBLIC KEY ----';
 const PUBLIC_KEY_LINE =
 	/(?:^|\s)((?:ssh-(?:rsa|dss|ed25519)|ecdsa-sha2-nistp(?:256|384|521)|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)(?:-cert-v01@openssh\.com)?)\s+AAAA/m;
 const PEM_ENCRYPTED_HEADER = /^Proc-Type:\s*4,\s*ENCRYPTED$/i;
-const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}(?:==)?|[A-Za-z0-9+/]{3}=?)?$/;
+// Padding included: both of ssh's base64 decoders refuse a partial final quad.
+const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 const OPENSSH_KEY_MAGIC = Buffer.from('openssh-key-v1\0', 'latin1');
 const CERTIFICATE_SUFFIX = '-cert-v01@openssh.com';
@@ -43,7 +44,8 @@ const MAX_MPINT_BYTES = 16384 / 8 + 1;
 const MIN_RSA_BITS = 1024;
 const ED25519_PUBLIC_KEY_BYTES = 32;
 const ED25519_SECRET_KEY_BYTES = 64;
-const SSH_EC_CURVES = new Set(['prime256v1', 'secp384r1', 'secp521r1']);
+const EC_ORDER_BITS: Record<string, number> = { prime256v1: 256, secp384r1: 384, secp521r1: 521 };
+const SIGNING_CHECK = Buffer.from('harper ssh key check');
 // The shape of every SSH algorithm name; anything else in the type field is damage, not a type.
 const KEY_TYPE_NAME = /^[a-z0-9-]{1,64}(?:@[a-z0-9.-]{1,64})?$/;
 
@@ -159,24 +161,62 @@ function describePEMKeyProblem(label: string, der: Buffer): string | undefined {
 	switch (key.asymmetricKeyType) {
 		case 'rsa': {
 			const bits = key.asymmetricKeyDetails?.modulusLength ?? 0;
-			return bits < MIN_RSA_BITS ? rsaTooShort(bits) : undefined;
+			if (bits < MIN_RSA_BITS) return rsaTooShort(bits);
+			break;
 		}
 		case 'ec': {
 			const curve = key.asymmetricKeyDetails?.namedCurve;
-			return curve && SSH_EC_CURVES.has(curve) ? undefined : unsupported('curve', curve);
+			const orderBits = curve ? EC_ORDER_BITS[curve] : undefined;
+			if (!orderBits) return unsupported('curve', curve);
+			if (!isLargeEnoughScalar(Buffer.from(key.export({ format: 'jwk' }).d, 'base64url'), orderBits)) return DAMAGED;
+			break;
 		}
 		case 'ed25519':
-			return undefined;
+			break;
 		case 'dsa':
 			return DSA_KEY;
 		default:
 			return unsupported('type', key.asymmetricKeyType);
 	}
+	return signsFor(key, () => createPublicKey(key)) ? undefined : DAMAGED;
 }
 
 function rsaTooShort(bits: number): string {
 	return `The SSH key is a ${bits}-bit RSA key, and ssh requires at least ${MIN_RSA_BITS} bits. Use an Ed25519 key${FOR_EXAMPLE_A_NEW_KEY}`;
 }
+
+/**
+ * Whether `privateKey` makes a signature that `publicKey` — the public key ssh would present — verifies.
+ * A key can load and still fail this, and then it can never authenticate.
+ */
+function signsFor(privateKey: KeyObject, publicKey: () => KeyObject): boolean {
+	const digest = privateKey.asymmetricKeyType === 'ed25519' ? null : 'sha256';
+	try {
+		return verify(digest, SIGNING_CHECK, publicKey(), sign(digest, SIGNING_CHECK, privateKey));
+	} catch {
+		return false;
+	}
+}
+
+function bitLength(bytes: Buffer): number {
+	let start = 0;
+	while (start < bytes.length && bytes[start] === 0) start++;
+	return start === bytes.length ? 0 : (bytes.length - start - 1) * 8 + (32 - Math.clz32(bytes[start]));
+}
+
+/** OpenSSH's `sshkey_ec_validate_private` refuses a private scalar of half the order's bits or fewer. */
+function isLargeEnoughScalar(scalar: Buffer, orderBits: number): boolean {
+	return bitLength(scalar) > Math.floor(orderBits / 2);
+}
+
+const base64url = (value: Buffer | bigint) => {
+	if (Buffer.isBuffer(value)) return value.toString('base64url');
+	const hex = value.toString(16);
+	return Buffer.from(hex.length % 2 ? `0${hex}` : hex, 'hex').toString('base64url');
+};
+const toBigInt = (bytes: Buffer) => (bytes.length ? BigInt(`0x${bytes.toString('hex')}`) : 0n);
+const jwkPrivateKey = (key: webcrypto.JsonWebKey) => createPrivateKey({ key, format: 'jwk' });
+const jwkPublicKey = (key: webcrypto.JsonWebKey) => createPublicKey({ key, format: 'jwk' });
 
 /** RFC 4251 fields; a read that would overrun the input returns undefined rather than throwing. */
 class SSHFieldReader {
@@ -230,82 +270,133 @@ class SSHFieldReader {
 }
 
 /**
- * Reads one key type's fields, returning the public components they carry — which the key's public
- * blob and its private section must agree on (`sshkey_equal`) — or why ssh would refuse them.
+ * One key type's fields. The public blob and the private section each carry the public components,
+ * and OpenSSH refuses a key whose two copies differ (`sshkey_equal`).
  */
 interface OpenSSHKeyFormat {
 	readPublic(fields: SSHFieldReader): Buffer[] | string;
-	readPrivate(fields: SSHFieldReader): Buffer[] | string;
+	/** May throw when the fields don't make a key. */
+	readPrivate(fields: SSHFieldReader): { publicParts: Buffer[]; privateKey: KeyObject } | string;
+	publicKey(publicParts: Buffer[]): KeyObject;
 }
 
-const OPENSSH_KEY_FORMATS = new Map<string, OpenSSHKeyFormat>([
-	['ssh-ed25519', { readPublic: readEd25519Public, readPrivate: readEd25519Private }],
-	['ssh-rsa', { readPublic: readRSAPublic, readPrivate: readRSAPrivate }],
-	['ecdsa-sha2-nistp256', ecdsaFormat('nistp256', 'prime256v1')],
-	['ecdsa-sha2-nistp384', ecdsaFormat('nistp384', 'secp384r1')],
-	['ecdsa-sha2-nistp521', ecdsaFormat('nistp521', 'secp521r1')],
-]);
+const ed25519Format: OpenSSHKeyFormat = {
+	readPublic(fields) {
+		const publicKey = fields.string();
+		return publicKey?.length === ED25519_PUBLIC_KEY_BYTES ? [publicKey] : DAMAGED;
+	},
+	readPrivate(fields) {
+		const publicKey = fields.string();
+		const secretKey = fields.string();
+		// OpenSSH's bundled Ed25519 code (older releases, LibreSSL builds) signs with the secret key's second
+		// half as the public key, so a key whose halves disagree fails there
+		if (
+			publicKey?.length !== ED25519_PUBLIC_KEY_BYTES ||
+			secretKey?.length !== ED25519_SECRET_KEY_BYTES ||
+			!secretKey.subarray(ED25519_PUBLIC_KEY_BYTES).equals(publicKey)
+		) {
+			return DAMAGED;
+		}
+		const seed = secretKey.subarray(0, ED25519_SECRET_KEY_BYTES - ED25519_PUBLIC_KEY_BYTES);
+		return {
+			publicParts: [publicKey],
+			privateKey: jwkPrivateKey({ kty: 'OKP', crv: 'Ed25519', x: base64url(publicKey), d: base64url(seed) }),
+		};
+	},
+	publicKey: ([publicKey]) => jwkPublicKey({ kty: 'OKP', crv: 'Ed25519', x: base64url(publicKey) }),
+};
 
-function readEd25519Public(fields: SSHFieldReader): Buffer[] | string {
-	const publicKey = fields.string();
-	return publicKey?.length === ED25519_PUBLIC_KEY_BYTES ? [publicKey] : DAMAGED;
-}
-
-function readEd25519Private(fields: SSHFieldReader): Buffer[] | string {
-	const publicParts = readEd25519Public(fields);
-	if (typeof publicParts === 'string') return publicParts;
-	return fields.string()?.length === ED25519_SECRET_KEY_BYTES ? publicParts : DAMAGED;
-}
-
-function readRSAPublic(fields: SSHFieldReader): Buffer[] | string {
-	const exponent = fields.mpint();
-	const modulus = fields.mpint();
-	if (!exponent || !modulus) return DAMAGED;
-	return rsaModulusProblem(modulus) ?? [exponent, modulus];
-}
-
-function readRSAPrivate(fields: SSHFieldReader): Buffer[] | string {
-	const modulus = fields.mpint();
-	const exponent = fields.mpint();
-	// d, iqmp, p and q, none of which is zero in a key that can sign
-	for (let index = 0; index < 4; index++) {
-		if (!fields.mpint()?.length) return DAMAGED;
-	}
-	if (!exponent || !modulus) return DAMAGED;
-	return rsaModulusProblem(modulus) ?? [exponent, modulus];
-}
+const rsaFormat: OpenSSHKeyFormat = {
+	readPublic(fields) {
+		const exponent = fields.mpint();
+		const modulus = fields.mpint();
+		if (!exponent || !modulus) return DAMAGED;
+		return rsaModulusProblem(modulus) ?? [exponent, modulus];
+	},
+	readPrivate(fields) {
+		const [modulus, exponent, privateExponent, iqmp, p, q] = Array.from({ length: 6 }, () => fields.mpint());
+		if (!modulus || !exponent || !privateExponent || !iqmp || !p || !q) return DAMAGED;
+		const tooShort = rsaModulusProblem(modulus);
+		if (tooShort) return tooShort;
+		// OpenSSH derives these on load too; a factor under 2 makes that throw here as it fails there
+		const [d, primeP, primeQ] = [privateExponent, p, q].map(toBigInt);
+		return {
+			publicParts: [exponent, modulus],
+			privateKey: jwkPrivateKey({
+				kty: 'RSA',
+				n: base64url(modulus),
+				e: base64url(exponent),
+				d: base64url(privateExponent),
+				p: base64url(p),
+				q: base64url(q),
+				dp: base64url(d % (primeP - 1n)),
+				dq: base64url(d % (primeQ - 1n)),
+				qi: base64url(iqmp),
+			}),
+		};
+	},
+	publicKey: ([exponent, modulus]) => jwkPublicKey({ kty: 'RSA', n: base64url(modulus), e: base64url(exponent) }),
+};
 
 function rsaModulusProblem(modulus: Buffer): string | undefined {
-	const bits = modulus.length === 0 ? 0 : (modulus.length - 1) * 8 + (32 - Math.clz32(modulus[0]));
+	const bits = bitLength(modulus);
 	return bits < MIN_RSA_BITS ? rsaTooShort(bits) : undefined;
 }
 
-function ecdsaFormat(curveName: string, nodeCurve: string): OpenSSHKeyFormat {
+function ecdsaFormat(
+	curveName: string,
+	jwkCurve: string,
+	coordinateBytes: number,
+	orderBits: number
+): OpenSSHKeyFormat {
 	const readPublic = (fields: SSHFieldReader): Buffer[] | string => {
 		const curve = fields.cstring();
 		const point = fields.string();
-		return curve === curveName && point && isCurvePoint(point, nodeCurve) ? [point] : DAMAGED;
+		return curve === curveName && point && isUncompressedPoint(point, jwkCurve, coordinateBytes) ? [point] : DAMAGED;
 	};
+	const coordinates = (point: Buffer): webcrypto.JsonWebKey => ({
+		kty: 'EC',
+		crv: jwkCurve,
+		x: base64url(point.subarray(1, 1 + coordinateBytes)),
+		y: base64url(point.subarray(1 + coordinateBytes)),
+	});
 	return {
 		readPublic,
 		readPrivate(fields) {
 			const publicParts = readPublic(fields);
 			if (typeof publicParts === 'string') return publicParts;
-			return fields.mpint()?.length ? publicParts : DAMAGED;
+			const scalar = fields.mpint();
+			if (!scalar || scalar.length > coordinateBytes || !isLargeEnoughScalar(scalar, orderBits)) return DAMAGED;
+			const d = Buffer.concat([Buffer.alloc(coordinateBytes - scalar.length), scalar]);
+			return { publicParts, privateKey: jwkPrivateKey({ ...coordinates(publicParts[0]), d: base64url(d) }) };
 		},
+		publicKey: ([point]) => jwkPublicKey(coordinates(point)),
 	};
 }
 
-function isCurvePoint(point: Buffer, curve: string): boolean {
-	// a lone zero byte encodes the point at infinity, which convertKey would accept
-	if (point.length < 2) return false;
+/** OpenSSH reads only an uncompressed point (`sshbuf_get_eckey`), and it must lie on the curve. */
+function isUncompressedPoint(point: Buffer, jwkCurve: string, coordinateBytes: number): boolean {
+	if (point.length !== 1 + 2 * coordinateBytes || point[0] !== 4) return false;
 	try {
-		ECDH.convertKey(point, curve);
+		jwkPublicKey({
+			kty: 'EC',
+			crv: jwkCurve,
+			x: base64url(point.subarray(1, 1 + coordinateBytes)),
+			y: base64url(point.subarray(1 + coordinateBytes)),
+		});
 		return true;
 	} catch {
 		return false;
 	}
 }
+
+const OPENSSH_KEY_FORMATS = new Map<string, OpenSSHKeyFormat>([
+	['ssh-ed25519', ed25519Format],
+	['ssh-rsa', rsaFormat],
+	['ecdsa-sha2-nistp256', ecdsaFormat('nistp256', 'P-256', 32, 256)],
+	['ecdsa-sha2-nistp384', ecdsaFormat('nistp384', 'P-384', 48, 384)],
+	['ecdsa-sha2-nistp521', ecdsaFormat('nistp521', 'P-521', 66, 521)],
+]);
 
 /** The openssh-key-v1 container and the key inside it, laid out in PROTOCOL.key in the OpenSSH source. */
 function describeOpenSSHKeyProblem(bytes: Buffer): string | undefined {
@@ -348,13 +439,22 @@ function describeOpenSSHKeyProblem(bytes: Buffer): string | undefined {
 	if (!format) return undefined;
 
 	if (privateFields.cstring() !== keyType) return DAMAGED;
-	const privateParts = format.readPrivate(privateFields);
-	if (typeof privateParts === 'string') return privateParts;
+	let privatePart: ReturnType<OpenSSHKeyFormat['readPrivate']>;
+	try {
+		privatePart = format.readPrivate(privateFields);
+	} catch {
+		return DAMAGED;
+	}
+	if (typeof privatePart === 'string') return privatePart;
 	if (privateFields.cstring() === undefined || !isDeterministicPadding(privateFields.rest())) return DAMAGED;
-	return publicParts.length === privateParts.length &&
-		publicParts.every((part, index) => part.equals(privateParts[index]))
-		? undefined
-		: DAMAGED;
+	const privateCopy = privatePart.publicParts;
+	if (
+		privateCopy.length !== publicParts.length ||
+		publicParts.some((part, index) => !part.equals(privateCopy[index]))
+	) {
+		return DAMAGED;
+	}
+	return signsFor(privatePart.privateKey, () => format.publicKey(publicParts)) ? undefined : DAMAGED;
 }
 
 function isDeterministicPadding(padding: Buffer): boolean {
@@ -369,9 +469,10 @@ const SSH_CONFIG_FIELDS = {
 /**
  * Explains why `value` can't be written as the `Host` (`host`) or `HostName` (`hostname`) of an ssh
  * config block, or returns undefined when it can. The config is shared by every key on the node, so
- * each refusal is a value that would either break ssh's parse of the whole file (a second argument,
- * an unbalanced quote, a line break, or one that reads as a comment or an empty `=value`) or can
- * never be connected to (a leading dash).
+ * each refusal is a value that would break ssh's parse of the whole file (a second argument — which
+ * OpenSSH before 8.7 also splits at "=" —, an unbalanced quote, a line break, or a leading "#"), make
+ * its block also apply to other keys' aliases (a pattern), or can never be connected to (a leading
+ * dash).
  */
 export function describeSSHConfigValueProblem(field: 'host' | 'hostname', value: string): string | undefined {
 	const { value: noun, example } = SSH_CONFIG_FIELDS[field];
@@ -380,7 +481,10 @@ export function describeSSHConfigValueProblem(field: 'host' | 'hostname', value:
 	if (/[\s\p{Cc}]/u.test(value)) {
 		return `'${field}' must be a single ${noun} like "${example}", without spaces or line breaks${got}`;
 	}
-	if (/["']/.test(value)) return `'${field}' must not contain quotes${got}`;
-	if (/^[-#=]/.test(value)) return `'${field}' must not start with "${value[0]}"${got}`;
+	if (/["'=]/.test(value)) return `'${field}' must not contain quotes or "="${got}`;
+	if (field === 'host' && /[*?!]/.test(value)) {
+		return `'host' must be one alias, not a pattern: "*", "?" and "!" also match other keys' aliases${got}`;
+	}
+	if (/^[-#]/.test(value)) return `'${field}' must not start with "${value[0]}"${got}`;
 	return undefined;
 }

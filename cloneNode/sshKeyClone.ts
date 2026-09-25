@@ -1,11 +1,7 @@
 /**
- * Copies the leader's SSH keys onto this node one key at a time, so a key that can't be fetched, or
- * that this node's `add_ssh_key` refuses, costs only itself. A leader can hold keys stored before
- * `add_ssh_key` validated them, which the local add now refuses.
- *
- * @param requestLeader - sends an operation to the leader and resolves to its response.
- * @param addSSHKey - stores one key locally, as `add_ssh_key` does.
- * @param log - reports progress, and each skipped key by name (never its material).
+ * Copies the leader's SSH keys one key at a time, so a key that can't be fetched, or that this node's
+ * `add_ssh_key` refuses (a leader can hold keys stored before `add_ssh_key` validated them), costs
+ * only itself. A skipped key is logged by name, never with its material.
  */
 export async function cloneSSHKeysFromLeader(
 	requestLeader: (operation: { operation: string; name?: string }) => Promise<any>,

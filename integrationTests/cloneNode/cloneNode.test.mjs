@@ -107,10 +107,9 @@ suite('Clone Node', (ctx) => {
 			hostname: 'gitlab.com',
 			known_hosts: 'gitlab.com fake1\ngitlab.com fake2',
 		});
-		// ...beside a key stored before add_ssh_key validated keys, which the clone's own add_ssh_key
-		// now refuses: cloning must skip it without losing the valid key. The leader lists keys in
-		// readdir order, which puts this name first on an ordered filesystem (APFS) but not on ext4;
-		// unitTests/cloneNode/sshKeyClone.test.mjs pins the order.
+		// ...beside a key stored before add_ssh_key validated keys, which the clone must skip without
+		// losing the valid one. Named to list first where readdir is ordered (APFS; not ext4) — the
+		// unit tests in unitTests/cloneNode/sshKeyClone.test.mjs pin the order everywhere.
 		const leaderSSHDir = join(nodeCtx.harper.dataRootDir, 'ssh');
 		const legacyKeyFile = join(leaderSSHDir, 'aaalegacykey.key');
 		writeFileSync(legacyKeyFile, 'not\na key', { mode: 0o600 });

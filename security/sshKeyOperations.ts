@@ -199,7 +199,6 @@ export async function addSSHKey(
 		throw new ClientError('Provide either `key` or `generate: true`, not both.');
 	}
 
-	// Before anything durable or replicated: the config block and every peer get the vetted values.
 	req.host = vetSSHConfigValue('host', req.host);
 	req.hostname = vetSSHConfigValue('hostname', req.hostname);
 	if (req.key !== undefined) req.key = vetSSHPrivateKey(req.key);

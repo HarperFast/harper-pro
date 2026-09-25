@@ -33,7 +33,7 @@ import { tmpdir } from 'node:os';
 import { generateKeyPairSync } from 'node:crypto';
 import { hasSSH, hasSSHKeygen } from './sshKeyFixtures.mjs';
 
-// Real keys, minted in `before`: a supplied key is now refused unless ssh could load it.
+// Real keys, minted in `before`: a supplied key must be one ssh can load.
 let PRIVATE_KEY;
 let PUBLIC_KEY;
 let ROTATED_KEY;
@@ -391,8 +391,9 @@ describe('sshKeyOperations sealing', () => {
 				['host', 'deploy example.com', /must be a single alias/],
 				['hostname', 'git.example.com extra', /must be a single hostname/],
 				['hostname', 'git"example.com', /must not contain quotes/],
-				['hostname', '=#x', /must not start with "="/],
-				['host', '-oProxyCommand=x', /must not start with "-"/],
+				['hostname', '=#x', /must not contain quotes or "="/],
+				['host', '*.example.com', /must be one alias, not a pattern/],
+				['host', '-oProxyCommand', /must not start with "-"/],
 			]) {
 				const req = request({ name: 'bad', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com', [field]: value });
 				await assert.rejects(ops.addSSHKey(req), isClientError(new RegExp(`^'${field}' ${reason.source}`)));
