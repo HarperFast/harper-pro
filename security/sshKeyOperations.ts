@@ -405,12 +405,12 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 
 /**
  * Matches every SSH config block `addSSHKey` wrote for `name`: from its `#name` comment line through
- * the block's closing `IdentitiesOnly yes`. The name must end the comment line (trailing blanks
- * aside) — matched as a prefix, `#repo` would also match the block of a key named `repo-2`.
+ * the block's closing `IdentitiesOnly yes`. Blanks aside, the comment line must be exactly `#name` —
+ * matched as a prefix, `#repo` would also match the block of a key named `repo-2`.
  */
 function sshConfigBlockRegex(name: string): RegExp {
 	const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	return new RegExp(`^#${escapedName}[ \\t]*\\r?\\n[\\S\\s]*?IdentitiesOnly yes`, 'gm');
+	return new RegExp(`^[ \\t]*#${escapedName}[ \\t]*\\r?\\n[\\S\\s]*?IdentitiesOnly yes`, 'gm');
 }
 
 /**

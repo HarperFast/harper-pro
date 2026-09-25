@@ -301,14 +301,15 @@ describe('sshKeyOperations sealing', () => {
 			});
 		}
 
-		it('matches the comment line of a hand-edited config: CRLF line endings, trailing blanks', async () => {
-			const handEdited = (text) => text.replace(/^#.*$/gm, '$& \t').replace(/\n/g, '\r\n');
+		it('matches the comment line of a hand-edited config: blanks around the name, CRLF line endings', async () => {
+			const handEdited = (text) => text.replace(/^#.*$/gm, ' \t$& \t').replace(/\n/g, '\r\n');
 			for (const name of ['repo-2', 'repo']) await addKey(name);
 			writeFileSync(configPath(), handEdited(readFileSync(configPath(), 'utf8')));
 
 			assert.equal((await ops.getSSHKey({ name: 'repo' })).host, 'repo.alias');
 			await ops.deleteSSHKey({ name: 'repo' });
-			assert.equal(readFileSync(configPath(), 'utf8'), handEdited(blockFor('repo-2')));
+			// deleteSSHKey trims the rewritten file, which takes the leading blanks of its new first line
+			assert.equal(readFileSync(configPath(), 'utf8'), handEdited(blockFor('repo-2')).trimStart());
 		});
 	});
 
