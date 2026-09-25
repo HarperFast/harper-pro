@@ -1,15 +1,14 @@
-// Writes the transaction-log state a node holds after two origins have written at the same log key: one
-// transaction in this node's `local` log and one in another origin's log, both at `version`. Records are
-// written the way the replication apply loop writes them (explicit timestamp, origin `nodeId`), so a
-// record whose origin is `ghost` lands in the `ghost` log.
+// Writes the way the replication apply loop does (explicit timestamp, origin `nodeId`), so a record whose origin
+// is `ghost` lands in the `ghost` transaction log.
 export class OriginLogWrite extends Resource {
 	static loadAsInstance = false;
 	async post(target, data) {
-		const Table = databases.data.OriginRecord;
+		const Table = databases.data[data.table];
 		const auditStore = Table.auditStore;
 		const nodeLogs = auditStore.loadLogs();
 		auditStore.ensureLogExists(data.ghost);
 		const ghostNodeId = nodeLogs.indexOf(auditStore.logByName.get(data.ghost));
+		if (!(ghostNodeId > 0)) throw new Error(`No transaction log for ${data.ghost}`);
 		for (const { id, fromGhost } of data.records ?? []) {
 			const options = {
 				nodeId: fromGhost ? ghostNodeId : undefined,
@@ -24,5 +23,13 @@ export class OriginLogWrite extends Resource {
 			});
 		}
 		return { ghostNodeId };
+	}
+}
+
+export class RecordVersions extends Resource {
+	static loadAsInstance = false;
+	post(target, data) {
+		const primaryStore = databases.data[data.table].primaryStore;
+		return Object.fromEntries(data.ids.map((id) => [id, primaryStore.getEntry(id)?.version]));
 	}
 }

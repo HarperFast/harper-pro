@@ -233,26 +233,32 @@ export const tableUpdateListeners = new Map();
 // This a map of the database name to the subscription object, for the subscriptions from our tables to the replication module
 // when we receive messages from other nodes, we then forward them on to as a notification on these subscriptions
 export const databaseSubscriptions = new Map();
-const frameTurns = new WeakMap<object, { held: boolean; waiting: Array<() => void> }>();
+type FrameTurns = { held: boolean; waiting: Array<() => void>; endTurn: () => void };
+const frameTurns = new WeakMap<object, FrameTurns>();
 /**
- * Take the turn to queue transaction events on `subscription`, returning the function that ends it (or a
- * promise of it while another connection holds the turn). All connections on a thread deliver to one
- * subscription per database, and core applies it with a single transaction in progress, so events queued by
- * another connection in the middle of a frame land inside that frame's transaction (harper#1162).
+ * Core applies a subscription with one transaction in progress, and every connection on a thread feeds the same
+ * subscription, so a connection must hold the turn from the first event it queues until the end_txn that closes
+ * its transaction. Returns the function that ends the turn, or a promise of it while another connection holds it.
  */
 export function takeFrameTurn(subscription: object): (() => void) | Promise<() => void> {
 	let turns = frameTurns.get(subscription);
-	if (!turns) frameTurns.set(subscription, (turns = { held: false, waiting: [] }));
-	const endTurn = () => {
-		const next = turns.waiting.shift();
-		if (next) next();
-		else turns.held = false;
-	};
+	if (!turns) {
+		const newTurns: FrameTurns = {
+			held: false,
+			waiting: [],
+			endTurn() {
+				const next = newTurns.waiting.shift();
+				if (next) next();
+				else newTurns.held = false;
+			},
+		};
+		frameTurns.set(subscription, (turns = newTurns));
+	}
 	if (!turns.held) {
 		turns.held = true;
-		return endTurn;
+		return turns.endTurn;
 	}
-	return new Promise((resolve) => turns.waiting.push(() => resolve(endTurn)));
+	return new Promise((resolve) => turns.waiting.push(() => resolve(turns.endTurn)));
 }
 const DEBUG_MODE = true;
 // when we skip messages (usually because we aren't the originating node), we still need to occassionally send a sequence update
@@ -1696,23 +1702,27 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 		const flush = copyStoreFlush();
 		if (flush) await flush();
 	}
+	function sendEndTxnOutsideFrame(endTxn: any): void {
+		const send = (endTurn: () => void) => {
+			try {
+				tableSubscriptionToReplicator.send(endTxn);
+			} finally {
+				endTurn();
+			}
+		};
+		const turn = takeFrameTurn(tableSubscriptionToReplicator);
+		if (typeof turn === 'function') send(turn);
+		else
+			turn.then(send).catch((error) => {
+				logger.error?.(connectionId, 'Error queuing replication sequence update', error);
+			});
+	}
 	// Build an empty sequence-update end_txn. ONLY the RocksDB copy-apply path needs the durability flush gate:
 	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (localTime >=
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
 	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn exactly as before, so this
 	// adds no per-seq-update overhead and does not alter non-copyApply paths. (harper-pro#480)
-	function sendEndTxnOutsideFrame(endTxn: any): void {
-		const turn = takeFrameTurn(tableSubscriptionToReplicator);
-		if (typeof turn === 'function') {
-			tableSubscriptionToReplicator.send(endTxn);
-			turn();
-		} else
-			turn.then((endTurn) => {
-				tableSubscriptionToReplicator.send(endTxn);
-				endTurn();
-			});
-	}
 	function seqUpdateEndTxn(localTime: number): any {
 		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && localTime >= copyModeStartTime) {
 			return {
@@ -3603,6 +3613,7 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 				} finally {
 					removePauseReason();
 				}
+				if (wsClosed) return;
 			}
 			decoder.position = 8;
 			let beginTxn = true;
@@ -3712,9 +3723,9 @@ export function replicateOverWS(ws: WebSocket, options: any, authorization: any)
 								timestamp: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
 								user: auditRecord.user,
-								// A transaction binds to one origin's log. A frame holds every record at one log key from
-								// all of the sender's logs, so it can span origins; each origin gets its own transaction.
-								beginTxn: beginTxn || originNodeId !== txnNodeId,
+								// A frame holds every entry at one log key across the sender's logs, which can be several
+								// origins' transactions; RocksDB binds a transaction to one origin's log.
+								beginTxn: beginTxn || (STORAGE_IS_ROCKSDB && originNodeId !== txnNodeId),
 								expiresAt: auditRecord.expiresAt,
 							};
 						},
