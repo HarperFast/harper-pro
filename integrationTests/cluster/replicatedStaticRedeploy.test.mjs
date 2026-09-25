@@ -54,287 +54,306 @@ const PROJECT = 'qa710static';
 const FIXTURE_V1 = join(import.meta.dirname, 'fixture-static-redeploy');
 const FIXTURE_V2 = join(import.meta.dirname, 'fixture-static-redeploy-v2');
 
-suite('replicated redeploy of a static-file component (gh#1935 regression anchor)', { timeout: 300000 }, (ctx) => {
-	before(
-		async () => {
-			// Indexed assignment (not push) so ctx.nodes[0]/[1] keep their origin/replica
-			// identity regardless of which startHarper call resolves first, while still
-			// recording whichever nodes did start (for teardown) if the other one fails.
-			ctx.nodes = [];
-			await Promise.all(
-				Array(NODE_COUNT)
-					.fill(null)
-					.map(async (_, i) => {
-						const nodeCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
-						await startHarper(nodeCtx, nodeStartOptions(nodeCtx.harper));
-						ctx.nodes[i] = nodeCtx.harper;
-					})
-			);
+const BEFORE_ALL_TIMEOUT_MS = 220_000;
+const AFTER_ALL_TIMEOUT_MS = 60_000;
+const INITIAL_DEPLOY_TEST_TIMEOUT_MS = 320_000;
+const REDEPLOY_TEST_TIMEOUT_MS = 150_000;
+const RESTART_TEST_TIMEOUT_MS = 240_000;
+// The suite deadline cancels a child that is still inside its own budget, so it has to clear
+// the sum of every hook/test timeout below it -- otherwise the same generic timeout the
+// per-step budgets exist to avoid arrives from one level up instead.
+const SUITE_TIMEOUT_MS =
+	BEFORE_ALL_TIMEOUT_MS +
+	AFTER_ALL_TIMEOUT_MS +
+	INITIAL_DEPLOY_TEST_TIMEOUT_MS +
+	REDEPLOY_TEST_TIMEOUT_MS +
+	RESTART_TEST_TIMEOUT_MS;
 
-			const tokenResponse = await sendOperation(ctx.nodes[0], {
-				operation: 'create_authentication_tokens',
-				authorization: ctx.nodes[0].admin,
-			});
-			await sendOperation(ctx.nodes[1], {
-				operation: 'add_node',
-				rejectUnauthorized: false,
-				hostname: ctx.nodes[0].hostname,
-				authorization: 'Bearer ' + tokenResponse.operation_token,
-			});
-
-			let retries = 0;
-			// eslint-disable-next-line no-constant-condition
-			while (true) {
-				const statuses = await Promise.all(ctx.nodes.map((n) => sendOperation(n, { operation: 'cluster_status' })));
-				const fullyConnected = statuses.every(
-					(s) =>
-						s.connections.length === NODE_COUNT - 1 &&
-						s.connections.every((c) => c.database_sockets.every((sock) => sock.connected))
+suite(
+	'replicated redeploy of a static-file component (gh#1935 regression anchor)',
+	{ timeout: SUITE_TIMEOUT_MS },
+	(ctx) => {
+		before(
+			async () => {
+				// Indexed assignment (not push) so ctx.nodes[0]/[1] keep their origin/replica
+				// identity regardless of which startHarper call resolves first, while still
+				// recording whichever nodes did start (for teardown) if the other one fails.
+				ctx.nodes = [];
+				await Promise.all(
+					Array(NODE_COUNT)
+						.fill(null)
+						.map(async (_, i) => {
+							const nodeCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+							await startHarper(nodeCtx, nodeStartOptions(nodeCtx.harper));
+							ctx.nodes[i] = nodeCtx.harper;
+						})
 				);
-				if (fullyConnected) break;
-				if (retries++ > 25) throw new Error('Cluster did not fully connect: ' + JSON.stringify(statuses));
-				await delay(500 * retries);
-			}
-			// Let the reverse-direction (origin -> replica) connection's cert trust settle before
-			// deploy_component tries to replicate/restart over it (see deployTrackingReplication.test.mjs).
-			// Empirically flaky below ~3s in this harness (intermittent "self-signed certificate" on the
-			// restart-propagation leg) — unrelated to the static-files behavior under test.
-			await delay(3000);
-		},
-		// The connect-retry loop above backs off up to 500ms * (1+...+26) ≈ 175s before giving up,
-		// so this ceiling has to clear that budget (plus startup/request overhead) — otherwise a
-		// cluster that's still legitimately converging gets killed by this timeout instead of by
-		// the loop's own, more informative "did not fully connect" error.
-		{ timeout: 220_000 }
-	);
 
-	after(
-		async () => {
-			if (!ctx.nodes) return;
-			await stopAndTeardownNodes(ctx.nodes);
-		},
-		{ timeout: 60_000 }
-	);
+				const tokenResponse = await sendOperation(ctx.nodes[0], {
+					operation: 'create_authentication_tokens',
+					authorization: ctx.nodes[0].admin,
+				});
+				await sendOperation(ctx.nodes[1], {
+					operation: 'add_node',
+					rejectUnauthorized: false,
+					hostname: ctx.nodes[0].hostname,
+					authorization: 'Bearer ' + tokenResponse.operation_token,
+				});
 
-	test(
-		'initial deploy: control + existing pages serve on both nodes',
-		// Sequential pollHealth over both nodes below can back off up to ~120s each
-		// (retries * intervalMs) before giving up, so this ceiling has to clear ~240s
-		// of that plus the snapshotPages budget, or a legitimately-slow-but-healthy
-		// node gets killed by this timeout instead of pollHealth's own error.
-		{ timeout: 320_000 },
-		async () => {
-			// First-time load of a brand-new component needs restart:true (matches customer's
-			// initial site deploy) — restart:false on a never-before-loaded component writes the
-			// files but doesn't mount its HTTP handlers into the running server (see
-			// core/integrationTests/deploy/redeploy-restart-flag.test.ts, issue135-replicated-*).
-			// The REDEPLOY under test in the next case is the one that uses restart:false.
-			const payload = await targz(FIXTURE_V1);
-			const res = await sendOperation(ctx.nodes[0], {
-				operation: 'deploy_component',
-				project: PROJECT,
-				payload,
-				replicated: true,
-				restart: true,
-			});
-			assert.ok(
-				res.message?.startsWith(`Successfully deployed: ${PROJECT}`),
-				`unexpected deploy message: ${JSON.stringify(res)}`
-			);
+				let retries = 0;
+				// eslint-disable-next-line no-constant-condition
+				while (true) {
+					const statuses = await Promise.all(ctx.nodes.map((n) => sendOperation(n, { operation: 'cluster_status' })));
+					const fullyConnected = statuses.every(
+						(s) =>
+							s.connections.length === NODE_COUNT - 1 &&
+							s.connections.every((c) => c.database_sockets.every((sock) => sock.connected))
+					);
+					if (fullyConnected) break;
+					if (retries++ > 25) throw new Error('Cluster did not fully connect: ' + JSON.stringify(statuses));
+					await delay(500 * retries);
+				}
+				// Let the reverse-direction (origin -> replica) connection's cert trust settle before
+				// deploy_component tries to replicate/restart over it (see deployTrackingReplication.test.mjs).
+				// Empirically flaky below ~3s in this harness (intermittent "self-signed certificate" on the
+				// restart-propagation leg) — unrelated to the static-files behavior under test.
+				await delay(3000);
+			},
+			// The connect-retry loop above backs off up to 500ms * (1+...+26) ≈ 175s before giving up,
+			// so this ceiling has to clear that budget (plus startup/request overhead) — otherwise a
+			// cluster that's still legitimately converging gets killed by this timeout instead of by
+			// the loop's own, more informative "did not fully connect" error.
+			{ timeout: BEFORE_ALL_TIMEOUT_MS }
+		);
 
-			await delay(5000);
-			for (const node of ctx.nodes) await pollHealth(node);
+		after(
+			async () => {
+				if (!ctx.nodes) return;
+				await stopAndTeardownNodes(ctx.nodes);
+			},
+			{ timeout: AFTER_ALL_TIMEOUT_MS }
+		);
 
-			for (const node of ctx.nodes) {
-				const snap = await snapshotPages(node, ['existing.html']);
-				assert.equal(
-					snap.control.status,
-					200,
-					`${node.hostname} control.html should be 200: ${JSON.stringify(snap.control)}`
-				);
-				assert.ok(snap.control.body.includes('CONTROL-V1'));
-				assert.equal(
-					snap['existing.html'].status,
-					200,
-					`${node.hostname} existing.html should be 200 after initial deploy: ${JSON.stringify(snap['existing.html'])}`
-				);
+		test(
+			'initial deploy: control + existing pages serve on both nodes',
+			// Sequential pollHealth over both nodes below can back off up to ~120s each
+			// (retries * intervalMs) before giving up, so this ceiling has to clear ~240s
+			// of that plus the snapshotPages budget, or a legitimately-slow-but-healthy
+			// node gets killed by this timeout instead of pollHealth's own error.
+			{ timeout: INITIAL_DEPLOY_TEST_TIMEOUT_MS },
+			async () => {
+				// First-time load of a brand-new component needs restart:true (matches customer's
+				// initial site deploy) — restart:false on a never-before-loaded component writes the
+				// files but doesn't mount its HTTP handlers into the running server (see
+				// core/integrationTests/deploy/redeploy-restart-flag.test.ts, issue135-replicated-*).
+				// The REDEPLOY under test in the next case is the one that uses restart:false.
+				const payload = await targz(FIXTURE_V1);
+				const res = await sendOperation(ctx.nodes[0], {
+					operation: 'deploy_component',
+					project: PROJECT,
+					payload,
+					replicated: true,
+					restart: true,
+				});
 				assert.ok(
-					snap['existing.html'].body.includes('EXISTING-V1'),
-					`${node.hostname} existing.html body: ${snap['existing.html'].body}`
+					res.message?.startsWith(`Successfully deployed: ${PROJECT}`),
+					`unexpected deploy message: ${JSON.stringify(res)}`
 				);
 
-				// ARMING: prove the 200/404 checker can actually see a difference on THIS node,
-				// at THIS moment, before we trust any later 200 as meaningful. `new.html` does not
-				// exist yet (it's only added by the V2 fixture in the redeploy test below), so it
-				// must 404 here. If this ever comes back 200, the oracle is broken (e.g. a stale
-				// static map serving directory listings or a catch-all) and the redeploy test's
-				// 200 assertions would be worthless.
-				const absent = await getPage(node, '/new.html');
-				assert.equal(
-					absent.status,
-					404,
-					`${node.hostname} new.html should 404 before it exists (oracle arming check): ${JSON.stringify(absent)}`
-				);
-			}
-		}
-	);
+				await delay(5000);
+				for (const node of ctx.nodes) await pollHealth(node);
 
-	test(
-		'redeploy: new page + changed page register on ORIGIN and REPLICA without a restart',
-		// pollUntilExpected runs 3x per node (control/existing/new) sequentially across both
-		// nodes, each backing off up to its own 15s budget — worst case ~90s — plus the
-		// per-worker concurrentBurst pass after it, so this ceiling has to clear both budgets
-		// rather than race them.
-		{ timeout: 150_000 },
-		async () => {
-			const payload = await targz(FIXTURE_V2);
-			const res = await sendOperation(ctx.nodes[0], {
-				operation: 'deploy_component',
-				project: PROJECT,
-				payload,
-				replicated: true,
-				restart: false,
-			});
-			assert.equal(res.message, `Successfully deployed: ${PROJECT}`, JSON.stringify(res));
-
-			// deploy_component reporting success is not route-registration: give each node a
-			// bounded, fair window (15s, polled every 500ms — well past the ~3s settle time
-			// observed in exploration) to actually mount the new routes before treating a
-			// leftover 404 as a real, assertable finding rather than a startup race.
-			ctx.snapshots = {};
-			for (const [i, node] of ctx.nodes.entries()) {
-				const label = i === 0 ? 'origin' : 'replica';
-				const control = await pollUntilExpected(node, 'control.html', 'CONTROL-V1');
-				const existing = await pollUntilExpected(node, 'existing.html', 'EXISTING-V2-CHANGED');
-				const newPage = await pollUntilExpected(node, 'new.html', 'NEW-PAGE-V2');
-				const snap = { control, 'existing.html': existing, 'new.html': newPage };
-				ctx.snapshots[label] = snap;
-				console.log(
-					`[QA-710] ${label} (${node.hostname}) post-redeploy, no restart: ` +
-						`control=${control.status} existing.html=${existing.status}(${JSON.stringify(existing.body)}) ` +
-						`new.html=${newPage.status}(${JSON.stringify(newPage.body)})`
-				);
-
-				// Readiness oracle — must be 200, or nothing else here means anything.
-				assert.equal(
-					control.status,
-					200,
-					`${label} control.html should still be 200 (readiness oracle): ${JSON.stringify(control)}`
-				);
-				assert.ok(control.body.includes('CONTROL-V1'), `${label} control.html body: ${control.body}`);
-
-				// CORRECT invariant under test (gh#1935): every node — origin AND replica —
-				// must serve the CHANGED page and the NEW page at 200 with their new bodies,
-				// without a restart. A 404 or stale body here, on either node, is the defect
-				// reported in gh#1935 and must fail the test, not just be logged.
-				assert.equal(
-					existing.status,
-					200,
-					`${label} (${node.hostname}) existing.html should be 200 after redeploy (no restart) — gh#1935 regression if 404: ${JSON.stringify(existing)}`
-				);
-				assert.ok(
-					existing.body.includes('EXISTING-V2-CHANGED'),
-					`${label} existing.html should reflect the CHANGED body after redeploy: ${existing.body}`
-				);
-				assert.equal(
-					newPage.status,
-					200,
-					`${label} (${node.hostname}) new.html should be 200 after redeploy (no restart) — gh#1935 regression if 404: ${JSON.stringify(newPage)}`
-				);
-				assert.ok(
-					newPage.body.includes('NEW-PAGE-V2'),
-					`${label} new.html should reflect the NEW body after redeploy: ${newPage.body}`
-				);
-			}
-
-			// Per-worker resolution: burst concurrent requests at each node. With the default
-			// threads.count (CPU-count workers), a burst fans out across HTTP workers — if only
-			// some workers had picked up the redeployed static map (per-worker staleness, as
-			// opposed to a uniform per-node result), this would show up as a mixed-status burst.
-			for (const [i, node] of ctx.nodes.entries()) {
-				const label = i === 0 ? 'origin' : 'replica';
-				for (const [path, expectedBody] of [
-					['existing.html', 'EXISTING-V2-CHANGED'],
-					['new.html', 'NEW-PAGE-V2'],
-				]) {
-					const burst = await concurrentBurst(node, path);
-					const bad = burst.filter((r) => r.status !== 200 || !r.body.includes(expectedBody));
+				for (const node of ctx.nodes) {
+					const snap = await snapshotPages(node, ['existing.html']);
 					assert.equal(
-						bad.length,
-						0,
-						`${label} (${node.hostname}) ${path}: ${bad.length}/${burst.length} concurrent requests did not see the redeployed ` +
-							`page uniformly (per-worker staleness) — sample: ${JSON.stringify(bad[0])}`
+						snap.control.status,
+						200,
+						`${node.hostname} control.html should be 200: ${JSON.stringify(snap.control)}`
+					);
+					assert.ok(snap.control.body.includes('CONTROL-V1'));
+					assert.equal(
+						snap['existing.html'].status,
+						200,
+						`${node.hostname} existing.html should be 200 after initial deploy: ${JSON.stringify(snap['existing.html'])}`
+					);
+					assert.ok(
+						snap['existing.html'].body.includes('EXISTING-V1'),
+						`${node.hostname} existing.html body: ${snap['existing.html'].body}`
+					);
+
+					// ARMING: prove the 200/404 checker can actually see a difference on THIS node,
+					// at THIS moment, before we trust any later 200 as meaningful. `new.html` does not
+					// exist yet (it's only added by the V2 fixture in the redeploy test below), so it
+					// must 404 here. If this ever comes back 200, the oracle is broken (e.g. a stale
+					// static map serving directory listings or a catch-all) and the redeploy test's
+					// 200 assertions would be worthless.
+					const absent = await getPage(node, '/new.html');
+					assert.equal(
+						absent.status,
+						404,
+						`${node.hostname} new.html should 404 before it exists (oracle arming check): ${JSON.stringify(absent)}`
 					);
 				}
 			}
-		}
-	);
+		);
 
-	test(
-		'restart:true on the replica only fixes that node; origin unaffected',
-		// restartNode (up to 60s) + a single pollHealth call (up to ~120s) + two snapshotPages calls
-		// (up to ~20s each) — this ceiling has to clear that combined budget.
-		{ timeout: 240_000 },
-		async () => {
-			console.log('[QA-710] pre-restart snapshots:', JSON.stringify(ctx.snapshots));
-			if (!ctx.snapshots?.origin) return; // test 2 didn't set snapshots — its own failure already surfaces the issue
-			const before = ctx.snapshots;
+		test(
+			'redeploy: new page + changed page register on ORIGIN and REPLICA without a restart',
+			// pollUntilExpected runs 3x per node (control/existing/new) sequentially across both
+			// nodes, each backing off up to its own 15s budget — worst case ~90s — plus the
+			// per-worker concurrentBurst pass after it, so this ceiling has to clear both budgets
+			// rather than race them.
+			{ timeout: REDEPLOY_TEST_TIMEOUT_MS },
+			async () => {
+				const payload = await targz(FIXTURE_V2);
+				const res = await sendOperation(ctx.nodes[0], {
+					operation: 'deploy_component',
+					project: PROJECT,
+					payload,
+					replicated: true,
+					restart: false,
+				});
+				assert.equal(res.message, `Successfully deployed: ${PROJECT}`, JSON.stringify(res));
 
-			await restartNode(ctx.nodes[1]);
-			await pollHealth(ctx.nodes[1]);
+				// deploy_component reporting success is not route-registration: give each node a
+				// bounded, fair window (15s, polled every 500ms — well past the ~3s settle time
+				// observed in exploration) to actually mount the new routes before treating a
+				// leftover 404 as a real, assertable finding rather than a startup race.
+				ctx.snapshots = {};
+				for (const [i, node] of ctx.nodes.entries()) {
+					const label = i === 0 ? 'origin' : 'replica';
+					const control = await pollUntilExpected(node, 'control.html', 'CONTROL-V1');
+					const existing = await pollUntilExpected(node, 'existing.html', 'EXISTING-V2-CHANGED');
+					const newPage = await pollUntilExpected(node, 'new.html', 'NEW-PAGE-V2');
+					const snap = { control, 'existing.html': existing, 'new.html': newPage };
+					ctx.snapshots[label] = snap;
+					console.log(
+						`[QA-710] ${label} (${node.hostname}) post-redeploy, no restart: ` +
+							`control=${control.status} existing.html=${existing.status}(${JSON.stringify(existing.body)}) ` +
+							`new.html=${newPage.status}(${JSON.stringify(newPage.body)})`
+					);
 
-			const replicaAfter = await snapshotPages(ctx.nodes[1], ['existing.html', 'new.html']);
-			const originAfter = await snapshotPages(ctx.nodes[0], ['existing.html', 'new.html']);
+					// Readiness oracle — must be 200, or nothing else here means anything.
+					assert.equal(
+						control.status,
+						200,
+						`${label} control.html should still be 200 (readiness oracle): ${JSON.stringify(control)}`
+					);
+					assert.ok(control.body.includes('CONTROL-V1'), `${label} control.html body: ${control.body}`);
 
-			console.log(
-				`[QA-710] replica (${ctx.nodes[1].hostname}) post-restart: ` +
-					`existing.html=${replicaAfter['existing.html'].status}(${JSON.stringify(replicaAfter['existing.html'].body)}) ` +
-					`new.html=${replicaAfter['new.html'].status}(${JSON.stringify(replicaAfter['new.html'].body)})`
-			);
-			console.log(
-				`[QA-710] origin (${ctx.nodes[0].hostname}) unchanged (no restart): ` +
-					`existing.html=${originAfter['existing.html'].status}(${JSON.stringify(originAfter['existing.html'].body)}) ` +
-					`new.html=${originAfter['new.html'].status}(${JSON.stringify(originAfter['new.html'].body)})`
-			);
+					// CORRECT invariant under test (gh#1935): every node — origin AND replica —
+					// must serve the CHANGED page and the NEW page at 200 with their new bodies,
+					// without a restart. A 404 or stale body here, on either node, is the defect
+					// reported in gh#1935 and must fail the test, not just be logged.
+					assert.equal(
+						existing.status,
+						200,
+						`${label} (${node.hostname}) existing.html should be 200 after redeploy (no restart) — gh#1935 regression if 404: ${JSON.stringify(existing)}`
+					);
+					assert.ok(
+						existing.body.includes('EXISTING-V2-CHANGED'),
+						`${label} existing.html should reflect the CHANGED body after redeploy: ${existing.body}`
+					);
+					assert.equal(
+						newPage.status,
+						200,
+						`${label} (${node.hostname}) new.html should be 200 after redeploy (no restart) — gh#1935 regression if 404: ${JSON.stringify(newPage)}`
+					);
+					assert.ok(
+						newPage.body.includes('NEW-PAGE-V2'),
+						`${label} new.html should reflect the NEW body after redeploy: ${newPage.body}`
+					);
+				}
 
-			assert.equal(replicaAfter.control.status, 200, 'replica control.html should be 200 post-restart');
-			assert.equal(originAfter.control.status, 200, 'origin control.html should still be 200');
+				// Per-worker resolution: burst concurrent requests at each node. With the default
+				// threads.count (CPU-count workers), a burst fans out across HTTP workers — if only
+				// some workers had picked up the redeployed static map (per-worker staleness, as
+				// opposed to a uniform per-node result), this would show up as a mixed-status burst.
+				for (const [i, node] of ctx.nodes.entries()) {
+					const label = i === 0 ? 'origin' : 'replica';
+					for (const [path, expectedBody] of [
+						['existing.html', 'EXISTING-V2-CHANGED'],
+						['new.html', 'NEW-PAGE-V2'],
+					]) {
+						const burst = await concurrentBurst(node, path);
+						const bad = burst.filter((r) => r.status !== 200 || !r.body.includes(expectedBody));
+						assert.equal(
+							bad.length,
+							0,
+							`${label} (${node.hostname}) ${path}: ${bad.length}/${burst.length} concurrent requests did not see the redeployed ` +
+								`page uniformly (per-worker staleness) — sample: ${JSON.stringify(bad[0])}`
+						);
+					}
+				}
+			}
+		);
 
-			// Title claims restart:true "fixes" the replica — that only holds if the replica's
-			// redeployed pages are actually up after the restart, not merely fetched and logged.
-			assert.equal(
-				replicaAfter['existing.html'].status,
-				200,
-				`replica existing.html should still be 200 after restart: ${JSON.stringify(replicaAfter['existing.html'])}`
-			);
-			assert.ok(
-				replicaAfter['existing.html'].body.includes('EXISTING-V2-CHANGED'),
-				`replica existing.html body should still be the changed page after restart: ${replicaAfter['existing.html'].body}`
-			);
-			assert.equal(
-				replicaAfter['new.html'].status,
-				200,
-				`replica new.html should still be 200 after restart: ${JSON.stringify(replicaAfter['new.html'])}`
-			);
-			assert.ok(
-				replicaAfter['new.html'].body.includes('NEW-PAGE-V2'),
-				`replica new.html body should still be the new page after restart: ${replicaAfter['new.html'].body}`
-			);
+		test(
+			'restart:true on the replica only fixes that node; origin unaffected',
+			// restartNode (up to 60s) + a single pollHealth call (up to ~120s) + two snapshotPages calls
+			// (up to ~20s each) — this ceiling has to clear that combined budget.
+			{ timeout: RESTART_TEST_TIMEOUT_MS },
+			async () => {
+				console.log('[QA-710] pre-restart snapshots:', JSON.stringify(ctx.snapshots));
+				if (!ctx.snapshots?.origin) return; // test 2 didn't set snapshots — its own failure already surfaces the issue
+				const before = ctx.snapshots;
 
-			// Restarting the replica should not regress the origin.
-			assert.equal(
-				originAfter['existing.html'].status,
-				before.origin['existing.html'].status,
-				'origin existing.html status should be unchanged by restarting the OTHER node'
-			);
-			assert.equal(
-				originAfter['new.html'].status,
-				before.origin['new.html'].status,
-				'origin new.html status should be unchanged by restarting the OTHER node'
-			);
-		}
-	);
-});
+				await restartNode(ctx.nodes[1]);
+				await pollHealth(ctx.nodes[1]);
+
+				const replicaAfter = await snapshotPages(ctx.nodes[1], ['existing.html', 'new.html']);
+				const originAfter = await snapshotPages(ctx.nodes[0], ['existing.html', 'new.html']);
+
+				console.log(
+					`[QA-710] replica (${ctx.nodes[1].hostname}) post-restart: ` +
+						`existing.html=${replicaAfter['existing.html'].status}(${JSON.stringify(replicaAfter['existing.html'].body)}) ` +
+						`new.html=${replicaAfter['new.html'].status}(${JSON.stringify(replicaAfter['new.html'].body)})`
+				);
+				console.log(
+					`[QA-710] origin (${ctx.nodes[0].hostname}) unchanged (no restart): ` +
+						`existing.html=${originAfter['existing.html'].status}(${JSON.stringify(originAfter['existing.html'].body)}) ` +
+						`new.html=${originAfter['new.html'].status}(${JSON.stringify(originAfter['new.html'].body)})`
+				);
+
+				assert.equal(replicaAfter.control.status, 200, 'replica control.html should be 200 post-restart');
+				assert.equal(originAfter.control.status, 200, 'origin control.html should still be 200');
+
+				// Title claims restart:true "fixes" the replica — that only holds if the replica's
+				// redeployed pages are actually up after the restart, not merely fetched and logged.
+				assert.equal(
+					replicaAfter['existing.html'].status,
+					200,
+					`replica existing.html should still be 200 after restart: ${JSON.stringify(replicaAfter['existing.html'])}`
+				);
+				assert.ok(
+					replicaAfter['existing.html'].body.includes('EXISTING-V2-CHANGED'),
+					`replica existing.html body should still be the changed page after restart: ${replicaAfter['existing.html'].body}`
+				);
+				assert.equal(
+					replicaAfter['new.html'].status,
+					200,
+					`replica new.html should still be 200 after restart: ${JSON.stringify(replicaAfter['new.html'])}`
+				);
+				assert.ok(
+					replicaAfter['new.html'].body.includes('NEW-PAGE-V2'),
+					`replica new.html body should still be the new page after restart: ${replicaAfter['new.html'].body}`
+				);
+
+				// Restarting the replica should not regress the origin.
+				assert.equal(
+					originAfter['existing.html'].status,
+					before.origin['existing.html'].status,
+					'origin existing.html status should be unchanged by restarting the OTHER node'
+				);
+				assert.equal(
+					originAfter['new.html'].status,
+					before.origin['new.html'].status,
+					'origin new.html status should be unchanged by restarting the OTHER node'
+				);
+			}
+		);
+	}
+);
 
 // Reused on restart too — a restart without options.config wipes replication.databases (see
 // integrationTests/cluster/replicationTopology.test.mjs comment on nodeStartOptions).
