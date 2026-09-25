@@ -308,7 +308,6 @@ describe('sshKeyOperations sealing', () => {
 
 			assert.equal((await ops.getSSHKey({ name: 'repo' })).host, 'repo.alias');
 			await ops.deleteSSHKey({ name: 'repo' });
-			// deleteSSHKey trims the rewritten file, which takes the leading blanks of its new first line
 			assert.equal(readFileSync(configPath(), 'utf8'), handEdited(blockFor('repo-2')).trimStart());
 		});
 	});
