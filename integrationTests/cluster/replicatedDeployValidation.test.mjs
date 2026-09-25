@@ -26,7 +26,7 @@ const DEPLOY_ANSWER_MS = 90_000;
 
 suite('Replicated deploy_component answers and keeps the user record to itself', { timeout: 240_000 }, (ctx) => {
 	before(async () => {
-		const nodes = [];
+		ctx.nodes = [];
 		for (let i = 0; i < 2; i++) {
 			const node = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 			await startHarper(node, {
@@ -37,9 +37,9 @@ suite('Replicated deploy_component answers and keeps the user record to itself',
 				},
 				env: { HARPER_NO_FLUSH_ON_EXIT: true },
 			});
-			nodes.push(node.harper);
+			// Pushed as each starts, so a second start that throws still leaves the first for `after`.
+			ctx.nodes.push(node.harper);
 		}
-		ctx.nodes = nodes;
 
 		const tokenResponse = await sendOperation(ctx.nodes[0], {
 			operation: 'create_authentication_tokens',
