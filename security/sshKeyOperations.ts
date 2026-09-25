@@ -1,6 +1,17 @@
 import Joi from 'joi';
 import { join, dirname, basename } from 'node:path';
-import { constants, access, readFile, writeFile, unlink, chmod, appendFile, mkdir, readdir } from 'node:fs/promises';
+import {
+	constants,
+	access,
+	readFile,
+	writeFile,
+	unlink,
+	chmod,
+	appendFile,
+	mkdir,
+	readdir,
+	stat,
+} from 'node:fs/promises';
 
 import { validateBySchema } from '../core/validation/validationWrapper.js';
 import harperLogger from '../core/utility/logging/harper_logger.js';
@@ -369,7 +380,7 @@ export async function deleteSSHKey(req: { name: string }): Promise<{ message: st
 	}
 
 	if (await exists(configFile)) {
-		const fileContents = (await readFile(configFile, 'utf8')).replace(sshConfigBlockRegex(name), '').trim();
+		const fileContents = withoutSSHConfigBlocks(await readFile(configFile, 'utf8'), name).trim();
 		await writeFileEnsureDir(configFile, fileContents);
 	}
 
@@ -381,9 +392,9 @@ export async function deleteSSHKey(req: { name: string }): Promise<{ message: st
 }
 
 /**
- * Lists the SSH keys the other key operations can act on — each regular `<name>.key` file in the ssh
- * dir whose name passes `SSH_KEY_NAME_REGEX` — along with their associated Host and HostName
- * configuration from the SSH config file.
+ * Lists the SSH keys the other key operations can act on — each `<name>.key` file in the ssh dir, or
+ * symlink to one, whose name passes `SSH_KEY_NAME_REGEX` — along with their associated Host and
+ * HostName configuration from the SSH config file.
  *
  * @returns An array of objects containing the key name and optionally
  * the Host and HostName from the SSH config file.
@@ -393,32 +404,67 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 	if (!(await exists(sshDir))) return [];
 
 	const configContents: string | null = (await exists(configFile)) ? await readFile(configFile, 'utf8') : null;
-	const entries = await readdir(sshDir, { withFileTypes: true });
-	return entries
-		.filter((entry) => entry.isFile() && entry.name.endsWith('.key'))
-		.map((entry) => basename(entry.name, '.key'))
-		.filter((name) => SSH_KEY_NAME_REGEX.test(name))
-		.map((name) => {
-			const result: { name: string; host?: string; hostname?: string } = { name };
+	const results: { name: string; host?: string; hostname?: string }[] = [];
+	for (const entry of await readdir(sshDir, { withFileTypes: true })) {
+		const name = basename(entry.name, '.key');
+		if (!entry.name.endsWith('.key') || !SSH_KEY_NAME_REGEX.test(name)) continue;
+		// `get_ssh_key` reads through a symlink, so one whose target is a regular file is a key too
+		const isKeyFile =
+			entry.isFile() ||
+			(entry.isSymbolicLink() && (await stat(join(sshDir, entry.name)).catch(() => undefined))?.isFile());
+		if (!isKeyFile) continue;
 
-			if (configContents) {
-				const { host, hostname } = extractMatchingHostAndHostname(configContents, name);
-				if (host) result.host = host;
-				if (hostname) result.hostname = hostname;
-			}
-
-			return result;
-		});
+		const result: { name: string; host?: string; hostname?: string } = { name };
+		if (configContents) {
+			const { host, hostname } = extractMatchingHostAndHostname(configContents, name);
+			if (host) result.host = host;
+			if (hostname) result.hostname = hostname;
+		}
+		results.push(result);
+	}
+	return results;
 }
 
+const SSH_CONFIG_KEY_COMMENT = /^[ \t]*#([a-zA-Z0-9-_]+)[ \t]*$/;
+const SSH_CONFIG_IDENTITIES_ONLY_YES = /^[ \t]*IdentitiesOnly(?:[ \t]*=[ \t]*|[ \t]+)yes[ \t]*$/i;
+
 /**
- * Matches every SSH config block `addSSHKey` wrote for `name`: from its `#name` comment line through
- * the block's closing `IdentitiesOnly yes`. Blanks aside, the comment line must be exactly `#name` —
- * matched as a prefix, `#repo` would also match the block of a key named `repo-2`.
+ * Where each SSH config block `addSSHKey` wrote for `name` sits in `config`, as `[start, end)`
+ * offsets that include the block's final line break. A block opens at a comment line that is exactly
+ * `#name` (blanks aside — matched as a prefix, `#repo` would claim `#repo-2`'s block) and closes after
+ * its `IdentitiesOnly yes` line, spelled any way OpenSSH accepts. If that line was removed or mangled
+ * by hand, the block ends at the next key's comment line, or the end of the file, so it never takes in
+ * a sibling key's block.
  */
-function sshConfigBlockRegex(name: string): RegExp {
-	const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	return new RegExp(`^[ \\t]*#${escapedName}[ \\t]*\\r?\\n[\\S\\s]*?IdentitiesOnly yes`, 'gm');
+function findSSHConfigBlocks(config: string, name: string): [number, number][] {
+	const blocks: [number, number][] = [];
+	let openedAt: number | undefined;
+	for (let lineStart = 0; lineStart < config.length;) {
+		const newline = config.indexOf('\n', lineStart);
+		const lineEnd = newline === -1 ? config.length : newline + 1;
+		const line = config.slice(lineStart, newline === -1 ? config.length : newline).replace(/\r$/, '');
+		const commentName = SSH_CONFIG_KEY_COMMENT.exec(line)?.[1];
+		if (commentName !== undefined) {
+			if (openedAt !== undefined) blocks.push([openedAt, lineStart]);
+			openedAt = commentName === name ? lineStart : undefined;
+		} else if (openedAt !== undefined && SSH_CONFIG_IDENTITIES_ONLY_YES.test(line)) {
+			blocks.push([openedAt, lineEnd]);
+			openedAt = undefined;
+		}
+		lineStart = lineEnd;
+	}
+	if (openedAt !== undefined) blocks.push([openedAt, config.length]);
+	return blocks;
+}
+
+function withoutSSHConfigBlocks(config: string, name: string): string {
+	let remaining = '';
+	let keptFrom = 0;
+	for (const [start, end] of findSSHConfigBlocks(config, name)) {
+		remaining += config.slice(keptFrom, start);
+		keptFrom = end;
+	}
+	return remaining + config.slice(keptFrom);
 }
 
 /**
@@ -432,11 +478,11 @@ function sshConfigBlockRegex(name: string): RegExp {
  * the matching config block, or an empty object if no match is found.
  */
 function extractMatchingHostAndHostname(configContents: string, name: string): { host?: string; hostname?: string } {
-	const match = configContents.match(sshConfigBlockRegex(name));
+	const [block] = findSSHConfigBlocks(configContents, name);
 
-	if (!match?.[0]) return {};
+	if (!block) return {};
 
-	const configBlock = match[0];
+	const configBlock = configContents.slice(...block);
 
 	const host = configBlock.match(/^Host\s+(.+)$/m)?.[1]?.trim();
 	const hostname = configBlock.match(/^\s*HostName\s+(.+)$/m)?.[1]?.trim();
