@@ -1,18 +1,6 @@
 /**
- * Integration test: `update_node` is a registered, dispatchable operation.
- *
- * `setNode()` (replication/setNode.ts) has special-cased `req.operation === 'update_node'` for
- * its response message since it was written, and the documented API
- * (documentation/reference/replication/clustering.md, "Update Node") describes it — but the
- * `server.registerOperation?.()` block never registered the name, so every documented
- * update_node call hit Harper's flat operation-dispatch map lookup
- * (core/server/serverHelpers/serverUtilities.ts `getOperationFunction`, no aliasing) and 400'd
- * with "Operation 'update_node' not found". Fails on base (400, operation-not-found); passes
- * with the fix (200, the update_node-specific success message).
- *
- * Second case: the docs say update_node "will attempt to add the node if it does not exist", so
- * it must also succeed against a hostname with no existing hdb_nodes record (task brief's own
- * open question — resolved by the docs, not by a new existence check).
+ * Integration test: `update_node` is a registered, dispatchable operation, and (per docs) adds
+ * the node when it doesn't already exist.
  */
 import { suite, test, before, after } from 'node:test';
 import { match } from 'node:assert/strict';
@@ -28,6 +16,11 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	'bin',
 	'harper.js'
 );
+
+// Anchored at both ends so it does NOT match the success-with-warning variant setNode() returns
+// when the peer rejects/errors ("Successfully updated '<url>' but there was an error ..."):
+// a peer-rejected update_node must fail this test, not pass it.
+const UPDATE_SUCCESS = /^Successfully updated '[^']+'$/;
 
 suite('update_node is a registered, dispatchable operation', { timeout: 120000 }, (ctx) => {
 	before(async () => {
@@ -46,11 +39,17 @@ suite('update_node is a registered, dispatchable operation', { timeout: 120000 }
 
 		const ctxA = makeNodeCtx(hostnameA);
 		const ctxB = makeNodeCtx(hostnameB);
-		await Promise.all([startHarper(ctxA, commonConfig(hostnameA)), startHarper(ctxB, commonConfig(hostnameB))]);
-		ctx.nodeA = ctxA.harper;
-		ctx.nodeB = ctxB.harper;
+		// Assign as each node starts (not after Promise.all resolves) so `after` can tear down
+		// whichever one succeeded if the other's startHarper rejects.
+		await Promise.all([
+			startHarper(ctxA, commonConfig(hostnameA)).then(() => {
+				ctx.nodeA = ctxA.harper;
+			}),
+			startHarper(ctxB, commonConfig(hostnameB)).then(() => {
+				ctx.nodeB = ctxB.harper;
+			}),
+		]);
 
-		// Establish A as an existing node on B before exercising update_node against it.
 		await sendOperation(ctx.nodeB, {
 			operation: 'add_node',
 			hostname: ctx.nodeA.hostname,
@@ -77,36 +76,33 @@ suite('update_node is a registered, dispatchable operation', { timeout: 120000 }
 			authorization: nodeA.admin,
 		});
 
-		// setNode()'s update_node branch (replication/setNode.ts:271-273) produces this exact
-		// message -- distinct from add_node/set_node's "Successfully added ... to cluster" -- so a
-		// 200 here with this text proves dispatch reached the real handler, not some coincidental
-		// other route.
-		match(response.message, /^Successfully updated /, `unexpected message: ${JSON.stringify(response.message)}`);
+		match(response.message, UPDATE_SUCCESS, `unexpected message: ${JSON.stringify(response.message)}`);
 	});
 
 	test('update_node against a hostname with no existing node record adds it (documented add-if-absent)', async (t) => {
 		const { nodeB } = ctx;
 		const hostnameC = await getNextAvailableLoopbackAddress();
 		const ctxC = { name: t.name, harper: { hostname: hostnameC } };
-		await startHarper(ctxC, {
-			config: {
-				analytics: { aggregatePeriod: -1 },
-				logging: { colors: false, stdStreams: false, console: true },
-				replication: { port: hostnameC + ':9933', securePort: null, databases: ['data'] },
-			},
-			env: { HARPER_NO_FLUSH_ON_EXIT: true },
-		});
-		const nodeC = ctxC.harper;
 		try {
+			await startHarper(ctxC, {
+				config: {
+					analytics: { aggregatePeriod: -1 },
+					logging: { colors: false, stdStreams: false, console: true },
+					replication: { port: hostnameC + ':9933', securePort: null, databases: ['data'] },
+				},
+				env: { HARPER_NO_FLUSH_ON_EXIT: true },
+			});
+			const nodeC = ctxC.harper;
+
 			const response = await sendOperation(nodeB, {
 				operation: 'update_node',
 				hostname: nodeC.hostname,
 				rejectUnauthorized: false,
 				authorization: nodeC.admin,
 			});
-			match(response.message, /^Successfully updated /, `unexpected message: ${JSON.stringify(response.message)}`);
+			match(response.message, UPDATE_SUCCESS, `unexpected message: ${JSON.stringify(response.message)}`);
 		} finally {
-			await teardownHarper({ harper: nodeC });
+			await teardownHarper({ harper: ctxC.harper });
 		}
 	});
 });
