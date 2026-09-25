@@ -1853,10 +1853,14 @@ export async function ensureNode(name: string, node, options?: { localOnly?: boo
 		logger.error('Error parsing replication CA info for hdb_nodes table', err.message);
 	}
 
-	// getSync (not get): get() returns a Promise on a RocksDB block-cache miss. A truthy Promise here
-	// would drop the existing revoked_certificates merge below (existing.revoked_certificates undefined)
-	// and defeat the sticky LOCAL_ONLY check (existing?.isLeader undefined), re-opening harper-pro#246.
-	const existing = table.primaryStore.getSync(name);
+	// Awaited get() (not the primaryStore.getSync() point read): ensureNode() is called back-to-back
+	// for the same row within one request sequence (e.g. add_node immediately followed by update_node
+	// against the row it just created), and getSync() was observed to intermittently miss a write from
+	// moments earlier. A miss here drops the revoked_certificates merge below (existing.revoked_certificates
+	// undefined) and defeats the sticky LOCAL_ONLY check (existing?.isLeader undefined), reopening
+	// harper-pro#246. Safe to await here (unlike a fire-and-forget get(), which would treat its own
+	// pending Promise as a truthy "existing" record) because ensureNode() is async throughout.
+	const existing = await table.get(name);
 	logger.debug(`Ensuring node ${name} at ${getNodeURL(node)}, existing record:`, existing, 'new record:', node);
 	if (existing && Array.isArray(node.revoked_certificates)) {
 		const existingRevoked = existing.revoked_certificates || [];

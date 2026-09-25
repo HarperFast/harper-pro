@@ -1,7 +1,5 @@
 /**
- * `update_node` must be dispatchable (regression: it was never registered), must add a node it
- * doesn't already know about (documented add-if-absent), and a metadata-only call against an
- * existing node must not touch -- and so cannot widen -- its replication topology.
+ * A metadata-only update_node against an existing node must not alter its replication topology.
  */
 import { suite, test, before, after } from 'node:test';
 import { match, ok, deepEqual } from 'node:assert/strict';
@@ -18,7 +16,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	'harper.js'
 );
 
-// Anchored at both ends: excludes setNode()'s success-with-warning suffix (a rejected/unreachable peer).
+// Anchored to exclude the success-with-warning suffix.
 const UPDATE_SUCCESS = /^Successfully updated '[^']+'$/;
 
 function nodeConfig(hostname) {
