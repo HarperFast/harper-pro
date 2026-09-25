@@ -20,7 +20,7 @@
  * (`materializeGitSSH`) and is covered by core's Application tests.
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { generateKeyPairSync } from 'node:crypto';
@@ -310,6 +310,44 @@ describe('sshKeyOperations sealing', () => {
 			await ops.deleteSSHKey({ name: 'repo' });
 			// deleteSSHKey trims the rewritten file, which takes the leading blanks of its new first line
 			assert.equal(readFileSync(configPath(), 'utf8'), handEdited(blockFor('repo-2')).trimStart());
+		});
+	});
+
+	describe('key names add_ssh_key could never create', () => {
+		const NAME_ERROR = 'SSH key name can only contain alphanumeric, dash and underscore characters';
+		// the key path is `<ssh dir>/<name>.key`, so `../outside` is `<root>/outside.key`
+		const outsidePath = () => join(rootDir, 'outside.key');
+		beforeEach(() => writeFileSync(outsidePath(), 'not an ssh key'));
+
+		for (const [operation, call] of [
+			['get_ssh_key', (name) => ops.getSSHKey({ name })],
+			['update_ssh_key', (name) => ops.updateSSHKey(request({ name, key: ROTATED_KEY }))],
+			['delete_ssh_key', (name) => ops.deleteSSHKey({ name })],
+		]) {
+			it(`${operation} refuses a name that resolves outside the ssh dir`, async () => {
+				await assert.rejects(call('../outside'), { message: NAME_ERROR });
+				assert.equal(readFileSync(outsidePath(), 'utf8'), 'not an ssh key');
+			});
+		}
+
+		it('get_ssh_key, update_ssh_key and delete_ssh_key still accept every name add_ssh_key does', async () => {
+			const name = 'deploy_key-2';
+			await ops.addSSHKey(request({ name, key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' }));
+
+			assert.equal((await ops.getSSHKey({ name })).host, 'gh');
+			assert.equal((await ops.updateSSHKey(request({ name, key: ROTATED_KEY }))).message, `Updated ssh key: ${name}`);
+			assert.equal((await ops.deleteSSHKey({ name })).message, `Deleted ssh key: ${name}`);
+		});
+
+		it('list_ssh_keys reports only the regular `<name>.key` files those operations accept', async () => {
+			await ops.addSSHKey(request({ name: 'deploy_key-2', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' }));
+			for (const stray of ['known_hosts.old', 'orphan', 'a.b.key']) writeFileSync(join(sshDir, stray), '');
+			mkdirSync(join(sshDir, 'directory.key'));
+
+			assert.deepEqual(
+				(await ops.listSSHKeys()).map((entry) => entry.name),
+				['deploy_key-2']
+			);
 		});
 	});
 

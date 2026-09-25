@@ -77,8 +77,15 @@ function sealSSHKey(name: string, key: string): string {
 	return ENV_ENCRYPTED_PREFIX + encryptEnvelope(key, publicKey, fingerprint);
 }
 
+// Every name-taking operation accepts exactly the names add_ssh_key can create: the name becomes a path
+// segment (`<ssh dir>/<name>.key`), so anything wider lets a name like `../x` reach outside the ssh dir.
+const sshKeyNameSchema = Joi.string()
+	.pattern(SSH_KEY_NAME_REGEX)
+	.required()
+	.messages({ 'string.pattern.base': SSH_KEY_NAME_ERROR_MSG });
+
 const addValidationSchema = Joi.object({
-	name: Joi.string().pattern(SSH_KEY_NAME_REGEX).required().messages({ 'string.pattern.base': SSH_KEY_NAME_ERROR_MSG }),
+	name: sshKeyNameSchema,
 	// `key` is optional so it can be omitted with `generate: true` (the server mints it); the
 	// "key xor generate" invariant is enforced in addSSHKey for a precise error. `.strict()` because
 	// Joi would otherwise accept the strings 'true'/'false' by coercion, and `validateBySchema`
@@ -91,16 +98,16 @@ const addValidationSchema = Joi.object({
 });
 
 const getSSHKeyValidationSchema = Joi.object({
-	name: Joi.string().required(),
+	name: sshKeyNameSchema,
 });
 
 const updateSSHKeyValidationSchema = Joi.object({
-	name: Joi.string().required(),
+	name: sshKeyNameSchema,
 	key: Joi.string().required(),
 });
 
 const deleteSSHKeyValidationSchema = Joi.object({
-	name: Joi.string().required(),
+	name: sshKeyNameSchema,
 });
 
 const setSSHKnownHostsValidationSchema = Joi.object({
@@ -374,7 +381,8 @@ export async function deleteSSHKey(req: { name: string }): Promise<{ message: st
 }
 
 /**
- * Lists all SSH keys along with their associated Host and HostName
+ * Lists the SSH keys the other key operations can act on — each regular `<name>.key` file in the ssh
+ * dir whose name passes `SSH_KEY_NAME_REGEX` — along with their associated Host and HostName
  * configuration from the SSH config file.
  *
  * @returns An array of objects containing the key name and optionally
@@ -384,13 +392,13 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 	const { sshDir, configFile } = getSSHPaths(undefined);
 	if (!(await exists(sshDir))) return [];
 
-	const EXCLUDED_FILES = new Set(['known_hosts', 'config']);
 	const configContents: string | null = (await exists(configFile)) ? await readFile(configFile, 'utf8') : null;
-	const files: string[] = await readdir(sshDir);
-	return files
-		.filter((file) => !EXCLUDED_FILES.has(file))
-		.map((file) => {
-			const name: string = basename(file, '.key');
+	const entries = await readdir(sshDir, { withFileTypes: true });
+	return entries
+		.filter((entry) => entry.isFile() && entry.name.endsWith('.key'))
+		.map((entry) => basename(entry.name, '.key'))
+		.filter((name) => SSH_KEY_NAME_REGEX.test(name))
+		.map((name) => {
 			const result: { name: string; host?: string; hostname?: string } = { name };
 
 			if (configContents) {
