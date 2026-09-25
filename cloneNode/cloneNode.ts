@@ -1366,7 +1366,9 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 	});
 
 	if (statusCode < 200 || statusCode >= 300) {
-		throw new Error(`Leader request failed: ${statusCode} ${statusMessage}`);
+		// the leader's reason (e.g. "Key not found") travels only in the plain-text body; callers classify on it
+		const reason = responseBody.toString('utf8').trim().slice(0, 500);
+		throw new Error(`Leader request failed: ${statusCode} ${statusMessage}${reason ? `: ${reason}` : ''}`);
 	}
 
 	if (contentType.includes('application/cbor')) {
