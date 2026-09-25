@@ -79,6 +79,16 @@ describe('sendOperationToNode', function () {
 		expect(error.message).to.match(/closed \(1006\) before deploy_component was answered/);
 	});
 
+	it('keeps an answer read in the same turn as the connection closing', async () => {
+		let deliver;
+		session.sendOperation.returns(new Promise((resolve) => (deliver = resolve)));
+		const answer = sendOperationToNode(PEER, { operation: 'deploy_component', project: 'app' });
+		await open(socket);
+		deliver({ message: 'Successfully deployed: app' });
+		socket.emit('close', 1000, Buffer.alloc(0));
+		expect(await answer).to.deep.equal({ message: 'Successfully deployed: app' });
+	});
+
 	it('rejects when the connection closes before it opens', async () => {
 		const answer = sendOperationToNode(PEER, { operation: 'deploy_component', project: 'app' });
 		while (!socket.listenerCount('close')) await new Promise((resolve) => setImmediate(resolve));

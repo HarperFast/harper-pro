@@ -678,11 +678,12 @@ export async function sendOperationToNode(node, operation, options?) {
 		});
 		socket.on('close', (code, reason) => {
 			logger.info('Sending operation connection to ' + nodeUrl + ' closed', code);
-			reject(
-				new Error(
-					`The connection to ${nodeUrl} closed (${code}${reason?.length ? ` ${reason}` : ''}) before ${forwarded.operation} was answered; its outcome there is unknown`
-				)
+			const closedFirst = new Error(
+				`The connection to ${nodeUrl} closed (${code}${reason?.length ? ` ${reason}` : ''}) before ${forwarded.operation} was answered; its outcome there is unknown`
 			);
+			// After this turn's microtasks: an answer read in the same turn as the close has queued its
+			// settlement already, and must win.
+			setImmediate(() => reject(closedFirst));
 		});
 	}).finally(() => {
 		clearTimeout(timer);
