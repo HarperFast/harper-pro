@@ -3846,13 +3846,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				type: 'end_txn',
 				localTime: seqId,
 				remoteNodeIds: receivingDataFromNodeIds,
+				txnStream,
 				async onCommit() {
 					await flushCopyRowsDurable();
 				},
 			};
 		}
-		return { type: 'end_txn', localTime: seqId, remoteNodeIds: receivingDataFromNodeIds };
+		return { type: 'end_txn', localTime: seqId, remoteNodeIds: receivingDataFromNodeIds, txnStream };
 	}
+	// Identifies this connection's transactions to core's apply loop, which every connection on this thread
+	// feeds through one subscription per database.
+	const txnStream = {};
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	// Re-learned from every NODE_NAME and never carried across sockets: the peer may have been upgraded or
@@ -4648,6 +4652,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// A replication header should begin with either a transaction timestamp or messagepack message of
 		// of an array that begins with the command code
 		lastMessageTime = performance.now();
+		let frameOpen = false;
 		try {
 			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
 			if (body[0] > 127) {
@@ -6501,6 +6506,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 			decoder.position = 8;
 			let beginTxn = true;
+			let txnNodeId: number;
 			let event;
 			let sequenceIdReceived;
 			let maxBatchTxnLogKey; // this batch's origin log key; end_txn resume cursor when no sequence-update set lastSequenceIdReceived
@@ -6703,6 +6709,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// record's blob callback is installed re-enters the callback on the stored record's own blob
 				// references (unbounded recursion).
 				const localSourceNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
+				if (localSourceNodeId === undefined) throw new Error(`No node name mapped for origin id ${auditRecord.nodeId}`);
 				if (auditRecord.type === 'lockBarrier') {
 					// Captured now, reported from this frame's onCommit: a barrier is proof only once committed.
 					let barrier;
@@ -6765,7 +6772,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								version: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
 								user: auditRecord.user,
-								beginTxn,
+								// A frame holds every entry at one log key across the sender's logs, which can be several
+								// origins' transactions; RocksDB binds a transaction to one origin's log.
+								beginTxn: beginTxn || (STORAGE_IS_ROCKSDB && localSourceNodeId !== txnNodeId),
+								txnStream,
 								expiresAt: auditRecord.expiresAt,
 							};
 						},
@@ -6884,6 +6894,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						continue;
 					}
 					beginTxn = false;
+					txnNodeId = localSourceNodeId;
 					// TODO: Once it is committed, also record the localtime in the table with symbol metadata, so we can resume from that point
 					logger.debug?.(
 						connectionId,
@@ -6910,6 +6921,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (event.isCopyApply && event.table) copiedTablesThisPass.add(event.table);
 					if (messageIsCopyFrame && event.table) lastCopyFrameKey = { table: event.table, id: event.id };
 					tableSubscriptionToReplicator.send(event);
+					frameOpen = true;
 					// Per-record backpressure: a single large WS message can synchronously decode
 					// thousands of records, each holding a decoded value object and a closure over
 					// the source buffer. Without yielding here the consumer can never drain the
@@ -6930,6 +6942,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						await new Promise(setImmediate);
 						lastYieldTime = performance.now();
 					}
+					if (wsClosed) return;
 				}
 				decoder.position = start + eventLength;
 			} while (decoder.position < body.byteLength);
@@ -6967,6 +6980,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						? lastSequenceIdReceived
 						: Math.max(lastSequenceIdReceived ?? 0, maxBatchTxnLogKey), // resume cursor from the batch even without a sequence-update
 				remoteNodeIds: receivingDataFromNodeIds,
+				txnStream,
 				async onCommit() {
 					// Test-only: hold this copy commit (and so the commit-backlog pause) open — see the hook.
 					const testCommitDelay = isCopyFrame && maybeDelayCopyCommitForTest(databaseName);
@@ -7074,6 +7088,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				},
 			};
 			tableSubscriptionToReplicator.send(endTxnEvent);
+			frameOpen = false;
 		} catch (error) {
 			closeOnInboundMessageError(error, {
 				connectionId,
@@ -7081,6 +7096,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				markInboundClosed: () => (wsClosed = true),
 				close,
 			});
+		} finally {
+			if (frameOpen) tableSubscriptionToReplicator.send({ type: 'abort_txn', txnStream });
 		}
 	}
 	ws.on('ping', resetPingTimer);
