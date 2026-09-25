@@ -389,6 +389,12 @@ server.registerOperation?.({
 	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],
 });
 server.registerOperation?.({
+	name: 'update_node',
+	execute: setNode,
+	httpMethod: 'PUT',
+	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],
+});
+server.registerOperation?.({
 	name: 'add_node_back',
 	execute: addNodeBack,
 	httpMethod: 'PUT',
