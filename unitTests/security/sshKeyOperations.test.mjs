@@ -342,6 +342,18 @@ describe('sshKeyOperations sealing', () => {
 			assert.equal(readFileSync(configPath(), 'utf8'), blockFor('second'));
 		});
 
+		it('delete_ssh_key stops at the next Host section when a block has no closing `IdentitiesOnly yes`', async () => {
+			const unmanaged = 'Host other\n\tHostName example.net';
+			await addKey('first');
+			writeFileSync(
+				configPath(),
+				`${readFileSync(configPath(), 'utf8').replace('\tIdentitiesOnly yes', '\tIdentitiesOnly no')}\n${unmanaged}`
+			);
+
+			await ops.deleteSSHKey({ name: 'first' });
+			assert.equal(readFileSync(configPath(), 'utf8'), unmanaged);
+		});
+
 		it('delete_ssh_key takes a middle block with its line break, leaving no blank line', async () => {
 			for (const name of ['first', 'middle', 'last']) await addKey(name);
 

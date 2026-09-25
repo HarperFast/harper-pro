@@ -425,29 +425,41 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 const SSH_CONFIG_KEY_COMMENT = /^[ \t]*#([a-zA-Z0-9-_]+)[ \t]*$/;
 const SSH_CONFIG_IDENTITIES_ONLY_YES =
 	/^[ \t]*IdentitiesOnly(?:[ \t]*=[ \t]*|[ \t]+)(?:yes|"yes"|'yes')(?:[ \t]+#.*|[ \t]*)$/i;
+const SSH_CONFIG_SECTION_START = /^[ \t]*(?:Host|Match)(?:[ \t]*=|[ \t]+)/i;
 
 /**
  * Where each SSH config block `addSSHKey` wrote for `name` sits in `config`, as `[start, end)`
  * offsets that include the block's final line break. A block opens at a comment line that is exactly
  * `#name` (blanks aside — matched as a prefix, `#repo` would claim `#repo-2`'s block) and closes after
  * its `IdentitiesOnly yes` line, in any case, with blanks or `=` before a value that may be quoted, and
- * an optional trailing comment. If that line is missing or written some other way, the block ends at
- * the next key's comment line, or the end of the file, so it never takes in a sibling key's block.
+ * an optional trailing comment. If that line is missing or written some other way, the block ends
+ * where the next section starts — the next key's comment line, the next `Host` or `Match` line after
+ * its own, or the end of the file — so it never takes in a sibling key's block or an unmanaged section.
  */
 function findSSHConfigBlocks(config: string, name: string): [number, number][] {
 	const blocks: [number, number][] = [];
 	let openedAt: number | undefined;
+	let sawOwnSection = false;
 	for (let lineStart = 0; lineStart < config.length;) {
 		const newline = config.indexOf('\n', lineStart);
 		const lineEnd = newline === -1 ? config.length : newline + 1;
 		const line = config.slice(lineStart, newline === -1 ? config.length : newline).replace(/\r$/, '');
 		const commentName = SSH_CONFIG_KEY_COMMENT.exec(line)?.[1];
-		if (commentName !== undefined) {
-			if (openedAt !== undefined) blocks.push([openedAt, lineStart]);
-			openedAt = commentName === name ? lineStart : undefined;
-		} else if (openedAt !== undefined && SSH_CONFIG_IDENTITIES_ONLY_YES.test(line)) {
-			blocks.push([openedAt, lineEnd]);
+		const startsSection = SSH_CONFIG_SECTION_START.test(line);
+		if (openedAt !== undefined && (commentName !== undefined || (startsSection && sawOwnSection))) {
+			blocks.push([openedAt, lineStart]);
 			openedAt = undefined;
+		}
+		if (commentName === name) {
+			openedAt = lineStart;
+			sawOwnSection = false;
+		} else if (openedAt !== undefined) {
+			if (startsSection) {
+				sawOwnSection = true;
+			} else if (SSH_CONFIG_IDENTITIES_ONLY_YES.test(line)) {
+				blocks.push([openedAt, lineEnd]);
+				openedAt = undefined;
+			}
 		}
 		lineStart = lineEnd;
 	}
