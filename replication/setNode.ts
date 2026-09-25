@@ -378,10 +378,9 @@ function reverseSubscription(subscription) {
 }
 
 /**
- * Direct primary-key lookup first (the common case: `hostname` is the row's own key), falling back
- * to a table scan matching on `url` because `setNode()` stores a row under the PEER-reported name
- * (:265), which can differ from the hostname/address a caller used to reach it. The table is small
- * and this only runs on a metadata-only update_node, an admin-only path.
+ * Direct primary-key lookup first (the common case), falling back to a table scan matching on `url`
+ * because `setNode()` stores a row under the PEER-reported name, which can differ from the hostname
+ * a caller used to reach it. The table is small and this only runs on update_node, an admin-only path.
  */
 async function findExistingNodeRecord(hostname: string, url: string) {
 	const hdbNodes = getHDBNodeTable();
@@ -393,41 +392,57 @@ async function findExistingNodeRecord(hostname: string, url: string) {
 	return undefined;
 }
 
-// Fields setNode() applies that the local metadata patch below does not: any of these must go
-// through the full add-style flow so the request has an actual effect instead of a silent no-op.
-const FIELDS_REQUIRING_FULL_SETNODE = [
-	'subscriptions',
-	'sendsTo',
-	'receivesFrom',
-	'url',
-	'isLeader',
-	'retain_authorization',
-	'start_time',
-];
+// Fields setNode() applies that the local metadata patch below does not -- a request naming one of
+// these needs setNode()'s peer round-trip (a URL/address move, a leader promotion's full-copy
+// request, a CSR re-sign, stored reconnect credentials) and so falls through to it below.
+const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization', 'start_time', 'force_signing'];
 
 /**
  * revoked_certificates and shard are both read from THIS node's own hdb_nodes row, so a request
- * limited to those (plus hostname) needs neither setNode()'s peer round-trip nor its CSR/CA
- * handshake -- it patches the existing row locally instead, leaving every other field (topology,
- * url, isLeader, auth, start_time) untouched. A brand-new node, or a request carrying any of
- * FIELDS_REQUIRING_FULL_SETNODE, falls through to setNode()'s normal flow.
+ * limited to those (plus hostname) patches the existing row locally, with no peer contact.
+ * A request naming a FIELDS_REQUIRING_FULL_SETNODE field still needs setNode()'s full flow, but that
+ * flow treats an omitted subscriptions/sendsTo/receivesFrom/subscribe/publish as "reset to full
+ * mesh" -- carried forward explicitly here so an unrelated field on an existing selective node
+ * doesn't silently widen it. A brand-new node, or a request that already specifies topology itself,
+ * proceeds unmodified.
  */
 async function updateNode(req: any) {
 	const hostname = req.hostname || req.node_name || req.name;
 	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
-	const eligibleForLocalPatch = hostname && !FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined);
-	if (eligibleForLocalPatch) {
-		const validation = validateBySchema(req, validationSchema);
-		if (validation) {
-			throw handleHDBError(validation, validation.message, HTTP_STATUS_CODES.BAD_REQUEST, undefined, undefined, true);
-		}
+	const requestHasTopology = Boolean(
+		req.subscriptions || req.sendsTo || req.receivesFrom || req.subscribe !== undefined || req.publish !== undefined
+	);
+
+	if (hostname && !requestHasTopology) {
 		const found = await findExistingNodeRecord(hostname, url);
 		if (found) {
-			const patch: any = { url: found.record.url };
-			if (req.revoked_certificates) patch.revoked_certificates = req.revoked_certificates;
-			if (req.shard !== undefined) patch.shard = req.shard;
-			await ensureNode(found.name, patch);
-			return `Successfully updated '${patch.url}'`;
+			if (!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined)) {
+				const validation = validateBySchema(req, validationSchema);
+				if (validation) {
+					throw handleHDBError(
+						validation,
+						validation.message,
+						HTTP_STATUS_CODES.BAD_REQUEST,
+						undefined,
+						undefined,
+						true
+					);
+				}
+				const patch: any = {};
+				if (req.revoked_certificates) patch.revoked_certificates = req.revoked_certificates;
+				if (req.shard !== undefined) patch.shard = req.shard;
+				await ensureNode(found.name, patch);
+				return `Successfully updated '${found.record.url}'`;
+			}
+			if (Array.isArray(found.record.subscriptions)) req.subscriptions = found.record.subscriptions;
+			else if (found.record.replicates && typeof found.record.replicates === 'object') {
+				req.sendsTo = found.record.replicates.sendsTo;
+				req.receivesFrom = found.record.replicates.receivesFrom;
+			} else if (found.record.replicates !== true) {
+				throw new ClientError(
+					`update_node cannot apply this change to '${hostname}' without also carrying its existing replication topology forward, and that topology cannot be re-expressed automatically; use set_node to change topology and metadata together`
+				);
+			}
 		}
 	}
 	return setNode(req);
