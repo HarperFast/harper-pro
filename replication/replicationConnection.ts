@@ -446,11 +446,7 @@ const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWater
 // receiver moves past it, so a failure that recurs on every delivery cannot stall a peer's replication forever.
 const FAILED_FRAME_REPLAYS = env.get('replication_failedFrameReplays') ?? 5;
 const failedFrameAttempts = new Map<string, { position: number; attempts: number }>();
-/**
- * Whether a frame whose transaction failed at `position` should be replayed (true) or moved past (false).
- * Attempts at one position are counted per peer and database across reconnects; once they exceed
- * `maxReplays`, further failures there are moved past until a later position commits.
- */
+/** Attempts are counted per peer and database across reconnects; a later position's commit clears them. */
 export function holdFailedFrame(
 	attemptsByPeer: Map<string, { position: number; attempts: number }>,
 	peerKey: string,
@@ -1579,11 +1575,9 @@ export function maybeFailApplyForTest(event: any): void {
 	const remaining = FAIL_APPLY_FOR_TEST?.get(event.id);
 	if (!(remaining > 0)) return;
 	FAIL_APPLY_FOR_TEST.set(event.id, remaining - 1);
-	event.finished = {
-		then(_resolve: unknown, reject: (error: Error) => void) {
-			reject(new Error(`Apply failure for ${event.id} (test-injected, harper#1162)`));
-		},
-	};
+	const failure = Promise.reject(new Error(`Apply failure for ${event.id} (test-injected, harper#1162)`));
+	failure.catch(() => {});
+	event.finished = failure;
 }
 
 // Test-only override for a source that resolved to NO resume cursor. Unarmed (production) it returns
@@ -2610,6 +2604,7 @@ export const DECODE_MISSING_STRUCTURE_METRIC = 'decode-missing-structure';
 // `decode-hold`: record retained, connection closed to resync, cursor NOT advanced (unknown table id).
 export const DECODE_DROP_METRIC = 'decode-drop';
 export const DECODE_HOLD_METRIC = 'decode-hold';
+export const FAILED_FRAME_SKIP_METRIC = 'failed-frame-skip';
 
 /**
  * Classify a decode error thrown while applying a received copy/audit record, choosing how loudly to
@@ -3916,6 +3911,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				position,
 				error
 			);
+			recordAction(true, FAILED_FRAME_SKIP_METRIC, `${remoteNodeName}.${databaseName}`);
 			return false;
 		}
 	}
@@ -7046,7 +7042,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						: Math.max(lastSequenceIdReceived ?? 0, maxBatchTxnLogKey), // resume cursor from the batch even without a sequence-update
 				remoteNodeIds: receivingDataFromNodeIds,
 				txnStream,
-				onFailure: onFrameFailure,
+				// core skips this frame's onCommit when it fails, so release what onCommit would have
+				onFailure(error: unknown, position: number) {
+					outstandingCommits--;
+					if (commitBacklogPaused) {
+						commitBacklogPaused = false;
+						removePauseReason();
+					}
+					return onFrameFailure(error, position);
+				},
 				async onCommit() {
 					// Test-only: hold this copy commit (and so the commit-backlog pause) open — see the hook.
 					const testCommitDelay = isCopyFrame && maybeDelayCopyCommitForTest(databaseName);
@@ -7077,8 +7081,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// visibility; this is monotonic across batches. The durable watermark below only ever
 					// catches up TO this value, never past it.
 					committedSequence = Math.max(committedSequence, endTxnEvent.localTime ?? 0);
-					const peerKey = `${remoteNodeName}/${databaseName}`;
-					if (endTxnEvent.localTime >= failedFrameAttempts.get(peerKey)?.position) failedFrameAttempts.delete(peerKey);
+					if (failedFrameAttempts.size > 0) {
+						const peerKey = `${remoteNodeName}/${databaseName}`;
+						if (endTxnEvent.localTime >= failedFrameAttempts.get(peerKey)?.position)
+							failedFrameAttempts.delete(peerKey);
+					}
 					// Advance the durable watermark WITHOUT awaiting blobs — for copy AND non-copy frames alike.
 					// COPY MODE used to keep a synchronous `await Promise.all(outstandingBlobsToFinish)` here on
 					// the assumption only the non-copy catch-up path could deadlock. That was wrong (#426): the
