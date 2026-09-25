@@ -10,6 +10,7 @@ const TIMEOUT_MS = 30000;
 
 function startOptions(node) {
 	return {
+		env: node.env,
 		config: {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: true, console: true },
@@ -21,17 +22,21 @@ function startOptions(node) {
 
 /**
  * Starts nodes that load the fixture-origin-log component and have `table` in the data database. `replication`
- * adds replication config per node name.
+ * adds replication config, and `env` environment variables, per node name.
  */
-export async function startOriginLogNodes(suiteName, names, table, replication = {}) {
+export async function startOriginLogNodes(suiteName, names, table, replication = {}, env = {}) {
 	const nodes = await Promise.all(
 		names.map(async (name) => {
 			const nodeCtx = {
 				name: suiteName + '-' + name,
-				harper: { hostname: await getNextAvailableLoopbackAddress(), replication: replication[name] },
+				harper: {
+					hostname: await getNextAvailableLoopbackAddress(),
+					replication: replication[name],
+					env: env[name],
+				},
 			};
 			await startHarper(nodeCtx, startOptions(nodeCtx.harper));
-			return nodeCtx.harper;
+			return Object.assign(nodeCtx.harper, { replication: replication[name], env: env[name] });
 		})
 	);
 	await Promise.all(
@@ -60,6 +65,7 @@ export async function restartNode(node) {
 export async function startNode(node) {
 	const started = (await startHarper({ harper: node }, startOptions(node))).harper;
 	started.replication = node.replication;
+	started.env = node.env;
 	return started;
 }
 

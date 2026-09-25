@@ -45,3 +45,13 @@ export class RecordLogs extends Resource {
 		return logs;
 	}
 }
+
+export class ReplicationCursor extends Resource {
+	static loadAsInstance = false;
+	post(target, data) {
+		const Table = databases.data[data.table];
+		const nodeLogs = Table.auditStore.loadLogs();
+		const nodeId = nodeLogs.indexOf(Table.auditStore.logByName.get(data.node));
+		return { seqId: Table.dbisDB.getSync([Symbol.for('seq'), nodeId])?.seqId ?? null };
+	}
+}

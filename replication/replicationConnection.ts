@@ -442,6 +442,26 @@ const oversizedSendWarnThrottle = createThrottleState();
 // heap past its limit. If the local replicator queue grows beyond this threshold we pause
 // the WS connection and wait for it to drain before continuing the decode loop.
 const RECEIVE_EVENT_HIGH_WATER_MARK = env.get('replication_receiveEventHighWaterMark') ?? 100;
+// Times a frame whose transaction failed is replayed (by reconnecting from the durable cursor) before the
+// receiver moves past it, so a failure that recurs on every delivery cannot stall a peer's replication forever.
+const FAILED_FRAME_REPLAYS = env.get('replication_failedFrameReplays') ?? 5;
+const failedFrameAttempts = new Map<string, { position: number; attempts: number }>();
+/**
+ * Whether a frame whose transaction failed at `position` should be replayed (true) or moved past (false).
+ * Attempts at one position are counted per peer and database across reconnects; once they exceed
+ * `maxReplays`, further failures there are moved past until a later position commits.
+ */
+export function holdFailedFrame(
+	attemptsByPeer: Map<string, { position: number; attempts: number }>,
+	peerKey: string,
+	position: number,
+	maxReplays: number
+): boolean {
+	const prior = attemptsByPeer.get(peerKey);
+	const attempts = prior?.position === position ? prior.attempts + 1 : 1;
+	attemptsByPeer.set(peerKey, { position, attempts });
+	return attempts <= maxReplays;
+}
 // Even when the consumer keeps up (queue below the high-water mark), a single large inbound message
 // would otherwise decode thousands of records in one synchronous turn — pegging the worker, blocking
 // replication ping responses, and tripping core's "JavaScript execution has taken too long" monitor
@@ -1542,6 +1562,28 @@ export function maybeInjectDecodeFailureForTest(recordId: unknown): void {
 	) {
 		throw new Error('Unexpected end of MessagePack data (test-injected, harper-pro#537)');
 	}
+}
+
+// Test-only fault injection for the failed-frame hold/escalate test (harper#1162). HARPER_TEST_FAIL_APPLY on the
+// RECEIVER is a list of `<recordId>:<deliveries>`; the first <deliveries> applies of each named record fail as a
+// non-retryable apply error. Read once at module load, like the hook above.
+const FAIL_APPLY_FOR_TEST = process.env.HARPER_TEST_FAIL_APPLY
+	? new Map(
+			process.env.HARPER_TEST_FAIL_APPLY.split(',').map((entry) => {
+				const [recordId, deliveries] = entry.split(':');
+				return [recordId, Number(deliveries)];
+			})
+		)
+	: undefined;
+export function maybeFailApplyForTest(event: any): void {
+	const remaining = FAIL_APPLY_FOR_TEST?.get(event.id);
+	if (!(remaining > 0)) return;
+	FAIL_APPLY_FOR_TEST.set(event.id, remaining - 1);
+	event.finished = {
+		then(_resolve: unknown, reject: (error: Error) => void) {
+			reject(new Error(`Apply failure for ${event.id} (test-injected, harper#1162)`));
+		},
+	};
 }
 
 // Test-only override for a source that resolved to NO resume cursor. Unarmed (production) it returns
@@ -3847,12 +3889,35 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				localTime: seqId,
 				remoteNodeIds: receivingDataFromNodeIds,
 				txnStream,
+				onFailure: onFrameFailure,
 				async onCommit() {
 					await flushCopyRowsDurable();
 				},
 			};
 		}
-		return { type: 'end_txn', localTime: seqId, remoteNodeIds: receivingDataFromNodeIds, txnStream };
+		return {
+			type: 'end_txn',
+			localTime: seqId,
+			remoteNodeIds: receivingDataFromNodeIds,
+			txnStream,
+			onFailure: onFrameFailure,
+		};
+	}
+	// Returns true to hold: core then records no cursor for this connection's later frames either.
+	function onFrameFailure(error: unknown, position: number): boolean {
+		if (holdFailedFrame(failedFrameAttempts, `${remoteNodeName}/${databaseName}`, position, FAILED_FRAME_REPLAYS)) {
+			logger.warn?.(connectionId, 'Replicated transaction failed; reconnecting to replay it', position, error);
+			close(1011, 'Replicated transaction failed');
+			return true;
+		} else {
+			logger.error?.(
+				connectionId,
+				`Replicated transaction failed on ${FAILED_FRAME_REPLAYS + 1} deliveries; moving past it`,
+				position,
+				error
+			);
+			return false;
+		}
 	}
 	// Identifies this connection's transactions to core's apply loop, which every connection on this thread
 	// feeds through one subscription per database.
@@ -6920,6 +6985,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// and already delivers per-row events, so it needs no marker and is intentionally excluded.
 					if (event.isCopyApply && event.table) copiedTablesThisPass.add(event.table);
 					if (messageIsCopyFrame && event.table) lastCopyFrameKey = { table: event.table, id: event.id };
+					maybeFailApplyForTest(event);
 					tableSubscriptionToReplicator.send(event);
 					frameOpen = true;
 					// Per-record backpressure: a single large WS message can synchronously decode
@@ -6981,6 +7047,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						: Math.max(lastSequenceIdReceived ?? 0, maxBatchTxnLogKey), // resume cursor from the batch even without a sequence-update
 				remoteNodeIds: receivingDataFromNodeIds,
 				txnStream,
+				onFailure: onFrameFailure,
 				async onCommit() {
 					// Test-only: hold this copy commit (and so the commit-backlog pause) open — see the hook.
 					const testCommitDelay = isCopyFrame && maybeDelayCopyCommitForTest(databaseName);
@@ -7011,6 +7078,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// visibility; this is monotonic across batches. The durable watermark below only ever
 					// catches up TO this value, never past it.
 					committedSequence = Math.max(committedSequence, endTxnEvent.localTime ?? 0);
+					const peerKey = `${remoteNodeName}/${databaseName}`;
+					if (endTxnEvent.localTime >= failedFrameAttempts.get(peerKey)?.position) failedFrameAttempts.delete(peerKey);
 					// Advance the durable watermark WITHOUT awaiting blobs — for copy AND non-copy frames alike.
 					// COPY MODE used to keep a synchronous `await Promise.all(outstandingBlobsToFinish)` here on
 					// the assumption only the non-copy catch-up path could deadlock. That was wrong (#426): the
