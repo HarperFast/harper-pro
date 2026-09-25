@@ -15,12 +15,7 @@
  * Plus `generate: true` (harper-pro#594), where the node mints the keypair itself: the minted private
  * half must take that same seal-then-replicate path, and `generate` must not survive into the
  * replicated op. The encoding of the minted key is covered in `sshKeyGeneration.test.mjs`.
- *
- * And the validation both take for a supplied plaintext key: a key ssh couldn't load, or a host
- * value that would break the node's ssh config, is refused before anything is written or
- * replicated, and a pasted key is stored in the form ssh reads. The rules themselves are covered in
- * `sshKeyValidation.test.mjs`; here, that the operations apply them — including on the clone path.
- *
+ * *
  * The at-use half — decrypting to a transient 0600 file for the git invocation — lives in core
  * (`materializeGitSSH`) and is covered by core's Application tests; one test here drives a stored key
  * through it to ssh itself.
