@@ -3919,9 +3919,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return false;
 		}
 	}
-	// Identifies this connection's transactions to core's apply loop, which every connection on this thread
-	// feeds through one subscription per database.
 	const txnStream = {};
+	// true while a frame's records are queued without its end_txn; an end_txn queued meanwhile would close it
+	let frameOpen = false;
+	let drainEndTxnDeferred = false;
 	let sendPingInterval, lastPingTime, skippedMessageSequenceUpdateTimer;
 	let receiveWatchdog: { reset: () => void; stop: () => void } | undefined;
 	// Re-learned from every NODE_NAME and never carried across sockets: the peer may have been upgraded or
@@ -4717,7 +4718,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// A replication header should begin with either a transaction timestamp or messagepack message of
 		// of an array that begins with the command code
 		lastMessageTime = performance.now();
-		let frameOpen = false;
 		try {
 			const decoder = ((body as any).dataView = new Decoder(body.buffer, body.byteOffset, body.byteLength));
 			if (body[0] > 127) {
@@ -6837,8 +6837,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								version: auditRecord.version,
 								value: auditRecord.getValue(tableDecoder),
 								user: auditRecord.user,
-								// A frame holds every entry at one log key across the sender's logs, which can be several
-								// origins' transactions; RocksDB binds a transaction to one origin's log.
+								// a frame can hold several origins' transactions (replication/DESIGN.md)
 								beginTxn: beginTxn || (STORAGE_IS_ROCKSDB && localSourceNodeId !== txnNodeId),
 								txnStream,
 								expiresAt: auditRecord.expiresAt,
@@ -7158,6 +7157,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			};
 			tableSubscriptionToReplicator.send(endTxnEvent);
 			frameOpen = false;
+			if (drainEndTxnDeferred) {
+				drainEndTxnDeferred = false;
+				tableSubscriptionToReplicator.send(
+					seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+				);
+			}
 		} catch (error) {
 			closeOnInboundMessageError(error, {
 				connectionId,
@@ -7166,7 +7171,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				close,
 			});
 		} finally {
-			if (frameOpen) tableSubscriptionToReplicator.send({ type: 'abort_txn', txnStream });
+			if (frameOpen) {
+				frameOpen = false;
+				tableSubscriptionToReplicator.send({ type: 'abort_txn', txnStream });
+			}
 		}
 	}
 	ws.on('ping', resetPingTimer);
@@ -7943,9 +7951,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// Safe: at drain with no gap, every received record (incl. blobs) through lastSequenceIdReceived
 						// is durable, and core applies this end_txn after the records already enqueued ahead of it, so
 						// the cursor never advances past an uncommitted/undurable point. max() keeps it monotonic.
-						tableSubscriptionToReplicator.send(
-							seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
-						);
+						if (frameOpen) drainEndTxnDeferred = true;
+						else
+							tableSubscriptionToReplicator.send(
+								seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+							);
 					}
 					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
 					// durable: persist it (and finish the copy if COPY_COMPLETE already arrived). No-op outside

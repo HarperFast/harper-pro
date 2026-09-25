@@ -57,7 +57,7 @@ export async function startOriginLogNodes(suiteName, names, table, replication =
 	return Promise.all(nodes.map(restartNode));
 }
 
-export async function restartNode(node) {
+async function restartNode(node) {
 	await killHarper({ harper: node });
 	return startNode(node);
 }
@@ -74,6 +74,7 @@ export async function postToFixture(node, resource, body) {
 	for (;;) {
 		try {
 			const response = await fetch(`${node.httpURL}/${resource}`, {
+				signal: AbortSignal.timeout(10000),
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json',
