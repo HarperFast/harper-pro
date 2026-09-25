@@ -1,10 +1,7 @@
 /**
- * The origin of a replicated operation must settle every peer's result — with the answer, an error, the
- * connection closing, or a deadline — and report at warn when it is not an answer. A peer that never
- * answered a replicated deploy_component used to hold the origin's operation, its deployment row and its
- * own post-deploy restart until something restarted the peer, with nothing logged at the default level.
- *
- * The socket and the replication session are fakes, so each case drives exactly the event under test.
+ * The origin of a replicated operation settles every peer's result — with the answer, an error, the
+ * connection closing, or a deadline — and reports at warn when it is not an answer. The socket and the
+ * replication session are fakes, so each case drives exactly the event under test.
  */
 import { expect } from 'chai';
 import sinon from 'sinon';
@@ -105,6 +102,17 @@ describe('sendOperationToNode', function () {
 		const error = await rejection(answer);
 		expect(error.message).to.match(/deploy_component to wss:\/\/peer-a\.example\.com:9933 did not answer within 20ms/);
 		expect(socket.closeCalls).to.equal(1);
+	});
+
+	// Node fires a timer at once when its delay exceeds 2^31-1ms.
+	it('holds a deadline beyond the timer range instead of firing it at once', async () => {
+		let deliver;
+		session.sendOperation.returns(new Promise((resolve) => (deliver = resolve)));
+		const answer = sendOperationToNode(PEER, { operation: 'deploy_component', project: 'app' }, { timeoutMs: 2 ** 40 });
+		await open(socket);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		deliver({ message: 'Successfully deployed: app' });
+		expect(await answer).to.deep.equal({ message: 'Successfully deployed: app' });
 	});
 
 	it("never forwards the sender's hdb_user, and leaves the caller's operation untouched", async () => {

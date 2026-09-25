@@ -1,8 +1,7 @@
 /**
- * A replicated deploy_component, end to end: sent from one node's operations API, built and test-loaded on a
- * peer's worker, and answered back. The fixture has the shape of the component a hung replicated deploy was
- * reported against. Nodes log at debug, where both ends of the replicated operation print it, so the log
- * check below covers the sender's user record, with its refresh token, being forwarded or logged.
+ * A replicated deploy_component end to end: sent from one node's operations API, built and test-loaded on a
+ * peer's worker, and answered back. Nodes log at debug, where both ends print the replicated operation, so the
+ * log check covers the sender's user record, with its refresh token, being forwarded or logged.
  */
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
