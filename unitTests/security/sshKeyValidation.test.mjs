@@ -505,14 +505,19 @@ describe('SSH private key validation', () => {
 			}
 		});
 
-		it('a certificate key only by its container, which is all that is parsed of one', () => {
+		it('a certificate in place of a key, of any certificate type', () => {
 			const certificate = { publicFields: sshString('opaque'), privateFields: sshString('opaque') };
-			const keyType = 'ssh-ed25519-cert-v01@openssh.com';
-			assert.equal(describeSSHPrivateKeyProblem(openSSHPrivateKey({ keyType, fields: certificate })), undefined);
-			assert.equal(
-				describeSSHPrivateKeyProblem(openSSHPrivateKey({ keyType, fields: certificate, checkInts: [1, 2] })),
-				DAMAGED
-			);
+			for (const keyType of [
+				'ssh-ed25519-cert-v01@openssh.com',
+				'ssh-rsa-cert-v01@openssh.com',
+				'made-up-cert-v01@openssh.com',
+			]) {
+				assert.match(
+					describeSSHPrivateKeyProblem(openSSHPrivateKey({ keyType, fields: certificate })),
+					/^The SSH key holds an SSH certificate/,
+					keyType
+				);
+			}
 		});
 	});
 

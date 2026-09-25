@@ -15,10 +15,9 @@
  * Plus `generate: true` (harper-pro#594), where the node mints the keypair itself: the minted private
  * half must take that same seal-then-replicate path, and `generate` must not survive into the
  * replicated op. The encoding of the minted key is covered in `sshKeyGeneration.test.mjs`.
- * *
+ *
  * The at-use half — decrypting to a transient 0600 file for the git invocation — lives in core
- * (`materializeGitSSH`) and is covered by core's Application tests; one test here drives a stored key
- * through it to ssh itself.
+ * (`materializeGitSSH`) and is covered by core's Application tests.
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';

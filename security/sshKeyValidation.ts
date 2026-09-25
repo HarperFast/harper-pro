@@ -54,6 +54,7 @@ const SECURITY_KEY =
 	'The SSH key only works with its hardware security key attached, and the server Harper runs git on ' +
 	`has none. Use a regular key${FOR_EXAMPLE_A_NEW_KEY}`;
 const DAMAGED = "The SSH key is damaged and can't be read. Copy it again from the original file.";
+const CERTIFICATE = `The SSH key holds an SSH certificate, which Harper doesn't take in place of a key. Use a plain private key${FOR_EXAMPLE_A_NEW_KEY}`;
 const PUBLIC_KEY_HINT = 'Use the private key — the file without the .pub extension.';
 
 const unsupported = (what: string, name: string | undefined) =>
@@ -425,15 +426,14 @@ function describeOpenSSHKeyProblem(bytes: Buffer): string | undefined {
 	if (keyType === undefined) return DAMAGED;
 	if (keyType.startsWith('ssh-dss')) return DSA_KEY;
 	if (keyType.startsWith('sk-')) return SECURITY_KEY;
-	// A certificate key gets only the container checks: ssh-keygen never writes one into a private-key
-	// file, and parsing the certificate isn't worth it for that.
+	// ssh-keygen never writes a certificate into a private-key file, and checking one would mean
+	// verifying its CA signature, so a certificate is refused rather than stored unchecked
+	if (keyType.endsWith(CERTIFICATE_SUFFIX)) return CERTIFICATE;
 	const format = OPENSSH_KEY_FORMATS.get(keyType);
-	if (!format && !keyType.endsWith(CERTIFICATE_SUFFIX)) {
-		return KEY_TYPE_NAME.test(keyType) ? unsupported('type', keyType) : DAMAGED;
-	}
-	const publicParts = format?.readPublic(publicFields);
+	if (!format) return KEY_TYPE_NAME.test(keyType) ? unsupported('type', keyType) : DAMAGED;
+	const publicParts = format.readPublic(publicFields);
 	if (typeof publicParts === 'string') return publicParts;
-	if (format && publicFields.remaining() !== 0) return DAMAGED;
+	if (publicFields.remaining() !== 0) return DAMAGED;
 
 	if (kdfName !== 'none') return PASSPHRASE_PROTECTED;
 	if (cipherName !== 'none') return DAMAGED;
@@ -446,7 +446,6 @@ function describeOpenSSHKeyProblem(bytes: Buffer): string | undefined {
 	const privateFields = new SSHFieldReader(privateSection);
 	const checkInt = privateFields.uint32();
 	if (checkInt === undefined || checkInt !== privateFields.uint32()) return DAMAGED;
-	if (!format) return undefined;
 
 	if (privateFields.cstring() !== keyType) return DAMAGED;
 	let privatePart: ReturnType<OpenSSHKeyFormat['readPrivate']>;
