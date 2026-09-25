@@ -148,6 +148,33 @@ export const hasSSH = (() => {
 	}
 })();
 
+/**
+ * Whether this host's `ssh-keygen` loads `key` and signs with it for its own public key — what
+ * authenticating with it takes. A key can load and still fail this.
+ */
+export function sshKeygenSigns(key) {
+	const dir = mkdtempSync(join(tmpdir(), 'ssh-key-oracle-'));
+	try {
+		const file = join(dir, 'id');
+		const data = join(dir, 'data');
+		writeFileSync(file, key, { mode: 0o600 });
+		writeFileSync(data, 'harper');
+		// `-Y sign` takes the public half from id.pub, which a PEM private key doesn't carry itself
+		const publicKey = execFileSync('ssh-keygen', ['-y', '-P', '', '-f', file], { stdio: ['ignore', 'pipe', 'ignore'] });
+		writeFileSync(`${file}.pub`, publicKey);
+		execFileSync('ssh-keygen', ['-Y', 'sign', '-f', file, '-n', 'harper', data], { stdio: 'ignore' });
+		execFileSync('ssh-keygen', ['-Y', 'check-novalidate', '-n', 'harper', '-s', `${data}.sig`], {
+			input: 'harper',
+			stdio: ['pipe', 'ignore', 'ignore'],
+		});
+		return true;
+	} catch {
+		return false;
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 /** Whether this host's `ssh-keygen` loads `key` from a file, the way ssh loads an IdentityFile. */
 export function sshKeygenLoads(key) {
 	const dir = mkdtempSync(join(tmpdir(), 'ssh-key-oracle-'));

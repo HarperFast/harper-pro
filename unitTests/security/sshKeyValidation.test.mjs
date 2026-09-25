@@ -1,18 +1,18 @@
 /**
- * `add_ssh_key` / `update_ssh_key` refuse a key ssh couldn't load, because nothing else reads a
- * stored key before ssh loads it for a git deploy — where it fails as a generic auth error. The
- * validator mirrors OpenSSH's own loader, so these tests pin both halves of that contract: every key
- * ssh loads is accepted (a false refusal would lock out a working deploy key), and each way a key
- * fails to load is refused with a message that names the mistake.
+ * `add_ssh_key` / `update_ssh_key` refuse a key ssh couldn't authenticate with, because nothing else
+ * reads a stored key before ssh loads it for a git deploy — where it fails as a generic auth error.
+ * These tests pin both halves of that contract: every key ssh loads and signs with is accepted (a
+ * false refusal would lock out a working deploy key), and each way a key fails is refused with a
+ * message that names the mistake.
  *
- * The oracle suites compare verdicts with the host's real `ssh-keygen -y` and `ssh -G`, wherever
- * they exist (CI's Linux images, macOS). Two verdicts are policy rather than loader behavior, and
- * are asserted as such: DSA is refused though OpenSSH before 10 still loads it, and Ed25519 in
- * PKCS#8 is accepted though only OpenSSL builds of OpenSSH load it.
+ * The oracle suites compare verdicts with the host's real `ssh-keygen` (`-y` to load, `-Y sign` to
+ * sign) and `ssh -G`, wherever they exist (CI's Linux images, macOS). Two verdicts are policy rather
+ * than ssh behavior, and are asserted as such: DSA is refused though OpenSSH before 10 still loads
+ * it, and Ed25519 in PKCS#8 is accepted though only OpenSSL builds of OpenSSH load it.
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { generateKeyPairSync } from 'node:crypto';
+import { createECDH, createPrivateKey, ECDH, generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,6 +28,7 @@ import {
 	padTo,
 	pemPrivateKey,
 	sshKeygenLoads,
+	sshKeygenSigns,
 	sshString,
 	uint32,
 } from './sshKeyFixtures.mjs';
@@ -94,6 +95,24 @@ describe('SSH private key validation', () => {
 				const spaced = key.replace(/\n([A-Za-z0-9+/]{10})/g, '\n$1 \t');
 				assert.equal(describeSSHPrivateKeyProblem(spaced), undefined);
 			}
+		});
+
+		it('an OpenSSH private section already block-aligned, with no padding at all', () => {
+			const fields = openSSHKeyFields('ssh-ed25519');
+			const section = [1, 2, 3, 4, 5, 6, 7, 8]
+				.map((length) =>
+					Buffer.concat([
+						uint32(9),
+						uint32(9),
+						sshString('ssh-ed25519'),
+						fields.privateFields,
+						sshString('c'.repeat(length)),
+					])
+				)
+				.find((candidate) => candidate.length % 8 === 0);
+			const key = openSSHPrivateKey({ fields, privateSection: section });
+			assert.equal(describeSSHPrivateKeyProblem(key), undefined);
+			if (hasSSHKeygen) assert.ok(sshKeygenLoads(key), 'ssh loads it too');
 		});
 
 		it('a form feed inside an OpenSSH body line, which only OpenSSH’s own decoder skips', () => {
@@ -286,6 +305,18 @@ describe('SSH private key validation', () => {
 	});
 
 	describe('refuses a damaged body', () => {
+		// P-256 fields for private scalar `d` (a fresh key's by default), its point passed through `encode`
+		const ecdsaFields = (encode, d) => {
+			const ecdh = createECDH('prime256v1');
+			if (d) ecdh.setPrivateKey(Buffer.concat([Buffer.alloc(32 - d.length), d]));
+			else ecdh.generateKeys();
+			const curve = sshString('nistp256');
+			const point = sshString(encode(ecdh.getPublicKey()));
+			return {
+				publicFields: Buffer.concat([curve, point]),
+				privateFields: Buffer.concat([curve, point, mpint(ecdh.getPrivateKey())]),
+			};
+		};
 		const withBody = (key, edit) => {
 			const lines = key.trimEnd().split('\n');
 			return [lines[0], ...edit(lines.slice(1, -1)), lines.at(-1)].join('\n') + '\n';
@@ -314,6 +345,18 @@ describe('SSH private key validation', () => {
 				);
 			}
 			assert.equal(describeSSHPrivateKeyProblem(armor(OPENSSH_LABEL, Buffer.alloc(0))), DAMAGED);
+		});
+
+		it("a body missing its final base64 padding, which both of ssh's decoders refuse", () => {
+			const pem = pemPrivateKey('ec', 'sec1', { namedCurve: 'P-256' });
+			// the 8-byte padding absorbs small changes, so walk the comment through a few blocks
+			const openSSH = Array.from({ length: 24 }, (_, length) =>
+				openSSHPrivateKey({ comment: 'c'.repeat(length + 1) })
+			).find((key) => /=\n-----END/.test(key));
+			for (const key of [pem, openSSH]) {
+				assert.match(key, /=\n-----END/);
+				assert.equal(describeSSHPrivateKeyProblem(key.replace(/=+\n(-----END)/, '\n$1')), DAMAGED);
+			}
 		});
 
 		it('a PEM body whose outer length is right but holds no key (an empty SEQUENCE)', () => {
@@ -412,6 +455,32 @@ describe('SSH private key validation', () => {
 					fields: ed25519,
 				}),
 				'a NUL inside its comment': openSSHKeyBytes({ comment: 'a\0b' }),
+				'an ECDSA point in compressed form': openSSHKeyBytes({
+					keyType: 'ecdsa-sha2-nistp256',
+					fields: ecdsaFields((point) => ECDH.convertKey(point, 'prime256v1', undefined, undefined, 'compressed')),
+				}),
+				// the same length as an uncompressed point, but a prefix OpenSSH doesn't read
+				'an ECDSA point in hybrid form': openSSHKeyBytes({
+					keyType: 'ecdsa-sha2-nistp256',
+					fields: ecdsaFields((point) => Buffer.concat([Buffer.from([6 + (point[64] & 1)]), point.subarray(1)])),
+				}),
+				"an ECDSA private scalar of half the order's bits or fewer": openSSHKeyBytes({
+					keyType: 'ecdsa-sha2-nistp256',
+					fields: ecdsaFields((point) => point, Buffer.from([1])),
+				}),
+				'an RSA prime of 1': openSSHKeyBytes({
+					keyType: 'ssh-rsa',
+					fields: openSSHKeyFields('ssh-rsa', { rsaPrivate: { p: Buffer.from([1]) } }),
+				}),
+				'an Ed25519 secret key whose second half is not the public key': openSSHKeyBytes({
+					fields: {
+						publicFields: ed25519.publicFields,
+						privateFields: Buffer.concat([
+							ed25519.publicFields,
+							sshString(Buffer.concat([ed25519.privateFields.subarray(40, 72), otherEd25519.publicFields.subarray(4)])),
+						]),
+					},
+				}),
 				'a key type field that is not a name': openSSHKeyBytes({
 					publicBlob: Buffer.concat([sshString('ssh-ed2\x015519'), ed25519.publicFields]),
 				}),
@@ -443,16 +512,135 @@ describe('SSH private key validation', () => {
 		});
 	});
 
+	describe('refuses a key that loads but cannot sign for its public key', () => {
+		// ssh presents the public key, so a private key that doesn't match it can never authenticate
+		const mismatched = () => {
+			const ed25519 = openSSHKeyFields('ssh-ed25519');
+			const otherEd25519 = openSSHKeyFields('ssh-ed25519');
+			const [rsa, otherRSA] = [openSSHKeyFields('ssh-rsa'), openSSHKeyFields('ssh-rsa')];
+			const [ecdsa, otherECDSA] = [openSSHKeyFields('ecdsa-sha2-nistp256'), openSSHKeyFields('ecdsa-sha2-nistp256')];
+			// an RSA private section opens with its copy of n and e
+			const rsaPublicCopy = (fields) => 8 + fields.readUInt32BE(0) + fields.readUInt32BE(4 + fields.readUInt32BE(0));
+			const [own, other] = [0, 1].map(() =>
+				generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey.export({ format: 'jwk' })
+			);
+			return {
+				"an OpenSSH Ed25519 key whose seed is another key's": openSSHPrivateKey({
+					fields: {
+						publicFields: ed25519.publicFields,
+						privateFields: Buffer.concat([
+							ed25519.publicFields,
+							sshString(Buffer.concat([otherEd25519.privateFields.subarray(40, 72), ed25519.publicFields.subarray(4)])),
+						]),
+					},
+				}),
+				"an OpenSSH RSA key whose private components are another key's": openSSHPrivateKey({
+					keyType: 'ssh-rsa',
+					fields: {
+						publicFields: rsa.publicFields,
+						privateFields: Buffer.concat([
+							rsa.privateFields.subarray(0, rsaPublicCopy(rsa.privateFields)),
+							otherRSA.privateFields.subarray(rsaPublicCopy(otherRSA.privateFields)),
+						]),
+					},
+				}),
+				"an OpenSSH ECDSA key whose private scalar is another key's": openSSHPrivateKey({
+					keyType: 'ecdsa-sha2-nistp256',
+					fields: {
+						publicFields: ecdsa.publicFields,
+						privateFields: Buffer.concat([
+							ecdsa.publicFields,
+							otherECDSA.privateFields.subarray(otherECDSA.publicFields.length),
+						]),
+					},
+				}),
+				"a SEC1 EC key whose embedded public key is another key's": createPrivateKey({
+					key: { ...other, d: own.d },
+					format: 'jwk',
+				}).export({ type: 'sec1', format: 'pem' }),
+			};
+		};
+
+		it('refuses each as damaged', () => {
+			for (const [what, key] of Object.entries(mismatched()))
+				assert.equal(describeSSHPrivateKeyProblem(key), DAMAGED, what);
+		});
+
+		it('though ssh-keygen loads each — loading never checks the pair — and then cannot sign with it', function () {
+			if (!hasSSHKeygen) this.skip();
+			for (const [what, key] of Object.entries(mismatched())) {
+				assert.ok(sshKeygenLoads(key), what);
+				assert.ok(!sshKeygenSigns(key), what);
+			}
+		});
+	});
+
+	describe('refuses what OpenSSH refuses on load though the key could sign', () => {
+		const refusedOnLoad = () => {
+			const ecdsa = openSSHKeyFields('ecdsa-sha2-nistp256');
+			const other = openSSHKeyFields('ecdsa-sha2-nistp256');
+			const { n, e, d, p, q, qi } = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({
+				format: 'jwk',
+			});
+			const bytes = (value) => Buffer.from(value, 'base64url');
+			// a modulus written without the leading zero byte that keeps its high bit from reading as a sign
+			const unsignedModulus = sshString(bytes(n));
+			const smallScalar = createECDH('prime256v1');
+			smallScalar.setPrivateKey(Buffer.concat([Buffer.alloc(31), Buffer.from([1])]));
+			const point = smallScalar.getPublicKey();
+			return {
+				"an OpenSSH ECDSA key whose private section's copy of the public point is another key's": openSSHPrivateKey({
+					keyType: 'ecdsa-sha2-nistp256',
+					fields: {
+						publicFields: ecdsa.publicFields,
+						privateFields: Buffer.concat([other.publicFields, ecdsa.privateFields.subarray(ecdsa.publicFields.length)]),
+					},
+				}),
+				'an OpenSSH RSA key whose modulus reads as negative': openSSHPrivateKey({
+					keyType: 'ssh-rsa',
+					fields: {
+						publicFields: Buffer.concat([mpint(bytes(e)), unsignedModulus]),
+						privateFields: Buffer.concat([
+							unsignedModulus,
+							mpint(bytes(e)),
+							...[d, qi, p, q].map((value) => mpint(bytes(value))),
+						]),
+					},
+				}),
+				"a SEC1 EC key whose private scalar has half the order's bits or fewer": createPrivateKey({
+					key: {
+						kty: 'EC',
+						crv: 'P-256',
+						x: point.subarray(1, 33).toString('base64url'),
+						y: point.subarray(33).toString('base64url'),
+						d: smallScalar.getPrivateKey().toString('base64url'),
+					},
+					format: 'jwk',
+				}).export({ type: 'sec1', format: 'pem' }),
+			};
+		};
+
+		it('refuses each as damaged', () => {
+			for (const [what, key] of Object.entries(refusedOnLoad()))
+				assert.equal(describeSSHPrivateKeyProblem(key), DAMAGED, what);
+		});
+
+		it('as ssh-keygen does', function () {
+			if (!hasSSHKeygen) this.skip();
+			for (const [what, key] of Object.entries(refusedOnLoad())) assert.ok(!sshKeygenLoads(key), what);
+		});
+	});
+
 	describe('against the real ssh-keygen', () => {
 		before(function () {
 			if (!hasSSHKeygen) this.skip();
 		});
 
-		it('loads every key the fixtures build, so the acceptances above are of real keys', () => {
-			for (const [kind, key] of Object.entries(keys)) assert.ok(sshKeygenLoads(key), kind);
+		it('loads and signs with every key the fixtures build, so the acceptances above are of real keys', () => {
+			for (const [kind, key] of Object.entries(keys)) assert.ok(sshKeygenSigns(key), kind);
 		});
 
-		it('agrees with the validator on each way a pasted key goes wrong, once it is stored normalized', function () {
+		it('agrees with it on whether a pasted key can sign once stored normalized, for each way a paste goes wrong', function () {
 			this.timeout(60000);
 			const mutations = {
 				'as generated': (key) => key,
@@ -466,6 +654,7 @@ describe('SSH private key validation', () => {
 				'with a body line lost': (key) => key.replace(/\n[A-Za-z0-9+/=]+\n/, '\n'),
 				'with a body line doubled': (key) => key.replace(/\n([A-Za-z0-9+/=]+)\n/, '\n$1\n$1\n'),
 				'with its END line cut off': (key) => key.trimEnd().split('\n').slice(0, -1).join('\n') + '\n',
+				'without its final padding': (key) => key.replace(/=+\n(-----END)/, '\n$1'),
 				'with a character changed': (key) => {
 					const lines = key.split('\n');
 					lines[3] = lines[3].slice(0, 20) + (lines[3][20] === 'A' ? 'B' : 'A') + lines[3].slice(21);
@@ -477,7 +666,7 @@ describe('SSH private key validation', () => {
 				for (const [how, mutate] of Object.entries(mutations)) {
 					const pasted = mutate(key);
 					const accepted = describeSSHPrivateKeyProblem(pasted) === undefined;
-					if (accepted !== sshKeygenLoads(normalizeSSHPrivateKey(pasted))) {
+					if (accepted !== sshKeygenSigns(normalizeSSHPrivateKey(pasted))) {
 						disagreements.push(`${kind} ${how}: validator ${accepted ? 'accepts' : 'refuses'}`);
 					}
 				}
@@ -516,11 +705,12 @@ describe('SSH config value validation', () => {
 		'10.0.0.1',
 		'::1',
 		'fe80::1%en0',
-		'*.example.org',
 		'%h.example.com',
 		'a,b',
 		'git#lab.com',
 	];
+	// a HostName is never matched against, so only an alias can't be a pattern
+	const acceptedAsHostname = ['*.example.org', 'repo?.example.org'];
 	const refused = {
 		'a b': 'must be a single',
 		'a\tb': 'must be a single',
@@ -530,16 +720,30 @@ describe('SSH config value validation', () => {
 		'a"b': 'must not contain quotes',
 		"a'b": 'must not contain quotes',
 		'"github.com"': 'must not contain quotes',
-		'-oProxyCommand=evil': 'must not start with "-"',
+		'=': 'must not contain quotes or "="',
+		'=#x': 'must not contain quotes or "="',
+		// OpenSSH before 8.7 splits an argument at "=", making this two
+		'example.com=extra': 'must not contain quotes or "="',
+		'-oProxyCommand': 'must not start with "-"',
 		'#github.com': 'must not start with "#"',
-		'=': 'must not start with "="',
-		'=#x': 'must not start with "="',
 	};
+	const refusedAsHost = ['*', '*.github.com', 'repo?.github.com', '!github.com'];
 
 	it('accepts any alias or hostname ssh reads as one argument', () => {
 		for (const value of accepted) {
 			for (const field of ['host', 'hostname'])
 				assert.equal(describeSSHConfigValueProblem(field, value), undefined, `${field} ${value}`);
+		}
+		for (const value of acceptedAsHostname)
+			assert.equal(describeSSHConfigValueProblem('hostname', value), undefined, value);
+	});
+
+	it("refuses an alias that is a pattern, since its block would also apply to other keys' aliases", () => {
+		for (const value of refusedAsHost) {
+			assert.equal(
+				describeSSHConfigValueProblem('host', value),
+				`'host' must be one alias, not a pattern: "*", "?" and "!" also match other keys' aliases; got ${JSON.stringify(value)}.`
+			);
 		}
 	});
 
@@ -575,34 +779,44 @@ describe('SSH config value validation', () => {
 			if (dir) rmSync(dir, { recursive: true, force: true });
 		});
 
-		// the block add_ssh_key writes, after another key's
-		const resolvesOtherKey = (host, hostname) => {
+		// the block add_ssh_key writes, beside another key's — before it or after it, since keys are
+		// appended in the order they are added and ssh takes each option from the first block that matches
+		const resolvesOtherKey = (host, hostname, { newBlockFirst = false } = {}) => {
 			const config = join(dir, 'config');
 			const block = (name, blockHost, blockHostname) =>
 				`#${name}\nHost ${blockHost}\n\tHostName ${blockHostname}\n\tUser git\n\tIdentityFile /nonexistent/${name}.key\n\tIdentitiesOnly yes`;
-			writeFileSync(
-				config,
-				[block('other', 'other.example.com', 'github.com'), block('new', host, hostname)].join('\n')
-			);
+			const blocks = [block('other', 'other.example.com', 'github.com'), block('new', host, hostname)];
+			writeFileSync(config, (newBlockFirst ? blocks.reverse() : blocks).join('\n'));
 			try {
 				return execFileSync('ssh', ['-G', '-F', config, 'other.example.com'], { stdio: ['ignore', 'pipe', 'ignore'] })
 					.toString()
-					.includes('hostname github.com');
+					.includes('hostname github.com\n');
 			} catch {
 				return false;
 			}
 		};
 
-		it('leaves every other key resolvable for every value accepted here', () => {
-			for (const value of accepted) {
-				assert.ok(resolvesOtherKey(value, 'gitlab.com'), `Host ${value}`);
-				assert.ok(resolvesOtherKey('new.example.com', value), `HostName ${value}`);
+		it('leaves every other key resolvable for every value accepted here, in either order', () => {
+			for (const newBlockFirst of [false, true]) {
+				for (const value of accepted) {
+					assert.ok(resolvesOtherKey(value, 'gitlab.com', { newBlockFirst }), `Host ${value}`);
+					assert.ok(resolvesOtherKey('new.example.com', value, { newBlockFirst }), `HostName ${value}`);
+				}
+				for (const value of acceptedAsHostname) {
+					assert.ok(resolvesOtherKey('new.example.com', value, { newBlockFirst }), `HostName ${value}`);
+				}
 			}
 		});
 
 		it('breaks every other key for the values refused for that reason', () => {
 			for (const value of ['a b', 'a"b', "a'b", '#github.com', '=', '=#x']) {
 				assert.ok(!resolvesOtherKey('new.example.com', value), `HostName ${JSON.stringify(value)}`);
+			}
+		});
+
+		it('sends the other key to the wrong host when a pattern alias comes first', () => {
+			for (const value of ['*', '*.example.com', 'other.example.co?']) {
+				assert.ok(!resolvesOtherKey(value, 'gitlab.com', { newBlockFirst: true }), `Host ${value}`);
 			}
 		});
 	});
