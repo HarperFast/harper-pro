@@ -378,9 +378,9 @@ function reverseSubscription(subscription) {
 }
 
 /**
- * Direct primary-key lookup first (the common case), falling back to a table scan matching on `url`
- * because `setNode()` stores a row under the PEER-reported name, which can differ from the hostname
- * a caller used to reach it. The table is small and this only runs on update_node, an admin-only path.
+ * Direct primary-key lookup first, falling back to a table scan matching on `url` because
+ * `setNode()` stores a row under the PEER-reported name, which can differ from the hostname a
+ * caller used to reach it.
  */
 async function findExistingNodeRecord(hostname: string, url: string) {
 	const hdbNodes = getHDBNodeTable();
@@ -392,7 +392,6 @@ async function findExistingNodeRecord(hostname: string, url: string) {
 	return undefined;
 }
 
-// Fields only setNode()'s peer-handshake flow applies.
 const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization', 'start_time', 'force_signing'];
 
 /**
@@ -403,6 +402,11 @@ const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization'
 async function updateNode(req: any) {
 	const hostname = req.hostname || req.node_name || req.name || (req.url ? urlToNodeName(req.url) : undefined);
 	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
+	if (req.replicates !== undefined) {
+		throw new ClientError(
+			`update_node does not support 'replicates' (setNode() never applies it either); use 'subscriptions'/'sendsTo'/'receivesFrom' to change topology, or set_node to reset to full replication`
+		);
+	}
 	if ((req.subscribe !== undefined || req.publish !== undefined) && !req.subscriptions) {
 		throw new ClientError(
 			`update_node does not support top-level 'subscribe'/'publish' without 'subscriptions'; supply a subscriptions array, or use set_node`
