@@ -88,8 +88,8 @@ function sealSSHKey(name: string, key: string): string {
 	return ENV_ENCRYPTED_PREFIX + encryptEnvelope(key, publicKey, fingerprint);
 }
 
-// Every name-taking operation accepts exactly the names add_ssh_key can create: the name becomes a path
-// segment (`<ssh dir>/<name>.key`), so anything wider lets a name like `../x` reach outside the ssh dir.
+// The name is a path segment (`<ssh dir>/<name>.key`): accept only what add_ssh_key can create, or `../x`
+// escapes the ssh dir.
 const sshKeyNameSchema = Joi.string()
 	.pattern(SSH_KEY_NAME_REGEX)
 	.required()
@@ -408,7 +408,7 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 	for (const file of await readdir(sshDir)) {
 		const name = basename(file, '.key');
 		if (!file.endsWith('.key') || !SSH_KEY_NAME_REGEX.test(name)) continue;
-		// `stat` follows a symlink the way `get_ssh_key`'s readFile does, so a link to a key file counts too
+		// like get_ssh_key's readFile, stat follows a symlink to its key file
 		if (!(await stat(join(sshDir, file)).catch(() => undefined))?.isFile()) continue;
 
 		const result: { name: string; host?: string; hostname?: string } = { name };
@@ -428,11 +428,11 @@ const SSH_CONFIG_BLANK_OR_COMMENT = /^[ \t]*(?:#.*)?$/;
 
 /**
  * Where each SSH config block `addSSHKey` wrote for `name` sits in `config`, as `[start, end)`
- * offsets. A block is the key's comment line — exactly `#name`, blanks aside, since matched as a
- * prefix `#repo` would claim `#repo-2`'s block — plus the `Host` section it heads, which, as OpenSSH
- * scopes it, runs to the next `Host` or `Match` line. It also stops at the next key's header, a
- * `#name` line whose next directive is `Host` or `Match`, so a hand-edited block never takes in a
- * sibling key's block or an unmanaged section.
+ * offsets. A block is the key's `#name` line — the whole line, blanks aside, or `#repo` would claim
+ * `#repo-2`'s block — plus the `Host` section it heads, which, as OpenSSH scopes it, runs to the next
+ * `Host` or `Match` line. A `#name` line heads the next `Host` or `Match` line unless a directive or
+ * another `#name` line comes first, and a block also stops at the next key's header, so a hand-edited
+ * block never takes in a sibling key's block or an unmanaged section.
  */
 function findSSHConfigBlocks(config: string, name: string): [number, number][] {
 	const lines: { start: number; text: string }[] = [];
@@ -442,19 +442,22 @@ function findSSHConfigBlocks(config: string, name: string): [number, number][] {
 		lines.push({ start, text: config.slice(start, end).replace(/\r$/, '') });
 		start = end + 1;
 	}
-	const startsSection = (index: number) => index < lines.length && SSH_CONFIG_SECTION_START.test(lines[index].text);
-	const nextDirective = (index: number) => {
-		let next = index + 1;
-		while (next < lines.length && SSH_CONFIG_BLANK_OR_COMMENT.test(lines[next].text)) next++;
-		return next;
+	const startsSection = (index: number) => SSH_CONFIG_SECTION_START.test(lines[index].text);
+	const sectionHeadedBy = (index: number): number | undefined => {
+		for (let next = index + 1; next < lines.length; next++) {
+			const { text } = lines[next];
+			if (SSH_CONFIG_KEY_COMMENT.test(text)) return undefined;
+			if (!SSH_CONFIG_BLANK_OR_COMMENT.test(text)) return startsSection(next) ? next : undefined;
+		}
+		return undefined;
 	};
 	const isKeyHeader = (index: number) =>
-		SSH_CONFIG_KEY_COMMENT.test(lines[index].text) && startsSection(nextDirective(index));
+		SSH_CONFIG_KEY_COMMENT.test(lines[index].text) && sectionHeadedBy(index) !== undefined;
 
 	const blocks: [number, number][] = [];
 	for (let index = 0; index < lines.length; index++) {
 		if (SSH_CONFIG_KEY_COMMENT.exec(lines[index].text)?.[1] !== name) continue;
-		let end = startsSection(nextDirective(index)) ? nextDirective(index) + 1 : index + 1;
+		let end = (sectionHeadedBy(index) ?? index) + 1;
 		while (end < lines.length && !startsSection(end) && !isKeyHeader(end)) end++;
 		blocks.push([lines[index].start, end < lines.length ? lines[end].start : config.length]);
 		index = end - 1;

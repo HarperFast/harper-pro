@@ -343,6 +343,15 @@ describe('sshKeyOperations sealing', () => {
 			assert.equal(readFileSync(configPath(), 'utf8'), `${unmanaged}\n${blockFor('second')}`);
 		});
 
+		it("get_ssh_key and delete_ssh_key leave the next key's block alone when a block is down to its `#name` line", async () => {
+			for (const name of ['first', 'second']) await addKey(name);
+			writeFileSync(configPath(), `#first\n${blockFor('second')}`);
+
+			assert.equal((await ops.getSSHKey({ name: 'first' })).host, undefined);
+			await ops.deleteSSHKey({ name: 'first' });
+			assert.equal(readFileSync(configPath(), 'utf8'), blockFor('second'));
+		});
+
 		it('delete_ssh_key stops at the first Host section when a block lost its own Host line', async () => {
 			const unmanaged = 'Host other\n\tHostName example.net';
 			await addKey('first');
