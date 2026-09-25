@@ -33,6 +33,7 @@
 		"server": "readonly",
 		"databases": "readonly",
 		"tables": "readonly",
+		"transaction": "readonly",
 		"createBlob": "readonly",
 		"lockdown": "readonly",
 		"threads": "readonly",
