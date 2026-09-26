@@ -101,10 +101,7 @@ suite('Certificate', (ctx) => {
 		const csrResponse = await sendOperation(ctx.harper, {
 			operation: 'create_csr',
 		});
-		ok(
-			csrResponse.pem?.includes('BEGIN CERTIFICATE REQUEST'),
-			'Response should include a certificate signing request'
-		);
+		ok(csrResponse.pem?.includes('BEGIN CERTIFICATE REQUEST'), 'Response should include a certificate signing request');
 		ok(csrResponse.privateKeyName, 'Response should include the private key name');
 
 		// Parse the CSR - will throw if malformed

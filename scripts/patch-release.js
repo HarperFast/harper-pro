@@ -353,7 +353,9 @@ async function main() {
 			die(`--set-version "${SET_VERSION}" is not a valid semver`);
 		}
 		if (semver.compare(target, coreCurrent) <= 0 || semver.compare(target, proCurrent) <= 0) {
-			die(`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`);
+			die(
+				`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`
+			);
 		}
 		if (
 			runSafe(`git rev-parse -q --verify "refs/tags/v${target}"`).code === 0 ||
@@ -382,7 +384,9 @@ async function main() {
 		// Use a placeholder so Step 6 can still show the CM command it would run.
 		proVersion = `v${target}`;
 	} else {
-		const confirm = YES_MODE ? 'y' : await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
+		const confirm = YES_MODE
+			? 'y'
+			: await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
 		if (confirm.toLowerCase() !== 'y') {
 			warn('Aborted.');
 			// Exit 0 (a human/--yes declined, nothing failed) but still emit a RESULT line

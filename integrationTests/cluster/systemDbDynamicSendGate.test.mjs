@@ -65,65 +65,77 @@ async function waitFor(node, id, { timeoutMs = 60000, pollMs = 300 } = {}) {
 	return false;
 }
 
-suite('opted-in node still authorizes a full-replication neighbor via the dynamic send gate', { timeout: 240000 }, (ctx) => {
-	before(async () => {
-		const A = await getNextAvailableLoopbackAddress();
-		const B = await getNextAvailableLoopbackAddress();
-		const C = await getNextAvailableLoopbackAddress();
-		Object.assign(ctx, { A, B, C });
+suite(
+	'opted-in node still authorizes a full-replication neighbor via the dynamic send gate',
+	{ timeout: 240000 },
+	(ctx) => {
+		before(async () => {
+			const A = await getNextAvailableLoopbackAddress();
+			const B = await getNextAvailableLoopbackAddress();
+			const C = await getNextAvailableLoopbackAddress();
+			Object.assign(ctx, { A, B, C });
 
-		const cA = { name: ctx.name, harper: { hostname: A } };
-		const cB = { name: ctx.name, harper: { hostname: B } };
-		const cC = { name: ctx.name, harper: { hostname: C } };
-		await Promise.all([
-			// A: full replication with B (BOOLEAN route → A's send gate to B falls to the dynamic hdb_nodes gate).
-			startHarper(cA, optionsFor(A, [{ hostname: B, port: 9933 }])),
-			// B: full replication with A (boolean) + a DIRECTIONAL route to C (this opts B in, making B's
-			// self-record a directional object rather than `replicates: true`).
-			startHarper(
-				cB,
-				optionsFor(B, [
-					{ hostname: A, port: 9933 },
-					{ hostname: C, port: 9933, replicates: { sends: true, receives: false } },
-				])
-			),
-			// C: directional route back to B.
-			startHarper(cC, optionsFor(C, [{ hostname: B, port: 9933, replicates: { sends: false, receives: true } }])),
-		]);
-		ctx.nodeA = cA.harper;
-		ctx.nodeB = cB.harper;
-		ctx.nodeC = cC.harper;
+			const cA = { name: ctx.name, harper: { hostname: A } };
+			const cB = { name: ctx.name, harper: { hostname: B } };
+			const cC = { name: ctx.name, harper: { hostname: C } };
+			await Promise.all([
+				// A: full replication with B (BOOLEAN route → A's send gate to B falls to the dynamic hdb_nodes gate).
+				startHarper(cA, optionsFor(A, [{ hostname: B, port: 9933 }])),
+				// B: full replication with A (boolean) + a DIRECTIONAL route to C (this opts B in, making B's
+				// self-record a directional object rather than `replicates: true`).
+				startHarper(
+					cB,
+					optionsFor(B, [
+						{ hostname: A, port: 9933 },
+						{ hostname: C, port: 9933, replicates: { sends: true, receives: false } },
+					])
+				),
+				// C: directional route back to B.
+				startHarper(cC, optionsFor(C, [{ hostname: B, port: 9933, replicates: { sends: false, receives: true } }])),
+			]);
+			ctx.nodeA = cA.harper;
+			ctx.nodeB = cB.harper;
+			ctx.nodeC = cC.harper;
 
-		await Promise.all(
-			[ctx.nodeA, ctx.nodeB, ctx.nodeC].map((node) =>
-				ensureTableExists(node, {
-					database: DB,
-					table: TABLE,
-					primary_key: 'id',
-					attributes: [
-						{ name: 'id', type: 'ID' },
-						{ name: 'name', type: 'String' },
-					],
-				})
-			)
-		);
-		await delay(8000); // let self-records propagate + sockets establish
-	});
+			await Promise.all(
+				[ctx.nodeA, ctx.nodeB, ctx.nodeC].map((node) =>
+					ensureTableExists(node, {
+						database: DB,
+						table: TABLE,
+						primary_key: 'id',
+						attributes: [
+							{ name: 'id', type: 'ID' },
+							{ name: 'name', type: 'String' },
+						],
+					})
+				)
+			);
+			await delay(8000); // let self-records propagate + sockets establish
+		});
 
-	after(async () => {
-		await Promise.all([
-			ctx.nodeA && teardownHarper({ harper: ctx.nodeA }),
-			ctx.nodeB && teardownHarper({ harper: ctx.nodeB }),
-			ctx.nodeC && teardownHarper({ harper: ctx.nodeC }),
-		]);
-	});
+		after(async () => {
+			await Promise.all([
+				ctx.nodeA && teardownHarper({ harper: ctx.nodeA }),
+				ctx.nodeB && teardownHarper({ harper: ctx.nodeB }),
+				ctx.nodeC && teardownHarper({ harper: ctx.nodeC }),
+			]);
+		});
 
-	test('a data write on A reaches its full-replication neighbor B through the dynamic gate', async () => {
-		const { nodeA, nodeB } = ctx;
-		const rec = 'dyn-' + Date.now();
-		await sendOperation(nodeA, { operation: 'insert', database: DB, table: TABLE, records: [{ id: rec, name: rec }] });
-		const reachedB = await waitFor(nodeB, rec, { timeoutMs: 90000 });
-		console.log(`[DYN-GATE] data write on A reached full-replication neighbor B = ${reachedB}`);
-		ok(reachedB, 'A must authorize B (a full-replication neighbor) via the dynamic send gate even though B is opted-in');
-	});
-});
+		test('a data write on A reaches its full-replication neighbor B through the dynamic gate', async () => {
+			const { nodeA, nodeB } = ctx;
+			const rec = 'dyn-' + Date.now();
+			await sendOperation(nodeA, {
+				operation: 'insert',
+				database: DB,
+				table: TABLE,
+				records: [{ id: rec, name: rec }],
+			});
+			const reachedB = await waitFor(nodeB, rec, { timeoutMs: 90000 });
+			console.log(`[DYN-GATE] data write on A reached full-replication neighbor B = ${reachedB}`);
+			ok(
+				reachedB,
+				'A must authorize B (a full-replication neighbor) via the dynamic send gate even though B is opted-in'
+			);
+		});
+	}
+);
