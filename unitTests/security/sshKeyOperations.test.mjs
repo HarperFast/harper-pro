@@ -20,7 +20,7 @@
  * (`materializeGitSSH`) and is covered by core's Application tests.
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { generateKeyPairSync } from 'node:crypto';
@@ -260,6 +260,164 @@ describe('sshKeyOperations sealing', () => {
 		assert.ok(!fetched.key.includes('OPENSSH PRIVATE KEY'));
 		assert.equal(fetched.host, 'gh');
 		assert.equal(fetched.hostname, 'example.com');
+	});
+
+	describe('ssh config blocks', () => {
+		const configPath = () => join(sshDir, 'config');
+		const addKey = (name) =>
+			ops.addSSHKey(request({ name, key: PRIVATE_KEY, host: `${name}.alias`, hostname: 'example.com' }));
+		const blockFor = (name) =>
+			`#${name}\nHost ${name}.alias\n\tHostName example.com\n\tUser git\n\tIdentityFile ${join(sshDir, `${name}.key`)}\n\tIdentitiesOnly yes`;
+		const byName = (a, b) => a.name.localeCompare(b.name);
+
+		describe('of keys whose names share a prefix', () => {
+			// `repo` is a prefix of `repo-2`, so a `#repo` pattern not anchored to its whole comment line
+			// also matches the `#repo-2` block
+			for (const order of [
+				['repo-2', 'repo'],
+				// `repo`'s block opens the file, with no line break before its comment line
+				['repo', 'repo-2'],
+			]) {
+				describe(`added as ${order.join(', ')}`, () => {
+					beforeEach(async () => {
+						for (const name of order) await addKey(name);
+					});
+
+					it('get_ssh_key and list_ssh_keys return each key its own host', async () => {
+						for (const name of order) assert.equal((await ops.getSSHKey({ name })).host, `${name}.alias`);
+						assert.deepEqual((await ops.listSSHKeys()).sort(byName), [
+							{ name: 'repo', host: 'repo.alias', hostname: 'example.com' },
+							{ name: 'repo-2', host: 'repo-2.alias', hostname: 'example.com' },
+						]);
+					});
+
+					it("delete_ssh_key removes only its own block, leaving the sibling's intact", async () => {
+						await ops.deleteSSHKey({ name: 'repo' });
+
+						assert.equal(readFileSync(configPath(), 'utf8'), blockFor('repo-2'));
+						assert.deepEqual(await ops.listSSHKeys(), [
+							{ name: 'repo-2', host: 'repo-2.alias', hostname: 'example.com' },
+						]);
+					});
+				});
+			}
+
+			it('matches the comment line of a hand-edited config: blanks around the name, CRLF line endings', async () => {
+				const handEdited = (text) => text.replace(/^#.*$/gm, ' \t$& \t').replace(/\n/g, '\r\n');
+				for (const name of ['repo-2', 'repo']) await addKey(name);
+				writeFileSync(configPath(), handEdited(readFileSync(configPath(), 'utf8')));
+
+				assert.equal((await ops.getSSHKey({ name: 'repo' })).host, 'repo.alias');
+				await ops.deleteSSHKey({ name: 'repo' });
+				assert.equal(readFileSync(configPath(), 'utf8'), handEdited(blockFor('repo-2')).trimStart());
+			});
+		});
+
+		for (const [edit, identitiesOnlyLine] of [
+			['re-spaced', '\tIdentitiesOnly    yes\n'],
+			['removed', ''],
+		]) {
+			it(`delete_ssh_key stops at the next key's block when a block's IdentitiesOnly line was ${edit}`, async () => {
+				for (const name of ['first', 'second']) await addKey(name);
+				writeFileSync(
+					configPath(),
+					readFileSync(configPath(), 'utf8').replace('\tIdentitiesOnly yes\n', identitiesOnlyLine)
+				);
+
+				await ops.deleteSSHKey({ name: 'first' });
+				assert.equal(readFileSync(configPath(), 'utf8'), blockFor('second'));
+			});
+		}
+
+		it('delete_ssh_key removes a hand-edited block whole and stops at the next Host section', async () => {
+			const unmanaged = 'Host other\n\tHostName example.net';
+			for (const name of ['first', 'second']) await addKey(name);
+			writeFileSync(
+				configPath(),
+				readFileSync(configPath(), 'utf8')
+					.replace('Host first.alias\n', 'Host first.alias\n#staging\n')
+					.replace('\tIdentitiesOnly yes\n', `\tIdentitiesOnly no\n\tUser deploy\n${unmanaged}\n`)
+			);
+
+			await ops.deleteSSHKey({ name: 'first' });
+			assert.equal(readFileSync(configPath(), 'utf8'), `${unmanaged}\n${blockFor('second')}`);
+		});
+
+		it("get_ssh_key and delete_ssh_key leave the next key's block alone when a block is down to its `#name` line", async () => {
+			for (const name of ['first', 'second']) await addKey(name);
+			writeFileSync(configPath(), `#first\n${blockFor('second')}`);
+
+			assert.equal((await ops.getSSHKey({ name: 'first' })).host, undefined);
+			await ops.deleteSSHKey({ name: 'first' });
+			assert.equal(readFileSync(configPath(), 'utf8'), blockFor('second'));
+		});
+
+		it('delete_ssh_key stops at the first Host section when a block lost its own Host line', async () => {
+			const unmanaged = 'Host other\n\tHostName example.net';
+			await addKey('first');
+			writeFileSync(
+				configPath(),
+				`${readFileSync(configPath(), 'utf8').replace('Host first.alias\n', '')}\n${unmanaged}`
+			);
+
+			assert.equal((await ops.getSSHKey({ name: 'first' })).host, undefined);
+			await ops.deleteSSHKey({ name: 'first' });
+			assert.equal(readFileSync(configPath(), 'utf8'), unmanaged);
+		});
+
+		it('delete_ssh_key takes a middle block with its line break, leaving no blank line', async () => {
+			for (const name of ['first', 'middle', 'last']) await addKey(name);
+
+			await ops.deleteSSHKey({ name: 'middle' });
+			assert.equal(readFileSync(configPath(), 'utf8'), `${blockFor('first')}\n${blockFor('last')}`);
+		});
+
+		it('delete_ssh_key keeps config lines after a block that belong to no key', async () => {
+			const unmanaged = 'Host other\n\tHostName example.net';
+			await addKey('repo');
+			writeFileSync(configPath(), `${readFileSync(configPath(), 'utf8')}\n${unmanaged}`);
+
+			await ops.deleteSSHKey({ name: 'repo' });
+			assert.equal(readFileSync(configPath(), 'utf8'), unmanaged);
+		});
+	});
+
+	describe('key names add_ssh_key could never create', () => {
+		const NAME_ERROR = 'SSH key name can only contain alphanumeric, dash and underscore characters';
+		// the key path is `<ssh dir>/<name>.key`, so `../outside` is `<root>/outside.key`
+		const outsidePath = () => join(rootDir, 'outside.key');
+		beforeEach(() => writeFileSync(outsidePath(), 'not an ssh key'));
+
+		for (const [operation, call] of [
+			['get_ssh_key', (name) => ops.getSSHKey({ name })],
+			['update_ssh_key', (name) => ops.updateSSHKey(request({ name, key: ROTATED_KEY }))],
+			['delete_ssh_key', (name) => ops.deleteSSHKey({ name })],
+		]) {
+			it(`${operation} refuses a name that resolves outside the ssh dir`, async () => {
+				await assert.rejects(call('../outside'), { message: NAME_ERROR });
+				assert.equal(readFileSync(outsidePath(), 'utf8'), 'not an ssh key');
+			});
+		}
+
+		it('get_ssh_key, update_ssh_key and delete_ssh_key still accept every name add_ssh_key does', async () => {
+			const name = 'deploy_key-2';
+			await ops.addSSHKey(request({ name, key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' }));
+
+			assert.equal((await ops.getSSHKey({ name })).host, 'gh');
+			assert.equal((await ops.updateSSHKey(request({ name, key: ROTATED_KEY }))).message, `Updated ssh key: ${name}`);
+			assert.equal((await ops.deleteSSHKey({ name })).message, `Deleted ssh key: ${name}`);
+		});
+
+		it('list_ssh_keys reports only the `<name>.key` files, or links to one, those operations accept', async () => {
+			await ops.addSSHKey(request({ name: 'deploy_key-2', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' }));
+			for (const stray of ['known_hosts.old', 'orphan', 'a.b.key']) writeFileSync(join(sshDir, stray), '');
+			mkdirSync(join(sshDir, 'directory.key'));
+			symlinkSync(join(sshDir, 'deploy_key-2.key'), join(sshDir, 'linked.key'));
+			symlinkSync(join(sshDir, 'missing'), join(sshDir, 'dangling.key'));
+
+			assert.deepEqual((await ops.listSSHKeys()).map((entry) => entry.name).sort(), ['deploy_key-2', 'linked']);
+			assert.equal((await ops.getSSHKey({ name: 'linked' })).key, storedKeyFor('deploy_key-2'));
+		});
 	});
 
 	describe('degraded mode (no secret custody on this node)', () => {

@@ -1,6 +1,6 @@
 import { suite, test, before, beforeEach, afterEach, after } from 'node:test';
 import { equal, deepEqual, ok } from 'node:assert';
-import { rm } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -253,6 +253,55 @@ suite('SSH Key Operations', (ctx) => {
 		({ status, data } = await sendOperation(ctx.harper, { operation: 'list_ssh_keys' }));
 		equal(status, 200);
 		deepEqual(data, []);
+	});
+
+	test('get_ssh_key and delete_ssh_key act on their own config block, not one whose name extends theirs', async () => {
+		for (const name of ['testkey-prefix-2', 'testkey-prefix']) {
+			await sendOperation(ctx.harper, {
+				operation: 'add_ssh_key',
+				name,
+				key: 'random\nstring',
+				host: `${name}.gitlab.com`,
+				hostname: 'gitlab.com',
+			});
+		}
+
+		let { status, data } = await sendOperation(ctx.harper, { operation: 'get_ssh_key', name: 'testkey-prefix' });
+		equal(status, 200);
+		equal(data.host, 'testkey-prefix.gitlab.com');
+
+		({ status, data } = await sendOperation(ctx.harper, { operation: 'delete_ssh_key', name: 'testkey-prefix' }));
+		equal(status, 200);
+
+		({ status, data } = await sendOperation(ctx.harper, { operation: 'list_ssh_keys' }));
+		equal(status, 200);
+		deepEqual(data, [{ host: 'testkey-prefix-2.gitlab.com', hostname: 'gitlab.com', name: 'testkey-prefix-2' }]);
+	});
+
+	test('get_ssh_key, update_ssh_key and delete_ssh_key refuse a name that resolves outside the ssh dir', async () => {
+		const operations = [
+			{ operation: 'get_ssh_key' },
+			{ operation: 'update_ssh_key', key: 'updated\nstring' },
+			{ operation: 'delete_ssh_key' },
+		];
+		const probePath = ({ operation }) => join(ctx.harper.dataRootDir, `${operation}-probe.key`);
+		try {
+			for (const operation of operations) {
+				await writeFile(probePath(operation), 'not an ssh key');
+				const { status, data } = await sendOperation(ctx.harper, {
+					...operation,
+					name: `../${operation.operation}-probe`,
+				});
+				ok(status >= 400, `${operation.operation}: expected a client error, got ${status}`);
+				equal(data.error, 'SSH key name can only contain alphanumeric, dash and underscore characters');
+				equal(await readFile(probePath(operation), 'utf8'), 'not an ssh key');
+			}
+
+			const { status } = await sendOperation(ctx.harper, { operation: 'list_ssh_keys' });
+			equal(status, 200);
+		} finally {
+			await Promise.all(operations.map((operation) => rm(probePath(operation), { force: true })));
+		}
 	});
 
 	test('add_ssh_key with duplicate name returns error', async () => {
