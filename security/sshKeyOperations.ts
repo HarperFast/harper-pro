@@ -12,6 +12,11 @@ import { encryptEnvelope, parseEnvelopeFields } from '../core/utility/secretEnve
 import { ENV_ENCRYPTED_PREFIX } from '../core/utility/envFile.ts';
 import { replicateOperation } from '../replication/replicator.ts';
 import { generateEd25519SSHKeyPair } from './sshKeyGeneration.ts';
+import {
+	describeSSHConfigValueProblem,
+	describeSSHPrivateKeyProblem,
+	normalizeSSHPrivateKey,
+} from './sshKeyValidation.ts';
 
 // SSH key name can only be alphanumeric, dash and underscores
 const SSH_KEY_NAME_REGEX = /^[a-zA-Z0-9-_]+$/;
@@ -75,6 +80,24 @@ function sealSSHKey(name: string, key: string): string {
 
 	const { publicKey, fingerprint } = custody.getPublicKey();
 	return ENV_ENCRYPTED_PREFIX + encryptEnvelope(key, publicKey, fingerprint);
+}
+
+/**
+ * An `enc:v1:` envelope passes through for `sealSSHKey` to vet: it can't be inspected without
+ * decrypting it, which forwarding a key must never require.
+ */
+function vetSSHPrivateKey(key: string): string {
+	if (key.startsWith(ENV_ENCRYPTED_PREFIX)) return key;
+	const problem = describeSSHPrivateKeyProblem(key);
+	if (problem) throw new ClientError(problem);
+	return normalizeSSHPrivateKey(key);
+}
+
+function vetSSHConfigValue(field: 'host' | 'hostname', value: string): string {
+	const trimmed = value.trim();
+	const problem = describeSSHConfigValueProblem(field, trimmed);
+	if (problem) throw new ClientError(problem);
+	return trimmed;
 }
 
 const addValidationSchema = Joi.object({
@@ -143,11 +166,13 @@ interface AddSSHKeyRequest {
  * @param req - The request object containing the SSH key details.
  * @param req.name - The name of the SSH key to add.
  * @param req.key - The SSH key contents, either plaintext or an `enc:v1:` envelope. Mutually
- * exclusive with `generate`; exactly one of the two is required.
+ * exclusive with `generate`; exactly one of the two is required. A plaintext key is stored
+ * normalized, and refused when ssh couldn't load it.
  * @param req.generate - Mint an ed25519 keypair on this node instead of supplying `key`, so the
  * private half never travels from the client. The public half comes back as `public_key`.
- * @param req.host - The Host alias to use in the SSH config block.
- * @param req.hostname - The HostName (real hostname) to use in the SSH config block.
+ * @param req.host - The Host alias to use in the SSH config block; trimmed, and refused when it would
+ * break the node's ssh config.
+ * @param req.hostname - The HostName (real hostname) to use in the SSH config block; vetted like `host`.
  * @param req.known_hosts - Optional known_hosts entries to append to the known_hosts file.
  * @returns An object containing a success message, optional replication results, and `public_key`
  * when the keypair was generated.
@@ -171,6 +196,10 @@ export async function addSSHKey(
 	if (generate && req.key) {
 		throw new ClientError('Provide either `key` or `generate: true`, not both.');
 	}
+
+	req.host = vetSSHConfigValue('host', req.host);
+	req.hostname = vetSSHConfigValue('hostname', req.hostname);
+	if (req.key !== undefined) req.key = vetSSHPrivateKey(req.key);
 
 	// Reject a duplicate name BEFORE minting anything: with `generate: true` a taken name means the add
 	// is already doomed, so there is no reason to mint private-key material for a request guaranteed to
@@ -312,7 +341,8 @@ export async function getSSHKey(req: {
  *
  * @param req - The request object containing the updated key details.
  * @param req.name - The name of the SSH key to update.
- * @param req.key - The new SSH key contents, either plaintext or an `enc:v1:` envelope.
+ * @param req.key - The new SSH key contents, either plaintext or an `enc:v1:` envelope; vetted like
+ * `add_ssh_key`'s, so a key ssh couldn't load never replaces a working one.
  * @returns An object containing a success message and optional replication results.
  */
 export async function updateSSHKey(req: {
@@ -322,6 +352,7 @@ export async function updateSSHKey(req: {
 	const validation = validateBySchema(req, updateSSHKeyValidationSchema);
 	if (validation) throw new ClientError(validation.message);
 
+	req.key = vetSSHPrivateKey(req.key);
 	const { name, key } = req;
 	harperLogger?.trace(`updating ssh key`, name);
 

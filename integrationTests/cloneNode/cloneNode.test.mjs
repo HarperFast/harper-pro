@@ -1,7 +1,8 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { readFileSync } from 'node:fs';
+import { generateKeyPairSync } from 'node:crypto';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -97,11 +98,24 @@ suite('Clone Node', (ctx) => {
 		await sendOperation(nodeCtx.harper, {
 			operation: 'add_ssh_key',
 			name: 'clonetestkey1',
-			key: 'clonerandom\nstring',
+			key: generateKeyPairSync('ec', {
+				namedCurve: 'P-256',
+				publicKeyEncoding: { type: 'spki', format: 'pem' },
+				privateKeyEncoding: { type: 'sec1', format: 'pem' },
+			}).privateKey,
 			host: 'testkey1.gitlab.com',
 			hostname: 'gitlab.com',
 			known_hosts: 'gitlab.com fake1\ngitlab.com fake2',
 		});
+		// ...beside a key stored before add_ssh_key validated keys, which the clone must skip without
+		// losing the valid one; named to list first where readdir is ordered (APFS, not ext4)
+		const leaderSSHDir = join(nodeCtx.harper.dataRootDir, 'ssh');
+		const legacyKeyFile = join(leaderSSHDir, 'aaalegacykey.key');
+		writeFileSync(legacyKeyFile, 'not\na key', { mode: 0o600 });
+		appendFileSync(
+			join(leaderSSHDir, 'config'),
+			`\n#aaalegacykey\nHost legacy.gitlab.com\n\tHostName gitlab.com\n\tUser git\n\tIdentityFile ${legacyKeyFile}\n\tIdentitiesOnly yes`
+		);
 
 		// Deploy a filesystem-only application file-by-file using set_component_file.
 		// This creates the component on disk without a config entry and without triggering
@@ -241,7 +255,7 @@ suite('Clone Node', (ctx) => {
 		const sshKeys = await sendOperation(ctx.nodes[1], {
 			operation: 'list_ssh_keys',
 		});
-		equal(sshKeys.length, 1, 'Should find 1 SSH key in clone node');
+		equal(sshKeys.length, 1, 'Should find only the valid SSH key in clone node');
 		equal(sshKeys[0].name, 'clonetestkey1', 'SSH key name should match the original');
 
 		// Verify that JWT keys were cloned successfully

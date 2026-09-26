@@ -20,14 +20,17 @@
  * (`materializeGitSSH`) and is covered by core's Application tests.
  */
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { generateKeyPairSync } from 'node:crypto';
+import { hasSSH, hasSSHKeygen } from './sshKeyFixtures.mjs';
 
-const PRIVATE_KEY = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA\n-----END OPENSSH PRIVATE KEY-----\n';
-const ROTATED_KEY =
-	'-----BEGIN OPENSSH PRIVATE KEY-----\ncm90YXRlZC1rZXktbWF0ZXJpYWw\n-----END OPENSSH PRIVATE KEY-----\n';
+// Real keys, minted in `before`: a supplied key must be one ssh can load.
+let PRIVATE_KEY;
+let PUBLIC_KEY;
+let ROTATED_KEY;
 
 function makePem() {
 	return generateKeyPairSync('rsa', {
@@ -64,6 +67,9 @@ describe('sshKeyOperations sealing', () => {
 		custodyModule = await import('#src/security/keyCustody');
 		harperLogger = (await import('#src/core/utility/logging/harper_logger')).default;
 		ops = await import('#src/security/sshKeyOperations');
+		const { generateEd25519SSHKeyPair } = await import('#src/security/sshKeyGeneration');
+		({ privateKey: PRIVATE_KEY, publicKey: PUBLIC_KEY } = await generateEd25519SSHKeyPair('harper:deploy'));
+		({ privateKey: ROTATED_KEY } = await generateEd25519SSHKeyPair('harper:rotated'));
 	});
 
 	beforeEach(() => {
@@ -297,6 +303,150 @@ describe('sshKeyOperations sealing', () => {
 			await ops.addSSHKey(request({ name: 'replica', key: envelope, host: 'gh', hostname: 'example.com' }));
 
 			assert.equal(storedKeyFor('replica'), envelope);
+		});
+
+		it('stores a pasted key as the normalized plaintext ssh reads', async () => {
+			await ops.addSSHKey(request({ name: 'deploy', key: pasted(PRIVATE_KEY), host: 'gh', hostname: 'example.com' }));
+
+			assert.equal(storedKeyFor('deploy'), PRIVATE_KEY);
+		});
+	});
+
+	// an indented, CRLF, double-spaced copy of `key` — every line of it still the key's
+	const pasted = (key) =>
+		key
+			.trimEnd()
+			.split('\n')
+			.map((line) => `\t${line}  `)
+			.join('\r\n\r\n');
+	const isClientError = (pattern) => (error) => error.statusCode === 400 && pattern.test(error.message);
+	const configFile = () => join(sshDir, 'config');
+
+	describe('validating what is supplied', () => {
+		it('refuses a public key in place of the private one, and writes nothing', async () => {
+			const req = request({ name: 'deploy', key: PUBLIC_KEY, host: 'gh', hostname: 'example.com' });
+
+			await assert.rejects(
+				ops.addSSHKey(req),
+				isClientError(/^The SSH key looks like a public key \("ssh-ed25519 …"\)/)
+			);
+			assert.throws(() => storedKeyFor('deploy'), /ENOENT/);
+			assert.throws(() => readFileSync(configFile()), /ENOENT/);
+			assert.equal(req.key, PUBLIC_KEY, 'nothing was sealed for replication either');
+		});
+
+		it('stores, and replicates, a pasted key in the form ssh reads', async () => {
+			const req = request({ name: 'deploy', key: pasted(PRIVATE_KEY), host: 'gh', hostname: 'example.com' });
+			await ops.addSSHKey(req);
+
+			assert.equal(decrypt(storedKeyFor('deploy')), PRIVATE_KEY);
+			assert.equal(req.key, storedKeyFor('deploy'));
+		});
+
+		it('refuses a rotation to a key ssh could not load, leaving the working key untouched', async () => {
+			await ops.addSSHKey(request({ name: 'deploy', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' }));
+			const keyBefore = storedKeyFor('deploy');
+			const configBefore = readFileSync(configFile(), 'utf8');
+
+			const broken = PRIVATE_KEY.replace(/\n[A-Za-z0-9+/=]+\n/, '\n');
+			await assert.rejects(ops.updateSSHKey(request({ name: 'deploy', key: broken })), isClientError(/damaged/));
+			await assert.rejects(ops.updateSSHKey(request({ name: 'deploy', key: PUBLIC_KEY })), isClientError(/public key/));
+
+			assert.equal(storedKeyFor('deploy'), keyBefore);
+			assert.equal(readFileSync(configFile(), 'utf8'), configBefore);
+		});
+
+		it('rotates to a pasted key stored in the form ssh reads', async () => {
+			await ops.addSSHKey(request({ name: 'deploy', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' }));
+			const req = request({ name: 'deploy', key: pasted(ROTATED_KEY) });
+			await ops.updateSSHKey(req);
+
+			assert.equal(decrypt(storedKeyFor('deploy')), ROTATED_KEY);
+			assert.equal(req.key, storedKeyFor('deploy'));
+		});
+
+		it('writes and replicates host and hostname trimmed', async () => {
+			// deliberately not github.com, which fetches api.github.com's known hosts for real
+			const req = request({
+				name: 'deploy',
+				key: PRIVATE_KEY,
+				host: ' deploy.example.com\n',
+				hostname: '\tgit.example.com ',
+			});
+			await ops.addSSHKey(req);
+
+			assert.match(readFileSync(configFile(), 'utf8'), /^Host deploy\.example\.com\n\tHostName git\.example\.com\n/m);
+			assert.equal(req.host, 'deploy.example.com');
+			assert.equal(req.hostname, 'git.example.com');
+		});
+
+		it('refuses a host or hostname that would break the ssh config every key shares, before writing anything', async () => {
+			for (const [field, value, reason] of [
+				['host', 'deploy example.com', /must be a single alias/],
+				['hostname', 'git.example.com extra', /must be a single hostname/],
+				['hostname', 'git"example.com', /must not contain quotes/],
+				['hostname', '=#x', /must not contain quotes or "="/],
+				['host', '*.example.com', /must be one alias, not a pattern/],
+				['host', '-oProxyCommand', /must not start with "-"/],
+			]) {
+				const req = request({ name: 'bad', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com', [field]: value });
+				await assert.rejects(ops.addSSHKey(req), isClientError(new RegExp(`^'${field}' ${reason.source}`)));
+			}
+			assert.throws(() => storedKeyFor('bad'), /ENOENT/);
+			assert.throws(() => readFileSync(configFile()), /ENOENT/);
+		});
+
+		it('cloning from a leader skips a legacy key this node refuses, and still clones the next one', async () => {
+			// a key the leader stored before validation existed, as its get_ssh_key returns it
+			const leader = {
+				legacy: { name: 'legacy', key: 'random\nstring', host: 'legacy.example.com', hostname: 'example.com' },
+				deploy: { name: 'deploy', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' },
+			};
+			const logged = [];
+			const { cloneSSHKeysFromLeader } = await import('#src/cloneNode/sshKeyClone');
+			await cloneSSHKeysFromLeader(
+				async ({ operation, name }) =>
+					operation === 'list_ssh_keys' ? [{ name: 'legacy' }, { name: 'deploy' }] : { ...leader[name] },
+				ops.addSSHKey,
+				(message, level) => logged.push({ message, level })
+			);
+
+			assert.equal(decrypt(storedKeyFor('deploy')), PRIVATE_KEY);
+			assert.throws(() => storedKeyFor('legacy'), /ENOENT/);
+			const errors = logged.filter(({ level }) => level === 'error').map(({ message }) => message);
+			assert.equal(errors.length, 1);
+			assert.match(errors[0], /^Skipped cloning SSH key 'legacy': The SSH key doesn't look like a private key\./);
+			assert.ok(!logged.some(({ message }) => message.includes('random')), 'no key material may be logged');
+		});
+	});
+
+	describe('a stored key, loaded by ssh for a git deploy', () => {
+		before(function () {
+			if (!hasSSH || !hasSSHKeygen) this.skip();
+		});
+
+		it("decrypts through core's materializeGitSSH to a key ssh loads, under the alias it was added with", async function () {
+			this.timeout(60000);
+			const { materializeGitSSH } = await import('#src/core/components/Application');
+			await ops.addSSHKey(
+				request({ name: 'deploy', key: pasted(PRIVATE_KEY), host: 'deploy.example.com', hostname: 'git.example.com' })
+			);
+
+			const gitSSH = await materializeGitSSH();
+			try {
+				const sshConfig = gitSSH.command.match(/-F (\S+)/)[1];
+				const resolved = execFileSync('ssh', ['-G', '-F', sshConfig, 'deploy.example.com'], {
+					stdio: ['ignore', 'pipe', 'pipe'],
+				}).toString();
+				assert.match(resolved, /^hostname git\.example\.com$/m);
+				const identityFile = resolved.match(/^identityfile (.+)$/m)[1];
+				const derived = execFileSync('ssh-keygen', ['-y', '-P', '', '-f', identityFile], {
+					stdio: ['ignore', 'pipe', 'pipe'],
+				}).toString();
+				assert.equal(derived.split(' ').slice(0, 2).join(' '), PUBLIC_KEY.split(' ').slice(0, 2).join(' '));
+			} finally {
+				await gitSSH.cleanup();
+			}
 		});
 	});
 });

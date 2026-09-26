@@ -1,5 +1,6 @@
 import { suite, test, before, beforeEach, afterEach, after } from 'node:test';
 import { equal, deepEqual, ok } from 'node:assert';
+import { generateKeyPairSync } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
@@ -12,6 +13,15 @@ const GITHUB_SSH_KEYS = ['ssh-ed25519 fixture-key-one', 'ecdsa-sha2-nistp256 fix
 const GITHUB_KNOWN_HOSTS = GITHUB_SSH_KEYS.map((key) => `github.com ${key}\n`).join('');
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(TEST_DIRECTORY, '..', '..', 'dist', 'bin', 'harper.js');
+
+// add_ssh_key and update_ssh_key refuse anything ssh couldn't load, so every key sent here is real.
+function makeKey() {
+	return generateKeyPairSync('ec', {
+		namedCurve: 'P-256',
+		publicKeyEncoding: { type: 'spki', format: 'pem' },
+		privateKeyEncoding: { type: 'sec1', format: 'pem' },
+	}).privateKey;
+}
 
 async function sendOperation(node, operation) {
 	const response = await fetch(node.operationsAPIURL, {
@@ -101,7 +111,7 @@ suite('SSH Key Operations', (ctx) => {
 		let { status, data } = await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',
 			name: 'testkey1',
-			key: 'random\nstring',
+			key: makeKey(),
 			host: 'testkey1.gitlab.com',
 			hostname: 'gitlab.com',
 			known_hosts: 'gitlab.com fake1\ngitlab.com fake2',
@@ -121,7 +131,7 @@ suite('SSH Key Operations', (ctx) => {
 		// Keys are sealed at rest (harper-pro#581) and get_ssh_key returns the envelope as-is —
 		// the only consumer is cloneSSHKeys, which never needs the plaintext.
 		ok(data.key.startsWith('enc:v1:'), 'expected key to be returned as an enc:v1: envelope');
-		ok(!data.key.includes('random\nstring'), 'expected key to not be returned in plaintext');
+		ok(!data.key.includes('PRIVATE KEY'), 'expected key to not be returned in plaintext');
 	});
 
 	test('add_ssh_key generate=true mints a keypair and returns the public key', async () => {
@@ -150,7 +160,7 @@ suite('SSH Key Operations', (ctx) => {
 			operation: 'add_ssh_key',
 			name: 'testkey-both',
 			generate: true,
-			key: 'random\nstring',
+			key: makeKey(),
 			host: 'testkey-both.gitlab.com',
 			hostname: 'gitlab.com',
 		});
@@ -185,7 +195,7 @@ suite('SSH Key Operations', (ctx) => {
 		let { status, data } = await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',
 			name: 'testkey-github',
-			key: 'random\nstring',
+			key: makeKey(),
 			host: 'testkey-github.github.com',
 			hostname: 'github.com',
 		});
@@ -203,7 +213,7 @@ suite('SSH Key Operations', (ctx) => {
 		let { status, data } = await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',
 			name: 'testkey-github-fallback',
-			key: 'random\nstring',
+			key: makeKey(),
 			host: 'testkey-github-fallback.github.com',
 			hostname: 'github.com',
 		});
@@ -223,7 +233,7 @@ suite('SSH Key Operations', (ctx) => {
 		await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',
 			name: 'testkey-update',
-			key: 'original\nstring',
+			key: makeKey(),
 			host: 'testkey-update.gitlab.com',
 			hostname: 'gitlab.com',
 		});
@@ -231,7 +241,7 @@ suite('SSH Key Operations', (ctx) => {
 		const { status, data } = await sendOperation(ctx.harper, {
 			operation: 'update_ssh_key',
 			name: 'testkey-update',
-			key: 'updated\nstring',
+			key: makeKey(),
 		});
 		equal(status, 200);
 		equal(data.message, 'Updated ssh key: testkey-update');
@@ -241,7 +251,7 @@ suite('SSH Key Operations', (ctx) => {
 		await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',
 			name: 'testkey-delete',
-			key: 'random\nstring',
+			key: makeKey(),
 			host: 'testkey-delete.gitlab.com',
 			hostname: 'gitlab.com',
 		});
@@ -256,10 +266,11 @@ suite('SSH Key Operations', (ctx) => {
 	});
 
 	test('add_ssh_key with duplicate name returns error', async () => {
+		const key = makeKey();
 		await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',
 			name: 'testkey-duplicate',
-			key: 'key',
+			key,
 			host: 'test',
 			hostname: 'gitlab.com',
 		});
@@ -267,7 +278,7 @@ suite('SSH Key Operations', (ctx) => {
 		const { status, data } = await sendOperation(ctx.harper, {
 			operation: 'add_ssh_key',
 			name: 'testkey-duplicate',
-			key: 'key',
+			key,
 			host: 'test',
 			hostname: 'gitlab.com',
 		});
@@ -275,11 +286,85 @@ suite('SSH Key Operations', (ctx) => {
 		equal(data.error, 'Key already exists. Use update_ssh_key or delete_ssh_key and then add_ssh_key');
 	});
 
+	test('add_ssh_key refuses a public key sent in place of the private one, and stores nothing', async () => {
+		let { status, data } = await sendOperation(ctx.harper, {
+			operation: 'add_ssh_key',
+			name: 'testkey-public',
+			key: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGExampleExampleExampleExampleExampleExample me@laptop',
+			host: 'testkey-public.gitlab.com',
+			hostname: 'gitlab.com',
+		});
+		equal(status, 400);
+		equal(
+			data.error,
+			'The SSH key looks like a public key ("ssh-ed25519 …"). Use the private key — the file without the .pub extension.'
+		);
+
+		({ status, data } = await sendOperation(ctx.harper, { operation: 'list_ssh_keys' }));
+		equal(status, 200);
+		deepEqual(data, []);
+	});
+
+	test('add_ssh_key refuses a hostname that would break the ssh config every key shares', async () => {
+		const { status, data } = await sendOperation(ctx.harper, {
+			operation: 'add_ssh_key',
+			name: 'testkey-hostname',
+			key: makeKey(),
+			host: 'testkey-hostname.gitlab.com',
+			hostname: 'gitlab.com extra',
+		});
+		equal(status, 400);
+		equal(
+			data.error,
+			`'hostname' must be a single hostname like "github.com", without spaces or line breaks; got "gitlab.com extra".`
+		);
+	});
+
+	test('add_ssh_key accepts a key pasted with CRLF line endings and indentation', async () => {
+		const pasted = makeKey()
+			.trimEnd()
+			.split('\n')
+			.map((line) => `    ${line}`)
+			.join('\r\n');
+		const { status, data } = await sendOperation(ctx.harper, {
+			operation: 'add_ssh_key',
+			name: 'testkey-pasted',
+			key: pasted,
+			host: 'testkey-pasted.gitlab.com',
+			hostname: 'gitlab.com',
+		});
+		equal(status, 200, JSON.stringify(data));
+		equal(data.message, 'Added ssh key: testkey-pasted');
+	});
+
+	test('update_ssh_key refuses a damaged key and keeps the working one', async () => {
+		await sendOperation(ctx.harper, {
+			operation: 'add_ssh_key',
+			name: 'testkey-damaged',
+			key: makeKey(),
+			host: 'testkey-damaged.gitlab.com',
+			hostname: 'gitlab.com',
+		});
+		const before = await sendOperation(ctx.harper, { operation: 'get_ssh_key', name: 'testkey-damaged' });
+
+		const lines = makeKey().split('\n');
+		const { status, data } = await sendOperation(ctx.harper, {
+			operation: 'update_ssh_key',
+			name: 'testkey-damaged',
+			key: [...lines.slice(0, 1), ...lines.slice(2)].join('\n'),
+		});
+		equal(status, 400);
+		equal(data.error, "The SSH key is damaged and can't be read. Copy it again from the original file.");
+
+		const after = await sendOperation(ctx.harper, { operation: 'get_ssh_key', name: 'testkey-damaged' });
+		equal(after.data.key, before.data.key);
+	});
+
 	test('update_ssh_key on nonexistent key returns error', async () => {
 		const { status, data } = await sendOperation(ctx.harper, {
 			operation: 'update_ssh_key',
 			name: 'nonexistent',
-			key: 'anything',
+			key: makeKey(),
 		});
 		ok(status >= 400);
 		equal(data.error, "SSH key 'nonexistent' does not exist. Use add_ssh_key to create it.");
