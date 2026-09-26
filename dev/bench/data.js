@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790323244861,
+  "lastUpdate": 1790409258071,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -5303,6 +5303,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2578.58,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Dawson Toth",
+            "username": "dawsontoth",
+            "email": "dawson@harperdb.io"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "5bcdccae84747c9093f3bd8caf1fb4066bc64971",
+          "message": "Fail an unanswered replicated operation instead of waiting forever, and stop forwarding the user's refresh token (#915)\n\n* fix(replication): settle every peer of a replicated operation, and stop forwarding hdb_user\n\nA replicated deploy_component whose peer never answered held the origin's\noperation, its deployment row and its own restart until the peer was\nrestarted, and nothing was logged at the default level.\n\nsendOperationToNode now settles through one deadline that runs from\nbefore the connection opens, and rejects when the connection closes\nbefore an answer, saying the operation's outcome there is unknown. It\nsettles through the session's promise with then() rather than adopting\nit, which had left its own deadline dead once the socket opened.\nreplicateOperation forwards a caller's timeoutMs (core passes one for\ndeploys) and warns for every failed peer with only the operation name,\nnode and reason. A peer whose answer is ready after its connection closed\nwarns instead of dropping it silently.\n\nThe forwarded operation no longer carries the sender's hdb_user: the\nreceiver replaces it with the connection's node identity, so the user\nrecord and its refresh_token were only ever logged at debug on both\nends. redactOperationForLog masks it for older senders and now covers\nevery field core's operation log drops.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Let an answer read with the connection's close win over the close\n\nThe close listener rejected synchronously, ahead of the microtask that\nsettles an answer read in the same turn, so a peer that answered and\nclosed at once was recorded as not answering. The close now rejects\nafter the turn's microtasks.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Pin the timer-range clamp with a test; trim test headers to what they cover\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Give the sendOperationToNode tests their own sinon sandbox\n\nRestoring the default sandbox replays fakes other files left on it.\nreceiveWatchdog.test.mjs spies on the fake setTimeout and restores that\nspy directly, so a later default-sandbox restore reinstalls the dead fake\nglobally and every later real timer in the run never fires.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Guard the operation-answer paths against a request that is not an object\n\nReview feedback: a malformed OPERATION_REQUEST whose body is not an object\nthrew again from its own error answer and closed the connection, and the\nundelivered-answer warn read request.operation unguarded.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Pin the malformed OPERATION_REQUEST answer with a test; name the undelivered one\n\nReview feedback: a body that is not an object is answered with an error and\nthe connection stays open, and an answer ready after the close is dropped\nwithout a throw. Both cases closed the connection with 1011 before ac30a8a.\nThe undelivered-answer warn now reads \"An operation\" rather than \"undefined\"\nwhen the request had no operation name.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* Keep an already-started node reachable for teardown if the second fails to start\n\nReview feedback: ctx.nodes was assigned only after both nodes started, so a\nsecond startHarper that threw left the first running with nothing to stop it.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-09-25T22:42:59Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/5bcdccae84747c9093f3bd8caf1fb4066bc64971"
+        },
+        "date": 1790409256367,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 6921.13,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 17563.91,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 14752.24,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 7149.01,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 5187.56,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2483.49,
             "unit": "ops/sec"
           }
         ]
