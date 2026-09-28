@@ -671,12 +671,17 @@ async function appendToSSHConfig(configFile: string, text: string): Promise<void
 	}
 }
 
+/**
+ * Without #722's writer lock this is check-then-truncate, not atomic: an append another thread makes
+ * between the last size check and the truncate is lost, and one made before it leaves the partial block.
+ */
 async function removePartialAppend(handle: FileHandle, before: number, text: Buffer): Promise<void> {
 	const written = (await handle.stat()).size - before;
 	if (written <= 0 || written >= text.length) return;
 	const tail = Buffer.alloc(written);
 	await handle.read(tail, 0, written, before);
-	if (tail.equals(text.subarray(0, written))) await handle.truncate(before);
+	if (!tail.equals(text.subarray(0, written))) return;
+	if ((await handle.stat()).size === before + written) await handle.truncate(before);
 }
 
 async function readSSHConfigFile(configFile: string): Promise<string | undefined> {

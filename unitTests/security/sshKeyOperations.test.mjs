@@ -589,7 +589,34 @@ describe('sshKeyOperations sealing', () => {
 					FileHandle.prototype.appendFile = appendFile;
 				}
 
-				assert.ok(readConfig().startsWith(`${blockFor('first')}\n# a note`), readConfig());
+				// the rollback can't remove its own bytes from behind another writer's, so its partial block stays
+				const partial = `\n${blockFor('second').slice(0, blockFor('second').indexOf('Host'))}`;
+				assert.equal(readConfig(), `${blockFor('first')}\n# a note${partial}`);
+				await assert.rejects(ops.deleteSSHKey({ name: 'second' }), /no "# END harper ssh key second" line ends it/);
+			});
+
+			it('keeps what another writer appended while the rollback was checking', async () => {
+				await addKey('first');
+				const probe = await open(join(rootDir, 'probe'), 'w');
+				const FileHandle = probe.constructor;
+				await probe.close();
+				const { appendFile, read } = FileHandle.prototype;
+				FileHandle.prototype.appendFile = async function (data, options) {
+					await appendFile.call(this, String(data).slice(0, String(data).indexOf('Host')), options);
+					throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+				};
+				FileHandle.prototype.read = async function (...args) {
+					const result = await read.apply(this, args);
+					writeFileSync(configPath(), '\n# a late note', { flag: 'a' });
+					return result;
+				};
+				try {
+					await assert.rejects(addKey('second'), { code: 'ENOSPC' });
+				} finally {
+					Object.assign(FileHandle.prototype, { appendFile, read });
+				}
+
+				assert.ok(readConfig().endsWith('\n# a late note'), readConfig());
 			});
 
 			it('removes its temporary file when replacing the config fails', async function () {
@@ -678,7 +705,6 @@ describe('sshKeyOperations sealing', () => {
 
 			it("leaves a section alone when its IdentityFile isn't the key file add_ssh_key wrote for that name", async () => {
 				seedKeys('prod', 'moved');
-				// the user's own section under a key's name, and a block whose IdentityFile was repointed
 				const lookalike = '#prod\nHost prod\n\tHostName prod.example.net\n\tIdentityFile ~/.ssh/prod.key';
 				const repointed = legacyBlockFor('moved').replace(keyPath('moved'), '/elsewhere/ssh/moved.key');
 				writeFileSync(configPath(), `${lookalike}\n${repointed}`);
