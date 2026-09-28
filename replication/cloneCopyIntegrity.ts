@@ -1,14 +1,17 @@
-import { unpack } from 'msgpackr';
-
 const COPY_DROP = Symbol.for('cloneCopyDrop');
-const REMOTE_NODE_IDS = Symbol.for('remote-ids');
+
+type CloneMetadataStore = {
+	getSync(key: any): unknown;
+	putSync(key: any, value: unknown): unknown;
+	removeSync(key: any): unknown;
+};
 
 type DbisStore = {
 	getSync(key: any): unknown;
 	put(key: any, value: unknown): unknown;
 	putSync(key: any, value: unknown): unknown;
 	removeSync(key: any): unknown;
-	transactionSync<T>(callback: () => T): T;
+	transactionSync<T>(callback: (transaction?: CloneMetadataStore) => T): T;
 };
 
 export type CloneCopyDrop = {
@@ -35,8 +38,8 @@ export type CloneIncompleteStatus =
 	  }
 	| { state: 'unknown'; reason: 'invalid-marker' | 'unreadable-marker' };
 
-function markerKey(sourceNodeId: number) {
-	return [COPY_DROP, sourceNodeId];
+function markerKey(sourceName: string) {
+	return [COPY_DROP, sourceName];
 }
 
 function validatedMarker(value: unknown): CloneCopyDrop | undefined {
@@ -59,21 +62,26 @@ function validatedMarker(value: unknown): CloneCopyDrop | undefined {
 	return value as CloneCopyDrop;
 }
 
-function readMarker(dbisDB: DbisStore, sourceNodeId: number): CloneCopyDrop | undefined {
-	return validatedMarker(dbisDB.getSync(markerKey(sourceNodeId)));
+function readMarker(dbisDB: Pick<CloneMetadataStore, 'getSync'>, sourceName: string): CloneCopyDrop | undefined {
+	return validatedMarker(dbisDB.getSync(markerKey(sourceName)));
 }
 
 export function beginCloneCopyIntegrityPass(
 	dbisDB: DbisStore,
-	sourceNodeId: number,
+	sourceName: string,
 	copyStartTime: number,
 	now = Date.now()
-): { dropCount: number } {
-	const marker = readMarker(dbisDB, sourceNodeId);
+): { dropCount: number; preserveUnknown?: true } {
+	let marker: CloneCopyDrop | undefined;
+	try {
+		marker = readMarker(dbisDB, sourceName);
+	} catch {
+		return { dropCount: 0, preserveUnknown: true };
+	}
 	if (!marker) return { dropCount: 0 };
 	if (marker.copyStartTime === copyStartTime) return { dropCount: marker.count };
 	if (marker.repairAnchor !== copyStartTime) {
-		dbisDB.putSync(markerKey(sourceNodeId), {
+		dbisDB.putSync(markerKey(sourceName), {
 			...marker,
 			repairAnchor: copyStartTime,
 			repairStartedAt: now,
@@ -84,14 +92,23 @@ export function beginCloneCopyIntegrityPass(
 
 export async function recordCloneCopyDrop(
 	dbisDB: DbisStore,
-	sourceNodeId: number,
+	sourceName: string,
 	copyStartTime: number,
 	table: string,
 	reason: string,
 	now = Date.now()
 ): Promise<CloneCopyDrop> {
-	const existing = readMarker(dbisDB, sourceNodeId);
-	if (existing?.copyStartTime === copyStartTime) return existing;
+	let existing: CloneCopyDrop | undefined;
+	try {
+		existing = readMarker(dbisDB, sourceName);
+	} catch {
+		// A real drop gives us authoritative replacement evidence for an unreadable old marker.
+	}
+	if (existing?.copyStartTime === copyStartTime) {
+		const updated = { ...existing, count: existing.count + 1 };
+		await dbisDB.put(markerKey(sourceName), updated);
+		return updated;
+	}
 	const marker: CloneCopyDrop = {
 		copyStartTime,
 		table: table.slice(0, 256),
@@ -99,19 +116,24 @@ export async function recordCloneCopyDrop(
 		detectedAt: now,
 		count: 1,
 	};
-	await dbisDB.put(markerKey(sourceNodeId), marker);
+	// If this is a failed repair, keep the prior terminal verdict visible until this pass finalizes.
+	if (existing?.repairAnchor === copyStartTime && existing.finalizedAt !== undefined)
+		marker.finalizedAt = existing.finalizedAt;
+	await dbisDB.put(markerKey(sourceName), marker);
 	return marker;
 }
 
 export function finishCloneCopyIntegrityPass(
-	dbisDB: DbisStore,
-	sourceNodeId: number,
+	dbisDB: CloneMetadataStore,
+	sourceName: string,
 	copyStartTime: number,
 	dropCount: number,
-	now = Date.now()
+	now = Date.now(),
+	preserveUnknown = false
 ): 'finalized' | 'repaired' | 'unchanged' {
-	const marker = readMarker(dbisDB, sourceNodeId);
-	if (dropCount > 0) {
+	if (preserveUnknown && dropCount === 0) return 'unchanged';
+	const marker = readMarker(dbisDB, sourceName);
+	if (dropCount > 0 || marker?.copyStartTime === copyStartTime) {
 		if (!marker || marker.copyStartTime !== copyStartTime)
 			throw new Error('clone-copy drop marker does not match the copy pass being finalized');
 		const finalized: CloneCopyDrop = {
@@ -122,11 +144,11 @@ export function finishCloneCopyIntegrityPass(
 			count: Math.max(marker.count, dropCount),
 			finalizedAt: now,
 		};
-		dbisDB.putSync(markerKey(sourceNodeId), finalized);
+		dbisDB.putSync(markerKey(sourceName), finalized);
 		return 'finalized';
 	}
 	if (marker?.repairAnchor === copyStartTime) {
-		dbisDB.removeSync(markerKey(sourceNodeId));
+		dbisDB.removeSync(markerKey(sourceName));
 		return 'repaired';
 	}
 	return 'unchanged';
@@ -134,32 +156,42 @@ export function finishCloneCopyIntegrityPass(
 
 export function finishCloneCopyMetadata(
 	dbisDB: DbisStore,
-	sourceNodeId: number,
+	sourceName: string,
+	sourceNodeId: number | undefined,
 	copyStartTime: number,
 	dropCount: number,
 	cloneAttempt?: string,
-	now = Date.now()
+	now = Date.now(),
+	preserveUnknown = false
 ): 'finalized' | 'repaired' | 'unchanged' {
-	return dbisDB.transactionSync(() => {
-		const disposition = finishCloneCopyIntegrityPass(dbisDB, sourceNodeId, copyStartTime, dropCount, now);
-		if (cloneAttempt)
-			dbisDB.putSync([Symbol.for('cloneCopyComplete'), sourceNodeId], {
+	return dbisDB.transactionSync((transaction) => {
+		const metadataStore = transaction ?? dbisDB;
+		const disposition = finishCloneCopyIntegrityPass(
+			metadataStore,
+			sourceName,
+			copyStartTime,
+			dropCount,
+			now,
+			preserveUnknown
+		);
+		if (cloneAttempt && sourceNodeId !== undefined)
+			metadataStore.putSync([Symbol.for('cloneCopyComplete'), sourceNodeId], {
 				cloneAttempt,
 				copyStartTime,
 			});
-		dbisDB.removeSync([Symbol.for('copyCursor'), sourceNodeId]);
+		if (sourceNodeId !== undefined) metadataStore.removeSync([Symbol.for('copyCursor'), sourceNodeId]);
 		return disposition;
 	});
 }
 
 export function cloneIncompleteStatus(
-	dbisDB: Pick<DbisStore, 'getSync'> | undefined,
-	sourceNodeId: number | undefined
+	dbisDB: Pick<CloneMetadataStore, 'getSync'> | undefined,
+	sourceName: string | undefined
 ): CloneIncompleteStatus | undefined {
-	if (!dbisDB || sourceNodeId === undefined) return undefined;
+	if (!dbisDB || !sourceName) return undefined;
 	let marker: CloneCopyDrop | undefined;
 	try {
-		marker = validatedMarker(dbisDB.getSync(markerKey(sourceNodeId)));
+		marker = validatedMarker(dbisDB.getSync(markerKey(sourceName)));
 	} catch (error) {
 		const invalid = error instanceof Error && error.message === 'invalid durable clone-copy drop marker';
 		return {
@@ -179,14 +211,4 @@ export function cloneIncompleteStatus(
 		finalizedAt: marker.finalizedAt,
 		repairAnchor: marker.repairAnchor,
 	};
-}
-
-export function readRemoteNodeId(auditStore: any, remoteNodeName: string): number | undefined {
-	try {
-		const encoded = auditStore?.getBinary?.(REMOTE_NODE_IDS);
-		const nodeId = encoded && unpack(encoded)?.remoteNameToId?.[remoteNodeName];
-		return Number.isInteger(nodeId) && nodeId >= 0 ? nodeId : undefined;
-	} catch {
-		return undefined;
-	}
 }

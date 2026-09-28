@@ -356,8 +356,9 @@ export async function cloneNode(): Promise<void> {
 	if (syncOutcome === 'incomplete') {
 		updateConfigValue(CONFIG_PARAMS.CLONED, false);
 		clearCloneAttempt();
+		clearSyncStartedMarker();
 		log(
-			`Clone from leader node ${leaderURL} completed with one or more undecodable copy records; node is running but Unavailable and not marked as cloned. Inspect cluster_status cloneIncomplete and repair by replacing the affected database store with a clean clone`,
+			`Clone from leader node ${leaderURL} completed with one or more undecodable copy records; node is running but Unavailable and not marked as cloned. Inspect cluster_status cloneIncomplete, stop the node, replace the affected database store, and restart to request a clean clone`,
 			'error'
 		);
 		return;

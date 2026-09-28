@@ -126,11 +126,12 @@ suite('Clone Node - incomplete copy stays Unavailable', { timeout: 300_000 }, (c
 		await waitForCondition(
 			async () =>
 				!existsSync(join(ctx.clone.dataRootDir, '.cloneAttempt.json')) &&
+				!existsSync(join(ctx.clone.dataRootDir, 'tmp', 'clone-sync-started.json')) &&
 				/completed with one or more undecodable copy records/.test(await readLog(ctx.clone)),
 			{
 				timeoutMs: 30_000,
 				pollMs: 250,
-				description: 'the incomplete-clone verdict to retire the clone attempt',
+				description: 'the incomplete-clone verdict to retire clone attempt and resume state',
 			}
 		);
 

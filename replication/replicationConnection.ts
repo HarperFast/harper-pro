@@ -3765,7 +3765,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
 	let copyCompleteReceived = false;
 	let copyIntegrityPass = 0;
+	let copyIntegritySourceName: string | undefined;
 	let copyDropCount = 0;
+	let preserveUnknownCopyMarker = false;
 	// User-DB tables that received at least one audit-less copy-apply snapshot row in the current copy
 	// pass (harper-pro#495). Only these need a reload marker: an empty (or fully-audited) table delivered
 	// nothing invisible to its live subscribers, so emitting a marker for it would be wasted work. Reset
@@ -3889,21 +3891,29 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 			if (copyFlushInFlight) return; // a flush is persisting the final cursor; finish on its completion
 			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
-			if (copyFromNodeId !== undefined) {
+			if (copyIntegritySourceName) {
 				try {
 					const dbisDB = getDatabaseStores().dbisDB;
 					if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
-					finishCloneCopyMetadata(dbisDB as any, copyFromNodeId, copyModeStartTime, copyDropCount, cloneAttempt);
+					finishCloneCopyMetadata(
+						dbisDB as any,
+						copyIntegritySourceName,
+						copyFromNodeId,
+						copyModeStartTime,
+						copyDropCount,
+						cloneAttempt,
+						undefined,
+						preserveUnknownCopyMarker
+					);
 				} catch (error) {
 					wsClosed = true;
-					logger.warn?.(connectionId, 'failed to finalize copy integrity metadata', databaseName, error);
 					close(1011, 'Failed to finalize copy integrity metadata');
+					runRecoveryDiagnostic(() =>
+						logger.warn?.(connectionId, 'failed to finalize copy integrity metadata', databaseName, error)
+					);
 					return;
 				}
 			}
-			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
-			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
-			// (received-version watermark suppressed) and it could never reach Available.
 			inCopyMode = false;
 			subscriptionSetupWatchdog?.resume();
 			// Retired before the flags its onStall re-checks are cleared, so the timer stops waking the
@@ -3912,7 +3922,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
 			copyIntegrityPass = 0;
+			copyIntegritySourceName = undefined;
 			copyDropCount = 0;
+			preserveUnknownCopyMarker = false;
 			pendingCopyCursor = null;
 			copyProgressWatchdog?.stop(); // copy is done; no longer watching for copy-progress stalls (#453)
 			// Copy is over: narrow the byte watchdog back from COPY_TIMEOUT to PING_TIMEOUT so an idle/dead
@@ -5406,20 +5418,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyModeOrderVersion = message[2];
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						copyIntegrityPass = copyWatermark.currentPass;
+						copyIntegritySourceName = remoteNodeName;
 						copyDropCount = 0;
-						if (copyFromNodeId !== undefined) {
-							try {
-								const dbisDB = getDatabaseStores().dbisDB;
-								if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
-								copyDropCount = beginCloneCopyIntegrityPass(dbisDB as any, copyFromNodeId, copyModeStartTime).dropCount;
-							} catch (error) {
-								wsClosed = true;
-								close(1011, 'Failed to read copy integrity metadata');
-								runRecoveryDiagnostic(() =>
-									logger.error?.(connectionId, 'failed to start copy integrity pass', databaseName, error)
-								);
-								return;
-							}
+						preserveUnknownCopyMarker = false;
+						try {
+							if (!copyIntegritySourceName) throw new Error('copy source has no authenticated node name');
+							const dbisDB = getDatabaseStores().dbisDB;
+							if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
+							const integrity = beginCloneCopyIntegrityPass(dbisDB as any, copyIntegritySourceName, copyModeStartTime);
+							copyDropCount = integrity.dropCount;
+							preserveUnknownCopyMarker = integrity.preserveUnknown === true;
+						} catch (error) {
+							wsClosed = true;
+							close(1011, 'Failed to read copy integrity metadata');
+							runRecoveryDiagnostic(() =>
+								logger.error?.(connectionId, 'failed to start copy integrity pass', databaseName, error)
+							);
+							return;
 						}
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
@@ -7032,7 +7047,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const copyFramePass = copyWatermark.currentPass;
 			const copyFrameStartTime = copyModeStartTime;
 			const copyFrameOrder = copyModeOrderVersion;
-			const copyFrameSourceNodeId = copyFromNodeId;
+			const copyFrameSourceName = copyIntegritySourceName;
 			do {
 				getSharedStatus();
 				const eventLength = decoder.readInt();
@@ -7344,23 +7359,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					};
 					if (
 						messageIsCopyFrame &&
-						copyFrameSourceNodeId !== undefined &&
+						copyFrameSourceName !== undefined &&
 						copyFramePass === copyIntegrityPass &&
 						!connectionSuperseded()
 					) {
 						try {
-							if (copyDropCount === 0) {
-								const dbisDB = getDatabaseStores().dbisDB;
-								if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
-								await recordCloneCopyDrop(
-									dbisDB as any,
-									copyFrameSourceNodeId,
-									copyFrameStartTime,
-									hole.tableName,
-									hole.reason
-								);
-							}
-							copyDropCount++;
+							const dbisDB = getDatabaseStores().dbisDB;
+							if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
+							const marker = await recordCloneCopyDrop(
+								dbisDB as any,
+								copyFrameSourceName,
+								copyFrameStartTime,
+								hole.tableName,
+								hole.reason
+							);
+							copyDropCount = marker.count;
+							preserveUnknownCopyMarker = false;
 						} catch (error) {
 							wsClosed = true;
 							close(1011, 'Could not record incomplete copy; reconnecting');
