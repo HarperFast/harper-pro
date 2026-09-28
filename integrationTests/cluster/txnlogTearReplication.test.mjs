@@ -13,6 +13,12 @@
  * transaction it does not receive in full. Streaming replication commits what it drained; #2087's
  * atomic discard of a truncated transaction is the crash-recovery replay arm, not exercised here.
  *
+ * B joins at the log key of a seed entry A writes first (`add_node` `start_time`), so none of B's
+ * subscriptions can resolve to a base copy of A's intact table, which never reads the torn log.
+ * Without it, B's restart full-copies whenever its resume cursor was not yet persisted when B was
+ * stopped: the cursor trails applied rows, and after a copy it waits on a memtable flush. B's copy of
+ * the seed table staying empty is the evidence.
+ *
  * Not covered: the readable tear shape, where the torn frame is yielded with a garbage payload and
  * wedges the receiver (harper-pro#669); a torn tail; `cluster_status` surfacing the break
  * (harper-pro#667); and the write side that lets a tear happen at all (rocksdb-js#748).
@@ -41,6 +47,8 @@ const LOG_ID = 1;
 
 const DATABASE = 'data';
 const TABLE = 'torn';
+const SEED_TABLE = 'seed';
+const SEED_ID = 'seed';
 const BATCH_ONE = 10;
 const BATCH_TWO = 50;
 const TOTAL = BATCH_ONE + BATCH_TWO;
@@ -76,21 +84,30 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 		ctx.nodeB = await startNode();
 
 		for (const node of [ctx.nodeA, ctx.nodeB]) {
-			await sendOperation(
-				node,
-				{
-					operation: 'create_table',
-					database: DATABASE,
-					table: TABLE,
-					primary_key: 'id',
-					attributes: [
-						{ name: 'id', type: 'ID' },
-						{ name: 'payload', type: 'String' },
-					],
-				},
-				{ signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS) }
-			);
+			for (const table of [SEED_TABLE, TABLE]) {
+				await sendOperation(
+					node,
+					{
+						operation: 'create_table',
+						database: DATABASE,
+						table,
+						primary_key: 'id',
+						attributes: [
+							{ name: 'id', type: 'ID' },
+							{ name: 'payload', type: 'String' },
+						],
+					},
+					{ signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS) }
+				);
+			}
 		}
+
+		await insertRecords(ctx.nodeA, SEED_TABLE, [SEED_ID]);
+		const seedLogPath = localLogPath(ctx.nodeA.dataRootDir);
+		const seedLogKey = await waitForCondition(() => readSeedLogKey(seedLogPath), {
+			timeoutMs: OPERATION_TIMEOUT_MS,
+			description: () => `the first frame of ${seedLogPath} to carry the seed record`,
+		});
 
 		await sendOperation(
 			ctx.nodeB,
@@ -99,6 +116,7 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 				rejectUnauthorized: false,
 				hostname: ctx.nodeA.hostname,
 				authorization: ctx.nodeB.admin,
+				start_time: seedLogKey,
 			},
 			{ signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS) }
 		);
@@ -156,11 +174,9 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 
 		// The sender commits the drained prefix when the drain ends, after it discovered the break, so
 		// the prefix must have landed before the diagnostic is read and the negative window opens.
-		assertExactRows(
-			await waitForRowCount(ctx.nodeB, beforeBreak.length),
-			beforeBreak,
-			'after B resumed past its cursor'
-		);
+		const resumedRows = await waitForRowCount(ctx.nodeB, beforeBreak.length);
+		await assertNeverCopied(ctx.nodeB, 'after B resumed past its cursor');
+		assertExactRows(resumedRows, beforeBreak, 'after B resumed past its cursor');
 
 		const diagnostic = breakDiagnostic(tear);
 		const logsOfA = async () => [...new Set([await readLog(stoppedA), await readLog(ctx.nodeA)])].join('\n');
@@ -172,11 +188,9 @@ suite('Mid-log txnlog tear: replication stops at the break and reports it', { ti
 		// A write A acknowledges after the restart is behind the break too, so it must not arrive either.
 		await insertRows(ctx.nodeA, TOTAL, 1);
 		await delay(QUARANTINE_SETTLE_MS);
-		assertExactRows(
-			await readRows(ctx.nodeB),
-			beforeBreak,
-			`${QUARANTINE_SETTLE_MS}ms after A acknowledged a write behind the break`
-		);
+		const quarantined = `${QUARANTINE_SETTLE_MS}ms after A acknowledged a write behind the break`;
+		assertExactRows(await readRows(ctx.nodeB), beforeBreak, quarantined);
+		await assertNeverCopied(ctx.nodeB, quarantined);
 
 		// Repair is a positive control only after the corrupt source has stopped and B is still quarantined.
 		const brokenA = ctx.nodeA;
@@ -251,13 +265,33 @@ function readFrames(buffer) {
 	const frames = [];
 	let position = FILE_HEADER_SIZE;
 	while (position + ENTRY_HEADER_SIZE <= buffer.length) {
-		if (view.getFloat64(position) === 0) break;
+		const timestamp = view.getFloat64(position);
+		if (timestamp === 0) break;
 		const length = view.getUint32(position + 8);
 		if (length === 0 || position + ENTRY_HEADER_SIZE + length > buffer.length) break;
-		frames.push({ position, length });
+		frames.push({ position, length, timestamp });
 		position += ENTRY_HEADER_SIZE + length;
 	}
 	return frames;
+}
+
+function frameCarries(buffer, { position, length }, id) {
+	return buffer.subarray(position + ENTRY_HEADER_SIZE, position + ENTRY_HEADER_SIZE + length).includes(payloadFor(id));
+}
+
+// The header timestamp is the entry's log key. A's sender upgrades a start to a base copy only below
+// its oldest retained key and replays exclusive of the start, so this exact key streams every later
+// write and never the seed.
+function readSeedLogKey(logPath) {
+	let buffer;
+	try {
+		buffer = readFileSync(logPath);
+	} catch (error) {
+		if (error.code === 'ENOENT') return;
+		throw error;
+	}
+	const [seedFrame] = readFrames(buffer);
+	if (seedFrame && frameCarries(buffer, seedFrame, SEED_ID)) return seedFrame.timestamp;
 }
 
 /**
@@ -269,20 +303,24 @@ function readFrames(buffer) {
  * reader yields it as an entry whose payload is the torn bytes plus its neighbour's; only the
  * consumer can tell it is garbage (harper-pro#669).
  *
- * The oracle maps frame k to row k, so that mapping is checked here against the bytes of every
- * frame rather than assumed: one frame per acknowledged row, in write order.
+ * The oracle maps row frame k (the frames after the seed's) to row k, so that mapping is checked
+ * here against the bytes of every frame rather than assumed: one frame per acknowledged row, in
+ * write order. The returned `index` is that row index; `position` and `length` are physical.
  */
 function tearFrame(logPath, framesFromEnd) {
 	const buffer = readFileSync(logPath);
 	ok(buffer.subarray(0, 4).toString() === LOG_FILE_MAGIC, `${logPath} is not a transaction log`);
-	const frames = readFrames(buffer);
+	const [seedFrame, ...frames] = readFrames(buffer);
+	ok(
+		seedFrame && frameCarries(buffer, seedFrame, SEED_ID),
+		`the first frame of ${logPath} does not carry the seed record`
+	);
 	ok(
 		frames.length === TOTAL,
-		`${logPath} holds ${frames.length} frames for ${TOTAL} rows; the oracle maps frame k to row k and needs one frame per row`
+		`${logPath} holds ${frames.length} row frames for ${TOTAL} rows; the oracle maps row frame k to row k and needs one frame per row`
 	);
-	frames.forEach(({ position, length }, index) => {
-		const payload = buffer.subarray(position + ENTRY_HEADER_SIZE, position + ENTRY_HEADER_SIZE + length);
-		ok(payload.includes(payloadFor(rowId(index))), `frame ${index} does not carry ${rowId(index)}`);
+	frames.forEach((frame, index) => {
+		ok(frameCarries(buffer, frame, rowId(index)), `row frame ${index} does not carry ${rowId(index)}`);
 	});
 	const index = frames.length - 1 - framesFromEnd;
 	ok(index > BATCH_ONE, `the torn frame (${index}) must sit past B's resume cursor (${BATCH_ONE})`);
@@ -303,13 +341,13 @@ function localLogPath(dataRootDir) {
 }
 
 /** A failed query fails the test rather than reading as an empty table. */
-async function readRows(node, signal = AbortSignal.timeout(OPERATION_TIMEOUT_MS)) {
+async function readRows(node, signal = AbortSignal.timeout(OPERATION_TIMEOUT_MS), table = TABLE) {
 	const rows = await sendOperation(
 		node,
 		{
 			operation: 'search_by_value',
 			database: DATABASE,
-			table: TABLE,
+			table,
 			search_attribute: 'id',
 			search_value: '*',
 			get_attributes: ['id', 'payload'],
@@ -345,6 +383,15 @@ function assertExactRows(rows, expectedIds, when) {
 	}
 }
 
+// Every base-copy path walks every table of the database, the seed's included.
+async function assertNeverCopied(node, when) {
+	const seedRows = await readRows(node, undefined, SEED_TABLE);
+	ok(
+		seedRows.length === 0,
+		`${when}: ${node.hostname} holds A's seed record, so it received a base copy of A's tables instead of replaying A's log`
+	);
+}
+
 function assertRowsPresent(rows, expectedIds, when) {
 	const byId = new Map(rows.map((row) => [row.id, row.payload]));
 	const missing = expectedIds.filter((id) => !byId.has(id));
@@ -354,14 +401,18 @@ function assertRowsPresent(rows, expectedIds, when) {
 	}
 }
 
-async function insertRows(node, from, count) {
+function insertRows(node, from, count) {
+	return insertRecords(node, TABLE, rowIds(from, count));
+}
+
+async function insertRecords(node, table, ids) {
 	await sendOperation(
 		node,
 		{
 			operation: 'insert',
 			database: DATABASE,
-			table: TABLE,
-			records: rowIds(from, count).map((id) => ({ id, payload: payloadFor(id) })),
+			table,
+			records: ids.map((id) => ({ id, payload: payloadFor(id) })),
 		},
 		{ signal: AbortSignal.timeout(OPERATION_TIMEOUT_MS) }
 	);
