@@ -685,6 +685,14 @@ describe('SSH private key validation', () => {
 			for (const [kind, key] of Object.entries(keys)) assert.ok(sshKeygenSigns(key), kind);
 		});
 
+		it('accepts an unencrypted key whose KDF options are not empty, since ssh ignores them', () => {
+			for (const kdfOptions of [Buffer.from('x'), Buffer.concat([sshString(Buffer.alloc(16, 7)), uint32(16)])]) {
+				const key = openSSHPrivateKey({ kdfOptions });
+				assert.ok(sshKeygenSigns(key), kdfOptions.toString('hex'));
+				assert.equal(describeSSHPrivateKeyProblem(key), undefined, kdfOptions.toString('hex'));
+			}
+		});
+
 		it('agrees with it on whether a pasted key can sign once stored normalized, for each way a paste goes wrong', function () {
 			this.timeout(60000);
 			const mutations = {
