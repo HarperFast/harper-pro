@@ -537,10 +537,7 @@ const PAUSE_STALL_THRESHOLD_MS = Math.max(
 // unenforced. Only reached on a genuine decode failure — a decodable row is evaluated on the first probe.
 const SEND_AUTH_REPROBE_INITIAL_MS = 500;
 const SEND_AUTH_REPROBE_MAX_MS = 5_000;
-// The grace period is a wall-clock deadline, not a sum of sleeps: a resolver hang or event-loop stall
-// must not extend how long a revocation carried by an undecodable write can go unenforced.
 const SEND_AUTH_REPROBE_BUDGET_MS = 30_000;
-// The bound that still holds when the clock does not advance.
 const SEND_AUTH_REPROBE_ATTEMPTS = 120;
 
 /**
@@ -589,7 +586,6 @@ export async function shouldCloseSendAuthWatch(
 	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref()));
 
 	let node = isGenuineNodeDeletion(event.type) ? undefined : resolve(name);
-	// Built only once a row comes back undecodable: the ordinary decodable event never reads the clock.
 	let backoff;
 	while (node === SEND_AUTH_UNCHANGED && !deps.isClosed()) {
 		backoff ??= createBackoff({
@@ -603,13 +599,9 @@ export async function shouldCloseSendAuthWatch(
 		const delay = backoff.nextDelay();
 		if (delay === undefined) break;
 		await sleep(delay);
-		// Re-check before trusting the next read, not just at the top of the loop: the grace period is
-		// advertised as a deadline, so a row that only becomes decodable after an event-loop stall
-		// pushed us past it must not authorize. Fail closed on the elapsed time, not on the row.
 		if (backoff.exhausted) break;
 		node = resolve(name);
-		// resolveNodeForSendAuth reads the store synchronously, so the read itself can carry the clock
-		// past the deadline. Same rule applies to what it returned.
+		// The read itself can cross the deadline: fail closed on elapsed time, not on what it returned.
 		if (backoff.exhausted) {
 			node = SEND_AUTH_UNCHANGED;
 			break;
@@ -2483,6 +2475,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	retryBackoff: Backoff; // created on the first failure
 
 	random = Math.random; // injectable so the jittered reconnect schedule is deterministically testable
+	setReconnectTimer = setTimeout;
 	retries = 0;
 	isConnected = true; // we start out assuming we will be connected
 	isFinished = false;
@@ -2510,6 +2503,8 @@ export class NodeReplicationConnection extends EventEmitter {
 	nodeName?: string;
 	authorization?: string;
 	tentativeNode?: any;
+	// The subscription half of this connection's key; differs from `url` only for a proxied failover subscription.
+	subscriptionUrl?: string;
 	// Shared-memory connection-health buffer for this outbound (db, peer) link, stashed by replicateOverWS
 	// once resolved so close()/forceReconnect() can record DOWN/error without re-resolving auditStore (W1).
 	sharedStatus?: Float64Array;
@@ -2582,6 +2577,7 @@ export class NodeReplicationConnection extends EventEmitter {
 					database: this.databaseName,
 					url: this.url,
 					opened: true,
+					subscriptionUrl: this.subscriptionUrl,
 				});
 			}
 			this.isConnected = true;
@@ -2705,14 +2701,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	scheduleReconnect() {
 		this.reconnectScheduled = true;
 		this.resetSession();
-		// Double the ceiling each retry, capped at 30 s. The previous ~0.4%/retry
-		// growth took >1000 retries to reach any meaningful delay, so rapid
-		// reconnects to a dead peer (symphony accepts the TLS handshake then drops
-		// it) would still accumulate unreleased native TLS state faster than V8 can
-		// GC under CPU-saturated bulk-write conditions, leading to OOM (#339).
-		// Doubling reaches 30 s in ~6 retries and resets on success. The delay is drawn
-		// with full jitter so a fleet reacting to one outage does not redial in lockstep. Keep
-		// the original 500 ms lower bound from #339 while jittering the rest of the window.
+		// The 500 ms floor preserves the TLS-state safety bound from #339; jitter decorrelates fleet redials.
 		this.retryBackoff ??= createBackoff({
 			initialMs: INITIAL_RETRY_TIME,
 			maxMs: MAX_RETRY_TIME,
@@ -2721,7 +2710,7 @@ export class NodeReplicationConnection extends EventEmitter {
 		});
 		const delay = this.retryBackoff.nextDelay();
 		if (delay === undefined) return;
-		setTimeout(() => {
+		this.setReconnectTimer(() => {
 			this.connect();
 		}, delay).unref();
 	}

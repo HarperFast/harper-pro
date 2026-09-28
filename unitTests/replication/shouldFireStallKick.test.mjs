@@ -39,8 +39,6 @@ describe('shouldFireStallKick', () => {
 		assert.deepEqual(verdict(makeEntry({ unsubscribed: true })), { fire: false, releaseThrottle: false });
 	});
 
-	// The regression: skipping on a reconnect used to keep the stamp, and a fresh socket that also stalls
-	// never moves lastReceivedTime past it — so the net never re-armed for that pair again.
 	it('releases the throttle when the leg reconnected inside the stagger window', () => {
 		assert.deepEqual(verdict(makeEntry({ connectGeneration: 4 })), { fire: false, releaseThrottle: true });
 	});

@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import {
+	applyOwningConnectionOpen,
 	attachSelfCatchupNode,
 	claimRecovery,
 	connectReportAdvancesGeneration,
@@ -58,12 +59,71 @@ describe('subscription routing and connection ownership', () => {
 	});
 
 	it('advances generation only for an owning socket-open report', () => {
-		const entry = { worker: { threadId: 7 } };
-		assert.equal(connectReportAdvancesGeneration(entry, { opened: true, reportingThreadId: 7 }), true);
+		const entry = { worker: { threadId: 7 }, nodes: [{ url: 'wss://primary:9933' }] };
+		assert.equal(
+			connectReportAdvancesGeneration(entry, {
+				opened: true,
+				reportingThreadId: 7,
+				subscriptionUrl: 'wss://primary:9933',
+			}),
+			true
+		);
 		assert.equal(connectReportAdvancesGeneration(entry, { reportingThreadId: 7 }), false);
-		assert.equal(connectReportAdvancesGeneration(entry, { opened: true, reportingThreadId: 8 }), false);
+		assert.equal(
+			connectReportAdvancesGeneration(entry, {
+				opened: true,
+				reportingThreadId: 8,
+				subscriptionUrl: 'wss://primary:9933',
+			}),
+			false
+		);
+		assert.equal(
+			connectReportAdvancesGeneration(entry, {
+				opened: true,
+				reportingThreadId: 7,
+				subscriptionUrl: 'wss://proxied:9933',
+			}),
+			false
+		);
 		assert.equal(connectReportAdvancesGeneration(entry, { opened: true }), true);
 		assert.equal(connectReportAdvancesGeneration({}, { opened: true, reportingThreadId: 7 }), false);
+	});
+
+	it('retires main-thread catchup ownership only when the primary connection opens', () => {
+		const rider = { name: 'self', startTime: 123, endTime: 456, replicates: true };
+		const entry = {
+			worker: { threadId: 7 },
+			nodes: [{ url: 'wss://primary:9933' }],
+			selfCatchupNode: rider,
+			connectGeneration: 2,
+			receiveStallReconnectAt: 50,
+		};
+
+		assert.equal(
+			applyOwningConnectionOpen(
+				entry,
+				{ opened: true, reportingThreadId: 7, subscriptionUrl: 'wss://proxied:9933' },
+				100,
+				900
+			),
+			false
+		);
+		assert.strictEqual(entry.selfCatchupNode, rider);
+		assert.equal(entry.connectGeneration, 2);
+
+		assert.equal(
+			applyOwningConnectionOpen(
+				entry,
+				{ opened: true, reportingThreadId: 7, subscriptionUrl: 'wss://primary:9933' },
+				100,
+				900
+			),
+			true
+		);
+		assert.equal(entry.selfCatchupNode, undefined);
+		assert.equal(entry.connectGeneration, 3);
+		assert.equal(entry.receiveStallReconnectAt, undefined);
+		assert.equal(entry.receiveStallGraceUntil, 1000);
 	});
 
 	it('reattaches retained self-catchup state to a direct recovery payload', () => {

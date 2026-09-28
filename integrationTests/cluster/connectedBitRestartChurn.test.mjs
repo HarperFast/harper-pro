@@ -326,6 +326,56 @@ suite(
 		);
 
 		test(
+			'rolling HTTP-worker replacement preserves subscription ownership and data flow',
+			{ timeout: 90000 },
+			async () => {
+				const restart = await sendOperation(ctx.follower, {
+					operation: 'restart_service',
+					service: 'http_workers',
+				});
+				ok(restart.job_id, `restart_service returned no job id: ${JSON.stringify(restart)}`);
+
+				let job;
+				const restartDeadline = Date.now() + 60000;
+				while (Date.now() < restartDeadline) {
+					job = (await sendOperation(ctx.follower, { operation: 'get_job', id: restart.job_id }))[0];
+					if (job?.status === 'COMPLETE' || job?.status === 'ERROR') break;
+					await delay(POLL_INTERVAL_MS);
+				}
+				equal(job?.status, 'COMPLETE', `HTTP-worker restart did not complete: ${JSON.stringify(job)}`);
+
+				const marker = 'worker-restart-' + Date.now();
+				for (const db of DB_NAMES) {
+					await sendOperation(ctx.leader, {
+						operation: 'upsert',
+						database: db,
+						table: 'test',
+						records: [{ id: marker, name: 'after-worker-restart' }],
+					});
+				}
+				for (const db of DB_NAMES) {
+					let seen = false;
+					const deadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
+					while (Date.now() < deadline) {
+						const records = await sendOperation(ctx.follower, {
+							operation: 'search_by_id',
+							database: db,
+							table: 'test',
+							ids: [marker],
+							get_attributes: ['id'],
+						}).catch(() => []);
+						if (records.some?.((record) => record.id === marker)) {
+							seen = true;
+							break;
+						}
+						await delay(POLL_INTERVAL_MS);
+					}
+					ok(seen, `${db} did not converge after replacing the follower's HTTP worker`);
+				}
+			}
+		);
+
+		test(
 			'chaos: repeated genuine SIGKILL + restart under write/admin load never wedges the connected bit',
 			{ timeout: 300000 },
 			async () => {

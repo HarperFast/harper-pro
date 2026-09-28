@@ -123,10 +123,7 @@ const NODE_WATCHER_RESTART_DELAY_MS = 1000;
 // Cap the exponential backoff so a persistent failure (subscribe throws every time)
 // doesn't run a tight 1s log+retry loop forever — back off up to 30s instead.
 const NODE_WATCHER_MAX_DELAY_MS = 30_000;
-// How long an iteration has to survive before it counts as a healthy run that clears the backoff.
-// Resolving `subscribe()` is not progress, and neither is receiving an event: a subscription that
-// replays one row and immediately throws does both on every cycle, which is exactly the shape that
-// used to pin the restart delay at 1s forever (harper-pro#327).
+// Acquiring a subscription does not prove the watcher stayed healthy long enough to reset its backoff.
 const NODE_WATCHER_HEALTHY_UPTIME_MS = 10_000;
 type WatcherOptions = {
 	subscribe?: () => Promise<AsyncIterable<any>> | AsyncIterable<any>;
@@ -192,8 +189,6 @@ export async function runNodeUpdateWatcher(
 	});
 	const isCurrent = () => generation === (watcherGenerations.get(key) ?? 0);
 	while (restarts < maxRestarts && isCurrent()) {
-		// Stamped only once the subscription is live: time spent acquiring (or failing) one is not uptime,
-		// so a subscribe() that blocks past the threshold and then throws must not read as a healthy run.
 		let liveSince: number | undefined;
 		try {
 			const events = await subscribe();
@@ -224,8 +219,6 @@ export async function runNodeUpdateWatcher(
 			if (!isCurrent()) break; // superseded watcher; iterator.return rejected
 			logger.error?.('hdb_nodes watcher failed; restarting', error);
 		}
-		// A watcher that stayed up long enough to have done real work restarts quickly; anything shorter
-		// is a failure cycle and keeps escalating toward the cap.
 		if (liveSince !== undefined && now() - liveSince >= healthyUptimeMs) backoff.reset();
 		restarts++;
 		if (restarts >= maxRestarts || !isCurrent()) return;

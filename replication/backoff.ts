@@ -1,23 +1,12 @@
-/**
- * The one backoff schedule replication retries use; the adopting sites and their parameters are in
- * `DESIGN.md` under "Backoff discipline".
- *
- * Full jitter (uniform over the whole window) is the default because decorrelating a fleet's retries
- * matters more than a tight worst-case delay on these cold error paths. `minMs` preserves a site's
- * independent lower bound while jittering the rest of the window.
- *
- * `budgetMs` is a deadline read off an injected monotonic clock, not a sum of requested sleeps: a
- * resolver hang or an event-loop stall must not extend a bounded grace period past what it advertises.
- * `maxAttempts` is the bound that still holds when the clock does not advance.
- */
-
 export interface BackoffOptions {
 	initialMs: number;
 	maxMs: number;
 	minMs?: number;
 	factor?: number;
 	jitter?: 'full' | 'none';
+	// A deadline read off `now`, not a sum of requested sleeps: a stalled event loop must not extend it.
 	budgetMs?: number;
+	// The bound that still holds when `now` does not advance.
 	maxAttempts?: number;
 	random?: () => number;
 	now?: () => number;

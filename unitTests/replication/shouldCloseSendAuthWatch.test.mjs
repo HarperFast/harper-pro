@@ -88,9 +88,6 @@ describe('shouldCloseSendAuthWatch', () => {
 		expect(timedOut).to.equal(true);
 	});
 
-	// harper-pro#327: the grace period is advertised as a 30s deadline, so a row that only becomes
-	// decodable after the loop was suspended past it must not authorize. Checking `exhausted` only at the
-	// top of the loop was not enough — the loop exits on a non-UNCHANGED row without ever consulting it.
 	it('fails closed on a row that only resolves after the budget deadline passed', async () => {
 		let clock = 0;
 		let timedOut = false;

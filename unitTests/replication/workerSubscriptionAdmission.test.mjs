@@ -83,8 +83,6 @@ describe('worker subscription admission', () => {
 		assert.equal(keyCalls, 1);
 	});
 
-	// A rejection used to leave the retained action waiting for another inbound message or the ~30s wedge
-	// reconcile — the empty-subscription window the gate exists to close. It now re-attempts itself.
 	it('re-attempts a rejected readiness on an escalating schedule without a new message', async () => {
 		let attempts = 0;
 		const actions = [];

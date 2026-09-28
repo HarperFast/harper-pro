@@ -563,6 +563,7 @@ function getSubscriptionConnection(
 			dbName,
 			(connection = new NodeReplicationConnection(connectingUrl, subscription, dbName, nodeName, authorization))
 		);
+		connection.subscriptionUrl = subscriptionUrl;
 		connection.connect();
 		connection.once('finished', () => {
 			if (dbConnections.get(dbName) === connection) dbConnections.delete(dbName);
@@ -571,11 +572,8 @@ function getSubscriptionConnection(
 	}
 }
 
-// The `connections` key, shared by subscribe, unsubscribe, force-reconnect and the worker's pre-readiness
-// admission so all four derive identical identity including the missing-nested-URL fallback. The teardown
-// sites pass the pair in the opposite order to the subscribe path; the two URLs are the same string for
-// every ordinary subscription, and differ only under failover (connectToNextWorker subscribes node B over
-// peer A's URL), where the teardown lookup has always missed.
+// Shared by subscription setup, teardown, forced reconnect, and pre-readiness admission so the
+// missing peer-URL fallback cannot differ between lifecycle paths.
 export function getSubscriptionConnectionKey(url: string, peerUrl?: string): string {
 	return url + '-' + (peerUrl ?? url);
 }

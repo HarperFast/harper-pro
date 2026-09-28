@@ -1,20 +1,13 @@
-/**
- * Regression coverage for harper-pro#327: subscription setup used to be scheduled with a flat 200ms
- * `setTimeout` per qualifying node update — no dedup, no cap, not unref'd — so whatever re-drove
- * `onNodeUpdate` amplified 1:1 into main-thread timers, worker-side WebSocket/TLS setup, and warn
- * lines, ending in an OOM kill.
- *
- * The storm test drives input continuously *across* timer firings, which is the shape of the incident;
- * a one-shot burst would only prove coalescing. Against the flat-200ms behavior the same input
- * produces one dispatch per event and one live timer per event, so both assertions go red.
- */
-
 import assert from 'node:assert';
-import { createSubscribeSetupScheduler, dispatchSubscriptionNodes } from '#src/replication/subscriptionManager';
+import {
+	clearWorkerFromEntries,
+	createSubscribeSetupScheduler,
+	dispatchSubscriptionNodes,
+	dispatchSubscriptionRequest,
+} from '#src/replication/subscriptionManager';
 
 const URL_A = 'wss://peer-a:9933';
 const URL_B = 'wss://peer-b:9933';
-// Mirrors the production constants: floor NODE_SUBSCRIBE_DELAY, first ceiling 2x that, cap 30s.
 const MIN_DELAY = 200;
 const MAX_DELAY = 30_000;
 
@@ -80,14 +73,12 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
 		let maxPending = 0;
 
-		// 60,000 qualifying updates spread over 60s of simulated time (~1,000/s, the observed storm rate).
 		for (let i = 0; i < 60_000; i++) {
 			scheduler.schedule(URL_A, 'data', NODES);
 			maxPending = Math.max(maxPending, scheduler.pendingCount());
 			timers.tick(1);
 		}
 
-		// Ceilings double 400 → 30,000; each delay is 200 + 0.5 * (ceiling - 200).
 		assert.deepEqual(
 			dispatches.map((d) => d.at),
 			[300, 800, 1700, 3400, 6700, 13_200, 26_100, 41_200, 56_300]
@@ -149,9 +140,6 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		for (let i = 0; i < aDelays.length; i++) assert.ok(aDelays[i] < bDelays[i]);
 	});
 
-	// The regression that made the deduped path lose the enriched payload: onDatabase replaces
-	// entry.nodes on its early-return path without running the leader/url enrichment, so the setup has
-	// to carry the payload of the call that armed or last refreshed it, not whatever the entry holds.
 	it('fires with the newest payload a deduped call supplied', () => {
 		const { scheduler, dispatches } = makeScheduler(() => 0.5);
 		const first = [{ name: 'peer-a', url: URL_A }];
@@ -268,8 +256,6 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 	});
 });
 
-// Real Node timers, deliberately: hasRef() is what proves the process can still exit with a setup
-// pending, and a faked timer has no such thing.
 describe('subscription-setup scheduler timer refs', () => {
 	it("unref's the setup timer so a pending retry cannot hold the process open", () => {
 		const realSetTimeout = globalThis.setTimeout;
@@ -282,6 +268,57 @@ describe('subscription-setup scheduler timer refs', () => {
 		}
 		assert.equal(armed.hasRef(), false);
 		clearTimeout(armed);
+	});
+});
+
+describe('scheduled setup ownership transitions', () => {
+	it('never falls onto the main thread when its worker exits before fire', () => {
+		const manual = createManualTimers();
+		const oldWorker = { postMessage: () => assert.fail('exited worker received setup') };
+		const replacementMessages = [];
+		const replacementWorker = { postMessage: (message) => replacementMessages.push(message) };
+		const entry = { worker: oldWorker, nodes: NODES };
+		const connectionMap = new Map([[URL_A, new Map([['data', entry]])]]);
+		const mainMessages = [];
+		let liveWorkers = [oldWorker];
+		const scheduler = createSubscribeSetupScheduler({
+			dispatch(url, database, nodes) {
+				const current = connectionMap.get(url)?.get(database);
+				if (current)
+					dispatchSubscriptionRequest(
+						current,
+						{ type: 'subscribe-to-node', url, database, nodes },
+						liveWorkers,
+						false,
+						(message) => mainMessages.push(message)
+					);
+			},
+			random: () => 0.5,
+			setTimer: manual.setTimer,
+			clearTimer: manual.clearTimer,
+		});
+
+		scheduler.schedule(URL_A, 'data', NODES);
+		clearWorkerFromEntries(connectionMap, oldWorker);
+		liveWorkers = [replacementWorker];
+		manual.tick(300);
+		assert.deepEqual(mainMessages, []);
+		assert.deepEqual(replacementMessages, []);
+
+		entry.worker = replacementWorker;
+		scheduler.schedule(URL_A, 'data', NODES);
+		manual.tick(500);
+		assert.equal(replacementMessages.length, 1);
+		assert.equal(replacementMessages[0].database, 'data');
+	});
+
+	it('uses the main thread only when it is the configured worker', () => {
+		const messages = [];
+		assert.equal(
+			dispatchSubscriptionRequest({}, { id: 1 }, [], true, (message) => messages.push(message)),
+			'main'
+		);
+		assert.deepEqual(messages, [{ id: 1 }]);
 	});
 });
 

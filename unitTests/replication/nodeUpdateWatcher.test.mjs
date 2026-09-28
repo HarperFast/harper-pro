@@ -123,9 +123,6 @@ describe('runNodeUpdateWatcher restart loop', () => {
 		expect(subscribeCalls).to.equal(2);
 	});
 
-	// harper-pro#327: the marker used to be set the instant subscribe() resolved, so a subscription that
-	// resolved and then immediately threw counted as a success on every pass, reset the backoff, and
-	// pinned the restart at restartDelayMs forever. Against that code the delays below are [4, 4, 4, 4].
 	it('escalates when subscribe() resolves and iteration immediately throws', async () => {
 		const delays = captureTimerDelays();
 		try {

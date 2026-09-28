@@ -9,17 +9,10 @@ import { createBackoff, type Backoff } from './backoff.ts';
 
 const logger = harperLogger.forComponent('blob-repair').conditional as Logger;
 
-// Paces a sweep whose peers cannot serve anything: without it the per-record loop spins as fast as the
-// incomplete-blob cursor yields. Capped low (not at the 30s replication cap) because the delay is paid
-// per unrepairable record while the cursor stays open.
 const REPAIR_RETRY_INITIAL_MS = 50;
 const REPAIR_RETRY_MAX_MS = 1000;
-// Wall-clock ceiling on how long one unbroken failure run may spend *pausing*. Once spent the sweep keeps
-// scanning at full speed: pacing exists to stop a hot loop, and inferring the rest of the cursor from an
-// unrepairable prefix would silently skip records a later peer can still serve. A repair restarts it.
+// Do not stop the sweep when this budget is spent: a later record may still be repairable.
 const REPAIR_PACING_BUDGET_MS = 60_000;
-// Once unpaced the per-record warn would fire at peer-RTT rate for the rest of the sweep — hundreds of
-// thousands of lines during exactly the incident where the log is the diagnostic channel. Sample it.
 const REPAIR_UNPACED_WARN_EVERY = 100;
 
 export function createRepairPacing(deps: { now?: () => number; random?: () => number } = {}) {

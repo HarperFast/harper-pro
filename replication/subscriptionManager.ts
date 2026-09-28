@@ -5,7 +5,7 @@
  */
 import { getDatabases } from '../core/resources/databases.ts';
 import { transaction } from '../core/resources/transaction.ts';
-import { workers, onMessageByType, whenThreadsStarted } from '../core/server/threads/manageThreads.js';
+import { workers, onMessageByType, whenThreadsStarted, getWorkerCount } from '../core/server/threads/manageThreads.js';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import {
 	subscribeToNode,
@@ -72,18 +72,14 @@ type ConnectedWorkerStatus = {
 	// re-fired every tick. Mirrors disconnectedAt for the connected:false path. See findStalledReceivingNodeUrls.
 	receiveStallReconnectAt?: number;
 	receiveStallGraceUntil?: number;
+	// The single recovery timer the reconcile has armed for this entry (wedge re-drive or stall kick).
+	reDriveTimer?: ReturnType<typeof setTimeout>;
+	connectGeneration?: number;
+	selfCatchupNode?: SelfCatchupNode;
 	// W1 T1 (#431) fire telemetry: the last main-thread recovery net that acted on this entry, and the
 	// last shared-memory truth correction applied to it. Logged with each subsequent fire so the
 	// watchdog-demotion soak can tell "sole detector" fires from ones where another layer (or the
 	// truth-driven path) had already engaged. Telemetry only — never consulted for recovery decisions.
-	// The single recovery timer the reconcile has armed for this entry (wedge re-drive or stall kick).
-	// Owned rather than fire-and-forget: with many databases a staggered sweep can outrun the reconcile
-	// window that started it, so later reconcile ticks preserve the entry's pending attempt instead of
-	// replacing or stacking another wave, and worker exit/unsubscribe/delete can disarm it.
-	reDriveTimer?: ReturnType<typeof setTimeout>;
-	// Bumped when the owning worker reports a socket open, so a delayed stall kick cannot target its old socket.
-	connectGeneration?: number;
-	selfCatchupNode?: SelfCatchupNode;
 	lastRecovery?: { mechanism: string; at: number };
 	lastTruthCorrection?: { direction: 'down' | 'up'; at: number };
 };
@@ -231,8 +227,6 @@ export function createSubscribeSetupScheduler(deps: {
 				schedule.timer = undefined;
 				const pending = schedule.nodes;
 				schedule.nodes = undefined;
-				// A synchronous throw here (postMessage on an uncloneable payload) would take the process
-				// down, and this is the recovery path.
 				try {
 					if (pending) dispatch(url, database, pending);
 				} catch (error) {
@@ -247,12 +241,7 @@ export function createSubscribeSetupScheduler(deps: {
 			if (schedule?.timer) schedule.nodes = nodes;
 		},
 		noteConnected(url, database) {
-			// Reset only — the armed setup is deliberately left to fire. The main thread cannot attribute a
-			// connect report to the entry that armed the setup: `connectToNextWorker` subscribes a failover
-			// peer on a worker that is not `entry.worker`, and a superseded worker's hung-but-open connection
-			// reports for the same (url, database) as its replacement. Cancelling on a report we cannot
-			// attribute strands a just-recreated entry unsubscribed; letting a redundant subscribe reach a
-			// live connection is what this path always did.
+			// An open resets pacing but does not cancel a setup whose ownership may have changed while armed.
 			schedules.get(url)?.get(database)?.backoff.reset();
 		},
 		cancel(url, database) {
@@ -334,8 +323,9 @@ function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 		nodeName: getThisNodeName(),
 		dispatch(dispatchNodes) {
 			const request = { ...dispatchNodes[0], type: 'subscribe-to-node', database, nodes: dispatchNodes };
-			if (entry.worker) entry.worker.postMessage(request);
-			else subscribeToNode(request);
+			const target = dispatchSubscriptionRequest(entry, request, workers, getWorkerCount() === 1, subscribeToNode);
+			if (target === 'deferred')
+				logger.warn('Deferring replication subscription until a live http worker owns it', url, database);
 		},
 		consume() {
 			selfCatchupOfDatabase.delete(database);
@@ -344,6 +334,24 @@ function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 			entry.selfCatchupNode = selfCatchupNode;
 		},
 	});
+}
+
+export function dispatchSubscriptionRequest(
+	entry: { worker?: { postMessage: (request: any) => void } },
+	request: any,
+	liveWorkers: any[],
+	mainIsWorker: boolean,
+	dispatchOnMain: (request: any) => void
+): 'worker' | 'main' | 'deferred' {
+	if (entry.worker && liveWorkers.includes(entry.worker)) {
+		entry.worker.postMessage(request);
+		return 'worker';
+	}
+	if (mainIsWorker) {
+		dispatchOnMain(request);
+		return 'main';
+	}
+	return 'deferred';
 }
 
 const subscribeSetupScheduler = createSubscribeSetupScheduler({ dispatch: dispatchSubscribeSetup });
@@ -710,13 +718,26 @@ export function deriveEffectiveLeader(args: {
 }
 
 export function connectReportAdvancesGeneration(
-	entry: { worker?: { threadId?: number } },
-	report: { opened?: boolean; reportingThreadId?: number }
+	entry: { worker?: { threadId?: number }; nodes?: { url?: string }[] },
+	report: { opened?: boolean; reportingThreadId?: number; subscriptionUrl?: string }
 ): boolean {
-	return (
-		report.opened === true &&
-		(report.reportingThreadId === undefined || report.reportingThreadId === entry.worker?.threadId)
-	);
+	if (report.opened !== true) return false;
+	if (report.reportingThreadId === undefined) return true;
+	return report.reportingThreadId === entry.worker?.threadId && report.subscriptionUrl === entry.nodes?.[0]?.url;
+}
+
+export function applyOwningConnectionOpen(
+	entry: ConnectedWorkerStatus & { nodes?: { url?: string }[] },
+	report: { opened?: boolean; reportingThreadId?: number; subscriptionUrl?: string },
+	now: number,
+	stallThresholdMs: number
+): boolean {
+	if (!connectReportAdvancesGeneration(entry, report)) return false;
+	entry.connectGeneration = (entry.connectGeneration ?? 0) + 1;
+	entry.receiveStallReconnectAt = undefined;
+	entry.receiveStallGraceUntil = now + stallThresholdMs;
+	entry.selfCatchupNode = undefined;
+	return true;
 }
 
 /**
@@ -827,9 +848,7 @@ export async function startOnMainThread(options) {
 	// we need to wait for the threads to start before we can start adding nodes
 	// but don't await this because this start function has to finish before the threads can start
 	whenThreadsStarted.then(async () => {
-		// A deploy_component reload re-invokes startOnMainThread on this same already-resolved module
-		// instance while the prior node watcher remains live. Build the replacement separately so that
-		// watcher sees either complete route set, then preserve the exported array identity on commit.
+		// Publish all routes at once because the previous keyed watcher remains live across component reloads.
 		const nextRoutes: Route[] = [];
 		const tentativeRouteNodes = [];
 		const nodes = [];
@@ -996,8 +1015,6 @@ export async function startOnMainThread(options) {
 					break;
 				}
 			}
-			// A node that moved to a new URL leaves its old URL's entry behind (pre-existing); at least do
-			// not let a setup armed for the address it left fire against it.
 			const previousNode = nodeMap.get(node.name);
 			const previousUrl = previousNode && getNodeURL(previousNode);
 			if (previousUrl && previousUrl !== getNodeURL(node)) subscribeSetupScheduler.cancelUrl(previousUrl);
@@ -1094,10 +1111,7 @@ export async function startOnMainThread(options) {
 				});
 				if (!shouldSubscribe) shouldSubscribe = shouldReplicateFromNode(nodes[0] as any, databaseName);
 			}
-			// Resolve the URL here rather than at the subscribe-scheduling site below: this array becomes
-			// `entry.nodes`, and the early-return path replaces it without ever reaching that site — which
-			// left the wedge re-drive posting a request with no url ("Failed to create web socket to
-			// undefined"). Placed after shouldReplicateFromNode so its verdict is unchanged.
+			// Existing-entry re-drives also consume this payload, so resolve its URL before the early return.
 			nodes[0].url ??= getNodeURL(nodes[0] as any);
 			const httpWorkers = workers.filter((worker) => worker.name === 'http');
 			// Defensively detect entries that point at a worker no longer in the http pool.
@@ -1109,8 +1123,6 @@ export async function startOnMainThread(options) {
 			// entry stuck and the subscription never recovers.
 			if (existingEntry && httpWorkers.length > 0 && !httpWorkers.includes(existingEntry.worker as any)) {
 				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
-				// The armed recovery closes over the worker being replaced; its fire-time guard would no-op,
-				// but until then it retains an exited Worker and its request per entry.
 				clearTimeout(existingEntry.reDriveTimer);
 				dbReplicationWorkers.delete(databaseName);
 				existingEntry = undefined;
@@ -1168,8 +1180,6 @@ export async function startOnMainThread(options) {
 				);
 				if (subscribeDelay !== undefined && subscribeStagger)
 					subscribeStagger.nextDelayFloor = subscribeDelay + RECONNECT_STAGGER_MS;
-				// The warn belongs to an armed setup, not to an event, or a re-drive storm reproduces the
-				// 165k-line logs of harper-pro#327 even though the work itself is now bounded.
 				if (subscribeDelay !== undefined) {
 					logger.warn(`Setting up subscription with leader ${leaderName} for node ${nodeName} in ${subscribeDelay}ms`);
 				}
@@ -1327,11 +1337,7 @@ export async function startOnMainThread(options) {
 			return;
 		}
 		mainWorkerEntry.connected = true;
-		if (connectReportAdvancesGeneration(mainWorkerEntry, connection)) {
-			mainWorkerEntry.connectGeneration = (mainWorkerEntry.connectGeneration ?? 0) + 1;
-			mainWorkerEntry.receiveStallReconnectAt = undefined;
-			mainWorkerEntry.receiveStallGraceUntil = Date.now() + RECEIVE_STALL_THRESHOLD_MS;
-		}
+		applyOwningConnectionOpen(mainWorkerEntry, connection, Date.now(), RECEIVE_STALL_THRESHOLD_MS);
 		subscribeSetupScheduler.noteConnected(connection.url, connection.database);
 		mainWorkerEntry.disconnectedAt = undefined;
 		mainWorkerEntry.latency = connection.latency;
@@ -1477,7 +1483,7 @@ export async function startOnMainThread(options) {
 			getReceiveStatus
 		);
 		if (staleNodeUrls.size === 0 && wedgedNodeUrls.size === 0 && stalledByUrl.size === 0) return;
-		// A large staggered sweep can overlap later reconcile ticks; each entry keeps its pending attempt.
+		// A large staggered sweep can overlap later reconcile ticks; preserve each pending attempt.
 		const armReDrive = (entry: any, delay: number, url: string, database: string, fire: () => void) => {
 			const timer = setTimeout(() => {
 				entry.reDriveTimer = undefined;
@@ -1490,10 +1496,7 @@ export async function startOnMainThread(options) {
 			timer.unref();
 			return timer;
 		};
-		// Decorrelation only, no escalation: these re-drives are already throttled by the disconnectedAt /
-		// receiveStallReconnectAt re-stamps, so the ceiling is fixed. ONE draw for the whole sweep, used as a
-		// common base offset: drawing per entry would make consecutive delays differ by up to +/-200ms and let
-		// ~4 dials share any 50ms instant, which is precisely the concurrency #446's stagger bounds.
+		// One draw for the sweep preserves the 50 ms spacing between consecutive recovery attempts.
 		const reDriveBaseDelay =
 			createBackoff({
 				initialMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
@@ -1650,7 +1653,7 @@ export async function startOnMainThread(options) {
 						`Reconciling ${reconnectCount} stalled connected:true subscription(s) for ${url} (no receive progress for ${RECEIVE_STALL_THRESHOLD_MS}ms; staggered over ${reconnectCount * RECONNECT_STAGGER_MS}ms) [${fireDetails.join(' | ')}]`
 					);
 			}
-			if (staleNodeUrls.has(url) && !isWedged) staleNodesToReassign.push(node);
+			if (staleNodeUrls.has(url)) staleNodesToReassign.push(node);
 		}
 		if (staleNodesToReassign.length > 0) {
 			// A dead worker can own subscriptions across many nodes, and onNodeUpdate re-drives EVERY
@@ -1759,9 +1762,7 @@ export function createWorkerSubscriptionAdmission(deps: {
 		}
 	}
 	function scheduleFlush() {
-		// One readiness attempt and one armed re-attempt at a time: without the second guard, every message
-		// arriving during a boot-time load failure starts its own attempt and arms its own timer, and the
-		// retained continuations grow with input again — the shape this gate exists to bound.
+		// Keep one readiness attempt or retry regardless of how many messages are retained.
 		if (flushScheduled || retryArmed) return;
 		flushScheduled = true;
 		deps
@@ -1777,9 +1778,6 @@ export function createWorkerSubscriptionAdmission(deps: {
 			.catch((error) => deps.onError(undefined, error))
 			.finally(() => {
 				flushScheduled = false;
-				// A readiness failure would otherwise strand the retained actions until another message
-				// arrives or the wedge reconcile notices ~30s later — the empty-subscription window this
-				// gate exists to close (harper-pro#289 / #233). Re-attempt on the shared schedule instead.
 				if (!ready && pending.size > 0) {
 					retryBackoff ??= createBackoff({
 						initialMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,

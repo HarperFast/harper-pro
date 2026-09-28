@@ -135,9 +135,11 @@ ending in an OOM kill. The scheduler holds one armed setup per **(peer URL, data
 the armed setup carries the newest level-state payload — `onDatabase`'s early-return path refreshes
 that payload without arming another timer, so a pending setup observes the latest routing, leadership,
 and exclusion state. Self-catchup is separate one-shot state: the first dispatch claims it for one
-connection entry, which retains and reattaches the same bounded rider on every recovery re-drive. The
-global claim is consumed only after the worker message is accepted, so timer cancellation, entry refresh,
-a long offline retry, or a synchronous `postMessage` throw cannot lose or overwrite it.
+connection entry, which retains and reattaches the bounded rider until the owning primary connection opens.
+The worker then owns it for socket-local reconnects and the main-thread copy is retired, avoiding repeated
+historical scans on later worker replacements. The global claim is consumed only after the worker message
+is accepted, so timer cancellation, entry refresh, a long offline retry, or a synchronous `postMessage`
+throw cannot lose or overwrite it.
 A setup is cancelled on
 unsubscribe, on node deletion, and on a same-name URL migration, all of which became reachable once a
 pending timer could live 30 s instead of 200 ms. The wedge/stall recovery kicks are owned the same way —
@@ -146,11 +148,11 @@ keeps the already-armed attempt instead of restamping it out of existence, and d
 worker exits or the entry is replaced.
 
 **A connect report cancels nothing; every report resets the pair's escalated setup delay.** Gating that reset
-on entry ownership let a chaos-restart peer's delay escalate past its reconvergence budget:
-`connectToNextWorker` can subscribe a failover peer on a worker that is not `entry.worker`. Reports do carry
-their worker thread id, and only the owning worker's explicit socket-open edge advances
-`connectGeneration`; pongs and foreign/superseded opens still perform the pair-level reset but cannot cancel
-a stall kick. What makes leaving the timers armed safe is that each re-checks live state when it fires: the
+on entry ownership let a chaos-restart peer's delay escalate past its reconvergence budget. A worker can
+carry both the primary and a proxied failover connection, so reports carry their thread id and subscription
+URL; only the owning worker's explicit primary socket-open edge advances `connectGeneration`. Pongs and
+proxy/superseded opens still perform the pair-level reset but cannot cancel a stall kick. What makes leaving
+the timers armed safe is that each re-checks live state when it fires: the
 setup re-reads the entry and its `unsubscribed` flag, the wedge kick claims its entry through the
 `disconnectedAt` stamp a connect clears, and the stall kick claims it through `connectGeneration` (a stalled
 connection is `connected: true` with no `disconnectedAt`, so the stamp cannot discriminate for it), the
@@ -173,6 +175,10 @@ waiting for another message or the wedge reconcile. After readiness,
 the handlers run inline and allocate no queue state; the existing connection map is then the single-flight
 owner. Subscribe, unsubscribe, force-reconnect, and startup admission all derive the connection key through
 `getSubscriptionConnectionKey`, including the missing nested-URL fallback.
+
+An armed setup dispatches on the main thread only in configured single-thread mode. If its worker exits
+before it fires in a multi-threaded process, the setup is deferred; the stale-worker reconcile reassigns the
+entry even when another database for the same peer is simultaneously in wedge recovery.
 
 **What is deliberately NOT on this schedule:** the receive/copy watchdogs and their thresholds, and the
 doubling copy-finalize _timeout bound_ alongside them (these _detect_ stalls or bound a wait; this
