@@ -352,9 +352,20 @@ export async function cloneNode(): Promise<void> {
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
 	// once sync is confirmed and availability has been published as Available — a timeout or failure
 	// must not be treated as success.
-	const syncOutcome = await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
+	const syncOutcome =
+		resumeMarker?.verdict === 'incomplete'
+			? 'incomplete'
+			: await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
 	if (syncOutcome === 'incomplete') {
 		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		writeSyncStartedMarker({
+			startedAt: syncStartedAt,
+			replicationEstablished: true,
+			targetTimestamps,
+			totalBytes,
+			setupComplete: true,
+			verdict: 'incomplete',
+		});
 		clearCloneAttempt();
 		log(
 			`Clone from leader node ${leaderURL} completed with one or more undecodable copy records; node is running but Unavailable and not marked as cloned. Inspect cluster_status cloneIncomplete, stop the node, replace the affected database store, and restart with FORCE_CLONE=true to request a clean clone`,
@@ -580,6 +591,8 @@ async function finishCloneSetup(): Promise<boolean> {
  * leader-config-refined value checkSyncStatus matches exactly against cluster_status (the heuristic
  * URL is wrong for a TLS-only leader). `targetTimestamps`/`totalBytes` pin the leader snapshot a
  * resume reuses instead of re-fetching. `setupComplete` covers `finishCloneSetup` (JWT/custody/SSH).
+ * `verdict` makes a terminal incomplete copy independent of process-local socket state and the
+ * original clone-duration budget on later restarts.
  */
 type SyncStartedMarker = {
 	leaderURL?: string;
@@ -589,6 +602,7 @@ type SyncStartedMarker = {
 	targetTimestamps?: Record<string, number>;
 	totalBytes?: number;
 	setupComplete?: boolean;
+	verdict?: 'incomplete';
 };
 
 function syncStartedMarkerPath(): string {

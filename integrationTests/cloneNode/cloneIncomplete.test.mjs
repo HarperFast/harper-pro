@@ -1,6 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { readLog, restartNode, stopNodeProcess, sendOperation, waitForCondition } from '../cluster/clusterShared.mjs';
@@ -174,5 +174,23 @@ suite('Clone Node - incomplete copy stays Unavailable', { timeout: 300_000 }, (c
 			id: 'availability',
 		});
 		assert.equal(restartedAvailability.status, 'Unavailable');
+
+		const syncMarkerPath = join(ctx.clone.dataRootDir, 'tmp', 'clone-sync-started.json');
+		const syncMarker = JSON.parse(readFileSync(syncMarkerPath, 'utf8'));
+		assert.equal(syncMarker.verdict, 'incomplete');
+		writeFileSync(syncMarkerPath, JSON.stringify({ ...syncMarker, startedAt: 0 }));
+		await stopNodeProcess(ctx.leader);
+		await restartNode(ctx.clone);
+		await waitForCondition(async () => incompleteOutcomeCount(await readLog(ctx.clone)) >= 3, {
+			timeoutMs: 30_000,
+			pollMs: 250,
+			description: 'the terminal verdict to survive an expired clone ceiling without the leader',
+		});
+		assert.equal(existsSync(syncMarkerPath), true, 'the terminal verdict must retain the setup marker');
+		assert.equal(
+			readFileSync(ctx.setupTraceFile, 'utf8').trim().split('\n').length,
+			1,
+			'a restart after the clone ceiling must not replay one-shot clone setup'
+		);
 	});
 });
