@@ -570,7 +570,6 @@ describe('sshKeyOperations sealing', () => {
 				harperLogger.info = originalInfo;
 				harperLogger.error = originalError;
 			});
-			// as a node upgraded from an earlier version holds them: the key files, and a config of legacy blocks
 			const seedKeys = (...names) => {
 				for (const name of names) writeFileSync(keyPath(name), 'enc:v1:sealed');
 			};
