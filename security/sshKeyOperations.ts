@@ -602,8 +602,8 @@ function configuredHost(view: SSHConfigView, name: string): { host?: string; hos
 	let hostname: string | undefined;
 	for (let index = block.first; index <= block.last; index++) {
 		const { text } = view.lines[index];
-		host ??= /^[ \t]*Host[ \t]+(.+)$/.exec(text)?.[1].trim();
-		hostname ??= /^[ \t]*HostName[ \t]+(.+)$/.exec(text)?.[1].trim();
+		host ??= /^[ \t]*Host(?:[ \t]*=[ \t]*|[ \t]+)(.+)$/i.exec(text)?.[1].trim();
+		hostname ??= /^[ \t]*HostName(?:[ \t]*=[ \t]*|[ \t]+)(.+)$/i.exec(text)?.[1].trim();
 	}
 	return { ...(host && { host }), ...(hostname && { hostname }) };
 }

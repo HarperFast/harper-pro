@@ -440,6 +440,19 @@ describe('sshKeyOperations sealing', () => {
 			assert.equal(readConfig(), unmanaged);
 		});
 
+		it('get_ssh_key reads Host and HostName in any case, with or without "="', async () => {
+			await addKey('deploy');
+			writeFileSync(
+				configPath(),
+				readConfig()
+					.replace('Host deploy.alias', 'host=deploy.alias')
+					.replace('\tHostName example.com', '\tHOSTNAME = example.com')
+			);
+
+			const { host, hostname } = await ops.getSSHKey({ name: 'deploy' });
+			assert.deepEqual({ host, hostname }, { host: 'deploy.alias', hostname: 'example.com' });
+		});
+
 		describe('with a damaged marker', () => {
 			const damagedError = (name, line) =>
 				isClientError(
