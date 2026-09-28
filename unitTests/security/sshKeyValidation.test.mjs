@@ -685,6 +685,14 @@ describe('SSH private key validation', () => {
 			for (const [kind, key] of Object.entries(keys)) assert.ok(sshKeygenSigns(key), kind);
 		});
 
+		it('accepts an unencrypted key whose KDF options are not empty, since ssh ignores them', () => {
+			for (const kdfOptions of [Buffer.from('x'), Buffer.concat([sshString(Buffer.alloc(16, 7)), uint32(16)])]) {
+				const key = openSSHPrivateKey({ kdfOptions });
+				assert.ok(sshKeygenSigns(key), kdfOptions.toString('hex'));
+				assert.equal(describeSSHPrivateKeyProblem(key), undefined, kdfOptions.toString('hex'));
+			}
+		});
+
 		it('agrees with it on whether a pasted key can sign once stored normalized, for each way a paste goes wrong', function () {
 			this.timeout(60000);
 			const mutations = {
@@ -749,13 +757,15 @@ describe('SSH config value validation', () => {
 		'gh_1',
 		'10.0.0.1',
 		'::1',
-		'fe80::1%en0',
+		'fe80::1%%en0',
 		'%h.example.com',
 		'a,b',
 		'git#lab.com',
 	];
 	// a HostName is never matched against, so only an alias can't be a pattern
 	const acceptedAsHostname = ['*.example.org', 'repo?.example.org'];
+	// ...and ssh expands "%" only in a HostName
+	const acceptedAsHost = ['fe80::1%en0'];
 	const refused = {
 		'a b': 'must be a single',
 		'a\tb': 'must be a single',
@@ -765,12 +775,18 @@ describe('SSH config value validation', () => {
 		'a"b': 'must not contain quotes',
 		"a'b": 'must not contain quotes',
 		'"github.com"': 'must not contain quotes',
-		'=': 'must not contain quotes or "="',
-		'=#x': 'must not contain quotes or "="',
+		'=': 'must not contain quotes, "=" or "\\"',
+		'=#x': 'must not contain quotes, "=" or "\\"',
 		// OpenSSH before 8.7 splits an argument at "=", making this two
-		'example.com=extra': 'must not contain quotes or "="',
+		'example.com=extra': 'must not contain quotes, "=" or "\\"',
+		'github.com\\': 'must not contain quotes, "=" or "\\"',
+		'git\\hub.com': 'must not contain quotes, "=" or "\\"',
 		'-oProxyCommand': 'must not start with "-"',
 		'#github.com': 'must not start with "#"',
+		'%Q': 'can use "%" only as "%h"',
+		'fe80::1%en0': 'can use "%" only as "%h"',
+		'x%': 'can use "%" only as "%h"',
+		'%h%': 'can use "%" only as "%h"',
 	};
 	const refusedAsHost = ['*', '*.github.com', 'repo?.github.com', '!github.com'];
 
@@ -781,6 +797,7 @@ describe('SSH config value validation', () => {
 		}
 		for (const value of acceptedAsHostname)
 			assert.equal(describeSSHConfigValueProblem('hostname', value), undefined, value);
+		for (const value of acceptedAsHost) assert.equal(describeSSHConfigValueProblem('host', value), undefined, value);
 	});
 
 	it("refuses an alias that is a pattern, since its block would also apply to other keys' aliases", () => {
@@ -824,12 +841,14 @@ describe('SSH config value validation', () => {
 			if (dir) rmSync(dir, { recursive: true, force: true });
 		});
 
-		// the block add_ssh_key writes, beside another key's — before it or after it, since keys are
-		// appended in the order they are added and ssh takes each option from the first block that matches
+		// the block add_ssh_key writes
+		const block = (name, blockHost, blockHostname) =>
+			`#${name}\nHost ${blockHost}\n\tHostName ${blockHostname}\n\tUser git\n\tIdentityFile /nonexistent/${name}.key\n\tIdentitiesOnly yes`;
+
+		// beside another key's — before it or after it, since keys are appended in the order they are
+		// added and ssh takes each option from the first block that matches
 		const resolvesOtherKey = (host, hostname, { newBlockFirst = false } = {}) => {
 			const config = join(dir, 'config');
-			const block = (name, blockHost, blockHostname) =>
-				`#${name}\nHost ${blockHost}\n\tHostName ${blockHostname}\n\tUser git\n\tIdentityFile /nonexistent/${name}.key\n\tIdentitiesOnly yes`;
 			const blocks = [block('other', 'other.example.com', 'github.com'), block('new', host, hostname)];
 			writeFileSync(config, (newBlockFirst ? blocks.reverse() : blocks).join('\n'));
 			try {
@@ -850,8 +869,23 @@ describe('SSH config value validation', () => {
 				for (const value of acceptedAsHostname) {
 					assert.ok(resolvesOtherKey('new.example.com', value, { newBlockFirst }), `HostName ${value}`);
 				}
+				for (const value of acceptedAsHost) {
+					assert.ok(resolvesOtherKey(value, 'gitlab.com', { newBlockFirst }), `Host ${value}`);
+				}
 			}
 		});
+
+		// ssh's own verdict on the new key: undefined when it resolves, else what ssh says
+		const sshRefusal = (host, hostname) => {
+			const config = join(dir, 'config');
+			writeFileSync(config, block('new', host, hostname));
+			try {
+				execFileSync('ssh', ['-G', '-F', config, host], { stdio: ['ignore', 'ignore', 'pipe'] });
+				return undefined;
+			} catch (error) {
+				return String(error.stderr);
+			}
+		};
 
 		it('breaks every other key for the values refused for that reason', () => {
 			for (const value of ['a b', 'a"b', "a'b", '#github.com', '=', '=#x']) {
@@ -862,6 +896,29 @@ describe('SSH config value validation', () => {
 		it('sends the other key to the wrong host when a pattern alias comes first', () => {
 			for (const value of ['*', '*.example.com', 'other.example.co?']) {
 				assert.ok(!resolvesOtherKey(value, 'gitlab.com', { newBlockFirst: true }), `Host ${value}`);
+			}
+		});
+
+		it('reads a backslash literally, never as a line continuation, and refuses an alias containing one', () => {
+			for (const newBlockFirst of [false, true]) {
+				assert.ok(resolvesOtherKey('new.example.com', 'github.com\\', { newBlockFirst }), 'HostName github.com\\');
+				assert.ok(resolvesOtherKey('gh\\', 'gitlab.com', { newBlockFirst }), 'Host gh\\');
+			}
+			assert.match(sshRefusal('gh\\', 'gitlab.com'), /hostname contains invalid characters/);
+			assert.equal(
+				describeSSHConfigValueProblem('host', 'gh\\'),
+				`'host' must not contain quotes, "=" or "\\"; got ${JSON.stringify('gh\\')}.`
+			);
+		});
+
+		it('agrees with ssh on which "%" a HostName may use', () => {
+			for (const value of ['%h', '%h.example.com', '%%', 'fe80::1%%en0', '%%h']) {
+				assert.equal(sshRefusal('gh', value), undefined, value);
+				assert.equal(describeSSHConfigValueProblem('hostname', value), undefined, value);
+			}
+			for (const value of ['%Q', '%p', 'fe80::1%en0', 'x%', '%h%', '%%%']) {
+				assert.match(sshRefusal('gh', value), /unknown key|invalid format/, value);
+				assert.match(describeSSHConfigValueProblem('hostname', value), /^'hostname' can use "%" only as "%h"/, value);
 			}
 		});
 	});

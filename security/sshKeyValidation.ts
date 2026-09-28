@@ -487,9 +487,12 @@ export function describeSSHConfigValueProblem(field: 'host' | 'hostname', value:
 	if (/[\s\p{Cc}]/u.test(value)) {
 		return `'${field}' must be a single ${noun} like "${example}", without spaces or line breaks${got}`;
 	}
-	if (/["'=]/.test(value)) return `'${field}' must not contain quotes or "="${got}`;
+	if (/["'=\\]/.test(value)) return `'${field}' must not contain quotes, "=" or "\\"${got}`;
 	if (field === 'host' && /[*?!]/.test(value)) {
 		return `'host' must be one alias, not a pattern: "*", "?" and "!" also match other keys' aliases${got}`;
+	}
+	if (field === 'hostname' && value.replace(/%[%h]/g, '').includes('%')) {
+		return `'hostname' can use "%" only as "%h" (the alias) or "%%" (a literal "%"), the expansions ssh allows in a HostName${got}`;
 	}
 	if (/^[-#]/.test(value)) return `'${field}' must not start with "${value[0]}"${got}`;
 	return undefined;

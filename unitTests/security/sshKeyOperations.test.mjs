@@ -1009,7 +1009,7 @@ describe('sshKeyOperations sealing', () => {
 				['host', 'deploy example.com', /must be a single alias/],
 				['hostname', 'git.example.com extra', /must be a single hostname/],
 				['hostname', 'git"example.com', /must not contain quotes/],
-				['hostname', '=#x', /must not contain quotes or "="/],
+				['hostname', '=#x', /must not contain quotes, "=" or "\\"/],
 				['host', '*.example.com', /must be one alias, not a pattern/],
 				['host', '-oProxyCommand', /must not start with "-"/],
 			]) {
@@ -1026,21 +1026,48 @@ describe('sshKeyOperations sealing', () => {
 				legacy: { name: 'legacy', key: 'random\nstring', host: 'legacy.example.com', hostname: 'example.com' },
 				deploy: { name: 'deploy', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' },
 			};
-			const logged = [];
+			let logged = [];
 			const { cloneSSHKeysFromLeader } = await import('#src/cloneNode/sshKeyClone');
-			await cloneSSHKeysFromLeader(
-				async ({ operation, name }) =>
-					operation === 'list_ssh_keys' ? [{ name: 'legacy' }, { name: 'deploy' }] : { ...leader[name] },
-				ops.addSSHKey,
-				(message, level) => logged.push({ message, level })
-			);
+			const cloneFromLeader = () =>
+				cloneSSHKeysFromLeader({
+					requestLeader: async ({ operation, name }) =>
+						operation === 'list_ssh_keys' ? [{ name: 'legacy' }, { name: 'deploy' }] : { ...leader[name] },
+					addSSHKey: ops.addSSHKey,
+					localSSHKeyState: ops.localSSHKeyState,
+					removeLocalSSHKey: ops.removeLocalSSHKey,
+					log: (message, level) => logged.push({ message, level }),
+				});
+			const errors = () => logged.filter(({ level }) => level === 'error').map(({ message }) => message);
+			await cloneFromLeader();
 
 			assert.equal(decrypt(storedKeyFor('deploy')), PRIVATE_KEY);
 			assert.throws(() => storedKeyFor('legacy'), /ENOENT/);
-			const errors = logged.filter(({ level }) => level === 'error').map(({ message }) => message);
-			assert.equal(errors.length, 1);
-			assert.match(errors[0], /^Skipped cloning SSH key 'legacy': The SSH key doesn't look like a private key\./);
+			assert.equal(errors().length, 1);
+			assert.match(errors()[0], /^Skipped cloning SSH key 'legacy': The SSH key doesn't look like a private key\./);
 			assert.ok(!logged.some(({ message }) => message.includes('random')), 'no key material may be logged');
+
+			// a later start re-runs the setup: the key the first attempt stored is left, not refused as a duplicate
+			logged = [];
+			await cloneFromLeader();
+			assert.deepEqual(
+				errors().map((message) => message.split(':')[0]),
+				["Skipped cloning SSH key 'legacy'"]
+			);
+			assert.ok(logged.some(({ message }) => message === "SSH key 'deploy' is already on this node"));
+
+			// ...and a key it left partly written is added again, not taken as cloned: without its config
+			// block, or with a block cut off before `IdentityFile`
+			for (const config of ['', '#deploy\nHost gh\n\tHostName example.com']) {
+				writeFileSync(join(sshDir, 'config'), config);
+				assert.equal(await ops.localSSHKeyState('deploy'), 'partial');
+				logged = [];
+				await cloneFromLeader();
+				assert.equal(await ops.localSSHKeyState('deploy'), 'complete');
+				assert.equal((await ops.getSSHKey({ name: 'deploy' })).host, 'gh');
+				assert.equal(decrypt(storedKeyFor('deploy')), PRIVATE_KEY);
+				assert.ok(logged.some(({ message }) => message.startsWith("Replacing SSH key 'deploy'")));
+			}
+			assert.equal(await ops.localSSHKeyState('../deploy'), 'absent');
 		});
 	});
 

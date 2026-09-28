@@ -409,11 +409,49 @@ export async function deleteSSHKey(req: { name: string }): Promise<{ message: st
 	const { name } = req;
 	harperLogger?.trace(`deleting ssh key`, name);
 
-	const { sshDir, filePath, configFile } = getSSHPaths(name);
+	const { filePath } = getSSHPaths(name);
 	if (!(await exists(filePath))) {
 		throw new ClientError(`SSH key '${name}' does not exist.`);
 	}
 
+	await removeSSHKeyFiles(name);
+
+	const response = await replicateOperation(req);
+	response.message = `Deleted ssh key: ${name}`;
+	return response;
+}
+
+/**
+ * Clone setup only: whether this node holds `name` as `addSSHKey` leaves it, down to the config block's
+ * last line, or only part of it — `addSSHKey` writes the key file, then its block, and can stop between.
+ */
+export async function localSSHKeyState(name: string): Promise<'absent' | 'partial' | 'complete'> {
+	// no key can exist under a name `addSSHKey` refuses, and it must not become a path
+	if (!SSH_KEY_NAME_REGEX.test(name)) return 'absent';
+	const { sshDir, filePath, configFile } = getSSHPaths(name);
+	if (!(await exists(filePath))) return 'absent';
+	const config = await readSSHConfigFile(configFile);
+	if (config === undefined) return 'partial';
+	const view = readSSHConfig(config, sshDir);
+	// a marked block ends with the last line `addSSHKey` writes; an unmarked one, with `IdentitiesOnly yes`
+	const complete = (view.blocks.get(name) ?? []).some(
+		(block) =>
+			!block.legacy || view.lines.slice(block.first, block.last + 1).some(({ text }) => text === '\tIdentitiesOnly yes')
+	);
+	return complete ? 'complete' : 'partial';
+}
+
+/**
+ * Clone setup only: removes this node's copy of a key that `localSSHKeyState` finds partial, so it can
+ * be added again. Never replicated: peers hold a complete copy.
+ */
+export async function removeLocalSSHKey(name: string): Promise<void> {
+	if (!SSH_KEY_NAME_REGEX.test(name)) throw new ClientError(SSH_KEY_NAME_ERROR_MSG);
+	await removeSSHKeyFiles(name);
+}
+
+async function removeSSHKeyFiles(name: string): Promise<void> {
+	const { sshDir, filePath, configFile } = getSSHPaths(name);
 	const config = await readSSHConfigFile(configFile);
 	if (config !== undefined) {
 		const view = readSSHConfig(config, sshDir);
@@ -428,12 +466,7 @@ export async function deleteSSHKey(req: { name: string }): Promise<{ message: st
 		const updated = renderSSHConfig(view, name);
 		if (updated !== config) await writeSSHConfig(configFile, updated);
 	}
-
 	await unlink(filePath);
-
-	const response = await replicateOperation(req);
-	response.message = `Deleted ssh key: ${name}`;
-	return response;
 }
 
 /**
