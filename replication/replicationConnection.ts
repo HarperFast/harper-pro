@@ -134,6 +134,8 @@ import {
 	unregisterReplicatedApplyFailureListener,
 	type ReplicatedApplyFailureListener,
 } from '../core/resources/replicatedApplyFailure.ts';
+import { normalizeWebSocketCloseReason } from './webSocketClose.ts';
+export { normalizeWebSocketCloseReason } from './webSocketClose.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
 // blob-send backpressure both need it, so the private field is declared here rather than at each read.
@@ -267,6 +269,20 @@ export function mayRebuildSendRange(
 ): boolean {
 	const since = midLogBreak ? Math.max(breakSince, lastRebuildAt) : lastRebuildAt;
 	return !(since > 0 && now - since < (midLogBreak ? quarantineMs : repairMs));
+}
+export function sendLogBreakRepairDecision(
+	midLogBreak: boolean,
+	breakSince: number,
+	lastRebuildAt: number,
+	now: number
+): { breakSince: number; rebuild: boolean; retryInMs: number } {
+	const establishedBreakSince = breakSince || now;
+	const rebuild = mayRebuildSendRange(midLogBreak, establishedBreakSince, lastRebuildAt, now);
+	return {
+		breakSince: establishedBreakSince,
+		rebuild,
+		retryInMs: rebuild ? 0 : rebuildRetryDelayMs(midLogBreak, establishedBreakSince, lastRebuildAt, now),
+	};
 }
 type RecoveryCloseBound = { lastCloseAt?: number; closeCount?: number; lastEventAt?: number };
 // A decode-drop close can land on any HTTP worker after reconnecting, so its budget belongs in the
@@ -1053,6 +1069,93 @@ export function keepaliveArmsOnOpen(readyState: number): boolean {
 	return readyState === WebSocket.CONNECTING;
 }
 
+export function runRecoveryDiagnostic(diagnostic: () => void): void {
+	try {
+		diagnostic();
+	} catch {}
+}
+
+type RecoveryTransport = {
+	close: (code?: number, reason?: string) => void;
+	terminate: () => void;
+	destroy?: () => void;
+};
+
+type RecoveryTeardownDependencies = {
+	transport: RecoveryTransport;
+	schedule: (callback: () => void) => void;
+	escalate: () => void;
+	report?: (stage: string, error: unknown) => void;
+};
+
+export function escalateRecoverySession(
+	failedSocket: unknown,
+	currentSocket: unknown,
+	intentional: boolean,
+	deps: {
+		retire: () => void;
+		forceReconnect?: () => void;
+		report?: (stage: string, error: unknown) => void;
+	}
+): void {
+	const report = (stage: string, error: unknown) => runRecoveryDiagnostic(() => deps.report?.(stage, error));
+	try {
+		deps.retire();
+	} catch (error) {
+		report('retire', error);
+	}
+	if (intentional || currentSocket !== failedSocket || !deps.forceReconnect) return;
+	try {
+		deps.forceReconnect();
+	} catch (error) {
+		report('forceReconnect', error);
+		try {
+			deps.retire();
+		} catch (retireError) {
+			report('retire', retireError);
+		}
+	}
+}
+
+export function closeRecoveryTransport(
+	code: number | undefined,
+	reason: unknown,
+	deps: RecoveryTeardownDependencies
+): boolean {
+	const normalizedReason = normalizeWebSocketCloseReason(reason);
+	const report = (stage: string, error: unknown) => runRecoveryDiagnostic(() => deps.report?.(stage, error));
+	try {
+		deps.transport.close(code, normalizedReason);
+		return true;
+	} catch (error) {
+		report('close', error);
+	}
+	try {
+		deps.transport.terminate();
+	} catch (error) {
+		report('terminate', error);
+	}
+	try {
+		deps.transport.destroy?.();
+	} catch (error) {
+		report('destroy', error);
+	}
+	const escalate = () => {
+		try {
+			deps.escalate();
+		} catch (error) {
+			report('escalate', error);
+		}
+	};
+	try {
+		deps.schedule(escalate);
+	} catch (error) {
+		report('schedule', error);
+		queueMicrotask(escalate);
+	}
+	return false;
+}
+
 /** Close after an error escapes an inbound frame so later queued frames cannot advance past it. */
 export function closeOnInboundMessageError(
 	error: unknown,
@@ -1064,12 +1167,12 @@ export function closeOnInboundMessageError(
 	}
 ): void {
 	deps.markInboundClosed();
-	// The log must never prevent the close — this handler is the last line of defense, so the
-	// logger access is fully guarded rather than trusted.
-	deps.logger?.error?.(
-		deps.connectionId,
-		'Error handling incoming replication message; closing so replication resumes from the last durable cursor',
-		error
+	runRecoveryDiagnostic(() =>
+		deps.logger?.error?.(
+			deps.connectionId,
+			'Error handling incoming replication message; closing so replication resumes from the last durable cursor',
+			error
+		)
 	);
 	deps.close(1011, 'Error handling incoming replication message');
 }
@@ -4515,9 +4618,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			await poisonRecordLockPair(databaseName, origin ?? `node#${originId}`, tableName, reason);
 			return true;
 		} catch (error) {
-			logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error);
 			wsClosed = true;
-			closeOrTerminate(1011, 'could not record a replication hole; reconnecting');
+			close(1011, 'could not record a replication hole; reconnecting');
+			runRecoveryDiagnostic(() =>
+				logger.error?.(connectionId, 'could not record a replication hole for record locks; holding', error)
+			);
 			return false;
 		}
 	}
@@ -4566,7 +4671,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			decodeDropResyncPending = false;
 			stopDecodeDropResyncApplyFailureListener();
 			wsClosed = true;
-			closeOrTerminate(1011, 'replicated apply failed while structure resync was pending');
+			close(1011, 'replicated apply failed while structure resync was pending');
 		};
 		decodeDropResyncApplyFailureListener = listener;
 		registerReplicatedApplyFailureListener(databaseName, listener);
@@ -4579,20 +4684,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		sendLogBreakIsMidLog = midLogBreak;
 		if (wsClosed) return false;
 		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
-		if (midLogBreak && isNewBreak)
-			logger.error?.(
-				connectionId,
-				`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind the break are quarantined and no fresh iterator can cross it, so this leg will not send past it. Repair the transaction log or re-clone this node.`
-			);
 		// Nothing is cached to drop where the loop already rebuilds every wake.
 		if (!auditStore?.reusableIterable) return false;
 		// A torn tail is not always walkable yet, and rebuilding on every wake would be a `getRange` per
 		// commit. A quarantined break cannot be walked at all until someone repairs the log, so it waits far
 		// longer — but it does wait, rather than never looking again.
 		const now = Date.now();
-		if (sendLogBreakSince === 0) sendLogBreakSince = now;
-		if (!mayRebuildSendRange(midLogBreak, sendLogBreakSince, lastSendLogRepairAt, now)) {
-			sendLogRebuildRetryInMs = rebuildRetryDelayMs(midLogBreak, sendLogBreakSince, lastSendLogRepairAt, now);
+		const repairDecision = sendLogBreakRepairDecision(midLogBreak, sendLogBreakSince, lastSendLogRepairAt, now);
+		sendLogBreakSince = repairDecision.breakSince;
+		sendLogRebuildRetryInMs = repairDecision.retryInMs;
+		if (midLogBreak && isNewBreak)
+			runRecoveryDiagnostic(() =>
+				logger.error?.(
+					connectionId,
+					`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind the break are quarantined and no fresh iterator can cross it, so this leg will not send past it. Repair the transaction log or re-clone this node.`
+				)
+			);
+		if (!repairDecision.rebuild) {
 			return false;
 		}
 		lastSendLogRepairAt = now;
@@ -4600,7 +4708,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// nor a throwing fire counter can lose the `true` this returns. Losing it would leave the cache
 		// cleared and the floor stamped while the caller believed no repair happened.
 		auditLogIterable = undefined;
-		try {
+		runRecoveryDiagnostic(() => {
 			// Assigned before the log call: `logger.warn?.` is undefined under `logging.level: error`, so an
 			// inlined call would stop counting (harper-pro#431).
 			const fireDetail = recordFireForLog('send-log-break');
@@ -4609,9 +4717,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				`Replication send to ${remoteNodeName}${dbContext} stopped at a ${midLogBreak ? 'quarantined mid-log' : 'torn'} transaction-log frame (${breaks} break(s) on the cached iterable); it is latched done, so this session would send nothing further. Rebuilding the send range from ${resumeFrom}. ` +
 					fireDetail
 			);
-		} catch (error) {
-			logger.trace?.(connectionId, 'could not report the send-range rebuild', error);
-		}
+		});
 		return true;
 	}
 	if (databaseName) {
@@ -6785,7 +6891,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											sendLogBreakSince = 0;
 										}
 									} catch (error) {
-										logger.trace?.(connectionId, 'could not read the send iterable corrupt-frame state', error);
+										runRecoveryDiagnostic(() =>
+											logger.trace?.(connectionId, 'could not read the send iterable corrupt-frame state', error)
+										);
 									}
 									// Finalized even when the drain stopped at a break. harper#2087's fail-stop policy is that the
 									// stream DELIVERS everything before the break and stops there, and
@@ -6827,13 +6935,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								} while (!closed);
 							})
 							.catch((error) => {
-								logger.error?.(connectionId, 'Error handling subscription to node', error);
 								// An authorization-watch rejection before it resolves reaches this chain too (the setup
 								// gate awaits the same promise), and that chain has already closed with a more accurate
 								// code — so a second close here would only overwrite the reason.
-								if (closed || wsClosed) return;
-								closed = true;
-								close(1008, 'Error handling subscription to node ' + error);
+								if (!closed && !wsClosed) {
+									closed = true;
+									close(1008, 'Error handling subscription to node');
+								}
+								runRecoveryDiagnostic(() => logger.error?.(connectionId, 'Error handling subscription to node', error));
 							});
 						break;
 					}
@@ -7514,27 +7623,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 					}
 					if (decodeDropResync !== 'none') {
-						logger.warn?.(
-							connectionId,
-							`Resubscribing to ${databaseName} from ${remoteNodeName} to resync table structures after an undecodable record${replayingPendingHole ? '; a blob holds the resume cursor behind this frame, so it is re-delivered after the structures are re-sent' : '; the dropped record is not re-delivered'}`
-						);
 						decodeDropResyncPending = false;
 						stopDecodeDropResyncApplyFailureListener();
 						wsClosed = true;
-						if (!closeOrTerminate(CLOSE_DECODE_DROP_RESYNC, 'undecodable record; resubscribing to resync structures')) {
-							logger.error?.(
+						close(CLOSE_DECODE_DROP_RESYNC, 'undecodable record; resubscribing to resync structures');
+						runRecoveryDiagnostic(() =>
+							logger.warn?.(
 								connectionId,
-								`Could not close or terminate ${databaseName} to ${remoteNodeName} for a structure resync`
-							);
-							// Do not re-open inbound processing after any queued frames were skipped for this resync:
-							// a later cursor could otherwise make those frames permanently unrecoverable. The close
-							// claim stays spent; a raw-socket destroy is the final best-effort teardown path.
-							try {
-								ws._socket?.destroy();
-							} catch (error) {
-								logger.error?.(connectionId, 'Error destroying connection after close and terminate failed', error);
-							}
-						}
+								`Resubscribing to ${databaseName} from ${remoteNodeName} to resync table structures after an undecodable record${replayingPendingHole ? '; a blob holds the resume cursor behind this frame, so it is re-delivered after the structures are re-sent' : '; the dropped record is not re-delivered'}`
+							)
+						);
 					}
 				},
 			};
@@ -7700,26 +7798,47 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	ws.on('close', retireInstance);
 
-	// Returns whether the close was actually issued so callers can undo latches and budget claims when
-	// `ws.close()` throws.
-	function close(code?, reason?, intentional?: boolean): boolean {
-		try {
-			// Only the deliberate "we are done with this connection" call sites pass intentional=true
-			// (currently just the empty-subscription delayed close below). Everything else — auth
-			// failures after open, peer-initiated DISCONNECT, schema/sequence errors — is a
-			// transient protocol close that should reconnect, so we let the WS close event fall
-			// through to NodeReplicationConnection's normal retry path instead of marking the
-			// connection as finished or emitting 'finished' (which would remove it from the
-			// worker's connections map).
-			if (intentional && options.connection) options.connection.intentionallyUnsubscribed = true;
-			logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, code, reason);
-			ws.close(code, reason);
-			if (intentional) options.connection?.emit('finished'); // synchronously indicate that the connection is finished, so it is not accidentally reused
-			return true;
-		} catch (error) {
-			logger.error?.(connectionId, 'Error closing connection', error);
-			return false;
+	function close(code?: number, reason?: unknown, intentional?: boolean): boolean {
+		// Only the deliberate "we are done with this connection" call sites pass intentional=true
+		// (currently just the empty-subscription delayed close below). Everything else — auth
+		// failures after open, peer-initiated DISCONNECT, schema/sequence errors — is a
+		// transient protocol close that should reconnect, so we let the WS close event fall
+		// through to NodeReplicationConnection's normal retry path instead of marking the
+		// connection as finished or emitting 'finished' (which would remove it from the
+		// worker's connections map).
+		if (intentional && options.connection) options.connection.intentionallyUnsubscribed = true;
+		const normalizedReason = normalizeWebSocketCloseReason(reason);
+		const closeStarted = closeRecoveryTransport(code, normalizedReason, {
+			transport: {
+				close: (safeCode, safeReason) => {
+					ws.close(safeCode, safeReason);
+					runRecoveryDiagnostic(() =>
+						logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, safeCode, safeReason)
+					);
+				},
+				terminate: () => ws.terminate(),
+				destroy: () => ws._socket?.destroy(),
+			},
+			schedule: (callback) => setImmediate(callback),
+			escalate: () =>
+				escalateRecoverySession(ws, options.connection?.socket, intentional === true, {
+					retire: () =>
+						retireInstance(code, normalizedReason === undefined ? undefined : Buffer.from(normalizedReason)),
+					forceReconnect: options.connection ? () => options.connection.forceReconnect() : undefined,
+					report: (stage, error) =>
+						logger.error?.(connectionId, `Error during replication session ${stage} escalation`, error),
+				}),
+			report: (stage, error) =>
+				logger.error?.(connectionId, `Error during replication connection ${stage} fallback`, error),
+		});
+		if (intentional) {
+			try {
+				options.connection?.emit('finished');
+			} catch (error) {
+				runRecoveryDiagnostic(() => logger.error?.(connectionId, 'Error finishing closed connection', error));
+			}
 		}
+		return closeStarted;
 	}
 	// The requester stops waiting at its own deadline or when it restarts, and this node's work goes on,
 	// so an answer can be ready after its connection is gone. A send then drops it without a trace.
@@ -7731,16 +7850,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return;
 		}
 		ws.send(encode([OPERATION_RESPONSE, answer]));
-	}
-	function closeOrTerminate(code: number, reason: string): boolean {
-		if (close(code, reason)) return true;
-		try {
-			ws.terminate();
-			return true;
-		} catch (error) {
-			logger.error?.(connectionId, 'Error terminating connection after close failed', error);
-			return false;
-		}
 	}
 	// Track the blobs being sent, so we can wait for them to finish before sending the next blob.
 	// The same blobs can't be sent concurrently of the packets will get mixed up. The receiving

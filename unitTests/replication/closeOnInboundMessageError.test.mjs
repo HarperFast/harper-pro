@@ -87,4 +87,22 @@ describe('closeOnInboundMessageError', () => {
 
 		expect(close.calledOnce).to.equal(true);
 	});
+
+	it('still closes without throwing when the logger throws', () => {
+		const close = sinon.spy();
+
+		expect(() =>
+			closeOnInboundMessageError(new Error('boom'), {
+				connectionId: 7,
+				logger: {
+					error() {
+						throw new Error('logger failed');
+					},
+				},
+				markInboundClosed: () => {},
+				close,
+			})
+		).not.to.throw();
+		expect(close.calledOnce).to.equal(true);
+	});
 });

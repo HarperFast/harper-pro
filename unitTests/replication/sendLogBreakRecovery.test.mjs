@@ -19,6 +19,7 @@ import {
 	decodeDropResyncDisposition,
 	mayRebuildSendRange,
 	rebuildRetryDelayMs,
+	sendLogBreakRepairDecision,
 	SEND_LOG_REPAIR_INTERVAL_MS,
 	SEND_LOG_QUARANTINE_RECHECK_MS,
 	recoveryCloseAllowed,
@@ -158,6 +159,16 @@ describe('rebuildRetryDelayMs — the wake a denied rebuild needs', () => {
 				);
 			}
 		}
+	});
+});
+
+describe('sendLogBreakRepairDecision', () => {
+	it('establishes the clock and quarantine wake before diagnostics run', () => {
+		expect(sendLogBreakRepairDecision(true, 0, 0, NOW)).to.deep.equal({
+			breakSince: NOW,
+			rebuild: false,
+			retryInMs: SEND_LOG_QUARANTINE_RECHECK_MS,
+		});
 	});
 });
 
