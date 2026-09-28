@@ -923,8 +923,8 @@ function sumTableSizes(dbObj: Record<string, any>): number {
 async function cloneSSHKeys() {
 	if (skipSSHKeys) return;
 
-	const { addSSHKey } = await import('../security/sshKeyOperations.js');
-	await cloneSSHKeysFromLeader(leaderRequest, addSSHKey, log);
+	const { addSSHKey, listSSHKeys } = await import('../security/sshKeyOperations.js');
+	await cloneSSHKeysFromLeader({ requestLeader: leaderRequest, addSSHKey, listLocalSSHKeys: listSSHKeys, log });
 }
 
 /**

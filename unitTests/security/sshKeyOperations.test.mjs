@@ -560,21 +560,33 @@ describe('sshKeyOperations sealing', () => {
 				legacy: { name: 'legacy', key: 'random\nstring', host: 'legacy.example.com', hostname: 'example.com' },
 				deploy: { name: 'deploy', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' },
 			};
-			const logged = [];
+			let logged = [];
 			const { cloneSSHKeysFromLeader } = await import('#src/cloneNode/sshKeyClone');
-			await cloneSSHKeysFromLeader(
-				async ({ operation, name }) =>
-					operation === 'list_ssh_keys' ? [{ name: 'legacy' }, { name: 'deploy' }] : { ...leader[name] },
-				ops.addSSHKey,
-				(message, level) => logged.push({ message, level })
-			);
+			const cloneFromLeader = () =>
+				cloneSSHKeysFromLeader({
+					requestLeader: async ({ operation, name }) =>
+						operation === 'list_ssh_keys' ? [{ name: 'legacy' }, { name: 'deploy' }] : { ...leader[name] },
+					addSSHKey: ops.addSSHKey,
+					listLocalSSHKeys: ops.listSSHKeys,
+					log: (message, level) => logged.push({ message, level }),
+				});
+			const errors = () => logged.filter(({ level }) => level === 'error').map(({ message }) => message);
+			await cloneFromLeader();
 
 			assert.equal(decrypt(storedKeyFor('deploy')), PRIVATE_KEY);
 			assert.throws(() => storedKeyFor('legacy'), /ENOENT/);
-			const errors = logged.filter(({ level }) => level === 'error').map(({ message }) => message);
-			assert.equal(errors.length, 1);
-			assert.match(errors[0], /^Skipped cloning SSH key 'legacy': The SSH key doesn't look like a private key\./);
+			assert.equal(errors().length, 1);
+			assert.match(errors()[0], /^Skipped cloning SSH key 'legacy': The SSH key doesn't look like a private key\./);
 			assert.ok(!logged.some(({ message }) => message.includes('random')), 'no key material may be logged');
+
+			// a later start re-runs the setup: the key the first attempt stored is left, not refused as a duplicate
+			logged = [];
+			await cloneFromLeader();
+			assert.deepEqual(
+				errors().map((message) => message.split(':')[0]),
+				["Skipped cloning SSH key 'legacy'"]
+			);
+			assert.ok(logged.some(({ message }) => message === "SSH key 'deploy' is already on this node"));
 		});
 	});
 

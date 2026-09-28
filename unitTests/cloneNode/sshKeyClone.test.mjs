@@ -1,15 +1,23 @@
 import assert from 'node:assert/strict';
 import { cloneSSHKeysFromLeader } from '#src/cloneNode/sshKeyClone';
 
-function leaderWith(keys, { failGet = [] } = {}) {
-	return async ({ operation, name }) => {
+function leaderWith(keys, { failures = {} } = {}) {
+	const requested = [];
+	const remaining = { ...failures };
+	const requestLeader = async ({ operation, name }) => {
+		requested.push(name ?? operation);
+		const target = name ?? operation;
+		if (remaining[target] > 0) {
+			remaining[target]--;
+			throw new Error(`leader request for '${target}' failed`);
+		}
 		if (operation === 'list_ssh_keys') return Object.keys(keys).map((key) => ({ name: key }));
-		if (failGet.includes(name)) throw new Error(`leader request for '${name}' failed`);
 		return { name, ...keys[name] };
 	};
+	return { requestLeader, requested };
 }
 
-function recorder() {
+function recorder({ local = [] } = {}) {
 	const added = [];
 	const logged = [];
 	return {
@@ -17,58 +25,96 @@ function recorder() {
 		logged,
 		errors: () => logged.filter(({ level }) => level === 'error').map(({ message }) => message),
 		addSSHKey: async (key) => {
-			if (key.key === 'refused') throw new Error('The SSH key is damaged');
+			if (key.key === 'refused') throw Object.assign(new Error('The SSH key is damaged'), { statusCode: 400 });
+			if (key.key === 'disk full') throw new Error('ENOSPC: no space left on device');
 			added.push(key.name);
 		},
+		listLocalSSHKeys: async () => local.map((name) => ({ name })),
 		log: (message, level) => logged.push({ message, level }),
 	};
 }
 
-describe('cloneSSHKeysFromLeader', () => {
-	it('clones the keys after one the local add_ssh_key refuses', async () => {
-		const clone = recorder();
-		await cloneSSHKeysFromLeader(
-			leaderWith({ first: { key: 'refused' }, second: { key: 'ok' } }),
-			clone.addSSHKey,
-			clone.log
-		);
-
-		assert.deepEqual(clone.added, ['second']);
-		assert.deepEqual(clone.errors(), ["Skipped cloning SSH key 'first': The SSH key is damaged"]);
+const clone = (leader, node, options) =>
+	cloneSSHKeysFromLeader({
+		requestLeader: leader.requestLeader,
+		addSSHKey: node.addSSHKey,
+		listLocalSSHKeys: node.listLocalSSHKeys,
+		log: node.log,
+		retryDelayMs: 0,
+		...options,
 	});
 
-	it('clones the keys after one the leader fails to return', async () => {
-		const clone = recorder();
-		const leader = leaderWith({ first: { key: 'ok' }, second: { key: 'ok' } }, { failGet: ['first'] });
-		await cloneSSHKeysFromLeader(leader, clone.addSSHKey, clone.log);
+describe('cloneSSHKeysFromLeader', () => {
+	it('clones the keys after one the local add_ssh_key refuses', async () => {
+		const node = recorder();
+		await clone(leaderWith({ first: { key: 'refused' }, second: { key: 'ok' } }), node);
 
-		assert.deepEqual(clone.added, ['second']);
-		assert.deepEqual(clone.errors(), ["Skipped cloning SSH key 'first': leader request for 'first' failed"]);
+		assert.deepEqual(node.added, ['second']);
+		assert.deepEqual(node.errors(), ["Skipped cloning SSH key 'first': The SSH key is damaged"]);
+	});
+
+	it('retries a leader request that fails, then clones the key', async () => {
+		const node = recorder();
+		const leader = leaderWith({ first: { key: 'ok' } }, { failures: { list_ssh_keys: 2, first: 2 } });
+		await clone(leader, node);
+
+		assert.deepEqual(node.added, ['first']);
+		assert.deepEqual(node.errors(), []);
+	});
+
+	it('throws when a leader request still fails after every attempt, cloning no key after it', async () => {
+		const node = recorder();
+		const leader = leaderWith({ first: { key: 'ok' }, second: { key: 'ok' } }, { failures: { first: 3 } });
+		await assert.rejects(clone(leader, node), {
+			message: "get_ssh_key 'first' failed on the leader 3 times: leader request for 'first' failed",
+		});
+
+		assert.deepEqual(node.added, []);
+		assert.deepEqual(leader.requested, ['list_ssh_keys', 'first', 'first', 'first']);
+	});
+
+	it('throws when the key listing still fails after every attempt', async () => {
+		const node = recorder();
+		const leader = leaderWith({ first: { key: 'ok' } }, { failures: { list_ssh_keys: 3 } });
+		await assert.rejects(clone(leader, node), {
+			message: "list_ssh_keys failed on the leader 3 times: leader request for 'list_ssh_keys' failed",
+		});
+
+		assert.deepEqual(node.added, []);
+	});
+
+	it('throws a key this node cannot store, rather than skipping it', async () => {
+		const node = recorder();
+		await assert.rejects(clone(leaderWith({ first: { key: 'disk full' }, second: { key: 'ok' } }), node), {
+			message: "Unable to store SSH key 'first' cloned from the leader: ENOSPC: no space left on device",
+		});
+
+		assert.deepEqual(node.added, []);
+	});
+
+	it('leaves a key an earlier attempt cloned, without fetching it again', async () => {
+		const node = recorder({ local: ['first'] });
+		const leader = leaderWith({ first: { key: 'ok' }, second: { key: 'ok' } });
+		await clone(leader, node);
+
+		assert.deepEqual(node.added, ['second']);
+		assert.deepEqual(leader.requested, ['list_ssh_keys', 'second']);
+		assert.deepEqual(node.errors(), []);
+		assert.ok(node.logged.some(({ message }) => message === "SSH key 'first' is already on this node"));
 	});
 
 	it('names each key it clones', async () => {
-		const clone = recorder();
-		await cloneSSHKeysFromLeader(leaderWith({ deploy: { key: 'ok' } }), clone.addSSHKey, clone.log);
+		const node = recorder();
+		await clone(leaderWith({ deploy: { key: 'ok' } }), node);
 
-		assert.ok(clone.logged.some(({ message }) => message === 'Cloning SSH key: deploy'));
-	});
-
-	it('logs a failed key listing and clones nothing, without throwing', async () => {
-		const clone = recorder();
-		const leader = async () => {
-			throw new Error('leader unreachable');
-		};
-		await cloneSSHKeysFromLeader(leader, clone.addSSHKey, clone.log);
-
-		assert.deepEqual(clone.added, []);
-		assert.deepEqual(clone.errors(), ['Error cloning SSH keys: Error: leader unreachable']);
+		assert.ok(node.logged.some(({ message }) => message === 'Cloning SSH key: deploy'));
 	});
 
 	it('says so when the leader has no keys', async () => {
-		const clone = recorder();
-		await cloneSSHKeysFromLeader(leaderWith({}), clone.addSSHKey, clone.log);
+		const node = recorder();
+		await clone(leaderWith({}), node);
 
-		assert.deepEqual(clone.added, []);
-		assert.deepEqual(clone.logged, [{ message: 'No SSH keys found on leader node to clone', level: undefined }]);
+		assert.deepEqual(node.added, []);
+		assert.deepEqual(node.logged, [{ message: 'No SSH keys found on leader node to clone', level: undefined }]);
 	});
 });
