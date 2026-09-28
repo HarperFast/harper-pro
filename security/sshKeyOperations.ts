@@ -1,6 +1,6 @@
 import Joi from 'joi';
 import { randomUUID } from 'node:crypto';
-import { join, dirname, basename } from 'node:path';
+import { join, dirname, basename, resolve } from 'node:path';
 import {
 	constants,
 	access,
@@ -12,8 +12,9 @@ import {
 	mkdir,
 	readdir,
 	stat,
+	lstat,
 	open,
-	realpath,
+	readlink,
 	rename,
 	type FileHandle,
 } from 'node:fs/promises';
@@ -21,7 +22,12 @@ import {
 import { validateBySchema } from '../core/validation/validationWrapper.js';
 import { isUnsupportedSyncError } from '../core/utility/fsync.ts';
 import harperLogger from '../core/utility/logging/harper_logger.js';
-import { ClientError } from '../core/utility/errors/hdbError.js';
+import { ClientError, ServerError } from '../core/utility/errors/hdbError.js';
+import {
+	ComponentPreparationLockTimeoutError,
+	withComponentPreparationLock,
+} from '../core/components/componentPreparationLock.ts';
+import { isThreadRunning } from '../core/server/threads/manageThreads.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { getSecretCustody } from '../core/resources/secretDecryptor.ts';
@@ -228,7 +234,7 @@ export async function addSSHKey(
 	// Reject a duplicate name BEFORE minting anything: with `generate: true` a taken name means the add
 	// is already doomed, so there is no reason to mint private-key material for a request guaranteed to
 	// throw below.
-	const { filePath, configFile, knownHostsFile } = getSSHPaths(req.name);
+	const { sshDir, filePath, configFile, knownHostsFile } = getSSHPaths(req.name);
 	if (await exists(filePath)) {
 		throw new ClientError('Key already exists. Use update_ssh_key or delete_ssh_key and then add_ssh_key');
 	}
@@ -272,12 +278,12 @@ Host ${host}
 	IdentitiesOnly yes
 ${SSH_CONFIG_END}${name}`;
 
-	// If the file already exists, add a new config block, otherwise write the file for the first time
-	if (await exists(configFile)) {
-		await appendToSSHConfig(configFile, '\n' + configBlock);
-	} else {
-		await writeSSHConfig(configFile, configBlock);
-	}
+	await withSSHConfigLock(async () => {
+		const config = await readSSHConfigFile(configFile);
+		const updated =
+			config === undefined ? configBlock : `${renderSSHConfig(readSSHConfig(config, sshDir))}\n${configBlock}`;
+		await writeSSHConfig(configFile, updated);
+	});
 
 	let additionalMessage = '';
 
@@ -452,21 +458,23 @@ export async function removeLocalSSHKey(name: string): Promise<void> {
 
 async function removeSSHKeyFiles(name: string): Promise<void> {
 	const { sshDir, filePath, configFile } = getSSHPaths(name);
-	const config = await readSSHConfigFile(configFile);
-	if (config !== undefined) {
-		const view = readSSHConfig(config, sshDir);
-		const unterminatedLine = view.unterminatedBeginLine.get(name);
-		if (unterminatedLine !== undefined) {
-			throw new ClientError(
-				`SSH key '${name}' was not deleted: line ${unterminatedLine} of the SSH config begins its block ` +
-					`("${SSH_CONFIG_BEGIN}${name}"), but no "${SSH_CONFIG_END}${name}" line ends it. ` +
-					'Restore that line, or remove the block by hand, then delete the key again.'
-			);
+	await withSSHConfigLock(async () => {
+		const config = await readSSHConfigFile(configFile);
+		if (config !== undefined) {
+			const view = readSSHConfig(config, sshDir);
+			const unterminatedLine = view.unterminatedBeginLine.get(name);
+			if (unterminatedLine !== undefined) {
+				throw new ClientError(
+					`SSH key '${name}' was not deleted: line ${unterminatedLine} of the SSH config begins its block ` +
+						`("${SSH_CONFIG_BEGIN}${name}"), but no "${SSH_CONFIG_END}${name}" line ends it. ` +
+						'Restore that line, or remove the block by hand, then delete the key again.'
+				);
+			}
+			const updated = renderSSHConfig(view, name);
+			if (updated !== config) await writeSSHConfig(configFile, updated);
 		}
-		const updated = renderSSHConfig(view, name);
-		if (updated !== config) await writeSSHConfig(configFile, updated);
-	}
-	await unlink(filePath);
+		await unlink(filePath);
+	});
 }
 
 /**
@@ -680,41 +688,44 @@ function renderSSHConfig(view: SSHConfigView, removing?: string): string {
 	return rendered;
 }
 
+const SSH_CONFIG_LOCK_WAIT_MS = 30_000;
+
 /**
- * An append that fails part way removes the bytes it wrote, so the config never keeps a BEGIN line whose
- * END line never landed. Truncating needs no free space, which a failed write often lacks, and an append
- * keeps a concurrent add's block, which a replacement would drop.
+ * Every write of the SSH config is a read-modify-write, so each runs under a lock shared by every thread
+ * and process on the node, or two writers would each drop the other's change.
  */
-async function appendToSSHConfig(configFile: string, text: string): Promise<void> {
-	const handle = await open(configFile, 'a+');
+async function withSSHConfigLock<T>(write: () => Promise<T>): Promise<T> {
+	let acquired = false;
 	try {
-		const before = (await handle.stat()).size;
-		try {
-			await handle.appendFile(text, 'utf8');
-		} catch (error) {
-			await removePartialAppend(handle, before, Buffer.from(text, 'utf8')).catch((rollbackError) =>
-				harperLogger?.warn(
-					`Unable to remove a partly appended block from the SSH config: ${(rollbackError as Error).message}`
-				)
-			);
-			throw error;
-		}
-	} finally {
-		await handle.close();
+		return await withComponentPreparationLock(
+			getSSHPaths(undefined).sshDir,
+			() => {
+				acquired = true;
+				return write();
+			},
+			{
+				purpose: 'ssh-config',
+				timeoutMs: SSH_CONFIG_LOCK_WAIT_MS,
+				renewTimeoutWhileOwnerAlive: false,
+				// a claim left by a crashed worker of this process would otherwise read as live until a restart
+				isOwnerAlive: (owner) => owner.pid !== process.pid || isThreadRunning(owner.threadId),
+			}
+		);
+	} catch (error) {
+		if (acquired || !(error instanceof ComponentPreparationLockTimeoutError)) throw error;
+		const busy = new ServerError(`The SSH config is busy; ${error.message}`, 503);
+		busy.cause = error;
+		throw busy;
 	}
 }
 
-/**
- * Without #722's writer lock this is check-then-truncate, not atomic: an append another thread makes
- * between the last size check and the truncate is lost, and one made before it leaves the partial block.
- */
-async function removePartialAppend(handle: FileHandle, before: number, text: Buffer): Promise<void> {
-	const written = (await handle.stat()).size - before;
-	if (written <= 0 || written >= text.length) return;
-	const tail = Buffer.alloc(written);
-	await handle.read(tail, 0, written, before);
-	if (!tail.equals(text.subarray(0, written))) return;
-	if ((await handle.stat()).size === before + written) await handle.truncate(before);
+async function symlinkTarget(path: string): Promise<string> {
+	let target = path;
+	for (let hops = 0; hops < 40; hops++) {
+		if (!(await lstat(target).catch(() => undefined))?.isSymbolicLink()) return target;
+		target = resolve(dirname(target), await readlink(target));
+	}
+	throw new Error(`Too many levels of symbolic links in ${path}`);
 }
 
 async function readSSHConfigFile(configFile: string): Promise<string | undefined> {
@@ -728,10 +739,10 @@ async function readSSHConfigFile(configFile: string): Promise<string | undefined
 
 /**
  * A crash leaves the old config or the new one, never a truncated file that would disable every key on
- * the node. A symlinked config is replaced at its target, keeping the link.
+ * the node. A symlinked config, dangling or not, is replaced at its target, keeping the link.
  */
 async function writeSSHConfig(configFile: string, contents: string): Promise<void> {
-	const target = await realpath(configFile).catch(() => configFile);
+	const target = await symlinkTarget(configFile);
 	const mode = (await stat(target).catch(() => undefined))?.mode;
 	const temporaryFile = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
 	let handle: FileHandle | undefined;
@@ -777,12 +788,17 @@ export function migrateSSHConfigOnce(): Promise<void> {
 export async function migrateSSHConfig(): Promise<void> {
 	try {
 		const { sshDir, configFile } = getSSHPaths(undefined);
-		const config = await readSSHConfigFile(configFile);
-		if (config === undefined) return;
-		const view = readSSHConfig(config, sshDir);
-		let marked = 0;
-		for (const named of view.blocks.values()) marked += named.filter((block) => block.legacy).length;
-		if (marked) await writeSSHConfig(configFile, renderSSHConfig(view));
+		const migrated = await withSSHConfigLock(async () => {
+			const config = await readSSHConfigFile(configFile);
+			if (config === undefined) return undefined;
+			const view = readSSHConfig(config, sshDir);
+			let marked = 0;
+			for (const named of view.blocks.values()) marked += named.filter((block) => block.legacy).length;
+			if (marked) await writeSSHConfig(configFile, renderSSHConfig(view));
+			return { view, marked };
+		});
+		if (!migrated) return;
+		const { view, marked } = migrated;
 
 		const unmanaged = (await listSSHKeyNames(sshDir)).filter((name) => !view.blocks.has(name));
 		const findings = [

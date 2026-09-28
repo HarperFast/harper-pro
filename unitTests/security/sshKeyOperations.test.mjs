@@ -550,21 +550,19 @@ describe('sshKeyOperations sealing', () => {
 				assert.deepEqual(readdirSync(sshDir).sort(), ['config', 'first.key', 'known_hosts', 'second.key']);
 			});
 
-			it('removes a block whose append failed part way, so the key can still be deleted', async () => {
+			it('leaves the config as it was when writing a new block fails, so the key can still be deleted', async () => {
 				await addKey('first');
-				// short of disk space after the block's lines were written but before its END line
 				const probe = await open(join(rootDir, 'probe'), 'w');
 				const FileHandle = probe.constructor;
 				await probe.close();
-				const appendFile = FileHandle.prototype.appendFile;
-				FileHandle.prototype.appendFile = async function (data, options) {
-					await appendFile.call(this, String(data).slice(0, String(data).indexOf('# END')), options);
+				const { writeFile } = FileHandle.prototype;
+				FileHandle.prototype.writeFile = async function () {
 					throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
 				};
 				try {
 					await assert.rejects(addKey('second'), { code: 'ENOSPC' });
 				} finally {
-					FileHandle.prototype.appendFile = appendFile;
+					FileHandle.prototype.writeFile = writeFile;
 				}
 
 				assert.equal(readConfig(), blockFor('first'));
@@ -572,51 +570,31 @@ describe('sshKeyOperations sealing', () => {
 				assert.deepEqual(readdirSync(sshDir).sort(), ['config', 'first.key', 'known_hosts']);
 			});
 
-			it('keeps what another writer appended while a failed append was writing', async () => {
-				await addKey('first');
-				const probe = await open(join(rootDir, 'probe'), 'w');
-				const FileHandle = probe.constructor;
-				await probe.close();
-				const appendFile = FileHandle.prototype.appendFile;
-				FileHandle.prototype.appendFile = async function (data, options) {
-					writeFileSync(configPath(), '\n# a note', { flag: 'a' });
-					await appendFile.call(this, String(data).slice(0, String(data).indexOf('Host')), options);
-					throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
-				};
-				try {
-					await assert.rejects(addKey('second'), { code: 'ENOSPC' });
-				} finally {
-					FileHandle.prototype.appendFile = appendFile;
-				}
+			it('serializes concurrent adds, so none of their blocks is lost', async () => {
+				const names = ['first', 'second', 'third', 'fourth'];
+				await Promise.all(names.map(addKey));
 
-				// the rollback can't remove its own bytes from behind another writer's, so its partial block stays
-				const partial = `\n${blockFor('second').slice(0, blockFor('second').indexOf('Host'))}`;
-				assert.equal(readConfig(), `${blockFor('first')}\n# a note${partial}`);
-				await assert.rejects(ops.deleteSSHKey({ name: 'second' }), /no "# END harper ssh key second" line ends it/);
+				const config = readConfig();
+				for (const name of names) assert.equal(config.split(blockFor(name)).length, 2, `${name}'s block, once`);
+				assert.equal(config.length, names.map(blockFor).join('\n').length);
 			});
 
-			it('keeps what another writer appended while the rollback was checking', async () => {
+			it('serializes an add and a delete, so neither change is lost', async () => {
 				await addKey('first');
-				const probe = await open(join(rootDir, 'probe'), 'w');
-				const FileHandle = probe.constructor;
-				await probe.close();
-				const { appendFile, read } = FileHandle.prototype;
-				FileHandle.prototype.appendFile = async function (data, options) {
-					await appendFile.call(this, String(data).slice(0, String(data).indexOf('Host')), options);
-					throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
-				};
-				FileHandle.prototype.read = async function (...args) {
-					const result = await read.apply(this, args);
-					writeFileSync(configPath(), '\n# a late note', { flag: 'a' });
-					return result;
-				};
-				try {
-					await assert.rejects(addKey('second'), { code: 'ENOSPC' });
-				} finally {
-					Object.assign(FileHandle.prototype, { appendFile, read });
-				}
+				await Promise.all([addKey('second'), ops.deleteSSHKey({ name: 'first' })]);
 
-				assert.ok(readConfig().endsWith('\n# a late note'), readConfig());
+				assert.equal(readConfig().replace(/^\n/, ''), blockFor('second'));
+				await ops.deleteSSHKey({ name: 'second' });
+			});
+
+			it('writes a dangling symlinked config at its target, keeping the link', async () => {
+				mkdirSync(sshDir, { recursive: true });
+				const target = join(rootDir, 'managed-ssh-config');
+				symlinkSync(target, configPath());
+
+				await addKey('first');
+				assert.ok(lstatSync(configPath()).isSymbolicLink());
+				assert.equal(readFileSync(target, 'utf8'), blockFor('first'));
 			});
 
 			it('removes its temporary file when replacing the config fails', async function () {
