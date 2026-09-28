@@ -16,8 +16,9 @@ import {
 	isRetriableSourceBlobReadError,
 	isPermanentSourceBlobErrorCode,
 	shouldRetrySourceBlobRead,
-	BLOB_SEND_RETRY_DELAYS_MS,
+	BLOB_SEND_RETRY_BACKOFF,
 } from '#src/replication/replicationConnection';
+import { createBackoff } from '#src/replication/backoff';
 
 describe('isRetriableSourceBlobReadError (#683)', () => {
 	it('classifies a 503 read fault (pending replication / mid-write) as retriable', () => {
@@ -49,11 +50,10 @@ describe('isRetriableSourceBlobReadError (#683)', () => {
 
 describe('shouldRetrySourceBlobRead — the sendBlobs retry gate (#683)', () => {
 	const retriable = Object.assign(new Error('Blob pending replication'), { statusCode: 503 });
-	const base = { error: retriable, sentAnyChunk: false, wsClosed: false, draining: false, attempt: 0 };
+	const base = { error: retriable, sentAnyChunk: false, wsClosed: false, draining: false };
 
 	it('retries a 503 read fault while nothing has been sent and the connection is healthy', () => {
 		expect(shouldRetrySourceBlobRead(base)).to.equal(true);
-		expect(shouldRetrySourceBlobRead({ ...base, attempt: BLOB_SEND_RETRY_DELAYS_MS.length - 1 })).to.equal(true);
 	});
 
 	it('never retries once a chunk is on the wire — the receiver holds partial state', () => {
@@ -63,10 +63,6 @@ describe('shouldRetrySourceBlobRead — the sendBlobs retry gate (#683)', () => 
 	it('never retries on a closed connection or while draining for worker shutdown', () => {
 		expect(shouldRetrySourceBlobRead({ ...base, wsClosed: true })).to.equal(false);
 		expect(shouldRetrySourceBlobRead({ ...base, draining: true })).to.equal(false);
-	});
-
-	it('stops after the delay schedule is exhausted', () => {
-		expect(shouldRetrySourceBlobRead({ ...base, attempt: BLOB_SEND_RETRY_DELAYS_MS.length })).to.equal(false);
 	});
 
 	it('never retries a non-503 error regardless of the other state', () => {
@@ -79,14 +75,14 @@ describe('shouldRetrySourceBlobRead — the sendBlobs retry gate (#683)', () => 
 	});
 });
 
-describe('BLOB_SEND_RETRY_DELAYS_MS (#683)', () => {
-	it('escalates and stays well inside the blob timeout window', () => {
-		for (let i = 1; i < BLOB_SEND_RETRY_DELAYS_MS.length; i++) {
-			expect(BLOB_SEND_RETRY_DELAYS_MS[i]).to.be.greaterThan(BLOB_SEND_RETRY_DELAYS_MS[i - 1]);
-		}
-		const total = BLOB_SEND_RETRY_DELAYS_MS.reduce((sum, ms) => sum + ms, 0);
+describe('BLOB_SEND_RETRY_BACKOFF (#683)', () => {
+	it('waits exactly 250, 500, 1000, 2000 ms, then forwards the error', () => {
+		const backoff = createBackoff(BLOB_SEND_RETRY_BACKOFF);
+		const delays = [];
+		for (let i = 0; i < 5; i++) delays.push(backoff.nextDelay());
+		expect(delays).to.deep.equal([250, 500, 1000, 2000, undefined]);
 		// The whole retry budget must be negligible against REPLICATION_BLOBTIMEOUT (900s default):
 		// a retrying send holds one of the MAX_OUTSTANDING_BLOBS_BEING_SENT slots while it waits.
-		expect(total).to.be.lessThan(10_000);
+		expect(delays.reduce((sum, ms) => sum + (ms ?? 0), 0)).to.be.lessThan(10_000);
 	});
 });

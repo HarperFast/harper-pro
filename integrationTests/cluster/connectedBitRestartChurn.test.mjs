@@ -452,7 +452,7 @@ suite(
 					// SHORT outage here (well under WEDGE_RECONCILE_THRESHOLD_MS) so recovery goes
 					// through the SAME long-lived NodeReplicationConnection object's own retry (fast,
 					// deterministic) rather than the disruptive 30s forceResubscribe path -- that path
-					// has its own exponential-backoff dynamics (retryTime doubles to a 30s cap) that make
+					// has its own exponential-backoff dynamics (the reconnect ceiling doubles to a 30s cap) that make
 					// "converged within N seconds" a poor discriminator once crossed (see the separate
 					// long-outage test below, which hunts the specific race with a generous bound instead).
 					const disconnectDeadline = killedAt + 8000;

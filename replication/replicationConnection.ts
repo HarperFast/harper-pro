@@ -128,7 +128,7 @@ import { createInflate } from 'node:zlib';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
-import { createBackoff, type Backoff } from './backoff.ts';
+import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
 // blob-send backpressure both need it, so the private field is declared here rather than at each read.
@@ -830,7 +830,7 @@ export async function shouldCloseSendAuthWatch(
 	const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref()));
 
 	let node = isGenuineNodeDeletion(event.type) ? undefined : resolve(name);
-	let backoff;
+	let backoff: Backoff | undefined;
 	while (node === SEND_AUTH_UNCHANGED && !deps.isClosed()) {
 		backoff ??= createBackoff({
 			initialMs: SEND_AUTH_REPROBE_INITIAL_MS,
@@ -839,7 +839,6 @@ export async function shouldCloseSendAuthWatch(
 			maxAttempts: deps.reprobeAttempts ?? SEND_AUTH_REPROBE_ATTEMPTS,
 			now: deps.now,
 		});
-		if (backoff.exhausted) break;
 		const delay = backoff.nextDelay();
 		if (delay === undefined) break;
 		await sleep(delay);
@@ -1701,8 +1700,9 @@ export function isPermanentSourceBlobErrorCode(errorCode: unknown, errorStatus?:
 // error to the receiver. The dominant 503 is a PENDING placeholder left by a concurrent replication
 // receive (harper-pro#481) — a rolling population that heals within seconds at this node — while a
 // forwarded 503 latches the receiver's blob gap and pins its resume cursor until a reconnect (#683).
-// A few short in-place retries are far cheaper than that whole-link cost.
-export const BLOB_SEND_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+// A few short in-place retries are far cheaper than that whole-link cost. Unjittered: the retried read is
+// local, so there is no fleet to decorrelate, and full jitter would halve the time the placeholder gets to heal.
+export const BLOB_SEND_RETRY_BACKOFF: BackoffOptions = { initialMs: 250, maxMs: 2000, maxAttempts: 4, jitter: 'none' };
 
 /**
  * Whether a failed source blob read is worth retrying in place before forwarding the error to the
@@ -1717,23 +1717,16 @@ export function isRetriableSourceBlobReadError(error: unknown): boolean {
 /**
  * Whether `sendBlobs` should retry a failed source blob read in place instead of forwarding the
  * error frame (#683): only a 503-class fault, only while the receiver holds no partial state
- * (nothing sent yet), never on a closed connection or one draining for worker shutdown (the peer
- * re-requests on reconnect, #527), and only within the bounded delay schedule.
+ * (nothing sent yet), and never on a closed connection or one draining for worker shutdown (the peer
+ * re-requests on reconnect, #527). The attempt bound is `BLOB_SEND_RETRY_BACKOFF`'s.
  */
 export function shouldRetrySourceBlobRead(state: {
 	error: unknown;
 	sentAnyChunk: boolean;
 	wsClosed: boolean;
 	draining: boolean;
-	attempt: number;
 }): boolean {
-	return (
-		!state.sentAnyChunk &&
-		!state.wsClosed &&
-		!state.draining &&
-		state.attempt < BLOB_SEND_RETRY_DELAYS_MS.length &&
-		isRetriableSourceBlobReadError(state.error)
-	);
+	return !state.sentAnyChunk && !state.wsClosed && !state.draining && isRetriableSourceBlobReadError(state.error);
 }
 
 export type BlobGapEscalation = { cycles: number; heldMs: number; cohort?: boolean };
@@ -3352,10 +3345,6 @@ export class NodeReplicationConnection extends EventEmitter {
 		this.setReconnectTimer(() => {
 			this.connect();
 		}, delay).unref();
-	}
-	/** The ceiling the next reconnect will be drawn under; the initial value means "not backed off". */
-	get retryTime(): number {
-		return this.retryBackoff?.ceiling ?? INITIAL_RETRY_TIME;
 	}
 	// Called by replicateOverWS after a frame is actually sent: real progress, so it is safe to reset the
 	// backoff. Gated on a non-zero retries so the healthy hot path (already reset) does nothing.
@@ -7572,7 +7561,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// is retried in place rather than forwarded, since a forwarded 503 latches the receiver's blob
 			// gap and pins its resume cursor until a reconnect (#683).
 			let sentAnyChunk = false;
-			for (let attempt = 0; ; attempt++) {
+			let readRetryBackoff: Backoff | undefined;
+			while (true) {
 				// Opened inside the try: if core surfaces the 503 synchronously from stream() rather than
 				// from the first iterator.next(), the retry (and the error frame) must still engage.
 				let iterator: AsyncIterator<Uint8Array> | undefined;
@@ -7668,20 +7658,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					} catch {}
 					// A stored-body send never retries in place: its reader is single-use and a settled
 					// published file has no transient read faults to wait out.
-					if (
-						!storedBody &&
-						shouldRetrySourceBlobRead({ error, sentAnyChunk, wsClosed, draining: isDrainingBlobSends(), attempt })
-					) {
+					const retryDelay =
+						!storedBody && shouldRetrySourceBlobRead({ error, sentAnyChunk, wsClosed, draining: isDrainingBlobSends() })
+							? (readRetryBackoff ??= createBackoff(BLOB_SEND_RETRY_BACKOFF)).nextDelay()
+							: undefined;
+					if (retryDelay !== undefined) {
 						logger.debug?.(
 							'Blob read transiently unavailable; retrying before forwarding the error',
 							id,
 							'attempt',
-							attempt + 1,
+							readRetryBackoff!.attempts,
 							errorToString(error)
 						);
 						// Deliberately NOT noted as blob-send progress: a purely-retrying send has moved no
 						// bytes, and a shutdown drain should be free to reap it (the peer re-requests, #527).
-						await delay(BLOB_SEND_RETRY_DELAYS_MS[attempt]);
+						await delay(retryDelay);
 						continue;
 					}
 					// Throttle the warn (a peer backfilling thousands of already-deleted blobs makes this fire

@@ -99,12 +99,12 @@ describe('NodeReplicationConnection.forceReconnect', () => {
 		conn.random = () => 0.999999; // pin the draw so the doubled ceiling is observable as a wait
 
 		conn.forceReconnect(); // the initial window is clamped to the 500 ms floor
-		expect(conn.retryTime).to.equal(1000);
+		expect(conn.retryBackoff.ceiling).to.equal(1000);
 		clock.tick(500);
 		expect(conn.connect.callCount).to.equal(1);
 
 		conn.forceReconnect(); // ceiling 1000 -> 2000, draws 999
-		expect(conn.retryTime).to.equal(2000);
+		expect(conn.retryBackoff.ceiling).to.equal(2000);
 		clock.tick(998);
 		expect(conn.connect.callCount, 'second reconnect waits the doubled ceiling').to.equal(1);
 		clock.tick(1);

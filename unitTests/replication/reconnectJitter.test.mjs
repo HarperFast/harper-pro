@@ -51,7 +51,7 @@ describe('NodeReplicationConnection reconnect jitter (harper-pro#327)', () => {
 		for (let i = 0; i < 8; i++) {
 			connection.reconnectScheduled = false;
 			connection.scheduleReconnect();
-			ceilings.push(connection.retryTime);
+			ceilings.push(connection.retryBackoff.ceiling);
 		}
 
 		assert.deepEqual(ceilings, [1000, 2000, 4000, 8000, 16_000, 30_000, 30_000, 30_000]);
@@ -73,20 +73,16 @@ describe('NodeReplicationConnection reconnect jitter (harper-pro#327)', () => {
 		);
 	});
 
-	it('retryTime reads as the initial interval before any failure', () => {
-		assert.equal(makeConnection(Math.random).retryTime, INITIAL_RETRY_TIME);
-	});
-
 	it('onFrameSent resets the ceiling and the retry counter', () => {
 		const connection = makeConnection(() => 0.5);
 		scheduleDelays(connection, 3);
 		connection.retries = 7;
-		assert.equal(connection.retryTime, 4000);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
 
 		connection.onFrameSent();
 
 		assert.equal(connection.retries, 0);
-		assert.equal(connection.retryTime, INITIAL_RETRY_TIME);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
 		assert.equal(scheduleDelays(connection, 1)[0], 500, 'drawing under the initial ceiling again');
 	});
 });

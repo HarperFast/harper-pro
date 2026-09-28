@@ -146,6 +146,15 @@ const RECONNECT_STAGGER_MS = 50;
 // pacing, so jitter is drawn above it rather than through it. See createSubscribeSetupScheduler.
 const NODE_SUBSCRIBE_INITIAL_CEILING_MS = 2 * NODE_SUBSCRIBE_DELAY;
 const NODE_SUBSCRIBE_MAX_DELAY_MS = 30_000;
+function createSubscribeBackoff(random?: () => number): Backoff {
+	return createBackoff({
+		initialMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
+		maxMs: NODE_SUBSCRIBE_MAX_DELAY_MS,
+		minMs: NODE_SUBSCRIBE_DELAY,
+		random,
+	});
+}
+
 // Cadence of the per-process safety-net reconcile that rebinds subscriptions whose
 // worker no longer exists. Pure read-side filter against `workers` and
 // `connectionReplicationMap` on each tick when nothing is wrong, so a short interval
@@ -190,7 +199,7 @@ interface SubscribeSchedule {
 	nodes?: any[];
 }
 
-/** Shared by the setups of one stale-worker reassignment sweep, so they dial at least `staggerMs` apart (#446). */
+/** Shared by the setups of one stale-worker reassignment sweep, so no two dial within `RECONNECT_STAGGER_MS` (#446). */
 export interface SetupSweep {
 	// Fire times on the scheduler's monotonic clock: the sweep's calls are made at different instants.
 	armedAt: number[];
@@ -227,25 +236,11 @@ export interface SubscribeSetupScheduler {
 export function createSubscribeSetupScheduler(deps: {
 	dispatch: (url: string, database: string, nodes: any[]) => void;
 	random?: () => number;
-	initialMs?: number;
-	maxMs?: number;
-	minMs?: number;
-	staggerMs?: number;
 	setTimer?: typeof setTimeout;
 	clearTimer?: typeof clearTimeout;
 	now?: () => number;
 }): SubscribeSetupScheduler {
-	const {
-		dispatch,
-		random,
-		initialMs = NODE_SUBSCRIBE_INITIAL_CEILING_MS,
-		maxMs = NODE_SUBSCRIBE_MAX_DELAY_MS,
-		minMs = NODE_SUBSCRIBE_DELAY,
-		staggerMs = RECONNECT_STAGGER_MS,
-		setTimer = setTimeout,
-		clearTimer = clearTimeout,
-		now = () => performance.now(),
-	} = deps;
+	const { dispatch, random, setTimer = setTimeout, clearTimer = clearTimeout, now = () => performance.now() } = deps;
 	const schedules = new Map<string, Map<string, SubscribeSchedule>>();
 
 	function drop(url: string, database: string) {
@@ -263,7 +258,7 @@ export function createSubscribeSetupScheduler(deps: {
 			if (!forUrl) schedules.set(url, (forUrl = new Map()));
 			let schedule = forUrl.get(database);
 			if (!schedule) {
-				schedule = { backoff: createBackoff({ initialMs, maxMs, minMs, random }) };
+				schedule = { backoff: createSubscribeBackoff(random) };
 				forUrl.set(database, schedule);
 			}
 			schedule.nodes = nodes;
@@ -279,8 +274,8 @@ export function createSubscribeSetupScheduler(deps: {
 				for (let moved = true; moved;) {
 					moved = false;
 					for (const armedAt of sweep.armedAt) {
-						if (Math.abs(armedAt - fireAt) < staggerMs) {
-							fireAt = armedAt + staggerMs;
+						if (Math.abs(armedAt - fireAt) < RECONNECT_STAGGER_MS) {
+							fireAt = armedAt + RECONNECT_STAGGER_MS;
 							moved = true;
 						}
 					}
@@ -1937,12 +1932,7 @@ export async function startOnMainThread(options) {
 			return timer;
 		};
 		// One draw for the sweep preserves the 50 ms spacing between consecutive recovery attempts.
-		const reDriveBaseDelay =
-			createBackoff({
-				initialMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
-				maxMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
-				minMs: NODE_SUBSCRIBE_DELAY,
-			}).nextDelay() ?? NODE_SUBSCRIBE_DELAY;
+		const reDriveBaseDelay = createSubscribeBackoff().nextDelay() ?? NODE_SUBSCRIBE_DELAY;
 		if (staleNodeUrls.size > 0)
 			logger.warn(
 				'Reconciling replication subscriptions for nodes pointing at exited workers:',
@@ -2225,12 +2215,7 @@ export function createWorkerSubscriptionAdmission(deps: {
 			.finally(() => {
 				flushScheduled = false;
 				if (!ready && pending.size > 0) {
-					retryBackoff ??= createBackoff({
-						initialMs: NODE_SUBSCRIBE_INITIAL_CEILING_MS,
-						maxMs: NODE_SUBSCRIBE_MAX_DELAY_MS,
-						minMs: NODE_SUBSCRIBE_DELAY,
-						random: deps.random,
-					});
+					retryBackoff ??= createSubscribeBackoff(deps.random);
 					const delay = retryBackoff.nextDelay();
 					if (delay !== undefined) {
 						retryArmed = true;
