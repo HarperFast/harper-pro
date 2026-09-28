@@ -174,22 +174,30 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		assert.deepEqual(dispatches, []);
 	});
 
-	it('honors a caller-supplied minimum delay above the jittered backoff', () => {
+	it('holds a sweep setup at the floor the sweep has reached', () => {
 		const { scheduler } = makeScheduler(() => 0.5);
-		assert.equal(scheduler.schedule(URL_A, 'data', NODES, 450), 450);
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES, { nextDelayFloor: 450 }), 450);
 	});
 
 	it('preserves sweep spacing when independent jitter draws would collide', () => {
 		const draws = [0.75, 0.5, 0.25, 0];
 		const { scheduler } = makeScheduler(() => draws.shift());
-		const delays = [];
-		let nextDelayFloor = 0;
-		for (let i = 0; i < 4; i++) {
-			const delay = scheduler.schedule(URL_A, `data${i}`, NODES, nextDelayFloor);
-			delays.push(delay);
-			nextDelayFloor = delay + 50;
-		}
+		const sweep = { nextDelayFloor: 0 };
+		const delays = [0, 1, 2, 3].map((i) => scheduler.schedule(URL_A, `data${i}`, NODES, sweep));
 		assert.deepEqual(delays, [350, 400, 450, 500]);
+	});
+
+	it('does not let a pair with an escalated backoff drag the rest of the sweep', () => {
+		const { scheduler } = makeScheduler(() => 0.99);
+		for (let attempt = 0; attempt < 8; attempt++) {
+			scheduler.schedule(URL_A, 'failing', NODES);
+			timers.tick(MAX_DELAY);
+		}
+		const sweep = { nextDelayFloor: 0 };
+		const escalated = scheduler.schedule(URL_A, 'failing', NODES, sweep);
+		const healthy = scheduler.schedule(URL_A, 'healthy', NODES, sweep);
+		assert.ok(escalated > 20_000, `escalated delay ${escalated}`);
+		assert.ok(healthy < 400, `healthy delay ${healthy}`);
 	});
 
 	// A connect report cannot be attributed to the entry that armed the setup (failover subscribes on a

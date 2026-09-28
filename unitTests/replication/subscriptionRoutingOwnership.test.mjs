@@ -6,6 +6,7 @@ import {
 	connectReportAdvancesGeneration,
 	deriveEffectiveLeader,
 	getConfiguredRoutes,
+	pendingSelfCatchupNode,
 	replaceConfiguredRoutes,
 } from '#src/replication/subscriptionManager';
 
@@ -62,24 +63,30 @@ describe('subscription routing and connection ownership', () => {
 		const entry = { worker: { threadId: 7 }, nodes: [{ url: 'wss://primary:9933' }] };
 		const open = { newSocket: true, threadId: 7, subscriptionUrl: 'wss://primary:9933' };
 		assert.equal(connectReportAdvancesGeneration(entry, open), true);
-		// a pong or metadata post from the same connection
 		assert.equal(connectReportAdvancesGeneration(entry, { threadId: 7, subscriptionUrl: 'wss://primary:9933' }), false);
-		// a superseded worker's socket
 		assert.equal(connectReportAdvancesGeneration(entry, { ...open, threadId: 8 }), false);
-		// a proxied failover subscription carried over the same URL by the owning worker
 		assert.equal(connectReportAdvancesGeneration(entry, { ...open, subscriptionUrl: 'wss://proxied:9933' }), false);
-		// single-thread mode: the main thread owns the connection and the entry has no worker
 		assert.equal(connectReportAdvancesGeneration({ nodes: entry.nodes }, { ...open, threadId: 0 }), true);
 	});
 
-	it('retires main-thread catchup ownership and restarts the stall grace on a new connection', () => {
+	it('restarts the stall grace and hands the catchup rider to the worker on a new connection', () => {
 		const rider = { name: 'self', startTime: 123, endTime: 456, replicates: true };
 		const entry = { selfCatchupNode: rider, connectGeneration: 2, receiveStallReconnectAt: 50 };
+		assert.strictEqual(pendingSelfCatchupNode(entry), rider);
 		advanceConnectGeneration(entry, 100, 900);
-		assert.equal(entry.selfCatchupNode, undefined);
 		assert.equal(entry.connectGeneration, 3);
 		assert.equal(entry.receiveStallReconnectAt, undefined);
 		assert.equal(entry.receiveStallGraceUntil, 1000);
+		assert.equal(pendingSelfCatchupNode(entry), undefined);
+		assert.strictEqual(entry.selfCatchupNode, rider);
+	});
+
+	it('re-sends the catchup rider to a replacement worker after the first one opened with it', () => {
+		const rider = { name: 'self', startTime: 123, endTime: 456, replicates: true };
+		const opened = { selfCatchupNode: rider };
+		advanceConnectGeneration(opened, 100, 900);
+		const recreated = { selfCatchupNode: opened.selfCatchupNode };
+		assert.strictEqual(pendingSelfCatchupNode(recreated), rider);
 	});
 
 	it('reattaches retained self-catchup state to a direct recovery payload', () => {

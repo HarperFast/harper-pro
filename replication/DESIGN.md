@@ -212,9 +212,13 @@ ending in an OOM kill. The scheduler holds one armed setup per **(peer URL, data
 the armed setup carries the newest level-state payload — `onDatabase`'s early-return path refreshes
 that payload without arming another timer, so a pending setup observes the latest routing, leadership,
 and exclusion state. Self-catchup is separate one-shot state: the first dispatch claims it for one
-connection entry, which retains and reattaches the bounded rider until the owning primary connection opens.
-The worker then owns it for socket-local reconnects and the main-thread copy is retired, avoiding repeated
-historical scans on later worker replacements. The global claim is consumed only after the worker message
+connection entry, which keeps the bounded rider for its life and reattaches it until the owning primary
+connection opens. That worker then re-sends it on its own reconnects, so recovery re-drives to it stop
+carrying it: the rider's old `startTime` becomes the leader's `min(startTime)` and costs a scan from there to
+now. A replacement worker (a recreated entry) is sent it again, because the main thread cannot see catchup
+finish and a worker that exits mid-catchup would otherwise take the range with it — one scan per worker
+replacement. A same-worker wedge re-drive after the open still replaces the worker's subscription list
+without it, as `main` always did. The global claim is consumed only after the worker message
 is accepted, so timer cancellation, entry refresh, a long offline retry, or a synchronous `postMessage`
 throw cannot lose or overwrite it.
 A setup is cancelled on

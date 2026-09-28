@@ -98,7 +98,12 @@ type ConnectedWorkerStatus = {
 	// The single recovery timer the reconcile has armed for this entry (wedge re-drive or stall kick).
 	reDriveTimer?: ReturnType<typeof setTimeout>;
 	connectGeneration?: number;
+	// Kept for the entry's life: the main thread cannot see catchup finish, so a replacement worker (a
+	// recreated entry) is sent it again rather than losing the range with the worker that died mid-catchup.
 	selfCatchupNode?: SelfCatchupNode;
+	// The rider the current worker's primary connection has opened with; that worker re-sends it on its own
+	// reconnects, so recovery re-drives to it stop carrying another historical scan.
+	selfCatchupHeldByWorker?: SelfCatchupNode;
 	// W1 T1 (#431) fire telemetry: the last main-thread recovery net that acted on this entry, and the
 	// last shared-memory truth correction applied to it. Logged with each subsequent fire so the
 	// watchdog-demotion soak can tell "sole detector" fires from ones where another layer (or the
@@ -185,12 +190,17 @@ interface SubscribeSchedule {
 	nodes?: any[];
 }
 
+/** Shared by the setups of one stale-worker reassignment sweep, so they dial at least `staggerMs` apart (#446). */
+export interface SetupSweep {
+	nextDelayFloor: number;
+}
+
 export interface SubscribeSetupScheduler {
 	/**
 	 * Arm a setup for this pair with `nodes` as its payload, or return undefined when one is already
 	 * pending (deduped) — the payload is refreshed either way, so the newest one is what fires.
 	 */
-	schedule(url: string, database: string, nodes: any[], minimumDelayMs?: number): number | undefined;
+	schedule(url: string, database: string, nodes: any[], sweep?: SetupSweep): number | undefined;
 	/** Replace the payload of an already-armed setup without arming one. */
 	refreshPending(url: string, database: string, nodes: any[]): void;
 	/** The pair reached 'open': real progress, so drop the escalated delay. */
@@ -219,6 +229,7 @@ export function createSubscribeSetupScheduler(deps: {
 	initialMs?: number;
 	maxMs?: number;
 	minMs?: number;
+	staggerMs?: number;
 	setTimer?: typeof setTimeout;
 	clearTimer?: typeof clearTimeout;
 }): SubscribeSetupScheduler {
@@ -228,6 +239,7 @@ export function createSubscribeSetupScheduler(deps: {
 		initialMs = NODE_SUBSCRIBE_INITIAL_CEILING_MS,
 		maxMs = NODE_SUBSCRIBE_MAX_DELAY_MS,
 		minMs = NODE_SUBSCRIBE_DELAY,
+		staggerMs = RECONNECT_STAGGER_MS,
 		setTimer = setTimeout,
 		clearTimer = clearTimeout,
 	} = deps;
@@ -243,7 +255,7 @@ export function createSubscribeSetupScheduler(deps: {
 	}
 
 	return {
-		schedule(url, database, nodes, minimumDelayMs = 0) {
+		schedule(url, database, nodes, sweep) {
 			let forUrl = schedules.get(url);
 			if (!forUrl) schedules.set(url, (forUrl = new Map()));
 			let schedule = forUrl.get(database);
@@ -255,7 +267,11 @@ export function createSubscribeSetupScheduler(deps: {
 			if (schedule.timer) return undefined;
 			const backoffDelay = schedule.backoff.nextDelay();
 			if (backoffDelay === undefined) return undefined;
-			const delay = Math.max(backoffDelay, minimumDelayMs);
+			const floor = sweep?.nextDelayFloor ?? 0;
+			const delay = Math.max(backoffDelay, floor);
+			// A pair whose own backoff has escalated lands past the fresh-draw window, already clear of the
+			// sweep's ladder; chaining the floor through it would drag every later setup out to its ceiling.
+			if (sweep && delay < floor + initialMs) sweep.nextDelayFloor = delay + staggerMs;
 			schedule.timer = setTimer(() => {
 				schedule.timer = undefined;
 				const pending = schedule.nodes;
@@ -325,6 +341,10 @@ export function dispatchSubscriptionNodes(
 	if (deps.startTime !== undefined) deps.consume();
 }
 
+export function pendingSelfCatchupNode(entry: ConnectedWorkerStatus): SelfCatchupNode | undefined {
+	return entry.selfCatchupNode === entry.selfCatchupHeldByWorker ? undefined : entry.selfCatchupNode;
+}
+
 export function attachSelfCatchupNode(nodes: any[], selfCatchupNode?: SelfCatchupNode): any[] {
 	return selfCatchupNode && !nodes.includes(selfCatchupNode) ? [...nodes, selfCatchupNode] : nodes;
 }
@@ -352,7 +372,7 @@ function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 	const startTime = env.get(CONFIG_PARAMS.REPLICATION_FAILOVER) ? selfCatchupOfDatabase.get(database) : undefined;
 	dispatchSubscriptionNodes(nodes, {
 		startTime,
-		selfCatchupNode: entry.selfCatchupNode,
+		selfCatchupNode: pendingSelfCatchupNode(entry),
 		nodeName: getThisNodeName(),
 		dispatch(dispatchNodes) {
 			const request = {
@@ -868,6 +888,8 @@ export function deriveEffectiveLeader(args: {
 	nodeName?: string;
 }): boolean {
 	const { persistedIsLeader, hasExplicitLeader, leaderName, nodeName } = args;
+	// The "first other node in hdb_nodes" fallback is only a guess and never names a leader: honoring it would
+	// make a responder with no leader config treat an add_node requester as its leader and full-copy backwards.
 	return (
 		persistedIsLeader === true ||
 		(persistedIsLeader !== false && (!leaderName || (hasExplicitLeader && nodeName === leaderName)))
@@ -891,7 +913,7 @@ export function advanceConnectGeneration(entry: ConnectedWorkerStatus, now: numb
 	entry.connectGeneration = (entry.connectGeneration ?? 0) + 1;
 	entry.receiveStallReconnectAt = undefined;
 	entry.receiveStallGraceUntil = now + stallThresholdMs;
-	entry.selfCatchupNode = undefined;
+	entry.selfCatchupHeldByWorker = entry.selfCatchupNode;
 }
 
 /**
@@ -1183,13 +1205,7 @@ export async function startOnMainThread(options) {
 	 * This is called when a new node is added to the hdbNodes table
 	 * @param node
 	 */
-	// A shared delay floor keeps independently jittered reconnects spaced across a stale-worker sweep.
-	function onNodeUpdate(
-		node,
-		hostname = node?.name,
-		forceResubscribe = false,
-		subscribeStagger?: { nextDelayFloor: number }
-	) {
+	function onNodeUpdate(node, hostname = node?.name, forceResubscribe = false, subscribeStagger?: SetupSweep) {
 		// Any row change (including a delete) can flip an origin's exclusion eligibility for any
 		// database. Deferred through a timer, so it reads the map state after this call's own
 		// subscribe/unsubscribe bookkeeping has been applied.
@@ -1471,10 +1487,8 @@ export async function startOnMainThread(options) {
 					getNodeURL(node),
 					databaseName,
 					nodes,
-					subscribeStagger?.nextDelayFloor
+					subscribeStagger
 				);
-				if (subscribeDelay !== undefined && subscribeStagger)
-					subscribeStagger.nextDelayFloor = subscribeDelay + RECONNECT_STAGGER_MS;
 				if (subscribeDelay !== undefined) {
 					logger.warn(`Setting up subscription with leader ${leaderName} for node ${nodeName} in ${subscribeDelay}ms`);
 				}
@@ -1985,7 +1999,7 @@ export async function startOnMainThread(options) {
 						if (entry.unsubscribed) return; // forceReconnect would reopen work we just told the worker to drop
 						if (entry.worker !== worker) return;
 						if (!entry.nodes?.[0]) return;
-						const requestNodes = attachSelfCatchupNode(entry.nodes, entry.selfCatchupNode);
+						const requestNodes = attachSelfCatchupNode(entry.nodes, pendingSelfCatchupNode(entry));
 						worker.postMessage({
 							...requestNodes[0],
 							type: 'subscribe-to-node',
@@ -2063,7 +2077,7 @@ export async function startOnMainThread(options) {
 			// staggering guarded against before #357 made the reconcile the single reassignment path. A
 			// per-node stagger alone left the per-database burst (a peer with N databases dialed N at once),
 			// so stagger per DATABASE across the whole sweep like the wedge path does. See cb1kenobi review on #446.
-			const subscribeStagger = { nextDelayFloor: 0 };
+			const subscribeStagger: SetupSweep = { nextDelayFloor: 0 };
 			for (const node of staleNodesToReassign) {
 				// The node may have been removed or replaced since we flagged it; only re-drive it if it is
 				// still the current entry in nodeMap, so a deleted node isn't resurrected (gemini review).
