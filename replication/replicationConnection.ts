@@ -38,6 +38,7 @@ import {
 } from './replicator.ts';
 import { redactOperationForLog } from './logRedaction.ts';
 import { CopyCursorWatermark } from './copyCursorWatermark.ts';
+import { beginCloneCopyIntegrityPass, finishCloneCopyMetadata, recordCloneCopyDrop } from './cloneCopyIntegrity.ts';
 import {
 	recordPeerLockCapability,
 	recordPeerLockLevel,
@@ -3763,6 +3764,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let copyModeOrderVersion; // copy-order version the leader announced in COPY_START; persisted in the cursor (#421)
 	let copyFromNodeId; // local id of the node we are copying from — the key for the persisted cursor
 	let copyCompleteReceived = false;
+	let copyIntegrityPass = 0;
+	let copyDropCount = 0;
 	// User-DB tables that received at least one audit-less copy-apply snapshot row in the current copy
 	// pass (harper-pro#495). Only these need a reload marker: an empty (or fully-audited) table delivered
 	// nothing invisible to its live subscribers, so emitting a marker for it would be wasted work. Reset
@@ -3886,22 +3889,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			}
 			if (copyFlushInFlight) return; // a flush is persisting the final cursor; finish on its completion
 			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
-			if (cloneAttempt && copyFromNodeId !== undefined) {
+			if (copyFromNodeId !== undefined) {
 				try {
-					getDatabaseStores().dbisDB?.put([Symbol.for('cloneCopyComplete'), copyFromNodeId], {
-						cloneAttempt,
-						copyStartTime: copyModeStartTime,
-					});
+					const dbisDB = getDatabaseStores().dbisDB;
+					if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
+					finishCloneCopyMetadata(dbisDB as any, copyFromNodeId, copyModeStartTime, copyDropCount, cloneAttempt);
 				} catch (error) {
-					logger.warn?.(connectionId, 'failed to persist clone copy completion', databaseName, error);
-					close(1011, 'Failed to persist clone copy completion');
+					wsClosed = true;
+					logger.warn?.(connectionId, 'failed to finalize copy integrity metadata', databaseName, error);
+					close(1011, 'Failed to finalize copy integrity metadata');
 					return;
 				}
 			}
 			// guard only the cursor removal on a known node id; ALWAYS exit copy mode, otherwise a
 			// COPY_START whose getIdOfRemoteNode returned undefined would strand the node in copy mode
 			// (received-version watermark suppressed) and it could never reach Available.
-			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
 			subscriptionSetupWatchdog?.resume();
 			// Retired before the flags its onStall re-checks are cleared, so the timer stops waking the
@@ -3909,6 +3911,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			copyFinalizeWatchdog?.stop();
 			copyCompleteReceived = false;
 			copyFromNodeId = undefined;
+			copyIntegrityPass = 0;
+			copyDropCount = 0;
 			pendingCopyCursor = null;
 			copyProgressWatchdog?.stop(); // copy is done; no longer watching for copy-progress stalls (#453)
 			// Copy is over: narrow the byte watchdog back from COPY_TIMEOUT to PING_TIMEOUT so an idle/dead
@@ -5401,6 +5405,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
+						copyIntegrityPass = copyWatermark.currentPass;
+						copyDropCount = 0;
+						if (copyFromNodeId !== undefined) {
+							try {
+								const dbisDB = getDatabaseStores().dbisDB;
+								if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
+								copyDropCount = beginCloneCopyIntegrityPass(dbisDB as any, copyFromNodeId, copyModeStartTime).dropCount;
+							} catch (error) {
+								wsClosed = true;
+								close(1011, 'Failed to read copy integrity metadata');
+								runRecoveryDiagnostic(() =>
+									logger.error?.(connectionId, 'failed to start copy integrity pass', databaseName, error)
+								);
+								return;
+							}
+						}
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
 						if (cloneAttempt && sharedStatus) sharedStatus[RECEIVED_VERSION_POSITION] = 0;
@@ -7012,6 +7032,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const copyFramePass = copyWatermark.currentPass;
 			const copyFrameStartTime = copyModeStartTime;
 			const copyFrameOrder = copyModeOrderVersion;
+			const copyFrameSourceNodeId = copyFromNodeId;
 			do {
 				getSharedStatus();
 				const eventLength = decoder.readInt();
@@ -7321,6 +7342,34 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						tableName: tableDecoder.name,
 						reason: 'undecodable record',
 					};
+					if (
+						messageIsCopyFrame &&
+						copyFrameSourceNodeId !== undefined &&
+						copyFramePass === copyIntegrityPass &&
+						!connectionSuperseded()
+					) {
+						try {
+							if (copyDropCount === 0) {
+								const dbisDB = getDatabaseStores().dbisDB;
+								if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
+								await recordCloneCopyDrop(
+									dbisDB as any,
+									copyFrameSourceNodeId,
+									copyFrameStartTime,
+									hole.tableName,
+									hole.reason
+								);
+							}
+							copyDropCount++;
+						} catch (error) {
+							wsClosed = true;
+							close(1011, 'Could not record incomplete copy; reconnecting');
+							runRecoveryDiagnostic(() =>
+								logger.error?.(connectionId, 'could not record incomplete copy; holding', error)
+							);
+							return;
+						}
+					}
 					// Only the claiming frame may defer its holes for replay.
 					if (decodeDropResyncClaimedByFrame) (pendingReplicationHoles ??= []).push(hole);
 					else if (!(await recordReplicationHole(hole.originId, hole.tableName, hole.reason))) return;

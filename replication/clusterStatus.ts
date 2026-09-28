@@ -5,6 +5,7 @@ import { onMessageByType } from '../core/server/threads/manageThreads.js';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { requestClusterStatus } from './subscriptionManager.ts';
 import { getReplicationSharedStatus, getHDBNodeTable } from './knownNodes.ts';
+import { cloneIncompleteStatus, readRemoteNodeId } from './cloneCopyIntegrity.ts';
 import {
 	CONFIRMATION_STATUS_POSITION,
 	RECEIVED_VERSION_POSITION,
@@ -55,15 +56,22 @@ export async function clusterStatus() {
 		for (let socket of connection.database_sockets) {
 			const databaseName = socket.database;
 			let auditStore;
+			let dbisDB;
 			for (let table of Object.values(databases[databaseName] || {})) {
-				auditStore = table.auditStore;
-				if (auditStore) break;
+				auditStore ??= table.auditStore;
+				dbisDB ??= table.dbisDB;
+				if (auditStore && dbisDB) break;
 			}
 			if (!auditStore) {
 				if (!socket.connected) socket.peerCapabilities = undefined;
 				continue;
 			}
 			let replicationSharedStatus = getReplicationSharedStatus(auditStore, databaseName, remoteNodeName);
+			// Status must not call getIdOfRemoteNode/exportIdMapping: both can allocate or rewrite the
+			// mapping. Decode the already-persisted record without changing replication state.
+			const sourceNodeId = readRemoteNodeId(auditStore, remoteNodeName);
+			const cloneIncomplete = cloneIncompleteStatus(dbisDB, sourceNodeId);
+			if (cloneIncomplete) socket.cloneIncomplete = cloneIncomplete;
 			socket.lastCommitConfirmed = asDate(replicationSharedStatus[CONFIRMATION_STATUS_POSITION]);
 			socket.lastReceivedRemoteTime = asDate(replicationSharedStatus[RECEIVED_VERSION_POSITION]);
 			socket.lastReceivedLocalTime = asDate(replicationSharedStatus[RECEIVED_TIME_POSITION]);

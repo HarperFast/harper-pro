@@ -4,6 +4,7 @@ export type SyncMonitorLog = (message: string, level?: string) => void;
 
 export type SyncCheckResult = {
 	syncComplete: boolean;
+	cloneIncomplete?: true;
 	/** Most recent arrival stamp (ms epoch) among databases still below their target; 0 if none. */
 	latestReceivedMs: number;
 	/** Databases that had a replication socket to the leader in this check. */
@@ -52,6 +53,8 @@ export async function checkSyncStatus(
 	}
 
 	let syncComplete = true;
+	let copyStreamsComplete = true;
+	let finalizedIncompleteCopy = false;
 	let latestReceivedMs = 0;
 	const socketDatabases = new Set<string>();
 	for (const socket of leaderConnection.database_sockets) {
@@ -69,17 +72,31 @@ export async function checkSyncStatus(
 		// an accurate comparison against the leader's last_updated_record targets.
 		const receivedVersion = socket.lastReceivedVersion;
 		if (receivedVersion && receivedVersion >= targetTime) {
-			log(`Database ${dbName}: Synchronized`, 'debug');
-			continue;
-		}
-
-		syncComplete = false;
-		if (receivedVersion) {
-			log(
-				`Database ${dbName}: Not yet synchronized (received: ${receivedVersion}, target: ${targetTime}, gap: ${targetTime - receivedVersion}ms)`
-			);
+			const integrityState = socket.cloneIncomplete?.state;
+			if (!integrityState) {
+				log(`Database ${dbName}: Synchronized`, 'debug');
+				continue;
+			}
+			syncComplete = false;
+			if (integrityState === 'incomplete') {
+				finalizedIncompleteCopy = true;
+				log(
+					`Database ${dbName}: copy finished with ${socket.cloneIncomplete.count} undecodable record(s) in ${socket.cloneIncomplete.table}; clone is incomplete`,
+					'error'
+				);
+			} else {
+				log(`Database ${dbName}: copy integrity state is ${integrityState}; waiting`, 'debug');
+			}
 		} else {
-			log(`No lastReceivedVersion data received yet for database ${dbName}`, 'debug');
+			copyStreamsComplete = false;
+			syncComplete = false;
+			if (receivedVersion) {
+				log(
+					`Database ${dbName}: Not yet synchronized (received: ${receivedVersion}, target: ${targetTime}, gap: ${targetTime - receivedVersion}ms)`
+				);
+			} else {
+				log(`No lastReceivedVersion data received yet for database ${dbName}`, 'debug');
+			}
 		}
 
 		// Only databases still below target slide the stall deadline — arrivals on synced or
@@ -100,10 +117,13 @@ export async function checkSyncStatus(
 		if (!socketDatabases.has(dbName)) {
 			log(`Database ${dbName}: no replication socket to the leader yet`, 'debug');
 			syncComplete = false;
+			copyStreamsComplete = false;
 		}
 	}
 
-	return { syncComplete, latestReceivedMs, socketDatabases };
+	const result: SyncCheckResult = { syncComplete, latestReceivedMs, socketDatabases };
+	if (copyStreamsComplete && finalizedIncompleteCopy) result.cloneIncomplete = true;
+	return result;
 }
 
 export type MonitorSyncLoopOptions = {
@@ -134,7 +154,9 @@ export type MonitorSyncLoopOptions = {
  * actually got a definite answer; a check that merely timed out or errored reports `stalled`
  * instead, so a transient blip can't erase resumable state.
  */
-export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<'synced' | 'stalled' | 'unconverged'> {
+export async function monitorSyncLoop(
+	options: MonitorSyncLoopOptions
+): Promise<'synced' | 'incomplete' | 'stalled' | 'unconverged'> {
 	const now = options.now ?? Date.now;
 	const delay = options.delay ?? sleep;
 	const maxDurationMs = options.maxDurationMs ?? Number.POSITIVE_INFINITY;
@@ -179,12 +201,13 @@ export async function monitorSyncLoop(options: MonitorSyncLoopOptions): Promise<
 				await delay(options.checkIntervalMs);
 				continue;
 			}
-			const { syncComplete, latestReceivedMs, socketDatabases } = result;
+			const { syncComplete, cloneIncomplete, latestReceivedMs, socketDatabases } = result;
 			for (const dbName of socketDatabases) {
 				if (dbName in options.targetTimestamps) seenTargetSockets.add(dbName);
 			}
 
 			if (syncComplete) return 'synced';
+			if (cloneIncomplete) return 'incomplete';
 			gotDefiniteCheck = true;
 
 			if (latestReceivedMs > lastProgressAt) lastProgressAt = latestReceivedMs;

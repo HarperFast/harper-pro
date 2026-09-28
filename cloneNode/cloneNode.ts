@@ -353,6 +353,15 @@ export async function cloneNode(): Promise<void> {
 	// once sync is confirmed and availability has been published as Available — a timeout or failure
 	// must not be treated as success.
 	const syncOutcome = await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
+	if (syncOutcome === 'incomplete') {
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		clearCloneAttempt();
+		log(
+			`Clone from leader node ${leaderURL} completed with one or more undecodable copy records; node is running but Unavailable and not marked as cloned. Inspect cluster_status cloneIncomplete and repair by replacing the affected database store with a clean clone`,
+			'error'
+		);
+		return;
+	}
 	if (syncOutcome === 'failed') {
 		// Return (don't throw) so Harper stays running and queryable. Clear `cloned` explicitly: a
 		// forced reclone has already carried the previous `cloned: true` into the rewritten config.
@@ -622,10 +631,11 @@ function clearSyncStartedMarker(): void {
  * Result of monitoring clone synchronization.
  * - `synced`: sync was confirmed and `availability` was published as Available.
  * - `skipped`: sync monitoring was disabled (skip-sync-monitor); `availability` is left untouched.
+ * - `incomplete`: copying finished but durable copy-drop state proves one or more rows were skipped.
  * - `failed`: sync was not confirmed (stall timeout, missing targets, or a failed status write);
  *   `availability` is left Unavailable and the node must not be marked as cloned.
  */
-type SyncOutcome = 'synced' | 'skipped' | 'failed';
+type SyncOutcome = 'synced' | 'skipped' | 'incomplete' | 'failed';
 
 /**
  * Monitors database synchronization after cloning and drives this node's `availability` status.
@@ -768,6 +778,14 @@ async function monitorSync(
 		}
 
 		return 'synced';
+	}
+
+	if (outcome === 'incomplete') {
+		log(
+			'All copy streams finished, but durable cloneIncomplete state records skipped copy rows; leaving availability Unavailable and not marking node as cloned',
+			'error'
+		);
+		return 'incomplete';
 	}
 
 	if (outcome === 'unconverged') {

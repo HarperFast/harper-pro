@@ -37,6 +37,88 @@ describe('checkSyncStatus', () => {
 		assert.deepEqual(result, { syncComplete: true, latestReceivedMs: 0, socketDatabases: new Set(['system', 'data']) });
 	});
 
+	it('reports a finalized copy drop only after every copy stream completes', async () => {
+		const incomplete = {
+			state: 'incomplete',
+			table: 'widgets',
+			reason: 'undecodable record',
+			count: 1,
+		};
+		const pending = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: 1500, cloneIncomplete: incomplete },
+					{ database: 'data', lastReceivedVersion: 1999 },
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.equal(pending.cloneIncomplete, undefined);
+		assert.equal(pending.syncComplete, false);
+
+		const finished = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: 1500, cloneIncomplete: incomplete },
+					{ database: 'data', lastReceivedVersion: 2500 },
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.equal(finished.cloneIncomplete, true);
+		assert.equal(finished.syncComplete, false);
+	});
+
+	it('keeps a repair pass pending instead of returning incomplete early', async () => {
+		const result = await checkSyncStatus(
+			{ data: 2000 },
+			async () =>
+				statusResponse([
+					{
+						database: 'data',
+						lastReceivedVersion: 2500,
+						cloneIncomplete: { state: 'repairing', table: 'widgets', reason: 'undecodable record', count: 1 },
+					},
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.equal(result.syncComplete, false);
+		assert.equal(result.cloneIncomplete, undefined);
+	});
+
+	it('ignores an incomplete marker on a non-leader connection', async () => {
+		const result = await checkSyncStatus(
+			{ data: 2000 },
+			async () => ({
+				connections: [
+					{
+						name: 'other',
+						url: 'wss://other:9933',
+						database_sockets: [
+							{
+								database: 'data',
+								lastReceivedVersion: 2500,
+								cloneIncomplete: { state: 'incomplete', table: 'widgets', reason: 'drop', count: 1 },
+							},
+						],
+					},
+					{
+						name: 'leader',
+						url: LEADER_URL,
+						database_sockets: [{ database: 'data', lastReceivedVersion: 2500 }],
+					},
+				],
+			}),
+			LEADER_URL,
+			noopLog
+		);
+		assert.equal(result.syncComplete, true);
+		assert.equal(result.cloneIncomplete, undefined);
+	});
+
 	it('reports incomplete when any database is behind its target', async () => {
 		const result = await checkSyncStatus(
 			{ system: 1000, data: 2000 },
@@ -230,6 +312,33 @@ describe('monitorSyncLoop', () => {
 			...clock,
 		});
 		assert.equal(outcome, 'synced');
+	});
+
+	it('returns incomplete without waiting for the stall deadline once a dropped copy is finalized', async () => {
+		const clock = fakeClock();
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { data: 2000 },
+			clusterStatus: async () =>
+				statusResponse([
+					{
+						database: 'data',
+						lastReceivedVersion: 2500,
+						cloneIncomplete: {
+							state: 'incomplete',
+							table: 'widgets',
+							reason: 'undecodable record',
+							count: 1,
+						},
+					},
+				]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			checkIntervalMs: 1000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'incomplete');
+		assert.ok(clock.now() < 10000);
 	});
 
 	it('ratchets a seen socket into the required set so its loss cannot complete the clone', async () => {
