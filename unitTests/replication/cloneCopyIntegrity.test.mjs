@@ -70,12 +70,14 @@ describe('clone copy integrity', () => {
 		});
 	});
 
-	it('persists every observed drop before finalization', async () => {
+	it('persists the first drop and folds later in-memory counts into finalization', async () => {
 		const store = memoryStore();
 		await recordCloneCopyDrop(store, 'leader', 100, 'widgets', 'first drop', 2);
 		await recordCloneCopyDrop(store, 'leader', 100, 'widgets', 'second drop', 3);
 
-		assert.deepStrictEqual(beginCloneCopyIntegrityPass(store, 'leader', 100, 4), { dropCount: 2 });
+		assert.deepStrictEqual(beginCloneCopyIntegrityPass(store, 'leader', 100, 4), { dropCount: 1 });
+		assert.equal(cloneIncompleteStatus(store, 'leader').count, 1);
+		finishCloneCopyMetadata(store, 'leader', 7, 100, 2, 'attempt-1', 5);
 		assert.equal(cloneIncompleteStatus(store, 'leader').count, 2);
 	});
 

@@ -71,6 +71,31 @@ describe('checkSyncStatus', () => {
 		assert.equal(finished.syncComplete, false);
 	});
 
+	it('keeps a finalized incomplete verdict terminal across a restart with no receive watermark', async () => {
+		const result = await checkSyncStatus(
+			{ system: 1000, data: 2000 },
+			async () =>
+				statusResponse([
+					{ database: 'system', lastReceivedVersion: 1500 },
+					{
+						database: 'data',
+						lastReceivedVersion: 0,
+						cloneIncomplete: {
+							state: 'incomplete',
+							table: 'widgets',
+							reason: 'undecodable record',
+							count: 1,
+						},
+					},
+				]),
+			LEADER_URL,
+			noopLog
+		);
+
+		assert.equal(result.cloneIncomplete, true);
+		assert.equal(result.syncComplete, false);
+	});
+
 	it('keeps a repair pass pending instead of returning incomplete early', async () => {
 		const result = await checkSyncStatus(
 			{ data: 2000 },

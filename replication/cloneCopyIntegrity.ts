@@ -104,11 +104,7 @@ export async function recordCloneCopyDrop(
 	} catch {
 		// A real drop gives us authoritative replacement evidence for an unreadable old marker.
 	}
-	if (existing?.copyStartTime === copyStartTime) {
-		const updated = { ...existing, count: existing.count + 1 };
-		await dbisDB.put(markerKey(sourceName), updated);
-		return updated;
-	}
+	if (existing?.copyStartTime === copyStartTime) return existing;
 	const marker: CloneCopyDrop = {
 		copyStartTime,
 		table: table.slice(0, 256),

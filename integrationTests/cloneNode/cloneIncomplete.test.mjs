@@ -1,6 +1,6 @@
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { readLog, restartNode, stopNodeProcess, sendOperation, waitForCondition } from '../cluster/clusterShared.mjs';
@@ -59,6 +59,9 @@ async function incompleteSocket(node, signal) {
 	} catch {}
 }
 
+const incompleteOutcomeCount = (log) =>
+	(log.match(/completed with one or more undecodable copy records/g) ?? []).length;
+
 suite('Clone Node - incomplete copy stays Unavailable', { timeout: 300_000 }, (ctx) => {
 	before(async () => {
 		ctx.nodes = [];
@@ -96,6 +99,7 @@ suite('Clone Node - incomplete copy stays Unavailable', { timeout: 300_000 }, (c
 
 	test('finishes copying, persists the short-clone verdict, and retains it across restart', async () => {
 		const cloneCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		ctx.setupTraceFile = join(ctx.leader.dataRootDir, 'incomplete-clone-setup-trace.log');
 		await startHarper(
 			cloneCtx,
 			nodeConfig(cloneCtx.harper.hostname, {
@@ -104,6 +108,7 @@ suite('Clone Node - incomplete copy stays Unavailable', { timeout: 300_000 }, (c
 				HDB_LEADER_PASSWORD: ctx.leader.admin.password,
 				ALLOW_SELF_SIGNED: true,
 				HARPER_TEST_DECODE_FAIL_RECORD_PREFIX: POISON_PREFIX,
+				CLONE_SETUP_TRACE_FILE: ctx.setupTraceFile,
 			})
 		);
 		ctx.clone = cloneCtx.harper;
@@ -126,12 +131,12 @@ suite('Clone Node - incomplete copy stays Unavailable', { timeout: 300_000 }, (c
 		await waitForCondition(
 			async () =>
 				!existsSync(join(ctx.clone.dataRootDir, '.cloneAttempt.json')) &&
-				!existsSync(join(ctx.clone.dataRootDir, 'tmp', 'clone-sync-started.json')) &&
+				existsSync(join(ctx.clone.dataRootDir, 'tmp', 'clone-sync-started.json')) &&
 				/completed with one or more undecodable copy records/.test(await readLog(ctx.clone)),
 			{
 				timeoutMs: 30_000,
 				pollMs: 250,
-				description: 'the incomplete-clone verdict to retire clone attempt and resume state',
+				description: 'the incomplete-clone verdict to retire the clone attempt and retain setup state',
 			}
 		);
 
@@ -154,6 +159,16 @@ suite('Clone Node - incomplete copy stays Unavailable', { timeout: 300_000 }, (c
 			pollMs: 500,
 			description: 'cloneIncomplete to survive restart',
 		});
+		await waitForCondition(async () => incompleteOutcomeCount(await readLog(ctx.clone)) >= 2, {
+			timeoutMs: 30_000,
+			pollMs: 250,
+			description: 'the restarted clone monitor to re-emit the terminal incomplete verdict',
+		});
+		assert.equal(
+			readFileSync(ctx.setupTraceFile, 'utf8').trim().split('\n').length,
+			1,
+			'an unrepaired restart must not replay one-shot clone setup'
+		);
 		const restartedAvailability = await sendOperation(ctx.clone, {
 			operation: 'get_status',
 			id: 'availability',

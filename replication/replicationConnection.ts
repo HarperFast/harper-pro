@@ -3766,8 +3766,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let copyCompleteReceived = false;
 	let copyIntegrityPass = 0;
 	let copyIntegritySourceName: string | undefined;
+	let copyIntegrityPassStarted = false;
 	let copyDropCount = 0;
 	let preserveUnknownCopyMarker = false;
+	function beginCopyIntegrityPassIfStoreExists() {
+		if (copyIntegrityPassStarted) return true;
+		if (!copyIntegritySourceName) throw new Error('copy source has no authenticated node name');
+		const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
+		if (!dbisDB) return false;
+		copyFromNodeId ??= getIdOfRemoteNode(copyIntegritySourceName, databaseAuditStore);
+		const integrity = beginCloneCopyIntegrityPass(dbisDB as any, copyIntegritySourceName, copyModeStartTime);
+		copyDropCount = integrity.dropCount;
+		preserveUnknownCopyMarker = integrity.preserveUnknown === true;
+		copyIntegrityPassStarted = true;
+		return true;
+	}
 	// User-DB tables that received at least one audit-less copy-apply snapshot row in the current copy
 	// pass (harper-pro#495). Only these need a reload marker: an empty (or fully-audited) table delivered
 	// nothing invisible to its live subscribers, so emitting a marker for it would be wasted work. Reset
@@ -3893,18 +3906,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 			if (copyIntegritySourceName) {
 				try {
-					const dbisDB = getDatabaseStores().dbisDB;
-					if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
-					finishCloneCopyMetadata(
-						dbisDB as any,
-						copyIntegritySourceName,
-						copyFromNodeId,
-						copyModeStartTime,
-						copyDropCount,
-						cloneAttempt,
-						undefined,
-						preserveUnknownCopyMarker
-					);
+					if (beginCopyIntegrityPassIfStoreExists()) {
+						const dbisDB = getDatabaseStores().dbisDB;
+						if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
+						finishCloneCopyMetadata(
+							dbisDB as any,
+							copyIntegritySourceName,
+							copyFromNodeId,
+							copyModeStartTime,
+							copyDropCount,
+							cloneAttempt,
+							undefined,
+							preserveUnknownCopyMarker
+						);
+					}
 				} catch (error) {
 					wsClosed = true;
 					close(1011, 'Failed to finalize copy integrity metadata');
@@ -3923,6 +3938,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			copyFromNodeId = undefined;
 			copyIntegrityPass = 0;
 			copyIntegritySourceName = undefined;
+			copyIntegrityPassStarted = false;
 			copyDropCount = 0;
 			preserveUnknownCopyMarker = false;
 			pendingCopyCursor = null;
@@ -5330,6 +5346,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							},
 							rootStore: table.primaryStore.rootStore,
 						};
+						if (inCopyMode && !copyIntegrityPassStarted) {
+							try {
+								beginCopyIntegrityPassIfStoreExists();
+							} catch (error) {
+								wsClosed = true;
+								close(1011, 'Failed to read copy integrity metadata');
+								runRecoveryDiagnostic(() =>
+									logger.error?.(connectionId, 'failed to start copy integrity pass', databaseName, error)
+								);
+								return;
+							}
+						}
 						break;
 					case RECORD_LOCK_HOMES_DIGEST:
 						// `data` (`message[1]`) is the digest; `message[2]` names the database — the same slot
@@ -5419,15 +5447,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						copyIntegrityPass = copyWatermark.currentPass;
 						copyIntegritySourceName = remoteNodeName;
+						copyIntegrityPassStarted = false;
 						copyDropCount = 0;
 						preserveUnknownCopyMarker = false;
 						try {
-							if (!copyIntegritySourceName) throw new Error('copy source has no authenticated node name');
-							const dbisDB = getDatabaseStores().dbisDB;
-							if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
-							const integrity = beginCloneCopyIntegrityPass(dbisDB as any, copyIntegritySourceName, copyModeStartTime);
-							copyDropCount = integrity.dropCount;
-							preserveUnknownCopyMarker = integrity.preserveUnknown === true;
+							beginCopyIntegrityPassIfStoreExists();
 						} catch (error) {
 							wsClosed = true;
 							close(1011, 'Failed to read copy integrity metadata');
@@ -7364,17 +7388,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						!connectionSuperseded()
 					) {
 						try {
+							if (!beginCopyIntegrityPassIfStoreExists()) throw new Error(`no dbis store for ${databaseName}`);
 							const dbisDB = getDatabaseStores().dbisDB;
 							if (!dbisDB) throw new Error(`no dbis store for ${databaseName}`);
-							const marker = await recordCloneCopyDrop(
-								dbisDB as any,
-								copyFrameSourceName,
-								copyFrameStartTime,
-								hole.tableName,
-								hole.reason
-							);
-							copyDropCount = marker.count;
-							preserveUnknownCopyMarker = false;
+							if (copyDropCount === 0) {
+								const marker = await recordCloneCopyDrop(
+									dbisDB as any,
+									copyFrameSourceName,
+									copyFrameStartTime,
+									hole.tableName,
+									hole.reason
+								);
+								copyDropCount = marker.count;
+								preserveUnknownCopyMarker = false;
+							} else copyDropCount++;
 						} catch (error) {
 							wsClosed = true;
 							close(1011, 'Could not record incomplete copy; reconnecting');

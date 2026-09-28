@@ -71,22 +71,23 @@ export async function checkSyncStatus(
 		// Raw version (high-precision float64) preserves the sub-millisecond precision needed for
 		// an accurate comparison against the leader's last_updated_record targets.
 		const receivedVersion = socket.lastReceivedVersion;
+		const integrityState = socket.cloneIncomplete?.state;
+		if (integrityState === 'incomplete') {
+			syncComplete = false;
+			finalizedIncompleteCopy = true;
+			log(
+				`Database ${dbName}: copy finished with ${socket.cloneIncomplete.count} undecodable record(s) in ${socket.cloneIncomplete.table}; clone is incomplete`,
+				'error'
+			);
+			continue;
+		}
 		if (receivedVersion && receivedVersion >= targetTime) {
-			const integrityState = socket.cloneIncomplete?.state;
 			if (!integrityState) {
 				log(`Database ${dbName}: Synchronized`, 'debug');
 				continue;
 			}
 			syncComplete = false;
-			if (integrityState === 'incomplete') {
-				finalizedIncompleteCopy = true;
-				log(
-					`Database ${dbName}: copy finished with ${socket.cloneIncomplete.count} undecodable record(s) in ${socket.cloneIncomplete.table}; clone is incomplete`,
-					'error'
-				);
-			} else {
-				log(`Database ${dbName}: copy integrity state is ${integrityState}; waiting`, 'debug');
-			}
+			log(`Database ${dbName}: copy integrity state is ${integrityState}; waiting`, 'debug');
 		} else {
 			copyStreamsComplete = false;
 			syncComplete = false;
