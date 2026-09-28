@@ -491,6 +491,9 @@ export function describeSSHConfigValueProblem(field: 'host' | 'hostname', value:
 	if (field === 'host' && /[*?!]/.test(value)) {
 		return `'host' must be one alias, not a pattern: "*", "?" and "!" also match other keys' aliases${got}`;
 	}
+	if (field === 'hostname' && value.replace(/%[%h]/g, '').includes('%')) {
+		return `'hostname' can use "%" only as "%h" (the alias) or "%%" (a literal "%"), the expansions ssh allows in a HostName${got}`;
+	}
 	if (/^[-#]/.test(value)) return `'${field}' must not start with "${value[0]}"${got}`;
 	return undefined;
 }

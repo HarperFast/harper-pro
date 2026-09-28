@@ -749,13 +749,15 @@ describe('SSH config value validation', () => {
 		'gh_1',
 		'10.0.0.1',
 		'::1',
-		'fe80::1%en0',
+		'fe80::1%%en0',
 		'%h.example.com',
 		'a,b',
 		'git#lab.com',
 	];
 	// a HostName is never matched against, so only an alias can't be a pattern
 	const acceptedAsHostname = ['*.example.org', 'repo?.example.org'];
+	// ...and ssh expands "%" only in a HostName
+	const acceptedAsHost = ['fe80::1%en0'];
 	const refused = {
 		'a b': 'must be a single',
 		'a\tb': 'must be a single',
@@ -773,6 +775,10 @@ describe('SSH config value validation', () => {
 		'git\\hub.com': 'must not contain quotes, "=" or "\\"',
 		'-oProxyCommand': 'must not start with "-"',
 		'#github.com': 'must not start with "#"',
+		'%Q': 'can use "%" only as "%h"',
+		'fe80::1%en0': 'can use "%" only as "%h"',
+		'x%': 'can use "%" only as "%h"',
+		'%h%': 'can use "%" only as "%h"',
 	};
 	const refusedAsHost = ['*', '*.github.com', 'repo?.github.com', '!github.com'];
 
@@ -783,6 +789,7 @@ describe('SSH config value validation', () => {
 		}
 		for (const value of acceptedAsHostname)
 			assert.equal(describeSSHConfigValueProblem('hostname', value), undefined, value);
+		for (const value of acceptedAsHost) assert.equal(describeSSHConfigValueProblem('host', value), undefined, value);
 	});
 
 	it("refuses an alias that is a pattern, since its block would also apply to other keys' aliases", () => {
@@ -854,8 +861,23 @@ describe('SSH config value validation', () => {
 				for (const value of acceptedAsHostname) {
 					assert.ok(resolvesOtherKey('new.example.com', value, { newBlockFirst }), `HostName ${value}`);
 				}
+				for (const value of acceptedAsHost) {
+					assert.ok(resolvesOtherKey(value, 'gitlab.com', { newBlockFirst }), `Host ${value}`);
+				}
 			}
 		});
+
+		// ssh's own verdict on the new key: undefined when it resolves, else what ssh says
+		const sshRefusal = (host, hostname) => {
+			const config = join(dir, 'config');
+			writeFileSync(config, block('new', host, hostname));
+			try {
+				execFileSync('ssh', ['-G', '-F', config, host], { stdio: ['ignore', 'ignore', 'pipe'] });
+				return undefined;
+			} catch (error) {
+				return String(error.stderr);
+			}
+		};
 
 		it('breaks every other key for the values refused for that reason', () => {
 			for (const value of ['a b', 'a"b', "a'b", '#github.com', '=', '=#x']) {
@@ -874,16 +896,22 @@ describe('SSH config value validation', () => {
 				assert.ok(resolvesOtherKey('new.example.com', 'github.com\\', { newBlockFirst }), 'HostName github.com\\');
 				assert.ok(resolvesOtherKey('gh\\', 'gitlab.com', { newBlockFirst }), 'Host gh\\');
 			}
-			const config = join(dir, 'config');
-			writeFileSync(config, block('new', 'gh\\', 'gitlab.com'));
-			assert.throws(
-				() => execFileSync('ssh', ['-G', '-F', config, 'gh\\'], { stdio: ['ignore', 'ignore', 'pipe'] }),
-				/hostname contains invalid characters/
-			);
+			assert.match(sshRefusal('gh\\', 'gitlab.com'), /hostname contains invalid characters/);
 			assert.equal(
 				describeSSHConfigValueProblem('host', 'gh\\'),
 				`'host' must not contain quotes, "=" or "\\"; got ${JSON.stringify('gh\\')}.`
 			);
+		});
+
+		it('agrees with ssh on which "%" a HostName may use', () => {
+			for (const value of ['%h', '%h.example.com', '%%', 'fe80::1%%en0', '%%h']) {
+				assert.equal(sshRefusal('gh', value), undefined, value);
+				assert.equal(describeSSHConfigValueProblem('hostname', value), undefined, value);
+			}
+			for (const value of ['%Q', '%p', 'fe80::1%en0', 'x%', '%h%', '%%%']) {
+				assert.match(sshRefusal('gh', value), /unknown key|invalid format/, value);
+				assert.match(describeSSHConfigValueProblem('hostname', value), /^'hostname' can use "%" only as "%h"/, value);
+			}
 		});
 	});
 });
