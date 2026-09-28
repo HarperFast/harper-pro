@@ -144,17 +144,26 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 					A,
 					{ operation: 'describe_table', table: 'LargeLocation', exact_count: true },
 					{ signal }
-				).catch((error) => {
-					lastCountError = error;
-					return {};
-				})
+				).then(
+					(body) => {
+						lastCountError = undefined;
+						return body;
+					},
+					(error) => {
+						lastCountError = error;
+						return {};
+					}
+				)
 			).record_count;
 		await waitForCondition(
 			async (signal) => {
 				if (!Number.isInteger(await seededCount(signal))) return false;
 				const response = await fetch(A.httpURL + '/', { signal }).catch(() => null);
-				await response?.arrayBuffer().catch(() => null);
-				return response && response.status < 500;
+				const bodyRead = await response?.arrayBuffer().then(
+					() => true,
+					() => false
+				);
+				return bodyRead && response.status < 500;
 			},
 			{
 				timeoutMs: 60000,
@@ -163,16 +172,21 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			}
 		);
 		for (let id = 0; id < BLOB_RECORDS; id++) {
-			const response = await fetch(A.httpURL + '/LargeLocation/' + id, { signal: AbortSignal.timeout(30000) });
-			await response.arrayBuffer().catch((error) => {
-				throw new Error(`seed GET of LargeLocation/${id} failed`, { cause: error });
-			});
+			const response = await fetch(A.httpURL + '/LargeLocation/' + id, { signal: AbortSignal.timeout(30000) })
+				.then(async (seedResponse) => {
+					await seedResponse.arrayBuffer();
+					return seedResponse;
+				})
+				.catch((error) => {
+					throw new Error(`seed GET of LargeLocation/${id} failed`, { cause: error });
+				});
 			ok(response.ok, `seed GET of LargeLocation/${id} failed: HTTP ${response.status}`);
 			let count;
 			await waitForCondition(async (signal) => (count = await seededCount(signal)) > id, {
 				timeoutMs: 30000,
 				pollMs: 100,
-				description: () => `the seed of LargeLocation/${id} to commit (record_count ${count})`,
+				description: () =>
+					`the seed of LargeLocation/${id} to commit (record_count ${count}, last describe_table error: ${lastCountError?.message})`,
 			});
 		}
 
