@@ -264,10 +264,6 @@ export async function addSSHKey(
 	const storedKey = sealSSHKey(name, key);
 	req.key = storedKey;
 
-	// Create the key file
-	await writeFileEnsureDir(filePath, storedKey, 0o600);
-	await chmod(filePath, 0o600);
-
 	// Build the config block string
 	const configBlock = `#${name}
 ${SSH_CONFIG_BEGIN}${name}
@@ -278,7 +274,11 @@ Host ${host}
 	IdentitiesOnly yes
 ${SSH_CONFIG_END}${name}`;
 
-	await withSSHConfigLock(async () => {
+	await withSSHKeyLock(async () => {
+		if (await exists(filePath))
+			throw new ClientError('Key already exists. Use update_ssh_key or delete_ssh_key and then add_ssh_key');
+		await writeFileEnsureDir(filePath, storedKey, 0o600);
+		await chmod(filePath, 0o600);
 		const config = await readSSHConfigFile(configFile);
 		const updated =
 			config === undefined ? configBlock : `${renderSSHConfig(readSSHConfig(config, sshDir))}\n${configBlock}`;
@@ -381,15 +381,17 @@ export async function updateSSHKey(req: {
 	harperLogger?.trace(`updating ssh key`, name);
 
 	const { filePath } = getSSHPaths(name);
-	if (!(await exists(filePath))) {
-		throw new ClientError(`SSH key '${name}' does not exist. Use add_ssh_key to create it.`);
-	}
+	const missing = () => new ClientError(`SSH key '${name}' does not exist. Use add_ssh_key to create it.`);
+	if (!(await exists(filePath))) throw missing();
 
 	const storedKey = sealSSHKey(name, key);
 	req.key = storedKey;
 
-	await writeFileEnsureDir(filePath, storedKey, 0o600);
-	await chmod(filePath, 0o600);
+	await withSSHKeyLock(async () => {
+		if (!(await exists(filePath))) throw missing();
+		await writeFileEnsureDir(filePath, storedKey, 0o600);
+		await chmod(filePath, 0o600);
+	});
 
 	const response = await replicateOperation(req);
 	response.message = `Updated ssh key: ${name}`;
@@ -458,7 +460,8 @@ export async function removeLocalSSHKey(name: string): Promise<void> {
 
 async function removeSSHKeyFiles(name: string): Promise<void> {
 	const { sshDir, filePath, configFile } = getSSHPaths(name);
-	await withSSHConfigLock(async () => {
+	await withSSHKeyLock(async () => {
+		if (!(await exists(filePath))) throw new ClientError(`SSH key '${name}' does not exist.`);
 		const config = await readSSHConfigFile(configFile);
 		if (config !== undefined) {
 			const view = readSSHConfig(config, sshDir);
@@ -691,10 +694,11 @@ function renderSSHConfig(view: SSHConfigView, removing?: string): string {
 const SSH_CONFIG_LOCK_WAIT_MS = 30_000;
 
 /**
- * Every write of the SSH config is a read-modify-write, so each runs under a lock shared by every thread
- * and process on the node, or two writers would each drop the other's change.
+ * Every write of a key file or the SSH config runs under one lock shared by every thread and process on
+ * the node: each config write is a read-modify-write that would otherwise drop a concurrent writer's
+ * change, and a key's existence check must hold until its key file and config block agree.
  */
-async function withSSHConfigLock<T>(write: () => Promise<T>): Promise<T> {
+async function withSSHKeyLock<T>(write: () => Promise<T>): Promise<T> {
 	let acquired = false;
 	try {
 		return await withComponentPreparationLock(
@@ -722,7 +726,11 @@ async function withSSHConfigLock<T>(write: () => Promise<T>): Promise<T> {
 async function symlinkTarget(path: string): Promise<string> {
 	let target = path;
 	for (let hops = 0; hops < 40; hops++) {
-		if (!(await lstat(target).catch(() => undefined))?.isSymbolicLink()) return target;
+		const stats = await lstat(target).catch((error) => {
+			if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+			throw error;
+		});
+		if (!stats?.isSymbolicLink()) return target;
 		target = resolve(dirname(target), await readlink(target));
 	}
 	throw new Error(`Too many levels of symbolic links in ${path}`);
@@ -788,7 +796,7 @@ export function migrateSSHConfigOnce(): Promise<void> {
 export async function migrateSSHConfig(): Promise<void> {
 	try {
 		const { sshDir, configFile } = getSSHPaths(undefined);
-		const migrated = await withSSHConfigLock(async () => {
+		const migrated = await withSSHKeyLock(async () => {
 			const config = await readSSHConfigFile(configFile);
 			if (config === undefined) return undefined;
 			const view = readSSHConfig(config, sshDir);

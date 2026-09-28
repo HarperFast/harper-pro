@@ -36,6 +36,7 @@ import {
 	symlinkSync,
 } from 'node:fs';
 import { open } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { generateKeyPairSync } from 'node:crypto';
@@ -585,6 +586,57 @@ describe('sshKeyOperations sealing', () => {
 
 				assert.equal(readConfig().replace(/^\n/, ''), blockFor('second'));
 				await ops.deleteSSHKey({ name: 'second' });
+			});
+
+			// holds the lock the operations share from this thread, starts `operation`, and runs `check` while
+			// the lock is still held; waits use timers/promises because an earlier suite can leave the global
+			// setTimeout faked
+			const whileLockIsHeld = async (operation, check) => {
+				const { withComponentPreparationLock } = await import('#src/core/components/componentPreparationLock');
+				let pending;
+				await withComponentPreparationLock(sshDir, async () => {
+					pending = operation();
+					await delay(500);
+					check();
+				});
+				return pending;
+			};
+
+			it('add_ssh_key writes neither its key file nor its block until it holds the lock', async () => {
+				mkdirSync(sshDir, { recursive: true });
+				await whileLockIsHeld(
+					() => addKey('first'),
+					() => assert.equal(existsSync(keyPath('first')) || existsSync(configPath()), false)
+				);
+
+				assert.equal(readConfig(), blockFor('first'));
+			});
+
+			it('update_ssh_key and delete_ssh_key change nothing until they hold the lock', async () => {
+				await addKey('first');
+				const keyBefore = storedKeyFor('first');
+				await whileLockIsHeld(
+					() => ops.updateSSHKey(request({ name: 'first', key: ROTATED_KEY })),
+					() => assert.equal(storedKeyFor('first'), keyBefore)
+				);
+				assert.equal(decrypt(storedKeyFor('first')), ROTATED_KEY);
+
+				await whileLockIsHeld(
+					() => ops.deleteSSHKey({ name: 'first' }),
+					() => assert.equal(existsSync(keyPath('first')) && readConfig(), blockFor('first'))
+				);
+				assert.equal(existsSync(keyPath('first')), false);
+			});
+
+			it('refuses the second of two concurrent deletes of one key as missing', async () => {
+				await addKey('first');
+				const outcomes = await Promise.allSettled([
+					ops.deleteSSHKey({ name: 'first' }),
+					ops.deleteSSHKey({ name: 'first' }),
+				]);
+
+				assert.deepEqual(outcomes.map(({ status }) => status).sort(), ['fulfilled', 'rejected']);
+				assert.ok(isClientError(/^SSH key 'first' does not exist\.$/)(outcomes.find(({ reason }) => reason).reason));
 			});
 
 			it('writes a dangling symlinked config at its target, keeping the link', async () => {
