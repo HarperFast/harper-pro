@@ -353,19 +353,25 @@ export async function cloneNode(): Promise<void> {
 	// once sync is confirmed and availability has been published as Available — a timeout or failure
 	// must not be treated as success.
 	const syncOutcome =
-		resumeMarker?.verdict === 'incomplete'
+		resumeMarker?.verdict === 'incomplete' && !skipSyncMonitor
 			? 'incomplete'
 			: await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
 	if (syncOutcome === 'incomplete') {
 		updateConfigValue(CONFIG_PARAMS.CLONED, false);
-		writeSyncStartedMarker({
-			startedAt: syncStartedAt,
-			replicationEstablished: true,
-			targetTimestamps,
-			totalBytes,
-			setupComplete: true,
-			verdict: 'incomplete',
-		});
+		if (resumeMarker?.verdict !== 'incomplete') {
+			try {
+				writeSyncStartedMarker({
+					startedAt: syncStartedAt,
+					replicationEstablished: true,
+					targetTimestamps,
+					totalBytes,
+					setupComplete: true,
+					verdict: 'incomplete',
+				});
+			} catch (error) {
+				log(`Could not persist the incomplete clone verdict: ${error}`, 'error');
+			}
+		}
 		clearCloneAttempt();
 		log(
 			`Clone from leader node ${leaderURL} completed with one or more undecodable copy records; node is running but Unavailable and not marked as cloned. Inspect cluster_status cloneIncomplete, stop the node, replace the affected database store, and restart with FORCE_CLONE=true to request a clean clone`,
