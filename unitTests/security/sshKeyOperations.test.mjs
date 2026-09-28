@@ -543,7 +543,7 @@ describe('sshKeyOperations sealing', () => {
 				['host', 'deploy example.com', /must be a single alias/],
 				['hostname', 'git.example.com extra', /must be a single hostname/],
 				['hostname', 'git"example.com', /must not contain quotes/],
-				['hostname', '=#x', /must not contain quotes or "="/],
+				['hostname', '=#x', /must not contain quotes, "=" or "\\"/],
 				['host', '*.example.com', /must be one alias, not a pattern/],
 				['host', '-oProxyCommand', /must not start with "-"/],
 			]) {

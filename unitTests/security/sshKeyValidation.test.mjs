@@ -765,10 +765,12 @@ describe('SSH config value validation', () => {
 		'a"b': 'must not contain quotes',
 		"a'b": 'must not contain quotes',
 		'"github.com"': 'must not contain quotes',
-		'=': 'must not contain quotes or "="',
-		'=#x': 'must not contain quotes or "="',
+		'=': 'must not contain quotes, "=" or "\\"',
+		'=#x': 'must not contain quotes, "=" or "\\"',
 		// OpenSSH before 8.7 splits an argument at "=", making this two
-		'example.com=extra': 'must not contain quotes or "="',
+		'example.com=extra': 'must not contain quotes, "=" or "\\"',
+		'github.com\\': 'must not contain quotes, "=" or "\\"',
+		'git\\hub.com': 'must not contain quotes, "=" or "\\"',
 		'-oProxyCommand': 'must not start with "-"',
 		'#github.com': 'must not start with "#"',
 	};
@@ -824,12 +826,14 @@ describe('SSH config value validation', () => {
 			if (dir) rmSync(dir, { recursive: true, force: true });
 		});
 
-		// the block add_ssh_key writes, beside another key's — before it or after it, since keys are
-		// appended in the order they are added and ssh takes each option from the first block that matches
+		// the block add_ssh_key writes
+		const block = (name, blockHost, blockHostname) =>
+			`#${name}\nHost ${blockHost}\n\tHostName ${blockHostname}\n\tUser git\n\tIdentityFile /nonexistent/${name}.key\n\tIdentitiesOnly yes`;
+
+		// beside another key's — before it or after it, since keys are appended in the order they are
+		// added and ssh takes each option from the first block that matches
 		const resolvesOtherKey = (host, hostname, { newBlockFirst = false } = {}) => {
 			const config = join(dir, 'config');
-			const block = (name, blockHost, blockHostname) =>
-				`#${name}\nHost ${blockHost}\n\tHostName ${blockHostname}\n\tUser git\n\tIdentityFile /nonexistent/${name}.key\n\tIdentitiesOnly yes`;
 			const blocks = [block('other', 'other.example.com', 'github.com'), block('new', host, hostname)];
 			writeFileSync(config, (newBlockFirst ? blocks.reverse() : blocks).join('\n'));
 			try {
@@ -863,6 +867,23 @@ describe('SSH config value validation', () => {
 			for (const value of ['*', '*.example.com', 'other.example.co?']) {
 				assert.ok(!resolvesOtherKey(value, 'gitlab.com', { newBlockFirst: true }), `Host ${value}`);
 			}
+		});
+
+		it('reads a backslash literally, never as a line continuation, and refuses an alias containing one', () => {
+			for (const newBlockFirst of [false, true]) {
+				assert.ok(resolvesOtherKey('new.example.com', 'github.com\\', { newBlockFirst }), 'HostName github.com\\');
+				assert.ok(resolvesOtherKey('gh\\', 'gitlab.com', { newBlockFirst }), 'Host gh\\');
+			}
+			const config = join(dir, 'config');
+			writeFileSync(config, block('new', 'gh\\', 'gitlab.com'));
+			assert.throws(
+				() => execFileSync('ssh', ['-G', '-F', config, 'gh\\'], { stdio: ['ignore', 'ignore', 'pipe'] }),
+				/hostname contains invalid characters/
+			);
+			assert.equal(
+				describeSSHConfigValueProblem('host', 'gh\\'),
+				`'host' must not contain quotes, "=" or "\\"; got ${JSON.stringify('gh\\')}.`
+			);
 		});
 	});
 });
