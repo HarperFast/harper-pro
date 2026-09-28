@@ -417,7 +417,7 @@ export async function deleteSSHKey(req: { name: string }): Promise<{ message: st
 	const config = await readSSHConfigFile(configFile);
 	if (config !== undefined) {
 		const view = readSSHConfig(config, sshDir);
-		const unterminatedLine = view.unterminated.get(name);
+		const unterminatedLine = view.unterminatedBeginLine.get(name);
 		if (unterminatedLine !== undefined) {
 			throw new ClientError(
 				`SSH key '${name}' was not deleted: line ${unterminatedLine} of the SSH config begins its block ` +
@@ -478,7 +478,6 @@ const SSH_CONFIG_IDENTITY_FILE = /^[ \t]*IdentityFile(?:[ \t]*=[ \t]*|[ \t]+)(.*
 
 interface SSHConfigLine {
 	start: number;
-	// past the line break, when the line has one
 	end: number;
 	text: string;
 }
@@ -486,7 +485,6 @@ interface SSHConfigLine {
 interface SSHConfigBlock {
 	first: number;
 	last: number;
-	// written before blocks had markers: `first` is its `#name` line, `last` its last directive
 	legacy: boolean;
 }
 
@@ -494,21 +492,15 @@ interface SSHConfigView {
 	config: string;
 	lines: SSHConfigLine[];
 	blocks: Map<string, SSHConfigBlock[]>;
-	// the 1-based line of the name's first BEGIN that no END closes
-	unterminated: Map<string, number>;
+	unterminatedBeginLine: Map<string, number>;
 }
 
 /**
- * The key blocks in an SSH config. A block runs from `# BEGIN harper ssh key <name>` to the next
- * `# END harper ssh key <name>` with no other marker between, plus the `#<name>` line directly above
- * its BEGIN, kept so that a version that finds blocks by their `#<name>` line alone still reads and
- * deletes exactly the block. A BEGIN that meets another marker or the end of the file first leaves the
- * block's end unknown; a stray END delimits nothing.
- *
- * A block written before blocks had markers is read as if it had them: a `#<name>` line and the section
- * it heads, bounded the way OpenSSH scopes it, trailing comments excluded — but only when one of its
- * `IdentityFile` lines is exactly the key file `addSSHKey` writes for that name, since nothing else in
- * that format shows who wrote the section.
+ * A key's block runs from its BEGIN line to the next END line for its name, with no other marker between,
+ * plus the `#<name>` line directly above BEGIN: earlier versions find blocks by that line alone, so it
+ * keeps a rolled-back node reading and deleting exactly the block. A block written before the markers
+ * counts only when it names exactly the key file `addSSHKey` writes, since nothing else in that format
+ * shows who wrote it.
  */
 function readSSHConfig(config: string, sshDir: string): SSHConfigView {
 	const lines: SSHConfigLine[] = [];
@@ -525,11 +517,11 @@ function readSSHConfig(config: string, sshDir: string): SSHConfigView {
 		if (named) named.push(block);
 		else blocks.set(name, [block]);
 	};
-	const unterminated = new Map<string, number>();
+	const unterminatedBeginLine = new Map<string, number>();
 	const marked = new Uint8Array(lines.length);
 	let open: { name: string; index: number } | undefined;
 	const abandonOpen = () => {
-		if (open && !unterminated.has(open.name)) unterminated.set(open.name, open.index + 1);
+		if (open && !unterminatedBeginLine.has(open.name)) unterminatedBeginLine.set(open.name, open.index + 1);
 		open = undefined;
 	};
 	for (let index = 0; index < lines.length; index++) {
@@ -557,7 +549,7 @@ function readSSHConfig(config: string, sshDir: string): SSHConfigView {
 		from = to;
 	}
 	for (const named of blocks.values()) named.sort((a, b) => a.first - b.first);
-	return { config, lines, blocks, unterminated };
+	return { config, lines, blocks, unterminatedBeginLine };
 }
 
 function findLegacySSHConfigBlocks(
@@ -617,9 +609,8 @@ function configuredHost(view: SSHConfigView, name: string): { host?: string; hos
 }
 
 /**
- * The config with markers around its legacy blocks and without `removing`'s blocks. A removed block
- * takes one line break with it, the one before it when it ends the file, so removing the block
- * `addSSHKey` last appended restores the file it appended to.
+ * A removed block takes one line break with it, the preceding one when it ends the file, so deleting the
+ * key added last restores the file byte for byte.
  */
 function renderSSHConfig(view: SSHConfigView, removing?: string): string {
 	const { config, lines } = view;
@@ -666,8 +657,8 @@ async function readSSHConfigFile(configFile: string): Promise<string | undefined
 }
 
 /**
- * Replace the config so that a crash leaves the old file or the new one, never a truncated file that
- * would disable every key on the node. A symlinked config is replaced at its target, keeping the link.
+ * A crash leaves the old config or the new one, never a truncated file that would disable every key on
+ * the node. A symlinked config is replaced at its target, keeping the link.
  */
 async function writeSSHConfig(configFile: string, contents: string): Promise<void> {
 	const target = await realpath(configFile).catch(() => configFile);
@@ -692,12 +683,7 @@ async function writeSSHConfig(configFile: string, contents: string): Promise<voi
 		directory = await open(dirname(target), 'r');
 		await directory.sync();
 	} catch (error) {
-		// the new config is already in place; only its survival across a power loss is in doubt
-		if (!isUnsupportedSyncError(error)) {
-			harperLogger?.warn(
-				`Unable to sync ${dirname(target)} after rewriting the SSH config: ${(error as Error).message}`
-			);
-		}
+		if (!isUnsupportedSyncError(error)) throw error;
 	} finally {
 		await directory?.close().catch(() => {});
 	}
@@ -715,9 +701,8 @@ export function migrateSSHConfigOnce(): Promise<void> {
 }
 
 /**
- * Writes BEGIN/END lines around the blocks of a config written before blocks had them, and logs what it
- * found. Never rejects: on failure the config stays as it was, and every operation still reads it as
- * if migrated.
+ * Never rejects: on failure the config stays as it was, and every operation still reads it as if
+ * migrated.
  */
 export async function migrateSSHConfig(): Promise<void> {
 	try {
@@ -733,12 +718,12 @@ export async function migrateSSHConfig(): Promise<void> {
 		const findings = [
 			marked && `added BEGIN/END lines around ${marked} key block(s)`,
 			unmanaged.length && `found no block it can manage for key(s) ${unmanaged.join(', ')}`,
-			view.unterminated.size &&
-				`found a BEGIN line with no END line for key(s) ${[...view.unterminated.keys()].join(', ')}`,
+			view.unterminatedBeginLine.size &&
+				`found a BEGIN line with no END line for key(s) ${[...view.unterminatedBeginLine.keys()].join(', ')}`,
 		].filter(Boolean);
 		if (!findings.length) return;
 		const summary = `SSH config ${configFile}: ${findings.join('; ')}`;
-		if (unmanaged.length || view.unterminated.size) harperLogger?.warn(summary);
+		if (unmanaged.length || view.unterminatedBeginLine.size) harperLogger?.warn(summary);
 		else harperLogger?.info(summary);
 	} catch (error) {
 		harperLogger?.error(`Unable to add BEGIN/END lines to the SSH config: ${(error as Error)?.message ?? error}`);
