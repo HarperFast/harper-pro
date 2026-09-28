@@ -69,7 +69,7 @@ describe('replication recovery teardown', () => {
 		const report = sinon.stub().throws(new Error('logger failed'));
 
 		expect(() => escalateRecoverySession(socket, socket, false, { retire, forceReconnect, report })).not.to.throw();
-		expect(retire.callCount).to.equal(2);
+		expect(retire.calledOnce).to.equal(true);
 		expect(forceReconnect.calledOnce).to.equal(true);
 	});
 });

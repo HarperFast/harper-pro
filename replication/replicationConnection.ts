@@ -1109,11 +1109,6 @@ export function escalateRecoverySession(
 		deps.forceReconnect();
 	} catch (error) {
 		report('forceReconnect', error);
-		try {
-			deps.retire();
-		} catch (retireError) {
-			report('retire', retireError);
-		}
 	}
 }
 
@@ -4684,8 +4679,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		sendLogBreakIsMidLog = midLogBreak;
 		if (wsClosed) return false;
 		const dbContext = databaseName ? ` (db: "${databaseName}")` : '';
+		const reportMidLogBreak = () => {
+			if (midLogBreak && isNewBreak)
+				runRecoveryDiagnostic(() =>
+					logger.error?.(
+						connectionId,
+						`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind the break are quarantined and no fresh iterator can cross it, so this leg will not send past it. Repair the transaction log or re-clone this node.`
+					)
+				);
+		};
 		// Nothing is cached to drop where the loop already rebuilds every wake.
-		if (!auditStore?.reusableIterable) return false;
+		if (!auditStore?.reusableIterable) {
+			reportMidLogBreak();
+			return false;
+		}
 		// A torn tail is not always walkable yet, and rebuilding on every wake would be a `getRange` per
 		// commit. A quarantined break cannot be walked at all until someone repairs the log, so it waits far
 		// longer — but it does wait, rather than never looking again.
@@ -4693,20 +4700,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const repairDecision = sendLogBreakRepairDecision(midLogBreak, sendLogBreakSince, lastSendLogRepairAt, now);
 		sendLogBreakSince = repairDecision.breakSince;
 		sendLogRebuildRetryInMs = repairDecision.retryInMs;
-		if (midLogBreak && isNewBreak)
-			runRecoveryDiagnostic(() =>
-				logger.error?.(
-					connectionId,
-					`Replication send to ${remoteNodeName}${dbContext} stopped at a mid-log corrupt transaction-log frame; entries behind the break are quarantined and no fresh iterator can cross it, so this leg will not send past it. Repair the transaction log or re-clone this node.`
-				)
-			);
+		reportMidLogBreak();
 		if (!repairDecision.rebuild) {
 			return false;
 		}
 		lastSendLogRepairAt = now;
-		// The state transition FIRST, and the telemetry after it — contained, so neither a throwing logger
-		// nor a throwing fire counter can lose the `true` this returns. Losing it would leave the cache
-		// cleared and the floor stamped while the caller believed no repair happened.
 		auditLogIterable = undefined;
 		runRecoveryDiagnostic(() => {
 			// Assigned before the log call: `logger.warn?.` is undefined under `logging.level: error`, so an
@@ -6895,12 +6893,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											logger.trace?.(connectionId, 'could not read the send iterable corrupt-frame state', error)
 										);
 									}
-									// Finalized even when the drain stopped at a break. harper#2087's fail-stop policy is that the
-									// stream DELIVERS everything before the break and stops there, and
-									// `integrationTests/cluster/txnlogTearReplication.test.mjs` pins exactly that ("B receives every
-									// entry before the torn frame, nothing behind it"). That the peer's cursor ends up exclusive of
-									// a torn transaction is the documented, accepted consequence — its remainder needs a re-clone —
-									// not something this recovery path may reinterpret.
+									// harper#2087's fail-stop policy delivers everything before a corrupt frame and stops there.
 									if (frame.position - frame.encodingStart > 8) {
 										sendAuditRecord(
 											{
@@ -6910,16 +6903,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									// `nextTransaction` was captured BEFORE this scan and resolves on the NEXT commit, so the
-									// commit that woke this iteration — the one whose rows the latched iterator failed to yield —
-									// would stay unsent until some later commit. On a quiescent source, which is the #810 field
-									// shape, that is no later commit at all. Re-scan now instead; the repair's own interval floor
-									// is what stops this from spinning if the fresh range breaks again immediately.
+									// Re-scan now: the commit that woke us is the one the latched iterator missed.
 									if (repairedSendRange) continue;
-									// A torn tail cannot become readable without a new commit. Wait for that commit before
-									// starting its remaining floor, so a quiet source has one pending waiter instead of a
-									// periodic rebuild. A mid-log quarantine may be repaired without a commit, so it keeps
-									// its periodic recheck.
+									// A torn tail needs a new commit; a repaired mid-log quarantine does not.
 									if (rebuildRetryInMs > 0) {
 										if (!sendLogBreakIsMidLog) {
 											await waitForSessionEndOrTransaction(nextTransaction);
@@ -7779,7 +7765,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			const aborted = abortInFlightBlobsOnClose(blobsInFlight, remoteNodeName, (_blobId, stream) =>
 				unregisterBlobReceiveInFlight(stream.fileId, auditStore?.rootStore)
 			);
-			logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`);
+			runRecoveryDiagnostic(() =>
+				logger.debug?.(connectionId, `aborted ${aborted} in-flight blob receive(s) on close for re-request`)
+			);
 		}
 		if (auditSubscription) auditSubscription.emit('close');
 		if (subscriptionRequest) subscriptionRequest.end();
@@ -7792,9 +7780,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		for (const [_id, { reject }] of awaitingResponse) {
 			reject(new Error(`Connection closed ${reasonBuffer?.toString()} ${code}`));
 		}
-		if (Object.keys(repairDeclines).length > 0)
-			logger.warn?.(connectionId, 'blob repair declines for this connection', repairDeclines);
-		logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
+		runRecoveryDiagnostic(() => {
+			if (Object.keys(repairDeclines).length > 0)
+				logger.warn?.(connectionId, 'blob repair declines for this connection', repairDeclines);
+			logger.debug?.(connectionId, 'closed', code, reasonBuffer?.toString());
+		});
 	}
 	ws.on('close', retireInstance);
 
@@ -8083,8 +8073,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const buffer = result.value as Buffer;
 						if (lastBuffer) {
 							logger.debug?.('Sending blob chunk', id, 'length', lastBuffer.length);
-							// Chunks are wire progress for this peer: the send loop can be parked on drain or the
-							// outstanding-blob cap while these keep flowing, and without this that reads as stopped.
 							// do the previous buffer so we know if it is the last one or not
 							ws.send(
 								encode([
