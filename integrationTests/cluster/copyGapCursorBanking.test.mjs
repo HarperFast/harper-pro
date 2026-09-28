@@ -134,30 +134,39 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 		// A's log must be appended in record-key order: a transaction created before but committed
 		// after a later one is re-delivered by the copy's post-walk tail, which would give a faulted
 		// record a second fresh save the schedule above does not account for. A cache-fill GET takes
-		// its log key when it starts but answers before its transaction commits, and a repeated GET can
-		// start a second fill of the same id, so each id gets exactly one GET and its commit is
-		// observed before the next id's GET starts.
+		// its log key when it starts but answers before its transaction commits, so each commit is
+		// awaited; exactly one GET per id, since a repeated GET can start a second fill of the same id.
 		const [A] = ctx.nodes;
+		let lastCountError;
 		const seededCount = async (signal) =>
 			(
 				await sendOperation(
 					A,
 					{ operation: 'describe_table', table: 'LargeLocation', exact_count: true },
 					{ signal }
-				).catch(() => ({}))
+				).catch((error) => {
+					lastCountError = error;
+					return {};
+				})
 			).record_count;
 		await waitForCondition(
 			async (signal) => {
 				if (!Number.isInteger(await seededCount(signal))) return false;
 				const response = await fetch(A.httpURL + '/', { signal }).catch(() => null);
-				await response?.arrayBuffer();
+				await response?.arrayBuffer().catch(() => null);
 				return response && response.status < 500;
 			},
-			{ timeoutMs: 60000, description: "A's operations and HTTP servers after the deploy restart" }
+			{
+				timeoutMs: 60000,
+				description: () =>
+					`A's operations and HTTP servers after the deploy restart (last describe_table error: ${lastCountError?.message})`,
+			}
 		);
 		for (let id = 0; id < BLOB_RECORDS; id++) {
 			const response = await fetch(A.httpURL + '/LargeLocation/' + id, { signal: AbortSignal.timeout(30000) });
-			await response.arrayBuffer();
+			await response.arrayBuffer().catch((error) => {
+				throw new Error(`seed GET of LargeLocation/${id} failed`, { cause: error });
+			});
 			ok(response.ok, `seed GET of LargeLocation/${id} failed: HTTP ${response.status}`);
 			let count;
 			await waitForCondition(async (signal) => (count = await seededCount(signal)) > id, {
