@@ -226,9 +226,10 @@ worker exits or the entry is replaced.
 
 **A connect report cancels nothing; every report resets the pair's escalated setup delay.** Gating that reset
 on entry ownership let a chaos-restart peer's delay escalate past its reconvergence budget. A worker can
-carry both the primary and a proxied failover connection, so reports carry their thread id and subscription
-URL; only the owning worker's explicit primary socket-open edge advances `connectGeneration`. Pongs and
-proxy/superseded opens still perform the pair-level reset but cannot cancel a stall kick. What makes leaving
+carry both the primary and a proxied failover connection, so a socket-open report (`newSocket`) carries its
+thread id and subscription URL; only the owning worker's primary open advances `connectGeneration`, as does a
+truth up-correction, which stands in for an open edge that never arrived. Pongs and proxy/superseded opens
+still perform the pair-level reset but cannot cancel a stall kick. What makes leaving
 the timers armed safe is that each re-checks live state when it fires: the
 setup re-reads the entry and its `unsubscribed` flag, the wedge kick claims its entry through the
 `disconnectedAt` stamp a connect clears, and the stall kick claims it through `connectGeneration` (a stalled
