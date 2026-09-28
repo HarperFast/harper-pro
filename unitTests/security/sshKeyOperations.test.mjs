@@ -747,7 +747,7 @@ describe('sshKeyOperations sealing', () => {
 				assert.match(logged[0][1], /^Unable to add BEGIN\/END lines to the SSH config: EACCES/);
 			});
 
-			it("a node rolled back to an earlier version still reads and deletes each key's block", async () => {
+			it("a node rolled back to an earlier version still reads and deletes each key's block the way it always has", async () => {
 				for (const name of ['first', 'middle', 'last']) await addKey(name);
 				const config = readConfig();
 				for (const [parser, earlier] of [
@@ -760,6 +760,12 @@ describe('sshKeyOperations sealing', () => {
 				}
 				assert.equal(anchoredParser.delete(config, 'middle'), `${blockFor('first')}\n${blockFor('last')}`);
 				assert.equal(anchoredParser.delete(config, 'last'), `${blockFor('first')}\n${blockFor('middle')}`);
+				// it doesn't know END, so it also takes a line a user put after END, before the next section, as it always has
+				const withLineAfterEnd = config.replace(
+					'# END harper ssh key middle\n',
+					'# END harper ssh key middle\n\tUser deploy\n'
+				);
+				assert.equal(anchoredParser.delete(withLineAfterEnd, 'middle'), `${blockFor('first')}\n${blockFor('last')}`);
 
 				// the regex leaves middle's END line behind, which reads as nothing once this version is back
 				writeFileSync(configPath(), regexParser.delete(config, 'middle'));

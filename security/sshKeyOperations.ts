@@ -498,9 +498,9 @@ interface SSHConfigView {
 /**
  * A key's block runs from its BEGIN line to the next END line for its name, with no other marker between,
  * plus the `#<name>` line directly above BEGIN: earlier versions find blocks by that line alone, so it
- * keeps a rolled-back node reading and deleting exactly the block. A block written before the markers
- * counts only when it names exactly the key file `addSSHKey` writes, since nothing else in that format
- * shows who wrote it.
+ * keeps a rolled-back node reading and deleting the block the way it always has. A block written before
+ * the markers counts only when it names exactly the key file `addSSHKey` writes, since nothing else in
+ * that format shows who wrote it.
  */
 function readSSHConfig(config: string, sshDir: string): SSHConfigView {
 	const lines: SSHConfigLine[] = [];
