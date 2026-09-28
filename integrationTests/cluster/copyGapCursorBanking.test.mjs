@@ -37,7 +37,14 @@ import {
 	getNextAvailableLoopbackAddress,
 	targz,
 } from '@harperfast/integration-testing';
-import { sendOperation, fetchWithRetry, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
+import {
+	sendOperation,
+	fetchWithRetry,
+	readLog,
+	restartNode,
+	stopNodeProcess,
+	waitForCondition,
+} from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -124,35 +131,40 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			restart: false,
 		});
 		await restartNode(ctx.nodes[0]);
-		// A's log must be appended in key order: a transaction created before but committed after a
-		// later one is re-delivered by the copy's post-walk tail, which would give a faulted record a
-		// second fresh save the schedule above does not account for. A cache-fill GET fixes its
-		// transaction's key when it starts but answers before that transaction commits, so each id's
-		// commit is awaited before the next GET. Exactly one GET per id, never retried: a second one
-		// can start another fill of the same id that commits after later ids.
-		const seededCount = async () =>
-			(await sendOperation(ctx.nodes[0], { operation: 'describe_table', table: 'LargeLocation', exact_count: true }))
-				.record_count;
-		await fetchWithRetry(ctx.nodes[0].httpURL + '/');
-		for (let attempt = 0; ; attempt++) {
-			try {
-				await seededCount();
-				break;
-			} catch (error) {
-				if (attempt >= 60) throw error;
-				await delay(500);
-			}
-		}
+		// A's log must be appended in record-key order: a transaction created before but committed
+		// after a later one is re-delivered by the copy's post-walk tail, which would give a faulted
+		// record a second fresh save the schedule above does not account for. A cache-fill GET takes
+		// its log key when it starts but answers before its transaction commits, and a repeated GET can
+		// start a second fill of the same id, so each id gets exactly one GET and its commit is
+		// observed before the next id's GET starts.
+		const [A] = ctx.nodes;
+		const seededCount = async (signal) =>
+			(
+				await sendOperation(
+					A,
+					{ operation: 'describe_table', table: 'LargeLocation', exact_count: true },
+					{ signal }
+				).catch(() => ({}))
+			).record_count;
+		await waitForCondition(
+			async (signal) => {
+				if (!Number.isInteger(await seededCount(signal))) return false;
+				const response = await fetch(A.httpURL + '/', { signal }).catch(() => null);
+				await response?.arrayBuffer();
+				return response && response.status < 500;
+			},
+			{ timeoutMs: 60000, description: "A's operations and HTTP servers after the deploy restart" }
+		);
 		for (let id = 0; id < BLOB_RECORDS; id++) {
-			const response = await fetch(ctx.nodes[0].httpURL + '/LargeLocation/' + id);
+			const response = await fetch(A.httpURL + '/LargeLocation/' + id, { signal: AbortSignal.timeout(30000) });
 			await response.arrayBuffer();
 			ok(response.ok, `seed GET of LargeLocation/${id} failed: HTTP ${response.status}`);
-			const deadline = Date.now() + 30000;
 			let count;
-			while ((count = await seededCount()) <= id) {
-				ok(Date.now() < deadline, `seed of LargeLocation/${id} never committed (count ${count})`);
-				await delay(50);
-			}
+			await waitForCondition(async (signal) => (count = await seededCount(signal)) > id, {
+				timeoutMs: 30000,
+				pollMs: 100,
+				description: () => `the seed of LargeLocation/${id} to commit (record_count ${count})`,
+			});
 		}
 
 		const bootLog = await readLog(ctx.nodes[1]);
