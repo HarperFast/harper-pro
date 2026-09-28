@@ -1,0 +1,4 @@
+type EchoTarget @table @export {
+	id: String @primaryKey
+	name: String @indexed
+}

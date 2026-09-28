@@ -376,6 +376,89 @@ function reverseSubscription(subscription) {
 	const { subscribe, publish } = subscription;
 	return { ...subscription, subscribe: publish, publish: subscribe };
 }
+
+/**
+ * Direct primary-key lookup first, falling back to a table scan matching on `url` because
+ * `setNode()` stores a row under the PEER-reported name, which can differ from the hostname a
+ * caller used to reach it.
+ */
+async function findExistingNodeRecord(hostname: string, url: string) {
+	const hdbNodes = getHDBNodeTable();
+	const direct = await hdbNodes.get(hostname);
+	if (direct) return { name: hostname, record: direct };
+	for await (const node of hdbNodes.search({})) {
+		if (node?.url === url) return { name: node.name ?? hostname, record: node };
+	}
+	return undefined;
+}
+
+const FIELDS_REQUIRING_FULL_SETNODE = ['url', 'isLeader', 'retain_authorization', 'start_time', 'force_signing'];
+
+/**
+ * revoked_certificates/shard are read from THIS node's own row, so those patch it locally with no
+ * peer contact. Anything else needs setNode(), which resets omitted topology to full mesh and
+ * derives a default url from this node's own port -- both carried forward from the existing row.
+ */
+async function updateNode(req: any) {
+	const hostname = req.hostname || req.node_name || req.name || (req.url ? urlToNodeName(req.url) : undefined);
+	const url = req.url || (hostname ? hostnameToUrl(hostname) : undefined);
+	if (req.replicates !== undefined) {
+		throw new ClientError(
+			`update_node does not support 'replicates'; use 'subscriptions'/'sendsTo'/'receivesFrom' to change topology, or set_node to reset to full replication`
+		);
+	}
+	if ((req.subscribe !== undefined || req.publish !== undefined) && !req.subscriptions) {
+		throw new ClientError(
+			`update_node does not support top-level 'subscribe'/'publish' without 'subscriptions'; supply a subscriptions array, or use set_node`
+		);
+	}
+	const requestHasTopology = Boolean(req.subscriptions || req.sendsTo || req.receivesFrom);
+
+	if (hostname) {
+		const found = await findExistingNodeRecord(hostname, url);
+		if (found) {
+			// Normalize to the row's own identity regardless of which path runs below, so an alias or a
+			// custom port/scheme a caller used to reach the peer is never mistaken for a change to apply.
+			req.hostname = found.name;
+			req.url ??= found.record.url;
+
+			if (!requestHasTopology) {
+				if (!FIELDS_REQUIRING_FULL_SETNODE.some((field) => req[field] !== undefined)) {
+					const validation = validateBySchema(req, validationSchema);
+					if (validation) {
+						throw handleHDBError(
+							validation,
+							validation.message,
+							HTTP_STATUS_CODES.BAD_REQUEST,
+							undefined,
+							undefined,
+							true
+						);
+					}
+					const patch: any = {};
+					if (req.revoked_certificates) patch.revoked_certificates = req.revoked_certificates;
+					if (req.shard !== undefined) patch.shard = req.shard;
+					await ensureNode(found.name, patch);
+					return `Successfully updated '${found.record.url}'`;
+				}
+				const directional = found.record.replicates;
+				const hasDirectionalArrays =
+					directional && typeof directional === 'object' && (directional.sendsTo || directional.receivesFrom);
+				if (Array.isArray(found.record.subscriptions)) req.subscriptions = found.record.subscriptions;
+				else if (hasDirectionalArrays) {
+					req.sendsTo = directional.sendsTo;
+					req.receivesFrom = directional.receivesFrom;
+				} else if (directional !== true) {
+					throw new ClientError(
+						`update_node cannot apply this change to '${hostname}' without also carrying its existing replication topology forward, and that topology cannot be re-expressed automatically; use set_node to change topology and metadata together`
+					);
+				}
+			}
+		}
+	}
+	return setNode(req);
+}
+
 server.registerOperation?.({
 	name: 'set_node',
 	execute: setNode,
@@ -385,6 +468,12 @@ server.registerOperation?.({
 server.registerOperation?.({
 	name: 'add_node',
 	execute: setNode,
+	httpMethod: 'PUT',
+	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],
+});
+server.registerOperation?.({
+	name: 'update_node',
+	execute: updateNode,
 	httpMethod: 'PUT',
 	parametersSchema: [{ name: 'hostname', in: 'path', schema: { type: 'string' } }],
 });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, readLog } from './clusterShared.mjs';
+import { sendOperation, readLog, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
@@ -11,6 +11,8 @@ const DB = 'data';
 const TABLE = 'setup_recovery';
 const SETUP_TIMEOUT_MS = 3000;
 const RECOVERY_TIMEOUT_MS = 30000;
+const CONVERGENCE_POLL_MS = 250;
+const DIAGNOSTIC_TIMEOUT_MS = 5000;
 
 function optionsFor(node, env, databases = [DB, 'system']) {
 	return {
@@ -29,24 +31,87 @@ function optionsFor(node, env, databases = [DB, 'system']) {
 	};
 }
 
-async function hasRecord(node, id) {
-	const result = await sendOperation(node, {
-		operation: 'search_by_id',
-		database: DB,
-		table: TABLE,
-		ids: [id],
-		get_attributes: ['id'],
-	}).catch(() => null);
+async function hasRecord(node, id, signal) {
+	const result = await sendOperation(
+		node,
+		{
+			operation: 'search_by_id',
+			database: DB,
+			table: TABLE,
+			ids: [id],
+			get_attributes: ['id'],
+		},
+		{ signal }
+	);
 	return Array.isArray(result) && result.some((record) => record?.id === id);
 }
 
-async function waitForRecord(node, id, timeoutMs = RECOVERY_TIMEOUT_MS) {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await hasRecord(node, id)) return true;
-		await delay(250);
+/**
+ * `cluster_status` returns the peer's whole hdb_nodes record, keeping a retained `authorization`
+ * credential, so the snapshot names the replication fields rather than serializing the response.
+ * A field the reader came for must never be silently absent, so each is filled rather than dropped.
+ */
+async function replicationDiagnostics(node) {
+	const controller = new AbortController();
+	const deadline = setTimeout(
+		() => controller.abort(new Error(`cluster_status did not answer within ${DIAGNOSTIC_TIMEOUT_MS}ms`)),
+		DIAGNOSTIC_TIMEOUT_MS
+	);
+	try {
+		const status = await sendOperation(node, { operation: 'cluster_status' }, { signal: controller.signal });
+		return JSON.stringify(
+			(status?.connections ?? []).map((connection) => ({
+				name: connection.name ?? null,
+				database_sockets: (connection.database_sockets ?? []).map((socket) => ({
+					database: socket.database ?? null,
+					connected: socket.connected ?? null,
+					lastReceivedStatus: socket.lastReceivedStatus ?? null,
+					lastReceivedVersion: socket.lastReceivedVersion ?? null,
+					lastReceivedLocalTime: socket.lastReceivedLocalTime ?? null,
+					lastLiveness: socket.lastLiveness ?? null,
+					sendingMessage: socket.sendingMessage ?? null,
+					backPressurePercent: socket.backPressurePercent ?? null,
+					recoveryFires: socket.recoveryFires ?? null,
+					lastConnectionError: socket.lastConnectionError ?? null,
+				})),
+			}))
+		);
+	} catch (error) {
+		return `cluster_status unavailable: ${error.message}`;
+	} finally {
+		clearTimeout(deadline);
 	}
-	return false;
+}
+
+/**
+ * A probe error is recorded rather than rethrown so that a node answering 500 while replication is
+ * healthy stays distinguishable from non-convergence. The deadline aborts the probe in flight, and
+ * that rejection is the timeout itself — recording it would overwrite the last real one.
+ */
+async function waitForConvergence(node, probe, description, timeoutMs = RECOVERY_TIMEOUT_MS) {
+	let lastProbeError;
+	try {
+		await waitForCondition(
+			async (signal) => {
+				try {
+					return await probe(signal);
+				} catch (error) {
+					if (!signal.aborted) lastProbeError = error;
+					return false;
+				}
+			},
+			{ timeoutMs, pollMs: CONVERGENCE_POLL_MS, description }
+		);
+	} catch (error) {
+		throw new Error(
+			`${error.message}; last probe error: ${lastProbeError?.message ?? 'none'}; ${node.hostname} ${await replicationDiagnostics(node)}`,
+			{ cause: error }
+		);
+	}
+}
+
+function waitForRecord(node, id, description, timeoutMs = RECOVERY_TIMEOUT_MS) {
+	return waitForConvergence(node, (signal) => hasRecord(node, id, signal), description, timeoutMs);
 }
 
 async function waitForLog(node, pattern, timeoutMs = RECOVERY_TIMEOUT_MS) {
@@ -73,30 +138,24 @@ function countSetupWatchdogWarnings(log, database = DB) {
 		.filter((line) => line.includes('Subscription-setup watchdog:') && line.includes(`(db: "${database}")`)).length;
 }
 
-async function socketConnected(node, database) {
-	const status = await sendOperation(node, { operation: 'cluster_status' });
-	return status.connections.some((connection) =>
+async function socketConnected(node, database, signal) {
+	const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
+	return status?.connections?.some((connection) =>
 		connection.database_sockets?.some((socket) => socket.database === database && socket.connected === true)
 	);
 }
 
-async function waitForSocket(node, database, timeoutMs = RECOVERY_TIMEOUT_MS) {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (await socketConnected(node, database).catch(() => false)) return true;
-		await delay(250);
-	}
-	return false;
+function waitForSocket(node, database, description, timeoutMs = RECOVERY_TIMEOUT_MS) {
+	return waitForConvergence(node, (signal) => socketConnected(node, database, signal), description, timeoutMs);
 }
 
-async function waitForRole(node, role, timeoutMs = RECOVERY_TIMEOUT_MS) {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		const roles = await sendOperation(node, { operation: 'list_roles' }).catch(() => null);
-		if (Array.isArray(roles) && roles.some((entry) => entry?.role === role)) return true;
-		await delay(250);
-	}
-	return false;
+async function hasRole(node, role, signal) {
+	const roles = await sendOperation(node, { operation: 'list_roles' }, { signal });
+	return Array.isArray(roles) && roles.some((entry) => entry?.role === role);
+}
+
+function waitForRole(node, role, description, timeoutMs = RECOVERY_TIMEOUT_MS) {
+	return waitForConvergence(node, (signal) => hasRole(node, role, signal), description, timeoutMs);
 }
 
 suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
@@ -154,10 +213,10 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			table: TABLE,
 			records: [{ id: first }],
 		});
-		assert.equal(
-			await waitForRecord(ctx.receiver, first),
-			true,
-			'a record written after the setup hang must arrive over the recovered subscription'
+		await waitForRecord(
+			ctx.receiver,
+			first,
+			'a record written after the setup hang to arrive over the recovered subscription'
 		);
 		assert.equal(await socketConnected(ctx.receiver, DB), true, 'the recovered data socket must be connected');
 
@@ -171,12 +230,60 @@ suite('subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			table: TABLE,
 			records: [{ id: second }],
 		});
-		assert.equal(await waitForRecord(ctx.receiver, second), true, 'healthy idle must not rearm setup recovery');
+		await waitForRecord(ctx.receiver, second, 'healthy idle not to rearm setup recovery');
 		assert.equal(
 			countSetupWatchdogWarnings(await readLog(ctx.receiver)),
 			warningsBeforeIdle,
 			'healthy idle must not cause setup-watchdog reconnect churn'
 		);
+	});
+
+	test('a convergence timeout reports the replication state it was waiting on', async () => {
+		await assert.rejects(
+			waitForConvergence(ctx.receiver, () => false, 'a condition that never holds', 1000),
+			({ message }) => {
+				assert.match(message, /Timed out after 1000ms waiting for a condition that never holds/);
+				assert.match(
+					message,
+					/"lastReceivedStatus":"(Receiving|Waiting)"/,
+					'the snapshot must carry the receive state, not just the key'
+				);
+				assert.match(message, /"connected":(true|false)/, 'the snapshot must carry the link truth');
+				assert.doesNotMatch(
+					message,
+					/authorization/i,
+					'the snapshot must project replication fields, never the whole hdb_nodes record'
+				);
+				assert.match(message, /last probe error: none/);
+				return true;
+			}
+		);
+
+		let polls = 0;
+		await assert.rejects(
+			waitForConvergence(
+				ctx.receiver,
+				(signal) => {
+					if (polls++ === 0) throw new Error('probe exploded');
+					return new Promise((resolve, reject) =>
+						signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+					);
+				},
+				'a condition whose probe fails and then hangs',
+				1000
+			),
+			({ message }) => {
+				assert.match(
+					message,
+					/last probe error: probe exploded/,
+					'a broken oracle must stay distinguishable from non-convergence, and the deadline abort must not overwrite it'
+				);
+				return true;
+			}
+		);
+
+		const unreachable = { ...ctx.receiver, operationsAPIURL: 'http://127.0.0.1:1/' };
+		assert.match(await replicationDiagnostics(unreachable), /^cluster_status unavailable: /);
 	});
 });
 
@@ -237,7 +344,7 @@ suite('sender subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			table: TABLE,
 			records: [{ id }],
 		});
-		assert.equal(await waitForRecord(ctx.receiver, id), true, 'the sender-timeout retry must converge');
+		await waitForRecord(ctx.receiver, id, 'the sender-timeout retry to converge');
 		assert.doesNotMatch(
 			await readLog(ctx.receiver),
 			/Subscription-setup watchdog:.*\(db: "data"\)/,
@@ -285,11 +392,11 @@ suite('system subscription setup recovery', { timeout: 120000 }, (ctx) => {
 			/Subscription-setup watchdog:.*\(db: "system"\)/,
 			'the unsolicited handshake schema must not retire the correlated system request'
 		);
-		assert.equal(await waitForSocket(ctx.receiver, 'system'), true, 'the replacement system socket must connect');
+		await waitForSocket(ctx.receiver, 'system', 'the replacement system socket to connect');
 
 		const role = `after-system-setup-watchdog-${Date.now()}`;
 		await sendOperation(ctx.source, { operation: 'add_role', role, permission: { super_user: false } });
-		assert.equal(await waitForRole(ctx.receiver, role), true, 'system-table replication must converge after recovery');
+		await waitForRole(ctx.receiver, role, 'system-table replication to converge after recovery');
 		assert.ok(
 			countSetupWatchdogWarnings(await readLog(ctx.receiver), 'system') >= 1,
 			'the correlated system request should trigger recovery'

@@ -67,7 +67,7 @@ import { ok, equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog } from './clusterShared.mjs';
+import { sendOperation, ensureTableExists, readLog } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT =
 	process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT ||
@@ -172,8 +172,7 @@ suite(
 
 				await Promise.all(
 					[ctx.nodeA, ctx.nodeB].map((node) =>
-						sendOperation(node, {
-							operation: 'create_table',
+						ensureTableExists(node, {
 							database: DB,
 							table: TABLE,
 							primary_key: 'id',

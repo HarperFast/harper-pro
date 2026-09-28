@@ -21,9 +21,9 @@
 import { suite, test, before, after } from 'node:test';
 import { equal } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { startHarper, teardownHarper, targz } from '@harperfast/integration-testing';
+import { startHarper, targz } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, fetchWithRetry } from './clusterShared.mjs';
+import { sendOperation, fetchWithRetry, restartNode, stopAndTeardownNodes } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -99,7 +99,7 @@ suite('Issue #135: Resource SDK search after graceful restart (Scenario A)', { t
 	});
 
 	after(async () => {
-		await teardownHarper(ctx);
+		await stopAndTeardownNodes([ctx.harper]);
 	});
 
 	test('Resource SDK search returns same count as ops API after graceful restart', async () => {
@@ -127,8 +127,7 @@ suite('Issue #135: Resource SDK search after graceful restart (Scenario A)', { t
 		equal(beforeRestart.length, ROW_COUNT, `pre-restart ops count should be ${ROW_COUNT}`);
 
 		// Graceful restart.
-		await sendOperation(node, { operation: 'restart' }).catch(() => {}); // may disconnect before responding
-		await delay(5000);
+		await restartNode(node);
 		await pollHealth(node, { retries: 40, intervalMs: 2000 });
 		console.log('Harper is back up after restart');
 

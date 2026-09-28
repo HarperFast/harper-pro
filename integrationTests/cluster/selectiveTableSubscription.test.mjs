@@ -17,7 +17,7 @@ import { ok, equal } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { resolve } from 'node:path';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, ensureTableExists } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = resolve(
 	import.meta.dirname ?? module.path,
@@ -79,12 +79,10 @@ suite('Selective table subscription', { timeout: 120000 }, (ctx) => {
 		ctx.nodeA = ctxA.harper;
 		ctx.nodeB = ctxB.harper;
 
-		// Create both tables on both nodes. Schema for Table2 won't propagate over the
-		// bridge (excludeTables affects schema as well as data), so each node must
-		// create it independently.
+		// Create both tables on both nodes. Table2 stays a strict create: it is excluded from the
+		// bridge, so its create_table succeeding on B is the proof its schema did not propagate.
 		for (const node of [ctx.nodeA, ctx.nodeB]) {
-			await sendOperation(node, {
-				operation: 'create_table',
+			await ensureTableExists(node, {
 				database: 'data',
 				table: 'Table1',
 				primary_key: 'id',

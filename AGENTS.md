@@ -48,6 +48,10 @@ npm run lint:fix
 npm run format:write       # prettier
 npm run lint:required      # quiet — for CI
 
+# Typecheck (CI gate — the fast, always-on-PR check; most build workflows are schedule/dispatch-only)
+npm run typecheck          # tsc --noEmit — what CI runs
+npm run typecheck:fast     # tsgo (TypeScript 7 preview) — faster, can disagree with the gate
+
 # Tests
 npm run test:unit                  # mocha unit tests (fast, no server — build first)
 npm run test:integration

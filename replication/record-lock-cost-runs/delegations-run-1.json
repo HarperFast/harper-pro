@@ -1,0 +1,1468 @@
+{
+	"machine": {
+		"cpu": "12th Gen Intel(R) Core(TM) i7-12700H",
+		"cores": 20,
+		"memoryGiB": 31,
+		"platform": "linux-x64",
+		"node": "v26.2.0"
+	},
+	"ranAt": "2026-09-13T05:53:55.081Z",
+	"uncontended": {
+		"perNode": [
+			{
+				"requester": 0,
+				"homeLocalKeys": 41,
+				"acquire": {
+					"n": 120,
+					"min": 0.03,
+					"p50": 0.34,
+					"p95": 0.78,
+					"p99": 1.02,
+					"max": 1.9,
+					"mean": 0.34
+				},
+				"byHome": {
+					"homeLocal": {
+						"n": 41,
+						"min": 0.03,
+						"p50": 0.04,
+						"p95": 0.13,
+						"p99": 0.28,
+						"max": 0.28,
+						"mean": 0.05
+					},
+					"remoteHome": {
+						"n": 79,
+						"min": 0.22,
+						"p50": 0.45,
+						"p95": 0.85,
+						"p99": 1.9,
+						"max": 1.9,
+						"mean": 0.5
+					}
+				},
+				"release": {
+					"n": 120,
+					"min": 0,
+					"p50": 0.01,
+					"p95": 0.02,
+					"p99": 0.03,
+					"max": 0.04,
+					"mean": 0.01
+				},
+				"log": [
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					}
+				]
+			},
+			{
+				"requester": 1,
+				"homeLocalKeys": 42,
+				"acquire": {
+					"n": 120,
+					"min": 0.02,
+					"p50": 0.18,
+					"p95": 0.5,
+					"p99": 0.85,
+					"max": 1.54,
+					"mean": 0.21
+				},
+				"byHome": {
+					"homeLocal": {
+						"n": 42,
+						"min": 0.02,
+						"p50": 0.03,
+						"p95": 0.1,
+						"p99": 0.23,
+						"max": 0.23,
+						"mean": 0.05
+					},
+					"remoteHome": {
+						"n": 78,
+						"min": 0.15,
+						"p50": 0.22,
+						"p95": 0.55,
+						"p99": 1.54,
+						"max": 1.54,
+						"mean": 0.3
+					}
+				},
+				"release": {
+					"n": 120,
+					"min": 0,
+					"p50": 0.01,
+					"p95": 0.02,
+					"p99": 0.03,
+					"max": 0.03,
+					"mean": 0.01
+				},
+				"log": [
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					}
+				]
+			},
+			{
+				"requester": 2,
+				"homeLocalKeys": 39,
+				"acquire": {
+					"n": 120,
+					"min": 0.02,
+					"p50": 0.3,
+					"p95": 1.1,
+					"p99": 1.47,
+					"max": 1.71,
+					"mean": 0.36
+				},
+				"byHome": {
+					"homeLocal": {
+						"n": 39,
+						"min": 0.02,
+						"p50": 0.04,
+						"p95": 0.26,
+						"p99": 0.46,
+						"max": 0.46,
+						"mean": 0.07
+					},
+					"remoteHome": {
+						"n": 81,
+						"min": 0.15,
+						"p50": 0.38,
+						"p95": 1.18,
+						"p99": 1.71,
+						"max": 1.71,
+						"mean": 0.5
+					}
+				},
+				"release": {
+					"n": 120,
+					"min": 0,
+					"p50": 0.01,
+					"p95": 0.05,
+					"p99": 0.06,
+					"max": 0.06,
+					"mean": 0.01
+				},
+				"log": [
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					},
+					{
+						"entriesPerAcquisition": 0,
+						"bytesPerAcquisition": 0,
+						"byType": {}
+					}
+				]
+			}
+		],
+		"acquire": {
+			"n": 360,
+			"min": 0.02,
+			"p50": 0.25,
+			"p95": 0.78,
+			"p99": 1.47,
+			"max": 1.9,
+			"mean": 0.31
+		},
+		"byHome": {
+			"homeLocal": {
+				"n": 122,
+				"min": 0.02,
+				"p50": 0.04,
+				"p95": 0.13,
+				"p99": 0.28,
+				"max": 0.46,
+				"mean": 0.06
+			},
+			"remoteHome": {
+				"n": 238,
+				"min": 0.15,
+				"p50": 0.37,
+				"p95": 0.86,
+				"p99": 1.54,
+				"max": 1.9,
+				"mean": 0.43
+			}
+		},
+		"release": {
+			"n": 360,
+			"min": 0,
+			"p50": 0.01,
+			"p95": 0.02,
+			"p99": 0.05,
+			"max": 0.06,
+			"mean": 0.01
+		},
+		"lockStats": [
+			{
+				"delegations": 121,
+				"granted": 112,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			},
+			{
+				"delegations": 121,
+				"granted": 133,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			},
+			{
+				"delegations": 121,
+				"granted": 118,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			}
+		]
+	},
+	"repeat": {
+		"requester": 0,
+		"byHome": {
+			"local": {
+				"id": "repeat-1789278848062-0-1789278848063",
+				"firstLockMs": 0.28,
+				"repeat": {
+					"n": 200,
+					"min": 0.01,
+					"p50": 0.02,
+					"p95": 0.04,
+					"p99": 0.07,
+					"max": 0.11,
+					"mean": 0.03
+				},
+				"release": {
+					"n": 200,
+					"min": 0,
+					"p50": 0.01,
+					"p95": 0.01,
+					"p99": 0.02,
+					"max": 0.03,
+					"mean": 0.01
+				}
+			},
+			"remote": {
+				"id": "repeat-1789278848062-1-1789278848065",
+				"firstLockMs": 1.09,
+				"repeat": {
+					"n": 200,
+					"min": 0.01,
+					"p50": 0.01,
+					"p95": 0.02,
+					"p99": 0.06,
+					"max": 0.23,
+					"mean": 0.01
+				},
+				"release": {
+					"n": 200,
+					"min": 0,
+					"p50": 0,
+					"p95": 0,
+					"p99": 0.04,
+					"max": 0.06,
+					"mean": 0
+				}
+			}
+		},
+		"log": [
+			{
+				"entriesPerAcquisition": 0,
+				"bytesPerAcquisition": 0,
+				"byType": {}
+			},
+			{
+				"entriesPerAcquisition": 0,
+				"bytesPerAcquisition": 0,
+				"byType": {}
+			},
+			{
+				"entriesPerAcquisition": 0,
+				"bytesPerAcquisition": 0,
+				"byType": {}
+			}
+		],
+		"lockStats": [
+			{
+				"delegations": 123,
+				"granted": 113,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			},
+			{
+				"delegations": 121,
+				"granted": 134,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			},
+			{
+				"delegations": 121,
+				"granted": 118,
+				"admitted": 0,
+				"droppedOffOwner": 0
+			}
+		]
+	},
+	"hotKey": [
+		{
+			"contenders": 2,
+			"durationMs": 15000,
+			"sections": 15492,
+			"failures": 0,
+			"sectionsPerSecond": 1031.2,
+			"agreedCounter": 15492,
+			"converged": true,
+			"lostUpdates": 0,
+			"finalCounter": [15492, 15492, 15492],
+			"lockMs": {
+				"n": 15492,
+				"min": 0.03,
+				"p50": 0.05,
+				"p95": 0.17,
+				"p99": 1.03,
+				"max": 585.67,
+				"mean": 1.23
+			},
+			"sectionMs": {
+				"n": 15492,
+				"min": 0.1,
+				"p50": 0.13,
+				"p95": 0.39,
+				"p99": 1.3,
+				"max": 585.94,
+				"mean": 1.34
+			},
+			"requestMs": {
+				"n": 15492,
+				"min": 0.34,
+				"p50": 0.59,
+				"p95": 1.64,
+				"p99": 7.87,
+				"max": 587.44,
+				"mean": 1.94
+			},
+			"perNode": [
+				{
+					"node": 0,
+					"sections": 9017,
+					"failures": 0,
+					"lastN": 15491,
+					"lockMs": {
+						"n": 9017,
+						"min": 0.03,
+						"p50": 0.05,
+						"p95": 0.15,
+						"p99": 0.88,
+						"max": 510.41,
+						"mean": 0.99
+					},
+					"sectionMs": {
+						"n": 9017,
+						"min": 0.1,
+						"p50": 0.13,
+						"p95": 0.35,
+						"p99": 1.17,
+						"max": 510.61,
+						"mean": 1.09
+					},
+					"requestMs": {
+						"n": 9017,
+						"min": 0.34,
+						"p50": 0.57,
+						"p95": 1.53,
+						"p99": 7.68,
+						"max": 511.57,
+						"mean": 1.66
+					}
+				},
+				{
+					"node": 1,
+					"sections": 6475,
+					"failures": 0,
+					"lastN": 15492,
+					"lockMs": {
+						"n": 6475,
+						"min": 0.03,
+						"p50": 0.05,
+						"p95": 0.19,
+						"p99": 1.22,
+						"max": 585.67,
+						"mean": 1.57
+					},
+					"sectionMs": {
+						"n": 6475,
+						"min": 0.1,
+						"p50": 0.14,
+						"p95": 0.43,
+						"p99": 1.56,
+						"max": 585.94,
+						"mean": 1.69
+					},
+					"requestMs": {
+						"n": 6475,
+						"min": 0.35,
+						"p50": 0.62,
+						"p95": 1.77,
+						"p99": 8.08,
+						"max": 587.44,
+						"mean": 2.32
+					}
+				}
+			],
+			"log": [
+				{
+					"entriesPerAcquisition": 0.02,
+					"bytesPerAcquisition": 1,
+					"byType": {
+						"lockRelease": {
+							"entries": 327,
+							"bytes": 17920,
+							"bytesPerEntry": 55
+						}
+					}
+				},
+				{
+					"entriesPerAcquisition": 0.02,
+					"bytesPerAcquisition": 1,
+					"byType": {
+						"lockRelease": {
+							"entries": 262,
+							"bytes": 14338,
+							"bytesPerEntry": 55
+						}
+					}
+				},
+				{
+					"entriesPerAcquisition": 0,
+					"bytesPerAcquisition": 0,
+					"byType": {}
+				}
+			],
+			"lockStats": [
+				{
+					"delegations": 123,
+					"granted": 113,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				},
+				{
+					"delegations": 122,
+					"granted": 134,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				},
+				{
+					"delegations": 121,
+					"granted": 119,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				}
+			],
+			"audit": {
+				"distinctValues": 15492,
+				"sections": 15492,
+				"repeatedCount": 0,
+				"repeatedAcrossNodes": 0,
+				"repeatedValues": [],
+				"holes": [],
+				"maxWritten": 15492,
+				"finalCounter": [15492, 15492, 15492]
+			}
+		},
+		{
+			"contenders": 3,
+			"durationMs": 15000,
+			"sections": 18690,
+			"failures": 0,
+			"sectionsPerSecond": 1241,
+			"agreedCounter": 18665,
+			"converged": false,
+			"lostUpdates": 25,
+			"finalCounter": [18665, 18665, 18665],
+			"lockMs": {
+				"n": 18690,
+				"min": 0.03,
+				"p50": 0.05,
+				"p95": 0.12,
+				"p99": 0.57,
+				"max": 2825.87,
+				"mean": 1.75
+			},
+			"sectionMs": {
+				"n": 18690,
+				"min": 0.09,
+				"p50": 0.13,
+				"p95": 0.32,
+				"p99": 0.79,
+				"max": 2825.95,
+				"mean": 1.86
+			},
+			"requestMs": {
+				"n": 18690,
+				"min": 0.32,
+				"p50": 0.55,
+				"p95": 1.36,
+				"p99": 8.04,
+				"max": 2827,
+				"mean": 2.41
+			},
+			"perNode": [
+				{
+					"node": 0,
+					"sections": 3809,
+					"failures": 0,
+					"lastN": 18664,
+					"lockMs": {
+						"n": 3809,
+						"min": 0.03,
+						"p50": 0.05,
+						"p95": 0.19,
+						"p99": 26.16,
+						"max": 2649.22,
+						"mean": 3.3
+					},
+					"sectionMs": {
+						"n": 3809,
+						"min": 0.1,
+						"p50": 0.13,
+						"p95": 0.37,
+						"p99": 26.4,
+						"max": 2649.45,
+						"mean": 3.4
+					},
+					"requestMs": {
+						"n": 3809,
+						"min": 0.33,
+						"p50": 0.5,
+						"p95": 1.59,
+						"p99": 28.28,
+						"max": 2650.58,
+						"mean": 3.94
+					}
+				},
+				{
+					"node": 1,
+					"sections": 12348,
+					"failures": 0,
+					"lastN": 18663,
+					"lockMs": {
+						"n": 12348,
+						"min": 0.03,
+						"p50": 0.05,
+						"p95": 0.11,
+						"p99": 0.16,
+						"max": 901.66,
+						"mean": 0.57
+					},
+					"sectionMs": {
+						"n": 12348,
+						"min": 0.09,
+						"p50": 0.13,
+						"p95": 0.3,
+						"p99": 0.41,
+						"max": 901.82,
+						"mean": 0.68
+					},
+					"requestMs": {
+						"n": 12348,
+						"min": 0.32,
+						"p50": 0.56,
+						"p95": 1.27,
+						"p99": 2.3,
+						"max": 902.91,
+						"mean": 1.21
+					}
+				},
+				{
+					"node": 2,
+					"sections": 2533,
+					"failures": 0,
+					"lastN": 18665,
+					"lockMs": {
+						"n": 2533,
+						"min": 0.03,
+						"p50": 0.06,
+						"p95": 0.23,
+						"p99": 77.6,
+						"max": 2825.87,
+						"mean": 5.18
+					},
+					"sectionMs": {
+						"n": 2533,
+						"min": 0.1,
+						"p50": 0.15,
+						"p95": 0.41,
+						"p99": 77.79,
+						"max": 2825.95,
+						"mean": 5.3
+					},
+					"requestMs": {
+						"n": 2533,
+						"min": 0.34,
+						"p50": 0.67,
+						"p95": 1.64,
+						"p99": 79,
+						"max": 2827,
+						"mean": 5.94
+					}
+				}
+			],
+			"log": [
+				{
+					"entriesPerAcquisition": 0.01,
+					"bytesPerAcquisition": 1,
+					"byType": {
+						"lockRelease": {
+							"entries": 187,
+							"bytes": 10285,
+							"bytesPerEntry": 55
+						}
+					}
+				},
+				{
+					"entriesPerAcquisition": 0.04,
+					"bytesPerAcquisition": 2,
+					"byType": {
+						"lockRelease": {
+							"entries": 680,
+							"bytes": 37284,
+							"bytesPerEntry": 55
+						}
+					}
+				},
+				{
+					"entriesPerAcquisition": 0.01,
+					"bytesPerAcquisition": 0,
+					"byType": {
+						"lockRelease": {
+							"entries": 145,
+							"bytes": 7970,
+							"bytesPerEntry": 55
+						}
+					}
+				}
+			],
+			"lockStats": [
+				{
+					"delegations": 123,
+					"granted": 113,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				},
+				{
+					"delegations": 122,
+					"granted": 135,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				},
+				{
+					"delegations": 122,
+					"granted": 119,
+					"admitted": 0,
+					"droppedOffOwner": 0
+				}
+			],
+			"audit": {
+				"distinctValues": 18665,
+				"sections": 18690,
+				"repeatedCount": 25,
+				"repeatedAcrossNodes": 25,
+				"repeatedValues": [
+					{
+						"n": 8909,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 8910,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 8911,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 8912,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 8913,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 8914,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 8915,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 8916,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 8917,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 9862,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 17418,
+						"nodes": [0, 1]
+					},
+					{
+						"n": 1,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 4342,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 8167,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 8637,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 8735,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 8908,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 14321,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 14335,
+						"nodes": [1, 2]
+					},
+					{
+						"n": 14684,
+						"nodes": [0, 2]
+					}
+				],
+				"holes": [],
+				"maxWritten": 18665,
+				"finalCounter": [18665, 18665, 18665]
+			}
+		}
+	],
+	"reacquisition": [
+		{
+			"lease": 300000,
+			"windowMs": 60000,
+			"cadenceMs": 5000,
+			"runMs": 180253,
+			"firstLockMs": 0.98,
+			"ticks": 36,
+			"reacquisitions": 3,
+			"measuredRate": 0.0833,
+			"predictedRate": 0.0833,
+			"reacquiredAtMs": [60089, 120166, 180253],
+			"thresholdMs": 0.15,
+			"atWindowMultiple": 3,
+			"windowLooksStale": false,
+			"localReferenceMs": {
+				"n": 36,
+				"min": 0.01,
+				"p50": 0.05,
+				"p95": 0.11,
+				"p99": 0.12,
+				"max": 0.12,
+				"mean": 0.05
+			},
+			"servedLocallyDeltaMs": {
+				"n": 33,
+				"min": -0.01,
+				"p50": 0.03,
+				"p95": 0.1,
+				"p99": 0.12,
+				"max": 0.12,
+				"mean": 0.04
+			},
+			"reacquiredDeltaMs": {
+				"n": 3,
+				"min": 0.79,
+				"p50": 1.26,
+				"p95": 1.36,
+				"p99": 1.36,
+				"max": 1.36,
+				"mean": 1.14
+			},
+			"samples": [
+				{
+					"elapsedMs": 5011,
+					"acquireMs": 0.10017599999991944,
+					"servedLocallyMs": 0.056865999998990446,
+					"deltaMs": 0.043
+				},
+				{
+					"elapsedMs": 10018,
+					"acquireMs": 0.0911019999985001,
+					"servedLocallyMs": 0.05440600000292761,
+					"deltaMs": 0.037
+				},
+				{
+					"elapsedMs": 15023,
+					"acquireMs": 0.04576299999462208,
+					"servedLocallyMs": 0.03087200000300072,
+					"deltaMs": 0.015
+				},
+				{
+					"elapsedMs": 20029,
+					"acquireMs": 0.07954400000744499,
+					"servedLocallyMs": 0.05142800000612624,
+					"deltaMs": 0.028
+				},
+				{
+					"elapsedMs": 25036,
+					"acquireMs": 0.025217999995220453,
+					"servedLocallyMs": 0.013252000004285946,
+					"deltaMs": 0.012
+				},
+				{
+					"elapsedMs": 30042,
+					"acquireMs": 0.1728819999989355,
+					"servedLocallyMs": 0.11732599999231752,
+					"deltaMs": 0.056
+				},
+				{
+					"elapsedMs": 35051,
+					"acquireMs": 0.06797099999675993,
+					"servedLocallyMs": 0.03919300000416115,
+					"deltaMs": 0.029
+				},
+				{
+					"elapsedMs": 40060,
+					"acquireMs": 0.15780400000221562,
+					"servedLocallyMs": 0.057415999996010214,
+					"deltaMs": 0.1
+				},
+				{
+					"elapsedMs": 45068,
+					"acquireMs": 0.08301000000210479,
+					"servedLocallyMs": 0.0719740000058664,
+					"deltaMs": 0.011
+				},
+				{
+					"elapsedMs": 50077,
+					"acquireMs": 0.10773200000403449,
+					"servedLocallyMs": 0.05487000000721309,
+					"deltaMs": 0.053
+				},
+				{
+					"elapsedMs": 55082,
+					"acquireMs": 0.06958700000541285,
+					"servedLocallyMs": 0.04398399998899549,
+					"deltaMs": 0.026
+				},
+				{
+					"elapsedMs": 60089,
+					"acquireMs": 0.8292430000001332,
+					"servedLocallyMs": 0.037157999991904944,
+					"deltaMs": 0.792
+				},
+				{
+					"elapsedMs": 65095,
+					"acquireMs": 0.02577400000882335,
+					"servedLocallyMs": 0.012679000006755814,
+					"deltaMs": 0.013
+				},
+				{
+					"elapsedMs": 70102,
+					"acquireMs": 0.0502239999914309,
+					"servedLocallyMs": 0.038366000007954426,
+					"deltaMs": 0.012
+				},
+				{
+					"elapsedMs": 75106,
+					"acquireMs": 0.15658300000359304,
+					"servedLocallyMs": 0.08554000000003725,
+					"deltaMs": 0.071
+				},
+				{
+					"elapsedMs": 80112,
+					"acquireMs": 0.0633360000065295,
+					"servedLocallyMs": 0.044507999991765246,
+					"deltaMs": 0.019
+				},
+				{
+					"elapsedMs": 85117,
+					"acquireMs": 0.035727999988012016,
+					"servedLocallyMs": 0.0184949999966193,
+					"deltaMs": 0.017
+				},
+				{
+					"elapsedMs": 90124,
+					"acquireMs": 0.08260799999698065,
+					"servedLocallyMs": 0.05250200000591576,
+					"deltaMs": 0.03
+				},
+				{
+					"elapsedMs": 95130,
+					"acquireMs": 0.0837069999834057,
+					"servedLocallyMs": 0.04704100001254119,
+					"deltaMs": 0.037
+				},
+				{
+					"elapsedMs": 100136,
+					"acquireMs": 0.07036800001515076,
+					"servedLocallyMs": 0.04507200000807643,
+					"deltaMs": 0.025
+				},
+				{
+					"elapsedMs": 105142,
+					"acquireMs": 0.08158699999330565,
+					"servedLocallyMs": 0.051601999992271885,
+					"deltaMs": 0.03
+				},
+				{
+					"elapsedMs": 110148,
+					"acquireMs": 0.08833800000138581,
+					"servedLocallyMs": 0.05189199998858385,
+					"deltaMs": 0.036
+				},
+				{
+					"elapsedMs": 115157,
+					"acquireMs": 0.09336500000790693,
+					"servedLocallyMs": 0.05782600000384264,
+					"deltaMs": 0.036
+				},
+				{
+					"elapsedMs": 120166,
+					"acquireMs": 1.457832000014605,
+					"servedLocallyMs": 0.0982310000108555,
+					"deltaMs": 1.36
+				},
+				{
+					"elapsedMs": 125176,
+					"acquireMs": 0.08408200001576915,
+					"servedLocallyMs": 0.05094099999405444,
+					"deltaMs": 0.033
+				},
+				{
+					"elapsedMs": 130182,
+					"acquireMs": 0.09143200001562946,
+					"servedLocallyMs": 0.051734000007854775,
+					"deltaMs": 0.04
+				},
+				{
+					"elapsedMs": 135191,
+					"acquireMs": 0.08438200000091456,
+					"servedLocallyMs": 0.050839000003179535,
+					"deltaMs": 0.034
+				},
+				{
+					"elapsedMs": 140200,
+					"acquireMs": 0.10116800002288073,
+					"servedLocallyMs": 0.05774199997540563,
+					"deltaMs": 0.043
+				},
+				{
+					"elapsedMs": 145204,
+					"acquireMs": 0.03322599999955855,
+					"servedLocallyMs": 0.017774000007193536,
+					"deltaMs": 0.015
+				},
+				{
+					"elapsedMs": 150212,
+					"acquireMs": 0.18140100000891834,
+					"servedLocallyMs": 0.06305100000463426,
+					"deltaMs": 0.118
+				},
+				{
+					"elapsedMs": 155217,
+					"acquireMs": 0.10318599999300204,
+					"servedLocallyMs": 0.05391099999542348,
+					"deltaMs": 0.049
+				},
+				{
+					"elapsedMs": 160224,
+					"acquireMs": 0.09722100000362843,
+					"servedLocallyMs": 0.10415299999294803,
+					"deltaMs": -0.007
+				},
+				{
+					"elapsedMs": 165231,
+					"acquireMs": 0.027086999994935468,
+					"servedLocallyMs": 0.01909800001885742,
+					"deltaMs": 0.008
+				},
+				{
+					"elapsedMs": 170238,
+					"acquireMs": 0.16644699999596924,
+					"servedLocallyMs": 0.11128199999802746,
+					"deltaMs": 0.055
+				},
+				{
+					"elapsedMs": 175247,
+					"acquireMs": 0.08342799998354167,
+					"servedLocallyMs": 0.051374000002397224,
+					"deltaMs": 0.032
+				},
+				{
+					"elapsedMs": 180253,
+					"acquireMs": 1.3550979999999981,
+					"servedLocallyMs": 0.09091299999272451,
+					"deltaMs": 1.264
+				}
+			]
+		},
+		{
+			"lease": 240000,
+			"windowMs": 120000,
+			"cadenceMs": 5000,
+			"runMs": 260362,
+			"firstLockMs": 1.14,
+			"ticks": 52,
+			"reacquisitions": 3,
+			"measuredRate": 0.0577,
+			"predictedRate": 0.0417,
+			"reacquiredAtMs": [120173, 145209, 240346],
+			"thresholdMs": 0.15,
+			"atWindowMultiple": 2,
+			"windowLooksStale": false,
+			"localReferenceMs": {
+				"n": 52,
+				"min": 0.01,
+				"p50": 0.05,
+				"p95": 0.1,
+				"p99": 0.13,
+				"max": 0.13,
+				"mean": 0.05
+			},
+			"servedLocallyDeltaMs": {
+				"n": 49,
+				"min": 0,
+				"p50": 0.02,
+				"p95": 0.06,
+				"p99": 0.14,
+				"max": 0.14,
+				"mean": 0.03
+			},
+			"reacquiredDeltaMs": {
+				"n": 3,
+				"min": 0.35,
+				"p50": 0.51,
+				"p95": 1.28,
+				"p99": 1.28,
+				"max": 1.28,
+				"mean": 0.71
+			},
+			"samples": [
+				{
+					"elapsedMs": 5012,
+					"acquireMs": 0.07714200002374128,
+					"servedLocallyMs": 0.050694000005023554,
+					"deltaMs": 0.026
+				},
+				{
+					"elapsedMs": 10020,
+					"acquireMs": 0.07619900000281632,
+					"servedLocallyMs": 0.053294000012101606,
+					"deltaMs": 0.023
+				},
+				{
+					"elapsedMs": 15029,
+					"acquireMs": 0.0936599999840837,
+					"servedLocallyMs": 0.05399700000998564,
+					"deltaMs": 0.04
+				},
+				{
+					"elapsedMs": 20034,
+					"acquireMs": 0.07872399999178015,
+					"servedLocallyMs": 0.07876100001158193,
+					"deltaMs": 0
+				},
+				{
+					"elapsedMs": 25041,
+					"acquireMs": 0.20257899997523054,
+					"servedLocallyMs": 0.06577399998786859,
+					"deltaMs": 0.137
+				},
+				{
+					"elapsedMs": 30048,
+					"acquireMs": 0.07964099998935126,
+					"servedLocallyMs": 0.05305600000428967,
+					"deltaMs": 0.027
+				},
+				{
+					"elapsedMs": 35053,
+					"acquireMs": 0.10298100003274158,
+					"servedLocallyMs": 0.07113300001947209,
+					"deltaMs": 0.032
+				},
+				{
+					"elapsedMs": 40061,
+					"acquireMs": 0.10194200003752485,
+					"servedLocallyMs": 0.05064899998251349,
+					"deltaMs": 0.051
+				},
+				{
+					"elapsedMs": 45070,
+					"acquireMs": 0.08577300002798438,
+					"servedLocallyMs": 0.045354000001680106,
+					"deltaMs": 0.04
+				},
+				{
+					"elapsedMs": 50077,
+					"acquireMs": 0.06695100001525134,
+					"servedLocallyMs": 0.04335799999535084,
+					"deltaMs": 0.024
+				},
+				{
+					"elapsedMs": 55081,
+					"acquireMs": 0.043839999998454005,
+					"servedLocallyMs": 0.03380299999844283,
+					"deltaMs": 0.01
+				},
+				{
+					"elapsedMs": 60087,
+					"acquireMs": 0.02083599998150021,
+					"servedLocallyMs": 0.012577000015880913,
+					"deltaMs": 0.008
+				},
+				{
+					"elapsedMs": 65093,
+					"acquireMs": 0.040354999946430326,
+					"servedLocallyMs": 0.019119000004138798,
+					"deltaMs": 0.021
+				},
+				{
+					"elapsedMs": 70100,
+					"acquireMs": 0.04719099996145815,
+					"servedLocallyMs": 0.04223600000841543,
+					"deltaMs": 0.005
+				},
+				{
+					"elapsedMs": 75108,
+					"acquireMs": 0.03860599995823577,
+					"servedLocallyMs": 0.024509000009857118,
+					"deltaMs": 0.014
+				},
+				{
+					"elapsedMs": 80112,
+					"acquireMs": 0.07383099995786324,
+					"servedLocallyMs": 0.05142799997702241,
+					"deltaMs": 0.022
+				},
+				{
+					"elapsedMs": 85118,
+					"acquireMs": 0.026483999972697347,
+					"servedLocallyMs": 0.016242000041529536,
+					"deltaMs": 0.01
+				},
+				{
+					"elapsedMs": 90126,
+					"acquireMs": 0.07082700001774356,
+					"servedLocallyMs": 0.04658800002653152,
+					"deltaMs": 0.024
+				},
+				{
+					"elapsedMs": 95134,
+					"acquireMs": 0.1206440000096336,
+					"servedLocallyMs": 0.07967900001676753,
+					"deltaMs": 0.041
+				},
+				{
+					"elapsedMs": 100141,
+					"acquireMs": 0.0798940000240691,
+					"servedLocallyMs": 0.05203000002074987,
+					"deltaMs": 0.028
+				},
+				{
+					"elapsedMs": 105147,
+					"acquireMs": 0.08099799999035895,
+					"servedLocallyMs": 0.06846599996788427,
+					"deltaMs": 0.013
+				},
+				{
+					"elapsedMs": 110156,
+					"acquireMs": 0.06493400002364069,
+					"servedLocallyMs": 0.0593409999855794,
+					"deltaMs": 0.006
+				},
+				{
+					"elapsedMs": 115164,
+					"acquireMs": 0.05001200002152473,
+					"servedLocallyMs": 0.04227799997897819,
+					"deltaMs": 0.008
+				},
+				{
+					"elapsedMs": 120173,
+					"acquireMs": 1.353951999975834,
+					"servedLocallyMs": 0.07713699998566881,
+					"deltaMs": 1.277
+				},
+				{
+					"elapsedMs": 125179,
+					"acquireMs": 0.07039399998029694,
+					"servedLocallyMs": 0.05802100000437349,
+					"deltaMs": 0.012
+				},
+				{
+					"elapsedMs": 130184,
+					"acquireMs": 0.08914300001924857,
+					"servedLocallyMs": 0.057612999982666224,
+					"deltaMs": 0.032
+				},
+				{
+					"elapsedMs": 135193,
+					"acquireMs": 0.07099999999627471,
+					"servedLocallyMs": 0.047420999966561794,
+					"deltaMs": 0.024
+				},
+				{
+					"elapsedMs": 140200,
+					"acquireMs": 0.11084999999729916,
+					"servedLocallyMs": 0.09969900001306087,
+					"deltaMs": 0.011
+				},
+				{
+					"elapsedMs": 145209,
+					"acquireMs": 0.43549699999857694,
+					"servedLocallyMs": 0.08701600000495091,
+					"deltaMs": 0.348
+				},
+				{
+					"elapsedMs": 150217,
+					"acquireMs": 0.07309100002748892,
+					"servedLocallyMs": 0.04224899999098852,
+					"deltaMs": 0.031
+				},
+				{
+					"elapsedMs": 155223,
+					"acquireMs": 0.09922999999253079,
+					"servedLocallyMs": 0.05191400001058355,
+					"deltaMs": 0.047
+				},
+				{
+					"elapsedMs": 160231,
+					"acquireMs": 0.1431200000224635,
+					"servedLocallyMs": 0.13111299998126924,
+					"deltaMs": 0.012
+				},
+				{
+					"elapsedMs": 165240,
+					"acquireMs": 0.11039799998980016,
+					"servedLocallyMs": 0.10148399998433888,
+					"deltaMs": 0.009
+				},
+				{
+					"elapsedMs": 170248,
+					"acquireMs": 0.0648700000019744,
+					"servedLocallyMs": 0.04087699996307492,
+					"deltaMs": 0.024
+				},
+				{
+					"elapsedMs": 175255,
+					"acquireMs": 0.07714400003897026,
+					"servedLocallyMs": 0.05125999997835606,
+					"deltaMs": 0.026
+				},
+				{
+					"elapsedMs": 180261,
+					"acquireMs": 0.08045000000856817,
+					"servedLocallyMs": 0.052515999996103346,
+					"deltaMs": 0.028
+				},
+				{
+					"elapsedMs": 185271,
+					"acquireMs": 0.1940939999767579,
+					"servedLocallyMs": 0.11120099999243394,
+					"deltaMs": 0.083
+				},
+				{
+					"elapsedMs": 190276,
+					"acquireMs": 0.08128199999919161,
+					"servedLocallyMs": 0.05155199998989701,
+					"deltaMs": 0.03
+				},
+				{
+					"elapsedMs": 195284,
+					"acquireMs": 0.09166799997910857,
+					"servedLocallyMs": 0.06101400003535673,
+					"deltaMs": 0.031
+				},
+				{
+					"elapsedMs": 200293,
+					"acquireMs": 0.08342700003413484,
+					"servedLocallyMs": 0.05652500002179295,
+					"deltaMs": 0.027
+				},
+				{
+					"elapsedMs": 205300,
+					"acquireMs": 0.08075999998254701,
+					"servedLocallyMs": 0.05231100000673905,
+					"deltaMs": 0.028
+				},
+				{
+					"elapsedMs": 210306,
+					"acquireMs": 0.07724300003610551,
+					"servedLocallyMs": 0.05027700000209734,
+					"deltaMs": 0.027
+				},
+				{
+					"elapsedMs": 215314,
+					"acquireMs": 0.07896199997048825,
+					"servedLocallyMs": 0.06719899998279288,
+					"deltaMs": 0.012
+				},
+				{
+					"elapsedMs": 220324,
+					"acquireMs": 0.09974899998633191,
+					"servedLocallyMs": 0.06788399996003136,
+					"deltaMs": 0.032
+				},
+				{
+					"elapsedMs": 225332,
+					"acquireMs": 0.11161299998639151,
+					"servedLocallyMs": 0.04745400004321709,
+					"deltaMs": 0.064
+				},
+				{
+					"elapsedMs": 230335,
+					"acquireMs": 0.023473999986890703,
+					"servedLocallyMs": 0.01174899999750778,
+					"deltaMs": 0.012
+				},
+				{
+					"elapsedMs": 235341,
+					"acquireMs": 0.08426599996164441,
+					"servedLocallyMs": 0.025314999977126718,
+					"deltaMs": 0.059
+				},
+				{
+					"elapsedMs": 240346,
+					"acquireMs": 0.5272070000064559,
+					"servedLocallyMs": 0.020797999983187765,
+					"deltaMs": 0.506
+				},
+				{
+					"elapsedMs": 245348,
+					"acquireMs": 0.02432199998293072,
+					"servedLocallyMs": 0.020354000036604702,
+					"deltaMs": 0.004
+				},
+				{
+					"elapsedMs": 250355,
+					"acquireMs": 0.027665000001434237,
+					"servedLocallyMs": 0.01701299997512251,
+					"deltaMs": 0.011
+				},
+				{
+					"elapsedMs": 255358,
+					"acquireMs": 0.04020800004946068,
+					"servedLocallyMs": 0.025527000019792467,
+					"deltaMs": 0.015
+				},
+				{
+					"elapsedMs": 260362,
+					"acquireMs": 0.04255900002317503,
+					"servedLocallyMs": 0.02642299997387454,
+					"deltaMs": 0.016
+				}
+			]
+		}
+	],
+	"unlockedWrites": {
+		"batchSize": 500,
+		"rounds": 30,
+		"arms": {
+			"off": {
+				"probe": {
+					"acquired": false,
+					"message": "cluster record locks are not enabled on this node (replication.recordLocks); lock with { scope: 'node' } for a node-local lock"
+				},
+				"batchMs": {
+					"n": 30,
+					"min": 18.4,
+					"p50": 20.57,
+					"p95": 28.2,
+					"p99": 28.45,
+					"max": 28.45,
+					"mean": 21.64
+				},
+				"putsPerSecond": {
+					"atP50": 24307,
+					"atP95": 17730
+				}
+			},
+			"none": {
+				"probe": {
+					"acquired": false,
+					"statusCode": 503,
+					"message": "Cluster-scoped record locks are not available on data: no record lock transport is registered"
+				},
+				"batchMs": {
+					"n": 30,
+					"min": 18,
+					"p50": 20.71,
+					"p95": 27.5,
+					"p99": 30.8,
+					"max": 30.8,
+					"mean": 21.6
+				},
+				"putsPerSecond": {
+					"atP50": 24143,
+					"atP95": 18182
+				}
+			},
+			"on": {
+				"probe": {
+					"acquired": true
+				},
+				"batchMs": {
+					"n": 30,
+					"min": 18.03,
+					"p50": 20.35,
+					"p95": 32.25,
+					"p99": 33.11,
+					"max": 33.11,
+					"mean": 22.08
+				},
+				"putsPerSecond": {
+					"atP50": 24570,
+					"atP95": 15504
+				}
+			}
+		}
+	}
+}

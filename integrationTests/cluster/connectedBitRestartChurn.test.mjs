@@ -6,16 +6,11 @@
  *   proven by a real data round-trip, not by the bit), and recovery still holds when the outage is
  *   held past WEDGE_RECONCILE_THRESHOLD_MS (30s) so the disruptive `findWedgedNodeUrls` net fires
  *   (asserted to fire, with #525's structured telemetry present).
- *   DOES NOT PIN: #523's actual up-correction path. `connectedToNode()` only fires on WS 'open'
- *   when `this.nodeSubscriptions` is already populated (replicationConnection.ts:1388), which is
- *   only unset for a FRESH connection object (built by wedge-reconcile's `forceResubscribe`, not a
- *   routine reconnect). The correction line "Corrected replication connection state
- *   (disconnected -> up)" was NOT observed in any run — the race window is sub-millisecond (WS
- *   handshake vs async subscribe()) and there is no fault-injection hook for it. That path's only
- *   coverage remains unitTests/replication/reconcileEntryWithTruth.test.mjs. Deterministic
- *   end-to-end coverage would need a test-only hook mirroring `armReplicationWedgeForTest` /
- *   `maybeStallCopyForTest`. The log evidence is therefore reported, never asserted — do not
- *   "strengthen" it into an assertion, it would flake.
+ *   DOES NOT PIN HERE: #523's actual up-correction path. The WS-open edge requires
+ *   `this.nodeSubscriptions` to be populated, and later metadata/pong edges normally heal the bit.
+ *   `truthResiduals.test.mjs` R5 instead synthesizes the desync with an environment-gated hook.
+ *   This stress test only reports incidental correction-log evidence; do not make its timing-dependent
+ *   count a hard assertion.
  */
 /**
  * QA-587: does the replication "connected bit" reconcile UP from shared-memory truth,
@@ -59,7 +54,7 @@
  * both nodes (to congest the follower's main-thread message queue) -- the same class of
  * race the shipped fix's commit message describes ("the connect edge was lost or never
  * processed"). This is a best-effort stress recipe, not a deterministic fault-injection
- * hook (none exists for this specific race in replicationConnection.ts); the hard,
+ * hook (deterministic coverage lives in truthResiduals R5); the hard,
  * non-blind assertions do not depend on hitting the exact race every run:
  *   1. every kill is a genuine SIGKILL (captured process exit signal) and every cycle
  *      genuinely observes connected:false via tight cluster_status polling -- proves the
@@ -79,11 +74,11 @@
  */
 
 import { suite, test, before, after } from 'node:test';
-import { ok, equal } from 'node:assert/strict';
+import { ok, equal, fail } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog, concurrent } from './clusterShared.mjs';
+import { sendOperation, readLog, concurrent, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -99,6 +94,7 @@ const KILL_CYCLES = Number(process.env.HARPER_TEST_CONNECTED_BIT_KILL_CYCLES) ||
 const POLL_INTERVAL_MS = 150;
 const CONVERGENCE_TIMEOUT_MS = 25000; // well under WEDGE_RECONCILE_THRESHOLD_MS (30_000ms, subscriptionManager.ts)
 const DATA_FLOW_TIMEOUT_MS = 15000;
+const CLUSTER_STATUS_DIAGNOSTIC_TIMEOUT_MS = 5000;
 const KILL_WAIT_MS = 15000;
 const WRITE_BURST_COUNT = 150;
 const WRITE_BURST_CONCURRENCY = 20;
@@ -108,20 +104,12 @@ const FLOOD_CONCURRENCY = 15;
 // subscription) converged in ~1.8s every cycle with ZERO up-correction log lines: the
 // automatic retry reuses the SAME long-lived NodeReplicationConnection object, whose
 // `nodeSubscriptions` was already populated by the original add_node and never gets
-// cleared across a routine reconnect -- so `connectedToNode()`'s `if (this.nodeSubscriptions)`
-// guard (replicationConnection.ts:1388) is always true and the edge fires cleanly every
-// time. That test recipe only re-covers the ALREADY-covered normal retry path
-// (replicationReconnect.test.mjs), not harper-pro#289's "connect edge lost" race.
-// The race requires a FRESH connection object (new `nodeSubscriptions` populated
-// asynchronously, after `connect()` -- i.e. after the WS may have already opened), which
-// only happens on: (a) the very first subscribe, or (b) the wedge-reconcile's
-// forceResubscribe path when a peer has been connected:false past
-// WEDGE_RECONCILE_THRESHOLD_MS (30_000ms) -- `replicator.isReusableConnection` may decide
-// the stale connection is not reusable and build a new one. So this pass deliberately
-// holds the leader down PAST the 30s wedge threshold before restarting, to force that
-// disruptive path to engage and (maybe) construct a fresh, race-eligible connection object
-// right as the leader comes back -- the same conditions the task's "kill a peer... while
-// subscription churn is happening" and "restart mid-catch-up" hints are gesturing at.
+// cleared across a routine reconnect -- so the open handler's `nodeSubscriptions` guard is always true
+// and the edge fires cleanly every time. That test recipe only re-covers the ALREADY-covered normal
+// retry path (replicationReconnect.test.mjs), not harper-pro#289's "connect edge lost" race.
+// Ordinary first-subscribe scheduling populates `nodeSubscriptions` before the handshake completes;
+// truthResiduals R5 injects a synthetic late-subscribe ordering. This stress pass instead holds
+// the leader down past the wedge threshold to exercise the disruptive forceResubscribe recovery path.
 const WEDGE_RECONCILE_THRESHOLD_MS = 30000; // subscriptionManager.ts WEDGE_RECONCILE_THRESHOLD_MS
 const RECONCILE_INTERVAL_MS = 5000; // subscriptionManager.ts RECONCILE_INTERVAL_MS (the sweep period)
 // Hold the leader down long enough that the sweep CANNOT miss the threshold. 34_000 was too tight and
@@ -135,13 +123,28 @@ const WEDGE_TRIGGER_WAIT_MS = WEDGE_RECONCILE_THRESHOLD_MS + 5000 + 2 * RECONCIL
 // timeout can be derived from the same budget it polls against, instead of a hand-picked
 // number that can silently fall out of sync.
 const GENEROUS_CONVERGENCE_TIMEOUT_MS = 90000;
-// Worst case: the full outage wait, then the full convergence window, then a sequential
-// post-recovery data-flow probe per database -- each of those phases can legitimately consume
-// its entire budget before the assertion that would fail fires. Without summing them the test's
-// own { timeout } can (and did) fire first, so the run reports a timeout instead of the
-// intended false-green/wedge assertion.
+// The pre-kill write burst, the SIGKILL wait, the log read and the leader's own restart run inside
+// this test with no deadline of their own, so they need a budget here or the sum below understates
+// the worst case.
+const UNBUDGETED_PHASES_MS = KILL_WAIT_MS + 60000;
+// Worst case: the full outage wait, then the full convergence window, then the post-recovery
+// data-flow probe -- each of those phases can legitimately consume its entire budget before the
+// assertion that would fail fires. Without summing them the test's own { timeout } fires first and
+// the run reports a timeout instead of the intended false-green/wedge assertion.
 const LONG_OUTAGE_TEST_TIMEOUT_MS =
-	WEDGE_TRIGGER_WAIT_MS + GENEROUS_CONVERGENCE_TIMEOUT_MS + DB_NAMES.length * DATA_FLOW_TIMEOUT_MS + 20000;
+	WEDGE_TRIGGER_WAIT_MS + GENEROUS_CONVERGENCE_TIMEOUT_MS + DATA_FLOW_TIMEOUT_MS + UNBUDGETED_PHASES_MS;
+const SETUP_TEST_TIMEOUT_MS = 60000;
+const CHAOS_TEST_TIMEOUT_MS = 300000;
+const SUMMARY_TEST_TIMEOUT_MS = 30000;
+// The suite deadline cancels a child that is still inside its own budget, so it has to clear the
+// sum of them plus the two node starts in `before` -- otherwise the same generic timeout the
+// per-test budgets above exist to avoid arrives from one level up.
+const SUITE_TIMEOUT_MS =
+	SETUP_TEST_TIMEOUT_MS +
+	CHAOS_TEST_TIMEOUT_MS +
+	LONG_OUTAGE_TEST_TIMEOUT_MS +
+	SUMMARY_TEST_TIMEOUT_MS +
+	UNBUDGETED_PHASES_MS;
 
 function nodeStartOptions(node) {
 	return {
@@ -187,6 +190,67 @@ async function writeBurst(node, dbNames, count, concurrency, idPrefix) {
 	await finish();
 }
 
+// Every database is probed before anything asserts: which of the six flowed is what separates one
+// racing subscription from a dead link. Each gets its own DATA_FLOW_TIMEOUT_MS, and `Promise.all`
+// starting them together is what makes that one window rather than six consecutive ones.
+async function probeReplicated(follower, marker) {
+	const startedAt = Date.now();
+	return Promise.all(
+		DB_NAMES.map(async (db) => {
+			// The last attempt's error only, so a rejection early in the window is not still being
+			// reported after the node recovered and simply had nothing to return.
+			let lastError;
+			try {
+				await waitForCondition(
+					async (signal) => {
+						lastError = undefined;
+						const res = await sendOperation(
+							follower,
+							{ operation: 'search_by_id', database: db, table: 'test', ids: [marker], get_attributes: ['id'] },
+							{ signal }
+						).catch((probeError) => {
+							lastError = probeError;
+							if (signal.aborted) throw probeError;
+							return [];
+						});
+						return Array.isArray(res) && res.some((r) => r.id === marker);
+					},
+					{ timeoutMs: DATA_FLOW_TIMEOUT_MS, pollMs: 200, description: () => `${marker} on ${db}` }
+				);
+				return { db, seen: true, ms: Date.now() - startedAt };
+			} catch {
+				return { db, seen: false, ms: Date.now() - startedAt, error: lastError };
+			}
+		})
+	);
+}
+
+async function assertAllReplicated(follower, peerHostname, results, what) {
+	if (results.every((r) => r.seen)) return;
+	const status = await sendOperation(
+		follower,
+		{ operation: 'cluster_status' },
+		{ signal: AbortSignal.timeout(CLUSTER_STATUS_DIAGNOSTIC_TIMEOUT_MS) }
+	).catch((error) => ({ error: String(error) }));
+	const missing = results.filter((r) => !r.seen).map((r) => r.db);
+	const perDb = results.map((r) => `${r.db}=${r.seen ? `${r.ms}ms` : 'MISS'}`).join(' ');
+	const probeErrors = results.filter((r) => r.error).map((r) => `${r.db}: ${r.error}`);
+	const sockets = socketsForPeer(status, peerHostname).map((s) =>
+		[
+			s.database,
+			`connected=${s.connected}`,
+			`recv=${s.lastReceivedStatus}`,
+			`liveness=${s.lastLiveness}`,
+			`backPressure=${s.backPressurePercent}%`,
+		].join(' ')
+	);
+	fail(
+		`${what}: ${missing.join(', ')} did not replicate to follower within ${DATA_FLOW_TIMEOUT_MS}ms ` +
+			`(${perDb})${probeErrors.length ? `; probe errors: ${probeErrors.join(' | ')}` : ''}` +
+			`; follower sockets to peer: ${status.error ? `unavailable (${status.error})` : `[${sockets.join(' | ')}]`}`
+	);
+}
+
 // Extra admin-API flood against `node` itself, purely to congest its own main-thread
 // message queue (HTTP worker -> main thread IPC) at the exact moment reconnect-edge
 // messages are also trying to land -- widening the window for the edge-vs-truth race.
@@ -225,7 +289,7 @@ async function sigkillNode(node, timeoutMs = KILL_WAIT_MS) {
 
 suite(
 	'QA-587: replication connected bit never wedges stuck-false across crash-restart churn (harper-pro#431/PR#523 general guarantees)',
-	{ timeout: 480000 },
+	{ timeout: SUITE_TIMEOUT_MS },
 	(ctx) => {
 		before(async () => {
 			const hostLeader = await getNextAvailableLoopbackAddress();
@@ -272,7 +336,7 @@ suite(
 
 		test(
 			'setup: follower subscribes to leader across all databases and baseline data flows',
-			{ timeout: 60000 },
+			{ timeout: SETUP_TEST_TIMEOUT_MS },
 			async () => {
 				await sendOperation(ctx.follower, {
 					operation: 'add_node',
@@ -303,25 +367,12 @@ suite(
 						records: [{ id: marker, name: 'baseline' }],
 					});
 				}
-				for (const db of DB_NAMES) {
-					let seen = false;
-					const dDeadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
-					while (Date.now() < dDeadline) {
-						const res = await sendOperation(ctx.follower, {
-							operation: 'search_by_id',
-							database: db,
-							table: 'test',
-							ids: [marker],
-							get_attributes: ['id'],
-						});
-						if (Array.isArray(res) && res.some((r) => r.id === marker)) {
-							seen = true;
-							break;
-						}
-						await delay(200);
-					}
-					ok(seen, `baseline write on ${db} did not replicate to follower`);
-				}
+				await assertAllReplicated(
+					ctx.follower,
+					ctx.leader.hostname,
+					await probeReplicated(ctx.follower, marker),
+					'baseline write'
+				);
 			}
 		);
 
@@ -377,7 +428,7 @@ suite(
 
 		test(
 			'chaos: repeated genuine SIGKILL + restart under write/admin load never wedges the connected bit',
-			{ timeout: 300000 },
+			{ timeout: CHAOS_TEST_TIMEOUT_MS },
 			async () => {
 				for (let cycle = 1; cycle <= KILL_CYCLES; cycle++) {
 					const cycleResult = {
@@ -474,28 +525,12 @@ suite(
 					);
 					console.log(`[qa587] cycle ${cycle}: converged in ${cycleResult.convergenceMs}ms after restart`);
 
-					for (const db of DB_NAMES) {
-						let seen = false;
-						const dDeadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
-						while (Date.now() < dDeadline) {
-							const res = await sendOperation(ctx.follower, {
-								operation: 'search_by_id',
-								database: db,
-								table: 'test',
-								ids: [inFlightMarker],
-								get_attributes: ['id'],
-							}).catch(() => []);
-							if (Array.isArray(res) && res.some((r) => r.id === inFlightMarker)) {
-								seen = true;
-								break;
-							}
-							await delay(200);
-						}
-						ok(
-							seen,
-							`cycle ${cycle}: post-restart in-flight write on ${db} did not replicate to follower (false-green connected:true)`
-						);
-					}
+					await assertAllReplicated(
+						ctx.follower,
+						ctx.leader.hostname,
+						await probeReplicated(ctx.follower, inFlightMarker),
+						`cycle ${cycle}: post-restart in-flight write (false-green connected:true)`
+					);
 
 					// Non-blind proof #2 / no-false-green check: a fresh write made AFTER convergence
 					// must actually replicate, not just flip the bit.
@@ -508,31 +543,14 @@ suite(
 							records: [{ id: marker, name: 'chaos' }],
 						});
 					}
-					let allFlowed = true;
-					for (const db of DB_NAMES) {
-						let seen = false;
-						const dDeadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
-						while (Date.now() < dDeadline) {
-							const res = await sendOperation(ctx.follower, {
-								operation: 'search_by_id',
-								database: db,
-								table: 'test',
-								ids: [marker],
-								get_attributes: ['id'],
-							}).catch(() => []);
-							if (Array.isArray(res) && res.some((r) => r.id === marker)) {
-								seen = true;
-								break;
-							}
-							await delay(200);
-						}
-						if (!seen) allFlowed = false;
-						ok(
-							seen,
-							`cycle ${cycle}: fresh post-recovery write on ${db} did not replicate to follower (false-green connected:true)`
-						);
-					}
-					cycleResult.dataFlowed = allFlowed;
+					const flowed = await probeReplicated(ctx.follower, marker);
+					cycleResult.dataFlowed = flowed.every((r) => r.seen);
+					await assertAllReplicated(
+						ctx.follower,
+						ctx.leader.hostname,
+						flowed,
+						`cycle ${cycle}: fresh post-recovery write (false-green connected:true)`
+					);
 				}
 			}
 		);
@@ -545,21 +563,17 @@ suite(
 				// green, genuine SIGKILL" guarantees via the connection's own fast retry -- which
 				// never gives the internal edge-vs-truth desync (harper-pro#289) a chance to occur,
 				// since `this.nodeSubscriptions` is already populated on that long-lived connection
-				// object and `connectedToNode()`'s guard (replicationConnection.ts:1388) always
-				// passes on an ordinary reconnect. The specific race this fix (#431/PR#523) exists
-				// for requires a FRESH connection object whose async `subscribe()` call races the
-				// WS 'open' event -- which this codebase only constructs via the wedge-reconcile's
-				// forceResubscribe path (findWedgedNodeUrls, WEDGE_RECONCILE_THRESHOLD_MS = 30s).
-				// So this cycle deliberately holds the leader down past that threshold to give the
-				// disruptive path -- and the narrow race inside it -- a chance to fire.
+				// object and the open handler's guard always passes on an ordinary reconnect. This
+				// cycle deliberately holds the leader down
+				// past the wedge threshold to exercise the disruptive forceResubscribe path.
 				//
 				// A prior diagnostic run (not committed) confirmed this outage length reliably
 				// triggers the disruptive "Reconciling N wedged subscription(s)" log line, but
 				// convergence afterward is legitimately governed by the connection's own
 				// exponential retry backoff (capped at 30s) rather than a fixed bound -- so this
 				// check uses a generous window and treats the up-correction log line as
-				// informational evidence, not a hard requirement (a black-box SIGKILL cannot force
-				// the sub-millisecond IPC-vs-shared-memory race that #289 describes on demand).
+				// informational evidence, not a hard requirement. The deterministic ordering is
+				// covered separately by truthResiduals.test.mjs.
 				const cycleResult = {
 					cycle: 'long-outage',
 					signal: null,
@@ -622,35 +636,18 @@ suite(
 						records: [{ id: marker, name: 'chaos' }],
 					});
 				}
-				let allFlowed = true;
-				for (const db of DB_NAMES) {
-					let seen = false;
-					const dDeadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
-					while (Date.now() < dDeadline) {
-						const res = await sendOperation(ctx.follower, {
-							operation: 'search_by_id',
-							database: db,
-							table: 'test',
-							ids: [marker],
-							get_attributes: ['id'],
-						}).catch(() => []);
-						if (Array.isArray(res) && res.some((r) => r.id === marker)) {
-							seen = true;
-							break;
-						}
-						await delay(200);
-					}
-					if (!seen) allFlowed = false;
-					ok(
-						seen,
-						`long outage: fresh post-recovery write on ${db} did not replicate to follower (false-green connected:true)`
-					);
-				}
-				cycleResult.dataFlowed = allFlowed;
+				const flowed = await probeReplicated(ctx.follower, marker);
+				cycleResult.dataFlowed = flowed.every((r) => r.seen);
+				await assertAllReplicated(
+					ctx.follower,
+					ctx.leader.hostname,
+					flowed,
+					'long outage: fresh post-recovery write (false-green connected:true)'
+				);
 			}
 		);
 
-		test('non-blind summary + wedge-reconcile telemetry evidence', { timeout: 30000 }, async () => {
+		test('non-blind summary + wedge-reconcile telemetry evidence', { timeout: SUMMARY_TEST_TIMEOUT_MS }, async () => {
 			ok(ctx.cycles.length === KILL_CYCLES, 'chaos cycles did not run to completion');
 			ok(ctx.longOutageCycle, 'long-outage cycle did not run to completion');
 
@@ -704,8 +701,8 @@ suite(
 				console.log(
 					'[qa587] the exact internal edge-vs-truth desync (harper-pro#289, the specific race #431 fixes) was not observed this run -- ' +
 						'the stress recipe (multi-db fan-out SIGKILL, write/admin load, and deliberately crossing the 30s wedge ' +
-						'threshold to force the disruptive forceResubscribe path) did not hit the sub-millisecond IPC-vs-shared-memory ' +
-						`race window. General fix guarantees (no wedge, no false green, genuine fault every cycle including a ${WEDGE_TRIGGER_WAIT_MS / 1000}s ` +
+						'threshold to force the disruptive forceResubscribe path) did not naturally produce the subscribe-after-open ' +
+						`ordering. General fix guarantees (no wedge, no false green, genuine fault every cycle including a ${WEDGE_TRIGGER_WAIT_MS / 1000}s ` +
 						'outage past the wedge threshold) are still confirmed above.'
 				);
 			}

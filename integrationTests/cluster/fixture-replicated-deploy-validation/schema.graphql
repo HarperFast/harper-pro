@@ -1,0 +1,4 @@
+type DeployValidationProbe @table @export {
+	id: ID @primaryKey
+	name: String
+}

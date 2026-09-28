@@ -89,7 +89,7 @@ EOF
 FROM docker.io/node:${NODE_VERSION} AS pprof
 
 # Keep in sync with the @datadog/pprof version in package-lock.json.
-ARG PPROF_VERSION=5.15.1
+ARG PPROF_VERSION=5.18.1
 
 COPY --from=build /usr/src/node-src/out/Release/node /usr/local/bin/node
 

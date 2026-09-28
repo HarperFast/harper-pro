@@ -26,7 +26,13 @@ import {
 	databaseSubscriptions,
 	tableUpdateListeners,
 	LATENCY_POSITION,
+	deriveConnectionTruth,
 } from './replicationConnection.ts';
+import {
+	ensureRecordLockTransport,
+	releaseRecordLockTransport,
+	setConnectionDownSinceReader,
+} from './recordLockTransport.ts';
 import { redactOperationForLog } from './logRedaction.ts';
 import { registerShutdownDrain } from '../core/components/shutdownDrain.ts';
 import { hasProgressingBlobSends, drainBlobSends } from './blobSendDrain.ts';
@@ -102,6 +108,13 @@ export function buildReplicationMtlsConfig(replicationOptions: any) {
  */
 export function start(options) {
 	logger.notify('Starting replication server');
+	// Installed here, not at module load: knownNodes → replicator → recordLockTransport is an import
+	// cycle, and assigning recordLockTransport's `downSinceReader` while that module is still evaluating
+	// would hit its temporal dead zone. `start()` runs after every module has finished loading.
+	setConnectionDownSinceReader((status) => {
+		const truth = deriveConnectionTruth(status);
+		return truth.connected ? undefined : truth.errorTime;
+	});
 	if (options.hostname && !env.get('node_hostname')) {
 		// for back-compat, carry this over
 		env.setProperty('node_hostname', options.hostname);
@@ -369,8 +382,10 @@ function assignReplicationSource(options) {
 				}
 			}
 			dbSubscriptions.delete(databaseName);
+			releaseRecordLockTransport(databaseName);
 			return;
 		}
+		ensureRecordLockTransport(databaseName);
 		for (const tableName in database) {
 			const Table = database[tableName];
 			setReplicator(databaseName, Table, options);
@@ -611,6 +626,13 @@ export function operationConnectionOptions(url: string): { url: string } {
 	return { url };
 }
 
+// setTimeout fires at once when given a longer delay.
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+/**
+ * Settles with the node's answer, or rejects on a socket error, on the connection closing first, or at
+ * `options.timeoutMs`. A rejection says nothing about whether the operation ran there.
+ */
 export async function sendOperationToNode(node, operation, options?) {
 	if (!options) options = {};
 	options.serverName = node.name;
@@ -620,17 +642,40 @@ export async function sendOperationToNode(node, operation, options?) {
 	// trusts each node's CA. Bootstrap callers (add_node/clone) pass a bare { url } node with no ca and are unaffected.
 	if (node.ca) options.nodeCA = node.ca;
 	const nodeUrl = getNodeURL(node);
+	// The receiver runs a forwarded operation as the connection's node, replacing hdb_user with that
+	// identity, so the sender's user record — and its refresh_token — is never needed there.
+	let forwarded = operation;
+	if (operation.hdb_user !== undefined) {
+		forwarded = { ...operation };
+		delete forwarded.hdb_user;
+	}
+	const timeoutMs =
+		Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+			? Math.min(options.timeoutMs, MAX_TIMER_DELAY_MS)
+			: undefined;
 	const socket = await createWebSocket(nodeUrl, options);
 	const session = replicateOverWS(socket, operationConnectionOptions(nodeUrl), {});
+	let timer: NodeJS.Timeout | undefined;
 	return new Promise((resolve, reject) => {
+		if (timeoutMs)
+			timer = setTimeout(
+				() =>
+					reject(
+						new Error(
+							`${forwarded.operation} to ${nodeUrl} did not answer within ${timeoutMs}ms; its outcome there is unknown`
+						)
+					),
+				timeoutMs
+			).unref();
 		socket.on('open', () => {
 			// operation may carry a secret (registry token / ssh key / password); redact before
 			// logging. logsAtLevel guards the copy so it stays off the non-debug hot path.
 			if (logger.logsAtLevel('debug'))
-				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(operation));
+				logger.debug('Sending operation connection to ' + nodeUrl + ' opened', redactOperationForLog(forwarded));
 			// A throw inside this listener is an uncaught exception, and leaves this promise pending.
 			try {
-				resolve(session.sendOperation(operation));
+				// Not `resolve(promise)`: adopting the session's promise would disarm the deadline and close below.
+				session.sendOperation(forwarded).then(resolve, reject);
 			} catch (error) {
 				reject(error);
 			}
@@ -638,10 +683,17 @@ export async function sendOperationToNode(node, operation, options?) {
 		socket.on('error', (error) => {
 			reject(error);
 		});
-		socket.on('close', (error) => {
-			logger.info('Sending operation connection to ' + nodeUrl + ' closed', error);
+		socket.on('close', (code, reason) => {
+			logger.info('Sending operation connection to ' + nodeUrl + ' closed', code);
+			const closedFirst = new Error(
+				`The connection to ${nodeUrl} closed (${code}${reason?.length ? ` ${reason}` : ''}) before ${forwarded.operation} was answered; its outcome there is unknown`
+			);
+			// After this turn's microtasks: an answer read in the same turn as the close has queued its
+			// settlement already, and must win.
+			setImmediate(() => reject(closedFirst));
 		});
 	}).finally(() => {
+		clearTimeout(timer);
 		socket.close();
 	});
 }
@@ -681,6 +733,10 @@ export function subscribeToNode(request: any) {
 		} else {
 			connection.nodeName = request.nodes[0].name;
 		}
+		// The main-thread-computed multi-hop exclusion set (subscriptionManager.computeExclusionOrigins).
+		// The session reads it when building SUBSCRIPTION_REQUEST's excluded list; only overwrite when the
+		// request carries one, so a re-subscribe from a path without the set keeps the last known value.
+		if (request.exclusionOrigins) connection.exclusionOrigins = request.exclusionOrigins;
 		connection.subscribe(
 			request.nodes.filter((node) => {
 				return shouldReplicateFromNode(node, request.database);
@@ -700,23 +756,45 @@ export function subscribeToNode(request: any) {
 		logger.error('Error in subscription to node', request.nodes[0]?.url, error);
 	}
 }
-export function unsubscribeFromNode({ url, nodes, database }) {
-	logger.trace(
-		'Unsubscribing from node',
-		url,
-		database,
-		'nodes',
-		Array.from(getHDBNodeTable().primaryStore.getRange({}))
-	);
+export async function unsubscribeFromNode({ url, nodes, database, clearStatus = false }) {
+	logger.trace('Unsubscribing from node', url, database);
 	const connectionKey = getSubscriptionConnectionKey(url, nodes[0]?.url);
 	const dbConnections = connections.get(connectionKey);
-	if (dbConnections) {
-		const connection = dbConnections.get(database);
-		if (connection) {
-			connection.unsubscribe();
-			dbConnections.delete(database);
-		}
+	const connection = dbConnections?.get(database);
+	if (!connection) return;
+	// Retire locally before attempting the transport close, not after: close() can throw, and a
+	// connection that keeps its cache entry and its owner marker goes on writing DOWN/1008 into the
+	// (database, peer) buffer the removal just cleared. unsubscribe() sets intentionallyUnsubscribed
+	// before it touches the socket, so a connection dropped here can never reconnect on its own.
+	dbConnections.delete(database);
+	if (clearStatus) releaseSharedStatusOnUnsubscribe(connection);
+	try {
+		connection.unsubscribe();
+	} catch (error) {
+		logger.error('Error unsubscribing from node', url, database, error);
 	}
+}
+// Retire a connection's claim on the (database, peer) shared status when its node leaves the cluster.
+//
+// `unsubscribe()` only starts the teardown. The socket closes asynchronously, and until it does this session
+// keeps writing: its close handler stamps DOWN + close code 1008, and a frame or pong arriving on the still-
+// closing socket re-stamps CONNECTED and fresh liveness. Every one of those writes is gated on
+// `nodeSubscriptions !== undefined`, which unsubscribing never clears, so all of them land AFTER the main
+// thread has zeroed the buffer on removal. A same-process re-add then resolves the same buffer and inherits
+// them: cluster_status reports a failure the new link never suffered, or reports it connected before it has
+// handshaked — which also clears the down-since baseline findWedgedNodeUrls needs, so a re-added link that
+// never opens gets no wedge recovery until liveness ages out (>= 120s).
+//
+// Dropping `nodeSubscriptions` is the fix because it is the marker every owner-class write already consults,
+// including the ones that reach the buffer through replicateOverWS's own closure rather than this handle.
+// Only on the removal path: the other unsubscribe caller (replication turned off for a database) keeps its
+// entry, and its close still records DOWN. Deliberately does not clear the buffer as well — a re-add can be
+// assigned to a different HTTP worker, whose connection this one cannot see, and its CONNECTED stamp must
+// survive. (harper-pro#431)
+export function releaseSharedStatusOnUnsubscribe(connection) {
+	if (!connection) return;
+	connection.nodeSubscriptions = undefined;
+	connection.sharedStatus = undefined;
 }
 
 // Force a wedged-but-connected subscription to tear down and reconnect. Unlike unsubscribeFromNode this
@@ -727,6 +805,18 @@ export function unsubscribeFromNode({ url, nodes, database }) {
 // defense-in-depth fallback when a subscription is stuck connected:true / Receiving with no progress and
 // the worker-local copy-progress watchdog (harper-pro#453) did not recover it. The connection-key lookup
 // mirrors unsubscribeFromNode so it resolves the same connection the subscribe path created.
+// Apply a recomputed exclusion-origin set (an update-exclusion-origins message from the main thread's
+// subscriptionManager broadcast) to every live subscription connection for the database. Each session
+// diffs against the list it last sent, so a set that changes nothing sends nothing.
+export function updateExclusionOrigins({ database, origins }: { database: string; origins: string[] }) {
+	for (const dbConnections of connections.values()) {
+		const connection = dbConnections.get(database);
+		if (!connection) continue;
+		connection.exclusionOrigins = origins;
+		connection.emit('exclusion-origins-updated', origins);
+	}
+}
+
 export function forceReconnectToNode({ url, nodes, database }) {
 	const connectionKey = getSubscriptionConnectionKey(url, nodes?.[0]?.url);
 	const connection = connections.get(connectionKey)?.get(database);
@@ -811,7 +901,7 @@ function hasExplicitlyReplicatedTable(databaseName) {
 	}
 }
 
-export async function replicateOperation(req, options?: { onPeerResult?: (result: any) => void }) {
+export async function replicateOperation(req, options?: { onPeerResult?: (result: any) => void; timeoutMs?: number }) {
 	const response: { message: string; replicated?: any[] } = { message: '' };
 	if (req.replicated !== false) {
 		req.replicated = false; // don't send a replicated flag to the nodes we are sending to
@@ -826,18 +916,23 @@ export async function replicateOperation(req, options?: { onPeerResult?: (result
 		// each peer settles — letting callers surface per-peer progress in real time
 		// rather than waiting for the aggregate at the end.
 		const onPeerResult = options?.onPeerResult;
+		const timeoutMs = options?.timeoutMs;
 		const perPeer = server.nodes.map((node) =>
-			sendOperationToNode(node, req)
+			sendOperationToNode(node, req, timeoutMs === undefined ? undefined : { timeoutMs })
 				.then((value: any) => {
 					const result: any = value && typeof value === 'object' ? value : { value };
 					result.node = node.name;
 					return result;
 				})
-				.catch((reason) => ({
-					status: 'failed',
-					reason: reason?.toString?.() ?? String(reason),
-					node: node.name,
-				}))
+				.catch((reason) => {
+					// Only the operation's name: its body can carry secrets the redaction lists do not know yet.
+					logger.warn(`Replicating ${req.operation} to ${node.name} failed:`, reason?.message ?? String(reason));
+					return {
+						status: 'failed',
+						reason: reason?.toString?.() ?? String(reason),
+						node: node.name,
+					};
+				})
 				.then((result) => {
 					if (onPeerResult) {
 						try {

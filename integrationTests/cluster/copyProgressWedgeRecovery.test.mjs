@@ -29,7 +29,7 @@ import { ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, readLog } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -132,9 +132,10 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 			authorization: ctx.nodes[1].admin,
 		});
 
-		// Let the copy-progress watchdog fire (at ~COPY_STALL_TIMEOUT) and forceReconnect re-establish, so the
-		// retried copy can complete. The byte watchdog (pingTimeout) is deliberately shorter yet must NOT
-		// recover anything, because pings keep bytesRead advancing — proving copy-progress is the recovery path.
+		// Let the copy-progress watchdog fire (COPY_STALL_TIMEOUT plus its 2×pingInterval
+		// transport-evidence confirmation) and forceReconnect re-establish, so the retried copy can
+		// complete. The byte watchdog (pingTimeout) is deliberately shorter yet must NOT recover
+		// anything, because pings keep bytesRead advancing — proving copy-progress is the recovery path.
 		await delay(COPY_STALL_TIMEOUT_MS + 8000);
 
 		const recordId = 'after-stall-1';
@@ -190,5 +191,29 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 			await delay(POLL_INTERVAL_MS);
 		}
 		ok(connected, 'cluster_status should report the recovered data socket as connected');
+
+		// The recovery actor must be the copy-progress watchdog, within its documented bound and
+		// with no byte-level fire — scoped to the data connection so the system database's own
+		// socket cannot leak into the oracles (harper-pro#697).
+		const log = await readLog(ctx.nodes[1]);
+		const lineTime = (line) => Date.parse(line.slice(0, 24));
+		const dataDbTag = `(db: "${STALL_DB}")`;
+		const fires = log
+			.split('\n')
+			.filter((line) => line.includes('Copy-progress watchdog:') && line.includes(dataDbTag));
+		ok(fires.length >= 1, 'the copy-progress watchdog must have fired on the data connection to drive the recovery');
+		const byteFires = log.split('\n').filter((line) => line.includes('Receive watchdog:') && line.includes(dataDbTag));
+		ok(byteFires.length === 0, 'no byte-level watchdog may act on this ping-alive wedge');
+		// The bound is measured from COPY_START — where noteCopyProgress() first arms the timer —
+		// not from the subscription request, whose setup gates can add unbounded scheduling delay.
+		const copyStartLine = log
+			.split('\n')
+			.find((line) => line.includes('bulk copy starting from') && line.includes(dataDbTag));
+		ok(copyStartLine, 'subscriber log must show the data copy starting');
+		const detectionMs = lineTime(fires[0]) - lineTime(copyStartLine);
+		ok(
+			detectionMs <= COPY_STALL_TIMEOUT_MS * 2 + PING_INTERVAL_MS * 2 + 5000,
+			`copy-progress fire must land within its documented bound; took ${detectionMs}ms`
+		);
 	});
 });

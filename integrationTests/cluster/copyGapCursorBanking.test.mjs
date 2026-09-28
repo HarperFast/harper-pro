@@ -10,9 +10,9 @@
  *
  * Setup: A seeds file-backed blob records, then B joins (add_node → base copy A→B). B's
  * fault injector makes every /blobs/ save SLOW (kept in flight across frames — the condition
- * that starves the old snapshot) and fails selected saves across both the initial and resumed
- * passes. `replication.blobGapReconnectMs` shortens the #683 watchdog so gap cycles take seconds
- * instead of 15 minutes.
+ * that starves the old snapshot) and fails selected records' saves across both the initial and
+ * resumed passes. `replication.blobGapReconnectMs` shortens the #683 watchdog so gap cycles take
+ * seconds instead of 15 minutes.
  *
  * Oracles (the resume trail is the discriminating one):
  *  1. Injected blob gaps force repeated reconnect cycles.
@@ -20,13 +20,14 @@
  *     least one of them banked past the first record: each cycle banked the prefix walked before
  *     that cycle's first fault. Without per-position banking, no mid-walk cursor is persisted
  *     under these conditions, so reconnects re-request a full copy and this assertion fails.
- *  3. The copy converges: B reaches A's record count and every referenced blob payload is intact.
+ *  3. The copy converges: B reaches A's record count and every record's referenced blob payload
+ *     is intact (the referenced bytes, not merely bytes somewhere on disk: a failed save whose
+ *     re-delivery lands under a fresh fileId leaves the record dangling while the payload exists).
  */
 
 import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
-import { readdirSync, existsSync, statSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import {
@@ -36,23 +37,23 @@ import {
 	getNextAvailableLoopbackAddress,
 	targz,
 } from '@harperfast/integration-testing';
-import { sendOperation, fetchWithRetry, concurrent, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
+import { sendOperation, fetchWithRetry, readLog, restartNode, stopNodeProcess } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
 const BLOB_RECORDS = 40; // /LargeLocation/{n} on A — each a deterministic ~50 KB file-backed blob
 const BLOB_BYTES = 50 * 1024;
-// Saves 15 and 31 damage the initial pass; save 42 faults the second repair after the resumed
-// walk has advanced beyond the first gap.
-const FAIL_SAVE_NUMBERS = [15, 31, 42];
+// Records 14 and 30 are damaged in the initial pass; the resumed walk's in-place repair of record
+// 30 fails after that walk has advanced beyond the first gap. Selected by record, not by save
+// ordinal: the copy's post-walk log tail can re-deliver records the walk already copied, which
+// an ordinal schedule counts as walk saves.
+const FAIL_SAVES = ['14:1', '30:1', '30:repair'];
 const INITIAL_DAMAGED_RECORDS = 2;
 const BLOB_SLOW_MS = 400; // every save held in flight, so the pre-#699 snapshot instant never occurs
 const GAP_RECONNECT_MS = 3000; // #683 watchdog cycle, shortened from the 900s default
 
 // The fixture's blob content is deterministic per record id, so the expected payload hash of every
-// record is computable here — presence of each record's exact bytes on disk is the integrity
-// oracle. Re-streams mint fresh fileIds (raw file counts inflate with orphaned duplicates) and
-// failed-save header stubs sit below the size floor; hashing sidesteps both. Mirrors
+// record is computable here — each record serving its exact bytes is the integrity oracle. Mirrors
 // fixture-large-blob-deterministic/resources.js.
 const CHUNK = 1024;
 const CHUNKS = 50;
@@ -67,34 +68,6 @@ function expectedPayloadHash(id) {
 		hash.update(buf);
 	}
 	return hash.digest('hex');
-}
-
-// Record ids whose exact payload bytes are present in B's blob store (blob files carry an 8-byte
-// header before the payload).
-function missingPayloadIds(dataRootDir, totalRecords, db = 'data') {
-	const root = join(dataRootDir, 'blobs', db);
-	const onDisk = new Set();
-	if (existsSync(root)) {
-		const walk = (dir) => {
-			for (const entry of readdirSync(dir, { withFileTypes: true })) {
-				const p = join(dir, entry.name);
-				try {
-					if (entry.isDirectory()) walk(p);
-					else if (statSync(p).size >= BLOB_BYTES) {
-						const bytes = readFileSync(p);
-						onDisk.add(createHash('sha1').update(bytes.subarray(8)).digest('hex'));
-					}
-				} catch {
-					// the orphan sweep can unlink files between readdir and stat/read; a vanished file
-					// is simply not a payload on disk
-				}
-			}
-		};
-		walk(root);
-	}
-	const missing = [];
-	for (let id = 0; id < totalRecords; id++) if (!onDisk.has(expectedPayloadHash(id))) missing.push(id);
-	return missing;
 }
 
 async function missingReferencedPayloadIds(node, totalRecords) {
@@ -135,7 +108,7 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			},
 			env: {
 				HARPER_NO_FLUSH_ON_EXIT: true,
-				HARPER_TEST_BLOB_FAIL_NUMBERS: FAIL_SAVE_NUMBERS.join(','),
+				HARPER_TEST_BLOB_FAIL_SAVES: FAIL_SAVES.join(','),
 				HARPER_TEST_BLOB_SLOW_MS: String(BLOB_SLOW_MS),
 			},
 		});
@@ -153,14 +126,13 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 		await restartNode(ctx.nodes[0]);
 		// Seed with count-verified retries: under load the deploy restart can race the first GETs, so
 		// re-request every id until describe_table confirms the full set (GETs are idempotent).
+		// Sequential, so A's log is appended in key order: a transaction created before but committed
+		// after a later one is re-delivered by the copy's post-walk tail, which would give a faulted
+		// record a second fresh save the schedule above does not account for.
 		for (let attempt = 0; attempt < 20; attempt++) {
-			let nextId = 0;
-			const { execute, finish } = concurrent(
-				() => fetchWithRetry(ctx.nodes[0].httpURL + '/LargeLocation/' + nextId++).catch(() => null),
-				10
-			);
-			for (let i = 0; i < BLOB_RECORDS; i++) await execute();
-			await finish();
+			for (let id = 0; id < BLOB_RECORDS; id++) {
+				await fetchWithRetry(ctx.nodes[0].httpURL + '/LargeLocation/' + id).catch(() => null);
+			}
 			const seeded =
 				(await sendOperation(ctx.nodes[0], { operation: 'describe_table', table: 'LargeLocation' }).catch(() => ({})))
 					.record_count ?? 0;
@@ -205,6 +177,7 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 		let resumeKeys = [];
 		let inPlaceRepairs = 0;
 		let injected = 0;
+		let missing = [];
 		const deadline = Date.now() + 360000;
 		while (Date.now() < deadline) {
 			bCount =
@@ -218,15 +191,13 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			injected = (bLog.match(/\[blob-fail-slow-injector\] failing save /g) ?? []).length;
 			if (
 				bCount >= aCount &&
-				injected >= FAIL_SAVE_NUMBERS.length &&
+				injected >= FAIL_SAVES.length &&
 				inPlaceRepairs >= INITIAL_DAMAGED_RECORDS &&
-				missingPayloadIds(B.dataRootDir, aCount).length === 0
+				(missing = await missingReferencedPayloadIds(B, aCount)).length === 0
 			)
 				break;
 			await delay(2000);
 		}
-
-		const missing = await missingReferencedPayloadIds(B, aCount);
 		const watchdogFires = (bLog.match(/Blob-gap watchdog/g) ?? []).length;
 		const bankedReconnects = (bLog.match(/reconnecting immediately to re-stream/g) ?? []).length;
 		console.log(
@@ -236,8 +207,8 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 		);
 
 		ok(
-			injected === FAIL_SAVE_NUMBERS.length,
-			`fault schedule did not fully materialize (${injected}/${FAIL_SAVE_NUMBERS.length} injected failures)`
+			injected === FAIL_SAVES.length,
+			`fault schedule did not fully materialize (${injected}/${FAIL_SAVES.length} injected failures)`
 		);
 		// A banked cycle reconnects immediately after its final barrier persist; the watchdog only
 		// paces cycles that banked nothing. Either signal proves gap cycles occurred.
@@ -253,8 +224,6 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			resumeKeys.every((key) => Number.isFinite(key)),
 			`a copy resume logged an unparseable cursor key: [${resumeKeys}]`
 		);
-		// Repair saves share the injector's fault-ordinal counter, so a resumed pass whose own first
-		// fault is the repair of the record at the gap re-banks the same prefix.
 		ok(
 			resumeKeys.some((key) => key > 0),
 			`no cycle banked past the first record: [${resumeKeys}] — the copy is re-walking from the start`
