@@ -35,6 +35,7 @@ import {
 	statSync,
 	symlinkSync,
 } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { generateKeyPairSync } from 'node:crypto';
@@ -547,6 +548,48 @@ describe('sshKeyOperations sealing', () => {
 				}
 				assert.equal(readConfig(), before);
 				assert.deepEqual(readdirSync(sshDir).sort(), ['config', 'first.key', 'known_hosts', 'second.key']);
+			});
+
+			it('removes a block whose append failed part way, so the key can still be deleted', async () => {
+				await addKey('first');
+				// short of disk space after the block's lines were written but before its END line
+				const probe = await open(join(rootDir, 'probe'), 'w');
+				const FileHandle = probe.constructor;
+				await probe.close();
+				const appendFile = FileHandle.prototype.appendFile;
+				FileHandle.prototype.appendFile = async function (data, options) {
+					await appendFile.call(this, String(data).slice(0, String(data).indexOf('# END')), options);
+					throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+				};
+				try {
+					await assert.rejects(addKey('second'), { code: 'ENOSPC' });
+				} finally {
+					FileHandle.prototype.appendFile = appendFile;
+				}
+
+				assert.equal(readConfig(), blockFor('first'));
+				await ops.deleteSSHKey({ name: 'second' });
+				assert.deepEqual(readdirSync(sshDir).sort(), ['config', 'first.key', 'known_hosts']);
+			});
+
+			it('keeps what another writer appended while a failed append was writing', async () => {
+				await addKey('first');
+				const probe = await open(join(rootDir, 'probe'), 'w');
+				const FileHandle = probe.constructor;
+				await probe.close();
+				const appendFile = FileHandle.prototype.appendFile;
+				FileHandle.prototype.appendFile = async function (data, options) {
+					writeFileSync(configPath(), '\n# a note', { flag: 'a' });
+					await appendFile.call(this, String(data).slice(0, String(data).indexOf('Host')), options);
+					throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+				};
+				try {
+					await assert.rejects(addKey('second'), { code: 'ENOSPC' });
+				} finally {
+					FileHandle.prototype.appendFile = appendFile;
+				}
+
+				assert.ok(readConfig().startsWith(`${blockFor('first')}\n# a note`), readConfig());
 			});
 
 			it('removes its temporary file when replacing the config fails', async function () {

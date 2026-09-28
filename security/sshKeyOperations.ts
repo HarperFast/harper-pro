@@ -274,9 +274,9 @@ ${SSH_CONFIG_END}${name}`;
 
 	// If the file already exists, add a new config block, otherwise write the file for the first time
 	if (await exists(configFile)) {
-		await appendFile(configFile, '\n' + configBlock);
+		await appendToSSHConfig(configFile, '\n' + configBlock);
 	} else {
-		await writeFileEnsureDir(configFile, configBlock);
+		await writeSSHConfig(configFile, configBlock);
 	}
 
 	let additionalMessage = '';
@@ -645,6 +645,38 @@ function renderSSHConfig(view: SSHConfigView, removing?: string): string {
 	const lastLine = lines.at(-1);
 	if (lastLine && removed[lines.length - 1] && !lineBreakOf(lastLine)) rendered = rendered.replace(/\r?\n$/, '');
 	return rendered;
+}
+
+/**
+ * An append that fails part way removes the bytes it wrote, so the config never keeps a BEGIN line whose
+ * END line never landed. Truncating needs no free space, which a failed write often lacks, and an append
+ * keeps a concurrent add's block, which a replacement would drop.
+ */
+async function appendToSSHConfig(configFile: string, text: string): Promise<void> {
+	const handle = await open(configFile, 'a+');
+	try {
+		const before = (await handle.stat()).size;
+		try {
+			await handle.appendFile(text, 'utf8');
+		} catch (error) {
+			await removePartialAppend(handle, before, Buffer.from(text, 'utf8')).catch((rollbackError) =>
+				harperLogger?.warn(
+					`Unable to remove a partly appended block from the SSH config: ${(rollbackError as Error).message}`
+				)
+			);
+			throw error;
+		}
+	} finally {
+		await handle.close();
+	}
+}
+
+async function removePartialAppend(handle: FileHandle, before: number, text: Buffer): Promise<void> {
+	const written = (await handle.stat()).size - before;
+	if (written <= 0 || written >= text.length) return;
+	const tail = Buffer.alloc(written);
+	await handle.read(tail, 0, written, before);
+	if (tail.equals(text.subarray(0, written))) await handle.truncate(before);
 }
 
 async function readSSHConfigFile(configFile: string): Promise<string | undefined> {
