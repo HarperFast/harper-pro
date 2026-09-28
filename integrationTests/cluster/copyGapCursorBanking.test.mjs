@@ -124,20 +124,35 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			restart: false,
 		});
 		await restartNode(ctx.nodes[0]);
-		// Seed with count-verified retries: under load the deploy restart can race the first GETs, so
-		// re-request every id until describe_table confirms the full set (GETs are idempotent).
-		// Sequential, so A's log is appended in key order: a transaction created before but committed
-		// after a later one is re-delivered by the copy's post-walk tail, which would give a faulted
-		// record a second fresh save the schedule above does not account for.
-		for (let attempt = 0; attempt < 20; attempt++) {
-			for (let id = 0; id < BLOB_RECORDS; id++) {
-				await fetchWithRetry(ctx.nodes[0].httpURL + '/LargeLocation/' + id).catch(() => null);
+		// A's log must be appended in key order: a transaction created before but committed after a
+		// later one is re-delivered by the copy's post-walk tail, which would give a faulted record a
+		// second fresh save the schedule above does not account for. A cache-fill GET fixes its
+		// transaction's key when it starts but answers before that transaction commits, so each id's
+		// commit is awaited before the next GET. Exactly one GET per id, never retried: a second one
+		// can start another fill of the same id that commits after later ids.
+		const seededCount = async () =>
+			(await sendOperation(ctx.nodes[0], { operation: 'describe_table', table: 'LargeLocation', exact_count: true }))
+				.record_count;
+		await fetchWithRetry(ctx.nodes[0].httpURL + '/');
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await seededCount();
+				break;
+			} catch (error) {
+				if (attempt >= 60) throw error;
+				await delay(500);
 			}
-			const seeded =
-				(await sendOperation(ctx.nodes[0], { operation: 'describe_table', table: 'LargeLocation' }).catch(() => ({})))
-					.record_count ?? 0;
-			if (seeded >= BLOB_RECORDS) break;
-			await delay(2000);
+		}
+		for (let id = 0; id < BLOB_RECORDS; id++) {
+			const response = await fetch(ctx.nodes[0].httpURL + '/LargeLocation/' + id);
+			await response.arrayBuffer();
+			ok(response.ok, `seed GET of LargeLocation/${id} failed: HTTP ${response.status}`);
+			const deadline = Date.now() + 30000;
+			let count;
+			while ((count = await seededCount()) <= id) {
+				ok(Date.now() < deadline, `seed of LargeLocation/${id} never committed (count ${count})`);
+				await delay(50);
+			}
 		}
 
 		const bootLog = await readLog(ctx.nodes[1]);
