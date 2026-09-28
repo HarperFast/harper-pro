@@ -19,9 +19,11 @@ function leaderWith(keys, { failures = {} } = {}) {
 
 function recorder({ local = [] } = {}) {
 	const added = [];
+	const removed = [];
 	const logged = [];
 	return {
 		added,
+		removed,
 		logged,
 		errors: () => logged.filter(({ level }) => level === 'error').map(({ message }) => message),
 		addSSHKey: async (key) => {
@@ -29,7 +31,8 @@ function recorder({ local = [] } = {}) {
 			if (key.key === 'disk full') throw new Error('ENOSPC: no space left on device');
 			added.push(key.name);
 		},
-		listLocalSSHKeys: async () => local.map((name) => ({ name })),
+		listLocalSSHKeys: async () => local,
+		removeLocalSSHKey: async (name) => removed.push(name),
 		log: (message, level) => logged.push({ message, level }),
 	};
 }
@@ -39,6 +42,7 @@ const clone = (leader, node, options) =>
 		requestLeader: leader.requestLeader,
 		addSSHKey: node.addSSHKey,
 		listLocalSSHKeys: node.listLocalSSHKeys,
+		removeLocalSSHKey: node.removeLocalSSHKey,
 		log: node.log,
 		retryDelayMs: 0,
 		...options,
@@ -93,7 +97,7 @@ describe('cloneSSHKeysFromLeader', () => {
 	});
 
 	it('leaves a key an earlier attempt cloned, without fetching it again', async () => {
-		const node = recorder({ local: ['first'] });
+		const node = recorder({ local: [{ name: 'first', host: 'gh', hostname: 'example.com' }] });
 		const leader = leaderWith({ first: { key: 'ok' }, second: { key: 'ok' } });
 		await clone(leader, node);
 
@@ -101,6 +105,16 @@ describe('cloneSSHKeysFromLeader', () => {
 		assert.deepEqual(leader.requested, ['list_ssh_keys', 'second']);
 		assert.deepEqual(node.errors(), []);
 		assert.ok(node.logged.some(({ message }) => message === "SSH key 'first' is already on this node"));
+	});
+
+	it('replaces a key an earlier attempt left without its ssh config block', async () => {
+		const node = recorder({ local: [{ name: 'first' }] });
+		const leader = leaderWith({ first: { key: 'ok' } });
+		await clone(leader, node);
+
+		assert.deepEqual(node.removed, ['first']);
+		assert.deepEqual(node.added, ['first']);
+		assert.deepEqual(leader.requested, ['list_ssh_keys', 'first']);
 	});
 
 	it('names each key it clones', async () => {

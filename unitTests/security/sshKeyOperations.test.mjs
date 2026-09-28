@@ -568,6 +568,7 @@ describe('sshKeyOperations sealing', () => {
 						operation === 'list_ssh_keys' ? [{ name: 'legacy' }, { name: 'deploy' }] : { ...leader[name] },
 					addSSHKey: ops.addSSHKey,
 					listLocalSSHKeys: ops.listSSHKeys,
+					removeLocalSSHKey: ops.removeLocalSSHKey,
 					log: (message, level) => logged.push({ message, level }),
 				});
 			const errors = () => logged.filter(({ level }) => level === 'error').map(({ message }) => message);
@@ -587,6 +588,14 @@ describe('sshKeyOperations sealing', () => {
 				["Skipped cloning SSH key 'legacy'"]
 			);
 			assert.ok(logged.some(({ message }) => message === "SSH key 'deploy' is already on this node"));
+
+			// ...and a key it left without its config block is added again, not taken as cloned
+			writeFileSync(join(sshDir, 'config'), '');
+			logged = [];
+			await cloneFromLeader();
+			assert.equal((await ops.getSSHKey({ name: 'deploy' })).host, 'gh');
+			assert.equal(decrypt(storedKeyFor('deploy')), PRIVATE_KEY);
+			assert.ok(logged.some(({ message }) => message.startsWith("Replacing SSH key 'deploy'")));
 		});
 	});
 

@@ -4,23 +4,23 @@ export const LEADER_REQUEST_ATTEMPTS = 3;
 export const LEADER_RETRY_DELAY_MS = 250;
 
 /**
- * Key by key, since a leader can hold keys stored before `add_ssh_key` validated them, and one this node
- * refuses must not cost the rest: that refusal is skipped, logged by name and never with the key's
- * material. Anything else throws, so the clone's setup stays unfinished and a later start retries it: a
- * leader request that still fails after `attempts` tries, or a key this node can't store. A key an earlier
- * attempt already cloned is left as it is.
+ * Key by key: a leader can hold keys stored before `add_ssh_key` validated them, and one this node refuses
+ * must not cost the rest, so only that refusal is skipped (logged by name, never with its material). Any
+ * other failure throws, leaving setup unfinished for a later start to retry.
  */
 export async function cloneSSHKeysFromLeader({
 	requestLeader,
 	addSSHKey,
 	listLocalSSHKeys,
+	removeLocalSSHKey,
 	log,
 	attempts = LEADER_REQUEST_ATTEMPTS,
 	retryDelayMs = LEADER_RETRY_DELAY_MS,
 }: {
 	requestLeader: (operation: { operation: string; name?: string }) => Promise<any>;
 	addSSHKey: (key: any) => Promise<unknown>;
-	listLocalSSHKeys: () => Promise<Array<{ name: string }>>;
+	listLocalSSHKeys: () => Promise<Array<{ name: string; host?: string; hostname?: string }>>;
+	removeLocalSSHKey: (name: string) => Promise<void>;
 	log: (message: string, level?: 'notify' | 'error') => void;
 	attempts?: number;
 	retryDelayMs?: number;
@@ -47,11 +47,16 @@ export async function cloneSSHKeysFromLeader({
 		return;
 	}
 
-	const localNames = new Set((await listLocalSSHKeys()).map(({ name }) => name));
+	const local = new Map((await listLocalSSHKeys()).map((key) => [key.name, key]));
 	for (const { name } of keys) {
-		if (localNames.has(name)) {
+		const existing = local.get(name);
+		if (existing?.host && existing.hostname) {
 			log(`SSH key '${name}' is already on this node`);
 			continue;
+		}
+		if (existing) {
+			log(`Replacing SSH key '${name}', which an earlier attempt left without its ssh config block`);
+			await removeLocalSSHKey(name);
 		}
 		log(`Cloning SSH key: ${name}`);
 		const key = await fromLeader({ operation: 'get_ssh_key', name });

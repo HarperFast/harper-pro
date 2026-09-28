@@ -405,21 +405,34 @@ export async function deleteSSHKey(req: { name: string }): Promise<{ message: st
 	const { name } = req;
 	harperLogger?.trace(`deleting ssh key`, name);
 
-	const { filePath, configFile } = getSSHPaths(name);
+	const { filePath } = getSSHPaths(name);
 	if (!(await exists(filePath))) {
 		throw new ClientError(`SSH key '${name}' does not exist.`);
 	}
 
-	if (await exists(configFile)) {
-		const fileContents = withoutSSHConfigBlocks(await readFile(configFile, 'utf8'), name).trim();
-		await writeFileEnsureDir(configFile, fileContents);
-	}
-
-	await unlink(filePath);
+	await removeSSHKeyFiles(name);
 
 	const response = await replicateOperation(req);
 	response.message = `Deleted ssh key: ${name}`;
 	return response;
+}
+
+/**
+ * Clone setup only: removes this node's copy of a key that an interrupted `addSSHKey` left without its
+ * config block, so it can be added again. Never replicated: peers hold a complete copy.
+ */
+export async function removeLocalSSHKey(name: string): Promise<void> {
+	if (!SSH_KEY_NAME_REGEX.test(name)) throw new ClientError(SSH_KEY_NAME_ERROR_MSG);
+	await removeSSHKeyFiles(name);
+}
+
+async function removeSSHKeyFiles(name: string): Promise<void> {
+	const { filePath, configFile } = getSSHPaths(name);
+	if (await exists(configFile)) {
+		const fileContents = withoutSSHConfigBlocks(await readFile(configFile, 'utf8'), name).trim();
+		await writeFileEnsureDir(configFile, fileContents);
+	}
+	await unlink(filePath);
 }
 
 /**
