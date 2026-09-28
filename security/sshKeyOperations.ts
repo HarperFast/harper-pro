@@ -1,4 +1,5 @@
 import Joi from 'joi';
+import { randomUUID } from 'node:crypto';
 import { join, dirname, basename } from 'node:path';
 import {
 	constants,
@@ -11,9 +12,14 @@ import {
 	mkdir,
 	readdir,
 	stat,
+	open,
+	realpath,
+	rename,
+	type FileHandle,
 } from 'node:fs/promises';
 
 import { validateBySchema } from '../core/validation/validationWrapper.js';
+import { isUnsupportedSyncError } from '../core/utility/fsync.ts';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 import { ClientError } from '../core/utility/errors/hdbError.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -258,11 +264,13 @@ export async function addSSHKey(
 
 	// Build the config block string
 	const configBlock = `#${name}
+${SSH_CONFIG_BEGIN}${name}
 Host ${host}
 	HostName ${hostname}
 	User git
 	IdentityFile ${filePath}
-	IdentitiesOnly yes`;
+	IdentitiesOnly yes
+${SSH_CONFIG_END}${name}`;
 
 	// If the file already exists, add a new config block, otherwise write the file for the first time
 	if (await exists(configFile)) {
@@ -332,7 +340,7 @@ export async function getSSHKey(req: {
 	if (validation) throw new ClientError(validation.message);
 
 	const { name } = req;
-	const { filePath, configFile } = getSSHPaths(name);
+	const { sshDir, filePath, configFile } = getSSHPaths(name);
 
 	if (!(await exists(filePath))) {
 		throw new ClientError(`SSH key '${name}' does not exist.`);
@@ -341,16 +349,8 @@ export async function getSSHKey(req: {
 	harperLogger?.trace(`getting ssh key`, name, filePath);
 
 	const key = await readFile(filePath, 'utf8');
-	const result: { name: string; key: string; host?: string; hostname?: string } = { name, key };
-
-	if (await exists(configFile)) {
-		const configContents = await readFile(configFile, 'utf8');
-		const { host, hostname } = extractMatchingHostAndHostname(configContents, name);
-		if (host) result.host = host;
-		if (hostname) result.hostname = hostname;
-	}
-
-	return result;
+	const config = await readSSHConfigFile(configFile);
+	return { name, key, ...(config !== undefined && configuredHost(readSSHConfig(config, sshDir), name)) };
 }
 
 /**
@@ -391,8 +391,12 @@ export async function updateSSHKey(req: {
 }
 
 /**
- * Deletes an existing SSH key and removes its associated config block from
- * the SSH config file.
+ * Deletes an existing SSH key and removes its associated config blocks from
+ * the SSH config file, leaving every line outside them as it was.
+ *
+ * Refused, changing nothing, when the key's block has a BEGIN line with no END line, since where the
+ * block ends is then unknown. The config is rewritten before the key file is unlinked, so a rewrite
+ * that fails leaves the key usable.
  *
  * @param req - The request object containing the key name.
  * @param req.name - The name of the SSH key to delete.
@@ -405,14 +409,24 @@ export async function deleteSSHKey(req: { name: string }): Promise<{ message: st
 	const { name } = req;
 	harperLogger?.trace(`deleting ssh key`, name);
 
-	const { filePath, configFile } = getSSHPaths(name);
+	const { sshDir, filePath, configFile } = getSSHPaths(name);
 	if (!(await exists(filePath))) {
 		throw new ClientError(`SSH key '${name}' does not exist.`);
 	}
 
-	if (await exists(configFile)) {
-		const fileContents = withoutSSHConfigBlocks(await readFile(configFile, 'utf8'), name).trim();
-		await writeFileEnsureDir(configFile, fileContents);
+	const config = await readSSHConfigFile(configFile);
+	if (config !== undefined) {
+		const view = readSSHConfig(config, sshDir);
+		const unterminatedLine = view.unterminated.get(name);
+		if (unterminatedLine !== undefined) {
+			throw new ClientError(
+				`SSH key '${name}' was not deleted: line ${unterminatedLine} of the SSH config begins its block ` +
+					`("${SSH_CONFIG_BEGIN}${name}"), but no "${SSH_CONFIG_END}${name}" line ends it. ` +
+					'Restore that line, or remove the block by hand, then delete the key again.'
+			);
+		}
+		const updated = renderSSHConfig(view, name);
+		if (updated !== config) await writeSSHConfig(configFile, updated);
 	}
 
 	await unlink(filePath);
@@ -434,48 +448,128 @@ export async function listSSHKeys(): Promise<{ name: string; host?: string; host
 	const { sshDir, configFile } = getSSHPaths(undefined);
 	if (!(await exists(sshDir))) return [];
 
-	const configContents: string | null = (await exists(configFile)) ? await readFile(configFile, 'utf8') : null;
+	const config = await readSSHConfigFile(configFile);
+	const view = config === undefined ? undefined : readSSHConfig(config, sshDir);
 	const results: { name: string; host?: string; hostname?: string }[] = [];
-	for (const file of await readdir(sshDir)) {
-		const name = basename(file, '.key');
-		if (!file.endsWith('.key') || !SSH_KEY_NAME_REGEX.test(name)) continue;
-		// like get_ssh_key's readFile, stat follows a symlink to its key file
-		if (!(await stat(join(sshDir, file)).catch(() => undefined))?.isFile()) continue;
-
-		const result: { name: string; host?: string; hostname?: string } = { name };
-		if (configContents) {
-			const { host, hostname } = extractMatchingHostAndHostname(configContents, name);
-			if (host) result.host = host;
-			if (hostname) result.hostname = hostname;
-		}
-		results.push(result);
+	for (const name of await listSSHKeyNames(sshDir)) {
+		results.push({ name, ...(view && configuredHost(view, name)) });
 	}
 	return results;
 }
 
+async function listSSHKeyNames(sshDir: string): Promise<string[]> {
+	const names: string[] = [];
+	for (const file of await readdir(sshDir)) {
+		const name = basename(file, '.key');
+		if (!file.endsWith('.key') || !SSH_KEY_NAME_REGEX.test(name)) continue;
+		// like get_ssh_key's readFile, stat follows a symlink to its key file
+		if ((await stat(join(sshDir, file)).catch(() => undefined))?.isFile()) names.push(name);
+	}
+	return names;
+}
+
+const SSH_CONFIG_BEGIN = '# BEGIN harper ssh key ';
+const SSH_CONFIG_END = '# END harper ssh key ';
+const SSH_CONFIG_MARKER = /^[ \t]*# (BEGIN|END) harper ssh key ([a-zA-Z0-9-_]+)[ \t]*$/;
 const SSH_CONFIG_KEY_COMMENT = /^[ \t]*#([a-zA-Z0-9-_]+)[ \t]*$/;
 const SSH_CONFIG_SECTION_START = /^[ \t]*(?:Host|Match)(?:[ \t]*=|[ \t]+)/i;
 const SSH_CONFIG_BLANK_OR_COMMENT = /^[ \t]*(?:#.*)?$/;
+const SSH_CONFIG_IDENTITY_FILE = /^[ \t]*IdentityFile(?:[ \t]*=[ \t]*|[ \t]+)(.*?)[ \t]*$/i;
+
+interface SSHConfigLine {
+	start: number;
+	// past the line break, when the line has one
+	end: number;
+	text: string;
+}
+
+interface SSHConfigBlock {
+	first: number;
+	last: number;
+	// written before blocks had markers: `first` is its `#name` line, `last` its last directive
+	legacy: boolean;
+}
+
+interface SSHConfigView {
+	config: string;
+	lines: SSHConfigLine[];
+	blocks: Map<string, SSHConfigBlock[]>;
+	// the 1-based line of the name's first BEGIN that no END closes
+	unterminated: Map<string, number>;
+}
 
 /**
- * Where each SSH config block `addSSHKey` wrote for `name` sits in `config`, as `[start, end)`
- * offsets. A block is the key's `#name` line — the whole line, blanks aside, or `#repo` would claim
- * `#repo-2`'s block — plus the `Host` section it heads, which, as OpenSSH scopes it, runs to the next
- * `Host` or `Match` line. A `#name` line heads the next `Host` or `Match` line unless a directive or
- * another `#name` line comes first, and a block also stops at the next key's header, so a hand-edited
- * block never takes in a sibling key's block or an unmanaged section.
+ * The key blocks in an SSH config. A block runs from `# BEGIN harper ssh key <name>` to the next
+ * `# END harper ssh key <name>` with no other marker between, plus the `#<name>` line directly above
+ * its BEGIN, kept so that a version that finds blocks by their `#<name>` line alone still reads and
+ * deletes exactly the block. A BEGIN that meets another marker or the end of the file first leaves the
+ * block's end unknown; a stray END delimits nothing.
+ *
+ * A block written before blocks had markers is read as if it had them: a `#<name>` line and the section
+ * it heads, bounded the way OpenSSH scopes it, trailing comments excluded — but only when one of its
+ * `IdentityFile` lines is exactly the key file `addSSHKey` writes for that name, since nothing else in
+ * that format shows who wrote the section.
  */
-function findSSHConfigBlocks(config: string, name: string): [number, number][] {
-	const lines: { start: number; text: string }[] = [];
+function readSSHConfig(config: string, sshDir: string): SSHConfigView {
+	const lines: SSHConfigLine[] = [];
 	for (let start = 0; start < config.length;) {
 		const newline = config.indexOf('\n', start);
-		const end = newline === -1 ? config.length : newline;
-		lines.push({ start, text: config.slice(start, end).replace(/\r$/, '') });
-		start = end + 1;
+		const end = newline === -1 ? config.length : newline + 1;
+		lines.push({ start, end, text: config.slice(start, newline === -1 ? end : newline).replace(/\r$/, '') });
+		start = end;
 	}
+
+	const blocks = new Map<string, SSHConfigBlock[]>();
+	const addBlock = (name: string, block: SSHConfigBlock) => {
+		const named = blocks.get(name);
+		if (named) named.push(block);
+		else blocks.set(name, [block]);
+	};
+	const unterminated = new Map<string, number>();
+	const marked = new Uint8Array(lines.length);
+	let open: { name: string; index: number } | undefined;
+	const abandonOpen = () => {
+		if (open && !unterminated.has(open.name)) unterminated.set(open.name, open.index + 1);
+		open = undefined;
+	};
+	for (let index = 0; index < lines.length; index++) {
+		const marker = SSH_CONFIG_MARKER.exec(lines[index].text);
+		if (!marker) continue;
+		marked[index] = 1;
+		const [, kind, name] = marker;
+		if (kind === 'BEGIN') {
+			abandonOpen();
+			open = { name, index };
+		} else if (open?.name === name) {
+			const headed = open.index > 0 && SSH_CONFIG_KEY_COMMENT.exec(lines[open.index - 1].text)?.[1] === name;
+			const first = headed ? open.index - 1 : open.index;
+			marked.fill(1, first, index + 1);
+			addBlock(name, { first, last: index, legacy: false });
+			open = undefined;
+		} else abandonOpen();
+	}
+	abandonOpen();
+
+	for (let from = 0; from < lines.length; from++) {
+		let to = from;
+		while (to < lines.length && !marked[to]) to++;
+		if (to > from) findLegacySSHConfigBlocks(lines, from, to, sshDir, addBlock);
+		from = to;
+	}
+	for (const named of blocks.values()) named.sort((a, b) => a.first - b.first);
+	return { config, lines, blocks, unterminated };
+}
+
+function findLegacySSHConfigBlocks(
+	lines: SSHConfigLine[],
+	from: number,
+	to: number,
+	sshDir: string,
+	addBlock: (name: string, block: SSHConfigBlock) => void
+): void {
 	const startsSection = (index: number) => SSH_CONFIG_SECTION_START.test(lines[index].text);
 	const sectionHeadedBy = (index: number): number | undefined => {
-		for (let next = index + 1; next < lines.length; next++) {
+		for (let next = index + 1; next < to; next++) {
 			const { text } = lines[next];
 			if (SSH_CONFIG_KEY_COMMENT.test(text)) return undefined;
 			if (!SSH_CONFIG_BLANK_OR_COMMENT.test(text)) return startsSection(next) ? next : undefined;
@@ -485,51 +579,170 @@ function findSSHConfigBlocks(config: string, name: string): [number, number][] {
 	const isKeyHeader = (index: number) =>
 		SSH_CONFIG_KEY_COMMENT.test(lines[index].text) && sectionHeadedBy(index) !== undefined;
 
-	const blocks: [number, number][] = [];
-	for (let index = 0; index < lines.length; index++) {
-		if (SSH_CONFIG_KEY_COMMENT.exec(lines[index].text)?.[1] !== name) continue;
+	for (let index = from; index < to; index++) {
+		const name = SSH_CONFIG_KEY_COMMENT.exec(lines[index].text)?.[1];
+		if (!name) continue;
 		let end = (sectionHeadedBy(index) ?? index) + 1;
-		while (end < lines.length && !startsSection(end) && !isKeyHeader(end)) end++;
-		blocks.push([lines[index].start, end < lines.length ? lines[end].start : config.length]);
-		index = end - 1;
+		while (end < to && !startsSection(end) && !isKeyHeader(end)) end++;
+		let last = end - 1;
+		while (last > index && SSH_CONFIG_BLANK_OR_COMMENT.test(lines[last].text)) last--;
+		if (!namesKeyFile(lines, index + 1, last, join(sshDir, name + '.key'))) continue;
+		addBlock(name, { first: index, last, legacy: true });
+		index = last;
 	}
-	return blocks;
 }
 
-function withoutSSHConfigBlocks(config: string, name: string): string {
-	let remaining = '';
-	let keptFrom = 0;
-	for (const [start, end] of findSSHConfigBlocks(config, name)) {
-		remaining += config.slice(keptFrom, start);
-		keptFrom = end;
+function namesKeyFile(lines: SSHConfigLine[], from: number, to: number, keyFile: string): boolean {
+	const normalize = (path: string) => (process.platform === 'win32' ? path.replace(/\\/g, '/').toLowerCase() : path);
+	for (let index = from; index <= to; index++) {
+		const identityFile = SSH_CONFIG_IDENTITY_FILE.exec(lines[index].text)?.[1];
+		if (identityFile !== undefined && normalize(identityFile.replace(/^"(.*)"$/, '$1')) === normalize(keyFile)) {
+			return true;
+		}
 	}
-	return remaining + config.slice(keptFrom);
+	return false;
+}
+
+function configuredHost(view: SSHConfigView, name: string): { host?: string; hostname?: string } {
+	const block = view.blocks.get(name)?.[0];
+	if (!block) return {};
+	let host: string | undefined;
+	let hostname: string | undefined;
+	for (let index = block.first; index <= block.last; index++) {
+		const { text } = view.lines[index];
+		host ??= /^[ \t]*Host[ \t]+(.+)$/.exec(text)?.[1].trim();
+		hostname ??= /^[ \t]*HostName[ \t]+(.+)$/.exec(text)?.[1].trim();
+	}
+	return { ...(host && { host }), ...(hostname && { hostname }) };
 }
 
 /**
- * Extracts the Host and HostName values from an SSH config block matching
- * the given key name. Config blocks are identified by a leading comment
- * in the format `#keyName`.
- *
- * @param configContents - The full contents of the SSH config file.
- * @param name - The name of the SSH key whose config block to extract from.
- * @returns An object containing the optional Host and HostName values from
- * the matching config block, or an empty object if no match is found.
+ * The config with markers around its legacy blocks and without `removing`'s blocks. A removed block
+ * takes one line break with it, the one before it when it ends the file, so removing the block
+ * `addSSHKey` last appended restores the file it appended to.
  */
-function extractMatchingHostAndHostname(configContents: string, name: string): { host?: string; hostname?: string } {
-	const [block] = findSSHConfigBlocks(configContents, name);
+function renderSSHConfig(view: SSHConfigView, removing?: string): string {
+	const { config, lines } = view;
+	const lineBreakOf = (line: SSHConfigLine) =>
+		config[line.end - 1] !== '\n' ? '' : config[line.end - 2] === '\r' ? '\r\n' : '\n';
+	const removed = new Uint8Array(lines.length);
+	const beginAfter = new Map<number, string>();
+	const endAfter = new Map<number, { name: string; lineBreak: string }>();
+	for (const [name, named] of view.blocks) {
+		for (const block of named) {
+			if (name === removing) removed.fill(1, block.first, block.last + 1);
+			else if (block.legacy) {
+				beginAfter.set(block.first, name);
+				endAfter.set(block.last, { name, lineBreak: lineBreakOf(lines[block.first]) });
+			}
+		}
+	}
 
-	if (!block) return {};
+	let rendered = '';
+	for (let index = 0; index < lines.length; index++) {
+		if (removed[index]) continue;
+		const line = lines[index];
+		rendered += config.slice(line.start, line.end);
+		const begin = beginAfter.get(index);
+		if (begin !== undefined) rendered += SSH_CONFIG_BEGIN + begin + lineBreakOf(line);
+		const end = endAfter.get(index);
+		if (end) {
+			const lineBreak = lineBreakOf(line);
+			rendered += lineBreak ? SSH_CONFIG_END + end.name + lineBreak : end.lineBreak + SSH_CONFIG_END + end.name;
+		}
+	}
+	const lastLine = lines.at(-1);
+	if (lastLine && removed[lines.length - 1] && !lineBreakOf(lastLine)) rendered = rendered.replace(/\r?\n$/, '');
+	return rendered;
+}
 
-	const configBlock = configContents.slice(...block);
+async function readSSHConfigFile(configFile: string): Promise<string | undefined> {
+	try {
+		return await readFile(configFile, 'utf8');
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+		throw error;
+	}
+}
 
-	const host = configBlock.match(/^Host\s+(.+)$/m)?.[1]?.trim();
-	const hostname = configBlock.match(/^\s*HostName\s+(.+)$/m)?.[1]?.trim();
+/**
+ * Replace the config so that a crash leaves the old file or the new one, never a truncated file that
+ * would disable every key on the node. A symlinked config is replaced at its target, keeping the link.
+ */
+async function writeSSHConfig(configFile: string, contents: string): Promise<void> {
+	const target = await realpath(configFile).catch(() => configFile);
+	const mode = (await stat(target).catch(() => undefined))?.mode;
+	const temporaryFile = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
+	let handle: FileHandle | undefined;
+	try {
+		handle = await open(temporaryFile, 'wx', 0o600);
+		await handle.writeFile(contents, 'utf8');
+		if (mode !== undefined) await handle.chmod(mode & 0o777);
+		await handle.sync();
+		await handle.close();
+		handle = undefined;
+		await rename(temporaryFile, target);
+	} catch (error) {
+		await handle?.close().catch(() => {});
+		await unlink(temporaryFile).catch(() => {});
+		throw error;
+	}
+	let directory: FileHandle | undefined;
+	try {
+		directory = await open(dirname(target), 'r');
+		await directory.sync();
+	} catch (error) {
+		// the new config is already in place; only its survival across a power loss is in doubt
+		if (!isUnsupportedSyncError(error)) {
+			harperLogger?.warn(
+				`Unable to sync ${dirname(target)} after rewriting the SSH config: ${(error as Error).message}`
+			);
+		}
+	} finally {
+		await directory?.close().catch(() => {});
+	}
+}
 
-	return {
-		...(host && { host }),
-		...(hostname && { hostname }),
-	};
+let startupMigration: Promise<void> | undefined;
+
+/**
+ * `migrateSSHConfig`, once per process. Called on the main thread before any worker thread starts or
+ * any listener binds, when no SSH key operation can be writing the config.
+ */
+export function migrateSSHConfigOnce(): Promise<void> {
+	startupMigration ??= migrateSSHConfig();
+	return startupMigration;
+}
+
+/**
+ * Writes BEGIN/END lines around the blocks of a config written before blocks had them, and logs what it
+ * found. Never rejects: on failure the config stays as it was, and every operation still reads it as
+ * if migrated.
+ */
+export async function migrateSSHConfig(): Promise<void> {
+	try {
+		const { sshDir, configFile } = getSSHPaths(undefined);
+		const config = await readSSHConfigFile(configFile);
+		if (config === undefined) return;
+		const view = readSSHConfig(config, sshDir);
+		let marked = 0;
+		for (const named of view.blocks.values()) marked += named.filter((block) => block.legacy).length;
+		if (marked) await writeSSHConfig(configFile, renderSSHConfig(view));
+
+		const unmanaged = (await listSSHKeyNames(sshDir)).filter((name) => !view.blocks.has(name));
+		const findings = [
+			marked && `added BEGIN/END lines around ${marked} key block(s)`,
+			unmanaged.length && `found no block it can manage for key(s) ${unmanaged.join(', ')}`,
+			view.unterminated.size &&
+				`found a BEGIN line with no END line for key(s) ${[...view.unterminated.keys()].join(', ')}`,
+		].filter(Boolean);
+		if (!findings.length) return;
+		const summary = `SSH config ${configFile}: ${findings.join('; ')}`;
+		if (unmanaged.length || view.unterminated.size) harperLogger?.warn(summary);
+		else harperLogger?.info(summary);
+	} catch (error) {
+		harperLogger?.error(`Unable to add BEGIN/END lines to the SSH config: ${(error as Error)?.message ?? error}`);
+	}
 }
 
 /**
