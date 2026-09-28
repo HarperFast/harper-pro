@@ -49,8 +49,6 @@ suite('SSH config written before key blocks had BEGIN and END lines', (ctx) => {
 			/^#first\n# BEGIN harper ssh key first\nHost first\.alias\n[^]*\n# END harper ssh key first\n#second\n/
 		);
 
-		// stopped, and started again on a config an earlier version wrote for the same keys, with a section of
-		// the user's own after them
 		await killHarper(ctx);
 		await writeFile(
 			configFile,

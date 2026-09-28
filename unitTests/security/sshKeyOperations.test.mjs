@@ -288,7 +288,6 @@ describe('sshKeyOperations sealing', () => {
 		const keyPath = (name) => join(sshDir, `${name}.key`);
 		const addKey = (name) =>
 			ops.addSSHKey(request({ name, key: PRIVATE_KEY, host: `${name}.alias`, hostname: 'example.com' }));
-		// the block add_ssh_key wrote before blocks had BEGIN and END lines
 		const legacyBlockFor = (name) =>
 			`#${name}\nHost ${name}.alias\n\tHostName example.com\n\tUser git\n\tIdentityFile ${keyPath(name)}\n\tIdentitiesOnly yes`;
 		const withMarkers = (legacyBlock) => {
@@ -718,9 +717,30 @@ describe('sshKeyOperations sealing', () => {
 				// the blank line is where the regex cut middle's lines out
 				assert.equal(readConfig(), '\n# END harper ssh key middle');
 			});
+
+			it('an earlier version handles keys whose names share a prefix in this format as it does in the old one', async () => {
+				// the regex matches `#repo` as a prefix of `#repo-2` in either format, which #910 fixed
+				const withoutMarkers = (config) => config.replace(/^# (BEGIN|END) harper ssh key .*\n?/gm, '').trim();
+				for (const order of [
+					['repo-2', 'repo'],
+					['repo', 'repo-2'],
+				]) {
+					const marked = order.map(blockFor).join('\n');
+					const legacy = order.map(legacyBlockFor).join('\n');
+					for (const name of order) {
+						assert.deepEqual(anchoredParser.get(marked, name), { host: `${name}.alias`, hostname: 'example.com' });
+						assert.equal(anchoredParser.delete(marked, name), blockFor(order.find((other) => other !== name)));
+						assert.deepEqual(regexParser.get(marked, name), regexParser.get(legacy, name), order.join());
+						assert.equal(
+							withoutMarkers(regexParser.delete(marked, name)),
+							regexParser.delete(legacy, name),
+							order.join()
+						);
+					}
+				}
+			});
 		});
 
-		// The hand-edited shapes #910 had to infer, as an upgraded node's config holds them.
 		function handEditedLegacyConfig(migrated = false) {
 			const block = (name, extra = '') => {
 				const legacy = legacyBlockFor(name) + extra;
