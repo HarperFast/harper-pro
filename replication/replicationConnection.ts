@@ -3085,7 +3085,7 @@ const COPY_FLUSH_RETRY_MAX_MS = 30_000;
 export class NodeReplicationConnection extends EventEmitter {
 	socket: ReplicationWebSocket;
 	startTime: number;
-	retryBackoff: Backoff; // created on the first failure
+	retryBackoff?: Backoff;
 
 	random = Math.random;
 	setReconnectTimer = setTimeout;

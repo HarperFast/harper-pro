@@ -76,7 +76,7 @@ describe('shouldRetrySourceBlobRead — the sendBlobs retry gate (#683)', () => 
 });
 
 describe('BLOB_SEND_RETRY_BACKOFF (#683)', () => {
-	it('waits exactly 250, 500, 1000, 2000 ms, then forwards the error', () => {
+	it('waits exactly 250, 500, 1000, 2000 ms, then is exhausted', () => {
 		const backoff = createBackoff(BLOB_SEND_RETRY_BACKOFF);
 		const delays = [];
 		for (let i = 0; i < 5; i++) delays.push(backoff.nextDelay());
