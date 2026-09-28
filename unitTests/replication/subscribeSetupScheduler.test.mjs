@@ -174,17 +174,35 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		assert.deepEqual(dispatches, []);
 	});
 
-	it('holds a sweep setup at the floor the sweep has reached', () => {
-		const { scheduler } = makeScheduler(() => 0.5);
-		assert.equal(scheduler.schedule(URL_A, 'data', NODES, { nextDelayFloor: 450 }), 450);
+	function assertSpaced(delays) {
+		const sorted = [...delays].sort((x, y) => x - y);
+		for (let i = 1; i < sorted.length; i++) assert.ok(sorted[i] - sorted[i - 1] >= 50, `${sorted} too close`);
+	}
+
+	it('slides a sweep setup past one armed within the stagger window', () => {
+		const { scheduler } = makeScheduler(() => 0.6);
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES, { armedDelays: [300] }), 350);
 	});
 
 	it('preserves sweep spacing when independent jitter draws would collide', () => {
-		const draws = [0.75, 0.5, 0.25, 0];
+		const draws = [0.75, 0.5, 0.26, 0.24, 0];
 		const { scheduler } = makeScheduler(() => draws.shift());
-		const sweep = { nextDelayFloor: 0 };
-		const delays = [0, 1, 2, 3].map((i) => scheduler.schedule(URL_A, `data${i}`, NODES, sweep));
-		assert.deepEqual(delays, [350, 400, 450, 500]);
+		const sweep = { armedDelays: [] };
+		const delays = [0, 1, 2, 3, 4].map((i) => scheduler.schedule(URL_A, `data${i}`, NODES, sweep));
+		assert.deepEqual(delays, [350, 300, 400, 248, 450]);
+		assertSpaced(delays);
+	});
+
+	it('keeps spacing next to a pair drawn just past the fresh-draw window', () => {
+		// 300 ms on the first attempt, then 401 ms from the 800 ms ceiling, then a fresh pair's 399 ms
+		const draws = [0.5, 201 / 600, 0.995];
+		const { scheduler } = makeScheduler(() => draws.shift());
+		scheduler.schedule(URL_A, 'failed-once', NODES);
+		timers.tick(MAX_DELAY);
+		const sweep = { armedDelays: [] };
+		const failedOnce = scheduler.schedule(URL_A, 'failed-once', NODES, sweep);
+		const fresh = scheduler.schedule(URL_A, 'fresh', NODES, sweep);
+		assert.deepEqual([failedOnce, fresh], [401, 451]);
 	});
 
 	it('does not let a pair with an escalated backoff drag the rest of the sweep', () => {
@@ -193,7 +211,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 			scheduler.schedule(URL_A, 'failing', NODES);
 			timers.tick(MAX_DELAY);
 		}
-		const sweep = { nextDelayFloor: 0 };
+		const sweep = { armedDelays: [] };
 		const escalated = scheduler.schedule(URL_A, 'failing', NODES, sweep);
 		const healthy = scheduler.schedule(URL_A, 'healthy', NODES, sweep);
 		assert.ok(escalated > 20_000, `escalated delay ${escalated}`);

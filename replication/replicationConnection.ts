@@ -3822,7 +3822,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (copyFromNodeId !== undefined)
 						getDatabaseStores().dbisDB?.put([Symbol.for('copyCursor'), copyFromNodeId], cursorAtFlush);
 					copyFlushBackoffUntil = 0;
-					copyFlushBackoff?.reset(); // flush succeeded
+					copyFlushBackoff?.reset();
 					if (copyCompleteReceived) noteCopyFinalizeProgress();
 					logger.trace?.(connectionId, 'copy cursor advanced (rows flushed durable)');
 					// A persist under a drained barrier is the connection's LAST possible progress: every

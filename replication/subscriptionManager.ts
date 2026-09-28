@@ -192,7 +192,7 @@ interface SubscribeSchedule {
 
 /** Shared by the setups of one stale-worker reassignment sweep, so they dial at least `staggerMs` apart (#446). */
 export interface SetupSweep {
-	nextDelayFloor: number;
+	armedDelays: number[];
 }
 
 export interface SubscribeSetupScheduler {
@@ -267,11 +267,21 @@ export function createSubscribeSetupScheduler(deps: {
 			if (schedule.timer) return undefined;
 			const backoffDelay = schedule.backoff.nextDelay();
 			if (backoffDelay === undefined) return undefined;
-			const floor = sweep?.nextDelayFloor ?? 0;
-			const delay = Math.max(backoffDelay, floor);
-			// A pair whose own backoff has escalated lands past the fresh-draw window, already clear of the
-			// sweep's ladder; chaining the floor through it would drag every later setup out to its ceiling.
-			if (sweep && delay < floor + initialMs) sweep.nextDelayFloor = delay + staggerMs;
+			let delay = backoffDelay;
+			if (sweep) {
+				// Slide only past setups this sweep armed nearby: a floor chained through every setup would let
+				// one pair's escalated delay drag the rest of the sweep out to its ceiling.
+				for (let moved = true; moved;) {
+					moved = false;
+					for (const armed of sweep.armedDelays) {
+						if (Math.abs(armed - delay) < staggerMs) {
+							delay = armed + staggerMs;
+							moved = true;
+						}
+					}
+				}
+				sweep.armedDelays.push(delay);
+			}
 			schedule.timer = setTimer(() => {
 				schedule.timer = undefined;
 				const pending = schedule.nodes;
@@ -2077,7 +2087,7 @@ export async function startOnMainThread(options) {
 			// staggering guarded against before #357 made the reconcile the single reassignment path. A
 			// per-node stagger alone left the per-database burst (a peer with N databases dialed N at once),
 			// so stagger per DATABASE across the whole sweep like the wedge path does. See cb1kenobi review on #446.
-			const subscribeStagger: SetupSweep = { nextDelayFloor: 0 };
+			const subscribeStagger: SetupSweep = { armedDelays: [] };
 			for (const node of staleNodesToReassign) {
 				// The node may have been removed or replaced since we flagged it; only re-drive it if it is
 				// still the current entry in nodeMap, so a deleted node isn't resurrected (gemini review).
