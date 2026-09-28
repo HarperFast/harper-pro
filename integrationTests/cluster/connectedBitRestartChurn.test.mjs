@@ -385,15 +385,27 @@ suite(
 					service: 'http_workers',
 				});
 				ok(restart.job_id, `restart_service returned no job id: ${JSON.stringify(restart)}`);
-
 				let job;
-				const restartDeadline = Date.now() + 60000;
-				while (Date.now() < restartDeadline) {
-					job = (await sendOperation(ctx.follower, { operation: 'get_job', id: restart.job_id }))[0];
-					if (job?.status === 'COMPLETE' || job?.status === 'ERROR') break;
-					await delay(POLL_INTERVAL_MS);
-				}
-				equal(job?.status, 'COMPLETE', `HTTP-worker restart did not complete: ${JSON.stringify(job)}`);
+				await waitForCondition(
+					async (signal) => {
+						const jobs = await sendOperation(
+							ctx.follower,
+							{ operation: 'get_job', id: restart.job_id },
+							{ signal }
+						).catch((error) => {
+							if (signal.aborted) throw error;
+							return [];
+						});
+						job = jobs[0] ?? job;
+						return job?.status === 'COMPLETE' || job?.status === 'ERROR';
+					},
+					{
+						timeoutMs: 60000,
+						pollMs: POLL_INTERVAL_MS,
+						description: () => `HTTP-worker restart job ${JSON.stringify(job)}`,
+					}
+				);
+				equal(job.status, 'COMPLETE', `HTTP-worker restart did not complete: ${JSON.stringify(job)}`);
 
 				const marker = 'worker-restart-' + Date.now();
 				for (const db of DB_NAMES) {
@@ -404,25 +416,12 @@ suite(
 						records: [{ id: marker, name: 'after-worker-restart' }],
 					});
 				}
-				for (const db of DB_NAMES) {
-					let seen = false;
-					const deadline = Date.now() + DATA_FLOW_TIMEOUT_MS;
-					while (Date.now() < deadline) {
-						const records = await sendOperation(ctx.follower, {
-							operation: 'search_by_id',
-							database: db,
-							table: 'test',
-							ids: [marker],
-							get_attributes: ['id'],
-						}).catch(() => []);
-						if (records.some?.((record) => record.id === marker)) {
-							seen = true;
-							break;
-						}
-						await delay(POLL_INTERVAL_MS);
-					}
-					ok(seen, `${db} did not converge after replacing the follower's HTTP worker`);
-				}
+				await assertAllReplicated(
+					ctx.follower,
+					ctx.leader.hostname,
+					await probeReplicated(ctx.follower, marker),
+					'write after replacing the follower HTTP workers'
+				);
 			}
 		);
 

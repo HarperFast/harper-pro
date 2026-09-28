@@ -587,8 +587,6 @@ function getSubscriptionConnection(
 	}
 }
 
-// Shared by subscription setup, teardown, forced reconnect, and pre-readiness admission so the
-// missing peer-URL fallback cannot differ between lifecycle paths.
 export function getSubscriptionConnectionKey(url: string, peerUrl?: string): string {
 	return url + '-' + (peerUrl ?? url);
 }

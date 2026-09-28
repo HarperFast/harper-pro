@@ -3094,7 +3094,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	startTime: number;
 	retryBackoff: Backoff; // created on the first failure
 
-	random = Math.random; // injectable so the jittered reconnect schedule is deterministically testable
+	random = Math.random;
 	setReconnectTimer = setTimeout;
 	retries = 0;
 	isConnected = true; // we start out assuming we will be connected

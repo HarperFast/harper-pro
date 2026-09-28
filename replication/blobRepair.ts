@@ -67,6 +67,8 @@ export async function repairBlobs(
 			break;
 		}
 
+		// Once unpaced, the per-record warns fire at peer-RTT rate for the rest of the sweep; sample them.
+		const logRecord = !pacingSpent || (failed + 1) % REPAIR_UNPACED_WARN_EVERY === 0;
 		let peerRepaired = false;
 		for (const connection of peerConnections) {
 			try {
@@ -97,7 +99,7 @@ export async function repairBlobs(
 				logger.info?.('Repaired blob for record', recordId, 'in', tableName);
 				break;
 			} catch (error) {
-				logger.warn?.('Blob repair fetch failed for record', recordId, 'in', tableName, error);
+				if (logRecord) logger.warn?.('Blob repair fetch failed for record', recordId, 'in', tableName, error);
 			}
 		}
 
@@ -106,7 +108,7 @@ export async function repairBlobs(
 			pacingSpent = false;
 		} else {
 			failed++;
-			if (!pacingSpent || failed % REPAIR_UNPACED_WARN_EVERY === 0)
+			if (logRecord)
 				logger.warn?.(
 					'Could not repair blob for record',
 					recordId,
