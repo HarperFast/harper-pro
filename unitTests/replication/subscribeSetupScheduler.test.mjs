@@ -60,6 +60,7 @@ function makeScheduler(random) {
 		random,
 		setTimer: timers.setTimer,
 		clearTimer: timers.clearTimer,
+		now: timers.now,
 	});
 	return { scheduler, dispatches };
 }
@@ -181,16 +182,30 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 
 	it('slides a sweep setup past one armed within the stagger window', () => {
 		const { scheduler } = makeScheduler(() => 0.6);
-		assert.equal(scheduler.schedule(URL_A, 'data', NODES, { armedDelays: [300] }), 350);
+		assert.equal(scheduler.schedule(URL_A, 'data', NODES, { armedAt: [300] }), 350);
 	});
 
 	it('preserves sweep spacing when independent jitter draws would collide', () => {
 		const draws = [0.75, 0.5, 0.26, 0.24, 0];
 		const { scheduler } = makeScheduler(() => draws.shift());
-		const sweep = { armedDelays: [] };
+		const sweep = { armedAt: [] };
 		const delays = [0, 1, 2, 3, 4].map((i) => scheduler.schedule(URL_A, `data${i}`, NODES, sweep));
 		assert.deepEqual(delays, [350, 300, 400, 248, 450]);
 		assertSpaced(delays);
+	});
+
+	it('spaces sweep setups by fire time when the sweep calls are made at different instants', () => {
+		const draws = [0.75, 0.5];
+		const { scheduler, dispatches } = makeScheduler(() => draws.shift());
+		const sweep = { armedAt: [] };
+		assert.equal(scheduler.schedule(URL_A, 'first', NODES, sweep), 350);
+		timers.tick(20);
+		assert.equal(scheduler.schedule(URL_A, 'second', NODES, sweep), 380);
+		timers.tick(MAX_DELAY);
+		assert.deepEqual(
+			dispatches.map((d) => d.at),
+			[350, 400]
+		);
 	});
 
 	it('keeps spacing next to a pair drawn just past the fresh-draw window', () => {
@@ -199,7 +214,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 		const { scheduler } = makeScheduler(() => draws.shift());
 		scheduler.schedule(URL_A, 'failed-once', NODES);
 		timers.tick(MAX_DELAY);
-		const sweep = { armedDelays: [] };
+		const sweep = { armedAt: [] };
 		const failedOnce = scheduler.schedule(URL_A, 'failed-once', NODES, sweep);
 		const fresh = scheduler.schedule(URL_A, 'fresh', NODES, sweep);
 		assert.deepEqual([failedOnce, fresh], [401, 451]);
@@ -211,7 +226,7 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 			scheduler.schedule(URL_A, 'failing', NODES);
 			timers.tick(MAX_DELAY);
 		}
-		const sweep = { armedDelays: [] };
+		const sweep = { armedAt: [] };
 		const escalated = scheduler.schedule(URL_A, 'failing', NODES, sweep);
 		const healthy = scheduler.schedule(URL_A, 'healthy', NODES, sweep);
 		assert.ok(escalated > 20_000, `escalated delay ${escalated}`);

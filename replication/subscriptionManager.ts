@@ -192,7 +192,8 @@ interface SubscribeSchedule {
 
 /** Shared by the setups of one stale-worker reassignment sweep, so they dial at least `staggerMs` apart (#446). */
 export interface SetupSweep {
-	armedDelays: number[];
+	// Fire times on the scheduler's monotonic clock: the sweep's calls are made at different instants.
+	armedAt: number[];
 }
 
 export interface SubscribeSetupScheduler {
@@ -232,6 +233,7 @@ export function createSubscribeSetupScheduler(deps: {
 	staggerMs?: number;
 	setTimer?: typeof setTimeout;
 	clearTimer?: typeof clearTimeout;
+	now?: () => number;
 }): SubscribeSetupScheduler {
 	const {
 		dispatch,
@@ -242,6 +244,7 @@ export function createSubscribeSetupScheduler(deps: {
 		staggerMs = RECONNECT_STAGGER_MS,
 		setTimer = setTimeout,
 		clearTimer = clearTimeout,
+		now = () => performance.now(),
 	} = deps;
 	const schedules = new Map<string, Map<string, SubscribeSchedule>>();
 
@@ -271,16 +274,19 @@ export function createSubscribeSetupScheduler(deps: {
 			if (sweep) {
 				// Slide only past setups this sweep armed nearby: a floor chained through every setup would let
 				// one pair's escalated delay drag the rest of the sweep out to its ceiling.
+				const armedNow = now();
+				let fireAt = armedNow + backoffDelay;
 				for (let moved = true; moved;) {
 					moved = false;
-					for (const armed of sweep.armedDelays) {
-						if (Math.abs(armed - delay) < staggerMs) {
-							delay = armed + staggerMs;
+					for (const armedAt of sweep.armedAt) {
+						if (Math.abs(armedAt - fireAt) < staggerMs) {
+							fireAt = armedAt + staggerMs;
 							moved = true;
 						}
 					}
 				}
-				sweep.armedDelays.push(delay);
+				sweep.armedAt.push(fireAt);
+				delay = fireAt - armedNow;
 			}
 			schedule.timer = setTimer(() => {
 				schedule.timer = undefined;
@@ -2087,7 +2093,7 @@ export async function startOnMainThread(options) {
 			// staggering guarded against before #357 made the reconcile the single reassignment path. A
 			// per-node stagger alone left the per-database burst (a peer with N databases dialed N at once),
 			// so stagger per DATABASE across the whole sweep like the wedge path does. See cb1kenobi review on #446.
-			const subscribeStagger: SetupSweep = { armedDelays: [] };
+			const subscribeStagger: SetupSweep = { armedAt: [] };
 			for (const node of staleNodesToReassign) {
 				// The node may have been removed or replaced since we flagged it; only re-drive it if it is
 				// still the current entry in nodeMap, so a deleted node isn't resurrected (gemini review).
