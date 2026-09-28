@@ -418,8 +418,26 @@ export async function deleteSSHKey(req: { name: string }): Promise<{ message: st
 }
 
 /**
- * Clone setup only: removes this node's copy of a key that an interrupted `addSSHKey` left without its
- * config block, so it can be added again. Never replicated: peers hold a complete copy.
+ * Clone setup only: whether this node holds `name` as `addSSHKey` leaves it, down to the config block's
+ * last line, or only part of it — `addSSHKey` writes the key file, then its block, and can stop between.
+ */
+export async function localSSHKeyState(name: string): Promise<'absent' | 'partial' | 'complete'> {
+	// no key can exist under a name `addSSHKey` refuses, and it must not become a path
+	if (!SSH_KEY_NAME_REGEX.test(name)) return 'absent';
+	const { filePath, configFile } = getSSHPaths(name);
+	if (!(await exists(filePath))) return 'absent';
+	if (!(await exists(configFile))) return 'partial';
+	const config = await readFile(configFile, 'utf8');
+	const complete = findSSHConfigBlocks(config, name).some(([start, end]) => {
+		const block = config.slice(start, end);
+		return block.includes(`\n\tIdentityFile ${filePath}\n`) && /^\tIdentitiesOnly yes$/m.test(block);
+	});
+	return complete ? 'complete' : 'partial';
+}
+
+/**
+ * Clone setup only: removes this node's copy of a key that `localSSHKeyState` finds partial, so it can
+ * be added again. Never replicated: peers hold a complete copy.
  */
 export async function removeLocalSSHKey(name: string): Promise<void> {
 	if (!SSH_KEY_NAME_REGEX.test(name)) throw new ClientError(SSH_KEY_NAME_ERROR_MSG);

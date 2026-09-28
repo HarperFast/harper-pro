@@ -936,7 +936,7 @@ function sumTableSizes(dbObj: Record<string, any>): number {
 async function cloneSSHKeys() {
 	if (skipSSHKeys) return;
 
-	const { addSSHKey, listSSHKeys, removeLocalSSHKey } = await import('../security/sshKeyOperations.js');
+	const { addSSHKey, localSSHKeyState, removeLocalSSHKey } = await import('../security/sshKeyOperations.js');
 	// Test hook: a leader that never answers an SSH key request, to drive setup's containment
 	// deterministically; loopback leaders don't fail on cue.
 	const simulateFailure = process.env.CLONE_SIMULATE_SSH_KEY_FAILURE === 'true';
@@ -947,7 +947,7 @@ async function cloneSSHKeys() {
 				}
 			: leaderRequest,
 		addSSHKey,
-		listLocalSSHKeys: listSSHKeys,
+		localSSHKeyState,
 		removeLocalSSHKey,
 		log,
 	});

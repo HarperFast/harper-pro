@@ -17,7 +17,7 @@ function leaderWith(keys, { failures = {} } = {}) {
 	return { requestLeader, requested };
 }
 
-function recorder({ local = [] } = {}) {
+function recorder({ local = {} } = {}) {
 	const added = [];
 	const removed = [];
 	const logged = [];
@@ -31,7 +31,7 @@ function recorder({ local = [] } = {}) {
 			if (key.key === 'disk full') throw new Error('ENOSPC: no space left on device');
 			added.push(key.name);
 		},
-		listLocalSSHKeys: async () => local,
+		localSSHKeyState: async (name) => local[name] ?? 'absent',
 		removeLocalSSHKey: async (name) => removed.push(name),
 		log: (message, level) => logged.push({ message, level }),
 	};
@@ -41,7 +41,7 @@ const clone = (leader, node, options) =>
 	cloneSSHKeysFromLeader({
 		requestLeader: leader.requestLeader,
 		addSSHKey: node.addSSHKey,
-		listLocalSSHKeys: node.listLocalSSHKeys,
+		localSSHKeyState: node.localSSHKeyState,
 		removeLocalSSHKey: node.removeLocalSSHKey,
 		log: node.log,
 		retryDelayMs: 0,
@@ -97,7 +97,7 @@ describe('cloneSSHKeysFromLeader', () => {
 	});
 
 	it('leaves a key an earlier attempt cloned, without fetching it again', async () => {
-		const node = recorder({ local: [{ name: 'first', host: 'gh', hostname: 'example.com' }] });
+		const node = recorder({ local: { first: 'complete' } });
 		const leader = leaderWith({ first: { key: 'ok' }, second: { key: 'ok' } });
 		await clone(leader, node);
 
@@ -107,8 +107,8 @@ describe('cloneSSHKeysFromLeader', () => {
 		assert.ok(node.logged.some(({ message }) => message === "SSH key 'first' is already on this node"));
 	});
 
-	it('replaces a key an earlier attempt left without its ssh config block', async () => {
-		const node = recorder({ local: [{ name: 'first' }] });
+	it('replaces a key an earlier attempt left partly written', async () => {
+		const node = recorder({ local: { first: 'partial' } });
 		const leader = leaderWith({ first: { key: 'ok' } });
 		await clone(leader, node);
 

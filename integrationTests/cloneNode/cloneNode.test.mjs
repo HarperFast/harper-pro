@@ -520,8 +520,7 @@ suite('Clone Node - unconfirmed sync leaves node Unavailable and uncloned', (ctx
 	});
 });
 
-// A leader that keeps failing SSH key requests must leave setup unfinished, not complete the clone
-// without its keys. CLONE_SIMULATE_SSH_KEY_FAILURE fails every such request, retries included.
+// CLONE_SIMULATE_SSH_KEY_FAILURE fails every SSH key request to the leader, retries included.
 suite('Clone Node - SSH key clone failure leaves node Unavailable and uncloned', (ctx) => {
 	before(async () => {
 		ctx.nodes = [];

@@ -11,7 +11,7 @@ export const LEADER_RETRY_DELAY_MS = 250;
 export async function cloneSSHKeysFromLeader({
 	requestLeader,
 	addSSHKey,
-	listLocalSSHKeys,
+	localSSHKeyState,
 	removeLocalSSHKey,
 	log,
 	attempts = LEADER_REQUEST_ATTEMPTS,
@@ -19,7 +19,7 @@ export async function cloneSSHKeysFromLeader({
 }: {
 	requestLeader: (operation: { operation: string; name?: string }) => Promise<any>;
 	addSSHKey: (key: any) => Promise<unknown>;
-	listLocalSSHKeys: () => Promise<Array<{ name: string; host?: string; hostname?: string }>>;
+	localSSHKeyState: (name: string) => Promise<'absent' | 'partial' | 'complete'>;
 	removeLocalSSHKey: (name: string) => Promise<void>;
 	log: (message: string, level?: 'notify' | 'error') => void;
 	attempts?: number;
@@ -47,15 +47,14 @@ export async function cloneSSHKeysFromLeader({
 		return;
 	}
 
-	const local = new Map((await listLocalSSHKeys()).map((key) => [key.name, key]));
 	for (const { name } of keys) {
-		const existing = local.get(name);
-		if (existing?.host && existing.hostname) {
+		const state = await localSSHKeyState(name);
+		if (state === 'complete') {
 			log(`SSH key '${name}' is already on this node`);
 			continue;
 		}
-		if (existing) {
-			log(`Replacing SSH key '${name}', which an earlier attempt left without its ssh config block`);
+		if (state === 'partial') {
+			log(`Replacing SSH key '${name}', which an earlier attempt left partly written`);
 			await removeLocalSSHKey(name);
 		}
 		log(`Cloning SSH key: ${name}`);
