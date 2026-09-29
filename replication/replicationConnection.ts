@@ -6206,6 +6206,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 								return new Promise(setImmediate); // we still need to yield (otherwise we might never send a sequence id update)
 							}
+							if (!substituteEntry && auditRecord.isHandoffRedelivery) {
+								// a redelivery has no ordinary audit-log entry behind it, so the raw-entry path below
+								// (`encoded`/`getValue`) can find neither as an own field on this spread copy -- if
+								// the image read failed or produced nothing, the peer already has whatever the
+								// original patch carried through ordinary replay, so skip rather than crash
+								logger.warn?.(connectionId, 'skipping a redelivery with no readable image', auditRecord.recordId);
+								return skipAuditRecord();
+							}
 							if (!sentNodeIds.has(auditRecord.nodeId)) {
 								sentNodeIds.add(auditRecord.nodeId);
 								// If this is a nodeId that we have not sent yet, send a message to the remote node with the node id
