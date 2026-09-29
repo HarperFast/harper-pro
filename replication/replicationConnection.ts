@@ -200,6 +200,7 @@ const HANDOFF_RECEIPT = 151;
 const HANDOFF_RECEIPT_REQUEST = 152;
 const HANDOFF_RESWEEP_INTERVAL_MS = 5 * 60_000;
 const RECEIPT_PRUNE_INTERVAL_MS = 1000;
+const RECEIPT_APPLY_CONCURRENCY = 16;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -5213,11 +5214,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						for (const [receiptTableId, recordId] of receipts)
 							handoffRequestedAt.delete(receiptRequestKey(receiptTableId, recordId));
 						const receiptPeer = remoteNodeName;
-						// one chain step per batch: order is kept, and a bulk return does not queue one closure per record
+						// one chain step per batch, a bounded number of records in flight inside it; a batch never
+						// names one record twice, so nothing in it races on a key
 						receiptApplyChain = receiptApplyChain.then(async () => {
-							for (const [receiptTableId, recordId, version] of receipts) {
+							const applyOne = async ([receiptTableId, recordId, version]: [number, any, number]) => {
 								const receiptTable = tableSubscriptionToReplicator.tableById[receiptTableId];
-								if (!receiptTable || !coreRetainsTransitionImages(receiptTable)) continue;
+								if (!receiptTable || !coreRetainsTransitionImages(receiptTable)) return;
 								try {
 									const outcome = await applyHandoffReceipt(
 										receiptTable,
@@ -5240,7 +5242,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// the image stays retained; the next receipt or redelivery sweep retries
 									logger.warn?.(connectionId, 'handoff receipt not applied', receiptTable.tableName, recordId, error);
 								}
-							}
+							};
+							for (const group of chunkReceipts(receipts, RECEIPT_APPLY_CONCURRENCY))
+								await Promise.all(group.map(applyOne));
 						});
 						break;
 					}
@@ -7045,10 +7049,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												if (resweep && !peerCanReceipt) break;
 												if (!table || !coreRetainsTransitionImages(table) || !tableToTableEntry(table)) continue;
 												let owed: TransitionEntry[];
+												let superseded: number;
 												try {
-													owed = await transitionsOwedToPeer(table, remoteNodeName, getThisNodeName(), (residencyId) =>
-														getResidence(residencyId, table)
-													);
+													({ owed, superseded } = await transitionsOwedToPeer(
+														table,
+														remoteNodeName,
+														getThisNodeName(),
+														(residencyId) => getResidence(residencyId, table)
+													));
 												} catch (error) {
 													logger.warn?.(
 														connectionId,
@@ -7058,10 +7066,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													);
 													continue;
 												}
-												if (owed.length > 0)
+												if (owed.length > 0 || superseded > 0)
 													logger.info?.(
 														connectionId,
-														`Redelivering ${owed.length} retained residency transition image(s) of ${table.tableName} to ${remoteNodeName}`
+														`Redelivering ${owed.length} retained residency transition image(s) of ${table.tableName} to ${remoteNodeName}; ${superseded} retained image(s) superseded by a newer local row await a receipt`
 													);
 												for (const retained of owed) {
 													if (closed) return;
@@ -7219,6 +7227,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										flushReceiptRequests();
 										// a timed wake can land after the socket was marked closed, before the close event
 										if (closed || wsClosed) return;
+										if (!handoffSweepDone) continue;
 										// A commit that landed during the scan rotated the promise captured before it: rescan
 										// immediately, without paying for timer setup, a Promise/executor allocation or a waker.
 										if (whenNextTransaction(auditStore) !== nextTransaction) continue;
