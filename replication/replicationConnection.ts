@@ -3088,6 +3088,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	retryBackoff?: Backoff;
 	creditedDurableSequence = 0;
 	sendFailed = false;
+	progressWhileSendFailed = false;
 
 	random = Math.random;
 	setReconnectTimer = setTimeout;
@@ -3356,17 +3357,26 @@ export class NodeReplicationConnection extends EventEmitter {
 	}
 	onFrameSent() {
 		this.sendFailed = false;
+		this.progressWhileSendFailed = false;
 		this.resetRetryBackoff();
 	}
 	onSendFailed() {
 		this.sendFailed = true;
+	}
+	// A loop stuck on an oversized frame never catches up, so this cannot clear the veto for it.
+	onSenderCaughtUp() {
+		if (!this.sendFailed) return;
+		this.sendFailed = false;
+		if (this.progressWhileSendFailed) this.resetRetryBackoff();
+		this.progressWhileSendFailed = false;
 	}
 	// A subscriber's outbound leg sends no transaction frames, so this is its progress signal. A watermark this
 	// connection already credited is a replay, not progress, and a leg whose own sends fail has not recovered.
 	onDurableProgress(sequence: number) {
 		if (!(sequence > this.creditedDurableSequence) || !isValidReplicationClock(sequence)) return;
 		this.creditedDurableSequence = sequence;
-		if (!this.sendFailed) this.resetRetryBackoff();
+		if (this.sendFailed) this.progressWhileSendFailed = true;
+		else this.resetRetryBackoff();
 	}
 	// Retire the live replicateOverWS instance: the single enforcement point for "at most one live session
 	// per connection". Every path that supersedes a session (socket replaced in connect(), forceReconnect)
@@ -6539,9 +6549,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									// Caught up: a send that failed earlier is no longer failing. A loop stuck on an
-									// oversized frame never gets here.
-									if (options.connection && !supersededOrClosed()) options.connection.sendFailed = false;
+									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
 									await nextTransaction;
 								} while (!closed);
 							})

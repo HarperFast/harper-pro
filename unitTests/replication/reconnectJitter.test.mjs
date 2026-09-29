@@ -162,4 +162,26 @@ describe('NodeReplicationConnection durable receive progress', () => {
 		connection.onDurableProgress(2000);
 		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
 	});
+
+	it('a sender that catches up after a failure releases the receive progress it vetoed', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onSendFailed();
+		failedAttempts(connection, 3);
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+
+		connection.onSenderCaughtUp();
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
+
+	it('catching up with no vetoed progress lifts the veto without resetting', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onSendFailed();
+		failedAttempts(connection, 3);
+
+		connection.onSenderCaughtUp();
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
 });

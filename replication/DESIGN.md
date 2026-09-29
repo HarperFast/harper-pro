@@ -263,22 +263,22 @@ An armed setup dispatches on the main thread only in configured single-thread mo
 before it fires in a multi-threaded process, the setup is deferred; the stale-worker reconcile reassigns the
 entry even when another database for the same peer is simultaneously in wedge recovery.
 
-**The reconnect backoff resets on progress in either direction, never on socket open.** A leg that reopens
-and fails before moving data — a peer that accepts TLS and drops it (harper-pro#339), or a stream blocked at
-an oversized frame (#713) — must keep escalating. The sending side resets in `onFrameSent`. A subscriber's
+**The reconnect backoff resets on progress in either direction, never on socket open.** A leg that reopens and
+fails before moving data — a peer that accepts TLS and drops it (harper-pro#339), or a stream blocked at an
+oversized frame (#713) — must keep escalating. The sending side resets in `onFrameSent`. A subscriber's
 outbound leg sends no transaction frames (in a two-way mesh the peer serves our subscription from its own
-server session), so it resets through `onDurableProgress` when its receive-side durable watermark advances:
-at a commit and at the last in-flight blob's drain. Three things keep that from resetting a leg that is not
+server session), so it resets through `onDurableProgress` when its receive-side durable watermark advances: at
+a commit and at the last in-flight blob's drain. Three things keep that from resetting a leg that is not
 working. Only an advance past the highest valid clock this `NodeReplicationConnection` has already credited
 counts, so replaying the same undurable frames after each reconnect is not progress. Nothing counts while a
 copy-apply copy is in progress, because its rows are not durable until the copy's final flush; finishing the
 copy counts. And a sender-loop failure on the leg (`onSendFailed`) vetoes receive credit until the sender
-sends a frame or catches up, so a leg that both receives and serves a subscription does not redial at the
-floor while its own sends fail every time — a loop stuck on an oversized frame does neither. Only the session
-that still owns the socket reports any of these. Without the receive signal, the ceiling
-carried across unrelated outages until every reconnect waited out the 30 s cap
-(`connectedBitRestartChurn.test.mjs`). Still open: a leg that receives nothing new between outages (idle,
-or mid-copy) carries its escalated ceiling into the next one.
+sends a frame or catches up (`onSenderCaughtUp`, which then applies any credit it held back), so a leg that
+both receives and serves a subscription does not redial at the floor while its own sends fail every time — a
+loop stuck on an oversized frame does neither. Only the session that still owns the socket reports any of
+these. Without the receive signal, the ceiling carried across unrelated outages until every reconnect waited
+out the 30 s cap (`connectedBitRestartChurn.test.mjs`). Still open: a leg that receives nothing new between
+outages (idle, or mid-copy) carries its escalated ceiling into the next one.
 
 **What is deliberately NOT on this schedule:** the receive/copy watchdogs and their thresholds, and the
 doubling copy-finalize _timeout bound_ alongside them (these _detect_ stalls or bound a wait; this
