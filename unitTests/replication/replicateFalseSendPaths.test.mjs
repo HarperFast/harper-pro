@@ -15,6 +15,8 @@ import { decode, encode } from 'msgpackr';
 import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
 import { loadGQLSchema } from '#src/core/resources/graphql';
 import { tables } from '#src/core/resources/databases';
+import { createAuditEntry } from '#src/core/resources/auditStore';
+import { FrameWriter } from '#src/replication/frameWriter';
 import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
 import { setReplicator } from '#src/replication/replicator';
 
@@ -23,7 +25,9 @@ const TABLE_FIXED_STRUCTURE = 132;
 const GET_RECORD = 133;
 const GET_RECORD_RESPONSE = 134;
 const NODE_NAME = 140;
+const NODE_NAME_TO_ID_MAP = 141;
 const BLOB_CHUNK = 146;
+const REMOTE_SEQUENCE_UPDATE = 11;
 const COPY_START = 148;
 const COPY_COMPLETE = 149;
 // Above FILE_STORAGE_THRESHOLD (8 KiB): the value is stored as a blob file, so a copy of the row would
@@ -183,5 +187,90 @@ describe('replicate: false on the full copy (harper-pro#883)', function () {
 			socket.sent.some((frame) => frame.recordFrame > 8),
 			'the control table row must be on the wire'
 		);
+	});
+});
+
+// One replicated transaction as a pre-#883 sender frames it: the origin log key, one put entry (its
+// leading local-time float stripped, as the sender does), and the end-of-transaction sequence update.
+function oldSenderFrame(table, tableId, record) {
+	const frame = new FrameWriter();
+	const txnLogKey = Date.now();
+	frame.writeFloat64(txnLogKey);
+	const entry = Buffer.from(
+		createAuditEntry({
+			type: 'put',
+			tableId,
+			recordId: record.id,
+			version: txnLogKey,
+			previousVersion: null,
+			nodeId: 0,
+			encodedRecord: Buffer.from(table.primaryStore.encoder.encode(record)),
+		})
+	);
+	const start = entry[0] === 66 ? 8 : 0;
+	frame.writeInt(entry.length - start);
+	frame.writeBytes(entry, start);
+	frame.writeInt(9);
+	frame.writeInt(REMOTE_SEQUENCE_UPDATE);
+	frame.writeFloat64(txnLogKey);
+	return Buffer.from(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
+}
+
+function structureFrame(table, tableId) {
+	const encoder = table.primaryStore.encoder;
+	return encode([
+		TABLE_FIXED_STRUCTURE,
+		{
+			typedStructs: encoder.typedStructs,
+			structures: encoder.structures,
+			attributes: table.attributes,
+			schemaDefined: true,
+		},
+		tableId,
+		table.tableName,
+	]);
+}
+
+async function waitForRecord(table, id) {
+	for (let turn = 0; turn < 200; turn++) {
+		const record = await table.get(id);
+		if (record) return record;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	return undefined;
+}
+
+describe('replicate: false on the receive path (harper-pro#883)', function () {
+	this.timeout(30_000);
+	let socket;
+
+	before(async () => {
+		setReplicator('data', tables.ReplicateFalseShared, {});
+		for (let turn = 0; turn < 100 && databaseSubscriptions.get('data')?.then; turn++) {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		assert.ok(databaseSubscriptions.get('data')?.auditStore, 'the data subscription must resolve in-process');
+	});
+
+	afterEach(() => {
+		socket?.close(1000);
+	});
+
+	it("drops a pre-fix sender's row for a table this node declares replicate: false, and applies the replicated one", async () => {
+		const local = tables.ReplicateFalseLocal;
+		const shared = tables.ReplicateFalseShared;
+		socket = new FakeSocket();
+		replicateOverWS(socket, {}, { replicates: true });
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], {}]));
+		await settle(socket, 1);
+		socket.emit('message', encode([NODE_NAME_TO_ID_MAP, { 'peer-a': 0 }, ['peer-a']]));
+		socket.emit('message', structureFrame(local, 21));
+		socket.emit('message', structureFrame(shared, 22));
+		socket.emit('message', oldSenderFrame(local, 21, { id: 'from-old-sender', payload: 'must not land' }));
+		socket.emit('message', oldSenderFrame(shared, 22, { id: 'from-old-sender', payload: 'lands' }));
+		const applied = await waitForRecord(shared, 'from-old-sender');
+		assert.equal(applied?.payload, 'lands', 'the replicated table must still apply the same sender frames');
+		assert.ok(!(await local.get('from-old-sender')), 'the local table must not apply a peer row');
+		assert.deepEqual(socket.closes, [], 'the drop must not close the connection');
 	});
 });

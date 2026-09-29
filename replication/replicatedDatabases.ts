@@ -22,7 +22,6 @@ export function isExplicitDatabaseSubscription(subscriptions: unknown, dbName: s
 	);
 }
 
-/** `replicate: false` is the only opt-out; an absent flag and `true` both replicate. */
 export function tableReplicates(table: { replicate?: boolean } | undefined): boolean {
 	return table?.replicate !== false;
 }

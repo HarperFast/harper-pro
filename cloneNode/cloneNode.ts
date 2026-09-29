@@ -875,6 +875,10 @@ async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string
 		if (typeof allDb[db] !== 'object') continue;
 		if (!isReplicatedDatabase(db, shardedReplicates) && !isExplicitDatabaseSubscription(leaderNode?.subscriptions, db))
 			continue;
+		// A database whose every table is non-replicating gets no target and no required socket: nothing
+		// subscribes it on either side, so a target for it would leave the clone waiting for a socket
+		// that is never opened.
+		if (!hasReplicatedTable(allDb[db])) continue;
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
 		totalBytes += sumTableSizes(allDb[db]);
 	}
@@ -903,6 +907,15 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 	}
 
 	return mostRecent;
+}
+
+/** Whether a describe response holds any table this node would actually receive. */
+function hasReplicatedTable(dbObj: Record<string, any>): boolean {
+	for (const table in dbObj) {
+		const tableObj = dbObj[table];
+		if (typeof tableObj === 'object' && tableObj != null && tableReplicates(tableObj)) return true;
+	}
+	return false;
 }
 
 /** Sum the on-disk table sizes in one describe response, for sizing the sync wait's ceiling. */
