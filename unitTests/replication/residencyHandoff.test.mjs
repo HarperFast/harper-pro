@@ -269,13 +269,16 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
 	});
 
-	it('keeps but stops owing an entry the origin’s own row has moved past', async () => {
+	it('keeps but stops owing an entry whose record moved on to a residency that no longer names the peer', async () => {
 		const table = fakeTable({
-			retained: [{ recordId: 'movedOn', tableId: 7, version: V1, residencyId: 5 }],
-			entries: { movedOn: stub(V2) },
+			retained: [
+				{ recordId: 'movedOn', tableId: 7, version: V1, residencyId: 5 },
+				{ recordId: 'stillMine', tableId: 7, version: V1, residencyId: 5 },
+			],
+			entries: { movedOn: { ...stub(V2), residencyId: 4 }, stillMine: { ...stub(V2), residencyId: 5 } },
 		});
-		const { owed, superseded } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists));
-		expect(owed).to.deep.equal([]);
+		const { owed, superseded } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf({ ...lists, 4: ['C'] }));
+		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['stillMine']);
 		expect(superseded).to.equal(1);
 		expect(table.released).to.deep.equal([]);
 	});
