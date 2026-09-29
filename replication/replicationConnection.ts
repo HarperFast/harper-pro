@@ -6157,9 +6157,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								return new Promise(setImmediate); // we still need to yield (otherwise we might never send a sequence id update)
 							}
 							if (!substituteEntry && auditRecord.isHandoffRedelivery) {
-								// a redelivery has no ordinary audit-log entry behind it, so the raw-entry path below
-								// (`encoded`/`getValue`) can find neither as an own field on this spread copy -- skip
-								// a missing image rather than crash; the next resweep retries it
+								// a redelivery has no ordinary audit-log entry behind it: if the image itself
+								// could not be read, skip rather than fall through to the raw-entry path below,
+								// which assumes a real audit record's `encoded`/`getValue`
 								logger.warn?.(connectionId, 'skipping a redelivery with no readable image', auditRecord.recordId);
 								return skipAuditRecord();
 							}
@@ -6948,20 +6948,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// re-carrying this specific entry. A deferred entry waits for a later resweep, once
 												// currentSequenceId has itself reached `key` through ordinary traffic.
 												if (key > currentSequenceId) continue;
-												// own properties: the send path spreads the record into an invalidate entry, and the image
-												// accessor may live on core's prototype
-												const redelivery = {
-													...retained,
-													getTransitionImage: retained.getTransitionImage?.bind(retained),
-													isHandoffRedelivery: true,
-												};
+												// prototype delegation, not a spread: core may define fields like `type`/`encoded`/
+												// `getTransitionImage` as prototype getters/methods rather than own properties, and a
+												// spread copy would silently lose those (the invalidate branch above spreads a real
+												// audit-log record instead, never a redelivery's retained entry)
+												const redelivery = Object.create(retained, {
+													isHandoffRedelivery: { value: true, enumerable: true },
+												});
 												await sendAuditRecord(redelivery, key);
 												redelivered++;
 											}
 											// counted after the per-entry TTL skip, not owed.length, so a re-sweep whose every
 											// image was already requested within the receiver's TTL logs nothing rather than N.
-											// An upper bound, not exact: sendAuditRecord can still fall back to the original
-											// patch (an excluded table route, or a failed image read) without reporting it back.
+											// An upper bound, not exact: sendAuditRecord can still skip the entry entirely (an
+											// excluded table route, or a failed image read) without reporting it back.
 											if (redelivered > 0)
 												logger.info?.(
 													connectionId,
