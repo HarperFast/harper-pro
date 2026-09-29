@@ -6207,9 +6207,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								return new Promise(setImmediate); // we still need to yield (otherwise we might never send a sequence id update)
 							}
 							if (!substituteEntry && auditRecord.isHandoffRedelivery) {
-								// a redelivery has no ordinary audit-log entry behind it: if the image itself
-								// could not be read, skip rather than fall through to the raw-entry path below,
-								// which assumes a real audit record's `encoded`/`getValue`
+								// no substitute image means transitionImageValue produced nothing to send -- skip
+								// rather than fall through to the raw-entry path below, which assumes a real
+								// audit record's `encoded`/`getValue`
 								logger.warn?.(connectionId, 'skipping a redelivery with no readable image', auditRecord.recordId);
 								return skipAuditRecord();
 							}
@@ -7124,12 +7124,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													// re-carrying this specific entry. A deferred entry waits for a later resweep, once
 													// currentSequenceId has itself reached `key` through ordinary traffic.
 													if (key > currentSequenceId) continue;
-													// prototype delegation, not a spread: core may define fields like `type`/`encoded`/
-													// `getTransitionImage` as prototype getters/methods rather than own properties, and a
-													// spread copy would silently lose those (the invalidate branch above spreads a real
-													// audit-log record instead, never a redelivery's retained entry)
+													// core may define TransitionEntry fields as prototype getters, so this preserves
+													// retained's prototype chain instead of spreading it. getTransitionImage is still bound
+													// explicitly: a method call's `this` would otherwise be this wrapper, not retained,
+													// which breaks a receiver-sensitive core implementation (e.g. a private field)
 													const redelivery = Object.create(retained, {
 														isHandoffRedelivery: { value: true, enumerable: true },
+														getTransitionImage: { value: retained.getTransitionImage?.bind(retained), enumerable: true },
 													});
 													await sendAuditRecord(redelivery, key);
 													redelivered++;
