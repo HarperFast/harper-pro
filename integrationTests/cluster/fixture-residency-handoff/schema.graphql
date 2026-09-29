@@ -1,0 +1,7 @@
+type Homed @table @export {
+	id: String @primaryKey
+	home: String @indexed
+	name: String
+	size: Int
+	note: String
+}

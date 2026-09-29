@@ -36,6 +36,11 @@ describe('isDurableIdentityTie — provably-already-applied record detection', (
 		expect(await isDurableIdentityTie(entry({ nodeId: undefined }), VERSION, 1, false)).to.equal(false);
 	});
 
+	it('is never a tie over an INVALIDATED stub: a stub does not prove the complete record was applied (harper#2257)', async () => {
+		expect(await isDurableIdentityTie(entry({ metadataFlags: 1 }), VERSION, NODE_ID, false)).to.equal(false);
+		expect(await isDurableIdentityTie(entry({ metadataFlags: 0 }), VERSION, NODE_ID, false)).to.equal(true);
+	});
+
 	it('is not a tie when nothing is stored locally', async () => {
 		expect(await isDurableIdentityTie(undefined, VERSION, NODE_ID, false)).to.equal(false);
 	});

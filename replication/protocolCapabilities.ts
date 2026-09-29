@@ -54,6 +54,14 @@ export const ORIGIN_FLOORS_CAPABILITY = 1;
  */
 export const TABLE_LIFECYCLE_CAPABILITY = 1;
 
+/**
+ * Level at which a peer certifies a record-residency handoff (HarperFast/harper#2257): it can parse a
+ * transition PATCH entry carrying core's attached complete image, and it answers each one it commits as
+ * a complete row with a `HANDOFF_RECEIPT`. A peer below this level is sent a plain complete `put`
+ * instead and can never certify release, so the origin keeps the image until that peer upgrades.
+ */
+export const RESIDENCY_HANDOFF_RECEIPT_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	safeCopyAudit: number;
@@ -64,6 +72,7 @@ export interface ResolvedPeerCapabilities {
 	originCursors: number;
 	originFloors: number;
 	tableLifecycle: number;
+	residencyHandoffReceipt: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -107,6 +116,7 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		originCursors: resolveLevel(bag?.originCursors, ORIGIN_CURSORS_CAPABILITY, 0),
 		originFloors: resolveLevel(bag?.originFloors, ORIGIN_FLOORS_CAPABILITY, 0),
 		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
+		residencyHandoffReceipt: resolveLevel(bag?.residencyHandoffReceipt, RESIDENCY_HANDOFF_RECEIPT_CAPABILITY, 0),
 	});
 }
 
@@ -125,6 +135,10 @@ export function peerSupportsOriginCursors(resolved: ResolvedPeerCapabilities): b
 
 export function peerSupportsOriginFloors(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.originFloors >= ORIGIN_FLOORS_CAPABILITY;
+}
+
+export function peerSupportsHandoffReceipts(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.residencyHandoffReceipt >= RESIDENCY_HANDOFF_RECEIPT_CAPABILITY;
 }
 
 /** A peer that advertised nothing — the pre-registry baseline. */
@@ -163,6 +177,7 @@ export function buildLocalCapabilities(
 		originCursors: perOriginLogs ? ORIGIN_CURSORS_CAPABILITY : 0,
 		originFloors: perOriginLogs ? ORIGIN_FLOORS_CAPABILITY : 0,
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
+		residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
 	});
 }
 
@@ -177,7 +192,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.recordLocks === b.recordLocks &&
 		a.originCursors === b.originCursors &&
 		a.originFloors === b.originFloors &&
-		a.tableLifecycle === b.tableLifecycle
+		a.tableLifecycle === b.tableLifecycle &&
+		a.residencyHandoffReceipt === b.residencyHandoffReceipt
 	);
 }
 
