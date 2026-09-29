@@ -304,7 +304,11 @@ export async function cloneNode(): Promise<void> {
 	harperLogger = logger.loggerWithTag('cloneNode');
 
 	const syncStartedAt: number = resumeMarker?.startedAt ?? Date.now();
-	let targetTimestamps: Record<string, number> | undefined = resumeMarker?.targetTimestamps;
+	let targetTimestamps: Record<string, number> | undefined = resumeMarker?.targetsExcludeLocalTables
+		? resumeMarker.targetTimestamps
+		: undefined;
+	if (resumeMarker?.targetTimestamps && !resumeMarker.targetsExcludeLocalTables)
+		log('Re-deriving clone sync targets: the resumed marker predates excluding non-replicating tables');
 	let totalBytes: number = resumeMarker?.totalBytes ?? 0;
 
 	try {
@@ -321,7 +325,13 @@ export async function cloneNode(): Promise<void> {
 			// and a base copy already running resumes from its durable cursor rather than restarting.
 			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
 			await establishReplicationSetup();
-			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: true, targetTimestamps, totalBytes });
+			writeSyncStartedMarker({
+				startedAt: syncStartedAt,
+				replicationEstablished: true,
+				targetTimestamps,
+				totalBytes,
+				targetsExcludeLocalTables: true,
+			});
 		}
 
 		if (!targetTimestamps) {
@@ -576,6 +586,12 @@ type SyncStartedMarker = {
 	startedAt?: number;
 	replicationEstablished?: boolean;
 	targetTimestamps?: Record<string, number>;
+	/**
+	 * Whether `targetTimestamps` was derived with non-replicating tables excluded. A marker written
+	 * before that filtering can name a database whose every table is local, whose socket no side ever
+	 * opens, so a resume that reused it would wait out the whole clone ceiling. Absent means re-derive.
+	 */
+	targetsExcludeLocalTables?: boolean;
 	totalBytes?: number;
 	setupComplete?: boolean;
 };
@@ -818,6 +834,7 @@ async function fetchAndPersistSnapshot(
 	writeSyncStartedMarker({
 		startedAt: syncStartedAt,
 		replicationEstablished: true,
+		targetsExcludeLocalTables: true,
 		targetTimestamps: snapshot.targetTimestamps,
 		totalBytes: snapshot.totalBytes,
 	});

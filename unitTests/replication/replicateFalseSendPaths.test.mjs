@@ -1,13 +1,8 @@
 /**
- * harper-pro#883: the source is the party that keeps a `replicate: false` table on the node. These
- * drive the real inbound handlers of `replicateOverWS` with a fake socket and a real table declared
- * `@table(replicate: false)`, next to a replicated control table:
- *  - GET_RECORD for the local table is refused with an error frame before anything is read or sent
- *    (no TABLE_FIXED_STRUCTURE precedes it), while the control table is still served;
- *  - the NODE_NAME handshake omits the local table's definition and keeps the control table's;
- *  - a full copy (SUBSCRIPTION_REQUEST at startTime 0 from a peer that declared no table, so its request
- *    excludes nothing) announces and copies the control table only, and opens no blob — the wire is what
- *    is asserted, not a receiver's outcome.
+ * The sender keeps a `replicate: false` table on its node, asserted on the wire: these drive the real
+ * inbound handlers of `replicateOverWS` over a fake socket, against a real `@table(replicate: false)`
+ * table beside a replicated control table. A peer that declared no table excludes nothing in its
+ * subscription request, which is the case the sender alone has to enforce.
  */
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -15,9 +10,9 @@ import { decode, encode } from 'msgpackr';
 import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
 import { loadGQLSchema } from '#src/core/resources/graphql';
 import { tables } from '#src/core/resources/databases';
-import { createAuditEntry } from '#src/core/resources/auditStore';
+import { HAS_BLOBS, createAuditEntry } from '#src/core/resources/auditStore';
 import { FrameWriter } from '#src/replication/frameWriter';
-import { databaseSubscriptions, replicateOverWS } from '#src/replication/replicationConnection';
+import { databaseSubscriptions, encodeCopyRecordValue, replicateOverWS } from '#src/replication/replicationConnection';
 import { setReplicator } from '#src/replication/replicator';
 
 const SUBSCRIPTION_REQUEST = 129;
@@ -192,7 +187,7 @@ describe('replicate: false on the full copy (harper-pro#883)', function () {
 
 // One replicated transaction as a pre-#883 sender frames it: the origin log key, one put entry (its
 // leading local-time float stripped, as the sender does), and the end-of-transaction sequence update.
-function oldSenderFrame(table, tableId, record) {
+function oldSenderFrame(table, tableId, record, options = {}) {
 	const frame = new FrameWriter();
 	const txnLogKey = Date.now();
 	frame.writeFloat64(txnLogKey);
@@ -204,7 +199,8 @@ function oldSenderFrame(table, tableId, record) {
 			version: txnLogKey,
 			previousVersion: null,
 			nodeId: 0,
-			encodedRecord: Buffer.from(table.primaryStore.encoder.encode(record)),
+			extendedType: options.extendedType,
+			encodedRecord: options.encodedRecord ?? Buffer.from(table.primaryStore.encoder.encode(record)),
 		})
 	);
 	const start = entry[0] === 66 ? 8 : 0;
@@ -272,5 +268,34 @@ describe('replicate: false on the receive path (harper-pro#883)', function () {
 		assert.equal(applied?.payload, 'lands', 'the replicated table must still apply the same sender frames');
 		assert.ok(!(await local.get('from-old-sender')), 'the local table must not apply a peer row');
 		assert.deepEqual(socket.closes, [], 'the drop must not close the connection');
+	});
+
+	it('drops a blob-carrying row for the local table without leaving its announced stream in flight', async () => {
+		const local = tables.ReplicateFalseLocal;
+		// Real stored bytes: the blob references inside them are what the drop path enumerates in order
+		// to retire the streams a sender announces ahead of the record.
+		await local.put({ id: 'blob-donor', payload: BLOB_PAYLOAD });
+		const donor = local.primaryStore.getEntry('blob-donor');
+		assert.ok(donor.metadataFlags & HAS_BLOBS, 'premise: the donor row is blob-carrying');
+		// The sender's own copy-row encode, so the blob references travel exactly as they do in production.
+		const announced = [];
+		const encodedRecord = Buffer.from(
+			encodeCopyRecordValue(local.primaryStore, donor.value, (blob) => announced.push(blob))
+		);
+		assert.ok(announced.length > 0, 'premise: encoding the donor row surfaces its blob reference');
+
+		socket = new FakeSocket();
+		replicateOverWS(socket, {}, { replicates: true });
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], {}]));
+		await settle(socket, 1);
+		socket.emit('message', encode([NODE_NAME_TO_ID_MAP, { 'peer-a': 0 }, ['peer-a']]));
+		socket.emit('message', structureFrame(local, 31));
+		socket.emit(
+			'message',
+			oldSenderFrame(local, 31, { id: 'blob-from-old-sender' }, { encodedRecord, extendedType: HAS_BLOBS })
+		);
+		for (let turn = 0; turn < 60; turn++) await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.ok(!(await local.get('blob-from-old-sender')), 'a blob-carrying peer row must not land either');
+		assert.deepEqual(socket.closes, [], 'enumerating the dropped record blobs must not close the connection');
 	});
 });

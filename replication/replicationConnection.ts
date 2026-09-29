@@ -4431,8 +4431,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	// undefined = not yet computed; null = computed, no exclusions; Set = tables to drop on receive
-	// Table name -> why this connection drops its inbound records; undefined until the first record.
-	let receiveBlockedTables: Map<string, string> | undefined;
+	// Table name -> why this connection drops its inbound records. undefined until the first record,
+	// null when nothing is blocked.
+	let receiveBlockedTables: Map<string, string> | null | undefined;
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
 	// Serialize message handling so that async backpressure inside onWSMessage doesn't allow
@@ -6311,10 +6312,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														}
 														await new Promise(setImmediate);
 														if (closed) return;
-														// A redeclaration replaces the Table object, so re-resolve by name: a table
-														// made non-replicating during this walk stops here instead of finishing it.
-														// Evaluated at the pacer's yield — the only point where a flip can have become
-														// visible — so the row path pays nothing and the window is one pacer interval.
+														// Re-resolve by name: a redeclaration replaces the Table object. Evaluated at the
+														// pacer's yield, so the row path pays nothing; DESIGN.md note 23 records the window.
 														if (!tableReplicates(tables[tableName] ?? table)) break;
 													}
 													// Local-only records must never be full-copied to a peer. metadataFlags is the
@@ -6665,13 +6664,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					close(1011, 'missing table structure; reconnecting to resync');
 					return;
 				}
-				// Lazily computed once remoteNodeName is known: the route's own exclusions (preferring
-				// routeReplicates from the subscriber-side connection, falling back to
-				// authorization.replicates for the server-side handler), plus every table this node
-				// declares non-replicating — an older sender still forwards those, and a node-local table
-				// has one writer. One map, so the record path pays a single lookup and gets the reason with
-				// it. It is a snapshot taken at the first record: the sender's gate is the enforcement
-				// point, and this is the backstop behind it.
+				// Route exclusions (config route first, peer authorization second) plus this node's
+				// non-replicating tables, resolved once: an older sender still forwards both. A snapshot,
+				// because the sender's gate is the enforcement point and this only backstops it.
 				if (receiveBlockedTables === undefined) {
 					const firstNode = options.connection?.nodeSubscriptions?.[0];
 					const receivesFromEntries =
@@ -6679,16 +6674,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						(authorization?.replicates && typeof authorization.replicates === 'object'
 							? authorization.replicates.receivesFrom
 							: undefined);
-					receiveBlockedTables = new Map();
+					const blocked = new Map<string, string>();
 					const routeExcluded = getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName);
 					if (routeExcluded)
-						for (const tableName of routeExcluded)
-							receiveBlockedTables.set(tableName, 'table excluded by the receive route');
+						for (const tableName of routeExcluded) blocked.set(tableName, 'table excluded by the receive route');
 					for (const tableName in tables)
-						if (!tableReplicates(tables[tableName]) && !receiveBlockedTables.has(tableName))
-							receiveBlockedTables.set(tableName, 'table does not replicate on this node');
+						if (!tableReplicates(tables[tableName]) && !blocked.has(tableName))
+							blocked.set(tableName, 'table does not replicate on this node');
+					// null rather than an empty map: the ordinary link blocks nothing, and this is the only
+					// per-record work the drop adds.
+					receiveBlockedTables = blocked.size > 0 ? blocked : null;
 				}
-				const dropReason = tableDecoder && receiveBlockedTables.get(tableDecoder.name);
+				const dropReason = receiveBlockedTables && tableDecoder && receiveBlockedTables.get(tableDecoder.name);
 				if (dropReason) {
 					logger.trace?.(
 						connectionId,
@@ -6699,9 +6696,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						dropReason
 					);
 					if (auditRecord.extendedType & HAS_BLOBS) {
-						// The record's blobs were announced ahead of it and are already buffered here. Dropping
-						// the record without them leaves each stream to the blobsTimer sweep a blobTimeout later
-						// (900s default), so a peer streaming a dropped table holds that memory meanwhile.
+						// Blobs are announced ahead of their record, so they are already buffered; without this
+						// they would sit until the blobsTimer sweep a blobTimeout later (900s default).
 						try {
 							for (const blob of collectAuditRecordBlobsFromBinary(auditRecord, tableDecoder, auditStore?.rootStore))
 								discardIncomingBlobStream(blob);
