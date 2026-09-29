@@ -7124,10 +7124,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													// re-carrying this specific entry. A deferred entry waits for a later resweep, once
 													// currentSequenceId has itself reached `key` through ordinary traffic.
 													if (key > currentSequenceId) continue;
-													// core may define TransitionEntry fields as prototype getters, so this preserves
-													// retained's prototype chain instead of spreading it. getTransitionImage is still bound
-													// explicitly: a method call's `this` would otherwise be this wrapper, not retained,
-													// which breaks a receiver-sensitive core implementation (e.g. a private field)
+													// getTransitionImage is bound to retained: a method call's `this` is the object it was
+													// called on, not resolved through the prototype chain the way a field read is, and core's
+													// implementation may be receiver-sensitive (e.g. a private field)
 													const redelivery = Object.create(retained, {
 														isHandoffRedelivery: { value: true, enumerable: true },
 														getTransitionImage: { value: retained.getTransitionImage?.bind(retained), enumerable: true },
