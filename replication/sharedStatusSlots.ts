@@ -59,14 +59,11 @@ export const RECORD_LOCKS_CAPABILITY_POSITION = allocate();
 export const RECORD_LOCK_HOMES_AGREEMENT_POSITION = allocate();
 export const RECORD_LOCK_LEVEL_POSITION = allocate();
 
-// Total buffer size. 64 gives headroom for the peer-scoped transport (harper-pro#884) and the
-// ownership domain (harper-pro#886) with slots to spare, without another growth pass this epic.
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
-// The count actually allocated above. A multi-slot allocate() call (like the fire-counter block)
-// can push this past REPLICATION_SHARED_STATUS_SLOTS while every individual *_POSITION constant
-// still numerically reads "in range" on its own (a block's start, not its end) — Float64Array
-// silently drops an out-of-bounds write rather than throwing, so that gap would corrupt a
-// neighboring (database, peer)'s memory with no test failure. Fail at load time instead.
+// A multi-slot allocate() (the fire-counter block) can push this past REPLICATION_SHARED_STATUS_SLOTS
+// while its own base constant still reads in range — that's the block's start, not its end. Indexing a
+// Float64Array past its length is a silent no-op (verified: no throw, reads back as undefined), so an
+// overflowing field would silently never read or write instead of failing loudly.
 export const ALLOCATED_SLOTS = cursor;
 if (ALLOCATED_SLOTS > REPLICATION_SHARED_STATUS_SLOTS) {
 	throw new Error(
