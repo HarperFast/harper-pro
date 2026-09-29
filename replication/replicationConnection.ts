@@ -7635,8 +7635,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													if (closed) return;
 													if (resweep && handoffRequestedAt.has(receiptRequestKey(table.tableId, retained.recordId)))
 														continue;
-													const redelivery = Object.create(retained);
-													redelivery.isHandoffRedelivery = true;
+													// own properties: the send path spreads the record into an invalidate entry
+													const redelivery = { ...retained, isHandoffRedelivery: true };
 													await sendAuditRecord(redelivery, retained.txnLogKey ?? retained.version);
 												}
 											}

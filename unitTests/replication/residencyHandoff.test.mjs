@@ -357,19 +357,20 @@ describe('residency handoff — answering receipt requests', () => {
 		expect(result.settled).to.deep.equal([pending]);
 	});
 
-	it('treats a throwing or asynchronous lookup as not yet provable', async () => {
+	it('treats a throwing lookup as not yet provable, and awaits a deferred one', async () => {
 		const { receipts, waiting } = await settleReceiptRequests(
 			[
 				request('throws', V1, () => {
 					throw new Error('closed');
 				}),
 				request('async', V1, () => Promise.resolve(complete(V1))),
+				request('rejects', V1, () => Promise.reject(new Error('miss'))),
 			],
 			blobsOk,
 			NOW
 		);
-		expect(receipts).to.deep.equal([]);
-		expect(waiting.length).to.equal(2);
+		expect(receipts).to.deep.equal([[7, 'async', V1]]);
+		expect(waiting.map((r) => r.recordId)).to.deep.equal(['throws', 'rejects']);
 	});
 });
 
