@@ -198,8 +198,8 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // transition image, from the receiver's row state once that row is complete and durable (harper#2257).
 const HANDOFF_RECEIPT = 151;
 const HANDOFF_RECEIPT_REQUEST = 152;
-// how often a sending subscription re-runs its owed-image sweep on its next pass
 const HANDOFF_RESWEEP_INTERVAL_MS = 5 * 60_000;
+const RECEIPT_PRUNE_INTERVAL_MS = 1000;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -4582,32 +4582,35 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// a gap. See onCommit, the blob save `.finally`, and the sequence-update branches.
 	let hasBlobGap = false;
 	let lastDurableSequenceId = 0;
-	// Receipt requests from the sender, keyed by record. Not answered while a base copy applies WAL-off
-	// rows (until its flush) or while a blob is in flight or gapped. A settle checks only the keys it is
-	// given — the records a frame touched, or the requests that just arrived — and a full pass runs at
-	// the rare points where any row may have become durable (blob drain, copy finish).
+	// Receipt requests from the sender, keyed by record. A settle checks only the keys it is handed — the
+	// records a frame touched, or the requests that just arrived. While a base copy applies WAL-off rows
+	// (until its flush) or a blob is in flight or gapped, those keys are deferred instead, and the blob
+	// drain or the copy finish settles exactly the deferred set.
 	const receiptRequests = new Map<string, ReceiptRequest>();
 	let receiptApplyChain: Promise<void> = Promise.resolve();
 	let settlingReceipts: Promise<void> | undefined;
-	let resettleKeys: Set<string> | 'all' | undefined;
+	let resettleKeys: Set<string> | undefined;
+	let deferredReceiptKeys: Set<string> | undefined;
+	let lastReceiptPruneAt = 0;
 	function settleHandoffReceipts(keys?: Iterable<string>): Promise<void> {
 		if (settlingReceipts) {
-			if (!keys) resettleKeys = 'all';
-			else if (resettleKeys !== 'all') {
-				const pending = resettleKeys ?? (resettleKeys = new Set());
-				for (const key of keys) pending.add(key);
-			}
+			const pending = resettleKeys ?? (resettleKeys = new Set());
+			for (const key of keys ?? deferredReceiptKeys ?? []) pending.add(key);
+			if (!keys) deferredReceiptKeys = undefined;
 			return settlingReceipts;
 		}
-		if (receiptRequests.size === 0 || inCopyMode || outstandingBlobsToFinish.length !== 0 || hasBlobGap)
+		if (inCopyMode || outstandingBlobsToFinish.length !== 0 || hasBlobGap) {
+			if (keys) for (const key of keys) (deferredReceiptKeys ??= new Set()).add(key);
 			return Promise.resolve();
+		}
 		const selected: ReceiptRequest[] = [];
-		if (keys) {
-			for (const key of keys) {
+		const wanted = keys ?? deferredReceiptKeys;
+		if (!keys) deferredReceiptKeys = undefined;
+		if (wanted)
+			for (const key of wanted) {
 				const request = receiptRequests.get(key);
 				if (request) selected.push(request);
 			}
-		} else selected.push(...receiptRequests.values());
 		if (selected.length === 0) return Promise.resolve();
 		settlingReceipts = settleReceiptRequests(selected, storedBlobsAreComplete)
 			.then(({ receipts, settled }) => {
@@ -4624,7 +4627,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				settlingReceipts = undefined;
 				const again = resettleKeys;
 				resettleKeys = undefined;
-				if (again) void settleHandoffReceipts(again === 'all' ? undefined : again);
+				if (again) void settleHandoffReceipts(again);
 			});
 		return settlingReceipts;
 	}
@@ -5169,8 +5172,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!requestDecoder) continue;
 							const key = receiptRequestKey(requestTableId, recordId);
 							if (!receiptRequests.has(key) && receiptRequests.size >= MAX_PENDING_RECEIPT_REQUESTS) {
-								for (const [staleKey, stale] of receiptRequests)
-									if (now >= stale.expiresAt) receiptRequests.delete(staleKey);
+								if (now - lastReceiptPruneAt >= RECEIPT_PRUNE_INTERVAL_MS) {
+									lastReceiptPruneAt = now;
+									for (const [staleKey, stale] of receiptRequests)
+										if (now >= stale.expiresAt) receiptRequests.delete(staleKey);
+								}
 								if (receiptRequests.size >= MAX_PENDING_RECEIPT_REQUESTS) continue;
 							}
 							receiptRequests.set(key, {
@@ -5760,7 +5766,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let sentNodeIds = new Set<number>();
 						let closed = false;
 						let handoffSweepDone = false;
+						let handoffSweepCount = 0;
 						let handoffResweepTimer: ReturnType<typeof setInterval> | undefined;
+						let wakeForResweep: (() => void) | undefined;
+						// receipt requests ride after the frame that carries their images, in bounded batches
+						let pendingReceiptRequests: [number, any, number][] = [];
+						const handoffRequestedAt = new Map<string, number>();
+						const requestHandoffReceipt = (request: [number, any, number]) => {
+							pendingReceiptRequests.push(request);
+							handoffRequestedAt.set(receiptRequestKey(request[0], request[1]), Date.now());
+						};
+						const flushReceiptRequests = () => {
+							if (pendingReceiptRequests.length === 0) return;
+							const requests = pendingReceiptRequests;
+							pendingReceiptRequests = [];
+							for (const chunk of chunkReceipts(requests))
+								ws.send(encode([HANDOFF_RECEIPT_REQUEST, chunk, databaseName]));
+						};
 						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
 						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
 						tableSubscriptionToReplicator = subscriptionForConnection(
@@ -6216,8 +6238,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (substituteEntry) {
 								frame.writeInt(substituteEntry.length);
 								frame.writeBytes(substituteEntry);
-								// may overtake its frame: the receiver holds the request until the row completes or it expires
-								if (receiptRequest) ws.send(encode([HANDOFF_RECEIPT_REQUEST, [receiptRequest], databaseName]));
+								if (receiptRequest) requestHandoffReceipt(receiptRequest);
 							} else {
 								// directly write the audit record.
 								const encoded = auditRecord.encoded;
@@ -6286,6 +6307,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (checkExcessMessageSize(frame.position - frame.encodingStart))
 									throw new Error('Replication message too large to send');
 								ws.send(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
+								flushReceiptRequests();
 								// A frame actually went out: tell the outbound connection so it can reset its reconnect
 								// backoff on genuine progress rather than on bare socket-open (harper-pro#339).
 								if (!supersededOrClosed()) options.connection?.onFrameSent?.();
@@ -6306,6 +6328,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						auditSubscription.once('close', () => {
 							closed = true;
 							if (handoffResweepTimer) clearInterval(handoffResweepTimer);
+							wakeForResweep?.();
 							subscriptionToHdbNodes?.end();
 						});
 						// find the earliest start time of the subscriptions
@@ -6846,8 +6869,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															copyTxnLogKey,
 															nodeId
 														);
-														if (copyReceiptRequest)
-															ws.send(encode([HANDOFF_RECEIPT_REQUEST, [copyReceiptRequest], databaseName]));
+														if (copyReceiptRequest) requestHandoffReceipt(copyReceiptRequest);
 														logger.debug?.(
 															'sent record from table',
 															entry.key,
@@ -7001,13 +7023,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 										if (!handoffSweepDone) {
 											handoffSweepDone = true;
+											const resweep = handoffSweepCount++ > 0;
 											handoffResweepTimer ??= setInterval(() => {
 												handoffSweepDone = false;
+												wakeForResweep?.();
 											}, HANDOFF_RESWEEP_INTERVAL_MS).unref();
-											// Redeliver every retained transition image this peer is still owed (harper#2257): a
-											// receipt that never came back, an origin restart, or a peer that committed the entry
-											// without promoting it. Bounded by the unreleased set; ordinary replay carries nothing extra.
+											const sweepNow = Date.now();
+											for (const [key, at] of handoffRequestedAt)
+												if (sweepNow - at >= RECEIPT_REQUEST_TTL_MS) handoffRequestedAt.delete(key);
+											// a peer that cannot receipt gets each image once; a re-sweep re-asks only what has had
+											// the receiver's full TTL to answer
+											const peerCanReceipt = peerCapabilitiesLearned && peerSupportsHandoffReceipts(peerCapabilities);
 											for (const table of tableSubscriptionToReplicator.tableById) {
+												if (resweep && !peerCanReceipt) break;
 												if (!table || !coreRetainsTransitionImages(table) || !tableToTableEntry(table)) continue;
 												let owed: TransitionEntry[];
 												try {
@@ -7030,6 +7058,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													);
 												for (const retained of owed) {
 													if (closed) return;
+													if (resweep && handoffRequestedAt.has(receiptRequestKey(table.tableId, retained.recordId)))
+														continue;
 													const redelivery = Object.create(retained);
 													redelivery.isHandoffRedelivery = true;
 													await sendAuditRecord(redelivery, retained.txnLogKey ?? retained.version);
@@ -7073,6 +7103,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											getSharedStatus()[SENDING_TIME_POSITION] = 0;
 											currentSequenceId = copyStartTime;
 										}
+<<<<<<< HEAD
 									}
 									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
 									// Capture the current generation before scanning. A commit after this live scan
@@ -7153,6 +7184,72 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
 									await nextTransaction;
 								} while (!closed);
+=======
+										if (capturedFloors) {
+											const liveRange: any = auditLogIterable;
+											// exactStartFailures alone is not a scan-integrity signal on an ordinary range: core
+											// reports `missing` whenever the first polled entry isn't exactly the cursor, which is
+											// the ordinary, healthy case for a plain (non-boundary) resume (see boundaryLogName's
+											// comment above). failedLogs and corruptFrameStop are genuine scan failures on ANY
+											// range and must still withhold certification even when there is no boundary.
+											if (
+												(boundaryLogName && liveRange?.exactStartFailures?.size > 0) ||
+												liveRange?.failedLogs?.size > 0 ||
+												liveRange?.corruptFrameStop?.breaks > 0
+											) {
+												// a scan that may have skipped an entry can certify nothing more on this range
+												if (floorEmissionLatchedRange !== liveRange)
+													logger.warn?.(
+														connectionId,
+														`A transaction-log scan for ${remoteNodeName} reported a failure; origin floors are no longer certified on this connection until it reconnects`
+													);
+												floorEmissionLatchedRange = liveRange;
+											} else if (floorEmissionLatchedRange !== liveRange) certifyOriginFloors(capturedFloors);
+											capturedFloors = undefined;
+										}
+										getSharedStatus()[SENDING_TIME_POSITION] = 0;
+										if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
+										flushReceiptRequests();
+										// a timed wake can land after the socket was marked closed, before the close event
+										if (closed || wsClosed) return;
+										// A commit that landed during the scan rotated the promise captured before it: rescan
+										// immediately, without paying for timer setup, a Promise/executor allocation or a waker.
+										if (whenNextTransaction(auditStore) !== nextTransaction) continue;
+										// an `includeNodes` update re-admits a log whose entries are already committed; the
+										// owed-image re-sweep timer wakes this same wait too (`wakeForResweep`).
+										let wake: () => void;
+										// one timer per loop; an exit that skips the clear leaks nothing but one unreferenced timer
+										if (certifiesOriginFloors()) {
+											if (floorTimer) floorTimer.refresh();
+											else floorTimer = setTimeout(() => wakeSender?.(), originFloorIntervalMs).unref();
+										}
+										try {
+											await new Promise<void>((resolve, reject) => {
+												wake = wakeSender = resolve;
+												wakeForResweep = resolve;
+												wakeSenderFailed = reject;
+												// One reaction per transaction generation: a timed wake sees the same pending promise
+												// again, and a reaction per wake would accumulate on an idle database.
+												if (attachedNextTransaction !== nextTransaction) {
+													attachedNextTransaction = nextTransaction;
+													nextTransaction.then(
+														() => wakeSender?.(),
+														(error) => wakeSenderFailed?.(error)
+													);
+												}
+											});
+										} finally {
+											// a superseded loop must not clear the live loop's waker
+											if (wakeSender === wake) wakeSender = undefined;
+											wakeForResweep = undefined;
+										}
+										// a timed wake can land after the socket was marked closed, before the close event
+										if (closed || wsClosed) return;
+									} while (!closed);
+								} finally {
+									clearTimeout(floorTimer);
+								}
+>>>>>>> 65877a9 (Wake an idle send loop for the owed-image re-sweep, defer blocked receipt settles to exactly their keys, batch receipt requests after their frame, and re-ask only what a peer has had its full TTL to answer)
 							})
 							.catch((error) => {
 								logger.error?.(connectionId, 'Error handling subscription to node', error);
