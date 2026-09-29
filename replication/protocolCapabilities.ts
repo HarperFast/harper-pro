@@ -32,6 +32,39 @@ export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
  */
 export const RECORD_LOCKS_CAPABILITY = 4;
 
+<<<<<<< HEAD
+=======
+/**
+ * Level at which a peer sends and applies the per-origin cursor vector (harper-pro#989, W4 harper-pro#434):
+ * `SUBSCRIPTION_REQUEST[4]`, `originCursors` on an `includeNodes` update, and the relayed-log anchors on
+ * `COPY_START[3]`. Advertised only by a build whose transaction logs are per origin (RocksDB).
+ */
+export const ORIGIN_CURSORS_CAPABILITY = 1;
+
+/**
+ * Level at which a peer sends and applies origin-closed floor certificates (harper-pro#922 item 2): the optional
+ * per-origin floor vector on `SEQUENCE_ID_UPDATE[2]`, stored as `nodes[].closedFloor`, and a resume request that
+ * starts at a stored floor. Advertised only by a build whose transaction logs are per origin (RocksDB), since only
+ * core's RocksDB store certifies a floor.
+ */
+export const ORIGIN_FLOORS_CAPABILITY = 1;
+
+/**
+ * Table lifecycle stamps: a peer at this level reads `createdTime` on definitions and structure frames and
+ * the drop-marker list in `DB_SCHEMA[4]`, which is sent only to such a peer. The stamps ride existing
+ * fields older receivers ignore.
+ */
+export const TABLE_LIFECYCLE_CAPABILITY = 1;
+
+/**
+ * Level at which a peer certifies a record-residency handoff (HarperFast/harper#2257): it can parse a
+ * transition PATCH entry carrying core's attached complete image, and it answers each one it commits as
+ * a complete row with a `HANDOFF_RECEIPT`. A peer below this level is sent a plain complete `put`
+ * instead and can never certify release, so the origin keeps the image until that peer upgrades.
+ */
+export const RESIDENCY_HANDOFF_RECEIPT_CAPABILITY = 1;
+
+>>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	safeCopyAudit: number;
@@ -39,6 +72,13 @@ export interface ResolvedPeerCapabilities {
 	subscriptionSetupAck: number;
 	subscriptionSetupBudgetMs: number | undefined;
 	recordLocks: number;
+<<<<<<< HEAD
+=======
+	originCursors: number;
+	originFloors: number;
+	tableLifecycle: number;
+	residencyHandoffReceipt: number;
+>>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -79,6 +119,13 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		subscriptionSetupAck: resolveLevel(bag?.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY, 0),
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
 		recordLocks: resolveExactLevel(bag?.recordLocks, 0),
+<<<<<<< HEAD
+=======
+		originCursors: resolveLevel(bag?.originCursors, ORIGIN_CURSORS_CAPABILITY, 0),
+		originFloors: resolveLevel(bag?.originFloors, ORIGIN_FLOORS_CAPABILITY, 0),
+		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
+		residencyHandoffReceipt: resolveLevel(bag?.residencyHandoffReceipt, RESIDENCY_HANDOFF_RECEIPT_CAPABILITY, 0),
+>>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
 	});
 }
 
@@ -87,6 +134,21 @@ export function peerSupportsRecordLocks(resolved: ResolvedPeerCapabilities): boo
 	return resolved.recordLocks === RECORD_LOCKS_CAPABILITY;
 }
 
+<<<<<<< HEAD
+=======
+export function peerSupportsOriginCursors(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.originCursors >= ORIGIN_CURSORS_CAPABILITY;
+}
+
+export function peerSupportsOriginFloors(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.originFloors >= ORIGIN_FLOORS_CAPABILITY;
+}
+
+export function peerSupportsHandoffReceipts(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.residencyHandoffReceipt >= RESIDENCY_HANDOFF_RECEIPT_CAPABILITY;
+}
+
+>>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
 /** A peer that advertised nothing — the pre-registry baseline. */
 export const ABSENT_PEER_CAPABILITIES: ResolvedPeerCapabilities = resolvePeerCapabilities(undefined);
 
@@ -118,6 +180,14 @@ export function buildLocalCapabilities(
 		subscriptionSetupBudgetMs,
 		// A node that has not enabled cluster locks never grants, so it must not claim it would.
 		recordLocks: advertisedRecordLocksLevel(recordLocksEnabled, false),
+<<<<<<< HEAD
+=======
+		// LMDB keys one shared audit log by local time, so it has no origin cursor to send or apply.
+		originCursors: perOriginLogs ? ORIGIN_CURSORS_CAPABILITY : 0,
+		originFloors: perOriginLogs ? ORIGIN_FLOORS_CAPABILITY : 0,
+		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
+		residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
+>>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
 	});
 }
 
@@ -129,7 +199,15 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.protocolVersion === b.protocolVersion &&
 		a.subscriptionSetupAck === b.subscriptionSetupAck &&
 		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
+<<<<<<< HEAD
 		a.recordLocks === b.recordLocks
+=======
+		a.recordLocks === b.recordLocks &&
+		a.originCursors === b.originCursors &&
+		a.originFloors === b.originFloors &&
+		a.tableLifecycle === b.tableLifecycle &&
+		a.residencyHandoffReceipt === b.residencyHandoffReceipt
+>>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
 	);
 }
 
