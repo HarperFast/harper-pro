@@ -251,9 +251,7 @@ async function assertAllReplicated(follower, peerHostname, results, what) {
 	);
 }
 
-// The worker logs its disconnect warn only while its retry counter is at zero, and only replication progress
-// resets it (NodeReplicationConnection.resetRetryBackoff) -- so a database with no warn in a cycle's window
-// entered that outage still carrying the previous one's escalated reconnect backoff.
+// The worker warns on a disconnect only while its retry counter is at zero, which only replication progress restores.
 async function databasesWithoutFreshDisconnect(follower, leaderHostname, fromMs, toMs) {
 	const pattern = new RegExp(
 		`Disconnected from wss://${leaderHostname.replaceAll('.', '\\.')}:\\d+ \\(db: "([^"]+)"\\)`

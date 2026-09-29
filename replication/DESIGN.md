@@ -265,15 +265,19 @@ entry even when another database for the same peer is simultaneously in wedge re
 
 **The reconnect backoff resets on progress in either direction, never on socket open.** A leg that reopens
 and fails before moving data — a peer that accepts TLS and drops it (harper-pro#339), or a stream blocked at
-an oversized frame (#713) — must keep escalating. The sending side resets when a transaction frame goes out.
-A subscriber's outbound leg sends none (in a two-way mesh the peer serves our subscription from its own
+an oversized frame (#713) — must keep escalating. The sending side resets in `onFrameSent`. A subscriber's
+outbound leg sends no transaction frames (in a two-way mesh the peer serves our subscription from its own
 server session), so it resets through `onDurableProgress` when its receive-side durable watermark advances:
-at a commit and at the last in-flight blob's drain. Only an advance past the highest value this
-`NodeReplicationConnection` has already credited counts, and only from the session that still owns the
-socket, so replaying the same undurable frames after each reconnect is not progress. Without the receive
-signal, the ceiling carried across unrelated outages until every reconnect waited out the 30 s cap
-(`connectedBitRestartChurn.test.mjs`). Still open: an idle leg that receives nothing between outages carries
-its escalated ceiling into the next one.
+at a commit and at the last in-flight blob's drain. Three things keep that from resetting a leg that is not
+working. Only an advance past the highest valid clock this `NodeReplicationConnection` has already credited
+counts, so replaying the same undurable frames after each reconnect is not progress. Nothing counts while a
+copy-apply copy is in progress, because its rows are not durable until the copy's flush. And a sender-loop
+failure on the leg (`onSendFailed`) vetoes receive credit until a frame is sent again, so a leg that both
+receives and serves a subscription does not redial at the floor while its own sends fail every time. Only
+the session that still owns the socket reports either signal. Without the receive signal, the ceiling
+carried across unrelated outages until every reconnect waited out the 30 s cap
+(`connectedBitRestartChurn.test.mjs`). Still open: a leg that receives nothing new between outages (idle,
+or mid-copy) carries its escalated ceiling into the next one.
 
 **What is deliberately NOT on this schedule:** the receive/copy watchdogs and their thresholds, and the
 doubling copy-finalize _timeout bound_ alongside them (these _detect_ stalls or bound a wait; this

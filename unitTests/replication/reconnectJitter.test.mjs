@@ -73,13 +73,13 @@ describe('NodeReplicationConnection reconnect jitter (harper-pro#327)', () => {
 		);
 	});
 
-	it('resetRetryBackoff resets the ceiling and the retry counter', () => {
+	it('onFrameSent resets the ceiling and the retry counter', () => {
 		const connection = makeConnection(() => 0.5);
 		scheduleDelays(connection, 3);
 		connection.retries = 7;
 		assert.equal(connection.retryBackoff.ceiling, 4000);
 
-		connection.resetRetryBackoff();
+		connection.onFrameSent();
 
 		assert.equal(connection.retries, 0);
 		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
@@ -124,12 +124,42 @@ describe('NodeReplicationConnection durable receive progress', () => {
 		connection.onDurableProgress(5000);
 		failedAttempts(connection, 3);
 
-		// A fresh session re-streams from the persisted cursor and commits the same range again.
 		connection.onDurableProgress(4000);
 		connection.onDurableProgress(5000);
 		assert.equal(connection.retryBackoff.ceiling, 4000);
 
 		connection.onDurableProgress(5001);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
+
+	it('a malformed sequence neither resets nor stops later progress from resetting', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		failedAttempts(connection, 3);
+
+		for (const malformed of [NaN, Infinity, 9e15, -1]) connection.onDurableProgress(malformed);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+		failedAttempts(connection, 3);
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, 4000, 'the replay guard still holds after the malformed values');
+	});
+
+	it('receive progress does not reset a leg whose own sends are failing until a frame goes out again', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onSendFailed();
+		failedAttempts(connection, 3);
+
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+		failedAttempts(connection, 1);
+		assert.equal(connection.retryBackoff.ceiling, 8000);
+
+		connection.onFrameSent();
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+		failedAttempts(connection, 2);
+		connection.onDurableProgress(2000);
 		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
 	});
 });
