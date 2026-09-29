@@ -94,25 +94,23 @@ describe('NodeReplicationConnection.forceReconnect', () => {
 		expect(conn.socket.terminate.callCount).to.equal(0);
 	});
 
-	it('backs off the retry interval on repeated wedges (mirrors the close-handler backoff)', () => {
+	it('backs off the retry ceiling on repeated wedges (mirrors the close-handler backoff)', () => {
 		const conn = makeConnection();
+		conn.random = () => 0.999999; // pin the draw so the doubled ceiling is observable as a wait
 
-		conn.forceReconnect(); // retryTime 500 -> 1000
+		conn.forceReconnect(); // the initial window is clamped to the 500 ms floor
+		expect(conn.retryBackoff.ceiling).to.equal(1000);
 		clock.tick(500);
 		expect(conn.connect.callCount).to.equal(1);
 
-		conn.forceReconnect(); // retryTime 1000 -> 2000
-		clock.tick(999);
-		expect(conn.connect.callCount, 'second reconnect waits the doubled interval').to.equal(1);
+		conn.forceReconnect(); // ceiling 1000 -> 2000, draws 999
+		expect(conn.retryBackoff.ceiling).to.equal(2000);
+		clock.tick(998);
+		expect(conn.connect.callCount, 'second reconnect waits the doubled ceiling').to.equal(1);
 		clock.tick(1);
 		expect(conn.connect.callCount).to.equal(2);
 	});
 
-	// harper-pro#466 backstop reliance (Codex review): the wedge reconcile re-posts subscribe-to-node
-	// with forceReconnect:true so subscribeToNode can drive recovery on a connection that is still
-	// "reusable" (isReusableConnection true). A never-opened connection has isConnected still true (the
-	// optimistic startup default) and no socket. forceReconnect must still flip it disconnected for the
-	// reconciler/notify and arm a fresh connect — a plain re-subscribe would only re-emit the listener.
 	it('drives recovery on a never-opened, still-reusable connection (no socket yet)', () => {
 		const conn = makeConnection();
 		conn.socket = undefined; // never opened — getSubscriptionConnection kept it cached as reusable

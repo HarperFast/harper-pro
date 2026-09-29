@@ -20,14 +20,33 @@
  * (`materializeGitSSH`) and is covered by core's Application tests.
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import {
+	chmodSync,
+	existsSync,
+	lstatSync,
+	mkdtempSync,
+	mkdirSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	readFileSync,
+	writeFileSync,
+	statSync,
+	symlinkSync,
+} from 'node:fs';
+import { open } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { generateKeyPairSync } from 'node:crypto';
+import { hasSSH, hasSSHKeygen } from './sshKeyFixtures.mjs';
+import { anchoredParser, regexParser } from './sshConfigEarlierParsers.mjs';
 
-const PRIVATE_KEY = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA\n-----END OPENSSH PRIVATE KEY-----\n';
-const ROTATED_KEY =
-	'-----BEGIN OPENSSH PRIVATE KEY-----\ncm90YXRlZC1rZXktbWF0ZXJpYWw\n-----END OPENSSH PRIVATE KEY-----\n';
+// Real keys, minted in `before`: a supplied key must be one ssh can load.
+let PRIVATE_KEY;
+let PUBLIC_KEY;
+let ROTATED_KEY;
 
 function makePem() {
 	return generateKeyPairSync('rsa', {
@@ -64,6 +83,9 @@ describe('sshKeyOperations sealing', () => {
 		custodyModule = await import('#src/security/keyCustody');
 		harperLogger = (await import('#src/core/utility/logging/harper_logger')).default;
 		ops = await import('#src/security/sshKeyOperations');
+		const { generateEd25519SSHKeyPair } = await import('#src/security/sshKeyGeneration');
+		({ privateKey: PRIVATE_KEY, publicKey: PUBLIC_KEY } = await generateEd25519SSHKeyPair('harper:deploy'));
+		({ privateKey: ROTATED_KEY } = await generateEd25519SSHKeyPair('harper:rotated'));
 	});
 
 	beforeEach(() => {
@@ -264,18 +286,32 @@ describe('sshKeyOperations sealing', () => {
 
 	describe('ssh config blocks', () => {
 		const configPath = () => join(sshDir, 'config');
+		const readConfig = () => readFileSync(configPath(), 'utf8');
+		const keyPath = (name) => join(sshDir, `${name}.key`);
 		const addKey = (name) =>
 			ops.addSSHKey(request({ name, key: PRIVATE_KEY, host: `${name}.alias`, hostname: 'example.com' }));
-		const blockFor = (name) =>
-			`#${name}\nHost ${name}.alias\n\tHostName example.com\n\tUser git\n\tIdentityFile ${join(sshDir, `${name}.key`)}\n\tIdentitiesOnly yes`;
+		const legacyBlockFor = (name) =>
+			`#${name}\nHost ${name}.alias\n\tHostName example.com\n\tUser git\n\tIdentityFile ${keyPath(name)}\n\tIdentitiesOnly yes`;
+		const withMarkers = (legacyBlock) => {
+			const [header, ...lines] = legacyBlock.split('\n');
+			const name = header.slice(1);
+			return [header, `# BEGIN harper ssh key ${name}`, ...lines, `# END harper ssh key ${name}`].join('\n');
+		};
+		const blockFor = (name) => withMarkers(legacyBlockFor(name));
 		const byName = (a, b) => a.name.localeCompare(b.name);
+		const unmanaged = 'Host other\n\tHostName example.net';
+
+		it("writes each key's block between BEGIN and END lines, under its `#name` line", async () => {
+			await addKey('first');
+			await addKey('second');
+
+			assert.equal(readConfig(), `${blockFor('first')}\n${blockFor('second')}`);
+		});
 
 		describe('of keys whose names share a prefix', () => {
-			// `repo` is a prefix of `repo-2`, so a `#repo` pattern not anchored to its whole comment line
-			// also matches the `#repo-2` block
 			for (const order of [
 				['repo-2', 'repo'],
-				// `repo`'s block opens the file, with no line break before its comment line
+				// `repo`'s block opens the file
 				['repo', 'repo-2'],
 			]) {
 				describe(`added as ${order.join(', ')}`, () => {
@@ -294,7 +330,7 @@ describe('sshKeyOperations sealing', () => {
 					it("delete_ssh_key removes only its own block, leaving the sibling's intact", async () => {
 						await ops.deleteSSHKey({ name: 'repo' });
 
-						assert.equal(readFileSync(configPath(), 'utf8'), blockFor('repo-2'));
+						assert.equal(readConfig(), blockFor('repo-2'));
 						assert.deepEqual(await ops.listSSHKeys(), [
 							{ name: 'repo-2', host: 'repo-2.alias', hostname: 'example.com' },
 						]);
@@ -302,14 +338,14 @@ describe('sshKeyOperations sealing', () => {
 				});
 			}
 
-			it('matches the comment line of a hand-edited config: blanks around the name, CRLF line endings', async () => {
+			it('reads the markers of a hand-edited config: blanks around them, CRLF line endings', async () => {
 				const handEdited = (text) => text.replace(/^#.*$/gm, ' \t$& \t').replace(/\n/g, '\r\n');
 				for (const name of ['repo-2', 'repo']) await addKey(name);
-				writeFileSync(configPath(), handEdited(readFileSync(configPath(), 'utf8')));
+				writeFileSync(configPath(), handEdited(readConfig()));
 
 				assert.equal((await ops.getSSHKey({ name: 'repo' })).host, 'repo.alias');
 				await ops.deleteSSHKey({ name: 'repo' });
-				assert.equal(readFileSync(configPath(), 'utf8'), handEdited(blockFor('repo-2')).trimStart());
+				assert.equal(readConfig(), handEdited(blockFor('repo-2')));
 			});
 		});
 
@@ -317,69 +353,535 @@ describe('sshKeyOperations sealing', () => {
 			['re-spaced', '\tIdentitiesOnly    yes\n'],
 			['removed', ''],
 		]) {
-			it(`delete_ssh_key stops at the next key's block when a block's IdentitiesOnly line was ${edit}`, async () => {
+			it(`delete_ssh_key removes a block whose IdentitiesOnly line was ${edit}, and nothing after it`, async () => {
 				for (const name of ['first', 'second']) await addKey(name);
-				writeFileSync(
-					configPath(),
-					readFileSync(configPath(), 'utf8').replace('\tIdentitiesOnly yes\n', identitiesOnlyLine)
-				);
+				writeFileSync(configPath(), readConfig().replace('\tIdentitiesOnly yes\n', identitiesOnlyLine));
 
 				await ops.deleteSSHKey({ name: 'first' });
-				assert.equal(readFileSync(configPath(), 'utf8'), blockFor('second'));
+				assert.equal(readConfig(), blockFor('second'));
 			});
 		}
 
-		it('delete_ssh_key removes a hand-edited block whole and stops at the next Host section', async () => {
-			const unmanaged = 'Host other\n\tHostName example.net';
+		it('delete_ssh_key removes every line between its markers, and keeps every line outside them', async () => {
 			for (const name of ['first', 'second']) await addKey(name);
 			writeFileSync(
 				configPath(),
-				readFileSync(configPath(), 'utf8')
-					.replace('Host first.alias\n', 'Host first.alias\n#staging\n')
-					.replace('\tIdentitiesOnly yes\n', `\tIdentitiesOnly no\n\tUser deploy\n${unmanaged}\n`)
+				readConfig()
+					.replace('\tIdentitiesOnly yes\n', `\tIdentitiesOnly no\n#staging\n${unmanaged}\n`)
+					// ssh reads this line as part of first's Host section, but it is outside first's markers
+					.replace('# END harper ssh key first\n', '# END harper ssh key first\n\tUser deploy\n# about second\n')
 			);
 
 			await ops.deleteSSHKey({ name: 'first' });
-			assert.equal(readFileSync(configPath(), 'utf8'), `${unmanaged}\n${blockFor('second')}`);
+			assert.equal(readConfig(), `\tUser deploy\n# about second\n${blockFor('second')}`);
 		});
 
-		it("get_ssh_key and delete_ssh_key leave the next key's block alone when a block is down to its `#name` line", async () => {
+		it("never takes a `#word` line above the user's own Host section for key word's block", async () => {
+			const usersSection = '#word\nHost word\n\tHostName word.example.net';
+			mkdirSync(sshDir, { recursive: true });
+			writeFileSync(configPath(), usersSection);
+			await addKey('word');
+
+			assert.equal((await ops.getSSHKey({ name: 'word' })).host, 'word.alias');
+			await ops.deleteSSHKey({ name: 'word' });
+			assert.equal(readConfig(), usersSection);
+		});
+
+		it("get_ssh_key and delete_ssh_key leave a lone `#name` line, and the next key's block, alone", async () => {
 			for (const name of ['first', 'second']) await addKey(name);
 			writeFileSync(configPath(), `#first\n${blockFor('second')}`);
 
 			assert.equal((await ops.getSSHKey({ name: 'first' })).host, undefined);
 			await ops.deleteSSHKey({ name: 'first' });
-			assert.equal(readFileSync(configPath(), 'utf8'), blockFor('second'));
+			assert.equal(readConfig(), `#first\n${blockFor('second')}`);
 		});
 
-		it('delete_ssh_key stops at the first Host section when a block lost its own Host line', async () => {
-			const unmanaged = 'Host other\n\tHostName example.net';
+		it('delete_ssh_key removes a block that lost its own Host line', async () => {
 			await addKey('first');
-			writeFileSync(
-				configPath(),
-				`${readFileSync(configPath(), 'utf8').replace('Host first.alias\n', '')}\n${unmanaged}`
-			);
+			writeFileSync(configPath(), `${readConfig().replace('Host first.alias\n', '')}\n${unmanaged}`);
 
 			assert.equal((await ops.getSSHKey({ name: 'first' })).host, undefined);
 			await ops.deleteSSHKey({ name: 'first' });
-			assert.equal(readFileSync(configPath(), 'utf8'), unmanaged);
+			assert.equal(readConfig(), unmanaged);
 		});
 
 		it('delete_ssh_key takes a middle block with its line break, leaving no blank line', async () => {
 			for (const name of ['first', 'middle', 'last']) await addKey(name);
 
 			await ops.deleteSSHKey({ name: 'middle' });
-			assert.equal(readFileSync(configPath(), 'utf8'), `${blockFor('first')}\n${blockFor('last')}`);
+			assert.equal(readConfig(), `${blockFor('first')}\n${blockFor('last')}`);
 		});
 
 		it('delete_ssh_key keeps config lines after a block that belong to no key', async () => {
-			const unmanaged = 'Host other\n\tHostName example.net';
 			await addKey('repo');
-			writeFileSync(configPath(), `${readFileSync(configPath(), 'utf8')}\n${unmanaged}`);
+			writeFileSync(configPath(), `${readConfig()}\n${unmanaged}`);
 
 			await ops.deleteSSHKey({ name: 'repo' });
-			assert.equal(readFileSync(configPath(), 'utf8'), unmanaged);
+			assert.equal(readConfig(), unmanaged);
 		});
+
+		it('delete_ssh_key undoes add_ssh_key byte for byte', async () => {
+			mkdirSync(sshDir, { recursive: true });
+			for (const before of [unmanaged, `${unmanaged}\n`, `\r\n${unmanaged}\r\n\r\n`]) {
+				writeFileSync(configPath(), before);
+				await addKey('deploy');
+				await ops.deleteSSHKey({ name: 'deploy' });
+				assert.equal(readConfig(), before, JSON.stringify(before));
+			}
+		});
+
+		it('get_ssh_key reads the first of two blocks for a key, and delete_ssh_key removes both', async () => {
+			await addKey('deploy');
+			writeFileSync(
+				configPath(),
+				`${readConfig()}\n${blockFor('deploy').replace('deploy.alias', 'newer.alias')}\n${unmanaged}`
+			);
+
+			assert.equal((await ops.getSSHKey({ name: 'deploy' })).host, 'deploy.alias');
+			await ops.deleteSSHKey({ name: 'deploy' });
+			assert.equal(readConfig(), unmanaged);
+		});
+
+		it('get_ssh_key reads Host and HostName in any case, with or without "="', async () => {
+			await addKey('deploy');
+			writeFileSync(
+				configPath(),
+				readConfig()
+					.replace('Host deploy.alias', 'host=deploy.alias')
+					.replace('\tHostName example.com', '\tHOSTNAME = example.com')
+			);
+
+			const { host, hostname } = await ops.getSSHKey({ name: 'deploy' });
+			assert.deepEqual({ host, hostname }, { host: 'deploy.alias', hostname: 'example.com' });
+		});
+
+		describe('with a damaged marker', () => {
+			const damagedError = (name, line) =>
+				isClientError(
+					new RegExp(
+						`^SSH key '${name}' was not deleted: line ${line} of the SSH config begins its block \\("# BEGIN harper ssh key ${name}"\\), but no "# END harper ssh key ${name}" line ends it\\.`
+					)
+				);
+
+			it('delete_ssh_key refuses a key whose BEGIN line has no END, changing nothing, and deletes the others', async () => {
+				for (const name of ['first', 'second', 'third']) await addKey(name);
+				const damaged = readConfig().replace('# END harper ssh key first\n', '');
+				writeFileSync(configPath(), damaged);
+
+				await assert.rejects(ops.deleteSSHKey({ name: 'first' }), damagedError('first', 2));
+				assert.equal(readConfig(), damaged);
+				assert.ok(existsSync(keyPath('first')), 'the key file must be kept');
+				assert.equal((await ops.getSSHKey({ name: 'first' })).host, undefined);
+
+				await ops.deleteSSHKey({ name: 'third' });
+				assert.equal(readConfig(), damaged.replace(`\n${blockFor('third')}`, ''));
+			});
+
+			for (const [shape, edit] of [
+				[
+					"first's END moved below second's block",
+					(config) => `${config.replace('# END harper ssh key first\n', '')}\n# END harper ssh key first`,
+				],
+				[
+					"second's END copied into first's block",
+					(config) => config.replace('\tUser git\n', '\tUser git\n# END harper ssh key second\n'),
+				],
+			]) {
+				it(`treats a block as unterminated when ${shape}, and still reads the other block`, async () => {
+					for (const name of ['first', 'second']) await addKey(name);
+					writeFileSync(configPath(), edit(readConfig()));
+
+					await assert.rejects(ops.deleteSSHKey({ name: 'first' }), damagedError('first', 2));
+					assert.equal((await ops.getSSHKey({ name: 'second' })).host, 'second.alias');
+				});
+			}
+
+			it('treats the last block as unterminated when the file ends before its END line', async () => {
+				for (const name of ['first', 'second']) await addKey(name);
+				const damaged = readConfig().replace(/\n# END harper ssh key second$/, '');
+				writeFileSync(configPath(), damaged);
+
+				await assert.rejects(ops.deleteSSHKey({ name: 'second' }), damagedError('second', 10));
+				assert.equal(readConfig(), damaged);
+			});
+
+			it('ignores an END line with no BEGIN', async () => {
+				for (const name of ['first', 'second']) await addKey(name);
+				writeFileSync(configPath(), `# END harper ssh key first\n${readConfig()}`);
+
+				await ops.deleteSSHKey({ name: 'first' });
+				assert.equal(readConfig(), `# END harper ssh key first\n${blockFor('second')}`);
+			});
+		});
+
+		describe('rewriting the config', () => {
+			it('keeps its mode and leaves no temporary file behind', async () => {
+				for (const name of ['first', 'second']) await addKey(name);
+				chmodSync(configPath(), 0o640);
+
+				await ops.deleteSSHKey({ name: 'first' });
+				assert.equal(statSync(configPath()).mode & 0o777, 0o640);
+				assert.deepEqual(readdirSync(sshDir).sort(), ['config', 'known_hosts', 'second.key']);
+			});
+
+			it('writes a symlinked config at its target, keeping the link', async () => {
+				for (const name of ['first', 'second']) await addKey(name);
+				const target = join(rootDir, 'managed-ssh-config');
+				renameSync(configPath(), target);
+				symlinkSync(target, configPath());
+
+				await ops.deleteSSHKey({ name: 'first' });
+				assert.ok(lstatSync(configPath()).isSymbolicLink());
+				assert.equal(readFileSync(target, 'utf8'), blockFor('second'));
+			});
+
+			it('fails delete_ssh_key, keeping the key and the config, when the config cannot be rewritten', async function () {
+				// root is not held back by directory permissions
+				if (process.getuid?.() === 0) this.skip();
+				for (const name of ['first', 'second']) await addKey(name);
+				const before = readConfig();
+
+				chmodSync(sshDir, 0o500);
+				try {
+					await assert.rejects(ops.deleteSSHKey({ name: 'first' }), { code: 'EACCES' });
+				} finally {
+					chmodSync(sshDir, 0o700);
+				}
+				assert.equal(readConfig(), before);
+				assert.deepEqual(readdirSync(sshDir).sort(), ['config', 'first.key', 'known_hosts', 'second.key']);
+			});
+
+			it('leaves the config as it was when writing a new block fails, so the key can still be deleted', async () => {
+				await addKey('first');
+				const probe = await open(join(rootDir, 'probe'), 'w');
+				const FileHandle = probe.constructor;
+				await probe.close();
+				const { writeFile } = FileHandle.prototype;
+				FileHandle.prototype.writeFile = async function () {
+					throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+				};
+				try {
+					await assert.rejects(addKey('second'), { code: 'ENOSPC' });
+				} finally {
+					FileHandle.prototype.writeFile = writeFile;
+				}
+
+				assert.equal(readConfig(), blockFor('first'));
+				await ops.deleteSSHKey({ name: 'second' });
+				assert.deepEqual(readdirSync(sshDir).sort(), ['config', 'first.key', 'known_hosts']);
+			});
+
+			it('serializes concurrent adds, so none of their blocks is lost', async () => {
+				const names = ['first', 'second', 'third', 'fourth'];
+				await Promise.all(names.map(addKey));
+
+				const config = readConfig();
+				for (const name of names) assert.equal(config.split(blockFor(name)).length, 2, `${name}'s block, once`);
+				assert.equal(config.length, names.map(blockFor).join('\n').length);
+			});
+
+			it('serializes an add and a delete, so neither change is lost', async () => {
+				await addKey('first');
+				await Promise.all([addKey('second'), ops.deleteSSHKey({ name: 'first' })]);
+
+				assert.equal(readConfig().replace(/^\n/, ''), blockFor('second'));
+				await ops.deleteSSHKey({ name: 'second' });
+			});
+
+			// holds the lock the operations share from this thread, starts `operation`, and runs `check` while
+			// the lock is still held; waits use timers/promises because an earlier suite can leave the global
+			// setTimeout faked
+			const whileLockIsHeld = async (operation, check) => {
+				const { withComponentPreparationLock } = await import('#src/core/components/componentPreparationLock');
+				let pending;
+				await withComponentPreparationLock(sshDir, async () => {
+					pending = operation();
+					await delay(500);
+					check();
+				});
+				return pending;
+			};
+
+			it('add_ssh_key writes neither its key file nor its block until it holds the lock', async () => {
+				mkdirSync(sshDir, { recursive: true });
+				await whileLockIsHeld(
+					() => addKey('first'),
+					() => assert.equal(existsSync(keyPath('first')) || existsSync(configPath()), false)
+				);
+
+				assert.equal(readConfig(), blockFor('first'));
+			});
+
+			it('update_ssh_key and delete_ssh_key change nothing until they hold the lock', async () => {
+				await addKey('first');
+				const keyBefore = storedKeyFor('first');
+				await whileLockIsHeld(
+					() => ops.updateSSHKey(request({ name: 'first', key: ROTATED_KEY })),
+					() => assert.equal(storedKeyFor('first'), keyBefore)
+				);
+				assert.equal(decrypt(storedKeyFor('first')), ROTATED_KEY);
+
+				await whileLockIsHeld(
+					() => ops.deleteSSHKey({ name: 'first' }),
+					() => assert.equal(existsSync(keyPath('first')) && readConfig(), blockFor('first'))
+				);
+				assert.equal(existsSync(keyPath('first')), false);
+			});
+
+			it('refuses the second of two concurrent deletes of one key as missing', async () => {
+				await addKey('first');
+				const outcomes = await Promise.allSettled([
+					ops.deleteSSHKey({ name: 'first' }),
+					ops.deleteSSHKey({ name: 'first' }),
+				]);
+
+				assert.deepEqual(outcomes.map(({ status }) => status).sort(), ['fulfilled', 'rejected']);
+				assert.ok(isClientError(/^SSH key 'first' does not exist\.$/)(outcomes.find(({ reason }) => reason).reason));
+			});
+
+			it('writes a dangling symlinked config at its target, keeping the link', async () => {
+				mkdirSync(sshDir, { recursive: true });
+				const target = join(rootDir, 'managed-ssh-config');
+				symlinkSync(target, configPath());
+
+				await addKey('first');
+				assert.ok(lstatSync(configPath()).isSymbolicLink());
+				assert.equal(readFileSync(target, 'utf8'), blockFor('first'));
+			});
+
+			it('removes its temporary file when replacing the config fails', async function () {
+				// an immutable config refuses the rename, after the temporary file is written; Linux needs root for that
+				if (process.platform !== 'darwin') this.skip();
+				for (const name of ['first', 'second']) await addKey(name);
+				const before = readConfig();
+
+				execFileSync('chflags', ['uchg', configPath()]);
+				try {
+					await assert.rejects(ops.deleteSSHKey({ name: 'first' }), { code: 'EPERM' });
+				} finally {
+					execFileSync('chflags', ['nouchg', configPath()]);
+				}
+				assert.equal(readConfig(), before);
+				assert.deepEqual(readdirSync(sshDir).sort(), ['config', 'first.key', 'known_hosts', 'second.key']);
+			});
+		});
+
+		describe('written before blocks had BEGIN and END lines', () => {
+			let logged;
+			let originalInfo;
+			let originalError;
+			beforeEach(() => {
+				mkdirSync(sshDir, { recursive: true });
+				logged = [];
+				originalInfo = harperLogger.info;
+				originalError = harperLogger.error;
+				harperLogger.info = (...args) => logged.push(['info', args.join(' ')]);
+				harperLogger.error = (...args) => logged.push(['error', args.join(' ')]);
+			});
+			afterEach(() => {
+				harperLogger.info = originalInfo;
+				harperLogger.error = originalError;
+			});
+			const seedKeys = (...names) => {
+				for (const name of names) writeFileSync(keyPath(name), 'enc:v1:sealed');
+			};
+
+			it('get_ssh_key and list_ssh_keys read its blocks without writing the config', async () => {
+				seedKeys('repo', 'repo-2');
+				const legacy = `${legacyBlockFor('repo-2')}\n${legacyBlockFor('repo')}`;
+				writeFileSync(configPath(), legacy);
+
+				assert.equal((await ops.getSSHKey({ name: 'repo' })).host, 'repo.alias');
+				assert.deepEqual((await ops.listSSHKeys()).sort(byName), [
+					{ name: 'repo', host: 'repo.alias', hostname: 'example.com' },
+					{ name: 'repo-2', host: 'repo-2.alias', hostname: 'example.com' },
+				]);
+				assert.equal(readConfig(), legacy);
+			});
+
+			it('migrateSSHConfig adds BEGIN and END lines around each key block, changing nothing else', async () => {
+				seedKeys('first', 'second', 'third');
+				writeFileSync(configPath(), handEditedLegacyConfig());
+
+				await ops.migrateSSHConfig();
+				assert.equal(readConfig(), handEditedLegacyConfig(true));
+				assert.deepEqual(logged, [['info', `SSH config ${configPath()}: added BEGIN/END lines around 3 key block(s)`]]);
+				assert.deepEqual(warnings, []);
+			});
+
+			it('adding BEGIN and END lines changes nothing ssh resolves for any host', async function () {
+				if (!hasSSH) this.skip();
+				seedKeys('first', 'second', 'third');
+				const probe = join(rootDir, 'probe-config');
+				const resolve = (config, host) => {
+					writeFileSync(probe, config);
+					return execFileSync('ssh', ['-G', '-F', probe, host], { stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+				};
+				for (const host of ['first.alias', 'second.alias', 'third.alias', 'other', 'staging', 'unlisted.example.com']) {
+					assert.equal(resolve(handEditedLegacyConfig(true), host), resolve(handEditedLegacyConfig(), host), host);
+				}
+			});
+
+			it('migrateSSHConfig leaves a migrated config as it is', async () => {
+				seedKeys('first', 'second', 'third');
+				writeFileSync(configPath(), handEditedLegacyConfig());
+				await ops.migrateSSHConfig();
+				const { ino } = statSync(configPath());
+
+				await ops.migrateSSHConfig();
+				assert.equal(readConfig(), handEditedLegacyConfig(true));
+				assert.equal(statSync(configPath()).ino, ino, 'the second pass must not rewrite the file');
+			});
+
+			it("leaves a section alone when its IdentityFile isn't the key file add_ssh_key wrote for that name", async () => {
+				seedKeys('prod', 'moved');
+				const lookalike = '#prod\nHost prod\n\tHostName prod.example.net\n\tIdentityFile ~/.ssh/prod.key';
+				const repointed = legacyBlockFor('moved').replace(keyPath('moved'), '/elsewhere/ssh/moved.key');
+				writeFileSync(configPath(), `${lookalike}\n${repointed}`);
+
+				await ops.migrateSSHConfig();
+				assert.equal(readConfig(), `${lookalike}\n${repointed}`);
+				assert.equal((await ops.getSSHKey({ name: 'prod' })).host, undefined);
+				await ops.deleteSSHKey({ name: 'prod' });
+				assert.equal(readConfig(), `${lookalike}\n${repointed}`);
+				assert.equal(warnings.length, 1);
+				assert.match(warnings[0], /: found no block it can manage for key\(s\) (moved, prod|prod, moved)$/);
+			});
+
+			it("delete_ssh_key writes BEGIN and END lines around the other keys' blocks", async () => {
+				seedKeys('first', 'second');
+				writeFileSync(configPath(), `${legacyBlockFor('first')}\n${legacyBlockFor('second')}\n${unmanaged}`);
+
+				await ops.deleteSSHKey({ name: 'first' });
+				assert.equal(readConfig(), `${blockFor('second')}\n${unmanaged}`);
+			});
+
+			it('keeps CRLF line endings on the lines it adds', async () => {
+				seedKeys('first');
+				const crlf = (text) => text.replace(/\n/g, '\r\n');
+				writeFileSync(configPath(), crlf(`${legacyBlockFor('first')}\n${unmanaged}\n`));
+
+				await ops.migrateSSHConfig();
+				assert.equal(readConfig(), crlf(`${blockFor('first')}\n${unmanaged}\n`));
+			});
+
+			it('get_ssh_key reads the first block in the file, with markers or without', async () => {
+				seedKeys('deploy');
+				writeFileSync(
+					configPath(),
+					`${legacyBlockFor('deploy')}\n${blockFor('deploy').replace('deploy.alias', 'newer.alias')}`
+				);
+
+				assert.equal((await ops.getSSHKey({ name: 'deploy' })).host, 'deploy.alias');
+				await ops.deleteSSHKey({ name: 'deploy' });
+				assert.equal(readConfig(), '');
+			});
+
+			it('marks only the unmarked blocks of a config that has both', async () => {
+				seedKeys('old');
+				writeFileSync(configPath(), legacyBlockFor('old'));
+				await addKey('new');
+
+				await ops.migrateSSHConfig();
+				assert.equal(readConfig(), `${blockFor('old')}\n${blockFor('new')}`);
+			});
+
+			it('migrateSSHConfig logs a config it cannot rewrite, and resolves', async function () {
+				if (process.getuid?.() === 0) this.skip();
+				seedKeys('first');
+				writeFileSync(configPath(), legacyBlockFor('first'));
+
+				chmodSync(sshDir, 0o500);
+				try {
+					await ops.migrateSSHConfig();
+				} finally {
+					chmodSync(sshDir, 0o700);
+				}
+				assert.equal(readConfig(), legacyBlockFor('first'));
+				assert.equal(logged.length, 1);
+				assert.equal(logged[0][0], 'error');
+				assert.match(logged[0][1], /^Unable to add BEGIN\/END lines to the SSH config: EACCES/);
+			});
+
+			it("a node rolled back to an earlier version still reads and deletes each key's block the way it always has", async () => {
+				for (const name of ['first', 'middle', 'last']) await addKey(name);
+				const config = readConfig();
+				for (const [parser, earlier] of [
+					['anchoredParser', anchoredParser],
+					['regexParser', regexParser],
+				]) {
+					for (const name of ['first', 'middle', 'last']) {
+						assert.deepEqual(earlier.get(config, name), { host: `${name}.alias`, hostname: 'example.com' }, parser);
+					}
+				}
+				assert.equal(anchoredParser.delete(config, 'middle'), `${blockFor('first')}\n${blockFor('last')}`);
+				assert.equal(anchoredParser.delete(config, 'last'), `${blockFor('first')}\n${blockFor('middle')}`);
+				// it doesn't know END, so it also takes a line a user put after END, before the next section, as it always has
+				const withLineAfterEnd = config.replace(
+					'# END harper ssh key middle\n',
+					'# END harper ssh key middle\n\tUser deploy\n'
+				);
+				assert.equal(anchoredParser.delete(withLineAfterEnd, 'middle'), `${blockFor('first')}\n${blockFor('last')}`);
+
+				// the regex leaves middle's END line behind, which reads as nothing once this version is back
+				writeFileSync(configPath(), regexParser.delete(config, 'middle'));
+				rmSync(keyPath('middle'));
+				assert.deepEqual((await ops.listSSHKeys()).sort(byName), [
+					{ name: 'first', host: 'first.alias', hostname: 'example.com' },
+					{ name: 'last', host: 'last.alias', hostname: 'example.com' },
+				]);
+				await ops.deleteSSHKey({ name: 'first' });
+				await ops.deleteSSHKey({ name: 'last' });
+				// the blank line is where the regex cut middle's lines out
+				assert.equal(readConfig(), '\n# END harper ssh key middle');
+			});
+
+			it('an earlier version handles keys whose names share a prefix in this format as it does in the old one', async () => {
+				// the regex matches `#repo` as a prefix of `#repo-2` in either format, which #910 fixed
+				const withoutMarkers = (config) => config.replace(/^# (BEGIN|END) harper ssh key .*\n?/gm, '').trim();
+				for (const order of [
+					['repo-2', 'repo'],
+					['repo', 'repo-2'],
+				]) {
+					const marked = order.map(blockFor).join('\n');
+					const legacy = order.map(legacyBlockFor).join('\n');
+					for (const name of order) {
+						assert.deepEqual(anchoredParser.get(marked, name), { host: `${name}.alias`, hostname: 'example.com' });
+						assert.equal(anchoredParser.delete(marked, name), blockFor(order.find((other) => other !== name)));
+						assert.deepEqual(regexParser.get(marked, name), regexParser.get(legacy, name), order.join());
+						assert.equal(
+							withoutMarkers(regexParser.delete(marked, name)),
+							regexParser.delete(legacy, name),
+							order.join()
+						);
+					}
+				}
+			});
+		});
+
+		function handEditedLegacyConfig(migrated = false) {
+			const block = (name, extra = '') => {
+				const legacy = legacyBlockFor(name) + extra;
+				return migrated ? withMarkers(legacy) : legacy;
+			};
+			return [
+				'# my own settings',
+				'Host *',
+				'\tServerAliveInterval 60',
+				// a directive the user added to first's section goes with it
+				block('first', '\n\tProxyJump bastion'),
+				// a comment heading the next section stays outside first's markers
+				'# notes on other',
+				unmanaged,
+				block('second'),
+				'',
+				// the user's own section under a comment that looks like a key's `#name` line
+				'#staging',
+				'Host staging',
+				'\tHostName staging.example.net',
+				block('third'),
+			].join('\n');
+		}
 	});
 
 	describe('key names add_ssh_key could never create', () => {
@@ -455,6 +957,199 @@ describe('sshKeyOperations sealing', () => {
 			await ops.addSSHKey(request({ name: 'replica', key: envelope, host: 'gh', hostname: 'example.com' }));
 
 			assert.equal(storedKeyFor('replica'), envelope);
+		});
+
+		it('stores a pasted key as the normalized plaintext ssh reads', async () => {
+			await ops.addSSHKey(request({ name: 'deploy', key: pasted(PRIVATE_KEY), host: 'gh', hostname: 'example.com' }));
+
+			assert.equal(storedKeyFor('deploy'), PRIVATE_KEY);
+		});
+	});
+
+	// an indented, CRLF, double-spaced copy of `key` — every line of it still the key's
+	const pasted = (key) =>
+		key
+			.trimEnd()
+			.split('\n')
+			.map((line) => `\t${line}  `)
+			.join('\r\n\r\n');
+	const isClientError = (pattern) => (error) => error.statusCode === 400 && pattern.test(error.message);
+	const configFile = () => join(sshDir, 'config');
+
+	describe('validating what is supplied', () => {
+		it('refuses a public key in place of the private one, and writes nothing', async () => {
+			const req = request({ name: 'deploy', key: PUBLIC_KEY, host: 'gh', hostname: 'example.com' });
+
+			await assert.rejects(
+				ops.addSSHKey(req),
+				isClientError(/^The SSH key looks like a public key \("ssh-ed25519 …"\)/)
+			);
+			assert.throws(() => storedKeyFor('deploy'), /ENOENT/);
+			assert.throws(() => readFileSync(configFile()), /ENOENT/);
+			assert.equal(req.key, PUBLIC_KEY, 'nothing was sealed for replication either');
+		});
+
+		it('stores, and replicates, a pasted key in the form ssh reads', async () => {
+			const req = request({ name: 'deploy', key: pasted(PRIVATE_KEY), host: 'gh', hostname: 'example.com' });
+			await ops.addSSHKey(req);
+
+			assert.equal(decrypt(storedKeyFor('deploy')), PRIVATE_KEY);
+			assert.equal(req.key, storedKeyFor('deploy'));
+		});
+
+		it('refuses a rotation to a key ssh could not load, leaving the working key untouched', async () => {
+			await ops.addSSHKey(request({ name: 'deploy', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' }));
+			const keyBefore = storedKeyFor('deploy');
+			const configBefore = readFileSync(configFile(), 'utf8');
+
+			const broken = PRIVATE_KEY.replace(/\n[A-Za-z0-9+/=]+\n/, '\n');
+			await assert.rejects(ops.updateSSHKey(request({ name: 'deploy', key: broken })), isClientError(/damaged/));
+			await assert.rejects(ops.updateSSHKey(request({ name: 'deploy', key: PUBLIC_KEY })), isClientError(/public key/));
+
+			assert.equal(storedKeyFor('deploy'), keyBefore);
+			assert.equal(readFileSync(configFile(), 'utf8'), configBefore);
+		});
+
+		it('rotates to a pasted key stored in the form ssh reads', async () => {
+			await ops.addSSHKey(request({ name: 'deploy', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' }));
+			const req = request({ name: 'deploy', key: pasted(ROTATED_KEY) });
+			await ops.updateSSHKey(req);
+
+			assert.equal(decrypt(storedKeyFor('deploy')), ROTATED_KEY);
+			assert.equal(req.key, storedKeyFor('deploy'));
+		});
+
+		it('writes and replicates host and hostname trimmed', async () => {
+			// deliberately not github.com, which fetches api.github.com's known hosts for real
+			const req = request({
+				name: 'deploy',
+				key: PRIVATE_KEY,
+				host: ' deploy.example.com\n',
+				hostname: '\tgit.example.com ',
+			});
+			await ops.addSSHKey(req);
+
+			assert.match(readFileSync(configFile(), 'utf8'), /^Host deploy\.example\.com\n\tHostName git\.example\.com\n/m);
+			assert.equal(req.host, 'deploy.example.com');
+			assert.equal(req.hostname, 'git.example.com');
+		});
+
+		it('refuses a host or hostname that would break the ssh config every key shares, before writing anything', async () => {
+			for (const [field, value, reason] of [
+				['host', 'deploy example.com', /must be a single alias/],
+				['hostname', 'git.example.com extra', /must be a single hostname/],
+				['hostname', 'git"example.com', /must not contain quotes/],
+				['hostname', '=#x', /must not contain quotes, "=" or "\\"/],
+				['host', '*.example.com', /must be one alias, not a pattern/],
+				['host', '-oProxyCommand', /must not start with "-"/],
+			]) {
+				const req = request({ name: 'bad', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com', [field]: value });
+				await assert.rejects(ops.addSSHKey(req), isClientError(new RegExp(`^'${field}' ${reason.source}`)));
+			}
+			assert.throws(() => storedKeyFor('bad'), /ENOENT/);
+			assert.throws(() => readFileSync(configFile()), /ENOENT/);
+		});
+
+		it('cloning from a leader skips a legacy key this node refuses, and still clones the next one', async () => {
+			// a key the leader stored before validation existed, as its get_ssh_key returns it
+			const leader = {
+				legacy: { name: 'legacy', key: 'random\nstring', host: 'legacy.example.com', hostname: 'example.com' },
+				deploy: { name: 'deploy', key: PRIVATE_KEY, host: 'gh', hostname: 'example.com' },
+			};
+			let logged = [];
+			const { cloneSSHKeysFromLeader } = await import('#src/cloneNode/sshKeyClone');
+			const cloneFromLeader = () =>
+				cloneSSHKeysFromLeader({
+					requestLeader: async ({ operation, name }) =>
+						operation === 'list_ssh_keys' ? [{ name: 'legacy' }, { name: 'deploy' }] : { ...leader[name] },
+					addSSHKey: ops.addSSHKey,
+					localSSHKeyState: ops.localSSHKeyState,
+					removeLocalSSHKey: ops.removeLocalSSHKey,
+					log: (message, level) => logged.push({ message, level }),
+				});
+			const errors = () => logged.filter(({ level }) => level === 'error').map(({ message }) => message);
+			await cloneFromLeader();
+
+			assert.equal(decrypt(storedKeyFor('deploy')), PRIVATE_KEY);
+			assert.throws(() => storedKeyFor('legacy'), /ENOENT/);
+			assert.equal(errors().length, 1);
+			assert.match(errors()[0], /^Skipped cloning SSH key 'legacy': The SSH key doesn't look like a private key\./);
+			assert.ok(!logged.some(({ message }) => message.includes('random')), 'no key material may be logged');
+
+			// a later start re-runs the setup: the key the first attempt stored is left, not refused as a duplicate
+			logged = [];
+			await cloneFromLeader();
+			assert.deepEqual(
+				errors().map((message) => message.split(':')[0]),
+				["Skipped cloning SSH key 'legacy'"]
+			);
+			assert.ok(logged.some(({ message }) => message === "SSH key 'deploy' is already on this node"));
+
+			// ...and a key it left partly written is added again, not taken as cloned: without its config
+			// block, or with a block cut off before `IdentityFile`
+			for (const config of ['', '#deploy\nHost gh\n\tHostName example.com']) {
+				writeFileSync(join(sshDir, 'config'), config);
+				assert.equal(await ops.localSSHKeyState('deploy'), 'partial');
+				logged = [];
+				await cloneFromLeader();
+				assert.equal(await ops.localSSHKeyState('deploy'), 'complete');
+				assert.equal((await ops.getSSHKey({ name: 'deploy' })).host, 'gh');
+				assert.equal(decrypt(storedKeyFor('deploy')), PRIVATE_KEY);
+				assert.ok(logged.some(({ message }) => message.startsWith("Replacing SSH key 'deploy'")));
+			}
+			assert.equal(await ops.localSSHKeyState('../deploy'), 'absent');
+		});
+	});
+
+	describe('a stored key, loaded by ssh for a git deploy', () => {
+		before(function () {
+			if (!hasSSH || !hasSSHKeygen) this.skip();
+		});
+
+		const assertLoadsForGitDeploy = async () => {
+			const { materializeGitSSH } = await import('#src/core/components/Application');
+			const gitSSH = await materializeGitSSH();
+			try {
+				const sshConfig = gitSSH.command.match(/-F (\S+)/)[1];
+				const resolved = execFileSync('ssh', ['-G', '-F', sshConfig, 'deploy.example.com'], {
+					stdio: ['ignore', 'pipe', 'pipe'],
+				}).toString();
+				assert.match(resolved, /^hostname git\.example\.com$/m);
+				const identityFile = resolved.match(/^identityfile (.+)$/m)[1];
+				const derived = execFileSync('ssh-keygen', ['-y', '-P', '', '-f', identityFile], {
+					stdio: ['ignore', 'pipe', 'pipe'],
+				}).toString();
+				assert.equal(derived.split(' ').slice(0, 2).join(' '), PUBLIC_KEY.split(' ').slice(0, 2).join(' '));
+			} finally {
+				await gitSSH.cleanup();
+			}
+		};
+
+		it("decrypts through core's materializeGitSSH to a key ssh loads, under the alias it was added with", async function () {
+			this.timeout(60000);
+			await ops.addSSHKey(
+				request({ name: 'deploy', key: pasted(PRIVATE_KEY), host: 'deploy.example.com', hostname: 'git.example.com' })
+			);
+
+			await assertLoadsForGitDeploy();
+		});
+
+		it('still loads once BEGIN and END lines are added around a block an earlier version wrote', async function () {
+			this.timeout(60000);
+			await ops.addSSHKey(
+				request({ name: 'deploy', key: PRIVATE_KEY, host: 'deploy.example.com', hostname: 'git.example.com' })
+			);
+			const configPath = join(sshDir, 'config');
+			writeFileSync(
+				configPath,
+				readFileSync(configPath, 'utf8')
+					.replace(/^# (BEGIN|END) .*\n?/gm, '')
+					.trimEnd()
+			);
+
+			await ops.migrateSSHConfig();
+			assert.match(readFileSync(configPath, 'utf8'), /^# BEGIN harper ssh key deploy$/m);
+			await assertLoadsForGitDeploy();
 		});
 	});
 });

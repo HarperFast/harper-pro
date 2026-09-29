@@ -83,6 +83,15 @@ describe('findStalledReceivingNodeUrls', () => {
 		expect(result).to.deep.equal(new Map([['wss://peer:9933', new Set(['data'])]]));
 	});
 
+	it('does not reuse an old watermark during a fresh connection grace period', () => {
+		const w = makeWorker();
+		const map = makeConnectionMap([
+			['wss://peer:9933', [['data', entry(w, { receiveStallGraceUntil: NOW + THRESHOLD })]]],
+		]);
+		const result = findStalledReceivingNodeUrls(map, [w], NOW, THRESHOLD, isDesired, reader({ 'data|peer': stalled }));
+		expect(result).to.deep.equal(new Map());
+	});
+
 	it('does not flag a copy that is still progressing (RECEIVED_TIME advancing)', () => {
 		const w = makeWorker();
 		const map = makeConnectionMap([['wss://peer:9933', [['data', entry(w)]]]]);
