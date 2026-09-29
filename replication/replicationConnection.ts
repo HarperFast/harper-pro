@@ -4588,6 +4588,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// drain or the copy finish settles exactly the deferred set.
 	const receiptRequests = new Map<string, ReceiptRequest>();
 	let receiptApplyChain: Promise<void> = Promise.resolve();
+	// when this node last asked the peer for a receipt, per record; cleared by the receipt
+	const handoffRequestedAt = new Map<string, number>();
 	let settlingReceipts: Promise<void> | undefined;
 	let resettleKeys: Set<string> | undefined;
 	let deferredReceiptKeys: Set<string> | undefined;
@@ -5211,6 +5213,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						for (const [receiptTableId, recordId, version] of receipts) {
 							const receiptTable = tableSubscriptionToReplicator.tableById[receiptTableId];
 							if (!receiptTable || !coreRetainsTransitionImages(receiptTable)) continue;
+							handoffRequestedAt.delete(receiptRequestKey(receiptTableId, recordId));
 							receiptApplyChain = receiptApplyChain.then(() =>
 								applyHandoffReceipt(
 									receiptTable,
@@ -5769,9 +5772,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let handoffSweepCount = 0;
 						let handoffResweepTimer: ReturnType<typeof setInterval> | undefined;
 						let wakeForResweep: (() => void) | undefined;
-						// receipt requests ride after the frame that carries their images, in bounded batches
 						let pendingReceiptRequests: [number, any, number][] = [];
-						const handoffRequestedAt = new Map<string, number>();
 						const requestHandoffReceipt = (request: [number, any, number]) => {
 							pendingReceiptRequests.push(request);
 							handoffRequestedAt.set(receiptRequestKey(request[0], request[1]), Date.now());
@@ -6306,8 +6307,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// closes the leg so it resumes from the un-advanced cursor (as the blob path does).
 								if (checkExcessMessageSize(frame.position - frame.encodingStart))
 									throw new Error('Replication message too large to send');
-								ws.send(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
+								// requests first: the receiver tracks a frame's records for settlement only while a
+								// request for them is already waiting
 								flushReceiptRequests();
+								ws.send(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
 								// A frame actually went out: tell the outbound connection so it can reset its reconnect
 								// backoff on genuine progress rather than on bare socket-open (harper-pro#339).
 								if (!supersededOrClosed()) options.connection?.onFrameSent?.();
@@ -7024,6 +7027,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										if (!handoffSweepDone) {
 											handoffSweepDone = true;
 											const resweep = handoffSweepCount++ > 0;
+											if (closed) return;
 											handoffResweepTimer ??= setInterval(() => {
 												handoffSweepDone = false;
 												wakeForResweep?.();
