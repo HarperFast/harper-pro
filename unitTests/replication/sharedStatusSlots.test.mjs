@@ -11,12 +11,14 @@ import { getReplicationSharedStatus } from '#src/replication/knownNodes';
 const REPLICATION_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'replication');
 const REGISTRY_RELATIVE_PATH = 'sharedStatusSlots.ts';
 
-/** Every `_POSITION`-suffixed identifier bound by a variable declaration in a source file. */
+/** Every `_POSITION`-suffixed identifier bound by a variable declaration, destructuring element, or
+ * class property in a source file. */
 function declaredPositionNames(source, fileName) {
 	const names = [];
 	const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
 	const visit = (node) => {
-		if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text.endsWith('_POSITION')) {
+		const binds = ts.isVariableDeclaration(node) || ts.isBindingElement(node) || ts.isPropertyDeclaration(node);
+		if (binds && ts.isIdentifier(node.name) && node.name.text.endsWith('_POSITION')) {
 			names.push(node.name.text);
 		}
 		ts.forEachChild(node, visit);
@@ -80,6 +82,12 @@ describe('replication shared-status slot registry', () => {
 		// with a deliberate overflow instead.
 		expect(() => slots.assertAllocationFits(65, 64)).to.throw(/allocated 65 slots/);
 		expect(() => slots.assertAllocationFits(64, 64)).to.not.throw();
+	});
+
+	it('declaredPositionNames also catches destructured and class-property declarations', () => {
+		expect(declaredPositionNames('const { NEW_POSITION } = obj;', 'a.ts')).to.deep.equal(['NEW_POSITION']);
+		expect(declaredPositionNames('const { foo: NEW_POSITION } = obj;', 'a.ts')).to.deep.equal(['NEW_POSITION']);
+		expect(declaredPositionNames('class X { static NEW_POSITION = 40; }', 'a.ts')).to.deep.equal(['NEW_POSITION']);
 	});
 
 	it('never hand-numbers a *_POSITION slot constant outside the registry', () => {
