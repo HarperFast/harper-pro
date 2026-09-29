@@ -4399,7 +4399,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	let schemaUpdateListener, dbRemovalListener;
 	const tableDecoders = [];
-	const remoteTableById = [];
+	// The declaration to judge a send by. The live map wins: a drop removes the entry and a recreate
+	// replaces the object, so a cached class can outlive both. A connection that never resolved its
+	// database keeps the cached one instead, since treating that as "dropped" would stop replication
+	// rather than protect anything.
+	const liveDeclaration = (cached: any, tableName: string) => (tables ? tables[tableName] : cached);
 	let receivingDataFromNodeNames;
 	const residencyMap = [];
 	const sentResidencyLists = [];
@@ -4464,10 +4468,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	// undefined = not yet computed; null = nothing blocked; Map = table name -> why it is dropped.
 	let receiveBlockedTables: Map<string, string> | null | undefined;
-	// The blocked set is derived from the local declarations, so a table replaced in the live map
-	// (a drop and recreate) has to discard it, or a pre-fix sender keeps writing into it for the life
-	// of the socket. For the life of the connection because the receive path also runs on inbound-only
-	// sockets, which never reach the sender-side listener below.
+	// Discarded on a table replacement, or a pre-fix sender keeps writing into a table that has left
+	// the live map for the life of the socket. Per connection: the receive path also runs on
+	// inbound-only sockets, which never reach the sender-side listener below.
 	const blockedTablesInvalidator = onUpdatedTable((table) => {
 		if (!databaseName || table?.databaseName === databaseName) receiveBlockedTables = undefined;
 	});
@@ -5301,10 +5304,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// `tables` is undefined for a database this connection never resolved (a name that does
 							// not exist locally), and a bare lookup then threw a TypeError that the catch below
 							// handed to the peer as its error text. Answer the same refusal as an unknown table.
-							const table = remoteTableById[tableId] || (remoteTableById[tableId] = tables?.[message[4]]);
-							if (!table || !tableReplicates(tables?.[table.tableName] ?? table)) {
-								// One wording for both cases, so a guessing peer cannot tell an unknown table from a
-								// non-replicating one.
+							// Resolved per request: a cached class outlives a drop.
+							const table = tables?.[message[4]];
+							if (!table || !tableReplicates(table)) {
+								// One wording for every case, so a guessing peer cannot tell them apart.
 								logger.warn?.(
 									connectionId,
 									'Refusing record request for',
@@ -5626,7 +5629,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const tableToTableEntry = (table) => {
 							if (
 								table &&
-								tableReplicates(tables?.[table.tableName] ?? table) &&
+								tableReplicates(liveDeclaration(table, table.tableName)) &&
 								!sendExcludedTables?.has(table.tableName) &&
 								(firstNode.replicateByDefault
 									? !firstNode.tables.includes(table.tableName)
@@ -5692,7 +5695,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 							}
 							const table = tableEntry.table;
-							if (!tableReplicates(tables?.[table.tableName] ?? table)) {
+							const liveTable = liveDeclaration(table, table.tableName);
+							if (!liveTable || !tableReplicates(liveTable)) {
 								return skipAuditRecord();
 							}
 							const primaryStore = table.primaryStore;
@@ -6354,10 +6358,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														if (closed) return;
 													}
 													// After the yield, so no await separates this from the encode below, which opens the
-													// row's blobs. It catches a drop-and-recreate mid-walk, which replaces the object in
-													// the live map; an in-place `@table` change does not, since `Table.replicate` is fixed
-													// when the class is built (core `Table.ts`) and only the durable descriptor is rewritten.
-													if (!tableReplicates(tables?.[tableName] ?? table)) break;
+													// row's blobs. See DESIGN.md note 24 for what a live change can and cannot be.
+													const liveCopyTable = liveDeclaration(table, tableName);
+													if (!liveCopyTable || !tableReplicates(liveCopyTable)) break;
 													// Local-only records must never be full-copied to a peer. metadataFlags is the
 													// already-available record metadata integer from the range entry — a pure bitmask
 													// test, no record value decode added to this send path.
