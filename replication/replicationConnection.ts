@@ -6857,24 +6857,29 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// Capture the current generation before scanning. A commit after this live scan
 									// drains must wake this iteration; subscribing afterward can miss that commit.
 									const nextTransaction = whenNextTransaction(auditStore);
-									if (!(auditStore.reusableIterable && auditLogIterable)) {
+									// The integration-only stopped-range injection must replace a copy's pre-positioned
+									// range as well: the production cache is deliberately retained across that boundary,
+									// but the test models a later corrupt-frame stop on that very cached range.
+									const deadAuditIterableForTest = maybeDeadAuditIterableForTest<typeof auditLogIterable>(databaseName);
+									if (deadAuditIterableForTest) {
+										boundaryLogName = undefined;
+										auditLogIterable = deadAuditIterableForTest;
+									} else if (!(auditStore.reusableIterable && auditLogIterable)) {
 										// No append-order resume here — only the copy's own pre-positioned range above does that. A
 										// reconnect resumes with the subscription's startTime at the anchor key, and
 										// `matchesSubscription` below requires that startTime to be BELOW an entry's key, so an
 										// older-keyed entry this range would correctly yield is dropped by the subscription predicate
 										// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
 										boundaryLogName = undefined;
-										auditLogIterable =
-											maybeDeadAuditIterableForTest(databaseName) ??
-											(auditStore.getRange({
-												start: currentSequenceId || 1,
-												exclusiveStart: true,
-												exactStart: false,
-												log: excludedNodes ? undefined : logName,
-												startByLog: new Map([[logName, currentSequenceId || 1]]),
-												excludeLogs: excludedNodes,
-												snapshot: false, // don't want to use a snapshot, and we want to see new entries
-											}) as typeof auditLogIterable);
+										auditLogIterable = auditStore.getRange({
+											start: currentSequenceId || 1,
+											exclusiveStart: true,
+											exactStart: false,
+											log: excludedNodes ? undefined : logName,
+											startByLog: new Map([[logName, currentSequenceId || 1]]),
+											excludeLogs: excludedNodes,
+											snapshot: false, // don't want to use a snapshot, and we want to see new entries
+										}) as typeof auditLogIterable;
 									}
 									for (const auditRecord of auditLogIterable) {
 										const key: number = auditRecord.txnLogKey;
