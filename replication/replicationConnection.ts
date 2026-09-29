@@ -3086,6 +3086,7 @@ export class NodeReplicationConnection extends EventEmitter {
 	socket: ReplicationWebSocket;
 	startTime: number;
 	retryBackoff?: Backoff;
+	creditedDurableSequence = 0;
 
 	random = Math.random;
 	setReconnectTimer = setTimeout;
@@ -3194,9 +3195,9 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.socket._socket.unref();
 			// in normal startup, just use info, but adjust log level to warn if we were previously disconnected, because there was a warn message on the disconnect and we want to keep symmetry
 			logger[this.isConnected ? 'info' : 'warn']?.(`Connected to ${this.url}, db: ${this.databaseName}`);
-			// Reset backoff on first successful SEND (onFrameSent), not here on open: a leg that reopens and
-			// immediately fails to send (an oversized frame throws and closes it) must keep escalating toward
-			// the 30 s cap instead of hot-looping at 500 ms and accumulating native TLS state (harper-pro#339).
+			// Reset backoff on progress (resetRetryBackoff), not here on open: a leg that reopens and immediately
+			// fails to send (an oversized frame throws and closes it) must keep escalating toward the 30 s cap
+			// instead of hot-looping at 500 ms and accumulating native TLS state (harper-pro#339).
 			// if we have already connected, we need to send a reconnected event
 			if (this.nodeSubscriptions && this.socket === socket) {
 				connectedToNode({
@@ -3346,13 +3347,21 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.connect();
 		}, delay).unref();
 	}
-	// Called by replicateOverWS after a frame is actually sent: real progress, so it is safe to reset the
-	// backoff. Gated on a non-zero retries so the healthy hot path (already reset) does nothing.
-	onFrameSent() {
+	// Called by replicateOverWS on real progress in either direction, never on bare socket-open (harper-pro#339).
+	// Gated so the healthy hot path (already reset) does nothing.
+	resetRetryBackoff() {
 		if (this.retries !== 0 || this.retryBackoff?.attempts) {
 			this.retries = 0;
 			this.retryBackoff?.reset();
 		}
+	}
+	// A subscriber's outbound leg sends no transaction frames, so its durable receive watermark is its only
+	// progress signal. Only an advance past what this connection already credited counts: a session that
+	// re-receives the same undurable frames after every reconnect must keep escalating.
+	onDurableProgress(sequence: number) {
+		if (sequence <= this.creditedDurableSequence) return;
+		this.creditedDurableSequence = sequence;
+		this.resetRetryBackoff();
 	}
 	// Retire the live replicateOverWS instance: the single enforcement point for "at most one live session
 	// per connection". Every path that supersedes a session (socket replaced in connect(), forceReconnect)
@@ -4498,6 +4507,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let hasBlobGap = false;
 	let lastDurableSequenceId = 0;
 	let committedSequence = 0;
+	function advanceDurableWatermark() {
+		lastDurableSequenceId = committedSequence;
+		if (!supersededOrClosed()) options.connection?.onDurableProgress?.(lastDurableSequenceId);
+	}
 	// Blob-divergence escalation (harper-pro#386). Each blob save failure already logs at `error`, but a
 	// sustained failing link emits that per-blob spam without a single line naming it as ongoing
 	// divergence. Once this connection crosses SUSTAINED_BLOB_FAILURE_THRESHOLD failures we log one
@@ -5930,7 +5943,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								ws.send(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
 								// A frame actually went out: tell the outbound connection so it can reset its reconnect
 								// backoff on genuine progress rather than on bare socket-open (harper-pro#339).
-								options.connection?.onFrameSent?.();
+								options.connection?.resetRetryBackoff?.();
 								logger.debug?.(connectionId, 'Sent message, size:', frame.position - frame.encodingStart);
 								if (databaseName !== 'system') {
 									recordAction(
@@ -7110,7 +7123,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// (`hasBlobGap`) holds the watermark until a reconnect re-streams it. Because the watermark
 					// only ever includes durable blobs, the persisted cursor never advances past an unfinished or
 					// failed blob — preserving the no-data-loss guarantee — while the apply loop never blocks.
-					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
+					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) advanceDurableWatermark();
 					endTxnEvent.localTime = lastDurableSequenceId;
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
 					// (version < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
@@ -7973,7 +7986,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// `hasBlobGap` unset, see the `.catch`) — lets the watermark catch up to the highest committed
 					// sequence, which the next end_txn/sequence-update persists as the resume cursor.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) {
-						lastDurableSequenceId = committedSequence;
+						advanceDurableWatermark();
 						// The last in-flight blob is now durable. Any resume-cursor update we sent earlier while it
 						// was outstanding was clamped to the pre-drain watermark (cursorBlockedByBlob() at the
 						// REMOTE_SEQUENCE_UPDATE / SEQUENCE_ID_UPDATE sites). Re-emit an end_txn at the now-durable

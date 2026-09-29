@@ -73,16 +73,63 @@ describe('NodeReplicationConnection reconnect jitter (harper-pro#327)', () => {
 		);
 	});
 
-	it('onFrameSent resets the ceiling and the retry counter', () => {
+	it('resetRetryBackoff resets the ceiling and the retry counter', () => {
 		const connection = makeConnection(() => 0.5);
 		scheduleDelays(connection, 3);
 		connection.retries = 7;
 		assert.equal(connection.retryBackoff.ceiling, 4000);
 
-		connection.onFrameSent();
+		connection.resetRetryBackoff();
 
 		assert.equal(connection.retries, 0);
 		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
 		assert.equal(scheduleDelays(connection, 1)[0], 500, 'drawing under the initial ceiling again');
+	});
+});
+
+describe('NodeReplicationConnection durable receive progress', () => {
+	function failedAttempts(connection, attempts) {
+		scheduleDelays(connection, attempts);
+		connection.retries = attempts;
+	}
+
+	it('a durable watermark past anything credited ends the failure streak', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		failedAttempts(connection, 4);
+		assert.equal(connection.retryBackoff.ceiling, 8000);
+
+		connection.onDurableProgress(1000);
+
+		assert.equal(connection.retries, 0);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
+
+	it('a watermark that has not moved is not progress, so the backoff keeps escalating', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onDurableProgress(1000);
+		failedAttempts(connection, 3);
+
+		connection.onDurableProgress(0);
+		connection.onDurableProgress(999);
+		connection.onDurableProgress(1000);
+
+		assert.equal(connection.retries, 3);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+		failedAttempts(connection, 1);
+		assert.equal(connection.retryBackoff.ceiling, 8000);
+	});
+
+	it('the credited watermark carries across sockets, so a replay from the old cursor does not reset', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onDurableProgress(5000);
+		failedAttempts(connection, 3);
+
+		// A fresh session re-streams from the persisted cursor and commits the same range again.
+		connection.onDurableProgress(4000);
+		connection.onDurableProgress(5000);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+
+		connection.onDurableProgress(5001);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
 	});
 });

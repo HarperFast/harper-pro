@@ -194,7 +194,7 @@ decorrelated schedule.** Pacing alone is not enough; the storm surface below nee
 | Site                                                                            | Schedule                                                                                                                                                                                                                                                                           | Reset signal                                                              |
 | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `createSubscribeSetupScheduler` (`subscriptionManager.ts`) — subscription setup | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s; within a stale-worker sweep each setup's fire time slides past any the sweep already armed within `RECONNECT_STAGGER_MS`, so independent draws keep that spacing and an escalated pair delays no one else | `connectedToNode` (reset only; the armed setup still fires)               |
-| `NodeReplicationConnection.scheduleReconnect`                                   | fixed 500 ms floor, ceiling `INITIAL_RETRY_TIME` 500 ms → 30 s, full jitter; the floor preserves the hard minimum from the TLS-state incident while the remaining window decorrelates fleet redials (harper-pro#339)                                                               | `onFrameSent` — first frame actually sent, **not** socket open            |
+| `NodeReplicationConnection.scheduleReconnect`                                   | fixed 500 ms floor, ceiling `INITIAL_RETRY_TIME` 500 ms → 30 s, full jitter; the floor preserves the hard minimum from the TLS-state incident while the remaining window decorrelates fleet redials (harper-pro#339)                                                               | progress, **not** socket open — see below                                 |
 | `reconcileWorkers` wedge / receive-stall re-drives                              | one fixed-window draw per sweep, used as a common base under the existing `RECONNECT_STAGGER_MS` spacing (decorrelation only; the re-drives are already throttled by the `disconnectedAt` / `receiveStallReconnectAt` re-stamps), one owned `entry.reDriveTimer` per entry         | n/a — disarmed on unsubscribe, delete, worker exit, and entry replacement |
 | `runNodeUpdateWatcher` (`knownNodes.ts`) — hdb_nodes watcher restart            | full-jitter ceiling 1 s → 30 s                                                                                                                                                                                                                                                     | an iteration that survived `NODE_WATCHER_HEALTHY_UPTIME_MS`               |
 | `shouldCloseSendAuthWatch` reprobe (`replicationConnection.ts`)                 | 500 ms → 5 s under a 30 s wall-clock budget, then fails closed                                                                                                                                                                                                                     | n/a (one-shot loop)                                                       |
@@ -262,6 +262,18 @@ owner. Subscribe, unsubscribe, force-reconnect, and startup admission all derive
 An armed setup dispatches on the main thread only in configured single-thread mode. If its worker exits
 before it fires in a multi-threaded process, the setup is deferred; the stale-worker reconcile reassigns the
 entry even when another database for the same peer is simultaneously in wedge recovery.
+
+**The reconnect backoff resets on progress in either direction, never on socket open.** A leg that reopens
+and fails before moving data — a peer that accepts TLS and drops it (harper-pro#339), or a stream blocked at
+an oversized frame (#713) — must keep escalating. The sending side resets when a transaction frame goes out.
+A subscriber's outbound leg sends none (in a two-way mesh the peer serves our subscription from its own
+server session), so it resets through `onDurableProgress` when its receive-side durable watermark advances:
+at a commit and at the last in-flight blob's drain. Only an advance past the highest value this
+`NodeReplicationConnection` has already credited counts, and only from the session that still owns the
+socket, so replaying the same undurable frames after each reconnect is not progress. Without the receive
+signal, the ceiling carried across unrelated outages until every reconnect waited out the 30 s cap
+(`connectedBitRestartChurn.test.mjs`). Still open: an idle leg that receives nothing between outages carries
+its escalated ceiling into the next one.
 
 **What is deliberately NOT on this schedule:** the receive/copy watchdogs and their thresholds, and the
 doubling copy-finalize _timeout bound_ alongside them (these _detect_ stalls or bound a wait; this

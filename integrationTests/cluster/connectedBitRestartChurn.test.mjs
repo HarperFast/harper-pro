@@ -74,7 +74,7 @@
  */
 
 import { suite, test, before, after } from 'node:test';
-import { ok, equal, fail } from 'node:assert/strict';
+import { ok, equal, deepEqual, fail } from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
@@ -249,6 +249,23 @@ async function assertAllReplicated(follower, peerHostname, results, what) {
 			`(${perDb})${probeErrors.length ? `; probe errors: ${probeErrors.join(' | ')}` : ''}` +
 			`; follower sockets to peer: ${status.error ? `unavailable (${status.error})` : `[${sockets.join(' | ')}]`}`
 	);
+}
+
+// The worker logs its disconnect warn only while its retry counter is at zero, and only replication progress
+// resets it (NodeReplicationConnection.resetRetryBackoff) -- so a database with no warn in a cycle's window
+// entered that outage still carrying the previous one's escalated reconnect backoff.
+async function databasesWithoutFreshDisconnect(follower, leaderHostname, fromMs, toMs) {
+	const pattern = new RegExp(
+		`Disconnected from wss://${leaderHostname.replaceAll('.', '\\.')}:\\d+ \\(db: "([^"]+)"\\)`
+	);
+	const warned = new Set();
+	for (const line of (await readLog(follower)).split('\n')) {
+		const match = pattern.exec(line);
+		if (!match) continue;
+		const loggedAt = Date.parse(line.slice(0, 24));
+		if (loggedAt >= fromMs && loggedAt <= toMs) warned.add(match[1]);
+	}
+	return DB_NAMES.filter((db) => !warned.has(db));
 }
 
 // Extra admin-API flood against `node` itself, purely to congest its own main-thread
@@ -549,6 +566,12 @@ suite(
 						ctx.leader.hostname,
 						flowed,
 						`cycle ${cycle}: fresh post-recovery write (false-green connected:true)`
+					);
+
+					deepEqual(
+						await databasesWithoutFreshDisconnect(ctx.follower, ctx.leader.hostname, killedAt, convergedAt),
+						[],
+						`cycle ${cycle}: these databases logged no fresh worker disconnect, so their reconnect backoff was not reset by the data replicated since the previous outage`
 					);
 				}
 			}
