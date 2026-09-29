@@ -377,6 +377,55 @@ suite(
 		);
 
 		test(
+			'rolling HTTP-worker replacement preserves subscription ownership and data flow',
+			{ timeout: 90000 },
+			async () => {
+				const restart = await sendOperation(ctx.follower, {
+					operation: 'restart_service',
+					service: 'http_workers',
+				});
+				ok(restart.job_id, `restart_service returned no job id: ${JSON.stringify(restart)}`);
+				let job;
+				await waitForCondition(
+					async (signal) => {
+						const jobs = await sendOperation(
+							ctx.follower,
+							{ operation: 'get_job', id: restart.job_id },
+							{ signal }
+						).catch((error) => {
+							if (signal.aborted) throw error;
+							return [];
+						});
+						job = jobs[0] ?? job;
+						return job?.status === 'COMPLETE' || job?.status === 'ERROR';
+					},
+					{
+						timeoutMs: 60000,
+						pollMs: POLL_INTERVAL_MS,
+						description: () => `HTTP-worker restart job ${JSON.stringify(job)}`,
+					}
+				);
+				equal(job.status, 'COMPLETE', `HTTP-worker restart did not complete: ${JSON.stringify(job)}`);
+
+				const marker = 'worker-restart-' + Date.now();
+				for (const db of DB_NAMES) {
+					await sendOperation(ctx.leader, {
+						operation: 'upsert',
+						database: db,
+						table: 'test',
+						records: [{ id: marker, name: 'after-worker-restart' }],
+					});
+				}
+				await assertAllReplicated(
+					ctx.follower,
+					ctx.leader.hostname,
+					await probeReplicated(ctx.follower, marker),
+					'write after replacing the follower HTTP workers'
+				);
+			}
+		);
+
+		test(
 			'chaos: repeated genuine SIGKILL + restart under write/admin load never wedges the connected bit',
 			{ timeout: CHAOS_TEST_TIMEOUT_MS },
 			async () => {
@@ -403,7 +452,7 @@ suite(
 					// SHORT outage here (well under WEDGE_RECONCILE_THRESHOLD_MS) so recovery goes
 					// through the SAME long-lived NodeReplicationConnection object's own retry (fast,
 					// deterministic) rather than the disruptive 30s forceResubscribe path -- that path
-					// has its own exponential-backoff dynamics (retryTime doubles to a 30s cap) that make
+					// has its own exponential-backoff dynamics (the reconnect ceiling doubles to a 30s cap) that make
 					// "converged within N seconds" a poor discriminator once crossed (see the separate
 					// long-outage test below, which hunts the specific race with a generous bound instead).
 					const disconnectDeadline = killedAt + 8000;

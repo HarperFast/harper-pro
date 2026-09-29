@@ -38,7 +38,11 @@ describe('NodeReplicationConnection connect() reschedules when createWebSocket r
 	// url = null makes createWebSocket reject (TypeError: Invalid URL) before any socket exists or any
 	// listener is attached — the exact pre-'open' rejection shape of the #466 wedge.
 	function makeRejectingConnection() {
-		return new NodeReplicationConnection(null, null, 'db', 'peer');
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		// The retry delay is drawn uniformly under the ceiling (harper-pro#327). Pin the draw to the top of
+		// the window so a single tick advances past exactly one retry.
+		connection.random = () => 0.999999;
+		return connection;
 	}
 
 	it('a createWebSocket rejection leaves reconnectScheduled=true with a pending retry, not a permanent stuck state', async () => {
@@ -47,7 +51,7 @@ describe('NodeReplicationConnection connect() reschedules when createWebSocket r
 
 		expect(conn.socket, 'no socket was installed (rejected before open)').to.equal(undefined);
 		expect(conn.reconnectScheduled, 'a retry is armed and tracked').to.equal(true);
-		expect(conn.retryTime, 'backoff advanced past the initial interval').to.equal(1000);
+		expect(conn.retryBackoff.ceiling, 'backoff advanced past the initial interval').to.equal(1000);
 
 		// Let unhandledRejection microtasks (if any) flush — there must be none.
 		await Promise.resolve();
@@ -57,7 +61,7 @@ describe('NodeReplicationConnection connect() reschedules when createWebSocket r
 	it('the armed retry actually fires another connect() (self-healing), it does not vanish', async () => {
 		const conn = makeRejectingConnection();
 		const connectSpy = sinon.spy(conn, 'connect');
-		await conn.connect(); // first attempt rejects + schedules at retryTime=500
+		await conn.connect(); // first attempt rejects + schedules at the 500 ms floor
 
 		expect(connectSpy.callCount, 'one attempt so far').to.equal(1);
 		expect(conn.reconnectScheduled).to.equal(true);
@@ -66,7 +70,7 @@ describe('NodeReplicationConnection connect() reschedules when createWebSocket r
 		expect(connectSpy.callCount, 'the scheduled retry re-invoked connect()').to.equal(2);
 		// Still wedged on the same null url, so it remains scheduled with a further-backed-off retry.
 		expect(conn.reconnectScheduled, 'still armed for the next attempt').to.equal(true);
-		expect(conn.retryTime, 'backoff doubled again').to.equal(2000);
+		expect(conn.retryBackoff.ceiling, 'backoff doubled again').to.equal(2000);
 
 		await Promise.resolve();
 		expect(unhandled).to.deep.equal([]);

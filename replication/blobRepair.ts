@@ -4,8 +4,35 @@ import { databases } from '../core/resources/databases.ts';
 import { server } from '../core/server/Server.ts';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 import type { Logger } from '../core/utility/logging/logger.ts';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { createBackoff, type Backoff } from './backoff.ts';
 
 const logger = harperLogger.forComponent('blob-repair').conditional as Logger;
+
+const REPAIR_RETRY_INITIAL_MS = 50;
+const REPAIR_RETRY_MAX_MS = 1000;
+// Do not stop the sweep when this budget is spent: a later record may still be repairable.
+const REPAIR_PACING_BUDGET_MS = 60_000;
+const REPAIR_UNPACED_WARN_EVERY = 100;
+
+export function createRepairPacing(deps: { now?: () => number; random?: () => number } = {}) {
+	let backoff: Backoff | undefined;
+	return {
+		nextDelay() {
+			backoff ??= createBackoff({
+				initialMs: REPAIR_RETRY_INITIAL_MS,
+				maxMs: REPAIR_RETRY_MAX_MS,
+				budgetMs: REPAIR_PACING_BUDGET_MS,
+				now: deps.now,
+				random: deps.random,
+			});
+			return backoff.nextDelay();
+		},
+		reset() {
+			backoff = undefined;
+		},
+	};
+}
 
 export async function allBlobsAreComplete(
 	blobs: any[],
@@ -15,15 +42,19 @@ export async function allBlobsAreComplete(
 }
 
 export async function repairBlobs(
-	dbName: string
+	dbName: string,
+	deps: { sleep?: (ms: number) => Promise<unknown>; now?: () => number } = {}
 ): Promise<{ checked: number; repaired: number; failed: number; noConnection: number }> {
 	const database = (databases as any)[dbName];
 	if (!database) throw new Error(`Unknown database '${dbName}'`);
+	const pause = deps.sleep ?? sleep;
 
 	let checked = 0;
 	let repaired = 0;
 	let failed = 0;
 	let noConnection = 0;
+	const pacing = createRepairPacing({ now: deps.now });
+	let pacingSpent = false;
 
 	for await (const { tableName, table, recordId } of findIncompleteBlobRefs(database, dbName)) {
 		checked++;
@@ -36,6 +67,8 @@ export async function repairBlobs(
 			break;
 		}
 
+		// Once unpaced, the per-record warns fire at peer-RTT rate for the rest of the sweep; sample them.
+		const logRecord = !pacingSpent || (failed + 1) % REPAIR_UNPACED_WARN_EVERY === 0;
 		let peerRepaired = false;
 		for (const connection of peerConnections) {
 			try {
@@ -66,13 +99,35 @@ export async function repairBlobs(
 				logger.info?.('Repaired blob for record', recordId, 'in', tableName);
 				break;
 			} catch (error) {
-				logger.warn?.('Blob repair fetch failed for record', recordId, 'in', tableName, error);
+				if (logRecord) logger.warn?.('Blob repair fetch failed for record', recordId, 'in', tableName, error);
 			}
 		}
 
-		if (!peerRepaired) {
+		if (peerRepaired) {
+			pacing.reset();
+			pacingSpent = false;
+		} else {
 			failed++;
-			logger.warn?.('Could not repair blob for record', recordId, 'in', tableName, '— no peer had a complete copy');
+			if (logRecord)
+				logger.warn?.(
+					'Could not repair blob for record',
+					recordId,
+					'in',
+					tableName,
+					'— no peer had a complete copy',
+					pacingSpent ? `(${failed} failed so far; sampling 1 in ${REPAIR_UNPACED_WARN_EVERY})` : ''
+				);
+			const delay = pacing.nextDelay();
+			if (delay === undefined) {
+				if (!pacingSpent) {
+					pacingSpent = true;
+					logger.warn?.(
+						'Blob repair pacing budget spent for',
+						dbName,
+						`after ${REPAIR_PACING_BUDGET_MS}ms of unrepairable records; continuing the sweep unpaced`
+					);
+				}
+			} else await pause(delay);
 		}
 	}
 

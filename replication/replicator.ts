@@ -562,7 +562,7 @@ function getSubscriptionConnection(
 	authorization?: string,
 	status?: { reused: boolean }
 ) {
-	const connectionKey = connectingUrl + '-' + subscriptionUrl;
+	const connectionKey = getSubscriptionConnectionKey(connectingUrl, subscriptionUrl);
 	let dbConnections = connections.get(connectionKey);
 	if (!dbConnections) {
 		dbConnections = new Map();
@@ -578,12 +578,17 @@ function getSubscriptionConnection(
 			dbName,
 			(connection = new NodeReplicationConnection(connectingUrl, subscription, dbName, nodeName, authorization))
 		);
+		connection.subscriptionUrl = subscriptionUrl;
 		connection.connect();
 		connection.once('finished', () => {
 			if (dbConnections.get(dbName) === connection) dbConnections.delete(dbName);
 		});
 		return connection;
 	}
+}
+
+export function getSubscriptionConnectionKey(url: string, peerUrl?: string): string {
+	return url + '-' + (peerUrl ?? url);
 }
 const nodeNameToRetrievalConnections = new Map<string, Map<string, NodeReplicationConnection>>();
 /**
@@ -751,7 +756,7 @@ export function subscribeToNode(request: any) {
 }
 export async function unsubscribeFromNode({ url, nodes, database, clearStatus = false }) {
 	logger.trace('Unsubscribing from node', url, database);
-	const connectionKey = url + '-' + (nodes[0]?.url ?? url);
+	const connectionKey = getSubscriptionConnectionKey(url, nodes[0]?.url);
 	const dbConnections = connections.get(connectionKey);
 	const connection = dbConnections?.get(database);
 	if (!connection) return;
@@ -811,7 +816,7 @@ export function updateExclusionOrigins({ database, origins }: { database: string
 }
 
 export function forceReconnectToNode({ url, nodes, database }) {
-	const connectionKey = url + '-' + (nodes?.[0]?.url ?? url);
+	const connectionKey = getSubscriptionConnectionKey(url, nodes?.[0]?.url);
 	const connection = connections.get(connectionKey)?.get(database);
 	if (connection) connection.forceReconnect();
 }
