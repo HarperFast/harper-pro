@@ -1,16 +1,13 @@
 /**
  * Record-based residency transitions (HarperFast/harper#2257): the Pro half.
  *
- * When a record-based `setResidency(fn)` write excludes the writing node, core keeps only an
- * INVALIDATED index-only stub and retains the complete post-write image until the new residents hold
- * it. Where core keeps that image and how its audit entry is shaped is the companion core PR's contract
- * and is still being settled, so this module is the ONLY place replication touches it: three optional
- * accessors (`getTransitionImage` on an audit record, `pendingTransitionEntries` / `pendingTransitionEntry`
- * and `releaseTransitionEntry` on a table). A core without them reads as "unsupported" and every caller
- * falls back to today's behavior. What Pro owns outright is here too: which peers must hold the image
- * before it may be released, and the durable per-peer receipts that prove it.
+ * Core keeps the complete post-write image of a write that moved a record off this node; this module is
+ * the only place replication reaches it, through optional accessors a core without the companion change
+ * simply lacks. Pro decides which peers must hold the image before it may be released and keeps the
+ * per-peer receipts that prove it.
  */
 import { INVALIDATED } from '../core/resources/Table.ts';
+import { HAS_BLOBS } from '../core/resources/auditStore.ts';
 
 /** A retained transition entry: the audit record core keeps reachable until every resident holds it. */
 export interface TransitionEntry {
@@ -36,12 +33,10 @@ export type HandoffReceiptTuple = [number, any, number];
 export interface LocalEntryState {
 	version?: number;
 	metadataFlags?: number;
+	value?: unknown;
 }
 
-/**
- * The complete post-write image core retains for a residency-transition write, decoded; undefined for
- * an ordinary entry or a core without the companion change. The one accessor the forward path consults.
- */
+/** Core's retained complete image for a residency-transition write; undefined for any other entry. */
 export function transitionImageValue(auditRecord: TransitionEntry, primaryStore: any): any {
 	return auditRecord.getTransitionImage?.(primaryStore);
 }
@@ -70,10 +65,7 @@ export function localRowSatisfies(entry: LocalEntryState | undefined, version: n
 	return !!entry && !((entry.metadataFlags ?? 0) & INVALIDATED) && (entry.version ?? -Infinity) >= version;
 }
 
-/**
- * Exact transition identity: an image stands in for a stub only at the stub's own version. A newer stub
- * (a later transition to somewhere else) must never be served through an older image.
- */
+/** An image stands in for a stub only at the stub's own version; a newer stub means a later transition. */
 export function imageMatchesRow(image: { version: number } | undefined, entry: LocalEntryState | undefined): boolean {
 	return !!image && !!entry && image.version === entry.version;
 }
@@ -148,8 +140,9 @@ export function peersOwedImage(
 	return residency.filter((node) => node !== selfName && !((receipts.get(node) ?? -Infinity) >= version));
 }
 
-// Receipts live in the database's own `dbisDB` so a receipt taken on one thread, or before a restart,
-// counts on every thread afterwards. Key: [marker, tableId, recordId, peerName] -> version.
+// [marker, tableId, recordId, peerName] -> version, in the database's dbisDB so every thread and a
+// restarted origin see the same receipts. The Symbol prefix sorts below `false`, where core's catalog
+// scans start.
 const HANDOFF_RECEIPT = Symbol.for('residencyHandoffReceipt');
 const KEY_END = '￿';
 
@@ -249,24 +242,32 @@ export async function transitionsOwedToPeer(
 	return owed;
 }
 
-/** A sender's request for a receipt, as carried on the wire: the same tuple shape as the receipt. */
 export interface ReceiptRequest {
 	tableId: number;
 	recordId: any;
 	version: number;
 	getEntry: (id: any) => LocalEntryState | undefined;
+	attempts?: number;
 }
 
+export function receiptRequestKey(tableId: number, recordId: any): string {
+	return `${tableId}\u0000${typeof recordId}\u0000${String(recordId)}`;
+}
+
+/** A request re-checked this many times without its row completing is dropped; the sender's next sweep re-asks. */
+export const MAX_RECEIPT_REQUEST_ATTEMPTS = 1000;
+export const MAX_PENDING_RECEIPT_REQUESTS = 10000;
+
 /**
- * Answers the requests whose row this node now holds complete at the requested version or newer, and
- * returns the rest to keep waiting for a later commit. A request is never answered from the row's
- * absence or from a stub, and never dropped: an image core did not promote stays owed until the sender's
- * next redelivery, which re-requests it.
+ * Answers the requests whose row this node holds complete at the requested version or newer, with every
+ * blob the row references durably on disk. A stub or an absent row keeps waiting for a later commit. A
+ * row that is a stub at or past the requested version moved away again and can never satisfy the
+ * request, so it is dropped, as is a request that has waited out its attempts.
  */
-export function settleReceiptRequests(requests: ReceiptRequest[]): {
-	receipts: HandoffReceiptTuple[];
-	waiting: ReceiptRequest[];
-} {
+export async function settleReceiptRequests(
+	requests: Iterable<ReceiptRequest>,
+	blobsComplete: (value: unknown) => Promise<boolean>
+): Promise<{ receipts: HandoffReceiptTuple[]; waiting: ReceiptRequest[] }> {
 	const receipts: HandoffReceiptTuple[] = [];
 	const waiting: ReceiptRequest[] = [];
 	for (const request of requests) {
@@ -277,15 +278,33 @@ export function settleReceiptRequests(requests: ReceiptRequest[]): {
 			entry = undefined;
 		}
 		if (entry && typeof (entry as any).then === 'function') entry = undefined;
-		if (localRowSatisfies(entry, request.version)) receipts.push([request.tableId, request.recordId, entry!.version!]);
-		else waiting.push(request);
+		if (localRowSatisfies(entry, request.version)) {
+			let durable = true;
+			if ((entry!.metadataFlags ?? 0) & HAS_BLOBS) {
+				try {
+					durable = await blobsComplete(entry!.value);
+				} catch {
+					durable = false;
+				}
+			}
+			if (durable) {
+				receipts.push([request.tableId, request.recordId, entry!.version!]);
+				continue;
+			}
+		} else if (entry && (entry.metadataFlags ?? 0) & INVALIDATED && (entry.version ?? 0) >= request.version) {
+			continue;
+		}
+		request.attempts = (request.attempts ?? 0) + 1;
+		if (request.attempts < MAX_RECEIPT_REQUEST_ATTEMPTS) waiting.push(request);
 	}
 	return { receipts, waiting };
 }
 
+export const MAX_RECEIPT_BATCH = 1000;
+
 /** Shape check for an inbound receipt or receipt-request batch; anything else is dropped whole. */
-export function decodeHandoffReceipts(data: unknown): HandoffReceiptTuple[] | undefined {
-	if (!Array.isArray(data)) return undefined;
+export function decodeHandoffReceipts(data: unknown, maxItems = MAX_RECEIPT_BATCH): HandoffReceiptTuple[] | undefined {
+	if (!Array.isArray(data) || data.length > maxItems) return undefined;
 	const receipts: HandoffReceiptTuple[] = [];
 	for (const item of data) {
 		if (!Array.isArray(item) || item.length !== 3) return undefined;

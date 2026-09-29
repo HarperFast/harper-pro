@@ -15,6 +15,8 @@ import {
 	handoffReleasable,
 	imageMatchesRow,
 	localRowSatisfies,
+	MAX_RECEIPT_BATCH,
+	MAX_RECEIPT_REQUEST_ATTEMPTS,
 	peersOwedImage,
 	recordHandoffReceipt,
 	releaseIfLocallyComplete,
@@ -23,6 +25,7 @@ import {
 } from '#src/replication/residencyHandoff';
 
 const INVALIDATED = 1;
+const HAS_BLOBS = 0x2000;
 const V1 = 1700000000000;
 const V2 = V1 + 1000;
 
@@ -271,27 +274,67 @@ describe('residency handoff — redelivery and local completion', () => {
 
 describe('residency handoff — answering receipt requests', () => {
 	const request = (recordId, version, getEntry) => ({ tableId: 7, recordId, version, getEntry });
+	const blobsOk = async () => true;
+	const blobsMissing = async () => false;
 
-	it('answers only requests whose row is complete at the requested version or newer, and keeps the rest', () => {
-		const entries = { done: complete(V2), pending: stub(V2), older: complete(V1) };
+	it('answers only requests whose row is complete at the requested version or newer, and keeps the rest', async () => {
+		const entries = { done: complete(V2), pendingStub: stub(V1 - 1), older: complete(V1) };
 		const getEntry = (id) => entries[id];
-		const { receipts, waiting } = settleReceiptRequests([
-			request('done', V1, getEntry),
-			request('pending', V1, getEntry),
-			request('older', V2, getEntry),
-			request('missing', V1, getEntry),
-		]);
+		const { receipts, waiting } = await settleReceiptRequests(
+			[
+				request('done', V1, getEntry),
+				request('pendingStub', V1, getEntry),
+				request('older', V2, getEntry),
+				request('missing', V1, getEntry),
+			],
+			blobsOk
+		);
 		expect(receipts).to.deep.equal([[7, 'done', V2]]);
-		expect(waiting.map((r) => r.recordId)).to.deep.equal(['pending', 'older', 'missing']);
+		expect(waiting.map((r) => r.recordId)).to.deep.equal(['pendingStub', 'older', 'missing']);
 	});
 
-	it('treats a throwing or asynchronous lookup as not yet provable', () => {
-		const { receipts, waiting } = settleReceiptRequests([
-			request('throws', V1, () => {
-				throw new Error('closed');
-			}),
-			request('async', V1, () => Promise.resolve(complete(V1))),
-		]);
+	it('does not answer for a blob-carrying row until every blob file is durably complete', async () => {
+		const blobRow = { version: V2, metadataFlags: HAS_BLOBS, value: { id: 'b' } };
+		const getEntry = () => blobRow;
+		let settled = await settleReceiptRequests([request('b', V1, getEntry)], blobsMissing);
+		expect(settled.receipts).to.deep.equal([]);
+		expect(settled.waiting.length).to.equal(1);
+		settled = await settleReceiptRequests(settled.waiting, blobsOk);
+		expect(settled.receipts).to.deep.equal([[7, 'b', V2]]);
+		settled = await settleReceiptRequests([request('b', V1, getEntry)], async () => {
+			throw new Error('fs');
+		});
+		expect(settled.receipts).to.deep.equal([]);
+	});
+
+	it('drops a request whose row is a stub at or past the requested version: the record moved away again', async () => {
+		const getEntry = () => stub(V2);
+		const { receipts, waiting } = await settleReceiptRequests([request('gone', V1, getEntry)], blobsOk);
+		expect(receipts).to.deep.equal([]);
+		expect(waiting).to.deep.equal([]);
+	});
+
+	it('drops a request after it has waited out its attempts', async () => {
+		const pending = request('never', V1, () => undefined);
+		let waiting = [pending];
+		for (let i = 0; i < MAX_RECEIPT_REQUEST_ATTEMPTS - 1; i++) {
+			({ waiting } = await settleReceiptRequests(waiting, blobsOk));
+			expect(waiting.length).to.equal(1);
+		}
+		({ waiting } = await settleReceiptRequests(waiting, blobsOk));
+		expect(waiting).to.deep.equal([]);
+	});
+
+	it('treats a throwing or asynchronous lookup as not yet provable', async () => {
+		const { receipts, waiting } = await settleReceiptRequests(
+			[
+				request('throws', V1, () => {
+					throw new Error('closed');
+				}),
+				request('async', V1, () => Promise.resolve(complete(V1))),
+			],
+			blobsOk
+		);
 		expect(receipts).to.deep.equal([]);
 		expect(waiting.length).to.equal(2);
 	});
@@ -309,6 +352,12 @@ describe('residency handoff — wire shape', () => {
 			[8, 42, V2],
 		]);
 		expect(decodeHandoffReceipts([])).to.deep.equal([]);
+	});
+
+	it('drops a batch over the size bound whole', () => {
+		const tuples = Array.from({ length: MAX_RECEIPT_BATCH + 1 }, (_, i) => [7, `r${i}`, V1]);
+		expect(decodeHandoffReceipts(tuples)).to.equal(undefined);
+		expect(decodeHandoffReceipts(tuples.slice(0, MAX_RECEIPT_BATCH)).length).to.equal(MAX_RECEIPT_BATCH);
 	});
 
 	it('drops a malformed batch whole', () => {
