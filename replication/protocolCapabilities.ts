@@ -57,10 +57,10 @@ export const ORIGIN_FLOORS_CAPABILITY = 1;
 export const TABLE_LIFECYCLE_CAPABILITY = 1;
 
 /**
- * Level at which a peer certifies a record-residency handoff (HarperFast/harper#2257): it can parse a
- * transition PATCH entry carrying core's attached complete image, and it answers each one it commits as
- * a complete row with a `HANDOFF_RECEIPT`. A peer below this level is sent a plain complete `put`
- * instead and can never certify release, so the origin keeps the image until that peer upgrades.
+ * Level at which a peer answers `HANDOFF_RECEIPT_REQUEST` with a `HANDOFF_RECEIPT` once it durably holds
+ * the complete row a residency transition handed it (HarperFast/harper#2257). The image itself travels as
+ * an ordinary complete `put` at every level; a peer below this one can never certify release, so the
+ * origin keeps the image until that peer upgrades.
  */
 export const RESIDENCY_HANDOFF_RECEIPT_CAPABILITY = 1;
 
