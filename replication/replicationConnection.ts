@@ -1412,6 +1412,29 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 }
 
 /**
+ * Blob completeness for a residency-handoff receipt (harper#2257): unlike `storedBlobsAreComplete`, an
+ * inline blob (no file id) needs no file check — its bytes are already inside the row's own encoded
+ * value, which the caller has already confirmed is durably stored. Only a file-backed blob still needs
+ * `blobFileMissingOrIncompleteAsync`; an unreachable one (found in the header but not in the value) fails
+ * the same way `storedBlobsAreComplete` does.
+ */
+export async function receiptBlobsComplete(value: unknown): Promise<boolean> {
+	if (value == null) return false;
+	let anyBlobFound = false;
+	const fileBlobs: Blob[] = [];
+	findBlobsInObject(value, (blob: Blob) => {
+		anyBlobFound = true;
+		if (getFileId(blob)) fileBlobs.push(blob);
+	});
+	// HAS_BLOBS claimed a blob but the value holds none at all (inline or file-backed) — as unreachable
+	// as `storedBlobsAreComplete`'s case, so the same conservative refusal applies. Blobs found but all
+	// inline is fine: their bytes are already inside `value`, which the caller already confirmed durable.
+	if (!anyBlobFound) return false;
+	for (const blob of fileBlobs) if ((await blobFileMissingOrIncompleteAsync(blob)) !== false) return false;
+	return true;
+}
+
+/**
  * Whether an incoming record is a provably-already-applied identity tie with the one stored locally:
  * same version AND same origin node — the condition core's `precedesExistingVersion` early-matches as a
  * tie — and, for a blob-carrying record, every one of the STORED record's file-backed blobs durably finalized on
@@ -4615,7 +4638,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (request) selected.push(request);
 			}
 		if (selected.length === 0) return Promise.resolve();
-		settlingReceipts = settleReceiptRequests(selected, storedBlobsAreComplete)
+		settlingReceipts = settleReceiptRequests(selected, receiptBlobsComplete)
 			.then(({ receipts, settled }) => {
 				for (const request of settled) {
 					const key = receiptRequestKey(request.tableId, request.recordId);
@@ -5214,8 +5237,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						for (const [receiptTableId, recordId] of receipts)
 							handoffRequestedAt.delete(receiptRequestKey(receiptTableId, recordId));
 						const receiptPeer = remoteNodeName;
-						// one chain step per batch, a bounded number of records in flight inside it; a batch never
-						// names one record twice, so nothing in it races on a key
+						// one chain step per batch, a bounded number of records in flight inside it; the sender
+						// never repeats a record within one batch, and a duplicate would only race
+						// recordHandoffReceipt to a lower stored version, which is harmless
 						receiptApplyChain = receiptApplyChain.then(async () => {
 							const applyOne = async ([receiptTableId, recordId, version]: [number, any, number]) => {
 								const receiptTable = tableSubscriptionToReplicator.tableById[receiptTableId];
