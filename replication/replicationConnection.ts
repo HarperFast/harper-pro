@@ -5190,35 +5190,38 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							);
 							break;
 						}
-						for (const [receiptTableId, recordId, version] of receipts) {
-							const receiptTable = tableSubscriptionToReplicator.tableById[receiptTableId];
-							if (!receiptTable || !coreRetainsTransitionImages(receiptTable)) continue;
+						for (const [receiptTableId, recordId] of receipts)
 							handoffRequestedAt.delete(receiptRequestKey(receiptTableId, recordId));
-							receiptApplyChain = receiptApplyChain.then(() =>
-								applyHandoffReceipt(
-									receiptTable,
-									remoteNodeName,
-									{ recordId, version },
-									getThisNodeName(),
-									(residencyId) => getResidence(residencyId, receiptTable)
-								).then(
-									(outcome) =>
-										logger.trace?.(
-											connectionId,
-											'handoff receipt',
-											outcome,
-											receiptTable.tableName,
-											recordId,
-											version,
-											'from',
-											remoteNodeName
-										),
+						const receiptPeer = remoteNodeName;
+						// one chain step per batch: order is kept, and a bulk return does not queue one closure per record
+						receiptApplyChain = receiptApplyChain.then(async () => {
+							for (const [receiptTableId, recordId, version] of receipts) {
+								const receiptTable = tableSubscriptionToReplicator.tableById[receiptTableId];
+								if (!receiptTable || !coreRetainsTransitionImages(receiptTable)) continue;
+								try {
+									const outcome = await applyHandoffReceipt(
+										receiptTable,
+										receiptPeer,
+										{ recordId, version },
+										getThisNodeName(),
+										(residencyId) => getResidence(residencyId, receiptTable)
+									);
+									logger.trace?.(
+										connectionId,
+										'handoff receipt',
+										outcome,
+										receiptTable.tableName,
+										recordId,
+										version,
+										'from',
+										receiptPeer
+									);
+								} catch (error) {
 									// the image stays retained; the next receipt or redelivery sweep retries
-									(error) =>
-										logger.warn?.(connectionId, 'handoff receipt not applied', receiptTable.tableName, recordId, error)
-								)
-							);
-						}
+									logger.warn?.(connectionId, 'handoff receipt not applied', receiptTable.tableName, recordId, error);
+								}
+							}
+						});
 						break;
 					}
 					case COPY_START: {

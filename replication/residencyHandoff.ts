@@ -200,16 +200,13 @@ export async function applyHandoffReceipt(
 }
 
 /**
- * A retained entry is redundant once this node holds a complete row at that version or newer (a
- * transition back landed), or any row strictly newer than it: a later transition was written from a
- * complete base elsewhere — core never promotes a patch over an invalidated row — so that writer's
- * retained image, not this one, now guards the record. Releases it and returns true.
+ * A retained entry is redundant once this node again holds a complete row at that version or newer (a
+ * transition back landed). A newer STUB releases nothing: a non-resident's patch over a stub advances
+ * the version without anyone holding a complete row, so the image may still be the only complete copy.
  */
-export async function releaseIfSuperseded(table: any, retained: TransitionEntry): Promise<boolean> {
+export async function releaseIfLocallyComplete(table: any, retained: TransitionEntry): Promise<boolean> {
 	const entry = table.primaryStore.getEntry(retained.recordId);
-	const superseded =
-		localRowSatisfies(entry, retained.version) || (!!entry && (entry.version ?? -Infinity) > retained.version);
-	if (!superseded) return false;
+	if (!localRowSatisfies(entry, retained.version)) return false;
 	await releaseTransitionEntry(table, retained.recordId, retained.version);
 	await clearHandoffReceipts(table.dbisDB, table.tableId, retained.recordId);
 	return true;
@@ -230,7 +227,7 @@ export async function transitionsOwedToPeer(
 	if (!retained) return [];
 	const owed: TransitionEntry[] = [];
 	for (const entry of retained) {
-		if (await releaseIfSuperseded(table, entry)) continue;
+		if (await releaseIfLocallyComplete(table, entry)) continue;
 		const residency = residencyOf(entry.residencyId);
 		if (!residency?.includes(peerName)) continue;
 		const receipts = handoffReceipts(table.dbisDB, table.tableId, entry.recordId);
@@ -257,9 +254,9 @@ export const MAX_PENDING_RECEIPT_REQUESTS = 10000;
 
 /**
  * Answers the requests whose row this node holds complete at the requested version or newer, with every
- * blob the row references durably on disk. `settled` holds every request that leaves the queue: answered,
- * expired, or made unanswerable by a strictly newer stub (the record moved away again). A stub at the
- * requested version is the unpromoted row a redelivery is about to replace, so it keeps waiting.
+ * blob the row references durably on disk. `settled` holds every request that leaves the queue: answered
+ * or expired. A stub at any version keeps waiting: it is the unpromoted row that the image, once it
+ * arrives, lets core resequence into a complete one.
  */
 export async function settleReceiptRequests(
 	requests: Iterable<ReceiptRequest>,
@@ -291,9 +288,6 @@ export async function settleReceiptRequests(
 				settled.push(request);
 				continue;
 			}
-		} else if (entry && (entry.metadataFlags ?? 0) & INVALIDATED && (entry.version ?? 0) > request.version) {
-			settled.push(request);
-			continue;
 		}
 		if (now >= request.expiresAt) settled.push(request);
 		else waiting.push(request);
