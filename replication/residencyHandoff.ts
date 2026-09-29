@@ -215,25 +215,33 @@ export async function releaseIfLocallyComplete(table: any, retained: TransitionE
 /**
  * Retained entries a specific peer is still owed, for redelivery when a sending subscription is set up.
  * Bounded by the unreleased set: empty in steady state, and a peer that is not a resident of any of them
- * costs one pass over that set.
+ * costs one pass over that set. An entry the origin's own row has moved past stays retained (nothing
+ * proves a complete copy exists elsewhere) but is not owed: the peer's core would ignore the older
+ * image, so redelivering it could never earn a receipt. `superseded` counts those for the caller to log.
  */
 export async function transitionsOwedToPeer(
 	table: any,
 	peerName: string,
 	selfName: string,
 	residencyOf: (residencyId: number | undefined) => string[] | undefined
-): Promise<TransitionEntry[]> {
+): Promise<{ owed: TransitionEntry[]; superseded: number }> {
 	const retained = pendingTransitionEntries(table);
-	if (!retained) return [];
+	if (!retained) return { owed: [], superseded: 0 };
 	const owed: TransitionEntry[] = [];
+	let superseded = 0;
 	for (const entry of retained) {
 		if (await releaseIfLocallyComplete(table, entry)) continue;
+		const row = table.primaryStore.getEntry(entry.recordId);
+		if (row && (row.version ?? -Infinity) > entry.version) {
+			superseded++;
+			continue;
+		}
 		const residency = residencyOf(entry.residencyId);
 		if (!residency?.includes(peerName)) continue;
 		const receipts = handoffReceipts(table.dbisDB, table.tableId, entry.recordId);
 		if (peersOwedImage(residency, selfName, receipts, entry.version).includes(peerName)) owed.push(entry);
 	}
-	return owed;
+	return { owed, superseded };
 }
 
 export interface ReceiptRequest {

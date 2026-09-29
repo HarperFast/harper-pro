@@ -263,15 +263,27 @@ describe('residency handoff — redelivery and local completion', () => {
 			entries: { owedB: stub(), ackedB: stub(), notB: stub(), back: complete(V2) },
 		});
 		await recordHandoffReceipt(table.dbisDB, 7, 'ackedB', 'B', V1);
-		const owed = await transitionsOwedToPeer(table, 'B', 'A', residencyOf({ ...lists, 9: ['C'] }));
+		const { owed, superseded } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf({ ...lists, 9: ['C'] }));
 		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['owedB']);
+		expect(superseded).to.equal(0);
 		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
+	});
+
+	it('keeps but stops owing an entry the origin’s own row has moved past', async () => {
+		const table = fakeTable({
+			retained: [{ recordId: 'movedOn', tableId: 7, version: V1, residencyId: 5 }],
+			entries: { movedOn: stub(V2) },
+		});
+		const { owed, superseded } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists));
+		expect(owed).to.deep.equal([]);
+		expect(superseded).to.equal(1);
+		expect(table.released).to.deep.equal([]);
 	});
 
 	it('owes nothing on a core without the retained-image index', async () => {
 		const table = fakeTable();
 		delete table.pendingTransitionEntries;
-		expect(await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists))).to.deep.equal([]);
+		expect(await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists))).to.deep.equal({ owed: [], superseded: 0 });
 	});
 });
 
