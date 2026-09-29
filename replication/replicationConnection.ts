@@ -114,10 +114,12 @@ import {
 	applyHandoffReceipt,
 	copyRowDisposition,
 	coreRetainsTransitionImages,
+	chunkReceipts,
 	decodeHandoffReceipts,
 	fetchDisposition,
 	MAX_PENDING_RECEIPT_REQUESTS,
 	pendingTransitionEntry,
+	RECEIPT_REQUEST_TTL_MS,
 	receiptRequestKey,
 	settleReceiptRequests,
 	transitionImageValue,
@@ -230,6 +232,8 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // transition image, from the receiver's row state once that row is complete and durable (harper#2257).
 const HANDOFF_RECEIPT = 151;
 const HANDOFF_RECEIPT_REQUEST = 152;
+// how often a sending subscription re-runs its owed-image sweep on its next pass
+const HANDOFF_RESWEEP_INTERVAL_MS = 5 * 60_000;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -1430,11 +1434,6 @@ export function createRepairInflater(stream: Readable, expectedSize: number): Re
 	return bounded;
 }
 
-/**
- * Whether every file-backed blob reachable from a stored record is provably whole on disk — the same
- * classification the in-place repair uses, so a compressed body ties only once it has inflated to its
- * declared size and a torn one (which a length check cannot see) does not.
- */
 function valueHasBlobs(value: unknown): boolean {
 	if (value == null || typeof value !== 'object') return false;
 	let found = false;
@@ -1444,6 +1443,11 @@ function valueHasBlobs(value: unknown): boolean {
 	return found;
 }
 
+/**
+ * Whether every file-backed blob reachable from a stored record is provably whole on disk — the same
+ * classification the in-place repair uses, so a compressed body ties only once it has inflated to its
+ * declared size and a torn one (which a length check cannot see) does not.
+ */
 async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 	if (value == null) return false;
 	const blobs: Blob[] = [];
@@ -4042,6 +4046,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					);
 			}
 			creditDurableProgress();
+			void settleHandoffReceipts();
 			subscriptionSetupWatchdog?.resume();
 			// Retired before the flags its onStall re-checks are cleared, so the timer stops waking the
 			// event loop for the rest of the connection's life.
@@ -4924,26 +4929,49 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// a gap. See onCommit, the blob save `.finally`, and the sequence-update branches.
 	let hasBlobGap = false;
 	let lastDurableSequenceId = 0;
-	// Receipt requests from the sender, keyed by record so a re-request replaces its predecessor. Answered
-	// only outside a base copy (copy-applied rows are WAL-off until the copy's flush) and with no blob in
-	// flight or gapped, from the row's own state and blob files.
+	// Receipt requests from the sender, keyed by record. Not answered while a base copy applies WAL-off
+	// rows (until its flush) or while a blob is in flight or gapped. A settle checks only the keys it is
+	// given — the records a frame touched, or the requests that just arrived — and a full pass runs at
+	// the rare points where any row may have become durable (blob drain, copy finish).
 	const receiptRequests = new Map<string, ReceiptRequest>();
 	let receiptApplyChain: Promise<void> = Promise.resolve();
 	let settlingReceipts: Promise<void> | undefined;
-	function settleHandoffReceipts(): Promise<void> {
-		if (settlingReceipts) return settlingReceipts;
+	let resettleKeys: Set<string> | 'all' | undefined;
+	function settleHandoffReceipts(keys?: Iterable<string>): Promise<void> {
+		if (settlingReceipts) {
+			if (!keys) resettleKeys = 'all';
+			else if (resettleKeys !== 'all') {
+				const pending = resettleKeys ?? (resettleKeys = new Set());
+				for (const key of keys) pending.add(key);
+			}
+			return settlingReceipts;
+		}
 		if (receiptRequests.size === 0 || inCopyMode || outstandingBlobsToFinish.length !== 0 || hasBlobGap)
 			return Promise.resolve();
-		settlingReceipts = settleReceiptRequests([...receiptRequests.values()], storedBlobsAreComplete)
-			.then(({ receipts, waiting }) => {
-				receiptRequests.clear();
-				for (const request of waiting)
-					receiptRequests.set(receiptRequestKey(request.tableId, request.recordId), request);
-				if (receipts.length > 0 && !wsClosed) ws.send(encode([HANDOFF_RECEIPT, receipts, databaseName]));
+		const selected: ReceiptRequest[] = [];
+		if (keys) {
+			for (const key of keys) {
+				const request = receiptRequests.get(key);
+				if (request) selected.push(request);
+			}
+		} else selected.push(...receiptRequests.values());
+		if (selected.length === 0) return Promise.resolve();
+		settlingReceipts = settleReceiptRequests(selected, storedBlobsAreComplete)
+			.then(({ receipts, settled }) => {
+				for (const request of settled) {
+					const key = receiptRequestKey(request.tableId, request.recordId);
+					// a re-request that replaced this one during the settle keeps its place
+					if (receiptRequests.get(key) === request) receiptRequests.delete(key);
+				}
+				if (!wsClosed)
+					for (const chunk of chunkReceipts(receipts)) ws.send(encode([HANDOFF_RECEIPT, chunk, databaseName]));
 			})
 			.catch((error) => logger.warn?.(connectionId, 'could not settle handoff receipts', databaseName, error))
 			.finally(() => {
 				settlingReceipts = undefined;
+				const again = resettleKeys;
+				resettleKeys = undefined;
+				if (again) void settleHandoffReceipts(again === 'all' ? undefined : again);
 			});
 		return settlingReceipts;
 	}
@@ -5644,20 +5672,28 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							);
 							break;
 						}
+						const arrived: string[] = [];
+						const now = Date.now();
 						for (const [requestTableId, recordId, version] of requests) {
 							const requestDecoder = tableDecoders[requestTableId];
 							// no structure for the table yet, or the queue is full: the sender's next sweep asks again
 							if (!requestDecoder) continue;
 							const key = receiptRequestKey(requestTableId, recordId);
-							if (!receiptRequests.has(key) && receiptRequests.size >= MAX_PENDING_RECEIPT_REQUESTS) continue;
+							if (!receiptRequests.has(key) && receiptRequests.size >= MAX_PENDING_RECEIPT_REQUESTS) {
+								for (const [staleKey, stale] of receiptRequests)
+									if (now >= stale.expiresAt) receiptRequests.delete(staleKey);
+								if (receiptRequests.size >= MAX_PENDING_RECEIPT_REQUESTS) continue;
+							}
 							receiptRequests.set(key, {
 								tableId: requestTableId,
 								recordId,
 								version,
 								getEntry: requestDecoder.getEntry,
+								expiresAt: now + RECEIPT_REQUEST_TTL_MS,
 							});
+							arrived.push(key);
 						}
-						void settleHandoffReceipts();
+						void settleHandoffReceipts(arrived);
 						break;
 					}
 					case HANDOFF_RECEIPT: {
@@ -6063,7 +6099,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									entry.version = getLastVersion();
 								}
 								if (lastMetadata && lastMetadata[METADATA] & INVALIDATED) {
-									// stub bytes are never an answer; the retained image is, for a named resident only
 									let retained: TransitionEntry | undefined;
 									let image;
 									try {
@@ -6268,6 +6303,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let sentNodeIds = new Set<number>();
 						let closed = false;
 						let handoffSweepDone = false;
+						let handoffResweepTimer: ReturnType<typeof setInterval> | undefined;
 						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
 						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
 						tableSubscriptionToReplicator = subscriptionForConnection(
@@ -6587,8 +6623,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								(auditRecord.type === 'put' || auditRecord.type === 'patch') &&
 								!residency.includes(getThisNodeName())
 							) {
-								// this node wrote itself out of the residency: the peer needs the complete image, not a
-								// patch it has no base for; without one the entry goes as written
+								// the peer has no base for a patch that moved the record here; without an image the entry
+								// goes as written
 								let image;
 								try {
 									image = transitionImageValue(auditRecord, primaryStore);
@@ -6713,7 +6749,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (substituteEntry) {
 								frame.writeInt(substituteEntry.length);
 								frame.writeBytes(substituteEntry);
-								// may overtake its frame: the receiver re-checks waiting requests at every later commit
+								// may overtake its frame: the receiver holds the request until the row completes or it expires
 								if (receiptRequest) ws.send(encode([HANDOFF_RECEIPT_REQUEST, [receiptRequest], databaseName]));
 							} else {
 								// directly write the audit record.
@@ -6802,6 +6838,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						auditSubscription = new EventEmitter();
 						auditSubscription.once('close', () => {
 							closed = true;
+							if (handoffResweepTimer) clearInterval(handoffResweepTimer);
 							subscriptionToHdbNodes?.end();
 							wakeSender?.(); // an idle sender settles now rather than at the next transaction
 						});
@@ -7320,8 +7357,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// already-available record metadata integer from the range entry — a pure bitmask
 														// test, no record value decode added to this send path.
 														if (entry.metadataFlags & LOCAL_ONLY) continue;
-														// a resident peer gets a stub's retained image at the stub's version or nothing; a
-														// non-resident peer still gets the stub, which sendAuditRecord turns into an invalidate
 														let copyValue = entry.value;
 														let copyFlags = entry.metadataFlags;
 														let copyReceiptRequest: [number, any, number] | undefined;
@@ -7521,6 +7556,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 										if (!handoffSweepDone) {
 											handoffSweepDone = true;
+											handoffResweepTimer ??= setInterval(() => {
+												handoffSweepDone = false;
+											}, HANDOFF_RESWEEP_INTERVAL_MS).unref();
 											// Redeliver every retained transition image this peer is still owed (harper#2257): a
 											// receipt that never came back, an origin restart, or a peer that committed the entry
 											// without promoting it. Bounded by the unreleased set; ordinary replay carries nothing extra.
@@ -7738,6 +7776,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// `lockBarrier` control records in this body, reported as applied from the frame's onCommit —
 			// the successor-freshness proof (recordLockFreshness.ts) is the committed entry, never the frame.
 			let frameBarriers: { originId: number | undefined; nonce: number }[] | undefined;
+			let frameReceiptKeys: Set<string> | undefined;
 			// Last copy-frame key seen in this message body, applied OR skipped as an identity tie — the copy
 			// resume cursor must cover skipped keys too, or a copy whose records we all already hold would
 			// never advance it and every reconnect would restart the copy from the beginning.
@@ -7956,6 +7995,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// record's blob callback is installed re-enters the callback on the stored record's own blob
 				// references (unbounded recursion).
 				const localSourceNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
+				if (receiptRequests.size > 0) (frameReceiptKeys ??= new Set()).add(receiptRequestKey(auditRecord.tableId, id));
 				if (localSourceNodeId === undefined) throw new Error(`No node name mapped for origin id ${auditRecord.nodeId}`);
 				if (recordFrameOrigins) {
 					if (frameOrigin === undefined) frameOrigin = localSourceNodeId;
@@ -8333,7 +8373,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// This restores the original unconditional maybeFinishCopy() call; the blob-durability gate
 					// now lives inside flushDurableCopyCursor()/maybeFinishCopy().
 					flushDurableCopyCursor();
-					await settleHandoffReceipts();
+					if (frameReceiptKeys) void settleHandoffReceipts(frameReceiptKeys);
 					if (!lastSequenceIdCommitted && sequenceIdReceived) {
 						logger.trace?.(connectionId, 'queuing confirmation of a commit at', sequenceIdReceived);
 						setTimeout(() => {
