@@ -6,10 +6,12 @@ import {
 	LOCAL_PROTOCOL_VERSION,
 	MINIMUM_PROTOCOL_VERSION,
 	RECORD_LOCKS_CAPABILITY,
+	RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
+	peerSupportsHandoffReceipts,
 	peerSupportsRecordLocks,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
@@ -28,6 +30,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				subscriptionSetupAck: 0,
 				subscriptionSetupBudgetMs: undefined,
 				recordLocks: 0,
+				residencyHandoffReceipt: 0,
 			}
 		);
 	});
@@ -49,6 +52,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 		assert.deepStrictEqual(Object.keys(resolved).sort(), [
 			'protocolVersion',
 			'recordLocks',
+			'residencyHandoffReceipt',
 			'subscriptionSetupAck',
 			'subscriptionSetupBudgetMs',
 		]);
@@ -220,6 +224,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
+				residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -248,6 +253,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
+				residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
 			}
 		);
 	});
@@ -353,5 +359,27 @@ describe('noteUnknownCommand', () => {
 
 	it('starts a fresh connection at zero, so a reconnect can publish its own count', () => {
 		assert.strictEqual(createUnknownCommandState().count, 0);
+	});
+});
+
+describe('residencyHandoffReceipt — record-residency handoff receipts (harper#2257)', () => {
+	it('is absent for a legacy bag and for a bag that omits the key', () => {
+		assert.strictEqual(peerSupportsHandoffReceipts(resolvePeerCapabilities(undefined)), false);
+		assert.strictEqual(peerSupportsHandoffReceipts(resolvePeerCapabilities({ subscriptionSetupAck: 1 })), false);
+	});
+
+	it('is supported at the local level and clamps a future level down to it', () => {
+		assert.strictEqual(peerSupportsHandoffReceipts(resolvePeerCapabilities(buildLocalCapabilities(1000, false))), true);
+		assert.strictEqual(
+			resolvePeerCapabilities({ residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY + 5 })
+				.residencyHandoffReceipt,
+			RESIDENCY_HANDOFF_RECEIPT_CAPABILITY
+		);
+	});
+
+	it('is part of the equality that decides whether a re-advertised bag changed', () => {
+		const local = resolvePeerCapabilities(buildLocalCapabilities(1000, false));
+		const legacy = resolvePeerCapabilities({ ...buildLocalCapabilities(1000, false), residencyHandoffReceipt: 0 });
+		assert.strictEqual(samePeerCapabilities(local, legacy), false);
 	});
 });
