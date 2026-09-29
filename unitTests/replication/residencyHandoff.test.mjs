@@ -237,6 +237,21 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
 	});
 
+	it('awaits a getEntry that resolves asynchronously (a RocksDB cache miss), and treats a rejection as absent', async () => {
+		const rejected = Promise.reject(new Error('closed'));
+		rejected.catch(() => {}); // this fake constructs the rejection eagerly; resolveLocalEntry's own catch is under test
+		const table = fakeTable({
+			retained: [
+				{ recordId: 'async', tableId: 7, version: V1, residencyId: 5 },
+				{ recordId: 'rejects', tableId: 7, version: V1, residencyId: 5 },
+			],
+			entries: { async: Promise.resolve(complete(V2)), rejects: rejected },
+		});
+		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('async'))).to.equal(true);
+		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('rejects'))).to.equal(false);
+		expect(table.released).to.deep.equal([{ id: 'async', version: V1 }]);
+	});
+
 	it('keeps a retained entry whose local row is a stub at any version, or complete only at an older version', async () => {
 		const table = fakeTable({
 			retained: [
@@ -281,6 +296,16 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['stillMine']);
 		expect(superseded).to.equal(1);
 		expect(table.released).to.deep.equal([]);
+	});
+
+	it('awaits an async local row when checking whether a record has moved on', async () => {
+		const table = fakeTable({
+			retained: [{ recordId: 'movedOn', tableId: 7, version: V1, residencyId: 5 }],
+			entries: { movedOn: Promise.resolve({ ...stub(V2), residencyId: 4 }) },
+		});
+		const { owed, superseded } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf({ ...lists, 4: ['C'] }));
+		expect(owed).to.deep.equal([]);
+		expect(superseded).to.equal(1);
 	});
 
 	it('owes nothing on a core without the retained-image index', async () => {
