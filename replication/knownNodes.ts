@@ -12,7 +12,7 @@ import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
-import { REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
+import { CONFIRMATION_STATUS_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -93,9 +93,7 @@ export function getHDBNodeTable(): HdbNodeTable {
 		}) as unknown as HdbNodeTable)
 	);
 }
-// Slot layout and REPLICATION_SHARED_STATUS_SLOTS itself live in sharedStatusSlots.ts (the single
-// allocation point for this buffer) and the "Shared status buffers" section of DESIGN.md; re-exported
-// here since callers already import the size from this module.
+// Re-exported from sharedStatusSlots.ts (the buffer's slot registry) for existing importers.
 export { REPLICATION_SHARED_STATUS_SLOTS };
 export function getReplicationSharedStatus(
 	auditStore: any,
@@ -800,7 +798,7 @@ export function countAlreadyConfirmedPeers(
 	const confirmedPeers = new Set<string>();
 	for (const [nodeName, confirmationsForNode] of confirmationsByNode) {
 		const replicatedTime = confirmationsForNode.get(databaseName);
-		if (replicatedTime && replicatedTime[0] >= txnTime) confirmedPeers.add(nodeName);
+		if (replicatedTime && replicatedTime[CONFIRMATION_STATUS_POSITION] >= txnTime) confirmedPeers.add(nodeName);
 	}
 	return confirmedPeers;
 }
@@ -1016,7 +1014,7 @@ function startSubscriptionToReplications() {
 					databaseName,
 					nodeNameAtUpdate,
 					() => {
-						const updatedTime = replicatedTime[0];
+						const updatedTime = replicatedTime[CONFIRMATION_STATUS_POSITION];
 						const lastTime = replicatedTime.lastTime;
 						notifyConfirmedWaiters(
 							commitsAwaitingReplication.get(databaseName) || new Set(),

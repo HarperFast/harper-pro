@@ -98,10 +98,9 @@ import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 import './recordLockApply.ts';
 
-// Positions allocated in sharedStatusSlots.ts (the single point for this buffer's layout); re-exported
-// here since these are the historical, still-current import paths for unit tests. RECORD_LOCKS_CAPABILITY_POSITION
-// is the peer's capability support flag; RECORD_LOCK_HOMES_AGREEMENT_POSITION the home-map digest
-// agreement tri-state; RECORD_LOCK_LEVEL_POSITION the peer's exact advertised level (below).
+// Re-exported from sharedStatusSlots.ts (the buffer's slot registry) for existing importers.
+// RECORD_LOCKS_CAPABILITY_POSITION is the peer's capability support flag; RECORD_LOCK_HOMES_AGREEMENT_POSITION
+// the home-map digest agreement tri-state; RECORD_LOCK_LEVEL_POSITION the peer's exact advertised level.
 export { RECORD_LOCKS_CAPABILITY_POSITION, RECORD_LOCK_HOMES_AGREEMENT_POSITION, RECORD_LOCK_LEVEL_POSITION };
 export const LOCK_CAPABILITY_UNKNOWN = 0;
 export const LOCK_CAPABILITY_UNSUPPORTED = 1;
