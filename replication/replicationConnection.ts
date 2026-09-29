@@ -39,6 +39,23 @@ import {
 import { redactOperationForLog } from './logRedaction.ts';
 import { CopyCursorWatermark } from './copyCursorWatermark.ts';
 import {
+	CONFIRMATION_STATUS_POSITION,
+	RECEIVED_VERSION_POSITION,
+	RECEIVED_TIME_POSITION,
+	SENDING_TIME_POSITION,
+	LATENCY_POSITION,
+	RECEIVING_STATUS_POSITION,
+	BACK_PRESSURE_RATIO_POSITION,
+	BLOB_FAILURE_COUNT_POSITION,
+	LAST_BLOB_FAILURE_TIME_POSITION,
+	CONNECTION_STATE_POSITION,
+	LAST_LIVENESS_TIME_POSITION,
+	LAST_ERROR_CODE_POSITION,
+	LAST_ERROR_TIME_POSITION,
+	FIRE_MECHANISMS,
+	FIRE_COUNTER_BASE_POSITION,
+} from './sharedStatusSlots.ts';
+import {
 	recordPeerLockCapability,
 	recordPeerLockLevel,
 	recordPeerHomesDigest,
@@ -172,34 +189,31 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // changes so a leader resuming a cursor stamped with a different (or absent) version recopies from
 // scratch instead of silently skipping tables the old order had not yet reached (#421).
 const COPY_ORDER_VERSION = 1;
-export const CONFIRMATION_STATUS_POSITION = 0;
-export const RECEIVED_VERSION_POSITION = 1;
-export const RECEIVED_TIME_POSITION = 2;
-export const SENDING_TIME_POSITION = 3;
-export const LATENCY_POSITION = 4;
-export const RECEIVING_STATUS_POSITION = 5;
-export const BACK_PRESSURE_RATIO_POSITION = 6;
-// Blob-replication divergence signals (harper-pro#386). A blob save failure on the receive side means
-// a record committed but its bytes are not durably stored — the resume cursor holds (see `hasBlobGap`)
-// and, on a sustained failing link, the peer can silently diverge to the point of unrecoverable loss.
-// These slots surface that divergence in cluster_status so it is observable (count + recency) rather
-// than visible only as per-blob error spam in the logs.
-export const BLOB_FAILURE_COUNT_POSITION = 7; // cumulative count of blob save failures for this peer/db
-export const LAST_BLOB_FAILURE_TIME_POSITION = 8; // wall-clock time (ms) of the most recent blob failure
+// Slot positions are allocated in sharedStatusSlots.ts (the single point for this buffer's layout);
+// re-exported here since these are the historical, still-current import paths for this module's own
+// consumers and for unit tests.
+export {
+	CONFIRMATION_STATUS_POSITION,
+	RECEIVED_VERSION_POSITION,
+	RECEIVED_TIME_POSITION,
+	SENDING_TIME_POSITION,
+	LATENCY_POSITION,
+	RECEIVING_STATUS_POSITION,
+	BACK_PRESSURE_RATIO_POSITION,
+	BLOB_FAILURE_COUNT_POSITION,
+	LAST_BLOB_FAILURE_TIME_POSITION,
+	CONNECTION_STATE_POSITION,
+	LAST_LIVENESS_TIME_POSITION,
+	LAST_ERROR_CODE_POSITION,
+	LAST_ERROR_TIME_POSITION,
+	FIRE_MECHANISMS,
+	FIRE_COUNTER_BASE_POSITION,
+};
 // Per-connection blob save failures before we log one escalation line (above the per-blob errors). A
 // handful of failures on one connection indicates a persistently failing link, not a one-off blip.
 const SUSTAINED_BLOB_FAILURE_THRESHOLD = 5;
 export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
-// W1 (harper-pro#431): authoritative connection-health slots, written by the worker thread that owns the
-// outbound (db, peer) subscription socket and read by the main thread as the source of truth for link
-// state — rather than relying solely on the edge-triggered worker→main postMessage mirror, which desyncs
-// when a terminal state is reached without a 'close' (open-but-idle wedge, #289/#233). State is paired with
-// a liveness timestamp so a worker that died/wedged without writing DOWN cannot leave a stale CONNECTED.
-export const CONNECTION_STATE_POSITION = 9;
-export const LAST_LIVENESS_TIME_POSITION = 10; // wall-clock ms of last confirmed liveness (pong or received message)
-export const LAST_ERROR_CODE_POSITION = 11; // close code of the most recent disconnect
-export const LAST_ERROR_TIME_POSITION = 12; // wall-clock ms of the most recent disconnect
 export const CONNECTION_STATE_DOWN = 0;
 export const CONNECTION_STATE_CONNECTED = 2;
 // LAST_ERROR_CODE for a disconnect this node INFERRED rather than observed on the wire: the worker thread
@@ -302,21 +316,7 @@ export function describeRefusedWorkerExitStamp(status: Float64Array | undefined,
 // This is measurement only. No net is demoted, no threshold moves, and no fire predicate consults it — the
 // demotion decision (the byte-silence receive watchdog is the candidate) is a later, data-driven one.
 export type FireClassification = 'redundant' | 'load-bearing' | 'unknown';
-// Append only: the index into this list picks the counter slot pair, so reordering or removing a name
-// reassigns existing counters to a different mechanism.
-export const FIRE_MECHANISMS = [
-	'receive-watchdog',
-	'pause-stall',
-	'copy-progress',
-	'blob-gap',
-	'copy-finalize',
-	'subscription-setup',
-	'wedge-reconcile',
-	'receive-stall-net',
-] as const;
 export type FireMechanism = (typeof FIRE_MECHANISMS)[number];
-// Two counter slots per mechanism (redundant, load-bearing) starting here — see the slot map in DESIGN.md.
-export const FIRE_COUNTER_BASE_POSITION = 13;
 // These counters are the one read-modify-write on this buffer, safe only under the single-writer-per-slot-
 // pair invariant stated in DESIGN.md. unitTests/replication/fireCounters.test.mjs pins its disjointness half.
 export function fireCounterPositions(mechanism: string): { redundant: number; loadBearing: number } | undefined {

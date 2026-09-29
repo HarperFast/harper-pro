@@ -12,6 +12,7 @@ import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
+import { REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -92,13 +93,10 @@ export function getHDBNodeTable(): HdbNodeTable {
 		}) as unknown as HdbNodeTable)
 	);
 }
-// Float64 slots in the per-(database, peer) shared status buffer. Positions 0..6 are the replication status
-// fields, 7..8 the blob-divergence signals, 9..12 the W1 connection-truth fields (state/liveness/error-code/
-// error-time), 13..28 the eight R4 fire-classification counter pairs, 29 the record-lock capability flag
-// (RECORD_LOCKS_CAPABILITY_POSITION in recordLockTransport.ts), and 30..31 headroom (see the *_POSITION
-// exports in replicationConnection.ts and the slot map in DESIGN.md). Lives here, next to the allocation,
-// so the size and the map cannot drift apart.
-export const REPLICATION_SHARED_STATUS_SLOTS = 32;
+// Slot layout and REPLICATION_SHARED_STATUS_SLOTS itself live in sharedStatusSlots.ts (the single
+// allocation point for this buffer) and the "Shared status buffers" section of DESIGN.md; re-exported
+// here since callers already import the size from this module.
+export { REPLICATION_SHARED_STATUS_SLOTS };
 export function getReplicationSharedStatus(
 	auditStore: any,
 	databaseName: string,
