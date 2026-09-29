@@ -233,26 +233,16 @@ export async function applyHandoffReceipt(
 }
 
 /**
- * A retained entry is redundant once this node again holds a complete row at that version or newer (a
- * transition back landed). A newer STUB releases nothing: a non-resident's patch over a stub advances
- * the version without anyone holding a complete row, so the image may still be the only complete copy.
- * `transitionsOwedToPeer` inlines an equivalent check against a row it already read, to read each
- * retained entry's row only once per sweep pass; this standalone form exists for direct callers/tests.
- */
-export async function releaseIfLocallyComplete(table: any, retained: TransitionEntry): Promise<boolean> {
-	const entry = await resolveLocalEntry((id) => table.primaryStore.getEntry(id), retained.recordId);
-	if (!localRowSatisfies(entry, retained.version)) return false;
-	await releaseAndClearReceipts(table, retained.recordId, retained.version);
-	return true;
-}
-
-/**
  * Retained entries a specific peer is still owed, for redelivery when a sending subscription is set up.
  * Bounded by the unreleased set: empty in steady state, and a peer that is not a resident of any of them
- * costs one pass over that set. An entry whose record has since moved to a residency that no longer
- * names the peer stays retained (nothing proves a complete copy exists elsewhere) but is not owed to
- * that peer any more; `superseded` counts those. A newer row that still names the peer keeps the entry
- * owed: if that row is a stub, this image is what lets the peer's core complete it.
+ * costs one pass over that set. A retained entry is redundant once this node again holds a complete row
+ * at that version or newer (a transition back landed) and releases immediately. A newer STUB releases
+ * nothing: a non-resident's patch over a stub advances the version without anyone holding a complete
+ * row, so the image may still be the only complete copy. An entry whose record has since moved to a
+ * residency that no longer names the peer stays retained (nothing proves a complete copy exists
+ * elsewhere) but is not owed to that peer any more; `superseded` counts those. A newer row that still
+ * names the peer keeps the entry owed: if that row is a stub, this image is what lets the peer's core
+ * complete it.
  */
 export async function transitionsOwedToPeer(
 	table: any,

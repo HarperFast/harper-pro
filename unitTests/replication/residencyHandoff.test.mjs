@@ -20,7 +20,6 @@ import {
 	RECEIPT_REQUEST_TTL_MS,
 	peersOwedImage,
 	recordHandoffReceipt,
-	releaseIfLocallyComplete,
 	settleReceiptRequests,
 	transitionsOwedToPeer,
 } from '#src/replication/residencyHandoff';
@@ -233,7 +232,8 @@ describe('residency handoff — redelivery and local completion', () => {
 			retained: [{ recordId: 'back', tableId: 7, version: V1, residencyId: 5 }],
 			entries: { back: complete(V2) },
 		});
-		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('back'))).to.equal(true);
+		const { owed } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists));
+		expect(owed).to.deep.equal([]);
 		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
 	});
 
@@ -247,8 +247,8 @@ describe('residency handoff — redelivery and local completion', () => {
 			],
 			entries: { async: Promise.resolve(complete(V2)), rejects: rejected },
 		});
-		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('async'))).to.equal(true);
-		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('rejects'))).to.equal(false);
+		const { owed } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists));
+		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['rejects']);
 		expect(table.released).to.deep.equal([{ id: 'async', version: V1 }]);
 	});
 
@@ -259,11 +259,12 @@ describe('residency handoff — redelivery and local completion', () => {
 				{ recordId: 'newerStub', tableId: 7, version: V1, residencyId: 5 },
 				{ recordId: 'old', tableId: 7, version: V2, residencyId: 5 },
 			],
-			entries: { s: stub(V1), newerStub: stub(V2), old: complete(V1) },
+			// newerStub's row names the entry's own residency, so it is owed rather than counted superseded --
+			// that branch has its own coverage below
+			entries: { s: stub(V1), newerStub: { ...stub(V2), residencyId: 5 }, old: complete(V1) },
 		});
-		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('s'))).to.equal(false);
-		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('newerStub'))).to.equal(false);
-		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('old'))).to.equal(false);
+		const { owed } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists));
+		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['s', 'newerStub', 'old']);
 		expect(table.released).to.deep.equal([]);
 	});
 
