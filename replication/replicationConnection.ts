@@ -6905,7 +6905,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													table,
 													remoteNodeName,
 													getThisNodeName(),
-													(residencyId) => getResidence(residencyId, table)
+													(residencyId) => getResidence(residencyId, table),
+													(recordId, error) =>
+														logger.warn?.(
+															connectionId,
+															'could not read the local row for a retained transition image',
+															table.tableName,
+															recordId,
+															error
+														)
 												));
 											} catch (error) {
 												logger.warn?.(
