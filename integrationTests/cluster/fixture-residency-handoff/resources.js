@@ -20,10 +20,10 @@ export class HomedProbe extends Resource {
 		const table = tables.Homed;
 		const entry = table.primaryStore.getEntry(id);
 		const pending = [];
-		const pendingImages = table.pendingTransitionImages?.();
-		if (pendingImages) {
-			for (const image of pendingImages) {
-				pending.push({ id: String(image.id), version: image.version });
+		const retained = table.pendingTransitionEntries?.();
+		if (retained) {
+			for (const entry of retained) {
+				pending.push({ id: String(entry.recordId), version: entry.version });
 			}
 		}
 		return {
@@ -34,7 +34,7 @@ export class HomedProbe extends Resource {
 			value: entry?.value ?? null,
 			pending: pending.filter((image) => image.id === id),
 			pendingCount: pending.length,
-			pendingSupported: pendingImages !== undefined,
+			pendingSupported: retained !== undefined,
 		};
 	}
 }
