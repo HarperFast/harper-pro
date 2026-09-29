@@ -9,7 +9,7 @@ import { readFileSync, writeFileSync, mkdtempSync, rmSync, cpSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, waitForCondition } from './clusterShared.mjs';
 import { inventoryBuild } from '../../dist/core/components/buildArtifact.js';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
@@ -64,18 +64,20 @@ suite('Replicated builds — every node runs the origin’s tree', { timeout: 30
 			hostname: ctx.nodes[0].hostname,
 			authorization: 'Bearer ' + operation_token,
 		});
-		for (let retries = 0; ; retries++) {
-			const statuses = await Promise.all(ctx.nodes.map((node) => sendOperation(node, { operation: 'cluster_status' })));
-			// `every` over an empty socket list is vacuously true, which would report an unmeshed cluster as ready.
-			const meshed = statuses.every(
-				(s) =>
-					s.connections?.length === 1 &&
-					s.connections.every((c) => c.database_sockets?.length > 0 && c.database_sockets.every((d) => d.connected))
-			);
-			if (meshed) break;
-			if (retries > 25) throw new Error('Timed out waiting for the cluster to connect');
-			await delay(200 * (retries + 1));
-		}
+		await waitForCondition(
+			async () => {
+				const statuses = await Promise.all(
+					ctx.nodes.map((node) => sendOperation(node, { operation: 'cluster_status' }))
+				);
+				// `every` over an empty socket list is vacuously true, which would report an unmeshed cluster as ready.
+				return statuses.every(
+					(s) =>
+						s.connections?.length === 1 &&
+						s.connections.every((c) => c.database_sockets?.length > 0 && c.database_sockets.every((d) => d.connected))
+				);
+			},
+			{ pollMs: 200, description: 'the cluster to connect' }
+		);
 		await delay(500);
 	});
 
