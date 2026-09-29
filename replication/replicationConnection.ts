@@ -6293,6 +6293,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												}
 												for (const entry of table.primaryStore.getRange(rangeOptions)) {
 													if (closed) return;
+													// Re-resolve by name each row: a redeclaration replaces the Table object, and the row
+													// below allocates and awaits, so a flip becomes visible mid-walk. Measured at ~6ns
+													// against ~13ns for one of this row's own allocations.
+													if (!tableReplicates(tables?.[tableName] ?? table)) break;
 													// Bound the wall-clock gap between socket flushes and event-loop yields,
 													// independent of record count. The count checkpoint below alone can let a cold
 													// batch run past the watchdog window with no bytes flushed (reads dominate cost),
@@ -6312,9 +6316,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														}
 														await new Promise(setImmediate);
 														if (closed) return;
-														// Re-resolve by name: a redeclaration replaces the Table object. DESIGN.md note 23
-														// records why this sits at the pacer's yield and what that leaves open.
-														if (!tableReplicates(tables?.[tableName] ?? table)) break;
 													}
 													// Local-only records must never be full-copied to a peer. metadataFlags is the
 													// already-available record metadata integer from the range entry — a pure bitmask
