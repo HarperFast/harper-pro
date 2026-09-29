@@ -33,6 +33,7 @@ import {
 	ACTION_32_BIT,
 	auditRetention,
 	LOCAL_ONLY,
+	HAS_EXPIRATION_EXTENDED_TYPE,
 	isLockControlType,
 	readOriginClosedFloor,
 } from '../core/resources/auditStore.ts';
@@ -101,6 +102,7 @@ import {
 	noteUnknownCommand,
 	peerSupportsOriginCursors,
 	peerSupportsOriginFloors,
+	peerSupportsHandoffReceipts,
 	peerSupportsRecordLocks,
 	peerSupportsTableLifecycle,
 	resolvePeerCapabilities,
@@ -108,6 +110,20 @@ import {
 	subscriptionSetupCapabilityFrom,
 	type ResolvedPeerCapabilities,
 } from './protocolCapabilities.ts';
+import {
+	applyHandoffReceipt,
+	copyRowDisposition,
+	coreRetainsTransitionImages,
+	decodeHandoffReceipts,
+	fetchDisposition,
+	pendingTransitionEntry,
+	settleReceiptRequests,
+	transitionImageValue,
+	transitionsOwedToPeer,
+	type ReceiptRequest,
+	type TransitionEntry,
+} from './residencyHandoff.ts';
+import { INVALIDATED } from '../core/resources/Table.ts';
 import {
 	HAS_STRUCTURE_UPDATE,
 	isMissingStructureError,
@@ -207,6 +223,16 @@ const COPY_COMPLETE = 149; // leader -> follower: the bulk table copy finished; 
 // (e.g. sendSubscriptionRequestUpdate). Sent at initial handshake alongside NODE_NAME, and standalone
 // whenever this node's own active home-map digest for the database changes (on activate).
 const RECORD_LOCK_HOMES_DIGEST = 150;
+// receiver -> sender: `[HANDOFF_RECEIPT, [[tableId, recordId, version], ...], databaseName]`. Sent from
+// the receiver's blob-durable commit point for each residency-transition entry (HarperFast/harper#2257)
+// it now holds as a complete row; the sender releases core's retained image once every resident has one.
+// Capability-gated (`residencyHandoffReceipt`): a peer below the level never sees a transition entry.
+const HANDOFF_RECEIPT = 151;
+// sender -> receiver: `[HANDOFF_RECEIPT_REQUEST, [[tableId, recordId, version], ...], databaseName]`,
+// sent after a complete transition image was put on the wire for the peer. The receiver answers each
+// one from its own local row state, so it never has to recognize how core shapes a transition entry.
+const HANDOFF_RECEIPT_REQUEST = 152;
+const MAX_PENDING_RECEIPT_REQUESTS = 10000;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -1445,6 +1471,8 @@ export async function isDurableIdentityTie(
 ): Promise<boolean> {
 	if (sourceNodeId === undefined) return false;
 	if (!existing) return false;
+	// A stub is never proof that the complete record at this version is already applied (harper#2257).
+	if ((existing as { metadataFlags?: number }).metadataFlags & INVALIDATED) return false;
 	if (existing.version !== incomingVersion) return false;
 	if ((existing.nodeId ?? 0) !== sourceNodeId) return false;
 	if (!hasBlobs) return true;
@@ -4889,6 +4917,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// a gap. See onCommit, the blob save `.finally`, and the sequence-update branches.
 	let hasBlobGap = false;
 	let lastDurableSequenceId = 0;
+	// Receipt requests from the sender (harper#2257), answered from this node's own row state once the
+	// row is complete at the requested version and every in-flight blob is durable; the rest wait for a
+	// later commit. Bounded so a runaway sender cannot grow it without limit; the sender re-requests.
+	let receiptRequests: ReceiptRequest[] = [];
+	function settleHandoffReceipts() {
+		if (receiptRequests.length === 0 || outstandingBlobsToFinish.length !== 0 || hasBlobGap) return;
+		const { receipts, waiting } = settleReceiptRequests(receiptRequests);
+		receiptRequests = waiting;
+		if (receipts.length > 0) ws.send(encode([HANDOFF_RECEIPT, receipts, databaseName]));
+	}
 	let committedSequence = 0;
 	function creditDurableProgress() {
 		// Copy-apply rows are not durable until the copy's final flush, so they are not progress yet.
@@ -5567,6 +5605,72 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 						(getSharedStatus().buffer as any).notify();
 						break;
+					case HANDOFF_RECEIPT_REQUEST: {
+						const requests = decodeHandoffReceipts(data);
+						if (!requests || message[2] !== databaseName) {
+							logger.warn?.(
+								connectionId,
+								'dropping malformed handoff receipt request from',
+								remoteNodeName,
+								databaseName
+							);
+							break;
+						}
+						for (const [requestTableId, recordId, version] of requests) {
+							const requestDecoder = tableDecoders[requestTableId];
+							// no structure for the table yet: the sender's next redelivery sweep asks again
+							if (!requestDecoder) continue;
+							if (receiptRequests.length >= MAX_PENDING_RECEIPT_REQUESTS) receiptRequests.shift();
+							receiptRequests.push({ tableId: requestTableId, recordId, version, getEntry: requestDecoder.getEntry });
+						}
+						settleHandoffReceipts();
+						break;
+					}
+					case HANDOFF_RECEIPT: {
+						// Only meaningful on a connection this node sends on; `tableById` is that side's table set.
+						const receipts = decodeHandoffReceipts(data);
+						if (
+							!receipts ||
+							message[2] !== databaseName ||
+							typeof remoteNodeName !== 'string' ||
+							!tableSubscriptionToReplicator?.tableById
+						) {
+							logger.warn?.(
+								connectionId,
+								'dropping malformed handoff receipt batch from',
+								remoteNodeName,
+								databaseName
+							);
+							break;
+						}
+						for (const [receiptTableId, recordId, version] of receipts) {
+							const receiptTable = tableSubscriptionToReplicator.tableById[receiptTableId];
+							if (!receiptTable || !coreRetainsTransitionImages(receiptTable)) continue;
+							applyHandoffReceipt(
+								receiptTable,
+								remoteNodeName,
+								{ recordId, version },
+								getThisNodeName(),
+								(residencyId) => getResidence(residencyId, receiptTable)
+							).then(
+								(outcome) =>
+									logger.trace?.(
+										connectionId,
+										'handoff receipt',
+										outcome,
+										receiptTable.tableName,
+										recordId,
+										version,
+										'from',
+										remoteNodeName
+									),
+								// the image stays retained; the next receipt or redelivery sweep retries
+								(error) =>
+									logger.warn?.(connectionId, 'handoff receipt not applied', receiptTable.tableName, recordId, error)
+							);
+						}
+						break;
+					}
 					case COPY_START: {
 						if (!isValidFrameTxnLogKey(data)) {
 							// The anchor becomes this node's persisted copy cursor and its resume seqId. A non-finite or
@@ -5882,24 +5986,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// we are sending raw binary data back, so we have to send the typed structure information so the
 							// receiving side can properly decode it. We only need to send this once until it changes again, so we can check if the structure
 							// has changed. It will only grow, so we can just check the length.
-							const structuresBinary = table.primaryStore.getBinaryFast(Symbol.for('structures'));
-							const structureLength = structuresBinary?.length ?? 0;
-							if (structureLength > 0 && structureLength !== lastStructureLength) {
-								lastStructureLength = structureLength;
-								const structure = decode(structuresBinary);
-								ws.send(
-									encode([
-										TABLE_FIXED_STRUCTURE,
-										{
-											typedStructs: structure.typed,
-											structures: structure.named,
-											createdTime: advertisedCreatedTime(table),
-										},
-										tableId,
-										table.tableName,
-									])
-								);
-							}
+							const syncStructures = () => {
+								const structuresBinary = table.primaryStore.getBinaryFast(Symbol.for('structures'));
+								const structureLength = structuresBinary?.length ?? 0;
+								if (structureLength > 0 && structureLength !== lastStructureLength) {
+									lastStructureLength = structureLength;
+									const structure = decode(structuresBinary);
+									ws.send(
+										encode([
+											TABLE_FIXED_STRUCTURE,
+											{
+												typedStructs: structure.typed,
+												structures: structure.named,
+												createdTime: advertisedCreatedTime(table),
+											},
+											tableId,
+											table.tableName,
+										])
+									);
+								}
+							};
+							syncStructures();
 							// we might want to prefetch here
 							const binaryEntry = table.primaryStore.getBinaryFast(recordId);
 							if (binaryEntry) {
@@ -5919,28 +6026,72 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								} else {
 									entry.version = getLastVersion();
 								}
-								if (lastMetadata && lastMetadata[METADATA] & HAS_BLOBS) {
-									// if there are blobs, we need to find them and send their contents
-									// but first, the decoding process can destroy our buffer above, so we need to copy it
-									valueBuffer = Buffer.from(valueBuffer);
-									decodeWithBlobCallback(
-										() => table.primaryStore.decoder.decode(binaryEntry),
-										(blob) => sendBlobs(blob, recordId),
-										table.primaryStore.rootStore
+								if (lastMetadata && lastMetadata[METADATA] & INVALIDATED) {
+									// Stub bytes are never an answer (harper#2257). The retained image is, at the stub's own
+									// version, and only for a peer the transition's residency names; anything else is a miss.
+									let retained: TransitionEntry | undefined;
+									try {
+										retained = pendingTransitionEntry(table, recordId);
+									} catch (error) {
+										logger.warn?.(
+											connectionId,
+											'could not read the retained transition image',
+											table.tableName,
+											recordId,
+											error
+										);
+									}
+									const disposition = fetchDisposition(
+										{ version: entry.version, metadataFlags: lastMetadata[METADATA] },
+										retained,
+										remoteNodeName,
+										(residencyId) => getResidence(residencyId, table)
 									);
+									const image =
+										disposition === 'image' ? transitionImageValue(retained!, table.primaryStore) : undefined;
+									if (image === undefined) responseData = encode([GET_RECORD_RESPONSE, requestId]);
+									else {
+										const imageBuffer = encodeCopyRecordValue(table.primaryStore, image, (blob) =>
+											sendBlobs(blob, recordId)
+										);
+										syncStructures(); // encoding the image may have minted a structure the peer has not seen
+										responseData = encode([
+											GET_RECORD_RESPONSE,
+											requestId,
+											{
+												value: imageBuffer,
+												expiresAt: retained!.expiresAt,
+												version: retained!.version,
+												residencyId: retained!.residencyId,
+												nodeId: retained!.nodeId,
+												user: retained!.user,
+											},
+										]);
+									}
+								} else {
+									if (lastMetadata && lastMetadata[METADATA] & HAS_BLOBS) {
+										// if there are blobs, we need to find them and send their contents
+										// but first, the decoding process can destroy our buffer above, so we need to copy it
+										valueBuffer = Buffer.from(valueBuffer);
+										decodeWithBlobCallback(
+											() => table.primaryStore.decoder.decode(binaryEntry),
+											(blob) => sendBlobs(blob, recordId),
+											table.primaryStore.rootStore
+										);
+									}
+									responseData = encode([
+										GET_RECORD_RESPONSE,
+										requestId,
+										{
+											value: valueBuffer,
+											expiresAt: entry.expiresAt,
+											version: entry.version,
+											residencyId: entry.residencyId,
+											nodeId: entry.nodeId,
+											user: entry.user,
+										},
+									]);
 								}
-								responseData = encode([
-									GET_RECORD_RESPONSE,
-									requestId,
-									{
-										value: valueBuffer,
-										expiresAt: entry.expiresAt,
-										version: entry.version,
-										residencyId: entry.residencyId,
-										nodeId: entry.nodeId,
-										user: entry.user,
-									},
-								]);
 							} else {
 								responseData = encode([GET_RECORD_RESPONSE, requestId]);
 							}
@@ -6079,6 +6230,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
 						let sentNodeIds = new Set<number>();
 						let closed = false;
+						let handoffSweepDone = false;
 						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
 						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
 						tableSubscriptionToReplicator = subscriptionForConnection(
@@ -6308,12 +6460,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const timeRange = subscribedNodeIds?.[subscriptionNodeId];
 							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
 							// in the subscribedNodeIds list, than it matches the subscription
-							const matchesSubscription = matchesSubscriptionPosition(
-								timeRange as any,
-								!!excludedNodes,
-								originFloorById?.[subscriptionNodeId],
-								subscriptionPosition
-							);
+							const matchesSubscription =
+								auditRecord.isHandoffRedelivery === true ||
+								matchesSubscriptionPosition(
+									timeRange as any,
+									!!excludedNodes,
+									originFloorById?.[subscriptionNodeId],
+									subscriptionPosition
+								);
 							if (!matchesSubscription) {
 								if (DEBUG_MODE)
 									logger.trace?.(
@@ -6346,7 +6500,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								);
 							const residencyId = auditRecord.residencyId;
 							const residency = getResidence(residencyId, table);
-							let invalidationEntry;
+							let substituteEntry;
+							let receiptRequest: [number, any, number] | undefined;
 							if (residency && !residency.includes(remoteNodeName)) {
 								// If this node won't have residency, we need to send out invalidation messages
 								const previousResidency = getResidence(auditRecord.previousResidencyId, table);
@@ -6378,7 +6533,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// if there are any indices, we need to preserve a partial invalidated record to ensure we can still do searches
 									partialRecord[name] = fullRecord[name];
 								}
-								invalidationEntry = createAuditEntry({
+								substituteEntry = createAuditEntry({
 									...auditRecord,
 									tableId,
 									recordId,
@@ -6390,6 +6545,53 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									residencyId,
 								});
 								// entry is encoded, send it after checks for new structure and residency
+							} else if (
+								residency &&
+								(auditRecord.type === 'put' || auditRecord.type === 'patch') &&
+								!residency.includes(getThisNodeName())
+							) {
+								// This node wrote itself out of the residency, so the peer must receive the complete
+								// post-write image, never the patch it cannot base (harper#2257). Only core knows where it
+								// kept that image; an entry without one is forwarded as written.
+								let image;
+								try {
+									image = transitionImageValue(auditRecord, primaryStore);
+								} catch (error) {
+									logger.warn?.(
+										connectionId,
+										'could not read the transition image; forwarding the entry as written',
+										auditRecord.recordId,
+										error
+									);
+								}
+								if (image !== undefined) {
+									const recordId = auditRecord.recordId;
+									const hasBlobs = !!(auditRecord.extendedType & HAS_BLOBS);
+									let extendedType = hasBlobs ? HAS_BLOBS : 0;
+									if (residencyId) extendedType |= HAS_CURRENT_RESIDENCY_ID;
+									if (auditRecord.previousResidencyId) extendedType |= HAS_PREVIOUS_RESIDENCY_ID;
+									if (auditRecord.expiresAt != null) extendedType |= HAS_EXPIRATION_EXTENDED_TYPE;
+									const encodeImageEntry = () =>
+										createAuditEntry({
+											version: auditRecord.version,
+											tableId,
+											recordId,
+											previousVersion: null,
+											nodeId,
+											user: auditRecord.user,
+											type: 'put',
+											encodedRecord: encodeCopyRecordValue(primaryStore, image, (blob) => sendBlobs(blob, recordId)),
+											extendedType,
+											residencyId,
+											previousResidencyId: auditRecord.previousResidencyId,
+											expiresAt: auditRecord.expiresAt,
+										} as any);
+									substituteEntry = hasBlobs
+										? encodeWithCopyBlobTransferTags(image, encodeImageEntry)
+										: encodeImageEntry();
+									if (peerCapabilitiesLearned && peerSupportsHandoffReceipts(peerCapabilities))
+										receiptRequest = [tableId, recordId, auditRecord.version];
+								}
 							}
 
 							// Every skip branch must share the yield budget so the sequence-update timer can fire.
@@ -6472,10 +6674,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							/*
 						TODO: At some point we may want fancier logic to elide the version when it equals txnLogKey
 							and username from subsequent audit entries in multiple entry transactions*/
-							if (invalidationEntry) {
-								// if we have an invalidation entry to send, do that now
-								frame.writeInt(invalidationEntry.length);
-								frame.writeBytes(invalidationEntry);
+							if (substituteEntry) {
+								frame.writeInt(substituteEntry.length);
+								frame.writeBytes(substituteEntry);
+								// The receiver answers from its own row state, so this may overtake the frame it refers to.
+								if (receiptRequest) ws.send(encode([HANDOFF_RECEIPT_REQUEST, [receiptRequest], databaseName]));
 							} else {
 								// directly write the audit record.
 								const encoded = auditRecord.encoded;
@@ -7081,11 +7284,49 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// already-available record metadata integer from the range entry — a pure bitmask
 														// test, no record value decode added to this send path.
 														if (entry.metadataFlags & LOCAL_ONLY) continue;
+														// An INVALIDATED stub is never a complete record (harper#2257): a resident peer gets the
+														// retained image at the stub's own version or nothing, so a copy can never overwrite the
+														// complete row it holds. A non-resident peer still gets the stub, which sendAuditRecord
+														// turns into an `invalidate` entry as before.
+														let copyValue = entry.value;
+														let copyReceiptRequest: [number, any, number] | undefined;
+														if (entry.metadataFlags & INVALIDATED) {
+															const peerIsResident = !!getResidence(entry.residencyId, table)?.includes(remoteNodeName);
+															let retained: TransitionEntry | undefined;
+															if (peerIsResident) {
+																try {
+																	retained = pendingTransitionEntry(table, entry.key);
+																} catch (error) {
+																	logger.warn?.(
+																		connectionId,
+																		'could not read the retained transition image',
+																		tableName,
+																		entry.key,
+																		error
+																	);
+																}
+															}
+															const disposition = copyRowDisposition(entry, peerIsResident, retained);
+															if (disposition === 'image')
+																copyValue = transitionImageValue(retained!, table.primaryStore);
+															if (disposition === 'skip' || (disposition === 'image' && copyValue === undefined)) {
+																logger.trace?.(
+																	connectionId,
+																	'withholding an invalidated stub from a resident peer',
+																	tableName,
+																	entry.key
+																);
+																continue;
+															}
+															if (
+																disposition === 'image' &&
+																peerCapabilitiesLearned &&
+																peerSupportsHandoffReceipts(peerCapabilities)
+															)
+																copyReceiptRequest = [table.tableId, entry.key, entry.version];
+														}
 														// same origin normalization as recordNodeId below: undefined means we authored it
-														if (
-															withheldOriginNodeId !== undefined &&
-															(entry.nodeId ?? nodeId) === withheldOriginNodeId
-														) {
+														if (withheldOriginNodeId !== undefined && (entry.nodeId ?? nodeId) === withheldOriginNodeId) {
 															withheldRecordCount++;
 															continue;
 														}
@@ -7112,7 +7353,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																previousVersion: null,
 																nodeId: recordNodeId,
 																type: 'put',
-																encodedRecord: encodeCopyRecordValue(table.primaryStore, entry.value, (blob) =>
+																encodedRecord: encodeCopyRecordValue(table.primaryStore, copyValue, (blob) =>
 																	sendBlobs(blob, entry.key)
 																),
 																extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
@@ -7122,7 +7363,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															} as any);
 														const encoded =
 															entry.metadataFlags & HAS_BLOBS
-																? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
+																? encodeWithCopyBlobTransferTags(copyValue, encodeCopyRecord)
 																: encodeCopyRecord();
 														await sendAuditRecord(
 															{
@@ -7131,7 +7372,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																tableId: table.tableId,
 																type: 'put',
 																getValue() {
-																	return entry.value;
+																	return copyValue;
 																},
 																encoded,
 																version: entry.version,
@@ -7142,6 +7383,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															copyTxnLogKey,
 															nodeId
 														);
+														if (copyReceiptRequest)
+															ws.send(encode([HANDOFF_RECEIPT_REQUEST, [copyReceiptRequest], databaseName]));
 														logger.debug?.(
 															'sent record from table',
 															entry.key,
@@ -7226,6 +7469,35 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												excludeLogs: excludedNodes,
 												snapshot: false, // don't want to use a snapshot, and we want to see new entries
 											});
+										}
+										if (!handoffSweepDone) {
+											handoffSweepDone = true;
+											// Redeliver every retained transition image this peer is still owed (harper#2257): a
+											// receipt that never came back, an origin restart, or a peer that committed the entry
+											// without promoting it. Bounded by the unreleased set; ordinary replay carries nothing extra.
+											for (const table of tableSubscriptionToReplicator.tableById) {
+												if (!table || !coreRetainsTransitionImages(table) || !tableToTableEntry(table)) continue;
+												let owed: TransitionEntry[];
+												try {
+													owed = await transitionsOwedToPeer(table, remoteNodeName, getThisNodeName(), (residencyId) =>
+														getResidence(residencyId, table)
+													);
+												} catch (error) {
+													logger.warn?.(
+														connectionId,
+														'could not enumerate retained transition images',
+														table.tableName,
+														error
+													);
+													continue;
+												}
+												for (const retained of owed) {
+													if (closed) return;
+													const redelivery = Object.create(retained);
+													redelivery.isHandoffRedelivery = true;
+													await sendAuditRecord(redelivery, retained.txnLogKey ?? retained.version);
+												}
+											}
 										}
 										for (const auditRecord of auditLogIterable) {
 											const key: number = auditRecord.txnLogKey;
@@ -7971,6 +8243,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// core reads these after awaiting onCommit
 					endTxnEvent.originCursors = takeDurableOriginCursors();
 					endTxnEvent.originFloors = pendingOriginFloors.take(cursorBlockedByBlob());
+					settleHandoffReceipts();
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
 					// (version < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
 					// core persists [seq] = copyStartTime. Otherwise a small copy that finished before the cadence
@@ -8838,6 +9111,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// sequence, which the next end_txn/sequence-update persists as the resume cursor.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) {
 						advanceDurableWatermark();
+						settleHandoffReceipts();
 						// The last in-flight blob is now durable. Any resume-cursor update we sent earlier while it
 						// was outstanding was clamped to the pre-drain watermark (cursorBlockedByBlob() at the
 						// REMOTE_SEQUENCE_UPDATE / SEQUENCE_ID_UPDATE sites). Re-emit an end_txn at the now-durable

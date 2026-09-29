@@ -1,0 +1,323 @@
+/**
+ * The Pro half of a record-based residency transition (HarperFast/harper#2257): which row a base copy
+ * or `GET_RECORD` may present as complete, when the origin may release core's retained image, and the
+ * durable per-peer receipts that decide it. Core's side is reached only through the optional accessors
+ * the fakes below stand in for.
+ */
+import { expect } from 'chai';
+import {
+	applyHandoffReceipt,
+	clearHandoffReceipts,
+	copyRowDisposition,
+	decodeHandoffReceipts,
+	fetchDisposition,
+	handoffReceipts,
+	handoffReleasable,
+	imageMatchesRow,
+	localRowSatisfies,
+	peersOwedImage,
+	recordHandoffReceipt,
+	releaseIfLocallyComplete,
+	settleReceiptRequests,
+	transitionsOwedToPeer,
+} from '#src/replication/residencyHandoff';
+
+const INVALIDATED = 1;
+const V1 = 1700000000000;
+const V2 = V1 + 1000;
+
+const complete = (version = V1) => ({ version, metadataFlags: 0, value: { id: 'r', name: 'kept' } });
+const stub = (version = V1) => ({ version, metadataFlags: INVALIDATED, value: { home: 'B' } });
+const residencyOf = (lists) => (id) => lists[id];
+
+/** In-memory stand-in for a database's `dbisDB`: array keys, ordered prefix ranges. */
+function fakeDbisDB() {
+	const rows = new Map();
+	const keyOf = (key) => JSON.stringify(key.map((part) => (typeof part === 'symbol' ? part.description : part)));
+	return {
+		rows,
+		getSync(key) {
+			return rows.get(keyOf(key))?.value;
+		},
+		async put(key, value) {
+			rows.set(keyOf(key), { key, value });
+		},
+		async remove(key) {
+			rows.delete(keyOf(key));
+		},
+		*getRange({ start }) {
+			const prefix = keyOf(start).slice(0, -1);
+			for (const row of rows.values()) {
+				if (keyOf(row.key).startsWith(prefix)) yield row;
+			}
+		},
+	};
+}
+
+/** A table whose core accessors are the companion contract; `retained` is its pending set. */
+function fakeTable({ retained = [], entries = {}, dbisDB = fakeDbisDB() } = {}) {
+	const released = [];
+	return {
+		tableId: 7,
+		tableName: 'Homed',
+		dbisDB,
+		released,
+		primaryStore: { getEntry: (id) => entries[id] },
+		pendingTransitionEntries: () => retained.filter((entry) => !released.some((r) => r.id === entry.recordId)),
+		pendingTransitionEntry: (id) =>
+			retained.find((entry) => entry.recordId === id && !released.some((r) => r.id === id)),
+		releaseTransitionEntry: (id, version) => {
+			released.push({ id, version });
+		},
+	};
+}
+
+describe('residency handoff — row predicates', () => {
+	it('a complete row satisfies a version at or below its own; a stub never does', () => {
+		expect(localRowSatisfies(complete(V2), V1)).to.equal(true);
+		expect(localRowSatisfies(complete(V1), V1)).to.equal(true);
+		expect(localRowSatisfies(complete(V1), V2)).to.equal(false);
+		expect(localRowSatisfies(stub(V2), V1)).to.equal(false);
+		expect(localRowSatisfies(undefined, V1)).to.equal(false);
+	});
+
+	it('an image matches a row only at the row’s exact version', () => {
+		expect(imageMatchesRow({ version: V1 }, stub(V1))).to.equal(true);
+		expect(imageMatchesRow({ version: V1 }, stub(V2))).to.equal(false);
+		expect(imageMatchesRow(undefined, stub(V1))).to.equal(false);
+		expect(imageMatchesRow({ version: V1 }, undefined)).to.equal(false);
+	});
+});
+
+describe('residency handoff — what a base copy may send', () => {
+	it('sends a complete row as today, to anyone', () => {
+		expect(copyRowDisposition(complete(), true, undefined)).to.equal('row');
+		expect(copyRowDisposition(complete(), false, undefined)).to.equal('row');
+	});
+
+	it('still sends a stub to a non-resident peer (the send path turns it into an invalidate)', () => {
+		expect(copyRowDisposition(stub(), false, undefined)).to.equal('row');
+	});
+
+	it('sends a resident peer the retained image at the stub’s version, or withholds the row', () => {
+		expect(copyRowDisposition(stub(V1), true, { version: V1 })).to.equal('image');
+		expect(copyRowDisposition(stub(V2), true, { version: V1 })).to.equal('skip');
+		expect(copyRowDisposition(stub(V1), true, undefined)).to.equal('skip');
+	});
+});
+
+describe('residency handoff — what GET_RECORD may answer', () => {
+	const lists = { 3: ['B'], 4: ['C'] };
+
+	it('answers a complete row as today and misses on nothing stored', () => {
+		expect(fetchDisposition(complete(), undefined, 'B', residencyOf(lists))).to.equal('row');
+		expect(fetchDisposition(undefined, { version: V1, residencyId: 3 }, 'B', residencyOf(lists))).to.equal('miss');
+	});
+
+	it('never answers with stub bytes', () => {
+		expect(fetchDisposition(stub(), undefined, 'B', residencyOf(lists))).to.equal('miss');
+	});
+
+	it('answers a stub with the retained image only to a peer the transition’s residency names', () => {
+		const image = { version: V1, residencyId: 3 };
+		expect(fetchDisposition(stub(V1), image, 'B', residencyOf(lists))).to.equal('image');
+		expect(fetchDisposition(stub(V1), image, 'C', residencyOf(lists))).to.equal('miss');
+		expect(fetchDisposition(stub(V1), image, undefined, residencyOf(lists))).to.equal('miss');
+		expect(fetchDisposition(stub(V2), image, 'B', residencyOf(lists))).to.equal('miss');
+		expect(fetchDisposition(stub(V1), { version: V1, residencyId: 9 }, 'B', residencyOf(lists))).to.equal('miss');
+	});
+});
+
+describe('residency handoff — release rule', () => {
+	it('releases only when every other named resident has a receipt at or above the version', () => {
+		const receipts = new Map([
+			['B', V1],
+			['C', V2],
+		]);
+		expect(handoffReleasable(['B', 'C'], 'A', receipts, V1)).to.equal(true);
+		expect(handoffReleasable(['B', 'C', 'D'], 'A', receipts, V1)).to.equal(false);
+		expect(handoffReleasable(['B'], 'A', receipts, V2)).to.equal(false);
+	});
+
+	it('ignores the origin itself and never releases when nobody else is named', () => {
+		expect(handoffReleasable(['A', 'B'], 'A', new Map([['B', V1]]), V1)).to.equal(true);
+		expect(handoffReleasable(['A'], 'A', new Map(), V1)).to.equal(false);
+		expect(handoffReleasable([], 'A', new Map(), V1)).to.equal(false);
+		expect(handoffReleasable(undefined, 'A', new Map(), V1)).to.equal(false);
+	});
+
+	it('lists the residents still owed the image', () => {
+		expect(peersOwedImage(['A', 'B', 'C'], 'A', new Map([['B', V1]]), V1)).to.deep.equal(['C']);
+		expect(peersOwedImage(['B'], 'A', new Map([['B', V1 - 1]]), V1)).to.deep.equal(['B']);
+		expect(peersOwedImage(undefined, 'A', new Map(), V1)).to.deep.equal([]);
+	});
+});
+
+describe('residency handoff — durable receipts', () => {
+	it('records the highest receipt per peer and clears them per record', async () => {
+		const dbisDB = fakeDbisDB();
+		await recordHandoffReceipt(dbisDB, 7, 'r', 'B', V1);
+		await recordHandoffReceipt(dbisDB, 7, 'r', 'B', V1 - 5);
+		await recordHandoffReceipt(dbisDB, 7, 'r', 'C', V2);
+		await recordHandoffReceipt(dbisDB, 7, 'other', 'B', V2);
+		expect([...handoffReceipts(dbisDB, 7, 'r')]).to.deep.equal([
+			['B', V1],
+			['C', V2],
+		]);
+		await clearHandoffReceipts(dbisDB, 7, 'r');
+		expect(handoffReceipts(dbisDB, 7, 'r').size).to.equal(0);
+		expect(handoffReceipts(dbisDB, 7, 'other').get('B')).to.equal(V2);
+	});
+});
+
+describe('residency handoff — applying a peer’s receipt', () => {
+	const lists = { 3: ['B', 'C'], 5: ['B'] };
+	const retainedFor = (id, residencyId, version = V1) => ({ recordId: id, tableId: 7, version, residencyId });
+
+	it('ignores a receipt for a record with nothing retained, and one older than the retained version', async () => {
+		const table = fakeTable({ retained: [retainedFor('r', 5, V2)] });
+		expect(await applyHandoffReceipt(table, 'B', { recordId: 'x', version: V2 }, 'A', residencyOf(lists))).to.equal(
+			'ignored'
+		);
+		expect(await applyHandoffReceipt(table, 'B', { recordId: 'r', version: V1 }, 'A', residencyOf(lists))).to.equal(
+			'ignored'
+		);
+		expect(table.released).to.deep.equal([]);
+		expect(table.dbisDB.rows.size).to.equal(0);
+	});
+
+	it('records a receipt and releases once every named resident has one', async () => {
+		const table = fakeTable({ retained: [retainedFor('r', 3)] });
+		expect(await applyHandoffReceipt(table, 'B', { recordId: 'r', version: V1 }, 'A', residencyOf(lists))).to.equal(
+			'recorded'
+		);
+		expect(table.released).to.deep.equal([]);
+		expect(await applyHandoffReceipt(table, 'C', { recordId: 'r', version: V2 }, 'A', residencyOf(lists))).to.equal(
+			'released'
+		);
+		expect(table.released).to.deep.equal([{ id: 'r', version: V1 }]);
+		expect(table.dbisDB.rows.size).to.equal(0);
+	});
+
+	it('does not release on a receipt from a peer the residency does not name', async () => {
+		const table = fakeTable({ retained: [retainedFor('r', 5)] });
+		expect(await applyHandoffReceipt(table, 'C', { recordId: 'r', version: V1 }, 'A', residencyOf(lists))).to.equal(
+			'recorded'
+		);
+		expect(table.released).to.deep.equal([]);
+	});
+
+	it('does nothing when the core lookup throws, so the image stays retained', async () => {
+		const table = fakeTable({ retained: [retainedFor('r', 5)] });
+		table.pendingTransitionEntry = () => {
+			throw new Error('store closed');
+		};
+		let error;
+		await applyHandoffReceipt(table, 'B', { recordId: 'r', version: V1 }, 'A', residencyOf(lists)).catch(
+			(e) => (error = e)
+		);
+		expect(error?.message).to.equal('store closed');
+		expect(table.released).to.deep.equal([]);
+	});
+});
+
+describe('residency handoff — redelivery and local completion', () => {
+	const lists = { 3: ['B', 'C'], 5: ['B'] };
+
+	it('releases a retained entry whose row this node again holds complete at that version or newer', async () => {
+		const table = fakeTable({
+			retained: [{ recordId: 'back', tableId: 7, version: V1, residencyId: 5 }],
+			entries: { back: complete(V2) },
+		});
+		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('back'))).to.equal(true);
+		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
+	});
+
+	it('keeps a retained entry whose local row is still a stub, or complete only at an older version', async () => {
+		const table = fakeTable({
+			retained: [
+				{ recordId: 's', tableId: 7, version: V1, residencyId: 5 },
+				{ recordId: 'old', tableId: 7, version: V2, residencyId: 5 },
+			],
+			entries: { s: stub(V1), old: complete(V1) },
+		});
+		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('s'))).to.equal(false);
+		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('old'))).to.equal(false);
+		expect(table.released).to.deep.equal([]);
+	});
+
+	it('owes a peer exactly the retained entries that name it and lack its receipt', async () => {
+		const table = fakeTable({
+			retained: [
+				{ recordId: 'owedB', tableId: 7, version: V1, residencyId: 3 },
+				{ recordId: 'ackedB', tableId: 7, version: V1, residencyId: 3 },
+				{ recordId: 'notB', tableId: 7, version: V1, residencyId: 9 },
+				{ recordId: 'back', tableId: 7, version: V1, residencyId: 5 },
+			],
+			entries: { owedB: stub(), ackedB: stub(), notB: stub(), back: complete(V2) },
+		});
+		await recordHandoffReceipt(table.dbisDB, 7, 'ackedB', 'B', V1);
+		const owed = await transitionsOwedToPeer(table, 'B', 'A', residencyOf({ ...lists, 9: ['C'] }));
+		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['owedB']);
+		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
+	});
+
+	it('owes nothing on a core without the retained-image index', async () => {
+		const table = fakeTable();
+		delete table.pendingTransitionEntries;
+		expect(await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists))).to.deep.equal([]);
+	});
+});
+
+describe('residency handoff — answering receipt requests', () => {
+	const request = (recordId, version, getEntry) => ({ tableId: 7, recordId, version, getEntry });
+
+	it('answers only requests whose row is complete at the requested version or newer, and keeps the rest', () => {
+		const entries = { done: complete(V2), pending: stub(V2), older: complete(V1) };
+		const getEntry = (id) => entries[id];
+		const { receipts, waiting } = settleReceiptRequests([
+			request('done', V1, getEntry),
+			request('pending', V1, getEntry),
+			request('older', V2, getEntry),
+			request('missing', V1, getEntry),
+		]);
+		expect(receipts).to.deep.equal([[7, 'done', V2]]);
+		expect(waiting.map((r) => r.recordId)).to.deep.equal(['pending', 'older', 'missing']);
+	});
+
+	it('treats a throwing or asynchronous lookup as not yet provable', () => {
+		const { receipts, waiting } = settleReceiptRequests([
+			request('throws', V1, () => {
+				throw new Error('closed');
+			}),
+			request('async', V1, () => Promise.resolve(complete(V1))),
+		]);
+		expect(receipts).to.deep.equal([]);
+		expect(waiting.length).to.equal(2);
+	});
+});
+
+describe('residency handoff — wire shape', () => {
+	it('accepts a batch of [tableId, recordId, version] tuples', () => {
+		expect(
+			decodeHandoffReceipts([
+				[7, 'r', V1],
+				[8, 42, V2],
+			])
+		).to.deep.equal([
+			[7, 'r', V1],
+			[8, 42, V2],
+		]);
+		expect(decodeHandoffReceipts([])).to.deep.equal([]);
+	});
+
+	it('drops a malformed batch whole', () => {
+		expect(decodeHandoffReceipts(undefined)).to.equal(undefined);
+		expect(decodeHandoffReceipts('x')).to.equal(undefined);
+		expect(decodeHandoffReceipts([[7, 'r']])).to.equal(undefined);
+		expect(decodeHandoffReceipts([[-1, 'r', V1]])).to.equal(undefined);
+		expect(decodeHandoffReceipts([[7, null, V1]])).to.equal(undefined);
+		expect(decodeHandoffReceipts([[7, 'r', 0]])).to.equal(undefined);
+		expect(decodeHandoffReceipts([[7, 'r', 'v']])).to.equal(undefined);
+	});
+});
