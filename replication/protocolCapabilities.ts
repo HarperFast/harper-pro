@@ -31,7 +31,6 @@ export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
  * without the fence, so the levels stay mutually exclusive.
  */
 export const RECORD_LOCKS_CAPABILITY = 4;
-
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	protocolVersion: number;

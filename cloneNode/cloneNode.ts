@@ -352,7 +352,33 @@ export async function cloneNode(): Promise<void> {
 	// Monitor synchronization after cloning. Only finalize the clone (mark it cloned, log complete)
 	// once sync is confirmed and availability has been published as Available — a timeout or failure
 	// must not be treated as success.
-	const syncOutcome = await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
+	const syncOutcome =
+		resumeMarker?.verdict === 'incomplete' && !skipSyncMonitor
+			? 'incomplete'
+			: await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
+	if (syncOutcome === 'incomplete') {
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+		if (resumeMarker?.verdict !== 'incomplete') {
+			try {
+				writeSyncStartedMarker({
+					startedAt: syncStartedAt,
+					replicationEstablished: true,
+					targetTimestamps,
+					totalBytes,
+					setupComplete: true,
+					verdict: 'incomplete',
+				});
+			} catch (error) {
+				log(`Could not persist the incomplete clone verdict: ${error}`, 'error');
+			}
+		}
+		clearCloneAttempt();
+		log(
+			`Clone from leader node ${leaderURL} completed with one or more undecodable copy records; node is running but Unavailable and not marked as cloned. Inspect cluster_status cloneIncomplete, stop the node, replace the affected database store, and restart with FORCE_CLONE=true to request a clean clone`,
+			'error'
+		);
+		return;
+	}
 	if (syncOutcome === 'failed') {
 		// Return (don't throw) so Harper stays running and queryable. Clear `cloned` explicitly: a
 		// forced reclone has already carried the previous `cloned: true` into the rewritten config.
@@ -571,6 +597,8 @@ async function finishCloneSetup(): Promise<boolean> {
  * leader-config-refined value checkSyncStatus matches exactly against cluster_status (the heuristic
  * URL is wrong for a TLS-only leader). `targetTimestamps`/`totalBytes` pin the leader snapshot a
  * resume reuses instead of re-fetching. `setupComplete` covers `finishCloneSetup` (JWT/custody/SSH).
+ * `verdict` makes a terminal incomplete copy independent of process-local socket state and the
+ * original clone-duration budget on later restarts.
  */
 type SyncStartedMarker = {
 	leaderURL?: string;
@@ -580,6 +608,7 @@ type SyncStartedMarker = {
 	targetTimestamps?: Record<string, number>;
 	totalBytes?: number;
 	setupComplete?: boolean;
+	verdict?: 'incomplete';
 };
 
 function syncStartedMarkerPath(): string {
@@ -622,10 +651,11 @@ function clearSyncStartedMarker(): void {
  * Result of monitoring clone synchronization.
  * - `synced`: sync was confirmed and `availability` was published as Available.
  * - `skipped`: sync monitoring was disabled (skip-sync-monitor); `availability` is left untouched.
+ * - `incomplete`: copying finished but durable copy-drop state proves one or more rows were skipped.
  * - `failed`: sync was not confirmed (stall timeout, missing targets, or a failed status write);
  *   `availability` is left Unavailable and the node must not be marked as cloned.
  */
-type SyncOutcome = 'synced' | 'skipped' | 'failed';
+type SyncOutcome = 'synced' | 'skipped' | 'incomplete' | 'failed';
 
 /**
  * Monitors database synchronization after cloning and drives this node's `availability` status.
@@ -768,6 +798,14 @@ async function monitorSync(
 		}
 
 		return 'synced';
+	}
+
+	if (outcome === 'incomplete') {
+		log(
+			'All copy streams finished, but durable cloneIncomplete state records skipped copy rows; leaving availability Unavailable and not marking node as cloned',
+			'error'
+		);
+		return 'incomplete';
 	}
 
 	if (outcome === 'unconverged') {

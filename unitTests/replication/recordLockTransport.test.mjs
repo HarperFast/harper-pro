@@ -40,7 +40,13 @@ import {
 } from '#src/replication/recordLockTransport';
 import { DELEGATE_OPERATION, RECALL_OPERATION } from '#src/replication/recordLockRpc';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
-import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
+import {
+	FIRE_MECHANISMS,
+	fireCounterPositions,
+	DECODE_DROP_LAST_CLOSE_POSITION,
+	DECODE_DROP_CLOSE_COUNT_POSITION,
+	DECODE_DROP_LAST_EVENT_POSITION,
+} from '#src/replication/replicationConnection';
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
@@ -131,9 +137,29 @@ describe('peer lock capability in the shared status buffer', () => {
 	});
 
 	it('uses a slot outside the ones connection truth, blob signals, and the fire counters occupy', () => {
-		const fireCountersEnd = FIRE_COUNTER_BASE_POSITION + FIRE_MECHANISMS.length * 2; // exclusive
-		assert.ok(RECORD_LOCKS_CAPABILITY_POSITION >= fireCountersEnd);
-		assert.ok(RECORD_LOCKS_CAPABILITY_POSITION < REPLICATION_SHARED_STATUS_SLOTS);
+		const fireCounterSlots = new Set(
+			FIRE_MECHANISMS.flatMap((mechanism) => {
+				const positions = fireCounterPositions(mechanism);
+				return positions ? [positions.redundant, positions.loadBearing] : [];
+			})
+		);
+		for (const position of [
+			RECORD_LOCKS_CAPABILITY_POSITION,
+			RECORD_LOCK_HOMES_AGREEMENT_POSITION,
+			RECORD_LOCK_LEVEL_POSITION,
+		]) {
+			assert.ok(!fireCounterSlots.has(position));
+			assert.ok(position < REPLICATION_SHARED_STATUS_SLOTS);
+		}
+		for (const position of [
+			DECODE_DROP_LAST_CLOSE_POSITION,
+			DECODE_DROP_CLOSE_COUNT_POSITION,
+			DECODE_DROP_LAST_EVENT_POSITION,
+		]) {
+			assert.ok(!fireCounterSlots.has(position));
+			assert.ok(position > RECORD_LOCK_LEVEL_POSITION);
+			assert.ok(position < REPLICATION_SHARED_STATUS_SLOTS);
+		}
 	});
 });
 
