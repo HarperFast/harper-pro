@@ -6867,13 +6867,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										auditLogIterable =
 											maybeDeadAuditIterableForTest(databaseName) ??
 											(auditStore.getRange({
-											start: currentSequenceId || 1,
-											exclusiveStart: true,
-											exactStart: false,
-											log: excludedNodes ? undefined : logName,
-											startByLog: new Map([[logName, currentSequenceId || 1]]),
-											excludeLogs: excludedNodes,
-											snapshot: false, // don't want to use a snapshot, and we want to see new entries
+												start: currentSequenceId || 1,
+												exclusiveStart: true,
+												exactStart: false,
+												log: excludedNodes ? undefined : logName,
+												startByLog: new Map([[logName, currentSequenceId || 1]]),
+												excludeLogs: excludedNodes,
+												snapshot: false, // don't want to use a snapshot, and we want to see new entries
 											}) as typeof auditLogIterable);
 									}
 									for (const auditRecord of auditLogIterable) {
