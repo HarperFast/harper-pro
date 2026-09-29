@@ -6904,8 +6904,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												if (closed) return;
 												if (resweep && handoffRequestedAt.has(receiptRequestKey(table.tableId, retained.recordId)))
 													continue;
-												// own properties: the send path spreads the record into an invalidate entry
-												const redelivery = { ...retained, isHandoffRedelivery: true };
+												// own properties: the send path spreads the record into an invalidate entry, and the image
+												// accessor may live on core's prototype
+												const redelivery = {
+													...retained,
+													getTransitionImage: retained.getTransitionImage?.bind(retained),
+													isHandoffRedelivery: true,
+												};
 												await sendAuditRecord(redelivery, retained.txnLogKey ?? retained.version);
 											}
 										}
