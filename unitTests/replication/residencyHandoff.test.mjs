@@ -7,6 +7,7 @@
 import { expect } from 'chai';
 import {
 	applyHandoffReceipt,
+	chunkReceipts,
 	clearHandoffReceipts,
 	copyRowDisposition,
 	decodeHandoffReceipts,
@@ -16,7 +17,7 @@ import {
 	imageMatchesRow,
 	localRowSatisfies,
 	MAX_RECEIPT_BATCH,
-	MAX_RECEIPT_REQUEST_ATTEMPTS,
+	RECEIPT_REQUEST_TTL_MS,
 	peersOwedImage,
 	recordHandoffReceipt,
 	releaseIfLocallyComplete,
@@ -273,56 +274,71 @@ describe('residency handoff — redelivery and local completion', () => {
 });
 
 describe('residency handoff — answering receipt requests', () => {
-	const request = (recordId, version, getEntry) => ({ tableId: 7, recordId, version, getEntry });
+	const NOW = 1_800_000_000_000;
+	const request = (recordId, version, getEntry, expiresAt = NOW + RECEIPT_REQUEST_TTL_MS) => ({
+		tableId: 7,
+		recordId,
+		version,
+		getEntry,
+		expiresAt,
+	});
 	const blobsOk = async () => true;
 	const blobsMissing = async () => false;
 
 	it('answers only requests whose row is complete at the requested version or newer, and keeps the rest', async () => {
 		const entries = { done: complete(V2), pendingStub: stub(V1 - 1), older: complete(V1) };
 		const getEntry = (id) => entries[id];
-		const { receipts, waiting } = await settleReceiptRequests(
+		const { receipts, settled, waiting } = await settleReceiptRequests(
 			[
 				request('done', V1, getEntry),
 				request('pendingStub', V1, getEntry),
 				request('older', V2, getEntry),
 				request('missing', V1, getEntry),
 			],
-			blobsOk
+			blobsOk,
+			NOW
 		);
 		expect(receipts).to.deep.equal([[7, 'done', V2]]);
+		expect(settled.map((r) => r.recordId)).to.deep.equal(['done']);
 		expect(waiting.map((r) => r.recordId)).to.deep.equal(['pendingStub', 'older', 'missing']);
 	});
 
 	it('does not answer for a blob-carrying row until every blob file is durably complete', async () => {
 		const blobRow = { version: V2, metadataFlags: HAS_BLOBS, value: { id: 'b' } };
 		const getEntry = () => blobRow;
-		let settled = await settleReceiptRequests([request('b', V1, getEntry)], blobsMissing);
-		expect(settled.receipts).to.deep.equal([]);
-		expect(settled.waiting.length).to.equal(1);
-		settled = await settleReceiptRequests(settled.waiting, blobsOk);
-		expect(settled.receipts).to.deep.equal([[7, 'b', V2]]);
-		settled = await settleReceiptRequests([request('b', V1, getEntry)], async () => {
-			throw new Error('fs');
-		});
-		expect(settled.receipts).to.deep.equal([]);
+		let result = await settleReceiptRequests([request('b', V1, getEntry)], blobsMissing, NOW);
+		expect(result.receipts).to.deep.equal([]);
+		expect(result.waiting.length).to.equal(1);
+		result = await settleReceiptRequests(result.waiting, blobsOk, NOW);
+		expect(result.receipts).to.deep.equal([[7, 'b', V2]]);
+		result = await settleReceiptRequests(
+			[request('b', V1, getEntry)],
+			async () => {
+				throw new Error('fs');
+			},
+			NOW
+		);
+		expect(result.receipts).to.deep.equal([]);
+		expect(result.waiting.length).to.equal(1);
 	});
 
-	it('drops a request whose row is a stub at or past the requested version: the record moved away again', async () => {
-		const getEntry = () => stub(V2);
-		const { receipts, waiting } = await settleReceiptRequests([request('gone', V1, getEntry)], blobsOk);
-		expect(receipts).to.deep.equal([]);
-		expect(waiting).to.deep.equal([]);
+	it('drops a request only once the row is a strictly newer stub; an unpromoted stub at that version keeps waiting', async () => {
+		const gone = await settleReceiptRequests([request('gone', V1, () => stub(V2))], blobsOk, NOW);
+		expect(gone.receipts).to.deep.equal([]);
+		expect(gone.settled.length).to.equal(1);
+		expect(gone.waiting).to.deep.equal([]);
+		const unpromoted = await settleReceiptRequests([request('same', V1, () => stub(V1))], blobsOk, NOW);
+		expect(unpromoted.settled).to.deep.equal([]);
+		expect(unpromoted.waiting.length).to.equal(1);
 	});
 
-	it('drops a request after it has waited out its attempts', async () => {
-		const pending = request('never', V1, () => undefined);
-		let waiting = [pending];
-		for (let i = 0; i < MAX_RECEIPT_REQUEST_ATTEMPTS - 1; i++) {
-			({ waiting } = await settleReceiptRequests(waiting, blobsOk));
-			expect(waiting.length).to.equal(1);
-		}
-		({ waiting } = await settleReceiptRequests(waiting, blobsOk));
-		expect(waiting).to.deep.equal([]);
+	it('drops a request once it has expired', async () => {
+		const pending = request('never', V1, () => undefined, NOW + 1000);
+		let result = await settleReceiptRequests([pending], blobsOk, NOW + 999);
+		expect(result.waiting.length).to.equal(1);
+		result = await settleReceiptRequests([pending], blobsOk, NOW + 1000);
+		expect(result.waiting).to.deep.equal([]);
+		expect(result.settled).to.deep.equal([pending]);
 	});
 
 	it('treats a throwing or asynchronous lookup as not yet provable', async () => {
@@ -333,7 +349,8 @@ describe('residency handoff — answering receipt requests', () => {
 				}),
 				request('async', V1, () => Promise.resolve(complete(V1))),
 			],
-			blobsOk
+			blobsOk,
+			NOW
 		);
 		expect(receipts).to.deep.equal([]);
 		expect(waiting.length).to.equal(2);
@@ -352,6 +369,14 @@ describe('residency handoff — wire shape', () => {
 			[8, 42, V2],
 		]);
 		expect(decodeHandoffReceipts([])).to.deep.equal([]);
+	});
+
+	it('chunks outbound receipts at the inbound bound', () => {
+		const items = Array.from({ length: MAX_RECEIPT_BATCH * 2 + 1 }, (_, i) => i);
+		const chunks = chunkReceipts(items);
+		expect(chunks.map((chunk) => chunk.length)).to.deep.equal([MAX_RECEIPT_BATCH, MAX_RECEIPT_BATCH, 1]);
+		expect(chunks.flat()).to.deep.equal(items);
+		expect(chunkReceipts([])).to.deep.equal([]);
 	});
 
 	it('drops a batch over the size bound whole', () => {
