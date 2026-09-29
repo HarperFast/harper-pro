@@ -166,7 +166,7 @@ async function startWedgedPair(ctx, name, shape) {
 		description: 'the seed row to replicate before the send iterable is stopped',
 	});
 
-	// Written into the wedge: the source's loop now drains a stopped iterable and emits nothing.
+	// This live write must flow after torn-tail repair and remain behind a mid-log break.
 	await sendOperation(source, {
 		operation: 'insert',
 		database: DB,
@@ -194,7 +194,7 @@ suite('Send-log-break recovery (harper-pro#810)', { skip: !STRESS || !ROCKSDB, t
 		await waitForCondition((signal) => hasRow(subscriber, 'after-wedge', signal), {
 			timeoutMs: RECOVERY_TIMEOUT_MS,
 			pollMs: POLL_MS,
-			description: 'the row written into the wedge to replicate once the send range is rebuilt',
+			description: 'the live row to replicate once the send range is rebuilt',
 		});
 
 		const log = await readLog(source);

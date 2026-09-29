@@ -88,6 +88,9 @@ export async function checkSyncStatus(
 			}
 			syncComplete = false;
 			log(`Database ${dbName}: copy integrity state is ${integrityState}; waiting`, 'debug');
+			// The copy watermark has reached its target, so later arrivals cannot advance this
+			// incomplete integrity verdict. Let the monitor's stall deadline surface it instead.
+			continue;
 		} else {
 			copyStreamsComplete = false;
 			syncComplete = false;

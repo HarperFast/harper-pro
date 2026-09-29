@@ -219,13 +219,12 @@ export const WORKER_EXIT_ERROR_CODE = 100_001;
 // Application close codes (RFC 6455 reserves 4000-4999) so a recovery close is distinguishable in
 // `lastConnectionError` and peer logs from the protocol closes (1008/1011) already in use.
 export const CLOSE_DECODE_DROP_RESYNC = 4002;
-// Minimum gap between two structure-resync closes on one connection. The resync is latched per frame,
+// Minimum gap between two structure-resync closes on a (database, peer) leg. The resync is latched per frame,
 // but the drop that triggers it is the whole residual decode-failure bucket, not only the structure fork
 // a resubscribe can repair — a peer emitting records this build cannot decode at all (a mid-rollout
 // extension, say) would otherwise close on EVERY frame carrying that table, and a leg whose cursor has
-// aged past auditRetention upgrades each flap to a base copy. Carried on the connection, not the session,
-// so it survives the reconnect it causes. One reconnect per interval is a repair attempt; one per frame
-// is an outage.
+// aged past auditRetention upgrades each flap to a base copy. The shared leg state survives the reconnect
+// it causes. One reconnect per interval is a repair attempt; one per frame is an outage.
 export const DECODE_DROP_RESYNC_INTERVAL_MS = 5 * 60_000;
 // Total structure resyncs one connection may attempt. The frequency bound alone leaves an UNREPAIRABLE
 // fault — the sender's own structures are the forked side, or a peer emits an extension this build cannot
@@ -6857,9 +6856,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// Capture the current generation before scanning. A commit after this live scan
 									// drains must wake this iteration; subscribing afterward can miss that commit.
 									const nextTransaction = whenNextTransaction(auditStore);
-									// The integration-only stopped-range injection must replace a copy's pre-positioned
-									// range as well: the production cache is deliberately retained across that boundary,
-									// but the test models a later corrupt-frame stop on that very cached range.
+									// Test-only: replace a copy's cached range so the recovery path is exercised.
 									const deadAuditIterableForTest = maybeDeadAuditIterableForTest<typeof auditLogIterable>(databaseName);
 									if (deadAuditIterableForTest) {
 										boundaryLogName = undefined;
@@ -6967,9 +6964,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									// Re-scan now: the commit that woke us is the one the latched iterator missed.
+									// Re-scan immediately with a fresh range after a repair.
 									if (repairedSendRange) continue;
-									// A torn tail needs a new commit; a repaired mid-log quarantine does not.
+									// A torn tail waits for a commit; a mid-log quarantine waits for its retry deadline.
 									if (rebuildRetryInMs > 0) {
 										if (!sendLogBreakIsMidLog) {
 											await waitForSessionEndOrTransaction(nextTransaction);

@@ -114,6 +114,28 @@ describe('checkSyncStatus', () => {
 		assert.equal(result.cloneIncomplete, undefined);
 	});
 
+	it('does not let a non-terminal integrity marker extend the copy stall deadline', async () => {
+		const result = await checkSyncStatus(
+			{ data: 2000 },
+			async () =>
+				statusResponse([
+					{
+						database: 'data',
+						lastReceivedVersion: 2500,
+						lastReceivedLocalTime: utc(9000),
+						cloneIncomplete: { state: 'unknown' },
+					},
+				]),
+			LEADER_URL,
+			noopLog
+		);
+		assert.deepEqual(result, {
+			syncComplete: false,
+			latestReceivedMs: 0,
+			socketDatabases: new Set(['data']),
+		});
+	});
+
 	it('ignores an incomplete marker on a non-leader connection', async () => {
 		const result = await checkSyncStatus(
 			{ data: 2000 },
@@ -595,6 +617,30 @@ describe('monitorSyncLoop', () => {
 		});
 		assert.equal(outcome, 'unconverged');
 		assert.ok(clock.now() >= 60000, 'must run to the maximum duration, not stall early');
+	});
+
+	it('stalls rather than running to the ceiling when a target-reached copy has an unknown integrity marker', async () => {
+		const clock = fakeClock();
+		const outcome = await monitorSyncLoop({
+			targetTimestamps: { system: 1000 },
+			clusterStatus: async () =>
+				statusResponse([
+					{
+						database: 'system',
+						lastReceivedVersion: 1500,
+						lastReceivedLocalTime: utc(clock.now()),
+						cloneIncomplete: { state: 'unknown' },
+					},
+				]),
+			leaderReplicationURL: LEADER_URL,
+			stallTimeoutMs: 10000,
+			maxDurationMs: 60000,
+			checkIntervalMs: 3000,
+			log: noopLog,
+			...clock,
+		});
+		assert.equal(outcome, 'stalled');
+		assert.ok(clock.now() < 60000, 'must respect the stall deadline instead of consuming the whole ceiling');
 	});
 
 	it('checks once and succeeds even when the ceiling has already elapsed (resumed clone at a spent budget)', async () => {
