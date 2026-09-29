@@ -215,9 +215,10 @@ export async function releaseIfLocallyComplete(table: any, retained: TransitionE
 /**
  * Retained entries a specific peer is still owed, for redelivery when a sending subscription is set up.
  * Bounded by the unreleased set: empty in steady state, and a peer that is not a resident of any of them
- * costs one pass over that set. An entry the origin's own row has moved past stays retained (nothing
- * proves a complete copy exists elsewhere) but is not owed: the peer's core would ignore the older
- * image, so redelivering it could never earn a receipt. `superseded` counts those for the caller to log.
+ * costs one pass over that set. An entry whose record has since moved to a residency that no longer
+ * names the peer stays retained (nothing proves a complete copy exists elsewhere) but is not owed to
+ * that peer any more; `superseded` counts those. A newer row that still names the peer keeps the entry
+ * owed: if that row is a stub, this image is what lets the peer's core complete it.
  */
 export async function transitionsOwedToPeer(
 	table: any,
@@ -232,7 +233,7 @@ export async function transitionsOwedToPeer(
 	for (const entry of retained) {
 		if (await releaseIfLocallyComplete(table, entry)) continue;
 		const row = table.primaryStore.getEntry(entry.recordId);
-		if (row && (row.version ?? -Infinity) > entry.version) {
+		if (row && (row.version ?? -Infinity) > entry.version && !residencyOf(row.residencyId)?.includes(peerName)) {
 			superseded++;
 			continue;
 		}
