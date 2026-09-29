@@ -80,7 +80,7 @@ suite('Replicated builds — every node runs the origin’s tree', { timeout: 30
 	});
 
 	after(async () => {
-		await Promise.allSettled(nodeContexts.map((nodeCtx) => teardownHarper(nodeCtx)));
+		await Promise.allSettled(nodeContexts.map((nodeCtx) => nodeCtx && teardownHarper(nodeCtx)));
 		for (const dir of scratch) rmSync(dir, { recursive: true, force: true });
 	});
 
