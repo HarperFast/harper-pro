@@ -7689,10 +7689,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													await sendAuditRecord(redelivery, key);
 													redelivered++;
 												}
-												// counted after the per-entry TTL skip, not owed.length, so a re-sweep whose every
-												// image was already requested within the receiver's TTL logs nothing rather than N.
-												// An upper bound, not exact: sendAuditRecord can still skip the entry entirely (an
-												// excluded table route, or a failed image read) without reporting it back.
+												// an upper bound, not owed.length: sendAuditRecord can skip an entry (excluded route,
+												// failed image read) without reporting it back
 												if (redelivered > 0)
 													logger.info?.(
 														connectionId,
