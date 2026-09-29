@@ -418,19 +418,19 @@ Most replication behavior is exercised via integration tests that spin up multi-
 
 ## "Where is X" cheat sheet
 
-| Question                                  | Where                                                                                                       |
-| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Where does a remote message get decoded?  | `replicationConnection.ts → replicateOverWS`                                                                |
-| Where do cache-miss fetches pick a peer?  | `replicator.ts → Replicator.load` (declared inside `setReplicator`)                                         |
-| Where is the connection retry loop?       | `replicationConnection.ts → NodeReplicationConnection.scheduleReconnect` (uses `INITIAL_RETRY_TIME`)        |
-| Where is the retry/backoff schedule?      | `backoff.ts → createBackoff`; adopting sites listed under "Backoff discipline"                              |
-| Why is a subscribe setup not firing?      | `subscriptionManager.ts → createSubscribeSetupScheduler` — one armed setup per (url, database)              |
-| Where is mTLS configured?                 | `replicator.ts → buildReplicationMtlsConfig`                                                                |
-| Where is a new cluster member added?      | `setNode.ts` (the whole file is one operation)                                                              |
-| Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `COPY_COMPLETE`)                    |
-| Where are peer capabilities interpreted?  | `protocolCapabilities.ts → resolvePeerCapabilities`; carried in `NODE_NAME[4]`                              |
-| Who takes part in a cluster record lock?  | `recordLockTransport.ts → createRecordLockTransport().participants`; owner: `recordLockOwnerFor`            |
-| Where is `hdb_nodes` schema?              | `knownNodes.ts → getHDBNodeTable`                                                                           |
-| What does `cluster_status` return?        | `clusterStatus.ts` (82 lines, whole file)                                                                   |
-| Where is per-route table exclusion logic? | `knownNodes.ts → getExcludedTablesForRouteEntries`; threaded via `subscriptionManager.ts → routeReplicates` |
+| Question                                  | Where                                                                                                                                                                           |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where does a remote message get decoded?  | `replicationConnection.ts → replicateOverWS`                                                                                                                                    |
+| Where do cache-miss fetches pick a peer?  | `replicator.ts → Replicator.load` (declared inside `setReplicator`)                                                                                                             |
+| Where is the connection retry loop?       | `replicationConnection.ts → NodeReplicationConnection.scheduleReconnect` (uses `INITIAL_RETRY_TIME`)                                                                            |
+| Where is the retry/backoff schedule?      | `backoff.ts → createBackoff`; adopting sites listed under "Backoff discipline"                                                                                                  |
+| Why is a subscribe setup not firing?      | `subscriptionManager.ts → createSubscribeSetupScheduler` — one armed setup per (url, database)                                                                                  |
+| Where is mTLS configured?                 | `replicator.ts → buildReplicationMtlsConfig`                                                                                                                                    |
+| Where is a new cluster member added?      | `setNode.ts` (the whole file is one operation)                                                                                                                                  |
+| Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `COPY_COMPLETE`)                                                                                        |
+| Where are peer capabilities interpreted?  | `protocolCapabilities.ts → resolvePeerCapabilities`; carried in `NODE_NAME[4]`                                                                                                  |
+| Who takes part in a cluster record lock?  | `recordLockTransport.ts → createRecordLockTransport().participants`; owner: `recordLockOwnerFor`                                                                                |
+| Where is `hdb_nodes` schema?              | `knownNodes.ts → getHDBNodeTable`                                                                                                                                               |
+| What does `cluster_status` return?        | `clusterStatus.ts` (82 lines, whole file)                                                                                                                                       |
+| Where is per-route table exclusion logic? | `knownNodes.ts → getExcludedTablesForRouteEntries`; threaded via `subscriptionManager.ts → routeReplicates`                                                                     |
 | Where is `replicate: false` enforced?     | `replicatedDatabases.ts → tableReplicates`; sender gate `replicateOverWS → tableToTableEntry`, `GET_RECORD`, `tableDefinitionsForPeer`; `cloneNode.ts → cloneSchemas` (item 23) |
