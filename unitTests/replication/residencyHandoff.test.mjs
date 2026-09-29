@@ -20,7 +20,7 @@ import {
 	RECEIPT_REQUEST_TTL_MS,
 	peersOwedImage,
 	recordHandoffReceipt,
-	releaseIfSuperseded,
+	releaseIfLocallyComplete,
 	settleReceiptRequests,
 	transitionsOwedToPeer,
 } from '#src/replication/residencyHandoff';
@@ -233,30 +233,23 @@ describe('residency handoff — redelivery and local completion', () => {
 			retained: [{ recordId: 'back', tableId: 7, version: V1, residencyId: 5 }],
 			entries: { back: complete(V2) },
 		});
-		expect(await releaseIfSuperseded(table, table.pendingTransitionEntry('back'))).to.equal(true);
+		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('back'))).to.equal(true);
 		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
 	});
 
-	it('keeps a retained entry whose local row is still the stub at that version, or complete only at an older version', async () => {
+	it('keeps a retained entry whose local row is a stub at any version, or complete only at an older version', async () => {
 		const table = fakeTable({
 			retained: [
 				{ recordId: 's', tableId: 7, version: V1, residencyId: 5 },
+				{ recordId: 'newerStub', tableId: 7, version: V1, residencyId: 5 },
 				{ recordId: 'old', tableId: 7, version: V2, residencyId: 5 },
 			],
-			entries: { s: stub(V1), old: complete(V1) },
+			entries: { s: stub(V1), newerStub: stub(V2), old: complete(V1) },
 		});
-		expect(await releaseIfSuperseded(table, table.pendingTransitionEntry('s'))).to.equal(false);
-		expect(await releaseIfSuperseded(table, table.pendingTransitionEntry('old'))).to.equal(false);
+		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('s'))).to.equal(false);
+		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('newerStub'))).to.equal(false);
+		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('old'))).to.equal(false);
 		expect(table.released).to.deep.equal([]);
-	});
-
-	it('releases a retained entry once the local row moved on to a strictly newer version, stub or not', async () => {
-		const table = fakeTable({
-			retained: [{ recordId: 'moved-on', tableId: 7, version: V1, residencyId: 5 }],
-			entries: { 'moved-on': stub(V2) },
-		});
-		expect(await releaseIfSuperseded(table, table.pendingTransitionEntry('moved-on'))).to.equal(true);
-		expect(table.released).to.deep.equal([{ id: 'moved-on', version: V1 }]);
 	});
 
 	it('owes a peer exactly the retained entries that name it and lack its receipt', async () => {
@@ -331,14 +324,13 @@ describe('residency handoff — answering receipt requests', () => {
 		expect(result.waiting.length).to.equal(1);
 	});
 
-	it('drops a request only once the row is a strictly newer stub; an unpromoted stub at that version keeps waiting', async () => {
-		const gone = await settleReceiptRequests([request('gone', V1, () => stub(V2))], blobsOk, NOW);
-		expect(gone.receipts).to.deep.equal([]);
-		expect(gone.settled.length).to.equal(1);
-		expect(gone.waiting).to.deep.equal([]);
-		const unpromoted = await settleReceiptRequests([request('same', V1, () => stub(V1))], blobsOk, NOW);
-		expect(unpromoted.settled).to.deep.equal([]);
-		expect(unpromoted.waiting.length).to.equal(1);
+	it('keeps waiting over a stub at any version: the image lets core resequence it into a complete row', async () => {
+		const newer = await settleReceiptRequests([request('newer', V1, () => stub(V2))], blobsOk, NOW);
+		expect(newer.settled).to.deep.equal([]);
+		expect(newer.waiting.length).to.equal(1);
+		const same = await settleReceiptRequests([request('same', V1, () => stub(V1))], blobsOk, NOW);
+		expect(same.settled).to.deep.equal([]);
+		expect(same.waiting.length).to.equal(1);
 	});
 
 	it('drops a request once it has expired', async () => {
