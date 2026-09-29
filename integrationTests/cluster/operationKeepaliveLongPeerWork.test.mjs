@@ -36,9 +36,12 @@ const PING_TIMEOUT_MS = 2000;
 const PEER_WORK_MS = 12_000;
 
 suite('Replicated operation survives peer work longer than the watchdog window (#674)', { timeout: 180_000 }, (ctx) => {
+	// Held before starting, so a node that did start is torn down even when the other one fails to.
+	const nodeContexts = [];
 	before(async () => {
 		const nodeA = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		const nodeB = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
+		nodeContexts.push(nodeA, nodeB);
 		const config = (host) => ({
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, console: true, level: 'debug' },
@@ -88,7 +91,9 @@ suite('Replicated operation survives peer work longer than the watchdog window (
 	});
 
 	after(async () => {
-		for (const node of ctx.nodes ?? []) await teardownHarper({ harper: node });
+		await Promise.allSettled(
+			nodeContexts.filter((nodeCtx) => nodeCtx.harper?.process).map((nodeCtx) => teardownHarper(nodeCtx))
+		);
 	});
 
 	test('deploy_component replicates when the peer’s work outlasts 2x pingTimeout', async () => {
