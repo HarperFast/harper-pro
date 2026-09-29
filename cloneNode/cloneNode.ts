@@ -345,6 +345,7 @@ export async function cloneNode(): Promise<void> {
 			writeSyncStartedMarker({
 				startedAt: syncStartedAt,
 				replicationEstablished: true,
+				targetsExcludeLocalTables: true,
 				targetTimestamps,
 				totalBytes,
 				setupComplete: true,

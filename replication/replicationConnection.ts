@@ -5262,9 +5262,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const recordId = message[3];
 							const table = remoteTableById[tableId] || (remoteTableById[tableId] = tables[message[4]]);
 							if (!table || !tableReplicates(tables[table.tableName] ?? table)) {
-								// One wording for an unknown and a non-replicating table, so a guessing peer cannot
-								// tell them apart. The unknown case used to answer nothing at all, hanging the
-								// requester until its own timeout.
+								// One wording for both cases, so a guessing peer cannot tell an unknown table from a
+								// non-replicating one.
 								logger.warn?.(
 									connectionId,
 									'Refusing record request for',
@@ -6312,8 +6311,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														}
 														await new Promise(setImmediate);
 														if (closed) return;
-														// Re-resolve by name: a redeclaration replaces the Table object. Evaluated at the
-														// pacer's yield, so the row path pays nothing; DESIGN.md note 23 records the window.
+														// Re-resolve by name: a redeclaration replaces the Table object. DESIGN.md note 23
+														// records why this sits at the pacer's yield and what that leaves open.
 														if (!tableReplicates(tables[tableName] ?? table)) break;
 													}
 													// Local-only records must never be full-copied to a peer. metadataFlags is the
