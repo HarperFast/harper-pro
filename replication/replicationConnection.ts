@@ -6208,9 +6208,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 							if (!substituteEntry && auditRecord.isHandoffRedelivery) {
 								// a redelivery has no ordinary audit-log entry behind it, so the raw-entry path below
-								// (`encoded`/`getValue`) can find neither as an own field on this spread copy -- if
-								// the image read failed or produced nothing, the peer already has whatever the
-								// original patch carried through ordinary replay, so skip rather than crash
+								// (`encoded`/`getValue`) can find neither as an own field on this spread copy -- skip
+								// a missing image rather than crash; the next resweep retries it
 								logger.warn?.(connectionId, 'skipping a redelivery with no readable image', auditRecord.recordId);
 								return skipAuditRecord();
 							}
