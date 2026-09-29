@@ -18,11 +18,10 @@ import { getReplicationSharedStatus } from '#src/replication/knownNodes';
 
 const REPLICATION_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'replication');
 const REGISTRY_FILE = 'sharedStatusSlots.ts';
-// Matches a hand-numbered slot declaration, e.g. `const FOO_POSITION = 29;` — deliberately not
-// `= allocate(...)`, which is only valid inside the registry itself. Not anchored to `export`: a
-// declaration re-exported separately (`const FOO_POSITION = 29; export { FOO_POSITION };`) is the
-// same hand-numbering this guards against.
-const HAND_NUMBERED_POSITION = /\bconst\s+(\w+_POSITION)\s*=\s*-?\d+\b/g;
+// A local `const X_POSITION` declaration anywhere outside the registry is wrong regardless of its
+// initializer shape (literal, computed, or otherwise) — `allocate()` is only valid inside
+// sharedStatusSlots.ts, so nothing else may bind that name itself.
+const HAND_NUMBERED_POSITION = /\bconst\s+(\w+_POSITION)\b/g;
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
@@ -71,17 +70,14 @@ describe('replication shared-status slot registry', () => {
 	});
 
 	it('never allocates more slots than REPLICATION_SHARED_STATUS_SLOTS holds', () => {
-		// A block allocation (like the fire-counter one above) can push the true end past the size
-		// while its own base position still reads "in range" on its own — this pins the aggregate,
-		// belt-and-suspenders alongside the registry's own load-time throw for the same condition.
 		expect(slots.ALLOCATED_SLOTS).to.be.at.most(slots.REPLICATION_SHARED_STATUS_SLOTS);
 	});
 
 	it('never hand-numbers a *_POSITION slot constant outside the registry', () => {
 		const offenders = [];
-		for (const file of readdirSync(REPLICATION_DIR, { withFileTypes: true })) {
+		for (const file of readdirSync(REPLICATION_DIR, { withFileTypes: true, recursive: true })) {
 			if (!file.isFile() || !file.name.endsWith('.ts') || file.name === REGISTRY_FILE) continue;
-			const source = readFileSync(join(REPLICATION_DIR, file.name), 'utf8');
+			const source = readFileSync(join(file.parentPath ?? file.path, file.name), 'utf8');
 			HAND_NUMBERED_POSITION.lastIndex = 0;
 			let match;
 			while ((match = HAND_NUMBERED_POSITION.exec(source))) offenders.push(`${file.name}: ${match[1]}`);
