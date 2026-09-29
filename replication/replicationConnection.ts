@@ -1435,25 +1435,6 @@ export function createRepairInflater(stream: Readable, expectedSize: number): Re
 	return bounded;
 }
 
-/**
- * Whether an ordinary audit record from `nodeId` at `position` would pass the per-origin subscription
- * filter `sendAuditRecord`'s live send path applies (the same rule, minus its `isHandoffRedelivery`
- * bypass). Extracted so the redelivery sweep can predict whether the ordinary in-order replay will
- * independently deliver a retained transition's own audit entry, instead of duplicating this rule and
- * risking it drifting out of sync with the real one (harper#2257). Delegates to
- * `matchesSubscriptionPosition` so both call sites share the origin-floor gating too (harper-pro#998).
- */
-export function matchesReplicationSubscription(
-	nodeId: number,
-	position: number,
-	subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined,
-	excludedNodes: string[] | undefined,
-	originFloorById?: number[]
-): boolean {
-	const timeRange = subscribedNodeIds?.[nodeId];
-	return matchesSubscriptionPosition(timeRange as any, !!excludedNodes, originFloorById?.[nodeId], position);
-}
-
 function valueHasBlobs(value: unknown): boolean {
 	if (value == null || typeof value !== 'object') return false;
 	let found = false;
@@ -6606,16 +6587,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								encoder._mergeStructures(encoder.getStructures());
 								if (encoder.typedStructs) encoder.lastTypedStructuresLength = encoder.typedStructs.length;
 							}
+							const timeRange = subscribedNodeIds?.[subscriptionNodeId];
 							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
 							// in the subscribedNodeIds list, than it matches the subscription
 							const matchesSubscription =
 								auditRecord.isHandoffRedelivery === true ||
-								matchesReplicationSubscription(
-									subscriptionNodeId,
-									subscriptionPosition,
-									subscribedNodeIds,
-									excludedNodes,
-									originFloorById
+								matchesSubscriptionPosition(
+									timeRange as any,
+									!!excludedNodes,
+									originFloorById?.[subscriptionNodeId],
+									subscriptionPosition
 								);
 							if (!matchesSubscription) {
 								if (DEBUG_MODE)
@@ -7678,19 +7659,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													if (resweep && handoffRequestedAt.has(receiptRequestKey(table.tableId, retained.recordId)))
 														continue;
 													const key = retained.txnLogKey ?? retained.version;
-													// A sweep frame's key is treated as a resume-cursor claim by the receiver (RocksDB),
-													// exactly like an ordinary send. Sending it ahead of the in-order replay that is
-													// about to run (right below, this same pass) would let it claim progress through
-													// `key` before anything between the replay's start and `key` was actually sent.
-													// `exclusiveStart` on that replay's own range means it never revisits `key` itself,
-													// so `key` must be strictly past the boundary -- and the transition's own real
-													// audit entry must still be one the ordinary send path would accept -- before the
-													// sweep may skip it and let replay carry it instead.
-													if (
-														key > currentSequenceId &&
-														matchesReplicationSubscription(retained.nodeId ?? 0, key, subscribedNodeIds, excludedNodes, originFloorById)
-													)
-														continue;
+													// A sweep frame's key is a resume-cursor claim on the receiver (RocksDB), same as an
+													// ordinary send. Never above currentSequenceId, the boundary the in-order replay
+													// below is about to walk from -- regardless of whether that replay ends up
+													// re-carrying this specific entry. A deferred entry waits for a later resweep, once
+													// currentSequenceId has itself reached `key` through ordinary traffic.
+													if (key > currentSequenceId) continue;
 													// own properties: the send path spreads the record into an invalidate entry, and the image
 													// accessor may live on core's prototype
 													const redelivery = {

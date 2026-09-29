@@ -24,7 +24,6 @@ import {
 	settleReceiptRequests,
 	transitionsOwedToPeer,
 } from '#src/replication/residencyHandoff';
-import { matchesReplicationSubscription } from '#src/replication/replicationConnection';
 
 const INVALIDATED = 1;
 const HAS_BLOBS = 0x2000;
@@ -411,36 +410,5 @@ describe('residency handoff — wire shape', () => {
 		expect(decodeHandoffReceipts([[7, null, V1]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, 'r', 0]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, 'r', 'v']])).to.equal(undefined);
-	});
-});
-
-describe('matchesReplicationSubscription — predicts ordinary replay delivery for the redelivery sweep (harper#2257)', () => {
-	const NODE = 3;
-
-	it('matches inside an explicit per-origin window, and not outside it', () => {
-		const subscribedNodeIds = [];
-		subscribedNodeIds[NODE] = { startTime: 100, endTime: 200 };
-		expect(matchesReplicationSubscription(NODE, 150, subscribedNodeIds, undefined)).to.equal(true);
-		expect(matchesReplicationSubscription(NODE, 100, subscribedNodeIds, undefined)).to.equal(false); // not < 100
-		expect(matchesReplicationSubscription(NODE, 200, subscribedNodeIds, undefined)).to.equal(false); // not < 200
-		expect(matchesReplicationSubscription(NODE, 50, subscribedNodeIds, undefined)).to.equal(false);
-	});
-
-	it('has no upper bound when the window carries no endTime', () => {
-		const subscribedNodeIds = [];
-		subscribedNodeIds[NODE] = { startTime: 100 };
-		expect(matchesReplicationSubscription(NODE, 1_000_000, subscribedNodeIds, undefined)).to.equal(true);
-	});
-
-	it('matches an origin absent from an exclusion-list subscription, but not one present without a window', () => {
-		expect(matchesReplicationSubscription(NODE, 150, undefined, ['some-other-node'])).to.equal(true);
-		const subscribedNodeIds = [];
-		subscribedNodeIds[NODE] = false;
-		expect(matchesReplicationSubscription(NODE, 150, subscribedNodeIds, ['some-other-node'])).to.equal(false);
-	});
-
-	it('does not match an origin with no window and no exclusion list in play', () => {
-		expect(matchesReplicationSubscription(NODE, 150, undefined, undefined)).to.equal(false);
-		expect(matchesReplicationSubscription(NODE, 150, [], undefined)).to.equal(false);
 	});
 });
