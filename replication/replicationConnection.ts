@@ -191,9 +191,7 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // changes so a leader resuming a cursor stamped with a different (or absent) version recopies from
 // scratch instead of silently skipping tables the old order had not yet reached (#421).
 const COPY_ORDER_VERSION = 1;
-// Slot positions are allocated in sharedStatusSlots.ts (the single point for this buffer's layout);
-// re-exported here since these are the historical, still-current import paths for this module's own
-// consumers and for unit tests.
+// Re-exported from sharedStatusSlots.ts (the buffer's slot registry) for existing importers.
 export {
 	CONFIRMATION_STATUS_POSITION,
 	RECEIVED_VERSION_POSITION,

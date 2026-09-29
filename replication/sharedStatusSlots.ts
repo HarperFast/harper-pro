@@ -1,19 +1,11 @@
 /**
  * Single allocation point for every Float64 slot in the per-(database, peer) replication
- * shared-status buffer (`getReplicationSharedStatus` in `knownNodes.ts`; layout documented in the
- * "Shared status buffers" section of `DESIGN.md`). Every `*_POSITION` constant is assigned here,
- * in this order, from one local counter — so two slots cannot collide by construction, and the
- * only way to find the next free one is to read this file top to bottom.
- *
- * This module has no imports and must stay that way: `knownNodes.ts`, `replicationConnection.ts`
- * and `recordLockTransport.ts` all import from here, and any import back into one of them would
- * make allocation depend on module evaluation order instead of source order.
- *
- * Owning modules import their constants from here and re-export them unchanged, so existing
- * consumers (clusterStatus.ts, subscriptionManager.ts, replicator.ts, unit tests) keep importing
- * from the same paths as before. A new slot must be added here, never hand-numbered in an owning
- * module directly — `unitTests/replication/sharedStatusSlots.test.mjs` scans `replication/*.ts`
- * for a hand-numbered `*_POSITION` export and fails the build if it finds one outside this file.
+ * shared-status buffer (`getReplicationSharedStatus` in `knownNodes.ts`; layout in the "Shared
+ * status buffers" section of `DESIGN.md`). Must stay dependency-free: `knownNodes.ts`,
+ * `replicationConnection.ts` and `recordLockTransport.ts` all import from here, and an import back
+ * into one of them would make allocation depend on module evaluation order instead of source order.
+ * `unitTests/replication/sharedStatusSlots.test.mjs` enforces that a new slot is added here, never
+ * hand-numbered in an owning module.
  */
 
 let cursor = 0;
@@ -70,3 +62,14 @@ export const RECORD_LOCK_LEVEL_POSITION = allocate();
 // Total buffer size. 64 gives headroom for the peer-scoped transport (harper-pro#884) and the
 // ownership domain (harper-pro#886) with slots to spare, without another growth pass this epic.
 export const REPLICATION_SHARED_STATUS_SLOTS = 64;
+// The count actually allocated above. A multi-slot allocate() call (like the fire-counter block)
+// can push this past REPLICATION_SHARED_STATUS_SLOTS while every individual *_POSITION constant
+// still numerically reads "in range" on its own (a block's start, not its end) — Float64Array
+// silently drops an out-of-bounds write rather than throwing, so that gap would corrupt a
+// neighboring (database, peer)'s memory with no test failure. Fail at load time instead.
+export const ALLOCATED_SLOTS = cursor;
+if (ALLOCATED_SLOTS > REPLICATION_SHARED_STATUS_SLOTS) {
+	throw new Error(
+		`replication shared-status registry allocated ${ALLOCATED_SLOTS} slots but REPLICATION_SHARED_STATUS_SLOTS is ${REPLICATION_SHARED_STATUS_SLOTS} — grow the constant`
+	);
+}
