@@ -230,7 +230,8 @@ export async function transitionsOwedToPeer(
 	if (!retained) return { owed: [], superseded: 0 };
 	const owed: TransitionEntry[] = [];
 	let superseded = 0;
-	for (const entry of retained) {
+	// releasing mutates core's set, so never iterate it live
+	for (const entry of Array.from(retained)) {
 		if (await releaseIfLocallyComplete(table, entry)) continue;
 		const row = table.primaryStore.getEntry(entry.recordId);
 		if (row && (row.version ?? -Infinity) > entry.version && !residencyOf(row.residencyId)?.includes(peerName)) {
@@ -282,7 +283,13 @@ export async function settleReceiptRequests(
 		} catch {
 			entry = undefined;
 		}
-		if (entry && typeof (entry as any).then === 'function') entry = undefined;
+		if (entry && typeof (entry as any).then === 'function') {
+			try {
+				entry = await (entry as any);
+			} catch {
+				entry = undefined;
+			}
+		}
 		if (localRowSatisfies(entry, request.version)) {
 			let durable = true;
 			if ((entry!.metadataFlags ?? 0) & HAS_BLOBS) {
