@@ -1,7 +1,7 @@
 // Test-only component: makes a DETERMINISTIC subset of blob files on the SOURCE read back as core's
 // PENDING placeholder forever — the origin state behind the circular-503 wedge in harper-pro#432.
 // Every source read of such a blob rejects with `BlobReadError('Blob pending replication …', 503)`;
-// `sendBlobs` retries it in place (BLOB_SEND_RETRY_DELAYS_MS), then forwards `errorStatus: 503`,
+// `sendBlobs` retries it in place (BLOB_SEND_RETRY_BACKOFF), then forwards `errorStatus: 503`,
 // which the receiver classifies as TRANSIENT and holds. Each reconnect re-streams the same record
 // and gets the same 503, so without an escalation budget the receiver's resume cursor is pinned
 // indefinitely.

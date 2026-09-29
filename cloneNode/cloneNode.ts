@@ -38,6 +38,7 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
+import { cloneSSHKeysFromLeader } from './sshKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
 import {
 	CLONE_COMPLETION_GRACE_MS,
@@ -46,6 +47,7 @@ import {
 	completeCloneAttempt,
 	reusableCloneAttemptId,
 } from './cloneAttempt.ts';
+import { createBackoff } from '../replication/backoff.ts';
 import {
 	isExplicitDatabaseSubscription,
 	isReplicatedDatabase as isReplicatedDatabaseUnder,
@@ -104,6 +106,8 @@ import {
 
 const DEFAULT_SYNC_TIMEOUT_MS = 300000;
 const DEFAULT_SYNC_CHECK_INTERVAL_MS = 3000;
+const VERSION_PROBE_RETRY_DELAY_MS = 1000;
+const VERSION_PROBE_MAX_DELAY_MS = 4000;
 // Floor for the size-derived sync-wait ceiling, which guarantees the wait terminates even when data
 // keeps arriving without ever converging (arrivals slide the stall deadline).
 const MIN_MAX_CLONE_DURATION_MS = 3600000;
@@ -531,34 +535,47 @@ async function finishCloneSetup(): Promise<boolean> {
 	try {
 		await cloneJWTKeys();
 	} catch (err) {
-		// A node without the leader's JWT signing keys cannot issue or validate tokens, so the clone is
-		// not viable. Mirror the unconfirmed-sync handling below: keep Harper running so get_status stays
-		// queryable, publish Unavailable, clear the cloned flag so a subsequent start retries the clone,
-		// and stop before finalizing.
-		const { set: setStatus } = await import('../core/server/status/index.js');
-		try {
-			await setStatus({ id: 'availability', status: 'Unavailable' });
-		} catch (statusErr) {
-			log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
-		}
-		updateConfigValue(CONFIG_PARAMS.CLONED, false);
-		// A clone that stops here keeps running, and both halves of the in-flight signal would stay set,
-		// so the replication send path would go on withholding this leader's own records from a base copy
-		// back to it for the life of the process (harper-pro#737) — including from a leader that asked for
-		// that copy because it had lost them. Retiring the attempt costs a retry a fresh base copy.
-		clearCloneAttempt();
-		log(
-			`Clone from leader node ${leaderURL} failed to obtain JWT signing keys (${err}); node is running but Unavailable and not marked as cloned`,
-			'error'
-		);
+		// A node without the leader's JWT signing keys cannot issue or validate tokens.
+		await stopUnfinishedClone(`Clone from leader node ${leaderURL} failed to obtain JWT signing keys (${err})`);
 		return false;
 	}
 
 	await cloneEnvSecretsKeys();
 
-	await cloneSSHKeys();
+	try {
+		await cloneSSHKeys();
+	} catch (err) {
+		await stopUnfinishedClone(`Clone from leader node ${leaderURL} failed to clone its SSH keys (${err})`);
+		return false;
+	}
 
 	return true;
+}
+
+/**
+ * Mirrors the unconfirmed-sync handling: keep Harper running so get_status stays queryable, publish
+ * Unavailable, clear the cloned flag so a subsequent start retries the clone, and stop before finalizing.
+ */
+async function stopUnfinishedClone(reason: string): Promise<void> {
+	const { set: setStatus } = await import('../core/server/status/index.js');
+	try {
+		await setStatus({ id: 'availability', status: 'Unavailable' });
+	} catch (statusErr) {
+		log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
+	}
+	let unmarked = true;
+	try {
+		updateConfigValue(CONFIG_PARAMS.CLONED, false);
+	} catch (configErr) {
+		unmarked = false;
+		log(`Failed to clear the cloned flag, so a later start may skip this clone: ${configErr}`, 'error');
+	}
+	// A clone that stops here keeps running, and both halves of the in-flight signal would stay set,
+	// so the replication send path would go on withholding this leader's own records from a base copy
+	// back to it for the life of the process (harper-pro#737) — including from a leader that asked for
+	// that copy because it had lost them. Retiring the attempt costs a retry a fresh base copy.
+	clearCloneAttempt();
+	log(`${reason}; node is running but Unavailable${unmarked ? ' and not marked as cloned' : ''}`, 'error');
 }
 
 /**
@@ -717,6 +734,11 @@ async function monitorSync(
 	if (!systemSocketRequired) {
 		log(`'${SYSTEM_SCHEMA_NAME}' is not in this node's replication.databases; not requiring its socket`, 'debug');
 	}
+	const versionProbeBackoff = createBackoff({
+		initialMs: VERSION_PROBE_RETRY_DELAY_MS,
+		maxMs: VERSION_PROBE_MAX_DELAY_MS,
+		minMs: VERSION_PROBE_RETRY_DELAY_MS,
+	});
 	for (let attempt = 1; systemSocketRequired && attempt <= 3; attempt++) {
 		try {
 			const registration: any = await leaderRequest({ operation: 'registration_info' });
@@ -726,7 +748,10 @@ async function monitorSync(
 			break;
 		} catch (err) {
 			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
-			if (attempt < 3) await sleep(1000);
+			if (attempt < 3) {
+				const delay = versionProbeBackoff.nextDelay();
+				if (delay !== undefined) await sleep(delay);
+			}
 		}
 	}
 
@@ -922,26 +947,21 @@ function sumTableSizes(dbObj: Record<string, any>): number {
 async function cloneSSHKeys() {
 	if (skipSSHKeys) return;
 
-	const { addSSHKey } = await import('../security/sshKeyOperations.js');
-	try {
-		const keys: any = await leaderRequest({ operation: 'list_ssh_keys' });
-		if (!keys?.length) {
-			log('No SSH keys found on leader node to clone');
-			return;
-		}
-
-		for (const keyName of keys) {
-			log('Cloning SSH key:', keyName.name);
-			const keyData: any = await leaderRequest({
-				operation: 'get_ssh_key',
-				name: keyName.name,
-			});
-
-			await addSSHKey(keyData);
-		}
-	} catch (err) {
-		log(`Error cloning SSH keys: ${err}`, 'error');
-	}
+	const { addSSHKey, localSSHKeyState, removeLocalSSHKey } = await import('../security/sshKeyOperations.js');
+	// Test hook: a leader that never answers an SSH key request, to drive setup's containment
+	// deterministically; loopback leaders don't fail on cue.
+	const simulateFailure = process.env.CLONE_SIMULATE_SSH_KEY_FAILURE === 'true';
+	await cloneSSHKeysFromLeader({
+		requestLeader: simulateFailure
+			? async ({ operation }) => {
+					throw new Error(`CLONE_SIMULATE_SSH_KEY_FAILURE set; ${operation} not sent`);
+				}
+			: leaderRequest,
+		addSSHKey,
+		localSSHKeyState,
+		removeLocalSSHKey,
+		log,
+	});
 }
 
 /**

@@ -40,7 +40,7 @@ import { server } from '../core/server/Server.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { verifyCertificate } from '../core/security/certificateVerification/index.ts';
-export { startOnMainThread } from './subscriptionManager.ts';
+import { startOnMainThread as startSubscriptionsOnMainThread } from './subscriptionManager.ts';
 import {
 	subscribeToNodeUpdates,
 	getHDBNodeTable,
@@ -64,7 +64,7 @@ import './setNode.ts';
 import './clusterStatus.ts';
 import './blobRepair.ts';
 import '../security/keyService.ts';
-import '../security/sshKeyOperations.ts';
+import { migrateSSHConfigOnce } from '../security/sshKeyOperations.ts';
 
 // Each active replication connection legitimately registers a small handful of updateTable / dropDatabase
 // listeners on the global databaseEventsEmitter (one per subscriptionManager iterator and per per-DB WS), so a
@@ -100,6 +100,11 @@ export function buildReplicationMtlsConfig(replicationOptions: any) {
 	// If mtls is explicitly set to false, override it - mTLS is required for replication
 	// Default: mTLS enabled, certificate verification disabled
 	return true;
+}
+
+export async function startOnMainThread(options) {
+	await migrateSSHConfigOnce();
+	return startSubscriptionsOnMainThread(options);
 }
 
 /**
@@ -562,7 +567,7 @@ function getSubscriptionConnection(
 	authorization?: string,
 	status?: { reused: boolean }
 ) {
-	const connectionKey = connectingUrl + '-' + subscriptionUrl;
+	const connectionKey = getSubscriptionConnectionKey(connectingUrl, subscriptionUrl);
 	let dbConnections = connections.get(connectionKey);
 	if (!dbConnections) {
 		dbConnections = new Map();
@@ -578,12 +583,17 @@ function getSubscriptionConnection(
 			dbName,
 			(connection = new NodeReplicationConnection(connectingUrl, subscription, dbName, nodeName, authorization))
 		);
+		connection.subscriptionUrl = subscriptionUrl;
 		connection.connect();
 		connection.once('finished', () => {
 			if (dbConnections.get(dbName) === connection) dbConnections.delete(dbName);
 		});
 		return connection;
 	}
+}
+
+export function getSubscriptionConnectionKey(url: string, peerUrl?: string): string {
+	return url + '-' + (peerUrl ?? url);
 }
 const nodeNameToRetrievalConnections = new Map<string, Map<string, NodeReplicationConnection>>();
 /**
@@ -751,7 +761,7 @@ export function subscribeToNode(request: any) {
 }
 export async function unsubscribeFromNode({ url, nodes, database, clearStatus = false }) {
 	logger.trace('Unsubscribing from node', url, database);
-	const connectionKey = url + '-' + (nodes[0]?.url ?? url);
+	const connectionKey = getSubscriptionConnectionKey(url, nodes[0]?.url);
 	const dbConnections = connections.get(connectionKey);
 	const connection = dbConnections?.get(database);
 	if (!connection) return;
@@ -811,7 +821,7 @@ export function updateExclusionOrigins({ database, origins }: { database: string
 }
 
 export function forceReconnectToNode({ url, nodes, database }) {
-	const connectionKey = url + '-' + (nodes?.[0]?.url ?? url);
+	const connectionKey = getSubscriptionConnectionKey(url, nodes?.[0]?.url);
 	const connection = connections.get(connectionKey)?.get(database);
 	if (connection) connection.forceReconnect();
 }

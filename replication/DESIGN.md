@@ -14,6 +14,7 @@ Real-time, peer-to-peer replication of table data across cluster nodes via persi
 
 | File                       | Purpose                                                                                                                                                                                                               |
 | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backoff.ts`               | The one retry schedule (`createBackoff`): exponential ceiling, full jitter, floor, wall-clock budget. See "Backoff discipline".                                                                                       |
 | `replicationConnection.ts` | The protocol engine. Defines `NodeReplicationConnection`, encodes/decodes the binary frame format, drives audit-record forwarding, manages blobs, and writes shared latency/back-pressure counters. **The big file.** |
 | `replicator.ts`            | Setup module: `start()`, per-database/per-table `Replicator` resource class, retrieval-connection pool, operation forwarding, mTLS config.                                                                            |
 | `subscriptionManager.ts`   | Main-thread orchestration. Delegates subscription work to worker threads; routes around disconnects.                                                                                                                  |
@@ -179,6 +180,100 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 
 **Node discovery & TLS** — `hdb_nodes` subscriptions, `setNode.ts` for member ops, `buildReplicationMtlsConfig()` (`replicator.ts`), `monitorNodeCAs()` (`replicator.ts`).
 
+**Retry pacing** — `createBackoff` (`backoff.ts`) is the one schedule every retry site uses; see below.
+
+---
+
+## Backoff discipline (harper-pro#327)
+
+Every retry/reconnect initiation site paces attempts through **one** utility, `createBackoff` in
+`backoff.ts`: an exponential ceiling with **full jitter** (uniform draw across the window) by default,
+an optional fixed floor, an optional wall-clock/attempt budget, and injectable RNG/clock so every bound is
+deterministically testable. An exhausted schedule returns no delay rather than `0`, so a missed exhaustion
+check cannot create a busy loop. Before this there was no jitter anywhere in production code — a fleet
+reacting to one event retried in lockstep — and the delays themselves ranged from flat 200 ms to
+jitterless doubling.
+
+The invariant the discipline enforces: **at most one pending attempt per target, on a bounded, capped,
+decorrelated schedule.** Pacing alone is not enough; the storm surface below needed the dedup too.
+
+| Site                                                                            | Schedule                                                                                                                                                                                                                                                                           | Reset signal                                                              |
+| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `createSubscribeSetupScheduler` (`subscriptionManager.ts`) — subscription setup | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s; within a stale-worker sweep each setup's fire time slides past any the sweep already armed within `RECONNECT_STAGGER_MS`, so independent draws keep that spacing and an escalated pair delays no one else | `connectedToNode` (reset only; the armed setup still fires)               |
+| `NodeReplicationConnection.scheduleReconnect`                                   | fixed 500 ms floor, ceiling `INITIAL_RETRY_TIME` 500 ms → 30 s, full jitter; the floor preserves the hard minimum from the TLS-state incident while the remaining window decorrelates fleet redials (harper-pro#339)                                                               | `onFrameSent` — first frame actually sent, **not** socket open            |
+| `reconcileWorkers` wedge / receive-stall re-drives                              | one fixed-window draw per sweep, used as a common base under the existing `RECONNECT_STAGGER_MS` spacing (decorrelation only; the re-drives are already throttled by the `disconnectedAt` / `receiveStallReconnectAt` re-stamps), one owned `entry.reDriveTimer` per entry         | n/a — disarmed on unsubscribe, delete, worker exit, and entry replacement |
+| `runNodeUpdateWatcher` (`knownNodes.ts`) — hdb_nodes watcher restart            | full-jitter ceiling 1 s → 30 s                                                                                                                                                                                                                                                     | an iteration that survived `NODE_WATCHER_HEALTHY_UPTIME_MS`               |
+| `shouldCloseSendAuthWatch` reprobe (`replicationConnection.ts`)                 | 500 ms → 5 s under a 30 s wall-clock budget, then fails closed                                                                                                                                                                                                                     | n/a (one-shot loop)                                                       |
+| `fetchJWTKeyWithRetry`, the clone version probe (`cloneNode/`)                  | 250 ms → 1 s / 1 s → 4 s, attempt count unchanged                                                                                                                                                                                                                                  | n/a                                                                       |
+| `repairBlobs` (`blobRepair.ts`) — per-record                                    | 50 ms → 1 s, only on a record no peer could repair, under a 60 s per-failure-run pacing budget; once that is spent the sweep keeps scanning unpaced (with a sampled warn) rather than stopping, so an unrepairable prefix cannot hide the records behind it                        | a repaired record                                                         |
+| copy-cursor flush retry (`replicationConnection.ts`) — `onPersistFailure`       | fixed 250 ms floor, ceiling 250 ms → 30 s; the floor is what the `copyFlushBackoffUntil` guard depends on                                                                                                                                                                          | a flush that persisted the cursor                                         |
+| worker readiness re-attempt (`subscriptionManager.ts`)                          | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s, one armed re-attempt at a time                                                                                                                                                                            | components loaded                                                         |
+| `sendBlobs` in-place 503 re-read (`BLOB_SEND_RETRY_BACKOFF`)                    | 250 ms → 2 s, 4 attempts, **no jitter**: the retried read is this node's own blob, so there is no fleet to decorrelate, and full jitter would halve the expected time its PENDING placeholder has to heal before the 503 is forwarded                                              | n/a (per send)                                                            |
+
+**The subscription-setup scheduler is the one with dedup.** `onDatabase` used to turn every qualifying
+node update straight into a retained (not unref'd) 200 ms `setTimeout` plus a `subscribe-to-node`
+message, so whatever re-drove `onNodeUpdate` amplified 1:1 into main-thread timers, worker-side
+WebSocket/TLS setup, and `Setting up subscription with leader` warns — ~1,400 lines/s/node in the field,
+ending in an OOM kill. The scheduler holds one armed setup per **(peer URL, database)** in its own map
+(_not_ on the `connectionReplicationMap` entry, which the stale-worker path deletes and recreates), and
+the armed setup carries the newest level-state payload — `onDatabase`'s early-return path refreshes
+that payload without arming another timer, so a pending setup observes the latest routing, leadership,
+and exclusion state. Self-catchup is separate one-shot state: the first dispatch claims it for one
+connection entry, which keeps the bounded rider for its life and reattaches it until the owning primary
+connection opens. That worker then re-sends it on its own reconnects, so recovery re-drives to it stop
+carrying it: the rider's old `startTime` becomes the leader's `min(startTime)` and costs a scan from there to
+now. A replacement worker (a recreated entry) is sent it again, because the main thread cannot see catchup
+finish and a worker that exits mid-catchup would otherwise take the range with it — one scan per worker
+replacement. A same-worker wedge re-drive after the open still replaces the worker's subscription list
+without it, as `main` always did. The global claim is consumed only after the worker message
+is accepted, so timer cancellation, entry refresh, a long offline retry, or a synchronous `postMessage`
+throw cannot lose or overwrite it.
+A setup is cancelled on
+unsubscribe, on node deletion, and on a same-name URL migration, all of which became reachable once a
+pending timer could live 30 s instead of 200 ms. The wedge/stall recovery kicks are owned the same way —
+one `entry.reDriveTimer` per entry, so a staggered sweep that outruns the reconcile window that started it
+keeps the already-armed attempt instead of restamping it out of existence, and disarms it when the owning
+worker exits or the entry is replaced.
+
+**A connect report cancels nothing; every report resets the pair's escalated setup delay.** Gating that reset
+on entry ownership let a chaos-restart peer's delay escalate past its reconvergence budget. A worker can
+carry both the primary and a proxied failover connection, so a socket-open report (`newSocket`) carries its
+thread id and subscription URL; only the owning worker's primary open advances `connectGeneration`, as does a
+truth up-correction, which stands in for an open edge that never arrived. Pongs and proxy/superseded opens
+still perform the pair-level reset but cannot cancel a stall kick. What makes leaving
+the timers armed safe is that each re-checks live state when it fires: the
+setup re-reads the entry and its `unsubscribed` flag, the wedge kick claims its entry through the
+`disconnectedAt` stamp a connect clears, and the stall kick claims it through `connectGeneration` (a stalled
+connection is `connected: true` with no `disconnectedAt`, so the stamp cannot discriminate for it), the
+captured worker identity, and the receive watermark. `shouldFireStallKick`
+holds that decision, because the stamp it checks is also the re-detection throttle: a kick skipped because
+the leg reconnected has to hand the stamp back, or a fresh socket that stalls too is never detected — its
+`lastReceivedTime` can never move past a stamp it never advanced.
+
+Their jitter is drawn once
+per sweep rather than per entry: a per-entry draw would vary consecutive delays by up to ±200 ms and let
+several dials share a 50 ms instant, which is the concurrency the `RECONNECT_STAGGER_MS` spacing exists to
+bound (#446). The warn moved inside the "actually armed" branch: it now describes an attempt, not an
+event.
+
+The worker boundary has one additional admission point for its asynchronous startup window. Before
+components are ready, one insertion-ordered map retains only the latest subscribe/unsubscribe message
+per actual connection key and database, with one continuation on the readiness promise — and, if that
+readiness rejects, exactly one armed re-attempt on the same schedule, so the retained actions apply without
+waiting for another message or the wedge reconcile. After readiness,
+the handlers run inline and allocate no queue state; the existing connection map is then the single-flight
+owner. Subscribe, unsubscribe, force-reconnect, and startup admission all derive the connection key through
+`getSubscriptionConnectionKey`, including the missing nested-URL fallback.
+
+An armed setup dispatches on the main thread only in configured single-thread mode. If its worker exits
+before it fires in a multi-threaded process, the setup is deferred; the stale-worker reconcile reassigns the
+entry even when another database for the same peer is simultaneously in wedge recovery.
+
+**What is deliberately NOT on this schedule:** the receive/copy watchdogs and their thresholds, and the
+doubling copy-finalize _timeout bound_ alongside them (these _detect_ stalls or bound a wait; this
+discipline paces _retries_, and jittering a durability deadline would be actively wrong),
+`blobGapReconnectTimer`, `PING_INTERVAL`/`PING_TIMEOUT`, and `RECONCILE_INTERVAL_MS`.
+
 ---
 
 ## Non-obvious behaviors
@@ -253,7 +348,7 @@ Schema (defined in that function): `name` (PK), `subscriptions[]`, `system_info`
 
 8. **Blob durability watermark: holds on a local/transient gap, advances past a source-missing (ENOENT) one.** Records commit (== become visible) without waiting on their blobs; the persisted resume cursor instead tracks `lastDurableSequenceId`, which only advances to a committed sequence once that sequence's blobs (and all earlier ones) are durably saved (the `.finally` watermark advance + the `onCommit` clamp, both gated on `!hasBlobGap`). A blob save failure in `receiveBlobs` is classified. A **local/transient** fault (receiver `createWriteStream` ENOENT, disk full, mid-stream timeout) sets `hasBlobGap`, pinning the watermark so a reconnect re-streams and re-saves the blob — no silent loss (#368/#386). A **source-reported PERMANENT** failure — the sender's `sendBlobs` catch forwarded a `BLOB_CHUNK` `error` marker with `errorCode: 'ENOENT'` because the blob is gone at the origin (evicted/expired) — is unrecoverable: re-streaming reproduces it, so holding would wedge the connection forever. The receiver instead logs it loudly (`cluster_status.blobReplicationFailures` + a per-blob "advancing the resume cursor past it" error), advances, and leaves the diverged record for proactive blob backfill (#388). Classification is deliberately narrow (`isPermanentSourceBlobErrorCode` = ENOENT, or a forwarded `errorStatus` of 404/500 since harper#1425/#429): a transient sender fault (EIO, EMFILE, timeout, 503) or an older sender that doesn't forward `errorCode` stays unmarked, so it HOLDS like a local gap and a reconnect retries — never silently skipping a recoverable blob. The trigger is set on the destroy error via `markSourceBlobUnavailable`; the save `.catch` keys on `isUnrecoverableSourceBlobError`. See harper-pro#403.
 
-   The held gap is **bounded, not open-ended** (harper-pro#683). `hasBlobGap` is a per-connection one-way latch — nothing in the connection's lifetime clears it; only a reconnect (fresh connection state, resume from the clamped cursor) re-streams the gapped blob and heals it. A latched connection keeps flowing frames and answering pings, so no byte/frame watchdog ever notices it; in the field a link sat latched for hours until an UNRELATED reconnect resumed a whole-table base copy (the latch also blocks `maybeFinishCopy`, so a copy that took even ONE transient fault never exits copy mode, and EVERY later reconnect resumes the copy). Three #683 mitigations: (1) the **blob-gap reconnect timer** (`createBlobGapReconnectTimer`, armed on latch, interval `replication.blobGapReconnectMs`, default `blobTimeout` = 900s — separately tunable since #699 so operators can shorten gap cycles without also shortening blob stream timeouts) forces the healing reconnect if none happens naturally; (2) the **per-position copy-cursor watermark** below; (3) the **sender retries a 503 blob read in place** (`BLOB_SEND_RETRY_DELAYS_MS`, only before any chunk is on the wire) before forwarding the error — the dominant 503 is the source's own PENDING placeholder from a concurrent receive (#481), a rolling population that self-heals within seconds, and under all-to-all copies every node is simultaneously source and receiver, so without the sender retry no large copy could complete gap-free and copies livelocked. 503 remains classified TRANSIENT at the receiver (holds the gap) — reclassifying it as permanent would trade a seconds-long contention blip for permanent divergence.
+   The held gap is **bounded, not open-ended** (harper-pro#683). `hasBlobGap` is a per-connection one-way latch — nothing in the connection's lifetime clears it; only a reconnect (fresh connection state, resume from the clamped cursor) re-streams the gapped blob and heals it. A latched connection keeps flowing frames and answering pings, so no byte/frame watchdog ever notices it; in the field a link sat latched for hours until an UNRELATED reconnect resumed a whole-table base copy (the latch also blocks `maybeFinishCopy`, so a copy that took even ONE transient fault never exits copy mode, and EVERY later reconnect resumes the copy). Three #683 mitigations: (1) the **blob-gap reconnect timer** (`createBlobGapReconnectTimer`, armed on latch, interval `replication.blobGapReconnectMs`, default `blobTimeout` = 900s — separately tunable since #699 so operators can shorten gap cycles without also shortening blob stream timeouts) forces the healing reconnect if none happens naturally; (2) the **per-position copy-cursor watermark** below; (3) the **sender retries a 503 blob read in place** (`BLOB_SEND_RETRY_BACKOFF`, only before any chunk is on the wire) before forwarding the error — the dominant 503 is the source's own PENDING placeholder from a concurrent receive (#481), a rolling population that self-heals within seconds, and under all-to-all copies every node is simultaneously source and receiver, so without the sender retry no large copy could complete gap-free and copies livelocked. 503 remains classified TRANSIENT at the receiver (holds the gap) — reclassifying it as permanent would trade a seconds-long contention blip for permanent divergence.
 
    **A held source-503 gap is bounded ACROSS reconnects, not just within one (harper-pro#432).** #683's timer bounds how long one socket holds, but every per-socket counter (the sender's in-place retries, `blobFailureCount`, the timer itself) restarts with the socket, so a source that answers 503 on every re-stream — the circular PENDING-stub wedge seen in the field — pinned the resume cursor forever. `NodeReplicationConnection.blobGapBudget` (`createBlobGapEscalationBudget`) lives on the connection object and survives socket replacement: the save `.catch` charges one cycle per socket generation (`blobGapGeneration`) for each held delivery, keyed `(source file id, table, record id)` — charged at the failed save rather than at the `BLOB_CHUNK` error frame because only a failed save proves the delivery holds the cursor (a peer can send error frames for file ids no record references), and keyed by record too because adjacent records can share one source file across distinct transfers. Once a delivery has been held for `replication.blobGapEscalationCycles` cycles (default 10) or `replication.blobGapEscalationMs` since its first hold (default 30 min; evaluated at each failed re-stream, so it is a floor rather than a deadline — with the stock 15-minute gap cycle it trips first, on the third failure) it is reclassified through `markSourceBlobUnavailable` and the existing advance-past branch skips it: an error line containing "blob-gap escalation budget exhausted", `cluster_status.blobReplicationFailures`, the local file unlinked (the backfill signal — reads of that record's blob then fail as gone rather than retryable-pending), cursor advances. Exhaustion is sticky until a successful save of that delivery — forgetting it would let two deliveries with offset phases leapfrog forever (A escalates and is forgotten while B holds; the next cycle re-streams A, which starts over while B escalates and is forgotten). Nothing evicts live progress, and every hold has a terminal bound even at capacity: at `BLOB_GAP_BUDGET_MAX_TRACKED` tracked deliveries the oldest exhausted entry the current socket has not re-held is dropped to make room (its record was already skipped past; a re-held one keeps its stickiness), and a hold that still cannot be tracked is charged against one shared capacity cohort with the same bounds, warned once per socket — the cohort conflates its members, which is why the cap is generous, but without it `BLOB_GAP_BUDGET_MAX_TRACKED + 1` persistent gaps could rotate forever with no gap-free generation. Any entry unseen for two _active_ socket generations (ones that held a delivery or settled a tracked one) is retired at socket start: the gap timer reconnects precisely to re-stream every held delivery, so silence means it healed, was skipped past (a permanent source failure also settles its entry), or was superseded by a new source file id; sockets that die before settling anything — a peer in a restart loop, a copy the watchdogs keep terminating — do not count, so an unstable link cannot reset a held delivery's clock. Only a source-reported 503 is budgeted; local save faults (disk, receive-stream timeout) and code-less older senders still hold indefinitely, and a process restart resets the budget. Setting a bound to `0` disables it; both `0` restores the pre-#432 unbounded hold. The keys are registered in core (`CONFIG_PARAMS`, config schema, validator) like `blobGapReconnectMs` — `getConfigValue` resolves registered names only. Operators: alert on the escalation line, then run `repair_blob_data` once the source recovers; note the sweep only sees the subscription connections of the worker thread it runs on (an operation dispatched to the main thread reports `noConnection`).
 
@@ -300,6 +395,8 @@ position. This keeps bootstrap available without conflating clocks in the subseq
 
 22. **A forwarded operation always settles on the sender, and never carries the sender's user.** `sendOperationToNode` (`replicator.ts`) resolves with the peer's answer, or rejects on a socket error, on the connection closing before an answer, or at `options.timeoutMs` — one timer, running from before the connection opens. It settles through the session's promise with `then`, not `resolve(promise)`, because adopting that promise left its own deadline dead once the socket opened. `replicateOperation` passed no deadline at all, so a peer that stopped answering a replicated `deploy_component` held the origin's operation, its deployment row and its restart until the peer restarted; it now forwards the caller's `timeoutMs` (core passes one for deploys — see core `components/DESIGN.md`, "An origin waits for a peer's deploy answer"). A rejection says the operation's outcome on that node is unknown, because nothing cancels it there. Every failed peer is logged at warn with only the operation's name, the node and the reason — never the body, whose secrets a redaction list may not know yet — and on the peer, `answerOperation` warns when an answer is ready after its connection closed, the only trace of a deploy that finished after the origin stopped waiting. The operation that crosses the wire has no `hdb_user`: the receiver's `server.operation()` replaces it with the connection's node identity, so the sender's user record, 30-day `refresh_token` included, was only ever logged at debug on both ends. `redactOperationForLog` still masks it for senders that predate the strip, and covers every field core's operation log drops (`UNLOGGABLE_OPERATION_FIELDS`), held there by `unitTests/replication/logRedaction.test.mjs`.
 
+23. **Config-route reload publishes atomically.** `startOnMainThread` is re-entered on component reload while the previous keyed `hdb_nodes` watcher can still deliver events. The module-level `routes` array is also the authoritative main-thread input for leader inference and `configRouteReplicates`. Clearing it before asynchronous route preparation exposed a false "no configured leader/route" state: an existing subscription could retain or lose the wrong `isLeader` value, and a directional receive gate could temporarily fall back to the peer's differently encoded registry record. Route preparation now builds a local list and replaces the shared array contents in one `splice`, preserving the reference returned by `getConfiguredRoutes()`; tentative route-node updates run only after that commit. Effective leadership is recomputed before the existing-entry fast path, with explicit persisted `false` overriding configured inference.
+
 ---
 
 ## Tests
@@ -329,7 +426,9 @@ Most replication behavior is exercised via integration tests that spin up multi-
 | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | Where does a remote message get decoded?  | `replicationConnection.ts → replicateOverWS`                                                                |
 | Where do cache-miss fetches pick a peer?  | `replicator.ts → Replicator.load` (declared inside `setReplicator`)                                         |
-| Where is the connection retry loop?       | `replicationConnection.ts → NodeReplicationConnection` (uses `INITIAL_RETRY_TIME`)                          |
+| Where is the connection retry loop?       | `replicationConnection.ts → NodeReplicationConnection.scheduleReconnect` (uses `INITIAL_RETRY_TIME`)        |
+| Where is the retry/backoff schedule?      | `backoff.ts → createBackoff`; adopting sites listed under "Backoff discipline"                              |
+| Why is a subscribe setup not firing?      | `subscriptionManager.ts → createSubscribeSetupScheduler` — one armed setup per (url, database)              |
 | Where is mTLS configured?                 | `replicator.ts → buildReplicationMtlsConfig`                                                                |
 | Where is a new cluster member added?      | `setNode.ts` (the whole file is one operation)                                                              |
 | Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `COPY_COMPLETE`)                    |
