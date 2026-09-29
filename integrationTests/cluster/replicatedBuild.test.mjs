@@ -38,7 +38,8 @@ suite('Replicated builds — every node runs the origin’s tree', { timeout: 30
 	const builtBy = (node, project) => readFileSync(join(componentDir(node, project), 'built.txt'), 'utf8');
 
 	before(async () => {
-		await Promise.all(
+		// Settled before a failure is thrown, so teardown never races a launch that is still starting.
+		const launches = await Promise.allSettled(
 			Array.from({ length: NODE_COUNT }, async (_, index) => {
 				const nodeCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 				// Held before starting, so a node that did start is torn down even when the other one fails to.
@@ -53,6 +54,8 @@ suite('Replicated builds — every node runs the origin’s tree', { timeout: 30
 				});
 			})
 		);
+		const failedLaunch = launches.find((launch) => launch.status === 'rejected');
+		if (failedLaunch) throw failedLaunch.reason;
 		ctx.nodes = nodeContexts.map((nodeCtx) => nodeCtx.harper);
 		const { operation_token } = await sendOperation(ctx.nodes[0], {
 			operation: 'create_authentication_tokens',
