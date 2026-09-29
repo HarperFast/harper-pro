@@ -20,7 +20,7 @@ import {
 	RECEIPT_REQUEST_TTL_MS,
 	peersOwedImage,
 	recordHandoffReceipt,
-	releaseIfLocallyComplete,
+	releaseIfSuperseded,
 	settleReceiptRequests,
 	transitionsOwedToPeer,
 } from '#src/replication/residencyHandoff';
@@ -233,11 +233,11 @@ describe('residency handoff — redelivery and local completion', () => {
 			retained: [{ recordId: 'back', tableId: 7, version: V1, residencyId: 5 }],
 			entries: { back: complete(V2) },
 		});
-		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('back'))).to.equal(true);
+		expect(await releaseIfSuperseded(table, table.pendingTransitionEntry('back'))).to.equal(true);
 		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
 	});
 
-	it('keeps a retained entry whose local row is still a stub, or complete only at an older version', async () => {
+	it('keeps a retained entry whose local row is still the stub at that version, or complete only at an older version', async () => {
 		const table = fakeTable({
 			retained: [
 				{ recordId: 's', tableId: 7, version: V1, residencyId: 5 },
@@ -245,9 +245,18 @@ describe('residency handoff — redelivery and local completion', () => {
 			],
 			entries: { s: stub(V1), old: complete(V1) },
 		});
-		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('s'))).to.equal(false);
-		expect(await releaseIfLocallyComplete(table, table.pendingTransitionEntry('old'))).to.equal(false);
+		expect(await releaseIfSuperseded(table, table.pendingTransitionEntry('s'))).to.equal(false);
+		expect(await releaseIfSuperseded(table, table.pendingTransitionEntry('old'))).to.equal(false);
 		expect(table.released).to.deep.equal([]);
+	});
+
+	it('releases a retained entry once the local row moved on to a strictly newer version, stub or not', async () => {
+		const table = fakeTable({
+			retained: [{ recordId: 'moved-on', tableId: 7, version: V1, residencyId: 5 }],
+			entries: { 'moved-on': stub(V2) },
+		});
+		expect(await releaseIfSuperseded(table, table.pendingTransitionEntry('moved-on'))).to.equal(true);
+		expect(table.released).to.deep.equal([{ id: 'moved-on', version: V1 }]);
 	});
 
 	it('owes a peer exactly the retained entries that name it and lack its receipt', async () => {
