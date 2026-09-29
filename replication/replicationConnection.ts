@@ -3679,6 +3679,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// (received-version watermark suppressed) and it could never reach Available.
 			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
+			creditDurableProgress();
 			subscriptionSetupWatchdog?.resume();
 			// Retired before the flags its onStall re-checks are cleared, so the timer stops waking the
 			// event loop for the rest of the connection's life.
@@ -4512,11 +4513,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let hasBlobGap = false;
 	let lastDurableSequenceId = 0;
 	let committedSequence = 0;
-	function advanceDurableWatermark() {
-		lastDurableSequenceId = committedSequence;
-		// Copy-apply rows are not durable until the copy's flush, so they are not progress yet.
+	function creditDurableProgress() {
+		// Copy-apply rows are not durable until the copy's final flush, so they are not progress yet.
 		if (!(copyApplyActive() && inCopyMode) && !supersededOrClosed())
 			options.connection?.onDurableProgress?.(lastDurableSequenceId);
+	}
+	function advanceDurableWatermark() {
+		lastDurableSequenceId = committedSequence;
+		creditDurableProgress();
 	}
 	// Blob-divergence escalation (harper-pro#386). Each blob save failure already logs at `error`, but a
 	// sustained failing link emits that per-blob spam without a single line naming it as ongoing
@@ -6535,6 +6539,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
+									// Caught up: a send that failed earlier is no longer failing. A loop stuck on an
+									// oversized frame never gets here.
+									if (options.connection && !supersededOrClosed()) options.connection.sendFailed = false;
 									await nextTransaction;
 								} while (!closed);
 							})

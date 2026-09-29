@@ -271,10 +271,11 @@ server session), so it resets through `onDurableProgress` when its receive-side 
 at a commit and at the last in-flight blob's drain. Three things keep that from resetting a leg that is not
 working. Only an advance past the highest valid clock this `NodeReplicationConnection` has already credited
 counts, so replaying the same undurable frames after each reconnect is not progress. Nothing counts while a
-copy-apply copy is in progress, because its rows are not durable until the copy's flush. And a sender-loop
-failure on the leg (`onSendFailed`) vetoes receive credit until a frame is sent again, so a leg that both
-receives and serves a subscription does not redial at the floor while its own sends fail every time. Only
-the session that still owns the socket reports either signal. Without the receive signal, the ceiling
+copy-apply copy is in progress, because its rows are not durable until the copy's final flush; finishing the
+copy counts. And a sender-loop failure on the leg (`onSendFailed`) vetoes receive credit until the sender
+sends a frame or catches up, so a leg that both receives and serves a subscription does not redial at the
+floor while its own sends fail every time — a loop stuck on an oversized frame does neither. Only the session
+that still owns the socket reports any of these. Without the receive signal, the ceiling
 carried across unrelated outages until every reconnect waited out the 30 s cap
 (`connectedBitRestartChurn.test.mjs`). Still open: a leg that receives nothing new between outages (idle,
 or mid-copy) carries its escalated ceiling into the next one.

@@ -251,7 +251,7 @@ async function assertAllReplicated(follower, peerHostname, results, what) {
 	);
 }
 
-// The worker warns on a disconnect only while its retry counter is at zero, which only replication progress restores.
+// The worker warns on the first disconnect after its retry counter resets, which only replication progress does.
 async function databasesWithoutFreshDisconnect(follower, leaderHostname, fromMs, toMs) {
 	const pattern = new RegExp(
 		`Disconnected from wss://${leaderHostname.replaceAll('.', '\\.')}:\\d+ \\(db: "([^"]+)"\\)`
