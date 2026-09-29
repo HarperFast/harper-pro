@@ -28,6 +28,17 @@ const COPY_COMPLETE = 149;
 // Above FILE_STORAGE_THRESHOLD (8 KiB): the value is stored as a blob file, so a copy of the row would
 // have to stream it.
 const BLOB_PAYLOAD = 'stays here '.repeat(2048);
+
+const SCHEMA = () => `
+	type ReplicateFalseLocal @table(replicate: false) {
+		id: ID @primaryKey
+		payload: Blob
+	}
+	type ReplicateFalseShared @table {
+		id: ID @primaryKey
+		payload: String
+	}
+`;
 const OPEN = 1;
 const CLOSED = 3;
 
@@ -66,16 +77,7 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 
 	before(async () => {
 		setHdbBasePath(process.env.STORAGE_PATH);
-		await loadGQLSchema(`
-			type ReplicateFalseLocal @table(replicate: false) {
-				id: ID @primaryKey
-				payload: Blob
-			}
-			type ReplicateFalseShared @table {
-				id: ID @primaryKey
-				payload: String
-			}
-		`);
+		await loadGQLSchema(SCHEMA());
 		await tables.ReplicateFalseLocal.put({ id: 'local', payload: BLOB_PAYLOAD });
 		await tables.ReplicateFalseShared.put({ id: 'shared', payload: 'travels' });
 	});
@@ -128,9 +130,6 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 	});
 
 	it('refuses cleanly, not with an internal fault, when the connection resolved no database', async () => {
-		// `tables` is undefined for a database name this node does not have, and the bare lookup that
-		// resolves the requested table then threw a TypeError that the handler's catch handed straight
-		// to the peer as its error text.
 		const orphan = new FakeSocket();
 		replicateOverWS(orphan, {}, { replicates: true });
 		orphan.emit('message', encode([NODE_NAME, 'peer-a', 'database_that_does_not_exist', [], {}]));

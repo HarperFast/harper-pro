@@ -4464,6 +4464,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
 	// undefined = not yet computed; null = nothing blocked; Map = table name -> why it is dropped.
 	let receiveBlockedTables: Map<string, string> | null | undefined;
+	// The blocked set is derived from the local declarations, so a table replaced in the live map
+	// (a drop and recreate) has to discard it, or a pre-fix sender keeps writing into it for the life
+	// of the socket. For the life of the connection because the receive path also runs on inbound-only
+	// sockets, which never reach the sender-side listener below.
+	const blockedTablesInvalidator = onUpdatedTable((table) => {
+		if (!databaseName || table?.databaseName === databaseName) receiveBlockedTables = undefined;
+	});
+	ws.on('close', () => blockedTablesInvalidator.remove());
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
 	// Serialize message handling so that async backpressure inside onWSMessage doesn't allow
@@ -6325,10 +6333,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												}
 												for (const entry of table.primaryStore.getRange(rangeOptions)) {
 													if (closed) return;
-													// Re-resolve by name each row: a redeclaration replaces the Table object, and the row
-													// below allocates and awaits, so a flip becomes visible mid-walk. Measured at ~6ns
-													// against ~13ns for one of this row's own allocations.
-													if (!tableReplicates(tables?.[tableName] ?? table)) break;
 													// Bound the wall-clock gap between socket flushes and event-loop yields,
 													// independent of record count. The count checkpoint below alone can let a cold
 													// batch run past the watchdog window with no bytes flushed (reads dominate cost),
@@ -6349,6 +6353,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														await new Promise(setImmediate);
 														if (closed) return;
 													}
+													// After the yield, so no await separates this from the encode below, which opens the
+													// row's blobs. It catches a drop-and-recreate mid-walk, which replaces the object in
+													// the live map; an in-place `@table` change does not, since `Table.replicate` is fixed
+													// when the class is built (core `Table.ts`) and only the durable descriptor is rewritten.
+													if (!tableReplicates(tables?.[tableName] ?? table)) break;
 													// Local-only records must never be full-copied to a peer. metadataFlags is the
 													// already-available record metadata integer from the range entry — a pure bitmask
 													// test, no record value decode added to this send path.
