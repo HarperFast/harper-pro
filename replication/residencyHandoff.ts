@@ -200,12 +200,16 @@ export async function applyHandoffReceipt(
 }
 
 /**
- * A retained entry is redundant once this node again holds a complete row at that version or newer (a
- * transition back landed). Releases it and returns true; anything else stays retained.
+ * A retained entry is redundant once this node holds a complete row at that version or newer (a
+ * transition back landed), or any row strictly newer than it: a later transition was written from a
+ * complete base elsewhere — core never promotes a patch over an invalidated row — so that writer's
+ * retained image, not this one, now guards the record. Releases it and returns true.
  */
-export async function releaseIfLocallyComplete(table: any, retained: TransitionEntry): Promise<boolean> {
+export async function releaseIfSuperseded(table: any, retained: TransitionEntry): Promise<boolean> {
 	const entry = table.primaryStore.getEntry(retained.recordId);
-	if (!localRowSatisfies(entry, retained.version)) return false;
+	const superseded =
+		localRowSatisfies(entry, retained.version) || (!!entry && (entry.version ?? -Infinity) > retained.version);
+	if (!superseded) return false;
 	await releaseTransitionEntry(table, retained.recordId, retained.version);
 	await clearHandoffReceipts(table.dbisDB, table.tableId, retained.recordId);
 	return true;
@@ -226,7 +230,7 @@ export async function transitionsOwedToPeer(
 	if (!retained) return [];
 	const owed: TransitionEntry[] = [];
 	for (const entry of retained) {
-		if (await releaseIfLocallyComplete(table, entry)) continue;
+		if (await releaseIfSuperseded(table, entry)) continue;
 		const residency = residencyOf(entry.residencyId);
 		if (!residency?.includes(peerName)) continue;
 		const receipts = handoffReceipts(table.dbisDB, table.tableId, entry.recordId);
