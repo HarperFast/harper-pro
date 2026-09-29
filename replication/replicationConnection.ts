@@ -4430,9 +4430,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let subscriptionRequest, auditSubscription;
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
-	// undefined = not yet computed; null = computed, no exclusions; Set = tables to drop on receive
-	// Table name -> why this connection drops its inbound records. undefined until the first record,
-	// null when nothing is blocked.
+	// undefined = not yet computed; null = nothing blocked; Map = table name -> why it is dropped.
 	let receiveBlockedTables: Map<string, string> | null | undefined;
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
@@ -5260,8 +5258,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let responseData: Buffer;
 						try {
 							const recordId = message[3];
-							const table = remoteTableById[tableId] || (remoteTableById[tableId] = tables[message[4]]);
-							if (!table || !tableReplicates(tables[table.tableName] ?? table)) {
+							// `tables` is undefined for a database this connection never resolved (a name that does
+							// not exist locally), and a bare lookup then threw a TypeError that the catch below
+							// handed to the peer as its error text. Answer the same refusal as an unknown table.
+							const table = remoteTableById[tableId] || (remoteTableById[tableId] = tables?.[message[4]]);
+							if (!table || !tableReplicates(tables?.[table.tableName] ?? table)) {
 								// One wording for both cases, so a guessing peer cannot tell an unknown table from a
 								// non-replicating one.
 								logger.warn?.(
@@ -6313,7 +6314,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														if (closed) return;
 														// Re-resolve by name: a redeclaration replaces the Table object. DESIGN.md note 23
 														// records why this sits at the pacer's yield and what that leaves open.
-														if (!tableReplicates(tables[tableName] ?? table)) break;
+														if (!tableReplicates(tables?.[tableName] ?? table)) break;
 													}
 													// Local-only records must never be full-copied to a peer. metadataFlags is the
 													// already-available record metadata integer from the range entry — a pure bitmask
@@ -8426,18 +8427,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return definitions;
 	}
 	function sendNodeDBName(thisNodeName, databaseName) {
-		const tables = tableDefinitionsForPeer(databaseName);
+		const tableDefinitions = tableDefinitionsForPeer(databaseName);
 		logger.trace?.('Sending database info for node', thisNodeName, 'database name', databaseName);
 		// Test-only: a pre-#646 peer that sends no capability element, and a peer speaking a frame code this
 		// build does not know.
-		if (TEST_OMIT_CAPABILITIES) ws.send(encode([NODE_NAME, thisNodeName, databaseName, tables]));
+		if (TEST_OMIT_CAPABILITIES) ws.send(encode([NODE_NAME, thisNodeName, databaseName, tableDefinitions]));
 		else
 			ws.send(
 				encode([
 					NODE_NAME,
 					thisNodeName,
 					databaseName,
-					tables,
+					tableDefinitions,
 					{ ...LOCAL_CAPABILITIES, acceptBlobCodecs: acceptedBlobCodecs() },
 				])
 			);
@@ -8462,7 +8463,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
 	}
 	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
-		const tables = tableDefinitionsForPeer(
+		const tableDefinitions = tableDefinitionsForPeer(
 			databaseName,
 			nodeSubscriptions &&
 				((tableName) =>
@@ -8470,7 +8471,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						node.replicateByDefault ? !node.tables.includes(tableName) : node.tables.includes(tableName)
 					))
 		);
-		ws.send(encode([DB_SCHEMA, tables, databaseName, subscriptionSetupRequestId]));
+		ws.send(encode([DB_SCHEMA, tableDefinitions, databaseName, subscriptionSetupRequestId]));
 	}
 	blobsTimer = setInterval(
 		() => {

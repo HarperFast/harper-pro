@@ -127,6 +127,26 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 		assert.equal(typeof entry?.error, 'string', `expected an error frame, got ${JSON.stringify(entry)}`);
 	});
 
+	it('refuses cleanly, not with an internal fault, when the connection resolved no database', async () => {
+		// `tables` is undefined for a database name this node does not have, and the bare lookup that
+		// resolves the requested table then threw a TypeError that the handler's catch handed straight
+		// to the peer as its error text.
+		const orphan = new FakeSocket();
+		replicateOverWS(orphan, {}, { replicates: true });
+		orphan.emit('message', encode([NODE_NAME, 'peer-a', 'database_that_does_not_exist', [], {}]));
+		await settle(orphan, 1);
+		orphan.emit('message', encode([GET_RECORD, 11, 99, 'k', 'SomeTable']));
+		for (let turn = 0; turn < 60 && !orphan.sent.some((frame) => frame[0] === GET_RECORD_RESPONSE); turn++) {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		const response = orphan.sent.find((frame) => frame[0] === GET_RECORD_RESPONSE);
+		orphan.close(1000);
+		assert.ok(response, 'the peer must be answered rather than left waiting');
+		assert.equal(response[1], 11);
+		assert.match(response[2].error, /is not available for replication/);
+		assert.doesNotMatch(response[2].error, /Cannot read properties|undefined/);
+	});
+
 	it('still serves GET_RECORD for a replicated table', async () => {
 		const shared = tables.ReplicateFalseShared;
 		socket.emit('message', encode([GET_RECORD, 8, shared.tableId, 'shared', 'ReplicateFalseShared']));
