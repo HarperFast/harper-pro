@@ -5,9 +5,9 @@
  * failed replication. pingInterval/pingTimeout are lowered so that window is seconds instead of the
  * ~120s default, and the peer's work outlasts it.
  *
- * A peer takes the origin's build and installs nothing (harper#2315 step 7), so the long work is the peer's load check
- * of the candidate instead: `applications.lockdown: none` lets a worker load-validate, and the fixture's module waits
- * out HARPER_TEST_LOAD_DELAY_MS as it loads.
+ * Peers take the origin's build and install nothing, so the long peer work is the load check of the candidate:
+ * `applications.lockdown: none` lets a worker load-validate, and the fixture's module waits out
+ * HARPER_TEST_LOAD_DELAY_MS as it loads.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -93,6 +93,7 @@ suite('Replicated operation survives peer work longer than the watchdog window (
 
 	test('deploy_component replicates when the peer’s work outlasts 2x pingTimeout', async () => {
 		const payload = await targz(FIXTURE_PATH);
+		const startedAt = Date.now();
 		const deploy = await sendOperation(ctx.nodes[0], {
 			operation: 'deploy_component',
 			project: PROJECT,
@@ -105,6 +106,8 @@ suite('Replicated operation survives peer work longer than the watchdog window (
 			`deploy did not succeed: ${JSON.stringify(deploy)}`
 		);
 		ok(deploy.deployment_id, `deploy response carried no deployment_id: ${JSON.stringify(deploy)}`);
+		// Without this, a peer that stopped load-validating inside the operation would pass with the keep-alive removed.
+		ok(Date.now() - startedAt >= PEER_WORK_MS, `the peer answered before its ${PEER_WORK_MS}ms of work was done`);
 
 		const row = await sendOperation(ctx.nodes[0], {
 			operation: 'get_deployment',
