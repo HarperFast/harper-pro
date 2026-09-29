@@ -36,7 +36,16 @@ const residencyOf = (lists) => (id) => lists[id];
 /** In-memory stand-in for a database's `dbisDB`: array keys, ordered prefix ranges. */
 function fakeDbisDB() {
 	const rows = new Map();
-	const keyOf = (key) => JSON.stringify(key.map((part) => (typeof part === 'symbol' ? part.description : part)));
+	const normalize = (key) => key.map((part) => (typeof part === 'symbol' ? part.description : part));
+	const keyOf = (key) => JSON.stringify(normalize(key));
+	const comparePart = (a, b) => (a === b ? 0 : a < b ? -1 : 1);
+	const compareKeys = (a, b) => {
+		for (let i = 0; i < Math.max(a.length, b.length); i++) {
+			const cmp = comparePart(a[i], b[i]);
+			if (cmp !== 0) return cmp;
+		}
+		return 0;
+	};
 	return {
 		rows,
 		getSync(key) {
@@ -48,10 +57,14 @@ function fakeDbisDB() {
 		async remove(key) {
 			rows.delete(keyOf(key));
 		},
-		*getRange({ start }) {
-			const prefix = keyOf(start).slice(0, -1);
+		*getRange({ start, end }) {
+			const from = normalize(start);
+			const to = end === undefined ? undefined : normalize(end);
 			for (const row of rows.values()) {
-				if (keyOf(row.key).startsWith(prefix)) yield row;
+				const key = normalize(row.key);
+				if (compareKeys(key, from) < 0) continue;
+				if (to !== undefined && compareKeys(key, to) >= 0) continue;
+				yield row;
 			}
 		},
 	};
@@ -259,8 +272,6 @@ describe('residency handoff — redelivery and local completion', () => {
 				{ recordId: 'newerStub', tableId: 7, version: V1, residencyId: 5 },
 				{ recordId: 'old', tableId: 7, version: V2, residencyId: 5 },
 			],
-			// newerStub's row names the entry's own residency, so it is owed rather than counted superseded --
-			// that branch has its own coverage below
 			entries: { s: stub(V1), newerStub: { ...stub(V2), residencyId: 5 }, old: complete(V1) },
 		});
 		const { owed } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists));
