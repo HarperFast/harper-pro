@@ -34,6 +34,7 @@ export interface LocalEntryState {
 	version?: number;
 	metadataFlags?: number;
 	value?: unknown;
+	residencyId?: number;
 }
 
 /** Core's retained complete image for a residency-transition write; undefined for any other entry. */
@@ -62,6 +63,28 @@ export function releaseTransitionEntry(table: any, id: any, version: number): Pr
 
 export function localRowSatisfies(entry: LocalEntryState | undefined, version: number): boolean {
 	return !!entry && !((entry.metadataFlags ?? 0) & INVALIDATED) && (entry.version ?? -Infinity) >= version;
+}
+
+/**
+ * `getEntry` can return a MaybePromise (a RocksDB cache miss resolves asynchronously); a throw or a
+ * rejection reads as "no entry", the same as a genuine miss — every caller here already treats absence
+ * as the safe direction (never release, still treat as owed).
+ */
+async function resolveLocalEntry(getEntry: (id: any) => any, id: any): Promise<LocalEntryState | undefined> {
+	let entry: LocalEntryState | undefined;
+	try {
+		entry = getEntry(id);
+	} catch {
+		return undefined;
+	}
+	if (entry && typeof (entry as any).then === 'function') {
+		try {
+			entry = await (entry as any);
+		} catch {
+			return undefined;
+		}
+	}
+	return entry;
 }
 
 /** An image stands in for a stub only at the stub's own version; a newer stub means a later transition. */
@@ -205,7 +228,7 @@ export async function applyHandoffReceipt(
  * the version without anyone holding a complete row, so the image may still be the only complete copy.
  */
 export async function releaseIfLocallyComplete(table: any, retained: TransitionEntry): Promise<boolean> {
-	const entry = table.primaryStore.getEntry(retained.recordId);
+	const entry = await resolveLocalEntry((id) => table.primaryStore.getEntry(id), retained.recordId);
 	if (!localRowSatisfies(entry, retained.version)) return false;
 	await releaseTransitionEntry(table, retained.recordId, retained.version);
 	await clearHandoffReceipts(table.dbisDB, table.tableId, retained.recordId);
@@ -233,7 +256,7 @@ export async function transitionsOwedToPeer(
 	// releasing mutates core's set, so never iterate it live
 	for (const entry of Array.from(retained)) {
 		if (await releaseIfLocallyComplete(table, entry)) continue;
-		const row = table.primaryStore.getEntry(entry.recordId);
+		const row = await resolveLocalEntry((id) => table.primaryStore.getEntry(id), entry.recordId);
 		if (row && (row.version ?? -Infinity) > entry.version && !residencyOf(row.residencyId)?.includes(peerName)) {
 			superseded++;
 			continue;
@@ -277,19 +300,7 @@ export async function settleReceiptRequests(
 	const settled: ReceiptRequest[] = [];
 	const waiting: ReceiptRequest[] = [];
 	for (const request of requests) {
-		let entry: LocalEntryState | undefined;
-		try {
-			entry = request.getEntry(request.recordId);
-		} catch {
-			entry = undefined;
-		}
-		if (entry && typeof (entry as any).then === 'function') {
-			try {
-				entry = await (entry as any);
-			} catch {
-				entry = undefined;
-			}
-		}
+		const entry = await resolveLocalEntry(request.getEntry, request.recordId);
 		if (localRowSatisfies(entry, request.version)) {
 			let durable = true;
 			if ((entry!.metadataFlags ?? 0) & HAS_BLOBS) {

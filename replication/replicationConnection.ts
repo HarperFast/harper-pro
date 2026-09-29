@@ -5248,8 +5248,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									await Promise.all(group.map(applyOne));
 							})
 							.catch((error) => {
-								// applyOne's own try/catch covers a receipt failure; this is for anything outside it
-								// (e.g. tableById read before that try). Uncaught here, the rejection would poison
+								// applyOne's own try/catch covers a per-receipt failure; uncaught here would poison
 								// every later batch chained off receiptApplyChain and never surface anywhere.
 								logger.warn?.(connectionId, 'handoff receipt batch failed', error);
 							});
