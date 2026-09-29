@@ -18,7 +18,7 @@ import { readFileSync, truncateSync, writeFileSync } from 'node:fs';
 import { createBlob, getFilePathForBlob } from '#src/core/resources/blob';
 import { table } from '#src/core/resources/databases';
 import { setHdbBasePath } from '#src/core/utility/environment/environmentManager';
-import { getBlobTransferKey, isDurableIdentityTie } from '#src/replication/replicationConnection';
+import { getBlobTransferKey, isDurableIdentityTie, receiptBlobsComplete } from '#src/replication/replicationConnection';
 
 const VERSION = 1700000000000;
 const NODE_ID = 3;
@@ -140,6 +140,49 @@ describe('isDurableIdentityTie — the default verifier on stored blob files', (
 		expect(await ties(value)).to.equal(true);
 		truncateSync(filePath, 20000);
 		expect(await ties(value)).to.equal(false);
+	});
+});
+
+describe('receiptBlobsComplete — residency-handoff receipt blob proof (harper#2257)', () => {
+	let Records;
+	let nextId = 0;
+	before(() => {
+		setHdbBasePath(process.env.STORAGE_PATH);
+		Records = table({
+			database: 'receiptBlobsComplete',
+			table: 'records',
+			attributes: [
+				{ name: 'id', isPrimaryKey: true },
+				{ name: 'blob', type: 'Blob' },
+			],
+		});
+	});
+
+	async function storedRecord(payload, options) {
+		const id = `record-${nextId++}`;
+		await Records.put({ id, blob: createBlob(payload, options) });
+		const value = await Records.get(id);
+		return { value, filePath: getFilePathForBlob(value.blob) };
+	}
+
+	it('is not complete for a null value, and not complete when the value holds no blob at all', async () => {
+		expect(await receiptBlobsComplete(null)).to.equal(false);
+		expect(await receiptBlobsComplete({ id: 1, note: 'no blobs here' })).to.equal(false);
+	});
+
+	it('is complete for a row whose only blob is inline — below the file-storage threshold, no file to check', async () => {
+		// FILE_STORAGE_THRESHOLD is 8192 bytes; this payload stores inline with no fileId.
+		const { value, filePath } = await storedRecord(Buffer.from('short inline payload'));
+		expect(filePath).to.not.be.a('string', 'precondition: stored inline, no file');
+		expect(await receiptBlobsComplete(value)).to.equal(true);
+	});
+
+	it('checks a file-backed blob on disk, same as the identity-tie verifier', async () => {
+		const { value, filePath } = await storedRecord(Buffer.alloc(20000, 3));
+		expect(typeof filePath).to.equal('string', 'precondition: stored as a file');
+		expect(await receiptBlobsComplete(value)).to.equal(true);
+		truncateSync(filePath, 20000);
+		expect(await receiptBlobsComplete(value)).to.equal(false);
 	});
 });
 
