@@ -328,6 +328,22 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(table.released).to.deep.equal([]);
 	});
 
+	it('self-heals a crash-missed release even when the record has since moved to a residency naming neither peer', async () => {
+		// both B and C (entry.residencyId 3's residents) already receipted v1, then the process crashed
+		// before releasing; the record has since moved on to v2 under a residency (4: ['D']) that names
+		// neither B nor C -- the superseded check alone would skip this row and leave it pinned forever
+		const table = fakeTable({
+			retained: [{ recordId: 'crashedThenMoved', tableId: 7, version: V1, residencyId: 3 }],
+			entries: { crashedThenMoved: { ...stub(V2), residencyId: 4 } },
+		});
+		await recordHandoffReceipt(table.dbisDB, 7, 'crashedThenMoved', 'B', V1);
+		await recordHandoffReceipt(table.dbisDB, 7, 'crashedThenMoved', 'C', V1);
+		const { owed, superseded } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf({ ...lists, 4: ['D'] }));
+		expect(owed).to.deep.equal([]);
+		expect(superseded).to.equal(0);
+		expect(table.released).to.deep.equal([{ id: 'crashedThenMoved', version: V1 }]);
+	});
+
 	it('awaits an async local row when checking whether a record has moved on', async () => {
 		const table = fakeTable({
 			retained: [{ recordId: 'movedOn', tableId: 7, version: V1, residencyId: 5 }],

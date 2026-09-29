@@ -61,6 +61,11 @@ export function releaseTransitionEntry(table: any, id: any, version: number): Pr
 	return table?.releaseTransitionEntry?.(id, version);
 }
 
+async function releaseAndClearReceipts(table: any, recordId: any, version: number): Promise<void> {
+	await releaseTransitionEntry(table, recordId, version);
+	await clearHandoffReceipts(table.dbisDB, table.tableId, recordId);
+}
+
 export function localRowSatisfies(entry: LocalEntryState | undefined, version: number): boolean {
 	return !!entry && !((entry.metadataFlags ?? 0) & INVALIDATED) && (entry.version ?? -Infinity) >= version;
 }
@@ -223,8 +228,7 @@ export async function applyHandoffReceipt(
 	await recordHandoffReceipt(dbisDB, table.tableId, receipt.recordId, peerName, receipt.version);
 	const receipts = handoffReceipts(dbisDB, table.tableId, receipt.recordId);
 	if (!handoffReleasable(residencyOf(retained.residencyId), selfName, receipts, retained.version)) return 'recorded';
-	await releaseTransitionEntry(table, receipt.recordId, retained.version);
-	await clearHandoffReceipts(dbisDB, table.tableId, receipt.recordId);
+	await releaseAndClearReceipts(table, receipt.recordId, retained.version);
 	return 'released';
 }
 
@@ -232,14 +236,13 @@ export async function applyHandoffReceipt(
  * A retained entry is redundant once this node again holds a complete row at that version or newer (a
  * transition back landed). A newer STUB releases nothing: a non-resident's patch over a stub advances
  * the version without anyone holding a complete row, so the image may still be the only complete copy.
- * `transitionsOwedToPeer` inlines this same check against a row it already read rather than calling it,
- * to read each retained entry's row only once per sweep pass.
+ * `transitionsOwedToPeer` inlines an equivalent check against a row it already read, to read each
+ * retained entry's row only once per sweep pass; this standalone form exists for direct callers/tests.
  */
 export async function releaseIfLocallyComplete(table: any, retained: TransitionEntry): Promise<boolean> {
 	const entry = await resolveLocalEntry((id) => table.primaryStore.getEntry(id), retained.recordId);
 	if (!localRowSatisfies(entry, retained.version)) return false;
-	await releaseTransitionEntry(table, retained.recordId, retained.version);
-	await clearHandoffReceipts(table.dbisDB, table.tableId, retained.recordId);
+	await releaseAndClearReceipts(table, retained.recordId, retained.version);
 	return true;
 }
 
@@ -264,29 +267,25 @@ export async function transitionsOwedToPeer(
 	let superseded = 0;
 	// releasing mutates core's set, so never iterate it live
 	for (const entry of Array.from(retained)) {
-		// one read serves both the "we're complete again" and the "row moved past us" checks below
 		const row = await resolveLocalEntry(
 			(id) => table.primaryStore.getEntry(id),
 			entry.recordId,
 			(error) => onRowReadError?.(entry.recordId, error)
 		);
 		if (localRowSatisfies(row, entry.version)) {
-			await releaseTransitionEntry(table, entry.recordId, entry.version);
-			await clearHandoffReceipts(table.dbisDB, table.tableId, entry.recordId);
+			await releaseAndClearReceipts(table, entry.recordId, entry.version);
+			continue;
+		}
+		// checked ahead of the superseded case below: a residency move after every resident already
+		// receipted (e.g. a crash between the last receipt and the release it triggers) must not strand it
+		const residency = residencyOf(entry.residencyId);
+		const receipts = handoffReceipts(table.dbisDB, table.tableId, entry.recordId);
+		if (handoffReleasable(residency, selfName, receipts, entry.version)) {
+			await releaseAndClearReceipts(table, entry.recordId, entry.version);
 			continue;
 		}
 		if (row && (row.version ?? -Infinity) > entry.version && !residencyOf(row.residencyId)?.includes(peerName)) {
 			superseded++;
-			continue;
-		}
-		const residency = residencyOf(entry.residencyId);
-		const receipts = handoffReceipts(table.dbisDB, table.tableId, entry.recordId);
-		// self-heals a release this table missed (e.g. a crash between the last receipt and the release it
-		// triggered): every entry's receipts are re-checked here regardless of which peer asked, since the
-		// sweep already reads them for the owed check below
-		if (handoffReleasable(residency, selfName, receipts, entry.version)) {
-			await releaseTransitionEntry(table, entry.recordId, entry.version);
-			await clearHandoffReceipts(table.dbisDB, table.tableId, entry.recordId);
 			continue;
 		}
 		if (!residency?.includes(peerName)) continue;
