@@ -1,9 +1,11 @@
 import { suite, test, before, after } from 'node:test';
 import { equal, ok } from 'node:assert';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { readFileSync } from 'node:fs';
+import { generateKeyPairSync } from 'node:crypto';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { readLog } from '../cluster/clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -97,11 +99,24 @@ suite('Clone Node', (ctx) => {
 		await sendOperation(nodeCtx.harper, {
 			operation: 'add_ssh_key',
 			name: 'clonetestkey1',
-			key: 'clonerandom\nstring',
+			key: generateKeyPairSync('ec', {
+				namedCurve: 'P-256',
+				publicKeyEncoding: { type: 'spki', format: 'pem' },
+				privateKeyEncoding: { type: 'sec1', format: 'pem' },
+			}).privateKey,
 			host: 'testkey1.gitlab.com',
 			hostname: 'gitlab.com',
 			known_hosts: 'gitlab.com fake1\ngitlab.com fake2',
 		});
+		// ...beside a key stored before add_ssh_key validated keys, which the clone must skip without
+		// losing the valid one; named to list first where readdir is ordered (APFS, not ext4)
+		const leaderSSHDir = join(nodeCtx.harper.dataRootDir, 'ssh');
+		const legacyKeyFile = join(leaderSSHDir, 'aaalegacykey.key');
+		writeFileSync(legacyKeyFile, 'not\na key', { mode: 0o600 });
+		appendFileSync(
+			join(leaderSSHDir, 'config'),
+			`\n#aaalegacykey\nHost legacy.gitlab.com\n\tHostName gitlab.com\n\tUser git\n\tIdentityFile ${legacyKeyFile}\n\tIdentitiesOnly yes`
+		);
 
 		// Deploy a filesystem-only application file-by-file using set_component_file.
 		// This creates the component on disk without a config entry and without triggering
@@ -241,7 +256,7 @@ suite('Clone Node', (ctx) => {
 		const sshKeys = await sendOperation(ctx.nodes[1], {
 			operation: 'list_ssh_keys',
 		});
-		equal(sshKeys.length, 1, 'Should find 1 SSH key in clone node');
+		equal(sshKeys.length, 1, 'Should find only the valid SSH key in clone node');
 		equal(sshKeys[0].name, 'clonetestkey1', 'SSH key name should match the original');
 
 		// Verify that JWT keys were cloned successfully
@@ -502,5 +517,86 @@ suite('Clone Node - unconfirmed sync leaves node Unavailable and uncloned', (ctx
 		// A node whose sync never confirmed must not be marked cloned, so a restart can retry the clone.
 		const config = await sendOperation(ctx.nodes[1], { operation: 'get_configuration' });
 		ok(config.cloned !== true, 'an unconfirmed clone must not be marked cloned');
+	});
+});
+
+// CLONE_SIMULATE_SSH_KEY_FAILURE fails every SSH key request to the leader, retries included.
+suite('Clone Node - SSH key clone failure leaves node Unavailable and uncloned', (ctx) => {
+	before(async () => {
+		ctx.nodes = [];
+		const leaderCtx = {
+			name: ctx.name,
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
+		};
+		await startHarper(leaderCtx, {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false },
+				replication: {
+					port: leaderCtx.harper.hostname + ':9933',
+					securePort: null,
+				},
+			},
+			env: {
+				HARPER_NO_FLUSH_ON_EXIT: true,
+			},
+		});
+		ctx.nodes.push(leaderCtx.harper);
+	});
+
+	after(async () => {
+		await Promise.all(ctx.nodes.map((node) => teardownHarper({ harper: node })));
+	});
+
+	test('reports Unavailable, stays queryable, and is not marked cloned', async () => {
+		const cloneCtx = {
+			name: ctx.name,
+			harper: {
+				hostname: await getNextAvailableLoopbackAddress(),
+			},
+		};
+		await startHarper(cloneCtx, {
+			config: {
+				analytics: { aggregatePeriod: -1 },
+				logging: { colors: false },
+				replication: {
+					port: cloneCtx.harper.hostname + ':9933',
+					securePort: null,
+				},
+			},
+			env: {
+				HDB_LEADER_URL: `http://${ctx.nodes[0].hostname}:9925`,
+				HDB_LEADER_USERNAME: ctx.nodes[0].admin.username,
+				HDB_LEADER_PASSWORD: ctx.nodes[0].admin.password,
+				ALLOW_SELF_SIGNED: true,
+				HARPER_NO_FLUSH_ON_EXIT: true,
+				CLONE_SIMULATE_SSH_KEY_FAILURE: true,
+			},
+		});
+		ctx.nodes.push(cloneCtx.harper);
+
+		// until setup has given up: before that, a clone still in progress is Unavailable and uncloned too
+		let log = '';
+		const deadline = Date.now() + 60000;
+		while (Date.now() < deadline && !log.includes('failed to clone its SSH keys')) {
+			await sleep(1000);
+			log = await readLog(ctx.nodes[1]);
+		}
+		ok(
+			log.includes('list_ssh_keys failed on the leader 3 times'),
+			'setup must retry the leader request, then stop the clone'
+		);
+
+		const availability = await sendOperation(ctx.nodes[1], { operation: 'get_status', id: 'availability' });
+		equal(availability?.status, 'Unavailable', 'a clone without its SSH keys must report availability Unavailable');
+
+		const config = await sendOperation(ctx.nodes[1], { operation: 'get_configuration' });
+		ok(config.cloned !== true, 'a clone without its SSH keys must not be marked cloned');
+		ok(
+			!existsSync(join(ctx.nodes[1].dataRootDir, '.cloneAttempt.json')),
+			'a stopped clone must retire its attempt, or replication keeps withholding the leader its own records (harper-pro#737)'
+		);
 	});
 });
