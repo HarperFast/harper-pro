@@ -70,17 +70,23 @@ export function localRowSatisfies(entry: LocalEntryState | undefined, version: n
  * rejection reads as "no entry", the same as a genuine miss — every caller here already treats absence
  * as the safe direction (never release, still treat as owed).
  */
-async function resolveLocalEntry(getEntry: (id: any) => any, id: any): Promise<LocalEntryState | undefined> {
+async function resolveLocalEntry(
+	getEntry: (id: any) => any,
+	id: any,
+	onError?: (error: unknown) => void
+): Promise<LocalEntryState | undefined> {
 	let entry: LocalEntryState | undefined;
 	try {
 		entry = getEntry(id);
-	} catch {
+	} catch (error) {
+		onError?.(error);
 		return undefined;
 	}
 	if (entry && typeof (entry as any).then === 'function') {
 		try {
 			entry = await (entry as any);
-		} catch {
+		} catch (error) {
+			onError?.(error);
 			return undefined;
 		}
 	}
@@ -226,6 +232,8 @@ export async function applyHandoffReceipt(
  * A retained entry is redundant once this node again holds a complete row at that version or newer (a
  * transition back landed). A newer STUB releases nothing: a non-resident's patch over a stub advances
  * the version without anyone holding a complete row, so the image may still be the only complete copy.
+ * `transitionsOwedToPeer` inlines this same check against a row it already read rather than calling it,
+ * to read each retained entry's row only once per sweep pass.
  */
 export async function releaseIfLocallyComplete(table: any, retained: TransitionEntry): Promise<boolean> {
 	const entry = await resolveLocalEntry((id) => table.primaryStore.getEntry(id), retained.recordId);
@@ -247,7 +255,8 @@ export async function transitionsOwedToPeer(
 	table: any,
 	peerName: string,
 	selfName: string,
-	residencyOf: (residencyId: number | undefined) => string[] | undefined
+	residencyOf: (residencyId: number | undefined) => string[] | undefined,
+	onRowReadError?: (recordId: any, error: unknown) => void
 ): Promise<{ owed: TransitionEntry[]; superseded: number }> {
 	const retained = pendingTransitionEntries(table);
 	if (!retained) return { owed: [], superseded: 0 };
@@ -255,15 +264,32 @@ export async function transitionsOwedToPeer(
 	let superseded = 0;
 	// releasing mutates core's set, so never iterate it live
 	for (const entry of Array.from(retained)) {
-		if (await releaseIfLocallyComplete(table, entry)) continue;
-		const row = await resolveLocalEntry((id) => table.primaryStore.getEntry(id), entry.recordId);
+		// one read serves both the "we're complete again" and the "row moved past us" checks below
+		const row = await resolveLocalEntry(
+			(id) => table.primaryStore.getEntry(id),
+			entry.recordId,
+			(error) => onRowReadError?.(entry.recordId, error)
+		);
+		if (localRowSatisfies(row, entry.version)) {
+			await releaseTransitionEntry(table, entry.recordId, entry.version);
+			await clearHandoffReceipts(table.dbisDB, table.tableId, entry.recordId);
+			continue;
+		}
 		if (row && (row.version ?? -Infinity) > entry.version && !residencyOf(row.residencyId)?.includes(peerName)) {
 			superseded++;
 			continue;
 		}
 		const residency = residencyOf(entry.residencyId);
-		if (!residency?.includes(peerName)) continue;
 		const receipts = handoffReceipts(table.dbisDB, table.tableId, entry.recordId);
+		// self-heals a release this table missed (e.g. a crash between the last receipt and the release it
+		// triggered): every entry's receipts are re-checked here regardless of which peer asked, since the
+		// sweep already reads them for the owed check below
+		if (handoffReleasable(residency, selfName, receipts, entry.version)) {
+			await releaseTransitionEntry(table, entry.recordId, entry.version);
+			await clearHandoffReceipts(table.dbisDB, table.tableId, entry.recordId);
+			continue;
+		}
+		if (!residency?.includes(peerName)) continue;
 		if (peersOwedImage(residency, selfName, receipts, entry.version).includes(peerName)) owed.push(entry);
 	}
 	return { owed, superseded };

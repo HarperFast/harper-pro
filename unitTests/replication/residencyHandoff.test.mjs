@@ -284,6 +284,36 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
 	});
 
+	it('self-heals a release missed by a crash between the last receipt and applyHandoffReceipt completing', async () => {
+		const table = fakeTable({
+			retained: [{ recordId: 'crashedBeforeRelease', tableId: 7, version: V1, residencyId: 3 }],
+			entries: { crashedBeforeRelease: stub() },
+		});
+		// both residents (B, C) already receipted -- as if applyHandoffReceipt recorded C's receipt (the
+		// last one needed) and then crashed before reaching releaseTransitionEntry
+		await recordHandoffReceipt(table.dbisDB, 7, 'crashedBeforeRelease', 'B', V1);
+		await recordHandoffReceipt(table.dbisDB, 7, 'crashedBeforeRelease', 'C', V1);
+		const { owed } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists));
+		expect(owed).to.deep.equal([]);
+		expect(table.released).to.deep.equal([{ id: 'crashedBeforeRelease', version: V1 }]);
+	});
+
+	it('reports a row-read failure through the callback and still yields an owed/superseded result', async () => {
+		const table = fakeTable({
+			retained: [{ recordId: 'unreadable', tableId: 7, version: V1, residencyId: 3 }],
+			entries: {},
+		});
+		table.primaryStore.getEntry = () => {
+			throw new Error('store closed');
+		};
+		const errors = [];
+		const { owed } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists), (recordId, error) =>
+			errors.push({ recordId, message: error.message })
+		);
+		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['unreadable']);
+		expect(errors).to.deep.equal([{ recordId: 'unreadable', message: 'store closed' }]);
+	});
+
 	it('keeps but stops owing an entry whose record moved on to a residency that no longer names the peer', async () => {
 		const table = fakeTable({
 			retained: [
