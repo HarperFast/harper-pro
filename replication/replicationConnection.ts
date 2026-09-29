@@ -7066,10 +7066,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													);
 													continue;
 												}
-												if (owed.length > 0 || superseded > 0)
+												if (owed.length > 0)
 													logger.info?.(
 														connectionId,
-														`Redelivering ${owed.length} retained residency transition image(s) of ${table.tableName} to ${remoteNodeName}; ${superseded} retained image(s) superseded by a newer local row await a receipt`
+														`Redelivering ${owed.length} retained residency transition image(s) of ${table.tableName} to ${remoteNodeName}`
+													);
+												if (superseded > 0)
+													logger.debug?.(
+														connectionId,
+														`${superseded} retained residency transition image(s) of ${table.tableName} no longer name ${remoteNodeName}; retained, not redelivered`
 													);
 												for (const retained of owed) {
 													if (closed) return;
