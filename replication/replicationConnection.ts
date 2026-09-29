@@ -192,8 +192,8 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // transition image, from the receiver's row state once that row is complete and durable (harper#2257).
 const HANDOFF_RECEIPT = 151;
 const HANDOFF_RECEIPT_REQUEST = 152;
-// how often a sending subscription re-runs its owed-image sweep on its next pass
 const HANDOFF_RESWEEP_INTERVAL_MS = 5 * 60_000;
+const RECEIPT_PRUNE_INTERVAL_MS = 1000;
 // Identifies the table ordering the leader copies in (see orderTablesForCopy). The resume skip-loop
 // trusts that every table before the cursor's currentTable was already copied — only true if the
 // resume runs under the SAME order that built the cursor. Bump this whenever orderTablesForCopy
@@ -4562,32 +4562,35 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// a gap. See onCommit, the blob save `.finally`, and the sequence-update branches.
 	let hasBlobGap = false;
 	let lastDurableSequenceId = 0;
-	// Receipt requests from the sender, keyed by record. Not answered while a base copy applies WAL-off
-	// rows (until its flush) or while a blob is in flight or gapped. A settle checks only the keys it is
-	// given — the records a frame touched, or the requests that just arrived — and a full pass runs at
-	// the rare points where any row may have become durable (blob drain, copy finish).
+	// Receipt requests from the sender, keyed by record. A settle checks only the keys it is handed — the
+	// records a frame touched, or the requests that just arrived. While a base copy applies WAL-off rows
+	// (until its flush) or a blob is in flight or gapped, those keys are deferred instead, and the blob
+	// drain or the copy finish settles exactly the deferred set.
 	const receiptRequests = new Map<string, ReceiptRequest>();
 	let receiptApplyChain: Promise<void> = Promise.resolve();
 	let settlingReceipts: Promise<void> | undefined;
-	let resettleKeys: Set<string> | 'all' | undefined;
+	let resettleKeys: Set<string> | undefined;
+	let deferredReceiptKeys: Set<string> | undefined;
+	let lastReceiptPruneAt = 0;
 	function settleHandoffReceipts(keys?: Iterable<string>): Promise<void> {
 		if (settlingReceipts) {
-			if (!keys) resettleKeys = 'all';
-			else if (resettleKeys !== 'all') {
-				const pending = resettleKeys ?? (resettleKeys = new Set());
-				for (const key of keys) pending.add(key);
-			}
+			const pending = resettleKeys ?? (resettleKeys = new Set());
+			for (const key of keys ?? deferredReceiptKeys ?? []) pending.add(key);
+			if (!keys) deferredReceiptKeys = undefined;
 			return settlingReceipts;
 		}
-		if (receiptRequests.size === 0 || inCopyMode || outstandingBlobsToFinish.length !== 0 || hasBlobGap)
+		if (inCopyMode || outstandingBlobsToFinish.length !== 0 || hasBlobGap) {
+			if (keys) for (const key of keys) (deferredReceiptKeys ??= new Set()).add(key);
 			return Promise.resolve();
+		}
 		const selected: ReceiptRequest[] = [];
-		if (keys) {
-			for (const key of keys) {
+		const wanted = keys ?? deferredReceiptKeys;
+		if (!keys) deferredReceiptKeys = undefined;
+		if (wanted)
+			for (const key of wanted) {
 				const request = receiptRequests.get(key);
 				if (request) selected.push(request);
 			}
-		} else selected.push(...receiptRequests.values());
 		if (selected.length === 0) return Promise.resolve();
 		settlingReceipts = settleReceiptRequests(selected, storedBlobsAreComplete)
 			.then(({ receipts, settled }) => {
@@ -4604,7 +4607,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				settlingReceipts = undefined;
 				const again = resettleKeys;
 				resettleKeys = undefined;
-				if (again) void settleHandoffReceipts(again === 'all' ? undefined : again);
+				if (again) void settleHandoffReceipts(again);
 			});
 		return settlingReceipts;
 	}
@@ -5149,8 +5152,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!requestDecoder) continue;
 							const key = receiptRequestKey(requestTableId, recordId);
 							if (!receiptRequests.has(key) && receiptRequests.size >= MAX_PENDING_RECEIPT_REQUESTS) {
-								for (const [staleKey, stale] of receiptRequests)
-									if (now >= stale.expiresAt) receiptRequests.delete(staleKey);
+								if (now - lastReceiptPruneAt >= RECEIPT_PRUNE_INTERVAL_MS) {
+									lastReceiptPruneAt = now;
+									for (const [staleKey, stale] of receiptRequests)
+										if (now >= stale.expiresAt) receiptRequests.delete(staleKey);
+								}
 								if (receiptRequests.size >= MAX_PENDING_RECEIPT_REQUESTS) continue;
 							}
 							receiptRequests.set(key, {
@@ -5719,7 +5725,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let sentNodeIds = new Set<number>();
 						let closed = false;
 						let handoffSweepDone = false;
+						let handoffSweepCount = 0;
 						let handoffResweepTimer: ReturnType<typeof setInterval> | undefined;
+						let wakeForResweep: (() => void) | undefined;
+						// receipt requests ride after the frame that carries their images, in bounded batches
+						let pendingReceiptRequests: [number, any, number][] = [];
+						const handoffRequestedAt = new Map<string, number>();
+						const requestHandoffReceipt = (request: [number, any, number]) => {
+							pendingReceiptRequests.push(request);
+							handoffRequestedAt.set(receiptRequestKey(request[0], request[1]), Date.now());
+						};
+						const flushReceiptRequests = () => {
+							if (pendingReceiptRequests.length === 0) return;
+							const requests = pendingReceiptRequests;
+							pendingReceiptRequests = [];
+							for (const chunk of chunkReceipts(requests))
+								ws.send(encode([HANDOFF_RECEIPT_REQUEST, chunk, databaseName]));
+						};
 						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
 						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
 						tableSubscriptionToReplicator = subscriptionForConnection(
@@ -6166,8 +6188,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (substituteEntry) {
 								frame.writeInt(substituteEntry.length);
 								frame.writeBytes(substituteEntry);
-								// may overtake its frame: the receiver holds the request until the row completes or it expires
-								if (receiptRequest) ws.send(encode([HANDOFF_RECEIPT_REQUEST, [receiptRequest], databaseName]));
+								if (receiptRequest) requestHandoffReceipt(receiptRequest);
 							} else {
 								// directly write the audit record.
 								const encoded = auditRecord.encoded;
@@ -6236,6 +6257,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (checkExcessMessageSize(frame.position - frame.encodingStart))
 									throw new Error('Replication message too large to send');
 								ws.send(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
+								flushReceiptRequests();
 								// A frame actually went out: tell the outbound connection so it can reset its reconnect
 								// backoff on genuine progress rather than on bare socket-open (harper-pro#339).
 								if (!supersededOrClosed()) options.connection?.onFrameSent?.();
@@ -6256,6 +6278,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						auditSubscription.once('close', () => {
 							closed = true;
 							if (handoffResweepTimer) clearInterval(handoffResweepTimer);
+							wakeForResweep?.();
 							subscriptionToHdbNodes?.end();
 						});
 						// find the earliest start time of the subscriptions
@@ -6742,8 +6765,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														copyTxnLogKey,
 														nodeId
 													);
-													if (copyReceiptRequest)
-														ws.send(encode([HANDOFF_RECEIPT_REQUEST, [copyReceiptRequest], databaseName]));
+													if (copyReceiptRequest) requestHandoffReceipt(copyReceiptRequest);
 													logger.debug?.(
 														'sent record from table',
 														entry.key,
@@ -6825,10 +6847,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 									if (!handoffSweepDone) {
 										handoffSweepDone = true;
+										const resweep = handoffSweepCount++ > 0;
 										handoffResweepTimer ??= setInterval(() => {
 											handoffSweepDone = false;
+											wakeForResweep?.();
 										}, HANDOFF_RESWEEP_INTERVAL_MS).unref();
+										const sweepNow = Date.now();
+										for (const [key, at] of handoffRequestedAt)
+											if (sweepNow - at >= RECEIPT_REQUEST_TTL_MS) handoffRequestedAt.delete(key);
+										// a peer that cannot receipt gets each image once; a re-sweep re-asks only what has had
+										// the receiver's full TTL to answer
+										const peerCanReceipt = peerCapabilitiesLearned && peerSupportsHandoffReceipts(peerCapabilities);
 										for (const table of tableSubscriptionToReplicator.tableById) {
+											if (resweep && !peerCanReceipt) break;
 											if (!table || !coreRetainsTransitionImages(table) || !tableToTableEntry(table)) continue;
 											let owed: TransitionEntry[];
 											try {
@@ -6851,6 +6882,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												);
 											for (const retained of owed) {
 												if (closed) return;
+												if (resweep && handoffRequestedAt.has(receiptRequestKey(table.tableId, retained.recordId)))
+													continue;
 												const redelivery = Object.create(retained);
 												redelivery.isHandoffRedelivery = true;
 												await sendAuditRecord(redelivery, retained.txnLogKey ?? retained.version);
@@ -6913,7 +6946,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
 									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
-									await nextTransaction;
+									flushReceiptRequests();
+									await Promise.race([
+										nextTransaction,
+										new Promise<void>((resolve) => {
+											wakeForResweep = resolve;
+										}),
+									]);
+									wakeForResweep = undefined;
 								} while (!closed);
 							})
 							.catch((error) => {
