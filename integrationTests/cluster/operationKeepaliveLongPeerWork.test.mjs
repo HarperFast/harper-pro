@@ -3,7 +3,11 @@
  * written on a replicated operation's one-shot WS while the peer executes, so without a keep-alive
  * the receive watchdog terminates it and the origin reports a peer that is still installing as a
  * failed replication. pingInterval/pingTimeout are lowered so that window is seconds instead of the
- * ~120s default, and the install outlasts it.
+ * ~120s default, and the peer's work outlasts it.
+ *
+ * A peer takes the origin's build and installs nothing (harper#2315 step 7), so the long work is the peer's load check
+ * of the candidate instead: `applications.lockdown: none` lets a worker load-validate, and the fixture's module waits
+ * out HARPER_TEST_LOAD_DELAY_MS as it loads.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -22,15 +26,14 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	'harper.js'
 );
 
-const PROJECT = 'keepalive-long-install';
-const FIXTURE_PATH = join(import.meta.dirname, 'fixture-slow-install');
+const PROJECT = 'keepalive-long-peer-work';
+const FIXTURE_PATH = join(import.meta.dirname, 'fixture-slow-load');
 
 // pingTimeout is the watchdog's silence window; it re-arms once off the WS handshake bytes, so an
-// unfixed operation socket dies at ~2x this. The install must outlast that by a clear margin.
+// unfixed operation socket dies at ~2x this. The peer's work must outlast that by a clear margin.
 const PING_INTERVAL_MS = 1000;
 const PING_TIMEOUT_MS = 2000;
-const INSTALL_MS = 12_000;
-const INSTALL_COMMAND = 'node install-delay.mjs';
+const PEER_WORK_MS = 12_000;
 
 suite('Replicated operation survives peer work longer than the watchdog window (#674)', { timeout: 180_000 }, (ctx) => {
 	before(async () => {
@@ -39,6 +42,7 @@ suite('Replicated operation survives peer work longer than the watchdog window (
 		const config = (host) => ({
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, console: true, level: 'debug' },
+			applications: { lockdown: 'none' },
 			replication: {
 				securePort: host + ':9933',
 				pingInterval: PING_INTERVAL_MS,
@@ -47,11 +51,11 @@ suite('Replicated operation survives peer work longer than the watchdog window (
 		});
 		await startHarper(nodeA, {
 			config: config(nodeA.harper.hostname),
-			env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_INSTALL_DELAY_MS: String(INSTALL_MS) },
+			env: { HARPER_NO_FLUSH_ON_EXIT: true },
 		});
 		await startHarper(nodeB, {
 			config: config(nodeB.harper.hostname),
-			env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_INSTALL_DELAY_MS: String(INSTALL_MS) },
+			env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_LOAD_DELAY_MS: String(PEER_WORK_MS) },
 		});
 		ctx.nodes = [nodeA.harper, nodeB.harper];
 
@@ -87,13 +91,12 @@ suite('Replicated operation survives peer work longer than the watchdog window (
 		for (const node of ctx.nodes ?? []) await teardownHarper({ harper: node });
 	});
 
-	test('deploy_component replicates when the peer install outlasts 2x pingTimeout', async () => {
+	test('deploy_component replicates when the peer’s work outlasts 2x pingTimeout', async () => {
 		const payload = await targz(FIXTURE_PATH);
 		const deploy = await sendOperation(ctx.nodes[0], {
 			operation: 'deploy_component',
 			project: PROJECT,
 			payload,
-			install_command: INSTALL_COMMAND,
 			restart: false,
 		});
 
