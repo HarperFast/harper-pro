@@ -7248,7 +7248,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// record's blob callback is installed re-enters the callback on the stored record's own blob
 				// references (unbounded recursion).
 				const localSourceNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
-				if (receiptRequests.size > 0) (frameReceiptKeys ??= new Set()).add(receiptRequestKey(auditRecord.tableId, id));
+				if (receiptRequests.size > 0) {
+					const requestKey = receiptRequestKey(auditRecord.tableId, id);
+					if (receiptRequests.has(requestKey)) (frameReceiptKeys ??= new Set()).add(requestKey);
+				}
 				if (localSourceNodeId === undefined) throw new Error(`No node name mapped for origin id ${auditRecord.nodeId}`);
 				if (auditRecord.type === 'lockBarrier') {
 					// Captured now, reported from this frame's onCommit: a barrier is proof only once committed.
