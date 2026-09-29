@@ -1412,14 +1412,11 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 }
 
 /**
- * Blob completeness for a residency-handoff receipt (harper#2257). This proves nothing about the ROW's
- * own durability by itself — `getEntry` can surface a copy-applied row before its WAL-off write is
- * flushed, which is why `settleHandoffReceipts` gates on `inCopyMode`/`outstandingBlobsToFinish`/
- * `hasBlobGap` before ever reaching this call, not on which event triggered the attempt. Given that gate
- * held, an inline blob (no file id) needs no file check — its bytes travel inside the row's own encoded
- * value, so whatever made the row durable made them durable too. A file-backed blob still needs
- * `blobFileMissingOrIncompleteAsync`; a HAS_BLOBS claim reachable nowhere in the value (inline or file)
- * fails the same way `storedBlobsAreComplete` does.
+ * Blob completeness for a residency-handoff receipt (harper#2257): the caller owns proving the row
+ * itself is durable; this checks only the blobs it references. An inline blob (no file id) needs no file
+ * check — its bytes travel inside the row's own encoded value, so whatever made the row durable made them
+ * durable too. A file-backed blob still needs `blobFileMissingOrIncompleteAsync`; a HAS_BLOBS claim
+ * reachable nowhere in the value (inline or file) fails the same way `storedBlobsAreComplete` does.
  */
 export async function receiptBlobsComplete(value: unknown): Promise<boolean> {
 	if (value == null) return false;
@@ -4612,7 +4609,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// drain or the copy finish settles exactly the deferred set.
 	const receiptRequests = new Map<string, ReceiptRequest>();
 	let receiptApplyChain: Promise<void> = Promise.resolve();
-	// cleared on receipt or TTL-expiry pruning; a retried request only updates the timestamp
 	const handoffRequestedAt = new Map<string, number>();
 	let settlingReceipts: Promise<void> | undefined;
 	let resettleKeys: Set<string> | undefined;
@@ -7090,16 +7086,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													);
 													continue;
 												}
-												if (owed.length > 0)
-													logger.info?.(
-														connectionId,
-														`Redelivering ${owed.length} retained residency transition image(s) of ${table.tableName} to ${remoteNodeName}`
-													);
 												if (superseded > 0)
 													logger.debug?.(
 														connectionId,
 														`${superseded} retained residency transition image(s) of ${table.tableName} no longer name ${remoteNodeName}; retained, not redelivered`
 													);
+												let redelivered = 0;
 												for (const retained of owed) {
 													if (closed) return;
 													if (resweep && handoffRequestedAt.has(receiptRequestKey(table.tableId, retained.recordId)))
@@ -7112,7 +7104,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														isHandoffRedelivery: true,
 													};
 													await sendAuditRecord(redelivery, retained.txnLogKey ?? retained.version);
+													redelivered++;
 												}
+												// counted after the per-entry TTL skip, not owed.length, so a re-sweep whose every
+												// image was already requested within the receiver's TTL logs nothing rather than N.
+												// An upper bound, not exact: sendAuditRecord can still fall back to the original
+												// patch (an excluded table route, or a failed image read) without reporting it back.
+												if (redelivered > 0)
+													logger.info?.(
+														connectionId,
+														`Replaying ${redelivered} retained residency transition record(s) of ${table.tableName} to ${remoteNodeName}`
+													);
 											}
 										}
 										for (const auditRecord of auditLogIterable) {
