@@ -7,6 +7,10 @@
  * that version or a newer one. A later B-side patch and a transition back to A must never promote a
  * stub or an obsolete image into a complete row, and a base copy to a resident (B rebuilt from nothing)
  * must deliver the image, never the stub.
+ *
+ * Needs the companion core change (HarperFast/harper#2257): on a core that does not retain transition
+ * images every test here skips with that reason, so the guard half (`residencyStubGuard.test.mjs`) is
+ * what runs against today's core.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal, deepEqual } from 'node:assert/strict';
@@ -115,6 +119,10 @@ suite('Record-based residency transitions hand off the complete record (harper#2
 		]);
 		await Promise.all([startNode(ctx, 'A', hostA, dirA), startNode(ctx, 'B', hostB, dirB)]);
 		await addLeader(ctx.B, ctx.A);
+		const support = await probe(ctx.A, 'core-support-probe');
+		ctx.skipReason = support.pendingSupported
+			? undefined
+			: 'core does not retain residency transition images: needs the companion HarperFast/harper#2257 core change';
 	});
 
 	after(async () => {
@@ -136,7 +144,8 @@ suite('Record-based residency transitions hand off the complete record (harper#2
 		if (errors.length) throw new AggregateError(errors, 'Failed to tear down residency-handoff nodes');
 	});
 
-	test('a transition patch written while the new resident is down is delivered complete on reconnect and released only after it lands', async () => {
+	test('a transition patch written while the new resident is down is delivered complete on reconnect and released only after it lands', async (t) => {
+		if (ctx.skipReason) return t.skip(ctx.skipReason);
 		const { A } = ctx;
 		const id = 'moved-while-down';
 		await sendOperation(A, {
@@ -184,7 +193,8 @@ suite('Record-based residency transitions hand off the complete record (harper#2
 		deepEqual(await readRecord(A, id), { id, home: restarted.hostname, name: 'kept', size: 7, note: 'moved' });
 	});
 
-	test('a later patch on the new resident and a transition back never promote a stub or an obsolete image', async () => {
+	test('a later patch on the new resident and a transition back never promote a stub or an obsolete image', async (t) => {
+		if (ctx.skipReason) return t.skip(ctx.skipReason);
 		const { A, B } = ctx;
 		const id = 'moved-while-down';
 		await patchRecord(B, id, { note: 'edited on B' });
@@ -212,7 +222,8 @@ suite('Record-based residency transitions hand off the complete record (harper#2
 		deepEqual(await readRecord(B, id), { id, home: A.hostname, name: 'kept', size: 7, note: 'edited on B' });
 	});
 
-	test('a resident rebuilt from nothing receives the retained image from the base copy, never the stub', async () => {
+	test('a resident rebuilt from nothing receives the retained image from the base copy, never the stub', async (t) => {
+		if (ctx.skipReason) return t.skip(ctx.skipReason);
 		const { A } = ctx;
 		const id = 'moved-then-rebuilt';
 		await sendOperation(A, {
