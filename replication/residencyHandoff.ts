@@ -60,7 +60,6 @@ export function releaseTransitionEntry(table: any, id: any, version: number): Pr
 	return table?.releaseTransitionEntry?.(id, version);
 }
 
-/** True when the local row is a complete (non-INVALIDATED) record at `version` or newer. */
 export function localRowSatisfies(entry: LocalEntryState | undefined, version: number): boolean {
 	return !!entry && !((entry.metadataFlags ?? 0) & INVALIDATED) && (entry.version ?? -Infinity) >= version;
 }
@@ -73,10 +72,8 @@ export function imageMatchesRow(image: { version: number } | undefined, entry: L
 export type CopyRowDisposition = 'row' | 'image' | 'skip';
 
 /**
- * What a base copy may send a peer for a primary-store row. A complete row is sent as today. An
- * INVALIDATED stub is never a complete record: a non-resident peer still gets it (the send path turns it
- * into an `invalidate` entry carrying indexed fields), a resident peer gets the retained image at the
- * stub's version, and without one the row is withheld — the peer keeps what it holds.
+ * What a base copy may send for a primary-store row. A stub still goes to a non-resident peer because
+ * the send path turns it into an `invalidate` entry; a resident peer would store it as a complete row.
  */
 export function copyRowDisposition(
 	entry: LocalEntryState,
@@ -90,11 +87,7 @@ export function copyRowDisposition(
 
 export type FetchDisposition = 'row' | 'image' | 'miss';
 
-/**
- * What `GET_RECORD` may answer with. Stub bytes are never an answer; the retained image is one only for a
- * peer the transition's residency names, at the stub's own version. Anything else is a miss, which is
- * what the requester already handles.
- */
+/** What `GET_RECORD` may answer with; a miss is what the requester already handles. */
 export function fetchDisposition(
 	entry: LocalEntryState | undefined,
 	image: { version: number; residencyId?: number } | undefined,
@@ -247,28 +240,30 @@ export interface ReceiptRequest {
 	recordId: any;
 	version: number;
 	getEntry: (id: any) => LocalEntryState | undefined;
-	attempts?: number;
+	expiresAt: number;
 }
 
 export function receiptRequestKey(tableId: number, recordId: any): string {
 	return `${tableId}\u0000${typeof recordId}\u0000${String(recordId)}`;
 }
 
-/** A request re-checked this many times without its row completing is dropped; the sender's next sweep re-asks. */
-export const MAX_RECEIPT_REQUEST_ATTEMPTS = 1000;
+/** A request unanswered this long is dropped; the sender's next sweep re-asks. */
+export const RECEIPT_REQUEST_TTL_MS = 10 * 60_000;
 export const MAX_PENDING_RECEIPT_REQUESTS = 10000;
 
 /**
  * Answers the requests whose row this node holds complete at the requested version or newer, with every
- * blob the row references durably on disk. A stub or an absent row keeps waiting for a later commit. A
- * row that is a stub at or past the requested version moved away again and can never satisfy the
- * request, so it is dropped, as is a request that has waited out its attempts.
+ * blob the row references durably on disk. `settled` holds every request that leaves the queue: answered,
+ * expired, or made unanswerable by a strictly newer stub (the record moved away again). A stub at the
+ * requested version is the unpromoted row a redelivery is about to replace, so it keeps waiting.
  */
 export async function settleReceiptRequests(
 	requests: Iterable<ReceiptRequest>,
-	blobsComplete: (value: unknown) => Promise<boolean>
-): Promise<{ receipts: HandoffReceiptTuple[]; waiting: ReceiptRequest[] }> {
+	blobsComplete: (value: unknown) => Promise<boolean>,
+	now = Date.now()
+): Promise<{ receipts: HandoffReceiptTuple[]; settled: ReceiptRequest[]; waiting: ReceiptRequest[] }> {
 	const receipts: HandoffReceiptTuple[] = [];
+	const settled: ReceiptRequest[] = [];
 	const waiting: ReceiptRequest[] = [];
 	for (const request of requests) {
 		let entry: LocalEntryState | undefined;
@@ -289,15 +284,24 @@ export async function settleReceiptRequests(
 			}
 			if (durable) {
 				receipts.push([request.tableId, request.recordId, entry!.version!]);
+				settled.push(request);
 				continue;
 			}
-		} else if (entry && (entry.metadataFlags ?? 0) & INVALIDATED && (entry.version ?? 0) >= request.version) {
+		} else if (entry && (entry.metadataFlags ?? 0) & INVALIDATED && (entry.version ?? 0) > request.version) {
+			settled.push(request);
 			continue;
 		}
-		request.attempts = (request.attempts ?? 0) + 1;
-		if (request.attempts < MAX_RECEIPT_REQUEST_ATTEMPTS) waiting.push(request);
+		if (now >= request.expiresAt) settled.push(request);
+		else waiting.push(request);
 	}
-	return { receipts, waiting };
+	return { receipts, settled, waiting };
+}
+
+/** Outbound batches must respect the same bound the receiver enforces on inbound ones. */
+export function chunkReceipts<T>(items: T[], size = MAX_RECEIPT_BATCH): T[][] {
+	const chunks: T[][] = [];
+	for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+	return chunks;
 }
 
 export const MAX_RECEIPT_BATCH = 1000;
