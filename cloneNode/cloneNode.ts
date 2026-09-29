@@ -49,6 +49,7 @@ import {
 import {
 	isExplicitDatabaseSubscription,
 	isReplicatedDatabase as isReplicatedDatabaseUnder,
+	tableReplicates,
 } from '../replication/replicatedDatabases.ts';
 
 /**
@@ -895,7 +896,7 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 	for (const table in dbObj) {
 		const tableObj = dbObj[table];
 		// requestId is part of the describe response so we ignore it
-		if (typeof tableObj !== 'object' || tableObj == null) continue;
+		if (typeof tableObj !== 'object' || tableObj == null || !tableReplicates(tableObj)) continue;
 		if (tableObj.last_updated_record > mostRecent) {
 			mostRecent = tableObj.last_updated_record;
 		}
@@ -909,7 +910,7 @@ function sumTableSizes(dbObj: Record<string, any>): number {
 	let total = 0;
 	for (const table in dbObj) {
 		const tableObj = dbObj[table];
-		if (typeof tableObj !== 'object' || tableObj == null) continue;
+		if (typeof tableObj !== 'object' || tableObj == null || !tableReplicates(tableObj)) continue;
 		const size = tableObj.db_size ?? tableObj.table_size;
 		if (typeof size === 'number' && size > 0) total += size;
 	}
@@ -1244,6 +1245,11 @@ async function cloneSchemas(): Promise<void> {
 		const dbDescribe = allDb[dbName];
 		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;
 		if (!isReplicatedDatabase(dbName)) continue;
+		const replicatedTableNames = Object.keys(dbDescribe).filter((tableName) => {
+			const tableDesc = dbDescribe[tableName];
+			return tableDesc && typeof tableDesc === 'object' && tableReplicates(tableDesc);
+		});
+		if (replicatedTableNames.length === 0) continue;
 		if (!databases[dbName]) {
 			try {
 				await createSchema({ database: dbName, operation: OPERATIONS_ENUM.CREATE_DATABASE });
@@ -1259,9 +1265,8 @@ async function cloneSchemas(): Promise<void> {
 			}
 		}
 
-		for (const tableName of Object.keys(dbDescribe)) {
+		for (const tableName of replicatedTableNames) {
 			const tableDesc = dbDescribe[tableName];
-			if (!tableDesc || typeof tableDesc !== 'object') continue;
 			if (databases[dbName]?.[tableName]) continue;
 
 			// describe_all `attributes` entries use `{ attribute, type, is_primary_key }` — translate to

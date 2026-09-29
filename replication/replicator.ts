@@ -17,6 +17,7 @@ import {
 	onRemovedDB,
 } from '../core/resources/databases.ts';
 import { Resource } from '../core/resources/Resource.ts';
+import { tableReplicates } from './replicatedDatabases.ts';
 import { IterableEventQueue } from '../core/resources/IterableEventQueue.ts';
 import {
 	NodeReplicationConnection,
@@ -403,7 +404,7 @@ export function setReplicator(dbName: string, table: any, options: any) {
 	if (!table) {
 		return console.error(`Attempt to replicate non-existent table ${table.name} from database ${dbName}`);
 	}
-	if (table.replicate === false || table.sources?.some((source) => source.isReplicator)) return;
+	if (!tableReplicates(table) || table.sources?.some((source) => source.isReplicator)) return;
 	// We may try to consult this to get the other nodes for back-compat
 	// const { hub_routes } = getClusteringRoutes();
 	table.sourcedFrom(

@@ -127,6 +127,7 @@ import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
 import { createInflate } from 'node:zlib';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
+import { tableReplicates } from './replicatedDatabases.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
 
 // ws exposes no public accessor for the underlying socket, but replication's keep-alive and
@@ -3503,8 +3504,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// User-DB tables that received at least one audit-less copy-apply snapshot row in the current copy
 	// pass (harper-pro#495). Only these need a reload marker: an empty (or fully-audited) table delivered
 	// nothing invisible to its live subscribers, so emitting a marker for it would be wasted work. Reset
-	// on every COPY_START; the send path skips non-replicated tables, so this set is inherently
-	// replicated-only. (System-DB reload tables are a fixed list and don't consult this.)
+	// on every COPY_START; the sender's table gate (`tableToTableEntry`) skips non-replicated tables, so
+	// this set is inherently replicated-only. (System-DB reload tables are a fixed list and don't consult this.)
 	const copiedTablesThisPass = new Set<string>();
 	// Durable-eligible copy resume cursor awaiting persist (#426). The copy cursor
 	// (`{currentTable, afterKey, ...}` = "fully copied through this key") is KEY-based and, exactly like
@@ -5258,8 +5259,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						try {
 							const recordId = message[3];
 							const table = remoteTableById[tableId] || (remoteTableById[tableId] = tables[message[4]]);
-							if (!table) {
-								return logger.warn?.('Unknown table id trying to handle record request', tableId);
+							if (!table || !tableReplicates(tables[table.tableName] ?? table)) {
+								logger.warn?.(
+									connectionId,
+									'Refusing record request for',
+									databaseName,
+									message[4],
+									'from',
+									remoteNodeName
+								);
+								throw new Error(`Table ${databaseName}.${message[4]} is not available for replication`);
 							}
 							// we are sending raw binary data back, so we have to send the typed structure information so the
 							// receiving side can properly decode it. We only need to send this once until it changes again, so we can check if the structure
@@ -5545,20 +5554,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// this means we are unsubscribing
 							return;
 						const firstNode = nodeSubscriptions[0];
-						const tableToTableEntry = (table) => {
-							if (
-								table &&
-								(firstNode.replicateByDefault
-									? !firstNode.tables.includes(table.tableName)
-									: firstNode.tables.includes(table.tableName))
-							) {
-								return { table };
-							}
-						};
-						const currentTransaction = { txnLogKey: 0 };
-						let tableById;
-						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
-						let sentSequenceId; // the last sequence number we have sent
 						// Tables excluded from outgoing replication to this peer+database. Prefer this node's
 						// config-route sendsTo (the `sendRoute` resolved above), falling back to the peer's hdb_nodes
 						// authorization.replicates.sendsTo for add_node-configured peers. Previously this read only
@@ -5573,6 +5568,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							remoteNodeName,
 							databaseName
 						);
+						// The one outbound table gate (audit path, copy loop, copy-resume validation): this node's own
+						// declaration decides, not the peer's request (harper-pro#883), and route exclusions sit here
+						// ahead of any per-record work so a copied row's blobs are never opened for a skipped table.
+						// Read through the live database map: a redeclared table is a new class.
+						const tableToTableEntry = (table) => {
+							if (
+								table &&
+								tableReplicates(tables?.[table.tableName] ?? table) &&
+								!sendExcludedTables?.has(table.tableName) &&
+								(firstNode.replicateByDefault
+									? !firstNode.tables.includes(table.tableName)
+									: firstNode.tables.includes(table.tableName))
+							) {
+								return { table };
+							}
+						};
+						const currentTransaction = { txnLogKey: 0 };
+						let tableById;
+						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
+						let sentSequenceId; // the last sequence number we have sent
 						const sendAuditRecord = (auditRecord, cursor, subscriptionNodeId = auditRecord.nodeId) => {
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnLogKey) {
@@ -5626,7 +5641,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 							}
 							const table = tableEntry.table;
-							if (sendExcludedTables?.has(table.tableName)) {
+							if (!tableReplicates(tables?.[table.tableName] ?? table)) {
 								return skipAuditRecord();
 							}
 							const primaryStore = table.primaryStore;
@@ -6267,6 +6282,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												}
 												for (const entry of table.primaryStore.getRange(rangeOptions)) {
 													if (closed) return;
+													if (!tableReplicates(tables[tableName] ?? table)) break;
 													// Bound the wall-clock gap between socket flushes and event-loop yields,
 													// independent of record count. The count checkpoint below alone can let a cold
 													// batch run past the watchdog window with no bytes flushed (reads dominate cost),
@@ -6648,19 +6664,29 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					receiveExcludedTables =
 						getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName) ?? null;
 				}
-				if (tableDecoder && receiveExcludedTables?.has(tableDecoder.name)) {
+				// A table this node declares `replicate: false` is dropped like a route-excluded one: a sender
+				// that predates harper-pro#883 still forwards it, and a node-local table has one writer.
+				const dropReason =
+					tableDecoder &&
+					(receiveExcludedTables?.has(tableDecoder.name)
+						? 'table excluded by the receive route'
+						: !tableReplicates(tables?.[tableDecoder.name])
+							? 'table does not replicate on this node'
+							: undefined);
+				if (dropReason) {
 					logger.trace?.(
 						connectionId,
-						'dropping incoming replication for excluded table',
+						'dropping incoming replication for',
 						databaseName + '.' + tableDecoder.name,
 						'from',
-						remoteNodeName
+						remoteNodeName,
+						dropReason
 					);
 					if (
 						!(await recordReplicationHole(
 							remoteShortIdToLocalId.get(auditRecord.nodeId),
 							tableDecoder.name,
-							'table excluded by the receive route'
+							dropReason
 						))
 					)
 						return;
@@ -8038,7 +8064,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// if there is an explicit subscription listed
 					if (subscription.subscribe && (subscription.schema || subscription.database) === databaseName) {
 						const tableName = subscription.table;
-						if (tables?.[tableName]?.replicate !== false && !receiverExcludedTables?.has(tableName))
+						if (tableReplicates(tables?.[tableName]) && !receiverExcludedTables?.has(tableName))
 							// if replication is enabled for this table and not excluded
 							tableSubs.push(tableName);
 					}
@@ -8049,7 +8075,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				for (const tableName in tables) {
 					if (
 						replicateByDefault
-							? tables[tableName].replicate === false || receiverExcludedTables?.has(tableName)
+							? !tableReplicates(tables[tableName]) || receiverExcludedTables?.has(tableName)
 							: tables[tableName].replicate && !receiverExcludedTables?.has(tableName)
 					) {
 						tableSubs.push(tableName);
@@ -8349,12 +8375,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		sendNodeDBName(thisNodeName, databaseName);
 		return true;
 	}
-	function sendNodeDBName(thisNodeName, databaseName) {
+	// The table definitions a peer may learn from this node: never a `replicate: false` table (the
+	// frame cannot carry the flag, so the peer would materialize a replicated-by-default twin), and
+	// only the tables `subscribed` admits when a subscription scopes the schema.
+	function tableDefinitionsForPeer(databaseName: string, subscribed?: (tableName: string) => boolean) {
 		const database = getDatabases()?.[databaseName];
-		const tables = [];
+		const definitions = [];
 		for (const tableName in database) {
 			const table = database[tableName];
-			tables.push({
+			if (!tableReplicates(table) || (subscribed && !subscribed(tableName))) continue;
+			definitions.push({
 				table: tableName,
 				schemaDefined: table.schemaDefined,
 				attributes: table.attributes.map((attr) => ({
@@ -8364,6 +8394,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				})),
 			});
 		}
+		return definitions;
+	}
+	function sendNodeDBName(thisNodeName, databaseName) {
+		const tables = tableDefinitionsForPeer(databaseName);
 		logger.trace?.('Sending database info for node', thisNodeName, 'database name', databaseName);
 		// Test-only: a pre-#646 peer that sends no capability element, and a peer speaking a frame code this
 		// build does not know.
@@ -8399,28 +8433,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
 	}
 	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
-		const database = getDatabases()?.[databaseName];
-		const tables = [];
-		for (const tableName in database) {
-			if (
-				nodeSubscriptions &&
-				!nodeSubscriptions.some((node) => {
-					return node.replicateByDefault ? !node.tables.includes(tableName) : node.tables.includes(tableName);
-				})
-			)
-				continue;
-			const table = database[tableName];
-			tables.push({
-				table: tableName,
-				schemaDefined: table.schemaDefined,
-				attributes: table.attributes.map((attr) => ({
-					name: attr.name,
-					type: attr.type,
-					isPrimaryKey: attr.isPrimaryKey,
-				})),
-			});
-		}
-
+		const tables = tableDefinitionsForPeer(
+			databaseName,
+			nodeSubscriptions &&
+				((tableName) =>
+					nodeSubscriptions.some((node) =>
+						node.replicateByDefault ? !node.tables.includes(tableName) : node.tables.includes(tableName)
+					))
+		);
 		ws.send(encode([DB_SCHEMA, tables, databaseName, subscriptionSetupRequestId]));
 	}
 	blobsTimer = setInterval(
@@ -8553,6 +8573,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	// Check the attributes in the msg vs the table and if they dont match call ensureTable to create them
 	function ensureTableIfChanged(tableDefinition: any, existingTable: any) {
+		if (existingTable && !tableReplicates(existingTable)) return existingTable;
 		if (!existingTable) existingTable = {};
 		const wasSchemaDefined = existingTable.schemaDefined;
 		let hasChanges = false;
