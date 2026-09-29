@@ -1412,11 +1412,14 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
 }
 
 /**
- * Blob completeness for a residency-handoff receipt (harper#2257): unlike `storedBlobsAreComplete`, an
- * inline blob (no file id) needs no file check — its bytes are already inside the row's own encoded
- * value, which the caller has already confirmed is durably stored. Only a file-backed blob still needs
- * `blobFileMissingOrIncompleteAsync`; an unreachable one (found in the header but not in the value) fails
- * the same way `storedBlobsAreComplete` does.
+ * Blob completeness for a residency-handoff receipt (harper#2257). This proves nothing about the ROW's
+ * own durability by itself — `getEntry` can surface a copy-applied row before its WAL-off write is
+ * flushed, which is why `settleHandoffReceipts` gates on `inCopyMode`/`outstandingBlobsToFinish`/
+ * `hasBlobGap` before ever reaching this call, not on which event triggered the attempt. Given that gate
+ * held, an inline blob (no file id) needs no file check — its bytes travel inside the row's own encoded
+ * value, so whatever made the row durable made them durable too. A file-backed blob still needs
+ * `blobFileMissingOrIncompleteAsync`; a HAS_BLOBS claim reachable nowhere in the value (inline or file)
+ * fails the same way `storedBlobsAreComplete` does.
  */
 export async function receiptBlobsComplete(value: unknown): Promise<boolean> {
 	if (value == null) return false;
@@ -1426,9 +1429,6 @@ export async function receiptBlobsComplete(value: unknown): Promise<boolean> {
 		anyBlobFound = true;
 		if (getFileId(blob)) fileBlobs.push(blob);
 	});
-	// HAS_BLOBS claimed a blob but the value holds none at all (inline or file-backed) — as unreachable
-	// as `storedBlobsAreComplete`'s case, so the same conservative refusal applies. Blobs found but all
-	// inline is fine: their bytes are already inside `value`, which the caller already confirmed durable.
 	if (!anyBlobFound) return false;
 	for (const blob of fileBlobs) if ((await blobFileMissingOrIncompleteAsync(blob)) !== false) return false;
 	return true;
@@ -4612,7 +4612,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// drain or the copy finish settles exactly the deferred set.
 	const receiptRequests = new Map<string, ReceiptRequest>();
 	let receiptApplyChain: Promise<void> = Promise.resolve();
-	// when this node last asked the peer for a receipt, per record; cleared by the receipt
+	// cleared on receipt or TTL-expiry pruning; a retried request only updates the timestamp
 	const handoffRequestedAt = new Map<string, number>();
 	let settlingReceipts: Promise<void> | undefined;
 	let resettleKeys: Set<string> | undefined;
