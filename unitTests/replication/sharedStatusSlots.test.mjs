@@ -70,8 +70,16 @@ describe('replication shared-status slot registry', () => {
 		);
 	});
 
-	it('never allocates more slots than REPLICATION_SHARED_STATUS_SLOTS holds', () => {
+	it('has not exceeded its own declared capacity', () => {
 		expect(slots.ALLOCATED_SLOTS).to.be.at.most(slots.REPLICATION_SHARED_STATUS_SLOTS);
+	});
+
+	it('assertAllocationFits throws once allocation exceeds capacity, not before', () => {
+		// A module-level `if (over) throw` only ever runs in the passing case by the time this file's
+		// own import succeeds, so it can't prove the throw fires — call the extracted function directly
+		// with a deliberate overflow instead.
+		expect(() => slots.assertAllocationFits(65, 64)).to.throw(/allocated 65 slots/);
+		expect(() => slots.assertAllocationFits(64, 64)).to.not.throw();
 	});
 
 	it('never hand-numbers a *_POSITION slot constant outside the registry', () => {
