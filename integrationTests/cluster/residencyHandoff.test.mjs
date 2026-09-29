@@ -244,8 +244,8 @@ suite('Record-based residency transitions hand off the complete record (harper#2
 
 		await teardownHarper({ harper: ctx.B }).catch(() => {});
 		await rm(ctx.dataRootDirs.B, { recursive: true, force: true });
-		// not leaked: startNode reassigns ctx.B to the rebuilt node below, and the suite's after()
-		// hook tears it down through teardownHarper, which removes ctx.harper.dataRootDir itself
+		// startNode reassigns ctx.B to the rebuilt node below; the suite's after() hook tears that
+		// node down through teardownHarper, which removes ctx.harper.dataRootDir itself
 		const freshDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
 		const rebuilt = await startNode(ctx, 'B', ctx.B.hostname, freshDir);
 		await addLeader(rebuilt, A);
