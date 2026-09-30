@@ -4,12 +4,8 @@
  * a requested-but-failed CM dispatch must be terminal (not silently ok:true), --cm-trigger
  * must never bypass the deploy confirmation for a human without --yes, and declining the
  * first confirmation under --json must still emit a parsable RESULT line. Also covers
- * getArg's flag-with-no-usable-value guard and the deriveVersionName CM-slot rule.
- *
- * These exercise the pure decision helpers directly rather than spawning the script, since
- * main() drives real git/gh state with no seams to stub — except getArg's die() paths, which
- * spawn the real CLI: die() calls process.exit(), and that happens during top-level arg
- * parsing, before main() ever touches git/gh, so the subprocess exits immediately and safely.
+ * getArg's flag-with-no-usable-value guard, its require.main-only die() contract, the
+ * --version-name validation, and the deriveVersionName CM-slot rule.
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -43,7 +39,7 @@ describe('patch-release.js non-interactive contract', function () {
 		});
 
 		it('treats the string "0" as a real value, not a missing one', function () {
-			// Regression guard for the fix's own boundary: '0' is falsy-looking but a valid arg.
+			// '0' is falsy-looking but a valid arg.
 			assert.equal(getArg('--bump', 'patch', ['--bump', '0']), '0');
 		});
 
@@ -57,10 +53,15 @@ describe('patch-release.js non-interactive contract', function () {
 		// this never shells out to anything real.
 		describe('fails fast via die() instead of silently falling back to the default', function () {
 			function runCli(args) {
-				// die() exits during top-level arg parsing, well before main() could ever wait on
-				// stdin — but bound it anyway so a regression that reintroduces a prompt on this
-				// path fails the test instead of hanging the run.
-				return spawnSync(process.execPath, [scriptPath, ...args], { encoding: 'utf8', timeout: 5000 });
+				// die() exits during top-level arg parsing, well before main() ever touches git/gh —
+				// but contain it anyway: an empty PATH makes a regression that falls through into
+				// main() fail fast at "gh CLI not found" instead of running real git/gh against this
+				// worktree, and the timeout catches a regression that waits on stdin instead.
+				return spawnSync(process.execPath, [scriptPath, ...args], {
+					encoding: 'utf8',
+					timeout: 5000,
+					env: { ...process.env, PATH: '' },
+				});
 			}
 
 			it('when the flag is the last argument (value missing)', function () {
@@ -76,8 +77,6 @@ describe('patch-release.js non-interactive contract', function () {
 			});
 
 			it('when the next argument is another flag (`--branch --dry-run`)', function () {
-				// The exact bug from the task: argv[i+1] ('--dry-run') is truthy, so the old
-				// `argv[i+1] ? argv[i+1] : def` silently took it as the branch name.
 				const r = runCli(['--branch', '--dry-run']);
 				assert.equal(r.status, 1);
 				assert.match(r.stderr, /--branch requires a value/);
@@ -100,6 +99,38 @@ describe('patch-release.js non-interactive contract', function () {
 				assert.equal(result.ok, false);
 				assert.match(result.error, /--branch requires a value/);
 			});
+
+			it('does not exit the host process when the script is only require()d, not run', function () {
+				// A require()-only import (as this file does, above, to reach the pure exports) must
+				// never be able to kill the host process just because its own unrelated process.argv
+				// happens to collide with one of these flag names — only the actual CLI entry point
+				// (require.main === module) may die() here.
+				const r = spawnSync(
+					process.execPath,
+					['-e', 'require(process.argv[1])', '--', scriptPath, '--branch', '--dry-run'],
+					{ encoding: 'utf8', timeout: 5000, env: { ...process.env, PATH: '' } }
+				);
+				assert.equal(r.status, 0);
+			});
+		});
+	});
+
+	describe('--version-name validation', function () {
+		// Same die()-routing contract as getArg's failures: an invalid --version-name must exit
+		// nonzero and, under --json, still emit a parsable RESULT line — it used to exit via a
+		// bare err()+process.exit(1) that skipped the RESULT line entirely.
+		it('dies via die(), emitting a parsable RESULT line under --json', function () {
+			const r = spawnSync(process.execPath, [scriptPath, '--json', '--version-name', 'bogus'], {
+				encoding: 'utf8',
+				timeout: 5000,
+				env: { ...process.env, PATH: '' },
+			});
+			assert.equal(r.status, 1);
+			const resultLine = r.stdout.split('\n').find((line) => line.startsWith('RESULT: '));
+			assert.ok(resultLine, `expected a RESULT line on stdout, got:\n${r.stdout}`);
+			const result = JSON.parse(resultLine.slice('RESULT: '.length));
+			assert.equal(result.ok, false);
+			assert.match(result.error, /--version-name "bogus" is invalid/);
 		});
 	});
 
@@ -122,6 +153,13 @@ describe('patch-release.js non-interactive contract', function () {
 			// express this step, so it's a hand-picked target rather than a computed one.
 			assert.equal(deriveVersionName('5.2.0-beta.1', null), 'next');
 			assert.equal(deriveVersionName('5.2.0-rc.10', null), 'next');
+		});
+
+		it('handles a leading "v" the same as a bare version', function () {
+			// semver's version regex accepts an optional 'v' prefix, so this needs no special
+			// casing — locked in as a regression test since it was disputed during review.
+			assert.equal(deriveVersionName('v5.2.0-beta.1', null), 'next');
+			assert.equal(deriveVersionName('v5.2.1', null), 'stable');
 		});
 	});
 

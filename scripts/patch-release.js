@@ -112,12 +112,12 @@ const SET_VERSION = getArg('--set-version', null);
 // deliberate mismatch.
 const VERSION_NAME = getArg('--version-name', null);
 
-// Returns the value following the LAST occurrence of `flag` in `args` (so a repeated flag is
-// override-last-wins, the usual CLI convention), or `def` when `flag` is absent entirely. Every
-// occurrence is validated, not just the one whose value is returned — a flag present with no
-// usable next argument (end of argv, empty string, or another flag) is a malformed invocation,
-// not "use the default": e.g. `--branch --dry-run` must not silently take '--dry-run' as the
-// branch name, and that must hold for a later repeat too, not just the first occurrence.
+// Returns the value after the LAST occurrence of `flag` in `args` (repeats override,
+// last wins), or `def` if `flag` is absent. Every occurrence is validated, not just the
+// one returned: a flag with no usable next value (end of argv, empty, or another flag)
+// dies rather than silently falling back to `def`. die() only fires for the real CLI
+// entry point (require.main === module) — a require()-only import (as the test file
+// does, to reach the other exports) must never be able to exit the host process.
 // `args` defaults to the real argv; tests pass their own.
 function getArg(flag, def, args = argv) {
 	let value;
@@ -127,6 +127,7 @@ function getArg(flag, def, args = argv) {
 		found = true;
 		const next = args[i + 1];
 		if (!next || next.startsWith('--')) {
+			if (require.main !== module) return def;
 			die(`\n  Error: ${flag} requires a value.`);
 		}
 		value = next;
@@ -158,9 +159,9 @@ function buildCmFailureResult({ pushed, coreVersion, proVersion, error }) {
 }
 
 // ── Validate args ─────────────────────────────────────────────────────────────
-if (VERSION_NAME && VERSION_NAME !== 'stable' && VERSION_NAME !== 'next') {
-	err(`\n  Error: --version-name "${VERSION_NAME}" is invalid. Expected "stable" or "next".`);
-	process.exit(1);
+// Same require.main guard as getArg above: only the actual CLI entry point can die() here.
+if (VERSION_NAME && VERSION_NAME !== 'stable' && VERSION_NAME !== 'next' && require.main === module) {
+	die(`\n  Error: --version-name "${VERSION_NAME}" is invalid. Expected "stable" or "next".`);
 }
 
 // ── Shell helpers ─────────────────────────────────────────────────────────────
@@ -483,7 +484,7 @@ async function main() {
 	header('Deploy to environments (Central Manager)');
 	const plainVersion = proVersion.replace(/^v/, '');
 	const derivedVersionName = deriveVersionName(plainVersion, null);
-	const versionName = deriveVersionName(plainVersion, VERSION_NAME);
+	const versionName = VERSION_NAME ?? derivedVersionName;
 	const cmCmd =
 		`gh workflow run release-to-environments.yaml --repo HarperFast/central-manager ` +
 		`-f version=${plainVersion} -f version_name=${versionName} -f update_environments=all`;
