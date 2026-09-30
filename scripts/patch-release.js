@@ -163,7 +163,6 @@ function buildCmFailureResult({ pushed, coreVersion, proVersion, error }) {
 }
 
 // ── Validate args ─────────────────────────────────────────────────────────────
-// Same require.main guard as getArg above: only the actual CLI entry point can die() here.
 if (VERSION_NAME && VERSION_NAME !== 'stable' && VERSION_NAME !== 'next' && require.main === module) {
 	die(`\n  Error: --version-name "${VERSION_NAME}" is invalid. Expected "stable" or "next".`);
 }
@@ -487,8 +486,12 @@ async function main() {
 	// ── Step 6: trigger CM release-to-environments ─────────────────────────────
 	header('Deploy to environments (Central Manager)');
 	const plainVersion = proVersion.replace(/^v/, '');
+	// Two calls rather than `VERSION_NAME ?? derivedVersionName`: the override-selection logic
+	// stays in deriveVersionName (one place, exercised by production, not just by its tests) —
+	// the extra semver.prerelease() call is irrelevant for a script run a handful of times a
+	// release.
 	const derivedVersionName = deriveVersionName(plainVersion, null);
-	const versionName = VERSION_NAME ?? derivedVersionName;
+	const versionName = deriveVersionName(plainVersion, VERSION_NAME);
 	const cmCmd =
 		`gh workflow run release-to-environments.yaml --repo HarperFast/central-manager ` +
 		`-f version=${plainVersion} -f version_name=${versionName} -f update_environments=all`;

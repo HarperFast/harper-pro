@@ -97,10 +97,7 @@ describe('patch-release.js non-interactive contract', function () {
 			});
 
 			it('does not exit the host process when the script is only require()d, not run', function () {
-				// A require()-only import (as this file does, above, to reach the pure exports) must
-				// never be able to kill the host process just because its own unrelated process.argv
-				// happens to collide with one of these flag names — only the actual CLI entry point
-				// (require.main === module) may die() here.
+				// This is exactly how the top of this file imports the script's own exports.
 				const r = spawnSync(
 					process.execPath,
 					['-e', 'require(process.argv[1])', '--', scriptPath, '--branch', '--dry-run'],
@@ -165,8 +162,7 @@ describe('patch-release.js non-interactive contract', function () {
 		});
 
 		it('handles a leading "v" the same as a bare version', function () {
-			// semver's version regex accepts an optional 'v' prefix, so this needs no special
-			// casing — locked in as a regression test since it was disputed during review.
+			// semver's version regex accepts an optional 'v' prefix, so this needs no special casing.
 			assert.equal(deriveVersionName('v5.2.0-beta.1', null), 'next');
 			assert.equal(deriveVersionName('v5.2.1', null), 'stable');
 		});
