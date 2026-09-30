@@ -342,13 +342,10 @@ describe('residency handoff — redelivery and local completion', () => {
 	});
 
 	it('leaves an entry pinned (neither owed nor superseded) when the record moves to a peer the entry never named', async () => {
-		// Known, deliberate gap (PR #940's decision ledger: "redelivery assumes core completes a late
-		// image under a newer stub"): A handed the record to B; before B receipted, a patch moved it on to
-		// C, a peer the retained entry never named. C's stub needs this image to complete it, but the
-		// image's own content (and version) is B's, not C's -- redelivering it under a claim of C's
-		// residency without core's cooperation on version/field reconciliation risks handing C stale data
-		// under a false claim of completeness, which is worse than the accepted pin-forever fallback this
-		// asserts. Left to the companion core change, not fixed Pro-side.
+		// A handed the record to B; before B receipted, a patch moved it on to C, a peer the retained
+		// entry never named. The image's content and version are still B's, so redelivering it under a
+		// claim of C's residency would hand C stale fields under a false claim of completeness -- worse
+		// than pinning. Requires core to reconcile an older image against a newer stub; deferred there.
 		const table = fakeTable({
 			retained: [{ recordId: 'movedToC', tableId: 7, version: V1, residencyId: 5 }],
 			entries: { movedToC: { ...stub(V2), residencyId: 4 } },
