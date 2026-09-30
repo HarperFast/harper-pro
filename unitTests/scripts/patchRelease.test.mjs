@@ -3,12 +3,16 @@
  * (--yes/--cm-trigger/--json), covering the completion-path gaps flagged in PR #638:
  * a requested-but-failed CM dispatch must be terminal (not silently ok:true), --cm-trigger
  * must never bypass the deploy confirmation for a human without --yes, and declining the
- * first confirmation under --json must still emit a parsable RESULT line.
+ * first confirmation under --json must still emit a parsable RESULT line. Also covers
+ * getArg's flag-with-no-usable-value guard and the deriveVersionName CM-slot rule.
  *
  * These exercise the pure decision helpers directly rather than spawning the script, since
- * main() drives real git/gh state with no seams to stub.
+ * main() drives real git/gh state with no seams to stub — except getArg's die() paths, which
+ * spawn the real CLI: die() calls process.exit(), and that happens during top-level arg
+ * parsing, before main() ever touches git/gh, so the subprocess exits immediately and safely.
  */
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { closeSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -17,11 +21,95 @@ import { tmpdir } from 'node:os';
 
 const require = createRequire(import.meta.url);
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
-const { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult, buildSuccessResult, writeResult } = require(
-	join(root, 'scripts/patch-release.js')
-);
+const scriptPath = join(root, 'scripts/patch-release.js');
+const {
+	getArg,
+	deriveVersionName,
+	resolveDeployAnswer,
+	buildAbortedResult,
+	buildCmFailureResult,
+	buildSuccessResult,
+	writeResult,
+} = require(scriptPath);
 
 describe('patch-release.js non-interactive contract', function () {
+	describe('getArg', function () {
+		it('returns the default when the flag is absent', function () {
+			assert.equal(getArg('--branch', 'v5.0', ['--dry-run']), 'v5.0');
+		});
+
+		it('returns the value following a present flag', function () {
+			assert.equal(getArg('--branch', 'v5.0', ['--branch', 'v5.1']), 'v5.1');
+		});
+
+		it('treats the string "0" as a real value, not a missing one', function () {
+			// Regression guard for the fix's own boundary: '0' is falsy-looking but a valid arg.
+			assert.equal(getArg('--bump', 'patch', ['--bump', '0']), '0');
+		});
+
+		// die() calls process.exit(), which would tear down this test process if invoked
+		// in-process — so the failure paths run the real CLI as a subprocess instead. The
+		// die() call happens during top-level arg parsing, before main() touches git/gh, so
+		// this never shells out to anything real.
+		describe('fails fast via die() instead of silently falling back to the default', function () {
+			function runCli(args) {
+				return spawnSync(process.execPath, [scriptPath, ...args], { encoding: 'utf8' });
+			}
+
+			it('when the flag is the last argument (value missing)', function () {
+				const r = runCli(['--branch']);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
+			});
+
+			it('when the next argument is empty', function () {
+				const r = runCli(['--branch', '']);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
+			});
+
+			it('when the next argument is another flag (`--branch --dry-run`)', function () {
+				// The exact bug from the task: argv[i+1] ('--dry-run') is truthy, so the old
+				// `argv[i+1] ? argv[i+1] : def` silently took it as the branch name.
+				const r = runCli(['--branch', '--dry-run']);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
+			});
+
+			it('still emits a parsable RESULT line under --json', function () {
+				const r = runCli(['--json', '--branch', '--dry-run']);
+				assert.equal(r.status, 1);
+				const resultLine = r.stdout.split('\n').find((line) => line.startsWith('RESULT: '));
+				assert.ok(resultLine, `expected a RESULT line on stdout, got:\n${r.stdout}`);
+				const result = JSON.parse(resultLine.slice('RESULT: '.length));
+				assert.equal(result.ok, false);
+				assert.match(result.error, /--branch requires a value/);
+			});
+		});
+	});
+
+	describe('deriveVersionName', function () {
+		it('derives "next" for a prerelease target', function () {
+			assert.equal(deriveVersionName('5.2.0-beta.1', null), 'next');
+		});
+
+		it('derives "stable" for a GA target', function () {
+			assert.equal(deriveVersionName('5.2.1', null), 'stable');
+		});
+
+		it('lets an explicit --version-name override win even when it mismatches the derived slot', function () {
+			assert.equal(deriveVersionName('5.2.1', 'next'), 'next'); // GA forced into next
+			assert.equal(deriveVersionName('5.2.0-beta.1', 'stable'), 'stable'); // prerelease forced into stable
+		});
+
+		it('handles a --set-version prerelease-line transition target (alpha.N -> beta.1)', function () {
+			// scripts/patch-release.js's own doc example for --set-version: semver.inc can't
+			// express this step, so it's a hand-picked target rather than a computed one.
+			assert.equal(deriveVersionName('5.2.0-beta.1', null), 'next');
+			assert.equal(deriveVersionName('5.2.0-rc.10', null), 'next');
+		});
+	});
+
 	describe('resolveDeployAnswer', function () {
 		it('auto-confirms only when --cm-trigger and --yes are both set', function () {
 			assert.equal(resolveDeployAnswer({ cmTrigger: true, yesMode: true }), 'y');

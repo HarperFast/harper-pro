@@ -53,32 +53,10 @@ const path = require('path');
 const readline = require('readline');
 const semver = require('semver');
 
-// ── Args ──────────────────────────────────────────────────────────────────────
-const argv = process.argv.slice(2);
-const DRY_RUN = argv.includes('--dry-run');
-const RELEASE_BRANCH = getArg('--branch', 'v5.0');
-const CORE_RELEASE_BRANCH = getArg('--core-branch', RELEASE_BRANCH);
-const SOURCE_BRANCH = getArg('--source', 'main');
-const LABEL = getArg('--label', 'patch');
-const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major | prerelease
-// Explicit target version (without leading 'v'), overriding the --bump computation.
-// Needed for prerelease-line transitions semver.inc can't express in one step, e.g.
-// alpha.N → beta.1 (`--set-version 5.2.0-beta.1`).
-const SET_VERSION = getArg('--set-version', null);
-const YES_MODE = argv.includes('--yes');
-const CM_TRIGGER = argv.includes('--cm-trigger');
-const JSON_OUTPUT = argv.includes('--json');
-// CM version slot. Derived from the target version when unset — a prerelease goes
-// to `next`, a stable release to `stable`. Set explicitly only to force a
-// deliberate mismatch.
-const VERSION_NAME = getArg('--version-name', null);
-
-function getArg(flag, def) {
-	const i = argv.indexOf(flag);
-	return i !== -1 && argv[i + 1] ? argv[i + 1] : def;
-}
-
 // ── Logging ───────────────────────────────────────────────────────────────────
+// Defined before Args below: getArg() can call die(), which uses err()/writeResult() here —
+// a const read before its own declaration line has executed is a TDZ ReferenceError, not the
+// intended die() message, so this section has to be in place first.
 const C = {
 	reset: '\x1b[0m',
 	red: '\x1b[31m',
@@ -111,6 +89,43 @@ function die(message, code = 1, extra = {}) {
 		writeResult({ ok: false, error: cleanMessage, ...extra });
 	}
 	process.exit(code);
+}
+
+// ── Args ──────────────────────────────────────────────────────────────────────
+const argv = process.argv.slice(2);
+const DRY_RUN = argv.includes('--dry-run');
+const YES_MODE = argv.includes('--yes');
+const CM_TRIGGER = argv.includes('--cm-trigger');
+// Computed before any getArg() call below: die() (called from getArg on a bad flag value)
+// reads JSON_OUTPUT, and a const read before its own declaration line executes is a TDZ
+// ReferenceError, not the intended die() message.
+const JSON_OUTPUT = argv.includes('--json');
+const RELEASE_BRANCH = getArg('--branch', 'v5.0');
+const CORE_RELEASE_BRANCH = getArg('--core-branch', RELEASE_BRANCH);
+const SOURCE_BRANCH = getArg('--source', 'main');
+const LABEL = getArg('--label', 'patch');
+const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major | prerelease
+// Explicit target version (without leading 'v'), overriding the --bump computation.
+// Needed for prerelease-line transitions semver.inc can't express in one step, e.g.
+// alpha.N → beta.1 (`--set-version 5.2.0-beta.1`).
+const SET_VERSION = getArg('--set-version', null);
+// CM version slot. Derived from the target version when unset — a prerelease goes
+// to `next`, a stable release to `stable`. Set explicitly only to force a
+// deliberate mismatch.
+const VERSION_NAME = getArg('--version-name', null);
+
+// Returns the value following `flag` in `args`, or `def` when `flag` is absent. A flag that
+// IS present but has no usable next argument (end of argv, empty string, or another flag) is
+// a malformed invocation, not "use the default" — e.g. `--branch --dry-run` must not silently
+// take '--dry-run' as the branch name. `args` defaults to the real argv; tests pass their own.
+function getArg(flag, def, args = argv) {
+	const i = args.indexOf(flag);
+	if (i === -1) return def;
+	const value = args[i + 1];
+	if (!value || value.startsWith('--')) {
+		die(`\n  Error: ${flag} requires a value.`);
+	}
+	return value;
 }
 
 // Decides the CM-deploy prompt answer from flags: 'y'/'n' to auto-answer non-interactively,
@@ -257,6 +272,14 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 }
 
 // ── Semver helpers ────────────────────────────────────────────────────────────
+// The CM slot must follow the version. `stable` is what GA clusters consume, so
+// sending a prerelease there would put a beta in front of production traffic;
+// prereleases belong in `next`. `override` forces the rare deliberate mismatch
+// (validated upstream as 'stable' | 'next' | null).
+function deriveVersionName(version, override) {
+	return override ?? (semver.prerelease(version) ? 'next' : 'stable');
+}
+
 // Read version from a specific git ref's package.json. Without this we'd be
 // reading the working-tree version, which is typically `main` and may be
 // ahead of the release branch — producing a bogus "next version" target.
@@ -353,7 +376,9 @@ async function main() {
 			die(`--set-version "${SET_VERSION}" is not a valid semver`);
 		}
 		if (semver.compare(target, coreCurrent) <= 0 || semver.compare(target, proCurrent) <= 0) {
-			die(`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`);
+			die(
+				`--set-version "${SET_VERSION}" is not greater than current (core v${coreCurrent}, harper-pro v${proCurrent})`
+			);
 		}
 		if (
 			runSafe(`git rev-parse -q --verify "refs/tags/v${target}"`).code === 0 ||
@@ -382,7 +407,9 @@ async function main() {
 		// Use a placeholder so Step 6 can still show the CM command it would run.
 		proVersion = `v${target}`;
 	} else {
-		const confirm = YES_MODE ? 'y' : await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
+		const confirm = YES_MODE
+			? 'y'
+			: await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
 		if (confirm.toLowerCase() !== 'y') {
 			warn('Aborted.');
 			// Exit 0 (a human/--yes declined, nothing failed) but still emit a RESULT line
@@ -449,12 +476,8 @@ async function main() {
 	// ── Step 6: trigger CM release-to-environments ─────────────────────────────
 	header('Deploy to environments (Central Manager)');
 	const plainVersion = proVersion.replace(/^v/, '');
-	// The CM slot must follow the version. `stable` is what GA clusters consume, so
-	// sending a prerelease there would put a beta in front of production traffic;
-	// prereleases belong in `next`. Derive it rather than hardcode, and let
-	// --version-name override for the rare deliberate mismatch.
-	const derivedVersionName = semver.prerelease(plainVersion) ? 'next' : 'stable';
-	const versionName = VERSION_NAME ?? derivedVersionName;
+	const derivedVersionName = deriveVersionName(plainVersion, null);
+	const versionName = deriveVersionName(plainVersion, VERSION_NAME);
 	const cmCmd =
 		`gh workflow run release-to-environments.yaml --repo HarperFast/central-manager ` +
 		`-f version=${plainVersion} -f version_name=${versionName} -f update_environments=all`;
@@ -542,6 +565,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+	getArg,
+	deriveVersionName,
 	resolveDeployAnswer,
 	buildAbortedResult,
 	buildCmFailureResult,
