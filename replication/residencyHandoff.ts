@@ -349,8 +349,16 @@ export function chunkReceipts<T>(items: T[], size = MAX_RECEIPT_BATCH): T[][] {
 
 export const MAX_RECEIPT_BATCH = 1000;
 
+// Bounds a legitimate primary key never approaches, but a hostile peer's oversized id could -- rejecting
+// before writeKeyId/receiptRequestKey encode it keeps that cost off this node.
+const MAX_ID_ELEMENTS = 32;
+const MAX_ID_STRING_LENGTH = 4096;
+
 const isScalarIdPart = (part: unknown): boolean =>
-	part === null || typeof part === 'number' || typeof part === 'string' || typeof part === 'bigint';
+	part === null ||
+	typeof part === 'bigint' ||
+	(typeof part === 'number' && Number.isFinite(part)) ||
+	(typeof part === 'string' && part.length <= MAX_ID_STRING_LENGTH);
 
 /**
  * core's own `Id` contract is a scalar or a flat array of scalars, plus BigInt (ResourceInterface.ts,
@@ -359,8 +367,10 @@ const isScalarIdPart = (part: unknown): boolean =>
  */
 const isValidReceiptId = (recordId: unknown): boolean => {
 	if (recordId === undefined || recordId === null) return false;
-	if (typeof recordId === 'number' || typeof recordId === 'string' || typeof recordId === 'bigint') return true;
-	return Array.isArray(recordId) && recordId.every(isScalarIdPart);
+	if (typeof recordId === 'bigint') return true;
+	if (typeof recordId === 'number') return Number.isFinite(recordId);
+	if (typeof recordId === 'string') return recordId.length <= MAX_ID_STRING_LENGTH;
+	return Array.isArray(recordId) && recordId.length <= MAX_ID_ELEMENTS && recordId.every(isScalarIdPart);
 };
 
 /** Shape check for an inbound receipt or receipt-request batch; anything else is dropped whole. */

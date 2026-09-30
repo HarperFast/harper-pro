@@ -550,4 +550,13 @@ describe('residency handoff — wire shape', () => {
 		expect(decodeHandoffReceipts([[7, [1, [2]], V1]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, { a: 1 }, V1]])).to.equal(undefined);
 	});
+
+	it('rejects an id past the element count or string-length bound, and a nonfinite numeric part', () => {
+		expect(decodeHandoffReceipts([[7, Array(33).fill(1), V1]])).to.equal(undefined);
+		expect(decodeHandoffReceipts([[7, Array(32).fill(1), V1]])).to.not.equal(undefined);
+		expect(decodeHandoffReceipts([[7, 'x'.repeat(4097), V1]])).to.equal(undefined);
+		expect(decodeHandoffReceipts([[7, 'x'.repeat(4096), V1]])).to.not.equal(undefined);
+		expect(decodeHandoffReceipts([[7, NaN, V1]])).to.equal(undefined);
+		expect(decodeHandoffReceipts([[7, [Infinity], V1]])).to.equal(undefined);
+	});
 });
