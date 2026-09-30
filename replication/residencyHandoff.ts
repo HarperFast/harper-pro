@@ -8,6 +8,7 @@
  */
 import { INVALIDATED } from '../core/resources/Table.ts';
 import { HAS_BLOBS } from '../core/resources/auditStore.ts';
+import { writeKeyId } from '../core/resources/DatabaseTransaction.ts';
 
 /** A retained transition entry: the audit record core keeps reachable until every resident holds it. */
 export interface TransitionEntry {
@@ -292,34 +293,13 @@ export interface ReceiptRequest {
 	expiresAt: number;
 }
 
-// Untagged encodings collide: String() collapses distinct compound ids to the same text
-// (String([1,2]) === String(['1,2'])), and even a type-preserving JSON.stringify aliases a BigInt
-// against the identical-looking string (both render as "10n" once BigInt is converted to text). Each
-// arm below is tagged with a distinct leading character so no two types can produce the same output;
-// only the string arm needs JSON.stringify's escaping, since it's the only variable-length leaf that
-// can itself contain the separator characters used here. depth guards a maliciously deep/wide id: past
-// it every remaining level collapses to one tag, trading precision (a same-bucket false collision) for
-// a hard bound on recursion and output size -- the sender's own resweep re-asks either way.
-const MAX_ID_ENCODE_DEPTH = 8;
-
-function encodeIdPart(value: any, depth = 0): string {
-	if (depth > MAX_ID_ENCODE_DEPTH) return '!';
-	if (typeof value === 'bigint') return `n${value}`;
-	if (typeof value === 'number') return `#${value}`;
-	if (typeof value === 'boolean') return `b${value ? 1 : 0}`;
-	if (value === null) return 'z';
-	if (value === undefined) return 'u';
-	if (typeof value === 'string') return `s${JSON.stringify(value)}`;
-	if (Array.isArray(value)) return `[${value.map((item) => encodeIdPart(item, depth + 1)).join(',')}]`;
-	if (typeof value === 'object') {
-		const keys = Object.keys(value).sort();
-		return `{${keys.map((key) => `${JSON.stringify(key)}:${encodeIdPart(value[key], depth + 1)}`).join(',')}}`;
-	}
-	return `?${String(value)}`;
-}
-
 export function receiptRequestKey(tableId: number, recordId: any): string {
-	return `${tableId}\u0000${encodeIdPart(recordId)}`;
+	// writeKeyId, not String()/JSON.stringify: it's the SAME ordered-binary encoding the storage engines
+	// use for this id's identity (core/resources/DatabaseTransaction.ts), so it's already injective,
+	// bounded, and BigInt-correct for exactly this purpose -- reusing it beats reinventing a parallel
+	// encoder that has to rediscover the same edge cases (and, tried once here, didn't: a depth-capped
+	// hand-rolled encoder collided on two different values past the cap).
+	return `${tableId}\u0000${writeKeyId(recordId)}`;
 }
 
 /** A request unanswered this long is dropped; the sender's next sweep re-asks. */
