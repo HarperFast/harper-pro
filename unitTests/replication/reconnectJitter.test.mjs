@@ -86,3 +86,102 @@ describe('NodeReplicationConnection reconnect jitter (harper-pro#327)', () => {
 		assert.equal(scheduleDelays(connection, 1)[0], 500, 'drawing under the initial ceiling again');
 	});
 });
+
+describe('NodeReplicationConnection durable receive progress', () => {
+	function failedAttempts(connection, attempts) {
+		scheduleDelays(connection, attempts);
+		connection.retries = attempts;
+	}
+
+	it('a durable watermark past anything credited ends the failure streak', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		failedAttempts(connection, 4);
+		assert.equal(connection.retryBackoff.ceiling, 8000);
+
+		connection.onDurableProgress(1000);
+
+		assert.equal(connection.retries, 0);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
+
+	it('a watermark that has not moved is not progress, so the backoff keeps escalating', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onDurableProgress(1000);
+		failedAttempts(connection, 3);
+
+		connection.onDurableProgress(0);
+		connection.onDurableProgress(999);
+		connection.onDurableProgress(1000);
+
+		assert.equal(connection.retries, 3);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+		failedAttempts(connection, 1);
+		assert.equal(connection.retryBackoff.ceiling, 8000);
+	});
+
+	it('the credited watermark carries across sockets, so a replay from the old cursor does not reset', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onDurableProgress(5000);
+		failedAttempts(connection, 3);
+
+		connection.onDurableProgress(4000);
+		connection.onDurableProgress(5000);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+
+		connection.onDurableProgress(5001);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
+
+	it('a malformed sequence neither resets nor stops later progress from resetting', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		failedAttempts(connection, 3);
+
+		for (const malformed of [NaN, Infinity, 9e15, -1]) connection.onDurableProgress(malformed);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+		failedAttempts(connection, 3);
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, 4000, 'the replay guard still holds after the malformed values');
+	});
+
+	it('receive progress does not reset a leg whose own sends are failing until a frame goes out again', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onSendFailed();
+		failedAttempts(connection, 3);
+
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+		failedAttempts(connection, 1);
+		assert.equal(connection.retryBackoff.ceiling, 8000);
+
+		connection.onFrameSent();
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+		failedAttempts(connection, 2);
+		connection.onDurableProgress(2000);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
+
+	it('a sender that catches up after a failure releases the receive progress it vetoed', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onSendFailed();
+		failedAttempts(connection, 3);
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+
+		connection.onSenderCaughtUp();
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
+
+	it('catching up with no vetoed progress lifts the veto without resetting', () => {
+		const connection = new NodeReplicationConnection(null, null, 'db', 'peer');
+		connection.onSendFailed();
+		failedAttempts(connection, 3);
+
+		connection.onSenderCaughtUp();
+		assert.equal(connection.retryBackoff.ceiling, 4000);
+		connection.onDurableProgress(1000);
+		assert.equal(connection.retryBackoff.ceiling, INITIAL_RETRY_TIME);
+	});
+});
