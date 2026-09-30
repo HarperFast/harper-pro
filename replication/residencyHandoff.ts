@@ -351,7 +351,10 @@ export function chunkReceipts<T>(items: T[], size = MAX_RECEIPT_BATCH): T[][] {
 export const MAX_RECEIPT_BATCH = 1000;
 
 const isScalarIdPart = (part: unknown): boolean =>
-	part === null || typeof part === 'bigint' || (typeof part === 'number' && Number.isFinite(part)) || typeof part === 'string';
+	part === null ||
+	typeof part === 'bigint' ||
+	(typeof part === 'number' && Number.isFinite(part)) ||
+	typeof part === 'string';
 
 // LMDB's actual ordered-binary encoded-key limit, and the buffer to measure it with -- the same
 // constant and technique core itself uses to validate a primary key (Table.ts's checkValidId,
