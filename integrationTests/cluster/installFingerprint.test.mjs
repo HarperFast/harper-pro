@@ -106,7 +106,7 @@ suite('Install fingerprints — the origin reports a peer that installed differe
 			deployment_id: response.deployment_id,
 		});
 		deepEqual(row.install_fingerprint, expected);
-		equal(row.peer_results?.[0]?.install_matches, true, JSON.stringify(row.peer_results));
+		equal(row.peer_results[0].install_matches, true, JSON.stringify(row.peer_results));
 	});
 
 	test('a peer whose install wrote a different lockfile is named, and the deploy still succeeds', async () => {
@@ -132,10 +132,10 @@ suite('Install fingerprints — the origin reports a peer that installed differe
 			deployment_id: response.deployment_id,
 		});
 		equal(row.status, 'success');
-		equal(row.peer_results?.[0]?.install_matches, false, JSON.stringify(row.peer_results));
+		equal(row.peer_results[0].install_matches, false, JSON.stringify(row.peer_results));
 		deepEqual(row.peer_results[0].install_differs, ['package-lock.json']);
 		match(
-			JSON.stringify(row.event_log?.filter((entry) => entry.event === 'warning') ?? []),
+			JSON.stringify(row.event_log.filter((entry) => entry.event === 'warning')),
 			/Install fingerprints differ/,
 			'the warning is in the event log a streaming caller replays'
 		);
