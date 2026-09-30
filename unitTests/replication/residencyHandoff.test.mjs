@@ -354,6 +354,31 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(table.released).to.deep.equal([]);
 	});
 
+	it('rebinds a moved-on entry’s residencyId to the CURRENT residency, so the sender puts rather than invalidates', async () => {
+		// The sender (sendAuditRecord) reads `residencyId` straight off the redelivered entry to decide
+		// put-vs-invalidate for the destination peer. Left at the entry's original value (B only), C would
+		// fail that check and receive an invalidate instead of the image it needs. getTransitionImage must
+		// still resolve against the TRUE original entry, not the override wrapper -- a receiver-sensitive
+		// accessor (e.g. one closing over a private field) would throw if called with the wrong `this`.
+		let receivedThis;
+		const entry = {
+			recordId: 'movedToC',
+			tableId: 7,
+			version: V1,
+			residencyId: 5,
+			getTransitionImage() {
+				receivedThis = this;
+				return { version: V1 };
+			},
+		};
+		const table = fakeTable({ retained: [entry], entries: { movedToC: { ...stub(V2), residencyId: 4 } } });
+		const { owed } = await transitionsOwedToPeer(table, 'C', 'A', residencyOf({ ...lists, 4: ['C'] }));
+		expect(owed).to.have.lengthOf(1);
+		expect(owed[0].residencyId).to.equal(4);
+		expect(owed[0].getTransitionImage()).to.deep.equal({ version: V1 });
+		expect(receivedThis).to.equal(entry);
+	});
+
 	it('self-heals a crash-missed release even when the record has since moved to a residency naming neither peer', async () => {
 		// both B and C (entry.residencyId 3's residents) already receipted v1, then the process crashed
 		// before releasing; the record has since moved on to v2 under a residency (4: ['D']) that names

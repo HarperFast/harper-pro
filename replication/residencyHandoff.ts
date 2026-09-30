@@ -283,7 +283,22 @@ export async function transitionsOwedToPeer(
 			continue;
 		}
 		if (!currentResidency?.includes(peerName)) continue;
-		if (peersOwedImage(currentResidency, selfName, receipts, entry.version).includes(peerName)) owed.push(entry);
+		if (peersOwedImage(currentResidency, selfName, receipts, entry.version).includes(peerName)) {
+			// The sender reads `residencyId` straight off the entry it redelivers (replicationConnection.ts's
+			// sendAuditRecord) to decide put-vs-invalidate for the destination peer. Left at the entry's
+			// original value, a peer named only by the CURRENT residency would fail that check and get an
+			// invalidate instead of the image it's owed. getTransitionImage is re-bound to the true entry for
+			// the same reason the redelivery construction site binds it: prototype delegation changes a
+			// method call's receiver, and a second .bind at that site can't undo this one.
+			owed.push(
+				rowIsNewerStub
+					? Object.create(entry, {
+							residencyId: { value: row!.residencyId, enumerable: true },
+							getTransitionImage: { value: entry.getTransitionImage?.bind(entry), enumerable: true },
+						})
+					: entry
+			);
+		}
 	}
 	return { owed, superseded };
 }
