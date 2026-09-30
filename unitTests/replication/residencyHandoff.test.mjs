@@ -341,43 +341,22 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(table.released).to.deep.equal([]);
 	});
 
-	it('starts owing an entry to a peer the record’s current residency names but the retained entry never did', async () => {
-		// A handed the record to B (residencyId 5 -> ['B']); before B receipted, a patch moved it on to C
-		// (residencyId 4 -> ['C']) whose row is still a stub. C never appears in the entry's own residency,
-		// but C's stub is exactly what this retained image can complete.
+	it('leaves an entry pinned (neither owed nor superseded) when the record moves to a peer the entry never named', async () => {
+		// Known, deliberate gap (PR #940's decision ledger: "redelivery assumes core completes a late
+		// image under a newer stub"): A handed the record to B; before B receipted, a patch moved it on to
+		// C, a peer the retained entry never named. C's stub needs this image to complete it, but the
+		// image's own content (and version) is B's, not C's -- redelivering it under a claim of C's
+		// residency without core's cooperation on version/field reconciliation risks handing C stale data
+		// under a false claim of completeness, which is worse than the accepted pin-forever fallback this
+		// asserts. Left to the companion core change, not fixed Pro-side.
 		const table = fakeTable({
 			retained: [{ recordId: 'movedToC', tableId: 7, version: V1, residencyId: 5 }],
 			entries: { movedToC: { ...stub(V2), residencyId: 4 } },
 		});
 		const { owed, superseded } = await transitionsOwedToPeer(table, 'C', 'A', residencyOf({ ...lists, 4: ['C'] }));
-		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['movedToC']);
+		expect(owed).to.deep.equal([]);
 		expect(superseded).to.equal(0);
 		expect(table.released).to.deep.equal([]);
-	});
-
-	it('rebinds a moved-on entry’s residencyId to the CURRENT residency, so the sender puts rather than invalidates', async () => {
-		// The sender (sendAuditRecord) reads `residencyId` straight off the redelivered entry to decide
-		// put-vs-invalidate for the destination peer. Left at the entry's original value (B only), C would
-		// fail that check and receive an invalidate instead of the image it needs. getTransitionImage must
-		// still resolve against the TRUE original entry, not the override wrapper -- a receiver-sensitive
-		// accessor (e.g. one closing over a private field) would throw if called with the wrong `this`.
-		let receivedThis;
-		const entry = {
-			recordId: 'movedToC',
-			tableId: 7,
-			version: V1,
-			residencyId: 5,
-			getTransitionImage() {
-				receivedThis = this;
-				return { version: V1 };
-			},
-		};
-		const table = fakeTable({ retained: [entry], entries: { movedToC: { ...stub(V2), residencyId: 4 } } });
-		const { owed } = await transitionsOwedToPeer(table, 'C', 'A', residencyOf({ ...lists, 4: ['C'] }));
-		expect(owed).to.have.lengthOf(1);
-		expect(owed[0].residencyId).to.equal(4);
-		expect(owed[0].getTransitionImage()).to.deep.equal({ version: V1 });
-		expect(receivedThis).to.equal(entry);
 	});
 
 	it('self-heals a crash-missed release even when the record has since moved to a residency naming neither peer', async () => {
