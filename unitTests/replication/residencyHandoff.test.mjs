@@ -340,6 +340,20 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(table.released).to.deep.equal([]);
 	});
 
+	it('starts owing an entry to a peer the record’s current residency names but the retained entry never did', async () => {
+		// A handed the record to B (residencyId 5 -> ['B']); before B receipted, a patch moved it on to C
+		// (residencyId 4 -> ['C']) whose row is still a stub. C never appears in the entry's own residency,
+		// but C's stub is exactly what this retained image can complete.
+		const table = fakeTable({
+			retained: [{ recordId: 'movedToC', tableId: 7, version: V1, residencyId: 5 }],
+			entries: { movedToC: { ...stub(V2), residencyId: 4 } },
+		});
+		const { owed, superseded } = await transitionsOwedToPeer(table, 'C', 'A', residencyOf({ ...lists, 4: ['C'] }));
+		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['movedToC']);
+		expect(superseded).to.equal(0);
+		expect(table.released).to.deep.equal([]);
+	});
+
 	it('self-heals a crash-missed release even when the record has since moved to a residency naming neither peer', async () => {
 		// both B and C (entry.residencyId 3's residents) already receipted v1, then the process crashed
 		// before releasing; the record has since moved on to v2 under a residency (4: ['D']) that names

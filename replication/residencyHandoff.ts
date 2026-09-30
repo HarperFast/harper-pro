@@ -274,12 +274,16 @@ export async function transitionsOwedToPeer(
 			await releaseAndClearReceipts(table, entry.recordId, entry.version);
 			continue;
 		}
-		if (row && (row.version ?? -Infinity) > entry.version && !residencyOf(row.residencyId)?.includes(peerName)) {
+		// A newer stub's residency is the record's CURRENT home, not the retained entry's original target —
+		// a record that moved on to a peer the entry never named still needs the image to complete its stub.
+		const rowIsNewerStub = row && (row.version ?? -Infinity) > entry.version;
+		const currentResidency = rowIsNewerStub ? residencyOf(row!.residencyId) : residency;
+		if (rowIsNewerStub && !currentResidency?.includes(peerName)) {
 			superseded++;
 			continue;
 		}
-		if (!residency?.includes(peerName)) continue;
-		if (peersOwedImage(residency, selfName, receipts, entry.version).includes(peerName)) owed.push(entry);
+		if (!currentResidency?.includes(peerName)) continue;
+		if (peersOwedImage(currentResidency, selfName, receipts, entry.version).includes(peerName)) owed.push(entry);
 	}
 	return { owed, superseded };
 }
