@@ -292,24 +292,34 @@ export interface ReceiptRequest {
 	expiresAt: number;
 }
 
-// core patches BigInt.prototype.toJSON to always throw (server/serverHelpers/JSONStream.ts), so a
-// replacer function can't intercept it -- JSON.stringify calls toJSON before the replacer ever sees
-// the value. Pre-walk and tag any bigint (Harper ids can be BigInt) before JSON.stringify runs.
-function bigintSafe(value: any): any {
-	if (typeof value === 'bigint') return `${value}n`;
-	if (Array.isArray(value)) return value.map(bigintSafe);
-	if (value && typeof value === 'object') {
-		const out: Record<string, any> = {};
-		for (const key of Object.keys(value)) out[key] = bigintSafe(value[key]);
-		return out;
+// Untagged encodings collide: String() collapses distinct compound ids to the same text
+// (String([1,2]) === String(['1,2'])), and even a type-preserving JSON.stringify aliases a BigInt
+// against the identical-looking string (both render as "10n" once BigInt is converted to text). Each
+// arm below is tagged with a distinct leading character so no two types can produce the same output;
+// only the string arm needs JSON.stringify's escaping, since it's the only variable-length leaf that
+// can itself contain the separator characters used here. depth guards a maliciously deep/wide id: past
+// it every remaining level collapses to one tag, trading precision (a same-bucket false collision) for
+// a hard bound on recursion and output size -- the sender's own resweep re-asks either way.
+const MAX_ID_ENCODE_DEPTH = 8;
+
+function encodeIdPart(value: any, depth = 0): string {
+	if (depth > MAX_ID_ENCODE_DEPTH) return '!';
+	if (typeof value === 'bigint') return `n${value}`;
+	if (typeof value === 'number') return `#${value}`;
+	if (typeof value === 'boolean') return `b${value ? 1 : 0}`;
+	if (value === null) return 'z';
+	if (value === undefined) return 'u';
+	if (typeof value === 'string') return `s${JSON.stringify(value)}`;
+	if (Array.isArray(value)) return `[${value.map((item) => encodeIdPart(item, depth + 1)).join(',')}]`;
+	if (typeof value === 'object') {
+		const keys = Object.keys(value).sort();
+		return `{${keys.map((key) => `${JSON.stringify(key)}:${encodeIdPart(value[key], depth + 1)}`).join(',')}}`;
 	}
-	return value;
+	return `?${String(value)}`;
 }
 
 export function receiptRequestKey(tableId: number, recordId: any): string {
-	// JSON.stringify, not String(): a compound (array/object) id's String() form loses structure --
-	// String([1,2]) === String(['1,2']) === '1,2' -- and would collide two different records' requests.
-	return `${tableId}\u0000${JSON.stringify(bigintSafe(recordId))}`;
+	return `${tableId}\u0000${encodeIdPart(recordId)}`;
 }
 
 /** A request unanswered this long is dropped; the sender's next sweep re-asks. */
