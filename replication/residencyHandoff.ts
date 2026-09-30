@@ -312,7 +312,9 @@ export interface ReceiptRequest {
 }
 
 export function receiptRequestKey(tableId: number, recordId: any): string {
-	return `${tableId}\u0000${typeof recordId}\u0000${String(recordId)}`;
+	// JSON.stringify, not String(): a compound (array/object) id's String() form loses structure --
+	// String([1,2]) === String(['1,2']) === '1,2' -- and would collide two different records' requests.
+	return `${tableId}\u0000${JSON.stringify(recordId)}`;
 }
 
 /** A request unanswered this long is dropped; the sender's next sweep re-asks. */
