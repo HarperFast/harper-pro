@@ -486,10 +486,8 @@ async function main() {
 	// ── Step 6: trigger CM release-to-environments ─────────────────────────────
 	header('Deploy to environments (Central Manager)');
 	const plainVersion = proVersion.replace(/^v/, '');
-	// Two calls rather than `VERSION_NAME ?? derivedVersionName`: the override-selection logic
-	// stays in deriveVersionName (one place, exercised by production, not just by its tests) —
-	// the extra semver.prerelease() call is irrelevant for a script run a handful of times a
-	// release.
+	// The override-selection logic lives only in deriveVersionName, so this calls it for both
+	// values rather than reimplementing `VERSION_NAME ?? derivedVersionName` inline here.
 	const derivedVersionName = deriveVersionName(plainVersion, null);
 	const versionName = deriveVersionName(plainVersion, VERSION_NAME);
 	const cmCmd =
