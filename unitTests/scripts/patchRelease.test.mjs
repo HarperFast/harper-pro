@@ -48,15 +48,11 @@ describe('patch-release.js non-interactive contract', function () {
 		});
 
 		// die() calls process.exit(), which would tear down this test process if invoked
-		// in-process — so the failure paths run the real CLI as a subprocess instead. The
-		// die() call happens during top-level arg parsing, before main() touches git/gh, so
-		// this never shells out to anything real.
+		// in-process — so these run the real CLI as a subprocess instead. An empty PATH and a
+		// timeout contain a regression that falls through past die() into main()'s real git/gh
+		// calls, or waits on stdin.
 		describe('fails fast via die() instead of silently falling back to the default', function () {
 			function runCli(args) {
-				// die() exits during top-level arg parsing, well before main() ever touches git/gh —
-				// but contain it anyway: an empty PATH makes a regression that falls through into
-				// main() fail fast at "gh CLI not found" instead of running real git/gh against this
-				// worktree, and the timeout catches a regression that waits on stdin instead.
 				return spawnSync(process.execPath, [scriptPath, ...args], {
 					encoding: 'utf8',
 					timeout: 5000,
@@ -111,6 +107,19 @@ describe('patch-release.js non-interactive contract', function () {
 					{ encoding: 'utf8', timeout: 5000, env: { ...process.env, PATH: '' } }
 				);
 				assert.equal(r.status, 0);
+			});
+
+			it('still validates for real on an explicit call, even though import-time parsing is guarded', function () {
+				// The require.main guard above must not leak into explicit calls to the exported
+				// getArg (how tests exercise its validation) — only the implicit, no-args-supplied
+				// case (this module's own top-level parsing) is guarded.
+				const r = spawnSync(
+					process.execPath,
+					['-e', "require(process.argv[1]).getArg('--branch', 'v5.0', ['--branch'])", '--', scriptPath],
+					{ encoding: 'utf8', timeout: 5000, env: { ...process.env, PATH: '' } }
+				);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
 			});
 		});
 	});

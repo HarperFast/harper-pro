@@ -115,11 +115,15 @@ const VERSION_NAME = getArg('--version-name', null);
 // Returns the value after the LAST occurrence of `flag` in `args` (repeats override,
 // last wins), or `def` if `flag` is absent. Every occurrence is validated, not just the
 // one returned: a flag with no usable next value (end of argv, empty, or another flag)
-// dies rather than silently falling back to `def`. die() only fires for the real CLI
-// entry point (require.main === module) — a require()-only import (as the test file
-// does, to reach the other exports) must never be able to exit the host process.
-// `args` defaults to the real argv; tests pass their own.
-function getArg(flag, def, args = argv) {
+// dies rather than silently falling back to `def`. Explicit calls (an `args` array is
+// passed — how tests exercise validation) always validate for real. Only the implicit
+// case (`args` omitted, i.e. this module's own top-level parsing of the real argv) skips
+// die() when require.main !== module — a require()-only import (as the test file does,
+// to reach the other exports) must never be able to exit the host process just because
+// its own unrelated process.argv happens to collide with a flag name.
+function getArg(flag, def, args) {
+	const usingProcessArgv = args === undefined;
+	if (usingProcessArgv) args = argv;
 	let value;
 	let found = false;
 	for (let i = 0; i < args.length; i++) {
@@ -127,7 +131,7 @@ function getArg(flag, def, args = argv) {
 		found = true;
 		const next = args[i + 1];
 		if (!next || next.startsWith('--')) {
-			if (require.main !== module) return def;
+			if (usingProcessArgv && require.main !== module) return def;
 			die(`\n  Error: ${flag} requires a value.`);
 		}
 		value = next;
