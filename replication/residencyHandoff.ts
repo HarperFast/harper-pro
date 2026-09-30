@@ -274,31 +274,12 @@ export async function transitionsOwedToPeer(
 			await releaseAndClearReceipts(table, entry.recordId, entry.version);
 			continue;
 		}
-		// A newer stub's residency is the record's CURRENT home, not the retained entry's original target —
-		// a record that moved on to a peer the entry never named still needs the image to complete its stub.
-		const rowIsNewerStub = row && (row.version ?? -Infinity) > entry.version;
-		const currentResidency = rowIsNewerStub ? residencyOf(row!.residencyId) : residency;
-		if (rowIsNewerStub && !currentResidency?.includes(peerName)) {
+		if (row && (row.version ?? -Infinity) > entry.version && !residencyOf(row.residencyId)?.includes(peerName)) {
 			superseded++;
 			continue;
 		}
-		if (!currentResidency?.includes(peerName)) continue;
-		if (peersOwedImage(currentResidency, selfName, receipts, entry.version).includes(peerName)) {
-			// The sender reads `residencyId` straight off the entry it redelivers (replicationConnection.ts's
-			// sendAuditRecord) to decide put-vs-invalidate for the destination peer. Left at the entry's
-			// original value, a peer named only by the CURRENT residency would fail that check and get an
-			// invalidate instead of the image it's owed. getTransitionImage is re-bound to the true entry for
-			// the same reason the redelivery construction site binds it: prototype delegation changes a
-			// method call's receiver, and a second .bind at that site can't undo this one.
-			owed.push(
-				rowIsNewerStub
-					? Object.create(entry, {
-							residencyId: { value: row!.residencyId, enumerable: true },
-							getTransitionImage: { value: entry.getTransitionImage?.bind(entry), enumerable: true },
-						})
-					: entry
-			);
-		}
+		if (!residency?.includes(peerName)) continue;
+		if (peersOwedImage(residency, selfName, receipts, entry.version).includes(peerName)) owed.push(entry);
 	}
 	return { owed, superseded };
 }
