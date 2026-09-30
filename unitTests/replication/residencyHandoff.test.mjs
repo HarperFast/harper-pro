@@ -19,6 +19,7 @@ import {
 	MAX_RECEIPT_BATCH,
 	RECEIPT_REQUEST_TTL_MS,
 	peersOwedImage,
+	receiptRequestKey,
 	recordHandoffReceipt,
 	settleReceiptRequests,
 	transitionsOwedToPeer,
@@ -409,6 +410,14 @@ describe('residency handoff — redelivery and local completion', () => {
 		const table = fakeTable();
 		delete table.pendingTransitionEntries;
 		expect(await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists))).to.deep.equal({ owed: [], superseded: 0 });
+	});
+});
+
+describe('receiptRequestKey', () => {
+	it('distinguishes compound ids that String() would collapse to the same string', () => {
+		expect(receiptRequestKey(7, [1, 2])).to.not.equal(receiptRequestKey(7, ['1', 2]));
+		expect(receiptRequestKey(7, [1, 2])).to.not.equal(receiptRequestKey(7, ['1,2']));
+		expect(receiptRequestKey(7, 'r')).to.not.equal(receiptRequestKey(7, ['r']));
 	});
 });
 
