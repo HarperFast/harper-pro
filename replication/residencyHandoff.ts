@@ -9,6 +9,7 @@
 import { INVALIDATED } from '../core/resources/Table.ts';
 import { HAS_BLOBS } from '../core/resources/auditStore.ts';
 import { writeKeyId } from '../core/resources/DatabaseTransaction.ts';
+import { writeKey } from 'ordered-binary';
 
 /** A retained transition entry: the audit record core keeps reachable until every resident holds it. */
 export interface TransitionEntry {
@@ -349,16 +350,15 @@ export function chunkReceipts<T>(items: T[], size = MAX_RECEIPT_BATCH): T[][] {
 
 export const MAX_RECEIPT_BATCH = 1000;
 
-// Bounds a legitimate primary key never approaches, but a hostile peer's oversized id could -- rejecting
-// before writeKeyId/receiptRequestKey encode it keeps that cost off this node.
-const MAX_ID_ELEMENTS = 32;
-const MAX_ID_STRING_LENGTH = 4096;
-
 const isScalarIdPart = (part: unknown): boolean =>
-	part === null ||
-	typeof part === 'bigint' ||
-	(typeof part === 'number' && Number.isFinite(part)) ||
-	(typeof part === 'string' && part.length <= MAX_ID_STRING_LENGTH);
+	part === null || typeof part === 'bigint' || (typeof part === 'number' && Number.isFinite(part)) || typeof part === 'string';
+
+// LMDB's actual ordered-binary encoded-key limit, and the buffer to measure it with -- the same
+// constant and technique core itself uses to validate a primary key (Table.ts's checkValidId,
+// security/user.ts's keyTooLargeForStore), so an id this rejects is one core would reject too, and one
+// it accepts is one core would actually store.
+const MAX_KEY_BYTES = 1978;
+const KEY_SIZE_TEST_BUFFER = Buffer.allocUnsafeSlow(8192);
 
 /**
  * core's own `Id` contract is a scalar or a flat array of scalars, plus BigInt (ResourceInterface.ts,
@@ -367,10 +367,12 @@ const isScalarIdPart = (part: unknown): boolean =>
  */
 const isValidReceiptId = (recordId: unknown): boolean => {
 	if (recordId === undefined || recordId === null) return false;
-	if (typeof recordId === 'bigint') return true;
-	if (typeof recordId === 'number') return Number.isFinite(recordId);
-	if (typeof recordId === 'string') return recordId.length <= MAX_ID_STRING_LENGTH;
-	return Array.isArray(recordId) && recordId.length <= MAX_ID_ELEMENTS && recordId.every(isScalarIdPart);
+	if (!isScalarIdPart(recordId) && !(Array.isArray(recordId) && recordId.every(isScalarIdPart))) return false;
+	try {
+		return writeKey(recordId, KEY_SIZE_TEST_BUFFER, 0) <= MAX_KEY_BYTES;
+	} catch {
+		return false;
+	}
 };
 
 /** Shape check for an inbound receipt or receipt-request batch; anything else is dropped whole. */
