@@ -403,6 +403,19 @@ describe('receiptRequestKey', () => {
 		expect(() => receiptRequestKey(7, 10n)).to.not.throw();
 		expect(receiptRequestKey(7, 10n)).to.not.equal(receiptRequestKey(7, 11n));
 	});
+
+	it('distinguishes a BigInt id from the identical-looking string, unlike an untagged conversion', () => {
+		// String(10n) === '10' === String('10'), and a naive bigint->string tag ('10n') collides with the
+		// literal string '10n' too -- only a per-type tag distinguishes them.
+		expect(receiptRequestKey(7, 10n)).to.not.equal(receiptRequestKey(7, '10n'));
+		expect(receiptRequestKey(7, [10n])).to.not.equal(receiptRequestKey(7, ['10n']));
+	});
+
+	it('bounds recursion on a deeply nested id rather than growing without limit', () => {
+		let deep = 1;
+		for (let i = 0; i < 100; i++) deep = [deep];
+		expect(() => receiptRequestKey(7, deep)).to.not.throw();
+	});
 });
 
 describe('residency handoff — answering receipt requests', () => {
