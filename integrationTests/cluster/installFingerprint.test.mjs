@@ -1,7 +1,3 @@
-/**
- * Every node of a replicated deploy installs for itself. The origin compares each peer's install fingerprint with its
- * own and reports a difference, without failing the deploy.
- */
 import { suite, test, before, after } from 'node:test';
 import { deepEqual, equal, match, ok } from 'node:assert';
 import { createHash } from 'node:crypto';
@@ -62,9 +58,9 @@ suite('Install fingerprints — the origin reports a peer that installed differe
 			authorization: 'Bearer ' + operation_token,
 		});
 		await waitForCondition(
-			async () => {
+			async (signal) => {
 				const statuses = await Promise.all(
-					ctx.nodes.map((node) => sendOperation(node, { operation: 'cluster_status' }))
+					ctx.nodes.map((node) => sendOperation(node, { operation: 'cluster_status' }, { signal }))
 				);
 				// `every` over an empty socket list is vacuously true, which would report an unmeshed cluster as ready.
 				return statuses.every(
