@@ -552,8 +552,9 @@ describe('residency handoff — wire shape', () => {
 	});
 
 	it('rejects an id whose ordered-binary encoding exceeds LMDB’s real key-size limit (core’s own bound), and a nonfinite numeric part', () => {
-		// core's checkValidId (Table.ts) and keyTooLargeForStore (security/user.ts) reject a key past the
-		// same 1978-byte ordered-binary limit -- an id that fails this check is one core would reject too.
+		// core's checkValidId (Table.ts) and keyTooLargeForStore (security/user.ts) use the same
+		// 1978-byte ordered-binary limit for the size check; this filter is stricter on a few
+		// pathological shapes (e.g. a top-level Infinity) than checkValidId's NaN-only number check.
 		expect(decodeHandoffReceipts([[7, 'x'.repeat(100), V1]])).to.not.equal(undefined);
 		expect(decodeHandoffReceipts([[7, 'x'.repeat(3000), V1]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, Array(1000).fill(1), V1]])).to.equal(undefined);

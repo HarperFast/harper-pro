@@ -358,8 +358,10 @@ const isScalarIdPart = (part: unknown): boolean =>
 
 // LMDB's actual ordered-binary encoded-key limit, and the buffer to measure it with -- the same
 // constant and technique core itself uses to validate a primary key (Table.ts's checkValidId,
-// security/user.ts's keyTooLargeForStore), so an id this rejects is one core would reject too, and one
-// it accepts is one core would actually store.
+// security/user.ts's keyTooLargeForStore). This filter is stricter than core's in a few pathological
+// corners (e.g. it rejects a top-level Infinity, which checkValidId's NaN-only number check would
+// accept); that only means an already-vanishingly-unlikely id shape gets pinned instead of receipted,
+// the same safe direction as every other pin-over-release choice in this file.
 const MAX_KEY_BYTES = 1978;
 const KEY_SIZE_TEST_BUFFER = Buffer.allocUnsafeSlow(8192);
 
