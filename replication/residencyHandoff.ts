@@ -352,6 +352,23 @@ export function chunkReceipts<T>(items: T[], size = MAX_RECEIPT_BATCH): T[][] {
 
 export const MAX_RECEIPT_BATCH = 1000;
 
+const isScalarIdPart = (part: unknown): boolean =>
+	part === null || typeof part === 'number' || typeof part === 'string' || typeof part === 'bigint';
+
+/**
+ * core's own `Id` contract is a scalar or a flat array of scalars (ResourceInterface.ts's `Id` type,
+ * plus BigInt -- see DatabaseTransaction.ts's writeKeyId comment), and that type allows a bare `null`
+ * top-level id too -- but a receipt/request for "no record" is meaningless here, so null/undefined stay
+ * rejected at the top level same as before, while null is still a valid ELEMENT of a compound id.
+ * Rejecting anything else here, before it reaches writeKeyId/receiptRequestKey, keeps a peer from
+ * spending our CPU on nested/deep shapes core was never going to accept as a record id in the first place.
+ */
+const isValidReceiptId = (recordId: unknown): boolean => {
+	if (recordId === undefined || recordId === null) return false;
+	if (typeof recordId === 'number' || typeof recordId === 'string' || typeof recordId === 'bigint') return true;
+	return Array.isArray(recordId) && recordId.every(isScalarIdPart);
+};
+
 /** Shape check for an inbound receipt or receipt-request batch; anything else is dropped whole. */
 export function decodeHandoffReceipts(data: unknown, maxItems = MAX_RECEIPT_BATCH): HandoffReceiptTuple[] | undefined {
 	if (!Array.isArray(data) || data.length > maxItems) return undefined;
@@ -361,7 +378,7 @@ export function decodeHandoffReceipts(data: unknown, maxItems = MAX_RECEIPT_BATC
 		const [tableId, recordId, version] = item;
 		if (!Number.isSafeInteger(tableId) || tableId < 0) return undefined;
 		if (typeof version !== 'number' || !Number.isFinite(version) || version <= 0) return undefined;
-		if (recordId === undefined || recordId === null) return undefined;
+		if (!isValidReceiptId(recordId)) return undefined;
 		receipts.push([tableId, recordId, version]);
 	}
 	return receipts;
