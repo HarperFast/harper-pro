@@ -419,6 +419,11 @@ describe('receiptRequestKey', () => {
 		expect(receiptRequestKey(7, [1, 2])).to.not.equal(receiptRequestKey(7, ['1,2']));
 		expect(receiptRequestKey(7, 'r')).to.not.equal(receiptRequestKey(7, ['r']));
 	});
+
+	it('does not throw on a BigInt id, which bare JSON.stringify cannot serialize', () => {
+		expect(() => receiptRequestKey(7, 10n)).to.not.throw();
+		expect(receiptRequestKey(7, 10n)).to.not.equal(receiptRequestKey(7, 11n));
+	});
 });
 
 describe('residency handoff — answering receipt requests', () => {

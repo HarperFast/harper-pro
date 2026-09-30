@@ -311,10 +311,24 @@ export interface ReceiptRequest {
 	expiresAt: number;
 }
 
+// core patches BigInt.prototype.toJSON to always throw (server/serverHelpers/JSONStream.ts), so a
+// replacer function can't intercept it -- JSON.stringify calls toJSON before the replacer ever sees
+// the value. Pre-walk and tag any bigint (Harper ids can be BigInt) before JSON.stringify runs.
+function bigintSafe(value: any): any {
+	if (typeof value === 'bigint') return `${value}n`;
+	if (Array.isArray(value)) return value.map(bigintSafe);
+	if (value && typeof value === 'object') {
+		const out: Record<string, any> = {};
+		for (const key of Object.keys(value)) out[key] = bigintSafe(value[key]);
+		return out;
+	}
+	return value;
+}
+
 export function receiptRequestKey(tableId: number, recordId: any): string {
 	// JSON.stringify, not String(): a compound (array/object) id's String() form loses structure --
 	// String([1,2]) === String(['1,2']) === '1,2' -- and would collide two different records' requests.
-	return `${tableId}\u0000${JSON.stringify(recordId)}`;
+	return `${tableId}\u0000${JSON.stringify(bigintSafe(recordId))}`;
 }
 
 /** A request unanswered this long is dropped; the sender's next sweep re-asks. */
