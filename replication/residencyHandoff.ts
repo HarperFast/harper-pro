@@ -294,11 +294,8 @@ export interface ReceiptRequest {
 }
 
 export function receiptRequestKey(tableId: number, recordId: any): string {
-	// writeKeyId, not String()/JSON.stringify: it's the SAME ordered-binary encoding the storage engines
-	// use for this id's identity (core/resources/DatabaseTransaction.ts), so it's already injective,
-	// bounded, and BigInt-correct for exactly this purpose -- reusing it beats reinventing a parallel
-	// encoder that has to rediscover the same edge cases (and, tried once here, didn't: a depth-capped
-	// hand-rolled encoder collided on two different values past the cap).
+	// writeKeyId is the storage engines' own identity for this id (core/resources/DatabaseTransaction.ts) --
+	// injective and BigInt-correct already, unlike String()/JSON.stringify.
 	return `${tableId}\u0000${writeKeyId(recordId)}`;
 }
 
@@ -356,12 +353,9 @@ const isScalarIdPart = (part: unknown): boolean =>
 	part === null || typeof part === 'number' || typeof part === 'string' || typeof part === 'bigint';
 
 /**
- * core's own `Id` contract is a scalar or a flat array of scalars (ResourceInterface.ts's `Id` type,
- * plus BigInt -- see DatabaseTransaction.ts's writeKeyId comment), and that type allows a bare `null`
- * top-level id too -- but a receipt/request for "no record" is meaningless here, so null/undefined stay
- * rejected at the top level same as before, while null is still a valid ELEMENT of a compound id.
- * Rejecting anything else here, before it reaches writeKeyId/receiptRequestKey, keeps a peer from
- * spending our CPU on nested/deep shapes core was never going to accept as a record id in the first place.
+ * core's own `Id` contract is a scalar or a flat array of scalars, plus BigInt (ResourceInterface.ts,
+ * DatabaseTransaction.ts). A receipt for "no record" is meaningless, so top-level null/undefined stay
+ * rejected as before even though core's `Id` type allows a bare null; null remains valid as an element.
  */
 const isValidReceiptId = (recordId: unknown): boolean => {
 	if (recordId === undefined || recordId === null) return false;
