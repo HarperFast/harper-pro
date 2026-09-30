@@ -47,6 +47,10 @@ describe('patch-release.js non-interactive contract', function () {
 			assert.equal(getArg('--bump', 'patch', ['--bump', '0']), '0');
 		});
 
+		it('a repeated flag is last-occurrence-wins', function () {
+			assert.equal(getArg('--branch', 'v5.0', ['--branch', 'v5.1', '--branch', 'v5.2']), 'v5.2');
+		});
+
 		// die() calls process.exit(), which would tear down this test process if invoked
 		// in-process — so the failure paths run the real CLI as a subprocess instead. The
 		// die() call happens during top-level arg parsing, before main() touches git/gh, so
@@ -75,6 +79,14 @@ describe('patch-release.js non-interactive contract', function () {
 				// The exact bug from the task: argv[i+1] ('--dry-run') is truthy, so the old
 				// `argv[i+1] ? argv[i+1] : def` silently took it as the branch name.
 				const r = runCli(['--branch', '--dry-run']);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
+			});
+
+			it('when a later occurrence of the flag is malformed, even though the first is fine', function () {
+				// indexOf-based lookup would validate only the first '--branch' and silently
+				// proceed on 'v5.0', ignoring that the second occurrence has no value.
+				const r = runCli(['--branch', 'v5.0', '--branch']);
 				assert.equal(r.status, 1);
 				assert.match(r.stderr, /--branch requires a value/);
 			});

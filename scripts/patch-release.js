@@ -96,9 +96,7 @@ const argv = process.argv.slice(2);
 const DRY_RUN = argv.includes('--dry-run');
 const YES_MODE = argv.includes('--yes');
 const CM_TRIGGER = argv.includes('--cm-trigger');
-// Computed before any getArg() call below: die() (called from getArg on a bad flag value)
-// reads JSON_OUTPUT, and a const read before its own declaration line executes is a TDZ
-// ReferenceError, not the intended die() message.
+// Computed before any getArg() call below — see the Logging section's note on why.
 const JSON_OUTPUT = argv.includes('--json');
 const RELEASE_BRANCH = getArg('--branch', 'v5.0');
 const CORE_RELEASE_BRANCH = getArg('--core-branch', RELEASE_BRANCH);
@@ -114,18 +112,26 @@ const SET_VERSION = getArg('--set-version', null);
 // deliberate mismatch.
 const VERSION_NAME = getArg('--version-name', null);
 
-// Returns the value following `flag` in `args`, or `def` when `flag` is absent. A flag that
-// IS present but has no usable next argument (end of argv, empty string, or another flag) is
-// a malformed invocation, not "use the default" — e.g. `--branch --dry-run` must not silently
-// take '--dry-run' as the branch name. `args` defaults to the real argv; tests pass their own.
+// Returns the value following the LAST occurrence of `flag` in `args` (so a repeated flag is
+// override-last-wins, the usual CLI convention), or `def` when `flag` is absent entirely. Every
+// occurrence is validated, not just the one whose value is returned — a flag present with no
+// usable next argument (end of argv, empty string, or another flag) is a malformed invocation,
+// not "use the default": e.g. `--branch --dry-run` must not silently take '--dry-run' as the
+// branch name, and that must hold for a later repeat too, not just the first occurrence.
+// `args` defaults to the real argv; tests pass their own.
 function getArg(flag, def, args = argv) {
-	const i = args.indexOf(flag);
-	if (i === -1) return def;
-	const value = args[i + 1];
-	if (!value || value.startsWith('--')) {
-		die(`\n  Error: ${flag} requires a value.`);
+	let value;
+	let found = false;
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] !== flag) continue;
+		found = true;
+		const next = args[i + 1];
+		if (!next || next.startsWith('--')) {
+			die(`\n  Error: ${flag} requires a value.`);
+		}
+		value = next;
 	}
-	return value;
+	return found ? value : def;
 }
 
 // Decides the CM-deploy prompt answer from flags: 'y'/'n' to auto-answer non-interactively,
