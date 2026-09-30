@@ -551,11 +551,12 @@ describe('residency handoff — wire shape', () => {
 		expect(decodeHandoffReceipts([[7, { a: 1 }, V1]])).to.equal(undefined);
 	});
 
-	it('rejects an id past the element count or string-length bound, and a nonfinite numeric part', () => {
-		expect(decodeHandoffReceipts([[7, Array(33).fill(1), V1]])).to.equal(undefined);
-		expect(decodeHandoffReceipts([[7, Array(32).fill(1), V1]])).to.not.equal(undefined);
-		expect(decodeHandoffReceipts([[7, 'x'.repeat(4097), V1]])).to.equal(undefined);
-		expect(decodeHandoffReceipts([[7, 'x'.repeat(4096), V1]])).to.not.equal(undefined);
+	it('rejects an id whose ordered-binary encoding exceeds LMDB’s real key-size limit (core’s own bound), and a nonfinite numeric part', () => {
+		// core's checkValidId (Table.ts) and keyTooLargeForStore (security/user.ts) reject a key past the
+		// same 1978-byte ordered-binary limit -- an id that fails this check is one core would reject too.
+		expect(decodeHandoffReceipts([[7, 'x'.repeat(100), V1]])).to.not.equal(undefined);
+		expect(decodeHandoffReceipts([[7, 'x'.repeat(3000), V1]])).to.equal(undefined);
+		expect(decodeHandoffReceipts([[7, Array(1000).fill(1), V1]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, NaN, V1]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, [Infinity], V1]])).to.equal(undefined);
 	});
