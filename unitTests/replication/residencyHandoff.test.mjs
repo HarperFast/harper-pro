@@ -396,7 +396,6 @@ describe('receiptRequestKey', () => {
 	it('distinguishes compound ids that String() would collapse to the same string', () => {
 		expect(receiptRequestKey(7, [1, 2])).to.not.equal(receiptRequestKey(7, ['1', 2]));
 		expect(receiptRequestKey(7, [1, 2])).to.not.equal(receiptRequestKey(7, ['1,2']));
-		expect(receiptRequestKey(7, 'r')).to.not.equal(receiptRequestKey(7, ['r']));
 	});
 
 	it('does not throw on a BigInt id, which bare JSON.stringify cannot serialize', () => {
@@ -406,15 +405,23 @@ describe('receiptRequestKey', () => {
 
 	it('distinguishes a BigInt id from the identical-looking string, unlike an untagged conversion', () => {
 		// String(10n) === '10' === String('10'), and a naive bigint->string tag ('10n') collides with the
-		// literal string '10n' too -- only a per-type tag distinguishes them.
+		// literal string '10n' too -- writeKeyId (the storage engines' own key identity) does not.
 		expect(receiptRequestKey(7, 10n)).to.not.equal(receiptRequestKey(7, '10n'));
 		expect(receiptRequestKey(7, [10n])).to.not.equal(receiptRequestKey(7, ['10n']));
 	});
 
-	it('bounds recursion on a deeply nested id rather than growing without limit', () => {
+	it('does not throw on a deeply nested id', () => {
 		let deep = 1;
 		for (let i = 0; i < 100; i++) deep = [deep];
 		expect(() => receiptRequestKey(7, deep)).to.not.throw();
+	});
+
+	it('matches the storage engines’ own key identity, including where that aliases a scalar with its singleton array', () => {
+		// writeKeyId is the SAME identity core's stores use (DatabaseTransaction.ts): 'r' and ['r'] are
+		// the same stored key there, so treating them as the same receipt-request identity here is
+		// correct, not a collision -- a hand-rolled per-type-tagged encoder that told them apart would be
+		// answering a receipt for the wrong notion of "the same record".
+		expect(receiptRequestKey(7, 'r')).to.equal(receiptRequestKey(7, ['r']));
 	});
 });
 
