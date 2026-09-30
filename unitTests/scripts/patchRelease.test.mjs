@@ -53,7 +53,10 @@ describe('patch-release.js non-interactive contract', function () {
 		// this never shells out to anything real.
 		describe('fails fast via die() instead of silently falling back to the default', function () {
 			function runCli(args) {
-				return spawnSync(process.execPath, [scriptPath, ...args], { encoding: 'utf8' });
+				// die() exits during top-level arg parsing, well before main() could ever wait on
+				// stdin — but bound it anyway so a regression that reintroduces a prompt on this
+				// path fails the test instead of hanging the run.
+				return spawnSync(process.execPath, [scriptPath, ...args], { encoding: 'utf8', timeout: 5000 });
 			}
 
 			it('when the flag is the last argument (value missing)', function () {
