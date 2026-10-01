@@ -7,6 +7,7 @@ import {
 	MINIMUM_PROTOCOL_VERSION,
 	RECORD_LOCKS_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
+	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
@@ -28,6 +29,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				subscriptionSetupAck: 0,
 				subscriptionSetupBudgetMs: undefined,
 				recordLocks: 0,
+				tableLifecycle: 0,
 			}
 		);
 	});
@@ -51,6 +53,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 			'recordLocks',
 			'subscriptionSetupAck',
 			'subscriptionSetupBudgetMs',
+			'tableLifecycle',
 		]);
 	});
 
@@ -220,6 +223,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
+				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -248,6 +252,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
+				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 			}
 		);
 	});

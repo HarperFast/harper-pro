@@ -7,7 +7,13 @@ import {
 	table as ensureTable,
 	onUpdatedTable,
 	onRemovedDB,
+	onTableDropRecorded,
+	getTableDrops,
+	recordTableDrop,
+	dropTableMeta,
+	isDeadGeneration,
 } from '../core/resources/databases.ts';
+import { validateDropMarkers, dropMarkersByTable, definitionIsDead } from './tableLifecycle.ts';
 import {
 	createAuditEntry,
 	Decoder,
@@ -65,6 +71,7 @@ import {
 	createUnknownCommandState,
 	noteUnknownCommand,
 	peerSupportsRecordLocks,
+	peerSupportsTableLifecycle,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -735,6 +742,10 @@ const unknownCommandWarnThrottle = createThrottleState();
 // millisecond, and an NTP step backwards would make every later session compare older.
 let nextConnectionSessionOrdinal = 0;
 const TEST_OMIT_CAPABILITIES = process.env.HARPER_TEST_OMIT_REPLICATION_CAPABILITIES === '1';
+/** Test-only: a pre-#1212 sender has no capability bag and no lifecycle stamps on its definitions. */
+function advertisedCreatedTime(table: { createdTime?: number }): number | undefined {
+	return TEST_OMIT_CAPABILITIES ? undefined : table.createdTime;
+}
 // Only 200-255: every allocated command code is below 200, so a mis-set value cannot make a real node
 // emit a live DISCONNECT or drive its peer into copy mode.
 const TEST_UNKNOWN_COMMAND_CODE = Number(process.env.HARPER_TEST_SEND_UNKNOWN_COMMAND_CODE);
@@ -4421,7 +4432,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	if (databaseName) {
 		setDatabase(databaseName);
 	}
-	let schemaUpdateListener, dbRemovalListener;
+	let schemaUpdateListener, dbRemovalListener, dropRecordedListener;
 	const tableDecoders = [];
 	const remoteTableById = [];
 	let receivingDataFromNodeNames;
@@ -4846,15 +4857,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										schemaUpdateListener = forEachReplicatedDatabase(options, (database, databaseName) => {
 											if (checkDatabaseAccess(databaseName)) sendDBSchema(databaseName);
 										});
+										// A marker learned from another peer announces like a schema change: the drop it records
+										// has to reach peers that reconnect here first.
+										dropRecordedListener = onTableDropRecorded((database) => {
+											if (databases[database] && checkDatabaseAccess(database)) sendDBSchema(database);
+										});
 										// onWSMessage is async, so the WS may have already closed by the time we get
 										// here — in that case 'close' has fired and adding the cleanup listener now
 										// would silently leak. Drop the registration immediately.
 										if (wsClosed) {
 											schemaUpdateListener.remove();
+											dropRecordedListener.remove();
 											schemaUpdateListener = undefined;
+											dropRecordedListener = undefined;
 										} else {
 											ws.on('close', () => {
 												schemaUpdateListener?.remove();
+												dropRecordedListener?.remove();
 											});
 										}
 									}
@@ -4893,11 +4912,27 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							'Received table definitions for',
 							data.map((t) => t.table)
 						);
+						const schemaDatabaseName = message[2];
+						// The peer's drop markers first: a stale local generation goes before its own definition could
+						// be re-sent, and before this frame's definitions are compared against the markers it leaves.
+						const peerDropMarkers = checkDatabaseAccess(schemaDatabaseName) ? validateDropMarkers(message[4]) : [];
+						if (peerDropMarkers.length > 0) await applyPeerDropMarkers(schemaDatabaseName, peerDropMarkers);
+						const localDropMarkers = dropMarkersByTable(getTableDrops(schemaDatabaseName));
 						for (const tableDefinition of data) {
-							const newDatabaseName = message[2];
+							const newDatabaseName = schemaDatabaseName;
 							tableDefinition.database = newDatabaseName;
 							let table: any;
 							if (checkDatabaseAccess(newDatabaseName)) {
+								if (
+									definitionIsDead(
+										tableDefinition,
+										localDropMarkers.get(tableDefinition.table),
+										databases[newDatabaseName]?.[tableDefinition.table]
+									)
+								) {
+									refuseDeadDefinition(newDatabaseName, tableDefinition, 'DB_SCHEMA');
+									continue;
+								}
 								if (databaseName === 'system') {
 									// the system connection allows us to create new databases (which wouldn't otherwise have an existing connection)
 									if (!databases[newDatabaseName]?.[tableDefinition.table]) {
@@ -4967,12 +5002,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							return;
 						}
 						let table = tables[tableName];
+						if (definitionIsDead(data, dropMarkersByTable(getTableDrops(databaseName)).get(tableName), table)) {
+							refuseDeadDefinition(
+								databaseName,
+								{ table: tableName, createdTime: data.createdTime },
+								'TABLE_FIXED_STRUCTURE'
+							);
+							// Records of the dead generation follow this frame; they are skipped, never held or applied.
+							tableDecoders[tableId] = { name: tableName, refused: true };
+							break;
+						}
 						table = ensureTableIfChanged(
 							{
 								table: tableName,
 								database: databaseName,
 								attributes: data.attributes,
 								schemaDefined: data.schemaDefined,
+								createdTime: data.createdTime,
 							},
 							table
 						);
@@ -5341,6 +5387,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										{
 											typedStructs: structure.typed,
 											structures: structure.named,
+											createdTime: advertisedCreatedTime(table),
 										},
 										tableId,
 										table.tableName,
@@ -5408,6 +5455,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const { resolve, reject, tableId, key } = awaitingResponse.get(message[1]);
 						const entry = message[2];
 						if (entry?.error) reject(new Error(entry.error));
+						else if (entry && !tableDecoders[tableId]?.decoder)
+							reject(
+								new Error(`No usable structure for table id ${tableId}; the peer's generation of the table was refused`)
+							);
 						else if (entry) {
 							let blobsToDelete: any[];
 							decodeBlobsWithWrites(
@@ -5862,6 +5913,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											structures,
 											attributes: table.attributes,
 											schemaDefined: table.schemaDefined,
+											createdTime: advertisedCreatedTime(table),
 										},
 										tableId,
 										tableEntry.table.tableName,
@@ -6055,6 +6107,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											sendDBSchema(databaseName);
 										}
 									});
+									dropRecordedListener = onTableDropRecorded((database) => {
+										if (database === databaseName) sendDBSchema(databaseName);
+									});
 									dbRemovalListener = onRemovedDB((db) => {
 										// I guess if a database is removed then we disconnect. This is kind of weird situation for replication,
 										// as the replication system will try to preserve consistency between nodes and their databases, and
@@ -6069,13 +6124,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// above would stay subscribed on the global databaseEventsEmitter forever.
 									if (wsClosed) {
 										schemaUpdateListener.remove();
+										dropRecordedListener.remove();
 										dbRemovalListener.remove();
 										schemaUpdateListener = undefined;
+										dropRecordedListener = undefined;
 										dbRemovalListener = undefined;
 										return;
 									}
 									ws.on('close', () => {
 										schemaUpdateListener?.remove();
+										dropRecordedListener?.remove();
 										dbRemovalListener?.remove();
 									});
 								}
@@ -6702,6 +6760,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					wsClosed = true;
 					close(1011, 'missing table structure; reconnecting to resync');
 					return;
+				}
+				if (tableDecoder.refused) {
+					// A dead generation's records (harper#1212): nothing here may receive them, and the sender
+					// retires the table once it learns the marker, so advancing past them loses nothing live.
+					logger.trace?.(
+						connectionId,
+						'skipping record of a dropped table generation',
+						databaseName + '.' + tableDecoder.name
+					);
+					decoder.position = start + eventLength;
+					continue;
 				}
 				// Lazily compute receive-side exclusions once remoteNodeName is known.
 				// Prefer routeReplicates from the subscriber-side connection; fall back to
@@ -8483,6 +8552,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			tables.push({
 				table: tableName,
 				schemaDefined: table.schemaDefined,
+				createdTime: advertisedCreatedTime(table),
 				attributes: table.attributes.map((attr) => ({
 					name: attr.name,
 					type: attr.type,
@@ -8490,8 +8560,58 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				})),
 			});
 		}
-
-		ws.send(encode([DB_SCHEMA, tables, databaseName, subscriptionSetupRequestId]));
+		// Sender-side gating discipline: the marker list goes only to a peer that reads it.
+		const dropMarkers =
+			peerCapabilitiesLearned && peerSupportsTableLifecycle(peerCapabilities) ? getTableDrops(databaseName) : [];
+		ws.send(
+			dropMarkers.length > 0
+				? encode([DB_SCHEMA, tables, databaseName, subscriptionSetupRequestId, dropMarkers])
+				: encode([DB_SCHEMA, tables, databaseName, subscriptionSetupRequestId])
+		);
+	}
+	/**
+	 * A peer's drop markers for `schemaDatabaseName` (harper#1212). A local table created before the drop is
+	 * the generation the peer dropped: drop it here carrying the peer's time, so the marker this node then
+	 * relays never moves forward per hop (a re-stamp at rejoin time would retire a recreate made in between).
+	 * A marker for a table this node does not hold is recorded so a peer that reconnects here first learns it.
+	 */
+	async function applyPeerDropMarkers(
+		schemaDatabaseName: string,
+		markers: Array<{ table: string; droppedTime: number }>
+	) {
+		const database = databases[schemaDatabaseName];
+		if (!database) return;
+		for (const { table: tableName, droppedTime } of markers) {
+			const localTable = database[tableName];
+			if (localTable && isDeadGeneration(localTable.createdTime, droppedTime)) {
+				logger.warn?.(
+					connectionId,
+					`Dropping ${schemaDatabaseName}.${tableName}: ${remoteNodeName} dropped it after this generation was created and this node missed the drop (harper#1212)`
+				);
+				try {
+					await localTable.dropTable({ droppedTime });
+					await dropTableMeta({ table: tableName, database: schemaDatabaseName });
+				} catch (error) {
+					logger.error?.(
+						connectionId,
+						`Could not drop ${schemaDatabaseName}.${tableName} for a peer's drop marker`,
+						error
+					);
+				}
+			} else if (!localTable) {
+				recordTableDrop(schemaDatabaseName, tableName, droppedTime);
+			}
+		}
+	}
+	function refuseDeadDefinition(
+		schemaDatabaseName: string,
+		definition: { table: string; createdTime?: unknown },
+		frame: string
+	) {
+		logger.warn?.(
+			connectionId,
+			`Refusing ${frame} for ${schemaDatabaseName}.${definition.table} from ${remoteNodeName}: its generation (created ${definition.createdTime ?? 'before stamps'}) predates a drop of that table (harper#1212)`
+		);
 	}
 	blobsTimer = setInterval(
 		() => {
@@ -8654,6 +8774,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				table: tableDefinition.table,
 				database: tableDefinition.database,
 				schemaDefined: tableDefinition.schemaDefined,
+				createdTime: typeof tableDefinition.createdTime === 'number' ? tableDefinition.createdTime : undefined,
 				...existingTable,
 				// keep after the spread — a live Table's own attributes/origin would otherwise override the merge
 				attributes,
