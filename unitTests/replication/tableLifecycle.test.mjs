@@ -8,6 +8,7 @@ import {
 	validateDropMarkers,
 	dropMarkersByTable,
 	definitionIsDead,
+	hasRowOlderThan,
 	MAX_DROP_MARKERS_PER_FRAME,
 } from '#src/replication/tableLifecycle';
 
@@ -82,5 +83,20 @@ describe('definitionIsDead', () => {
 			true,
 			'a stamped stale copy stays dead'
 		);
+	});
+});
+
+describe('hasRowOlderThan', () => {
+	const tableWith = (...versions) => ({
+		primaryStore: {
+			getRange() {
+				return versions.map((version) => ({ version }));
+			},
+		},
+	});
+	it('finds a row written before the drop, and reads an empty or newer table as clean', () => {
+		assert.equal(hasRowOlderThan(tableWith(150, 99, 200), 100), true);
+		assert.equal(hasRowOlderThan(tableWith(100, 150), 100), false);
+		assert.equal(hasRowOlderThan(tableWith(), 100), false);
 	});
 });

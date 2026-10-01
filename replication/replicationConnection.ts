@@ -12,8 +12,10 @@ import {
 	recordTableDrop,
 	dropTableMeta,
 	isDeadGeneration,
+	catalogCreatedTime,
+	stampTableCreatedTime,
 } from '../core/resources/databases.ts';
-import { validateDropMarkers, localDropMarkers, definitionIsDead } from './tableLifecycle.ts';
+import { validateDropMarkers, localDropMarkers, definitionIsDead, hasRowOlderThan } from './tableLifecycle.ts';
 import {
 	createAuditEntry,
 	Decoder,
@@ -4913,7 +4915,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const schemaDatabaseName = message[2];
 						// Markers first: a stale local generation goes before this frame's definitions are compared.
 						const peerDropMarkers = checkDatabaseAccess(schemaDatabaseName) ? validateDropMarkers(message[4]) : [];
-						if (peerDropMarkers.length > 0) await applyPeerDropMarkers(schemaDatabaseName, peerDropMarkers);
+						if (peerDropMarkers.length > 0) {
+							const definitionsByTable = new Map<string, any>();
+							for (const tableDefinition of data) definitionsByTable.set(tableDefinition.table, tableDefinition);
+							await applyPeerDropMarkers(schemaDatabaseName, peerDropMarkers, definitionsByTable);
+						}
 						const knownDrops = localDropMarkers(schemaDatabaseName);
 						for (const tableDefinition of data) {
 							const newDatabaseName = schemaDatabaseName;
@@ -8588,10 +8594,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * never moves forward per hop (a re-stamp at rejoin time would retire a recreate made in between). The
 	 * marker is then recorded whatever the local state — a newer local generation does not prove the next
 	 * peer's copy is newer too — and only when it is news, since recording takes the catalog lock.
+	 *
+	 * A local table with no stamp was created on a build that stored none. It is the generation the peer
+	 * dropped if it still holds a row written before the drop; otherwise, when this frame also carries the
+	 * peer's stamped definition of a generation newer than the marker, it is that generation and takes its
+	 * stamp, so a node that recreated a table on the old build does not drop its live copy after upgrading.
 	 */
 	async function applyPeerDropMarkers(
 		schemaDatabaseName: string,
-		markers: Array<{ table: string; droppedTime: number }>
+		markers: Array<{ table: string; droppedTime: number }>,
+		definitionsByTable: Map<string, { createdTime?: unknown }>
 	) {
 		const database = databases[schemaDatabaseName];
 		if (!database) return;
@@ -8600,7 +8612,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		for (const { table: tableName, droppedTime } of markers) {
 			if (excluded?.has(tableName)) continue;
 			const localTable = database[tableName];
-			const dead = localTable !== undefined && isDeadGeneration(localTable.createdTime, droppedTime);
+			let dead = false;
+			if (localTable) {
+				const createdTime = localTable.createdTime ?? catalogCreatedTime(localTable);
+				dead = isDeadGeneration(createdTime, droppedTime);
+				if (dead && createdTime === undefined) {
+					const definitionStamp = definitionsByTable.get(tableName)?.createdTime;
+					if (
+						typeof definitionStamp === 'number' &&
+						!isDeadGeneration(definitionStamp, droppedTime) &&
+						!hasRowOlderThan(localTable, droppedTime) &&
+						stampTableCreatedTime(localTable, definitionStamp)
+					) {
+						logger.warn?.(
+							connectionId,
+							`Stamped ${schemaDatabaseName}.${tableName} as the generation ${remoteNodeName} describes: it was recreated on a build that kept no stamp and holds no row older than the drop`
+						);
+						dead = false;
+					}
+				}
+			}
 			// A marker already held is not news, unless a dead local generation survived an earlier failed drop.
 			if (!dead && (known.get(tableName)?.droppedTime ?? 0) >= droppedTime) continue;
 			let dropped = false;
@@ -8614,11 +8645,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					await dropTableMeta({ table: tableName, database: schemaDatabaseName });
 					dropped = true;
 				} catch (error) {
+					// The marker is kept; the throw closes the connection so this frame is re-delivered, rather than
+					// letting its definitions merge the new generation's records into the stale store.
+					recordTableDrop(schemaDatabaseName, tableName, droppedTime);
 					logger.error?.(
 						connectionId,
 						`Could not drop ${schemaDatabaseName}.${tableName} for a peer's drop marker`,
 						error
 					);
+					throw error;
 				}
 			}
 			if (!dropped) recordTableDrop(schemaDatabaseName, tableName, droppedTime);
@@ -8791,7 +8826,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		if (hasChanges) {
 			logger.debug?.('(Re)creating', tableDefinition);
-			return ensureTable({
+			const table: any = ensureTable({
 				table: tableDefinition.table,
 				database: tableDefinition.database,
 				schemaDefined: tableDefinition.schemaDefined,
@@ -8801,7 +8836,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				attributes,
 				origin: 'cluster',
 			});
+			if (TEST_OMIT_CAPABILITIES && !existingTable.tableName) unstampForTest(table);
+			return table;
 		}
 		return existingTable;
+	}
+	/** Test-only: a build before the stamps left the catalog row of a table it created without one. */
+	function unstampForTest(table: any) {
+		const key = table.tableName + '/';
+		const row = table.dbisDB?.getSync(key);
+		if (!row) return;
+		delete row.createdTime;
+		table.dbisDB.putSync(key, row);
+		table.createdTime = undefined;
 	}
 }
