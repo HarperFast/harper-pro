@@ -5,12 +5,9 @@
  *
  * Node A deploys a fixture declaring `LocalKeyspace @table(replicate: false)` (a Blob attribute, so
  * every row carries a file-backed blob) next to `SharedRecord @table`. Node B has no application and
- * no such table, so its subscription request excludes nothing: before the fix the leader's only
- * table filter was the peer's own request, and B ended the join with the table (created from
- * DB_SCHEMA), the row and the blob file. B joins A with `add_node isLeader:true`, the same
- * COPY_START path a clone takes. Every assertion here also holds for a node whose plugin declares
- * the table itself; this suite deliberately leaves B undeclared, since that is the case the source
- * alone has to enforce.
+ * no such table, so its subscription request excludes nothing — the case the source alone has to
+ * enforce, which is why B is deliberately left undeclared. B joins A with `add_node isLeader:true`,
+ * the same COPY_START path a clone takes.
  */
 import { suite, test, before, after } from 'node:test';
 import { deepEqual, equal, ok } from 'node:assert/strict';

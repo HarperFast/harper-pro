@@ -5335,10 +5335,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let responseData: Buffer;
 						try {
 							const recordId = message[3];
-							// `tables` is undefined for a database this connection never resolved (a name that does
-							// not exist locally), and a bare lookup then threw a TypeError that the catch below
-							// handed to the peer as its error text. Answer the same refusal as an unknown table.
-							// Resolved per request: a cached class outlives a drop.
+							// Resolved per request, not cached: a cached class outlives a drop.
 							const table = tables?.[message[4]];
 							if (!table || !tableReplicates(table)) {
 								// One wording for every case, so a guessing peer cannot tell them apart.
@@ -6745,9 +6742,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					close(1011, 'missing table structure; reconnecting to resync');
 					return;
 				}
-				// Route exclusions (config route first, peer authorization second) plus this node's
-				// non-replicating tables, resolved once: an older sender still forwards both. A snapshot,
-				// because the sender's gate is the enforcement point and this only backstops it.
+				// Route exclusions plus this node's non-replicating tables: a backstop for an older
+				// sender that still forwards both. The sender's gate is the enforcement point.
 				if (receiveBlockedTables === undefined) {
 					const firstNode = options.connection?.nodeSubscriptions?.[0];
 					const receivesFromEntries =
@@ -6762,8 +6758,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					for (const tableName in tables)
 						if (!tableReplicates(tables[tableName]) && !blocked.has(tableName))
 							blocked.set(tableName, 'table does not replicate on this node');
-					// null rather than an empty map: the ordinary link blocks nothing, and this is the only
-					// per-record work the drop adds.
 					receiveBlockedTables = blocked.size > 0 ? blocked : null;
 				}
 				const dropReason = receiveBlockedTables && tableDecoder && receiveBlockedTables.get(tableDecoder.name);

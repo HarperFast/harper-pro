@@ -605,9 +605,9 @@ type SyncStartedMarker = {
 	replicationEstablished?: boolean;
 	targetTimestamps?: Record<string, number>;
 	/**
-	 * Whether `targetTimestamps` was derived with non-replicating tables excluded. A marker written
-	 * before that filtering can name a database whose every table is local, whose socket no side ever
-	 * opens, so a resume that reused it would wait out the whole clone ceiling. Absent means re-derive.
+	 * Whether `targetTimestamps` was derived with non-replicating tables excluded. Absent means
+	 * re-derive: a marker that kept a database whose every table is local names a socket no side
+	 * opens, and a resume reusing it waits out the whole clone ceiling.
 	 */
 	targetsExcludeLocalTables?: boolean;
 	totalBytes?: number;

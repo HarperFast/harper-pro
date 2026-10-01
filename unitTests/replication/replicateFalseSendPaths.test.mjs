@@ -181,7 +181,7 @@ describe('replicate: false on the full copy (harper-pro#883)', function () {
 		replicateOverWS(socket, {}, { replicates: true });
 		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], {}]));
 		await settle(socket, 1);
-		// A peer that declared no table excludes nothing: before the fix this request received every table.
+		// A peer that declared no table excludes nothing, so the source's own gate is the only filter.
 		socket.emit(
 			'message',
 			encode([SUBSCRIPTION_REQUEST, [{ name: 'peer-a', startTime: 0, tables: [], replicateByDefault: true }], []])
