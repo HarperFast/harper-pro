@@ -313,6 +313,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 		async () => {
 			const table = 'missed_drop_legacy_peer';
 			const liveTable = 'recreated_while_legacy';
+			const onLegacy = 'recreated_on_legacy';
 
 			// B as a pre-stamp build: no capability bag, no stamps on the wire, none kept in its catalog. Both
 			// tables are created while it runs that build, so B's copies carry no stamp.
@@ -321,6 +322,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			await waitForBothConnected(ctx, 'after B rejoined as a pre-stamp peer');
 			const seeded = await seedConverged(ctx, table);
 			await seedConverged(ctx, liveTable);
+			await seedConverged(ctx, onLegacy);
 
 			// A drops and recreates liveTable while B is connected: B applies the drop and recreates the table
 			// from A's definition, so its copy is live and consistent but carries no stamp.
@@ -337,6 +339,25 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 				await waitFor(async () => (await idsIn(ctx.nodeB, liveTable))?.includes('a-after-recreate')),
 				"A's write to the recreated table did not reach the pre-stamp B"
 			);
+
+			// B itself drops and recreates a table while on the pre-stamp build: A applies the drop and keeps its
+			// marker, then refuses B's unstamped recreate for as long as B runs that build.
+			await sendOperation(ctx.nodeB, { operation: 'drop_table', database: 'data', table: onLegacy });
+			ok(await waitFor(async () => !(await tableExists(ctx.nodeA, onLegacy))), "B's drop did not reach A");
+			await sendOperation(ctx.nodeB, {
+				operation: 'create_table',
+				database: 'data',
+				table: onLegacy,
+				primary_key: 'id',
+			});
+			await sendOperation(ctx.nodeB, {
+				operation: 'upsert',
+				database: 'data',
+				table: onLegacy,
+				records: [{ id: 'b-recreated-row', origin: 'b', n: 4000 }],
+			});
+			await delay(SETTLE_MS);
+			equal(await tableExists(ctx.nodeA, onLegacy), false, "A took the pre-stamp node's unstamped recreate");
 
 			// Now B misses a drop.
 			await stop(ctx.nodeB);
@@ -383,6 +404,28 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 				{ a: await idsIn(ctx.nodeA, liveTable), b: await idsIn(ctx.nodeB, liveTable) },
 				{ a: ['a-after-recreate', 'b-live-write'], b: ['a-after-recreate', 'b-live-write'] },
 				'the upgraded node lost or resurrected rows of the table it recreated on the old build'
+			);
+			// The table B recreated on the old build is stamped as newer than the drop and reaches A at last. The
+			// rows B wrote to it while on the old build stay on B: A refused that generation's records then and
+			// advanced past them (see replication/DESIGN.md item 24). New writes flow.
+			ok(
+				await waitFor(async () => tableExists(ctx.nodeA, onLegacy)),
+				"the table recreated on the pre-stamp node did not reach A after B's upgrade"
+			);
+			await sendOperation(ctx.nodeB, {
+				operation: 'upsert',
+				database: 'data',
+				table: onLegacy,
+				records: [{ id: 'b-after-upgrade', origin: 'b', n: 5000 }],
+			});
+			ok(
+				await waitFor(async () => (await idsIn(ctx.nodeA, onLegacy))?.includes('b-after-upgrade')),
+				"a write to the table recreated on the pre-stamp node did not reach A after B's upgrade"
+			);
+			deepEqual(
+				await idsIn(ctx.nodeB, onLegacy),
+				['b-after-upgrade', 'b-recreated-row'],
+				'B lost rows of the table it recreated'
 			);
 		}
 	);

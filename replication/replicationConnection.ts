@@ -14,6 +14,7 @@ import {
 	isDeadGeneration,
 	catalogCreatedTime,
 	stampTableCreatedTime,
+	tableLifecycleTime,
 } from '../core/resources/databases.ts';
 import { validateDropMarkers, localDropMarkers, definitionIsDead, hasRowOlderThan } from './tableLifecycle.ts';
 import {
@@ -9325,9 +9326,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * peer's copy is newer too — and only when it is news, since recording takes the catalog lock.
 	 *
 	 * A local table with no stamp was created on a build that stored none. It is the generation the peer
-	 * dropped if it still holds a row written before the drop; otherwise, when this frame also carries the
-	 * peer's stamped definition of a generation newer than the marker, it is that generation and takes its
-	 * stamp, so a node that recreated a table on the old build does not drop its live copy after upgrading.
+	 * dropped if it still holds a row written before the drop. Otherwise it was created after the drop — from
+	 * the peer's recreate, or on this node while it ran that build — and is stamped as such, with the peer's
+	 * stamp when this frame carries a newer definition, else just after the drop, so an upgrade never drops a
+	 * live table. A stale copy whose every row was rewritten after the drop passes this test; those rows are
+	 * post-drop writes, not the pre-drop data the markers exist to retire.
 	 */
 	async function applyPeerDropMarkers(
 		schemaDatabaseName: string,
@@ -9345,17 +9348,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (localTable) {
 				const createdTime = localTable.createdTime ?? catalogCreatedTime(localTable);
 				dead = isDeadGeneration(createdTime, droppedTime);
-				if (dead && createdTime === undefined) {
+				if (dead && createdTime === undefined && !hasRowOlderThan(localTable, droppedTime)) {
 					const definitionStamp = definitionsByTable.get(tableName)?.createdTime;
-					if (
-						typeof definitionStamp === 'number' &&
-						!isDeadGeneration(definitionStamp, droppedTime) &&
-						!hasRowOlderThan(localTable, droppedTime) &&
-						stampTableCreatedTime(localTable, definitionStamp)
-					) {
+					const stamp =
+						typeof definitionStamp === 'number' && !isDeadGeneration(definitionStamp, droppedTime)
+							? definitionStamp
+							: tableLifecycleTime(droppedTime);
+					if (stampTableCreatedTime(localTable, stamp)) {
 						logger.warn?.(
 							connectionId,
-							`Stamped ${schemaDatabaseName}.${tableName} as the generation ${remoteNodeName} describes: it was recreated on a build that kept no stamp and holds no row older than the drop`
+							`Stamped ${schemaDatabaseName}.${tableName} as a generation newer than the drop ${remoteNodeName} relays: it was created on a build that kept no stamp and holds no row older than the drop`
 						);
 						dead = false;
 					}
