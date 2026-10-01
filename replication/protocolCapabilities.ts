@@ -47,6 +47,14 @@ export const ORIGIN_CURSORS_CAPABILITY = 1;
  */
 export const ORIGIN_FLOORS_CAPABILITY = 1;
 
+/**
+ * Table lifecycle stamps (harper#1212): a peer at this level reads `createdTime` on `DB_SCHEMA` /
+ * `TABLE_FIXED_STRUCTURE` definitions and the drop-marker list in `DB_SCHEMA[4]`, and drops or refuses
+ * a generation created before a drop of its name. The markers are sent only to a peer that advertises
+ * it (sender-side gating discipline); the stamps ride existing fields older receivers ignore.
+ */
+export const TABLE_LIFECYCLE_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	safeCopyAudit: number;
@@ -56,6 +64,7 @@ export interface ResolvedPeerCapabilities {
 	recordLocks: number;
 	originCursors: number;
 	originFloors: number;
+	tableLifecycle: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -98,7 +107,12 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		recordLocks: resolveExactLevel(bag?.recordLocks, 0),
 		originCursors: resolveLevel(bag?.originCursors, ORIGIN_CURSORS_CAPABILITY, 0),
 		originFloors: resolveLevel(bag?.originFloors, ORIGIN_FLOORS_CAPABILITY, 0),
+		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
 	});
+}
+
+export function peerSupportsTableLifecycle(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.tableLifecycle >= TABLE_LIFECYCLE_CAPABILITY;
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
@@ -149,6 +163,7 @@ export function buildLocalCapabilities(
 		// LMDB keys one shared audit log by local time, so it has no origin cursor to send or apply.
 		originCursors: perOriginLogs ? ORIGIN_CURSORS_CAPABILITY : 0,
 		originFloors: perOriginLogs ? ORIGIN_FLOORS_CAPABILITY : 0,
+		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 	});
 }
 
@@ -162,7 +177,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
 		a.recordLocks === b.recordLocks &&
 		a.originCursors === b.originCursors &&
-		a.originFloors === b.originFloors
+		a.originFloors === b.originFloors &&
+		a.tableLifecycle === b.tableLifecycle
 	);
 }
 
