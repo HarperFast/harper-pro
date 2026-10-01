@@ -9327,10 +9327,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const excluded = excludedTablesFromPeer(schemaDatabaseName);
 		const known = localDropMarkers(schemaDatabaseName);
 		for (const { table: tableName, droppedTime } of markers) {
-			if (excluded?.has(tableName) || (known.get(tableName)?.droppedTime ?? 0) >= droppedTime) continue;
+			if (excluded?.has(tableName)) continue;
 			const localTable = database[tableName];
+			const dead = localTable !== undefined && isDeadGeneration(localTable.createdTime, droppedTime);
+			// A marker already held is not news, unless a dead local generation survived an earlier failed drop.
+			if (!dead && (known.get(tableName)?.droppedTime ?? 0) >= droppedTime) continue;
 			let dropped = false;
-			if (localTable && isDeadGeneration(localTable.createdTime, droppedTime)) {
+			if (dead) {
 				logger.warn?.(
 					connectionId,
 					`Dropping ${schemaDatabaseName}.${tableName}: a drop relayed by ${remoteNodeName} postdates this generation, which missed it`
