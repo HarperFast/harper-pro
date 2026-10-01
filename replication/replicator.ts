@@ -13,6 +13,7 @@ import {
 	databases,
 	databaseEventsEmitter,
 	getDatabases,
+	getTableDrops,
 	onUpdatedTable,
 	onRemovedDB,
 } from '../core/resources/databases.ts';
@@ -908,6 +909,12 @@ export async function replicateOperation(req, options?: { onPeerResult?: (result
 	const response: { message: string; replicated?: any[] } = { message: '' };
 	if (req.replicated !== false) {
 		req.replicated = false; // don't send a replicated flag to the nodes we are sending to
+		if (req.operation === 'drop_table') {
+			// Every node must retire the same generations: a peer applies the origin's drop time (the marker the
+			// local drop just left), not its own clock's, which could postdate a recreate the origin makes next.
+			const marker = getTableDrops(req.schema ?? req.database)?.find((candidate) => candidate.table === req.table);
+			if (marker) req.droppedTime = marker.droppedTime;
+		}
 		logger.trace?.(
 			'Replicating operation',
 			req.operation,
