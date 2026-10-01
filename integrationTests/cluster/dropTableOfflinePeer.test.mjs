@@ -8,6 +8,7 @@
  * Scenarios 2/2b/2c stop B first, drop (and in 2c recreate) on A, then bring B back. Scenario 3 brings
  * B back as a pre-stamp peer (no capability bag, no lifecycle stamps): it cannot learn the drop, so A must
  * refuse its stale definition and the rows it streams, and B must catch up once it runs the current build.
+ * Scenario 4 checks that a drop a client asked not to replicate stays local. Each test owns its tables.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -245,7 +246,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 	}
 
 	test(
-		'scenario 2: B offline during the drop, rejoins without the table or its rows',
+		'scenario 2 and 2b: B offline during the drop, rejoins without the table or its rows; both restarted after',
 		{ timeout: 300000 },
 		async () => {
 			const table = 'missed_drop';
@@ -261,16 +262,13 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, table))), 'B kept the table it missed the drop of');
 			await delay(SETTLE_MS);
 			await expectAbsentOnBoth(ctx, table, "B's stale definition recreated it on A, or B kept it");
+
+			await restartBoth(ctx);
+			await delay(SETTLE_MS);
+			await expectAbsentOnBoth(ctx, table, 'after restarting both nodes');
+			await recreateEmptyOnBoth(ctx, table, "B's pre-drop rows reached the recreated table");
 		}
 	);
-
-	test('scenario 2b: both restarted after the rejoin, recreate empty', { timeout: 300000 }, async () => {
-		const table = 'missed_drop';
-		await restartBoth(ctx);
-		await delay(SETTLE_MS);
-		await expectAbsentOnBoth(ctx, table, 'after restarting both nodes');
-		await recreateEmptyOnBoth(ctx, table, "B's pre-drop rows reached the recreated table");
-	});
 
 	test(
 		'scenario 2c: A drops and recreates while B is offline, B rejoins without old rows',
@@ -314,6 +312,12 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 		async () => {
 			const table = 'missed_drop_legacy_peer';
 			const seeded = await seedConverged(ctx, table);
+			// A table dropped and recreated while both were connected: live on both, with a marker on both.
+			const liveTable = 'recreated_before_legacy_rejoin';
+			await seedConverged(ctx, liveTable);
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: liveTable });
+			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, liveTable))), 'drop did not reach B');
+			await recreateEmptyOnBoth(ctx, liveTable, 'rows survived the connected drop');
 
 			await stop(ctx.nodeB);
 			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table });
@@ -336,9 +340,8 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			});
 			await delay(SETTLE_MS);
 			equal(await tableExists(ctx.nodeA, table), false, "B's write to its stale copy reached A");
-			// The same pre-stamp peer's writes to a table that is live on A (recreated in scenario 1 after its
-			// drop) must keep replicating: a rolling upgrade cannot lose a not-yet-upgraded node's writes.
-			const liveTable = 'dropped_everywhere';
+			// The same pre-stamp peer's writes to a table that is live on A must keep replicating: a rolling
+			// upgrade cannot lose a not-yet-upgraded node's writes.
 			await sendOperation(ctx.nodeB, {
 				operation: 'upsert',
 				database: 'data',
@@ -358,4 +361,17 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			await expectAbsentOnBoth(ctx, table, 'after the pre-stamp peer was upgraded');
 		}
 	);
+
+	test('scenario 4: a drop the client asked not to replicate stays local', { timeout: 300000 }, async () => {
+		const table = 'dropped_locally';
+		const seeded = await seedConverged(ctx, table);
+		await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table, replicated: false });
+		equal(await tableExists(ctx.nodeA, table), false);
+		await delay(SETTLE_MS);
+		equal((await idsIn(ctx.nodeB, table))?.length, seeded.length, "a local-only drop reached B's copy");
+		// Peers behave exactly as before the markers existed: B's definition brings the table back to A.
+		await restartBoth(ctx);
+		await delay(SETTLE_MS);
+		equal((await idsIn(ctx.nodeB, table))?.length, seeded.length, 'B lost its copy after a restart');
+	});
 });

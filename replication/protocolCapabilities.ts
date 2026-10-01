@@ -48,10 +48,9 @@ export const ORIGIN_CURSORS_CAPABILITY = 1;
 export const ORIGIN_FLOORS_CAPABILITY = 1;
 
 /**
- * Table lifecycle stamps (harper#1212): a peer at this level reads `createdTime` on `DB_SCHEMA` /
- * `TABLE_FIXED_STRUCTURE` definitions and the drop-marker list in `DB_SCHEMA[4]`, and drops or refuses
- * a generation created before a drop of its name. The markers are sent only to a peer that advertises
- * it (sender-side gating discipline); the stamps ride existing fields older receivers ignore.
+ * Table lifecycle stamps: a peer at this level reads `createdTime` on definitions and structure frames and
+ * the drop-marker list in `DB_SCHEMA[4]`, which is sent only to such a peer. The stamps ride existing
+ * fields older receivers ignore.
  */
 export const TABLE_LIFECYCLE_CAPABILITY = 1;
 

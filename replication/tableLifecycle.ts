@@ -1,12 +1,10 @@
 /**
- * Table lifecycle on the wire (harper#1212). Core owns the two facts — a generation's `createdTime` on its
- * catalog row and a `droppedTime` marker that survives the drop — and the rule `isDeadGeneration`. This
- * module only shapes what a peer sends and checks what a peer sent: `DB_SCHEMA[4]` is untrusted input
- * that can delete a local table, so every entry is validated and the list is bounded before use.
+ * Table lifecycle on the wire. Core owns the two facts — a generation's `createdTime` and the `droppedTime`
+ * marker that survives its drop — and the rule `isDeadGeneration`; this module shapes what a peer sends,
+ * and validates what a peer sent (`DB_SCHEMA[4]` can delete a local table).
  */
-import { isDeadGeneration, type TableDropMarker } from '../core/resources/databases.ts';
+import { isDeadGeneration, getTableDrops, type TableDropMarker } from '../core/resources/databases.ts';
 
-/** A peer that has dropped more distinct names than this is sending a fault, not a schema. */
 export const MAX_DROP_MARKERS_PER_FRAME = 10000;
 
 export function validateDropMarkers(raw: unknown): TableDropMarker[] {
@@ -33,12 +31,18 @@ export function dropMarkersByTable(markers: TableDropMarker[]): Map<string, Tabl
 }
 
 /**
- * A definition (or structure frame) from a peer describes a dead generation when a local marker
- * postdates its stamp. A definition with no stamp — an older peer, or a table that predates the
- * stamps — is treated as created at 0, so any marker beats it, with one exception: while this node
- * holds a generation newer than the marker, an unstamped peer is taken to describe that live table.
- * A not-yet-upgraded peer's writes to a recreated table must keep flowing through a rolling upgrade;
- * the stale copy such a peer might hold instead is retired the moment it runs the current build.
+ * This node's markers by table, read from the catalog on every call: `databaseEventsEmitter` is per
+ * thread, so a cache here would miss a drop performed on another thread.
+ */
+export function localDropMarkers(databaseName: string): Map<string, TableDropMarker> {
+	return dropMarkersByTable(getTableDrops(databaseName));
+}
+
+/**
+ * A definition with no stamp (an older peer, or a table that predates the stamps) counts as created at 0,
+ * except while this node holds a generation newer than the marker, which an unstamped peer is taken to
+ * describe: a not-yet-upgraded peer's writes to a recreated table keep flowing through a rolling upgrade,
+ * and the stale copy such a peer might hold instead is retired as soon as it runs the current build.
  */
 export function definitionIsDead(
 	definition: { createdTime?: unknown },
