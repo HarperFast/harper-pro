@@ -8838,11 +8838,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				table: tableDefinition.table,
 				database: tableDefinition.database,
 				schemaDefined: tableDefinition.schemaDefined,
-				createdTime: typeof tableDefinition.createdTime === 'number' ? tableDefinition.createdTime : undefined,
 				...existingTable,
-				// keep after the spread — a live Table's own attributes/origin would otherwise override the merge
+				// keep after the spread — a live Table's own attributes/origin/createdTime would otherwise override
+				// the merge; the stamp only matters on a create, where there is no live Table to spread
 				attributes,
 				origin: 'cluster',
+				createdTime: typeof tableDefinition.createdTime === 'number' ? tableDefinition.createdTime : undefined,
 			});
 			if (TEST_OMIT_CAPABILITIES && !existingTable.tableName) unstampForTest(table);
 			return table;
