@@ -134,9 +134,11 @@ origin)` sharing one request and one nonce is only sound for a caller whose depe
   `[Symbol.for('lockPoison'), origin, table]` to the database's `dbis` store (`recordLockPoison.ts`)
   — first write only per pair; later drops for a poisoned pair write nothing — **before** the drop
   completes: the decode loop awaits it, and core's failure listener awaits it. A poison write that
-  fails latches the pair poisoned in memory and **holds the frame and reconnects** (the receive
-  loop's existing hold-and-reconnect path), so the cursor cannot advance past an unrecorded hole;
-  it cannot escape as an unhandled rejection. One warning names the record and the consequence;
+  fails latches the pair poisoned in this thread's memory. On the receive loop it also **holds the
+  frame and reconnects** (`recordReplicationHole`), so the cursor cannot advance past an
+  unrecorded hole. Through core's failure listener it does not: core logs the listener's rejection
+  and the apply loop continues (`notifyReplicatedApplyFailure`), so only the per-thread latch
+  records that hole — a known gap. One warning names the record and the consequence;
   `cluster_status.recordLocks` lists poisoned pairs. The barrier checks poison and the reclone flag
   by reading the store on the cold path — never a per-thread cache — because the hole is recorded
   on the socket's thread while the barrier waits on the coordinating thread, and the drop completes
@@ -162,8 +164,10 @@ origin)` sharing one request and one nonce is only sound for a caller whose depe
   visible at commit while blob bytes may still be pending (the `end_txn` `onCommit` advances the
   durable watermark without awaiting blobs), so a successor can read a `PENDING` blob stub exactly
   as any replicated reader can today. Not a freshness failure.
-- **Cost.** Disabled: nothing. Enabled, ordinary frames: one type comparison in the receive loop;
-  no allocation, no map lookup, no shared memory. Cold handoff: one RPC, one replicated no-op entry,
+- **Cost.** Disabled: no barrier traffic, but the receive loop's type comparison still runs, and
+  `recordReplicationHole` is not gated on the switch — every drop still pays a `dbis` read, and each
+  new `(origin, table)` pair a poison row and a warning. Enabled, ordinary frames: one type
+  comparison in the receive loop; no allocation, no map lookup, no shared memory. Cold handoff: one RPC, one replicated no-op entry,
   one apply. No bench measures it: `recordLockCost.bench.mjs` has no replication-throughput or
   allocation row (`RECORD_LOCK_COST_DELEGATIONS.md`, "Not measured").
 
