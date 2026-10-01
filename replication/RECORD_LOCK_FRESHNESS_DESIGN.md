@@ -137,10 +137,12 @@ origin)` sharing one request and one nonce is only sound for a caller whose depe
   fails latches the pair poisoned in this thread's memory. On the receive loop it also **holds the
   frame and reconnects** (`recordReplicationHole`), so the cursor cannot advance past an
   unrecorded hole. Through core's failure listener it does not: core logs the listener's rejection
-  and the apply loop continues (`notifyReplicatedApplyFailure`), so only the per-thread latch
-  records that hole — a known gap. One warning names the record and the consequence;
+  and the apply loop continues (`notifyReplicatedApplyFailure`), so that hole is visible only
+  through the latch on the thread that ran the listener, until a restart or ownership handoff
+  clears it — a known gap. One warning names the record and the consequence;
   `cluster_status.recordLocks` lists poisoned pairs. The barrier checks poison and the reclone flag
-  by reading the store on the cold path — never a per-thread cache — because the hole is recorded
+  on the cold path by reading the store, after this thread's own unwritten latch (`isPoisoned`) —
+  never a per-thread cache of recorded rows — because the hole is recorded
   on the socket's thread while the barrier waits on the coordinating thread, and the drop completes
   only after the row is durable. A poisoned pair rejects every dependency and every barrier request
   for it, permanently: a base copy cannot repair it (fact 3), so the only clearance is a fresh
