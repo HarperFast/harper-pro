@@ -314,6 +314,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			const table = 'missed_drop_legacy_peer';
 			const liveTable = 'recreated_while_legacy';
 			const onLegacy = 'recreated_on_legacy';
+			const emptyStale = 'dropped_not_recreated';
 
 			// B as a pre-stamp build: no capability bag, no stamps on the wire, none kept in its catalog. Both
 			// tables are created while it runs that build, so B's copies carry no stamp.
@@ -323,6 +324,13 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			const seeded = await seedConverged(ctx, table);
 			await seedConverged(ctx, liveTable);
 			await seedConverged(ctx, onLegacy);
+			await sendOperation(ctx.nodeA, {
+				operation: 'create_table',
+				database: 'data',
+				table: emptyStale,
+				primary_key: 'id',
+			});
+			ok(await waitFor(() => tableExists(ctx.nodeB, emptyStale)), `${emptyStale} did not replicate to B`);
 
 			// A drops and recreates liveTable while B is connected: B applies the drop and recreates the table
 			// from A's definition, so its copy is live and consistent but carries no stamp.
@@ -359,9 +367,10 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			await delay(SETTLE_MS);
 			equal(await tableExists(ctx.nodeA, onLegacy), false, "A took the pre-stamp node's unstamped recreate");
 
-			// Now B misses a drop.
+			// Now B misses two drops: a table with rows, and an empty one that is never recreated.
 			await stop(ctx.nodeB);
 			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table });
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: emptyStale });
 			await start(ctx, 'nodeB', { legacyPeer: true });
 			await waitForBothConnected(ctx, 'after the pre-stamp B rejoined');
 			await delay(SETTLE_MS);
@@ -427,6 +436,10 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 				['b-after-upgrade', 'b-recreated-row'],
 				'B lost rows of the table it recreated'
 			);
+			// An unstamped stale copy with no row at all cannot prove it was recreated: it goes, and stays gone on A.
+			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, emptyStale))), 'upgraded B kept an empty stale copy');
+			await delay(SETTLE_MS);
+			await expectAbsentOnBoth(ctx, emptyStale, 'an empty stale copy on the upgraded node brought the table back');
 		}
 	);
 

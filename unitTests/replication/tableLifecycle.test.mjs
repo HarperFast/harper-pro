@@ -8,7 +8,7 @@ import {
 	validateDropMarkers,
 	dropMarkersByTable,
 	definitionIsDead,
-	hasRowOlderThan,
+	rowsAround,
 	MAX_DROP_MARKERS_PER_FRAME,
 } from '#src/replication/tableLifecycle';
 
@@ -86,7 +86,7 @@ describe('definitionIsDead', () => {
 	});
 });
 
-describe('hasRowOlderThan', () => {
+describe('rowsAround', () => {
 	const tableWith = (...versions) => ({
 		primaryStore: {
 			getRange() {
@@ -94,9 +94,10 @@ describe('hasRowOlderThan', () => {
 			},
 		},
 	});
-	it('finds a row written before the drop, and reads an empty or newer table as clean', () => {
-		assert.equal(hasRowOlderThan(tableWith(150, 99, 200), 100), true);
-		assert.equal(hasRowOlderThan(tableWith(100, 150), 100), false);
-		assert.equal(hasRowOlderThan(tableWith(), 100), false);
+	it('reports a row written before the drop, and whether any row was written after it', () => {
+		assert.deepEqual(rowsAround(tableWith(150, 99, 200), 100), { older: true, newer: true });
+		assert.deepEqual(rowsAround(tableWith(99), 100), { older: true, newer: false });
+		assert.deepEqual(rowsAround(tableWith(100, 150), 100), { older: false, newer: true });
+		assert.deepEqual(rowsAround(tableWith(), 100), { older: false, newer: false });
 	});
 });

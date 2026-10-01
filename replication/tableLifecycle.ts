@@ -58,13 +58,15 @@ export function definitionIsDead(
 }
 
 /**
- * Whether a table still holds a record written before `time`. Versions are origin write times, so a row
- * of a generation created after a drop is never older than that drop; one that is proves the table is the
- * generation the drop retired. Stops at the first such row; a table without one is read once in full.
+ * Where a table's rows sit relative to `time`. Versions are origin write times, so a row of a generation
+ * created after a drop is never older than that drop; one that is proves the table is the generation the
+ * drop retired, and the scan stops there. A table with no older row is read once in full.
  */
-export function hasRowOlderThan(table: { primaryStore: any }, time: number): boolean {
+export function rowsAround(table: { primaryStore: any }, time: number): { older: boolean; newer: boolean } {
+	let newer = false;
 	for (const entry of table.primaryStore.getRange({ versions: true, lazy: true })) {
-		if (entry.version < time) return true;
+		if (entry.version < time) return { older: true, newer };
+		newer = true;
 	}
-	return false;
+	return { older: false, newer };
 }
