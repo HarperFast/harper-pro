@@ -5,10 +5,11 @@
  *
  * Two nodes, bidirectional replication of `data`, rows written on both and converged before each
  * scenario. Scenarios 1/1b drop with both nodes connected and restart them (gracefully / SIGKILL).
- * Scenarios 2/2b/2c stop B first, drop (and in 2c recreate) on A, then bring B back. Scenario 3 brings
- * B back as a pre-stamp peer (no capability bag, no lifecycle stamps): it cannot learn the drop, so A must
- * refuse its stale definition and the rows it streams, and B must catch up once it runs the current build.
- * Scenario 4 checks that a drop a client asked not to replicate stays local. Each test owns its tables.
+ * Scenarios 2/2b/2c stop B first, drop (and in 2c recreate) on A, then bring B back. Scenario 3 runs B as a
+ * pre-stamp build (no capability bag, no stamps on the wire or in its catalog) through a drop it sees and a
+ * drop it misses, then upgrades it: A must refuse the stale copy and its rows, and the upgraded B must retire
+ * the stale copy while keeping the table it recreated on the old build. Scenario 4 checks that a drop a
+ * client asked not to replicate stays local. Each test owns its tables.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -307,23 +308,41 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 	);
 
 	test(
-		'scenario 3: B rejoins as a pre-stamp peer; A refuses its stale table and rows until B is upgraded',
-		{ timeout: 300000 },
+		'scenario 3: B runs a pre-stamp build through a drop and a recreate, misses a drop, then upgrades',
+		{ timeout: 400000 },
 		async () => {
 			const table = 'missed_drop_legacy_peer';
-			const seeded = await seedConverged(ctx, table);
-			// A table dropped and recreated while both were connected: live on both, with a marker on both.
-			const liveTable = 'recreated_before_legacy_rejoin';
-			await seedConverged(ctx, liveTable);
-			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: liveTable });
-			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, liveTable))), 'drop did not reach B');
-			await recreateEmptyOnBoth(ctx, liveTable, 'rows survived the connected drop');
+			const liveTable = 'recreated_while_legacy';
 
+			// B as a pre-stamp build: no capability bag, no stamps on the wire, none kept in its catalog. Both
+			// tables are created while it runs that build, so B's copies carry no stamp.
 			await stop(ctx.nodeB);
-			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table });
-
 			await start(ctx, 'nodeB', { legacyPeer: true });
 			await waitForBothConnected(ctx, 'after B rejoined as a pre-stamp peer');
+			const seeded = await seedConverged(ctx, table);
+			await seedConverged(ctx, liveTable);
+
+			// A drops and recreates liveTable while B is connected: B applies the drop and recreates the table
+			// from A's definition, so its copy is live and consistent but carries no stamp.
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: liveTable });
+			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, liveTable))), 'drop did not reach the pre-stamp B');
+			await recreateEmptyOnBoth(ctx, liveTable, 'rows survived the connected drop');
+			await sendOperation(ctx.nodeA, {
+				operation: 'upsert',
+				database: 'data',
+				table: liveTable,
+				records: [{ id: 'a-after-recreate', origin: 'a', n: 1 }],
+			});
+			ok(
+				await waitFor(async () => (await idsIn(ctx.nodeB, liveTable))?.includes('a-after-recreate')),
+				"A's write to the recreated table did not reach the pre-stamp B"
+			);
+
+			// Now B misses a drop.
+			await stop(ctx.nodeB);
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table });
+			await start(ctx, 'nodeB', { legacyPeer: true });
+			await waitForBothConnected(ctx, 'after the pre-stamp B rejoined');
 			await delay(SETTLE_MS);
 			// A pre-stamp peer never learns the drop, so it keeps its copy: the invariant is that the copy
 			// cannot spread, not that it heals.
@@ -340,7 +359,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			});
 			await delay(SETTLE_MS);
 			equal(await tableExists(ctx.nodeA, table), false, "B's write to its stale copy reached A");
-			// The same pre-stamp peer's writes to a table that is live on A must keep replicating: a rolling
+			// The same pre-stamp peer's writes to the live recreated table must keep replicating: a rolling
 			// upgrade cannot lose a not-yet-upgraded node's writes.
 			await sendOperation(ctx.nodeB, {
 				operation: 'upsert',
@@ -350,15 +369,21 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			});
 			ok(
 				await waitFor(async () => (await idsIn(ctx.nodeA, liveTable))?.includes('b-live-write')),
-				"the pre-stamp peer's write to a live recreated table did not reach A"
+				"the pre-stamp peer's write to the live recreated table did not reach A"
 			);
 
+			// B upgrades. Its unstamped stale copy is retired; its unstamped live copy is kept and stamped.
 			await stop(ctx.nodeB);
 			await start(ctx, 'nodeB');
 			await waitForBothConnected(ctx, 'after B rejoined on the current build');
 			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, table))), 'upgraded B kept the stale table');
 			await delay(SETTLE_MS);
 			await expectAbsentOnBoth(ctx, table, 'after the pre-stamp peer was upgraded');
+			deepEqual(
+				{ a: await idsIn(ctx.nodeA, liveTable), b: await idsIn(ctx.nodeB, liveTable) },
+				{ a: ['a-after-recreate', 'b-live-write'], b: ['a-after-recreate', 'b-live-write'] },
+				'the upgraded node lost or resurrected rows of the table it recreated on the old build'
+			);
 		}
 	);
 

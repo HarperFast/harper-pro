@@ -56,3 +56,15 @@ export function definitionIsDead(
 	}
 	return isDeadGeneration(createdTime, marker.droppedTime);
 }
+
+/**
+ * Whether a table still holds a record written before `time`. Versions are origin write times, so a row
+ * of a generation created after a drop is never older than that drop; one that is proves the table is the
+ * generation the drop retired. Stops at the first such row; a table without one is read once in full.
+ */
+export function hasRowOlderThan(table: { primaryStore: any }, time: number): boolean {
+	for (const entry of table.primaryStore.getRange({ versions: true, lazy: true })) {
+		if (entry.version < time) return true;
+	}
+	return false;
+}
