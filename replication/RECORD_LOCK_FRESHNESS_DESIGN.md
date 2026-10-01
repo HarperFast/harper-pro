@@ -138,8 +138,9 @@ origin)` sharing one request and one nonce is only sound for a caller whose depe
   frame and reconnects** (`recordReplicationHole`), so the cursor cannot advance past an
   unrecorded hole. Through core's failure listener it does not: core logs the listener's rejection
   and the apply loop continues (`notifyReplicatedApplyFailure`), so that hole is visible only
-  through the latch on the thread that ran the listener, until a restart or ownership handoff
-  clears it — a known gap. One warning names the record and the consequence;
+  through the latch on the thread that ran the listener. A restart, or the database leaving
+  replication here (`releaseRecordLockTransport`), clears the latch; an ownership handoff moves the
+  barrier to a thread whose latch never had it — a known gap. One warning names the record and the consequence;
   `cluster_status.recordLocks` lists poisoned pairs. The barrier checks poison and the reclone flag
   on the cold path by reading the store, after this thread's own unwritten latch (`isPoisoned`) —
   never a per-thread cache of recorded rows — because the hole is recorded
