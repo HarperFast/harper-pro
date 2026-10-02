@@ -1,0 +1,7 @@
+type PairRecord @table @export {
+	id: String @primaryKey
+	token: String
+	sourceNode: String
+	sourceThread: Long
+	payload: Blob
+}
