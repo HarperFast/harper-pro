@@ -492,6 +492,8 @@ Regressions: `unitTests/replication/replicateFalseSendPaths.test.mjs` (frames), 
 
 ---
 
+24. **Sender fairness is shared per worker.** `yieldSendLoop` shares one pending macrotask and restarts its 2 ms monotonic budget on resume; normal and skipped audit sends use it after drain/blob waits, pinned by `sendLoopYield.test.mjs`. The copy-flush pacer's separate flush/watchdog yield remains unconditional.
+
 ## Tests
 
 **Integration tests** live in `../integrationTests/cluster/`:
