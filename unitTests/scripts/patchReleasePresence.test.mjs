@@ -10,6 +10,17 @@ const scriptPath = join(root, 'scripts/patch-release.js');
 const { milestoneTargetsRelease, isPRPresent } = createRequire(import.meta.url)(scriptPath);
 
 describe('patch-release milestone backport verification', function () {
+	it('rejects obsolete label selection with milestone guidance', function () {
+		const r = spawnSync(process.execPath, [scriptPath, '--label', 'patch', '--json'], {
+			encoding: 'utf8',
+			timeout: 5000,
+			env: { ...process.env, PATH: '' },
+		});
+		assert.equal(r.status, 1);
+		const result = JSON.parse(r.stdout.trim().slice('RESULT: '.length));
+		assert.match(result.error, /--label.*milestones/);
+	});
+
 	describe('milestoneTargetsRelease', function () {
 		for (const [milestone, line, expected] of [
 			['v5.1', 'v5.1', true],
@@ -178,20 +189,29 @@ describe('patch-release milestone backport verification', function () {
 				`#!${process.execPath}\n
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const args = process.argv.slice(2);
 const fixture = process.env.PATCH_RELEASE_FIXTURE;
 fs.appendFileSync(path.join(fixture, 'gh-calls.jsonl'), JSON.stringify(args) + '\\n');
 if (args[0] === '--version') console.log('gh fixture');
 else if (args[0] === 'pr' && args[1] === 'list') console.log('[]');
-else if (args[0] === 'api' && args.includes('--paginate') && args.includes('--slurp')) {
+else if (args[0] === 'api' && args.includes('--paginate')) {
     const prs = JSON.parse(fs.readFileSync(path.join(fixture, 'prs.json'), 'utf8'));
     let rows = args[1].includes('/harper-pro/') ? prs.pro : prs.core;
     const commits = args[1].match(new RegExp('/pulls/([0-9]+)/commits'));
     if (commits) {
         const pr = rows.find((pr) => pr.number === Number(commits[1]));
-        rows = (pr.originalCommits ?? [pr.merge_commit_sha]).map((sha) => ({sha, parents: [{}]}));
+        const repo = path.join(fixture, 'pro', ...(args[1].includes('/harper-pro/') ? [] : ['core']));
+        rows = (pr.originalCommits ?? [pr.merge_commit_sha]).map((sha) => ({
+            sha,
+            parents: execFileSync('git', ['-C', repo, 'rev-list', '--parents', '-n', '1', sha], {encoding:'utf8'})
+                .trim().split(' ').slice(1).map((sha) => ({sha})),
+        }));
     }
-    console.log(JSON.stringify([rows.slice(0, 1), rows.slice(1)]));
+    if (args.includes('--slurp')) console.log(JSON.stringify([rows.slice(0, 1), rows.slice(1)]));
+    else if (args.includes('--jq')) {
+        for (const row of rows.filter((row) => row.merged_at)) console.log(JSON.stringify({number:row.number,title:row.title,merge_commit_sha:row.merge_commit_sha,milestone:row.milestone?.title,base:row.base.ref}));
+    } else process.exit(1);
 } else { console.error('Unexpected gh call: ' + args.join(' ')); process.exit(1); }
 `,
 				{ mode: 0o755 }
@@ -216,6 +236,8 @@ else if (args[0] === 'api' && args.includes('--paginate') && args.includes('--sl
 				assert.equal(result.missingPRs[0].number, 42);
 				assert.match(result.missingPRs[0].repo, which === 'core' ? /\/harper$/ : /\/harper-pro$/);
 				assert.deepEqual(snapshot(), before);
+				assert.equal(git(pro, 'for-each-ref', '--format=%(refname)', 'refs/patch-release'), '');
+				assert.equal(git(core, 'for-each-ref', '--format=%(refname)', 'refs/patch-release'), '');
 			});
 		}
 
@@ -288,7 +310,7 @@ else if (args[0] === 'api' && args.includes('--paginate') && args.includes('--sl
 					merged_at: '2000-01-01T00:00:00Z',
 					milestone: { title: 'v5.1' },
 					base: { ref: 'main' },
-					originalCommits: originals,
+					originalCommits: mode === 'rebase' ? originals.toReversed() : originals,
 				});
 				publish(pro, 'main:refs/heads/main', 'feature:refs/pull/42/head');
 				const pickOrder = mode === 'rebase' ? originals.toReversed() : originals;
@@ -318,6 +340,94 @@ else if (args[0] === 'api' && args.includes('--paginate') && args.includes('--sl
 			const r = runCli(['--yes', '--json', '--core-branch', 'rc/5.1-core']);
 			assert.equal(r.status, 1, r.stdout + r.stderr);
 			assert.equal(resultOf(r).missingPRs[0].branch, 'rc/5.1-core');
+		});
+
+		it('recognizes a squash backport after the PR merged unrelated main changes', function () {
+			git(pro, 'checkout', '-b', 'feature');
+			const originals = [];
+			for (const name of ['first', 'second']) {
+				writeFileSync(join(pro, `${name}.txt`), `${name} change\n`);
+				git(pro, 'add', `${name}.txt`);
+				git(pro, 'commit', '-m', name);
+				originals.push(git(pro, 'rev-parse', 'HEAD'));
+			}
+			git(pro, 'checkout', 'main');
+			writeFileSync(join(pro, 'main-only.txt'), 'unrelated main change\n');
+			git(pro, 'add', 'main-only.txt');
+			git(pro, 'commit', '-m', 'Unrelated main change');
+			git(pro, 'checkout', 'feature');
+			git(pro, 'merge', '--no-ff', 'main', '-m', 'Merge main into feature');
+			git(pro, 'checkout', 'main');
+			git(pro, 'merge', '--squash', 'feature');
+			git(pro, 'commit', '-m', 'Squash PR 42');
+			const mergeSha = git(pro, 'rev-parse', 'HEAD');
+			prs.pro.push({
+				number: 42,
+				title: 'Updated PR',
+				merge_commit_sha: mergeSha,
+				merged_at: '2000-01-01T00:00:00Z',
+				milestone: { title: 'v5.1' },
+				base: { ref: 'main' },
+				originalCommits: originals,
+			});
+			publish(pro, 'main:refs/heads/main', 'feature:refs/pull/42/head');
+			git(pro, 'checkout', 'v5.1');
+			git(pro, 'cherry-pick', mergeSha);
+			git(pro, 'commit', '--amend', '-m', 'Backport the squash');
+			publish(pro, 'v5.1:refs/heads/v5.1');
+			git(pro, 'checkout', 'main');
+			const r = runCli(['--yes', '--dry-run', '--json']);
+			assert.equal(r.status, 0, r.stdout + r.stderr);
+			assert.equal(resultOf(r).ok, true);
+		});
+
+		it('requires merge-only resolution content as well as ordinary commits', function () {
+			git(pro, 'checkout', '-b', 'feature');
+			const originals = [];
+			for (const name of ['first', 'second']) {
+				git(pro, 'checkout', '-b', name, 'main');
+				writeFileSync(join(pro, `${name}.txt`), `${name} change\n`);
+				git(pro, 'add', `${name}.txt`);
+				git(pro, 'commit', '-m', name);
+				originals.push(git(pro, 'rev-parse', 'HEAD'));
+			}
+			git(pro, 'checkout', 'feature');
+			git(pro, 'merge', '--ff-only', 'first');
+			git(pro, 'merge', '--no-ff', '--no-commit', 'second');
+			writeFileSync(join(pro, 'resolution.txt'), 'merge-only resolution\n');
+			git(pro, 'add', 'resolution.txt');
+			git(pro, 'commit', '-m', 'Merge with additional resolution');
+			originals.push(git(pro, 'rev-parse', 'HEAD'));
+			git(pro, 'checkout', 'main');
+			git(pro, 'merge', '--squash', 'feature');
+			git(pro, 'commit', '-m', 'Squash PR 42');
+			const mergeSha = git(pro, 'rev-parse', 'HEAD');
+			prs.pro.push({
+				number: 42,
+				title: 'PR with merge resolution',
+				merge_commit_sha: mergeSha,
+				merged_at: '2000-01-01T00:00:00Z',
+				milestone: { title: 'v5.1' },
+				base: { ref: 'main' },
+				originalCommits: originals,
+			});
+			publish(pro, 'main:refs/heads/main', 'feature:refs/pull/42/head');
+			git(pro, 'checkout', 'v5.1');
+			git(pro, 'cherry-pick', ...originals.slice(0, 2));
+			publish(pro, 'v5.1:refs/heads/v5.1');
+			git(pro, 'checkout', 'main');
+			const partial = runCli(['--yes', '--dry-run', '--json']);
+			assert.equal(partial.status, 1, partial.stdout + partial.stderr);
+			assert.equal(resultOf(partial).missingPRs[0].number, 42);
+			git(pro, 'checkout', 'v5.1');
+			git(pro, 'reset', '--hard', 'v5.1.0');
+			git(pro, 'cherry-pick', mergeSha);
+			git(pro, 'commit', '--amend', '-m', 'Complete backport');
+			publish(pro, '+v5.1:refs/heads/v5.1');
+			git(pro, 'checkout', 'main');
+			const complete = runCli(['--yes', '--dry-run', '--json']);
+			assert.equal(complete.status, 0, complete.stdout + complete.stderr);
+			assert.equal(resultOf(complete).ok, true);
 		});
 
 		it('fails closed when a PR head cannot be fetched', function () {
@@ -367,7 +477,7 @@ else if (args[0] === 'api' && args.includes('--paginate') && args.includes('--sl
 			const r = runCli();
 			assert.equal(r.status, 1, r.stdout + r.stderr);
 			assert.equal(resultOf(r).ok, false);
-			assert.match(r.stderr, /merge-base --is-ancestor/);
+			assert.match(resultOf(r).error, /Local v5\.1 has commits absent from origin\/v5\.1/);
 			assert.deepEqual(snapshot(), before);
 		});
 	});

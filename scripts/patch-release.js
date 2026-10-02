@@ -46,7 +46,7 @@
  *                     "aborted":true}, exit 0 — the user declined, nothing failed).
  */
 
-const { execFileSync, execSync, spawnSync } = require('child_process');
+const { execFileSync, execSync, spawnSync } = require('node:child_process');
 const { existsSync, writeSync } = require('fs');
 const path = require('path');
 const readline = require('readline');
@@ -196,13 +196,6 @@ function detectGhRepo() {
 	return match[1];
 }
 
-function hasBranch(branch) {
-	return (
-		runSafe(`git show-ref --verify "refs/heads/${branch}"`).code === 0 ||
-		runSafe(`git show-ref --verify "refs/remotes/origin/${branch}"`).code === 0
-	);
-}
-
 // Most recent semver tag reachable from origin/RELEASE_BRANCH, with its commit date.
 function getLastRelease(branch = RELEASE_BRANCH) {
 	const tagR = runSafe(`git describe --tags --abbrev=0 --match 'v*.*.*' "origin/${branch}"`);
@@ -220,23 +213,27 @@ function milestoneTargetsRelease(milestone, releaseLine) {
 }
 
 function runFile(command, args, opts = {}) {
-	return execFileSync(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts }).trim();
+	return execFileSync(command, args, {
+		encoding: 'utf8',
+		maxBuffer: 64 * 1024 * 1024,
+		timeout: 600_000,
+		...opts,
+	}).trim();
 }
 
 function getMilestonePRs(ghRepo, releaseLine) {
-	const pages = JSON.parse(
-		runFile('gh', [
-			'api',
-			`repos/${ghRepo}/pulls?state=closed&base=${encodeURIComponent(SOURCE_BRANCH)}&per_page=100`,
-			'--paginate',
-			'--slurp',
-		])
-	);
-	return pages
-		.flat()
-		.filter(
-			(pr) => pr.merged_at && pr.base.ref === SOURCE_BRANCH && milestoneTargetsRelease(pr.milestone?.title, releaseLine)
-		)
+	const output = runFile('gh', [
+		'api',
+		`repos/${ghRepo}/pulls?state=closed&base=${encodeURIComponent(SOURCE_BRANCH)}&per_page=100`,
+		'--paginate',
+		'--jq',
+		'.[] | select(.merged_at != null) | {number, title, merge_commit_sha, milestone: .milestone.title, base: .base.ref} | @json',
+	]);
+	return output
+		.split('\n')
+		.filter(Boolean)
+		.map((line) => JSON.parse(line))
+		.filter((pr) => pr.base === SOURCE_BRANCH && milestoneTargetsRelease(pr.milestone, releaseLine))
 		.map((pr) => {
 			if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || !/^[0-9a-f]{40}$/.test(pr.merge_commit_sha)) {
 				throw new Error(`Invalid merge metadata for ${ghRepo} PR #${pr.number}`);
@@ -296,27 +293,56 @@ function getMissingPRs(prs, branch, ghRepo) {
 		return pr.mergeParents < 2 || !isPRPresent(pr, evidence);
 	});
 	if (!missing.length) return [];
-	const headRef = (pr) => `refs/remotes/origin/patch-release-pr-${pr.number}`;
-	runFile('git', ['fetch', 'origin', ...missing.map((pr) => `+refs/pull/${pr.number}/head:${headRef(pr)}`)]);
-	return missing.filter((pr) => {
-		const original = JSON.parse(
-			runFile('gh', ['api', `repos/${ghRepo}/pulls/${pr.number}/commits?per_page=100`, '--paginate', '--slurp'])
-		).flat();
-		if (!original.length || original.length >= 250) return true;
-		if (original.some((commit) => !/^[0-9a-f]{40}$/.test(commit.sha))) {
-			throw new Error(`Cannot verify complete commit list for ${ghRepo} PR #${pr.number}`);
+	const headRef = (pr) => `refs/patch-release/${process.pid}/pr-${pr.number}`;
+	try {
+		try {
+			runFile('git', ['fetch', 'origin', ...missing.map((pr) => `+refs/pull/${pr.number}/head:${headRef(pr)}`)]);
+		} catch (error) {
+			warn(`Could not verify original PR heads: ${error.message}`);
+			return missing;
 		}
-		const commits = original
-			.filter((commit) => commit.parents.length === 1)
-			.map((commit) => commitWithPatch(commit.sha))
-			.filter((commit) => commit.patchId);
-		if (!commits.length) return true;
-		const aggregate = getPatchIds(['diff', '--binary', `${original[0].sha}^1`, headRef(pr)])[0];
-		// GitHub's merge SHA may represent only the last commit of a rebase.
-		const wholeMerge = pr.mergeParents > 1 || commits.length === 1 || aggregate === pr.mergeCommit.patchId;
-		const mergeCommit = wholeMerge ? pr.mergeCommit : { patchId: aggregate };
-		return !isPRPresent({ mergeCommit, commits }, evidence);
-	});
+		return missing.filter((pr) => {
+			const original = JSON.parse(
+				runFile('gh', ['api', `repos/${ghRepo}/pulls/${pr.number}/commits?per_page=100`, '--paginate', '--slurp'])
+			).flat();
+			if (!original.length || original.length >= 250) return true;
+			if (original.some((commit) => !/^[0-9a-f]{40}$/.test(commit.sha))) {
+				throw new Error(`Cannot verify complete commit list for ${ghRepo} PR #${pr.number}`);
+			}
+			const commits = original
+				.filter((commit) => commit.parents.length === 1)
+				.map((commit) => commitWithPatch(commit.sha))
+				.filter((commit) => commit.patchId);
+			for (const commit of original.filter((commit) => commit.parents.length > 1)) {
+				let automaticTree;
+				if (commit.parents.length === 2) {
+					try {
+						automaticTree = runFile('git', ['merge-tree', '--write-tree', `${commit.sha}^1`, `${commit.sha}^2`]);
+					} catch (error) {
+						if (error.status !== 1) throw error;
+					}
+				}
+				// Ordinary picks cannot prove edits recorded only in a merge resolution.
+				if (automaticTree !== runFile('git', ['rev-parse', `${commit.sha}^{tree}`])) commits.push({ oid: commit.sha });
+			}
+			if (!commits.length) return true;
+			const originalShas = new Set(original.map((commit) => commit.sha));
+			const first = runFile('git', ['rev-list', '--reverse', '--topo-order', headRef(pr)])
+				.split('\n')
+				.find((sha) => originalShas.has(sha));
+			if (!first) throw new Error(`PR head does not contain the original commits for ${ghRepo} #${pr.number}`);
+			const commonBase = runFile('git', ['merge-base', `${pr.mergeCommit.oid}^1`, headRef(pr)]);
+			const baseShas = new Set(runFile('git', ['rev-list', commonBase]).split('\n'));
+			const aggregateBase = original.some((commit) => baseShas.has(commit.sha)) ? `${first}^1` : commonBase;
+			const aggregate = getPatchIds(['diff', '--binary', aggregateBase, headRef(pr)])[0];
+			// GitHub's merge SHA may represent only the last commit of a rebase.
+			const wholeMerge = pr.mergeParents > 1 || original.length === 1 || aggregate === pr.mergeCommit.patchId;
+			const mergeCommit = wholeMerge ? pr.mergeCommit : { patchId: aggregate };
+			return !isPRPresent({ mergeCommit, commits }, evidence);
+		});
+	} finally {
+		runFile('git', ['update-ref', '--stdin'], { input: missing.map((pr) => `delete ${headRef(pr)}\n`).join('') });
+	}
 }
 
 function getReleaseBranchCommits(lastTag, branch = RELEASE_BRANCH) {
@@ -348,11 +374,20 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 		`+refs/heads/${SOURCE_BRANCH}:refs/remotes/origin/${SOURCE_BRANCH}`,
 	]);
 
-	if (!hasBranch(branch)) {
-		die(`  Release branch "${branch}" not found.`);
+	let localBranchExists = false;
+	try {
+		runFile('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]);
+		localBranchExists = true;
+	} catch (error) {
+		if (error.status !== 1) throw error;
 	}
-	if (runSafe(`git show-ref --verify "refs/heads/${branch}"`).code === 0) {
-		runFile('git', ['merge-base', '--is-ancestor', branch, `origin/${branch}`]);
+	if (localBranchExists) {
+		try {
+			runFile('git', ['merge-base', '--is-ancestor', branch, `origin/${branch}`]);
+		} catch (error) {
+			if (error.status !== 1) throw error;
+			throw new Error(`Local ${branch} has commits absent from origin/${branch}; synchronize it before releasing.`);
+		}
 	}
 
 	const last = getLastRelease(branch);
