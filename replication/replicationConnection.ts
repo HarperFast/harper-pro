@@ -5656,7 +5656,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						);
 						// Route exclusions belong here rather than per record: the copy loop opens a row's blobs
 						// before the per-record filters run, so a skipped table's blobs would stream anyway.
-						// Resolved through the live database map because a redeclaration replaces the Table object.
+						// The live database map also reflects drop/recreate replacements.
 						const tableToTableEntry = (table) => {
 							if (
 								table &&

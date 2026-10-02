@@ -3,18 +3,26 @@
  * joining peer requests, not through blob transfer, not through live audit forwarding, and not
  * through the schema handshake.
  *
- * Node A deploys a fixture declaring `LocalKeyspace @table(replicate: false)` (a Blob attribute, so
- * every row carries a file-backed blob) next to `SharedRecord @table`. Node B has no application and
- * no such table, so its subscription request excludes nothing — the case the source alone has to
+ * Node A declares LocalKeyspace local either at creation or by redeploying a populated replicated
+ * table. Its Blob attribute makes every row file-backed, beside `SharedRecord @table`. Node B has
+ * no application or such table, so its subscription request excludes nothing — the source alone has to
  * enforce, which is why B is deliberately left undeclared. B joins A with `add_node isLeader:true`,
  * the same COPY_START path a clone takes.
  */
 import { suite, test, before, after } from 'node:test';
 import { deepEqual, equal, ok } from 'node:assert/strict';
-import { existsSync, readdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
-import { fetchWithRetry, sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
+import {
+	fetchWithRetry,
+	readNodePid,
+	sendOperation,
+	stopAndTeardownNodes,
+	waitForCondition,
+	waitForNewPid,
+} from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -84,6 +92,20 @@ async function waitForTable(node, table) {
 	);
 }
 
+async function deployFixture(node, fixture) {
+	const previousPid = await readNodePid(node);
+	await sendOperation(node, {
+		operation: 'deploy_component',
+		project: PROJECT,
+		payload: await targz(fixture),
+		replicated: false,
+		restart: true,
+	});
+	await waitForNewPid(node, previousPid);
+	await waitForTable(node, SHARED_TABLE);
+	await waitForTable(node, LOCAL_TABLE);
+}
+
 function waitForSharedRecord(node, id) {
 	return waitForCondition(
 		async (signal) => {
@@ -110,86 +132,109 @@ async function assertNothingLocalOn(node, signal) {
 	deepEqual(listBlobFiles(node.dataRootDir), [], `no blob file may reach ${node.hostname}`);
 }
 
-suite('replicate: false never leaves the node (harper-pro#883)', { timeout: 300_000 }, (ctx) => {
-	before(async () => {
-		const [hostnameA, hostnameB] = await Promise.all([
-			getNextAvailableLoopbackAddress(),
-			getNextAvailableLoopbackAddress(),
-		]);
-		const nodeA = { name: ctx.name, harper: { hostname: hostnameA } };
-		const nodeB = { name: ctx.name, harper: { hostname: hostnameB } };
-		const starts = await Promise.allSettled([
-			startHarper(nodeA, config(hostnameA)),
-			startHarper(nodeB, config(hostnameB)),
-		]);
-		ctx.nodeA = nodeA.harper;
-		ctx.nodeB = nodeB.harper;
-		const startErrors = starts.filter((result) => result.status === 'rejected').map((result) => result.reason);
-		if (startErrors.length) throw new AggregateError(startErrors, 'Failed to start the replicate:false nodes');
+for (const redeclare of [false, true]) {
+	suite(
+		`replicate: false ${redeclare ? 'after redeploy' : 'at creation'} (harper-pro#883)`,
+		{ timeout: 420_000 },
+		(ctx) => {
+			before(async () => {
+				const [hostnameA, hostnameB] = await Promise.all([
+					getNextAvailableLoopbackAddress(),
+					getNextAvailableLoopbackAddress(),
+				]);
+				const nodeA = { name: ctx.name, harper: { hostname: hostnameA } };
+				const nodeB = { name: ctx.name, harper: { hostname: hostnameB } };
+				const starts = await Promise.allSettled([
+					startHarper(nodeA, config(hostnameA)),
+					startHarper(nodeB, config(hostnameB)),
+				]);
+				ctx.nodeA = nodeA.harper;
+				ctx.nodeB = nodeB.harper;
+				const startErrors = starts.filter((result) => result.status === 'rejected').map((result) => result.reason);
+				if (startErrors.length) throw new AggregateError(startErrors, 'Failed to start the replicate:false nodes');
 
-		// Only A carries the application: B must learn nothing about LocalKeyspace from the wire.
-		await sendOperation(ctx.nodeA, {
-			operation: 'deploy_component',
-			project: PROJECT,
-			payload: await targz(FIXTURE_PATH),
-			replicated: false,
-			restart: true,
-		});
-		await waitForTable(ctx.nodeA, SHARED_TABLE);
-		await waitForTable(ctx.nodeA, LOCAL_TABLE);
-		await sendOperation(ctx.nodeA, {
-			operation: 'insert',
-			database: DATABASE,
-			table: LOCAL_TABLE,
-			records: [{ id: 'local-before-join', payload: BLOB_PAYLOAD }],
-		});
-		await sendOperation(ctx.nodeA, {
-			operation: 'insert',
-			database: DATABASE,
-			table: SHARED_TABLE,
-			records: [{ id: 'shared-before-join', value: 'copied' }],
-		});
-	});
+				// Only A carries the application: B must learn nothing about LocalKeyspace from the wire.
+				const fixture = mkdtempSync(join(tmpdir(), 'replicate-false-'));
+				try {
+					copyFileSync(join(FIXTURE_PATH, 'config.yaml'), join(fixture, 'config.yaml'));
+					const schema = readFileSync(join(FIXTURE_PATH, 'schema.graphql'), 'utf8');
+					writeFileSync(
+						join(fixture, 'schema.graphql'),
+						redeclare ? schema.replace('replicate: false', 'replicate: true') : schema
+					);
+					await deployFixture(ctx.nodeA, fixture);
+				} finally {
+					rmSync(fixture, { recursive: true, force: true });
+				}
+				const initial = await describeTable(ctx.nodeA, LOCAL_TABLE);
+				equal(initial.status, 200);
+				equal(initial.body.replicate, redeclare, 'the initial declaration must match the scenario');
+				await sendOperation(ctx.nodeA, {
+					operation: 'insert',
+					database: DATABASE,
+					table: LOCAL_TABLE,
+					records: [{ id: 'local-before-join', payload: BLOB_PAYLOAD }],
+				});
+				await sendOperation(ctx.nodeA, {
+					operation: 'insert',
+					database: DATABASE,
+					table: SHARED_TABLE,
+					records: [{ id: 'shared-before-join', value: 'copied' }],
+				});
+				if (redeclare) {
+					await deployFixture(ctx.nodeA, FIXTURE_PATH);
+					const rows = await sendOperation(ctx.nodeA, {
+						operation: 'search_by_id',
+						database: DATABASE,
+						table: LOCAL_TABLE,
+						ids: ['local-before-join'],
+						get_attributes: ['id'],
+					});
+					deepEqual(rows, [{ id: 'local-before-join' }], 'the existing row must survive the redeploy');
+				}
+			});
 
-	after(async () => {
-		// A restarted on deploy, so its spawned handle is stale; stop by pid before teardown.
-		await stopAndTeardownNodes([ctx.nodeA, ctx.nodeB]);
-	});
+			after(async () => {
+				// A restarted on deploy, so its spawned handle is stale; stop by pid before teardown.
+				await stopAndTeardownNodes([ctx.nodeA, ctx.nodeB]);
+			});
 
-	test('the full copy and the live tail deliver the shared table only, and no blob', async () => {
-		const { nodeA, nodeB } = ctx;
-		// premise: the row on A is blob-backed, so a leak would be a file on B
-		ok(listBlobFiles(nodeA.dataRootDir).length > 0, 'the LocalKeyspace row on A must be stored as a blob file');
-		const describedOnA = await describeTable(nodeA, LOCAL_TABLE);
-		equal(describedOnA.body?.replicate, false, 'premise: A declares the table replicate: false');
+			test('the full copy and the live tail deliver the shared table only, and no blob', async () => {
+				const { nodeA, nodeB } = ctx;
+				// premise: the row on A is blob-backed, so a leak would be a file on B
+				ok(listBlobFiles(nodeA.dataRootDir).length > 0, 'the LocalKeyspace row on A must be stored as a blob file');
+				const describedOnA = await describeTable(nodeA, LOCAL_TABLE);
+				equal(describedOnA.body?.replicate, false, 'premise: A declares the table replicate: false');
 
-		await sendOperation(nodeB, {
-			operation: 'add_node',
-			hostname: nodeA.hostname,
-			rejectUnauthorized: false,
-			isLeader: true,
-			authorization: nodeA.admin,
-		});
-		const copied = await waitForSharedRecord(nodeB, 'shared-before-join');
-		equal(copied.value, 'copied');
+				await sendOperation(nodeB, {
+					operation: 'add_node',
+					hostname: nodeA.hostname,
+					rejectUnauthorized: false,
+					isLeader: true,
+					authorization: nodeA.admin,
+				});
+				const copied = await waitForSharedRecord(nodeB, 'shared-before-join');
+				equal(copied.value, 'copied');
 
-		// A row written after the join rides the live tail, which starts only once the copy is
-		// complete — so its arrival proves the copy finished before the negative assertions below.
-		await sendOperation(nodeA, {
-			operation: 'insert',
-			database: DATABASE,
-			table: LOCAL_TABLE,
-			records: [{ id: 'local-after-join', payload: BLOB_PAYLOAD }],
-		});
-		await sendOperation(nodeA, {
-			operation: 'insert',
-			database: DATABASE,
-			table: SHARED_TABLE,
-			records: [{ id: 'shared-after-join', value: 'forwarded' }],
-		});
-		const forwarded = await waitForSharedRecord(nodeB, 'shared-after-join');
-		equal(forwarded.value, 'forwarded');
+				// A row written after the join rides the live tail, which starts only once the copy is
+				// complete — so its arrival proves the copy finished before the negative assertions below.
+				await sendOperation(nodeA, {
+					operation: 'insert',
+					database: DATABASE,
+					table: LOCAL_TABLE,
+					records: [{ id: 'local-after-join', payload: BLOB_PAYLOAD }],
+				});
+				await sendOperation(nodeA, {
+					operation: 'insert',
+					database: DATABASE,
+					table: SHARED_TABLE,
+					records: [{ id: 'shared-after-join', value: 'forwarded' }],
+				});
+				const forwarded = await waitForSharedRecord(nodeB, 'shared-after-join');
+				equal(forwarded.value, 'forwarded');
 
-		await assertNothingLocalOn(nodeB);
-	});
-});
+				await assertNothingLocalOn(nodeB);
+			});
+		}
+	);
+}
