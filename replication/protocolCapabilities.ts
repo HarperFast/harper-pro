@@ -32,12 +32,21 @@ export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
  */
 export const RECORD_LOCKS_CAPABILITY = 4;
 
+/**
+ * Level at which a peer answers `HANDOFF_RECEIPT_REQUEST` with a `HANDOFF_RECEIPT` once it durably holds
+ * the complete row a residency transition handed it (HarperFast/harper#2257). The image itself travels as
+ * an ordinary complete `put` at every level; a peer below this one can never certify release, so the
+ * origin keeps the image until that peer upgrades.
+ */
+export const RESIDENCY_HANDOFF_RECEIPT_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	protocolVersion: number;
 	subscriptionSetupAck: number;
 	subscriptionSetupBudgetMs: number | undefined;
 	recordLocks: number;
+	residencyHandoffReceipt: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -77,12 +86,17 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		subscriptionSetupAck: resolveLevel(bag?.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY, 0),
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
 		recordLocks: resolveExactLevel(bag?.recordLocks, 0),
+		residencyHandoffReceipt: resolveLevel(bag?.residencyHandoffReceipt, RESIDENCY_HANDOFF_RECEIPT_CAPABILITY, 0),
 	});
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
 export function peerSupportsRecordLocks(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.recordLocks === RECORD_LOCKS_CAPABILITY;
+}
+
+export function peerSupportsHandoffReceipts(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.residencyHandoffReceipt >= RESIDENCY_HANDOFF_RECEIPT_CAPABILITY;
 }
 
 /** A peer that advertised nothing — the pre-registry baseline. */
@@ -115,6 +129,7 @@ export function buildLocalCapabilities(
 		subscriptionSetupBudgetMs,
 		// A node that has not enabled cluster locks never grants, so it must not claim it would.
 		recordLocks: advertisedRecordLocksLevel(recordLocksEnabled, false),
+		residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
 	});
 }
 
@@ -125,7 +140,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.protocolVersion === b.protocolVersion &&
 		a.subscriptionSetupAck === b.subscriptionSetupAck &&
 		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
-		a.recordLocks === b.recordLocks
+		a.recordLocks === b.recordLocks &&
+		a.residencyHandoffReceipt === b.residencyHandoffReceipt
 	);
 }
 
