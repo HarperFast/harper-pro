@@ -98,7 +98,6 @@ import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 import './recordLockApply.ts';
 
-// Re-exported from sharedStatusSlots.ts (the buffer's slot registry) for existing importers.
 export { RECORD_LOCKS_CAPABILITY_POSITION, RECORD_LOCK_HOMES_AGREEMENT_POSITION, RECORD_LOCK_LEVEL_POSITION };
 export const LOCK_CAPABILITY_UNKNOWN = 0;
 export const LOCK_CAPABILITY_UNSUPPORTED = 1;

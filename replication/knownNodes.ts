@@ -101,7 +101,6 @@ export function getHDBNodeTable(): HdbNodeTable {
 		}) as unknown as HdbNodeTable)
 	);
 }
-// Re-exported from sharedStatusSlots.ts (the buffer's slot registry) for existing importers.
 export { REPLICATION_SHARED_STATUS_SLOTS };
 export function getReplicationSharedStatus(
 	auditStore: any,

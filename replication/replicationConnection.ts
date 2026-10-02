@@ -191,7 +191,6 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // changes so a leader resuming a cursor stamped with a different (or absent) version recopies from
 // scratch instead of silently skipping tables the old order had not yet reached (#421).
 const COPY_ORDER_VERSION = 1;
-// Re-exported from sharedStatusSlots.ts (the buffer's slot registry) for existing importers.
 export {
 	CONFIRMATION_STATUS_POSITION,
 	RECEIVED_VERSION_POSITION,
