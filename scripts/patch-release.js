@@ -9,14 +9,14 @@
  *
  * Flow:
  *   1. For each repo, display:
- *        - labeled PRs merged into main since the last release tag
+ *        - merged PRs whose milestones target the release line
  *        - commits on origin/<RELEASE_BRANCH> since the last release tag
- *      (so the user can visually verify they match — flag missing cherry-picks)
+ *      Verify backports by ancestry, cherry-pick trailers or stable patch IDs.
  *   2. After confirmation:
  *        - bump core version + tag (if core has new commits)
  *        - run build-tools/sync-core.sh to point harper-pro at the bumped core
  *        - bump harper-pro version + tag
- *        - push both repos with --follow-tags
+ *        - push both repos and their release tags
  *
  * Usage:
  *   node scripts/patch-release.js [options]
@@ -25,7 +25,6 @@
  *   --branch <name>        Release branch (default: v5.0)
  *   --core-branch <name>   Core release branch (default: same as --branch; use when core RC branch has a different name, e.g. rc/X.Y.Z-core)
  *   --source <name>        Source branch (default: main)
- *   --label <name>    PR label to filter on (default: patch)
  *   --bump <type>     npm version bump: patch|minor|major|prerelease (default: patch)
  *   --version-name <slot>  CM version slot: stable|next. Defaults to `next` for a
  *                     prerelease target and `stable` otherwise — only pass this to
@@ -47,7 +46,7 @@
  *                     "aborted":true}, exit 0 — the user declined, nothing failed).
  */
 
-const { execSync, spawnSync } = require('child_process');
+const { execFileSync, execSync, spawnSync } = require('child_process');
 const { existsSync, writeSync } = require('fs');
 const path = require('path');
 const readline = require('readline');
@@ -82,9 +81,9 @@ function writeResult(result, fd = 1) {
 	writeSync(fd, 'RESULT: ' + JSON.stringify(result) + '\n');
 }
 
-function die(message, code = 1, extra = {}) {
+function die(message, code = 1, extra = {}, emitResult = JSON_OUTPUT) {
 	err(message);
-	if (JSON_OUTPUT) {
+	if (emitResult) {
 		const cleanMessage = typeof message === 'string' ? message.trim() : message;
 		writeResult({ ok: false, error: cleanMessage, ...extra });
 	}
@@ -101,7 +100,7 @@ const JSON_OUTPUT = argv.includes('--json');
 const RELEASE_BRANCH = getArg('--branch', 'v5.0');
 const CORE_RELEASE_BRANCH = getArg('--core-branch', RELEASE_BRANCH);
 const SOURCE_BRANCH = getArg('--source', 'main');
-const LABEL = getArg('--label', 'patch');
+const LABEL = getArg('--label', null);
 const VERSION_BUMP = getArg('--bump', 'patch'); // patch | minor | major | prerelease
 // Explicit target version (without leading 'v'), overriding the --bump computation.
 // Needed for prerelease-line transitions semver.inc can't express in one step, e.g.
@@ -163,6 +162,7 @@ function buildCmFailureResult({ pushed, coreVersion, proVersion, error }) {
 }
 
 // ── Validate args ─────────────────────────────────────────────────────────────
+if (LABEL && require.main === module) die('--label is no longer supported; PR milestones determine backport targets.');
 if (VERSION_NAME && VERSION_NAME !== 'stable' && VERSION_NAME !== 'next' && require.main === module) {
 	die(`\n  Error: --version-name "${VERSION_NAME}" is invalid. Expected "stable" or "next".`);
 }
@@ -213,21 +213,117 @@ function getLastRelease(branch = RELEASE_BRANCH) {
 	return { tag, date: dateR.out };
 }
 
-function getPatchPRs(ghRepo, sinceDate) {
-	const json = run(
-		`gh pr list --repo "${ghRepo}" --label "${LABEL}" --state merged --base "${SOURCE_BRANCH}" ` +
-			`--json number,title,mergeCommit,mergedAt --limit 200`
+function milestoneTargetsRelease(milestone, releaseLine) {
+	const target = milestone?.replace(/^(v\d+\.\d+)\.\d+.*$/, '$1').match(/^v(\d+)\.(\d+)$/);
+	const release = releaseLine.match(/^v(\d+)\.(\d+)$/);
+	return !!(target && release && Number(target[1]) === Number(release[1]) && Number(target[2]) <= Number(release[2]));
+}
+
+function runFile(command, args, opts = {}) {
+	return execFileSync(command, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, ...opts }).trim();
+}
+
+function getMilestonePRs(ghRepo, releaseLine) {
+	const pages = JSON.parse(
+		runFile('gh', [
+			'api',
+			`repos/${ghRepo}/pulls?state=closed&base=${encodeURIComponent(SOURCE_BRANCH)}&per_page=100`,
+			'--paginate',
+			'--slurp',
+		])
 	);
-	let prs = JSON.parse(json).filter((pr) => pr.mergeCommit?.oid);
-	if (sinceDate) prs = prs.filter((pr) => pr.mergedAt && pr.mergedAt > sinceDate);
-	return prs;
+	return pages
+		.flat()
+		.filter(
+			(pr) => pr.merged_at && pr.base.ref === SOURCE_BRANCH && milestoneTargetsRelease(pr.milestone?.title, releaseLine)
+		)
+		.map((pr) => {
+			if (!Number.isSafeInteger(pr.number) || pr.number <= 0 || !/^[0-9a-f]{40}$/.test(pr.merge_commit_sha)) {
+				throw new Error(`Invalid merge metadata for ${ghRepo} PR #${pr.number}`);
+			}
+			return { number: pr.number, title: pr.title, mergeCommit: { oid: pr.merge_commit_sha } };
+		});
+}
+
+function isPRPresent(pr, { commitShas, cherryPickedShas, patchIds }) {
+	const present = (commit) =>
+		commitShas.has(commit.oid) ||
+		cherryPickedShas.has(commit.oid) ||
+		!!(commit.patchId && patchIds.has(commit.patchId));
+	return present(pr.mergeCommit) || !!(pr.commits?.length && pr.commits.every(present));
+}
+
+function getPatchIds(gitArgs) {
+	const output = runFile('bash', [
+		'-o',
+		'pipefail',
+		'-c',
+		'git "$@" | git patch-id --stable',
+		'patch-release',
+		...gitArgs,
+	]);
+	return output
+		.split('\n')
+		.filter(Boolean)
+		.map((line) => line.split(' ')[0]);
+}
+
+function getMissingPRs(prs, branch, ghRepo) {
+	if (!prs.length) return [];
+	const releaseRef = `origin/${branch}`;
+	const history = runFile('git', ['log', '--format=%H%x00%B%x00', releaseRef]).split('\0');
+	const evidence = { commitShas: new Set(), cherryPickedShas: new Set(), patchIds: new Set() };
+	for (let i = 0; i < history.length - 1; i += 2) {
+		evidence.commitShas.add(history[i].trim());
+		for (const match of history[i + 1].matchAll(/^\(cherry picked from commit ([0-9a-f]{40})\)$/gm)) {
+			evidence.cherryPickedShas.add(match[1]);
+		}
+	}
+	let missing = prs.filter((pr) => !evidence.commitShas.has(pr.mergeCommit.oid));
+	if (!missing.length) return [];
+	const common = runFile('git', ['merge-base', `origin/${SOURCE_BRANCH}`, releaseRef]);
+	evidence.patchIds = new Set(
+		getPatchIds(['log', '--format=%H', '--patch', '--binary', '--diff-merges=first-parent', `${common}..${releaseRef}`])
+	);
+	const patchBySha = new Map();
+	const commitWithPatch = (oid) => {
+		if (!patchBySha.has(oid)) patchBySha.set(oid, getPatchIds(['diff', '--binary', `${oid}^1`, oid])[0]);
+		return { oid, patchId: patchBySha.get(oid) };
+	};
+	missing = missing.filter((pr) => {
+		pr.mergeCommit = commitWithPatch(pr.mergeCommit.oid);
+		pr.mergeParents = runFile('git', ['rev-list', '--parents', '-n', '1', pr.mergeCommit.oid]).split(' ').length - 1;
+		return pr.mergeParents < 2 || !isPRPresent(pr, evidence);
+	});
+	if (!missing.length) return [];
+	const headRef = (pr) => `refs/remotes/origin/patch-release-pr-${pr.number}`;
+	runFile('git', ['fetch', 'origin', ...missing.map((pr) => `+refs/pull/${pr.number}/head:${headRef(pr)}`)]);
+	return missing.filter((pr) => {
+		const original = JSON.parse(
+			runFile('gh', ['api', `repos/${ghRepo}/pulls/${pr.number}/commits?per_page=100`, '--paginate', '--slurp'])
+		).flat();
+		if (!original.length || original.length >= 250) return true;
+		if (original.some((commit) => !/^[0-9a-f]{40}$/.test(commit.sha))) {
+			throw new Error(`Cannot verify complete commit list for ${ghRepo} PR #${pr.number}`);
+		}
+		const commits = original
+			.filter((commit) => commit.parents.length === 1)
+			.map((commit) => commitWithPatch(commit.sha))
+			.filter((commit) => commit.patchId);
+		if (!commits.length) return true;
+		const aggregate = getPatchIds(['diff', '--binary', `${original[0].sha}^1`, headRef(pr)])[0];
+		// GitHub's merge SHA may represent only the last commit of a rebase.
+		const wholeMerge = pr.mergeParents > 1 || commits.length === 1 || aggregate === pr.mergeCommit.patchId;
+		const mergeCommit = wholeMerge ? pr.mergeCommit : { patchId: aggregate };
+		return !isPRPresent({ mergeCommit, commits }, evidence);
+	});
 }
 
 function getReleaseBranchCommits(lastTag, branch = RELEASE_BRANCH) {
 	const range = lastTag ? `${lastTag}..origin/${branch}` : `origin/${branch}`;
-	const r = runSafe(`git log ${range} --format='%h%x09%s'`);
-	if (r.code !== 0 || !r.out) return [];
-	return r.out
+	const output = runFile('git', ['log', range, '--format=%h%x09%s']);
+	if (!output) return [];
+	return output
 		.split('\n')
 		.filter(Boolean)
 		.map((line) => {
@@ -244,23 +340,33 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 	info(`  GitHub repo: ${ghRepo}`);
 
 	log('  Fetching from origin...');
-	runSafe('git fetch origin ' + branch);
-	run('git fetch origin --tags');
+	runFile('git', [
+		'fetch',
+		'origin',
+		'--tags',
+		`+refs/heads/${branch}:refs/remotes/origin/${branch}`,
+		`+refs/heads/${SOURCE_BRANCH}:refs/remotes/origin/${SOURCE_BRANCH}`,
+	]);
 
 	if (!hasBranch(branch)) {
 		die(`  Release branch "${branch}" not found.`);
+	}
+	if (runSafe(`git show-ref --verify "refs/heads/${branch}"`).code === 0) {
+		runFile('git', ['merge-base', '--is-ancestor', branch, `origin/${branch}`]);
 	}
 
 	const last = getLastRelease(branch);
 	if (last) info(`  Last release: ${last.tag} (${last.date})`);
 	else warn(`  No prior semver tag on ${branch}.`);
 
-	const prs = getPatchPRs(ghRepo, last?.date);
+	const version = semver.parse(readPackageVersion(`origin/${branch}`));
+	const releaseLine = /^v\d+\.\d+$/.test(branch) ? branch : `v${version.major}.${version.minor}`;
+	const prs = getMilestonePRs(ghRepo, releaseLine);
 	prs.sort((a, b) => a.number - b.number);
 
 	const commits = getReleaseBranchCommits(last?.tag, branch);
 
-	log(`\n  ${C.bold}Labeled PRs merged into ${SOURCE_BRANCH} since ${last?.tag ?? 'beginning'}:${C.reset}`);
+	log(`\n  ${C.bold}Merged PRs with milestones targeting ${releaseLine}:${C.reset}`);
 	if (prs.length === 0) {
 		log(`    ${C.dim}(none)${C.reset}`);
 	} else {
@@ -278,7 +384,15 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 		}
 	}
 
-	return { prs, commits, lastTag: last?.tag ?? null };
+	const missingPRs = getMissingPRs(prs, branch, ghRepo).map((pr) => ({
+		repo: ghRepo,
+		branch,
+		number: pr.number,
+		title: pr.title,
+	}));
+	for (const pr of missingPRs) warn(`  MISSING: ${ghRepo} #${pr.number} on ${branch} — ${pr.title}`);
+	if (!missingPRs.length) ok(`\n  Backport verification passed (${prs.length} PRs).`);
+	return { prs, commits, missingPRs, lastTag: last?.tag ?? null };
 }
 
 // ── Semver helpers ────────────────────────────────────────────────────────────
@@ -360,13 +474,16 @@ async function main() {
 
 	// ── Show status for both repos ─────────────────────────────────────────────
 	const coreStatus = showRepoStatus({ absPath: corePath, name: 'harper (core)', branch: CORE_RELEASE_BRANCH });
-	showRepoStatus({ absPath: harperProRoot, name: 'harper-pro' });
+	const proStatus = showRepoStatus({ absPath: harperProRoot, name: 'harper-pro' });
+	const missingPRs = [...coreStatus.missingPRs, ...proStatus.missingPRs];
 
-	log('');
-	log(`${C.bold}Visual check:${C.reset} verify each labeled PR has a corresponding commit on ${RELEASE_BRANCH}.`);
-	log(
-		'If any PRs are missing commits, a cherry-pick may have failed or conflicted — abort and resolve before proceeding.'
-	);
+	if (missingPRs.length) {
+		const message =
+			'Missing milestone backports: ' + missingPRs.map((pr) => `${pr.repo} #${pr.number} (${pr.branch})`).join(', ');
+		if (YES_MODE) die(message, 1, { missingPRs, pushed: false, cmTriggered: false }, true);
+		warn('\n' + message);
+		warn('Abort and resolve missing backports, or verify manually before confirming a release.');
+	}
 
 	// ── Compute target version (sync core and harper-pro) ──────────────────────
 	// When both bump, sync to the highest of their natural next versions —
@@ -577,6 +694,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+	milestoneTargetsRelease,
+	isPRPresent,
 	getArg,
 	deriveVersionName,
 	resolveDeployAnswer,
