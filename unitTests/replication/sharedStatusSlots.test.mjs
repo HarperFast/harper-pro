@@ -1,5 +1,3 @@
-/** Invariants for the replication shared-status slot registry (`replication/sharedStatusSlots.ts`). */
-
 import { expect } from 'chai';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
@@ -11,8 +9,6 @@ import { getReplicationSharedStatus } from '#src/replication/knownNodes';
 const REPLICATION_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'replication');
 const REGISTRY_RELATIVE_PATH = 'sharedStatusSlots.ts';
 
-/** Every `_POSITION`-suffixed identifier bound by a variable declaration, destructuring element, or
- * class property in a source file. */
 function declaredPositionNames(source, fileName) {
 	const names = [];
 	const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
@@ -27,7 +23,6 @@ function declaredPositionNames(source, fileName) {
 	return names;
 }
 
-/** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
 	const buffers = new Map();
 	return {
@@ -45,8 +40,6 @@ describe('replication shared-status slot registry', () => {
 
 	it('assigns every *_POSITION export a distinct, in-range slot, reserving the fire-counter block whole', () => {
 		expect(positionEntries.length).to.be.greaterThan(0);
-		// Occupy the fire-counter block's whole range, not just its named base slot, so a single-slot
-		// constant landing anywhere inside it is caught as a collision too.
 		const occupied = new Map();
 		const blockStart = slots.FIRE_COUNTER_BASE_POSITION;
 		const blockLength = slots.FIRE_MECHANISMS.length * 2;
@@ -63,7 +56,7 @@ describe('replication shared-status slot registry', () => {
 
 	it('reserves the fire-counter block without overlapping its neighbors', () => {
 		const blockStart = slots.FIRE_COUNTER_BASE_POSITION;
-		const blockEnd = blockStart + slots.FIRE_MECHANISMS.length * 2; // exclusive
+		const blockEnd = blockStart + slots.FIRE_MECHANISMS.length * 2;
 		expect(blockStart, 'fire block must start after the core link-status slots').to.be.greaterThan(
 			slots.LAST_ERROR_TIME_POSITION
 		);
@@ -77,9 +70,6 @@ describe('replication shared-status slot registry', () => {
 	});
 
 	it('assertAllocationFits throws once allocation exceeds capacity, not before', () => {
-		// A module-level `if (over) throw` only ever runs in the passing case by the time this file's
-		// own import succeeds, so it can't prove the throw fires — call the extracted function directly
-		// with a deliberate overflow instead.
 		expect(() => slots.assertAllocationFits(65, 64)).to.throw(/allocated 65 slots/);
 		expect(() => slots.assertAllocationFits(64, 64)).to.not.throw();
 	});
