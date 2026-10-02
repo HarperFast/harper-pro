@@ -4967,7 +4967,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							logger.debug?.('Received operation request', redactOperationForLog(data), 'from', remoteNodeName);
 							// Core's drop_table reads this: a peer's forwarded drop (sent with replicated:false so it is
 							// not re-broadcast) must still leave its drop marker here, unlike a client's local-only drop.
-							if (isAuthorizedNode && data && typeof data === 'object') data.replicatedFrom = remoteNodeName;
+							// Scoped to drop_table: other operations (e.g. set_configuration) reject an unrecognized field.
+							if (isAuthorizedNode && data?.operation === 'drop_table') data.replicatedFrom = remoteNodeName;
 							server.operation(data, { user: authorization }, !isAuthorizedNode).then(
 								async (response) => {
 									try {
