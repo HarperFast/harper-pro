@@ -465,11 +465,12 @@ export function holdFailedFrame(
 // (MAX_EVENT_DELAY_TIME = 3 s). Yield the event loop at least this often (ms) while decoding so the
 // worker stays responsive during a bulk copy/clone.
 const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 100;
+
+// Small sender slices batch writes; sharing one pending turn prevents peer count multiplying the budget.
 const SEND_YIELD_INTERVAL = 2;
 let lastSendYieldTime = 0;
 let pendingSendYield: Promise<void> | undefined;
 
-// Subscriptions share one pending turn so their slices cannot multiply the worker's time budget.
 export function yieldSendLoop(): Promise<void> | undefined {
 	if (pendingSendYield) return pendingSendYield;
 	if (performance.now() - lastSendYieldTime >= SEND_YIELD_INTERVAL) {
@@ -5698,13 +5699,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!tableEntry) {
 								tableEntry = tableById[tableId] = tableToTableEntry(tableSubscriptionToReplicator.tableById[tableId]);
 								if (!tableEntry) {
-									// Must share the yield budget like every other skip path: a contiguous run of entries for a
-									// table this peer doesn't subscribe to (or a dropped table, or corrupt-entry
-									// sentinels with tableId undefined) otherwise iterates with await undefined,
-									// which never leaves the microtask queue. Timers, I/O, and watchdogs starve
-									// for the whole run, and the periodic sequence updates skipAuditRecord sends
-									// never go out, so the peer's cursor can't advance past the run and every
-									// reconnect rescans it from the start.
+									// Unsubscribed/dropped tables and corrupt-entry sentinels must still check the
+									// yield budget so the sequence-update timer can advance the peer past a skipped run.
 									logger.debug?.('Not subscribed to table', tableId);
 									return skipAuditRecord();
 								}
@@ -5827,8 +5823,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// entry is encoded, send it after checks for new structure and residency
 							}
 
-							// when we can skip an audit record, we still need to occasionally send a sequence update:
-							// Every skip branch must share the time-budget yield so the sequence-update timer can fire.
+							// Every skip branch must share the yield budget so the sequence-update timer can fire.
 							function skipAuditRecord() {
 								logger.trace?.(connectionId, 'skipping audit record', auditRecord.recordId);
 								if (!skippedMessageSequenceUpdateTimer) {

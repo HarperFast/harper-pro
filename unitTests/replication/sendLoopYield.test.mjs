@@ -15,6 +15,7 @@ const waitEnd = source.indexOf('const sendQueuedData =', waitStart);
 assert(skipStart >= 0 && skipEnd > skipStart && waitStart > skipEnd && waitEnd > waitStart);
 const skip = source.slice(skipStart, skipEnd);
 const wait = source.slice(waitStart, waitEnd).replace(/};\s*$/, '');
+const realPerformanceNow = performance.now.bind(performance);
 
 function createSender() {
 	const socket = new EventEmitter();
@@ -31,7 +32,7 @@ function createSender() {
 		setImmediate,
 		setTimeout,
 		DEBUG_MODE: false,
-		SEQUENCE_ID_UPDATE: 134,
+		SEQUENCE_ID_UPDATE: 143,
 		SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY: 300,
 		MAX_OUTSTANDING_BLOBS_BEING_SENT: 5,
 		outstandingBlobsBeingSent: 0,
@@ -71,9 +72,18 @@ describe('replication sender yield budget', function () {
 		sender = createSender();
 	});
 
-	afterEach(() => {
-		performanceNow.restore();
-		clock.restore();
+	afterEach(async () => {
+		try {
+			await clock.runAllAsync();
+			now += 2;
+			const turn = replication.yieldSendLoop?.();
+			performanceNow.callsFake(realPerformanceNow);
+			await clock.runAllAsync();
+			await turn;
+		} finally {
+			performanceNow.restore();
+			clock.restore();
+		}
 	});
 
 	it('sends records below the time budget without a macrotask per record', () => {

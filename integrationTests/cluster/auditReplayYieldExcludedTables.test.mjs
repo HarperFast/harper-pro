@@ -58,8 +58,8 @@
  * The load-bearing oracle is qa522's cursor-progress sample: `skipAuditRecord()` (the
  * fixed path) sends a sequence-position update while its budgeted macrotask yields
  * let the timer fire; the reverted path (`logger.debug?.(...)`) sends
- * none until the whole synchronous walk finally completes. Confirmed against this exact
- * mechanism in this environment: reverting #536 and re-running (3 cold reruns)
+ * none until the whole synchronous walk finally completes. Before time-budget pacing,
+ * reverting #536 and re-running in this environment (3 cold reruns)
  * consistently reproduces qa522's negative-control failure (`DEFECT-SHAPE: B's
  * lastReceivedVersion only showed 1 distinct value(s)`); re-applying the fix consistently
  * passes (3 cold reruns, >=2 distinct, monotonic).
@@ -105,10 +105,8 @@ const GHOST_COUNT = 70000; // larger than qa522's single 50k run
 // near-baseline (sub-second) if the fix is doing its job; anything crossing this means
 // the loop is not yielding like it should. Not the load-bearing oracle -- see file header.
 const PING_STALL_THRESHOLD_MS = 4000;
-// Fixed window for the ping/cursor probes, matching qa522's design. The whole run
-// completes in a couple of seconds on a local machine regardless of fix state at this
-// scale, so the window just needs to comfortably span that to catch qa522's proven
-// pass/fail signal (see header).
+// Fixed window for the ping/cursor probes, matching qa522's design; it includes receiver
+// setup as well as audit replay. The header records the original pass/fail evidence.
 const PROBE_WINDOW_MS = 8000;
 const CURSOR_SAMPLE_INTERVAL_MS = 150;
 
