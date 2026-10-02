@@ -32,12 +32,20 @@ export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
  */
 export const RECORD_LOCKS_CAPABILITY = 4;
 
+/**
+ * Table lifecycle stamps: a peer at this level reads `createdTime` on definitions and structure frames and
+ * the drop-marker list in `DB_SCHEMA[4]`, which is sent only to such a peer. The stamps ride existing
+ * fields older receivers ignore.
+ */
+export const TABLE_LIFECYCLE_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	protocolVersion: number;
 	subscriptionSetupAck: number;
 	subscriptionSetupBudgetMs: number | undefined;
 	recordLocks: number;
+	tableLifecycle: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -77,7 +85,12 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		subscriptionSetupAck: resolveLevel(bag?.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY, 0),
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
 		recordLocks: resolveExactLevel(bag?.recordLocks, 0),
+		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
 	});
+}
+
+export function peerSupportsTableLifecycle(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.tableLifecycle >= TABLE_LIFECYCLE_CAPABILITY;
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
@@ -115,6 +128,7 @@ export function buildLocalCapabilities(
 		subscriptionSetupBudgetMs,
 		// A node that has not enabled cluster locks never grants, so it must not claim it would.
 		recordLocks: advertisedRecordLocksLevel(recordLocksEnabled, false),
+		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 	});
 }
 
@@ -125,7 +139,8 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.protocolVersion === b.protocolVersion &&
 		a.subscriptionSetupAck === b.subscriptionSetupAck &&
 		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
-		a.recordLocks === b.recordLocks
+		a.recordLocks === b.recordLocks &&
+		a.tableLifecycle === b.tableLifecycle
 	);
 }
 

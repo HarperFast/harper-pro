@@ -9,6 +9,7 @@ import { decode, encode } from 'msgpackr';
 import { replicateOverWS } from '#src/replication/replicationConnection';
 // Registers server.operation, which the receive path dispatches through.
 import '#src/core/server/serverHelpers/serverUtilities';
+import { server } from '#src/core/server/Server';
 
 const OPERATION_REQUEST = 136;
 const OPERATION_RESPONSE = 137;
@@ -79,5 +80,39 @@ describe('answering an OPERATION_REQUEST', function () {
 		await new Promise((resolve) => setImmediate(resolve));
 		expect(socket.sent).to.deep.equal([]);
 		expect(socket.closes).to.deep.equal([]);
+	});
+
+	// harper#1212: a peer's forwarded drop_table must carry replicatedFrom (core's drop_table reads it to
+	// keep the origin's drop marker time); no other operation may gain the field, because core's other
+	// operation handlers (e.g. set_configuration) reject an unrecognized parameter.
+	describe('replicatedFrom', () => {
+		let realOperation, received;
+
+		beforeEach(() => {
+			realOperation = server.operation;
+			received = [];
+			server.operation = (data) => {
+				received.push(data);
+				return Promise.resolve({});
+			};
+		});
+
+		afterEach(() => {
+			server.operation = realOperation;
+		});
+
+		it('is added only to a forwarded drop_table', async () => {
+			socket.emit('message', encode([OPERATION_REQUEST, { operation: 'drop_table', schema: 'data', table: 't' }]));
+			await settled(socket);
+			expect(received).to.have.length(1);
+			expect(received[0].replicatedFrom).to.equal('peer-a');
+		});
+
+		it('is left unset on every other operation', async () => {
+			socket.emit('message', encode([OPERATION_REQUEST, { operation: 'set_configuration', logging_level: 'warn' }]));
+			await settled(socket);
+			expect(received).to.have.length(1);
+			expect(received[0]).to.not.have.property('replicatedFrom');
+		});
 	});
 });
