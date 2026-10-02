@@ -465,6 +465,25 @@ export function holdFailedFrame(
 // (MAX_EVENT_DELAY_TIME = 3 s). Yield the event loop at least this often (ms) while decoding so the
 // worker stays responsive during a bulk copy/clone.
 const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 100;
+
+// Small sender slices batch writes; sharing one pending turn prevents peer count multiplying the budget.
+const SEND_YIELD_INTERVAL = 2;
+let lastSendYieldTime = 0;
+let pendingSendYield: Promise<void> | undefined;
+
+export function yieldSendLoop(): Promise<void> | undefined {
+	if (pendingSendYield) return pendingSendYield;
+	if (performance.now() - lastSendYieldTime >= SEND_YIELD_INTERVAL) {
+		return (pendingSendYield = new Promise<void>((resolve) => {
+			setImmediate(() => {
+				lastSendYieldTime = performance.now();
+				pendingSendYield = undefined;
+				resolve();
+			});
+		}));
+	}
+}
+
 // A queued frame is usually a subarray of the socket read chunk it arrived in, so it pins the whole
 // chunk, not its own length. Both the frame ceiling and the honest retention bound are stated in these
 // units rather than in frame lengths.
@@ -2845,7 +2864,7 @@ export function createReceiveWatchdog(opts: {
  * Wall-clock pacer for the bulk-copy send loop. The copy normally flushes to the socket on a
  * record-count checkpoint, but reading a large cold table dominates copy cost, so a single
  * count-batch can exceed the receive watchdog window with no bytes on the wire — and the LOCAL_ONLY
- * skip path bypasses the per-record flush+yield entirely. Either starves the watchdog into killing
+ * skip path bypasses normal record sending and its budgeted yield. Either starves the watchdog into killing
  * the connection mid-copy. This bounds the wall-clock gap between flushes/yields: `due(now)` reports
  * whether at least `intervalMs` has elapsed since the last one, and callers `mark(now)` after each
  * flush or yield (whether triggered by this pacer or the count checkpoint) so the window restarts.
@@ -5680,13 +5699,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!tableEntry) {
 								tableEntry = tableById[tableId] = tableToTableEntry(tableSubscriptionToReplicator.tableById[tableId]);
 								if (!tableEntry) {
-									// Must yield like every other skip path: a contiguous run of entries for a
-									// table this peer doesn't subscribe to (or a dropped table, or corrupt-entry
-									// sentinels with tableId undefined) otherwise iterates with await undefined,
-									// which never leaves the microtask queue. Timers, I/O, and watchdogs starve
-									// for the whole run, and the periodic sequence updates skipAuditRecord sends
-									// never go out, so the peer's cursor can't advance past the run and every
-									// reconnect rescans it from the start.
+									// Unsubscribed/dropped tables and corrupt-entry sentinels must still check the
+									// yield budget so the sequence-update timer can advance the peer past a skipped run.
 									logger.debug?.('Not subscribed to table', tableId);
 									return skipAuditRecord();
 								}
@@ -5809,9 +5823,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// entry is encoded, send it after checks for new structure and residency
 							}
 
-							// when we can skip an audit record, we still need to occasionally send a sequence update:
-							// every skip branch in sendAuditRecord must return this call — its contract is the
-							// trailing yield below, not the logging (see the !tableEntry skip's rationale above, #536).
+							// Every skip branch must share the yield budget so the sequence-update timer can fire.
 							function skipAuditRecord() {
 								logger.trace?.(connectionId, 'skipping audit record', auditRecord.recordId);
 								if (!skippedMessageSequenceUpdateTimer) {
@@ -5825,7 +5837,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 									}, SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY).unref();
 								}
-								return new Promise(setImmediate); // we still need to yield (otherwise we might never send a sequence id update)
+								return yieldSendLoop();
 							}
 							if (!sentNodeIds.has(auditRecord.nodeId)) {
 								sentNodeIds.add(auditRecord.nodeId);
@@ -5951,7 +5963,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								return new Promise((resolve) => {
 									blobSentCallbacks.push(resolve);
 								});
-							} else return new Promise(setImmediate); // yield on each turn for fairness and letting other things run
+							} else return yieldSendLoop();
 						};
 						const sendQueuedData = () => {
 							if (frame.position - frame.encodingStart > 8) {
@@ -6336,7 +6348,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													// Bound the wall-clock gap between socket flushes and event-loop yields,
 													// independent of record count. The count checkpoint below alone can let a cold
 													// batch run past the watchdog window with no bytes flushed (reads dominate cost),
-													// and the LOCAL_ONLY `continue` below skips the normal per-record flush+yield
+													// and the LOCAL_ONLY `continue` below skips normal record sending and its budgeted yield
 													// entirely — a contiguous skipped run would then never reach the timers phase, so
 													// the ping timer and receive side starve. Flush any pending batch (plain flush, NOT
 													// an end_txn — see the watermark note below) and yield a macrotask on this cadence

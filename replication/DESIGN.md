@@ -408,6 +408,8 @@ position. This keeps bootstrap available without conflating clocks in the subseq
 
 23. **Config-route reload publishes atomically.** `startOnMainThread` is re-entered on component reload while the previous keyed `hdb_nodes` watcher can still deliver events. The module-level `routes` array is also the authoritative main-thread input for leader inference and `configRouteReplicates`. Clearing it before asynchronous route preparation exposed a false "no configured leader/route" state: an existing subscription could retain or lose the wrong `isLeader` value, and a directional receive gate could temporarily fall back to the peer's differently encoded registry record. Route preparation now builds a local list and replaces the shared array contents in one `splice`, preserving the reference returned by `getConfiguredRoutes()`; tentative route-node updates run only after that commit. Effective leadership is recomputed before the existing-entry fast path, with explicit persisted `false` overriding configured inference.
 
+24. **Audit sender fairness is shared per worker.** `yieldSendLoop` shares one pending macrotask and restarts its 2 ms monotonic budget on resume, pinned by `sendLoopYield.test.mjs`. Normal sends consult it when neither drain nor blob saturation requires a wait; skips consult it so their sequence-update timer can fire. The copy-flush pacer's separate yield remains unconditional, including copy-only skipped rows.
+
 ---
 
 ## Tests
