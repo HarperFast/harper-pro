@@ -357,6 +357,7 @@ else if (args[0] === 'api' && args.includes('--paginate')) {
 			git(pro, 'commit', '-m', 'Unrelated main change');
 			git(pro, 'checkout', 'feature');
 			git(pro, 'merge', '--no-ff', 'main', '-m', 'Merge main into feature');
+			originals.push(git(pro, 'rev-parse', 'HEAD'));
 			git(pro, 'checkout', 'main');
 			git(pro, 'merge', '--squash', 'feature');
 			git(pro, 'commit', '-m', 'Squash PR 42');
