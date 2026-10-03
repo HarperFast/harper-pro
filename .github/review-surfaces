@@ -1,0 +1,26 @@
+# Risk surfaces: how much human and agent review attention a change to a path deserves.
+# Read from the BASE branch by the pre-push review (skills-internal cross-model-review), so a PR
+# cannot lower the tier of its own files. Format: `<tier> <glob>`, last match wins; a glob with no
+# `/` matches at any depth. Defaults already make replication/ critical and security/ sensitive.
+#
+# critical  — correctness or durability of stored data, replication, cluster membership
+# sensitive — authentication, authorization, keys and certificates, licensing, request filtering
+# hot       — per-request or per-message paths where a regression is a performance incident
+# ordinary  — overrides a broader line above it
+
+critical  cloneNode/
+critical  bin/repairDeleteEchoRuns.ts
+
+sensitive cloneNode/jwtKeyClone.ts
+sensitive cloneNode/sshKeyClone.ts
+sensitive licensing/
+sensitive waf/
+
+# One tier per path: replication's per-message paths (frameWriter, replicationConnection) are hot
+# too, but they also define the wire format, so they stay critical.
+hot       waf/matcher.ts
+
+ordinary  replication/logRedaction.ts
+ordinary  replication/blobSendWarnThrottle.ts
+ordinary  replication/subscribeDeferralForTest.ts
+ordinary  replication/record-lock-*-runs/
