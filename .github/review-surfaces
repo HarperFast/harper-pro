@@ -10,19 +10,19 @@
 # hot       — per-request paths where a regression is a performance incident
 # ordinary  — overrides a broader line above it
 
-critical  replication/
-critical  cloneNode/
+critical  replication/**
+critical  cloneNode/**
 critical  bin/repairDeleteEchoRuns.ts
 
-sensitive security/
+sensitive security/**
 sensitive cloneNode/jwtKeyClone.ts
 sensitive cloneNode/sshKeyClone.ts
-sensitive licensing/
-sensitive waf/
+sensitive licensing/**
+sensitive waf/**
 sensitive replication/logRedaction.ts
 # Closes the injected cluster-key fd before anything spawns a worker or subprocess.
 sensitive bin/harper.js
 
 ordinary  replication/blobSendWarnThrottle.ts
 ordinary  replication/subscribeDeferralForTest.ts
-ordinary  replication/record-lock-*-runs/
+ordinary  replication/record-lock-*-runs/**
