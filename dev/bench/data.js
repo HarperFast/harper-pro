@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790928331077,
+  "lastUpdate": 1791014874935,
   "repoUrl": "https://github.com/HarperFast/harper-pro",
   "entries": {
     "YCSB Cluster Throughput": [
@@ -5667,6 +5667,58 @@ window.BENCHMARK_DATA = {
           {
             "name": "workload E — Short ranges (95% scan / 5% insert)",
             "value": 2462.65,
+            "unit": "ops/sec"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "committer": {
+            "name": "Kris Zyp",
+            "username": "kriszyp",
+            "email": "kriszyp@gmail.com"
+          },
+          "id": "fd88fa5db112483013a01fb477893358df7fc6fb",
+          "message": "Release v5.3.1",
+          "timestamp": "2026-10-02T23:34:35Z",
+          "url": "https://github.com/HarperFast/harper-pro/commit/fd88fa5db112483013a01fb477893358df7fc6fb"
+        },
+        "date": 1791014873186,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "load — bulk insert",
+            "value": 7241.81,
+            "unit": "records/sec"
+          },
+          {
+            "name": "workload C — Read only (100% read)",
+            "value": 14897.81,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload B — Read mostly (95% read / 5% update)",
+            "value": 13152.16,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload A — Update heavy (50% read / 50% update)",
+            "value": 7004.56,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload F — Read-modify-write (50% read / 50% read-modify-write)",
+            "value": 5292.92,
+            "unit": "ops/sec"
+          },
+          {
+            "name": "workload E — Short ranges (95% scan / 5% insert)",
+            "value": 2270.52,
             "unit": "ops/sec"
           }
         ]
