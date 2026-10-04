@@ -1,0 +1,26 @@
+# Terms with a situational meaning in harper-pro. PR descriptions define them at first use as <ins title="…">term</ins>.
+# One "term: definition" per line; keep each definition to one clause.
+base copy: bulk full-table copy to a peer (startTime 0), forced when its start predates retained history
+retention floor: later of oldest retained entry and now minus audit retention; older starts get a base copy
+copy cursor: follower's persisted base-copy position {copyStartTime, currentTable, afterKey} so a copy resumes mid-table
+copy anchor: key of the leader's latest committed local-log entry, where the post-copy tail resumes
+copyApply: receiver mode that applies base-copy rows as audit-less snapshots, so no per-row change events fire
+clone attempt: in-flight bootstrap of a new node from a leader, tracked by .cloneAttempt.json plus HARPER_CLONE_ATTEMPT
+wedge: link or subscription stuck without progress yet not failing, caught only by reconcile or a watchdog
+reconcile: main-thread sweep that rebinds dead-worker subscriptions and re-drives wedged or stalled receiving links
+resume cursor: persisted position a subscription restarts from, advanced at end_txn and held back by blob gaps
+blob gap: latch holding the resume cursor when a received record's blob bytes did not durably save
+frame: one replication message of every entry at one log key; may span origins, not a transaction
+identity tie: incoming write with the same version and origin node as the stored record, so already applied
+leading-duplicate skip: drops re-streamed records at or below the resume cursor when they are provable identity ties
+echo: a node's own write or delete returned to it by a peer in the mesh
+protocol capability: feature key a peer advertises in NODE_NAME; gated frames go only to peers that advertised it
+node id mapping: per-database table of node names to short ids, local node always 0, exchanged on handshake
+residency partial: stub on a non-resident node holding only stored indexed fields, so searches still work
+directional route: sendsTo/receivesFrom route that limits replication direction instead of forming a full mesh
+hdb_nodes: replicated system table that is the node registry holding each node's routes and subscriptions
+home map: operator-agreed list of nodes participating in record locks, published per generation, never derived
+home generation: version of the home map; staging refuses any at or below what a node has seen
+quiesce: surrender every delegation a node holds and recall every grant it issued, stopping old-generation grants
+lock barrier: replicated no-op entry matched by origin, position and nonce; the only proof prior writes applied
+coordinating worker: the one worker thread per database that runs record-lock coordination and owns its inbound apply
