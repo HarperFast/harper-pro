@@ -236,14 +236,18 @@ test(
 			records: [{ id: 'forward-write', name: 'after refusal' }],
 		});
 		await waitForCondition(
-			async () => {
-				const forwardRows = await sendOperation(current, {
-					operation: 'search_by_id',
-					database: 'data',
-					table: 'orders',
-					ids: ['forward-write'],
-					get_attributes: ['id'],
-				});
+			async (signal) => {
+				const forwardRows = await sendOperation(
+					current,
+					{
+						operation: 'search_by_id',
+						database: 'data',
+						table: 'orders',
+						ids: ['forward-write'],
+						get_attributes: ['id'],
+					},
+					{ signal }
+				);
 				return forwardRows.length === 1;
 			},
 			{ timeoutMs: 30_000, pollMs: 100, description: 'forward write from the capability-less peer reaches current' }
