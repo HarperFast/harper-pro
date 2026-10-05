@@ -1338,7 +1338,8 @@ export function recordLockOwnerFor(
 	// none can overlap the successor's first grant). Run them concurrently — the bump is a durable write,
 	// the fence-ack is fast — and assign only once both resolve (harper-pro#852).
 	// Every thread that may hold a relayed handle fences, not just the owner candidates.
-	Promise.all([bump(), broadcastOwnerlessAndWait(database, recordLockParticipantWorkers())])
+	const fenceWorkers = [...new Set([...recordLockParticipantWorkers(), ...liveWorkers])];
+	Promise.all([bump(), broadcastOwnerlessAndWait(database, fenceWorkers)])
 		.then(() => {
 			// Superseded while the fence/bump was in flight (another reassignment, a release) — abandon.
 			// Checked by attempt rather than by the PENDING_BUMP marker, which a LATER attempt may have
