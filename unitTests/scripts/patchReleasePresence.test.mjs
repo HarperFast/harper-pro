@@ -54,7 +54,6 @@ describe('patch-release milestone backport verification', function () {
 	});
 
 	describe('evaluateWorkflowRuns', function () {
-		// Rows shaped like the script's projections of the REST workflow-runs and jobs responses.
 		let runId = 0;
 		const job = (name, conclusion = 'success', status = 'completed') => ({
 			name,
@@ -119,6 +118,28 @@ describe('patch-release milestone backport verification', function () {
 			const full = run(10, [{ ...job('v24', 'failure'), ...at('12:00') }]);
 			const narrow = run(11, [{ ...job('v24'), ...at('11:00') }], { event: 'workflow_dispatch' });
 			assert.deepEqual(states([full, narrow]), [['v24', 'failure']]);
+		});
+
+		it('passes once a re-run of an older run supersedes a newer run that failed', function () {
+			const at = (time) => ({ completed_at: `2026-10-05T${time}:00Z` });
+			const full = run(1, [
+				{ ...job('v22'), ...at('12:00') },
+				{ ...job('v24'), ...at('12:00') },
+			]);
+			const narrow = run(2, [{ ...job('v22', 'failure'), ...at('11:00') }], { event: 'workflow_dispatch' });
+			assert.deepEqual(states([full, narrow]), []);
+		});
+
+		it('blocks a job re-run that started after the runs were listed', function () {
+			const done = run(9, [{ ...job('a'), completed_at: '2026-10-05T10:00:00Z' }]);
+			const rerunning = run(10, [job('a', null, 'in_progress')], { conclusion: 'success' });
+			assert.deepEqual(states([done, rerunning]), [['a', 'in_progress']]);
+		});
+
+		it('blocks a run cancelled before any job started, even beside a later green run', function () {
+			const cancelled = run(10, [], { conclusion: 'cancelled' });
+			const narrow = run(11, [job('Unit Test (Node.js v24)')], { event: 'workflow_dispatch' });
+			assert.deepEqual(states([cancelled, narrow]), [[null, 'cancelled']]);
 		});
 
 		it('orders by run_number, not by response order', function () {
