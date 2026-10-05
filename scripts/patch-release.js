@@ -410,30 +410,33 @@ function evaluateWorkflowRuns(runs) {
 		if (!Number.isSafeInteger(run.run_number)) throw new Error(`Invalid run_number on workflow run ${run.id}`);
 	}
 	evidence.sort((a, b) => a.run_number - b.run_number);
-	const latest = evidence.at(-1);
-	if (!latest) return { blocking: [{ state: 'missing' }], evidence };
+	if (!evidence.length) return { blocking: [{ state: 'missing' }], evidence };
 	// An unfinished run lists no jobs yet, so a completed narrower run would otherwise read as complete evidence.
 	const unfinished = evidence.find((run) => run.status !== 'completed');
 	if (unfinished) return { blocking: [{ state: unfinished.status, url: unfinished.html_url }], evidence };
-	// A re-run keeps its run_number, so recency between runs comes from the job's own completion time.
+	// Same reason for a run that ended before any job started (cancelled while queued, startup_failure).
+	const blocking = evidence
+		.filter((run) => !run.jobs.length && run.conclusion !== 'success')
+		.map((run) => ({ state: run.conclusion, url: run.html_url }));
+	// A re-run keeps its run_number, so recency comes from each job's completion; an unfinished job is newest.
+	const recency = (job) => (job.status === 'completed' ? (job.completed_at ?? '') : '\uffff');
 	const jobs = new Map();
 	for (const run of evidence) {
 		for (const job of run.jobs) {
-			if ((job.completed_at ?? '') >= (jobs.get(job.name)?.completed_at ?? '')) jobs.set(job.name, job);
+			const previous = jobs.get(job.name);
+			if (!previous || recency(job) >= recency(previous)) jobs.set(job.name, job);
 		}
 	}
-	const blocking = [...jobs.values()]
-		.filter((job) => job.status !== 'completed' || !PASSING_JOB_CONCLUSIONS.has(job.conclusion))
-		.map((job) => ({
-			state: job.status === 'completed' ? job.conclusion : job.status,
-			job: job.name,
-			url: job.html_url,
-		}));
-	if (!blocking.length && latest.conclusion !== 'success') {
-		blocking.push({ state: latest.conclusion, url: latest.html_url });
-	} else if (!jobs.size) {
-		blocking.push({ state: 'no-jobs', url: latest.html_url });
+	for (const job of jobs.values()) {
+		if (job.status !== 'completed' || !PASSING_JOB_CONCLUSIONS.has(job.conclusion)) {
+			blocking.push({
+				state: job.status === 'completed' ? job.conclusion : job.status,
+				job: job.name,
+				url: job.html_url,
+			});
+		}
 	}
+	if (!jobs.size && !blocking.length) blocking.push({ state: 'no-jobs', url: evidence.at(-1).html_url });
 	return { blocking, evidence, jobCount: jobs.size };
 }
 
@@ -460,8 +463,6 @@ function getWorkflowRuns(ghRepo, workflow, sha) {
 	}));
 }
 
-// An unreadable result blocks like a failed one (and is overridable the same way), so an API outage
-// or a renamed workflow can never read as green.
 function checkCandidateCI(ghRepo, branch, sha, workflows) {
 	log(`\n  ${C.bold}Required CI on ${sha.slice(0, 8)} (origin/${branch}):${C.reset}`);
 	const failures = [];
