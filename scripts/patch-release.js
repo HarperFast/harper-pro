@@ -8,11 +8,14 @@
  * release: bumps versions, syncs the core submodule, tags, and pushes.
  *
  * Flow:
- *   1. For each repo, display:
+ *   1. For each repo, pin the release candidate (the fetched origin/<branch> commit) and display:
  *        - merged PRs whose milestones target the release line
- *        - commits on origin/<RELEASE_BRANCH> since the last release tag
- *      Verify backports by ancestry, cherry-pick trailers or stable patch IDs.
- *   2. After confirmation:
+ *        - commits on the candidate since the last release tag
+ *      Verify backports by ancestry, cherry-pick trailers or stable patch IDs. When the release
+ *      branch is the source branch (a main-line release), backport verification is not applicable
+ *      and is reported as such.
+ *   2. Verify the required CI workflows passed on both candidates (REQUIRED_WORKFLOWS).
+ *   3. After confirmation:
  *        - bump core version + tag (if core has new commits)
  *        - run build-tools/sync-core.sh to point harper-pro at the bumped core
  *        - bump harper-pro version + tag
@@ -32,8 +35,14 @@
  *   --dry-run         Preview without making changes
  *   --yes             Non-interactive: auto-confirm all prompts. CM deploy (prompt 2) defaults to
  *                     NO in this mode — pass --cm-trigger to opt in. This is intentional: in
- *                     interactive mode prompt 2 defaults YES on EOF, which would silently deploy;
- *                     non-interactive mode inverts that default to be safe.
+ *                     interactive mode prompt 2 defaults YES on an empty answer, which would
+ *                     silently deploy; non-interactive mode inverts that default to be safe. Closed
+ *                     stdin answers every prompt "no".
+ *   --ci-override <reason>
+ *                     Emergency release: proceed although required CI on a release candidate is
+ *                     failing, pending, missing or unreadable. The reason and the failures are
+ *                     printed and recorded in RESULT. Without it, --yes aborts on non-green CI and
+ *                     interactive mode requires confirming the override at the proceed prompt.
  *   --cm-trigger      Request CM release-to-environments. Combined with --yes, auto-confirms prompt
  *                     2 (non-interactive opt-in). Without --yes, still prompts interactively — it
  *                     only changes the prompt's wording, never bypasses confirmation. When the
@@ -43,7 +52,8 @@
  *   --json            Print a final "RESULT: {...}" JSON line for machine parsing. Also emits on
  *                     fatal error paths (RESULT: {"ok":false,"error":"..."}, nonzero exit) and on
  *                     an aborted confirmation prompt (RESULT: {"ok":false,"error":"aborted",
- *                     "aborted":true}, exit 0 — the user declined, nothing failed).
+ *                     "aborted":true}, exit 0 — the user declined, nothing failed). With --yes, a
+ *                     missing backport or non-green CI emits RESULT even without --json.
  */
 
 const { execFileSync, execSync, spawnSync } = require('node:child_process');
@@ -110,6 +120,14 @@ const SET_VERSION = getArg('--set-version', null);
 // to `next`, a stable release to `stable`. Set explicitly only to force a
 // deliberate mismatch.
 const VERSION_NAME = getArg('--version-name', null);
+const CI_OVERRIDE = getArg('--ci-override', null)?.trim() ?? null;
+
+// Workflow files that pushes to both `main` and `vX.Y` release branches trigger. Lint, typecheck and
+// format workflows run on main pushes only, so a release-branch candidate never has their runs.
+const REQUIRED_WORKFLOWS = {
+	core: ['unit-test.yml', 'integration-tests.yml'],
+	pro: ['unit-tests.yaml', 'integration-tests.yaml'],
+};
 
 // Returns the value after the LAST occurrence of `flag` in `args` (repeats override,
 // last wins), or `def` if `flag` is absent. Every occurrence is validated, not just the
@@ -166,6 +184,7 @@ if (LABEL && require.main === module) die('--label is no longer supported; PR mi
 if (VERSION_NAME && VERSION_NAME !== 'stable' && VERSION_NAME !== 'next' && require.main === module) {
 	die(`\n  Error: --version-name "${VERSION_NAME}" is invalid. Expected "stable" or "next".`);
 }
+if (CI_OVERRIDE === '' && require.main === module) die('\n  Error: --ci-override requires a non-blank reason.');
 
 // ── Shell helpers ─────────────────────────────────────────────────────────────
 function run(cmd, opts = {}) {
@@ -178,14 +197,32 @@ function runSafe(cmd) {
 }
 
 // ── User prompt ───────────────────────────────────────────────────────────────
+// Resolves null once stdin has closed. One reader serves every prompt: an interface per prompt drops
+// piped answers an earlier one had buffered, and one created after stdin ended never settles. It is
+// paused between prompts so an idle stdin does not keep the process alive.
+let promptReader;
 async function prompt(question) {
-	const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-	return new Promise((resolve) =>
-		rl.question(question, (ans) => {
-			rl.close();
-			resolve(ans.trim());
-		})
-	);
+	process.stdout.write(question);
+	if (!promptReader) {
+		const rl = readline.createInterface({ input: process.stdin });
+		promptReader = { rl, lines: [], ended: false, settle: null };
+		rl.on('line', (line) => {
+			promptReader.lines.push(line.trim());
+			promptReader.settle?.();
+		});
+		rl.on('close', () => {
+			promptReader.ended = true;
+			promptReader.settle?.();
+		});
+	}
+	const reader = promptReader;
+	if (!reader.lines.length && !reader.ended) {
+		reader.rl.resume();
+		await new Promise((resolve) => (reader.settle = resolve));
+		reader.settle = null;
+		if (!reader.ended) reader.rl.pause();
+	}
+	return reader.lines.length ? reader.lines.shift() : null;
 }
 
 // ── Git / GitHub helpers ──────────────────────────────────────────────────────
@@ -196,9 +233,9 @@ function detectGhRepo() {
 	return match[1];
 }
 
-// Most recent semver tag reachable from origin/RELEASE_BRANCH, with its commit date.
-function getLastRelease(branch = RELEASE_BRANCH) {
-	const tagR = runSafe(`git describe --tags --abbrev=0 --match 'v*.*.*' "origin/${branch}"`);
+// Most recent semver tag reachable from the release candidate, with its commit date.
+function getLastRelease(candidate) {
+	const tagR = runSafe(`git describe --tags --abbrev=0 --match 'v*.*.*' "${candidate}"`);
 	if (tagR.code !== 0 || !tagR.out) return null;
 	const tag = tagR.out;
 	const dateR = runSafe(`git log -1 --format=%aI "${tag}"`);
@@ -265,9 +302,8 @@ function getPatchIds(gitArgs) {
 		.map((line) => line.split(' ')[0]);
 }
 
-function getMissingPRs(prs, branch, ghRepo) {
+function getMissingPRs(prs, releaseRef, ghRepo) {
 	if (!prs.length) return [];
-	const releaseRef = `origin/${branch}`;
 	const history = runFile('git', ['log', '--format=%H%x00%B%x00', releaseRef]).split('\0');
 	const evidence = { commitShas: new Set(), cherryPickedShas: new Set(), patchIds: new Set() };
 	for (let i = 0; i < history.length - 1; i += 2) {
@@ -345,8 +381,8 @@ function getMissingPRs(prs, branch, ghRepo) {
 	}
 }
 
-function getReleaseBranchCommits(lastTag, branch = RELEASE_BRANCH) {
-	const range = lastTag ? `${lastTag}..origin/${branch}` : `origin/${branch}`;
+function getReleaseBranchCommits(lastTag, candidate) {
+	const range = lastTag ? `${lastTag}..${candidate}` : candidate;
 	const output = runFile('git', ['log', range, '--format=%h%x09%s']);
 	if (!output) return [];
 	return output
@@ -358,8 +394,103 @@ function getReleaseBranchCommits(lastTag, branch = RELEASE_BRANCH) {
 		});
 }
 
+// A release branch that is the source branch contains every PR merged to it by construction, so
+// ancestry there proves nothing about backports.
+function backportVerificationApplies(branch, sourceBranch) {
+	return branch !== sourceBranch;
+}
+
+// ── Release-candidate CI ──────────────────────────────────────────────────────
+const PASSING_JOB_CONCLUSIONS = new Set(['success', 'skipped', 'neutral']);
+
+// `runs` are one workflow's runs on the candidate commit, each carrying its latest-attempt `jobs`.
+// Returns the blocking states (empty means green) and the runs counted as evidence.
+function evaluateWorkflowRuns(runs) {
+	// pull_request runs test refs/pull/N/merge, not the candidate commit itself.
+	const evidence = runs.filter((run) => run.event !== 'pull_request');
+	for (const run of evidence) {
+		if (!Number.isSafeInteger(run.run_number)) throw new Error(`Invalid run_number on workflow run ${run.id}`);
+	}
+	evidence.sort((a, b) => a.run_number - b.run_number);
+	const latest = evidence.at(-1);
+	if (!latest) return { blocking: [{ state: 'missing' }], evidence };
+	if (latest.status !== 'completed') return { blocking: [{ state: latest.status, url: latest.html_url }], evidence };
+	// Each job's most recent result decides, so a later narrower run (a single-Node dispatch) cannot
+	// mask a job that failed in an earlier full-matrix run.
+	const jobs = new Map();
+	for (const run of evidence) for (const job of run.jobs) jobs.set(job.name, job);
+	const blocking = [...jobs.values()]
+		.filter((job) => job.status !== 'completed' || !PASSING_JOB_CONCLUSIONS.has(job.conclusion))
+		.map((job) => ({
+			state: job.status === 'completed' ? job.conclusion : job.status,
+			job: job.name,
+			url: job.html_url,
+		}));
+	if (!blocking.length && latest.conclusion !== 'success') {
+		blocking.push({ state: latest.conclusion, url: latest.html_url });
+	}
+	return { blocking, evidence, jobCount: jobs.size };
+}
+
+function ghApiRows(endpoint, projection) {
+	return runFile('gh', ['api', endpoint, '--paginate', '--jq', `${projection} | @json`])
+		.split('\n')
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
+}
+
+function getWorkflowRuns(ghRepo, workflow, sha) {
+	return ghApiRows(
+		`repos/${ghRepo}/actions/workflows/${workflow}/runs?head_sha=${sha}&per_page=100`,
+		'.workflow_runs[] | {id, run_number, event, status, conclusion, html_url}'
+	).map((run) => ({
+		...run,
+		jobs:
+			run.event === 'pull_request'
+				? []
+				: ghApiRows(
+						`repos/${ghRepo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`,
+						'.jobs[] | {name, status, conclusion, html_url}'
+					),
+	}));
+}
+
+// An unreadable result blocks like a failed one (and is overridable the same way), so an API outage
+// or a renamed workflow can never read as green.
+function checkCandidateCI(ghRepo, branch, sha, workflows) {
+	log(`\n  ${C.bold}Required CI on ${sha.slice(0, 8)} (origin/${branch}):${C.reset}`);
+	const failures = [];
+	for (const workflow of workflows) {
+		let result;
+		try {
+			result = evaluateWorkflowRuns(getWorkflowRuns(ghRepo, workflow, sha));
+		} catch (error) {
+			result = { blocking: [{ state: 'error', error: (error.stderr || error.message).trim() }] };
+		}
+		if (!result.blocking.length) {
+			const runs = result.evidence.map((run) => `${run.event} #${run.run_number}`).join(', ');
+			ok(`    ✓ ${workflow} (${runs}; ${result.jobCount} jobs)`);
+			continue;
+		}
+		for (const blocking of result.blocking) {
+			const detail = [blocking.url, blocking.error].filter(Boolean).join(' — ');
+			warn(
+				`    ✗ ${workflow}${blocking.job ? ` / ${blocking.job}` : ''}: ${blocking.state}${detail ? `  ${detail}` : ''}`
+			);
+			failures.push({ repo: ghRepo, branch, sha, workflow, ...blocking });
+		}
+		if (result.blocking[0].state === 'missing') {
+			warn(`      No run on this commit. Start one, wait for it, then re-run the release:`);
+			warn(`      gh workflow run ${workflow} --repo ${ghRepo} --ref ${branch}`);
+		}
+	}
+	return failures;
+}
+
 // ── Per-repo status display ───────────────────────────────────────────────────
-function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
+// Pins the release candidate: every later step (backport history, version, CI, the release commit's
+// parent) uses `sha`, so a fetch that moves origin/<branch> mid-run cannot change what gets tagged.
+function showRepoStatus({ absPath, name, branch, requiredWorkflows }) {
 	header(name);
 	process.chdir(absPath);
 	const ghRepo = detectGhRepo();
@@ -373,6 +504,8 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 		`+refs/heads/${branch}:refs/remotes/origin/${branch}`,
 		`+refs/heads/${SOURCE_BRANCH}:refs/remotes/origin/${SOURCE_BRANCH}`,
 	]);
+	const sha = runFile('git', ['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`]);
+	info(`  Release candidate: origin/${branch} ${sha}`);
 
 	let localBranchExists = false;
 	try {
@@ -383,33 +516,35 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 	}
 	if (localBranchExists) {
 		try {
-			runFile('git', ['merge-base', '--is-ancestor', branch, `origin/${branch}`]);
+			runFile('git', ['merge-base', '--is-ancestor', branch, sha]);
 		} catch (error) {
 			if (error.status !== 1) throw error;
 			throw new Error(`Local ${branch} has commits absent from origin/${branch}; synchronize it before releasing.`);
 		}
 	}
 
-	const last = getLastRelease(branch);
+	const last = getLastRelease(sha);
 	if (last) info(`  Last release: ${last.tag} (${last.date})`);
 	else warn(`  No prior semver tag on ${branch}.`);
 
-	const version = semver.parse(readPackageVersion(`origin/${branch}`));
-	const releaseLine = /^v\d+\.\d+$/.test(branch) ? branch : `v${version.major}.${version.minor}`;
-	const prs = getMilestonePRs(ghRepo, releaseLine);
-	prs.sort((a, b) => a.number - b.number);
-
-	const commits = getReleaseBranchCommits(last?.tag, branch);
-
-	log(`\n  ${C.bold}Merged PRs with milestones targeting ${releaseLine}:${C.reset}`);
-	if (prs.length === 0) {
-		log(`    ${C.dim}(none)${C.reset}`);
-	} else {
-		for (const pr of prs) {
-			log(`    #${String(pr.number).padEnd(5)} ${pr.mergeCommit.oid.slice(0, 8)}  ${pr.title}`);
+	const verifyBackports = backportVerificationApplies(branch, SOURCE_BRANCH);
+	let prs = [];
+	if (verifyBackports) {
+		const version = semver.parse(readPackageVersion(sha));
+		const releaseLine = /^v\d+\.\d+$/.test(branch) ? branch : `v${version.major}.${version.minor}`;
+		prs = getMilestonePRs(ghRepo, releaseLine);
+		prs.sort((a, b) => a.number - b.number);
+		log(`\n  ${C.bold}Merged PRs with milestones targeting ${releaseLine}:${C.reset}`);
+		if (prs.length === 0) {
+			log(`    ${C.dim}(none)${C.reset}`);
+		} else {
+			for (const pr of prs) {
+				log(`    #${String(pr.number).padEnd(5)} ${pr.mergeCommit.oid.slice(0, 8)}  ${pr.title}`);
+			}
 		}
 	}
 
+	const commits = getReleaseBranchCommits(last?.tag, sha);
 	log(`\n  ${C.bold}Commits on origin/${branch} since ${last?.tag ?? 'beginning'}:${C.reset}`);
 	if (commits.length === 0) {
 		log(`    ${C.dim}(none)${C.reset}`);
@@ -419,15 +554,26 @@ function showRepoStatus({ absPath, name, branch = RELEASE_BRANCH }) {
 		}
 	}
 
-	const missingPRs = getMissingPRs(prs, branch, ghRepo).map((pr) => ({
-		repo: ghRepo,
-		branch,
-		number: pr.number,
-		title: pr.title,
-	}));
-	for (const pr of missingPRs) warn(`  MISSING: ${ghRepo} #${pr.number} on ${branch} — ${pr.title}`);
-	if (!missingPRs.length) ok(`\n  Backport verification passed (${prs.length} PRs).`);
-	return { prs, commits, missingPRs, lastTag: last?.tag ?? null };
+	let missingPRs = [];
+	let backportVerification = 'not-applicable';
+	if (verifyBackports) {
+		missingPRs = getMissingPRs(prs, sha, ghRepo).map((pr) => ({
+			repo: ghRepo,
+			branch,
+			number: pr.number,
+			title: pr.title,
+		}));
+		for (const pr of missingPRs) warn(`  MISSING: ${ghRepo} #${pr.number} on ${branch} — ${pr.title}`);
+		backportVerification = missingPRs.length ? 'missing' : 'passed';
+		if (!missingPRs.length) ok(`\n  Backport verification passed (${prs.length} PRs).`);
+	} else {
+		warn(
+			`\n  Backport verification not applicable: release cut from source branch ${branch}; no backport evidence was checked.`
+		);
+	}
+
+	const ciFailures = checkCandidateCI(ghRepo, branch, sha, requiredWorkflows);
+	return { sha, prs, commits, missingPRs, backportVerification, ciFailures, lastTag: last?.tag ?? null };
 }
 
 // ── Semver helpers ────────────────────────────────────────────────────────────
@@ -474,7 +620,38 @@ function setVersion(repoLabel, targetVersion) {
 	return newVersion;
 }
 
-function buildSuccessResult({ target, coreVersion, proVersion, coreBumping, pushed, cmTriggered, dryRun }) {
+// The release commit may add only its own packaging changes on top of the verified candidate.
+function assertReleaseBase(repoLabel, candidate) {
+	const head = runFile('git', ['rev-parse', 'HEAD']);
+	if (head !== candidate) {
+		throw new Error(
+			`${repoLabel} HEAD ${head} is not the verified release candidate ${candidate}; re-run the release.`
+		);
+	}
+	const changed = [
+		...runFile('git', ['diff', '--cached', '--name-only']).split('\n'),
+		...runFile('git', ['diff', '--name-only', '--', 'package.json', 'package-lock.json']).split('\n'),
+	].filter(Boolean);
+	if (changed.length) {
+		throw new Error(
+			`${repoLabel} has local changes that would be folded into the release commit: ${[...new Set(changed)].join(', ')}`
+		);
+	}
+}
+
+function buildSuccessResult({
+	target,
+	coreVersion,
+	proVersion,
+	coreBumping,
+	pushed,
+	cmTriggered,
+	dryRun,
+	backportVerification,
+	candidates,
+	ciFailures,
+	ciOverride,
+}) {
 	const reportedCoreVersion = dryRun && coreBumping ? `v${target}` : (coreVersion ?? null);
 	return {
 		ok: true,
@@ -485,6 +662,10 @@ function buildSuccessResult({ target, coreVersion, proVersion, coreBumping, push
 		pushed,
 		cmTriggered,
 		dryRun,
+		backportVerification,
+		candidates,
+		ciFailures,
+		ciOverride,
 	};
 }
 
@@ -508,25 +689,70 @@ async function main() {
 	const coreOriginalBranch = run('git branch --show-current');
 
 	// ── Show status for both repos ─────────────────────────────────────────────
-	const coreStatus = showRepoStatus({ absPath: corePath, name: 'harper (core)', branch: CORE_RELEASE_BRANCH });
-	const proStatus = showRepoStatus({ absPath: harperProRoot, name: 'harper-pro' });
+	const coreStatus = showRepoStatus({
+		absPath: corePath,
+		name: 'harper (core)',
+		branch: CORE_RELEASE_BRANCH,
+		requiredWorkflows: REQUIRED_WORKFLOWS.core,
+	});
+	const proStatus = showRepoStatus({
+		absPath: harperProRoot,
+		name: 'harper-pro',
+		branch: RELEASE_BRANCH,
+		requiredWorkflows: REQUIRED_WORKFLOWS.pro,
+	});
 	const missingPRs = [...coreStatus.missingPRs, ...proStatus.missingPRs];
+	const ciFailures = [...coreStatus.ciFailures, ...proStatus.ciFailures];
+	const backportVerification = { core: coreStatus.backportVerification, pro: proStatus.backportVerification };
+	const candidates = {
+		core: coreStatus.sha,
+		pro: proStatus.sha,
+		proCoreGitlink: runFile('git', ['rev-parse', `${proStatus.sha}:core`]),
+	};
+	if (candidates.proCoreGitlink !== candidates.core) {
+		warn(
+			`\n  harper-pro CI ran against core ${candidates.proCoreGitlink.slice(0, 8)}, but this release builds on core ` +
+				`${candidates.core.slice(0, 8)}: that pairing has no CI evidence before tagging.`
+		);
+	}
 
+	const gateErrors = [];
 	if (missingPRs.length) {
-		const message =
-			'Missing milestone backports: ' + missingPRs.map((pr) => `${pr.repo} #${pr.number} (${pr.branch})`).join(', ');
-		if (YES_MODE) die(message, 1, { missingPRs, pushed: false, cmTriggered: false }, true);
-		warn('\n' + message);
-		warn('Abort and resolve missing backports, or verify manually before confirming a release.');
+		gateErrors.push(
+			'Missing milestone backports: ' + missingPRs.map((pr) => `${pr.repo} #${pr.number} (${pr.branch})`).join(', ')
+		);
+	}
+	if (ciFailures.length && !CI_OVERRIDE) {
+		gateErrors.push(
+			'Release candidate CI is not green: ' +
+				ciFailures.map((f) => `${f.repo} ${f.workflow}${f.job ? ` / ${f.job}` : ''} ${f.state}`).join(', ')
+		);
+	}
+	if (YES_MODE && gateErrors.length) {
+		die(
+			gateErrors.join('; '),
+			1,
+			{ missingPRs, ciFailures, backportVerification, candidates, pushed: false, cmTriggered: false },
+			true
+		);
+	}
+	for (const message of gateErrors) warn('\n' + message);
+	if (missingPRs.length) warn('Abort and resolve missing backports, or verify manually before confirming a release.');
+	let ciOverride = null;
+	if (ciFailures.length && CI_OVERRIDE) {
+		ciOverride = { reason: CI_OVERRIDE };
+		warn(`\nCI gate overridden with --ci-override (${ciFailures.length} failing checks above): ${CI_OVERRIDE}`);
+	} else if (CI_OVERRIDE) {
+		info('\n--ci-override given, but required CI is green; no override recorded.');
 	}
 
 	// ── Compute target version (sync core and harper-pro) ──────────────────────
 	// When both bump, sync to the highest of their natural next versions —
 	// this catches up either repo that fell behind on a prior release.
 	process.chdir(corePath);
-	const coreCurrent = readPackageVersion(`origin/${CORE_RELEASE_BRANCH}`);
+	const coreCurrent = readPackageVersion(coreStatus.sha);
 	process.chdir(harperProRoot);
-	const proCurrent = readPackageVersion(`origin/${RELEASE_BRANCH}`);
+	const proCurrent = readPackageVersion(proStatus.sha);
 	const coreBumping = coreStatus.commits.length > 0;
 	const coreNext = semver.inc(coreCurrent, VERSION_BUMP);
 	const proNext = semver.inc(proCurrent, VERSION_BUMP);
@@ -569,21 +795,32 @@ async function main() {
 		// Use a placeholder so Step 6 can still show the CM command it would run.
 		proVersion = `v${target}`;
 	} else {
+		// --yes only reaches here with green CI or --ci-override, so this acknowledgment is interactive.
+		const acknowledgeCI = ciFailures.length > 0 && !ciOverride;
 		const confirm = YES_MODE
 			? 'y'
-			: await prompt(`\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `);
-		if (confirm.toLowerCase() !== 'y') {
+			: await prompt(
+					acknowledgeCI
+						? `\nRequired CI is NOT green (see above). Proceed with version bump, sync, tag, and push for ${RELEASE_BRANCH} anyway, overriding the CI gate? [y/N]: `
+						: `\nProceed with version bump, sync, tag, and push for ${RELEASE_BRANCH}? [y/N]: `
+				);
+		if (confirm?.toLowerCase() !== 'y') {
 			warn('Aborted.');
 			// Exit 0 (a human/--yes declined, nothing failed) but still emit a RESULT line
 			// under --json — otherwise a caller parsing stdout for completion gets nothing.
 			if (JSON_OUTPUT) writeResult(buildAbortedResult());
 			return;
 		}
+		if (acknowledgeCI) {
+			ciOverride = { reason: 'interactive confirmation' };
+			warn('CI gate overridden by interactive confirmation.');
+		}
 
 		// ── Step 1: bump core (if it has new commits) ──────────────────────────
 		process.chdir(corePath);
 		run(`git checkout "${CORE_RELEASE_BRANCH}"`);
-		run(`git merge --ff-only "origin/${CORE_RELEASE_BRANCH}"`);
+		run(`git merge --ff-only "${coreStatus.sha}"`);
+		assertReleaseBase('harper (core)', coreStatus.sha);
 		if (coreBumping) {
 			coreVersion = setVersion('harper (core)', target);
 		} else {
@@ -595,7 +832,8 @@ async function main() {
 		// ── Step 2: checkout harper-pro release branch ─────────────────────────
 		process.chdir(harperProRoot);
 		run(`git checkout "${RELEASE_BRANCH}"`);
-		run(`git merge --ff-only "origin/${RELEASE_BRANCH}"`);
+		run(`git merge --ff-only "${proStatus.sha}"`);
+		assertReleaseBase('harper-pro', proStatus.sha);
 
 		// ── Step 3: sync core submodule + deps ─────────────────────────────────
 		header('Syncing core submodule + dependencies');
@@ -664,7 +902,7 @@ async function main() {
 	// terminal (see below), but dying here would skip Step 7's branch restore, leaving a reused
 	// dispatch worktree stuck on the release branch. die() is deferred until after Step 7.
 	let cmFailure = null;
-	if (deploy.toLowerCase() !== 'n') {
+	if (deploy !== null && deploy.toLowerCase() !== 'n') {
 		log('\nTriggering CM workflow...');
 		if (DRY_RUN) {
 			ok('  [dry-run] Would run: ' + cmCmd);
@@ -695,12 +933,12 @@ async function main() {
 	process.chdir(corePath);
 	if (coreOriginalBranch && coreOriginalBranch !== CORE_RELEASE_BRANCH) {
 		const back = YES_MODE ? 'y' : await prompt(`\nReturn core to "${coreOriginalBranch}"? [Y/n]: `);
-		if (back.toLowerCase() !== 'n') run(`git checkout "${coreOriginalBranch}"`);
+		if (back?.toLowerCase() !== 'n') run(`git checkout "${coreOriginalBranch}"`);
 	}
 	process.chdir(harperProRoot);
 	if (harperProOriginalBranch && harperProOriginalBranch !== RELEASE_BRANCH) {
 		const back = YES_MODE ? 'y' : await prompt(`Return harper-pro to "${harperProOriginalBranch}"? [Y/n]: `);
-		if (back.toLowerCase() !== 'n') run(`git checkout "${harperProOriginalBranch}"`);
+		if (back?.toLowerCase() !== 'n') run(`git checkout "${harperProOriginalBranch}"`);
 	}
 
 	if (cmFailure) {
@@ -717,6 +955,10 @@ async function main() {
 				pushed,
 				cmTriggered,
 				dryRun: DRY_RUN,
+				backportVerification,
+				candidates,
+				ciFailures,
+				ciOverride,
 			})
 		);
 	}
@@ -731,6 +973,8 @@ if (require.main === module) {
 module.exports = {
 	milestoneTargetsRelease,
 	isPRPresent,
+	backportVerificationApplies,
+	evaluateWorkflowRuns,
 	getArg,
 	deriveVersionName,
 	resolveDeployAnswer,

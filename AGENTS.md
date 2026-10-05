@@ -114,7 +114,7 @@ When a feature spans both, prefer landing as much as possible in `core/` and glu
 ### Pro non-source
 
 - **`build-tools/`** — `build-pro.sh` orchestrates the build; `sync-core.sh` syncs the core submodule; `download-prebuilds.js` fetches native prebuilds; `set-core-branch.sh` pins core's branch.
-- **`scripts/`** — `patch-release.js` verifies milestone-targeted merged PRs on the release branches in both core and Pro, bumps versions, syncs the submodule, and pushes the branches and tags. The cherry-pick workflow lands backports separately. See `CONTRIBUTING.md` for usage.
+- **`scripts/`** — `patch-release.js` verifies milestone-targeted merged PRs and required CI on the release candidates in both core and Pro, bumps versions, syncs the submodule, and pushes the branches and tags. The cherry-pick workflow lands backports separately. See `CONTRIBUTING.md` for usage.
 - **`dev/`** — `sync-commits.js`. One-time repo-migration utility, not part of normal runtime.
 - **`static/`** — `defaultConfig.yaml` template, `ascii_logo.txt`.
 
