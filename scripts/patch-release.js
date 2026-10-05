@@ -404,20 +404,17 @@ const PASSING_JOB_CONCLUSIONS = new Set(['success', 'skipped', 'neutral']);
 
 // `runs` are one workflow's runs on the candidate commit, each carrying its latest-attempt `jobs`.
 function evaluateWorkflowRuns(runs) {
-	// pull_request runs test refs/pull/N/merge, not the candidate commit itself.
 	const evidence = runs.filter((run) => run.event !== 'pull_request');
 	for (const run of evidence) {
 		if (!Number.isSafeInteger(run.run_number)) throw new Error(`Invalid run_number on workflow run ${run.id}`);
 	}
 	evidence.sort((a, b) => a.run_number - b.run_number);
 	if (!evidence.length) return { blocking: [{ state: 'missing' }], evidence };
-	// An unfinished run lists no jobs yet, so a completed narrower run would otherwise read as complete evidence.
 	const unfinished = evidence.find((run) => run.status !== 'completed');
 	if (unfinished) return { blocking: [{ state: unfinished.status, url: unfinished.html_url }], evidence };
-	// Same reason for a run that ended before any job started (cancelled while queued, startup_failure).
 	const blocking = evidence
-		.filter((run) => !run.jobs.length && run.conclusion !== 'success')
-		.map((run) => ({ state: run.conclusion, url: run.html_url }));
+		.filter((run) => !run.jobs.length)
+		.map((run) => ({ state: run.conclusion === 'success' ? 'no-jobs' : run.conclusion, url: run.html_url }));
 	// A re-run keeps its run_number, so recency comes from each job's completion; an unfinished job is newest.
 	const recency = (job) => (job.status === 'completed' ? (job.completed_at ?? '') : '\uffff');
 	const jobs = new Map();
@@ -436,7 +433,6 @@ function evaluateWorkflowRuns(runs) {
 			});
 		}
 	}
-	if (!jobs.size && !blocking.length) blocking.push({ state: 'no-jobs', url: evidence.at(-1).html_url });
 	return { blocking, evidence, jobCount: jobs.size };
 }
 
@@ -457,7 +453,7 @@ function getWorkflowRuns(ghRepo, workflow, sha) {
 			run.event === 'pull_request'
 				? []
 				: ghApiRows(
-						`repos/${ghRepo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`,
+						`repos/${ghRepo}/actions/runs/${run.id}/jobs?filter=all&per_page=100`,
 						'.jobs[] | {name, status, conclusion, completed_at, html_url}'
 					),
 	}));
