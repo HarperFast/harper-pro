@@ -8,6 +8,7 @@ import { transaction } from '../core/resources/transaction.ts';
 import { onMessageByType, whenThreadsStarted, getWorkerCount } from '../core/server/threads/manageThreads.js';
 import { collectRecordLockStatus } from './recordLockTransport.ts';
 import { replicationWorkers } from './replicationWorkers.ts';
+import { isWorkerPoolActive } from '../core/server/threads/workerPools.ts';
 import { setSessionHolderReader } from './recordLockRpc.ts';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import {
@@ -55,7 +56,7 @@ import { createBackoff, type Backoff } from './backoff.ts';
 import lodash from 'lodash';
 const { cloneDeep } = lodash;
 import * as env from '../core/utility/environment/environmentManager.js';
-import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import { CONFIG_PARAMS, THREAD_TYPES } from '../core/utility/hdbTerms.ts';
 import { X509Certificate } from 'crypto';
 import minimist from 'minimist';
 const cliArgs = minimist(process.argv);
@@ -1729,7 +1730,9 @@ export async function startOnMainThread(options) {
 		};
 		if (worker) {
 			worker.postMessage(request);
-		} else subscribeToNode(request);
+		} else if (!isWorkerPoolActive(THREAD_TYPES.REPLICATION)) subscribeToNode(request);
+		// the main thread does not own replication sockets while the pool runs
+		else logger.warn('No replication workers available to fail over', database, 'to node', connectingNode.name);
 	}
 	// Read the per-(database, node) replication progress out of the process-shared status buffer the owning
 	// worker writes (the same buffer cluster_status reports from). Used by findStalledReceivingNodeUrls to

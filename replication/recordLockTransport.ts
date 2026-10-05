@@ -40,8 +40,8 @@ import {
 	onMessageByType,
 	sendToThread,
 	whenThreadsStarted,
-	workers,
 } from '../core/server/threads/manageThreads.js';
+import { recordLockParticipantWorkers, replicationWorkers } from './replicationWorkers.ts';
 import {
 	deliverLockControlEntry,
 	fenceRelayedAdmissions,
@@ -585,7 +585,7 @@ function sendHomesChangedAndWaitAck(worker: any, database: string): Promise<void
 /** Main thread: relay to every (non-excluded) worker and wait for all of them, bounded per worker. */
 async function broadcastHomesChangedAndWait(database: string, exclude?: any): Promise<void> {
 	await Promise.all(
-		httpWorkers()
+		recordLockParticipantWorkers()
 			.filter((worker) => worker !== exclude)
 			.map((worker) => sendHomesChangedAndWaitAck(worker, database))
 	);
@@ -871,7 +871,7 @@ export async function bumpHomeIncarnation(): Promise<number> {
 		const first = previous === 0;
 		await ensureNode(self, { recordLockIncarnation: next }, existing ? undefined : { localOnly: true });
 		setHomeIncarnation(next, first);
-		for (const worker of httpWorkers()) confer(worker, 'record-lock-incarnation', next, first);
+		for (const worker of recordLockParticipantWorkers()) confer(worker, 'record-lock-incarnation', next, first);
 		logger.info?.(`Record lock home incarnation for ${self} is now ${next}`);
 		return next;
 	})();
@@ -1084,11 +1084,6 @@ const recordLockOwners = new Map<string, any>();
 const everHadOwner = new Set<string>();
 let nextOwnerIndex = 0;
 
-/** Isolated-application workers included: broadcasts and fences must reach every thread that can serve `lock()`. */
-function httpWorkers(): any[] {
-	return workers.filter((worker: any) => worker.name === 'http');
-}
-
 function confer(worker: any, database: string, owned: boolean): void;
 function confer(worker: any, type: 'record-lock-incarnation', value: number, first: boolean): void;
 function confer(worker: any, databaseOrType: string, ownedOrValue: boolean | number, first?: boolean): void {
@@ -1144,7 +1139,7 @@ function watchOwnerExit(worker: any): void {
 			// rather than only when the subscription manager re-binds the database's subscriptions.
 			recordLockOwnerFor(
 				database,
-				httpWorkers().filter((candidate) => candidate !== worker)
+				replicationWorkers().filter((candidate) => candidate !== worker)
 			);
 		}
 	});
@@ -1172,7 +1167,7 @@ function broadcastOwnerThread(database: string): void {
 	const owner = recordLockOwners.get(database);
 	const threadId =
 		owner === undefined || owner === PENDING_BUMP ? undefined : owner === MAIN_OWNER ? 0 : owner.threadId;
-	for (const worker of httpWorkers()) {
+	for (const worker of recordLockParticipantWorkers()) {
 		try {
 			worker.postMessage({ type: 'record-lock-owner-thread', database, threadId });
 		} catch (error) {
@@ -1227,7 +1222,7 @@ export function handleOwnerThreadAck(message: { requestId: number }, port?: { th
  * `replication/DESIGN.md`. Main fences its own relayed handles synchronously first, and a fence it could
  * not complete fails the handoff for the same reason a worker's does. Main thread only.
  */
-function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorkers()): Promise<void> {
+function broadcastOwnerlessAndWait(database: string, workers: any[] = recordLockParticipantWorkers()): Promise<void> {
 	updateOwnerThread(database, undefined);
 	// Main's own fence, run explicitly for the same reason the worker handler re-runs it: on the
 	// owner-exit path `broadcastOwnerThread` already cleared main's owner, so the call above fences
@@ -1307,7 +1302,7 @@ function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorker
  */
 export function recordLockOwnerFor(
 	database: string,
-	liveWorkers: any[] = httpWorkers(),
+	liveWorkers: any[] = replicationWorkers(),
 	bump: () => Promise<number> = bumpHomeIncarnation
 ): any {
 	if (parentPort) throw new Error('record lock ownership is assigned on the main thread only');
@@ -1342,7 +1337,8 @@ export function recordLockOwnerFor(
 	// token) AND every surviving worker confirming it has fenced the departed owner's relayed handles (so
 	// none can overlap the successor's first grant). Run them concurrently — the bump is a durable write,
 	// the fence-ack is fast — and assign only once both resolve (harper-pro#852).
-	Promise.all([bump(), broadcastOwnerlessAndWait(database, liveWorkers)])
+	// Every thread that may hold a relayed handle fences, not just the owner candidates.
+	Promise.all([bump(), broadcastOwnerlessAndWait(database, recordLockParticipantWorkers())])
 		.then(() => {
 			// Superseded while the fence/bump was in flight (another reassignment, a release) — abandon.
 			// Checked by attempt rather than by the PENDING_BUMP marker, which a LATER attempt may have
@@ -1414,12 +1410,12 @@ export interface RecordLockClusterStatus extends Partial<RecordLockDatabaseStats
 /**
  * `cluster_status`'s `recordLocks` section: each database's owner with its coordinator counters, and
  * the per-thread counters (`droppedOffOwner`, `controlEntryRelayDrops`, `relayedAdmissions`) summed
- * over EVERY http worker — each is recorded on the thread that applied or asked, so the owner alone
+ * over EVERY http and replication worker — each is recorded on the thread that applied or asked, so the owner alone
  * would hide exactly what it reports. Every worker is asked concurrently under one bound so an
  * unresponsive one cannot hang the operation. Main thread only.
  */
 export async function collectRecordLockStatus(
-	liveWorkers: any[] = httpWorkers()
+	liveWorkers: any[] = recordLockParticipantWorkers()
 ): Promise<Record<string, RecordLockClusterStatus>> {
 	const result: Record<string, RecordLockClusterStatus> = {};
 	if (recordLockOwners.size === 0) return result;

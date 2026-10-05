@@ -52,7 +52,8 @@ import {
 	isValidNodeRecord,
 	readNodeForAuth,
 } from './knownNodes.ts';
-import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import { CONFIG_PARAMS, THREAD_TYPES } from '../core/utility/hdbTerms.ts';
+import { isWorkerPoolActive } from '../core/server/threads/workerPools.ts';
 import { exportIdMapping, getIdOfRemoteNode } from '../core/resources/nodeIdMapping.ts';
 import * as tls from 'node:tls';
 import { ServerError } from '../core/utility/errors/hdbError.js';
@@ -154,6 +155,9 @@ export function start(options) {
 		maxPayload: 10 * 1024 * 1024 * 1024, // 10 GB max payload, primarily to support replicating applications
 		...options,
 		mtls: mtlsConfig, // mTLS with optional certificate verification (always overrides)
+		// With the dedicated pool running, only its workers bind the replication port, so every inbound
+		// replication socket lands there; HTTP workers still run the rest of start() for cache-miss retrieval.
+		threadType: isWorkerPoolActive(THREAD_TYPES.REPLICATION) ? THREAD_TYPES.REPLICATION : undefined,
 	};
 	// noinspection JSVoidFunctionReturnValueUsed
 	// @ts-expect-error
