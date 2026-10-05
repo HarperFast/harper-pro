@@ -967,8 +967,7 @@ const recordLockOwners = new Map<string, any>();
 const everHadOwner = new Set<string>();
 let nextOwnerIndex = 0;
 
-/** Every live http worker, isolated-application ones included: the set record-lock broadcasts and fences reach.
- * Owners are picked from its `isReplicationWorker` subset. */
+/** Isolated-application workers included: broadcasts and fences must reach every thread that can serve `lock()`. */
 function httpWorkers(): any[] {
 	return workers.filter((worker: any) => worker.name === 'http');
 }

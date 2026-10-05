@@ -1,7 +1,7 @@
 /**
  * harper-pro#974: a worker dedicated to an isolated application is an `http` worker too, but replication must
- * never place a peer subscription or a database's record-lock coordination on it. Each node runs one pool
- * worker plus the dedicated one, so a round robin over every http worker would land every other database there.
+ * never place a peer subscription or a database's record-lock coordination on it. The isolated node runs one
+ * pool worker plus the dedicated one, so a round robin over every http worker would land every other database there.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
