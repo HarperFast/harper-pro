@@ -395,8 +395,6 @@ function getReleaseBranchCommits(lastTag, candidate) {
 		});
 }
 
-// A release branch that is the source branch contains every PR merged to it by construction, so
-// ancestry there proves nothing about backports.
 function backportVerificationApplies(branch, sourceBranch) {
 	return branch !== sourceBranch;
 }
@@ -417,10 +415,13 @@ function evaluateWorkflowRuns(runs) {
 	// An unfinished run lists no jobs yet, so a completed narrower run would otherwise read as complete evidence.
 	const unfinished = evidence.find((run) => run.status !== 'completed');
 	if (unfinished) return { blocking: [{ state: unfinished.status, url: unfinished.html_url }], evidence };
-	// Each job's most recent result decides, so a later narrower run (a single-Node dispatch) cannot
-	// mask a job that failed in an earlier full-matrix run.
+	// A re-run keeps its run_number, so recency between runs comes from the job's own completion time.
 	const jobs = new Map();
-	for (const run of evidence) for (const job of run.jobs) jobs.set(job.name, job);
+	for (const run of evidence) {
+		for (const job of run.jobs) {
+			if ((job.completed_at ?? '') >= (jobs.get(job.name)?.completed_at ?? '')) jobs.set(job.name, job);
+		}
+	}
 	const blocking = [...jobs.values()]
 		.filter((job) => job.status !== 'completed' || !PASSING_JOB_CONCLUSIONS.has(job.conclusion))
 		.map((job) => ({
@@ -454,7 +455,7 @@ function getWorkflowRuns(ghRepo, workflow, sha) {
 				? []
 				: ghApiRows(
 						`repos/${ghRepo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`,
-						'.jobs[] | {name, status, conclusion, html_url}'
+						'.jobs[] | {name, status, conclusion, completed_at, html_url}'
 					),
 	}));
 }
@@ -492,7 +493,6 @@ function checkCandidateCI(ghRepo, branch, sha, workflows) {
 }
 
 // ── Per-repo status display ───────────────────────────────────────────────────
-// Every later step uses `sha`, so a fetch that moves origin/<branch> mid-run cannot change what gets tagged.
 function showRepoStatus({ absPath, name, branch, requiredWorkflows }) {
 	header(name);
 	process.chdir(absPath);
@@ -821,14 +821,15 @@ async function main() {
 		process.chdir(corePath);
 		run(`git checkout "${CORE_RELEASE_BRANCH}"`);
 		run(`git merge --ff-only "${coreStatus.sha}"`);
-		assertReleaseBase('harper (core)', coreStatus.sha);
 		process.chdir(harperProRoot);
-		run(`git checkout "${RELEASE_BRANCH}"`);
-		run(`git merge --ff-only "${proStatus.sha}"`);
+		// With submodule.recurse set, these would move core to harper-pro's recorded gitlink.
+		run(`git -c submodule.recurse=false checkout "${RELEASE_BRANCH}"`);
+		run(`git -c submodule.recurse=false merge --ff-only "${proStatus.sha}"`);
 		assertReleaseBase('harper-pro', proStatus.sha);
+		process.chdir(corePath);
+		assertReleaseBase('harper (core)', coreStatus.sha);
 
 		// ── Step 2: bump core (if it has new commits) ──────────────────────────
-		process.chdir(corePath);
 		if (coreBumping) {
 			coreVersion = setVersion('harper (core)', target);
 		} else {

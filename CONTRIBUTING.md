@@ -70,7 +70,7 @@ node scripts/patch-release.js
 | `--ci-override <reason>`  | —                   | Emergency release past non-green required CI; the reason is printed and recorded in `RESULT`                          |
 | `--json`                  | —                   | Print a final `RESULT: {...}` JSON line on stdout for machine parsing (success, abort, or fatal error)                |
 
-A successful `RESULT` also carries `backportVerification` (`passed`, `missing` or `not-applicable` per repository), `candidates` (`core`, `pro`, `proCoreGitlink` SHAs), `ciFailures`, and `ciOverride` (`null` or `{ "reason": ... }`). Closed stdin answers the proceed and CM deploy prompts "no"; the branch-restore prompts keep their default and restore. A declined or closed proceed prompt emits the aborted `RESULT` with the same gate fields.
+A successful `RESULT` also carries `backportVerification` (`passed`, `missing` or `not-applicable` per repository), `candidates` (`core`, `pro`, `proCoreGitlink` SHAs), `ciFailures`, and `ciOverride` (`null` or `{ "reason": ... }`). Closed stdin answers the proceed and CM deploy prompts "no"; the branch-restore prompts keep their default and restore. With `--json`, a declined or closed proceed prompt emits the aborted `RESULT` with the same gate fields.
 
 **Example — preview what would be applied:**
 
