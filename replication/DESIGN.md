@@ -102,7 +102,7 @@ Which thread owns a replication socket:
 - **One predicate, two sets.** `isReplicationWorker` (`replicationWorkers()` is its live-worker filter) is the only placement rule: round-robin subscriptions and record-lock owner candidates both use it; `recordLockParticipantWorkers()` is every HTTP and pool worker, which must all hear owner changes and fence (`broadcastOwnerlessAndWait`), because any of them may hold a relayed handle. With the pool on, every cluster `lock()` on an HTTP worker relays to a pool owner.
 - **Active, not live.** While the pool is configured, `replicationWorkers()` returns only pool members, empty while all of them restart, so placement defers instead of moving to HTTP workers that do not own the port.
 - **Stays on the caller:** cache-miss retrieval (bridging it would serialize records and blobs across threads) and `sendOperationToNode` operation sockets (control plane).
-- **Pool workers run no application code.** A per-thread table hook an application installs (`Table.setResidencyById`) is absent where the sender runs, so such an application sends invalidations to non-resident peers with the pool on.
+- **Pool workers run no application code.** A per-thread table hook an application installs (`Table.setResidencyById`) is absent where the sender runs, so such an application sends invalidations to non-resident peers with the pool on (accepted for 5.4; harper-pro#980 proposes declarative residency).
 - `replicator.start()` still runs on every worker: HTTP workers need `assignReplicationSource` for retrieval. Only the listener registration carries `threadType`.
 
 ### Cluster record locks (`recordLockTransport.ts`, `recordLockRpc.ts`, `recordLockHomes.ts`, harper-pro#438 / #825)
