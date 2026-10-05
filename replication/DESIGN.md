@@ -119,7 +119,7 @@ What harper-pro supplies is core's `ClusterLockTransport`, registered per replic
 - `RECORD_LOCK_COST_DELEGATIONS.md` — the delegation protocol (harper-pro#824): repeat-lock collapses to 0.01–0.03 ms; a contended key is monopolized rather than shared; before the freshness barrier (harper#2542) the hot-key counter lost 0.05–0.13 % of updates at 3 contenders.
 - `RECORD_LOCK_RELAY_TRANSPORT.md` — the off-owner relay (`npm run bench:record-lock-relay`). A relayed acquire costs the coordinating worker's turn length (0.0164 ms idle, **1.008 ms at 1 ms of work per turn**, above the 0.68 ms round trip delegations replaced, for `(N-1)/N` of locks). `notify()` is no faster than `postMessage`. A local admission against a `getUserSharedBuffer` slot (0.0002 ms) is a follow-up that adds a fast path but cannot remove the revoke/ack fence, because a handle is revoked after `unlock()` has already returned the key (`recordLock.ts` `revokeLease()`).
 
-**Successor freshness (harper#2542, core half harper#2613, fence harper#2625).** A handoff now carries freshness as well as exclusion: core hands the transport the inherited `(origin, position)` lineage of a grant, and `establishLockFreshness()` (`recordLockFreshness.ts`) proves each cross-origin dependency by asking the origin for a `lockBarrier` control entry (`record_lock_barrier`, `recordLockRpc.ts`, node principal + current member at the exact level, rate-bounded) and waiting for that exact `(origin, position, nonce)` entry to commit here — reported from the frame's `onCommit` in `replicationConnection.ts`, relayed to the coordinating thread when applied elsewhere. Nothing numeric is a fence (rocksdb-js appends in commit order and reissues keys after a clock step), so ordinary frames pay only a type comparison. A record this node drops (excluded table, missing structure, decode error) or fails to apply terminally (core's awaited listener, harper#2628) poisons `(origin, table)` durably and permanently (`recordLockPoison.ts`); a clone attempt sets an ever-recloned flag before its first row, after which this node's own earlier lineage is refused. Every refusal is a 503 naming the reason; `cluster_status.recordLocks` carries the counters and poisoned pairs. The full design, the append-order probe and the rejected alternatives are in `RECORD_LOCK_FRESHNESS_DESIGN.md`; the planning rounds are in harper-pro#822's description.
+**Successor freshness (harper#2542, core half harper#2613, fence harper#2625).** A handoff now carries freshness as well as exclusion: core hands the transport the inherited `(origin, position)` lineage of a grant, and `establishLockFreshness()` (`recordLockFreshness.ts`) proves each cross-origin dependency by asking the origin for a `lockBarrier` control entry (`record_lock_barrier`, `recordLockRpc.ts`, node principal + current member at the exact level, rate-bounded) and waiting for that exact `(origin, position, nonce)` entry to commit here — reported from the frame's `onCommit` in `replicationConnection.ts`, relayed to the coordinating thread when applied elsewhere. Nothing numeric is a fence (rocksdb-js appends in commit order and reissues keys after a clock step), so ordinary frames pay only a type comparison. A record this node drops (excluded table, missing structure, decode error) or fails to apply terminally (core's awaited listener, harper#2628) poisons `(origin, table)` durably and permanently (`recordLockPoison.ts`), except when the poison write itself fails — then the hole is held only in that thread's memory (`RECORD_LOCK_FRESHNESS_DESIGN.md`, "Poison"); a clone attempt sets an ever-recloned flag before its first row, after which this node's own earlier lineage is refused. Every refusal is a 503 naming the reason; `cluster_status.recordLocks` carries the counters and poisoned pairs. The full design, the append-order probe and the rejected alternatives are in `RECORD_LOCK_FRESHNESS_DESIGN.md`; the planning rounds are in harper-pro#822's description.
 
 **Multi-worker service (harper-pro#852).** Two items core's §11 left owed are now closed. Every-serving-thread registration holds by construction: the transport registers from the replication built-in's `start()`, and a built-in is a trusted plugin `placedOnThisThread` loads on every http worker (dedicated application workers included), so every serving thread latches `clusterRequiredDatabases` and fails closed rather than taking the Phase 0 node lock alone. A `lock()` on a non-owner worker relays its admission to the owner (see the owner-relay bullet), so cluster locks work uniformly at `threads.count > 1`. The `recordLockHomes` row transition also moved to a **process-wide** guard: `withRow` takes a node-scoped hold lock on the `hdb_record_lock_homes` row itself and writes **through** that locked handle, so the read a `stage`/`fence`/`activate` decides against and the write that replaces the row are one cross-thread-exclusive critical section, and a lease lost to a storage stall fails the write (commit fence) rather than letting a stale plan overwrite a concurrent transition. Still outstanding from §11: the inbound-peer `lockRelease` cross-thread relay gap (a replicated release entry landing on a non-owner thread's subscription sink — distinct from the local-`lock()` release relay above). A crashed delegate holds its keys for up to `DELEGATION_LEASE_MS` (a core constant) before its home re-grants them; whether it should be configurable was left open on harper#2498.
 
@@ -131,23 +131,25 @@ A `Resource` class installed as a `source` of a table. Declared inside `setRepli
 
 Per (database, remote_node) pair: a `Float64Array` over the audit store's `getUserSharedBuffer`, shared across threads, used to avoid IPC for hot-path status updates. Position constants live in `replicationConnection.ts` (slots 29–31 in `recordLockTransport.ts`):
 
-| Position | Constant                           |
-| -------- | ---------------------------------- |
-| 0        | `CONFIRMATION_STATUS_POSITION`     |
-| 1        | `RECEIVED_VERSION_POSITION`        |
-| 2        | `RECEIVED_TIME_POSITION`           |
-| 3        | `SENDING_TIME_POSITION`            |
-| 4        | `LATENCY_POSITION`                 |
-| 5        | `RECEIVING_STATUS_POSITION`        |
-| 6        | `BACK_PRESSURE_RATIO_POSITION`     |
-| 7        | `BLOB_FAILURE_COUNT_POSITION`      |
-| 8        | `LAST_BLOB_FAILURE_TIME_POSITION`  |
-| 9        | `CONNECTION_STATE_POSITION`        |
-| 10       | `LAST_LIVENESS_TIME_POSITION`      |
-| 11       | `LAST_ERROR_CODE_POSITION`         |
-| 12       | `LAST_ERROR_TIME_POSITION`         |
-| 13–28    | fire-classification counters       |
-| 29       | `RECORD_LOCKS_CAPABILITY_POSITION` |
+| Position | Constant                               |
+| -------- | -------------------------------------- |
+| 0        | `CONFIRMATION_STATUS_POSITION`         |
+| 1        | `RECEIVED_VERSION_POSITION`            |
+| 2        | `RECEIVED_TIME_POSITION`               |
+| 3        | `SENDING_TIME_POSITION`                |
+| 4        | `LATENCY_POSITION`                     |
+| 5        | `RECEIVING_STATUS_POSITION`            |
+| 6        | `BACK_PRESSURE_RATIO_POSITION`         |
+| 7        | `BLOB_FAILURE_COUNT_POSITION`          |
+| 8        | `LAST_BLOB_FAILURE_TIME_POSITION`      |
+| 9        | `CONNECTION_STATE_POSITION`            |
+| 10       | `LAST_LIVENESS_TIME_POSITION`          |
+| 11       | `LAST_ERROR_CODE_POSITION`             |
+| 12       | `LAST_ERROR_TIME_POSITION`             |
+| 13–28    | fire-classification counters           |
+| 29       | `RECORD_LOCKS_CAPABILITY_POSITION`     |
+| 30       | `RECORD_LOCK_HOMES_AGREEMENT_POSITION` |
+| 31       | `RECORD_LOCK_LEVEL_POSITION`           |
 
 The buffer is 32 `Float64` slots (256 bytes), sized from `REPLICATION_SHARED_STATUS_SLOTS` in `knownNodes.ts`; 0–31 are used (30 is the record-lock home-map digest agreement tri-state, `RECORD_LOCK_HOMES_AGREEMENT_POSITION`; 31 is the peer's exact advertised `recordLocks` level, `RECORD_LOCK_LEVEL_POSITION`, both in `recordLockTransport.ts`); grow the constant for the next slot. Slots 0–12 are written concurrently by `replicationConnection.ts` without explicit synchronization (single-writer-per-field in practice) — **don't introduce read-modify-write patterns on those.** Slots 13–28 are the one deliberate exception; see the counter invariant below.
 
