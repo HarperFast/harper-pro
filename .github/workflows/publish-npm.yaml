@@ -45,42 +45,69 @@ jobs:
           RELEASE_LINE: ${{ steps.version-components.outputs.major }}.${{ steps.version-components.outputs.minor }}
         run: |
           set -euo pipefail
+
+          # npm applies `--tag` unconditionally, so nothing but this step keeps a
+          # moving tag from going backwards when release lines publish out of order.
+          # E404 is how the registry reports an absent tag; any other npm failure
+          # must abort, because treating it as "absent" is how the tag gets stolen.
+          tagVersion() {
+            local status=0 version
+            version=$(npm view "$PACKAGE_NAME@$1" version 2>"$RUNNER_TEMP/npm-view.err") || status=$?
+            if [[ $status -ne 0 ]]; then
+              if grep -q 'code E404' "$RUNNER_TEMP/npm-view.err"; then
+                return 0
+              fi
+              cat "$RUNNER_TEMP/npm-view.err" >&2
+              return "$status"
+            fi
+            printf '%s' "$version"
+          }
+
+          # Sort and take the last line rather than a `-r '>x'` range: ranges drop
+          # prereleases outside their own x.y.z, so a range reads 5.4.0-beta.1 as
+          # losing to 5.3.0-beta.4 and `next` would never leave the older line.
+          advances() {
+            if [[ -z "$1" ]]; then
+              return 0
+            fi
+            [[ "$(npx --yes semver@7.8.5 "$VERSION" "$1" | tail -1)" == "$VERSION" ]]
+          }
+
           if [[ "$PRERELEASE" == '' ]]; then
             baseTag=latest
           else
             baseTag=next
           fi
-          # Only move the base tag forward: a maintenance release (e.g. 5.2.x
-          # published after 5.3.x) must not steal `latest` from a newer line —
-          # it gets a line-scoped tag (e.g. `latest-5.2`) instead.
-          # E404 means the tag doesn't exist yet (first publish); any other npm
-          # error must abort — treating it as "no tag" would steal the tag.
-          viewStatus=0
-          currentVersion=$(npm view "$PACKAGE_NAME@$baseTag" version 2>"$RUNNER_TEMP/npm-view.err") || viewStatus=$?
-          if [[ $viewStatus -ne 0 ]]; then
-            if grep -q 'code E404' "$RUNNER_TEMP/npm-view.err"; then
-              currentVersion=''
-            else
-              cat "$RUNNER_TEMP/npm-view.err" >&2
-              exit "$viewStatus"
-            fi
-          fi
-          if [[ -z "$currentVersion" ]]; then
+          lineTag=$baseTag-$RELEASE_LINE
+
+          # Assign before testing: a command substitution that fails inside an `if`
+          # condition does not trip `set -e`, which would turn a registry error into
+          # an empty "no tag" and steal the tag this step exists to protect.
+          baseVersion=$(tagVersion "$baseTag")
+          lineVersion=$(tagVersion "$lineTag")
+
+          if advances "$baseVersion"; then
             packageTag=$baseTag
+          elif advances "$lineVersion"; then
+            packageTag=$lineTag
           else
-            highest=$(npx --yes semver@7.8.5 "$VERSION" "$currentVersion" | tail -1)
-            if [[ "$highest" == "$VERSION" ]]; then
-              packageTag=$baseTag
-            else
-              packageTag=$baseTag-$RELEASE_LINE
-            fi
+            # Older than both pointers, so neither may move. npm always applies some
+            # tag, so publish under a throwaway and drop it once the version is up.
+            packageTag=tmp-publish-$VERSION
+            echo "throwawayTag=$packageTag" >> "$GITHUB_OUTPUT"
           fi
-          echo "Publishing $PACKAGE_NAME@$VERSION with dist-tag '$packageTag' (current $baseTag: ${currentVersion:-none})"
+
+          echo "Publishing $PACKAGE_NAME@$VERSION with dist-tag '$packageTag' ($baseTag: ${baseVersion:-none}, $lineTag: ${lineVersion:-none})"
           echo "packageTag=$packageTag" >> "$GITHUB_OUTPUT"
       - name: Publish package to NPM registry
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access=public --tag=${{ steps.package-tag.outputs.packageTag }} harperfast-harper-pro-*.tgz
+      - name: Drop the throwaway dist-tag
+        if: steps.package-tag.outputs.throwawayTag != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm dist-tag rm '@harperfast/harper-pro' '${{ steps.package-tag.outputs.throwawayTag }}'
 
   send-slack-message-on-success:
     if: success() && !cancelled()
