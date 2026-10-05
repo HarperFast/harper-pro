@@ -114,6 +114,13 @@ describe('patch-release milestone backport verification', function () {
 			]);
 		});
 
+		it('lets a re-run of an older run supersede a newer run of the same job', function () {
+			const at = (time) => ({ completed_at: `2026-10-05T${time}:00Z` });
+			const full = run(10, [{ ...job('v24', 'failure'), ...at('12:00') }]);
+			const narrow = run(11, [{ ...job('v24'), ...at('11:00') }], { event: 'workflow_dispatch' });
+			assert.deepEqual(states([full, narrow]), [['v24', 'failure']]);
+		});
+
 		it('orders by run_number, not by response order', function () {
 			assert.deepEqual(states([run(8, [job('v22')]), run(7, [job('v22', 'failure')])]), []);
 		});
@@ -813,6 +820,27 @@ else if (args[0] === 'api' && args[1].includes('/actions/')) {
 				assert.equal(git(pro, 'tag', '--list', 'v5.1.1'), '');
 				assert.equal(git(core, 'rev-parse', 'v5.1'), git(remote(core), 'rev-parse', 'v5.1'));
 				assert.deepEqual(remoteSnapshot(), remoteBefore);
+			});
+
+			it('builds core on its candidate even when git recurses into submodules', function () {
+				allowRelease();
+				// harper-pro main pins a different core commit than v5.1, so a recursive checkout moves core.
+				addPR(core, 41, 'v6.0');
+				git(core, 'checkout', 'v5.1');
+				git(core, 'commit', '--allow-empty', '-m', 'Core backport');
+				publish(core, 'v5.1:refs/heads/v5.1');
+				git(core, 'checkout', 'main');
+				const coreCandidate = git(core, 'rev-parse', 'v5.1');
+				env.GIT_CONFIG_COUNT = '6';
+				env.GIT_CONFIG_KEY_5 = 'submodule.recurse';
+				env.GIT_CONFIG_VALUE_5 = 'true';
+				const r = runCli(['--yes', '--json']);
+				assert.equal(r.status, 0, r.stdout + r.stderr);
+				assert.equal(resultOf(r).coreVersion, 'v5.1.1');
+				const coreRelease = git(remote(core), 'rev-parse', 'refs/tags/v5.1.1^{commit}');
+				assert.equal(git(remote(core), 'rev-parse', `${coreRelease}^`), coreCandidate);
+				assert.equal(git(remote(core), 'rev-parse', 'v5.1'), coreRelease);
+				assert.equal(git(remote(pro), 'rev-parse', 'refs/tags/v5.1.1^{commit}:core'), coreRelease);
 			});
 
 			it('warns when harper-pro CI ran against a different core than the release builds on', function () {
