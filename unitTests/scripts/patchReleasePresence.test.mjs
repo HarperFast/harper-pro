@@ -158,8 +158,18 @@ describe('patch-release milestone backport verification', function () {
 			assert.deepEqual(states([queuedFull, narrow]), [[null, 'queued']]);
 		});
 
-		it('blocks a successful run that lists no jobs', function () {
+		it('blocks a successful run that lists no jobs, even beside a run that has jobs', function () {
 			assert.deepEqual(states([run(1, [])]), [[null, 'no-jobs']]);
+			assert.deepEqual(states([run(1, [job('a')]), run(2, [])]), [[null, 'no-jobs']]);
+		});
+
+		it('keeps a failure from an earlier attempt that the re-run did not repeat', function () {
+			const attempts = run(5, [
+				{ ...job('v22', 'failure'), completed_at: '2026-10-05T10:00:00Z' },
+				{ ...job('v24', 'failure'), completed_at: '2026-10-05T10:00:00Z' },
+				{ ...job('v22'), completed_at: '2026-10-05T11:00:00Z' },
+			]);
+			assert.deepEqual(states([attempts]), [['v24', 'failure']]);
 		});
 
 		it('blocks on a run that failed without any jobs', function () {
@@ -337,7 +347,7 @@ else if (args[0] === 'api' && args[1].includes('/actions/')) {
     // runs.json: { "<repo>/<workflow file>": [run rows with jobs] | "error" }; absent means one green push run.
     const runs = JSON.parse(fs.readFileSync(path.join(fixture, 'runs.json'), 'utf8'));
     const workflowRuns = args[1].match(new RegExp('^repos/[^/]+/([^/]+)/actions/workflows/([^/]+)/runs[?]head_sha=([0-9a-f]{40})&'));
-    const jobs = args[1].match(new RegExp('/actions/runs/([^/]+)/jobs[?]filter=latest&'));
+    const jobs = args[1].match(new RegExp('/actions/runs/([^/]+)/jobs[?]filter=all&'));
     if (workflowRuns) {
         const key = workflowRuns[1] + '/' + workflowRuns[2];
         const onWorkflowQuery = path.join(fixture, 'on-workflow-query.sh');
