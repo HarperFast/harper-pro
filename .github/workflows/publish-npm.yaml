@@ -127,7 +127,9 @@ jobs:
           # Assigned before testing so a registry failure ends the step: a silent
           # "no tag to remove" would strand the throwaway tag behind a green job.
           publishedTags=$(npm dist-tag ls "$PACKAGE_NAME")
-          if grep -q "^$THROWAWAY_TAG:" <<<"$publishedTags"; then
+          # Exact field compare, not grep: the tag contains `.`, which a regex would
+          # treat as a wildcard.
+          if awk -F': ' -v tag="$THROWAWAY_TAG" '$1 == tag { found = 1 } END { exit !found }' <<<"$publishedTags"; then
             npm dist-tag rm "$PACKAGE_NAME" "$THROWAWAY_TAG"
           else
             echo "No $THROWAWAY_TAG tag to remove"
