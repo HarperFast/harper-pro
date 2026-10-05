@@ -229,6 +229,13 @@ describe('patch-release.js non-interactive contract', function () {
 	});
 
 	describe('buildSuccessResult', function () {
+		const gate = {
+			backportVerification: { core: 'passed', pro: 'not-applicable' },
+			candidates: { core: 'a'.repeat(40), pro: 'b'.repeat(40), proCoreGitlink: 'a'.repeat(40) },
+			ciFailures: [],
+			ciOverride: null,
+		};
+
 		it('reports the projected core version and bump in a core-bumping dry run', function () {
 			assert.deepEqual(
 				buildSuccessResult({
@@ -239,6 +246,7 @@ describe('patch-release.js non-interactive contract', function () {
 					pushed: false,
 					cmTriggered: false,
 					dryRun: true,
+					...gate,
 				}),
 				{
 					ok: true,
@@ -249,6 +257,7 @@ describe('patch-release.js non-interactive contract', function () {
 					pushed: false,
 					cmTriggered: false,
 					dryRun: true,
+					...gate,
 				}
 			);
 		});
@@ -263,6 +272,7 @@ describe('patch-release.js non-interactive contract', function () {
 					pushed: false,
 					cmTriggered: false,
 					dryRun: true,
+					...gate,
 				}),
 				{
 					ok: true,
@@ -273,8 +283,27 @@ describe('patch-release.js non-interactive contract', function () {
 					pushed: false,
 					cmTriggered: false,
 					dryRun: true,
+					...gate,
 				}
 			);
+		});
+
+		it('carries a recorded CI override and the failures it covered', function () {
+			const ciFailures = [{ repo: 'HarperFast/harper', workflow: 'unit-test.yml', state: 'missing' }];
+			const result = buildSuccessResult({
+				target: '5.1.28',
+				coreVersion: null,
+				proVersion: 'v5.1.28',
+				coreBumping: false,
+				pushed: true,
+				cmTriggered: false,
+				dryRun: false,
+				...gate,
+				ciFailures,
+				ciOverride: { reason: 'incident hotfix' },
+			});
+			assert.deepEqual(result.ciFailures, ciFailures);
+			assert.deepEqual(result.ciOverride, { reason: 'incident hotfix' });
 		});
 	});
 
