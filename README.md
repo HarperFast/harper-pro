@@ -65,6 +65,8 @@ harper
 
 Harper will prompt you for configuration options during install, and then automatically start after install.
 
+`latest` always tracks the newest release. To stay on an older release line, install from that line's tag — `@harperfast/harper-pro@latest-5.2` for the newest 5.2.x, or `@5.2` for the same thing by semver range. `next` and `next-X.Y` are the prerelease equivalents. A line tag exists only once that line has been superseded by a newer one.
+
 ## Contributing
 
 Harper Pro does not accept external contributions. To contribute to the open-source core, see the [Harper contributing guide](https://github.com/HarperFast/harper/blob/main/CONTRIBUTING.md).
