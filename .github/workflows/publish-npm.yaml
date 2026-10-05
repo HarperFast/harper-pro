@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       harper-pro-version: ${{ steps.version-components.outputs.version }}
-      harper-pro-dist-tag: ${{ steps.package-tag.outputs.packageTag }}
+      harper-pro-dist-tag: ${{ steps.package-tag.outputs.reportedTag }}
     steps:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -49,24 +49,21 @@ jobs:
 
           # npm applies `--tag` unconditionally, so nothing but this step keeps a
           # moving tag from going backwards when release lines publish out of order.
-          # E404 is how the registry reports an absent tag; any other npm failure
-          # must abort, because treating it as "absent" is how the tag gets stolen.
+          #
+          # One lookup of the whole dist-tags map, rather than one `npm view` per
+          # tag: an absent tag is then simply a missing key, so there is no error
+          # string to classify. Per-tag lookups could not tell "this tag does not
+          # exist yet" from "the registry 404'd the package" — both report E404 —
+          # and reading the second as the first would hand `latest` to an older
+          # release during a registry blip. Any failure here ends the step; a brand
+          # new package would need its first publish bootstrapped by hand, which is
+          # a loud failure rather than a silent one.
+          distTags=$(npm view "$PACKAGE_NAME" dist-tags --json)
+
           tagVersion() {
-            local status=0 version
-            version=$(npm view "$PACKAGE_NAME@$1" version 2>"$RUNNER_TEMP/npm-view.err") || status=$?
-            if [[ $status -ne 0 ]]; then
-              if grep -q 'code E404' "$RUNNER_TEMP/npm-view.err"; then
-                return 0
-              fi
-              cat "$RUNNER_TEMP/npm-view.err" >&2
-              return "$status"
-            fi
-            printf '%s' "$version"
+            jq -r --arg tag "$1" '.[$tag] // ""' <<< "$distTags"
           }
 
-          # Sort and take the last line rather than a `-r '>x'` range: ranges drop
-          # prereleases outside their own x.y.z, so a range reads 5.4.0-beta.1 as
-          # losing to 5.3.0-beta.4 and `next` would never leave the older line.
           advances() {
             if [[ -z "$1" ]]; then
               return 0
@@ -83,9 +80,6 @@ jobs:
           fi
           lineTag=$baseTag-$RELEASE_LINE
 
-          # Assign before testing: a command substitution that fails inside an `if`
-          # condition does not trip `set -e`, which would turn a registry error into
-          # an empty "no tag" and steal the tag this step exists to protect.
           baseVersion=$(tagVersion "$baseTag")
           lineVersion=$(tagVersion "$lineTag")
 
@@ -105,6 +99,14 @@ jobs:
             packageTag=tmp-publish-$VERSION
             echo "throwawayTag=$packageTag" >> "$GITHUB_OUTPUT"
           fi
+
+          # The throwaway tag is removed moments later, so naming it in the
+          # notification would point operators at a 404.
+          reportedTag=$packageTag
+          if [[ "$packageTag" == tmp-publish-* ]]; then
+            reportedTag="untagged (install by exact version)"
+          fi
+          echo "reportedTag=$reportedTag" >> "$GITHUB_OUTPUT"
 
           echo "Publishing $PACKAGE_NAME@$VERSION with dist-tag '$packageTag' ($baseTag: ${baseVersion:-none}, $lineTag: ${lineVersion:-none})"
           echo "packageTag=$packageTag" >> "$GITHUB_OUTPUT"
