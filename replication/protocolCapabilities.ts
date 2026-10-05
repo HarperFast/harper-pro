@@ -34,6 +34,7 @@ export const RECORD_LOCKS_CAPABILITY = 4;
 
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
+	safeCopyAudit: number;
 	protocolVersion: number;
 	subscriptionSetupAck: number;
 	subscriptionSetupBudgetMs: number | undefined;
@@ -73,6 +74,7 @@ function resolveBudget(value: unknown): number | undefined {
 /** Keys this build does not know are dropped, so nothing downstream can consult one by accident. */
 export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 	return Object.freeze({
+		safeCopyAudit: bag?.safeCopyAudit === 1 ? 1 : 0,
 		protocolVersion: resolveLevel(bag?.protocolVersion, LOCAL_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION),
 		subscriptionSetupAck: resolveLevel(bag?.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY, 0),
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
@@ -110,6 +112,7 @@ export function buildLocalCapabilities(
 	recordLocksEnabled: boolean
 ): Readonly<Record<string, number>> {
 	return Object.freeze({
+		safeCopyAudit: 1,
 		protocolVersion: LOCAL_PROTOCOL_VERSION,
 		subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 		subscriptionSetupBudgetMs,
@@ -122,6 +125,7 @@ export function buildLocalCapabilities(
 export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b: ResolvedPeerCapabilities): boolean {
 	return (
 		a !== undefined &&
+		a.safeCopyAudit === b.safeCopyAudit &&
 		a.protocolVersion === b.protocolVersion &&
 		a.subscriptionSetupAck === b.subscriptionSetupAck &&
 		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
