@@ -90,7 +90,7 @@ function die(message, code = 1, extra = {}, emitResult = JSON_OUTPUT) {
 }
 
 // ── Runtime dependencies ──────────────────────────────────────────────────────
-// Runs only as the CLI: die() would exit a process that require()s this file.
+// die() would exit a process that require()s this file.
 if (require.main === module) {
 	try {
 		require.resolve('semver');

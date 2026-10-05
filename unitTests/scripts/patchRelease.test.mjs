@@ -9,16 +9,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import {
-	closeSync,
-	copyFileSync,
-	mkdirSync,
-	mkdtempSync,
-	openSync,
-	readFileSync,
-	rmSync,
-	writeFileSync,
-} from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -316,10 +307,8 @@ describe('patch-release.js non-interactive contract', function () {
 		let fixture;
 
 		beforeEach(function () {
+			// Hides semver from the child on any host, including ancestor or global node_modules.
 			fixture = mkdtempSync(join(tmpdir(), 'patch-release-preflight-'));
-			mkdirSync(join(fixture, 'scripts'));
-			copyFileSync(scriptPath, join(fixture, 'scripts/patch-release.js'));
-			// Fails semver resolution wherever it would come from: ancestor or global node_modules on the host.
 			writeFileSync(
 				join(fixture, 'hide-semver.cjs'),
 				`const Module = require('node:module');
@@ -333,17 +322,17 @@ Module._resolveFilename = function (request, ...rest) {
 		});
 
 		afterEach(function () {
-			rmSync(fixture, { recursive: true, force: true });
+			if (fixture) rmSync(fixture, { recursive: true, force: true });
 		});
 
 		it('exits nonzero with an npm ci message and a parsable RESULT line when semver is missing', function () {
-			const r = spawnSync(
-				process.execPath,
-				['-r', join(fixture, 'hide-semver.cjs'), join(fixture, 'scripts/patch-release.js')],
-				{ encoding: 'utf8', timeout: 5000, env: { ...process.env, PATH: '' } }
-			);
+			const r = spawnSync(process.execPath, ['-r', join(fixture, 'hide-semver.cjs'), scriptPath], {
+				encoding: 'utf8',
+				timeout: 5000,
+				env: { ...process.env, PATH: '' },
+			});
 			assert.equal(r.status, 1);
-			assert.match(r.stderr, /semver is not installed\. Run `npm ci` in .+ first\./);
+			assert.ok(r.stderr.includes(`Run \`npm ci\` in ${root} first.`), r.stderr);
 			assert.doesNotMatch(r.stderr, /MODULE_NOT_FOUND/);
 			const resultLine = r.stdout.split('\n').find((line) => line.startsWith('RESULT: '));
 			assert.ok(resultLine, 'RESULT line missing from stdout');
