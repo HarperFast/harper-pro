@@ -521,7 +521,7 @@ activate can never turn a departing node back into a granter), and its own row t
 each node independently verifies; it never authorizes policy.
 
 One fact found while tracing this, worth recording because it changes what the gate is _for_:
-`replicationConnection.ts` dispatches an inbound operation as `server.operation(data, { user },
+`replicationConnection.ts` dispatches an inbound operation as `server.operation(data, { user: authorization },
 !isAuthorizedNode)`, and a caller with an `hdb_nodes` row bypasses `verifyPerms` entirely — so a node
 principal could already invoke the `requiresSuperUser` per-node operations over the wire. The
 peer-callable operation is therefore not what lets a peer write; it is what keeps a `super_user` HTTP
@@ -548,7 +548,7 @@ The transition needs the same authority as any other cluster fan-out, and it doe
 boundary:
 
 1. **A node principal can already run any operation on a peer.** `replicationConnection.ts`
-   dispatches an inbound operation as `server.operation(data, { user }, !isAuthorizedNode)`, so a
+   dispatches an inbound operation as `server.operation(data, { user: authorization }, !isAuthorizedNode)`, so a
    caller with an `hdb_nodes` row skips `verifyPerms`. Replicated `deploy_component` and
    `set_configuration` ride that same path (`replicateOperation` → `sendOperationToNode`). A node
    principal can therefore deploy a component that calls the per-node operations locally, and can
