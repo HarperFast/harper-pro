@@ -40,7 +40,7 @@ Missing backports are listed before interactive confirmation. With `--yes`, any 
 
 ### Release-candidate CI
 
-The release commit is created locally, so CI cannot run on it before it is tagged. The script instead requires that the commit it builds on is green in each repository. For each required workflow it reads the runs on that exact commit (`pull_request` runs are ignored because they test a merge ref) and takes each job's result from the latest run that contains the job. A later single-Node dispatch therefore cannot hide a job that failed in an earlier full-matrix run. Missing runs, runs still in progress, failed or cancelled jobs, and API errors all block.
+The release commit is created locally, so CI cannot run on it before it is tagged. The script instead requires that the commit it builds on is green in each repository. For each required workflow it reads the runs on that exact commit (`pull_request` runs are ignored because they test a merge ref) and takes each job's most recently completed result across all runs and attempts (a job still running counts as newest). A later single-Node dispatch therefore cannot hide a job that failed in an earlier full-matrix run, and a partial re-run cannot hide a failure it did not repeat. Missing runs, runs still in progress, runs that list no jobs, failed or cancelled jobs, and API errors all block.
 
 Release branches advanced by the cherry-pick workflow usually have no runs on their head: its pushes use `GITHUB_TOKEN`, which does not trigger push workflows. The script prints the command to start a run, e.g. `gh workflow run integration-tests.yml --repo HarperFast/harper --ref v5.3`. Wait for it to finish, then re-run the release. The `gh` token needs Actions read access to both repositories.
 

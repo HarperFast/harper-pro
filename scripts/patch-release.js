@@ -402,7 +402,7 @@ function backportVerificationApplies(branch, sourceBranch) {
 // ── Release-candidate CI ──────────────────────────────────────────────────────
 const PASSING_JOB_CONCLUSIONS = new Set(['success', 'skipped', 'neutral']);
 
-// `runs` are one workflow's runs on the candidate commit, each carrying its latest-attempt `jobs`.
+// `runs` are one workflow's runs on the candidate commit, each carrying the `jobs` of every attempt.
 function evaluateWorkflowRuns(runs) {
 	const evidence = runs.filter((run) => run.event !== 'pull_request');
 	for (const run of evidence) {
