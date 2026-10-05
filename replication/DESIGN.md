@@ -22,7 +22,13 @@ Real-time, peer-to-peer replication of table data across cluster nodes via persi
 | `knownNodes.ts`            | Node registry (`hdb_nodes` system table) + shared-memory `Float64Array` status buffers (latency, confirmation, back-pressure).                                                                                        |
 | `clusterStatus.ts`         | Read-only status reporting for `cluster_status` operation.                                                                                                                                                            |
 | `protocolCapabilities.ts`  | The protocol capability registry: the single normalization point for the peer capability bag in `NODE_NAME[4]`.                                                                                                       |
+<<<<<<< HEAD
 | `recordLockTransport.ts`   | Cluster record locks (harper-pro#438): the epoch a key's home is derived from, the delegation wire (`recordLockRpc.ts`), and per-database coordinator ownership — what core's `LockCoordinator` cannot know           |
+=======
+| `recordLockTransport.ts`   | Cluster record locks (harper-pro#438): the home map (`homeMap()`) keys are homed by, the delegation wire (`recordLockRpc.ts`), and per-database coordinator ownership — what core's `LockCoordinator` cannot know     |
+| `recordLock*.ts` (others)  | `recordLockHomes.ts` (home-map row + operations), `recordLockApply.ts` (`record_lock_apply_homes`), `recordLockRpc.ts` (RPCs, relays), `recordLockFreshness.ts`, `recordLockPoison.ts`, `recordLockConfig.ts`         |
+| `replicationWorkers.ts`    | The one selector of workers that may own a subscription or record-lock coordination: http workers minus isolated-application ones (harper-pro#974). Broadcasts and fences still reach every http worker.              |
+>>>>>>> 932fdb9 (fix: Keep replication off isolated-application workers)
 | `repairDeleteEchoRuns.ts`  | Offline, operator-run compaction of echoed replicated-delete runs out of RocksDB transaction logs (CLI `bin/repairDeleteEchoRuns.ts`); imports nothing from the runtime. See non-obvious behavior 21.                 |
 
 ---
@@ -451,7 +457,12 @@ Most replication behavior is exercised via integration tests that spin up multi-
 | Where is a new cluster member added?      | `setNode.ts` (the whole file is one operation)                                                              |
 | Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `COPY_COMPLETE`)                    |
 | Where are peer capabilities interpreted?  | `protocolCapabilities.ts → resolvePeerCapabilities`; carried in `NODE_NAME[4]`                              |
+<<<<<<< HEAD
 | Who takes part in a cluster record lock?  | `recordLockTransport.ts → createRecordLockTransport().participants`; owner: `recordLockOwnerFor`            |
+=======
+| Who takes part in a cluster record lock?  | `recordLockTransport.ts → createRecordLockTransport().homeMap()`; owner: `recordLockOwnerFor`               |
+| Which workers may own replication work?   | `replicationWorkers.ts → isReplicationWorker`; never an isolated application's worker                       |
+>>>>>>> 932fdb9 (fix: Keep replication off isolated-application workers)
 | Where is `hdb_nodes` schema?              | `knownNodes.ts → getHDBNodeTable`                                                                           |
 | What does `cluster_status` return?        | `clusterStatus.ts` (82 lines, whole file)                                                                   |
 | Where is per-route table exclusion logic? | `knownNodes.ts → getExcludedTablesForRouteEntries`; threaded via `subscriptionManager.ts → routeReplicates` |

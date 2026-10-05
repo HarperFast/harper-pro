@@ -58,6 +58,15 @@ import { getDatabases } from '../core/resources/databases.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, getReplicationSharedStatus, shouldReplicateFromNode } from './knownNodes.ts';
+<<<<<<< HEAD
+=======
+import {
+	RECORD_LOCKS_CAPABILITY_POSITION,
+	RECORD_LOCK_HOMES_AGREEMENT_POSITION,
+	RECORD_LOCK_LEVEL_POSITION,
+} from './sharedStatusSlots.ts';
+import { isReplicationWorker } from './replicationWorkers.ts';
+>>>>>>> 932fdb9 (fix: Keep replication off isolated-application workers)
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import {
@@ -958,6 +967,8 @@ const recordLockOwners = new Map<string, any>();
 const everHadOwner = new Set<string>();
 let nextOwnerIndex = 0;
 
+/** Every live http worker, isolated-application ones included: the set record-lock broadcasts and fences reach.
+ * Owners are picked from its `isReplicationWorker` subset. */
 function httpWorkers(): any[] {
 	return workers.filter((worker: any) => worker.name === 'http');
 }
@@ -1189,12 +1200,13 @@ export function recordLockOwnerFor(
 	const current = recordLockOwners.get(database);
 	if (current === MAIN_OWNER) return undefined;
 	if (current === PENDING_BUMP) return undefined; // a handoff is already in flight; do not start a second
-	if (current && liveWorkers.includes(current)) return current;
+	if (current && isReplicationWorker(current) && liveWorkers.includes(current)) return current;
 	const hadPriorOwner = everHadOwner.has(database);
+	const candidates = liveWorkers.filter(isReplicationWorker);
 	let owner: any;
-	if (liveWorkers.length > 0) {
-		nextOwnerIndex %= liveWorkers.length;
-		owner = liveWorkers[nextOwnerIndex++];
+	if (candidates.length > 0) {
+		nextOwnerIndex %= candidates.length;
+		owner = candidates[nextOwnerIndex++];
 	} else if (getWorkerIndex() === 0) {
 		// Single-threaded mode: the main thread serves requests and holds the subscriptions itself.
 		owner = MAIN_OWNER;

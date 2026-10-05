@@ -561,6 +561,44 @@ describe('recordLockOwnerFor (main thread)', () => {
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-nobody'], undefined);
 	});
 
+	// harper-pro#974: a worker dedicated to an isolated application is an http worker carrying `application`.
+	it('never picks an isolated application worker as owner, for any database', () => {
+		const isolated = Object.assign(fakeWorker(141), { application: 'isolated-app' });
+		const plain = fakeWorker(142);
+		for (const database of ['iso-a', 'iso-b', 'iso-c']) {
+			assert.strictEqual(recordLockOwnerFor(database, [isolated, plain]), plain);
+			assert.strictEqual(recordLockOwnerFor(database, [plain, isolated]), plain);
+		}
+		assert.ok(!isolated.posted.some((m) => m.type === 'record-lock-owner'), 'never conferred or revoked');
+		assert.strictEqual(recordLockOwnerFor('iso-only', [isolated]), undefined, 'unowned rather than isolated');
+		assert.strictEqual(recordLockOwnerThreadIds()['iso-only'], undefined);
+		for (const database of ['iso-a', 'iso-b', 'iso-c', 'iso-only']) releaseRecordLockOwner(database);
+	});
+
+	it('withholds the successor until an isolated application worker acks its fence, since it can hold relayed handles', async () => {
+		const departing = fakeWorker(151);
+		const isolated = Object.assign(fenceAckWorker(152), { application: 'isolated-app' });
+		const successor = fakeWorker(153);
+		assert.strictEqual(recordLockOwnerFor('iso-handoff', [departing]), departing);
+		assert.strictEqual(
+			recordLockOwnerFor('iso-handoff', [isolated, successor], async () => 1),
+			undefined
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['iso-handoff'],
+			undefined,
+			'the bump and the pool fence resolved, but the isolated worker has not confirmed its fence'
+		);
+		const requestId = isolated.fenceRequestId();
+		assert.ok(requestId !== undefined, 'the isolated worker was asked to fence');
+		handleOwnerThreadAck({ requestId }, { threadId: 152 });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(recordLockOwnerThreadIds()['iso-handoff'], successor.threadId);
+		assert.ok(!isolated.posted.some((m) => m.type === 'record-lock-owner'), 'never conferred');
+		releaseRecordLockOwner('iso-handoff');
+	});
+
 	it('a release racing an in-flight handoff supersedes it — the bump completing does not resurrect it', async () => {
 		const dead = fakeWorker(71);
 		const live = fakeWorker(72);

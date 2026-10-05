@@ -5,8 +5,9 @@
  */
 import { getDatabases } from '../core/resources/databases.ts';
 import { transaction } from '../core/resources/transaction.ts';
-import { workers, onMessageByType, whenThreadsStarted, getWorkerCount } from '../core/server/threads/manageThreads.js';
+import { onMessageByType, whenThreadsStarted, getWorkerCount } from '../core/server/threads/manageThreads.js';
 import { collectRecordLockStatus, recordLockOwnerFor } from './recordLockTransport.ts';
+import { replicationWorkers } from './replicationWorkers.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import {
@@ -395,7 +396,13 @@ function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 				// current registry, not the state when this subscribe was scheduled.
 				exclusionOrigins: computeExclusionOrigins(database),
 			};
-			const target = dispatchSubscriptionRequest(entry, request, workers, getWorkerCount() === 1, subscribeToNode);
+			const target = dispatchSubscriptionRequest(
+				entry,
+				request,
+				replicationWorkers(),
+				getWorkerCount() === 1,
+				subscribeToNode
+			);
 			if (target === 'deferred')
 				logger.warn('Deferring replication subscription until a live http worker owns it', url, database);
 		},
@@ -1114,11 +1121,14 @@ export async function startOnMainThread(options) {
 	let nextWorkerIndex = 0;
 	// With cluster record locks enabled, every subscription for a database lives on the worker that
 	// coordinates its locks, so the coordinator applies the database's inbound control entries in order
-	// with its data; otherwise placement stays per (peer, database) round-robin.
-	function placeSubscription(databaseName: string, httpWorkers: any[]) {
-		if (CLUSTER_RECORD_LOCKS_ENABLED) return recordLockOwnerFor(databaseName, httpWorkers);
-		nextWorkerIndex = nextWorkerIndex % httpWorkers.length; // wrap around as necessary
-		return httpWorkers[nextWorkerIndex++];
+	// with its data; otherwise placement stays per (peer, database) round-robin. recordLockOwnerFor picks from the
+	// replication pool itself but fences every http worker on a handoff, so it is not handed the narrower list.
+	function placeSubscription(databaseName: string, replicationPool: any[]) {
+		if (CLUSTER_RECORD_LOCKS_ENABLED) return recordLockOwnerFor(databaseName);
+		// `% 0` would leave the index NaN for the life of the process
+		if (replicationPool.length === 0) return undefined;
+		nextWorkerIndex = nextWorkerIndex % replicationPool.length; // wrap around as necessary
+		return replicationPool[nextWorkerIndex++];
 	}
 	const databases = getDatabases();
 	// find all the databases last recorded audit entry so that we can inquire from the first node for self catch-up
@@ -1424,7 +1434,7 @@ export async function startOnMainThread(options) {
 			}
 			// Existing-entry re-drives also consume this payload, so resolve its URL before the early return.
 			nodes[0].url ??= getNodeURL(nodes[0] as any);
-			const httpWorkers = workers.filter((worker) => worker.name === 'http');
+			const replicationPool = replicationWorkers();
 			// Defensively detect entries that point at a worker no longer in the http pool.
 			// This happens when the worker.on('exit') handler below never fired (hung WebSocket
 			// refs blocking exit), the identity check rejected the reassignment, or its
@@ -1435,7 +1445,7 @@ export async function startOnMainThread(options) {
 			// Keeps the outgoing buffer alive across the delete/recreate below; a fresh resolve still wins,
 			// since a peer renamed while its worker was down owns a different buffer.
 			let carriedSharedStatus: Float64Array | undefined;
-			if (existingEntry && httpWorkers.length > 0 && !httpWorkers.includes(existingEntry.worker as any)) {
+			if (existingEntry && replicationPool.length > 0 && !replicationPool.includes(existingEntry.worker as any)) {
 				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
 				clearTimeout(existingEntry.reDriveTimer);
 				dbReplicationWorkers.delete(databaseName);
@@ -1470,7 +1480,7 @@ export async function startOnMainThread(options) {
 					existingEntry.createdAt = Date.now();
 				}
 			} else if (shouldSubscribe) {
-				worker = placeSubscription(databaseName, httpWorkers);
+				worker = placeSubscription(databaseName, replicationPool);
 				if (!worker) {
 					logger.warn('No http workers available to subscribe to node', node.name, getNodeURL(node));
 				}
@@ -1696,8 +1706,8 @@ export async function startOnMainThread(options) {
 		}
 	};
 	function connectToNextWorker(node: any, database: string, connectingNode = node) {
-		const httpWorkers = workers.filter((worker: any) => worker.name === 'http');
-		const worker = placeSubscription(database, httpWorkers);
+		const replicationPool = replicationWorkers();
+		const worker = placeSubscription(database, replicationPool);
 		// not enumerable property, we don't want this to be serialized in the postMessage
 		Object.defineProperty(node, 'worker', { value: worker, configurable: true });
 		const request = {
@@ -1795,7 +1805,7 @@ export async function startOnMainThread(options) {
 	}
 	function reconcileWorkers() {
 		const now = Date.now();
-		const httpWorkers = workers.filter((worker) => worker.name === 'http');
+		const replicationPool = replicationWorkers();
 		// Diagnostics for the two lifecycle corrections below, batched into one line each so a mass worker
 		// exit does not emit one log per (database, peer). Allocated only once something is actually wrong.
 		let stampedDeadOwner: string[] | undefined;
@@ -1847,7 +1857,7 @@ export async function startOnMainThread(options) {
 						reportedNonMemberStatus.delete(key);
 						// The entry's owning worker is gone from the live pool. Stamped before the truth read below
 						// so the correction lands on this tick rather than the next one.
-						if (!hasDeadOwner(entry, httpWorkers)) reportedUnstampedDeadOwner.delete(key);
+						if (!hasDeadOwner(entry, replicationPool)) reportedUnstampedDeadOwner.delete(key);
 						else if (stampWorkerExitDown(status, now)) {
 							(stampedDeadOwner ??= []).push(key);
 							reportedUnstampedDeadOwner.delete(key);
@@ -1898,10 +1908,10 @@ export async function startOnMainThread(options) {
 				clearedNonMembers.join(', ')
 			);
 		if (upCorrections) for (const connection of upCorrections) connectedToNode(connection);
-		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
+		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, replicationPool);
 		const wedgedNodeUrls = findWedgedNodeUrls(
 			connectionReplicationMap,
-			httpWorkers,
+			replicationPool,
 			now,
 			WEDGE_RECONCILE_THRESHOLD_MS,
 			shouldReplicateFromNode
@@ -1911,7 +1921,7 @@ export async function startOnMainThread(options) {
 		// if that watchdog fails to fire. See findStalledReceivingNodeUrls / RECEIVE_STALL_THRESHOLD_MS.
 		const stalledByUrl = findStalledReceivingNodeUrls(
 			connectionReplicationMap,
-			httpWorkers,
+			replicationPool,
 			now,
 			RECEIVE_STALL_THRESHOLD_MS,
 			shouldReplicateFromNode,
