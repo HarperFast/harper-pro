@@ -90,7 +90,7 @@ function die(message, code = 1, extra = {}, emitResult = JSON_OUTPUT) {
 }
 
 // ── Runtime dependencies ──────────────────────────────────────────────────────
-// Skipped on require(): die() would exit the importing process instead of throwing below.
+// Runs only as the CLI: die() would exit a process that require()s this file.
 if (require.main === module) {
 	try {
 		require.resolve('semver');

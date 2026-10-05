@@ -9,7 +9,16 @@
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { closeSync, copyFileSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
+import {
+	closeSync,
+	copyFileSync,
+	mkdirSync,
+	mkdtempSync,
+	openSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -305,14 +314,22 @@ describe('patch-release.js non-interactive contract', function () {
 
 	describe('runtime dependency preflight', function () {
 		let fixture;
-		let env;
 
 		beforeEach(function () {
 			fixture = mkdtempSync(join(tmpdir(), 'patch-release-preflight-'));
 			mkdirSync(join(fixture, 'scripts'));
-			mkdirSync(join(fixture, 'empty-node-path'));
 			copyFileSync(scriptPath, join(fixture, 'scripts/patch-release.js'));
-			env = { ...process.env, PATH: '', HOME: fixture, NODE_PATH: join(fixture, 'empty-node-path') };
+			// Fails semver resolution wherever it would come from: ancestor or global node_modules on the host.
+			writeFileSync(
+				join(fixture, 'hide-semver.cjs'),
+				`const Module = require('node:module');
+const resolveFilename = Module._resolveFilename;
+Module._resolveFilename = function (request, ...rest) {
+	if (request === 'semver') throw Object.assign(new Error("Cannot find module 'semver'"), { code: 'MODULE_NOT_FOUND' });
+	return resolveFilename.call(this, request, ...rest);
+};
+`
+			);
 		});
 
 		afterEach(function () {
@@ -320,17 +337,11 @@ describe('patch-release.js non-interactive contract', function () {
 		});
 
 		it('exits nonzero with an npm ci message and a parsable RESULT line when semver is missing', function () {
-			const probe = spawnSync(process.execPath, ['-e', "require.resolve('semver')"], {
-				cwd: join(fixture, 'scripts'),
-				env,
-			});
-			assert.notEqual(probe.status, 0, 'fixture resolves semver from an ancestor; the preflight is not exercised');
-
-			const r = spawnSync(process.execPath, [join(fixture, 'scripts/patch-release.js')], {
-				encoding: 'utf8',
-				timeout: 5000,
-				env,
-			});
+			const r = spawnSync(
+				process.execPath,
+				['-r', join(fixture, 'hide-semver.cjs'), join(fixture, 'scripts/patch-release.js')],
+				{ encoding: 'utf8', timeout: 5000, env: { ...process.env, PATH: '' } }
+			);
 			assert.equal(r.status, 1);
 			assert.match(r.stderr, /semver is not installed\. Run `npm ci` in .+ first\./);
 			assert.doesNotMatch(r.stderr, /MODULE_NOT_FOUND/);
