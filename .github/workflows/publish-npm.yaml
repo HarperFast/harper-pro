@@ -66,11 +66,16 @@ jobs:
           # Sort and take the last line rather than a `-r '>x'` range: ranges drop
           # prereleases outside their own x.y.z, so a range reads 5.4.0-beta.1 as
           # losing to 5.3.0-beta.4 and `next` would never leave the older line.
+          # `advances` only ever runs as an `if` test, where `set -e` is off and a
+          # failed substitution would silently read as "does not advance" — so the
+          # comparison is assigned first and a semver failure exits the step.
           advances() {
             if [[ -z "$1" ]]; then
               return 0
             fi
-            [[ "$(npx --yes semver@7.8.5 "$VERSION" "$1" | tail -1)" == "$VERSION" ]]
+            local highest
+            highest=$(npx --yes semver@7.8.5 "$VERSION" "$1" | tail -1) || exit $?
+            [[ "$highest" == "$VERSION" ]]
           }
 
           if [[ "$PRERELEASE" == '' ]]; then
@@ -86,13 +91,19 @@ jobs:
           baseVersion=$(tagVersion "$baseTag")
           lineVersion=$(tagVersion "$lineTag")
 
+          # The line tag may not exist yet while the base tag already holds a version
+          # from this same line; seeding from it stops a late patch creating the line
+          # tag on an older version than the line has already shipped.
+          if [[ -z "$lineVersion" && "$baseVersion" == "$RELEASE_LINE."* ]]; then
+            lineVersion=$baseVersion
+          fi
+
           if advances "$baseVersion"; then
             packageTag=$baseTag
           elif advances "$lineVersion"; then
             packageTag=$lineTag
           else
-            # Older than both pointers, so neither may move. npm always applies some
-            # tag, so publish under a throwaway and drop it once the version is up.
+            # npm always applies some tag, and neither pointer may move.
             packageTag=tmp-publish-$VERSION
             echo "throwawayTag=$packageTag" >> "$GITHUB_OUTPUT"
           fi
@@ -102,12 +113,24 @@ jobs:
       - name: Publish package to NPM registry
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access=public --tag=${{ steps.package-tag.outputs.packageTag }} harperfast-harper-pro-*.tgz
+          PACKAGE_TAG: ${{ steps.package-tag.outputs.packageTag }}
+        run: npm publish --access=public --tag="$PACKAGE_TAG" harperfast-harper-pro-*.tgz
+      # `always()`: a publish can commit the version and still report failure, and a
+      # re-run then stops at "already published" before ever reaching this step, so a
+      # throwaway tag skipped here would outlive every chance to remove it.
       - name: Drop the throwaway dist-tag
-        if: steps.package-tag.outputs.throwawayTag != ''
+        if: always() && steps.package-tag.outputs.throwawayTag != ''
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm dist-tag rm '@harperfast/harper-pro' '${{ steps.package-tag.outputs.throwawayTag }}'
+          PACKAGE_NAME: '@harperfast/harper-pro'
+          THROWAWAY_TAG: ${{ steps.package-tag.outputs.throwawayTag }}
+        run: |
+          set -euo pipefail
+          if npm view "$PACKAGE_NAME@$THROWAWAY_TAG" version >/dev/null 2>&1; then
+            npm dist-tag rm "$PACKAGE_NAME" "$THROWAWAY_TAG"
+          else
+            echo "No $THROWAWAY_TAG tag to remove"
+          fi
 
   send-slack-message-on-success:
     if: success() && !cancelled()
