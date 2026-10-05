@@ -558,7 +558,9 @@ boundary:
    local re-validation above, which is strictly more checking than the direct call it replaced.
 3. **An operator proof on this one operation would not narrow the boundary.** A node principal that
    wanted to mint a map could still do so through the route in (1). Narrowing what node principals may
-   run on a peer is a separate change, tracked in harper-pro#976.
+   run on a peer is a separate change, tracked in harper-pro#976. When #976 narrows node-principal
+   operations, `record_lock_transition` remains the one node-principal route to a peer's home map
+   (`hdb_record_lock_homes` is `LOCAL_ONLY`), so re-assess an operator proof (#869) at that point.
 4. **Nothing shipped is exposed by default.** `replication.recordLocks` is off by default and grants
    nothing until an operator stages and activates a generation.
 
