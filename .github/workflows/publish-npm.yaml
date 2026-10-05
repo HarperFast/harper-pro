@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       harper-pro-version: ${{ steps.version-components.outputs.version }}
+      harper-pro-dist-tag: ${{ steps.package-tag.outputs.packageTag }}
     steps:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -100,7 +101,7 @@ jobs:
           elif advances "$lineVersion"; then
             packageTag=$lineTag
           else
-            # npm always applies some tag, and neither pointer may move.
+            # npm always applies some tag.
             packageTag=tmp-publish-$VERSION
             echo "throwawayTag=$packageTag" >> "$GITHUB_OUTPUT"
           fi
@@ -123,9 +124,8 @@ jobs:
           THROWAWAY_TAG: ${{ steps.package-tag.outputs.throwawayTag }}
         run: |
           set -euo pipefail
-          # `dist-tag ls` rather than a `view` probe: a probe cannot tell "tag absent"
-          # from "registry unreachable", and swallowing the latter would leave the
-          # throwaway tag published forever behind a green job.
+          # Assigned before testing so a registry failure ends the step: a silent
+          # "no tag to remove" would strand the throwaway tag behind a green job.
           publishedTags=$(npm dist-tag ls "$PACKAGE_NAME")
           if grep -q "^$THROWAWAY_TAG:" <<<"$publishedTags"; then
             npm dist-tag rm "$PACKAGE_NAME" "$THROWAWAY_TAG"
@@ -146,7 +146,7 @@ jobs:
           payload: |
             {
               "channel": "#development-ci",
-              "text": "Harper Pro v${{ needs.publish-npm-package.outputs.harper-pro-version }} has been published to NPM",
+              "text": "Harper Pro v${{ needs.publish-npm-package.outputs.harper-pro-version }} has been published to NPM under dist-tag `${{ needs.publish-npm-package.outputs.harper-pro-dist-tag }}`",
               "blocks": [
                 {
                   "type": "header",
@@ -164,7 +164,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": ":white_check_mark: Published to :npm:"
+                      "text": ":white_check_mark: Published to :npm: as `${{ needs.publish-npm-package.outputs.harper-pro-dist-tag }}`"
                     },
                     {
                       "type": "mrkdwn",
