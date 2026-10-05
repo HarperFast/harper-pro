@@ -22,10 +22,11 @@ This is optional — without it you'll see standard merge conflict behavior. The
 
 The `scripts/patch-release.js` script automates the full patch release workflow:
 
-1. Fetches both repositories and checks that merged PRs whose milestones target the release line are present on the release branch in both `core` ([HarperFast/harper](https://github.com/HarperFast/harper)) and `harper-pro`.
-2. Bumps core's version and tags it if core has new commits, then runs `build-tools/sync-core.sh` to update the core submodule pointer and sync its dependencies into harper-pro.
-3. Bumps harper-pro's version, commits and tags it, then pushes the release branches and new tags automatically.
-4. Offers to trigger Central Manager's release-to-environments workflow. In `--yes` mode this step requires `--cm-trigger`.
+1. Fetches both repositories, pins each release candidate (the fetched `origin/<branch>` commit), and checks that merged PRs whose milestones target the release line are present on it in both `core` ([HarperFast/harper](https://github.com/HarperFast/harper)) and `harper-pro`. When the release branch is the source branch (a main-line release cut from `main`), there is nothing to backport and the script says `Backport verification not applicable` instead of reporting a pass.
+2. Checks that the required CI workflows passed on both candidates: `unit-test.yml` and `integration-tests.yml` in core, `unit-tests.yaml` and `integration-tests.yaml` in harper-pro.
+3. Bumps core's version and tags it if core has new commits, then runs `build-tools/sync-core.sh` to update the core submodule pointer and sync its dependencies into harper-pro.
+4. Bumps harper-pro's version, commits and tags it, then pushes the release branches and new tags automatically.
+5. Offers to trigger Central Manager's release-to-environments workflow. In `--yes` mode this step requires `--cm-trigger`.
 
 ### Marking a PR for patching
 
@@ -36,6 +37,16 @@ The workflow applies backports separately from the release script. Resolve and l
 The script verifies all merged PRs targeting the line, including PRs merged before the last release or milestoned later. It accepts a reachable merge commit, an exact `git cherry-pick -x` trailer, or a matching stable patch ID. For squash/rebase cherry-picks, a single merge SHA or its trailer also needs proof that it represents the whole PR. For multi-commit PRs, it also checks that every original non-merge commit landed. Merge commits that differ from Git's automatic merge require their own provenance or proof of the whole PR; ordinary picks alone cannot cover their resolution edits. It checks the whole release history, so backports in earlier releases remain covered.
 
 Missing backports are listed before interactive confirmation. With `--yes`, any missing backport aborts before versioning, tagging or pushing, including in `--dry-run`; it exits nonzero and emits a `RESULT: {...}` line even without `--json`, with `ok: false`, `missingPRs`, `pushed: false` and `cmTriggered: false`. There is no non-interactive waiver. If a manually resolved or contextual backport lacks matching provenance or patch IDs, verify it manually and run interactively. The same applies when GitHub's original-commit list reaches its 250-commit limit and cannot prove coverage. Custom release branches (including `--core-branch` RC branches) use their package version's major/minor to select milestones; the workflow only targets `vX.Y` branches automatically.
+
+### Release-candidate CI
+
+The release commit is created locally, so CI cannot run on it before it is tagged. The script instead requires that the commit it builds on is green in each repository. For each required workflow it reads the runs on that exact commit (`pull_request` runs are ignored because they test a merge ref) and takes each job's result from the latest run that contains the job. A later single-Node dispatch therefore cannot hide a job that failed in an earlier full-matrix run. Missing runs, runs still in progress, failed or cancelled jobs, and API errors all block.
+
+Release branches advanced by the cherry-pick workflow usually have no runs on their head: its pushes use `GITHUB_TOKEN`, which does not trigger push workflows. The script prints the command to start a run, e.g. `gh workflow run integration-tests.yml --repo HarperFast/harper --ref v5.3`. Wait for it to finish, then re-run the release. The `gh` token needs Actions read access to both repositories.
+
+With `--yes`, non-green CI aborts before versioning, tagging or pushing (including `--dry-run`): nonzero exit and a `RESULT` line even without `--json`, with `ciFailures` (repo, branch, sha, workflow, job, state, url or error). Interactively, the failing checks are printed and the proceed prompt asks you to confirm overriding the gate. For an emergency release, `--ci-override "<reason>"` proceeds in either mode; the reason is printed and recorded as `ciOverride` in `RESULT`. It does not waive missing backports.
+
+The gate checks each repository's own commit. Harper-pro's CI ran against harper-pro's own `core` pointer, while the release re-pins core to the core candidate. When those differ, the script warns, and `RESULT.candidates.proCoreGitlink` differs from `candidates.core`: that pairing is untested until the release commit's own CI runs.
 
 ### Running the script
 
@@ -56,7 +67,10 @@ node scripts/patch-release.js
 | `--dry-run`               | —                   | Preview all actions without making changes                                                                            |
 | `--yes`                   | —                   | Non-interactive: auto-confirm all prompts. CM deploy defaults to skipped in this mode — pass `--cm-trigger` to opt in |
 | `--cm-trigger`            | —                   | Request CM release-to-environments. With `--yes`, auto-confirms; without it, still prompts interactively              |
+| `--ci-override <reason>`  | —                   | Emergency release past non-green required CI; the reason is printed and recorded in `RESULT`                          |
 | `--json`                  | —                   | Print a final `RESULT: {...}` JSON line on stdout for machine parsing (success, abort, or fatal error)                |
+
+A successful `RESULT` also carries `backportVerification` (`passed`, `missing` or `not-applicable` per repository), `candidates` (`core`, `pro`, `proCoreGitlink` SHAs), `ciFailures`, and `ciOverride` (`null` or `{ "reason": ... }`). Closed stdin answers every prompt "no", including the CM deploy prompt.
 
 **Example — preview what would be applied:**
 
