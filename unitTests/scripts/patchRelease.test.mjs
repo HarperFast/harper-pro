@@ -304,15 +304,15 @@ describe('patch-release.js non-interactive contract', function () {
 	});
 
 	describe('runtime dependency preflight', function () {
-		// The script is copied into a tree with no node_modules, and NODE_PATH points at an empty
-		// dir, so require('semver') has nowhere to resolve from.
 		let fixture;
+		let env;
 
 		beforeEach(function () {
 			fixture = mkdtempSync(join(tmpdir(), 'patch-release-preflight-'));
 			mkdirSync(join(fixture, 'scripts'));
 			mkdirSync(join(fixture, 'empty-node-path'));
 			copyFileSync(scriptPath, join(fixture, 'scripts/patch-release.js'));
+			env = { ...process.env, PATH: '', HOME: fixture, NODE_PATH: join(fixture, 'empty-node-path') };
 		});
 
 		afterEach(function () {
@@ -320,15 +320,22 @@ describe('patch-release.js non-interactive contract', function () {
 		});
 
 		it('exits nonzero with an npm ci message and a parsable RESULT line when semver is missing', function () {
+			const probe = spawnSync(process.execPath, ['-e', "require.resolve('semver')"], {
+				cwd: join(fixture, 'scripts'),
+				env,
+			});
+			assert.notEqual(probe.status, 0, 'fixture resolves semver from an ancestor; the preflight is not exercised');
+
 			const r = spawnSync(process.execPath, [join(fixture, 'scripts/patch-release.js')], {
 				encoding: 'utf8',
 				timeout: 5000,
-				env: { ...process.env, PATH: '', NODE_PATH: join(fixture, 'empty-node-path') },
+				env,
 			});
 			assert.equal(r.status, 1);
 			assert.match(r.stderr, /semver is not installed\. Run `npm ci` in .+ first\./);
 			assert.doesNotMatch(r.stderr, /MODULE_NOT_FOUND/);
 			const resultLine = r.stdout.split('\n').find((line) => line.startsWith('RESULT: '));
+			assert.ok(resultLine, 'RESULT line missing from stdout');
 			const result = JSON.parse(resultLine.slice('RESULT: '.length));
 			assert.equal(result.ok, false);
 			assert.match(result.error, /npm ci/);

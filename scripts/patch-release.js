@@ -90,9 +90,7 @@ function die(message, code = 1, extra = {}, emitResult = JSON_OUTPUT) {
 }
 
 // ── Runtime dependencies ──────────────────────────────────────────────────────
-// A fresh clone has no node_modules, and the bare require would die with an unformatted
-// MODULE_NOT_FOUND and no RESULT line. Only the CLI run exits here; a require()-only import
-// keeps the throw from the require below, since die() would kill its host process.
+// Skipped on require(): die() would exit the importing process instead of throwing below.
 if (require.main === module) {
 	try {
 		require.resolve('semver');
