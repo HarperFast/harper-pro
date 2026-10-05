@@ -7,7 +7,7 @@
  * review).
  */
 import assert from 'node:assert';
-import { notifyThreadExit, setMainIsWorker } from '#js/core/server/threads/manageThreads';
+import { notifyThreadExit, setMainIsWorker, workers } from '#js/core/server/threads/manageThreads';
 import {
 	HOMES_AGREEMENT_MATCH,
 	HOMES_AGREEMENT_MISMATCH,
@@ -561,7 +561,6 @@ describe('recordLockOwnerFor (main thread)', () => {
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-nobody'], undefined);
 	});
 
-	// harper-pro#974: a worker dedicated to an isolated application is an http worker carrying `application`.
 	it('never picks an isolated application worker as owner, for any database', () => {
 		const isolated = Object.assign(fakeWorker(141), { application: 'isolated-app' });
 		const plain = fakeWorker(142);
@@ -573,6 +572,24 @@ describe('recordLockOwnerFor (main thread)', () => {
 		assert.strictEqual(recordLockOwnerFor('iso-only', [isolated]), undefined, 'unowned rather than isolated');
 		assert.strictEqual(recordLockOwnerThreadIds()['iso-only'], undefined);
 		for (const database of ['iso-a', 'iso-b', 'iso-c', 'iso-only']) releaseRecordLockOwner(database);
+	});
+
+	it('tells an isolated application worker which thread owns a database, since it can serve lock()', () => {
+		const isolated = Object.assign(fakeWorker(161), { application: 'isolated-app' });
+		const plain = fakeWorker(162);
+		workers.push(isolated, plain);
+		try {
+			assert.strictEqual(recordLockOwnerFor('iso-broadcast'), plain);
+			assert.ok(
+				isolated.posted.some(
+					(m) => m.type === 'record-lock-owner-thread' && m.database === 'iso-broadcast' && m.threadId === 162
+				)
+			);
+		} finally {
+			releaseRecordLockOwner('iso-broadcast');
+			workers.splice(workers.indexOf(isolated), 1);
+			workers.splice(workers.indexOf(plain), 1);
+		}
 	});
 
 	it('withholds the successor until an isolated application worker acks its fence, since it can hold relayed handles', async () => {

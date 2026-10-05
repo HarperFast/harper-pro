@@ -10,7 +10,6 @@ export function isReplicationWorker(worker: any): boolean {
 	return worker.name === 'http' && worker.application === undefined;
 }
 
-/** The live workers replication places subscriptions on and picks record-lock owners from, in start order. */
 export function replicationWorkers(): any[] {
 	return workers.filter(isReplicationWorker);
 }
