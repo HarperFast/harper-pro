@@ -307,8 +307,8 @@ describe('patch-release.js non-interactive contract', function () {
 		let fixture;
 
 		beforeEach(function () {
-			// Hides semver from the child on any host, including ancestor or global node_modules.
 			fixture = mkdtempSync(join(tmpdir(), 'patch-release-preflight-'));
+			// Hides semver from the child on any host, including ancestor or global node_modules.
 			writeFileSync(
 				join(fixture, 'hide-semver.cjs'),
 				`const Module = require('node:module');
