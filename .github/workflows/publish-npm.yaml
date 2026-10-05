@@ -49,21 +49,19 @@ jobs:
 
           # npm applies `--tag` unconditionally, so nothing but this step keeps a
           # moving tag from going backwards when release lines publish out of order.
-          #
-          # One lookup of the whole dist-tags map, rather than one `npm view` per
-          # tag: an absent tag is then simply a missing key, so there is no error
-          # string to classify. Per-tag lookups could not tell "this tag does not
-          # exist yet" from "the registry 404'd the package" — both report E404 —
-          # and reading the second as the first would hand `latest` to an older
-          # release during a registry blip. Any failure here ends the step; a brand
-          # new package would need its first publish bootstrapped by hand, which is
-          # a loud failure rather than a silent one.
+          # The whole map in one call: a per-tag lookup reports E404 both for an
+          # absent tag and for a 404 on the package, and reading the second as the
+          # first would hand `latest` to an older release during a registry blip.
           distTags=$(npm view "$PACKAGE_NAME" dist-tags --json)
 
           tagVersion() {
             jq -r --arg tag "$1" '.[$tag] // ""' <<< "$distTags"
           }
 
+          # Sort and take the last rather than a `-r '>x'` range: ranges exclude
+          # prereleases outside their own x.y.z, so a range reads 5.4.0-beta.1 as
+          # losing to 5.3.0-beta.4 and `next` would never leave the older line.
+          # Assigned before testing because `set -e` is off inside an `if`.
           advances() {
             if [[ -z "$1" ]]; then
               return 0
@@ -95,16 +93,15 @@ jobs:
           elif advances "$lineVersion"; then
             packageTag=$lineTag
           else
-            # npm always applies some tag.
             packageTag=tmp-publish-$VERSION
             echo "throwawayTag=$packageTag" >> "$GITHUB_OUTPUT"
           fi
 
           # The throwaway tag is removed moments later, so naming it in the
           # notification would point operators at a 404.
-          reportedTag=$packageTag
+          reportedTag="dist-tag \`$packageTag\`"
           if [[ "$packageTag" == tmp-publish-* ]]; then
-            reportedTag="untagged (install by exact version)"
+            reportedTag="no moving tag was changed; install this build by exact version"
           fi
           echo "reportedTag=$reportedTag" >> "$GITHUB_OUTPUT"
 
@@ -129,8 +126,8 @@ jobs:
           # Assigned before testing so a registry failure ends the step: a silent
           # "no tag to remove" would strand the throwaway tag behind a green job.
           publishedTags=$(npm dist-tag ls "$PACKAGE_NAME")
-          # Exact field compare, not grep: the tag contains `.`, which a regex would
-          # treat as a wildcard.
+          # Exact field compare: the tag embeds a dotted version, which a regex
+          # would read as wildcards.
           if awk -F': ' -v tag="$THROWAWAY_TAG" '$1 == tag { found = 1 } END { exit !found }' <<<"$publishedTags"; then
             npm dist-tag rm "$PACKAGE_NAME" "$THROWAWAY_TAG"
           else
@@ -150,7 +147,7 @@ jobs:
           payload: |
             {
               "channel": "#development-ci",
-              "text": "Harper Pro v${{ needs.publish-npm-package.outputs.harper-pro-version }} has been published to NPM under dist-tag `${{ needs.publish-npm-package.outputs.harper-pro-dist-tag }}`",
+              "text": "Harper Pro v${{ needs.publish-npm-package.outputs.harper-pro-version }} has been published to NPM — ${{ needs.publish-npm-package.outputs.harper-pro-dist-tag }}",
               "blocks": [
                 {
                   "type": "header",
@@ -168,7 +165,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": ":white_check_mark: Published to :npm: as `${{ needs.publish-npm-package.outputs.harper-pro-dist-tag }}`"
+                      "text": ":white_check_mark: Published to :npm: — ${{ needs.publish-npm-package.outputs.harper-pro-dist-tag }}"
                     },
                     {
                       "type": "mrkdwn",

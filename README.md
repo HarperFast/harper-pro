@@ -65,7 +65,9 @@ harper
 
 Harper will prompt you for configuration options during install, and then automatically start after install.
 
-`latest` always tracks the newest release. To stay on an older release line, install from that line's tag — `@harperfast/harper-pro@latest-5.2` for the newest 5.2.x, or `@5.2` for the same thing by semver range. `next` and `next-X.Y` are the prerelease equivalents. A line tag exists only once that line has been superseded by a newer one.
+`latest` points at the newest release line. To stay on an older line, install by semver range — `npm install -g @harperfast/harper-pro@5.2` resolves to the newest 5.2.x from the versions actually published, and is the form to reach for.
+
+There are also `latest-X.Y` and `next-X.Y` dist-tags, but a line only gets one once a newer line has taken over _and_ that older line publishes again — so `@latest-5.2` fails with `notarget` between 5.3 shipping and the next 5.2 release. `next` tracks the newest prerelease. A release older than every tag it could move publishes under a temporary tag that is removed immediately, so it is reachable only by exact version.
 
 ## Contributing
 
