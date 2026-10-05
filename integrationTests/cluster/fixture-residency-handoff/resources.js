@@ -18,7 +18,10 @@ export class HomedProbe extends Resource {
 		target.checkPermission = false;
 		const id = String(target.id);
 		const table = tables.Homed;
-		const entry = table.primaryStore.getEntry(id);
+		// getEntry can return a MaybePromise (a RocksDB cache miss resolves asynchronously, same as
+		// replication/residencyHandoff.ts's resolveLocalEntry handles); unawaited, the Promise itself is
+		// truthy and reads as a present, non-invalidated row with a null version/value.
+		const entry = await table.primaryStore.getEntry(id);
 		const pending = [];
 		const retained = table.pendingTransitionEntries?.();
 		if (retained) {
