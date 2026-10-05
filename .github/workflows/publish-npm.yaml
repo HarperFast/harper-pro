@@ -66,9 +66,6 @@ jobs:
           # Sort and take the last line rather than a `-r '>x'` range: ranges drop
           # prereleases outside their own x.y.z, so a range reads 5.4.0-beta.1 as
           # losing to 5.3.0-beta.4 and `next` would never leave the older line.
-          # `advances` only ever runs as an `if` test, where `set -e` is off and a
-          # failed substitution would silently read as "does not advance" — so the
-          # comparison is assigned first and a semver failure exits the step.
           advances() {
             if [[ -z "$1" ]]; then
               return 0
@@ -126,7 +123,11 @@ jobs:
           THROWAWAY_TAG: ${{ steps.package-tag.outputs.throwawayTag }}
         run: |
           set -euo pipefail
-          if npm view "$PACKAGE_NAME@$THROWAWAY_TAG" version >/dev/null 2>&1; then
+          # `dist-tag ls` rather than a `view` probe: a probe cannot tell "tag absent"
+          # from "registry unreachable", and swallowing the latter would leave the
+          # throwaway tag published forever behind a green job.
+          publishedTags=$(npm dist-tag ls "$PACKAGE_NAME")
+          if grep -q "^$THROWAWAY_TAG:" <<<"$publishedTags"; then
             npm dist-tag rm "$PACKAGE_NAME" "$THROWAWAY_TAG"
           else
             echo "No $THROWAWAY_TAG tag to remove"
