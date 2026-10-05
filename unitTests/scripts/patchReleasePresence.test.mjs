@@ -124,6 +124,16 @@ describe('patch-release milestone backport verification', function () {
 			assert.deepEqual(states([full, narrow]), [['Unit Test (Node.js v22)', 'failure']]);
 		});
 
+		it('blocks while an earlier run is still queued behind a completed narrower run', function () {
+			const queuedFull = run(10, [], { status: 'queued', conclusion: null });
+			const narrow = run(11, [job('Unit Test (Node.js v24)')], { event: 'workflow_dispatch' });
+			assert.deepEqual(states([queuedFull, narrow]), [[null, 'queued']]);
+		});
+
+		it('blocks a successful run that lists no jobs', function () {
+			assert.deepEqual(states([run(1, [])]), [[null, 'no-jobs']]);
+		});
+
 		it('blocks on a run that failed without any jobs', function () {
 			assert.deepEqual(states([run(1, [job('a')]), run(2, [], { conclusion: 'startup_failure' })]), [
 				[null, 'startup_failure'],
@@ -731,7 +741,13 @@ else if (args[0] === 'api' && args[1].includes('/actions/')) {
 					assert.equal(r.status, 0, r.stdout + r.stderr);
 					assert.match(r.stderr, /✗ unit-test\.yml \/ Unit Test \(Node\.js v22\): failure/);
 					assert.match(r.stdout, /Required CI is NOT green .* overriding the CI gate\? \[y\/N\]/);
-					assert.equal(resultOf(r).aborted, true);
+					const result = resultOf(r);
+					assert.equal(result.aborted, true);
+					assert.deepEqual(
+						result.ciFailures.map((f) => [f.workflow, f.job]),
+						[['unit-test.yml', 'Unit Test (Node.js v22)']]
+					);
+					assert.deepEqual(result.backportVerification, { core: 'passed', pro: 'passed' });
 					assert.deepEqual([snapshot(), remoteSnapshot()], before);
 				});
 			}
@@ -776,6 +792,27 @@ else if (args[0] === 'api' && args[1].includes('/actions/')) {
 				assert.deepEqual(result.candidates, { core: coreCandidate, pro: candidate, proCoreGitlink: coreCandidate });
 				assert.equal(git(remote(pro), 'rev-parse', 'refs/tags/v5.1.1^{commit}^'), candidate);
 				assert.equal(git(remote(pro), 'rev-parse', 'v5.1'), git(remote(pro), 'rev-parse', 'refs/tags/v5.1.1^{commit}'));
+			});
+
+			it('refuses a staged change before creating any release commit or tag', function () {
+				allowRelease();
+				git(core, 'checkout', 'v5.1');
+				git(core, 'commit', '--allow-empty', '-m', 'Core backport');
+				publish(core, 'v5.1:refs/heads/v5.1');
+				git(core, 'checkout', 'main');
+				writeFileSync(join(pro, 'unreviewed.txt'), 'not part of the candidate\n');
+				git(pro, 'add', 'unreviewed.txt');
+				const remoteBefore = remoteSnapshot();
+				const r = runCli(['--yes', '--json']);
+				assert.equal(r.status, 1, r.stdout + r.stderr);
+				assert.match(
+					resultOf(r).error,
+					/harper-pro has local changes that would be folded into the release commit: unreviewed\.txt/
+				);
+				assert.equal(git(core, 'tag', '--list', 'v5.1.1'), '');
+				assert.equal(git(pro, 'tag', '--list', 'v5.1.1'), '');
+				assert.equal(git(core, 'rev-parse', 'v5.1'), git(remote(core), 'rev-parse', 'v5.1'));
+				assert.deepEqual(remoteSnapshot(), remoteBefore);
 			});
 
 			it('warns when harper-pro CI ran against a different core than the release builds on', function () {

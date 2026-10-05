@@ -37,7 +37,8 @@
  *                     NO in this mode — pass --cm-trigger to opt in. This is intentional: in
  *                     interactive mode prompt 2 defaults YES on an empty answer, which would
  *                     silently deploy; non-interactive mode inverts that default to be safe. Closed
- *                     stdin answers every prompt "no".
+ *                     stdin answers the proceed and CM deploy prompts "no"; the branch-restore
+ *                     prompts keep their default and restore.
  *   --ci-override <reason>
  *                     Emergency release: proceed although required CI on a release candidate is
  *                     failing, pending, missing or unreadable. The reason and the failures are
@@ -165,8 +166,8 @@ function resolveDeployAnswer({ cmTrigger, yesMode }) {
 	return null;
 }
 
-function buildAbortedResult() {
-	return { ok: false, error: 'aborted', aborted: true, pushed: false, cmTriggered: false };
+function buildAbortedResult(gate = {}) {
+	return { ok: false, error: 'aborted', aborted: true, pushed: false, cmTriggered: false, ...gate };
 }
 
 // Builds the die() args for a CM-trigger failure that was explicitly requested via
@@ -404,7 +405,6 @@ function backportVerificationApplies(branch, sourceBranch) {
 const PASSING_JOB_CONCLUSIONS = new Set(['success', 'skipped', 'neutral']);
 
 // `runs` are one workflow's runs on the candidate commit, each carrying its latest-attempt `jobs`.
-// Returns the blocking states (empty means green) and the runs counted as evidence.
 function evaluateWorkflowRuns(runs) {
 	// pull_request runs test refs/pull/N/merge, not the candidate commit itself.
 	const evidence = runs.filter((run) => run.event !== 'pull_request');
@@ -414,7 +414,9 @@ function evaluateWorkflowRuns(runs) {
 	evidence.sort((a, b) => a.run_number - b.run_number);
 	const latest = evidence.at(-1);
 	if (!latest) return { blocking: [{ state: 'missing' }], evidence };
-	if (latest.status !== 'completed') return { blocking: [{ state: latest.status, url: latest.html_url }], evidence };
+	// An unfinished run lists no jobs yet, so a completed narrower run would otherwise read as complete evidence.
+	const unfinished = evidence.find((run) => run.status !== 'completed');
+	if (unfinished) return { blocking: [{ state: unfinished.status, url: unfinished.html_url }], evidence };
 	// Each job's most recent result decides, so a later narrower run (a single-Node dispatch) cannot
 	// mask a job that failed in an earlier full-matrix run.
 	const jobs = new Map();
@@ -428,6 +430,8 @@ function evaluateWorkflowRuns(runs) {
 		}));
 	if (!blocking.length && latest.conclusion !== 'success') {
 		blocking.push({ state: latest.conclusion, url: latest.html_url });
+	} else if (!jobs.size) {
+		blocking.push({ state: 'no-jobs', url: latest.html_url });
 	}
 	return { blocking, evidence, jobCount: jobs.size };
 }
@@ -488,8 +492,7 @@ function checkCandidateCI(ghRepo, branch, sha, workflows) {
 }
 
 // ── Per-repo status display ───────────────────────────────────────────────────
-// Pins the release candidate: every later step (backport history, version, CI, the release commit's
-// parent) uses `sha`, so a fetch that moves origin/<branch> mid-run cannot change what gets tagged.
+// Every later step uses `sha`, so a fetch that moves origin/<branch> mid-run cannot change what gets tagged.
 function showRepoStatus({ absPath, name, branch, requiredWorkflows }) {
 	header(name);
 	process.chdir(absPath);
@@ -620,7 +623,6 @@ function setVersion(repoLabel, targetVersion) {
 	return newVersion;
 }
 
-// The release commit may add only its own packaging changes on top of the verified candidate.
 function assertReleaseBase(repoLabel, candidate) {
 	const head = runFile('git', ['rev-parse', 'HEAD']);
 	if (head !== candidate) {
@@ -795,7 +797,6 @@ async function main() {
 		// Use a placeholder so Step 6 can still show the CM command it would run.
 		proVersion = `v${target}`;
 	} else {
-		// --yes only reaches here with green CI or --ci-override, so this acknowledgment is interactive.
 		const acknowledgeCI = ciFailures.length > 0 && !ciOverride;
 		const confirm = YES_MODE
 			? 'y'
@@ -808,7 +809,7 @@ async function main() {
 			warn('Aborted.');
 			// Exit 0 (a human/--yes declined, nothing failed) but still emit a RESULT line
 			// under --json — otherwise a caller parsing stdout for completion gets nothing.
-			if (JSON_OUTPUT) writeResult(buildAbortedResult());
+			if (JSON_OUTPUT) writeResult(buildAbortedResult({ missingPRs, ciFailures, backportVerification, candidates }));
 			return;
 		}
 		if (acknowledgeCI) {
@@ -816,11 +817,18 @@ async function main() {
 			warn('CI gate overridden by interactive confirmation.');
 		}
 
-		// ── Step 1: bump core (if it has new commits) ──────────────────────────
+		// ── Step 1: check out both verified candidates before creating any release commit ──
 		process.chdir(corePath);
 		run(`git checkout "${CORE_RELEASE_BRANCH}"`);
 		run(`git merge --ff-only "${coreStatus.sha}"`);
 		assertReleaseBase('harper (core)', coreStatus.sha);
+		process.chdir(harperProRoot);
+		run(`git checkout "${RELEASE_BRANCH}"`);
+		run(`git merge --ff-only "${proStatus.sha}"`);
+		assertReleaseBase('harper-pro', proStatus.sha);
+
+		// ── Step 2: bump core (if it has new commits) ──────────────────────────
+		process.chdir(corePath);
 		if (coreBumping) {
 			coreVersion = setVersion('harper (core)', target);
 		} else {
@@ -829,13 +837,8 @@ async function main() {
 			);
 		}
 
-		// ── Step 2: checkout harper-pro release branch ─────────────────────────
-		process.chdir(harperProRoot);
-		run(`git checkout "${RELEASE_BRANCH}"`);
-		run(`git merge --ff-only "${proStatus.sha}"`);
-		assertReleaseBase('harper-pro', proStatus.sha);
-
 		// ── Step 3: sync core submodule + deps ─────────────────────────────────
+		process.chdir(harperProRoot);
 		header('Syncing core submodule + dependencies');
 		// sync-core.sh runs with NO_USE_GIT=true so it doesn't reset core to main per
 		// .gitmodules — we manage the ref ourselves.
