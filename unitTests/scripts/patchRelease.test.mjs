@@ -9,7 +9,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { closeSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, copyFileSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -300,6 +300,38 @@ describe('patch-release.js non-interactive contract', function () {
 			const written = readFileSync(filePath, 'utf8');
 			assert.equal(written, 'RESULT: ' + JSON.stringify({ ok: true, pushed: true }) + '\n');
 			assert.deepEqual(JSON.parse(written.replace(/^RESULT: /, '')), { ok: true, pushed: true });
+		});
+	});
+
+	describe('runtime dependency preflight', function () {
+		// The script is copied into a tree with no node_modules, and NODE_PATH points at an empty
+		// dir, so require('semver') has nowhere to resolve from.
+		let fixture;
+
+		beforeEach(function () {
+			fixture = mkdtempSync(join(tmpdir(), 'patch-release-preflight-'));
+			mkdirSync(join(fixture, 'scripts'));
+			mkdirSync(join(fixture, 'empty-node-path'));
+			copyFileSync(scriptPath, join(fixture, 'scripts/patch-release.js'));
+		});
+
+		afterEach(function () {
+			rmSync(fixture, { recursive: true, force: true });
+		});
+
+		it('exits nonzero with an npm ci message and a parsable RESULT line when semver is missing', function () {
+			const r = spawnSync(process.execPath, [join(fixture, 'scripts/patch-release.js')], {
+				encoding: 'utf8',
+				timeout: 5000,
+				env: { ...process.env, PATH: '', NODE_PATH: join(fixture, 'empty-node-path') },
+			});
+			assert.equal(r.status, 1);
+			assert.match(r.stderr, /semver is not installed\. Run `npm ci` in .+ first\./);
+			assert.doesNotMatch(r.stderr, /MODULE_NOT_FOUND/);
+			const resultLine = r.stdout.split('\n').find((line) => line.startsWith('RESULT: '));
+			const result = JSON.parse(resultLine.slice('RESULT: '.length));
+			assert.equal(result.ok, false);
+			assert.match(result.error, /npm ci/);
 		});
 	});
 });

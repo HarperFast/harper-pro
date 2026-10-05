@@ -50,7 +50,6 @@ const { execFileSync, execSync, spawnSync } = require('node:child_process');
 const { existsSync, writeSync } = require('fs');
 const path = require('path');
 const readline = require('readline');
-const semver = require('semver');
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 // Defined before Args below: getArg() can call die(), which uses err()/writeResult() here —
@@ -89,6 +88,19 @@ function die(message, code = 1, extra = {}, emitResult = JSON_OUTPUT) {
 	}
 	process.exit(code);
 }
+
+// ── Runtime dependencies ──────────────────────────────────────────────────────
+// A fresh clone has no node_modules, and the bare require would die with an unformatted
+// MODULE_NOT_FOUND and no RESULT line. Only the CLI run exits here; a require()-only import
+// keeps the throw from the require below, since die() would kill its host process.
+if (require.main === module) {
+	try {
+		require.resolve('semver');
+	} catch {
+		die(`\n  Error: semver is not installed. Run \`npm ci\` in ${path.resolve(__dirname, '..')} first.`, 1, {}, true);
+	}
+}
+const semver = require('semver');
 
 // ── Args ──────────────────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
