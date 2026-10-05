@@ -61,7 +61,8 @@ jobs:
           # Sort and take the last rather than a `-r '>x'` range: ranges exclude
           # prereleases outside their own x.y.z, so a range reads 5.4.0-beta.1 as
           # losing to 5.3.0-beta.4 and `next` would never leave the older line.
-          # Assigned before testing because `set -e` is off inside an `if`.
+          # The explicit `|| exit` is what fails closed: this runs as an `if` test,
+          # where `set -e` is off and a failed comparison would read as "older".
           advances() {
             if [[ -z "$1" ]]; then
               return 0
