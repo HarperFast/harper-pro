@@ -49,7 +49,7 @@ export function coreRetainsTransitionImages(table: any): boolean {
 }
 
 /** Every retained transition entry for the table (unreleased), or undefined when core has no such index. */
-export function pendingTransitionEntries(table: any): Iterable<TransitionEntry> | undefined {
+function pendingTransitionEntries(table: any): Iterable<TransitionEntry> | undefined {
 	return table?.pendingTransitionEntries?.();
 }
 
@@ -59,7 +59,7 @@ export function pendingTransitionEntry(table: any, id: any): TransitionEntry | u
 }
 
 /** Drop the retained entry when its version is at or below `version`. No-op on an unsupported core. */
-export function releaseTransitionEntry(table: any, id: any, version: number): Promise<void> | void {
+function releaseTransitionEntry(table: any, id: any, version: number): Promise<void> | void {
 	return table?.releaseTransitionEntry?.(id, version);
 }
 
@@ -169,9 +169,12 @@ export function peersOwedImage(
 	return residency.filter((node) => node !== selfName && !((receipts.get(node) ?? -Infinity) >= version));
 }
 
-// [marker, tableId, recordId, peerName] -> version, in the database's dbisDB so every thread and a
+// [marker, tableId, recordIdKey, peerName] -> version, in the database's dbisDB so every thread and a
 // restarted origin see the same receipts. The Symbol prefix sorts below `false`, where core's catalog
-// scans start.
+// scans start. recordId is encoded through writeKeyId first: a compound (array) id written as its own
+// array element would flatten into this key's own element sequence (ordered-binary's array encoding is
+// just elements joined by the same separator at every depth), letting one record's receipt be stored
+// or read as another's; writeKeyId's one opaque string per id closes that off.
 const HANDOFF_RECEIPT = Symbol.for('residencyHandoffReceipt');
 const KEY_END = '￿';
 
@@ -182,7 +185,7 @@ export async function recordHandoffReceipt(
 	peerName: string,
 	version: number
 ): Promise<void> {
-	const key = [HANDOFF_RECEIPT, tableId, recordId, peerName];
+	const key = [HANDOFF_RECEIPT, tableId, writeKeyId(recordId), peerName];
 	const existing = dbisDB.getSync(key);
 	if (typeof existing === 'number' && existing >= version) return;
 	await dbisDB.put(key, version);
@@ -190,9 +193,10 @@ export async function recordHandoffReceipt(
 
 export function handoffReceipts(dbisDB: any, tableId: number, recordId: any): Map<string, number> {
 	const receipts = new Map<string, number>();
+	const idKey = writeKeyId(recordId);
 	for (const { key, value } of dbisDB.getRange({
-		start: [HANDOFF_RECEIPT, tableId, recordId],
-		end: [HANDOFF_RECEIPT, tableId, recordId, KEY_END],
+		start: [HANDOFF_RECEIPT, tableId, idKey],
+		end: [HANDOFF_RECEIPT, tableId, idKey, KEY_END],
 	})) {
 		if (Array.isArray(key) && typeof key[3] === 'string' && typeof value === 'number') receipts.set(key[3], value);
 	}
@@ -201,9 +205,10 @@ export function handoffReceipts(dbisDB: any, tableId: number, recordId: any): Ma
 
 export async function clearHandoffReceipts(dbisDB: any, tableId: number, recordId: any): Promise<void> {
 	const keys: any[] = [];
+	const idKey = writeKeyId(recordId);
 	for (const { key } of dbisDB.getRange({
-		start: [HANDOFF_RECEIPT, tableId, recordId],
-		end: [HANDOFF_RECEIPT, tableId, recordId, KEY_END],
+		start: [HANDOFF_RECEIPT, tableId, idKey],
+		end: [HANDOFF_RECEIPT, tableId, idKey, KEY_END],
 	})) {
 		keys.push(key);
 	}

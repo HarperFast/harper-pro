@@ -5,6 +5,7 @@
  * the fakes below stand in for.
  */
 import { expect } from 'chai';
+import { toBufferKey } from 'ordered-binary';
 import {
 	applyHandoffReceipt,
 	chunkReceipts,
@@ -34,19 +35,14 @@ const complete = (version = V1) => ({ version, metadataFlags: 0, value: { id: 'r
 const stub = (version = V1) => ({ version, metadataFlags: INVALIDATED, value: { home: 'B' } });
 const residencyOf = (lists) => (id) => lists[id];
 
-/** In-memory stand-in for a database's `dbisDB`: array keys, ordered prefix ranges. */
+/**
+ * In-memory stand-in for a database's `dbisDB`: array keys, ordered prefix ranges, encoded through the
+ * same ordered-binary `toBufferKey` the real stores use — not JSON, which preserves array nesting and
+ * would hide a compound (array) id flattening into its surrounding key (see the compound-id test below).
+ */
 function fakeDbisDB() {
 	const rows = new Map();
-	const normalize = (key) => key.map((part) => (typeof part === 'symbol' ? part.description : part));
-	const keyOf = (key) => JSON.stringify(normalize(key));
-	const comparePart = (a, b) => (a === b ? 0 : a < b ? -1 : 1);
-	const compareKeys = (a, b) => {
-		for (let i = 0; i < Math.max(a.length, b.length); i++) {
-			const cmp = comparePart(a[i], b[i]);
-			if (cmp !== 0) return cmp;
-		}
-		return 0;
-	};
+	const keyOf = (key) => toBufferKey(key).toString('hex');
 	return {
 		rows,
 		getSync(key) {
@@ -59,12 +55,12 @@ function fakeDbisDB() {
 			rows.delete(keyOf(key));
 		},
 		*getRange({ start, end }) {
-			const from = normalize(start);
-			const to = end === undefined ? undefined : normalize(end);
+			const from = toBufferKey(start);
+			const to = end === undefined ? undefined : toBufferKey(end);
 			for (const row of rows.values()) {
-				const key = normalize(row.key);
-				if (compareKeys(key, from) < 0) continue;
-				if (to !== undefined && compareKeys(key, to) >= 0) continue;
+				const key = toBufferKey(row.key);
+				if (Buffer.compare(key, from) < 0) continue;
+				if (to !== undefined && Buffer.compare(key, to) >= 0) continue;
 				yield row;
 			}
 		},
@@ -184,6 +180,24 @@ describe('residency handoff — durable receipts', () => {
 		await clearHandoffReceipts(dbisDB, 7, 'r');
 		expect(handoffReceipts(dbisDB, 7, 'r').size).to.equal(0);
 		expect(handoffReceipts(dbisDB, 7, 'other').get('B')).to.equal(V2);
+	});
+
+	it('keeps a compound-id record and a scalar-id record apart (harper-pro#940 compound-key finding)', async () => {
+		// A compound id is itself an array (core's Id contract allows a flat array of scalars). Written
+		// raw as one element of this module's own [marker, tableId, recordId, peerName] key, ordered-
+		// binary's array encoding — elements joined by the same separator at every depth — would flatten
+		// [1, 'B'] into the same byte sequence as the scalar id 1 followed by peer name 'B'. The fix
+		// (writeKeyId) encodes recordId as one opaque string first, so this scalar/compound pair below —
+		// chosen so the pre-fix flattening of record ['B'-compound]'s receipt would misread as record
+		// 1's — no longer collide.
+		const dbisDB = fakeDbisDB();
+		await recordHandoffReceipt(dbisDB, 7, [1, 'B'], 'C', V1);
+		await recordHandoffReceipt(dbisDB, 7, 1, 'B', V2);
+		expect([...handoffReceipts(dbisDB, 7, [1, 'B'])]).to.deep.equal([['C', V1]]);
+		expect([...handoffReceipts(dbisDB, 7, 1)]).to.deep.equal([['B', V2]]);
+		await clearHandoffReceipts(dbisDB, 7, [1, 'B']);
+		expect(handoffReceipts(dbisDB, 7, [1, 'B']).size).to.equal(0);
+		expect(handoffReceipts(dbisDB, 7, 1).get('B')).to.equal(V2);
 	});
 });
 
