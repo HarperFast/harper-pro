@@ -521,7 +521,7 @@ activate can never turn a departing node back into a granter), and its own row t
 each node independently verifies; it never authorizes policy.
 
 One fact found while tracing this, worth recording because it changes what the gate is _for_:
-`replicationConnection.ts` dispatches an inbound operation as `server.operation(data, { user },
+`replicationConnection.ts` dispatches an inbound operation as `server.operation(data, { user: authorization },
 !isAuthorizedNode)`, and a caller with an `hdb_nodes` row bypasses `verifyPerms` entirely — so a node
 principal could already invoke the `requiresSuperUser` per-node operations over the wire. The
 peer-callable operation is therefore not what lets a peer write; it is what keeps a `super_user` HTTP
@@ -544,24 +544,27 @@ narrows the blast radius rather than closing it — `homeMap()` iterates its **o
 a node rewritten to a singleton skips the peer loop and serves immediately, and a peer fails closed
 only once the changed digest reaches it over a live connection.
 
-It is accepted for this release, by the task owner's ruling on #822, on three facts:
+The transition needs the same authority as any other cluster fan-out, and it does not widen the trust
+boundary:
 
-1. **A cluster node principal is already trusted to write replicated data on every peer.** The relay
-   extends that existing trust to home-map policy; it does not open a new channel.
-2. **This operation does not widen the authority.** The per-node operations were reachable by a node
-   principal through the dispatcher bypass before harper-pro#862 added the relay. What the relay adds
-   is the local re-validation above — strictly more checking than the direct call it replaced.
-3. **Nothing shipped is exposed.** `replication.recordLocks` is off by default and grants nothing
-   until an operator stages and activates a generation, so reaching this needs an operator to have
-   enabled and activated the feature _and_ an attacker to hold a node principal.
+1. **A node principal can already run any operation on a peer.** `replicationConnection.ts`
+   dispatches an inbound operation as `server.operation(data, { user: authorization }, !isAuthorizedNode)`, so a
+   caller with an `hdb_nodes` row skips `verifyPerms`. Replicated `deploy_component` and
+   `set_configuration` ride that same path (`replicateOperation` → `sendOperationToNode`). A node
+   principal can therefore deploy a component that calls the per-node operations locally, and can
+   reach the same effect without this relay.
+2. **The relay adds checking, not reach.** The per-node operations were reachable by a node principal
+   through the dispatcher bypass before harper-pro#862 added the relay. What the relay adds is the
+   local re-validation above, which is strictly more checking than the direct call it replaced.
+3. **An operator proof on this one operation would not narrow the boundary.** A node principal that
+   wanted to mint a map could still do so through the route in (1). Narrowing what node principals may
+   run on a peer is a separate change, tracked in harper-pro#976. When #976 narrows node-principal
+   operations, `record_lock_transition` remains the one node-principal route to a peer's home map
+   (`hdb_record_lock_homes` is `LOCAL_ONLY`), so re-assess an operator proof (#869) at that point.
+4. **Nothing shipped is exposed by default.** `replication.recordLocks` is off by default and grants
+   nothing until an operator stages and activates a generation.
 
-What would close it is an operator-delegated proof carried on the transition — a short-lived
-capability or signed manifest minted by the `record_lock_apply_homes` caller's own `super_user`
-session, covering `(database, generation, digest, quiesce)` and an expiry, verified by each receiving
-node before it writes — with the node-principal gate kept as transport authentication. That is filed
-as harper-pro#869 and is a prerequisite for recommending this feature in production, and for #853's
-default-on question. The dispatcher's node-wide `verifyPerms` bypass is wider than record locks and
-wants its own assessment; #869 says so rather than folding it in.
+Accepted on that basis, by the task owner's ruling on #822.
 
 ### Approaches considered
 
