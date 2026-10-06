@@ -475,12 +475,17 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 	if (freshBudget) state.backoff.reset();
 	const current = () => refreshState.get(database)?.token === token;
 	const before = activeCache.get(database);
-	let recovered = false;
 	try {
 		const row = await readHomesRow(database);
 		if (!current()) return;
 		activeCache.set(database, row?.active);
-		recovered = state.backoff.attempts > 0;
+		// A peer digest that arrived while the row was unreadable was recorded as a mismatch against
+		// no digest at all, and a socket that handshook then received none; both need the recovered one.
+		// The backoff resets only once this is done, so a failure here re-arms the whole cycle.
+		if (state.backoff.attempts > 0) {
+			pushHomesDigestToPeers(database);
+			reconcileAllPeerHomesAgreement(database);
+		}
 		state.backoff.reset();
 	} catch (error) {
 		if (!current()) return;
@@ -489,14 +494,9 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		activeCache.delete(database);
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
 		state.timer = setTimeout(() => {
-			if (current()) refreshCache(database);
+			if (current())
+				refreshCache(database).catch((rejection) => logger.warn?.('record lock refresh retry failed', rejection));
 		}, state.backoff.nextDelay() ?? REFRESH_RETRY_MAX_MS).unref();
-	}
-	if (recovered) {
-		// A peer digest that arrived while the row was unreadable was recorded as a mismatch against
-		// no digest at all, and a socket that handshook then received none; both need the recovered one.
-		pushHomesDigestToPeers(database);
-		reconcileAllPeerHomesAgreement(database);
 	}
 	const after = activeCache.get(database);
 	// Core's coordinator seeds its restart-quarantine incarination tracking (`#coordinatingIncarnation`)

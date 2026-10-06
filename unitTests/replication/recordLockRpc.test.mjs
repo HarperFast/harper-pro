@@ -532,6 +532,21 @@ describe('forwarding an outbound lock operation over the worker holding the sess
 		assert.strictEqual(requester.posted.length, 1, 'a reply after the exit finds no hop');
 	});
 
+	it('a barrier whose holder exits mid-hop settles as an unknown outcome, never a resend that writes a second barrier', () => {
+		const requester = fakePort(1);
+		const holder = fakePort(42);
+		setSessionHolderReader(() => holder);
+		const barrier = { operation: 'record_lock_barrier', database: 'fwd', table: 't', nonce: 7 };
+		handleOutboundRequestOnMain(
+			{ requestId: 6, nodeName: 'peer', database: 'fwd', operation: barrier, deadlineAt: soon() },
+			requester
+		);
+		settleHopsOfExitedHolder(42);
+		assert.strictEqual(requester.posted.length, 1);
+		assert.match(requester.posted[0].error, /outcome is unknown/);
+		assert.strictEqual(requester.posted[0].noSession, undefined, 'the requester does not fall back for a barrier');
+	});
+
 	it('a holder with no live session to the peer says so rather than opening one', () => {
 		const main = fakePort();
 		handleOutboundRequestOnHolder(

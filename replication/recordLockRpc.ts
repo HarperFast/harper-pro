@@ -194,8 +194,10 @@ export async function sendRecordLockOperation(
 	const deadlineAt = outboundNow() + (timeoutMs ?? outboundTimeoutFor(operation.operation));
 	const session = liveSessionTo(nodeName, database);
 	if (session) {
+		const remaining = deadlineAt - outboundNow();
+		if (remaining <= 0) throw new Error(`${operation.operation} to ${nodeName} expired before it was sent`);
 		bucket.session++;
-		return session.sendOperation({ ...operation }, deadlineAt - outboundNow());
+		return session.sendOperation({ ...operation }, remaining);
 	}
 	if (parentPort) {
 		const forwarded = await forwardOverSessionHolder(nodeName, database, operation, deadlineAt);
@@ -226,7 +228,7 @@ const pendingOutbound = new Map<number, (answer: OutboundAnswer) => void>();
 /** Main thread, keyed by a hop id main mints (requesters' ids collide here). */
 const outboundHops = new Map<
 	number,
-	{ worker: any; holderThreadId: number; requestId: number; timer: NodeJS.Timeout }
+	{ worker: any; holderThreadId: number; requestId: number; barrier: boolean; timer: NodeJS.Timeout }
 >();
 let sessionHolderFor: (nodeName: string, database: string) => any = () => undefined;
 export function setSessionHolderReader(reader: (nodeName: string, database: string) => any): void {
@@ -325,7 +327,8 @@ export function handleOutboundRequestOnMain(message: any, worker: any): void {
 		() => settleHop(hopId, { error: `the worker holding the session to ${nodeName} did not answer` }),
 		deadlineAt - outboundNow() + RELAY_SLACK_MS
 	).unref();
-	outboundHops.set(hopId, { worker, holderThreadId: holder.threadId, requestId, timer });
+	const barrier = operation?.operation === BARRIER_OPERATION;
+	outboundHops.set(hopId, { worker, holderThreadId: holder.threadId, requestId, barrier, timer });
 	try {
 		holder.postMessage({ type: OUTBOUND_REQUEST, requestId: hopId, nodeName, database, operation, deadlineAt });
 	} catch (error) {
@@ -342,8 +345,19 @@ export function handleOutboundReplyOnMain(message: any): void {
 	settleHop(message?.requestId, answer);
 }
 
+/** A barrier that reached the holder may have been written; a resend would append a second, differently
+ * positioned barrier and fail the successor's freshness check, so its outcome is reported unknown
+ * (fail closed). A delegate or recall resend is idempotent, so the requester falls back. */
 export function settleHopsOfExitedHolder(threadId: number): void {
-	for (const [hopId, hop] of outboundHops) if (hop.holderThreadId === threadId) settleHop(hopId, { noSession: true });
+	for (const [hopId, hop] of outboundHops) {
+		if (hop.holderThreadId !== threadId) continue;
+		settleHop(
+			hopId,
+			hop.barrier
+				? { error: 'the holder exited before answering a freshness barrier; its outcome is unknown' }
+				: { noSession: true }
+		);
+	}
 }
 
 if (parentPort) {
