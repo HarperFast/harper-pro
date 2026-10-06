@@ -1125,14 +1125,7 @@ export async function startOnMainThread(options) {
 	setSessionHolderReader((nodeName, database) => {
 		const node = nodeMap.get(nodeName);
 		const entry = node ? connectionReplicationMap.get(getNodeURL(node))?.get(database) : undefined;
-		if (
-			!entry ||
-			hasDeadOwner(
-				entry,
-				workers.filter((worker) => worker.name === 'http')
-			)
-		)
-			return undefined;
+		if (!entry || hasDeadOwner(entry, replicationWorkers())) return undefined;
 		return entry.worker;
 	});
 	// Round-robin regardless of record-lock ownership: a control entry applied off the coordinating
