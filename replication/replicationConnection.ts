@@ -472,7 +472,7 @@ export function holdFailedFrame(
 // worker stays responsive during a bulk copy/clone.
 const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 100;
 
-// Small sender slices batch writes; sharing one pending turn prevents peer count multiplying the budget.
+// One pending turn is shared across senders so the yield cost does not multiply with peer count.
 const SEND_YIELD_INTERVAL = 2;
 let lastSendYieldTime = 0;
 let pendingSendYield: Promise<void> | undefined;

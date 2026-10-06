@@ -5,8 +5,7 @@ import { runInNewContext } from 'node:vm';
 import sinon from 'sinon';
 import * as replication from '#src/replication/replicationConnection';
 
-// Nested subscription closures need a socket/timer fixture here; the cluster suites cover
-// framing and real transport.
+// Nested subscription closures need a socket/timer fixture here.
 const source = readFileSync(new URL('../../dist/replication/replicationConnection.js', import.meta.url), 'utf8');
 const skipStart = source.indexOf('function skipAuditRecord() {');
 const skipEnd = source.indexOf('if (!sentNodeIds.has(', skipStart);
@@ -74,15 +73,15 @@ describe('replication sender yield budget', function () {
 
 	afterEach(async () => {
 		try {
-			await clock.runAllAsync();
+			await clock?.runAllAsync();
 			now += 2;
 			const turn = replication.yieldSendLoop?.();
-			performanceNow.callsFake(realPerformanceNow);
-			await clock.runAllAsync();
+			performanceNow?.callsFake(realPerformanceNow);
+			await clock?.runAllAsync();
 			await turn;
 		} finally {
-			performanceNow.restore();
-			clock.restore();
+			performanceNow?.restore();
+			clock?.restore();
 		}
 	});
 
