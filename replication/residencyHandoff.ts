@@ -171,12 +171,22 @@ export function peersOwedImage(
 
 // [marker, tableId, recordIdKey, peerName] -> version, in the database's dbisDB so every thread and a
 // restarted origin see the same receipts. The Symbol prefix sorts below `false`, where core's catalog
-// scans start. recordId is encoded through writeKeyId first: a compound (array) id written as its own
-// array element would flatten into this key's own element sequence (ordered-binary's array encoding is
-// just elements joined by the same separator at every depth), letting one record's receipt be stored
-// or read as another's; writeKeyId's one opaque string per id closes that off.
+// scans start. recordId goes through hexIdKey, not a bare writeKeyId string: a compound (array) id
+// written as its own array element would flatten into this key's own element sequence (ordered-binary
+// joins elements with the same separator byte, 0x00, at every depth). writeKeyId's output is that
+// separator byte's own raw latin1 value when the id's encoding contains one -- which ordered-binary's
+// string writer only escapes below 64 characters (index.js's short-string path); at or past that
+// length it writes the bytes through unescaped. Hex has no byte that needs escaping at any length, so
+// it closes this off for every id, not just short ones, at the cost of doubling the key's contribution
+// to the composite key -- an already-maximum-length id can now exceed the store's own key-size limit,
+// which the existing `dbisDB.put` catch in the caller already treats like any other failed receipt
+// (image stays retained, next receipt or resweep retries): pinning, not misattribution.
 const HANDOFF_RECEIPT = Symbol.for('residencyHandoffReceipt');
 const KEY_END = '￿';
+
+function hexIdKey(recordId: any): string {
+	return Buffer.from(writeKeyId(recordId) as string, 'latin1').toString('hex');
+}
 
 export async function recordHandoffReceipt(
 	dbisDB: any,
@@ -185,7 +195,7 @@ export async function recordHandoffReceipt(
 	peerName: string,
 	version: number
 ): Promise<void> {
-	const key = [HANDOFF_RECEIPT, tableId, writeKeyId(recordId), peerName];
+	const key = [HANDOFF_RECEIPT, tableId, hexIdKey(recordId), peerName];
 	const existing = dbisDB.getSync(key);
 	if (typeof existing === 'number' && existing >= version) return;
 	await dbisDB.put(key, version);
@@ -193,7 +203,7 @@ export async function recordHandoffReceipt(
 
 export function handoffReceipts(dbisDB: any, tableId: number, recordId: any): Map<string, number> {
 	const receipts = new Map<string, number>();
-	const idKey = writeKeyId(recordId);
+	const idKey = hexIdKey(recordId);
 	for (const { key, value } of dbisDB.getRange({
 		start: [HANDOFF_RECEIPT, tableId, idKey],
 		end: [HANDOFF_RECEIPT, tableId, idKey, KEY_END],
@@ -205,7 +215,7 @@ export function handoffReceipts(dbisDB: any, tableId: number, recordId: any): Ma
 
 export async function clearHandoffReceipts(dbisDB: any, tableId: number, recordId: any): Promise<void> {
 	const keys: any[] = [];
-	const idKey = writeKeyId(recordId);
+	const idKey = hexIdKey(recordId);
 	for (const { key } of dbisDB.getRange({
 		start: [HANDOFF_RECEIPT, tableId, idKey],
 		end: [HANDOFF_RECEIPT, tableId, idKey, KEY_END],
