@@ -348,6 +348,39 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(errors).to.deep.equal([{ recordId: 'unreadable', message: 'store closed' }]);
 	});
 
+	it('isolates a receipt-store failure (e.g. an oversized receipt key) to its own entry instead of aborting the sweep', async () => {
+		// Before this test, a dbisDB throw from handoffReceipts (uncaught inside transitionsOwedToPeer's
+		// loop) propagated out of the function entirely, abandoning every later retained entry -- one
+		// unstorable id could stop the whole table's sweep. Three entries here all hit the same poisoned
+		// getRange; the old behavior would report only the first and reject the call, not resolve it.
+		const table = fakeTable({
+			retained: [
+				{ recordId: 'unstorable1', tableId: 7, version: V1, residencyId: 3 },
+				{ recordId: 'unstorable2', tableId: 7, version: V1, residencyId: 3 },
+				{ recordId: 'unstorable3', tableId: 7, version: V1, residencyId: 3 },
+			],
+			entries: { unstorable1: stub(), unstorable2: stub(), unstorable3: stub() },
+		});
+		table.dbisDB.getRange = () => {
+			throw new Error('key too large for store');
+		};
+		const errors = [];
+		const { owed } = await transitionsOwedToPeer(
+			table,
+			'B',
+			'A',
+			residencyOf(lists),
+			undefined,
+			(recordId, error) => errors.push({ recordId, message: error.message })
+		);
+		expect(errors).to.deep.equal([
+			{ recordId: 'unstorable1', message: 'key too large for store' },
+			{ recordId: 'unstorable2', message: 'key too large for store' },
+			{ recordId: 'unstorable3', message: 'key too large for store' },
+		]);
+		expect(owed).to.deep.equal([]);
+	});
+
 	it('keeps but stops owing an entry whose record moved on to a residency that no longer names the peer', async () => {
 		const table = fakeTable({
 			retained: [

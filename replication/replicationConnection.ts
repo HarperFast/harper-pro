@@ -7651,6 +7651,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																table.tableName,
 																recordId,
 																error
+															),
+														(recordId, error) =>
+															logger.warn?.(
+																connectionId,
+																'could not read or clear receipts for a retained transition image; left pinned',
+																table.tableName,
+																recordId,
+																error
 															)
 													));
 												} catch (error) {

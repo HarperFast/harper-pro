@@ -266,7 +266,8 @@ export async function transitionsOwedToPeer(
 	peerName: string,
 	selfName: string,
 	residencyOf: (residencyId: number | undefined) => string[] | undefined,
-	onRowReadError?: (recordId: any, error: unknown) => void
+	onRowReadError?: (recordId: any, error: unknown) => void,
+	onReceiptStoreError?: (recordId: any, error: unknown) => void
 ): Promise<{ owed: TransitionEntry[]; superseded: number }> {
 	const retained = pendingTransitionEntries(table);
 	if (!retained) return { owed: [], superseded: 0 };
@@ -280,15 +281,33 @@ export async function transitionsOwedToPeer(
 			(error) => onRowReadError?.(entry.recordId, error)
 		);
 		if (localRowSatisfies(row, entry.version)) {
-			await releaseAndClearReceipts(table, entry.recordId, entry.version);
+			try {
+				await releaseAndClearReceipts(table, entry.recordId, entry.version);
+			} catch (error) {
+				onReceiptStoreError?.(entry.recordId, error);
+			}
 			continue;
 		}
-		// checked ahead of the superseded case below: a residency move after every resident already
-		// receipted (e.g. a crash between the last receipt and the release it triggers) must not strand it
-		const residency = residencyOf(entry.residencyId);
-		const receipts = handoffReceipts(table.dbisDB, table.tableId, entry.recordId);
+		// a record whose receipt key the backing store rejects (e.g. too large once encoded) cannot be
+		// managed here; isolate the failure to this one entry so it does not abort the sweep for every
+		// other retained entry in the table -- the image stays exactly where it was, pinned
+		let residency: string[] | undefined;
+		let receipts: Map<string, number>;
+		try {
+			// checked ahead of the superseded case below: a residency move after every resident already
+			// receipted (e.g. a crash between the last receipt and the release it triggers) must not strand it
+			residency = residencyOf(entry.residencyId);
+			receipts = handoffReceipts(table.dbisDB, table.tableId, entry.recordId);
+		} catch (error) {
+			onReceiptStoreError?.(entry.recordId, error);
+			continue;
+		}
 		if (handoffReleasable(residency, selfName, receipts, entry.version)) {
-			await releaseAndClearReceipts(table, entry.recordId, entry.version);
+			try {
+				await releaseAndClearReceipts(table, entry.recordId, entry.version);
+			} catch (error) {
+				onReceiptStoreError?.(entry.recordId, error);
+			}
 			continue;
 		}
 		if (row && (row.version ?? -Infinity) > entry.version && !residencyOf(row.residencyId)?.includes(peerName)) {
