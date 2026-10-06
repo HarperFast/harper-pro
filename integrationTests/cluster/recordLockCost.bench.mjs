@@ -389,13 +389,11 @@ async function grantedOn(node) {
 	return granted;
 }
 
-/** `BenchLock` over `ids`, with each key's home classified through the owner's gauge when the serving
- * worker's own gauge cannot see it (THREADS > 1): one request per id, warmed, so the samples stay the
- * node's own and the classification stays outside the timed region. */
+/** `BenchLock` over `ids` with each key's home classified; above one worker the serving worker's own
+ * gauge cannot see the owner's grants, so one request per id is bracketed by the owner's gauge. */
 async function lockEachClassified(node, ids, options) {
 	if (THREADS === 1) return call(node, 'BenchLock/', { ...options, ids, classifyHome: true });
-	// One warm-up key, delegated before the first baseline so its own grant never lands inside a
-	// measured interval; the fixture re-locks it untimed ahead of every sample.
+	// Delegated before the first baseline so its own grant never lands inside a measured interval.
 	const warmupId = `warm-${ids[0]}`;
 	await call(node, 'BenchLock/', { ids: [warmupId] });
 	const acquireMs = [];

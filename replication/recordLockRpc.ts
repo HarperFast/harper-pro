@@ -3,11 +3,9 @@
  * request/grant/recall between a delegate and a key's home, carried as two registered operations
  * over the replication connections that already exist.
  *
- * Send side. A request goes over a live outbound subscription session to the home: this worker's
- * own when it holds one, otherwise the sibling worker's that does, forwarded through main
- * (harper-pro#977 — subscriptions are placed round-robin, so the coordinating worker rarely holds
- * one). Only a topology with no session anywhere opens an operation connection per call
- * (`sendOperationToNode`), bounded.
+ * Send side. A request goes over a live outbound subscription session to the home — this worker's
+ * own, or a sibling's through main — and only with none anywhere over a connection opened for the
+ * call (`sendOperationToNode`). Every send is bounded by one deadline shared across the hops.
  *
  * Receive side. An operation arrives on whichever thread holds the socket. If that thread owns the
  * database's coordination it answers directly; otherwise it relays through the main thread, which
@@ -222,7 +220,7 @@ export async function sendRecordLockOperation(
 	return sendOperationToNode(node, { ...operation }, { timeoutMs: remaining });
 }
 
-// ---- harper-pro#977: forward an outbound lock operation to the worker holding the session --------
+// ---- forwarding an outbound lock operation to the worker holding the session ----------------------
 
 const OUTBOUND_REQUEST = 'record-lock-rpc-out';
 const OUTBOUND_REPLY = 'record-lock-rpc-out-reply';

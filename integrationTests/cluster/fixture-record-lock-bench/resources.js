@@ -89,7 +89,6 @@ export class BenchWrite extends Resource {
 	}
 }
 
-/** `count` unlocked puts, `batch` per transaction. */
 export class BenchWriteBatched extends Resource {
 	async post(data) {
 		const started = performance.now();
@@ -105,7 +104,6 @@ export class BenchWriteBatched extends Resource {
 	}
 }
 
-/** Exact Counter row count on this node. */
 export class BenchCount extends Resource {
 	async get() {
 		const { recordCount } = await tables.Counter.getRecordCount({ exactCount: true });

@@ -75,7 +75,7 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 			assert.equal(typeof locks.ownerThreadId, 'number', 'the single http worker coordinates the database');
 			assert.equal(locks.granted, 0);
 			assert.equal(locks.admitted, 0);
-			assert.equal(locks.droppedOffOwner, 0, 'nothing is applied off the coordinating worker');
+			assert.equal(locks.droppedOffOwner, 0, 'no control entry failed to reach the coordinating worker');
 			rings.push(JSON.stringify(locks.members));
 		}
 		// The whole point of deriving the home from an agreed set: every node computes the same ring.
@@ -544,7 +544,11 @@ suite(
 				(after.relayedControlEntries ?? 0) > (before.relayedControlEntries ?? 0),
 				`no control entry was relayed to multi's coordinating worker: ${JSON.stringify(after)}`
 			);
-			assert.equal(after.droppedOffOwner, 0, `releases were dropped off the owner: ${JSON.stringify(after)}`);
+			assert.equal(
+				after.droppedOffOwner,
+				0,
+				`a release failed to reach the coordinating worker: ${JSON.stringify(after)}`
+			);
 			assert.equal(after.controlEntryRelayDrops, 0, `releases could not be relayed: ${JSON.stringify(after)}`);
 			assert.ok(after.outbound, 'the owner reports how its lock operations reached the peers');
 			assert.equal(

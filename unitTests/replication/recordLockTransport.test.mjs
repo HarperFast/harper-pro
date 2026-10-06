@@ -890,7 +890,7 @@ describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
 		forgetRecordLockHomesCache('refresh-budget');
 	});
 
-	it('an operator-triggered refresh restores an exhausted retry budget', async () => {
+	it('keeps probing at the backoff ceiling once the budget is spent, and an operator refresh restores the budget', async () => {
 		let reads = 0;
 		setRecordLockHomesRowReader(async () => {
 			reads++;
@@ -898,20 +898,27 @@ describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
 		});
 		await refreshRecordLockHomesCache('refresh-exhausted');
 		await settle(1_500);
-		const exhaustedAt = reads;
-		assert.ok(exhaustedAt >= 4, `the budget was spent: ${reads} reads`);
-		await settle(300);
-		assert.strictEqual(reads, exhaustedAt, 'nothing retries once the budget is spent');
+		const spent = reads;
+		assert.ok(spent >= 7, `the budget was spent: ${reads} reads`);
+		await settle(700);
+		assert.ok(reads > spent, 'still probing at the ceiling after the budget');
+		setRecordLockHomesRowReader(async () => generation(9));
+		await settle(700);
+		assert.strictEqual(cachedActiveGeneration('refresh-exhausted'), 9, 'recovered without an operator');
+		let failOnce = true;
 		setRecordLockHomesRowReader(async () => {
-			if (++reads === exhaustedAt + 1) throw new Error('one more transient failure');
-			return generation(9);
+			if (failOnce) {
+				failOnce = false;
+				throw new Error('one transient failure');
+			}
+			return generation(10);
 		});
 		await refreshRecordLockHomesCache('refresh-exhausted', true);
-		await settle(300);
+		await settle(200);
 		assert.strictEqual(
 			cachedActiveGeneration('refresh-exhausted'),
-			9,
-			'the fresh budget carried the operator refresh through a transient failure'
+			10,
+			'a fresh budget retried the operator refresh promptly'
 		);
 		forgetRecordLockHomesCache('refresh-exhausted');
 	});

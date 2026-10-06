@@ -13,17 +13,15 @@
  *   fails the whole map closed rather than shrinking the ring — see
  *   `replication/RECORD_LOCK_HOMES_DESIGN.md` §4 for why the latter is itself a two-arbiter bug).
  *   A frozen, per-thread cache — never storage I/O, hashing or sorting on the read path — refreshed
- *   only when this node's own durable row changes (`onRecordLockHomesChanged`).
+ *   at registration and when this node's own durable row changes (`onRecordLockHomesChanged`), with
+ *   a paced retry while the row cannot be read.
  * - `homeIncarnation`: a durable, monotonic counter bumped once per **coordination incarnation** —
  *   a process start, or a coordinating-worker handoff (`recordLockOwnerFor`, below) — persisted on
  *   this node's own `hdb_nodes` row (`recordLockIncarnation`). Core orders fencing tokens on it.
  * - `requestDelegation` / `recallDelegation`: unicast operations over the existing replication
  *   connections (`recordLockRpc.ts`).
  * - `ownsCoordination()`: whether this worker thread is the one the main thread assigned to the
- *   database. Coordinator state is per thread while the key lock it arbitrates is process-wide, so
- *   exactly one thread may coordinate. It need not be the thread applying the database's inbound
- *   entries: a peer control entry applied elsewhere is relayed to it (`relayLockControlEntry`).
- *   Ownership is conferred by message rather than derived from `workerIndex` and moves only when the
+ *   database (DESIGN.md, the `ownsCoordination()` and control-entry bullets). Ownership is conferred by message rather than derived from `workerIndex` and moves only when the
  *   owner has exited: a live owner still holds delegations and grants.
  *
  * A peer's advertised home-map digest (`RECORD_LOCK_HOMES_DIGEST`, `replicationConnection.ts`) is
@@ -232,11 +230,7 @@ const relayedControlEntries = new Map<string, number>();
 /** Per database on the applying thread: entries that could not be sent (owner unknown here, port gone). */
 const controlEntryRelayDrops = new Map<string, number>();
 
-/**
- * Best-effort by design (DESIGN.md, the control-entry bullet): a lost or late relay only delays a
- * re-grant to the grant's deadline. `author` is core's resolved audit-header origin; a sibling thread
- * is trusted for it like the rest of the process, which can reach the coordinator directly.
- */
+/** Best-effort (DESIGN.md, the control-entry bullet): a lost or late relay only delays a re-grant. */
 export function relayLockControlEntry(
 	database: string,
 	table: string,
@@ -300,7 +294,7 @@ export interface RecordLockTransportDeps {
  * Pure over its dependencies and the injected cache reader so `homeMap()` is unit-testable without
  * a cluster or storage. `cacheFor` returns the frozen, already-current active generation for the
  * database — never storage I/O, hashing or sorting; that work happens in `refreshCache`, off the
- * hot path, triggered only by `onRecordLockHomesChanged`.
+ * hot path.
  */
 export function createRecordLockTransport(
 	database: string,
@@ -430,8 +424,9 @@ export function currentHomesDigest(database: string): string | undefined {
 
 /**
  * Per database lifetime: the token of the latest refresh (an older or torn-down lifetime's read
- * installs nothing) and the retry budget a failed read spends (harper-pro#853). Any failed refresh
- * arms a retry while budget remains; a success, or a refresh an operator triggered, restores it.
+ * installs nothing) and the retry backoff a failed read spends. Once the backoff is exhausted the
+ * retry keeps going at its ceiling for the lifetime: a row that stays unreadable is the one case
+ * nothing else re-triggers (harper-pro#853).
  */
 interface RefreshState {
 	token: object;
@@ -482,10 +477,12 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 	if (freshBudget) state.backoff.reset();
 	const current = () => refreshState.get(database)?.token === token;
 	const before = activeCache.get(database);
+	let recovered = false;
 	try {
 		const row = await readHomesRow(database);
 		if (!current()) return;
 		activeCache.set(database, row?.active);
+		recovered = state.backoff.attempts > 0;
 		state.backoff.reset();
 	} catch (error) {
 		if (!current()) return;
@@ -493,11 +490,15 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
-		const delay = state.backoff.nextDelay();
-		if (delay !== undefined)
-			state.timer = setTimeout(() => {
-				if (current()) refreshCache(database);
-			}, delay).unref();
+		state.timer = setTimeout(() => {
+			if (current()) refreshCache(database);
+		}, state.backoff.nextDelay() ?? REFRESH_RETRY_MAX_MS).unref();
+	}
+	if (recovered) {
+		// A peer digest that arrived while the row was unreadable was recorded as a mismatch against
+		// no digest at all, and a socket that handshook then received none; both need the recovered one.
+		pushHomesDigestToPeers(database);
+		reconcileAllPeerHomesAgreement(database);
 	}
 	const after = activeCache.get(database);
 	// Core's coordinator seeds its restart-quarantine incarination tracking (`#coordinatingIncarnation`)
