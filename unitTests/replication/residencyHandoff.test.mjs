@@ -182,22 +182,29 @@ describe('residency handoff — durable receipts', () => {
 		expect(handoffReceipts(dbisDB, 7, 'other').get('B')).to.equal(V2);
 	});
 
-	it('keeps a compound-id record and a scalar-id record apart (harper-pro#940 compound-key finding)', async () => {
-		// A compound id is itself an array (core's Id contract allows a flat array of scalars). Written
-		// raw as one element of this module's own [marker, tableId, recordId, peerName] key, ordered-
-		// binary's array encoding — elements joined by the same separator at every depth — would flatten
-		// [1, 'B'] into the same byte sequence as the scalar id 1 followed by peer name 'B'. The fix
-		// (writeKeyId) encodes recordId as one opaque string first, so this scalar/compound pair below —
-		// chosen so the pre-fix flattening of record ['B'-compound]'s receipt would misread as record
-		// 1's — no longer collide.
+	it('keeps a compound-id record and a scalar-id record apart, short and long (harper-pro#940)', async () => {
+		// A compound (array) id written raw as one element of this module's own
+		// [marker, tableId, recordId, peerName] key would flatten into the same bytes as a shorter id
+		// followed by a peer name (ordered-binary joins array elements with one separator at every
+		// depth). hexIdKey closes this at any id length, including past ordered-binary's 64-character
+		// short-string escaping threshold (the long-id case below).
 		const dbisDB = fakeDbisDB();
-		await recordHandoffReceipt(dbisDB, 7, [1, 'B'], 'C', V1);
-		await recordHandoffReceipt(dbisDB, 7, 1, 'B', V2);
+		const long = 'x'.repeat(100);
+		for (const [recordId, peerName, version] of [
+			[[1, 'B'], 'C', V1],
+			[1, 'B', V2],
+			[[long, 'B'], 'C', V1],
+			[long, 'B', V2],
+		]) {
+			await recordHandoffReceipt(dbisDB, 7, recordId, peerName, version);
+		}
 		expect([...handoffReceipts(dbisDB, 7, [1, 'B'])]).to.deep.equal([['C', V1]]);
 		expect([...handoffReceipts(dbisDB, 7, 1)]).to.deep.equal([['B', V2]]);
-		await clearHandoffReceipts(dbisDB, 7, [1, 'B']);
-		expect(handoffReceipts(dbisDB, 7, [1, 'B']).size).to.equal(0);
-		expect(handoffReceipts(dbisDB, 7, 1).get('B')).to.equal(V2);
+		expect([...handoffReceipts(dbisDB, 7, [long, 'B'])]).to.deep.equal([['C', V1]]);
+		expect([...handoffReceipts(dbisDB, 7, long)]).to.deep.equal([['B', V2]]);
+		await clearHandoffReceipts(dbisDB, 7, [long, 'B']);
+		expect(handoffReceipts(dbisDB, 7, [long, 'B']).size).to.equal(0);
+		expect(handoffReceipts(dbisDB, 7, long).get('B')).to.equal(V2);
 	});
 });
 
