@@ -5,7 +5,7 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
-import { cp, mkdtemp, rm } from 'node:fs/promises';
+import { cp, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
@@ -39,8 +39,9 @@ async function startNode(suiteName, { isolated = false, recordLocks = false } = 
 		await startHarper(ctx, { config, env: { HARPER_NO_FLUSH_ON_EXIT: true } });
 		return ctx.harper;
 	} catch (err) {
-		// nothing has registered this data root for teardown yet, so a failed fixture copy or Harper start must clean up itself
-		await rm(dataRootDir, { recursive: true, force: true }).catch(() => {});
+		// nothing has registered this node for teardown yet, so a failed fixture copy or Harper start must release
+		// its own loopback address and data root (teardownHarper no-ops the kill when there is no process)
+		await teardownHarper({ harper: { hostname, dataRootDir } }).catch(() => {});
 		throw err;
 	}
 }
