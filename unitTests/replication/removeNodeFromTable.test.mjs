@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { removeNodeFromTable } from '#src/replication/setNode';
+import { removeNodeFromTable, findExistingNodeRecord } from '#src/replication/setNode';
 import { getThisNodeName } from '#src/core/server/nodeName';
 
 const PEER_URL = 'ws://10.0.0.2:9933';
@@ -144,5 +144,14 @@ describe('removeNodeFromTable', () => {
 		};
 
 		await assert.rejects(removeNodeFromTable('peer-b', PEER_URL, table, neverSend), /storage unavailable/);
+	});
+});
+
+describe('findExistingNodeRecord', () => {
+	it("resolves an address to this node's own row, so update_node patches it rather than re-adding it", async () => {
+		const self = { name: getThisNodeName(), url: PEER_URL, replicates: { sendsTo: [{ database: 'data' }] } };
+		const table = nodeTable([self]);
+
+		assert.deepEqual(await findExistingNodeRecord('10.0.0.2', PEER_URL, table), { name: self.name, record: self });
 	});
 });

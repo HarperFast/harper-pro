@@ -40,15 +40,19 @@ function nodeStartOptions(hostname, extra = {}) {
 	};
 }
 
-async function nodeRows(node) {
-	return sendOperation(node, {
-		operation: 'search_by_value',
-		database: 'system',
-		table: 'hdb_nodes',
-		search_attribute: 'name',
-		search_value: '*',
-		get_attributes: ['name', 'url'],
-	});
+async function nodeRows(node, signal) {
+	return sendOperation(
+		node,
+		{
+			operation: 'search_by_value',
+			database: 'system',
+			table: 'hdb_nodes',
+			search_attribute: 'name',
+			search_value: '*',
+			get_attributes: ['name', 'url'],
+		},
+		{ signal }
+	);
 }
 
 async function postOperation(node, operation) {
@@ -125,10 +129,13 @@ suite('remove_node by an alias', { timeout: 180000 }, (ctx) => {
 			!(await nodeRows(ctx.nodeA)).some((row) => row.name === PEER_NAME),
 			'A no longer has a row for B after remove_node by IP'
 		);
-		await waitForCondition(async () => !(await nodeRows(ctx.nodeB)).some((row) => row.name === PEER_NAME), {
-			timeoutMs: 15000,
-			label: "remove_node_back deleting B's self row",
-		});
+		await waitForCondition(
+			async (signal) => !(await nodeRows(ctx.nodeB, signal)).some((row) => row.name === PEER_NAME),
+			{
+				timeoutMs: 15000,
+				description: "remove_node_back deleting B's self row",
+			}
+		);
 	});
 
 	test('a reciprocal removal that fails is reported in the remove_node result', async () => {

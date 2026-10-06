@@ -331,11 +331,15 @@ export async function addNodeBack(req) {
  */
 export async function removeNodeFromTable(hostname: string, url: string, hdbNodes, sendOperation) {
 	const found = await findExistingNodeRecord(hostname, url, hdbNodes);
-	if (!found) throw new ClientError(hostname + ' does not exist');
+	// Only the exact name selects this node's own row: removing it takes this node out of replication
+	// with every peer, too broad an effect to reach through an address.
+	if (!found || (found.name !== hostname && found.name === getThisNodeName())) {
+		throw new ClientError(hostname + ' does not exist');
+	}
 	const { name, record } = found;
 	// An exact-key hit wins over other rows at the same url; refusing it would also refuse their exact
 	// names, leaving no way to remove either.
-	const othersAtUrl = (await peerRowsAtUrl(record.url, hdbNodes)).filter((node) => node.name !== name);
+	const othersAtUrl = (await rowsAtUrl(record.url, hdbNodes)).filter((node) => node.name !== name);
 
 	// Revoke locally before notifying the peer: the dynamic send-authorization watch acts on this
 	// delete, so the peer's access must not outlive a round trip to that (possibly offline or
@@ -366,12 +370,11 @@ export async function removeNodeFromTable(hostname: string, url: string, hdbNode
 	return message;
 }
 
-async function peerRowsAtUrl(url: string, hdbNodes) {
+async function rowsAtUrl(url: string, hdbNodes) {
 	const rows = [];
 	if (!url) return rows;
-	const thisNodeName = getThisNodeName();
 	for await (const node of hdbNodes.search({})) {
-		if (node?.url === url && node.name !== thisNodeName) rows.push(node);
+		if (node?.url === url) rows.push(node);
 	}
 	return rows;
 }
@@ -402,14 +405,14 @@ function reverseSubscription(subscription) {
 /**
  * Direct primary-key lookup first, falling back to a table scan matching on `url` because
  * `setNode()` stores a row under the PEER-reported name, which can differ from the hostname a
- * caller used to reach it. The fallback resolves only peer rows (this node's own row needs its exact
- * name) and refuses an address that matches more than one row: `name` is the only key, so a stale
- * row can share a url with the live one, and callers delete or rewrite what this returns.
+ * caller used to reach it. The fallback refuses an address that matches more than one row: `name` is
+ * the only key, so a stale row can share a url with the live one, and callers delete or rewrite what
+ * this returns.
  */
-async function findExistingNodeRecord(hostname: string, url: string, hdbNodes = getHDBNodeTable()) {
+export async function findExistingNodeRecord(hostname: string, url: string, hdbNodes = getHDBNodeTable()) {
 	const direct = await hdbNodes.get(hostname);
 	if (direct) return { name: hostname, record: direct };
-	const matches = await peerRowsAtUrl(url, hdbNodes);
+	const matches = await rowsAtUrl(url, hdbNodes);
 	if (matches.length > 1) {
 		throw new ClientError(
 			`${hostname} matches more than one registered node (${matches.map((node) => node.name).join(', ')}); specify the node name`
