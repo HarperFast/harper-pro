@@ -257,6 +257,12 @@ export async function applyHandoffReceipt(
 	return 'released';
 }
 
+// A row/receipt read that resolves synchronously (both storage engines' common case) never actually
+// yields the event loop on its own `await`; without this, a large retained set (every record moved to
+// a long-down resident) would hold the worker thread for the whole sweep. One macrotask per batch keeps
+// other connections' I/O interleaved while the sweep walks a big backlog.
+const SWEEP_YIELD_EVERY = 64;
+
 /**
  * Retained entries a specific peer is still owed, for redelivery when a sending subscription is set up.
  * Bounded by the unreleased set: empty in steady state, and a peer that is not a resident of any of them
@@ -281,8 +287,10 @@ export async function transitionsOwedToPeer(
 	if (!retained) return { owed: [], superseded: 0 };
 	const owed: TransitionEntry[] = [];
 	let superseded = 0;
+	let walked = 0;
 	// releasing mutates core's set, so never iterate it live
 	for (const entry of Array.from(retained)) {
+		if (++walked % SWEEP_YIELD_EVERY === 0) await new Promise(setImmediate);
 		const row = await resolveLocalEntry(
 			(id) => table.primaryStore.getEntry(id),
 			entry.recordId,
