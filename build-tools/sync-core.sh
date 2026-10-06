@@ -67,10 +67,8 @@ sync_pkg_field devDependencies
 sync_pkg_field overrides
 sync_pkg_field optionalDependencies
 
-# A package harper-pro ships must not also be a devDependency: npm resolves the root's dev edge,
-# so the lock (and the release bundle copied from it) would carry a version the published
-# declaration may not accept. Core's development spec is the version core tests, so it becomes
-# harper-pro's production spec.
+# npm resolves a root package declared in both fields through devDependencies, so a shipped
+# package keeps one spec: core's tested one (build-tools/DESIGN.md).
 node -e '
 	const { readFileSync, writeFileSync } = require("node:fs");
 	const manifest = JSON.parse(readFileSync("package.json", "utf8"));

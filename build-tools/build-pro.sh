@@ -41,7 +41,8 @@ packageFile="harperfast-harper-pro-${version}.tgz"
 rm -f harperfast-harper-pro-*.tgz
 
 echo -e "\n📦 Installing locked deps"
-npm ci
+# No install script may run before the bundle is copied: it could rewrite bundled JavaScript.
+npm ci --ignore-scripts
 
 echo -e "\n📦 Applying Harper Pro branding"
 perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/installer.js
@@ -78,6 +79,9 @@ node -e '
 	if (missing.length) throw new Error(`Release archive is missing ${missing.join(", ")}`);
 ' "$stage/packed"
 mv "$stage/$packageFile" "$packageFile"
+
+# re2's binary comes only from its install script; the checkout's WAF and tests need it.
+npm rebuild re2
 
 echo -e "\n📦 Built Harper Pro ${version} in ${packageFile}"
 echo "📦 Run 'npm publish ${packageFile}' to release"

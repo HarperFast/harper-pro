@@ -59,13 +59,13 @@ Harper Pro has been tested on the following platforms:
 ## Installing Harper Pro
 
 ```
-npm install -g @harperfast/harper-pro
+npm install -g --allow-scripts=re2 @harperfast/harper-pro
 harper
 ```
 
-Harper will prompt you for configuration options during install, and then automatically start after install.
+npm 12 and later skip dependency install scripts unless allowed, and Harper Pro's web application firewall needs the native binary that `re2`'s install script provides; npm 11 warns that it does not know the flag and runs the script anyway. In a project, add `"allowScripts": { "re2": true }` to your `package.json` instead.
 
-npm 12 and later skip dependency install scripts unless you allow them. Harper Pro's web application firewall needs the native binary that `re2`'s install script provides, so install with `npm install -g --allow-scripts=re2 @harperfast/harper-pro`. In a project, add `"allowScripts": { "re2": true }` to your `package.json`.
+Harper will prompt you for configuration options during install, and then automatically start after install.
 
 `latest` points at the newest release line. To stay on an older line, install by semver range — `npm install -g @harperfast/harper-pro@5.2` resolves to the newest 5.2.x from the versions actually published, and is the form to reach for.
 
