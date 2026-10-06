@@ -429,11 +429,9 @@ export function currentHomesDigest(database: string): string | undefined {
 }
 
 /**
- * Per database lifetime: a token per refresh started — a read that resolves after a newer refresh
- * began installs nothing, and a token never repeats across teardown and re-registration — and the
- * retry budget a failed read spends (harper-pro#853: the startup refresh had no later trigger, so one
- * transient storage error left `homeMap()` undefined until an operator re-staged). Any failed refresh
- * arms a retry while budget remains; a successful one restores it.
+ * Per database lifetime: the token of the latest refresh (an older or torn-down lifetime's read
+ * installs nothing) and the retry budget a failed read spends (harper-pro#853). Any failed refresh
+ * arms a retry while budget remains; a success, or a refresh an operator triggered, restores it.
  */
 interface RefreshState {
 	token: object;
@@ -451,8 +449,8 @@ export function setRecordLockHomesRowReader(reader: typeof readHomesRow): typeof
 	readHomesRow = reader;
 	return previous;
 }
-export function refreshRecordLockHomesCache(database: string): Promise<void> {
-	return refreshCache(database);
+export function refreshRecordLockHomesCache(database: string, freshBudget = false): Promise<void> {
+	return refreshCache(database, freshBudget);
 }
 export function cachedActiveGeneration(database: string): number | undefined {
 	return activeCache.get(database)?.generation;
@@ -464,7 +462,7 @@ export function forgetRecordLockHomesCache(database: string): void {
 	activeCache.delete(database);
 }
 
-async function refreshCache(database: string): Promise<void> {
+async function refreshCache(database: string, freshBudget = false): Promise<void> {
 	let state = refreshState.get(database);
 	if (!state)
 		refreshState.set(
@@ -481,6 +479,7 @@ async function refreshCache(database: string): Promise<void> {
 	const token = (state.token = {});
 	clearTimeout(state.timer);
 	state.timer = undefined;
+	if (freshBudget) state.backoff.reset();
 	const current = () => refreshState.get(database)?.token === token;
 	const before = activeCache.get(database);
 	try {
@@ -531,7 +530,7 @@ const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
  * racing an unawaited refresh (a real pre-push review finding).
  */
 async function applyHomesChanged(database: string): Promise<void> {
-	await refreshCache(database);
+	await refreshCache(database, true);
 	pushHomesDigestToPeers(database);
 	reconcileAllPeerHomesAgreement(database);
 }
@@ -945,6 +944,7 @@ export interface RecordLockDatabaseStats {
 	granted: number;
 	/** Live admissions across its delegations. */
 	admitted: number;
+	/** Peer control entries applied off the owner that the transport could not relay (no hook, or it threw); summed across threads. */
 	droppedOffOwner: number;
 	/** Admissions this thread obtained from the owner worker for an off-owner `lock()` (harper-pro#852). */
 	relayedAdmissions: number;

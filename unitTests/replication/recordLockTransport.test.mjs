@@ -890,6 +890,32 @@ describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
 		forgetRecordLockHomesCache('refresh-budget');
 	});
 
+	it('an operator-triggered refresh restores an exhausted retry budget', async () => {
+		let reads = 0;
+		setRecordLockHomesRowReader(async () => {
+			reads++;
+			throw new Error('down');
+		});
+		await refreshRecordLockHomesCache('refresh-exhausted');
+		await settle(1_500);
+		const exhaustedAt = reads;
+		assert.ok(exhaustedAt >= 4, `the budget was spent: ${reads} reads`);
+		await settle(300);
+		assert.strictEqual(reads, exhaustedAt, 'nothing retries once the budget is spent');
+		setRecordLockHomesRowReader(async () => {
+			if (++reads === exhaustedAt + 1) throw new Error('one more transient failure');
+			return generation(9);
+		});
+		await refreshRecordLockHomesCache('refresh-exhausted', true);
+		await settle(300);
+		assert.strictEqual(
+			cachedActiveGeneration('refresh-exhausted'),
+			9,
+			'the fresh budget carried the operator refresh through a transient failure'
+		);
+		forgetRecordLockHomesCache('refresh-exhausted');
+	});
+
 	it('a read from a torn-down lifetime cannot install into, or clear, its replacement', async () => {
 		let release;
 		const slow = new Promise((resolve) => (release = resolve));
