@@ -21,9 +21,7 @@ const UNSUPPORTED_HERE = process.platform === 'win32' || process.env.HARPER_RUNT
 
 async function startNode(suiteName, { isolated = false, recordLocks = false } = {}) {
 	const hostname = await getNextAvailableLoopbackAddress();
-	const dataRootDir = await mkdtemp(
-		join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'harper-integration-test-')
-	);
+	const dataRootDir = await mkdtemp(join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'hit-'));
 	const config = {
 		analytics: { aggregatePeriod: -1 },
 		logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
