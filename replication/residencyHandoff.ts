@@ -65,7 +65,15 @@ function releaseTransitionEntry(table: any, id: any, version: number): Promise<v
 
 async function releaseAndClearReceipts(table: any, recordId: any, version: number): Promise<void> {
 	await releaseTransitionEntry(table, recordId, version);
-	await clearHandoffReceipts(table.dbisDB, table.tableId, recordId);
+	// Best-effort: the release above already succeeded, so a throw here (e.g. the same oversized-key
+	// condition hexIdKey can hit) must not read back to the caller as "release failed, image still
+	// pinned" -- it only means this record's now-unused receipt rows are left behind, harmless since
+	// nothing reads them once the retained entry is gone.
+	try {
+		await clearHandoffReceipts(table.dbisDB, table.tableId, recordId);
+	} catch {
+		/* stale receipt rows, not a release failure */
+	}
 }
 
 export function localRowSatisfies(entry: LocalEntryState | undefined, version: number): boolean {
