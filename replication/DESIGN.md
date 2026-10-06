@@ -58,7 +58,7 @@ The protocol decoder. Reads incoming binary commands — each is a top-level nam
 | `COPY_COMPLETE`                            | 149       | Leader → follower: the bulk copy finished; the follower clears its resume cursor                      |
 | `RECORD_LOCK_HOMES_DIGEST`                 | 150       | Record-lock home-map digest for one database; sender-gated like the lock control entries              |
 | `HANDOFF_RECEIPT`                          | 151       | Receiver → sender: it durably holds a complete row, blobs included, for `[tableId, recordId, version]` (harper#2257) |
-| `HANDOFF_RECEIPT_REQUEST`                  | 152       | Sender → receiver: asks for that receipt after putting a complete transition image on the wire        |
+| `HANDOFF_RECEIPT_REQUEST`                  | 152       | Sender → receiver: asks for that receipt, sent right before the frame carrying the complete transition image         |
 
 A code this build does not know falls to the switch's `default:`, which counts it on the connection and warns through a throttle shared by every socket in that worker thread, then keeps processing. It does **not** close: an unknown code means the peer is running a NEWER build, so closing would hard-loop the link — the reconnect replays the same frame. Note the consequence: the durable resume cursor still advances past a frame this build did not understand. Sender-side gating (below) is the invariant that makes that safe.
 
