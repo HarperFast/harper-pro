@@ -6,9 +6,9 @@
 import { getDatabases } from '../core/resources/databases.ts';
 import { transaction } from '../core/resources/transaction.ts';
 import { onMessageByType, whenThreadsStarted, getWorkerCount } from '../core/server/threads/manageThreads.js';
-import { collectRecordLockStatus, recordLockOwnerFor } from './recordLockTransport.ts';
+import { collectRecordLockStatus } from './recordLockTransport.ts';
 import { replicationWorkers } from './replicationWorkers.ts';
-import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { setSessionHolderReader } from './recordLockRpc.ts';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import {
 	subscribeToNode,
@@ -1122,12 +1122,15 @@ export async function startOnMainThread(options) {
 	// we do all of the main management of tracking connections and subscriptions on the main thread and delegate
 	// the actual work to the worker threads
 	let nextWorkerIndex = 0;
-	// With cluster record locks enabled, every subscription for a database lives on the worker that
-	// coordinates its locks, so the coordinator applies the database's inbound control entries in order
-	// with its data; otherwise placement stays per (peer, database) round-robin. recordLockOwnerFor picks from the
-	// replication pool itself but fences every http worker on a handoff, so it is not handed the narrower list.
-	function placeSubscription(databaseName: string, replicationPool: any[]) {
-		if (CLUSTER_RECORD_LOCKS_ENABLED) return recordLockOwnerFor(databaseName);
+	setSessionHolderReader((nodeName, database) => {
+		const node = nodeMap.get(nodeName);
+		const entry = node ? connectionReplicationMap.get(getNodeURL(node))?.get(database) : undefined;
+		if (!entry || hasDeadOwner(entry, replicationWorkers())) return undefined;
+		return entry.worker;
+	});
+	// Round-robin regardless of record-lock ownership: a control entry applied off the coordinating
+	// worker is relayed to it (harper-pro#977).
+	function placeSubscription(_databaseName: string, replicationPool: any[]) {
 		// `% 0` would leave the index NaN for the life of the process
 		if (replicationPool.length === 0) return undefined;
 		nextWorkerIndex = nextWorkerIndex % replicationPool.length; // wrap around as necessary

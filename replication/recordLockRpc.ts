@@ -3,11 +3,8 @@
  * request/grant/recall between a delegate and a key's home, carried as two registered operations
  * over the replication connections that already exist.
  *
- * Send side. A request goes over the live outbound subscription session to the home when this
- * worker has one — its inbound end on the home is placed on the home's coordinating worker by
- * `subscriptionManager`, so the request lands exactly where the coordinator lives — and otherwise
- * over a fresh operation connection (`sendOperationToNode`), which any of the home's workers may
- * accept.
+ * Send side: a live subscription session to the home when any worker holds one (a sibling's through
+ * main), else a connection opened for the call; one deadline bounds every hop.
  *
  * Receive side. An operation arrives on whichever thread holds the socket. If that thread owns the
  * database's coordination it answers directly; otherwise it relays through the main thread, which
@@ -27,6 +24,8 @@ import { server } from '../core/server/Server.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import {
+	DELEGATION_LEASE_MS,
+	LOCK_LEASE_SKEW_MS,
 	acquireForRelay,
 	deliverDelegationRecall,
 	deliverDelegationRequest,
@@ -41,6 +40,7 @@ import {
 } from '../core/resources/recordLockCoordinator.ts';
 import { getRepairConnectionsForDB, sendOperationToNode } from './replicator.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
+import { MAX_LOCK_TIMEOUT_MS } from '../core/resources/recordLock.ts';
 import { MAX_OUTSTANDING_BARRIERS } from './recordLockFreshness.ts';
 import type { TransitionOperation } from './recordLockApply.ts';
 
@@ -137,25 +137,236 @@ export interface BarrierOperation {
 	nonce: number;
 }
 
-/**
- * Send a lock operation to `nodeName`, preferring this worker's live outbound subscription session
- * for the database. The `sendOperationToNode` fallback opens a connection per call; it exists so a
- * directional topology (a home this node only receives from) still works, not as the fast path.
- */
-export async function sendRecordLockOperation(
-	nodeName: string,
-	database: string,
-	operation: DelegateOperation | RecallOperation | BarrierOperation | TransitionOperation,
-	timeoutMs?: number
-): Promise<any> {
+type LockOperation = DelegateOperation | RecallOperation | BarrierOperation | TransitionOperation;
+
+export interface OutboundOperationStats {
+	/** Sent over this thread's own live subscription session to the peer. */
+	session: number;
+	/** Forwarded to the sibling worker holding that session (harper-pro#977). */
+	forwarded: number;
+	/** Sent over a connection opened for the call — the directional-topology fallback. */
+	fresh: number;
+}
+const outboundStats = new Map<string, OutboundOperationStats>();
+/** Taken before any await, so a call that outlives its database's teardown updates an orphaned bucket
+ * rather than re-creating the map entry teardown removed. */
+function outboundBucket(database: string): OutboundOperationStats {
+	let stats = outboundStats.get(database);
+	if (!stats) outboundStats.set(database, (stats = { session: 0, forwarded: 0, fresh: 0 }));
+	return stats;
+}
+/** Process-wide monotonic milliseconds: the one clock every thread's hop timers and deadlines share. */
+export function outboundNow(): number {
+	return Number(process.hrtime.bigint() / 1_000_000n);
+}
+export function outboundOperationStats(database: string): OutboundOperationStats | undefined {
+	return outboundStats.get(database);
+}
+export function forgetOutboundOperationStats(database: string): void {
+	outboundStats.delete(database);
+}
+
+/** A delegate request must outlive core's own lock wait (its late-grant handback needs the transport's
+ * answer); a recall can run to the delegation's lease. */
+const DELEGATE_TIMEOUT_MS = MAX_LOCK_TIMEOUT_MS + RELAY_SLACK_MS;
+const RECALL_TIMEOUT_MS = DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS + RELAY_SLACK_MS;
+function outboundTimeoutFor(operation: string): number {
+	return operation === RECALL_OPERATION ? RECALL_TIMEOUT_MS : DELEGATE_TIMEOUT_MS;
+}
+
+function liveSessionTo(nodeName: string, database: string): any {
 	for (const connection of getRepairConnectionsForDB(database)) {
 		if (connection.nodeName !== nodeName) continue;
 		const session = connection.liveSession;
-		if (session?.sendOperation) return session.sendOperation({ ...operation }, timeoutMs);
+		if (session?.sendOperation) return session;
 	}
+	return undefined;
+}
+
+/** A sibling's answer, error included, is the operation's outcome — never retried over a fresh connection. */
+export async function sendRecordLockOperation(
+	nodeName: string,
+	database: string,
+	operation: LockOperation,
+	timeoutMs?: number
+): Promise<any> {
+	const bucket = outboundBucket(database);
+	const deadlineAt = outboundNow() + (timeoutMs ?? outboundTimeoutFor(operation.operation));
+	const session = liveSessionTo(nodeName, database);
+	if (session) {
+		const remaining = deadlineAt - outboundNow();
+		if (remaining <= 0) throw new Error(`${operation.operation} to ${nodeName} expired before it was sent`);
+		bucket.session++;
+		return session.sendOperation({ ...operation }, remaining);
+	}
+	if (parentPort) {
+		const forwarded = await forwardOverSessionHolder(nodeName, database, operation, deadlineAt);
+		if (forwarded) {
+			bucket.forwarded++;
+			if (forwarded.error !== undefined) throw new Error(forwarded.error);
+			return forwarded.reply;
+		}
+	}
+	const remaining = deadlineAt - outboundNow();
+	if (remaining <= 0) throw new Error(`${operation.operation} to ${nodeName} expired before a connection was opened`);
 	const node = (server.nodes ?? []).find((candidate: any) => candidate?.name === nodeName);
 	if (!node?.url) throw new Error(`no connection or hdb_nodes row for ${nodeName}`);
-	return sendOperationToNode(node, { ...operation }, timeoutMs === undefined ? undefined : { timeoutMs });
+	bucket.fresh++;
+	return sendOperationToNode(node, { ...operation }, { timeoutMs: remaining });
+}
+
+const OUTBOUND_REQUEST = 'record-lock-rpc-out';
+const OUTBOUND_REPLY = 'record-lock-rpc-out-reply';
+interface OutboundAnswer {
+	reply?: any;
+	error?: string;
+	/** No worker holds a live session to the peer: the requester falls back to its own connection. */
+	noSession?: boolean;
+}
+let nextOutboundId = 1;
+const pendingOutbound = new Map<number, (answer: OutboundAnswer) => void>();
+/** Main thread, keyed by a hop id main mints (requesters' ids collide here). */
+const outboundHops = new Map<
+	number,
+	{ worker: any; holderThreadId: number; requestId: number; barrier: boolean; timer: NodeJS.Timeout }
+>();
+let sessionHolderFor: (nodeName: string, database: string) => any = () => undefined;
+export function setSessionHolderReader(reader: (nodeName: string, database: string) => any): void {
+	sessionHolderFor = reader;
+}
+
+/** `deadlineAt` is `outboundNow()` ms, shared by every hop; the requester outwaits the hops by a slack. */
+function awaitOutbound(requestId: number, deadlineAt: number): Promise<OutboundAnswer> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(
+			() => {
+				pendingOutbound.delete(requestId);
+				resolve({ error: 'the forwarded record lock operation was not answered before its deadline' });
+			},
+			Math.max(0, deadlineAt - outboundNow()) + RELAY_SLACK_MS * 2
+		).unref();
+		pendingOutbound.set(requestId, (answer) => {
+			clearTimeout(timer);
+			pendingOutbound.delete(requestId);
+			resolve(answer);
+		});
+	});
+}
+
+/** Resolves undefined when no sibling holds a session, so the caller falls back to its own connection. */
+export async function forwardOverSessionHolder(
+	nodeName: string,
+	database: string,
+	operation: LockOperation,
+	deadlineAt: number,
+	postToMain: (message: any) => void = (message) => parentPort!.postMessage(message)
+): Promise<OutboundAnswer | undefined> {
+	const requestId = nextOutboundId++;
+	const answer = awaitOutbound(requestId, deadlineAt);
+	try {
+		postToMain({ type: OUTBOUND_REQUEST, requestId, nodeName, database, operation, deadlineAt });
+	} catch (error) {
+		pendingOutbound.get(requestId)?.({ noSession: true });
+		logger.debug?.('Could not forward a record lock operation through the main thread', error);
+	}
+	const result = await answer;
+	return result.noSession ? undefined : result;
+}
+
+function answerOutbound(port: any, requestId: number, answer: OutboundAnswer): void {
+	try {
+		port?.postMessage({ type: OUTBOUND_REPLY, requestId, ...answer });
+	} catch (error) {
+		logger.debug?.('Could not answer a forwarded record lock operation', error);
+	}
+}
+
+export function handleOutboundReply(message: any): void {
+	pendingOutbound.get(message?.requestId)?.(message);
+}
+
+export function handleOutboundRequestOnHolder(message: any, replyTo: any = parentPort): void {
+	const { requestId, nodeName, database, operation, deadlineAt } = message;
+	if (!(deadlineAt - outboundNow() > 0))
+		return answerOutbound(replyTo, requestId, { error: 'the record lock operation expired before it was sent' });
+	const session = liveSessionTo(nodeName, database);
+	if (!session) return answerOutbound(replyTo, requestId, { noSession: true });
+	Promise.resolve()
+		.then(() => {
+			const remaining = deadlineAt - outboundNow();
+			if (remaining <= 0) throw new Error('the record lock operation expired before it was sent');
+			return session.sendOperation({ ...operation }, remaining);
+		})
+		.then(
+			(reply) => answerOutbound(replyTo, requestId, { reply }),
+			(error) => answerOutbound(replyTo, requestId, { error: String(error?.message ?? error) })
+		);
+}
+
+function settleHop(hopId: number, answer: OutboundAnswer): void {
+	const hop = outboundHops.get(hopId);
+	if (!hop) return;
+	outboundHops.delete(hopId);
+	clearTimeout(hop.timer);
+	answerOutbound(hop.worker, hop.requestId, answer);
+}
+
+export function handleOutboundRequestOnMain(message: any, worker: any): void {
+	const { requestId, nodeName, database, operation, deadlineAt } = message;
+	if (typeof deadlineAt !== 'number' || !(deadlineAt > outboundNow()))
+		return answerOutbound(worker, requestId, { error: 'the record lock operation expired before it was forwarded' });
+	let holder: any;
+	try {
+		holder = sessionHolderFor(nodeName, database);
+	} catch (error) {
+		logger.debug?.('Could not look up the session holder for a record lock operation', error);
+	}
+	if (!holder || holder === worker) return answerOutbound(worker, requestId, { noSession: true });
+	const hopId = nextOutboundId++;
+	const timer = setTimeout(
+		() => settleHop(hopId, { error: `the worker holding the session to ${nodeName} did not answer` }),
+		deadlineAt - outboundNow() + RELAY_SLACK_MS
+	).unref();
+	const barrier = operation?.operation === BARRIER_OPERATION;
+	outboundHops.set(hopId, { worker, holderThreadId: holder.threadId, requestId, barrier, timer });
+	try {
+		holder.postMessage({ type: OUTBOUND_REQUEST, requestId: hopId, nodeName, database, operation, deadlineAt });
+	} catch (error) {
+		logger.debug?.('Could not forward a record lock operation to the session holder', error);
+		settleHop(hopId, { noSession: true });
+	}
+}
+
+export function handleOutboundReplyOnMain(message: any): void {
+	const answer: OutboundAnswer = {};
+	if (message?.noSession === true) answer.noSession = true;
+	else if (typeof message?.error === 'string') answer.error = message.error;
+	else answer.reply = message?.reply;
+	settleHop(message?.requestId, answer);
+}
+
+/** A barrier that reached the holder may have been written; a resend would append a second, differently
+ * positioned barrier and fail the successor's freshness check, so its outcome is reported unknown
+ * (fail closed). A delegate or recall resend is idempotent, so the requester falls back. */
+export function settleHopsOfExitedHolder(threadId: number): void {
+	for (const [hopId, hop] of outboundHops) {
+		if (hop.holderThreadId !== threadId) continue;
+		settleHop(
+			hopId,
+			hop.barrier
+				? { error: 'the holder exited before answering a freshness barrier; its outcome is unknown' }
+				: { noSession: true }
+		);
+	}
+}
+
+if (parentPort) {
+	onMessageByType(OUTBOUND_REQUEST, (message) => handleOutboundRequestOnHolder(message));
+	onMessageByType(OUTBOUND_REPLY, handleOutboundReply);
+} else {
+	onMessageByType(OUTBOUND_REQUEST, handleOutboundRequestOnMain);
+	onMessageByType(OUTBOUND_REPLY, handleOutboundReplyOnMain);
+	onThreadExit(settleHopsOfExitedHolder);
 }
 
 // ---- receive side ------------------------------------------------------------------------------
