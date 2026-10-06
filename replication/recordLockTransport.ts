@@ -233,12 +233,9 @@ const relayedControlEntries = new Map<string, number>();
 const controlEntryRelayDrops = new Map<string, number>();
 
 /**
- * A peer's `lockRelease` applied on this thread while another thread coordinates the database
- * (harper-pro#977). Best-effort by design: the owner clears a grant only for the exact live token and
- * freshness is proven by the successor's own barrier, so a relay that is late, reordered or lost can
- * only delay a re-grant until the grant's own deadline. `author` is the audit-header origin core
- * resolved; a sibling thread is trusted for it on the same basis as the rest of the process, which
- * can already reach the coordinator directly (`Table.lockCoordinator`).
+ * Best-effort by design (DESIGN.md, the control-entry bullet): a lost or late relay only delays a
+ * re-grant to the grant's deadline. `author` is core's resolved audit-header origin; a sibling thread
+ * is trusted for it like the rest of the process, which can reach the coordinator directly.
  */
 export function relayLockControlEntry(
 	database: string,
@@ -444,8 +441,9 @@ interface RefreshState {
 	timer?: NodeJS.Timeout;
 }
 const refreshState = new Map<string, RefreshState>();
-const REFRESH_RETRY_INITIAL_MS = Number(process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS) || 250;
-const REFRESH_RETRY_ATTEMPTS = 3;
+const REFRESH_RETRY_INITIAL_MS = Number(process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS) || 1_000;
+const REFRESH_RETRY_MAX_MS = REFRESH_RETRY_INITIAL_MS * 30;
+const REFRESH_RETRY_ATTEMPTS = 6;
 let readHomesRow: (database: string) => Promise<RecordLockHomesRow | undefined> = currentRow;
 /** Test seam: the row reader `refreshCache` uses. Returns the previous reader. */
 export function setRecordLockHomesRowReader(reader: typeof readHomesRow): typeof readHomesRow {
@@ -475,7 +473,7 @@ async function refreshCache(database: string): Promise<void> {
 				token: {},
 				backoff: createBackoff({
 					initialMs: REFRESH_RETRY_INITIAL_MS,
-					maxMs: REFRESH_RETRY_INITIAL_MS * 16,
+					maxMs: REFRESH_RETRY_MAX_MS,
 					maxAttempts: REFRESH_RETRY_ATTEMPTS,
 				}),
 			})
