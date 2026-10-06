@@ -36,6 +36,7 @@ import {
 	relayTimeoutFor,
 	releaseOnOwnerRelay,
 	setSessionHolderReader,
+	settleHopsOfExitedHolder,
 } from '#src/replication/recordLockRpc';
 
 const OWNER_THREAD = 8101;
@@ -446,25 +447,25 @@ describe('forwarding an outbound lock operation over the worker holding the sess
 		generation: 1,
 		leaseMs: 1000,
 	};
-	function fakePort() {
+	function fakePort(threadId = 0) {
 		const posted = [];
-		return { posted, postMessage: (message) => posted.push(message) };
+		return { threadId, posted, postMessage: (message) => posted.push(message) };
 	}
+	const soon = () => Date.now() + 5_000;
 
 	afterEach(() => setSessionHolderReader(() => undefined));
 
-	it('main forwards to the holder under its own hop id and retraces the answer to the requester', () => {
-		const requester = fakePort();
-		const holder = fakePort();
+	it('main forwards to the holder under its own hop id, carrying the same deadline, and retraces the answer', () => {
+		const requester = fakePort(1);
+		const holder = fakePort(2);
+		const deadlineAt = soon();
 		setSessionHolderReader((nodeName, database) => (nodeName === 'peer' && database === 'fwd' ? holder : undefined));
-		handleOutboundRequestOnMain(
-			{ requestId: 7, nodeName: 'peer', database: 'fwd', operation, timeoutMs: 1000 },
-			requester
-		);
+		handleOutboundRequestOnMain({ requestId: 7, nodeName: 'peer', database: 'fwd', operation, deadlineAt }, requester);
 		assert.strictEqual(holder.posted.length, 1);
 		const hop = holder.posted[0];
 		assert.strictEqual(hop.type, 'record-lock-rpc-out');
 		assert.notStrictEqual(hop.requestId, 7, 'main mints its own hop id');
+		assert.strictEqual(hop.deadlineAt, deadlineAt, 'one deadline for every hop, never a fresh budget');
 		assert.deepStrictEqual(hop.operation, operation);
 		assert.strictEqual(requester.posted.length, 0, 'nothing answered before the holder does');
 		handleOutboundReplyOnMain({ requestId: hop.requestId, reply: { granted: true } });
@@ -476,14 +477,14 @@ describe('forwarding an outbound lock operation over the worker holding the sess
 	});
 
 	it('main answers noSession when nobody holds the session, or when the requester itself does', () => {
-		const requester = fakePort();
+		const requester = fakePort(1);
 		handleOutboundRequestOnMain(
-			{ requestId: 1, nodeName: 'peer', database: 'fwd', operation, timeoutMs: 1000 },
+			{ requestId: 1, nodeName: 'peer', database: 'fwd', operation, deadlineAt: soon() },
 			requester
 		);
 		setSessionHolderReader(() => requester);
 		handleOutboundRequestOnMain(
-			{ requestId: 2, nodeName: 'peer', database: 'fwd', operation, timeoutMs: 1000 },
+			{ requestId: 2, nodeName: 'peer', database: 'fwd', operation, deadlineAt: soon() },
 			requester
 		);
 		assert.deepStrictEqual(
@@ -495,48 +496,74 @@ describe('forwarding an outbound lock operation over the worker holding the sess
 		);
 	});
 
-	it('main answers an error when the holder never replies within the bound', async () => {
-		const requester = fakePort();
-		const holder = fakePort();
+	it('main and the holder refuse work whose deadline has already passed instead of sending it', () => {
+		const requester = fakePort(1);
+		const holder = fakePort(2);
 		setSessionHolderReader(() => holder);
+		const expired = Date.now() - 1;
 		handleOutboundRequestOnMain(
-			{ requestId: 3, nodeName: 'peer', database: 'fwd', operation, timeoutMs: -1990 },
+			{ requestId: 3, nodeName: 'peer', database: 'fwd', operation, deadlineAt: expired },
 			requester
 		);
-		await new Promise((resolve) => setTimeout(resolve, 50));
-		assert.strictEqual(requester.posted.length, 1);
-		assert.match(requester.posted[0].error, /did not answer/);
+		assert.strictEqual(holder.posted.length, 0);
+		assert.match(requester.posted[0].error, /expired/);
+		const main = fakePort();
+		handleOutboundRequestOnHolder(
+			{ requestId: 4, nodeName: 'peer', database: 'fwd', operation, deadlineAt: expired },
+			main
+		);
+		assert.match(main.posted[0].error, /expired/);
+	});
+
+	it('main settles a hop whose holder exits with noSession, so the requester falls back', () => {
+		const requester = fakePort(1);
+		const holder = fakePort(42);
+		setSessionHolderReader(() => holder);
+		handleOutboundRequestOnMain(
+			{ requestId: 5, nodeName: 'peer', database: 'fwd', operation, deadlineAt: soon() },
+			requester
+		);
+		settleHopsOfExitedHolder(41);
+		assert.strictEqual(requester.posted.length, 0, 'another thread exiting settles nothing');
+		settleHopsOfExitedHolder(42);
+		assert.deepStrictEqual(requester.posted, [{ type: 'record-lock-rpc-out-reply', requestId: 5, noSession: true }]);
 		handleOutboundReplyOnMain({ requestId: holder.posted[0].requestId, reply: {} });
-		assert.strictEqual(requester.posted.length, 1, 'a late answer finds no hop');
+		assert.strictEqual(requester.posted.length, 1, 'a reply after the exit finds no hop');
 	});
 
 	it('a holder with no live session to the peer says so rather than opening one', () => {
 		const main = fakePort();
 		handleOutboundRequestOnHolder(
-			{ requestId: 9, nodeName: 'nobody', database: 'fwd', operation, timeoutMs: 1000 },
+			{ requestId: 9, nodeName: 'nobody', database: 'fwd', operation, deadlineAt: soon() },
 			main
 		);
 		assert.deepStrictEqual(main.posted, [{ type: 'record-lock-rpc-out-reply', requestId: 9, noSession: true }]);
 	});
 
-	it('the requester resolves the reply, throws the error, and falls back on noSession', async () => {
+	it('the requester resolves the reply, throws the error, falls back on noSession, and outwaits the deadline by a slack', async () => {
 		const toMain = fakePort();
 		const post = (message) => toMain.postMessage(message);
-		const replied = forwardOverSessionHolder('peer', 'fwd', operation, 1000, post);
+		const replied = forwardOverSessionHolder('peer', 'fwd', operation, soon(), post);
 		handleOutboundReply({ requestId: toMain.posted[0].requestId, reply: { granted: false, reason: 'contended' } });
 		assert.deepStrictEqual(await replied, {
 			requestId: toMain.posted[0].requestId,
 			reply: { granted: false, reason: 'contended' },
 		});
-		const failed = forwardOverSessionHolder('peer', 'fwd', operation, 1000, post);
+		const failed = forwardOverSessionHolder('peer', 'fwd', operation, soon(), post);
 		handleOutboundReply({ requestId: toMain.posted[1].requestId, error: 'closed' });
 		assert.strictEqual((await failed).error, 'closed');
-		const none = forwardOverSessionHolder('peer', 'fwd', operation, 1000, post);
+		const none = forwardOverSessionHolder('peer', 'fwd', operation, soon(), post);
 		handleOutboundReply({ requestId: toMain.posted[2].requestId, noSession: true });
 		assert.strictEqual(await none, undefined);
-		const unposted = await forwardOverSessionHolder('peer', 'fwd', operation, 1000, () => {
+		const unposted = await forwardOverSessionHolder('peer', 'fwd', operation, soon(), () => {
 			throw new Error('port closed');
 		});
 		assert.strictEqual(unposted, undefined, 'a post that throws falls back too');
+		// A grant that lands after the deadline but inside the slack still reaches the caller, which is
+		// what lets core hand an unclaimed grant back instead of stranding it on the home.
+		const late = forwardOverSessionHolder('peer', 'fwd', operation, Date.now() - 1, post);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		handleOutboundReply({ requestId: toMain.posted[3].requestId, reply: { granted: true } });
+		assert.deepStrictEqual((await late).reply, { granted: true });
 	});
 });

@@ -37,7 +37,11 @@ import {
 	recordPeerHomesAgreement,
 	recordPeerLockCapability,
 	releaseRecordLockOwner,
+	cachedActiveGeneration,
+	controlEntryRelayDropCount,
 	handleRelayedControlEntry,
+	refreshRecordLockHomesCache,
+	setRecordLockHomesRowReader,
 	relayLockControlEntry,
 	relayedControlEntryCount,
 } from '#src/replication/recordLockTransport';
@@ -798,13 +802,15 @@ describe('relaying a peer control entry to the coordinating worker (harper-pro#9
 		}
 	});
 
-	it('drops the entry while the owner is unknown or its port is gone, never throws', () => {
+	it('counts the entry as a relay drop while the owner is unknown or its port is gone, never throws', () => {
 		assert.doesNotThrow(() => relayLockControlEntry('relay-unknown', 't', entry, 'alpha', 1));
+		assert.strictEqual(controlEntryRelayDropCount('relay-unknown'), 1);
 		const owner = fakeWorker(9999);
 		recordLockOwnerFor('relay-gone', [owner]);
 		try {
 			assert.doesNotThrow(() => relayLockControlEntry('relay-gone', 't', entry, 'alpha', 1));
 			assert.strictEqual(port.posted.length, 0);
+			assert.strictEqual(controlEntryRelayDropCount('relay-gone'), 1);
 		} finally {
 			releaseRecordLockOwner('relay-gone');
 		}
@@ -828,5 +834,53 @@ describe('relaying a peer control entry to the coordinating worker (harper-pro#9
 			releaseRecordLockOwner('relay-recv');
 			setMainIsWorker(false);
 		}
+	});
+});
+
+describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
+	const generation = (n) => ({ active: { generation: n, homes: ['a'], digest: `d${n}` } });
+	let previous;
+	afterEach(() => setRecordLockHomesRowReader(previous));
+
+	it('retries a failed read on a backoff until one succeeds, then stops', async () => {
+		let reads = 0;
+		previous = setRecordLockHomesRowReader(async () => {
+			reads++;
+			if (reads < 3) throw new Error('storage hiccup');
+			return generation(5);
+		});
+		await refreshRecordLockHomesCache('refresh-retry', 3);
+		assert.strictEqual(cachedActiveGeneration('refresh-retry'), undefined, 'a failed read caches nothing');
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		assert.strictEqual(cachedActiveGeneration('refresh-retry'), 5);
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		assert.strictEqual(reads, 3, 'no retry after a success');
+	});
+
+	it('a read that resolves after a newer refresh began installs nothing', async () => {
+		let release;
+		const slow = new Promise((resolve) => (release = resolve));
+		previous = setRecordLockHomesRowReader(() => slow);
+		const stale = refreshRecordLockHomesCache('refresh-fence');
+		setRecordLockHomesRowReader(async () => generation(2));
+		await refreshRecordLockHomesCache('refresh-fence');
+		assert.strictEqual(cachedActiveGeneration('refresh-fence'), 2);
+		release(generation(1));
+		await stale;
+		assert.strictEqual(cachedActiveGeneration('refresh-fence'), 2, 'the retracted generation did not come back');
+	});
+
+	it('a pending retry is superseded by a newer refresh', async () => {
+		let failingReads = 0;
+		previous = setRecordLockHomesRowReader(async () => {
+			failingReads++;
+			throw new Error('down');
+		});
+		await refreshRecordLockHomesCache('refresh-supersede', 3);
+		setRecordLockHomesRowReader(async () => generation(7));
+		await refreshRecordLockHomesCache('refresh-supersede');
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		assert.strictEqual(failingReads, 1, 'the superseded attempt did not retry');
+		assert.strictEqual(cachedActiveGeneration('refresh-supersede'), 7);
 	});
 });

@@ -384,17 +384,35 @@ function logDelta(before, after, acquisitions) {
  * serving worker's coordinator, which at THREADS > 1 is usually not the one that grants. */
 async function grantedOn(node) {
 	const status = await sendOperation(node, { operation: 'cluster_status' });
-	return status.recordLocks?.[DB]?.granted ?? 0;
+	const granted = status.recordLocks?.[DB]?.granted;
+	if (typeof granted !== 'number') throw new Error(`${node.hostname}: the owner's granted gauge is unavailable`);
+	return granted;
+}
+
+/** `BenchLock` over `ids`, with each key's home classified through the owner's gauge when the serving
+ * worker's own gauge cannot see it (THREADS > 1): one request per id, warmed, so the samples stay the
+ * node's own and the classification stays outside the timed region. */
+async function lockEachClassified(node, ids, options) {
+	if (THREADS === 1) return call(node, 'BenchLock/', { ...options, ids, classifyHome: true });
+	const acquireMs = [];
+	const releaseMs = [];
+	const homeLocal = [];
+	for (const id of ids) {
+		const before = await grantedOn(node);
+		const one = await call(node, 'BenchLock/', { ...options, ids: [id], warmupId: `warm-${id}` });
+		homeLocal.push((await grantedOn(node)) > before);
+		acquireMs.push(one.acquireMs[0]);
+		releaseMs.push(one.releaseMs[0]);
+	}
+	return { acquireMs, releaseMs, homeLocal };
 }
 
 async function probeKeys(node, prefix, wanted, options) {
 	const found = {};
 	for (let attempt = 0; attempt < 40 && !wanted.every((side) => found[side]); attempt++) {
 		const id = `${prefix}-${attempt}-${Date.now()}`;
-		const grantedBefore = THREADS > 1 ? await grantedOn(node) : 0;
-		const first = await call(node, 'BenchLock/', { ...options, ids: [id], classifyHome: THREADS === 1 });
-		const homeLocal = THREADS > 1 ? (await grantedOn(node)) > grantedBefore : first.homeLocal[0];
-		found[homeLocal ? 'local' : 'remote'] ??= { id, first };
+		const first = await lockEachClassified(node, [id], options);
+		found[first.homeLocal[0] ? 'local' : 'remote'] ??= { id, first };
 	}
 	for (const side of wanted) assert.ok(found[side], `${prefix}: no ${side}-home key found`);
 	return found;
@@ -459,7 +477,7 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 		for (const [i, node] of nodes.entries()) {
 			const ids = Array.from({ length: UNCONTENDED_PER_NODE }, (_, k) => `uncontended-${i}-${k}-${Date.now()}`);
 			const before = await logSnapshot(nodes);
-			const { acquireMs, releaseMs, homeLocal } = await call(node, 'BenchLock/', { ids, classifyHome: true });
+			const { acquireMs, releaseMs, homeLocal } = await lockEachClassified(node, ids);
 			const after = await logSnapshotAfter(nodes);
 			pooledAcquire.push(...acquireMs);
 			pooledRelease.push(...releaseMs);

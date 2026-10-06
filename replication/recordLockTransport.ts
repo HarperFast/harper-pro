@@ -72,6 +72,7 @@ import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import {
 	currentRow,
 	onRecordLockHomesChanged,
+	type RecordLockHomesRow,
 	setHomesDrainReader,
 	setHomesMembershipReaders,
 	type RecordLockGenerationState,
@@ -83,6 +84,7 @@ import {
 	acquireOnOwnerRelay,
 	clearRelaySessionsForDatabase,
 	failRelayAcquiresForDatabase,
+	forgetOutboundOperationStats,
 	onRecordLockOwnershipLost,
 	outboundOperationStats,
 	quiesceOnOwner,
@@ -224,19 +226,18 @@ function routeBarrierAppliedFromMain(message: any): void {
 }
 
 const CONTROL_ENTRY_MESSAGE = 'record-lock-control-entry';
-/** Per database on the coordinating thread: control entries that arrived over the mesh and were applied. */
+/** Per database on the coordinating thread: peer control entries that arrived over the mesh and were applied. */
 const relayedControlEntries = new Map<string, number>();
+/** Per database on the applying thread: entries that could not be sent (owner unknown here, port gone). */
+const controlEntryRelayDrops = new Map<string, number>();
 
 /**
- * A peer's `lockRelease` entry applied on this thread while another thread coordinates the database
- * (harper-pro#977: subscriptions are placed round-robin, never on the owner). Core hands it over
- * through `relayControlEntry`; it goes straight to the owner over the port mesh, the path a relayed
- * `lock()` admission already takes. Delivery is best-effort by design: the entry is idempotent by
- * exact token on the owner, so one that is late, reordered or lost — owner unknown or mid-handoff,
- * port gone — can only delay a re-grant until the grant's own deadline, exactly what an off-owner
- * drop did before. `author` is the audit-header origin core resolved; the posting thread is trusted
- * for it on the same basis as the rest of the process: in-process code can already reach the
- * coordinator directly (`Table.lockCoordinator`), so a thread message confers no authority it lacks.
+ * A peer's `lockRelease` applied on this thread while another thread coordinates the database
+ * (harper-pro#977). Best-effort by design: the owner clears a grant only for the exact live token and
+ * freshness is proven by the successor's own barrier, so a relay that is late, reordered or lost can
+ * only delay a re-grant until the grant's own deadline. `author` is the audit-header origin core
+ * resolved; a sibling thread is trusted for it on the same basis as the rest of the process, which
+ * can already reach the coordinator directly (`Table.lockCoordinator`).
  */
 export function relayLockControlEntry(
 	database: string,
@@ -246,23 +247,28 @@ export function relayLockControlEntry(
 	position: number | undefined
 ): void {
 	const ownerThreadId = ownerThreadByDatabase.get(database);
-	if (ownerThreadId === undefined) return;
-	if (!sendToThread(ownerThreadId, { type: CONTROL_ENTRY_MESSAGE, database, table, entry, author, position }))
-		logger.debug?.(`Could not relay a record lock control entry to the owner worker for ${database}`);
+	if (
+		ownerThreadId === undefined ||
+		!sendToThread(ownerThreadId, { type: CONTROL_ENTRY_MESSAGE, database, table, entry, author, position })
+	)
+		controlEntryRelayDrops.set(database, (controlEntryRelayDrops.get(database) ?? 0) + 1);
 }
 
 export function handleRelayedControlEntry(message: any, port: any): void {
 	if (typeof message?.database !== 'string' || typeof message.table !== 'string') return;
 	if (typeof message.author !== 'string' || typeof message.entry !== 'object' || message.entry === null) return;
-	// An unstamped sender is not a sibling port; a message that outran an ownership change is for the
+	// An unstamped sender is not a sibling port; an entry that outran an ownership change is for the
 	// thread that used to coordinate, and re-relaying it would only chase the handoff.
 	if (port?.threadId === undefined || !ownsRecordLockCoordination(message.database)) return;
-	relayedControlEntries.set(message.database, (relayedControlEntries.get(message.database) ?? 0) + 1);
 	deliverLockControlEntry(message.database, message.table, message.entry, message.author, message.position);
+	relayedControlEntries.set(message.database, (relayedControlEntries.get(message.database) ?? 0) + 1);
 }
 onMessageByType(CONTROL_ENTRY_MESSAGE, handleRelayedControlEntry);
 export function relayedControlEntryCount(database: string): number {
 	return relayedControlEntries.get(database) ?? 0;
+}
+export function controlEntryRelayDropCount(database: string): number {
+	return controlEntryRelayDrops.get(database) ?? 0;
 }
 
 export interface RecordLockTransportDeps {
@@ -424,16 +430,54 @@ export function currentHomesDigest(database: string): string | undefined {
 	return activeCache.get(database)?.digest;
 }
 
-async function refreshCache(database: string): Promise<void> {
+/**
+ * Per database, the number of the latest refresh started: a read that resolves after a newer refresh
+ * began installs nothing, so a slow or retried read cannot put back a generation a later
+ * stage/activate retracted. Also what a retry checks before trying again.
+ */
+const refreshAttempts = new Map<string, number>();
+const REFRESH_RETRY_MS = (process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS ?? '250,1000,4000')
+	.split(',')
+	.map(Number);
+let readHomesRow: (database: string) => Promise<RecordLockHomesRow | undefined> = currentRow;
+/** Test seam: the row reader `refreshCache` uses. Returns the previous reader. */
+export function setRecordLockHomesRowReader(reader: typeof readHomesRow): typeof readHomesRow {
+	const previous = readHomesRow;
+	readHomesRow = reader;
+	return previous;
+}
+export function refreshRecordLockHomesCache(database: string, retries = 0): Promise<void> {
+	return refreshCache(database, retries);
+}
+/** The active generation this thread has cached, or undefined (test and status reads only). */
+export function cachedActiveGeneration(database: string): number | undefined {
+	return activeCache.get(database)?.generation;
+}
+
+async function refreshCache(database: string, retriesLeft = 0): Promise<void> {
+	const attempt = (refreshAttempts.get(database) ?? 0) + 1;
+	refreshAttempts.set(database, attempt);
 	const before = activeCache.get(database);
+	let failed = false;
 	try {
-		const row = await currentRow(database);
+		const row = await readHomesRow(database);
+		if (refreshAttempts.get(database) !== attempt) return;
 		activeCache.set(database, row?.active);
 	} catch (error) {
+		if (refreshAttempts.get(database) !== attempt) return;
 		// A storage error must not leave a stale (possibly superseded) generation cached; undefined is
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
+		failed = true;
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
+	}
+	if (failed && retriesLeft > 0) {
+		// The startup refresh has no later trigger (harper-pro#853): without this a transient storage
+		// error at boot leaves `homeMap()` undefined until an operator re-stages.
+		const delay = REFRESH_RETRY_MS[REFRESH_RETRY_MS.length - retriesLeft];
+		setTimeout(() => {
+			if (refreshAttempts.get(database) === attempt) refreshCache(database, retriesLeft - 1);
+		}, delay).unref();
 	}
 	const after = activeCache.get(database);
 	// Core's coordinator seeds its restart-quarantine incarination tracking (`#coordinatingIncarnation`)
@@ -833,7 +877,7 @@ export function ensureRecordLockTransport(database: string): void {
 	registerClusterLockTransport(database, transport);
 	if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
 	listenForApplyFailures(database);
-	refreshCache(database);
+	refreshCache(database, REFRESH_RETRY_MS.length);
 	if (parentPort) {
 		parentPort.postMessage({ type: 'record-lock-owner-request', database });
 		// harper-pro#852: learn which thread owns it, so a relayed acquire can reach the owner. A worker
@@ -867,6 +911,10 @@ export function releaseRecordLockTransport(database: string): void {
 	forgetPoisonState(database);
 	ownedDatabases.delete(database);
 	activeCache.delete(database);
+	refreshAttempts.delete(database);
+	relayedControlEntries.delete(database);
+	controlEntryRelayDrops.delete(database);
+	forgetOutboundOperationStats(database);
 	if (!parentPort) releaseRecordLockOwner(database);
 }
 
@@ -882,6 +930,8 @@ export interface RecordLockDatabaseStats {
 	relayedAdmissions: number;
 	/** Peer control entries other threads applied and relayed here; counted on the coordinating thread only (harper-pro#977). */
 	relayedControlEntries?: number;
+	/** Peer control entries this thread applied but could not relay (owner unknown here, port gone); summed across threads. */
+	controlEntryRelayDrops?: number;
 	/** How this thread's outbound lock operations reached their peer (harper-pro#977). */
 	outbound?: OutboundOperationStats;
 	/** The home map's member set as this thread sees it, or undefined while the map is withheld. */
@@ -907,6 +957,7 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 		admitted: 0,
 		droppedOffOwner: 0,
 		relayedAdmissions: 0,
+		controlEntryRelayDrops: controlEntryRelayDrops.get(database) ?? 0,
 	};
 	for (const tableName in tables) {
 		let stats: (RecordLockDatabaseStats & { relayedAdmissions?: number }) | undefined;
@@ -1218,8 +1269,8 @@ function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorker
 
 /**
  * The worker that coordinates `database`, assigning one only if none is live: an owner is never
- * moved while it runs (see the module comment). Every placement of a (peer, database) subscription
- * must use this so the coordinator's thread is the one applying the database's inbound entries.
+ * moved while it runs (see the module comment). Subscriptions are placed independently of it
+ * (round-robin); a control entry applied elsewhere is relayed to the owner (harper-pro#977).
  * Returns `undefined` when the main thread itself is the owner, while no owner is live yet, or
  * while a handoff's incarnation bump has not yet persisted (§5.1) — treated identically by every
  * caller: "not currently owned," never "assign one now" (only this function does that). Main
@@ -1366,6 +1417,7 @@ export async function collectRecordLockStatus(
 			if (mainStats) {
 				result[database].relayedAdmissions = mainStats.relayedAdmissions;
 				result[database].droppedOffOwner = mainStats.droppedOffOwner;
+				result[database].controlEntryRelayDrops = mainStats.controlEntryRelayDrops;
 			}
 		}
 	}
@@ -1386,6 +1438,7 @@ export async function collectRecordLockStatus(
 				entry.outbound = stats.outbound;
 			}
 			entry.droppedOffOwner = (entry.droppedOffOwner ?? 0) + stats.droppedOffOwner;
+			entry.controlEntryRelayDrops = (entry.controlEntryRelayDrops ?? 0) + (stats.controlEntryRelayDrops ?? 0);
 			// Summed over EVERY worker: a relayed admission is minted on the owner but its COUNT lives on
 			// the non-owner worker that obtained it (harper-pro#852), so the owner alone would report zero.
 			entry.relayedAdmissions = (entry.relayedAdmissions ?? 0) + (stats.relayedAdmissions ?? 0);

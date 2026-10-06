@@ -136,9 +136,11 @@ async function call(node, path, body, signal) {
 	return JSON.parse(text);
 }
 
-/** CPU ticks per OS thread of the node's main process: `{ tid: { comm, ticks } }`. */
+/** CPU ticks per OS thread of the node's main process: `{ tid: { comm, ticks } }`. Linux only; elsewhere the
+ * CPU columns are empty and the convergence timings still stand. */
 async function threadCpu(pid) {
 	const out = {};
+	if (process.platform !== 'linux') return out;
 	for (const tid of await readdir(`/proc/${pid}/task`)) {
 		let stat;
 		try {
@@ -202,26 +204,44 @@ async function runArm(suiteName, arm, rep) {
 		const expected = warmTotal + WRITER_NODES * WRITERS_PER_NODE * PUTS_PER_WRITER;
 		const cpuBefore = await Promise.all(pids.map((pid) => threadCpu(pid)));
 		const loadStarted = performance.now();
+		// One lifecycle for the writers and the convergence wait: a writer that fails aborts the wait, and
+		// the wait's deadline aborts a writer whose response never closes.
+		const load = new AbortController();
+		let writerFailure;
 		const writers = Promise.all(
 			writerNodes.map((node, n) =>
 				Promise.all(
 					Array.from({ length: WRITERS_PER_NODE }, (_, w) =>
-						call(node, 'BenchWriteBatched/', { prefix: `w-${rep}-${n}-${w}`, count: PUTS_PER_WRITER, batch: PUT_BATCH })
+						call(
+							node,
+							'BenchWriteBatched/',
+							{ prefix: `w-${rep}-${n}-${w}`, count: PUTS_PER_WRITER, batch: PUT_BATCH },
+							load.signal
+						)
 					)
 				).then(() => performance.now() - loadStarted)
 			)
-		);
+		).catch((error) => {
+			writerFailure = error;
+			load.abort(error);
+			throw error;
+		});
 		const convergeMs = Array.from({ length: NODES }, () => undefined);
-		await waitForCondition(
-			async (signal) => {
-				const counts = await Promise.all(nodes.map((node) => recordCount(node, signal)));
-				counts.forEach((count, i) => {
-					if (count >= expected && convergeMs[i] === undefined) convergeMs[i] = performance.now() - loadStarted;
-				});
-				return convergeMs.every((ms) => ms !== undefined);
-			},
-			{ timeoutMs: CONVERGE_TIMEOUT_MS, pollMs: 500, description: `every node to hold ${expected} rows` }
-		);
+		try {
+			await waitForCondition(
+				async (signal) => {
+					if (writerFailure) throw writerFailure;
+					const counts = await Promise.all(nodes.map((node) => recordCount(node, signal)));
+					counts.forEach((count, i) => {
+						if (count >= expected && convergeMs[i] === undefined) convergeMs[i] = performance.now() - loadStarted;
+					});
+					return convergeMs.every((ms) => ms !== undefined);
+				},
+				{ timeoutMs: CONVERGE_TIMEOUT_MS, pollMs: 500, description: `every node to hold ${expected} rows` }
+			);
+		} finally {
+			setTimeout(() => load.abort(new Error('writer response still open after convergence')), 30_000).unref();
+		}
 		const writeMs = await writers;
 		const cpuAfter = await Promise.all(pids.map((pid) => threadCpu(pid)));
 		const lockStatuses = await Promise.all(nodes.map((node) => sendOperation(node, { operation: 'cluster_status' })));
