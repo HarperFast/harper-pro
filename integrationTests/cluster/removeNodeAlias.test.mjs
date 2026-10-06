@@ -67,7 +67,7 @@ suite('remove_node by an alias', { timeout: 180000 }, (ctx) => {
 		ctx.offlineAddress = await getNextAvailableLoopbackAddress();
 		const ctxA = { name: ctx.name, harper: { hostname: hostnameA } };
 		const ctxB = { name: ctx.name, harper: { hostname: hostnameB } };
-		await Promise.all([
+		const results = await Promise.allSettled([
 			startHarper(ctxA, nodeStartOptions(hostnameA)).then(() => {
 				ctx.nodeA = ctxA.harper;
 			}),
@@ -82,6 +82,8 @@ suite('remove_node by an alias', { timeout: 180000 }, (ctx) => {
 				ctx.nodeB = ctxB.harper;
 			}),
 		]);
+		const rejected = results.find((result) => result.status === 'rejected');
+		if (rejected) throw rejected.reason;
 	});
 
 	after(async () => {

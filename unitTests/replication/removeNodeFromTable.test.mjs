@@ -51,18 +51,21 @@ describe('removeNodeFromTable', () => {
 		assert.equal(message, `Successfully removed 'peer-b' from cluster`);
 	});
 
-	it('uses a direct key match without scanning the table', async () => {
+	it('removes a direct key match and reports other rows still registered at its url', async () => {
 		const table = nodeTable([
 			{ name: '10.0.0.2', url: PEER_URL, replicates: true },
 			{ name: 'peer-b', url: PEER_URL, replicates: true },
 		]);
 		const send = recordingTransport();
 
-		await removeNodeFromTable('10.0.0.2', PEER_URL, table, send);
+		const message = await removeNodeFromTable('10.0.0.2', PEER_URL, table, send);
 
-		assert.equal(table.scans, 0);
 		assert.deepEqual(table.deleted, ['10.0.0.2']);
 		assert.equal(send.sent[0].operation.name, '10.0.0.2');
+		assert.equal(
+			message,
+			`Successfully removed '10.0.0.2' from cluster; still registered at ${PEER_URL} and not removed: 'peer-b'`
+		);
 	});
 
 	it('names this node in the reciprocal when the peer has explicit subscriptions', async () => {

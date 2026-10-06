@@ -327,13 +327,15 @@ export async function addNodeBack(req) {
 }
 
 /**
- * remove_node, after setNode has derived `hostname`/`url` from the request. The result reports a
- * reciprocal removal the peer did not confirm; the local removal stands either way.
+ * The local removal stands even when the peer does not confirm its reciprocal; the result says so.
  */
 export async function removeNodeFromTable(hostname: string, url: string, hdbNodes, sendOperation) {
 	const found = await findExistingNodeRecord(hostname, url, hdbNodes);
 	if (!found) throw new ClientError(hostname + ' does not exist');
 	const { name, record } = found;
+	// An exact-key hit wins over other rows at the same url; refusing it would also refuse their exact
+	// names, leaving no way to remove either.
+	const othersAtUrl = (await peerRowsAtUrl(record.url, hdbNodes)).filter((node) => node.name !== name);
 
 	// Revoke locally before notifying the peer: the dynamic send-authorization watch acts on this
 	// delete, so the peer's access must not outlive a round trip to that (possibly offline or
@@ -341,6 +343,7 @@ export async function removeNodeFromTable(hostname: string, url: string, hdbNode
 	// connection, so it is unaffected by the teardown this delete triggers.
 	await hdbNodes.delete(name);
 
+	let message = `Successfully removed '${name}' from cluster`;
 	try {
 		await sendOperation(
 			record,
@@ -355,9 +358,22 @@ export async function removeNodeFromTable(hostname: string, url: string, hdbNode
 		);
 	} catch (error) {
 		hdbLogger.warn(`Removal of '${name}' was not confirmed by that node, which may still hold its record:`, error);
-		return `Successfully removed '${name}' from cluster but removal on the target node was not confirmed: ${error.message}`;
+		message += ` but removal on the target node was not confirmed: ${error.message}`;
 	}
-	return `Successfully removed '${name}' from cluster`;
+	if (othersAtUrl.length > 0) {
+		message += `; still registered at ${record.url} and not removed: ${othersAtUrl.map((node) => `'${node.name}'`).join(', ')}`;
+	}
+	return message;
+}
+
+async function peerRowsAtUrl(url: string, hdbNodes) {
+	const rows = [];
+	if (!url) return rows;
+	const thisNodeName = getThisNodeName();
+	for await (const node of hdbNodes.search({})) {
+		if (node?.url === url && node.name !== thisNodeName) rows.push(node);
+	}
+	return rows;
 }
 
 /**
@@ -393,12 +409,7 @@ function reverseSubscription(subscription) {
 async function findExistingNodeRecord(hostname: string, url: string, hdbNodes = getHDBNodeTable()) {
 	const direct = await hdbNodes.get(hostname);
 	if (direct) return { name: hostname, record: direct };
-	if (!url) return undefined;
-	const thisNodeName = getThisNodeName();
-	const matches = [];
-	for await (const node of hdbNodes.search({})) {
-		if (node?.url === url && node.name !== thisNodeName) matches.push(node);
-	}
+	const matches = await peerRowsAtUrl(url, hdbNodes);
 	if (matches.length > 1) {
 		throw new ClientError(
 			`${hostname} matches more than one registered node (${matches.map((node) => node.name).join(', ')}); specify the node name`
