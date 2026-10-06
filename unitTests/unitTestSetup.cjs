@@ -12,7 +12,7 @@ process.env.STORAGE_PATH = testDir;
 process.env._DISABLE_NATS = 'true';
 process.env.LOGGING_STDSTREAMS = 'false';
 // Short backoff for the record-lock home-map refresh retry tests (recordLockTransport.test.mjs).
-process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS = '10,20,40';
+process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS = '10';
 
 function removeTestDir() {
 	try {

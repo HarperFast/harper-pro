@@ -39,6 +39,7 @@ import {
 	releaseRecordLockOwner,
 	cachedActiveGeneration,
 	controlEntryRelayDropCount,
+	forgetRecordLockHomesCache,
 	handleRelayedControlEntry,
 	refreshRecordLockHomesCache,
 	setRecordLockHomesRowReader,
@@ -839,28 +840,31 @@ describe('relaying a peer control entry to the coordinating worker (harper-pro#9
 
 describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
 	const generation = (n) => ({ active: { generation: n, homes: ['a'], digest: `d${n}` } });
+	const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 	let previous;
+	beforeEach(() => (previous = setRecordLockHomesRowReader(previous ?? (() => Promise.reject(new Error('unset'))))));
 	afterEach(() => setRecordLockHomesRowReader(previous));
 
 	it('retries a failed read on a backoff until one succeeds, then stops', async () => {
 		let reads = 0;
-		previous = setRecordLockHomesRowReader(async () => {
+		setRecordLockHomesRowReader(async () => {
 			reads++;
 			if (reads < 3) throw new Error('storage hiccup');
 			return generation(5);
 		});
-		await refreshRecordLockHomesCache('refresh-retry', 3);
+		await refreshRecordLockHomesCache('refresh-retry');
 		assert.strictEqual(cachedActiveGeneration('refresh-retry'), undefined, 'a failed read caches nothing');
-		await new Promise((resolve) => setTimeout(resolve, 60));
+		await settle(400);
 		assert.strictEqual(cachedActiveGeneration('refresh-retry'), 5);
-		await new Promise((resolve) => setTimeout(resolve, 60));
+		await settle(200);
 		assert.strictEqual(reads, 3, 'no retry after a success');
+		forgetRecordLockHomesCache('refresh-retry');
 	});
 
 	it('a read that resolves after a newer refresh began installs nothing', async () => {
 		let release;
 		const slow = new Promise((resolve) => (release = resolve));
-		previous = setRecordLockHomesRowReader(() => slow);
+		setRecordLockHomesRowReader(() => slow);
 		const stale = refreshRecordLockHomesCache('refresh-fence');
 		setRecordLockHomesRowReader(async () => generation(2));
 		await refreshRecordLockHomesCache('refresh-fence');
@@ -868,19 +872,45 @@ describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
 		release(generation(1));
 		await stale;
 		assert.strictEqual(cachedActiveGeneration('refresh-fence'), 2, 'the retracted generation did not come back');
+		forgetRecordLockHomesCache('refresh-fence');
 	});
 
-	it('a pending retry is superseded by a newer refresh', async () => {
-		let failingReads = 0;
-		previous = setRecordLockHomesRowReader(async () => {
-			failingReads++;
-			throw new Error('down');
+	it('a failed homes-changed refresh after a failed startup read keeps the retry budget alive', async () => {
+		let reads = 0;
+		setRecordLockHomesRowReader(async () => {
+			reads++;
+			if (reads < 3) throw new Error('down');
+			return generation(7);
 		});
-		await refreshRecordLockHomesCache('refresh-supersede', 3);
-		setRecordLockHomesRowReader(async () => generation(7));
-		await refreshRecordLockHomesCache('refresh-supersede');
-		await new Promise((resolve) => setTimeout(resolve, 80));
-		assert.strictEqual(failingReads, 1, 'the superseded attempt did not retry');
-		assert.strictEqual(cachedActiveGeneration('refresh-supersede'), 7);
+		await refreshRecordLockHomesCache('refresh-budget');
+		await refreshRecordLockHomesCache('refresh-budget');
+		assert.strictEqual(reads, 2);
+		await settle(600);
+		assert.strictEqual(cachedActiveGeneration('refresh-budget'), 7, 'recovered once storage came back');
+		forgetRecordLockHomesCache('refresh-budget');
+	});
+
+	it('a read from a torn-down lifetime cannot install into, or clear, its replacement', async () => {
+		let release;
+		const slow = new Promise((resolve) => (release = resolve));
+		setRecordLockHomesRowReader(() => slow);
+		const old = refreshRecordLockHomesCache('refresh-lifetime');
+		forgetRecordLockHomesCache('refresh-lifetime');
+		setRecordLockHomesRowReader(async () => generation(2));
+		await refreshRecordLockHomesCache('refresh-lifetime');
+		release(generation(1));
+		await old;
+		assert.strictEqual(cachedActiveGeneration('refresh-lifetime'), 2, 'the old lifetime installed nothing');
+		let reject;
+		const failing = new Promise((_, r) => (reject = r));
+		setRecordLockHomesRowReader(() => failing);
+		const oldFailure = refreshRecordLockHomesCache('refresh-lifetime');
+		forgetRecordLockHomesCache('refresh-lifetime');
+		setRecordLockHomesRowReader(async () => generation(3));
+		await refreshRecordLockHomesCache('refresh-lifetime');
+		reject(new Error('late failure'));
+		await oldFailure;
+		assert.strictEqual(cachedActiveGeneration('refresh-lifetime'), 3, 'the old lifetime cleared nothing');
+		forgetRecordLockHomesCache('refresh-lifetime');
 	});
 });

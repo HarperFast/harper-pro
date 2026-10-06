@@ -33,6 +33,7 @@ import {
 	handleRelease,
 	handleRevokeAck,
 	handleRevokeRequest,
+	outboundNow,
 	relayTimeoutFor,
 	releaseOnOwnerRelay,
 	setSessionHolderReader,
@@ -451,7 +452,7 @@ describe('forwarding an outbound lock operation over the worker holding the sess
 		const posted = [];
 		return { threadId, posted, postMessage: (message) => posted.push(message) };
 	}
-	const soon = () => Date.now() + 5_000;
+	const soon = () => outboundNow() + 5_000;
 
 	afterEach(() => setSessionHolderReader(() => undefined));
 
@@ -500,7 +501,7 @@ describe('forwarding an outbound lock operation over the worker holding the sess
 		const requester = fakePort(1);
 		const holder = fakePort(2);
 		setSessionHolderReader(() => holder);
-		const expired = Date.now() - 1;
+		const expired = outboundNow() - 1;
 		handleOutboundRequestOnMain(
 			{ requestId: 3, nodeName: 'peer', database: 'fwd', operation, deadlineAt: expired },
 			requester
@@ -561,7 +562,7 @@ describe('forwarding an outbound lock operation over the worker holding the sess
 		assert.strictEqual(unposted, undefined, 'a post that throws falls back too');
 		// A grant that lands after the deadline but inside the slack still reaches the caller, which is
 		// what lets core hand an unclaimed grant back instead of stranding it on the home.
-		const late = forwardOverSessionHolder('peer', 'fwd', operation, Date.now() - 1, post);
+		const late = forwardOverSessionHolder('peer', 'fwd', operation, outboundNow() - 1, post);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		handleOutboundReply({ requestId: toMain.posted[3].requestId, reply: { granted: true } });
 		assert.deepStrictEqual((await late).reply, { granted: true });

@@ -545,6 +545,7 @@ suite(
 				`no control entry was relayed to multi's coordinating worker: ${JSON.stringify(after)}`
 			);
 			assert.equal(after.droppedOffOwner, 0, `releases were dropped off the owner: ${JSON.stringify(after)}`);
+			assert.equal(after.controlEntryRelayDrops, 0, `releases could not be relayed: ${JSON.stringify(after)}`);
 			assert.ok(after.outbound, 'the owner reports how its lock operations reached the peers');
 			assert.equal(
 				after.outbound.fresh,

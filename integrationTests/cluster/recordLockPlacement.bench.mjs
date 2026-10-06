@@ -204,8 +204,9 @@ async function runArm(suiteName, arm, rep) {
 		const expected = warmTotal + WRITER_NODES * WRITERS_PER_NODE * PUTS_PER_WRITER;
 		const cpuBefore = await Promise.all(pids.map((pid) => threadCpu(pid)));
 		const loadStarted = performance.now();
-		// One lifecycle for the writers and the convergence wait: a writer that fails aborts the wait, and
-		// the wait's deadline aborts a writer whose response never closes.
+		// One lifecycle for the writers and the convergence wait: a writer failure aborts the wait and
+		// every count probe, a failed wait aborts the writers, and a response that never closes after
+		// its rows are visible is abandoned on a bound.
 		const load = new AbortController();
 		let writerFailure;
 		const writers = Promise.all(
@@ -221,17 +222,22 @@ async function runArm(suiteName, arm, rep) {
 					)
 				).then(() => performance.now() - loadStarted)
 			)
-		).catch((error) => {
-			writerFailure = error;
-			load.abort(error);
-			throw error;
-		});
+		).then(
+			(elapsed) => ({ elapsed }),
+			(error) => {
+				writerFailure = error;
+				load.abort(error);
+				return { error };
+			}
+		);
 		const convergeMs = Array.from({ length: NODES }, () => undefined);
 		try {
 			await waitForCondition(
 				async (signal) => {
 					if (writerFailure) throw writerFailure;
-					const counts = await Promise.all(nodes.map((node) => recordCount(node, signal)));
+					const counts = await Promise.all(
+						nodes.map((node) => recordCount(node, AbortSignal.any([signal, load.signal])))
+					);
 					counts.forEach((count, i) => {
 						if (count >= expected && convergeMs[i] === undefined) convergeMs[i] = performance.now() - loadStarted;
 					});
@@ -239,10 +245,17 @@ async function runArm(suiteName, arm, rep) {
 				},
 				{ timeoutMs: CONVERGE_TIMEOUT_MS, pollMs: 500, description: `every node to hold ${expected} rows` }
 			);
-		} finally {
-			setTimeout(() => load.abort(new Error('writer response still open after convergence')), 30_000).unref();
+		} catch (error) {
+			load.abort(error);
+			throw error;
 		}
-		const writeMs = await writers;
+		const responseBound = setTimeout(
+			() => load.abort(new Error('writer response still open after convergence')),
+			30_000
+		);
+		const outcome = await writers.finally(() => clearTimeout(responseBound));
+		if (outcome.error) throw outcome.error;
+		const writeMs = outcome.elapsed;
 		const cpuAfter = await Promise.all(pids.map((pid) => threadCpu(pid)));
 		const lockStatuses = await Promise.all(nodes.map((node) => sendOperation(node, { operation: 'cluster_status' })));
 		return {

@@ -151,10 +151,16 @@ export interface OutboundOperationStats {
 	fresh: number;
 }
 const outboundStats = new Map<string, OutboundOperationStats>();
-function countOutbound(database: string, route: keyof OutboundOperationStats): void {
+/** Taken before any await, so a call that outlives its database's teardown updates an orphaned bucket
+ * rather than re-creating the map entry teardown removed. */
+function outboundBucket(database: string): OutboundOperationStats {
 	let stats = outboundStats.get(database);
 	if (!stats) outboundStats.set(database, (stats = { session: 0, forwarded: 0, fresh: 0 }));
-	stats[route]++;
+	return stats;
+}
+/** Process-wide monotonic milliseconds: the one clock every thread's hop timers and deadlines share. */
+export function outboundNow(): number {
+	return Number(process.hrtime.bigint() / 1_000_000n);
 }
 export function outboundOperationStats(database: string): OutboundOperationStats | undefined {
 	return outboundStats.get(database);
@@ -186,36 +192,34 @@ function liveSessionTo(nodeName: string, database: string): any {
 	return undefined;
 }
 
-/**
- * Send a lock operation to `nodeName` over a live subscription session for the database: this
- * worker's own, else the sibling worker's that holds one (harper-pro#977). Only when no worker has
- * one does `sendOperationToNode` open a connection for the call. An answer from a sibling, error
- * included, is the operation's outcome: it is never retried over a fresh connection.
- */
+/** A sibling's answer, error included, is the operation's outcome — never retried over a fresh connection. */
 export async function sendRecordLockOperation(
 	nodeName: string,
 	database: string,
 	operation: LockOperation,
 	timeoutMs?: number
 ): Promise<any> {
-	const bound = timeoutMs ?? outboundTimeoutFor(operation.operation);
+	const bucket = outboundBucket(database);
+	const deadlineAt = outboundNow() + (timeoutMs ?? outboundTimeoutFor(operation.operation));
 	const session = liveSessionTo(nodeName, database);
 	if (session) {
-		countOutbound(database, 'session');
-		return session.sendOperation({ ...operation }, bound);
+		bucket.session++;
+		return session.sendOperation({ ...operation }, deadlineAt - outboundNow());
 	}
 	if (parentPort) {
-		const forwarded = await forwardOverSessionHolder(nodeName, database, operation, Date.now() + bound);
+		const forwarded = await forwardOverSessionHolder(nodeName, database, operation, deadlineAt);
 		if (forwarded) {
-			countOutbound(database, 'forwarded');
+			bucket.forwarded++;
 			if (forwarded.error !== undefined) throw new Error(forwarded.error);
 			return forwarded.reply;
 		}
 	}
+	const remaining = deadlineAt - outboundNow();
+	if (remaining <= 0) throw new Error(`${operation.operation} to ${nodeName} expired before a connection was opened`);
 	const node = (server.nodes ?? []).find((candidate: any) => candidate?.name === nodeName);
 	if (!node?.url) throw new Error(`no connection or hdb_nodes row for ${nodeName}`);
-	countOutbound(database, 'fresh');
-	return sendOperationToNode(node, { ...operation }, { timeoutMs: bound });
+	bucket.fresh++;
+	return sendOperationToNode(node, { ...operation }, { timeoutMs: remaining });
 }
 
 // ---- harper-pro#977: forward an outbound lock operation to the worker holding the session --------
@@ -230,8 +234,7 @@ interface OutboundAnswer {
 }
 let nextOutboundId = 1;
 const pendingOutbound = new Map<number, (answer: OutboundAnswer) => void>();
-/** Main thread: the requester and its own id behind each forwarded hop. Main mints the hop id, since
- * two requesters' ids collide here. */
+/** Main thread, keyed by a hop id main mints (requesters' ids collide here). */
 const outboundHops = new Map<
 	number,
 	{ worker: any; holderThreadId: number; requestId: number; timer: NodeJS.Timeout }
@@ -242,10 +245,10 @@ export function setSessionHolderReader(reader: (nodeName: string, database: stri
 }
 
 /**
- * One absolute deadline (`deadlineAt`, wall-clock ms) travels requester → main → holder, so no hop
- * grants itself a fresh budget after an earlier one has already given up: main and the holder refuse
- * work that is already expired, and the requester outwaits every hop by a slack so an answer that
- * made the deadline is never dropped on the way back.
+ * One deadline (`deadlineAt`, `outboundNow()` ms — monotonic, so a wall-clock step cannot reopen an
+ * expired request) travels requester → main → holder: no hop grants itself a fresh budget after an
+ * earlier one gave up, every hop refuses expired work, and the requester outwaits the hops by a slack
+ * so an answer that made the deadline is never dropped on the way back.
  */
 function awaitOutbound(requestId: number, deadlineAt: number): Promise<OutboundAnswer> {
 	return new Promise((resolve) => {
@@ -254,7 +257,7 @@ function awaitOutbound(requestId: number, deadlineAt: number): Promise<OutboundA
 				pendingOutbound.delete(requestId);
 				resolve({ error: 'the forwarded record lock operation was not answered before its deadline' });
 			},
-			Math.max(0, deadlineAt - Date.now()) + RELAY_SLACK_MS * 2
+			Math.max(0, deadlineAt - outboundNow()) + RELAY_SLACK_MS * 2
 		).unref();
 		pendingOutbound.set(requestId, (answer) => {
 			clearTimeout(timer);
@@ -298,13 +301,16 @@ export function handleOutboundReply(message: any): void {
 
 export function handleOutboundRequestOnHolder(message: any, replyTo: any = parentPort): void {
 	const { requestId, nodeName, database, operation, deadlineAt } = message;
-	const remaining = deadlineAt - Date.now();
-	if (!(remaining > 0))
+	if (!(deadlineAt - outboundNow() > 0))
 		return answerOutbound(replyTo, requestId, { error: 'the record lock operation expired before it was sent' });
 	const session = liveSessionTo(nodeName, database);
 	if (!session) return answerOutbound(replyTo, requestId, { noSession: true });
 	Promise.resolve()
-		.then(() => session.sendOperation({ ...operation }, remaining))
+		.then(() => {
+			const remaining = deadlineAt - outboundNow();
+			if (remaining <= 0) throw new Error('the record lock operation expired before it was sent');
+			return session.sendOperation({ ...operation }, remaining);
+		})
 		.then(
 			(reply) => answerOutbound(replyTo, requestId, { reply }),
 			(error) => answerOutbound(replyTo, requestId, { error: String(error?.message ?? error) })
@@ -321,7 +327,7 @@ function settleHop(hopId: number, answer: OutboundAnswer): void {
 
 export function handleOutboundRequestOnMain(message: any, worker: any): void {
 	const { requestId, nodeName, database, operation, deadlineAt } = message;
-	if (typeof deadlineAt !== 'number' || !(deadlineAt > Date.now()))
+	if (typeof deadlineAt !== 'number' || !(deadlineAt > outboundNow()))
 		return answerOutbound(worker, requestId, { error: 'the record lock operation expired before it was forwarded' });
 	let holder: any;
 	try {
@@ -333,7 +339,7 @@ export function handleOutboundRequestOnMain(message: any, worker: any): void {
 	const hopId = nextOutboundId++;
 	const timer = setTimeout(
 		() => settleHop(hopId, { error: `the worker holding the session to ${nodeName} did not answer` }),
-		deadlineAt - Date.now() + RELAY_SLACK_MS
+		deadlineAt - outboundNow() + RELAY_SLACK_MS
 	).unref();
 	outboundHops.set(hopId, { worker, holderThreadId: holder.threadId, requestId, timer });
 	try {
@@ -352,7 +358,6 @@ export function handleOutboundReplyOnMain(message: any): void {
 	settleHop(message?.requestId, answer);
 }
 
-/** Main: a holder that exits mid-hop can never answer; the requester falls back to its own connection. */
 export function settleHopsOfExitedHolder(threadId: number): void {
 	for (const [hopId, hop] of outboundHops) if (hop.holderThreadId === threadId) settleHop(hopId, { noSession: true });
 }

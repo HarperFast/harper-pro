@@ -394,17 +394,23 @@ async function grantedOn(node) {
  * node's own and the classification stays outside the timed region. */
 async function lockEachClassified(node, ids, options) {
 	if (THREADS === 1) return call(node, 'BenchLock/', { ...options, ids, classifyHome: true });
+	// One warm-up key, delegated before the first baseline so its own grant never lands inside a
+	// measured interval; the fixture re-locks it untimed ahead of every sample.
+	const warmupId = `warm-${ids[0]}`;
+	await call(node, 'BenchLock/', { ids: [warmupId] });
 	const acquireMs = [];
 	const releaseMs = [];
+	const atMs = [];
 	const homeLocal = [];
 	for (const id of ids) {
 		const before = await grantedOn(node);
-		const one = await call(node, 'BenchLock/', { ...options, ids: [id], warmupId: `warm-${id}` });
+		const one = await call(node, 'BenchLock/', { ...options, ids: [id], warmupId });
 		homeLocal.push((await grantedOn(node)) > before);
 		acquireMs.push(one.acquireMs[0]);
 		releaseMs.push(one.releaseMs[0]);
+		atMs.push(one.atMs[0]);
 	}
-	return { acquireMs, releaseMs, homeLocal };
+	return { acquireMs, releaseMs, atMs, homeLocal };
 }
 
 async function probeKeys(node, prefix, wanted, options) {

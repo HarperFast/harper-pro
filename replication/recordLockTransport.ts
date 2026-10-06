@@ -69,6 +69,7 @@ import {
 import { isReplicationWorker } from './replicationWorkers.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { createBackoff, type Backoff } from './backoff.ts';
 import {
 	currentRow,
 	onRecordLockHomesChanged,
@@ -226,7 +227,7 @@ function routeBarrierAppliedFromMain(message: any): void {
 }
 
 const CONTROL_ENTRY_MESSAGE = 'record-lock-control-entry';
-/** Per database on the coordinating thread: peer control entries that arrived over the mesh and were applied. */
+/** Per database on the coordinating thread: relayed peer control entries accepted for delivery (not whether one matched a live grant). */
 const relayedControlEntries = new Map<string, number>();
 /** Per database on the applying thread: entries that could not be sent (owner unknown here, port gone). */
 const controlEntryRelayDrops = new Map<string, number>();
@@ -431,14 +432,20 @@ export function currentHomesDigest(database: string): string | undefined {
 }
 
 /**
- * Per database, the number of the latest refresh started: a read that resolves after a newer refresh
- * began installs nothing, so a slow or retried read cannot put back a generation a later
- * stage/activate retracted. Also what a retry checks before trying again.
+ * Per database lifetime: a token per refresh started — a read that resolves after a newer refresh
+ * began installs nothing, and a token never repeats across teardown and re-registration — and the
+ * retry budget a failed read spends (harper-pro#853: the startup refresh had no later trigger, so one
+ * transient storage error left `homeMap()` undefined until an operator re-staged). Any failed refresh
+ * arms a retry while budget remains; a successful one restores it.
  */
-const refreshAttempts = new Map<string, number>();
-const REFRESH_RETRY_MS = (process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS ?? '250,1000,4000')
-	.split(',')
-	.map(Number);
+interface RefreshState {
+	token: object;
+	backoff: Backoff;
+	timer?: NodeJS.Timeout;
+}
+const refreshState = new Map<string, RefreshState>();
+const REFRESH_RETRY_INITIAL_MS = Number(process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS) || 250;
+const REFRESH_RETRY_ATTEMPTS = 3;
 let readHomesRow: (database: string) => Promise<RecordLockHomesRow | undefined> = currentRow;
 /** Test seam: the row reader `refreshCache` uses. Returns the previous reader. */
 export function setRecordLockHomesRowReader(reader: typeof readHomesRow): typeof readHomesRow {
@@ -446,38 +453,54 @@ export function setRecordLockHomesRowReader(reader: typeof readHomesRow): typeof
 	readHomesRow = reader;
 	return previous;
 }
-export function refreshRecordLockHomesCache(database: string, retries = 0): Promise<void> {
-	return refreshCache(database, retries);
+export function refreshRecordLockHomesCache(database: string): Promise<void> {
+	return refreshCache(database);
 }
-/** The active generation this thread has cached, or undefined (test and status reads only). */
 export function cachedActiveGeneration(database: string): number | undefined {
 	return activeCache.get(database)?.generation;
 }
+export function forgetRecordLockHomesCache(database: string): void {
+	const state = refreshState.get(database);
+	if (state) clearTimeout(state.timer);
+	refreshState.delete(database);
+	activeCache.delete(database);
+}
 
-async function refreshCache(database: string, retriesLeft = 0): Promise<void> {
-	const attempt = (refreshAttempts.get(database) ?? 0) + 1;
-	refreshAttempts.set(database, attempt);
+async function refreshCache(database: string): Promise<void> {
+	let state = refreshState.get(database);
+	if (!state)
+		refreshState.set(
+			database,
+			(state = {
+				token: {},
+				backoff: createBackoff({
+					initialMs: REFRESH_RETRY_INITIAL_MS,
+					maxMs: REFRESH_RETRY_INITIAL_MS * 16,
+					maxAttempts: REFRESH_RETRY_ATTEMPTS,
+				}),
+			})
+		);
+	const token = (state.token = {});
+	clearTimeout(state.timer);
+	state.timer = undefined;
+	const current = () => refreshState.get(database)?.token === token;
 	const before = activeCache.get(database);
-	let failed = false;
 	try {
 		const row = await readHomesRow(database);
-		if (refreshAttempts.get(database) !== attempt) return;
+		if (!current()) return;
 		activeCache.set(database, row?.active);
+		state.backoff.reset();
 	} catch (error) {
-		if (refreshAttempts.get(database) !== attempt) return;
+		if (!current()) return;
 		// A storage error must not leave a stale (possibly superseded) generation cached; undefined is
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
-		failed = true;
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
-	}
-	if (failed && retriesLeft > 0) {
-		// The startup refresh has no later trigger (harper-pro#853): without this a transient storage
-		// error at boot leaves `homeMap()` undefined until an operator re-stages.
-		const delay = REFRESH_RETRY_MS[REFRESH_RETRY_MS.length - retriesLeft];
-		setTimeout(() => {
-			if (refreshAttempts.get(database) === attempt) refreshCache(database, retriesLeft - 1);
-		}, delay).unref();
+		const delay = state.backoff.nextDelay();
+		if (delay !== undefined)
+			state.timer = setTimeout(() => {
+				if (current()) refreshCache(database);
+			}, delay).unref();
 	}
 	const after = activeCache.get(database);
 	// Core's coordinator seeds its restart-quarantine incarination tracking (`#coordinatingIncarnation`)
@@ -877,7 +900,7 @@ export function ensureRecordLockTransport(database: string): void {
 	registerClusterLockTransport(database, transport);
 	if (!CLUSTER_RECORD_LOCKS_ENABLED) return;
 	listenForApplyFailures(database);
-	refreshCache(database, REFRESH_RETRY_MS.length);
+	refreshCache(database);
 	if (parentPort) {
 		parentPort.postMessage({ type: 'record-lock-owner-request', database });
 		// harper-pro#852: learn which thread owns it, so a relayed acquire can reach the owner. A worker
@@ -904,14 +927,13 @@ function recreateRecordLockTransport(database: string): void {
 
 /** The database is no longer replicated here. Cluster scope keeps failing closed (core's rule). */
 export function releaseRecordLockTransport(database: string): void {
+	forgetRecordLockHomesCache(database);
 	if (!transports.delete(database)) return;
 	unregisterClusterLockTransport(database);
 	closeFreshnessBarrier(database);
 	stopListeningForApplyFailures(database);
 	forgetPoisonState(database);
 	ownedDatabases.delete(database);
-	activeCache.delete(database);
-	refreshAttempts.delete(database);
 	relayedControlEntries.delete(database);
 	controlEntryRelayDrops.delete(database);
 	forgetOutboundOperationStats(database);
@@ -1393,10 +1415,10 @@ export interface RecordLockClusterStatus extends Partial<RecordLockDatabaseStats
 
 /**
  * `cluster_status`'s `recordLocks` section: each database's owner with its coordinator counters, and
- * `droppedOffOwner` summed over EVERY http worker — that counter describes entries applied on a
- * non-owner, so reading it from the owner alone would hide exactly the misrouting it reports. Every
- * worker is asked concurrently under one bound so an unresponsive one cannot hang the operation.
- * Main thread only.
+ * the per-thread counters (`droppedOffOwner`, `controlEntryRelayDrops`, `relayedAdmissions`) summed
+ * over EVERY http worker — each is recorded on the thread that applied or asked, so the owner alone
+ * would hide exactly what it reports. Every worker is asked concurrently under one bound so an
+ * unresponsive one cannot hang the operation. Main thread only.
  */
 export async function collectRecordLockStatus(
 	liveWorkers: any[] = httpWorkers()
