@@ -374,12 +374,6 @@ function logDelta(before, after, acquisitions) {
 	});
 }
 
-/**
- * Lock fresh ids from `node` until every side of the ring in `wanted` has one, keeping the answer:
- * the probe IS that key's first lock, so a later batch on the same id measures only repeats.
- * Candidates that land on a side already filled are simply left with a delegation of their own,
- * which costs nothing.
- */
 /** The owner's `granted` gauge; the fixture's in-process gauge is the serving worker's, not the owner's. */
 async function grantedOn(node) {
 	const status = await sendOperation(node, { operation: 'cluster_status' });
@@ -410,6 +404,12 @@ async function lockEachClassified(node, ids, options) {
 	return { acquireMs, releaseMs, atMs, homeLocal };
 }
 
+/**
+ * Lock fresh ids from `node` until every side of the ring in `wanted` has one, keeping the answer:
+ * the probe IS that key's first lock, so a later batch on the same id measures only repeats.
+ * Candidates that land on a side already filled are simply left with a delegation of their own,
+ * which costs nothing.
+ */
 async function probeKeys(node, prefix, wanted, options) {
 	const found = {};
 	for (let attempt = 0; attempt < 40 && !wanted.every((side) => found[side]); attempt++) {
