@@ -58,15 +58,7 @@ import { getDatabases } from '../core/resources/databases.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, getReplicationSharedStatus, shouldReplicateFromNode } from './knownNodes.ts';
-<<<<<<< HEAD
-=======
-import {
-	RECORD_LOCKS_CAPABILITY_POSITION,
-	RECORD_LOCK_HOMES_AGREEMENT_POSITION,
-	RECORD_LOCK_LEVEL_POSITION,
-} from './sharedStatusSlots.ts';
 import { isReplicationWorker } from './replicationWorkers.ts';
->>>>>>> 932fdb9 (fix: Keep replication off isolated-application workers)
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import {
