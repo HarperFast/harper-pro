@@ -404,7 +404,7 @@ function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 				subscribeToNode
 			);
 			if (target === 'deferred')
-				logger.warn('Deferring replication subscription until a live http worker owns it', url, database);
+				logger.warn('Deferring replication subscription until a live replication worker owns it', url, database);
 		},
 		consume() {
 			selfCatchupOfDatabase.delete(database);
@@ -1482,7 +1482,7 @@ export async function startOnMainThread(options) {
 			} else if (shouldSubscribe) {
 				worker = placeSubscription(databaseName, replicationPool);
 				if (!worker) {
-					logger.warn('No http workers available to subscribe to node', node.name, getNodeURL(node));
+					logger.warn('No replication workers available to subscribe to node', node.name, getNodeURL(node));
 				}
 				dbReplicationWorkers.set(databaseName, {
 					worker,
