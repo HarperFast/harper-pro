@@ -5,11 +5,13 @@ import {
 	ABSENT_PEER_CAPABILITIES,
 	LOCAL_PROTOCOL_VERSION,
 	MINIMUM_PROTOCOL_VERSION,
+	ORIGIN_CURSORS_CAPABILITY,
 	RECORD_LOCKS_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
+	peerSupportsOriginCursors,
 	peerSupportsRecordLocks,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
@@ -29,6 +31,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				subscriptionSetupAck: 0,
 				subscriptionSetupBudgetMs: undefined,
 				recordLocks: 0,
+				originCursors: 0,
 			}
 		);
 	});
@@ -48,6 +51,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 	it('drops keys this build does not know instead of carrying them', () => {
 		const resolved = resolvePeerCapabilities({ subscriptionSetupAck: 1, futureThing: 3, somethingElse: 'x' });
 		assert.deepStrictEqual(Object.keys(resolved).sort(), [
+			'originCursors',
 			'protocolVersion',
 			'recordLocks',
 			'safeCopyAudit',
@@ -156,7 +160,7 @@ describe('resolvePeerCapabilities — subscriptionSetupBudgetMs is a parameter, 
 	});
 
 	it('is not min-clamped against the local advertised budget', () => {
-		const local = buildLocalCapabilities(1000, true);
+		const local = buildLocalCapabilities(1000, true, true);
 		const resolved = resolvePeerCapabilities({ subscriptionSetupBudgetMs: 900_000 });
 		assert.ok(resolved.subscriptionSetupBudgetMs > local.subscriptionSetupBudgetMs);
 		assert.strictEqual(resolved.subscriptionSetupBudgetMs, 900_000);
@@ -214,7 +218,7 @@ describe('subscriptionSetupCapabilityFrom', () => {
 
 describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 	it('advertises exactly the registry keys, frozen', () => {
-		const local = buildLocalCapabilities(90_000, true);
+		const local = buildLocalCapabilities(90_000, true, true);
 		assert.deepStrictEqual(
 			{ ...local },
 			{
@@ -223,14 +227,24 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
+				originCursors: ORIGIN_CURSORS_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
 	});
 
+	it('advertises originCursors only with per-origin transaction logs', () => {
+		assert.strictEqual(buildLocalCapabilities(90_000, true, false).originCursors, 0);
+		assert.strictEqual(peerSupportsOriginCursors(resolvePeerCapabilities(buildLocalCapabilities(1, true, true))), true);
+		assert.strictEqual(
+			peerSupportsOriginCursors(resolvePeerCapabilities(buildLocalCapabilities(1, true, false))),
+			false
+		);
+	});
+
 	it('round-trips through this node into the pre-registry setup behavior', () => {
 		// What a current peer advertises must still enable acknowledgement and carry its budget.
-		const resolved = resolvePeerCapabilities(buildLocalCapabilities(90_000, true));
+		const resolved = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
 		assert.strictEqual(resolved.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY);
 		assert.strictEqual(resolved.subscriptionSetupBudgetMs, 90_000);
 		assert.strictEqual(resolved.protocolVersion, LOCAL_PROTOCOL_VERSION);
@@ -239,7 +253,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 	it('keeps the NODE_NAME frame a five-element array whose element 4 is the bag', () => {
 		// Guards the outer wire shape only. Backward compatibility is proved by the legacy-shape resolver
 		// cases above — a golden of the NEW bytes cannot show that an old reader tolerates them.
-		const frame = encode([NODE_NAME, 'this-node', 'data', [], buildLocalCapabilities(90_000, true)]);
+		const frame = encode([NODE_NAME, 'this-node', 'data', [], buildLocalCapabilities(90_000, true, true)]);
 		assert.strictEqual(frame[0] > 127, true, 'first byte must mark this a command frame');
 		const decoded = decode(frame);
 		assert.strictEqual(decoded.length, 5);
@@ -252,6 +266,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
+				originCursors: ORIGIN_CURSORS_CAPABILITY,
 			}
 		);
 	});
@@ -275,7 +290,7 @@ describe('resolvePeerCapabilities — recordLocks is a level that fails closed w
 			peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: RECORD_LOCKS_CAPABILITY })),
 			true
 		);
-		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities(buildLocalCapabilities(1, true))), true);
+		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities(buildLocalCapabilities(1, true, true))), true);
 		// Level 1 was Ricart–Agrawala. A peer still advertising it is a different arbiter, not a slower
 		// one, so it is not a lock participant at all — versions are mutually exclusive, not ordered.
 		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities({ recordLocks: 1 })), false);
@@ -295,8 +310,11 @@ describe('resolvePeerCapabilities — recordLocks is a level that fails closed w
 	});
 
 	it('is advertised only by a node that has enabled cluster record locks', () => {
-		assert.strictEqual(buildLocalCapabilities(90_000, false).recordLocks, 0);
-		assert.strictEqual(peerSupportsRecordLocks(resolvePeerCapabilities(buildLocalCapabilities(90_000, false))), false);
+		assert.strictEqual(buildLocalCapabilities(90_000, false, true).recordLocks, 0);
+		assert.strictEqual(
+			peerSupportsRecordLocks(resolvePeerCapabilities(buildLocalCapabilities(90_000, false, true))),
+			false
+		);
 	});
 
 	it('does not move the protocol version: an additive key is not a shape change', () => {
@@ -314,7 +332,7 @@ describe('samePeerCapabilities', () => {
 
 	it('reports a change when the peer upgrades or downgrades', () => {
 		const legacy = resolvePeerCapabilities(undefined);
-		const current = resolvePeerCapabilities(buildLocalCapabilities(90_000, true));
+		const current = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
 		assert.strictEqual(samePeerCapabilities(legacy, current), false);
 		assert.strictEqual(samePeerCapabilities(current, legacy), false);
 		// A #813-era peer differs from a current one in recordLocks alone.
@@ -328,6 +346,25 @@ describe('samePeerCapabilities', () => {
 
 	it('treats "never posted" as a change', () => {
 		assert.strictEqual(samePeerCapabilities(undefined, ABSENT_PEER_CAPABILITIES), false);
+	});
+
+	it('reports a change in originCursors alone', () => {
+		const withCursors = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
+		const withoutCursors = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, false));
+		assert.strictEqual(samePeerCapabilities(withCursors, withoutCursors), false);
+	});
+});
+
+describe("resolvePeerCapabilities — originCursors is a level, absent means today's resume", () => {
+	it('resolves absent, malformed and pre-#989 bags to 0', () => {
+		for (const bag of [undefined, {}, { originCursors: 'yes' }, { originCursors: NaN }, { recordLocks: 4 }]) {
+			assert.strictEqual(peerSupportsOriginCursors(resolvePeerCapabilities(bag)), false, inspect(bag));
+		}
+	});
+
+	it('clamps a newer level to the one this build implements', () => {
+		assert.strictEqual(resolvePeerCapabilities({ originCursors: 7 }).originCursors, ORIGIN_CURSORS_CAPABILITY);
+		assert.strictEqual(peerSupportsOriginCursors(resolvePeerCapabilities({ originCursors: '1' })), true);
 	});
 });
 
