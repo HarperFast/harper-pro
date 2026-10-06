@@ -58,6 +58,11 @@ import { getDatabases } from '../core/resources/databases.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, getReplicationSharedStatus, shouldReplicateFromNode } from './knownNodes.ts';
+import {
+	RECORD_LOCKS_CAPABILITY_POSITION,
+	RECORD_LOCK_HOMES_AGREEMENT_POSITION,
+	RECORD_LOCK_LEVEL_POSITION,
+} from './sharedStatusSlots.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import {
@@ -93,16 +98,11 @@ import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 import './recordLockApply.ts';
 
-// Slots 29..31 of the 32-slot per-(database, peer) status buffer (`getReplicationSharedStatus`);
-// 0..28 are taken (13..28 by the R4 fire-classification counters, harper-pro#431). 29 is the
-// capability support flag; 30 is the home-map digest agreement tri-state; 31 is the exact
-// advertised level (below). The buffer is full — grow `REPLICATION_SHARED_STATUS_SLOTS` for the next.
-export const RECORD_LOCKS_CAPABILITY_POSITION = 29;
+export { RECORD_LOCKS_CAPABILITY_POSITION, RECORD_LOCK_HOMES_AGREEMENT_POSITION, RECORD_LOCK_LEVEL_POSITION };
 export const LOCK_CAPABILITY_UNKNOWN = 0;
 export const LOCK_CAPABILITY_UNSUPPORTED = 1;
 export const LOCK_CAPABILITY_SUPPORTED = 2;
 
-export const RECORD_LOCK_HOMES_AGREEMENT_POSITION = 30;
 export const HOMES_AGREEMENT_UNKNOWN = 0;
 export const HOMES_AGREEMENT_MISMATCH = 1;
 export const HOMES_AGREEMENT_MATCH = 2;
@@ -130,9 +130,7 @@ export function readPeerHomesAgreement(status: Float64Array): number {
 	return value === HOMES_AGREEMENT_MATCH || value === HOMES_AGREEMENT_MISMATCH ? value : HOMES_AGREEMENT_UNKNOWN;
 }
 
-/** Slot 31: the peer's exact advertised `recordLocks` level, so a refusal can name it. 0 while unknown. */
-export const RECORD_LOCK_LEVEL_POSITION = 31;
-
+/** The peer's exact advertised `recordLocks` level, so a refusal can name it. 0 while unknown. */
 export function recordPeerLockLevel(status: Float64Array, level: number): void {
 	status[RECORD_LOCK_LEVEL_POSITION] = Number.isSafeInteger(level) && level >= 0 ? level : 0;
 }
