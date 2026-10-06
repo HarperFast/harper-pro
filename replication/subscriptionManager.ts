@@ -274,8 +274,11 @@ export function createSubscribeSetupScheduler(deps: {
 				for (let moved = true; moved;) {
 					moved = false;
 					for (const armedAt of sweep.armedAt) {
-						if (Math.abs(armedAt - fireAt) < RECONNECT_STAGGER_MS) {
-							fireAt = armedAt + RECONNECT_STAGGER_MS;
+						const slidTo = armedAt + RECONNECT_STAGGER_MS;
+						// Just below a power of two the sum can round down and stay inside the window, so a slide
+						// that does not advance would repeat forever.
+						if (Math.abs(armedAt - fireAt) < RECONNECT_STAGGER_MS && slidTo > fireAt) {
+							fireAt = slidTo;
 							moved = true;
 						}
 					}

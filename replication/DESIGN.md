@@ -205,6 +205,12 @@ decorrelated schedule.** Pacing alone is not enough; the storm surface below nee
 | worker readiness re-attempt (`subscriptionManager.ts`)                          | floor `NODE_SUBSCRIBE_DELAY`, ceiling `2 × NODE_SUBSCRIBE_DELAY` → 30 s, one armed re-attempt at a time                                                                                                                                                                            | components loaded                                                         |
 | `sendBlobs` in-place 503 re-read (`BLOB_SEND_RETRY_BACKOFF`)                    | 250 ms → 2 s, 4 attempts, **no jitter**: the retried read is this node's own blob, so there is no fleet to decorrelate, and full jitter would halve the expected time its PENDING placeholder has to heal before the 503 is forwarded                                              | n/a (per send)                                                            |
 
+**A sweep slide counts only if it advances the fire time.** Fire times are `performance.now()` plus an
+integer delay, so just below a power of two `armedAt + RECONNECT_STAGGER_MS` can round back inside the
+window, and a slide that re-assigns that same time never terminates — on the main thread. Requiring strict
+advance through the sweep's finite set of armed times bounds the slide at one move per armed setup
+(`subscribeSetupScheduler.test.mjs` pins the rounding case).
+
 **The subscription-setup scheduler is the one with dedup.** `onDatabase` used to turn every qualifying
 node update straight into a retained (not unref'd) 200 ms `setTimeout` plus a `subscribe-to-node`
 message, so whatever re-drove `onNodeUpdate` amplified 1:1 into main-thread timers, worker-side

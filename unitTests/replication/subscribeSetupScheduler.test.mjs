@@ -51,6 +51,15 @@ function createManualTimers() {
 	};
 }
 
+// A slide that never terminates would hang the run instead of failing it.
+class PassLimitedArray extends Array {
+	passes = 0;
+	[Symbol.iterator]() {
+		if (++this.passes > 10) throw new Error('sweep slide did not terminate');
+		return super[Symbol.iterator]();
+	}
+}
+
 let timers;
 
 function makeScheduler(random) {
@@ -183,6 +192,23 @@ describe('subscription-setup scheduler (harper-pro#327)', () => {
 	it('slides a sweep setup past one armed within the stagger window', () => {
 		const { scheduler } = makeScheduler(() => 0.6);
 		assert.equal(scheduler.schedule(URL_A, 'data', NODES, { armedAt: [300] }), 350);
+	});
+
+	it('terminates a slide whose armed time plus the stagger rounds down across a power of two', () => {
+		// Below 2^13 by less than the stagger: armedAt + 50 lands in the next binade and loses its last bit.
+		const armedAt = 8150 + 2 ** -40;
+		assert.ok(armedAt + 50 - armedAt < 50);
+		const { scheduler, dispatches } = makeScheduler(() => 0);
+		timers.tick(7950);
+		const sweep = { armedAt: PassLimitedArray.of(armedAt) };
+		assert.equal(scheduler.schedule(URL_A, 'system', NODES, sweep), 250);
+		assert.deepEqual([...sweep.armedAt], [armedAt, 8200]);
+		assert.equal(scheduler.pendingCount(), 1);
+		timers.tick(MAX_DELAY);
+		assert.deepEqual(
+			dispatches.map((d) => [d.database, d.at]),
+			[['system', 8200]]
+		);
 	});
 
 	it('preserves sweep spacing when independent jitter draws would collide', () => {
