@@ -89,6 +89,30 @@ export class BenchWrite extends Resource {
 	}
 }
 
+/** `count` unlocked puts in one transaction per `batch` records, for a writer that outruns a single apply thread. */
+export class BenchWriteBatched extends Resource {
+	async post(data) {
+		const started = performance.now();
+		const batch = data.batch ?? 50;
+		for (let i = 0; i < data.count; i += batch) {
+			const context = {};
+			const end = Math.min(i + batch, data.count);
+			await transaction(context, () => {
+				for (let j = i; j < end; j++) tables.Counter.put({ id: `${data.prefix}-${j}`, n: j }, context);
+			});
+		}
+		return { elapsedMs: performance.now() - started };
+	}
+}
+
+/** Exact row count of Counter on this node: the convergence observable for the placement bench. */
+export class BenchCount extends Resource {
+	async get() {
+		const { recordCount } = await tables.Counter.getRecordCount({ exactCount: true });
+		return { recordCount };
+	}
+}
+
 /** What a cluster-scoped lock() answers here: the observable for which enablement arm a node is in. */
 export class LockProbe extends Resource {
 	async post(data) {

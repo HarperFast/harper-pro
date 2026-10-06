@@ -37,6 +37,9 @@ import {
 	recordPeerHomesAgreement,
 	recordPeerLockCapability,
 	releaseRecordLockOwner,
+	handleRelayedControlEntry,
+	relayLockControlEntry,
+	relayedControlEntryCount,
 } from '#src/replication/recordLockTransport';
 import { DELEGATE_OPERATION, RECALL_OPERATION } from '#src/replication/recordLockRpc';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
@@ -768,5 +771,62 @@ describe('createRecordLockTransport().establishLockFreshness', () => {
 			{ table: 'Counter', dependencies: null, deadlineMs: 300 },
 		]);
 		assert.strictEqual(homeMapReader(), undefined, 'the barrier reads the map the transport itself would answer');
+	});
+});
+
+describe('relaying a peer control entry to the coordinating worker (harper-pro#977)', () => {
+	const entry = { type: 'lockRelease', key: 'k', requester: 'alpha', token: [1, 1, 1], dependencies: null };
+	let port;
+	beforeEach(() => {
+		port = { threadId: 9101, posted: [], postMessage: (message) => port.posted.push(message) };
+		globalThis.threads.push(port);
+	});
+	afterEach(() => {
+		globalThis.threads.splice(globalThis.threads.indexOf(port), 1);
+	});
+
+	it('sends the entry, author and position straight to the owner thread over the mesh', () => {
+		const owner = fakeWorker(9101);
+		recordLockOwnerFor('relay-a', [owner]);
+		try {
+			relayLockControlEntry('relay-a', 't', entry, 'alpha', 42);
+			assert.deepStrictEqual(port.posted, [
+				{ type: 'record-lock-control-entry', database: 'relay-a', table: 't', entry, author: 'alpha', position: 42 },
+			]);
+		} finally {
+			releaseRecordLockOwner('relay-a');
+		}
+	});
+
+	it('drops the entry while the owner is unknown or its port is gone, never throws', () => {
+		assert.doesNotThrow(() => relayLockControlEntry('relay-unknown', 't', entry, 'alpha', 1));
+		const owner = fakeWorker(9999);
+		recordLockOwnerFor('relay-gone', [owner]);
+		try {
+			assert.doesNotThrow(() => relayLockControlEntry('relay-gone', 't', entry, 'alpha', 1));
+			assert.strictEqual(port.posted.length, 0);
+		} finally {
+			releaseRecordLockOwner('relay-gone');
+		}
+	});
+
+	it('applies a relayed entry only on the thread that coordinates the database, from a stamped sender', () => {
+		const message = { database: 'relay-recv', table: 't', entry, author: 'alpha', position: 5 };
+		handleRelayedControlEntry(message, port);
+		assert.strictEqual(relayedControlEntryCount('relay-recv'), 0, 'not the owner: dropped');
+		setMainIsWorker(true);
+		try {
+			recordLockOwnerFor('relay-recv', []);
+			handleRelayedControlEntry(message, { threadId: undefined });
+			assert.strictEqual(relayedControlEntryCount('relay-recv'), 0, 'unstamped sender: dropped');
+			handleRelayedControlEntry({ ...message, entry: null }, port);
+			handleRelayedControlEntry({ ...message, author: 7 }, port);
+			assert.strictEqual(relayedControlEntryCount('relay-recv'), 0, 'malformed envelope: dropped');
+			handleRelayedControlEntry(message, port);
+			assert.strictEqual(relayedControlEntryCount('relay-recv'), 1);
+		} finally {
+			releaseRecordLockOwner('relay-recv');
+			setMainIsWorker(false);
+		}
 	});
 });

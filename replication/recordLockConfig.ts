@@ -5,10 +5,11 @@ import * as logger from '../core/utility/logging/harper_logger.js';
 
 /**
  * `replication.recordLocks: true` admits this node to cluster-wide record locks (harper-pro#438). It
- * is an explicit opt-in because enabling it changes subscription placement — every subscription for a
- * database moves to the worker that coordinates the database's locks — which concentrates a
- * single-database cluster's inbound apply work on one worker. Off, nothing about replication changes
- * and a cluster-scoped `lock()` fails closed rather than silently arbitrating on one node.
+ * is an explicit opt-in because it advertises a protocol capability every peer must match exactly and
+ * a cluster-scoped `lock()` then fails closed until an operator activates a home map. It does not
+ * change where replication runs: subscriptions stay round-robin across workers whether the switch is
+ * on or off (harper-pro#977). Off, a cluster-scoped `lock()` fails closed rather than silently
+ * arbitrating on one node.
  *
  * Read from the raw config tree, NOT `env.get`: `env.get` resolves only keys registered in core's
  * `CONFIG_PARAM_MAP` (`knownNodes.ts` notes the same limit for other replication knobs), and this key

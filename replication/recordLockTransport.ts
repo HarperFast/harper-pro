@@ -21,8 +21,8 @@
  *   connections (`recordLockRpc.ts`).
  * - `ownsCoordination()`: whether this worker thread is the one the main thread assigned to the
  *   database. Coordinator state is per thread while the key lock it arbitrates is process-wide, so
- *   exactly one thread may coordinate, and it must be the thread whose sockets apply the database's
- *   inbound entries — `subscriptionManager` places every (peer, database) subscription on the owner.
+ *   exactly one thread may coordinate. It need not be the thread applying the database's inbound
+ *   entries: a peer control entry applied elsewhere is relayed to it (`relayLockControlEntry`).
  *   Ownership is conferred by message rather than derived from `workerIndex` and moves only when the
  *   owner has exited: a live owner still holds delegations and grants.
  *
@@ -40,14 +40,17 @@ import {
 	getWorkerIndex,
 	hasThreadExited,
 	onMessageByType,
+	sendToThread,
 	whenThreadsStarted,
 	workers,
 } from '../core/server/threads/manageThreads.js';
 import {
+	deliverLockControlEntry,
 	fenceRelayedAdmissions,
 	registerClusterLockTransport,
 	unregisterClusterLockTransport,
 	type ClusterLockTransport,
+	type LockControlEntry,
 	type DelegationRecall,
 	type DelegationReply,
 	type DelegationRequest,
@@ -81,10 +84,12 @@ import {
 	clearRelaySessionsForDatabase,
 	failRelayAcquiresForDatabase,
 	onRecordLockOwnershipLost,
+	outboundOperationStats,
 	quiesceOnOwner,
 	releaseOnOwnerRelay,
 	sendRecordLockOperation,
 	setRecordLockOwnershipReaders,
+	type OutboundOperationStats,
 } from './recordLockRpc.ts';
 import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
@@ -218,6 +223,48 @@ function routeBarrierAppliedFromMain(message: any): void {
 	}
 }
 
+const CONTROL_ENTRY_MESSAGE = 'record-lock-control-entry';
+/** Per database on the coordinating thread: control entries that arrived over the mesh and were applied. */
+const relayedControlEntries = new Map<string, number>();
+
+/**
+ * A peer's `lockRelease` entry applied on this thread while another thread coordinates the database
+ * (harper-pro#977: subscriptions are placed round-robin, never on the owner). Core hands it over
+ * through `relayControlEntry`; it goes straight to the owner over the port mesh, the path a relayed
+ * `lock()` admission already takes. Delivery is best-effort by design: the entry is idempotent by
+ * exact token on the owner, so one that is late, reordered or lost — owner unknown or mid-handoff,
+ * port gone — can only delay a re-grant until the grant's own deadline, exactly what an off-owner
+ * drop did before. `author` is the audit-header origin core resolved; the posting thread is trusted
+ * for it on the same basis as the rest of the process: in-process code can already reach the
+ * coordinator directly (`Table.lockCoordinator`), so a thread message confers no authority it lacks.
+ */
+export function relayLockControlEntry(
+	database: string,
+	table: string,
+	entry: LockControlEntry,
+	author: string,
+	position: number | undefined
+): void {
+	const ownerThreadId = ownerThreadByDatabase.get(database);
+	if (ownerThreadId === undefined) return;
+	if (!sendToThread(ownerThreadId, { type: CONTROL_ENTRY_MESSAGE, database, table, entry, author, position }))
+		logger.debug?.(`Could not relay a record lock control entry to the owner worker for ${database}`);
+}
+
+export function handleRelayedControlEntry(message: any, port: any): void {
+	if (typeof message?.database !== 'string' || typeof message.table !== 'string') return;
+	if (typeof message.author !== 'string' || typeof message.entry !== 'object' || message.entry === null) return;
+	// An unstamped sender is not a sibling port; a message that outran an ownership change is for the
+	// thread that used to coordinate, and re-relaying it would only chase the handoff.
+	if (port?.threadId === undefined || !ownsRecordLockCoordination(message.database)) return;
+	relayedControlEntries.set(message.database, (relayedControlEntries.get(message.database) ?? 0) + 1);
+	deliverLockControlEntry(message.database, message.table, message.entry, message.author, message.position);
+}
+onMessageByType(CONTROL_ENTRY_MESSAGE, handleRelayedControlEntry);
+export function relayedControlEntryCount(database: string): number {
+	return relayedControlEntries.get(database) ?? 0;
+}
+
 export interface RecordLockTransportDeps {
 	thisNodeName(): string;
 	/** Any table's auditStore for the database, which is what keys the shared status buffers. */
@@ -335,6 +382,7 @@ export function createRecordLockTransport(
 		releaseOnOwner(db: string, table: string, key: unknown, admissionId: number): void {
 			deps.releaseOnOwner(db, table, key, admissionId);
 		},
+		relayControlEntry: relayLockControlEntry,
 	};
 	return transport;
 }
@@ -832,6 +880,10 @@ export interface RecordLockDatabaseStats {
 	droppedOffOwner: number;
 	/** Admissions this thread obtained from the owner worker for an off-owner `lock()` (harper-pro#852). */
 	relayedAdmissions: number;
+	/** Peer control entries other threads applied and relayed here; counted on the coordinating thread only (harper-pro#977). */
+	relayedControlEntries?: number;
+	/** How this thread's outbound lock operations reached their peer (harper-pro#977). */
+	outbound?: OutboundOperationStats;
 	/** The home map's member set as this thread sees it, or undefined while the map is withheld. */
 	members?: string[];
 	/** Successor-freshness barrier counters, from the coordinating thread only. */
@@ -874,6 +926,8 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 		total.droppedOffOwner += stats.droppedOffOwner;
 		total.relayedAdmissions += stats.relayedAdmissions ?? 0;
 	}
+	total.relayedControlEntries = relayedControlEntries.get(database) ?? 0;
+	total.outbound = outboundOperationStats(database);
 	try {
 		total.members = transports.get(database)?.homeMap(database)?.homes;
 		total.freshness = freshnessBarriers.get(database)?.stats();
@@ -1328,6 +1382,8 @@ export async function collectRecordLockStatus(
 				entry.freshness = stats.freshness;
 				entry.poisoned = stats.poisoned;
 				entry.unprovenMs = stats.unprovenMs;
+				entry.relayedControlEntries = stats.relayedControlEntries;
+				entry.outbound = stats.outbound;
 			}
 			entry.droppedOffOwner = (entry.droppedOffOwner ?? 0) + stats.droppedOffOwner;
 			// Summed over EVERY worker: a relayed admission is minted on the owner but its COUNT lives on

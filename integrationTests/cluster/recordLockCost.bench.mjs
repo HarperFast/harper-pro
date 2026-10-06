@@ -58,6 +58,9 @@ const REACQUISITION_LEASES_MS = process.env.RECORD_LOCK_BENCH_REACQ_LEASES_MS
 const REACQUISITION_CADENCE_MS = Number(process.env.RECORD_LOCK_BENCH_REACQ_CADENCE_MS) || 5_000;
 const REACQUISITION_MAX_RUN_MS = Number(process.env.RECORD_LOCK_BENCH_REACQ_RUN_MS) || 260_000;
 const OUT = process.env.RECORD_LOCK_BENCH_OUT || join(tmpdir(), `record-lock-cost-${Date.now()}.json`);
+/** http workers per node. Above 1, an off-owner lock() relays its admission and the owner's outbound
+ * lock operations are forwarded to the worker holding the session (harper-pro#852, #977). */
+const THREADS = Number(process.env.RECORD_LOCK_BENCH_THREADS) || 1;
 
 const results = {
 	machine: {
@@ -67,6 +70,7 @@ const results = {
 		platform: `${process.platform}-${process.arch}`,
 		node: process.version,
 	},
+	threads: THREADS,
 	ranAt: new Date().toISOString(),
 };
 
@@ -85,7 +89,7 @@ function optionsFor(hostname, replication) {
 		config: {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
-			threads: { count: 1 },
+			threads: { count: THREADS },
 			replication,
 		},
 		// `bootstrapHomeMap` stages and activates back to back, so the drain backstop has to go, as it

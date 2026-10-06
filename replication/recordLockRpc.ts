@@ -3,11 +3,11 @@
  * request/grant/recall between a delegate and a key's home, carried as two registered operations
  * over the replication connections that already exist.
  *
- * Send side. A request goes over the live outbound subscription session to the home when this
- * worker has one — its inbound end on the home is placed on the home's coordinating worker by
- * `subscriptionManager`, so the request lands exactly where the coordinator lives — and otherwise
- * over a fresh operation connection (`sendOperationToNode`), which any of the home's workers may
- * accept.
+ * Send side. A request goes over a live outbound subscription session to the home: this worker's
+ * own when it holds one, otherwise the sibling worker's that does, forwarded through main
+ * (harper-pro#977 — subscriptions are placed round-robin, so the coordinating worker rarely holds
+ * one). Only a topology with no session anywhere opens an operation connection per call
+ * (`sendOperationToNode`), bounded.
  *
  * Receive side. An operation arrives on whichever thread holds the socket. If that thread owns the
  * database's coordination it answers directly; otherwise it relays through the main thread, which
@@ -27,6 +27,8 @@ import { server } from '../core/server/Server.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import {
+	DELEGATION_LEASE_MS,
+	LOCK_LEASE_SKEW_MS,
 	acquireForRelay,
 	deliverDelegationRecall,
 	deliverDelegationRequest,
@@ -137,25 +139,209 @@ export interface BarrierOperation {
 	nonce: number;
 }
 
+type LockOperation = DelegateOperation | RecallOperation | BarrierOperation | TransitionOperation;
+
+export interface OutboundOperationStats {
+	/** Sent over this thread's own live subscription session to the peer. */
+	session: number;
+	/** Forwarded to the sibling worker holding that session (harper-pro#977). */
+	forwarded: number;
+	/** Sent over a connection opened for the call — the directional-topology fallback. */
+	fresh: number;
+}
+const outboundStats = new Map<string, OutboundOperationStats>();
+function countOutbound(database: string, route: keyof OutboundOperationStats): void {
+	let stats = outboundStats.get(database);
+	if (!stats) outboundStats.set(database, (stats = { session: 0, forwarded: 0, fresh: 0 }));
+	stats[route]++;
+}
+export function outboundOperationStats(database: string): OutboundOperationStats | undefined {
+	return outboundStats.get(database);
+}
+
 /**
- * Send a lock operation to `nodeName`, preferring this worker's live outbound subscription session
- * for the database. The `sendOperationToNode` fallback opens a connection per call; it exists so a
- * directional topology (a home this node only receives from) still works, not as the fast path.
+ * A delegate or barrier request is answered from the home's memory; a recall is answered once the
+ * delegate has drained, which can run to the delegation's own lease. Every outbound call is bounded
+ * by one of these when the caller gave no deadline, so a peer that accepts a connection and never
+ * answers cannot pin a forwarded hop or a fallback socket for the life of the process.
+ */
+const OUTBOUND_TIMEOUT_MS = 10_000;
+const RECALL_TIMEOUT_MS = DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS + RELAY_SLACK_MS;
+function outboundTimeoutFor(operation: string): number {
+	return operation === RECALL_OPERATION ? RECALL_TIMEOUT_MS : OUTBOUND_TIMEOUT_MS;
+}
+
+function liveSessionTo(nodeName: string, database: string): any {
+	for (const connection of getRepairConnectionsForDB(database)) {
+		if (connection.nodeName !== nodeName) continue;
+		const session = connection.liveSession;
+		if (session?.sendOperation) return session;
+	}
+	return undefined;
+}
+
+/**
+ * Send a lock operation to `nodeName`: over this worker's own live subscription session for the
+ * database when it holds one, otherwise over the sibling worker that does (subscriptions are placed
+ * round-robin, so the coordinating worker usually holds none of them — harper-pro#977). The
+ * `sendOperationToNode` fallback opens a connection per call; it exists so a directional topology (a
+ * home this node only receives from) still works, not as a routine path.
  */
 export async function sendRecordLockOperation(
 	nodeName: string,
 	database: string,
-	operation: DelegateOperation | RecallOperation | BarrierOperation | TransitionOperation,
+	operation: LockOperation,
 	timeoutMs?: number
 ): Promise<any> {
-	for (const connection of getRepairConnectionsForDB(database)) {
-		if (connection.nodeName !== nodeName) continue;
-		const session = connection.liveSession;
-		if (session?.sendOperation) return session.sendOperation({ ...operation }, timeoutMs);
+	const bound = timeoutMs ?? outboundTimeoutFor(operation.operation);
+	const session = liveSessionTo(nodeName, database);
+	if (session) {
+		countOutbound(database, 'session');
+		return session.sendOperation({ ...operation }, bound);
+	}
+	if (parentPort) {
+		const forwarded = await forwardOverSessionHolder(nodeName, database, operation, bound);
+		if (forwarded) {
+			countOutbound(database, 'forwarded');
+			if (forwarded.error !== undefined) throw new Error(forwarded.error);
+			return forwarded.reply;
+		}
 	}
 	const node = (server.nodes ?? []).find((candidate: any) => candidate?.name === nodeName);
 	if (!node?.url) throw new Error(`no connection or hdb_nodes row for ${nodeName}`);
-	return sendOperationToNode(node, { ...operation }, timeoutMs === undefined ? undefined : { timeoutMs });
+	countOutbound(database, 'fresh');
+	return sendOperationToNode(node, { ...operation }, { timeoutMs: bound });
+}
+
+// ---- harper-pro#977: forward an outbound lock operation to the worker holding the session --------
+// Requester worker → main (which knows where every (peer, database) subscription lives) → holder
+// worker, which sends over its live session; the answer retraces the hops. Main mints its own hop id
+// so two requesters' ids cannot collide in its table. A hop that times out, loses its holder, or
+// finds no session answers the requester so it can fall back to a fresh connection, never hangs.
+
+const OUTBOUND_REQUEST = 'record-lock-rpc-out';
+const OUTBOUND_REPLY = 'record-lock-rpc-out-reply';
+interface OutboundAnswer {
+	reply?: any;
+	error?: string;
+	/** No worker holds a live session to the peer: the requester falls back to its own connection. */
+	noSession?: boolean;
+}
+let nextOutboundId = 1;
+const pendingOutbound = new Map<number, (answer: OutboundAnswer) => void>();
+/** Main thread: the requester and its own id behind each forwarded hop. */
+const outboundHops = new Map<number, { worker: any; requestId: number; timer?: NodeJS.Timeout }>();
+let sessionHolderFor: (nodeName: string, database: string) => any = () => undefined;
+/** Main thread: how to find the worker whose subscription to `nodeName` carries `database`. */
+export function setSessionHolderReader(reader: (nodeName: string, database: string) => any): void {
+	sessionHolderFor = reader;
+}
+
+function awaitOutbound(requestId: number, timeoutMs: number): Promise<OutboundAnswer> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(() => {
+			pendingOutbound.delete(requestId);
+			resolve({ error: `forwarded record lock operation did not answer within ${timeoutMs}ms` });
+		}, timeoutMs).unref();
+		pendingOutbound.set(requestId, (answer) => {
+			clearTimeout(timer);
+			pendingOutbound.delete(requestId);
+			resolve(answer);
+		});
+	});
+}
+
+/** Resolves undefined when no sibling holds a session, so the caller falls back to its own connection. */
+export async function forwardOverSessionHolder(
+	nodeName: string,
+	database: string,
+	operation: LockOperation,
+	timeoutMs: number,
+	postToMain: (message: any) => void = (message) => parentPort!.postMessage(message)
+): Promise<OutboundAnswer | undefined> {
+	const requestId = nextOutboundId++;
+	const answer = awaitOutbound(requestId, timeoutMs + RELAY_SLACK_MS * 2);
+	try {
+		postToMain({ type: OUTBOUND_REQUEST, requestId, nodeName, database, operation, timeoutMs });
+	} catch (error) {
+		pendingOutbound.get(requestId)?.({ noSession: true });
+		logger.debug?.('Could not forward a record lock operation through the main thread', error);
+	}
+	const result = await answer;
+	return result.noSession ? undefined : result;
+}
+
+function answerOutbound(port: any, requestId: number, answer: OutboundAnswer): void {
+	try {
+		port?.postMessage({ type: OUTBOUND_REPLY, requestId, ...answer });
+	} catch (error) {
+		logger.debug?.('Could not answer a forwarded record lock operation', error);
+	}
+}
+
+/** Requester worker: main answered a forwarded operation. */
+export function handleOutboundReply(message: any): void {
+	pendingOutbound.get(message?.requestId)?.(message);
+}
+
+/** Holder worker: send over this thread's live session and answer main. */
+export function handleOutboundRequestOnHolder(message: any, replyTo: any = parentPort): void {
+	const { requestId, nodeName, database, operation, timeoutMs } = message;
+	const session = liveSessionTo(nodeName, database);
+	if (!session) return answerOutbound(replyTo, requestId, { noSession: true });
+	Promise.resolve()
+		.then(() => session.sendOperation({ ...operation }, timeoutMs))
+		.then(
+			(reply) => answerOutbound(replyTo, requestId, { reply }),
+			(error) => answerOutbound(replyTo, requestId, { error: String(error?.message ?? error) })
+		);
+}
+
+/** Main: forward to the worker holding the session, or tell the requester nobody does. */
+export function handleOutboundRequestOnMain(message: any, worker: any): void {
+	const { requestId, nodeName, database, operation, timeoutMs } = message;
+	let holder: any;
+	try {
+		holder = sessionHolderFor(nodeName, database);
+	} catch (error) {
+		logger.debug?.('Could not look up the session holder for a record lock operation', error);
+	}
+	if (!holder || holder === worker) return answerOutbound(worker, requestId, { noSession: true });
+	const hopId = nextOutboundId++;
+	const timer = setTimeout(() => {
+		if (outboundHops.delete(hopId))
+			answerOutbound(worker, requestId, { error: `the worker holding the session to ${nodeName} did not answer` });
+	}, timeoutMs + RELAY_SLACK_MS).unref();
+	outboundHops.set(hopId, { worker, requestId, timer });
+	try {
+		holder.postMessage({ type: OUTBOUND_REQUEST, requestId: hopId, nodeName, database, operation, timeoutMs });
+	} catch (error) {
+		clearTimeout(timer);
+		outboundHops.delete(hopId);
+		logger.debug?.('Could not forward a record lock operation to the session holder', error);
+		answerOutbound(worker, requestId, { noSession: true });
+	}
+}
+
+/** Main: the holder answered; retrace the hop to the requester. */
+export function handleOutboundReplyOnMain(message: any): void {
+	const hop = outboundHops.get(message?.requestId);
+	if (!hop) return;
+	outboundHops.delete(message.requestId);
+	clearTimeout(hop.timer);
+	const answer: OutboundAnswer = {};
+	if (message.noSession === true) answer.noSession = true;
+	else if (typeof message.error === 'string') answer.error = message.error;
+	else answer.reply = message.reply;
+	answerOutbound(hop.worker, hop.requestId, answer);
+}
+
+if (parentPort) {
+	onMessageByType(OUTBOUND_REQUEST, (message) => handleOutboundRequestOnHolder(message));
+	onMessageByType(OUTBOUND_REPLY, handleOutboundReply);
+} else {
+	onMessageByType(OUTBOUND_REQUEST, handleOutboundRequestOnMain);
+	onMessageByType(OUTBOUND_REPLY, handleOutboundReplyOnMain);
 }
 
 // ---- receive side ------------------------------------------------------------------------------
