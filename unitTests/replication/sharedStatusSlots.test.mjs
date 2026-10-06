@@ -19,7 +19,8 @@ function declaredPositionNames(source, fileName) {
 			ts.isBindingElement(node) ||
 			ts.isPropertyDeclaration(node) ||
 			ts.isPropertyAssignment(node);
-		if (binds && ts.isIdentifier(node.name) && SLOT_NAME_SUFFIXES.some((s) => node.name.text.endsWith(s))) {
+		const named = binds && (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name));
+		if (named && SLOT_NAME_SUFFIXES.some((s) => node.name.text.endsWith(s))) {
 			names.push(node.name.text);
 		}
 		ts.forEachChild(node, visit);
@@ -91,8 +92,10 @@ describe('replication shared-status slot registry', () => {
 		expect(declaredPositionNames('const UNRELATED_OFFSET = 40;', 'a.ts')).to.deep.equal([]);
 	});
 
-	it('declaredPositionNames catches an object-literal slot too', () => {
+	it('declaredPositionNames catches an object-literal slot, quoted or not', () => {
 		expect(declaredPositionNames('const o = { PEER_POSITION: 30 };', 'a.ts')).to.deep.equal(['PEER_POSITION']);
+		expect(declaredPositionNames("const o = { 'PEER_POSITION': 30 };", 'a.ts')).to.deep.equal(['PEER_POSITION']);
+		expect(declaredPositionNames("const o = { 'PEER_SLOT': 30 };", 'a.ts')).to.deep.equal(['PEER_SLOT']);
 	});
 
 	it('never hand-numbers a slot constant outside the registry, under any of its spellings', () => {
