@@ -12,6 +12,7 @@ import { loadGQLSchema } from '#src/core/resources/graphql';
 import { tables } from '#src/core/resources/databases';
 import { HAS_BLOBS, createAuditEntry } from '#src/core/resources/auditStore';
 import { FrameWriter } from '#src/replication/frameWriter';
+import { buildLocalCapabilities } from '#src/replication/protocolCapabilities';
 import { databaseSubscriptions, encodeCopyRecordValue, replicateOverWS } from '#src/replication/replicationConnection';
 import { setReplicator } from '#src/replication/replicator';
 
@@ -85,7 +86,7 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 	beforeEach(async () => {
 		socket = new FakeSocket();
 		replicateOverWS(socket, {}, { name: 'peer-a', replicates: true });
-		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], {}]));
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false)]));
 		await settle(socket, 1);
 	});
 
@@ -179,7 +180,9 @@ describe('replicate: false on the full copy (harper-pro#883)', function () {
 	it('copies the replicated table only, announces no other table, and streams no blob', async () => {
 		socket = new FakeSocket();
 		replicateOverWS(socket, {}, { replicates: true });
-		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], {}]));
+		// Without a capability bag the sender reads this peer as v4 and waits on a legacy baseline
+		// answer no fake socket gives, so the copy never starts.
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false)]));
 		await settle(socket, 1);
 		// A peer that declared no table excludes nothing, so the source's own gate is the only filter.
 		socket.emit(
@@ -276,7 +279,7 @@ describe('replicate: false on the receive path (harper-pro#883)', function () {
 		const shared = tables.ReplicateFalseShared;
 		socket = new FakeSocket();
 		replicateOverWS(socket, {}, { replicates: true });
-		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], {}]));
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false)]));
 		await settle(socket, 1);
 		socket.emit('message', encode([NODE_NAME_TO_ID_MAP, { 'peer-a': 0 }, ['peer-a']]));
 		socket.emit('message', structureFrame(local, 21));
@@ -305,7 +308,7 @@ describe('replicate: false on the receive path (harper-pro#883)', function () {
 
 		socket = new FakeSocket();
 		replicateOverWS(socket, {}, { replicates: true });
-		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], {}]));
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false)]));
 		await settle(socket, 1);
 		socket.emit('message', encode([NODE_NAME_TO_ID_MAP, { 'peer-a': 0 }, ['peer-a']]));
 		socket.emit('message', structureFrame(local, 31));
