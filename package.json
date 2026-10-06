@@ -37,7 +37,6 @@
 		"studio/",
 		"dist/",
 		"*.d.ts",
-		"npm-shrinkwrap.json",
 		"!core/.*",
 		"!core/build-tools/",
 		"!core/config-app.schema.json",
@@ -131,7 +130,7 @@
 	},
 	"dependencies": {
 		"@aws-sdk/client-s3": "^3.1012.0",
-		"@aws-sdk/lib-storage": "3.1116.0",
+		"@aws-sdk/lib-storage": "3.1141.0",
 		"@datadog/pprof": "5.18.1",
 		"@endo/static-module-record": "^1.1.2",
 		"@fastify/autoload": "^6.3.1",
@@ -221,8 +220,6 @@
 		"yaml": "2.9.1"
 	},
 	"devDependencies": {
-		"@aws-sdk/client-s3": "^3.1012.0",
-		"@aws-sdk/lib-storage": "3.1141.0",
 		"@harperfast/code-guidelines": "^0.1.2",
 		"@harperfast/integration-testing": "^1.0.0",
 		"@modelcontextprotocol/sdk": "^1.29.0",

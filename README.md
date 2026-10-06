@@ -65,6 +65,8 @@ harper
 
 Harper will prompt you for configuration options during install, and then automatically start after install.
 
+npm 12 and later skip dependency install scripts unless you allow them. Harper Pro's web application firewall needs the native binary that `re2`'s install script provides, so install with `npm install -g --allow-scripts=re2 @harperfast/harper-pro`. In a project, add `"allowScripts": { "re2": true }` to your `package.json`.
+
 `latest` points at the newest release line. To stay on an older line, install by semver range — `npm install -g @harperfast/harper-pro@5.2` resolves to the newest 5.2.x from the versions actually published, and is the form to reach for.
 
 There are also `latest-X.Y` and `next-X.Y` dist-tags, but a line only gets one once a newer line has taken over _and_ that older line publishes again — so `@latest-5.2` fails with `notarget` between 5.3 shipping and the next 5.2 release. `next` tracks the newest prerelease. A release older than every tag it could move publishes under a temporary tag that is removed immediately, so it is reachable only by exact version.
