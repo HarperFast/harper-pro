@@ -1,6 +1,3 @@
-/**
- * An isolated application's worker is an http worker with `application` set: replication must not place on it.
- */
 import assert from 'node:assert';
 import { workers } from '#js/core/server/threads/manageThreads';
 import { isReplicationWorker, replicationWorkers } from '#src/replication/replicationWorkers';
