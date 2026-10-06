@@ -31,6 +31,8 @@ const validationSchema = Joi.object({
 // time), which would make a start_time cutoff host-dependent, so require an explicit zone.
 const ISO_8601_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 
+const REMOVE_NODE_BACK_TIMEOUT_MS = 30_000;
+
 /**
  * Resolve the `replicates` value to write for THIS node's own hdb_nodes row from add_node/set_node.
  * Preserve an existing directional record (authored from config routes by startOnMainThread on the main
@@ -79,37 +81,7 @@ export async function setNode(req: any) {
 
 	if (req.operation === 'remove_node') {
 		if (!url && !hostname) throw new ClientError('url or hostname is required for remove_node operation');
-		const nodeRecordId = hostname;
-		const hdbNodes = getHDBNodeTable();
-		const record = await hdbNodes.get(nodeRecordId);
-		if (!record) throw new ClientError(nodeRecordId + ' does not exist');
-
-		// Revoke locally before notifying the peer: the dynamic send-authorization watch acts on this
-		// delete, so the peer's access must not outlive a round trip to that (possibly offline or
-		// unreachable) peer. The reciprocal remove_node_back below travels on its own operation
-		// connection, so it is unaffected by the teardown this delete triggers.
-		await hdbNodes.delete(nodeRecordId);
-
-		try {
-			await sendOperationToNode(
-				record,
-				{
-					operation: 'remove_node_back',
-					name:
-						record?.subscriptions?.length > 0
-							? getThisNodeName() // if we are doing a removal with explicit subscriptions, we want to the other node to remove the record for this node
-							: nodeRecordId, // if we are doing a removal with full replication, we want the other node to remove its own record to indicate it is not replicating
-				},
-				undefined
-			);
-		} catch (err) {
-			hdbLogger.warn(
-				`Error removing node from target node ${nodeRecordId}, if it is offline and we be online in the future, you may need to clean up this node manually, or retry:`,
-				err
-			);
-		}
-
-		return `Successfully removed '${nodeRecordId}' from cluster`;
+		return removeNodeFromTable(hostname, url, getHDBNodeTable(), sendOperationToNode);
 	}
 
 	if (!url) throw new ClientError('url required for this operation');
@@ -355,6 +327,40 @@ export async function addNodeBack(req) {
 }
 
 /**
+ * remove_node, after setNode has derived `hostname`/`url` from the request. The result reports a
+ * reciprocal removal the peer did not confirm; the local removal stands either way.
+ */
+export async function removeNodeFromTable(hostname: string, url: string, hdbNodes, sendOperation) {
+	const found = await findExistingNodeRecord(hostname, url, hdbNodes);
+	if (!found) throw new ClientError(hostname + ' does not exist');
+	const { name, record } = found;
+
+	// Revoke locally before notifying the peer: the dynamic send-authorization watch acts on this
+	// delete, so the peer's access must not outlive a round trip to that (possibly offline or
+	// unreachable) peer. The reciprocal remove_node_back below travels on its own operation
+	// connection, so it is unaffected by the teardown this delete triggers.
+	await hdbNodes.delete(name);
+
+	try {
+		await sendOperation(
+			record,
+			{
+				operation: 'remove_node_back',
+				name:
+					record.subscriptions?.length > 0
+						? getThisNodeName() // explicit subscriptions: the peer removes its record for this node
+						: name, // full replication: the peer removes its own record, so it stops replicating
+			},
+			{ timeoutMs: REMOVE_NODE_BACK_TIMEOUT_MS }
+		);
+	} catch (error) {
+		hdbLogger.warn(`Removal of '${name}' was not confirmed by that node, which may still hold its record:`, error);
+		return `Successfully removed '${name}' from cluster but removal on the target node was not confirmed: ${error.message}`;
+	}
+	return `Successfully removed '${name}' from cluster`;
+}
+
+/**
  * Is called by other node when remove_node is requested and
  * system tables are not replicating
  */
@@ -380,15 +386,25 @@ function reverseSubscription(subscription) {
 /**
  * Direct primary-key lookup first, falling back to a table scan matching on `url` because
  * `setNode()` stores a row under the PEER-reported name, which can differ from the hostname a
- * caller used to reach it.
+ * caller used to reach it. The fallback resolves only peer rows (this node's own row needs its exact
+ * name) and refuses an address that matches more than one row: `name` is the only key, so a stale
+ * row can share a url with the live one, and callers delete or rewrite what this returns.
  */
-async function findExistingNodeRecord(hostname: string, url: string) {
-	const hdbNodes = getHDBNodeTable();
+async function findExistingNodeRecord(hostname: string, url: string, hdbNodes = getHDBNodeTable()) {
 	const direct = await hdbNodes.get(hostname);
 	if (direct) return { name: hostname, record: direct };
+	if (!url) return undefined;
+	const thisNodeName = getThisNodeName();
+	const matches = [];
 	for await (const node of hdbNodes.search({})) {
-		if (node?.url === url) return { name: node.name ?? hostname, record: node };
+		if (node?.url === url && node.name !== thisNodeName) matches.push(node);
 	}
+	if (matches.length > 1) {
+		throw new ClientError(
+			`${hostname} matches more than one registered node (${matches.map((node) => node.name).join(', ')}); specify the node name`
+		);
+	}
+	if (matches.length === 1) return { name: matches[0].name, record: matches[0] };
 	return undefined;
 }
 
