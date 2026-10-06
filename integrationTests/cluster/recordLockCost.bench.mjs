@@ -380,8 +380,7 @@ function logDelta(before, after, acquisitions) {
  * Candidates that land on a side already filled are simply left with a delegation of their own,
  * which costs nothing.
  */
-/** The owner's `granted` gauge through `cluster_status`: the fixture's in-process read sees only the
- * serving worker's coordinator, which at THREADS > 1 is usually not the one that grants. */
+/** The owner's `granted` gauge; the fixture's in-process gauge is the serving worker's, not the owner's. */
 async function grantedOn(node) {
 	const status = await sendOperation(node, { operation: 'cluster_status' });
 	const granted = status.recordLocks?.[DB]?.granted;

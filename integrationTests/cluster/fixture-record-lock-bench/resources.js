@@ -107,7 +107,6 @@ export class BenchWriteBatched extends Resource {
 						break;
 					}
 				}
-				// Every dispatched put settles inside the transaction, failure included.
 				const settled = await Promise.allSettled(puts);
 				const failed = settled.find((result) => result.status === 'rejected');
 				if (thrown) throw thrown;

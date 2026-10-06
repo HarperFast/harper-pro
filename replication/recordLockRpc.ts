@@ -166,14 +166,8 @@ export function forgetOutboundOperationStats(database: string): void {
 	outboundStats.delete(database);
 }
 
-/**
- * Bounds for an outbound call whose caller gave no deadline. A delegate request must outlive core's
- * own wait (`#requestRemotely` races the lock timeout and hands a late grant back to the home), so a
- * transport that gave up first would strand that grant on the home for the rest of its lease; a
- * recall is answered once the delegate drained, which can run to the delegation's lease. Either way
- * the bound is what keeps a silent peer from pinning a forwarded hop or a fallback socket for the
- * life of the process.
- */
+/** A delegate request must outlive core's own lock wait (its late-grant handback needs the transport's
+ * answer); a recall can run to the delegation's lease. */
 const DELEGATE_TIMEOUT_MS = MAX_LOCK_TIMEOUT_MS + RELAY_SLACK_MS;
 const RECALL_TIMEOUT_MS = DELEGATION_LEASE_MS + LOCK_LEASE_SKEW_MS + RELAY_SLACK_MS;
 function outboundTimeoutFor(operation: string): number {
