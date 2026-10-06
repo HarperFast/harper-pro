@@ -133,10 +133,10 @@ jobs:
       - name: Bundled files are byte-identical to the archive
         run: |
           set -euo pipefail
-          mkdir "$RUNNER_TEMP/archive"
-          # A relative archive path: GNU tar on Windows reads "D:\..." as a remote host.
-          tar -xzf package/harper-pro.tgz --strip-components=1 -C "$RUNNER_TEMP/archive"
-          node --input-type=module - "$RUNNER_TEMP/archive" "$RUNNER_TEMP/consumer/node_modules/@harperfast/harper-pro" <<'JS'
+          mkdir package-extract
+          # Relative paths: GNU tar on Windows reads "D:\..." as a remote host.
+          tar -xzf package/harper-pro.tgz --strip-components=1 -C package-extract
+          node --input-type=module - package-extract "$RUNNER_TEMP/consumer/node_modules/@harperfast/harper-pro" <<'JS'
           import { createHash } from 'node:crypto';
           import { readdirSync, readFileSync } from 'node:fs';
           import { join, relative } from 'node:path';
