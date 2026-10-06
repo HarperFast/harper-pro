@@ -97,7 +97,9 @@ export class BenchWriteBatched extends Resource {
 			const context = {};
 			const end = Math.min(i + batch, data.count);
 			await transaction(context, () => {
-				for (let j = i; j < end; j++) tables.Counter.put({ id: `${data.prefix}-${j}`, n: j }, context);
+				const puts = [];
+				for (let j = i; j < end; j++) puts.push(tables.Counter.put({ id: `${data.prefix}-${j}`, n: j }, context));
+				return Promise.all(puts);
 			});
 		}
 		return { elapsedMs: performance.now() - started };

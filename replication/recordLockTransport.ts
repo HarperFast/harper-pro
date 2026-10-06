@@ -21,7 +21,7 @@
  * - `requestDelegation` / `recallDelegation`: unicast operations over the existing replication
  *   connections (`recordLockRpc.ts`).
  * - `ownsCoordination()`: whether this worker thread is the one the main thread assigned to the
- *   database (DESIGN.md, the `ownsCoordination()` and control-entry bullets). Ownership is conferred by message rather than derived from `workerIndex` and moves only when the
+ *   database. Ownership is conferred by message rather than derived from `workerIndex` and moves only when the
  *   owner has exited: a live owner still holds delegations and grants.
  *
  * A peer's advertised home-map digest (`RECORD_LOCK_HOMES_DIGEST`, `replicationConnection.ts`) is
@@ -230,7 +230,6 @@ const relayedControlEntries = new Map<string, number>();
 /** Per database on the applying thread: entries that could not be sent (owner unknown here, port gone). */
 const controlEntryRelayDrops = new Map<string, number>();
 
-/** Best-effort (DESIGN.md, the control-entry bullet): a lost or late relay only delays a re-grant. */
 export function relayLockControlEntry(
 	database: string,
 	table: string,
@@ -422,12 +421,8 @@ export function currentHomesDigest(database: string): string | undefined {
 	return activeCache.get(database)?.digest;
 }
 
-/**
- * Per database lifetime: the token of the latest refresh (an older or torn-down lifetime's read
- * installs nothing) and the retry backoff a failed read spends. Once the backoff is exhausted the
- * retry keeps going at its ceiling for the lifetime: a row that stays unreadable is the one case
- * nothing else re-triggers (harper-pro#853).
- */
+/** The latest refresh's token (an older or torn-down lifetime's read installs nothing) and the retry
+ * backoff; past its ceiling the retry keeps pacing, since nothing else re-triggers an unreadable row. */
 interface RefreshState {
 	token: object;
 	backoff: Backoff;
@@ -1290,9 +1285,7 @@ function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorker
 
 /**
  * The worker that coordinates `database`, assigning one only if none is live: an owner is never
- * moved while it runs (see the module comment). Subscriptions are placed independently of it
- * (round-robin); a control entry applied elsewhere is relayed to the owner (harper-pro#977).
- * Returns `undefined` when the main thread itself is the owner, while no owner is live yet, or
+ * moved while it runs (see the module comment). Returns `undefined` when the main thread itself is the owner, while no owner is live yet, or
  * while a handoff's incarnation bump has not yet persisted (§5.1) — treated identically by every
  * caller: "not currently owned," never "assign one now" (only this function does that). Main
  * thread only.

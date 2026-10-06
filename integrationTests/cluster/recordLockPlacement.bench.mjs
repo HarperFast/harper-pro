@@ -34,10 +34,8 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 const FIXTURE = join(import.meta.dirname, 'fixture-record-lock-bench');
 const DB = 'data';
 const NODES = 3;
-/** Nodes that write; the rest only apply. Default leaves one pure receiver. */
 const WRITER_NODES = Number(process.env.RECORD_LOCK_PLACEMENT_WRITER_NODES) || NODES - 1;
 const REPS = Number(process.env.RECORD_LOCK_PLACEMENT_REPS) || 3;
-/** Concurrent writer requests per node and puts per request; each node applies (NODES-1) × this. */
 const WRITERS_PER_NODE = Number(process.env.RECORD_LOCK_PLACEMENT_WRITERS) || 8;
 const PUTS_PER_WRITER = Number(process.env.RECORD_LOCK_PLACEMENT_PUTS) || 5_000;
 const PUT_BATCH = Number(process.env.RECORD_LOCK_PLACEMENT_BATCH) || 50;
