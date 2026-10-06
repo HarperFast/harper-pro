@@ -608,6 +608,7 @@ describe('residency handoff — wire shape', () => {
 		expect(decodeHandoffReceipts([[7, null, V1]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, 'r', 0]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, 'r', 'v']])).to.equal(undefined);
+		expect(decodeHandoffReceipts([[7, 'r', 2.5]])).to.equal(undefined);
 	});
 
 	it('accepts a flat compound id (core’s own Id contract) but rejects a nested one', () => {
