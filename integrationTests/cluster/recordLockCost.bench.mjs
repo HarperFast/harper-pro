@@ -380,12 +380,21 @@ function logDelta(before, after, acquisitions) {
  * Candidates that land on a side already filled are simply left with a delegation of their own,
  * which costs nothing.
  */
+/** The owner's `granted` gauge through `cluster_status`: the fixture's in-process read sees only the
+ * serving worker's coordinator, which at THREADS > 1 is usually not the one that grants. */
+async function grantedOn(node) {
+	const status = await sendOperation(node, { operation: 'cluster_status' });
+	return status.recordLocks?.[DB]?.granted ?? 0;
+}
+
 async function probeKeys(node, prefix, wanted, options) {
 	const found = {};
 	for (let attempt = 0; attempt < 40 && !wanted.every((side) => found[side]); attempt++) {
 		const id = `${prefix}-${attempt}-${Date.now()}`;
-		const first = await call(node, 'BenchLock/', { ...options, ids: [id], classifyHome: true });
-		found[first.homeLocal[0] ? 'local' : 'remote'] ??= { id, first };
+		const grantedBefore = THREADS > 1 ? await grantedOn(node) : 0;
+		const first = await call(node, 'BenchLock/', { ...options, ids: [id], classifyHome: THREADS === 1 });
+		const homeLocal = THREADS > 1 ? (await grantedOn(node)) > grantedBefore : first.homeLocal[0];
+		found[homeLocal ? 'local' : 'remote'] ??= { id, first };
 	}
 	for (const side of wanted) assert.ok(found[side], `${prefix}: no ${side}-home key found`);
 	return found;
