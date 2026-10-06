@@ -4636,6 +4636,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (selected.length === 0) return Promise.resolve();
 		settlingReceipts = settleReceiptRequests(selected, receiptBlobsComplete)
 			.then(({ receipts, settled }) => {
+				// A COPY_START (or a new blob gap) arriving during the read/blob-check awaits above can
+				// make what was just answered a WAL-off copy-applied row; re-check the same entry guard
+				// and defer instead of certifying when it has changed.
+				if (inCopyMode || outstandingBlobsToFinish.length !== 0 || hasBlobGap) {
+					for (const request of settled)
+						(deferredReceiptKeys ??= new Set()).add(receiptRequestKey(request.tableId, request.recordId));
+					return;
+				}
 				for (const request of settled) {
 					const key = receiptRequestKey(request.tableId, request.recordId);
 					// a re-request that replaced this one during the settle keeps its place
