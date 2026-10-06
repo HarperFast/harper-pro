@@ -436,6 +436,20 @@ position. This keeps bootstrap available without conflating clocks in the subseq
 
 ---
 
+25. **A `replicate: false` table never leaves its node, on any path (harper-pro#883).** The declaration that counts is the **sender's own** `Table.replicate` (read through the live database map, so a redeclared table is seen at once) via `tableReplicates` in `replicatedDatabases.ts`; before this, the only outbound table filter was the peer's `SUBSCRIPTION_REQUEST`, so a peer that had not declared the table — a fresh clone or `add_node` join, or a stale schema — asked for everything and got it. What never leaves: the table's **records, blobs, and definition on the replication socket**. Outside that boundary by design: the authenticated operations API (`describe_*`) and application packaging (`cloneApplications`), because the epic's model declares a plugin's node-local schema on every node. Enforcement points: `tableToTableEntry` (the one outbound table gate — audit path, copy loop, copy-resume validation — which also carries the route `excludeTables`, so a copied row's blobs are never opened for a table whose rows would then be skipped; the copy walk re-checks per row and stops the table on a flip); `GET_RECORD` answers an error-shaped `GET_RECORD_RESPONSE` before `TABLE_FIXED_STRUCTURE`, the store read or any blob, with one generic wording for an unknown and a non-replicated table; `tableDefinitionsForPeer` omits the table from `NODE_NAME[3]` and `DB_SCHEMA`; cloneNode's `cloneSchemas` skips it (and a database with no replicated table) and `getLastUpdatedRecord` excludes it from the sync target. Receive side, defense in depth for a sender that predates this: the record is dropped like a route-excluded one (`recordReplicationHole`, blob chunks discarded by the same path), and `ensureTableIfChanged` never merges a peer's definition into a local `replicate: false` table.
+
+**Schema handshake: omit, not preserve.** The frame carries only `{table, schemaDefined, attributes[{name,type,isPrimaryKey}]}` and the receiver materializes it with `ensureTable({origin:'cluster'})`, so "preserve" would create a replicated-by-default twin that the peer then subscribes to and replicates its own writes out of; carrying the flag would be a shape change pre-fix receivers ignore, while omission is correct on every receiver version. `NODE_NAME[3]` has no reader at all. A twin created by a pre-fix join is left in place (deleting could destroy local data); it shows in `describe_table` without `replicate: false`.
+
+**What a live declaration change can and cannot do.** Core since harper#2903 assigns an explicit non-cluster `replicate` declaration to the live `Table.replicate` in `declareTable`, including when it reuses an existing class. Redeploying an existing table with `@table(replicate: false)` therefore takes effect on the first redeploy restart; the former two-restart limitation is closed. Cluster-origin declarations cannot override that local choice. The join regression covers both a table created local and a populated replicated table redeployed as local, waiting for the deployment's PID change before joining the peer.
+
+The audit send path and copy walk re-read the live declaration to observe changes and drop/recreate replacements. The copy check sits after the pacer's yield so no await separates it from the encode that opens the row's blobs (one property read, measured at ~6 ns against ~13 ns for one of that row's own allocations; sustained audit-stream throughput is not measured). The receive-side blocked set is discarded on `onUpdatedTable` rather than snapshotted for the life of the socket.
+
+A table that leaves scope mid-walk still gets `COPY_COMPLETE` for the pass, so re-enabling it later needs a resync — the copy cursor advanced past its uncopied rows. A database in replication scope whose every table is non-replicating subscribes on neither end, so it gets no clone sync target (`hasReplicatedTable`) and no required socket — a resume marker written before that filtering re-derives its targets rather than waiting on one; it still opens no (peer, db) socket, so keep such a database out of `replication.databases` rather than relying on that.
+
+Regressions: `unitTests/replication/replicateFalseSendPaths.test.mjs` (frames), `integrationTests/cluster/replicateFalseFullCopy.test.mjs` (join), `integrationTests/cloneNode/cloneNonReplicatedTable.test.mjs` (clone).
+
+---
+
 ## Tests
 
 **Integration tests** live in `../integrationTests/cluster/`:
@@ -459,19 +473,20 @@ Most replication behavior is exercised via integration tests that spin up multi-
 
 ## "Where is X" cheat sheet
 
-| Question                                  | Where                                                                                                       |
-| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Where does a remote message get decoded?  | `replicationConnection.ts → replicateOverWS`                                                                |
-| Where do cache-miss fetches pick a peer?  | `replicator.ts → Replicator.load` (declared inside `setReplicator`)                                         |
-| Where is the connection retry loop?       | `replicationConnection.ts → NodeReplicationConnection.scheduleReconnect` (uses `INITIAL_RETRY_TIME`)        |
-| Where is the retry/backoff schedule?      | `backoff.ts → createBackoff`; adopting sites listed under "Backoff discipline"                              |
-| Why is a subscribe setup not firing?      | `subscriptionManager.ts → createSubscribeSetupScheduler` — one armed setup per (url, database)              |
-| Where is mTLS configured?                 | `replicator.ts → buildReplicationMtlsConfig`                                                                |
-| Where is a new cluster member added?      | `setNode.ts` (`setNode`, `addNodeBack`)                                                                     |
-| Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `RECORD_LOCK_HOMES_DIGEST`)         |
-| Where are peer capabilities interpreted?  | `protocolCapabilities.ts → resolvePeerCapabilities`; carried in `NODE_NAME[4]`                              |
-| Who takes part in a cluster record lock?  | `recordLockTransport.ts → createRecordLockTransport().homeMap()`; owner: `recordLockOwnerFor`               |
-| Which workers may own replication work?   | `replicationWorkers.ts → isReplicationWorker`; never an isolated application's worker                       |
-| Where is `hdb_nodes` schema?              | `knownNodes.ts → getHDBNodeTable`                                                                           |
-| What does `cluster_status` return?        | `clusterStatus.ts`; its `recordLocks` section: `recordLockTransport.ts → collectRecordLockStatus`           |
-| Where is per-route table exclusion logic? | `knownNodes.ts → getExcludedTablesForRouteEntries`; threaded via `subscriptionManager.ts → routeReplicates` |
+| Question                                  | Where                                                                                                                                                                           |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where does a remote message get decoded?  | `replicationConnection.ts → replicateOverWS`                                                                                                                                    |
+| Where do cache-miss fetches pick a peer?  | `replicator.ts → Replicator.load` (declared inside `setReplicator`)                                                                                                             |
+| Where is the connection retry loop?       | `replicationConnection.ts → NodeReplicationConnection.scheduleReconnect` (uses `INITIAL_RETRY_TIME`)                                                                            |
+| Where is the retry/backoff schedule?      | `backoff.ts → createBackoff`; adopting sites listed under "Backoff discipline"                                                                                                  |
+| Why is a subscribe setup not firing?      | `subscriptionManager.ts → createSubscribeSetupScheduler` — one armed setup per (url, database)                                                                                  |
+| Where is mTLS configured?                 | `replicator.ts → buildReplicationMtlsConfig`                                                                                                                                    |
+| Where is a new cluster member added?      | `setNode.ts` (`setNode`, `addNodeBack`)                                                                                                                                         |
+| Where are protocol message types defined? | `replicationConnection.ts` — top-level consts (`SUBSCRIPTION_REQUEST` … `RECORD_LOCK_HOMES_DIGEST`)                                                                             |
+| Where are peer capabilities interpreted?  | `protocolCapabilities.ts → resolvePeerCapabilities`; carried in `NODE_NAME[4]`                                                                                                  |
+| Who takes part in a cluster record lock?  | `recordLockTransport.ts → createRecordLockTransport().homeMap()`; owner: `recordLockOwnerFor`                                                                                   |
+| Which workers may own replication work?   | `replicationWorkers.ts → isReplicationWorker`; never an isolated application's worker                                                                                           |
+| Where is `hdb_nodes` schema?              | `knownNodes.ts → getHDBNodeTable`                                                                                                                                               |
+| What does `cluster_status` return?        | `clusterStatus.ts`; its `recordLocks` section: `recordLockTransport.ts → collectRecordLockStatus`                                                                               |
+| Where is per-route table exclusion logic? | `knownNodes.ts → getExcludedTablesForRouteEntries`; threaded via `subscriptionManager.ts → routeReplicates`                                                                     |
+| Where is `replicate: false` enforced?     | `replicatedDatabases.ts → tableReplicates`; sender gate `replicateOverWS → tableToTableEntry`, `GET_RECORD`, `tableDefinitionsForPeer`; `cloneNode.ts → cloneSchemas` (item 24) |

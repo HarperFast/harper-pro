@@ -67,6 +67,7 @@ import {
 import { isReplicationWorker } from './replicationWorkers.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { tableReplicates as declarationReplicates } from './replicatedDatabases.ts';
 import { createBackoff, type Backoff } from './backoff.ts';
 import {
 	currentRow,
@@ -1525,7 +1526,7 @@ setRecordLockOwnershipReaders({
 
 function tableReplicates(database: string, table: string): boolean {
 	const definition = getDatabases()[database]?.[table];
-	return definition !== undefined && definition.replicate !== false;
+	return definition !== undefined && declarationReplicates(definition);
 }
 
 if (!parentPort) {

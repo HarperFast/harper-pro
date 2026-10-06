@@ -1,0 +1,9 @@
+type LocalKeyspace @table(replicate: false) @export {
+	id: ID @primaryKey
+	payload: Blob
+}
+
+type SharedRecord @table @export {
+	id: ID @primaryKey
+	value: String
+}
