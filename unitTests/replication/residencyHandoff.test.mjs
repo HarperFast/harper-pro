@@ -272,6 +272,23 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
 	});
 
+	it('still counts the release when only the follow-up receipt cleanup fails', async () => {
+		const table = fakeTable({
+			retained: [{ recordId: 'back', tableId: 7, version: V1, residencyId: 5 }],
+			entries: { back: complete(V2) },
+		});
+		table.dbisDB.getRange = () => {
+			throw new Error('key too large for store');
+		};
+		const errors = [];
+		const { owed } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists), undefined, (recordId, error) =>
+			errors.push({ recordId, message: error.message })
+		);
+		expect(owed).to.deep.equal([]);
+		expect(table.released).to.deep.equal([{ id: 'back', version: V1 }]);
+		expect(errors).to.deep.equal([]); // release succeeded; the cleanup failure is not a release failure
+	});
+
 	it('awaits a getEntry that resolves asynchronously (a RocksDB cache miss), and treats a rejection as absent', async () => {
 		const rejected = Promise.reject(new Error('closed'));
 		rejected.catch(() => {}); // this fake constructs the rejection eagerly; resolveLocalEntry's own catch is under test
@@ -365,13 +382,8 @@ describe('residency handoff — redelivery and local completion', () => {
 			throw new Error('key too large for store');
 		};
 		const errors = [];
-		const { owed } = await transitionsOwedToPeer(
-			table,
-			'B',
-			'A',
-			residencyOf(lists),
-			undefined,
-			(recordId, error) => errors.push({ recordId, message: error.message })
+		const { owed } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists), undefined, (recordId, error) =>
+			errors.push({ recordId, message: error.message })
 		);
 		expect(errors).to.deep.equal([
 			{ recordId: 'unstorable1', message: 'key too large for store' },
