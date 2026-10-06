@@ -21,8 +21,9 @@ const UNSUPPORTED_HERE = process.platform === 'win32' || process.env.HARPER_RUNT
 
 async function startNode(suiteName, { isolated = false, recordLocks = false } = {}) {
 	const hostname = await getNextAvailableLoopbackAddress();
-	const dataRootDir = await mkdtemp(join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'hit-'));
+	let dataRootDir;
 	try {
+		dataRootDir = await mkdtemp(join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'hit-'));
 		const config = {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
@@ -39,8 +40,9 @@ async function startNode(suiteName, { isolated = false, recordLocks = false } = 
 		await startHarper(ctx, { config, env: { HARPER_NO_FLUSH_ON_EXIT: true } });
 		return ctx.harper;
 	} catch (err) {
-		// nothing has registered this node for teardown yet, so a failed fixture copy or Harper start must release
-		// its own loopback address and data root (teardownHarper no-ops the kill when there is no process)
+		// nothing has registered this node for teardown yet, so a failure anywhere in this block -- including
+		// mkdtemp itself, before dataRootDir exists -- must release the reserved address itself (teardownHarper
+		// no-ops the kill when there is no process, and tolerates an undefined dataRootDir)
 		await teardownHarper({ harper: { hostname, dataRootDir } }).catch(() => {});
 		throw err;
 	}
