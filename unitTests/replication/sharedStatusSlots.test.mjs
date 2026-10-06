@@ -11,7 +11,12 @@ const REGISTRY_RELATIVE_PATH = 'sharedStatusSlots.ts';
 const SLOT_NAME_SUFFIXES = ['_POSITION', '_SLOT', '_INDEX'];
 
 function isLiteralName(node) {
-	return ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node);
+	if (node && ts.isParenthesizedExpression(node)) return isLiteralName(node.expression);
+	return node && (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node));
+}
+
+function literalNameText(node) {
+	return ts.isParenthesizedExpression(node) ? literalNameText(node.expression) : node.text;
 }
 
 function staticName(node) {
@@ -19,7 +24,7 @@ function staticName(node) {
 	if (ts.isIdentifier(node) || isLiteralName(node)) return node.text;
 	// Inside a computed key an identifier REFERENCES a constant rather than binding a name, so
 	// `{ [RECEIVED_VERSION_POSITION]: 'received' }` is a legitimate use of the registry, not a slot.
-	if (ts.isComputedPropertyName(node) && isLiteralName(node.expression)) return node.expression.text;
+	if (ts.isComputedPropertyName(node) && isLiteralName(node.expression)) return literalNameText(node.expression);
 	return undefined;
 }
 
@@ -111,6 +116,7 @@ describe('replication shared-status slot registry', () => {
 		expect(declaredPositionNames("const o = { 'PEER_POSITION': 30 };", 'a.ts')).to.deep.equal(['PEER_POSITION']);
 		expect(declaredPositionNames("const o = { ['PEER_SLOT']: 30 };", 'a.ts')).to.deep.equal(['PEER_SLOT']);
 		expect(declaredPositionNames('const o = { [`PEER_INDEX`]: 30 };', 'a.ts')).to.deep.equal(['PEER_INDEX']);
+		expect(declaredPositionNames("const o = { [('PEER_SLOT')]: 30 };", 'a.ts')).to.deep.equal(['PEER_SLOT']);
 		expect(declaredPositionNames('const o = { [dynamic]: 30 };', 'a.ts')).to.deep.equal([]);
 	});
 
