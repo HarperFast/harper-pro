@@ -31,7 +31,8 @@ function declaredPositionNames(source, fileName) {
 			ts.isVariableDeclaration(node) ||
 			ts.isBindingElement(node) ||
 			ts.isPropertyDeclaration(node) ||
-			ts.isPropertyAssignment(node);
+			ts.isPropertyAssignment(node) ||
+			ts.isEnumMember(node);
 		const name = binds ? staticName(node.name) : undefined;
 		if (name && SLOT_NAME_SUFFIXES.some((s) => name.endsWith(s))) {
 			names.push(name);
@@ -111,6 +112,11 @@ describe('replication shared-status slot registry', () => {
 		expect(declaredPositionNames("const o = { ['PEER_SLOT']: 30 };", 'a.ts')).to.deep.equal(['PEER_SLOT']);
 		expect(declaredPositionNames('const o = { [`PEER_INDEX`]: 30 };', 'a.ts')).to.deep.equal(['PEER_INDEX']);
 		expect(declaredPositionNames('const o = { [dynamic]: 30 };', 'a.ts')).to.deep.equal([]);
+	});
+
+	it('declaredPositionNames catches an enum member slot too', () => {
+		expect(declaredPositionNames('enum E { PEER_POSITION = 30 }', 'a.ts')).to.deep.equal(['PEER_POSITION']);
+		expect(declaredPositionNames("enum E { 'PEER_SLOT' = 30 }", 'a.ts')).to.deep.equal(['PEER_SLOT']);
 	});
 
 	it("declaredPositionNames leaves a map keyed by the registry's own constants alone", () => {
