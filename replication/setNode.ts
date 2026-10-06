@@ -1,8 +1,13 @@
 import { setCertTable } from '../core/security/keys.js';
-import { createCsr, signCertificate, getReplicationCert, getReplicationCertAuth } from '../security/certificate.ts';
+import {
+	createCsr,
+	signCertificate,
+	getReplicationCert,
+	getReplicationCertAuth,
+	loadForge,
+} from '../security/certificate.ts';
 import { validateBySchema } from '../core/validation/validationWrapper.js';
 import Joi from 'joi';
-const { pki } = require('node-forge');
 import { get } from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { ensureNode, computeSelfReplicates, getConfiguredRoutes } from './subscriptionManager.ts';
@@ -168,7 +173,7 @@ export async function setNode(req: any) {
 		hdbLogger.info('CSR response received from node:', url, 'saving certificate and CA in hdb_certificate');
 
 		await setCertTable({
-			name: pki.certificateFromPem(targetNodeResponse.signingCA).issuer.getField('CN').value,
+			name: loadForge().pki.certificateFromPem(targetNodeResponse.signingCA).issuer.getField('CN').value,
 			certificate: targetNodeResponse.signingCA,
 			is_authority: true,
 		});

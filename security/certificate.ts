@@ -1,6 +1,6 @@
 import type { Logger } from '../core/utility/logging/logger.ts';
 import Joi from 'joi';
-import forge from 'node-forge';
+import type * as Forge from 'node-forge';
 import { access, constants, readFile, writeFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { X509Certificate, createPrivateKey } from 'node:crypto';
@@ -27,8 +27,9 @@ import { replicateOperation } from '../replication/replicator.ts';
 
 const { forComponent } = harperLogger;
 const logger = forComponent('certificate').conditional as Logger;
-const pki = forge.pki;
 const CERT_VALIDITY_DAYS = 3650;
+
+export const loadForge = () => require('node-forge') as typeof Forge;
 
 const fileExists = async (path: string): Promise<boolean> =>
 	access(path, constants.F_OK)
@@ -66,6 +67,8 @@ export async function signCertificate(req) {
 			private_key = certAndKey.private_key;
 		}
 
+		const forge = loadForge();
+		const { pki } = forge;
 		private_key = pki.privateKeyFromPem(private_key);
 		response.signingCA = cert_auth.certificate;
 		const caAppCert = pki.certificateFromPem(cert_auth.certificate);
@@ -78,7 +81,7 @@ export async function signCertificate(req) {
 			return new Error(`Error verifying CSR: ` + err.message);
 		}
 
-		const cert = forge.pki.createCertificate();
+		const cert = pki.createCertificate();
 		cert.serialNumber = generateSerialNumber();
 		cert.validity.notBefore = new Date();
 		const notAfter = new Date();
@@ -115,6 +118,7 @@ export async function createCsr() {
 	const certificateTable = getCertTable();
 	const privateKeys: Map<string, string> = getPrivateKeys();
 	const hdbKeysDir = join(env.getHdbBasePath(), LICENSE_KEY_DIR_NAME);
+	const { pki } = loadForge();
 	let opsCert, opsPrivateKey, certName, privateKeyName;
 	for await (const cert of certificateTable.search([])) {
 		if (
@@ -175,7 +179,7 @@ export async function createCsr() {
 
 	csr.sign(opsPrivateKey);
 
-	return { pem: forge.pki.certificationRequestToPem(csr), privateKeyName };
+	return { pem: pki.certificationRequestToPem(csr), privateKeyName };
 }
 
 export async function getReplicationCert() {

@@ -52,8 +52,7 @@ import {
 } from './replicationConnection.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { createBackoff, type Backoff } from './backoff.ts';
-import lodash from 'lodash';
-const { cloneDeep } = lodash;
+import cloneDeep from 'lodash/cloneDeep.js';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { X509Certificate } from 'crypto';

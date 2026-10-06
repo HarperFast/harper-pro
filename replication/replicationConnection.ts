@@ -143,7 +143,6 @@ import {
 } from '../core/resources/blob.ts';
 import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
 import { createInflate } from 'node:zlib';
-import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
 import { tableReplicates } from './replicatedDatabases.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
@@ -154,6 +153,7 @@ import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 type ReplicationWebSocket = WebSocket & { _socket: Socket | null };
 
 const logger = forComponent('replication').conditional as Logger;
+let lmdbGetLastVersion: typeof import('lmdb').getLastVersion;
 
 // msgpackr v2 removed the built-in `randomAccessStructure` option; that random-access
 // struct support now lives in the `structon` package (the same wrapper core's
@@ -5405,7 +5405,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										valueBuffer = lastMetadata.value;
 									}
 								} else {
-									entry.version = getLastVersion();
+									entry.version = (lmdbGetLastVersion ??= (require('lmdb') as typeof import('lmdb')).getLastVersion)();
 								}
 								if (lastMetadata && lastMetadata[METADATA] & HAS_BLOBS) {
 									// if there are blobs, we need to find them and send their contents
