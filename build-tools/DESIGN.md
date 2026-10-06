@@ -48,3 +48,7 @@ The run stages install the distro `libjemalloc2` and set `ENV LD_PRELOAD=libjema
 - **`-pc` needs no change of its own.** It is this `Dockerfile` with `RUN_IMAGE=harperfast/node-pointer-compression`, whose final stage is `node:<major>` (Debian trixie), so `build-tools/node-pointer-compression.Dockerfile` stays allocator-free.
 - **OpenShift stays on glibc.** UBI10's repositories (BaseOS, AppStream, CodeReady Builder) ship no jemalloc, and EPEL would break certification.
 - **Opt-out:** `-e LD_PRELOAD=`. A deployment that sets `LD_PRELOAD` for its own library replaces jemalloc; it must list `libjemalloc.so.2` too to keep it. Host-manager's `MALLOC_ARENA_MAX` is a no-op under jemalloc.
+
+## Production dist emit
+
+harper-pro's `tsconfig.json` compiles `core/**` into `dist/core` itself, so core's own `npm run build` never runs in a harper-pro build. `npm run build` therefore calls core's `build-tools/build-dist.mjs --project tsconfig.json`, which emits comment-free JS with non-Latin-1 literals escaped and fails if any non-Latin-1 char remains in `dist/**/*.js`. Why that matters (V8 keeps every loaded module's source on each thread's heap, as UTF-16 if one char is above `0xFF`) is in [core/build-tools/DESIGN.md](../core/build-tools/DESIGN.md#emitted-dist-js-is-comment-free-and-latin-1-build-toolsbuild-distmjs). `build-pro.sh` must not tolerate a failed build, or that check stops guarding the package. `npm run build:watch` is plain `tsc --watch` and keeps comments.
