@@ -438,7 +438,8 @@ export function decodeHandoffReceipts(data: unknown, maxItems = MAX_RECEIPT_BATC
 		if (!Array.isArray(item) || item.length !== 3) return undefined;
 		const [tableId, recordId, version] = item;
 		if (!Number.isSafeInteger(tableId) || tableId < 0) return undefined;
-		if (typeof version !== 'number' || !Number.isFinite(version) || version <= 0) return undefined;
+		// core versions are integer timestamps; a non-integer can only be a malformed or forged peer send
+		if (!Number.isSafeInteger(version) || version <= 0) return undefined;
 		if (!isValidReceiptId(recordId)) return undefined;
 		receipts.push([tableId, recordId, version]);
 	}
