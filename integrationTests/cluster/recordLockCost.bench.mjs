@@ -58,6 +58,9 @@ const REACQUISITION_LEASES_MS = process.env.RECORD_LOCK_BENCH_REACQ_LEASES_MS
 const REACQUISITION_CADENCE_MS = Number(process.env.RECORD_LOCK_BENCH_REACQ_CADENCE_MS) || 5_000;
 const REACQUISITION_MAX_RUN_MS = Number(process.env.RECORD_LOCK_BENCH_REACQ_RUN_MS) || 260_000;
 const OUT = process.env.RECORD_LOCK_BENCH_OUT || join(tmpdir(), `record-lock-cost-${Date.now()}.json`);
+/** http workers per node. Above 1, an off-owner lock() relays its admission and the owner's outbound
+ * lock operations are forwarded to the worker holding the session (harper-pro#852, #977). */
+const THREADS = Number(process.env.RECORD_LOCK_BENCH_THREADS) || 1;
 
 const results = {
 	machine: {
@@ -67,6 +70,7 @@ const results = {
 		platform: `${process.platform}-${process.arch}`,
 		node: process.version,
 	},
+	threads: THREADS,
 	ranAt: new Date().toISOString(),
 };
 
@@ -85,7 +89,7 @@ function optionsFor(hostname, replication) {
 		config: {
 			analytics: { aggregatePeriod: -1 },
 			logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
-			threads: { count: 1 },
+			threads: { count: THREADS },
 			replication,
 		},
 		// `bootstrapHomeMap` stages and activates back to back, so the drain backstop has to go, as it
@@ -370,6 +374,36 @@ function logDelta(before, after, acquisitions) {
 	});
 }
 
+/** The owner's `granted` gauge; the fixture's in-process gauge is the serving worker's, not the owner's. */
+async function grantedOn(node) {
+	const status = await sendOperation(node, { operation: 'cluster_status' });
+	const granted = status.recordLocks?.[DB]?.granted;
+	if (typeof granted !== 'number') throw new Error(`${node.hostname}: the owner's granted gauge is unavailable`);
+	return granted;
+}
+
+/** `BenchLock` over `ids` with each key's home classified; above one worker the serving worker's own
+ * gauge cannot see the owner's grants, so one request per id is bracketed by the owner's gauge. */
+async function lockEachClassified(node, ids, options) {
+	if (THREADS === 1) return call(node, 'BenchLock/', { ...options, ids, classifyHome: true });
+	// Delegated before the first baseline so its own grant never lands inside a measured interval.
+	const warmupId = `warm-${ids[0]}`;
+	await call(node, 'BenchLock/', { ids: [warmupId] });
+	const acquireMs = [];
+	const releaseMs = [];
+	const atMs = [];
+	const homeLocal = [];
+	for (const id of ids) {
+		const before = await grantedOn(node);
+		const one = await call(node, 'BenchLock/', { ...options, ids: [id], warmupId });
+		homeLocal.push((await grantedOn(node)) > before);
+		acquireMs.push(one.acquireMs[0]);
+		releaseMs.push(one.releaseMs[0]);
+		atMs.push(one.atMs[0]);
+	}
+	return { acquireMs, releaseMs, atMs, homeLocal };
+}
+
 /**
  * Lock fresh ids from `node` until every side of the ring in `wanted` has one, keeping the answer:
  * the probe IS that key's first lock, so a later batch on the same id measures only repeats.
@@ -380,7 +414,7 @@ async function probeKeys(node, prefix, wanted, options) {
 	const found = {};
 	for (let attempt = 0; attempt < 40 && !wanted.every((side) => found[side]); attempt++) {
 		const id = `${prefix}-${attempt}-${Date.now()}`;
-		const first = await call(node, 'BenchLock/', { ...options, ids: [id], classifyHome: true });
+		const first = await lockEachClassified(node, [id], options);
 		found[first.homeLocal[0] ? 'local' : 'remote'] ??= { id, first };
 	}
 	for (const side of wanted) assert.ok(found[side], `${prefix}: no ${side}-home key found`);
@@ -446,7 +480,7 @@ suite('record lock cost: 3-node full mesh, replication.recordLocks on', { timeou
 		for (const [i, node] of nodes.entries()) {
 			const ids = Array.from({ length: UNCONTENDED_PER_NODE }, (_, k) => `uncontended-${i}-${k}-${Date.now()}`);
 			const before = await logSnapshot(nodes);
-			const { acquireMs, releaseMs, homeLocal } = await call(node, 'BenchLock/', { ids, classifyHome: true });
+			const { acquireMs, releaseMs, homeLocal } = await lockEachClassified(node, ids);
 			const after = await logSnapshotAfter(nodes);
 			pooledAcquire.push(...acquireMs);
 			pooledRelease.push(...releaseMs);
