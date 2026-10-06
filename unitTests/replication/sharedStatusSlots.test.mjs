@@ -10,6 +10,15 @@ const REPLICATION_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..'
 const REGISTRY_RELATIVE_PATH = 'sharedStatusSlots.ts';
 const SLOT_NAME_SUFFIXES = ['_POSITION', '_SLOT', '_INDEX'];
 
+/** The name a declaration binds, however it is spelled: bare, quoted, or a computed key whose
+ *  expression is a literal. Anything genuinely dynamic has no static name and returns undefined. */
+function staticName(node) {
+	if (!node) return undefined;
+	if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+	if (ts.isComputedPropertyName(node)) return staticName(node.expression);
+	return undefined;
+}
+
 function declaredPositionNames(source, fileName) {
 	const names = [];
 	const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
@@ -19,9 +28,9 @@ function declaredPositionNames(source, fileName) {
 			ts.isBindingElement(node) ||
 			ts.isPropertyDeclaration(node) ||
 			ts.isPropertyAssignment(node);
-		const named = binds && (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name));
-		if (named && SLOT_NAME_SUFFIXES.some((s) => node.name.text.endsWith(s))) {
-			names.push(node.name.text);
+		const name = binds ? staticName(node.name) : undefined;
+		if (name && SLOT_NAME_SUFFIXES.some((s) => name.endsWith(s))) {
+			names.push(name);
 		}
 		ts.forEachChild(node, visit);
 	};
@@ -92,10 +101,12 @@ describe('replication shared-status slot registry', () => {
 		expect(declaredPositionNames('const UNRELATED_OFFSET = 40;', 'a.ts')).to.deep.equal([]);
 	});
 
-	it('declaredPositionNames catches an object-literal slot, quoted or not', () => {
+	it('declaredPositionNames catches an object-literal slot however the key is spelled', () => {
 		expect(declaredPositionNames('const o = { PEER_POSITION: 30 };', 'a.ts')).to.deep.equal(['PEER_POSITION']);
 		expect(declaredPositionNames("const o = { 'PEER_POSITION': 30 };", 'a.ts')).to.deep.equal(['PEER_POSITION']);
-		expect(declaredPositionNames("const o = { 'PEER_SLOT': 30 };", 'a.ts')).to.deep.equal(['PEER_SLOT']);
+		expect(declaredPositionNames("const o = { ['PEER_SLOT']: 30 };", 'a.ts')).to.deep.equal(['PEER_SLOT']);
+		expect(declaredPositionNames('const o = { [`PEER_INDEX`]: 30 };', 'a.ts')).to.deep.equal(['PEER_INDEX']);
+		expect(declaredPositionNames('const o = { [dynamic]: 30 };', 'a.ts')).to.deep.equal([]);
 	});
 
 	it('never hand-numbers a slot constant outside the registry, under any of its spellings', () => {
