@@ -8,14 +8,17 @@ import { getReplicationSharedStatus } from '#src/replication/knownNodes';
 
 const REPLICATION_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'replication');
 const REGISTRY_RELATIVE_PATH = 'sharedStatusSlots.ts';
-// A slot named _SLOT or _INDEX would otherwise walk straight past an audit keyed on _POSITION alone.
 const SLOT_NAME_SUFFIXES = ['_POSITION', '_SLOT', '_INDEX'];
 
 function declaredPositionNames(source, fileName) {
 	const names = [];
 	const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
 	const visit = (node) => {
-		const binds = ts.isVariableDeclaration(node) || ts.isBindingElement(node) || ts.isPropertyDeclaration(node);
+		const binds =
+			ts.isVariableDeclaration(node) ||
+			ts.isBindingElement(node) ||
+			ts.isPropertyDeclaration(node) ||
+			ts.isPropertyAssignment(node);
 		if (binds && ts.isIdentifier(node.name) && SLOT_NAME_SUFFIXES.some((s) => node.name.text.endsWith(s))) {
 			names.push(node.name.text);
 		}
@@ -38,9 +41,9 @@ function fakeAuditStore() {
 }
 
 describe('replication shared-status slot registry', () => {
-	const positionEntries = Object.entries(slots).filter(([name]) => name.endsWith('_POSITION'));
+	const positionEntries = Object.entries(slots).filter(([name]) => SLOT_NAME_SUFFIXES.some((x) => name.endsWith(x)));
 
-	it('assigns every *_POSITION export a distinct, in-range slot, reserving the fire-counter block whole', () => {
+	it('assigns every slot export a distinct, in-range slot, reserving the fire-counter block whole', () => {
 		expect(positionEntries.length).to.be.greaterThan(0);
 		const occupied = new Map();
 		const blockStart = slots.FIRE_COUNTER_BASE_POSITION;
@@ -88,6 +91,10 @@ describe('replication shared-status slot registry', () => {
 		expect(declaredPositionNames('const UNRELATED_OFFSET = 40;', 'a.ts')).to.deep.equal([]);
 	});
 
+	it('declaredPositionNames catches an object-literal slot too', () => {
+		expect(declaredPositionNames('const o = { PEER_POSITION: 30 };', 'a.ts')).to.deep.equal(['PEER_POSITION']);
+	});
+
 	it('never hand-numbers a slot constant outside the registry, under any of its spellings', () => {
 		const offenders = [];
 		for (const file of readdirSync(REPLICATION_DIR, { withFileTypes: true, recursive: true })) {
@@ -108,9 +115,6 @@ describe('replication shared-status slot registry', () => {
 		expect(getReplicationSharedStatus(auditStore, 'data', 'peer')[topSlot]).to.equal(42);
 	});
 
-	// Probed against lmdb-js and @harperfast/rocksdb-js: a second request for a key already
-	// registered returns the FIRST buffer at its original size, with no throw, so writes past that
-	// length are silently dropped. Every caller must therefore pass one size per key.
 	it('getReplicationSharedStatus() always requests the registry capacity, never a caller-chosen size', () => {
 		const sizes = [];
 		const auditStore = {
