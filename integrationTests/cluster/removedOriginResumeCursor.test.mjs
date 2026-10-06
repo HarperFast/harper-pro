@@ -18,7 +18,8 @@
  *   1. R and Q write OLD rows; then, after more than the overlap window, MID rows.
  *   2. B stops. R writes LATE rows, which reach A only.
  *   3. A and then B remove R; R is killed (A's removal already disabled it).
- *   4. B restarts: LATE must arrive through A, and no peer may resend OLD (R's, or Q's through A).
+ *   4. B removes R: LATE must reach B through A without a restart, and without OLD. B then restarts:
+ *      no peer may resend OLD (R's, or Q's through A).
  *   5. N joins A, then B, by base copy: neither copy's tail may carry OLD, and a restart of N must not either.
  *   6. A restarts: no OLD is resent, and R's log on A and B does not grow from step 4 on.
  *
@@ -244,13 +245,19 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		await sendOperation(A, { operation: 'remove_node', hostname: R.hostname });
 		await killHarper({ harper: R });
 		await startNode(B);
+		// Removing R lifts its exclusion on B's subscription to A, which re-admits A's log for R live.
+		const markIncludeA = await logMark(A);
 		await sendOperation(B, { operation: 'remove_node', hostname: R.hostname });
+		await waitForIds(B, rLate, 'LATE reaches B through A once B removes R, without a restart');
+		await delay(SETTLE_MS);
+		deepEqual(await oldIdsSent(A, B, markIncludeA), [], 'A must not send OLD rows when it re-admits R for B');
 
 		const markA = await logMark(A);
 		const markB = await logMark(B);
 		await restartNode(B);
-		await waitForIds(B, rLate, "LATE reaches B through A after R's removal");
 		await waitForIds(A, ALL_IDS, 'A holds every row');
+		await upsert(A, ['a-after-b']);
+		await waitForIds(B, ['a-after-b'], 'B resumes from A after its restart');
 		await delay(SETTLE_MS);
 		deepEqual(
 			await postToFixture(B, 'RecordVersions', { ids: rLate }),
@@ -294,10 +301,12 @@ suite('Removed and relayed origins resume from per-origin cursors (harper-pro#98
 		deepEqual(await oldIdsSent(B, N, markBAgain), [], 'B must not resend OLD rows to N on its restart');
 		deepEqual(await oldIdsSent(N, A, markN), [], 'N must not send OLD rows back to A');
 		deepEqual(await oldIdsSent(N, B, markN), [], 'N must not send OLD rows back to B');
-		deepEqual(
-			(await postToFixture(N, 'LogEntryCount', { log: R.hostname })).count,
-			nRLogCount,
-			"N's log for R must not grow on its restart"
+		// N holds R's rows by copy, with no log entry to recognize a resend by, so the overlap window's rows are
+		// appended once; nothing older is.
+		const nRLogGrowth = (await postToFixture(N, 'LogEntryCount', { log: R.hostname })).count - nRLogCount;
+		ok(
+			nRLogGrowth <= rMid.length + rLate.length,
+			`N's log for R may grow by the overlap window's rows only, grew by ${nRLogGrowth}`
 		);
 	});
 

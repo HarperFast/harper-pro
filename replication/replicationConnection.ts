@@ -2764,12 +2764,9 @@ export function collectSeqRows(seqEntries: Iterable<{ key: any; value: any }>): 
 }
 
 /**
- * The cursor vector a subscriber sends `peerId` (harper-pro#989, W4 harper-pro#434): per origin, the highest
- * origin log key durably applied from that peer, as core records it in the peer's `seq` row `nodes[]`. Cursors
- * are per peer, never borrowed from another peer's row: another subscription can cover a different table scope.
- * A removed origin (its `hdb_nodes` row deleted) was excluded on every relay while it was a direct peer, so
- * no relay row names it; its own connection's row is the only record of what this node holds of it — its
- * own-origin cursor, or `seqId` on a row written before origin cursors existed.
+ * Never borrows another peer's row: that subscription can cover a different table scope. A removed origin (its
+ * `hdb_nodes` row deleted) was excluded on every relay while it was a direct peer, so only its own connection's
+ * row records what this node holds of it: its own-origin cursor, or `seqId` on a row older than origin cursors.
  */
 export function buildOriginCursorVector(
 	seqRows: Map<number, DbisCursor>,
@@ -2809,10 +2806,6 @@ export function parseOriginKeyMap(value: unknown): Map<string, number> {
 	return keys;
 }
 
-/**
- * The start, `ORIGIN_CURSOR_OVERLAP_MS` below each of a subscriber's cursors, for every named origin this node has
- * an id for.
- */
 export function resolveOriginFloors(
 	vector: unknown,
 	nameToId: Record<string, number> | undefined
@@ -2829,9 +2822,8 @@ export function resolveOriginFloors(
 }
 
 /**
- * Whether an entry at `position` belongs to a subscription, given the subscription's `timeRange` for the entry's
- * origin: `false` when the origin is excluded, `{ startTime, endTime }` when it is listed, `undefined` when it is
- * neither — which matches only with an exclusion list in force (multi-log), and only above the origin's `floor`.
+ * `timeRange` is `false` for an excluded origin, `{ startTime, endTime }` for a listed one, and `undefined` for
+ * neither, which matches only under an exclusion list (a multi-log range) and only above the origin's `floor`.
  */
 export function matchesSubscriptionPosition(
 	timeRange: { startTime: number; endTime?: number } | false | undefined,
@@ -2861,30 +2853,55 @@ export function collectRelayedLogAnchors(auditStore: any, skipLogs: Set<string>)
 }
 
 /**
- * Whether an incremental resume from `localStart` misses nothing retention purged, where the nominal
- * `now - auditRetention` cutoff would force a base copy. rocksdb-js keeps a log's newest file past retention, so an
- * idle sender's last own entry survives: when `localStart` names a retained entry of the local log, every entry
- * appended after it is retained too. Every other log the resume reads needs the subscriber's cursor for it at or
- * above the log's oldest retained key; a log with no cursor, or no entry left to compare, keeps the base copy.
+ * An append-order resume from `localStart` for a subscriber whose cursor is older than `now - auditRetention`,
+ * or undefined when one cannot be proven. rocksdb-js keeps a log's newest file past retention, so an idle sender's
+ * last own entry survives, and a range that resumes past that exact entry yields everything appended after it.
+ * Every other log in scope needs the subscriber's cursor for it, resumed past exactly the same way: a key range
+ * cannot prove coverage, since a log is appended out of key order. The caller still probes that every boundary
+ * forms (`rangeBoundaryFailure`) and keeps the base copy when one does not.
  */
-export function retainedHistoryCoversResume(
-	auditStore: any,
+export function retainedResumeRange(
 	localStart: number,
 	otherLogs: Iterable<string>,
-	originCursors: Record<string, number> | undefined
-): boolean {
-	if (classifyResumeAnchor(auditStore, localStart, 'local') !== 'entry') return false;
+	originCursors: Record<string, number> | undefined,
+	excludeLogs: string[] | undefined
+) {
+	const startByLog = new Map([['local', localStart]]);
 	for (const logName of otherLogs) {
 		const cursor = originCursors && Object.hasOwn(originCursors, logName) ? originCursors[logName] : undefined;
-		if (!isValidFrameTxnLogKey(cursor)) return false;
-		let oldestKey: number | undefined;
-		for (const entry of auditStore.getRange({ start: 1, log: logName, snapshot: false })) {
-			oldestKey = entry.txnLogKey;
-			break;
-		}
-		if (!(oldestKey <= cursor)) return false;
+		if (!isValidFrameTxnLogKey(cursor)) return undefined;
+		startByLog.set(logName, cursor);
 	}
-	return true;
+	return {
+		start: localStart,
+		exactStart: true,
+		exclusiveStart: true,
+		resumeAfterExactStart: true,
+		log: excludeLogs ? undefined : 'local',
+		startByLog,
+		excludeLogs,
+		snapshot: false,
+	};
+}
+
+/**
+ * Pulls one entry to prove every exact boundary in `rangeOptions` forms; core fills `exactStartFailures` only during
+ * `next()`. A throw is the same outcome as a recorded failure.
+ */
+export function rangeBoundaryFailure(auditStore: any, rangeOptions: any): unknown {
+	try {
+		const probe: any = auditStore.getRange(rangeOptions);
+		const probeIterator = probe[Symbol.iterator]();
+		try {
+			probeIterator.next();
+		} finally {
+			// releases the single-log iterator now; a no-op on the multi-log aggregate, which has no teardown hook
+			probeIterator.return?.();
+		}
+		return probe.exactStartFailures?.size > 0 || probe.failedLogs?.size > 0 || probe.corruptFrameStop?.breaks > 0;
+	} catch (error) {
+		return error;
+	}
 }
 
 /**
@@ -3856,8 +3873,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
 			if (copyOriginAnchors?.size && auditStore) {
-				for (const [originName, anchor] of copyOriginAnchors)
-					noteOriginProgress(getIdOfRemoteNode(originName, auditStore), anchor);
+				try {
+					// a peer-supplied name must not mint an id; an origin the copy carried rows for already has one
+					const nameToId = exportIdMapping(auditStore);
+					for (const [originName, anchor] of copyOriginAnchors) {
+						if (Object.hasOwn(nameToId, originName) && typeof nameToId[originName] === 'number')
+							noteOriginProgress(nameToId[originName], anchor);
+					}
+				} catch (error) {
+					// without the anchors those origins resume from 0, as they would without the capability
+					logger.warn?.(connectionId, 'could not record the copy anchors for', databaseName, error);
+				}
 				copyOriginAnchors = undefined;
 				if (frameOpen) drainEndTxnDeferred = true;
 				else
@@ -4680,13 +4706,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	ws.on('close', () => blockedTablesInvalidator.remove());
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
-	// Sender side of the per-origin cursor vector (harper-pro#989): the cursors the subscriber sent, the start they
-	// give each origin it neither lists nor excludes (by name, and by local id for matchesSubscription), and the
-	// `startByLog` map the live incremental range holds, which an `includeNodes` update extends before `addLog`.
+	// `liveStartByLog` is the map the live incremental range holds, so an `includeNodes` update can extend it.
 	let requestedOriginCursors: Record<string, number> | undefined;
 	let originFloors: Map<string, number> | undefined;
 	let originFloorById: number[] | undefined;
 	let liveStartByLog: Map<string, number> | undefined;
+	let wakeSender: (() => void) | undefined;
 	// Serialize message handling so that async backpressure inside onWSMessage doesn't allow
 	// the WS library to start processing the next frame before the current one is fully decoded.
 	// Without serialization, awaiting inside the handler would let concurrent message handlers
@@ -4743,9 +4768,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// `outstandingBlobsToFinish` before it clamps, so it only needs `hasBlobGap`; the sequence-update sites
 	// don't await, so they also gate on outstanding blobs.
 	const cursorBlockedByBlob = () => hasBlobGap || outstandingBlobsToFinish.length > 0;
-	// Receiver side of the per-origin cursor vector (harper-pro#989): the highest origin log key of each committed
-	// frame, by local origin id, held while a blob is outstanding, under the same rule as the durable watermark;
-	// and the relayed-log anchors a base copy announced, recorded only once that copy finishes.
+	// Origin progress is held under the durable watermark's blob rule; a copy's anchors wait for the copy to finish.
 	let pendingOriginCursors: Map<number, number> | undefined;
 	let copyOriginAnchors: Map<string, number> | undefined;
 	// A frame's log key is its origin's own log key only on RocksDB, on both ends.
@@ -5293,8 +5316,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
-						// The copy holds every relayed entry committed before these keys (message[3]); a pass that
-						// does not name them replaces a prior pass's.
+						// a restarted pass that names none replaces the prior pass's
 						copyOriginAnchors = recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
@@ -5705,7 +5727,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 
 						// Remove nodes from exclusion list (add their logs to the iterator)
 						const includeFloors =
-							auditStore?.reusableIterable === true
+							auditStore?.reusableIterable === true &&
+							peerCapabilitiesLearned &&
+							peerSupportsOriginCursors(peerCapabilities)
 								? resolveOriginFloors(data?.originCursors, exportIdMapping(auditStore))
 								: undefined;
 						for (const nodeName of nodesToInclude) {
@@ -5730,6 +5754,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 								// Add this log back to the iterator
 								auditLogIterable?.addLog(nodeName);
+								wakeSender?.();
 								logger.debug?.(connectionId, 'added log to iterator:', nodeName);
 							}
 						}
@@ -5740,7 +5765,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						nodeSubscriptions = data;
 						excludedNodes = message[2]; // use the third argument for exclusion list
 						const subscriptionSetupRequestId = message[3];
-						requestedOriginCursors = Object.fromEntries(parseOriginKeyMap(message[4]));
+						requestedOriginCursors =
+							peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities)
+								? Object.fromEntries(parseOriginKeyMap(message[4]))
+								: undefined;
 						originFloors = undefined;
 						originFloorById = undefined;
 						liveStartByLog = undefined;
@@ -6392,24 +6420,36 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												)
 											) {
 												auditStore.loadLogs?.();
-												if (
+												const resumeRange =
 													oldestLogName === 'local' &&
 													nodeSubscriptions.length === 1 &&
-													auditStore.reusableIterable === true &&
-													retainedHistoryCoversResume(
-														auditStore,
-														currentSequenceId,
-														excludedNodes
-															? [...auditStore.logByName.keys()].filter(
-																	(name) => name !== 'local' && !excludedNodes.includes(name)
-																)
-															: [],
-														requestedOriginCursors
-													)
-												) {
+													auditStore.reusableIterable === true
+														? retainedResumeRange(
+																currentSequenceId,
+																excludedNodes
+																	? [...auditStore.logByName.keys()].filter(
+																			(name) => name !== 'local' && !excludedNodes.includes(name)
+																		)
+																	: [],
+																requestedOriginCursors,
+																excludedNodes
+															)
+														: undefined;
+												if (resumeRange && !rangeBoundaryFailure(auditStore, resumeRange)) {
 													logger.info?.(
 														`Peer ${remoteNodeName} resumes database ${databaseName} incrementally from ${new Date(currentSequenceId).toISOString()}, past the auditRetention cutoff: that position is still an entry of this node's transaction log`
 													);
+													auditLogIterable = auditStore.getRange(resumeRange);
+													boundaryLogName = 'local';
+													// The range resumes each log past its exact entry, so a key filter would drop entries
+													// appended later with an older key.
+													for (const logName of resumeRange.startByLog.keys()) {
+														const localId = logName === 'local' ? 0 : exportIdMapping(auditStore)[logName];
+														if (typeof localId !== 'number') continue;
+														if (originFloorById) delete originFloorById[localId];
+														const listed = subscribedNodeIds[localId];
+														if (typeof listed === 'object') subscribedNodeIds[localId] = { ...listed, startTime: 0 };
+													}
 												} else {
 													logger.warn?.(
 														`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
@@ -6492,9 +6532,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// An empty log (anchorKey 0) still sends the wall clock, never a sentinel below every key: the
 											// follower persists it, and shouldForceBaseCopyForRetention reads such a cursor as purged history.
 											const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
-											// The copy also holds every relayed entry committed before now, so each relayed log resumes in
-											// append order past its own last committed key rather than from 0 (harper-pro#989). A resumed
-											// copy's walk began before now, so its relayed logs get no such anchor.
+											// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
 											const relayedAnchors =
 												!copyResume && canResumePastAnchor && excludedNodes
 													? collectRelayedLogAnchors(
@@ -6502,31 +6540,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															new Set([...excludedNodes, ...nodeSubscriptions.map(({ name }) => name)])
 														)
 													: undefined;
-											// Prove a boundary forms UNDER THESE OPTIONS. A freshly built iterable cannot answer: core
-											// fills `exactStartFailures` during `next()`, so the map is empty until something pulls.
-											const boundaryFailure = (rangeOptions: any): unknown => {
-												try {
-													const probe: any = auditStore.getRange(rangeOptions);
-													const probeIterator = probe[Symbol.iterator]();
-													try {
-														probeIterator.next();
-													} finally {
-														// Single-pull probe: release the underlying log iterator now rather than leaving
-														// it for GC. `return` is wired through for exactly this on the single-log path;
-														// a no-op where it isn't (the multi-log aggregate has no teardown hook at all).
-														probeIterator.return?.();
-													}
-													return (
-														probe.exactStartFailures?.size > 0 ||
-														probe.failedLogs?.size > 0 ||
-														probe.corruptFrameStop?.breaks > 0
-													);
-												} catch (error) {
-													// A throw here is the same outcome as a recorded failure and must not escape into the
-													// outer catch, which would close and reconnect into the same failing boundary.
-													return error;
-												}
-											};
+											const boundaryFailure = (rangeOptions: any) => rangeBoundaryFailure(auditStore, rangeOptions);
+											// only anchors the tail resumes past are the receiver's to keep
+											let announcedAnchors: Map<string, number> | undefined;
 											// A resumed copy resumes in append order only if its anchor still NAMES an entry of the log;
 											// anything else — a pre-#876 wall-clock anchor, a purged entry, a log that cannot be read — keeps
 											// the timestamp resume every build before this one used for every cursor. `resumeAnchorKind`
@@ -6552,6 +6568,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												if (relayedRange && !boundaryFailure(relayedRange)) {
 													auditLogIterable = auditStore.getRange(relayedRange);
 													boundaryLogName = logName;
+													announcedAnchors = relayedAnchors;
 												} else auditLogIterable = auditStore.getRange(emptyLogRange);
 												anchoredInLogOrder = true;
 											} else if (
@@ -6573,7 +6590,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													snapshot: false,
 												};
 												let unusable = boundaryFailure(boundaryRange);
-												if (unusable && relayedAnchors?.size) {
+												if (!unusable) announcedAnchors = relayedAnchors;
+												else if (relayedAnchors?.size) {
 													// A relayed log that cannot form its boundary must not cost the local log its own.
 													boundaryRange.startByLog = new Map([[logName, copyStartTime]]);
 													unusable = boundaryFailure(boundaryRange);
@@ -6590,6 +6608,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													boundaryLogName = logName;
 													anchoredInLogOrder = true;
 												}
+											}
+											if (announcedAnchors && originFloorById) {
+												// resumed past their exact anchors: a key floor would drop entries appended later with older keys
+												const nameToId = exportIdMapping(auditStore);
+												for (const logName of announcedAnchors.keys()) delete originFloorById[nameToId[logName]];
 											}
 											if (!anchoredInLogOrder && (copyResume || orderedTableNames.length > 0)) {
 												// A degraded anchor is otherwise indistinguishable from a log-order one in the logs.
@@ -6617,8 +6640,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// a resume cursor a later leader can validate before trusting the skip or the anchor.
 											ws.send(
 												encode(
-													relayedAnchors?.size && peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities)
-														? [COPY_START, copyStartTime, COPY_ORDER_VERSION, Object.fromEntries(relayedAnchors)]
+													announcedAnchors?.size &&
+														peerCapabilitiesLearned &&
+														peerSupportsOriginCursors(peerCapabilities)
+														? [COPY_START, copyStartTime, COPY_ORDER_VERSION, Object.fromEntries(announcedAnchors)]
 														: [COPY_START, copyStartTime, COPY_ORDER_VERSION]
 												)
 											);
@@ -6905,7 +6930,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
 									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
-									await nextTransaction;
+									// an `includeNodes` update re-admits a log whose entries are already committed
+									await new Promise<void>((resolve) => {
+										wakeSender = resolve;
+										nextTransaction.then(resolve, resolve);
+									});
+									wakeSender = undefined;
 								} while (!closed);
 							})
 							.catch((error) => {
@@ -7470,8 +7500,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						: Math.max(lastSequenceIdReceived ?? 0, maxBatchTxnLogKey), // resume cursor from the batch even without a sequence-update
 				remoteNodeIds: receivingDataFromNodeIds,
 				txnStream,
-				// filled in by onCommit below, which core awaits before it records the cursor
-				originCursors: frameOrigins && ([] as [number, number][]),
 				// core skips this frame's onCommit when it fails, so release what onCommit would have
 				onFailure(error: unknown, position: number) {
 					outstandingCommits--;
@@ -7530,11 +7558,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// failed blob — preserving the no-data-loss guarantee — while the apply loop never blocks.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) advanceDurableWatermark();
 					endTxnEvent.localTime = lastDurableSequenceId;
-					if (frameOrigins) {
-						for (const originId of frameOrigins) noteOriginProgress(originId, frameTxnLogKey);
-						const durableOriginCursors = takeDurableOriginCursors();
-						if (durableOriginCursors) endTxnEvent.originCursors.push(...durableOriginCursors);
-					}
+					if (frameOrigins) for (const originId of frameOrigins) noteOriginProgress(originId, frameTxnLogKey);
+					// core reads this after awaiting onCommit
+					endTxnEvent.originCursors = takeDurableOriginCursors();
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
 					// (version < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
 					// core persists [seq] = copyStartTime. Otherwise a small copy that finished before the cadence
@@ -8423,7 +8449,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return localBlob;
 	}
 	let lastSentExcludedNodes: string[] = [];
-	/** This node's per-origin cursors for the connected peer (buildOriginCursorVector), or undefined without the capability. */
 	function currentOriginCursorVector(): Record<string, number> | undefined {
 		const connectedNodeName = options.connection?.nodeSubscriptions?.[0]?.name;
 		if (!connectedNodeName || !recordsOriginCursors()) return undefined;

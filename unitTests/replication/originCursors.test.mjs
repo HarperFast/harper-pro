@@ -11,7 +11,7 @@ import {
 	matchesSubscriptionPosition,
 	parseOriginKeyMap,
 	resolveOriginFloors,
-	retainedHistoryCoversResume,
+	retainedResumeRange,
 } from '#src/replication/replicationConnection';
 
 const SEQ = Symbol.for('seq');
@@ -175,21 +175,30 @@ describe('collectRelayedLogAnchors', () => {
 	});
 });
 
-describe('retainedHistoryCoversResume', () => {
-	const store = fakeAuditStore({ local: [T - 100, T], removed: [T - 50, T - 40], empty: [] });
-
-	it('holds when the start is a retained local entry and every other log is covered by a cursor', () => {
-		assert.strictEqual(retainedHistoryCoversResume(store, T, [], undefined), true);
-		assert.strictEqual(retainedHistoryCoversResume(store, T, ['removed'], { removed: T - 50 }), true);
+describe('retainedResumeRange', () => {
+	it('resumes the local log and every other log in scope past their exact entries', () => {
+		const range = retainedResumeRange(T, ['removed'], { removed: T - 50, unrelated: T }, ['self']);
+		assert.deepStrictEqual(
+			range.startByLog,
+			new Map([
+				['local', T],
+				['removed', T - 50],
+			])
+		);
+		assert.strictEqual(range.resumeAfterExactStart, true);
+		assert.strictEqual(range.exactStart, true);
+		assert.deepStrictEqual(range.excludeLogs, ['self']);
+		assert.strictEqual(range.log, undefined);
 	});
 
-	it('fails when the start names no local entry', () => {
-		assert.strictEqual(retainedHistoryCoversResume(store, T - 1, [], undefined), false);
+	it('reads only the local log for a single-log subscription', () => {
+		assert.strictEqual(retainedResumeRange(T, [], undefined, undefined).log, 'local');
 	});
 
-	it('fails for another log with no cursor, a cursor below its oldest entry, or no entry at all', () => {
-		assert.strictEqual(retainedHistoryCoversResume(store, T, ['removed'], {}), false);
-		assert.strictEqual(retainedHistoryCoversResume(store, T, ['removed'], { removed: T - 51 }), false);
-		assert.strictEqual(retainedHistoryCoversResume(store, T, ['empty'], { empty: T }), false);
+	it('gives no range when another log in scope has no usable cursor', () => {
+		assert.strictEqual(retainedResumeRange(T, ['removed'], {}, []), undefined);
+		assert.strictEqual(retainedResumeRange(T, ['removed'], undefined, []), undefined);
+		assert.strictEqual(retainedResumeRange(T, ['removed'], { removed: 'T' }, []), undefined);
+		assert.strictEqual(retainedResumeRange(T, ['toString'], {}, []), undefined);
 	});
 });

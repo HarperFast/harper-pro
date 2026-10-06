@@ -86,7 +86,7 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 	beforeEach(async () => {
 		socket = new FakeSocket();
 		replicateOverWS(socket, {}, { name: 'peer-a', replicates: true });
-		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false)]));
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false, true)]));
 		await settle(socket, 1);
 	});
 
@@ -182,7 +182,7 @@ describe('replicate: false on the full copy (harper-pro#883)', function () {
 		replicateOverWS(socket, {}, { replicates: true });
 		// Without a capability bag the sender reads this peer as v4 and waits on a legacy baseline
 		// answer no fake socket gives, so the copy never starts.
-		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false)]));
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false, true)]));
 		await settle(socket, 1);
 		// A peer that declared no table excludes nothing, so the source's own gate is the only filter.
 		socket.emit(
@@ -279,7 +279,7 @@ describe('replicate: false on the receive path (harper-pro#883)', function () {
 		const shared = tables.ReplicateFalseShared;
 		socket = new FakeSocket();
 		replicateOverWS(socket, {}, { replicates: true });
-		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false)]));
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false, true)]));
 		await settle(socket, 1);
 		socket.emit('message', encode([NODE_NAME_TO_ID_MAP, { 'peer-a': 0 }, ['peer-a']]));
 		socket.emit('message', structureFrame(local, 21));
@@ -308,7 +308,7 @@ describe('replicate: false on the receive path (harper-pro#883)', function () {
 
 		socket = new FakeSocket();
 		replicateOverWS(socket, {}, { replicates: true });
-		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false)]));
+		socket.emit('message', encode([NODE_NAME, 'peer-a', 'data', [], buildLocalCapabilities(90_000, false, true)]));
 		await settle(socket, 1);
 		socket.emit('message', encode([NODE_NAME_TO_ID_MAP, { 'peer-a': 0 }, ['peer-a']]));
 		socket.emit('message', structureFrame(local, 31));
