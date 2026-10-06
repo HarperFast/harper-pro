@@ -1,7 +1,5 @@
 /**
- * harper-pro#974: a worker dedicated to an isolated application is an `http` worker that carries
- * `worker.application`. Replication must never place a subscription on it, and the reconcile must
- * treat a subscription found on it as needing a rebind, while plain http workers keep their order.
+ * An isolated application's worker is an http worker with `application` set: replication must not place on it.
  */
 import assert from 'node:assert';
 import { workers } from '#js/core/server/threads/manageThreads';

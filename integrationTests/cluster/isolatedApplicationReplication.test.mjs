@@ -43,7 +43,7 @@ async function createDatabases(node) {
 	for (const database of DATABASES) await ensureTableExists(node, { database, table: 'Probe', primary_key: 'id' });
 }
 
-/** The pool worker ids and the dedicated worker's id, after asserting the dedicated worker is running. */
+/** Thread ids of the pool worker and the dedicated worker; asserts exactly one of each. */
 async function threadsOf(node) {
 	const { threads } = await sendOperation(node, { operation: 'system_information', attributes: ['threads'] });
 	const pool = threads.filter((thread) => thread.name === 'http' && !thread.application).map((t) => t.threadId);
