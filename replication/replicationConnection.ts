@@ -5195,12 +5195,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							table
 						);
 						// A pool worker never ran the application, so it cannot maintain an index whose resolver the
-						// application assigns; applying here would leave the index silently wrong (harper-pro#975).
+						// application assigns; applying here would leave the index silently wrong. Latch inbound off
+						// and drop a decoder from an earlier structure message, so queued frames cannot apply either.
 						if (isDedicatedPoolWorker()) {
 							const unresolved = table?.unresolvedComputedIndexes?.();
 							if (unresolved?.length) {
 								const reason = `${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code, which replication.threads workers cannot run; use replication.threads: 0`;
 								logger.error?.(connectionId, `Refusing to replicate: ${reason}`);
+								wsClosed = true;
+								delete tableDecoders[tableId];
 								close(1011, reason);
 								return;
 							}

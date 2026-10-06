@@ -1157,7 +1157,7 @@ function assignOwner(database: string, owner: any): void {
 }
 
 /**
- * Tell every http worker which thread coordinates `database` (harper-pro#852), so a `lock()` served
+ * Tell every http and replication worker which thread coordinates `database` (harper-pro#852), so a `lock()` served
  * on a non-owner worker can send its acquire straight to the owner over the port mesh rather than
  * hopping through main. A PENDING_BUMP or absent owner clears the mapping — a worker with no owner
  * fails a cluster `lock()` closed (503) and retries once the owner is assigned, the same shape as
@@ -1208,7 +1208,7 @@ export function handleOwnerThreadAck(message: { requestId: number }, port?: { th
 }
 
 /**
- * Tell every LIVE http worker the database is now ownerless and WAIT for each to confirm it has fenced
+ * Tell every LIVE http and replication worker the database is now ownerless and WAIT for each to confirm it has fenced
  * the relayed handles it held, before the successor is assigned. Resolves once every worker has acked
  * OR exited; REJECTS if a live worker fails to ack within the timeout (handoff fails, database stays
  * unowned and fail-closed). The caller passes the already-filtered live set (the just-exited owner

@@ -346,7 +346,6 @@ export function start(options) {
 		for (const updateContexts of contextUpdaters) updateContexts();
 	});
 }
-/** Name the tables whose subscriptions a pool worker will refuse (see the TABLE_FIXED_STRUCTURE check). */
 function warnOfUnresolvedComputedIndexes() {
 	const databases = getDatabases();
 	for (const databaseName in databases) {

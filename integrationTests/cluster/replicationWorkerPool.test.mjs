@@ -13,33 +13,41 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 const NODE_COUNT = 2;
 const POOL_SIZE = 2;
 
-async function threadIds(node, name) {
-	const { threads } = await sendOperation(node, { operation: 'system_information', attributes: ['threads'] });
+async function threadIds(node, name, signal) {
+	const { threads } = await sendOperation(
+		node,
+		{ operation: 'system_information', attributes: ['threads'] },
+		{ signal }
+	);
 	return threads.filter((thread) => thread.name === name).map((thread) => thread.threadId);
 }
 
-async function outboundSocketThreads(node) {
-	const { connections } = await sendOperation(node, { operation: 'cluster_status' });
+async function outboundSocketThreads(node, signal) {
+	const { connections } = await sendOperation(node, { operation: 'cluster_status' }, { signal });
 	return connections.flatMap((connection) =>
 		connection.database_sockets.map((socket) => ({ ...socket, peer: connection.name }))
 	);
 }
 
-async function allConnected(nodes) {
+async function allConnected(nodes, signal) {
 	for (const node of nodes) {
-		const sockets = await outboundSocketThreads(node);
+		const sockets = await outboundSocketThreads(node, signal);
 		if (sockets.length === 0 || !sockets.every((socket) => socket.connected)) return false;
 	}
 	return true;
 }
 
-async function readReplicated(node, table, id) {
-	const [record] = await sendOperation(node, {
-		operation: 'search_by_id',
-		table,
-		get_attributes: ['id', 'name'],
-		ids: [id],
-	});
+async function readReplicated(node, table, id, signal) {
+	const [record] = await sendOperation(
+		node,
+		{
+			operation: 'search_by_id',
+			table,
+			get_attributes: ['id', 'name'],
+			ids: [id],
+		},
+		{ signal }
+	);
 	return record;
 }
 
@@ -89,7 +97,7 @@ suite('replication runs on the dedicated worker pool', (ctx) => {
 			hostname: ctx.nodes[0].hostname,
 			authorization: 'Bearer ' + token,
 		});
-		await waitForCondition(() => allConnected(ctx.nodes), { description: 'the cluster to connect' });
+		await waitForCondition((signal) => allConnected(ctx.nodes, signal), { description: 'the cluster to connect' });
 	});
 
 	after(async () => {
@@ -131,7 +139,7 @@ suite('replication runs on the dedicated worker pool', (ctx) => {
 			records: [{ id: '1', name: 'first' }],
 			replicatedConfirmation: 1,
 		});
-		const record = await waitForCondition(() => readReplicated(ctx.nodes[1], 'pooled', '1'), {
+		const record = await waitForCondition((signal) => readReplicated(ctx.nodes[1], 'pooled', '1', signal), {
 			timeoutMs: 30000,
 			description: 'the write to replicate',
 		});
@@ -143,15 +151,15 @@ suite('replication runs on the dedicated worker pool', (ctx) => {
 		const before = await threadIds(node, 'replication');
 		await sendOperation(node, { operation: 'restart_service', service: 'http_workers' });
 		const replaced = await waitForCondition(
-			async () => {
-				const pool = await threadIds(node, 'replication');
+			async (signal) => {
+				const pool = await threadIds(node, 'replication', signal);
 				return pool.length === POOL_SIZE && pool.every((id) => !before.includes(id)) && pool;
 			},
 			{ timeoutMs: 60000, description: 'the pool to be replaced' }
 		);
 		await waitForCondition(
-			async () => {
-				const sockets = await outboundSocketThreads(node);
+			async (signal) => {
+				const sockets = await outboundSocketThreads(node, signal);
 				return sockets.length > 0 && sockets.every((socket) => socket.connected && replaced.includes(socket.threadId));
 			},
 			{ timeoutMs: 60000, description: 'subscriptions to move to the new pool and reconnect' }
@@ -161,7 +169,7 @@ suite('replication runs on the dedicated worker pool', (ctx) => {
 			table: 'pooled',
 			records: [{ id: '2', name: 'after restart' }],
 		});
-		const record = await waitForCondition(() => readReplicated(node, 'pooled', '2'), {
+		const record = await waitForCondition((signal) => readReplicated(node, 'pooled', '2', signal), {
 			timeoutMs: 30000,
 			description: 'a write after the restart to replicate',
 		});
