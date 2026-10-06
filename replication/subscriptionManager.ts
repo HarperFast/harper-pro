@@ -5,9 +5,10 @@
  */
 import { getDatabases } from '../core/resources/databases.ts';
 import { transaction } from '../core/resources/transaction.ts';
-import { workers, onMessageByType, whenThreadsStarted, getWorkerCount } from '../core/server/threads/manageThreads.js';
-import { collectRecordLockStatus, recordLockOwnerFor } from './recordLockTransport.ts';
-import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { onMessageByType, whenThreadsStarted, getWorkerCount } from '../core/server/threads/manageThreads.js';
+import { collectRecordLockStatus } from './recordLockTransport.ts';
+import { replicationWorkers } from './replicationWorkers.ts';
+import { setSessionHolderReader } from './recordLockRpc.ts';
 import { lastTimeInAuditStore } from '../core/resources/nodeIdMapping.ts';
 import {
 	subscribeToNode,
@@ -395,9 +396,15 @@ function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 				// current registry, not the state when this subscribe was scheduled.
 				exclusionOrigins: computeExclusionOrigins(database),
 			};
-			const target = dispatchSubscriptionRequest(entry, request, workers, getWorkerCount() === 1, subscribeToNode);
+			const target = dispatchSubscriptionRequest(
+				entry,
+				request,
+				replicationWorkers(),
+				getWorkerCount() === 1,
+				subscribeToNode
+			);
 			if (target === 'deferred')
-				logger.warn('Deferring replication subscription until a live http worker owns it', url, database);
+				logger.warn('Deferring replication subscription until a live replication worker owns it', url, database);
 		},
 		consume() {
 			selfCatchupOfDatabase.delete(database);
@@ -539,9 +546,9 @@ function reportIdentityMismatchOnce(nodes: Array<{ name?: string; url?: string }
 }
 
 // Returns the set of node URLs whose replication entries either point at a worker no longer
-// in the supplied http pool, OR have no worker assigned at all while live workers exist.
+// in the supplied replication pool, OR have no worker assigned at all while live workers exist.
 // The second case covers "all workers were down at registration time" — onDatabase stores
-// `worker: undefined` when httpWorkers is empty, and without this the entry would never
+// `worker: undefined` when replicationPool is empty, and without this the entry would never
 // get reassigned once workers came back. Pure helper so the reconcile pass below — and its
 // unit tests — can verify the broken-chain detection without spinning up real workers.
 // Clear a dead worker from every subscription entry it owned, so findStaleNodeUrls re-binds those
@@ -617,16 +624,19 @@ export function shouldFireStallKick(args: {
 // session writes CONNECTED into the same buffer. Stamping it would flap a healthy link DOWN on every tick and
 // leave a sticky worker-exit code on it. An entry registered while the pool was empty defers its setup until
 // findStaleNodeUrls rebinds it; this must not pre-empt that. (harper-pro#431)
-export function hasDeadOwner(entry: { worker?: any }, httpWorkers: any[]): boolean {
-	return Boolean(entry.worker) && !httpWorkers.includes(entry.worker);
+export function hasDeadOwner(entry: { worker?: any }, replicationPool: any[]): boolean {
+	return Boolean(entry.worker) && !replicationPool.includes(entry.worker);
 }
-export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatusMap>, httpWorkers: any[]): Set<string> {
+export function findStaleNodeUrls(
+	connectionMap: Map<string, DBReplicationStatusMap>,
+	replicationPool: any[]
+): Set<string> {
 	const staleNodeUrls = new Set<string>();
 	// No live workers to reassign to — flagging here would cause endless no-op reassignments.
-	if (httpWorkers.length === 0) return staleNodeUrls;
+	if (replicationPool.length === 0) return staleNodeUrls;
 	for (const [url, dbReplicationWorkers] of connectionMap) {
 		for (const entry of dbReplicationWorkers.values()) {
-			if (!entry.worker || !httpWorkers.includes(entry.worker)) {
+			if (!entry.worker || !replicationPool.includes(entry.worker)) {
 				staleNodeUrls.add(url);
 				break;
 			}
@@ -648,13 +658,13 @@ export function findStaleNodeUrls(connectionMap: Map<string, DBReplicationStatus
 // and re-driven forever. See harper-pro#233 / #289.
 export function findWedgedNodeUrls(
 	connectionMap: Map<string, DBReplicationStatusMap>,
-	httpWorkers: any[],
+	replicationPool: any[],
 	now: number,
 	thresholdMs: number,
 	isDesired: (node: any, database: string) => boolean
 ): Set<string> {
 	const wedgedNodeUrls = new Set<string>();
-	if (httpWorkers.length === 0) return wedgedNodeUrls;
+	if (replicationPool.length === 0) return wedgedNodeUrls;
 	for (const [url, dbReplicationWorkers] of connectionMap) {
 		for (const [database, entry] of dbReplicationWorkers) {
 			// connected !== true (not === false) so a never-connected entry — connected still undefined
@@ -666,7 +676,7 @@ export function findWedgedNodeUrls(
 			if (
 				entry.connected !== true &&
 				entry.worker &&
-				httpWorkers.includes(entry.worker) &&
+				replicationPool.includes(entry.worker) &&
 				downSince != null &&
 				now - downSince >= thresholdMs &&
 				isDesired(entry.nodes?.[0], database)
@@ -808,14 +818,14 @@ export function isReceiveStalled(
 // legitimately-unsubscribed entry is never re-driven.
 export function findStalledReceivingNodeUrls(
 	connectionMap: Map<string, DBReplicationStatusMap>,
-	httpWorkers: any[],
+	replicationPool: any[],
 	now: number,
 	thresholdMs: number,
 	isDesired: (node: any, database: string) => boolean,
 	getReceiveStatus: (database: string, nodeName: string) => ReceiveStatus | undefined
 ): Map<string, Set<string>> {
 	const stalledByUrl = new Map<string, Set<string>>();
-	if (httpWorkers.length === 0) return stalledByUrl;
+	if (replicationPool.length === 0) return stalledByUrl;
 	for (const [url, dbReplicationWorkers] of connectionMap) {
 		for (const [database, entry] of dbReplicationWorkers) {
 			// connected:false entries are the findWedgedNodeUrls path; only consider live-worker,
@@ -824,7 +834,7 @@ export function findStalledReceivingNodeUrls(
 				entry.connected === false ||
 				(entry.receiveStallGraceUntil != null && now < entry.receiveStallGraceUntil) ||
 				!entry.worker ||
-				!httpWorkers.includes(entry.worker) ||
+				!replicationPool.includes(entry.worker) ||
 				!isDesired(entry.nodes?.[0], database)
 			)
 				continue;
@@ -1112,13 +1122,19 @@ export async function startOnMainThread(options) {
 	// we do all of the main management of tracking connections and subscriptions on the main thread and delegate
 	// the actual work to the worker threads
 	let nextWorkerIndex = 0;
-	// With cluster record locks enabled, every subscription for a database lives on the worker that
-	// coordinates its locks, so the coordinator applies the database's inbound control entries in order
-	// with its data; otherwise placement stays per (peer, database) round-robin.
-	function placeSubscription(databaseName: string, httpWorkers: any[]) {
-		if (CLUSTER_RECORD_LOCKS_ENABLED) return recordLockOwnerFor(databaseName, httpWorkers);
-		nextWorkerIndex = nextWorkerIndex % httpWorkers.length; // wrap around as necessary
-		return httpWorkers[nextWorkerIndex++];
+	setSessionHolderReader((nodeName, database) => {
+		const node = nodeMap.get(nodeName);
+		const entry = node ? connectionReplicationMap.get(getNodeURL(node))?.get(database) : undefined;
+		if (!entry || hasDeadOwner(entry, replicationWorkers())) return undefined;
+		return entry.worker;
+	});
+	// Round-robin regardless of record-lock ownership: a control entry applied off the coordinating
+	// worker is relayed to it (harper-pro#977).
+	function placeSubscription(_databaseName: string, replicationPool: any[]) {
+		// `% 0` would leave the index NaN for the life of the process
+		if (replicationPool.length === 0) return undefined;
+		nextWorkerIndex = nextWorkerIndex % replicationPool.length; // wrap around as necessary
+		return replicationPool[nextWorkerIndex++];
 	}
 	const databases = getDatabases();
 	// find all the databases last recorded audit entry so that we can inquire from the first node for self catch-up
@@ -1424,8 +1440,8 @@ export async function startOnMainThread(options) {
 			}
 			// Existing-entry re-drives also consume this payload, so resolve its URL before the early return.
 			nodes[0].url ??= getNodeURL(nodes[0] as any);
-			const httpWorkers = workers.filter((worker) => worker.name === 'http');
-			// Defensively detect entries that point at a worker no longer in the http pool.
+			const replicationPool = replicationWorkers();
+			// Defensively detect entries that point at a worker no longer in the replication pool.
 			// This happens when the worker.on('exit') handler below never fired (hung WebSocket
 			// refs blocking exit), the identity check rejected the reassignment, or its
 			// setTimeout retry was lost. We also catch the case where the entry has no worker
@@ -1435,7 +1451,7 @@ export async function startOnMainThread(options) {
 			// Keeps the outgoing buffer alive across the delete/recreate below; a fresh resolve still wins,
 			// since a peer renamed while its worker was down owns a different buffer.
 			let carriedSharedStatus: Float64Array | undefined;
-			if (existingEntry && httpWorkers.length > 0 && !httpWorkers.includes(existingEntry.worker as any)) {
+			if (existingEntry && replicationPool.length > 0 && !replicationPool.includes(existingEntry.worker as any)) {
 				logger.warn(`Subscription for ${databaseName} on node ${node.name} has no live worker; reassigning`);
 				clearTimeout(existingEntry.reDriveTimer);
 				dbReplicationWorkers.delete(databaseName);
@@ -1470,9 +1486,9 @@ export async function startOnMainThread(options) {
 					existingEntry.createdAt = Date.now();
 				}
 			} else if (shouldSubscribe) {
-				worker = placeSubscription(databaseName, httpWorkers);
+				worker = placeSubscription(databaseName, replicationPool);
 				if (!worker) {
-					logger.warn('No http workers available to subscribe to node', node.name, getNodeURL(node));
+					logger.warn('No replication workers available to subscribe to node', node.name, getNodeURL(node));
 				}
 				dbReplicationWorkers.set(databaseName, {
 					worker,
@@ -1696,8 +1712,8 @@ export async function startOnMainThread(options) {
 		}
 	};
 	function connectToNextWorker(node: any, database: string, connectingNode = node) {
-		const httpWorkers = workers.filter((worker: any) => worker.name === 'http');
-		const worker = placeSubscription(database, httpWorkers);
+		const replicationPool = replicationWorkers();
+		const worker = placeSubscription(database, replicationPool);
 		// not enumerable property, we don't want this to be serialized in the postMessage
 		Object.defineProperty(node, 'worker', { value: worker, configurable: true });
 		const request = {
@@ -1795,7 +1811,7 @@ export async function startOnMainThread(options) {
 	}
 	function reconcileWorkers() {
 		const now = Date.now();
-		const httpWorkers = workers.filter((worker) => worker.name === 'http');
+		const replicationPool = replicationWorkers();
 		// Diagnostics for the two lifecycle corrections below, batched into one line each so a mass worker
 		// exit does not emit one log per (database, peer). Allocated only once something is actually wrong.
 		let stampedDeadOwner: string[] | undefined;
@@ -1847,7 +1863,7 @@ export async function startOnMainThread(options) {
 						reportedNonMemberStatus.delete(key);
 						// The entry's owning worker is gone from the live pool. Stamped before the truth read below
 						// so the correction lands on this tick rather than the next one.
-						if (!hasDeadOwner(entry, httpWorkers)) reportedUnstampedDeadOwner.delete(key);
+						if (!hasDeadOwner(entry, replicationPool)) reportedUnstampedDeadOwner.delete(key);
 						else if (stampWorkerExitDown(status, now)) {
 							(stampedDeadOwner ??= []).push(key);
 							reportedUnstampedDeadOwner.delete(key);
@@ -1898,10 +1914,10 @@ export async function startOnMainThread(options) {
 				clearedNonMembers.join(', ')
 			);
 		if (upCorrections) for (const connection of upCorrections) connectedToNode(connection);
-		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, httpWorkers);
+		const staleNodeUrls = findStaleNodeUrls(connectionReplicationMap, replicationPool);
 		const wedgedNodeUrls = findWedgedNodeUrls(
 			connectionReplicationMap,
-			httpWorkers,
+			replicationPool,
 			now,
 			WEDGE_RECONCILE_THRESHOLD_MS,
 			shouldReplicateFromNode
@@ -1911,7 +1927,7 @@ export async function startOnMainThread(options) {
 		// if that watchdog fails to fire. See findStalledReceivingNodeUrls / RECEIVE_STALL_THRESHOLD_MS.
 		const stalledByUrl = findStalledReceivingNodeUrls(
 			connectionReplicationMap,
-			httpWorkers,
+			replicationPool,
 			now,
 			RECEIVE_STALL_THRESHOLD_MS,
 			shouldReplicateFromNode,

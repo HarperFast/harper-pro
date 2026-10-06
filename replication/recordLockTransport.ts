@@ -13,17 +13,15 @@
  *   fails the whole map closed rather than shrinking the ring — see
  *   `replication/RECORD_LOCK_HOMES_DESIGN.md` §4 for why the latter is itself a two-arbiter bug).
  *   A frozen, per-thread cache — never storage I/O, hashing or sorting on the read path — refreshed
- *   only when this node's own durable row changes (`onRecordLockHomesChanged`).
+ *   at registration and when this node's own durable row changes (`onRecordLockHomesChanged`), with
+ *   a paced retry while the row cannot be read.
  * - `homeIncarnation`: a durable, monotonic counter bumped once per **coordination incarnation** —
  *   a process start, or a coordinating-worker handoff (`recordLockOwnerFor`, below) — persisted on
  *   this node's own `hdb_nodes` row (`recordLockIncarnation`). Core orders fencing tokens on it.
  * - `requestDelegation` / `recallDelegation`: unicast operations over the existing replication
  *   connections (`recordLockRpc.ts`).
  * - `ownsCoordination()`: whether this worker thread is the one the main thread assigned to the
- *   database. Coordinator state is per thread while the key lock it arbitrates is process-wide, so
- *   exactly one thread may coordinate, and it must be the thread whose sockets apply the database's
- *   inbound entries — `subscriptionManager` places every (peer, database) subscription on the owner.
- *   Ownership is conferred by message rather than derived from `workerIndex` and moves only when the
+ *   database. Ownership is conferred by message rather than derived from `workerIndex` and moves only when the
  *   owner has exited: a live owner still holds delegations and grants.
  *
  * A peer's advertised home-map digest (`RECORD_LOCK_HOMES_DIGEST`, `replicationConnection.ts`) is
@@ -40,14 +38,17 @@ import {
 	getWorkerIndex,
 	hasThreadExited,
 	onMessageByType,
+	sendToThread,
 	whenThreadsStarted,
 	workers,
 } from '../core/server/threads/manageThreads.js';
 import {
+	deliverLockControlEntry,
 	fenceRelayedAdmissions,
 	registerClusterLockTransport,
 	unregisterClusterLockTransport,
 	type ClusterLockTransport,
+	type LockControlEntry,
 	type DelegationRecall,
 	type DelegationReply,
 	type DelegationRequest,
@@ -58,12 +59,20 @@ import { getDatabases } from '../core/resources/databases.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { getHDBNodeTable, getReplicationSharedStatus, shouldReplicateFromNode } from './knownNodes.ts';
+import {
+	RECORD_LOCKS_CAPABILITY_POSITION,
+	RECORD_LOCK_HOMES_AGREEMENT_POSITION,
+	RECORD_LOCK_LEVEL_POSITION,
+} from './sharedStatusSlots.ts';
+import { isReplicationWorker } from './replicationWorkers.ts';
 import { ClientError } from '../core/utility/errors/hdbError.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { tableReplicates as declarationReplicates } from './replicatedDatabases.ts';
+import { createBackoff, type Backoff } from './backoff.ts';
 import {
 	currentRow,
 	onRecordLockHomesChanged,
+	type RecordLockHomesRow,
 	setHomesDrainReader,
 	setHomesMembershipReaders,
 	type RecordLockGenerationState,
@@ -75,11 +84,14 @@ import {
 	acquireOnOwnerRelay,
 	clearRelaySessionsForDatabase,
 	failRelayAcquiresForDatabase,
+	forgetOutboundOperationStats,
 	onRecordLockOwnershipLost,
+	outboundOperationStats,
 	quiesceOnOwner,
 	releaseOnOwnerRelay,
 	sendRecordLockOperation,
 	setRecordLockOwnershipReaders,
+	type OutboundOperationStats,
 } from './recordLockRpc.ts';
 import { createFreshnessBarrier, type FreshnessBarrier, type FreshnessStats } from './recordLockFreshness.ts';
 import { RECORD_LOCKS_CAPABILITY } from './protocolCapabilities.ts';
@@ -94,16 +106,11 @@ import { ensureNode } from './subscriptionManager.ts';
 import { getRepairConnectionsForDB } from './replicator.ts';
 import './recordLockApply.ts';
 
-// Slots 29..31 of the 32-slot per-(database, peer) status buffer (`getReplicationSharedStatus`);
-// 0..28 are taken (13..28 by the R4 fire-classification counters, harper-pro#431). 29 is the
-// capability support flag; 30 is the home-map digest agreement tri-state; 31 is the exact
-// advertised level (below). The buffer is full — grow `REPLICATION_SHARED_STATUS_SLOTS` for the next.
-export const RECORD_LOCKS_CAPABILITY_POSITION = 29;
+export { RECORD_LOCKS_CAPABILITY_POSITION, RECORD_LOCK_HOMES_AGREEMENT_POSITION, RECORD_LOCK_LEVEL_POSITION };
 export const LOCK_CAPABILITY_UNKNOWN = 0;
 export const LOCK_CAPABILITY_UNSUPPORTED = 1;
 export const LOCK_CAPABILITY_SUPPORTED = 2;
 
-export const RECORD_LOCK_HOMES_AGREEMENT_POSITION = 30;
 export const HOMES_AGREEMENT_UNKNOWN = 0;
 export const HOMES_AGREEMENT_MISMATCH = 1;
 export const HOMES_AGREEMENT_MATCH = 2;
@@ -131,9 +138,7 @@ export function readPeerHomesAgreement(status: Float64Array): number {
 	return value === HOMES_AGREEMENT_MATCH || value === HOMES_AGREEMENT_MISMATCH ? value : HOMES_AGREEMENT_UNKNOWN;
 }
 
-/** Slot 31: the peer's exact advertised `recordLocks` level, so a refusal can name it. 0 while unknown. */
-export const RECORD_LOCK_LEVEL_POSITION = 31;
-
+/** The peer's exact advertised `recordLocks` level, so a refusal can name it. 0 while unknown. */
 export function recordPeerLockLevel(status: Float64Array, level: number): void {
 	status[RECORD_LOCK_LEVEL_POSITION] = Number.isSafeInteger(level) && level >= 0 ? level : 0;
 }
@@ -220,6 +225,49 @@ function routeBarrierAppliedFromMain(message: any): void {
 	}
 }
 
+const CONTROL_ENTRY_MESSAGE = 'record-lock-control-entry';
+/** Per database on the coordinating thread: relayed peer control entries accepted for delivery (not whether one matched a live grant). */
+const relayedControlEntries = new Map<string, number>();
+/** Per database: relayed entries this thread refused — it no longer coordinates the database, or the sender was unstamped. */
+const controlEntryRelayRefusals = new Map<string, number>();
+/** Per database on the applying thread: entries that could not be sent (owner unknown here, port gone). */
+const controlEntryRelayDrops = new Map<string, number>();
+
+export function relayLockControlEntry(
+	database: string,
+	table: string,
+	entry: LockControlEntry,
+	author: string,
+	position: number | undefined
+): void {
+	const ownerThreadId = ownerThreadByDatabase.get(database);
+	if (
+		ownerThreadId === undefined ||
+		!sendToThread(ownerThreadId, { type: CONTROL_ENTRY_MESSAGE, database, table, entry, author, position })
+	)
+		controlEntryRelayDrops.set(database, (controlEntryRelayDrops.get(database) ?? 0) + 1);
+}
+
+export function handleRelayedControlEntry(message: any, port: any): void {
+	if (typeof message?.database !== 'string' || typeof message.table !== 'string') return;
+	if (typeof message.author !== 'string' || typeof message.entry !== 'object' || message.entry === null) return;
+	// An unstamped sender is not a sibling port; an entry that outran an ownership change is for the
+	// thread that used to coordinate, and re-relaying it would only chase the handoff.
+	if (port?.threadId === undefined || !ownsRecordLockCoordination(message.database)) {
+		controlEntryRelayRefusals.set(message.database, (controlEntryRelayRefusals.get(message.database) ?? 0) + 1);
+		return;
+	}
+	deliverLockControlEntry(message.database, message.table, message.entry, message.author, message.position);
+	relayedControlEntries.set(message.database, (relayedControlEntries.get(message.database) ?? 0) + 1);
+}
+onMessageByType(CONTROL_ENTRY_MESSAGE, handleRelayedControlEntry);
+export function relayedControlEntryCount(database: string): number {
+	return relayedControlEntries.get(database) ?? 0;
+}
+export function controlEntryRelayDropCount(database: string): number {
+	return (controlEntryRelayDrops.get(database) ?? 0) + (controlEntryRelayRefusals.get(database) ?? 0);
+}
+
 export interface RecordLockTransportDeps {
 	thisNodeName(): string;
 	/** Any table's auditStore for the database, which is what keys the shared status buffers. */
@@ -251,7 +299,7 @@ export interface RecordLockTransportDeps {
  * Pure over its dependencies and the injected cache reader so `homeMap()` is unit-testable without
  * a cluster or storage. `cacheFor` returns the frozen, already-current active generation for the
  * database — never storage I/O, hashing or sorting; that work happens in `refreshCache`, off the
- * hot path, triggered only by `onRecordLockHomesChanged`.
+ * hot path.
  */
 export function createRecordLockTransport(
 	database: string,
@@ -337,6 +385,7 @@ export function createRecordLockTransport(
 		releaseOnOwner(db: string, table: string, key: unknown, admissionId: number): void {
 			deps.releaseOnOwner(db, table, key, admissionId);
 		},
+		relayControlEntry: relayLockControlEntry,
 	};
 	return transport;
 }
@@ -378,16 +427,77 @@ export function currentHomesDigest(database: string): string | undefined {
 	return activeCache.get(database)?.digest;
 }
 
-async function refreshCache(database: string): Promise<void> {
+interface RefreshState {
+	token: object;
+	backoff: Backoff;
+	timer?: NodeJS.Timeout;
+}
+const refreshState = new Map<string, RefreshState>();
+const REFRESH_RETRY_INITIAL_MS = Number(process.env.HARPER_TEST_RECORD_LOCK_REFRESH_RETRY_MS) || 1_000;
+const REFRESH_RETRY_MAX_MS = REFRESH_RETRY_INITIAL_MS * 30;
+const REFRESH_RETRY_ATTEMPTS = 6;
+let readHomesRow: (database: string) => Promise<RecordLockHomesRow | undefined> = currentRow;
+/** Test seam: the row reader `refreshCache` uses. Returns the previous reader. */
+export function setRecordLockHomesRowReader(reader: typeof readHomesRow): typeof readHomesRow {
+	const previous = readHomesRow;
+	readHomesRow = reader;
+	return previous;
+}
+export function refreshRecordLockHomesCache(database: string, freshBudget = false): Promise<void> {
+	return refreshCache(database, freshBudget);
+}
+export function cachedActiveGeneration(database: string): number | undefined {
+	return activeCache.get(database)?.generation;
+}
+export function forgetRecordLockHomesCache(database: string): void {
+	const state = refreshState.get(database);
+	if (state) clearTimeout(state.timer);
+	refreshState.delete(database);
+	activeCache.delete(database);
+}
+
+async function refreshCache(database: string, freshBudget = false): Promise<void> {
+	let state = refreshState.get(database);
+	if (!state)
+		refreshState.set(
+			database,
+			(state = {
+				token: {},
+				backoff: createBackoff({
+					initialMs: REFRESH_RETRY_INITIAL_MS,
+					maxMs: REFRESH_RETRY_MAX_MS,
+					maxAttempts: REFRESH_RETRY_ATTEMPTS,
+				}),
+			})
+		);
+	const token = (state.token = {});
+	clearTimeout(state.timer);
+	state.timer = undefined;
+	if (freshBudget) state.backoff.reset();
+	const current = () => refreshState.get(database)?.token === token;
 	const before = activeCache.get(database);
 	try {
-		const row = await currentRow(database);
+		const row = await readHomesRow(database);
+		if (!current()) return;
 		activeCache.set(database, row?.active);
+		// A peer digest that arrived while the row was unreadable was recorded as a mismatch against
+		// no digest at all, and a socket that handshook then received none; both need the recovered one.
+		// The backoff resets only once this is done, so a failure here re-arms the whole cycle.
+		if (state.backoff.attempts > 0) {
+			pushHomesDigestToPeers(database);
+			reconcileAllPeerHomesAgreement(database);
+		}
+		state.backoff.reset();
 	} catch (error) {
+		if (!current()) return;
 		// A storage error must not leave a stale (possibly superseded) generation cached; undefined is
 		// the fail-closed default `homeMap()` already treats as "not available."
 		activeCache.delete(database);
 		logger.warn?.(`Could not refresh the record lock home map for ${database}`, error);
+		state.timer = setTimeout(() => {
+			if (current())
+				refreshCache(database).catch((rejection) => logger.warn?.('record lock refresh retry failed', rejection));
+		}, state.backoff.nextDelay() ?? REFRESH_RETRY_MAX_MS).unref();
 	}
 	const after = activeCache.get(database);
 	// Core's coordinator seeds its restart-quarantine incarination tracking (`#coordinatingIncarnation`)
@@ -420,7 +530,7 @@ const pendingHomesChangedAcks = new Map<number, (ok: boolean) => void>();
  * racing an unawaited refresh (a real pre-push review finding).
  */
 async function applyHomesChanged(database: string): Promise<void> {
-	await refreshCache(database);
+	await refreshCache(database, true);
 	pushHomesDigestToPeers(database);
 	reconcileAllPeerHomesAgreement(database);
 }
@@ -814,13 +924,17 @@ function recreateRecordLockTransport(database: string): void {
 
 /** The database is no longer replicated here. Cluster scope keeps failing closed (core's rule). */
 export function releaseRecordLockTransport(database: string): void {
+	forgetRecordLockHomesCache(database);
 	if (!transports.delete(database)) return;
 	unregisterClusterLockTransport(database);
 	closeFreshnessBarrier(database);
 	stopListeningForApplyFailures(database);
 	forgetPoisonState(database);
 	ownedDatabases.delete(database);
-	activeCache.delete(database);
+	relayedControlEntries.delete(database);
+	controlEntryRelayDrops.delete(database);
+	controlEntryRelayRefusals.delete(database);
+	forgetOutboundOperationStats(database);
 	if (!parentPort) releaseRecordLockOwner(database);
 }
 
@@ -831,9 +945,16 @@ export interface RecordLockDatabaseStats {
 	granted: number;
 	/** Live admissions across its delegations. */
 	admitted: number;
+	/** Peer control entries applied off the owner that the transport could not relay (no hook, or it threw); summed across threads. */
 	droppedOffOwner: number;
 	/** Admissions this thread obtained from the owner worker for an off-owner `lock()` (harper-pro#852). */
 	relayedAdmissions: number;
+	/** Peer control entries other threads applied and relayed here; counted on the coordinating thread only (harper-pro#977). */
+	relayedControlEntries?: number;
+	/** Relayed control entries lost on this thread: could not be sent (owner unknown, port gone) or refused on arrival (ownership moved, unstamped sender); summed across threads. */
+	controlEntryRelayDrops?: number;
+	/** How this thread's outbound lock operations reached their peer (harper-pro#977). */
+	outbound?: OutboundOperationStats;
 	/** The home map's member set as this thread sees it, or undefined while the map is withheld. */
 	members?: string[];
 	/** Successor-freshness barrier counters, from the coordinating thread only. */
@@ -857,6 +978,8 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 		admitted: 0,
 		droppedOffOwner: 0,
 		relayedAdmissions: 0,
+		controlEntryRelayDrops:
+			(controlEntryRelayDrops.get(database) ?? 0) + (controlEntryRelayRefusals.get(database) ?? 0),
 	};
 	for (const tableName in tables) {
 		let stats: (RecordLockDatabaseStats & { relayedAdmissions?: number }) | undefined;
@@ -876,6 +999,8 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 		total.droppedOffOwner += stats.droppedOffOwner;
 		total.relayedAdmissions += stats.relayedAdmissions ?? 0;
 	}
+	total.relayedControlEntries = relayedControlEntries.get(database) ?? 0;
+	total.outbound = outboundOperationStats(database);
 	try {
 		total.members = transports.get(database)?.homeMap(database)?.homes;
 		total.freshness = freshnessBarriers.get(database)?.stats();
@@ -959,6 +1084,7 @@ const recordLockOwners = new Map<string, any>();
 const everHadOwner = new Set<string>();
 let nextOwnerIndex = 0;
 
+/** Isolated-application workers included: broadcasts and fences must reach every thread that can serve `lock()`. */
 function httpWorkers(): any[] {
 	return workers.filter((worker: any) => worker.name === 'http');
 }
@@ -1165,9 +1291,7 @@ function broadcastOwnerlessAndWait(database: string, workers: any[] = httpWorker
 
 /**
  * The worker that coordinates `database`, assigning one only if none is live: an owner is never
- * moved while it runs (see the module comment). Every placement of a (peer, database) subscription
- * must use this so the coordinator's thread is the one applying the database's inbound entries.
- * Returns `undefined` when the main thread itself is the owner, while no owner is live yet, or
+ * moved while it runs (see the module comment). Returns `undefined` when the main thread itself is the owner, while no owner is live yet, or
  * while a handoff's incarnation bump has not yet persisted (§5.1) — treated identically by every
  * caller: "not currently owned," never "assign one now" (only this function does that). Main
  * thread only.
@@ -1190,12 +1314,13 @@ export function recordLockOwnerFor(
 	const current = recordLockOwners.get(database);
 	if (current === MAIN_OWNER) return undefined;
 	if (current === PENDING_BUMP) return undefined; // a handoff is already in flight; do not start a second
-	if (current && liveWorkers.includes(current)) return current;
+	if (current && isReplicationWorker(current) && liveWorkers.includes(current)) return current;
 	const hadPriorOwner = everHadOwner.has(database);
+	const candidates = liveWorkers.filter(isReplicationWorker);
 	let owner: any;
-	if (liveWorkers.length > 0) {
-		nextOwnerIndex %= liveWorkers.length;
-		owner = liveWorkers[nextOwnerIndex++];
+	if (candidates.length > 0) {
+		nextOwnerIndex %= candidates.length;
+		owner = candidates[nextOwnerIndex++];
 	} else if (getWorkerIndex() === 0) {
 		// Single-threaded mode: the main thread serves requests and holds the subscriptions itself.
 		owner = MAIN_OWNER;
@@ -1288,10 +1413,10 @@ export interface RecordLockClusterStatus extends Partial<RecordLockDatabaseStats
 
 /**
  * `cluster_status`'s `recordLocks` section: each database's owner with its coordinator counters, and
- * `droppedOffOwner` summed over EVERY http worker — that counter describes entries applied on a
- * non-owner, so reading it from the owner alone would hide exactly the misrouting it reports. Every
- * worker is asked concurrently under one bound so an unresponsive one cannot hang the operation.
- * Main thread only.
+ * the per-thread counters (`droppedOffOwner`, `controlEntryRelayDrops`, `relayedAdmissions`) summed
+ * over EVERY http worker — each is recorded on the thread that applied or asked, so the owner alone
+ * would hide exactly what it reports. Every worker is asked concurrently under one bound so an
+ * unresponsive one cannot hang the operation. Main thread only.
  */
 export async function collectRecordLockStatus(
 	liveWorkers: any[] = httpWorkers()
@@ -1312,6 +1437,7 @@ export async function collectRecordLockStatus(
 			if (mainStats) {
 				result[database].relayedAdmissions = mainStats.relayedAdmissions;
 				result[database].droppedOffOwner = mainStats.droppedOffOwner;
+				result[database].controlEntryRelayDrops = mainStats.controlEntryRelayDrops;
 			}
 		}
 	}
@@ -1328,8 +1454,11 @@ export async function collectRecordLockStatus(
 				entry.freshness = stats.freshness;
 				entry.poisoned = stats.poisoned;
 				entry.unprovenMs = stats.unprovenMs;
+				entry.relayedControlEntries = stats.relayedControlEntries;
+				entry.outbound = stats.outbound;
 			}
 			entry.droppedOffOwner = (entry.droppedOffOwner ?? 0) + stats.droppedOffOwner;
+			entry.controlEntryRelayDrops = (entry.controlEntryRelayDrops ?? 0) + (stats.controlEntryRelayDrops ?? 0);
 			// Summed over EVERY worker: a relayed admission is minted on the owner but its COUNT lives on
 			// the non-owner worker that obtained it (harper-pro#852), so the owner alone would report zero.
 			entry.relayedAdmissions = (entry.relayedAdmissions ?? 0) + (stats.relayedAdmissions ?? 0);
@@ -1474,12 +1603,6 @@ if (!parentPort) {
 			// 503 with no indication that a step of the runbook is simply missing.
 			logger.warn?.(
 				`replication.recordLocks is enabled: every cluster-scoped lock() for a database answers 503 until an operator applies a home map for it (record_lock_apply_homes), and every peer advertises record lock capability level ${RECORD_LOCKS_CAPABILITY} — a peer at any other level is not a participant and withholds the map on both sides.`
-			);
-			// The second line is the accepted-known caveat, not a runbook step, so it is said separately
-			// and only here: a design note nobody reads before flipping a switch is not where a production
-			// prerequisite belongs (RECORD_LOCK_HOMES_DESIGN.md, "Auth for the hop").
-			logger.warn?.(
-				'replication.recordLocks is enabled: a home map transition is authorized by node identity alone — any principal a peer resolves as a cluster node can apply one, with no proof an operator asked for it (harper-pro#869). Accepted while this feature is opt-in; treat an operator-delegated proof as a prerequisite before relying on cluster record locks in production.'
 			);
 		});
 }

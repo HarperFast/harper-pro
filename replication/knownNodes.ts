@@ -12,6 +12,7 @@ import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
+import { CONFIRMATION_STATUS_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
 import { createBackoff } from './backoff.ts';
 
 type MaybePromise<T> = T | Promise<T>;
@@ -93,13 +94,7 @@ export function getHDBNodeTable(): HdbNodeTable {
 		}) as unknown as HdbNodeTable)
 	);
 }
-// Float64 slots in the per-(database, peer) shared status buffer. Positions 0..6 are the replication status
-// fields, 7..8 the blob-divergence signals, 9..12 the W1 connection-truth fields (state/liveness/error-code/
-// error-time), 13..28 the eight R4 fire-classification counter pairs, 29 the record-lock capability flag
-// (RECORD_LOCKS_CAPABILITY_POSITION in recordLockTransport.ts), and 30..31 headroom (see the *_POSITION
-// exports in replicationConnection.ts and the slot map in DESIGN.md). Lives here, next to the allocation,
-// so the size and the map cannot drift apart.
-export const REPLICATION_SHARED_STATUS_SLOTS = 32;
+export { REPLICATION_SHARED_STATUS_SLOTS };
 export function getReplicationSharedStatus(
 	auditStore: any,
 	databaseName: string,
@@ -814,7 +809,7 @@ export function countAlreadyConfirmedPeers(
 	const confirmedPeers = new Set<string>();
 	for (const [nodeName, confirmationsForNode] of confirmationsByNode) {
 		const replicatedTime = confirmationsForNode.get(databaseName);
-		if (replicatedTime && replicatedTime[0] >= txnTime) confirmedPeers.add(nodeName);
+		if (replicatedTime && replicatedTime[CONFIRMATION_STATUS_POSITION] >= txnTime) confirmedPeers.add(nodeName);
 	}
 	return confirmedPeers;
 }
@@ -1030,7 +1025,7 @@ function startSubscriptionToReplications() {
 					databaseName,
 					nodeNameAtUpdate,
 					() => {
-						const updatedTime = replicatedTime[0];
+						const updatedTime = replicatedTime[CONFIRMATION_STATUS_POSITION];
 						const lastTime = replicatedTime.lastTime;
 						notifyConfirmedWaiters(
 							commitsAwaitingReplication.get(databaseName) || new Set(),

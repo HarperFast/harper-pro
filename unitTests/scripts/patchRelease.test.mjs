@@ -3,12 +3,12 @@
  * (--yes/--cm-trigger/--json), covering the completion-path gaps flagged in PR #638:
  * a requested-but-failed CM dispatch must be terminal (not silently ok:true), --cm-trigger
  * must never bypass the deploy confirmation for a human without --yes, and declining the
- * first confirmation under --json must still emit a parsable RESULT line.
- *
- * These exercise the pure decision helpers directly rather than spawning the script, since
- * main() drives real git/gh state with no seams to stub.
+ * first confirmation under --json must still emit a parsable RESULT line. Also covers
+ * getArg's flag-with-no-usable-value guard, its require.main-only die() contract, the
+ * --version-name validation, and the deriveVersionName CM-slot rule.
  */
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { closeSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
@@ -17,11 +17,157 @@ import { tmpdir } from 'node:os';
 
 const require = createRequire(import.meta.url);
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
-const { resolveDeployAnswer, buildAbortedResult, buildCmFailureResult, buildSuccessResult, writeResult } = require(
-	join(root, 'scripts/patch-release.js')
-);
+const scriptPath = join(root, 'scripts/patch-release.js');
+const {
+	getArg,
+	deriveVersionName,
+	resolveDeployAnswer,
+	buildAbortedResult,
+	buildCmFailureResult,
+	buildSuccessResult,
+	writeResult,
+} = require(scriptPath);
 
 describe('patch-release.js non-interactive contract', function () {
+	describe('getArg', function () {
+		it('returns the default when the flag is absent', function () {
+			assert.equal(getArg('--branch', 'v5.0', ['--dry-run']), 'v5.0');
+		});
+
+		it('returns the value following a present flag', function () {
+			assert.equal(getArg('--branch', 'v5.0', ['--branch', 'v5.1']), 'v5.1');
+		});
+
+		it('treats the string "0" as a real value, not a missing one', function () {
+			// '0' is falsy-looking but a valid arg.
+			assert.equal(getArg('--bump', 'patch', ['--bump', '0']), '0');
+		});
+
+		it('a repeated flag is last-occurrence-wins', function () {
+			assert.equal(getArg('--branch', 'v5.0', ['--branch', 'v5.1', '--branch', 'v5.2']), 'v5.2');
+		});
+
+		// die() calls process.exit(), which would tear down this test process if invoked
+		// in-process — so these run the real CLI as a subprocess instead. An empty PATH and a
+		// timeout contain a regression that falls through past die() into main()'s real git/gh
+		// calls, or waits on stdin.
+		describe('fails fast via die() instead of silently falling back to the default', function () {
+			function runCli(args) {
+				return spawnSync(process.execPath, [scriptPath, ...args], {
+					encoding: 'utf8',
+					timeout: 5000,
+					env: { ...process.env, PATH: '' },
+				});
+			}
+
+			it('when the flag is the last argument (value missing)', function () {
+				const r = runCli(['--branch']);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
+			});
+
+			it('when the next argument is empty', function () {
+				const r = runCli(['--branch', '']);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
+			});
+
+			it('when the next argument is another flag (`--branch --dry-run`)', function () {
+				const r = runCli(['--branch', '--dry-run']);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
+			});
+
+			it('when a later occurrence of the flag is malformed, even though the first is fine', function () {
+				// indexOf-based lookup would validate only the first '--branch' and silently
+				// proceed on 'v5.0', ignoring that the second occurrence has no value.
+				const r = runCli(['--branch', 'v5.0', '--branch']);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
+			});
+
+			it('still emits a parsable RESULT line under --json', function () {
+				const r = runCli(['--json', '--branch', '--dry-run']);
+				assert.equal(r.status, 1);
+				const resultLine = r.stdout.split('\n').find((line) => line.startsWith('RESULT: '));
+				assert.ok(resultLine, `expected a RESULT line on stdout, got:\n${r.stdout}`);
+				const result = JSON.parse(resultLine.slice('RESULT: '.length));
+				assert.equal(result.ok, false);
+				assert.match(result.error, /--branch requires a value/);
+			});
+
+			it('does not exit the host process when the script is only require()d, not run', function () {
+				// This is exactly how the top of this file imports the script's own exports.
+				const r = spawnSync(
+					process.execPath,
+					['-e', 'require(process.argv[1])', '--', scriptPath, '--branch', '--dry-run'],
+					{ encoding: 'utf8', timeout: 5000, env: { ...process.env, PATH: '' } }
+				);
+				assert.equal(r.status, 0);
+			});
+
+			it('still validates for real on an explicit call, even though import-time parsing is guarded', function () {
+				// The require.main guard above must not leak into explicit calls to the exported
+				// getArg (how tests exercise its validation) — only the implicit, no-args-supplied
+				// case (this module's own top-level parsing) is guarded.
+				const r = spawnSync(
+					process.execPath,
+					['-e', "require(process.argv[1]).getArg('--branch', 'v5.0', ['--branch'])", '--', scriptPath],
+					{ encoding: 'utf8', timeout: 5000, env: { ...process.env, PATH: '' } }
+				);
+				assert.equal(r.status, 1);
+				assert.match(r.stderr, /--branch requires a value/);
+			});
+		});
+	});
+
+	describe('--version-name validation', function () {
+		// Same die()-routing contract as getArg's failures: an invalid --version-name must exit
+		// nonzero and, under --json, still emit a parsable RESULT line — it used to exit via a
+		// bare err()+process.exit(1) that skipped the RESULT line entirely.
+		it('dies via die(), emitting a parsable RESULT line under --json', function () {
+			const r = spawnSync(process.execPath, [scriptPath, '--json', '--version-name', 'bogus'], {
+				encoding: 'utf8',
+				timeout: 5000,
+				env: { ...process.env, PATH: '' },
+			});
+			assert.equal(r.status, 1);
+			const resultLine = r.stdout.split('\n').find((line) => line.startsWith('RESULT: '));
+			assert.ok(resultLine, `expected a RESULT line on stdout, got:\n${r.stdout}`);
+			const result = JSON.parse(resultLine.slice('RESULT: '.length));
+			assert.equal(result.ok, false);
+			assert.match(result.error, /--version-name "bogus" is invalid/);
+		});
+	});
+
+	describe('deriveVersionName', function () {
+		it('derives "next" for a prerelease target', function () {
+			assert.equal(deriveVersionName('5.2.0-beta.1', null), 'next');
+		});
+
+		it('derives "stable" for a GA target', function () {
+			assert.equal(deriveVersionName('5.2.1', null), 'stable');
+		});
+
+		it('lets an explicit --version-name override win even when it mismatches the derived slot', function () {
+			assert.equal(deriveVersionName('5.2.1', 'next'), 'next'); // GA forced into next
+			assert.equal(deriveVersionName('5.2.0-beta.1', 'stable'), 'stable'); // prerelease forced into stable
+		});
+
+		it('handles a --set-version prerelease-line transition target (alpha.N -> beta.1)', function () {
+			// scripts/patch-release.js's own doc example for --set-version: semver.inc can't
+			// express this step, so it's a hand-picked target rather than a computed one.
+			assert.equal(deriveVersionName('5.2.0-beta.1', null), 'next');
+			assert.equal(deriveVersionName('5.2.0-rc.10', null), 'next');
+		});
+
+		it('handles a leading "v" the same as a bare version', function () {
+			// semver's version regex accepts an optional 'v' prefix, so this needs no special casing.
+			assert.equal(deriveVersionName('v5.2.0-beta.1', null), 'next');
+			assert.equal(deriveVersionName('v5.2.1', null), 'stable');
+		});
+	});
+
 	describe('resolveDeployAnswer', function () {
 		it('auto-confirms only when --cm-trigger and --yes are both set', function () {
 			assert.equal(resolveDeployAnswer({ cmTrigger: true, yesMode: true }), 'y');
