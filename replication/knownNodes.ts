@@ -12,15 +12,8 @@ import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { logger } from '../core/utility/logging/logger.ts';
 import { isExplicitDatabaseSubscription, isReplicatedDatabase } from './replicatedDatabases.ts';
-<<<<<<< HEAD
-<<<<<<< HEAD
-import { createBackoff } from './backoff.ts';
-=======
-import { REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
->>>>>>> 968be3e (Grow the replication shared-status buffer to 64 slots and centralize slot allocation)
-=======
 import { CONFIRMATION_STATUS_POSITION, REPLICATION_SHARED_STATUS_SLOTS } from './sharedStatusSlots.ts';
->>>>>>> 6bcee63 (Close the block-allocation gap and drop-through in the shared-status registry)
+import { createBackoff } from './backoff.ts';
 
 type MaybePromise<T> = T | Promise<T>;
 
