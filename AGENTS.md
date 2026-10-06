@@ -38,9 +38,9 @@ inside `.git/modules/core/`, remove them immediately — they are corrupting the
 ## Commands
 
 ```bash
-# Build (Pro-only — core has its own build)
-npm run build              # tsc → dist/
-npm run build:watch        # incremental
+# Build (compiles core/ into dist/core too; core's own build is not used here)
+npm run build              # core/build-tools/build-dist.mjs → dist/ (comment-free, Latin-1 JS, incl. dist/core)
+npm run build:watch        # incremental plain tsc (keeps comments and non-Latin-1 text)
 
 # Lint / Format
 npm run lint               # oxlint --deny-warnings
