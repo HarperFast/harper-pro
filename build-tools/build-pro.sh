@@ -41,7 +41,8 @@ echo -e "\n📦 Applying Harper Pro branding"
 perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/installer.js
 
 echo -e "\n📦 Building project"
-npm run build || true
+rm -rf dist
+npm run build
 
 echo -e "\n📦 Creating shrinkwrap"
 npm shrinkwrap
