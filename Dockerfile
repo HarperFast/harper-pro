@@ -57,9 +57,8 @@ ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 # exit status of the cleanup commands that follow it, and `harper version` asserts
 # the installed bin actually resolves and runs: v5.2.0-beta.4 published an image
 # with no harper in it off a green build when npm install hit a transient ETARGET.
-# The tarball carries its locked JavaScript bundle; npm selects the native packages
-# for this platform. re2 (the WAF's regex engine) gets its binary only from its
-# install script, which npm 12 skips unless allowed; npm 10/11 run it regardless.
+# re2 (the WAF's regex engine) gets its binary only from its install script,
+# which npm 12 skips unless allowed; npm 10/11 run it regardless.
 RUN <<-EOF
   set -e
   npm install --global --allow-scripts=re2 harperfast-harper-pro-*.tgz

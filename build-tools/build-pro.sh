@@ -13,10 +13,15 @@ function use_git {
 }
 
 stage=""
+rebuildRe2=""
 
 function cleanup {
   if [[ -n "$stage" ]]; then
     rm -rf "$stage"
+  fi
+  if [[ -n "$rebuildRe2" ]]; then
+    # re2's binary comes only from its install script; the checkout's WAF and tests need it.
+    npm rebuild re2 || echo "npm rebuild re2 failed; run it before testing this checkout"
   fi
   if use_git; then
     echo -e "\n📦 Restoring core files"
@@ -41,14 +46,19 @@ packageFile="harperfast-harper-pro-${version}.tgz"
 rm -f harperfast-harper-pro-*.tgz
 
 echo -e "\n📦 Installing locked deps"
+# npm ci would install from a leftover shrinkwrap instead of the lock the bundle is checked against.
+rm -f npm-shrinkwrap.json
 # No install script may run before the bundle is copied: it could rewrite bundled JavaScript.
+rebuildRe2=1
 npm ci --ignore-scripts
 
 echo -e "\n📦 Applying Harper Pro branding"
 perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/installer.js
 
 echo -e "\n📦 Building project"
-npm run build || true
+# A stale dist/ would mask a file the compiler stopped emitting.
+rm -rf dist
+npm run build
 
 ./build-tools/build-studio.sh
 
@@ -79,9 +89,6 @@ node -e '
 	if (missing.length) throw new Error(`Release archive is missing ${missing.join(", ")}`);
 ' "$stage/packed"
 mv "$stage/$packageFile" "$packageFile"
-
-# re2's binary comes only from its install script; the checkout's WAF and tests need it.
-npm rebuild re2
 
 echo -e "\n📦 Built Harper Pro ${version} in ${packageFile}"
 echo "📦 Run 'npm publish ${packageFile}' to release"

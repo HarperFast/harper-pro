@@ -67,8 +67,7 @@ sync_pkg_field devDependencies
 sync_pkg_field overrides
 sync_pkg_field optionalDependencies
 
-# npm resolves a root package declared in both fields through devDependencies, so a shipped
-# package keeps one spec: core's tested one (build-tools/DESIGN.md).
+# One spec per shipped package; see build-tools/DESIGN.md.
 node -e '
 	const { readFileSync, writeFileSync } = require("node:fs");
 	const manifest = JSON.parse(readFileSync("package.json", "utf8"));
