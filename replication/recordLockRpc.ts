@@ -239,12 +239,7 @@ export function setSessionHolderReader(reader: (nodeName: string, database: stri
 	sessionHolderFor = reader;
 }
 
-/**
- * One deadline (`deadlineAt`, `outboundNow()` ms — monotonic, so a wall-clock step cannot reopen an
- * expired request) travels requester → main → holder: no hop grants itself a fresh budget after an
- * earlier one gave up, every hop refuses expired work, and the requester outwaits the hops by a slack
- * so an answer that made the deadline is never dropped on the way back.
- */
+/** `deadlineAt` is `outboundNow()` ms, shared by every hop; the requester outwaits the hops by a slack. */
 function awaitOutbound(requestId: number, deadlineAt: number): Promise<OutboundAnswer> {
 	return new Promise((resolve) => {
 		const timer = setTimeout(

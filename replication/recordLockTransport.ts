@@ -227,6 +227,8 @@ function routeBarrierAppliedFromMain(message: any): void {
 const CONTROL_ENTRY_MESSAGE = 'record-lock-control-entry';
 /** Per database on the coordinating thread: relayed peer control entries accepted for delivery (not whether one matched a live grant). */
 const relayedControlEntries = new Map<string, number>();
+/** Per database: relayed entries this thread refused — it no longer coordinates the database, or the sender was unstamped. */
+const controlEntryRelayRefusals = new Map<string, number>();
 /** Per database on the applying thread: entries that could not be sent (owner unknown here, port gone). */
 const controlEntryRelayDrops = new Map<string, number>();
 
@@ -250,7 +252,10 @@ export function handleRelayedControlEntry(message: any, port: any): void {
 	if (typeof message.author !== 'string' || typeof message.entry !== 'object' || message.entry === null) return;
 	// An unstamped sender is not a sibling port; an entry that outran an ownership change is for the
 	// thread that used to coordinate, and re-relaying it would only chase the handoff.
-	if (port?.threadId === undefined || !ownsRecordLockCoordination(message.database)) return;
+	if (port?.threadId === undefined || !ownsRecordLockCoordination(message.database)) {
+		controlEntryRelayRefusals.set(message.database, (controlEntryRelayRefusals.get(message.database) ?? 0) + 1);
+		return;
+	}
 	deliverLockControlEntry(message.database, message.table, message.entry, message.author, message.position);
 	relayedControlEntries.set(message.database, (relayedControlEntries.get(message.database) ?? 0) + 1);
 }
@@ -259,7 +264,7 @@ export function relayedControlEntryCount(database: string): number {
 	return relayedControlEntries.get(database) ?? 0;
 }
 export function controlEntryRelayDropCount(database: string): number {
-	return controlEntryRelayDrops.get(database) ?? 0;
+	return (controlEntryRelayDrops.get(database) ?? 0) + (controlEntryRelayRefusals.get(database) ?? 0);
 }
 
 export interface RecordLockTransportDeps {
@@ -421,8 +426,6 @@ export function currentHomesDigest(database: string): string | undefined {
 	return activeCache.get(database)?.digest;
 }
 
-/** The latest refresh's token (an older or torn-down lifetime's read installs nothing) and the retry
- * backoff; past its ceiling the retry keeps pacing, since nothing else re-triggers an unreadable row. */
 interface RefreshState {
 	token: object;
 	backoff: Backoff;
@@ -929,6 +932,7 @@ export function releaseRecordLockTransport(database: string): void {
 	ownedDatabases.delete(database);
 	relayedControlEntries.delete(database);
 	controlEntryRelayDrops.delete(database);
+	controlEntryRelayRefusals.delete(database);
 	forgetOutboundOperationStats(database);
 	if (!parentPort) releaseRecordLockOwner(database);
 }
@@ -946,7 +950,7 @@ export interface RecordLockDatabaseStats {
 	relayedAdmissions: number;
 	/** Peer control entries other threads applied and relayed here; counted on the coordinating thread only (harper-pro#977). */
 	relayedControlEntries?: number;
-	/** Peer control entries this thread applied but could not relay (owner unknown here, port gone); summed across threads. */
+	/** Relayed control entries lost on this thread: could not be sent (owner unknown, port gone) or refused on arrival (ownership moved, unstamped sender); summed across threads. */
 	controlEntryRelayDrops?: number;
 	/** How this thread's outbound lock operations reached their peer (harper-pro#977). */
 	outbound?: OutboundOperationStats;
@@ -973,7 +977,8 @@ export function localRecordLockStats(database: string): RecordLockDatabaseStats 
 		admitted: 0,
 		droppedOffOwner: 0,
 		relayedAdmissions: 0,
-		controlEntryRelayDrops: controlEntryRelayDrops.get(database) ?? 0,
+		controlEntryRelayDrops:
+			(controlEntryRelayDrops.get(database) ?? 0) + (controlEntryRelayRefusals.get(database) ?? 0),
 	};
 	for (const tableName in tables) {
 		let stats: (RecordLockDatabaseStats & { relayedAdmissions?: number }) | undefined;

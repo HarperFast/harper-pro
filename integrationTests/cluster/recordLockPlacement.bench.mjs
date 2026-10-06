@@ -182,7 +182,6 @@ async function runArm(suiteName, arm, rep) {
 		}
 		const pids = await Promise.all(nodes.map((node) => readNodePid(node)));
 		const statuses = await Promise.all(nodes.map((node) => sendOperation(node, { operation: 'cluster_status' })));
-		// Warm every writer thread and the receive paths before timing anything.
 		await Promise.all(
 			writerNodes.map((node, n) =>
 				Promise.all(

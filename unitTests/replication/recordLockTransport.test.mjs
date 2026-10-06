@@ -826,6 +826,7 @@ describe('relaying a peer control entry to the coordinating worker (harper-pro#9
 			recordLockOwnerFor('relay-recv', []);
 			handleRelayedControlEntry(message, { threadId: undefined });
 			assert.strictEqual(relayedControlEntryCount('relay-recv'), 0, 'unstamped sender: dropped');
+			assert.strictEqual(controlEntryRelayDropCount('relay-recv'), 2, 'both refusals counted as drops');
 			handleRelayedControlEntry({ ...message, entry: null }, port);
 			handleRelayedControlEntry({ ...message, author: 7 }, port);
 			assert.strictEqual(relayedControlEntryCount('relay-recv'), 0, 'malformed envelope: dropped');

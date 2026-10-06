@@ -96,10 +96,22 @@ export class BenchWriteBatched extends Resource {
 		for (let i = 0; i < data.count; i += batch) {
 			const context = {};
 			const end = Math.min(i + batch, data.count);
-			await transaction(context, () => {
+			await transaction(context, async () => {
 				const puts = [];
-				for (let j = i; j < end; j++) puts.push(tables.Counter.put({ id: `${data.prefix}-${j}`, n: j }, context));
-				return Promise.all(puts);
+				let thrown;
+				for (let j = i; j < end; j++) {
+					try {
+						puts.push(tables.Counter.put({ id: `${data.prefix}-${j}`, n: j }, context));
+					} catch (error) {
+						thrown ??= error;
+						break;
+					}
+				}
+				// Every dispatched put settles inside the transaction, failure included.
+				const settled = await Promise.allSettled(puts);
+				const failed = settled.find((result) => result.status === 'rejected');
+				if (thrown) throw thrown;
+				if (failed) throw failed.reason;
 			});
 		}
 		return { elapsedMs: performance.now() - started };

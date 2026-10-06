@@ -1124,7 +1124,16 @@ export async function startOnMainThread(options) {
 	let nextWorkerIndex = 0;
 	setSessionHolderReader((nodeName, database) => {
 		const node = nodeMap.get(nodeName);
-		return node ? connectionReplicationMap.get(getNodeURL(node))?.get(database)?.worker : undefined;
+		const entry = node ? connectionReplicationMap.get(getNodeURL(node))?.get(database) : undefined;
+		if (
+			!entry ||
+			hasDeadOwner(
+				entry,
+				workers.filter((worker) => worker.name === 'http')
+			)
+		)
+			return undefined;
+		return entry.worker;
 	});
 	// Round-robin regardless of record-lock ownership: a control entry applied off the coordinating
 	// worker is relayed to it (harper-pro#977).

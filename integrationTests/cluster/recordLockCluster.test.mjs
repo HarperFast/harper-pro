@@ -484,7 +484,6 @@ suite(
 			for (const c of contexts) await stopNode(c);
 		});
 
-		/** The peer whose `data` subscription multi applies on a worker other than its coordinating one. */
 		async function offOwnerDelegate() {
 			const status = await clusterStatusOf(multi);
 			const ownerThreadId = status.recordLocks?.[DB]?.ownerThreadId;
@@ -502,7 +501,7 @@ suite(
 			return { delegate, contender: peers.find((peer) => peer !== delegate), ownerThreadId, placement };
 		}
 
-		/** A key multi homes, held by `delegate`: multi's `granted` gauge moves only for its own grants. */
+		/** multi's `granted` gauge moves only for its own grants. */
 		async function holdKeyHomedOnMulti(delegate) {
 			for (let i = 0; i < 40; i++) {
 				const id = `relay-${Date.now()}-${i}`;
