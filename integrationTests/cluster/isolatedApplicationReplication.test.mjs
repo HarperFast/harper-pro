@@ -5,7 +5,7 @@
  */
 import { suite, test, before, after } from 'node:test';
 import { ok, equal } from 'node:assert/strict';
-import { cp, mkdtemp } from 'node:fs/promises';
+import { cp, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
@@ -22,28 +22,33 @@ const UNSUPPORTED_HERE = process.platform === 'win32' || process.env.HARPER_RUNT
 async function startNode(suiteName, { isolated = false, recordLocks = false } = {}) {
 	const hostname = await getNextAvailableLoopbackAddress();
 	const dataRootDir = await mkdtemp(join(process.env.HARPER_INTEGRATION_TEST_INSTALL_PARENT_DIR || tmpdir(), 'hit-'));
-	const config = {
-		analytics: { aggregatePeriod: -1 },
-		logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
-		threads: { count: 1 },
-		replication: { securePort: hostname + ':9933', ...(recordLocks && { recordLocks: true }) },
-	};
-	if (isolated) {
-		await cp(FIXTURE, join(dataRootDir, 'components', ISOLATED_APP), { recursive: true, dereference: true });
-		// a dedicated worker is reachable only through UDS mirrors of the secure port
-		config.tls = { unixDomainSockets: true };
-		config[ISOLATED_APP] = { isolated: true };
+	try {
+		const config = {
+			analytics: { aggregatePeriod: -1 },
+			logging: { colors: false, stdStreams: true, console: true, level: 'warn' },
+			threads: { count: 1 },
+			replication: { securePort: hostname + ':9933', ...(recordLocks && { recordLocks: true }) },
+		};
+		if (isolated) {
+			await cp(FIXTURE, join(dataRootDir, 'components', ISOLATED_APP), { recursive: true, dereference: true });
+			// a dedicated worker is reachable only through UDS mirrors of the secure port
+			config.tls = { unixDomainSockets: true };
+			config[ISOLATED_APP] = { isolated: true };
+		}
+		const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
+		await startHarper(ctx, { config, env: { HARPER_NO_FLUSH_ON_EXIT: true } });
+		return ctx.harper;
+	} catch (err) {
+		// nothing has registered this data root for teardown yet, so a failed fixture copy or Harper start must clean up itself
+		await rm(dataRootDir, { recursive: true, force: true }).catch(() => {});
+		throw err;
 	}
-	const ctx = { name: suiteName, harper: { hostname, dataRootDir } };
-	await startHarper(ctx, { config, env: { HARPER_NO_FLUSH_ON_EXIT: true } });
-	return ctx.harper;
 }
 
 async function createDatabases(node) {
 	for (const database of DATABASES) await ensureTableExists(node, { database, table: 'Probe', primary_key: 'id' });
 }
 
-/** Thread ids of the pool worker and the dedicated worker; asserts exactly one of each. */
 async function threadsOf(node) {
 	const { threads } = await sendOperation(node, { operation: 'system_information', attributes: ['threads'] });
 	const pool = threads.filter((thread) => thread.name === 'http' && !thread.application).map((t) => t.threadId);
