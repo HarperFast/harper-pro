@@ -2885,9 +2885,8 @@ export function retainedResumeRange(
 }
 
 /**
- * Pulls one entry to prove every exact boundary in `rangeOptions` forms; core fills `exactStartFailures` only during
- * `next()`. A throw is the same outcome as a recorded failure. When only some logs fail, the failure is the set of
- * their names.
+ * Pulls one entry so every exact boundary in `rangeOptions` has been checked. A throw is the same outcome as a recorded
+ * failure. When only some logs fail, the failure is the set of their names.
  */
 export function rangeBoundaryFailure(auditStore: any, rangeOptions: any): unknown {
 	try {
@@ -2907,10 +2906,7 @@ export function rangeBoundaryFailure(auditStore: any, rangeOptions: any): unknow
 	}
 }
 
-/**
- * The anchors left once the logs a boundary probe named are dropped, or undefined when no narrower set is worth
- * probing: the failure named no log, named none of these, or named all of them.
- */
+/** The anchors a failed boundary probe did not name, or undefined when that leaves nothing narrower to probe. */
 export function anchorsWithoutFailedLogs(
 	anchors: Map<string, number>,
 	failure: unknown
@@ -4150,8 +4146,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (seqId >=
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
-	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn exactly as before, so this
-	// adds no per-seq-update overhead and does not alter non-copyApply paths. (harper-pro#480)
+	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn with no flush gate. (harper-pro#480)
 	function seqUpdateEndTxn(seqId: number): any {
 		const originCursors = takeDurableOriginCursors();
 		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && seqId >= copyModeStartTime) {
@@ -5332,7 +5327,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
-						// a restarted pass that names none replaces the prior pass's
 						copyOriginAnchors = recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
@@ -6612,7 +6606,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												};
 												let anchors = relayedAnchors;
 												let unusable = boundaryFailure(boundaryRange);
-												// A relayed log that cannot form its boundary loses only its own anchor, and never the local log's.
 												while (unusable && anchors?.size) {
 													anchors = anchorsWithoutFailedLogs(anchors, unusable);
 													boundaryRange.startByLog = new Map([[logName, copyStartTime], ...(anchors ?? [])]);
