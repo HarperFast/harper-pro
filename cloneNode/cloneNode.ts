@@ -21,6 +21,7 @@ import { decode as cborDecode } from 'cbor-x';
 import * as envMgr from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
 import { isHdbInstalled } from '../core/utility/installation.js';
+import { PRODUCT_NAME } from '../core/utility/packageUtils.js';
 import { getConfiguration, flattenConfig, createConfigFile, updateConfigValue } from '../core/config/configUtils.js';
 import { composeConfigFromEnv } from '../core/config/harperConfigEnvVars.ts';
 import assignCMDENVVariables from '../core/utility/assignCmdEnvVariables.js';
@@ -264,7 +265,7 @@ export async function cloneNode(): Promise<void> {
 
 	// If not a fresh clone, and the existing config shows the instance is already cloned, skip clone process and start normally
 	if (hdbConfig?.cloned && !forceClone) {
-		log('Skipping clone, instance already marked as cloned. Starting Harper.');
+		log(`Skipping clone, instance already marked as cloned. Starting ${PRODUCT_NAME}.`);
 		envMgr.initSync();
 		const { main } = await import('../core/bin/run.js');
 		return main();
@@ -1462,7 +1463,7 @@ function log(message: string, level: LogLevel = 'notify'): void {
  * Installs Harper as the base for the clone operation
  */
 async function installHarper(): Promise<void> {
-	log(`Clone installing Harper at root path: ${rootPath}`);
+	log(`Clone installing ${PRODUCT_NAME} at root path: ${rootPath}`);
 
 	if (usingCertAuth || leaderToken) {
 		// Set temporary admin credentials if cloning without username/password to allow installation to complete.
@@ -1601,7 +1602,7 @@ function resolveRootPath(): void {
 			freshClone = true;
 		}
 	} else if (isHdbInstalled(envMgr, logger)) {
-		log('Existing Harper install found, getting default root path from config');
+		log(`Existing ${PRODUCT_NAME} install found, getting default root path from config`);
 		try {
 			// getConfiguration will get the config file name from the boot properties file and then read the harperdb-config file
 			const config: Record<string, any> = getConfiguration();
@@ -1612,7 +1613,7 @@ function resolveRootPath(): void {
 			);
 		}
 	} else {
-		log('No Harper install found, starting fresh clone');
+		log(`No ${PRODUCT_NAME} install found, starting fresh clone`);
 		freshClone = true;
 		rootPath = join(homedir(), HDB_ROOT_DIR_NAME);
 		log(`Using default root path: ${rootPath}`);

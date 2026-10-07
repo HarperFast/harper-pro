@@ -14,10 +14,6 @@ function use_git {
 
 function cleanup {
   if use_git; then
-    echo -e "\n📦 Restoring core files"
-    pushd core
-    git restore .
-    popd
     echo -e "\n📦 Restoring package-lock.json"
     git restore package-lock.json
     echo -e "\n📦 Removing npm-shrinkwrap.json"
@@ -36,9 +32,6 @@ fi
 
 echo -e "\n📦 Installing production deps"
 npm ci
-
-echo -e "\n📦 Applying Harper Pro branding"
-perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/installer.js
 
 echo -e "\n📦 Building project"
 npm run build || true
