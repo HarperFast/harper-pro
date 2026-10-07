@@ -6131,7 +6131,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!tableEntry) {
 								tableEntry = tableById[tableId] = tableToTableEntry(tableSubscriptionToReplicator.tableById[tableId]);
 								if (!tableEntry) {
-									// Unsubscribed/dropped tables and corrupt-entry sentinels are skipped too.
 									logger.debug?.('Not subscribed to table', tableId);
 									return skipAuditRecord();
 								}

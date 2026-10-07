@@ -56,8 +56,8 @@
  * load-bearing oracle.
  *
  * The load-bearing oracle is qa522's cursor-progress sample: `skipAuditRecord()` (the
- * fixed path) sends a sequence-position update while its budgeted macrotask yields
- * let the timer fire; the reverted path (`logger.debug?.(...)`) sends
+ * fixed path) sends a sequence-position update within the probe window even on a long
+ * skip-run; the reverted path (`logger.debug?.(...)`) sends
  * none until the whole synchronous walk finally completes. Before time-budget pacing,
  * reverting #536 and re-running in this environment (3 cold reruns)
  * consistently reproduces qa522's negative-control failure (`DEFECT-SHAPE: B's

@@ -5,7 +5,6 @@ import { runInNewContext } from 'node:vm';
 import sinon from 'sinon';
 import * as replication from '#src/replication/replicationConnection';
 
-// Nested subscription closures need a socket/timer fixture here.
 const source = readFileSync(new URL('../../dist/replication/replicationConnection.js', import.meta.url), 'utf8');
 const skipStart = source.indexOf('function skipAuditRecord() {');
 const skipEnd = source.indexOf('if (!sentNodeIds.has(', skipStart);
