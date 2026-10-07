@@ -9,11 +9,12 @@ import { parse } from 'yaml';
 // Runs the shipped cherry-pick job's `run:` steps against a local origin, with `gh` and the
 // sticky-comment helper stubbed; the branches and pushes are real.
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-// `git merge-tree --merge-base` needs Git 2.40. On older Git the check exits 2 and every case here
-// would fail for that reason alone, so those suites are skipped with that reason instead.
+// `git merge-tree --merge-base` needs Git 2.40, and the `gh` stub needs jq. Without them the
+// suites are skipped rather than failing, since the check itself then exits 2 for every case.
 const [, gitMajor, gitMinor] = /(\d+)\.(\d+)/.exec(execFileSync('git', ['--version'], { encoding: 'utf8' }));
+const hasJq = spawnSync('jq', ['--version']).status === 0;
 const describeWithMergeBase =
-	Number(gitMajor) > 2 || (Number(gitMajor) === 2 && Number(gitMinor) >= 40) ? describe : describe.skip;
+	hasJq && (Number(gitMajor) > 2 || (Number(gitMajor) === 2 && Number(gitMinor) >= 40)) ? describe : describe.skip;
 const job = parse(readFileSync(join(root, '.github/workflows/cherry-pick-patch.yml'), 'utf8')).jobs['cherry-pick'];
 const changeLanded = join(root, '.github/scripts/change-landed.sh');
 const RELEASE = 'v5.3';
@@ -72,6 +73,7 @@ describeWithMergeBase('cherry-pick-patch.yml', function () {
 		// The landing happens after the pick step read the tip, so the merge step's fast-forward fails
 		// and the retry is the first to see it.
 		const run = fixture.runJob({
+			openPr: '3067',
 			beforeStep: {
 				'Merge into release branch': () =>
 					fixture.onRelease((git) => {
@@ -84,6 +86,7 @@ describeWithMergeBase('cherry-pick-patch.yml', function () {
 		assert.strictEqual(fixture.releaseFile(), fixture.lines(SECOND_FIX), run.log);
 		assert.deepStrictEqual(run.prCreates, [], run.log);
 		assert.deepStrictEqual(fixture.cherryPickBranches(), [], run.log);
+		assert.ok(run.gh.some(([command, sub, number]) => command === 'pr' && sub === 'close' && number === '3067'));
 		assert.match(run.stickies.at(-1), /already present/, run.log);
 	});
 
