@@ -291,11 +291,24 @@ export async function transitionsOwedToPeer(
 	// releasing mutates core's set, so never iterate it live
 	for (const entry of Array.from(retained)) {
 		if (++walked % SWEEP_YIELD_EVERY === 0) await new Promise(setImmediate);
+		let rowReadFailed = false;
 		const row = await resolveLocalEntry(
 			(id) => table.primaryStore.getEntry(id),
 			entry.recordId,
-			(error) => onRowReadError?.(entry.recordId, error)
+			(error) => {
+				rowReadFailed = true;
+				onRowReadError?.(entry.recordId, error);
+			}
 		);
+		// A confirmed miss (getEntry resolved, there is no row at all -- not even a tombstone, because its
+		// retention expired) is a deleted record: nobody can ever complete this transition's stub, so it is
+		// superseded, the same as a residency move past this peer. A transient read error returns the same
+		// `undefined`, but must NOT take this path -- that would stop owing (and let core resurrect) an
+		// image that may still be the record's only complete copy, so it falls through unchanged to "stays owed".
+		if (row === undefined && !rowReadFailed) {
+			superseded++;
+			continue;
+		}
 		if (localRowSatisfies(row, entry.version)) {
 			try {
 				await releaseAndClearReceipts(table, entry.recordId, entry.version);

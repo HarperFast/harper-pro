@@ -198,6 +198,15 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // transition image, from the receiver's row state once that row is complete and durable (harper#2257).
 const HANDOFF_RECEIPT = 151;
 const HANDOFF_RECEIPT_REQUEST = 152;
+// A receipt/request tuple's recordId can be a BigInt of any size core's own Id contract allows
+// (isValidReceiptId accepts it) -- the plain `encode` throws RangeError past the signed/unsigned
+// 64-bit range. The extension tag it writes instead (0x42) is decoded unconditionally by msgpackr's
+// built-in extension registry, so an ordinary `decode()` on the receiving end needs no matching option.
+// useRecords: false matches the module's own default `encode` (pack.js's `defaultPackr`): `.pack` reads
+// `this.lastNamedStructuresLength` internally, and `useRecords`'s default initializes `this.structures`
+// on the instance -- a detached `const` reference like this one then calls it with no receiver, which
+// only stays safe when that structures path is compiled out.
+export const encodeHandoffMessage = new Packr({ useBigIntExtension: true, useRecords: false }).pack;
 const HANDOFF_RESWEEP_INTERVAL_MS = 5 * 60_000;
 const RECEIPT_PRUNE_INTERVAL_MS = 1000;
 const RECEIPT_APPLY_CONCURRENCY = 16;
@@ -4650,7 +4659,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (receiptRequests.get(key) === request) receiptRequests.delete(key);
 				}
 				if (!wsClosed)
-					for (const chunk of chunkReceipts(receipts)) ws.send(encode([HANDOFF_RECEIPT, chunk, databaseName]));
+					for (const chunk of chunkReceipts(receipts))
+						ws.send(encodeHandoffMessage([HANDOFF_RECEIPT, chunk, databaseName]));
 			})
 			.catch((error) => logger.warn?.(connectionId, 'could not settle handoff receipts', databaseName, error))
 			.finally(() => {
@@ -5823,7 +5833,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const requests = pendingReceiptRequests;
 							pendingReceiptRequests = [];
 							for (const chunk of chunkReceipts(requests))
-								ws.send(encode([HANDOFF_RECEIPT_REQUEST, chunk, databaseName]));
+								ws.send(encodeHandoffMessage([HANDOFF_RECEIPT_REQUEST, chunk, databaseName]));
 						};
 						// dbSubscriptions, not the module-level map: that is the map Replicator.subscribe() resolves
 						// from for this connection, so writing anywhere else would leave a placeholder pending forever.
@@ -6814,7 +6824,24 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														let copyFlags = entry.metadataFlags;
 														let copyReceiptRequest: [number, any, number] | undefined;
 														if (entry.metadataFlags & INVALIDATED) {
-															const peerIsResident = !!getResidence(entry.residencyId, table)?.includes(remoteNodeName);
+															const residencyForEntry = getResidence(entry.residencyId, table);
+															if (residencyForEntry === undefined) {
+																// Unlike the ordinary live-send gate (whose `residency === undefined` fallback
+																// forwards the original entry's own type/flags unchanged), this path always
+																// builds a fresh synthetic 'put' frame below -- there is no equivalent
+																// "preserve as an invalidated entry" step here. Falling through as "not a
+																// resident" would ship this stub as that plain put, which is exactly the
+																// promotion this guard exists to prevent. Withhold until residency resolves,
+																// same as a genuine resident with no matching image.
+																logger.trace?.(
+																	connectionId,
+																	'withholding an invalidated stub: residency unresolved',
+																	tableName,
+																	entry.key
+																);
+																continue;
+															}
+															const peerIsResident = residencyForEntry.includes(remoteNodeName);
 															let retained: TransitionEntry | undefined;
 															if (peerIsResident) {
 																try {
