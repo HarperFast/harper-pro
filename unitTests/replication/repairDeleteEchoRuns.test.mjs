@@ -122,12 +122,16 @@ async function withDatabase(databasePath, callback) {
 function writeTransactions(databasePath, transactions) {
 	return withDatabase(databasePath, async (db, store) => {
 		for (const [timestamp, records] of transactions) {
-			await db.transaction((transaction) => {
-				// a local-log append must be reserved against the origin-closed floor (harper#3085)
-				reserveLocalKey(db, transaction, timestamp);
-				for (const record of records) store.put(0, { ...record }, { transaction });
-				releaseLocalKey(transaction);
-			});
+			let handle;
+			try {
+				await db.transaction((transaction) => {
+					handle = transaction;
+					reserveLocalKey(db, transaction, timestamp);
+					for (const record of records) store.put(0, { ...record }, { transaction });
+				});
+			} finally {
+				releaseLocalKey(handle);
+			}
 		}
 	});
 }
@@ -293,11 +297,16 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 				expect(Array.from(log.query({ start: T + 1 }))).to.have.length(0);
 				const { lastCommittedPosition, nextLogPosition } = log.getStats();
 				expect(lastCommittedPosition).to.not.deep.equal(nextLogPosition);
-				await db.transaction((transaction) => {
-					reserveLocalKey(db, transaction, T + 1);
-					store.put(0, putOf('next', T + 1), { transaction });
-					releaseLocalKey(transaction);
-				});
+				let handle;
+				try {
+					await db.transaction((transaction) => {
+						handle = transaction;
+						reserveLocalKey(db, transaction, T + 1);
+						store.put(0, putOf('next', T + 1), { transaction });
+					});
+				} finally {
+					releaseLocalKey(handle);
+				}
 				expect(log.getStats().lastCommittedPosition.sequence).to.equal(2);
 			});
 			expect((await readBack(databasePath)).map(({ id }) => id)).to.deep.equal(['p', 'z', 'next']);
