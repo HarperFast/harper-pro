@@ -223,6 +223,12 @@ decorrelated schedule.** Pacing alone is not enough; the storm surface below nee
 | `sendBlobs` in-place 503 re-read (`BLOB_SEND_RETRY_BACKOFF`)                               | 250 ms → 2 s, 4 attempts, **no jitter**: the retried read is this node's own blob, so there is no fleet to decorrelate, and full jitter would halve the expected time its PENDING placeholder has to heal before the 503 is forwarded                                              | n/a (per send)                                                            |
 | record-lock home-map refresh (`recordLockTransport.ts` `refreshCache`) — a failed row read | 1 s → 30 s, full jitter, then paced at the 30 s ceiling for the database lifetime; re-armed by any failed refresh, backoff restored by a successful or operator-triggered one, dropped with the transport (harper-pro#977, the #853 startup latch)                                 | a successful refresh                                                      |
 
+**A sweep slide counts only if it advances the fire time.** Fire times are `performance.now()` plus an
+integer delay, so just below a power of two `armedAt + RECONNECT_STAGGER_MS` can round back inside the
+window, and a slide that re-assigns that same time never terminates — on the main thread. Requiring strict
+advance through the sweep's finite set of armed times bounds the slide at one move per armed setup
+(`subscribeSetupScheduler.test.mjs` pins the rounding case).
+
 **The subscription-setup scheduler is the one with dedup.** `onDatabase` used to turn every qualifying
 node update straight into a retained (not unref'd) 200 ms `setTimeout` plus a `subscribe-to-node`
 message, so whatever re-drove `onNodeUpdate` amplified 1:1 into main-thread timers, worker-side
@@ -439,7 +445,7 @@ position. This keeps bootstrap available without conflating clocks in the subseq
 
 **Schema handshake: omit, not preserve.** The frame carries only `{table, schemaDefined, attributes[{name,type,isPrimaryKey}]}` and the receiver materializes it with `ensureTable({origin:'cluster'})`, so "preserve" would create a replicated-by-default twin that the peer then subscribes to and replicates its own writes out of; carrying the flag would be a shape change pre-fix receivers ignore, while omission is correct on every receiver version. `NODE_NAME[3]` has no reader at all. A twin created by a pre-fix join is left in place (deleting could destroy local data); it shows in `describe_table` without `replicate: false`.
 
-**What a live declaration change can and cannot do.** Core since harper#2903 assigns an explicit non-cluster `replicate` declaration to the live `Table.replicate` in `declareTable`, including when it reuses an existing class. Redeploying an existing table with `@table(replicate: false)` therefore takes effect on the first redeploy restart; the former two-restart limitation is closed. Cluster-origin declarations cannot override that local choice. The join regression covers both a table created local and a populated replicated table redeployed as local, waiting for the deployment's PID change before joining the peer.
+**What a live declaration change can and cannot do.** Core since harper#2903 assigns an explicit non-cluster `replicate` declaration to the live `Table.replicate` in `declareTable`, including when it reuses an existing class. Redeploying an existing table with `@table(replicate: false)` therefore takes effect on the first redeploy restart; the former two-restart limitation is closed. Cluster-origin declarations cannot override that local choice. The join regression covers both a table created local and a populated replicated table redeployed as local, awaiting the deployment's HTTP-worker rollout and both table routes before joining the peer.
 
 The audit send path and copy walk re-read the live declaration to observe changes and drop/recreate replacements. The copy check sits after the pacer's yield so no await separates it from the encode that opens the row's blobs (one property read, measured at ~6 ns against ~13 ns for one of that row's own allocations; sustained audit-stream throughput is not measured). The receive-side blocked set is discarded on `onUpdatedTable` rather than snapshotted for the life of the socket.
 
