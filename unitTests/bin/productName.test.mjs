@@ -23,6 +23,7 @@ describe('Harper Pro product name', () => {
 			const output = execFileSync(process.execPath, [join(REPO_ROOT, 'dist/bin/harper.js'), 'help'], {
 				encoding: 'utf8',
 				env: { ...process.env, HOME: home },
+				timeout: 25_000,
 			});
 			assert.match(output, /harper will simply run Harper Pro \(in the foreground\)/);
 		} finally {
@@ -33,7 +34,11 @@ describe('Harper Pro product name', () => {
 	it('is not shadowed by a package.json the published core resolves first', function () {
 		this.timeout(60_000);
 		const [{ files }] = JSON.parse(
-			execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: REPO_ROOT, encoding: 'utf8' })
+			execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+				cwd: REPO_ROOT,
+				encoding: 'utf8',
+				timeout: 55_000,
+			})
 		);
 		const lookupPath = [
 			'dist/core/utility/package.json',
