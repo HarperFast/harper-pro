@@ -61,8 +61,21 @@ async function hasRecord(node, id, signal) {
 		{ operation: 'search_by_id', database: 'data', table: TABLE, ids: [id], get_attributes: ['id'] },
 		{ signal }
 	);
-	return rows.length > 0;
+	if (rows.some((row) => row?.id === id)) return true;
+	// a read that fails yields an error row in place of the record
+	if (rows.length > 0) throw new Error(`reading ${id} on ${node.hostname} failed: ${JSON.stringify(rows)}`);
+	return false;
 }
+
+// the same `seqId > 1` test the product applies when it decides between a resume and a full copy
+const hasResumeCursorFor = (node, peer) => async (signal) =>
+	(
+		await fixtureRequest(node, 'ReplicationCursor', {
+			method: 'POST',
+			body: JSON.stringify({ node: peer.hostname }),
+			signal,
+		})
+	).seqId > 1;
 
 // while a node is still coming up, an unanswered probe means "not yet"
 const eventuallyHasRecord = (node, id) => (signal) =>
@@ -112,6 +125,12 @@ suite(
 					description: 'the seed rows reach B',
 				}
 			);
+			// B commits its resume cursor for A only after the rows it carries are visible; a kill in between
+			// loses the log position this test's catch-up depends on.
+			await waitForCondition(hasResumeCursorFor(ctx.B, ctx.A), {
+				timeoutMs: 90000,
+				description: 'B commits its resume cursor for A',
+			});
 		});
 
 		after(async () => {
