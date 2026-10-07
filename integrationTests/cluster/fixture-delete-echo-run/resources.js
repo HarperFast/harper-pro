@@ -43,3 +43,14 @@ export class DeleteEntries extends Resource {
 		return { count: deleteEntries(String(target.id)).length };
 	}
 }
+
+export class ReplicationCursor extends Resource {
+	static loadAsInstance = false;
+
+	post(target, { node }) {
+		const table = tables.EchoTarget;
+		const auditStore = table.primaryStore.rootStore.auditStore;
+		const nodeId = auditStore.loadLogs().indexOf(auditStore.logByName.get(node));
+		return { seqId: table.dbisDB.getSync([Symbol.for('seq'), nodeId])?.seqId ?? null };
+	}
+}
