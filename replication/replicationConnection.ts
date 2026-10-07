@@ -2886,7 +2886,8 @@ export function retainedResumeRange(
 
 /**
  * Pulls one entry to prove every exact boundary in `rangeOptions` forms; core fills `exactStartFailures` only during
- * `next()`. A throw is the same outcome as a recorded failure.
+ * `next()`. A throw is the same outcome as a recorded failure. When only some logs fail, the failure is the set of
+ * their names.
  */
 export function rangeBoundaryFailure(auditStore: any, rangeOptions: any): unknown {
 	try {
@@ -2898,10 +2899,25 @@ export function rangeBoundaryFailure(auditStore: any, rangeOptions: any): unknow
 			// releases the single-log iterator now; a no-op on the multi-log aggregate, which has no teardown hook
 			probeIterator.return?.();
 		}
-		return probe.exactStartFailures?.size > 0 || probe.failedLogs?.size > 0 || probe.corruptFrameStop?.breaks > 0;
+		if (probe.corruptFrameStop?.breaks > 0) return true;
+		if (!(probe.exactStartFailures?.size > 0 || probe.failedLogs?.size > 0)) return false;
+		return new Set<string>([...(probe.exactStartFailures?.keys() ?? []), ...(probe.failedLogs ?? [])]);
 	} catch (error) {
 		return error;
 	}
+}
+
+/**
+ * The anchors left once the logs a boundary probe named are dropped, or undefined when no narrower set is worth
+ * probing: the failure named no log, named none of these, or named all of them.
+ */
+export function anchorsWithoutFailedLogs(
+	anchors: Map<string, number>,
+	failure: unknown
+): Map<string, number> | undefined {
+	if (!(failure instanceof Set)) return undefined;
+	const kept = new Map([...anchors].filter(([logName]) => !failure.has(logName)));
+	return kept.size > 0 && kept.size < anchors.size ? kept : undefined;
 }
 
 /**
@@ -6557,18 +6573,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													excludeLogs: excludedNodes,
 													snapshot: false,
 												};
-												const relayedRange = relayedAnchors?.size
-													? {
-															...emptyLogRange,
-															exactStart: true,
-															resumeAfterExactStart: true,
-															startByLog: relayedAnchors,
-														}
-													: undefined;
-												if (relayedRange && !boundaryFailure(relayedRange)) {
+												let anchors = relayedAnchors;
+												let relayedRange: any;
+												while (anchors?.size) {
+													relayedRange = {
+														...emptyLogRange,
+														exactStart: true,
+														resumeAfterExactStart: true,
+														startByLog: anchors,
+													};
+													const failure = boundaryFailure(relayedRange);
+													if (!failure) break;
+													anchors = anchorsWithoutFailedLogs(anchors, failure);
+												}
+												if (anchors?.size) {
 													auditLogIterable = auditStore.getRange(relayedRange);
 													boundaryLogName = logName;
-													announcedAnchors = relayedAnchors;
+													announcedAnchors = anchors;
 												} else auditLogIterable = auditStore.getRange(emptyLogRange);
 												anchoredInLogOrder = true;
 											} else if (
@@ -6589,13 +6610,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													excludeLogs: excludedNodes,
 													snapshot: false,
 												};
+												let anchors = relayedAnchors;
 												let unusable = boundaryFailure(boundaryRange);
-												if (!unusable) announcedAnchors = relayedAnchors;
-												else if (relayedAnchors?.size) {
-													// A relayed log that cannot form its boundary must not cost the local log its own.
-													boundaryRange.startByLog = new Map([[logName, copyStartTime]]);
+												// A relayed log that cannot form its boundary loses only its own anchor, and never the local log's.
+												while (unusable && anchors?.size) {
+													anchors = anchorsWithoutFailedLogs(anchors, unusable);
+													boundaryRange.startByLog = new Map([[logName, copyStartTime], ...(anchors ?? [])]);
 													unusable = boundaryFailure(boundaryRange);
 												}
+												if (!unusable) announcedAnchors = anchors;
 												if (unusable) {
 													// Degrade rather than refuse, for the same reason. The anchor stays the entry's key, which
 													// under the timestamp range still replays everything keyed after it.

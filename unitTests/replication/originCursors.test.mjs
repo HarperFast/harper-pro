@@ -5,11 +5,13 @@
 import assert from 'node:assert';
 import {
 	ORIGIN_CURSOR_OVERLAP_MS,
+	anchorsWithoutFailedLogs,
 	buildOriginCursorVector,
 	collectRelayedLogAnchors,
 	collectSeqRows,
 	matchesSubscriptionPosition,
 	parseOriginKeyMap,
+	rangeBoundaryFailure,
 	resolveOriginFloors,
 	retainedResumeRange,
 } from '#src/replication/replicationConnection';
@@ -200,5 +202,68 @@ describe('retainedResumeRange', () => {
 		assert.strictEqual(retainedResumeRange(T, ['removed'], undefined, []), undefined);
 		assert.strictEqual(retainedResumeRange(T, ['removed'], { removed: 'T' }, []), undefined);
 		assert.strictEqual(retainedResumeRange(T, ['toString'], {}, []), undefined);
+	});
+});
+
+describe('rangeBoundaryFailure', () => {
+	// a range that records its failures on the first pull, as core's aggregate does
+	const probeStore = (failures) => ({
+		getRange() {
+			const probe = {
+				[Symbol.iterator]: () => ({
+					next() {
+						Object.assign(probe, failures);
+						return { done: true };
+					},
+				}),
+			};
+			return probe;
+		},
+	});
+
+	it('names only the logs whose boundary failed', () => {
+		const failure = rangeBoundaryFailure(
+			probeStore({ exactStartFailures: new Map([['relayed', 'missing']]), failedLogs: new Set(['broken']) }),
+			{}
+		);
+		assert.deepStrictEqual(failure, new Set(['relayed', 'broken']));
+	});
+
+	it('reports no failure for a boundary that formed, and a whole-range failure for a corrupt frame or a throw', () => {
+		assert.strictEqual(
+			rangeBoundaryFailure(probeStore({ exactStartFailures: new Map(), failedLogs: new Set() }), {}),
+			false
+		);
+		assert.strictEqual(rangeBoundaryFailure(probeStore({ corruptFrameStop: { breaks: 1 } }), {}), true);
+		const error = new Error('closed');
+		assert.strictEqual(
+			rangeBoundaryFailure(
+				{
+					getRange() {
+						throw error;
+					},
+				},
+				{}
+			),
+			error
+		);
+	});
+});
+
+describe('anchorsWithoutFailedLogs', () => {
+	const anchors = new Map([
+		['relayed', T - 10],
+		['removed', T - 20],
+	]);
+
+	it('keeps every anchor the failure did not name', () => {
+		assert.deepStrictEqual(anchorsWithoutFailedLogs(anchors, new Set(['removed'])), new Map([['relayed', T - 10]]));
+	});
+
+	it('leaves nothing narrower to probe when the failure named no anchor, every anchor, or no log', () => {
+		assert.strictEqual(anchorsWithoutFailedLogs(anchors, new Set(['local'])), undefined);
+		assert.strictEqual(anchorsWithoutFailedLogs(anchors, new Set(['relayed', 'removed'])), undefined);
+		assert.strictEqual(anchorsWithoutFailedLogs(anchors, true), undefined);
+		assert.strictEqual(anchorsWithoutFailedLogs(anchors, new Error('closed')), undefined);
 	});
 });
