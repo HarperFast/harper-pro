@@ -163,12 +163,11 @@ const oldIdsSentIn = (log, receiver) => [
 	...new Set([...log.matchAll(SENT)].filter(([, id, to]) => to === receiver.hostname && isOld(id)).map(([, id]) => id)),
 ];
 
-/** OLD ids `sender` sent `receiver` from `mark` on. */
 async function oldIdsSent(sender, receiver, mark) {
 	return oldIdsSentIn(await logSince(sender, mark), receiver);
 }
 
-/** OLD ids `sender` sent `receiver` in the tail of the base copy it made from `mark` on. */
+/** Only the copy's tail counts: the copy itself carries every row. */
 async function oldIdsSentAfterCopy(sender, receiver, mark) {
 	const copied = `Finished copy table ${TABLE} ${receiver.hostname}`;
 	let log;

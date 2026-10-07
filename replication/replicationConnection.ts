@@ -6932,9 +6932,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
 									// an `includeNodes` update re-admits a log whose entries are already committed
 									let wake: () => void;
-									await new Promise<void>((resolve) => {
+									await new Promise<void>((resolve, reject) => {
 										wake = wakeSender = resolve;
-										nextTransaction.then(resolve, resolve);
+										nextTransaction.then(resolve, reject);
 									});
 									// a superseded loop must not clear the live loop's waker
 									if (wakeSender === wake) wakeSender = undefined;
@@ -7021,7 +7021,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// the audited/resequencing path — reintroducing the O(n) copy-time work this avoids. (harper-pro#480)
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
 			// a copy frame's key is a walk position, not a log key
-			const frameOrigins: number[] | undefined = !messageIsCopyFrame && recordsOriginCursors() ? [] : undefined;
+			const recordFrameOrigins = !messageIsCopyFrame && recordsOriginCursors();
+			// almost every frame holds one origin; a second one allocates
+			let frameOrigin: number | undefined;
+			let frameMoreOrigins: number[] | undefined;
 			// Copy frames get a walk position, and everything staging or blob-tagging against it is
 			// captured NOW (decode time): onCommit runs later from the apply queue, by which time a
 			// same-socket COPY_START may have replaced the pass and its copyStartTime/copyOrder — staging
@@ -7229,7 +7232,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// references (unbounded recursion).
 				const localSourceNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
 				if (localSourceNodeId === undefined) throw new Error(`No node name mapped for origin id ${auditRecord.nodeId}`);
-				if (frameOrigins && !frameOrigins.includes(localSourceNodeId)) frameOrigins.push(localSourceNodeId);
+				if (recordFrameOrigins) {
+					if (frameOrigin === undefined) frameOrigin = localSourceNodeId;
+					else if (frameOrigin !== localSourceNodeId && !frameMoreOrigins?.includes(localSourceNodeId))
+						(frameMoreOrigins ??= []).push(localSourceNodeId);
+				}
 				if (auditRecord.type === 'lockBarrier') {
 					// Captured now, reported from this frame's onCommit: a barrier is proof only once committed.
 					let barrier;
@@ -7560,7 +7567,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// failed blob — preserving the no-data-loss guarantee — while the apply loop never blocks.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) advanceDurableWatermark();
 					endTxnEvent.localTime = lastDurableSequenceId;
-					if (frameOrigins) for (const originId of frameOrigins) noteOriginProgress(originId, frameTxnLogKey);
+					if (frameOrigin !== undefined) noteOriginProgress(frameOrigin, frameTxnLogKey);
+					if (frameMoreOrigins) for (const originId of frameMoreOrigins) noteOriginProgress(originId, frameTxnLogKey);
 					// core reads this after awaiting onCommit
 					endTxnEvent.originCursors = takeDurableOriginCursors();
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
