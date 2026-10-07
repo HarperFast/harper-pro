@@ -363,9 +363,7 @@ jobs:
 
           # ── Skip a change the release branch already has ────────────────
           #
-          # Replaying it commit by commit conflicts: each intermediate commit
-          # meets its own final content. One pick of the whole net change comes
-          # out empty instead, the test apply-picks.sh applies to each commit.
+          # Commit by commit, a squash that already landed conflicts; one pick of the whole net change does not.
           if [ -n "$CHANGE_HEAD" ] && "$RUNNER_TEMP/change-landed.sh" "origin/$RELEASE_BRANCH" "$CHANGE_BASE" "$CHANGE_HEAD"; then
             echo "The change from PR #$PR_NUMBER is already on $RELEASE_BRANCH — nothing to pick"
             echo "no_op=true" >> "$GITHUB_OUTPUT"
@@ -446,8 +444,6 @@ jobs:
             git fetch origin "+refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}"
             if [ "$ATTEMPT" -gt 1 ]; then
               git checkout -B "$BRANCH" "origin/$RELEASE_BRANCH"
-              # The landing that moved the tip may be this same change: check the
-              # new tip as the first pass checked the old one, before replaying.
               if [ -n "$CHANGE_HEAD" ] && "$RUNNER_TEMP/change-landed.sh" "origin/$RELEASE_BRANCH" "$CHANGE_BASE" "$CHANGE_HEAD"; then
                 LANDED=true
                 break

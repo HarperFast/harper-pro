@@ -3,7 +3,7 @@
 # Exits 0 only when one pick of <base>..<head> onto <target> would come out
 # empty under Git's merge rules: merge-tree with <base> as the merge base is
 # clean and leaves <target>'s tree unchanged. 1 means it would change <target>,
-# 2 that the check could not run. Callers pick on anything but 0.
+# 2 that the check could not run.
 set -u
 
 TARGET="$1"

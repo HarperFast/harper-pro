@@ -7,8 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
 
 // Runs the shipped cherry-pick job's `run:` steps against a local origin, with `gh` and the
-// sticky-comment helper stubbed, so a test sees exactly the branches and PRs a real run makes.
+// sticky-comment helper stubbed; the branches and pushes are real.
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+// `git merge-tree --merge-base` needs Git 2.40. On older Git the check exits 2 and every case here
+// would fail for that reason alone, so those suites are skipped with that reason instead.
+const [, gitMajor, gitMinor] = /(\d+)\.(\d+)/.exec(execFileSync('git', ['--version'], { encoding: 'utf8' }));
+const describeWithMergeBase =
+	Number(gitMajor) > 2 || (Number(gitMajor) === 2 && Number(gitMinor) >= 40) ? describe : describe.skip;
 const job = parse(readFileSync(join(root, '.github/workflows/cherry-pick-patch.yml'), 'utf8')).jobs['cherry-pick'];
 const changeLanded = join(root, '.github/scripts/change-landed.sh');
 const RELEASE = 'v5.3';
@@ -19,7 +24,7 @@ const DEADLINE = 60_000;
 const FIRST_FIX = { 5: 'first fix' };
 const SECOND_FIX = { 5: 'second fix', 6: 'second fix, continued' };
 
-describe('cherry-pick-patch.yml', function () {
+describeWithMergeBase('cherry-pick-patch.yml', function () {
 	let fixture;
 
 	beforeEach(function () {
@@ -202,7 +207,7 @@ describe('cherry-pick-patch.yml', function () {
 	});
 });
 
-describe('change-landed.sh', function () {
+describeWithMergeBase('change-landed.sh', function () {
 	let dir;
 	let env;
 	const git = (...args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8', timeout: DEADLINE }).trim();
@@ -272,7 +277,7 @@ describe('change-landed.sh', function () {
 
 // harper-pro's `core` is a submodule, and the cherry-pick checkout does not initialize it, so
 // these trees carry gitlinks whose commits are absent. Pins what the check reports for those.
-describe('change-landed.sh with a submodule pointer', function () {
+describeWithMergeBase('change-landed.sh with a submodule pointer', function () {
 	let dir;
 	let env;
 	const git = (...args) => execFileSync('git', args, { cwd: dir, env, encoding: 'utf8', timeout: DEADLINE }).trim();
@@ -393,7 +398,6 @@ if (command === 'api' && /^repos\\/[^/]+\\/[^/]+\\/pulls\\/\\d+$/.test(sub) && a
 	seedGit('add', 'lib.txt');
 	seedGit('commit', '-qm', 'Base');
 	seedGit('branch', RELEASE);
-	// main moves on after the release cut, away from the lines the PRs touch
 	let mainState = { 35: 'main-only change' };
 	commitLib(mainState, 'Main-only change');
 	seedGit('branch', 'feature');
