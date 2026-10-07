@@ -5,6 +5,7 @@
  * the fakes below stand in for.
  */
 import { expect } from 'chai';
+import { decode } from 'msgpackr';
 import { toBufferKey } from 'ordered-binary';
 import {
 	applyHandoffReceipt,
@@ -25,6 +26,7 @@ import {
 	settleReceiptRequests,
 	transitionsOwedToPeer,
 } from '#src/replication/residencyHandoff';
+import { encodeHandoffMessage } from '#src/replication/replicationConnection';
 
 const INVALIDATED = 1;
 const HAS_BLOBS = 0x2000;
@@ -393,6 +395,38 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(owed).to.deep.equal([]);
 	});
 
+	it('stops owing (supersedes) an entry whose record has no local row at all — a deleted record past tombstone retention', async () => {
+		// `entries` has no key for this recordId: primaryStore.getEntry resolves successfully to
+		// undefined, a CONFIRMED miss, not a read error. Redelivering here would resurrect a deleted
+		// record on a peer whose own tombstone has also expired (HarperFast/harper#2257).
+		const table = fakeTable({
+			retained: [{ recordId: 'deleted', tableId: 7, version: V1, residencyId: 5 }],
+			entries: {},
+		});
+		const { owed, superseded } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists));
+		expect(owed).to.deep.equal([]);
+		expect(superseded).to.equal(1);
+		expect(table.released).to.deep.equal([]);
+	});
+
+	it('keeps a confirmed-miss row distinct from a transient read error: an error still leaves the entry owed', async () => {
+		// Same undefined-row outcome as the deletion case above, but resolveLocalEntry's onError fires —
+		// must NOT take the supersede path, since the record may still exist and the read simply failed.
+		const rejected = Promise.reject(new Error('closed'));
+		rejected.catch(() => {});
+		const table = fakeTable({
+			retained: [{ recordId: 'readFailed', tableId: 7, version: V1, residencyId: 5 }],
+			entries: { readFailed: rejected },
+		});
+		const errors = [];
+		const { owed, superseded } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists), (recordId, error) =>
+			errors.push({ recordId, message: error.message })
+		);
+		expect(owed.map((entry) => entry.recordId)).to.deep.equal(['readFailed']);
+		expect(superseded).to.equal(0);
+		expect(errors).to.deep.equal([{ recordId: 'readFailed', message: 'closed' }]);
+	});
+
 	it('keeps but stops owing an entry whose record moved on to a residency that no longer names the peer', async () => {
 		const table = fakeTable({
 			retained: [
@@ -626,5 +660,18 @@ describe('residency handoff — wire shape', () => {
 		expect(decodeHandoffReceipts([[7, Array(1000).fill(1), V1]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, NaN, V1]])).to.equal(undefined);
 		expect(decodeHandoffReceipts([[7, [Infinity], V1]])).to.equal(undefined);
+	});
+
+	it('encodes a receipt/request frame carrying a BigInt id past the plain 64-bit MessagePack range, and decodes it unchanged', () => {
+		// isValidReceiptId above accepts a BigInt of any size core's Id contract allows; the plain
+		// msgpackr `encode` throws RangeError here (its default int format tops out at 64 bits), which
+		// would otherwise close the connection before the paired image frame ever sends.
+		const bigId = 123456789012345678901234567890n;
+		const frame = [152, [[7, bigId, V1]], 'db'];
+		const encoded = encodeHandoffMessage(frame);
+		expect(decode(encoded)).to.deep.equal(frame);
+		// An ordinary id still round-trips through the same encoder, so this isn't BigInt-only wiring.
+		const ordinaryFrame = [151, [[7, 'r', V1]], 'db'];
+		expect(decode(encodeHandoffMessage(ordinaryFrame))).to.deep.equal(ordinaryFrame);
 	});
 });
