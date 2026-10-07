@@ -73,7 +73,11 @@ async function op(node, operation, timeoutMs = OP_TIMEOUT_MS) {
 // re-copy leaves behind inflate it to TOTAL_RECORDS while rows are still missing
 async function recordCount(node) {
 	try {
-		const desc = await op(node, { operation: 'describe_table', database: 'data', table: 'test', exact_count: true });
+		const desc = await op(
+			node,
+			{ operation: 'describe_table', database: 'data', table: 'test', exact_count: true },
+			60000
+		);
 		return desc?.record_count ?? 0;
 	} catch {
 		return -1; // node unreachable (mid-restart); caller treats as "not yet observed"
