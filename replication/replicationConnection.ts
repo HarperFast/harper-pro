@@ -2886,7 +2886,7 @@ export function retainedResumeRange(
 
 /**
  * Pulls one entry so every exact boundary in `rangeOptions` has been checked. A throw is the same outcome as a recorded
- * failure. When only some logs fail, the failure is the set of their names.
+ * failure. When the failure is attributed to particular logs, it is the set of their names; a corrupt frame is not.
  */
 export function rangeBoundaryFailure(auditStore: any, rangeOptions: any): unknown {
 	try {
@@ -6355,7 +6355,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										...nodeSubscriptions.map(({ name }) => name),
 									])
 										originFloors.delete(name);
-									originFloorById = [];
+									// left undefined without floors, so the per-record predicate pays one check
+									originFloorById = originFloors.size > 0 ? [] : undefined;
 									for (const [name, floor] of originFloors) originFloorById[nameToId[name]] = floor;
 								}
 
