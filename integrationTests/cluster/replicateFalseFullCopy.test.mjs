@@ -15,14 +15,7 @@ import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startHarper, getNextAvailableLoopbackAddress, targz } from '@harperfast/integration-testing';
-import {
-	fetchWithRetry,
-	readNodePid,
-	sendOperation,
-	stopAndTeardownNodes,
-	waitForCondition,
-	waitForNewPid,
-} from './clusterShared.mjs';
+import { fetchWithRetry, sendOperation, stopAndTeardownNodes, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -93,7 +86,6 @@ async function waitForTable(node, table) {
 }
 
 async function deployFixture(node, fixture) {
-	const previousPid = await readNodePid(node);
 	await sendOperation(node, {
 		operation: 'deploy_component',
 		project: PROJECT,
@@ -101,7 +93,6 @@ async function deployFixture(node, fixture) {
 		replicated: false,
 		restart: true,
 	});
-	await waitForNewPid(node, previousPid);
 	await waitForTable(node, SHARED_TABLE);
 	await waitForTable(node, LOCAL_TABLE);
 }
@@ -195,7 +186,6 @@ for (const redeclare of [false, true]) {
 			});
 
 			after(async () => {
-				// A restarted on deploy, so its spawned handle is stale; stop by pid before teardown.
 				await stopAndTeardownNodes([ctx.nodeA, ctx.nodeB]);
 			});
 
