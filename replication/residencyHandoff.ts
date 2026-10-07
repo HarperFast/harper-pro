@@ -300,15 +300,6 @@ export async function transitionsOwedToPeer(
 				onRowReadError?.(entry.recordId, error);
 			}
 		);
-		// A confirmed miss (getEntry resolved, there is no row at all -- not even a tombstone, because its
-		// retention expired) is a deleted record: nobody can ever complete this transition's stub, so it is
-		// superseded, the same as a residency move past this peer. A transient read error returns the same
-		// `undefined`, but must NOT take this path -- that would stop owing (and let core resurrect) an
-		// image that may still be the record's only complete copy, so it falls through unchanged to "stays owed".
-		if (row === undefined && !rowReadFailed) {
-			superseded++;
-			continue;
-		}
 		if (localRowSatisfies(row, entry.version)) {
 			try {
 				await releaseAndClearReceipts(table, entry.recordId, entry.version);
@@ -337,6 +328,17 @@ export async function transitionsOwedToPeer(
 			} catch (error) {
 				onReceiptStoreError?.(entry.recordId, error);
 			}
+			continue;
+		}
+		// A confirmed miss (getEntry resolved, there is no row at all -- not even a tombstone, because its
+		// retention expired) is a deleted record: nobody can ever complete this transition's stub, so once
+		// handoffReleasable above has already had its chance to release a fully-receipted entry, a miss is
+		// superseded, the same as a residency move past this peer below. A transient read error resolves to
+		// the same `undefined`, but must NOT take this path -- that would stop owing (and let core
+		// resurrect) an image that may still be the record's only complete copy, so it falls through
+		// unchanged to "stays owed".
+		if (row === undefined && !rowReadFailed) {
+			superseded++;
 			continue;
 		}
 		if (row && (row.version ?? -Infinity) > entry.version && !residencyOf(row.residencyId)?.includes(peerName)) {

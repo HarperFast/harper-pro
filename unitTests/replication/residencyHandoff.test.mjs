@@ -409,6 +409,20 @@ describe('residency handoff — redelivery and local completion', () => {
 		expect(table.released).to.deep.equal([]);
 	});
 
+	it('still releases a deleted record whose image every other resident had already receipted', async () => {
+		// handoffReleasable must get its chance BEFORE the confirmed-miss supersede path, or a record
+		// deleted right after its last receipt would stay pinned forever instead of releasing normally.
+		const table = fakeTable({
+			retained: [{ recordId: 'deletedAfterReceipt', tableId: 7, version: V1, residencyId: 5 }],
+			entries: {},
+		});
+		await recordHandoffReceipt(table.dbisDB, 7, 'deletedAfterReceipt', 'B', V1);
+		const { owed, superseded } = await transitionsOwedToPeer(table, 'B', 'A', residencyOf(lists));
+		expect(owed).to.deep.equal([]);
+		expect(superseded).to.equal(0);
+		expect(table.released).to.deep.equal([{ id: 'deletedAfterReceipt', version: V1 }]);
+	});
+
 	it('keeps a confirmed-miss row distinct from a transient read error: an error still leaves the entry owed', async () => {
 		// Same undefined-row outcome as the deletion case above, but resolveLocalEntry's onError fires —
 		// must NOT take the supersede path, since the record may still exist and the read simply failed.
