@@ -95,8 +95,8 @@
 	"license": "Elastic-2.0",
 	"prettier": "@harperfast/code-guidelines/prettier",
 	"scripts": {
-		"build": "tsc --project tsconfig.json",
-		"build:watch": "npm run build -- --watch --incremental",
+		"build": "node core/build-tools/build-dist.mjs --project tsconfig.json",
+		"build:watch": "tsc --project tsconfig.json --watch --incremental",
 		"typecheck": "tsc --noEmit --project tsconfig.json",
 		"typecheck:fast": "npx -y -p @typescript/native-preview@7.0.0-dev.20260707.2 tsgo --noEmit --project tsconfig.json",
 		"core:sync": "./build-tools/sync-core.sh",
