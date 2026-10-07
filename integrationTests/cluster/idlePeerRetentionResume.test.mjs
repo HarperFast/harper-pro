@@ -8,7 +8,7 @@
  * and an incremental resume past it misses nothing; the sender now checks for that entry before forcing a copy.
  *
  * A peer whose log has no entry at all still takes the base copy: nothing proves nothing was purged
- * (harper-pro#922's closed floor is what would cover it; `retainedHistoryCoversResume` unit tests pin that). It is
+ * (harper-pro#922's closed floor is what would cover it; `retainedResumeRange` unit tests pin that). It is
  * not reproduced here, because whether a node's log stays empty depends on whether a copy wrote it a reload marker.
  *
  *   P ─ S     S subscribes to P. P writes once, then idles.

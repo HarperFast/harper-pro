@@ -4706,7 +4706,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	ws.on('close', () => blockedTablesInvalidator.remove());
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
-	// `liveStartByLog` is the map the live incremental range holds, so an `includeNodes` update can extend it.
+	// `liveStartByLog` is the live incremental range's own map, so an `includeNodes` update reaches the range
 	let requestedOriginCursors: Record<string, number> | undefined;
 	let originFloors: Map<string, number> | undefined;
 	let originFloorById: number[] | undefined;
@@ -6931,11 +6931,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
 									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
 									// an `includeNodes` update re-admits a log whose entries are already committed
+									let wake: () => void;
 									await new Promise<void>((resolve) => {
-										wakeSender = resolve;
+										wake = wakeSender = resolve;
 										nextTransaction.then(resolve, resolve);
 									});
-									wakeSender = undefined;
+									// a superseded loop must not clear the live loop's waker
+									if (wakeSender === wake) wakeSender = undefined;
 								} while (!closed);
 							})
 							.catch((error) => {
@@ -7018,7 +7020,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// COPY_COMPLETE could otherwise flip copyCompleteReceived mid-body and make trailing rows fall back to
 			// the audited/resequencing path — reintroducing the O(n) copy-time work this avoids. (harper-pro#480)
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
-			// The origins of this body's records, for the per-origin cursors; a copy frame's key is a walk position.
+			// a copy frame's key is a walk position, not a log key
 			const frameOrigins: number[] | undefined = !messageIsCopyFrame && recordsOriginCursors() ? [] : undefined;
 			// Copy frames get a walk position, and everything staging or blob-tagging against it is
 			// captured NOW (decode time): onCommit runs later from the apply queue, by which time a
