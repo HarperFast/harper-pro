@@ -5716,6 +5716,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const requestDecoder = tableDecoders[requestTableId];
 							// no structure for the table yet, or the queue is full: the sender's next sweep asks again
 							if (!requestDecoder) continue;
+							// Same boundary GET_RECORD enforces (:5777): a `replicate: false` table's records never
+							// leave this node on any path, including confirming one exists via a receipt. A dropped
+							// table resolves to no live entry here, and tableReplicates defaults an absent table to
+							// "replicates" -- the `!liveTable ||` must come first, same as GET_RECORD's own check.
+							const liveRequestTable = tables?.[requestDecoder.name];
+							if (!liveRequestTable || !tableReplicates(liveRequestTable)) continue;
 							const key = receiptRequestKey(requestTableId, recordId);
 							if (!receiptRequests.has(key) && receiptRequests.size >= MAX_PENDING_RECEIPT_REQUESTS) {
 								if (now - lastReceiptPruneAt >= RECEIPT_PRUNE_INTERVAL_MS) {
