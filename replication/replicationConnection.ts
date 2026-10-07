@@ -198,14 +198,9 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // transition image, from the receiver's row state once that row is complete and durable (harper#2257).
 const HANDOFF_RECEIPT = 151;
 const HANDOFF_RECEIPT_REQUEST = 152;
-// A receipt/request tuple's recordId can be a BigInt of any size core's own Id contract allows
-// (isValidReceiptId accepts it) -- the plain `encode` throws RangeError past the signed/unsigned
-// 64-bit range. The extension tag it writes instead (0x42) is decoded unconditionally by msgpackr's
-// built-in extension registry, so an ordinary `decode()` on the receiving end needs no matching option.
-// useRecords: false matches the module's own default `encode` (pack.js's `defaultPackr`): `.pack` reads
-// `this.lastNamedStructuresLength` internally, and `useRecords`'s default initializes `this.structures`
-// on the instance -- a detached `const` reference like this one then calls it with no receiver, which
-// only stays safe when that structures path is compiled out.
+// A receipt/request tuple's recordId can be a BigInt of any size core's own Id contract allows, past
+// the plain `encode`'s signed/unsigned 64-bit range (isValidReceiptId). An ordinary `decode()` needs no
+// matching option. useRecords: false matches `defaultPackr`, msgpackr's own detached module-level `encode`.
 export const encodeHandoffMessage = new Packr({ useBigIntExtension: true, useRecords: false }).pack;
 const HANDOFF_RESWEEP_INTERVAL_MS = 5 * 60_000;
 const RECEIPT_PRUNE_INTERVAL_MS = 1000;
