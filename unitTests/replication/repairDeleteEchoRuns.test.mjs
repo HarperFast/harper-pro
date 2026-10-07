@@ -28,6 +28,7 @@ import {
 	RepairRefusedError,
 } from '#src/replication/repairDeleteEchoRuns';
 import { RocksTransactionLogStore } from '#src/core/resources/RocksTransactionLogStore';
+import { releaseLocalKey, reserveLocalKey } from '#src/core/resources/originClosedFloor';
 
 // Required, not imported: the ESM entry would evaluate a second copy of the package beside the one the
 // data layer already loaded through CJS.
@@ -121,10 +122,16 @@ async function withDatabase(databasePath, callback) {
 function writeTransactions(databasePath, transactions) {
 	return withDatabase(databasePath, async (db, store) => {
 		for (const [timestamp, records] of transactions) {
-			await db.transaction((transaction) => {
-				transaction.setTimestamp(timestamp);
-				for (const record of records) store.put(0, { ...record }, { transaction });
-			});
+			let handle;
+			try {
+				await db.transaction((transaction) => {
+					handle = transaction;
+					reserveLocalKey(db, transaction, timestamp);
+					for (const record of records) store.put(0, { ...record }, { transaction });
+				});
+			} finally {
+				releaseLocalKey(handle);
+			}
 		}
 	});
 }
@@ -290,7 +297,16 @@ describe('repairDeleteEchoRuns (harper-pro#826)', function () {
 				expect(Array.from(log.query({ start: T + 1 }))).to.have.length(0);
 				const { lastCommittedPosition, nextLogPosition } = log.getStats();
 				expect(lastCommittedPosition).to.not.deep.equal(nextLogPosition);
-				await db.transaction((transaction) => store.put(0, putOf('next', T + 1), { transaction }));
+				let handle;
+				try {
+					await db.transaction((transaction) => {
+						handle = transaction;
+						reserveLocalKey(db, transaction, T + 1);
+						store.put(0, putOf('next', T + 1), { transaction });
+					});
+				} finally {
+					releaseLocalKey(handle);
+				}
 				expect(log.getStats().lastCommittedPosition.sequence).to.equal(2);
 			});
 			expect((await readBack(databasePath)).map(({ id }) => id)).to.deep.equal(['p', 'z', 'next']);
