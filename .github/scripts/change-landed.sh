@@ -6,9 +6,13 @@
 # 2 that the check could not run.
 set -u
 
-TARGET="$1"
-BASE="$2"
-HEAD="$3"
+TARGET="${1:-}"
+BASE="${2:-}"
+HEAD="${3:-}"
+if [ -z "$TARGET" ] || [ -z "$BASE" ] || [ -z "$HEAD" ]; then
+	echo "::warning::usage: change-landed.sh <target> <base> <head>"
+	exit 2
+fi
 
 MERGED=$(git merge-tree --write-tree --merge-base="$BASE" "$TARGET" "$HEAD")
 case $? in

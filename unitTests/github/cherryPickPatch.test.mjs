@@ -276,6 +276,12 @@ describeWithMergeBase('change-landed.sh', function () {
 		assert.strictEqual(result.status, 2, result.stderr);
 		assert.match(result.stdout, /^::warning::/m);
 	});
+
+	it('reports a call with a missing argument as a check that cannot run', function () {
+		const result = spawnSync('bash', [changeLanded, 'HEAD', 'HEAD'], { cwd: dir, env, encoding: 'utf8', timeout: DEADLINE });
+		assert.strictEqual(result.status, 2, result.stderr);
+		assert.match(result.stdout, /^::warning::/m);
+	});
 });
 
 // harper-pro's `core` is a submodule, and the cherry-pick checkout does not initialize it, so
