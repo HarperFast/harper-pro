@@ -13,7 +13,7 @@ for (const entry of builtIns) {
 }
 const packages = new Set();
 for (const path of Object.keys(require.cache)) {
-	const match = path.match(/[\\/]node_modules[\\/]((?:@[^\\/]+[\\/])?[^\\/]+)[\\/](.*)$/);
+	const match = path.match(/.*[\\/]node_modules[\\/]((?:@[^\\/]+[\\/])?[^\\/]+)[\\/](.*)$/);
 	if (match) packages.add(match[2] === 'lodash.js' ? 'lodash (full build)' : match[1].replace('\\', '/'));
 }
 process.stdout.write(JSON.stringify([...packages]), () => process.exit(0));
