@@ -176,8 +176,8 @@ for (const redeclare of [false, true]) {
 					await deployFixture(ctx.nodeA, FIXTURE_PATH);
 					await waitForCondition(
 						async (signal) => {
-							const described = await describeTable(ctx.nodeA, LOCAL_TABLE, signal);
-							return described.status === 200 && described.body.replicate === false;
+							const described = await describeTable(ctx.nodeA, LOCAL_TABLE, signal).catch(() => null);
+							return described?.status === 200 && described.body.replicate === false;
 						},
 						{ timeoutMs: 60_000, description: `${LOCAL_TABLE} to become local after redeploy` }
 					);
