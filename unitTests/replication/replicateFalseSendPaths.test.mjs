@@ -82,6 +82,9 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 		setHdbBasePath(process.env.STORAGE_PATH);
 		await loadGQLSchema(SCHEMA());
 		await tables.ReplicateFalseLocal.put({ id: 'local', payload: BLOB_PAYLOAD });
+		// Inline (non-file-blob) payload, so the HANDOFF_RECEIPT_REQUEST deny test below isn't also
+		// waiting on an async blob-completeness check it never intends to exercise.
+		await tables.ReplicateFalseLocal.put({ id: 'local-small', payload: 'tiny' });
 		await tables.ReplicateFalseShared.put({ id: 'shared', payload: 'travels' });
 	});
 
@@ -161,9 +164,12 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 	});
 
 	it('never answers a HANDOFF_RECEIPT_REQUEST for the non-replicated table (harper#2257)', async () => {
+		// 'local-small' (not 'local'): an inline payload keeps this deterministic -- a blob-backed row
+		// would also need the async blob-completeness check settle() isn't waiting on, which could let a
+		// too-short wait pass even without the gate this test exists to prove.
 		const local = tables.ReplicateFalseLocal;
 		socket.emit('message', structureFrame(local, local.tableId));
-		socket.emit('message', encode([HANDOFF_RECEIPT_REQUEST, [[local.tableId, 'local', 1]], 'data']));
+		socket.emit('message', encode([HANDOFF_RECEIPT_REQUEST, [[local.tableId, 'local-small', 1]], 'data']));
 		await settle(socket, 2);
 		assert.ok(
 			!socket.sent.some((frame) => frame[0] === HANDOFF_RECEIPT),
