@@ -368,15 +368,15 @@ suite(
 				cursorSamples.map((s) => `${s.t}:${s.version}`).join(' ')
 			);
 
-			// --- Assertion 1 (load-bearing): B's resume cursor advances during the run, not just
-			//     once at the end. This is the signal that actually distinguishes fixed vs
+			// --- Assertion 1 (load-bearing): B's resume cursor advances within the probe window,
+			//     not just once at the end. This is the signal that actually distinguishes fixed vs
 			//     pre-#536 code -- see the file header for confirmed pass/fail evidence. ---
 			const distinctVersions = new Set(cursorSamples.map((s) => s.version));
 			ok(
 				distinctVersions.size >= 2,
 				`DEFECT-SHAPE: B's lastReceivedVersion only showed ${distinctVersions.size} distinct value(s) ` +
-					`across ${cursorSamples.length} samples during the skip-run — periodic sequence updates from ` +
-					`skipAuditRecord() are not firing during the run, so a reconnect mid-run would rescan from the start`
+					`across ${cursorSamples.length} samples in the probe window — a periodic sequence update from ` +
+					`skipAuditRecord() did not land, so a reconnect mid-run would rescan from the start`
 			);
 			const versionsInOrder = cursorSamples.map((s) => s.version);
 			let monotonic = true;
