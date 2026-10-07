@@ -13,7 +13,6 @@ import {
 	parseOriginKeyMap,
 	rangeBoundaryFailure,
 	resolveOriginFloors,
-	retainedResumeRange,
 } from '#src/replication/replicationConnection';
 
 const SEQ = Symbol.for('seq');
@@ -174,34 +173,6 @@ describe('collectRelayedLogAnchors', () => {
 	it("anchors each relayed log at its last committed key, skipping the sender's own, the skipped and empty logs", () => {
 		const store = fakeAuditStore({ local: [T], removed: [T - 30, T - 20, T - 10], excluded: [T], empty: [] });
 		assert.deepStrictEqual(collectRelayedLogAnchors(store, new Set(['excluded'])), new Map([['removed', T - 10]]));
-	});
-});
-
-describe('retainedResumeRange', () => {
-	it('resumes the local log and every other log in scope past their exact entries', () => {
-		const range = retainedResumeRange(T, ['removed'], { removed: T - 50, unrelated: T }, ['self']);
-		assert.deepStrictEqual(
-			range.startByLog,
-			new Map([
-				['local', T],
-				['removed', T - 50],
-			])
-		);
-		assert.strictEqual(range.resumeAfterExactStart, true);
-		assert.strictEqual(range.exactStart, true);
-		assert.deepStrictEqual(range.excludeLogs, ['self']);
-		assert.strictEqual(range.log, undefined);
-	});
-
-	it('reads only the local log for a single-log subscription', () => {
-		assert.strictEqual(retainedResumeRange(T, [], undefined, undefined).log, 'local');
-	});
-
-	it('gives no range when another log in scope has no usable cursor', () => {
-		assert.strictEqual(retainedResumeRange(T, ['removed'], {}, []), undefined);
-		assert.strictEqual(retainedResumeRange(T, ['removed'], undefined, []), undefined);
-		assert.strictEqual(retainedResumeRange(T, ['removed'], { removed: 'T' }, []), undefined);
-		assert.strictEqual(retainedResumeRange(T, ['toString'], {}, []), undefined);
 	});
 });
 

@@ -2853,38 +2853,6 @@ export function collectRelayedLogAnchors(auditStore: any, skipLogs: Set<string>)
 }
 
 /**
- * An append-order resume from `localStart` for a subscriber whose cursor is older than `now - auditRetention`,
- * or undefined when one cannot be proven. rocksdb-js keeps a log's newest file past retention, so an idle sender's
- * last own entry survives, and a range that resumes past that exact entry yields everything appended after it.
- * Every other log in scope needs the subscriber's cursor for it, resumed past exactly the same way: a key range
- * cannot prove coverage, since a log is appended out of key order. The caller still probes that every boundary
- * forms (`rangeBoundaryFailure`) and keeps the base copy when one does not.
- */
-export function retainedResumeRange(
-	localStart: number,
-	otherLogs: Iterable<string>,
-	originCursors: Record<string, number> | undefined,
-	excludeLogs: string[] | undefined
-) {
-	const startByLog = new Map([['local', localStart]]);
-	for (const logName of otherLogs) {
-		const cursor = originCursors && Object.hasOwn(originCursors, logName) ? originCursors[logName] : undefined;
-		if (!isValidFrameTxnLogKey(cursor)) return undefined;
-		startByLog.set(logName, cursor);
-	}
-	return {
-		start: localStart,
-		exactStart: true,
-		exclusiveStart: true,
-		resumeAfterExactStart: true,
-		log: excludeLogs ? undefined : 'local',
-		startByLog,
-		excludeLogs,
-		snapshot: false,
-	};
-}
-
-/**
  * Pulls one entry so every exact boundary in `rangeOptions` has been checked. A throw is the same outcome as a recorded
  * failure. When the failure is attributed to particular logs, it is the set of their names; a corrupt frame is not.
  */
@@ -6430,43 +6398,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													Date.now() - auditRetention
 												)
 											) {
-												auditStore.loadLogs?.();
-												const resumeRange =
-													oldestLogName === 'local' &&
-													nodeSubscriptions.length === 1 &&
-													auditStore.reusableIterable === true
-														? retainedResumeRange(
-																currentSequenceId,
-																excludedNodes
-																	? [...auditStore.logByName.keys()].filter(
-																			(name) => name !== 'local' && !excludedNodes.includes(name)
-																		)
-																	: [],
-																requestedOriginCursors,
-																excludedNodes
-															)
-														: undefined;
-												if (resumeRange && !rangeBoundaryFailure(auditStore, resumeRange)) {
-													logger.info?.(
-														`Peer ${remoteNodeName} resumes database ${databaseName} incrementally from ${new Date(currentSequenceId).toISOString()}, past the auditRetention cutoff: that position is still an entry of this node's transaction log`
-													);
-													auditLogIterable = auditStore.getRange(resumeRange);
-													boundaryLogName = 'local';
-													// The range resumes each log past its exact entry, so a key filter would drop entries
-													// appended later with an older key.
-													for (const logName of resumeRange.startByLog.keys()) {
-														const localId = logName === 'local' ? 0 : exportIdMapping(auditStore)[logName];
-														if (typeof localId !== 'number') continue;
-														if (originFloorById) delete originFloorById[localId];
-														const listed = subscribedNodeIds[localId];
-														if (typeof listed === 'object') subscribedNodeIds[localId] = { ...listed, startTime: 0 };
-													}
-												} else {
-													logger.warn?.(
-														`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
-													);
-													currentSequenceId = 0;
-												}
+												logger.warn?.(
+													`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
+												);
+												currentSequenceId = 0;
 											}
 										}
 										if (currentSequenceId === 0) {
