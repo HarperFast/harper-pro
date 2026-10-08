@@ -82,17 +82,16 @@ describe('answering an OPERATION_REQUEST', function () {
 		expect(socket.closes).to.deep.equal([]);
 	});
 
-	// harper#1212: a peer's forwarded drop_table must carry replicatedFrom (core's drop_table reads it to
-	// keep the origin's drop marker time); no other operation may gain the field, because core's other
-	// operation handlers (e.g. set_configuration) reject an unrecognized parameter.
+	// harper#1212: core trusts a drop's provenance only from the operation context, which a client's JSON body
+	// cannot reach; it is passed only for drop_table, the one operation that reads it.
 	describe('replicatedFrom', () => {
 		let realOperation, received;
 
 		beforeEach(() => {
 			realOperation = server.operation;
 			received = [];
-			server.operation = (data) => {
-				received.push(data);
+			server.operation = (data, context) => {
+				received.push({ data, context });
 				return Promise.resolve({});
 			};
 		});
@@ -101,18 +100,34 @@ describe('answering an OPERATION_REQUEST', function () {
 			server.operation = realOperation;
 		});
 
-		it('is added only to a forwarded drop_table', async () => {
+		it('is passed in the context of a forwarded drop_table, never in its body', async () => {
 			socket.emit('message', encode([OPERATION_REQUEST, { operation: 'drop_table', schema: 'data', table: 't' }]));
 			await settled(socket);
 			expect(received).to.have.length(1);
-			expect(received[0].replicatedFrom).to.equal('peer-a');
+			expect(received[0].context.replicatedFrom).to.equal('peer-a');
+			expect(received[0].data).to.not.have.property('replicatedFrom');
+		});
+
+		it('names the peer of an operation connection, which sends no NODE_NAME', async () => {
+			const operationSocket = new FakeSocket();
+			// a server-side socket: its authorization settles after the connection opens
+			replicateOverWS(operationSocket, {}, Promise.resolve({ name: 'peer-b', replicates: true }));
+			operationSocket.emit(
+				'message',
+				encode([OPERATION_REQUEST, { operation: 'drop_table', schema: 'data', table: 't', replicated: false }])
+			);
+			await settled(operationSocket);
+			operationSocket.close(1000);
+			expect(received).to.have.length(1);
+			expect(received[0].context.replicatedFrom).to.equal('peer-b');
 		});
 
 		it('is left unset on every other operation', async () => {
 			socket.emit('message', encode([OPERATION_REQUEST, { operation: 'set_configuration', logging_level: 'warn' }]));
 			await settled(socket);
 			expect(received).to.have.length(1);
-			expect(received[0]).to.not.have.property('replicatedFrom');
+			expect(received[0].context.replicatedFrom).to.equal(undefined);
+			expect(received[0].data).to.not.have.property('replicatedFrom');
 		});
 	});
 });

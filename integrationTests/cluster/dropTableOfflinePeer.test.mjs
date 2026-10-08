@@ -1,15 +1,10 @@
 /**
- * Regression anchor for HarperFast/harper#1212, cluster half: a replicated `drop_table` must stay
- * dropped across restarts, and a peer that was offline for the drop must not bring the table or
- * its rows back when it rejoins, nor leak them into a same-name table created after the drop.
- *
- * Two nodes, bidirectional replication of `data`, rows written on both and converged before each
- * scenario. Scenarios 1/1b drop with both nodes connected and restart them (gracefully / SIGKILL).
- * Scenarios 2/2b/2c stop B first, drop (and in 2c recreate) on A, then bring B back. Scenario 3 runs B as a
- * pre-stamp build (no capability bag, no stamps on the wire or in its catalog) through a drop it sees and a
- * drop it misses, then upgrades it: A must refuse the stale copy and its rows, and the upgraded B must retire
- * the stale copy while keeping the table it recreated on the old build. Scenario 4 checks that a drop a
- * client asked not to replicate stays local. Each test owns its tables.
+ * HarperFast/harper#1212, cluster half: a replicated `drop_table` stays dropped across restarts, and a peer
+ * that missed it neither brings the table back nor leaks its rows into a same-name recreate. Scenario 3 runs B
+ * as a pre-stamp build (no capability bag, no stamps on the wire or in its catalog) through a drop it sees and
+ * one it misses, then upgrades it. Scenario 5 checks a peer's drop never retires a `replicate: false` table;
+ * scenario 6 that a node joining through a pre-stamp peer does not carry its stale definition back to the
+ * dropper. Each test owns its tables.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -21,8 +16,9 @@ import {
 	killHarper,
 	teardownHarper,
 	getNextAvailableLoopbackAddress,
+	targz,
 } from '@harperfast/integration-testing';
-import { sendOperation } from './clusterShared.mjs';
+import { sendOperation, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -37,49 +33,57 @@ const ROWS_PER_NODE = 20;
 // Replication has no "nothing more is coming" signal, so a check that something did NOT arrive
 // waits this long after both directions report connected.
 const SETTLE_MS = 5000;
+const FIXTURES = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 
-async function postOperation(node, operation) {
+async function postOperation(node, operation, signal) {
 	const response = await fetch(node.operationsAPIURL, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(operation),
+		signal,
 	});
 	return { status: response.status, body: await response.json() };
 }
 
-async function tableExists(node, table) {
-	const described = await sendOperation(node, { operation: 'describe_database', database: 'data' });
+async function tableExists(node, table, signal) {
+	const described = await sendOperation(node, { operation: 'describe_database', database: 'data' }, { signal });
 	return Object.hasOwn(described, table);
 }
 
-async function idsIn(node, table) {
-	const { status, body } = await postOperation(node, {
-		operation: 'search_by_value',
-		database: 'data',
-		table,
-		attribute: 'id',
-		value: '*',
-		get_attributes: ['id'],
-	});
+async function idsIn(node, table, signal) {
+	const { status, body } = await postOperation(
+		node,
+		{
+			operation: 'search_by_value',
+			database: 'data',
+			table,
+			attribute: 'id',
+			value: '*',
+			get_attributes: ['id'],
+		},
+		signal
+	);
 	if (status !== 200) return null;
 	return body.map((record) => record.id).sort();
 }
 
-async function waitFor(condition, maxMs = 30000, intervalMs = 300) {
-	const deadline = Date.now() + maxMs;
-	while (Date.now() < deadline) {
-		if (await condition().catch(() => false)) return true;
-		await delay(intervalMs);
-	}
-	return false;
+/** True once `condition(signal)` is truthy, false at the deadline; the signal cancels a probe a hung node never answers. */
+function waitFor(condition, maxMs = 30000, intervalMs = 300) {
+	return waitForCondition((signal) => Promise.resolve(condition(signal)).catch(() => false), {
+		timeoutMs: maxMs,
+		pollMs: intervalMs,
+	}).then(
+		() => true,
+		() => false
+	);
 }
 
-async function waitForConnected(node, maxMs = 90000) {
+async function waitForConnected(node, maxMs = 90000, peers = 1) {
 	return waitFor(
-		async () => {
-			const status = await sendOperation(node, { operation: 'cluster_status' });
+		async (signal) => {
+			const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
 			return (
-				status?.connections?.length > 0 &&
+				status?.connections?.length >= peers &&
 				status.connections.every(
 					(connection) =>
 						connection.database_sockets?.length > 0 && connection.database_sockets.every((socket) => socket.connected)
@@ -142,7 +146,7 @@ async function restartBoth(ctx, options) {
 
 async function seedConverged(ctx, table) {
 	await sendOperation(ctx.nodeA, { operation: 'create_table', database: 'data', table, primary_key: 'id' });
-	ok(await waitFor(() => tableExists(ctx.nodeB, table)), `${table} did not replicate to B`);
+	ok(await waitFor((signal) => tableExists(ctx.nodeB, table, signal)), `${table} did not replicate to B`);
 	const expected = [];
 	for (const [label, node] of [
 		['a', ctx.nodeA],
@@ -159,7 +163,7 @@ async function seedConverged(ctx, table) {
 	expected.sort();
 	for (const node of [ctx.nodeA, ctx.nodeB]) {
 		ok(
-			await waitFor(async () => (await idsIn(node, table))?.length === expected.length),
+			await waitFor(async (signal) => (await idsIn(node, table, signal))?.length === expected.length),
 			`${table} did not converge on ${node.hostname}`
 		);
 	}
@@ -176,7 +180,7 @@ async function expectAbsentOnBoth(ctx, table, why) {
 
 async function recreateEmptyOnBoth(ctx, table, why) {
 	await sendOperation(ctx.nodeA, { operation: 'create_table', database: 'data', table, primary_key: 'id' });
-	ok(await waitFor(() => tableExists(ctx.nodeB, table)), `recreate of ${table} did not reach B`);
+	ok(await waitFor((signal) => tableExists(ctx.nodeB, table, signal)), `recreate of ${table} did not reach B`);
 	await delay(SETTLE_MS);
 	deepEqual(
 		{ a: await idsIn(ctx.nodeA, table), b: await idsIn(ctx.nodeB, table) },
@@ -217,6 +221,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 		await Promise.all([
 			ctx.nodeA && teardownHarper({ harper: ctx.nodeA }).catch(() => {}),
 			ctx.nodeB && teardownHarper({ harper: ctx.nodeB }).catch(() => {}),
+			ctx.nodeJ && teardownHarper({ harper: ctx.nodeJ }).catch(() => {}),
 		]);
 	});
 
@@ -228,7 +233,10 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 
 			const drop = await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table });
 			equal(drop.replicated?.[0]?.status, undefined, `B did not acknowledge the drop: ${JSON.stringify(drop)}`);
-			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, table)), 30000, 50), 'drop did not reach B');
+			ok(
+				await waitFor(async (signal) => !(await tableExists(ctx.nodeB, table, signal)), 30000, 50),
+				'drop did not reach B'
+			);
 
 			await restartBoth(ctx, { crash });
 			await delay(SETTLE_MS);
@@ -260,7 +268,10 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 
 			await start(ctx, 'nodeB');
 			await waitForBothConnected(ctx, 'after B rejoined');
-			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, table))), 'B kept the table it missed the drop of');
+			ok(
+				await waitFor(async (signal) => !(await tableExists(ctx.nodeB, table, signal))),
+				'B kept the table it missed the drop of'
+			);
 			await delay(SETTLE_MS);
 			await expectAbsentOnBoth(ctx, table, "B's stale definition recreated it on A, or B kept it");
 
@@ -285,7 +296,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			await start(ctx, 'nodeB');
 			await waitForBothConnected(ctx, 'after B rejoined');
 			ok(
-				await waitFor(async () => (await idsIn(ctx.nodeB, table))?.length === 0),
+				await waitFor(async (signal) => (await idsIn(ctx.nodeB, table, signal))?.length === 0),
 				"B kept its pre-drop rows in the recreated table's name"
 			);
 			await sendOperation(ctx.nodeB, {
@@ -295,7 +306,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 				records: [{ id: 'b-new', origin: 'b', n: 1000 }],
 			});
 			ok(
-				await waitFor(async () => (await idsIn(ctx.nodeA, table))?.includes('b-new')),
+				await waitFor(async (signal) => (await idsIn(ctx.nodeA, table, signal))?.includes('b-new')),
 				'post-rejoin write did not reach A'
 			);
 			await delay(SETTLE_MS);
@@ -330,12 +341,15 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 				table: emptyStale,
 				primary_key: 'id',
 			});
-			ok(await waitFor(() => tableExists(ctx.nodeB, emptyStale)), `${emptyStale} did not replicate to B`);
+			ok(await waitFor((signal) => tableExists(ctx.nodeB, emptyStale, signal)), `${emptyStale} did not replicate to B`);
 
 			// A drops and recreates liveTable while B is connected: B applies the drop and recreates the table
 			// from A's definition, so its copy is live and consistent but carries no stamp.
 			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: liveTable });
-			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, liveTable))), 'drop did not reach the pre-stamp B');
+			ok(
+				await waitFor(async (signal) => !(await tableExists(ctx.nodeB, liveTable, signal))),
+				'drop did not reach the pre-stamp B'
+			);
 			await recreateEmptyOnBoth(ctx, liveTable, 'rows survived the connected drop');
 			await sendOperation(ctx.nodeA, {
 				operation: 'upsert',
@@ -344,14 +358,17 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 				records: [{ id: 'a-after-recreate', origin: 'a', n: 1 }],
 			});
 			ok(
-				await waitFor(async () => (await idsIn(ctx.nodeB, liveTable))?.includes('a-after-recreate')),
+				await waitFor(async (signal) => (await idsIn(ctx.nodeB, liveTable, signal))?.includes('a-after-recreate')),
 				"A's write to the recreated table did not reach the pre-stamp B"
 			);
 
 			// B itself drops and recreates a table while on the pre-stamp build: A applies the drop and keeps its
 			// marker, then refuses B's unstamped recreate for as long as B runs that build.
 			await sendOperation(ctx.nodeB, { operation: 'drop_table', database: 'data', table: onLegacy });
-			ok(await waitFor(async () => !(await tableExists(ctx.nodeA, onLegacy))), "B's drop did not reach A");
+			ok(
+				await waitFor(async (signal) => !(await tableExists(ctx.nodeA, onLegacy, signal))),
+				"B's drop did not reach A"
+			);
 			await sendOperation(ctx.nodeB, {
 				operation: 'create_table',
 				database: 'data',
@@ -398,7 +415,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 				records: [{ id: 'b-live-write', origin: 'b', n: 3000 }],
 			});
 			ok(
-				await waitFor(async () => (await idsIn(ctx.nodeA, liveTable))?.includes('b-live-write')),
+				await waitFor(async (signal) => (await idsIn(ctx.nodeA, liveTable, signal))?.includes('b-live-write')),
 				"the pre-stamp peer's write to the live recreated table did not reach A"
 			);
 
@@ -406,7 +423,10 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			await stop(ctx.nodeB);
 			await start(ctx, 'nodeB');
 			await waitForBothConnected(ctx, 'after B rejoined on the current build');
-			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, table))), 'upgraded B kept the stale table');
+			ok(
+				await waitFor(async (signal) => !(await tableExists(ctx.nodeB, table, signal))),
+				'upgraded B kept the stale table'
+			);
 			await delay(SETTLE_MS);
 			await expectAbsentOnBoth(ctx, table, 'after the pre-stamp peer was upgraded');
 			deepEqual(
@@ -416,9 +436,9 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			);
 			// The table B recreated on the old build is stamped as newer than the drop and reaches A at last. The
 			// rows B wrote to it while on the old build stay on B: A refused that generation's records then and
-			// advanced past them (see replication/DESIGN.md item 24). New writes flow.
+			// advanced past them (see replication/DESIGN.md item 27). New writes flow.
 			ok(
-				await waitFor(async () => tableExists(ctx.nodeA, onLegacy)),
+				await waitFor((signal) => tableExists(ctx.nodeA, onLegacy, signal)),
 				"the table recreated on the pre-stamp node did not reach A after B's upgrade"
 			);
 			await sendOperation(ctx.nodeB, {
@@ -428,7 +448,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 				records: [{ id: 'b-after-upgrade', origin: 'b', n: 5000 }],
 			});
 			ok(
-				await waitFor(async () => (await idsIn(ctx.nodeA, onLegacy))?.includes('b-after-upgrade')),
+				await waitFor(async (signal) => (await idsIn(ctx.nodeA, onLegacy, signal))?.includes('b-after-upgrade')),
 				"a write to the table recreated on the pre-stamp node did not reach A after B's upgrade"
 			);
 			deepEqual(
@@ -437,7 +457,10 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 				'B lost rows of the table it recreated'
 			);
 			// An unstamped stale copy with no row at all cannot prove it was recreated: it goes, and stays gone on A.
-			ok(await waitFor(async () => !(await tableExists(ctx.nodeB, emptyStale))), 'upgraded B kept an empty stale copy');
+			ok(
+				await waitFor(async (signal) => !(await tableExists(ctx.nodeB, emptyStale, signal))),
+				'upgraded B kept an empty stale copy'
+			);
 			await delay(SETTLE_MS);
 			await expectAbsentOnBoth(ctx, emptyStale, 'an empty stale copy on the upgraded node brought the table back');
 		}
@@ -455,4 +478,158 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 		await delay(SETTLE_MS);
 		equal((await idsIn(ctx.nodeB, table))?.length, seeded.length, 'B lost its copy after a restart');
 	});
+
+	test(
+		'scenario 5: a peer drop never retires a replicate:false table; a replicated table beside it still goes',
+		{ timeout: 300000 },
+		async () => {
+			const localTable = 'NodeLocalDrop';
+			const control = 'node_local_control';
+			const deployNodeLocal = async (node, fixture) => {
+				await sendOperation(node, {
+					operation: 'deploy_component',
+					project: 'drop-node-local',
+					payload: await targz(join(FIXTURES, fixture)),
+					replicated: false,
+					restart: true,
+				});
+				ok(
+					await waitFor((signal) => tableExists(node, localTable, signal), 60000),
+					`${node.hostname} did not load its node-local table`
+				);
+				await waitForBothConnected(ctx, `after ${node.hostname} deployed its node-local table`);
+			};
+			await deployNodeLocal(ctx.nodeB, 'fixture-drop-node-local');
+			const localIds = ['b-local-0', 'b-local-1', 'b-local-2'];
+			await sendOperation(ctx.nodeB, {
+				operation: 'upsert',
+				database: 'data',
+				table: localTable,
+				records: localIds.map((id) => ({ id })),
+			});
+			// A's replicated table of the same name: B keeps its own declaration and never takes A's.
+			await sendOperation(ctx.nodeA, {
+				operation: 'create_table',
+				database: 'data',
+				table: localTable,
+				primary_key: 'id',
+			});
+			await seedConverged(ctx, control);
+
+			// B learns these drops as markers when it reconnects.
+			await stop(ctx.nodeB);
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: localTable });
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: control });
+			await start(ctx, 'nodeB');
+			await waitForBothConnected(ctx, 'after B rejoined');
+			ok(
+				await waitFor(async (signal) => !(await tableExists(ctx.nodeB, control, signal))),
+				'B kept the replicated table it missed the drop of'
+			);
+			await delay(SETTLE_MS);
+			deepEqual(await idsIn(ctx.nodeB, localTable), localIds, "A's drop marker retired B's node-local table");
+
+			await stop(ctx.nodeB);
+			await start(ctx, 'nodeB');
+			await waitForBothConnected(ctx, 'after B reconnected again');
+			await delay(SETTLE_MS);
+			deepEqual(
+				await idsIn(ctx.nodeB, localTable),
+				localIds,
+				"a reconnect's drop markers retired B's node-local table"
+			);
+
+			// A connected drop reaches B as the forwarded operation instead.
+			await sendOperation(ctx.nodeA, {
+				operation: 'create_table',
+				database: 'data',
+				table: localTable,
+				primary_key: 'id',
+			});
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: localTable });
+			await delay(SETTLE_MS);
+			deepEqual(await idsIn(ctx.nodeB, localTable), localIds, "A's forwarded drop retired B's node-local table");
+
+			// A's own node-local tables: one B keeps node-local too, one B replicates. Neither drop is A's to send.
+			const sourceTable = 'NodeLocalSource';
+			await sendOperation(ctx.nodeB, {
+				operation: 'create_table',
+				database: 'data',
+				table: sourceTable,
+				primary_key: 'id',
+			});
+			await sendOperation(ctx.nodeB, {
+				operation: 'upsert',
+				database: 'data',
+				table: sourceTable,
+				records: [{ id: 'b-replicated' }],
+			});
+			await deployNodeLocal(ctx.nodeA, 'fixture-drop-node-local-source');
+			for (const table of [localTable, sourceTable])
+				await sendOperation(ctx.nodeA, { operation: 'upsert', database: 'data', table, records: [{ id: 'a-local' }] });
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: sourceTable });
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table: localTable });
+			await delay(SETTLE_MS);
+			deepEqual(
+				{ local: await idsIn(ctx.nodeB, localTable), replicated: await idsIn(ctx.nodeB, sourceTable) },
+				{ local: localIds, replicated: ['b-replicated'] },
+				"A's drop of its node-local tables reached B"
+			);
+			await expectAbsentOnBoth(ctx, control, 'the replicated control table came back');
+		}
+	);
+
+	test(
+		"scenario 6: a node joining through a pre-stamp peer does not carry that peer's stale table back to the dropper",
+		{ timeout: 400000 },
+		async () => {
+			const table = 'joined_through_legacy';
+			await stop(ctx.nodeB);
+			await start(ctx, 'nodeB', { legacyPeer: true });
+			await waitForBothConnected(ctx, 'after B rejoined as a pre-stamp peer');
+			const seeded = await seedConverged(ctx, table);
+			await stop(ctx.nodeB);
+			await sendOperation(ctx.nodeA, { operation: 'drop_table', database: 'data', table });
+			await start(ctx, 'nodeB', { legacyPeer: true });
+			await waitForBothConnected(ctx, 'after the pre-stamp B rejoined');
+
+			// With A down, B's unstamped definition is the first J learns of the name.
+			await stop(ctx.nodeA);
+			const hostnameJ = await getNextAvailableLoopbackAddress();
+			const ctxJ = { name: ctx.name, harper: { hostname: hostnameJ } };
+			await startHarper(ctxJ, nodeConfig(hostnameJ));
+			ctx.nodeJ = ctxJ.harper;
+			await sendOperation(ctx.nodeJ, {
+				operation: 'create_table',
+				database: 'data',
+				table: 'anchor',
+				primary_key: 'id',
+			});
+			await sendOperation(ctx.nodeJ, {
+				operation: 'add_node',
+				hostname: ctx.nodeB.hostname,
+				rejectUnauthorized: false,
+				authorization: ctx.nodeB.admin,
+			});
+			ok(
+				await waitFor(async (signal) => (await idsIn(ctx.nodeJ, table, signal))?.length === seeded.length, 90000),
+				"J did not take the pre-stamp peer's copy"
+			);
+
+			await start(ctx, 'nodeA');
+			await sendOperation(ctx.nodeJ, {
+				operation: 'add_node',
+				hostname: ctx.nodeA.hostname,
+				rejectUnauthorized: false,
+				authorization: ctx.nodeA.admin,
+			});
+			ok(await waitForConnected(ctx.nodeJ, 120000, 2), 'J did not connect to both A and B');
+			ok(
+				await waitFor(async (signal) => !(await tableExists(ctx.nodeJ, table, signal)), 60000),
+				'J kept the stale copy after learning the drop'
+			);
+			await delay(SETTLE_MS);
+			equal(await tableExists(ctx.nodeA, table), false, "J's copy of the stale definition recreated the table on A");
+		}
+	);
 });

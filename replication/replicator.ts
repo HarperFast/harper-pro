@@ -933,6 +933,7 @@ export async function replicateOperation(req, options?: { onPeerResult?: (result
 			// local drop just left), not its own clock's, which could postdate a recreate the origin makes next.
 			const droppedTime = pendingOrRecordedDropTime(req.schema ?? req.database, req.table);
 			if (droppedTime !== undefined) req.droppedTime = droppedTime;
+			else delete req.droppedTime;
 		}
 		logger.trace?.(
 			'Replicating operation',
