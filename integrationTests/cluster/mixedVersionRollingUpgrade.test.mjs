@@ -9,7 +9,8 @@
  * downgrade, confirmed with CONFIRM_DOWNGRADE) and must rejoin. After each step every node must hold
  * exactly the records the test wrote — fields, secondary index, blob bytes read over HTTP and held in
  * local blob files — on a plain table and a typed-struct (randomAccessFields) table, with inserts,
- * updates and deletes crossing the version boundary in both directions.
+ * updates and deletes crossing the version boundary in both directions. A last step pins a known defect:
+ * a node joining on the old release cannot take a base copy from this build (harper-pro#1007).
  *
  * HARPER_PRO_PREVIOUS_VERSION_PATHS lists previous installs (each `.../node_modules/@harperfast/harper-pro`),
  * separated by path.delimiter; one suite runs per install. Unset, the file skips. Set to a path that
@@ -23,7 +24,7 @@ import { tmpdir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, waitForCondition, stopAndTeardownNodes } from './clusterShared.mjs';
+import { sendOperation, waitForCondition, stopAndTeardownNodes, readLog } from './clusterShared.mjs';
 
 const PACKAGE_ROOT = join(import.meta.dirname, '..', '..');
 const CURRENT_BIN = join(PACKAGE_ROOT, 'dist', 'bin', 'harper.js');
@@ -41,7 +42,8 @@ const FILE_BLOB_BYTES = 20 * 1024;
 const INLINE_BLOB_BYTES = 200;
 const BLOB_HEADER_BYTES = 8;
 const CONVERGE_TIMEOUT_MS = 120_000;
-const WRITE_TIMEOUT_MS = 60_000;
+const KNOWN_ISSUE_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 60_000;
 // a rolling upgrade stops each node cleanly; the harness default escalates to SIGKILL after 5 s
 const SHUTDOWN_GRACE_MS = 30_000;
 
@@ -81,8 +83,15 @@ async function localBlobContents(dataRootDir) {
 		for (const entry of entries) {
 			const path = join(dir, entry.name);
 			if (entry.isDirectory()) await walk(path);
-			// blob compression is off by default, so the body after the header is the raw content
-			else contents.push((await readFile(path)).subarray(BLOB_HEADER_BYTES).toString());
+			else {
+				// a blob file can be unlinked between readdir and readFile (an aborted write, orphan cleanup)
+				const file = await readFile(path).catch((error) => {
+					if (error.code === 'ENOENT') return undefined;
+					throw error;
+				});
+				// blob compression is off by default, so the body after the header is the raw content
+				if (file) contents.push(file.subarray(BLOB_HEADER_BYTES).toString());
+			}
 		}
 	};
 	await walk(join(dataRootDir, 'blobs', DATABASE));
@@ -103,7 +112,6 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 		(ctx) => {
 			const nodes = [];
 			const [nodeA, nodeB, nodeC] = [0, 1, 2].map(() => ({ name: ctx.name }));
-			// what every node must converge to: id -> record, with the blob attribute held as its text
 			const expected = { [ITEM]: new Map(), [TYPED]: new Map() };
 			const categories = new Set();
 			let batchCount = 0;
@@ -113,7 +121,11 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 					nodeCtx.harper.process.spawnargs.includes(harperBinPath),
 					`${nodeCtx.harper.hostname} should have been launched from ${harperBinPath}`
 				);
-				const info = await sendOperation(nodeCtx.harper, { operation: 'registration_info' });
+				const info = await sendOperation(
+					nodeCtx.harper,
+					{ operation: 'registration_info' },
+					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+				);
 				equal(info.version, version, `${nodeCtx.harper.hostname} should be running ${version}`);
 			}
 
@@ -138,6 +150,10 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				ok(
 					outgoing.exitCode !== null || outgoing.signalCode !== null,
 					`${nodeCtx.harper.hostname} had not exited before its data directory was reused`
+				);
+				ok(
+					outgoing.signalCode !== 'SIGKILL',
+					`${nodeCtx.harper.hostname} did not shut down within ${SHUTDOWN_GRACE_MS}ms and was killed`
 				);
 			}
 
@@ -184,7 +200,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				return sendOperation(
 					nodeCtx.harper,
 					{ database: DATABASE, ...operation },
-					{ signal: AbortSignal.timeout(WRITE_TIMEOUT_MS) }
+					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
 				);
 			}
 
@@ -244,7 +260,6 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				}
 			}
 
-			// the first way `node` differs from the expected state, or undefined when it matches
 			async function findMismatch(node, signal) {
 				for (const table of [ITEM, TYPED]) {
 					const rows = await sendOperation(
@@ -338,6 +353,20 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				);
 			}
 
+			let failedStep;
+			// each step builds on the cluster the previous one left; after a failure the rest would only time out
+			function step(name, body) {
+				test(name, async (t) => {
+					if (failedStep) return t.skip(`"${failedStep}" failed`);
+					try {
+						await body();
+					} catch (error) {
+						failedStep = name;
+						throw error;
+					}
+				});
+			}
+
 			before(async () => {
 				await settleAll([nodeA, nodeB, nodeC].map(startFresh));
 			});
@@ -346,22 +375,31 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				await stopAndTeardownNodes(nodes.map((nodeCtx) => nodeCtx.harper));
 			});
 
-			test(`all nodes on ${previousVersion}: each seeds alone, then they connect`, async () => {
+			step(`all nodes on ${previousVersion}: each seeds alone, then they connect`, async () => {
 				// writing before connecting gives each node its own typed-structure dictionary
 				await Promise.all([writeBatch(nodeA, 'seed-a'), writeBatch(nodeB, 'seed-b'), writeBatch(nodeC, 'seed-c')]);
 				for (const joiner of [nodeB, nodeC]) {
-					await sendOperation(joiner.harper, {
-						operation: 'add_node',
-						hostname: nodeA.harper.hostname,
-						rejectUnauthorized: false,
-						authorization: nodeA.harper.admin,
-					});
+					await sendOperation(
+						joiner.harper,
+						{
+							operation: 'add_node',
+							hostname: nodeA.harper.hostname,
+							rejectUnauthorized: false,
+							authorization: nodeA.harper.admin,
+						},
+						{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+					);
 				}
 				await waitForMesh();
 				await assertConverged('seed');
+				// A cursor from a base copy is persisted only after a memtable flush, and a peer that switches
+				// binaries before then is asked for a base copy again (the known issue below); a cursor from a
+				// live write is persisted right after it applies.
+				await Promise.all([writeBatch(nodeA, 'live-a'), writeBatch(nodeB, 'live-b'), writeBatch(nodeC, 'live-c')]);
+				await assertConverged('first live writes');
 			});
 
-			test('1 of 3 upgraded: old and new nodes both write', async () => {
+			step('1 of 3 upgraded: old and new nodes both write', async () => {
 				await switchBinary(nodeC, CURRENT_BIN, CURRENT_VERSION, undefined, () =>
 					writeBatch(nodeA, 'c-down', { updateFrom: 'seed-c', deleteFrom: 'seed-c' })
 				);
@@ -372,7 +410,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				await assertConverged('1 of 3 upgraded');
 			});
 
-			test('2 of 3 upgraded: old and new nodes both write', async () => {
+			step('2 of 3 upgraded: old and new nodes both write', async () => {
 				await switchBinary(nodeB, CURRENT_BIN, CURRENT_VERSION, undefined, () =>
 					writeBatch(nodeA, 'b-down', { updateFrom: 'c-down', deleteFrom: 'c-down' })
 				);
@@ -383,7 +421,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				await assertConverged('2 of 3 upgraded');
 			});
 
-			test('3 of 3 upgraded', async () => {
+			step('3 of 3 upgraded', async () => {
 				await switchBinary(nodeA, CURRENT_BIN, CURRENT_VERSION, undefined, () =>
 					writeBatch(nodeB, 'a-down', { updateFrom: 'b-down', deleteFrom: 'b-down' })
 				);
@@ -391,7 +429,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				await assertConverged('3 of 3 upgraded');
 			});
 
-			test('a cold restart of every node keeps convergence', async () => {
+			step('a cold restart of every node keeps convergence', async () => {
 				await settleAll(nodes.map(stop));
 				await settleAll(nodes.map((nodeCtx) => start(nodeCtx, CURRENT_BIN, CURRENT_VERSION)));
 				await waitForMesh();
@@ -400,7 +438,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				await assertConverged('a write after the cold restart');
 			});
 
-			test(`one node rolled back to ${previousVersion} rejoins`, async () => {
+			step(`one node rolled back to ${previousVersion} rejoins`, async () => {
 				await switchBinary(nodeC, previousBin, previousVersion, { CONFIRM_DOWNGRADE: 'yes' }, () =>
 					writeBatch(nodeA, 'rollback-down', { updateFrom: 'a-down', deleteFrom: 'a-down' })
 				);
@@ -409,6 +447,33 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 					writeBatch(nodeA, 'rb-new', { updateFrom: 'cold', deleteFrom: 'cold' }),
 				]);
 				await assertConverged('after a one-node rollback');
+			});
+
+			// Pins https://github.com/HarperFast/harper-pro/issues/1007: this build refuses a base copy to a peer
+			// that does not advertise safeCopyAudit (every published 5.x release) when a table has no numeric
+			// update-timestamp attribute, and that peer's subscription closes 1008 and retries forever. Once this
+			// step times out, the issue is fixed: assert instead that the joining node converges.
+			step(`a node joining on ${previousVersion} is refused a base copy by this build (harper-pro#1007)`, async () => {
+				const nodeD = { name: ctx.name };
+				await startFresh(nodeD);
+				await sendOperation(
+					nodeD.harper,
+					{
+						operation: 'add_node',
+						hostname: nodeA.harper.hostname,
+						rejectUnauthorized: false,
+						authorization: nodeA.harper.admin,
+					},
+					{ signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }
+				);
+				const refusal = new RegExp(
+					`closing ${nodeD.harper.hostname.replaceAll('.', '\\.')} data 1008 .*Cannot verify replication baseline`
+				);
+				await waitForCondition(async () => refusal.test(await readLog(nodeA.harper)), {
+					timeoutMs: KNOWN_ISSUE_TIMEOUT_MS,
+					pollMs: 1000,
+					description: `${nodeA.harper.hostname} to refuse ${nodeD.harper.hostname} a base copy; if harper-pro#1007 is fixed, replace this step with a convergence assertion`,
+				});
 			});
 		}
 	);
