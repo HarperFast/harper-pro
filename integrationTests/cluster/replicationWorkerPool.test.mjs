@@ -62,7 +62,7 @@ async function inboundSocketThreadTypes(node) {
 
 suite('replication runs on the dedicated worker pool', (ctx) => {
 	before(async () => {
-		ctx.nodes = await Promise.all(
+		const started = await Promise.allSettled(
 			Array.from({ length: NODE_COUNT }, async () => {
 				const nodeCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 				await startHarper(nodeCtx, {
@@ -76,6 +76,10 @@ suite('replication runs on the dedicated worker pool', (ctx) => {
 				return nodeCtx.harper;
 			})
 		);
+		// a node that did start must still reach after()'s teardown when its sibling failed
+		ctx.nodes = started.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+		const failed = started.find((result) => result.status === 'rejected');
+		if (failed) throw failed.reason;
 		for (const node of ctx.nodes) {
 			await sendOperation(node, {
 				operation: 'create_table',

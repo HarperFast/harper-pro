@@ -17,7 +17,7 @@ const FIXTURE = join(import.meta.dirname, 'fixture-computed-index');
 
 suite('a replication pool refuses a table with application-resolved computed indexes', (ctx) => {
 	before(async () => {
-		ctx.nodes = await Promise.all(
+		const started = await Promise.allSettled(
 			[0, 1].map(async () => {
 				const hostname = await getNextAvailableLoopbackAddress();
 				const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
@@ -33,6 +33,10 @@ suite('a replication pool refuses a table with application-resolved computed ind
 				return node.harper;
 			})
 		);
+		// a node that did start must still reach after()'s teardown when its sibling failed
+		ctx.nodes = started.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+		const failed = started.find((result) => result.status === 'rejected');
+		if (failed) throw failed.reason;
 		const { operation_token } = await sendOperation(ctx.nodes[0], {
 			operation: 'create_authentication_tokens',
 			authorization: ctx.nodes[0].admin,
