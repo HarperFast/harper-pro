@@ -61,4 +61,8 @@ describe('rowsAround', () => {
 		}
 		assert.ok(turns > 0, 'other work ran during the scan');
 	});
+	it('stops at a yield once cancelled, with no result to act on', async () => {
+		const versions = Array.from({ length: 50000 }, () => 200);
+		assert.equal(await rowsAround(tableWith(...versions), 100, () => true), undefined);
+	});
 });

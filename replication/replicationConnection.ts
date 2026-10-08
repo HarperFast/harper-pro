@@ -20,6 +20,7 @@ import {
 } from '../core/resources/databases.ts';
 import { TableGenerationDroppedError } from '../core/utility/errors/hdbError.ts';
 import { validateDropMarkers, rowsAround, MAX_DROP_MARKERS_PER_FRAME } from './tableLifecycle.ts';
+import type { TableDropMarker } from '../core/resources/databases.ts';
 import {
 	createAuditEntry,
 	Decoder,
@@ -773,6 +774,8 @@ const unknownCommandWarnThrottle = createThrottleState();
 let nextConnectionSessionOrdinal = 0;
 const TEST_OMIT_CAPABILITIES = process.env.HARPER_TEST_OMIT_REPLICATION_CAPABILITIES === '1';
 const TEST_ORIGIN_FLOOR_INTERVAL_MS = Number(process.env.HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS);
+/** Authorized drop markers for a database not open on this thread yet: they cannot be recorded until it is. */
+const markersAwaitingDatabase = new Map<string, TableDropMarker[]>();
 /**
  * The catalog's stamp when this thread's class predates another thread's backfill. Test-only: a pre-stamp sender
  * has no capability bag and no lifecycle stamps on its definitions.
@@ -5317,12 +5320,16 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const peerDropMarkers =
 							markersAuthorized && checkDatabaseAccess(schemaDatabaseName) ? validateDropMarkers(message[4]) : [];
 						// A stale local generation goes before this frame's definitions are compared. Markers for a database
-						// not open here yet wait until a definition below opens it.
-						let markersPending = peerDropMarkers.length > 0;
-						if (markersPending && databases[schemaDatabaseName]) {
-							markersPending = false;
-							await applyPeerDropMarkers(schemaDatabaseName, peerDropMarkers, data);
+						// not open here wait, refusing what they retire, until a definition opens it.
+						const waiting = markersAwaitingDatabase.get(schemaDatabaseName);
+						let pendingMarkers = waiting ? validateDropMarkers([...waiting, ...peerDropMarkers]) : peerDropMarkers;
+						if (!databases[schemaDatabaseName]) {
+							if (pendingMarkers.length > 0) markersAwaitingDatabase.set(schemaDatabaseName, pendingMarkers);
+						} else if (pendingMarkers.length > 0) {
+							markersAwaitingDatabase.delete(schemaDatabaseName);
+							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
 							if (connectionSuperseded()) return;
+							pendingMarkers = [];
 						}
 						for (const tableDefinition of data) {
 							const newDatabaseName = schemaDatabaseName;
@@ -5331,7 +5338,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (checkDatabaseAccess(newDatabaseName)) {
 								if (
 									isDroppedPeerGeneration(newDatabaseName, tableDefinition.table, tableDefinition.createdTime) ||
-									(markersPending && frameRetires(peerDropMarkers, tableDefinition))
+									frameRetires(pendingMarkers, tableDefinition)
 								) {
 									refuseDeadDefinition(newDatabaseName, tableDefinition, 'DB_SCHEMA');
 									continue;
@@ -5362,8 +5369,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (!tables) tables = getDatabases()?.[newDatabaseName];
 							}
 						}
-						if (markersPending && databases[schemaDatabaseName])
-							await applyPeerDropMarkers(schemaDatabaseName, peerDropMarkers, data);
+						if (pendingMarkers.length > 0 && databases[schemaDatabaseName]) {
+							markersAwaitingDatabase.delete(schemaDatabaseName);
+							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
+						}
 						break;
 					}
 					case DISCONNECT:
@@ -9436,21 +9445,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// created before a drop recorded after its bound: core retires it
 		const createdBefore = catalogCreatedBefore(localTable);
 		if (createdBefore !== undefined && droppedTime > createdBefore) return;
-		const rows = await rowsAround(localTable, droppedTime);
-		if (rows.older) return;
+		const rows = await rowsAround(localTable, droppedTime, connectionSuperseded);
+		if (!rows || rows.older) return;
 		const definitionStamp = definitions.find((definition) => definition.table === localTable.tableName)?.createdTime;
 		const peerStamp =
 			typeof definitionStamp === 'number' && !isDeadGeneration(definitionStamp, droppedTime)
 				? definitionStamp
 				: undefined;
 		if (peerStamp === undefined && !rows.newer) return;
+		if (connectionSuperseded()) return;
 		if (stampTableCreatedTime(localTable, peerStamp ?? tableLifecycleTime(droppedTime)))
 			logger.warn?.(
 				connectionId,
 				`Stamped ${schemaDatabaseName}.${localTable.tableName} as a generation newer than the drop ${remoteNodeName} relays: it was created on a build that kept no stamp and holds no row older than the drop`
 			);
 	}
-	/** A frame's own marker for a definition, while the frame's database is not open here to record it in. */
+	/** A peer's marker for a definition, while its database is not open here to record it in. */
 	function frameRetires(markers: Array<{ table: string; droppedTime: number }>, definition: any) {
 		const marker = markers.find((candidate) => candidate.table === definition.table);
 		return marker !== undefined && isDeadGeneration(definition.createdTime, marker.droppedTime);
