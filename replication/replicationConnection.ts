@@ -2785,13 +2785,7 @@ export function parseOriginFloors(value: unknown): Map<string, number> {
 	return floors;
 }
 
-/**
- * The floors a relay may certify to a peer for the origins it does not list: only what this node's own direct row
- * for an origin holds, and only when that row marks the floor relayable — it was received over a direct subscription
- * with full table coverage, so this node holds every entry the origin certified, whatever the peer subscribes to. A
- * floor received over a relay is never forwarded; propagation is one hop beyond a direct full-coverage link. An
- * origin whose current socket no longer certifies (`certifies`) may be an older binary writing below its saved floor.
- */
+/** `certifies`: an origin whose current socket no longer certifies may be an older binary writing below its floor. */
 export function collectRelayableFloors(
 	seqRows: Map<number, DbisCursor>,
 	originNames: Iterable<string>,
@@ -3962,7 +3956,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (frameOpen) drainEndTxnDeferred = true;
 				else
 					tableSubscriptionToReplicator.send(
-						seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+						seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId), undefined, true)
 					);
 			}
 			creditDurableProgress();
@@ -4209,7 +4203,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
 	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn with no flush gate. (harper-pro#480)
-	function seqUpdateEndTxn(seqId: number, originFloors?: [number, number, boolean][]): any {
+	function seqUpdateEndTxn(seqId: number, originFloors?: [number, number, boolean][], releasePending = false): any {
 		const originCursors = takeDurableOriginCursors();
 		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && seqId >= copyModeStartTime) {
 			return {
@@ -4224,7 +4218,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				},
 			};
 		}
-		if (!originFloors && pendingOriginFloors.size === 0) {
+		// only an update that carries floors, or a blob drain releasing held ones, pays for a commit callback
+		if (!originFloors && !(releasePending && pendingOriginFloors.size > 0)) {
 			return {
 				type: 'end_txn',
 				localTime: seqId,
@@ -4683,8 +4678,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// Make the buffer available to the connection's lifecycle methods (close/forceReconnect) so they
 			// can record DOWN/error without re-resolving auditStore. See W1 (harper-pro#431).
 			if (options.connection) options.connection.sharedStatus = replicationSharedStatus;
+			publishPeerCertifiesFloors(replicationSharedStatus);
 		}
 		return replicationSharedStatus;
+	}
+	/**
+	 * Only this node's subscription link to the peer owns the slot: it is the socket that receives the peer's
+	 * certificates, and a retrieval or inbound socket must neither set nor clear it.
+	 */
+	function publishPeerCertifiesFloors(status: Float64Array) {
+		if (instanceRetired || !peerCapabilitiesLearned || options.connection?.nodeSubscriptions === undefined) return;
+		status[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
 	}
 	// A record this node will not apply is a hole in that origin's stream for that table. It is
 	// recorded durably BEFORE the drop completes, so no later barrier can certify past it; a store
@@ -4711,7 +4715,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (status) {
 			recordPeerLockCapability(status, peerSupportsRecordLocks(peerCapabilities));
 			recordPeerLockLevel(status, peerCapabilities.recordLocks);
-			status[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
+			publishPeerCertifiesFloors(status);
 		}
 	}
 	if (databaseName) {
@@ -7118,8 +7122,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
 									// an `includeNodes` update re-admits a log whose entries are already committed
 									let wake: () => void;
-									// one timer per loop, re-armed per wait; a wake after close ends the loop below, so an exit
-									// that skips the clear leaks nothing but one unreferenced timer
+									// one timer per loop; an exit that skips the clear leaks nothing but one unreferenced timer
 									if (certifiesOriginFloors()) {
 										if (floorTimer) floorTimer.refresh();
 										else floorTimer = setTimeout(() => wakeSender?.(), originFloorIntervalMs).unref();
@@ -7848,7 +7851,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (drainEndTxnDeferred) {
 				drainEndTxnDeferred = false;
 				tableSubscriptionToReplicator.send(
-					seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+					seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId), undefined, true)
 				);
 			}
 		} catch (error) {
@@ -7960,7 +7963,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (options.connection?.peerCapabilities === peerCapabilities) {
 			options.connection.peerCapabilities = undefined;
 			// the peer's floor capability describes this socket; the replacement writes its own
-			if (peerCapabilitiesLearned && replicationSharedStatus)
+			if (peerCapabilitiesLearned && replicationSharedStatus && options.connection.nodeSubscriptions !== undefined)
 				replicationSharedStatus[PEER_CERTIFIES_FLOORS_POSITION] = 0;
 		}
 		pendingSubscriptionSetupRequestId = undefined;
@@ -8660,7 +8663,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (frameOpen) drainEndTxnDeferred = true;
 						else
 							tableSubscriptionToReplicator.send(
-								seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+								seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId), undefined, true)
 							);
 					}
 					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
