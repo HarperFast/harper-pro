@@ -1,7 +1,3 @@
-/**
- * Origin-closed floor certificates (harper-pro#922 item 2): the resume value a stored floor contributes, the floors a
- * relay may forward, the received-vector parse, and the receiver's blob-gated pending set.
- */
 import assert from 'node:assert';
 import {
 	ORIGIN_CURSOR_OVERLAP_MS,
@@ -57,24 +53,26 @@ describe('parseOriginFloors', () => {
 describe('collectRelayableFloors', () => {
 	const row = (id, state) => [id, { seqId: T, nodes: [state] }];
 
-	it("forwards only a floor from the origin's own direct row that it marked relayable", () => {
+	const certifies = () => true;
+
+	it("forwards only a floor from the origin's own direct row that it marked relayable, while it certifies", () => {
 		const rows = new Map([
 			row(1, { id: 1, originLogKey: T, closedFloor: T - 5, relayable: true }),
 			row(2, { id: 2, originLogKey: T, closedFloor: T - 6, relayable: false }),
 			// a floor for `other` learned over the `peer` link lives on peer's row, never on other's own row
 			[3, { seqId: T, nodes: [{ id: 1, closedFloor: T - 1, relayable: true }] }],
 		]);
-		assert.deepStrictEqual(
-			[...collectRelayableFloors(rows, ['peer', 'relayed', 'other', 'unknown'], nameToId)],
-			[['peer', T - 5]]
-		);
+		const names = ['peer', 'relayed', 'other', 'unknown'];
+		assert.deepStrictEqual([...collectRelayableFloors(rows, names, nameToId, certifies)], [['peer', T - 5]]);
+		// an origin whose current socket no longer certifies may be an older binary writing below its floor
+		assert.strictEqual(collectRelayableFloors(rows, names, nameToId, (name) => name !== 'peer').size, 0);
 	});
 
 	it('never mints an id and ignores a malformed floor', () => {
 		const rows = new Map([row(1, { id: 1, closedFloor: NaN, relayable: true })]);
-		assert.strictEqual(collectRelayableFloors(rows, ['peer', 'ghost'], nameToId).size, 0);
-		assert.strictEqual(collectRelayableFloors(rows, ['peer'], undefined).size, 0);
-		assert.strictEqual(collectRelayableFloors(rows, ['peer'], { peer: 'x' }).size, 0);
+		assert.strictEqual(collectRelayableFloors(rows, ['peer', 'ghost'], nameToId, certifies).size, 0);
+		assert.strictEqual(collectRelayableFloors(rows, ['peer'], undefined, certifies).size, 0);
+		assert.strictEqual(collectRelayableFloors(rows, ['peer'], { peer: 'x' }, certifies).size, 0);
 	});
 });
 

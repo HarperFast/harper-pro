@@ -188,8 +188,8 @@ suite('Idle origins keep a certified resume floor (harper-pro#922)', { timeout: 
 
 		// capability-off: nothing is stored on either side of the A–E link
 		await delay(3 * FLOOR_INTERVAL_MS);
-		equal(await floorFor(A, E, E), null, 'E omits its bag, so A certifies nothing to it');
-		equal(await floorFor(E, A, A), null, 'A rejects floors from a peer that advertised no capability');
+		equal(await floorFor(A, E, E), null, 'A rejects floors from a peer that advertised no capability');
+		equal(await floorFor(E, A, A), null, 'E omits its bag, so A certifies nothing to it');
 	});
 
 	test('a long transaction holds the floor without delaying other writes', async () => {

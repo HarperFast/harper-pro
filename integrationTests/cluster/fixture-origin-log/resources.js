@@ -84,7 +84,6 @@ export class ReplicationCursor extends Resource {
 	}
 }
 
-/** A node's `[seq, peer]` row: the applied position and, per origin, the applied cursor and the certified floor. */
 export class ClosedFloors extends Resource {
 	static loadAsInstance = false;
 	post(target, data) {
@@ -106,7 +105,6 @@ export class ClosedFloors extends Resource {
 	}
 }
 
-/** The origin-closed floor this node last persisted for its own log (core's `origin-closed-floor` record). */
 export class OriginFloor extends Resource {
 	static loadAsInstance = false;
 	post(target, data) {

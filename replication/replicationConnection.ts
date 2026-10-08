@@ -56,6 +56,7 @@ import {
 	LAST_ERROR_TIME_POSITION,
 	FIRE_MECHANISMS,
 	FIRE_COUNTER_BASE_POSITION,
+	PEER_CERTIFIES_FLOORS_POSITION,
 } from './sharedStatusSlots.ts';
 import {
 	recordPeerLockCapability,
@@ -2752,10 +2753,10 @@ export function collectLastTxnTimes(seqEntries: Iterable<{ value: any }>): Map<a
 export const ORIGIN_CURSOR_OVERLAP_MS = 60_000;
 
 /**
- * How often a sender certifies floors to one peer (harper-pro#922 item 2): the idle wake of its subscription loop
- * and the minimum interval between two floor vectors. The certifier itself ticks every `ORIGIN_FLOOR_TICK_MS`.
+ * How often a sender certifies floors to one peer: the idle wake of its subscription loop and the minimum interval
+ * between two floor vectors. The certifier itself ticks every `ORIGIN_FLOOR_TICK_MS`.
  */
-export const ORIGIN_FLOOR_INTERVAL_MS = 30_000;
+const ORIGIN_FLOOR_INTERVAL_MS = 30_000;
 const originFloorIntervalMs =
 	Number.isFinite(TEST_ORIGIN_FLOOR_INTERVAL_MS) && TEST_ORIGIN_FLOOR_INTERVAL_MS > 0
 		? TEST_ORIGIN_FLOOR_INTERVAL_MS
@@ -2791,17 +2792,19 @@ export function parseOriginFloors(value: unknown): Map<string, number> {
  * The floors a relay may certify to a peer for the origins it does not list: only what this node's own direct row
  * for an origin holds, and only when that row marks the floor relayable — it was received over a direct subscription
  * with full table coverage, so this node holds every entry the origin certified, whatever the peer subscribes to. A
- * floor received over a relay is never forwarded; propagation is one hop beyond a direct full-coverage link.
+ * floor received over a relay is never forwarded; propagation is one hop beyond a direct full-coverage link. An
+ * origin whose current socket no longer certifies (`certifies`) may be an older binary writing below its saved floor.
  */
 export function collectRelayableFloors(
 	seqRows: Map<number, DbisCursor>,
 	originNames: Iterable<string>,
-	nameToId: Record<string, number> | undefined
+	nameToId: Record<string, number> | undefined,
+	certifies: (name: string) => boolean
 ): Map<string, number> {
 	const floors = new Map<string, number>();
 	if (!nameToId) return floors;
 	for (const name of originNames) {
-		if (!Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number') continue;
+		if (!Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number' || !certifies(name)) continue;
 		const id = nameToId[name];
 		const nodes = seqRows.get(id)?.nodes;
 		const state = Array.isArray(nodes) ? nodes.find((node) => node?.id === id) : undefined;
@@ -2810,7 +2813,7 @@ export function collectRelayableFloors(
 	return floors;
 }
 
-/** Keeps the floors a sequence update carried until the blob rule lets them be persisted (harper-pro#922). */
+/** Keeps the floors a sequence update carried until the blob rule lets them be persisted. */
 export class PendingOriginFloors {
 	private pending: Map<number, [number, number, boolean]> | undefined;
 	note(floors: Iterable<[number, number, boolean]> | undefined): void {
@@ -2821,7 +2824,6 @@ export class PendingOriginFloors {
 			else if (existing[1] === floor[1] && floor[2] && !existing[2]) existing[2] = true;
 		}
 	}
-	/** The eligible floors when nothing blocks them, else undefined and they stay pending. */
 	take(blocked: boolean): [number, number, boolean][] | undefined {
 		if (!this.pending?.size || blocked) return undefined;
 		const floors = [...this.pending.values()];
@@ -2861,7 +2863,6 @@ export function buildOriginCursorVector(
 	isMember: (name: string) => boolean,
 	useFloors = false
 ): Record<string, number> {
-	// A stored floor is used only while the peer certifies (`useFloors`): a downgraded peer may write below one.
 	const cursorOf = (node: any): number | undefined => {
 		const position = isValidFrameTxnLogKey(node?.originLogKey) ? node.originLogKey : undefined;
 		if (!useFloors || !isValidFloor(node?.closedFloor)) return position;
@@ -4236,9 +4237,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				originCursors,
 			};
 		}
-		// The floors this update carried become eligible only in ITS onCommit, which core awaits after every
-		// apply queued ahead of it: an earlier frame's late commit must not persist a floor past records still
-		// queued below it. The blob rule then holds them like origin cursors (harper-pro#922).
+		// eligible only in this update's own onCommit: an earlier frame's late commit must not persist a floor
+		// past records still queued below it
 		const event: any = {
 			type: 'end_txn',
 			localTime: seqId,
@@ -4877,7 +4877,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		pendingOriginCursors.clear();
 		return cursors;
 	}
-	// Origin-closed floors (harper-pro#922 item 2) ride `SEQUENCE_ID_UPDATE[2]` between peers that both certify.
 	const certifiesOriginFloors = () =>
 		STORAGE_IS_ROCKSDB && peerCapabilitiesLearned && peerSupportsOriginFloors(peerCapabilities);
 	const pendingOriginFloors = new PendingOriginFloors();
@@ -5198,6 +5197,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								handshakeStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
 								handshakeStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
 							}
+							if (handshakeStatus)
+								handshakeStatus[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
 							//const url = message[3] ?? thisNodeUrl;
 							logger.debug?.(connectionId, 'received node name:', remoteNodeName, 'db:', databaseName ?? message[2]);
 							if (!databaseName) {
@@ -6508,10 +6509,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									});
 								}
 
-								// Origin-closed floors this sender certifies to the peer (harper-pro#922 item 2): captured
-								// before a pass scans, sent after the pass drained, so every entry below a captured floor
-								// has gone out first. An idle connection is woken every interval to reach that point.
 								let lastFloorCaptureAt = 0;
+								let floorTimer: ReturnType<typeof setTimeout> | undefined;
 								let capturedFloors: Map<string, number> | undefined;
 								const certifiedFloors = new Map<string, number>();
 								let floorEmissionLatchedRange: unknown; // a range that lost an entry certifies nothing more
@@ -6522,7 +6521,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									try {
 										const thisNodeName = getThisNodeName();
 										const own = readOriginClosedFloor(auditStore);
-										if (own > 0 && !excludedNodes?.includes(thisNodeName))
+										if (isValidFloor(own) && !excludedNodes?.includes(thisNodeName))
 											(floors ??= new Map()).set(thisNodeName, own);
 										// only a multi-log range sends unlisted origins, and only per-origin logs have names
 										if (excludedNodes && auditStore.reusableIterable === true) {
@@ -6538,7 +6537,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const seqRows = collectSeqRows(
 													dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([0xff])] })
 												);
-												for (const [name, floor] of collectRelayableFloors(seqRows, names, exportIdMapping(auditStore)))
+												const certifies = (name: string) =>
+													getReplicationSharedStatus(auditStore, databaseName, name)[PEER_CERTIFIES_FLOORS_POSITION] ===
+													1;
+												for (const [name, floor] of collectRelayableFloors(
+													seqRows,
+													names,
+													exportIdMapping(auditStore),
+													certifies
+												))
 													(floors ??= new Map()).set(name, floor);
 											}
 										}
@@ -6555,12 +6562,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									return floors;
 								};
 								const certifyOriginFloors = (floors: Map<string, number>) => {
-									let rising: Record<string, number> | undefined;
-									for (const [name, floor] of floors)
-										if (!(certifiedFloors.get(name) >= floor)) (rising ??= {})[name] = floor;
+									let rising: Map<string, number> | undefined;
+									for (const [name, floor] of floors) {
+										// an origin a SUBSCRIPTION_UPDATE excluded during the pass had its scan cut short
+										if (excludedNodes?.includes(name) || !(certifiedFloors.get(name) >= floor)) continue;
+										(rising ??= new Map()).set(name, floor);
+									}
 									if (!rising || closed || wsClosed) return;
-									ws.send(encode([SEQUENCE_ID_UPDATE, currentSequenceId, rising]));
-									for (const name in rising) certifiedFloors.set(name, rising[name]);
+									ws.send(encode([SEQUENCE_ID_UPDATE, currentSequenceId, Object.fromEntries(rising)]));
+									for (const [name, floor] of rising) certifiedFloors.set(name, floor);
 									logger.debug?.(connectionId, 'certified origin floors to', remoteNodeName, rising);
 								};
 								let isFirst = true;
@@ -7094,37 +7104,54 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											liveRange?.exactStartFailures?.size > 0 ||
 											liveRange?.failedLogs?.size > 0 ||
 											liveRange?.corruptFrameStop?.breaks > 0
-										)
+										) {
+											// a scan that may have skipped an entry can certify nothing more on this range
+											if (floorEmissionLatchedRange !== liveRange)
+												logger.warn?.(
+													connectionId,
+													`A transaction-log scan for ${remoteNodeName} reported a failure; origin floors are no longer certified on this connection until it reconnects`
+												);
 											floorEmissionLatchedRange = liveRange;
-										else if (floorEmissionLatchedRange !== liveRange) certifyOriginFloors(capturedFloors);
+										} else if (floorEmissionLatchedRange !== liveRange) certifyOriginFloors(capturedFloors);
 										capturedFloors = undefined;
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
 									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
 									// an `includeNodes` update re-admits a log whose entries are already committed
 									let wake: () => void;
-									const floorTimer = certifiesOriginFloors()
-										? setTimeout(() => wakeSender?.(), originFloorIntervalMs).unref()
-										: undefined;
-									await new Promise<void>((resolve, reject) => {
-										wake = wakeSender = resolve;
-										wakeSenderFailed = reject;
-										// a commit that landed during the scan rotated the promise captured before it
-										if (whenNextTransaction(auditStore) !== nextTransaction) return resolve();
-										// One reaction per transaction generation: a timed wake sees the same pending promise
-										// again, and a reaction per wake would accumulate on an idle database.
-										if (attachedNextTransaction !== nextTransaction) {
-											attachedNextTransaction = nextTransaction;
-											nextTransaction.then(
-												() => wakeSender?.(),
-												(error) => wakeSenderFailed?.(error)
-											);
-										}
-									});
-									clearTimeout(floorTimer);
-									// a superseded loop must not clear the live loop's waker
-									if (wakeSender === wake) wakeSender = undefined;
+									// one timer per loop, re-armed per wait; a wake after close is inert, so an exit that skips
+									// the clear below leaks nothing but one unreferenced timer
+									if (certifiesOriginFloors()) {
+										if (floorTimer) floorTimer.refresh();
+										else
+											floorTimer = setTimeout(() => {
+												if (!closed && !wsClosed) wakeSender?.();
+											}, originFloorIntervalMs).unref();
+									}
+									try {
+										await new Promise<void>((resolve, reject) => {
+											wake = wakeSender = resolve;
+											wakeSenderFailed = reject;
+											// a commit that landed during the scan rotated the promise captured before it
+											if (whenNextTransaction(auditStore) !== nextTransaction) return resolve();
+											// One reaction per transaction generation: a timed wake sees the same pending promise
+											// again, and a reaction per wake would accumulate on an idle database.
+											if (attachedNextTransaction !== nextTransaction) {
+												attachedNextTransaction = nextTransaction;
+												nextTransaction.then(
+													() => wakeSender?.(),
+													(error) => wakeSenderFailed?.(error)
+												);
+											}
+										});
+									} finally {
+										// a superseded loop must not clear the live loop's waker
+										if (wakeSender === wake) wakeSender = undefined;
+									}
+									// a timed wake can land after the socket was marked closed, before the close event
+									if (closed || wsClosed) return;
 								} while (!closed);
+								clearTimeout(floorTimer);
 							})
 							.catch((error) => {
 								logger.error?.(connectionId, 'Error handling subscription to node', error);
@@ -7755,7 +7782,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					endTxnEvent.localTime = lastDurableSequenceId;
 					if (frameOrigin !== undefined) noteOriginProgress(frameOrigin, frameTxnLogKey);
 					if (frameMoreOrigins) for (const originId of frameMoreOrigins) noteOriginProgress(originId, frameTxnLogKey);
-					// core reads these after awaiting onCommit; only floors an earlier update already admitted are here
+					// core reads these after awaiting onCommit
 					endTxnEvent.originCursors = takeDurableOriginCursors();
 					endTxnEvent.originFloors = pendingOriginFloors.take(cursorBlockedByBlob());
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
@@ -8812,8 +8839,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// a proxied/indirect subscription has no direct cursor and instead arms from `proxiedSkipCursor`
 			// (set in the indirect block below).
 			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
-			// A floor the peer certified (harper-pro#922) is a proven start, used only while the peer still
-			// certifies: a downgraded peer may write below a floor it saved.
+			// A floor the peer certified is a proven start, used only while the peer still certifies: a
+			// downgraded peer may write below a floor it saved.
 			if (hasPersistedResumeCursor && connectedNode === node && certifiesOriginFloors()) {
 				const ownState = sequenceEntry?.nodes?.find?.((state: any) => state?.id === nodeId);
 				startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
