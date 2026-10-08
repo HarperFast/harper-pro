@@ -4683,11 +4683,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return replicationSharedStatus;
 	}
 	/**
-	 * Only this node's subscription link to the peer owns the slot: it is the socket that receives the peer's
-	 * certificates, and a retrieval or inbound socket must neither set nor clear it.
+	 * Only this node's direct subscription link to the peer owns the slot: it is the socket that receives the
+	 * peer's certificates. A retrieval socket, an inbound socket and a failover subscription that reaches another
+	 * node's data through this peer share the peer's buffer and must neither set nor clear it.
 	 */
+	const ownsPeerCertifiesFloorsSlot = () =>
+		peerCapabilitiesLearned && options.connection?.nodeSubscriptions?.[0]?.name === remoteNodeName;
 	function publishPeerCertifiesFloors(status: Float64Array) {
-		if (instanceRetired || !peerCapabilitiesLearned || options.connection?.nodeSubscriptions === undefined) return;
+		if (instanceRetired || !ownsPeerCertifiesFloorsSlot()) return;
 		status[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
 	}
 	// A record this node will not apply is a hole in that origin's stream for that table. It is
@@ -7963,7 +7966,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (options.connection?.peerCapabilities === peerCapabilities) {
 			options.connection.peerCapabilities = undefined;
 			// the peer's floor capability describes this socket; the replacement writes its own
-			if (peerCapabilitiesLearned && replicationSharedStatus && options.connection.nodeSubscriptions !== undefined)
+			if (replicationSharedStatus && ownsPeerCertifiesFloorsSlot())
 				replicationSharedStatus[PEER_CERTIFIES_FLOORS_POSITION] = 0;
 		}
 		pendingSubscriptionSetupRequestId = undefined;
