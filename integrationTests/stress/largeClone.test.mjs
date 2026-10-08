@@ -13,7 +13,8 @@
  *  1. Start a single source node A and write TARGET_GB of row data to it.
  *  2. Start a blank node B pointed at A via HDB_LEADER_URL (clone mode).
  *  3. Time from clone start until B reports availability: Available.
- *  4. Assert: row count matches; no OOM; completes within CLONE_BUDGET_SECS.
+ *  4. Assert: exact row count matches at the first Available tick; no OOM;
+ *     completes within CLONE_BUDGET_SECS.
  *  5. Emit write throughput and clone throughput.
  *
  * Run locally (1 GB, ~10–20 min):
@@ -71,7 +72,9 @@ if (!stressEnabled()) {
 	const ANON_CAP_MB = Number(process.env.HARPER_STRESS_LARGE_ANON_CAP_MB ?? 5120);
 	const CLONE_BUDGET_SECS = Number(process.env.HARPER_STRESS_LARGE_CLONE_BUDGET_SECS ?? Math.max(600, TARGET_GB * 180));
 	const WRITE_BUDGET_SECS = TARGET_GB * 300 + 600;
-	const SUITE_TIMEOUT_MS = (WRITE_BUDGET_SECS + CLONE_BUDGET_SECS + 600) * 1000;
+	// A full value scan of the cloned table; generous because it reads every payload.
+	const COUNT_TIMEOUT_SECS = Math.max(120, TARGET_GB * 60);
+	const SUITE_TIMEOUT_MS = (WRITE_BUDGET_SECS + CLONE_BUDGET_SECS + COUNT_TIMEOUT_SECS + 600) * 1000;
 	const TOTAL_RECORDS = Math.ceil((TARGET_GB * 1024 * 1024 * 1024) / PAYLOAD_SIZE);
 	const BATCH_COUNT = Math.ceil(TOTAL_RECORDS / BATCH_SIZE);
 
@@ -210,12 +213,31 @@ if (!stressEnabled()) {
 
 			// Log progress while waiting.
 			let available = false;
+			let availableAt;
+			let firstAvailableCount;
+			let firstAvailableCountError;
 			const deadline = Date.now() + CLONE_BUDGET_SECS * 1000;
 			while (Date.now() < deadline && !available) {
 				try {
 					const resp = await trySendOperation(cloneCtx.harper, { operation: 'get_status', id: 'availability' });
 					if (resp?.status === 'Available') {
 						available = true;
+						availableAt = Date.now();
+						cloneSampler.stop();
+						// The count is taken on the tick that first reads Available, with no catch-up retry:
+						// a clone that reports Available while still short of the leader must fail here.
+						// exact_count forces a full value scan; the default record_count is a rounded RocksDB
+						// estimate that diverges between nodes during bulk copy.
+						try {
+							const countResp = await sendOperation(
+								cloneCtx.harper,
+								{ operation: 'describe_table', table: 'large', exact_count: true },
+								{ timeoutMs: COUNT_TIMEOUT_SECS * 1000 }
+							);
+							firstAvailableCount = countResp.record_count;
+						} catch (error) {
+							firstAvailableCountError = error;
+						}
 						break;
 					}
 					const countResp = await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large', exact_count: true });
@@ -228,7 +250,7 @@ if (!stressEnabled()) {
 				await delay(5_000);
 			}
 
-			const cloneSecs = (Date.now() - cloneStart) / 1000;
+			const cloneSecs = ((availableAt ?? Date.now()) - cloneStart) / 1000;
 			const cloneMBps = available ? (TARGET_GB * 1024) / cloneSecs : 0;
 			const cloneSummary = summariseSamples(cloneSampler.stop());
 
@@ -259,19 +281,15 @@ if (!stressEnabled()) {
 			if (anonMb > 0)
 				ok(anonMb < ANON_CAP_MB, `clone peak anon ${anonMb.toFixed(0)} MB exceeded cap ${ANON_CAP_MB} MB`);
 
-			// Verify exact row count matches after clone completes.
-			// Use describe_table with exact_count rather than the default
-			// record_count — the latter is a rounded RocksDB estimate that diverges
-			// between nodes during bulk copy. The exact_count flag forces a full
-			// value scan (no extrapolation short-circuit), giving a precise count.
-			let finalCount = -1;
-			for (let i = 0; i < 30; i++) {
-				const rows = await trySendOperation(cloneCtx.harper, { operation: 'describe_table', table: 'large', exact_count: true });
-				finalCount = rows?.record_count ?? -1;
-				if (finalCount >= ctx.leaderRecordCount) break;
-				await delay(2_000);
-			}
-			equal(finalCount, ctx.leaderRecordCount, `Clone row count ${finalCount} != leader ${ctx.leaderRecordCount}`);
+			ok(
+				!firstAvailableCountError,
+				`exact row count query failed at the first Available tick: ${firstAvailableCountError?.message}`
+			);
+			equal(
+				firstAvailableCount,
+				ctx.leaderRecordCount,
+				`Clone row count ${firstAvailableCount} != leader ${ctx.leaderRecordCount} at the first Available tick`
+			);
 			} finally {
 				// Always stop the sampler so its timer doesn't keep the event loop
 				// alive after an early exit (e.g. startHarper throws).

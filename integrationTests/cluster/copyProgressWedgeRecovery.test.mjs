@@ -21,15 +21,14 @@
  * right after COPY_START (no further frames, no COPY_COMPLETE) while the sendPing timer keeps the socket
  * ping-alive. On the pre-#453 code the subscriber stays wedged forever (the test would time out); with the
  * fix the copy-progress watchdog reconnects on its own, the retried copy completes, and replication resumes —
- * with no restart. Proof is end-to-end: a record written on the source AFTER the stall must replicate to the
- * wedged subscriber, and cluster_status must return to connected:true.
+ * with no restart. Proof is end-to-end: the subscriber's cluster_status must return to connected:true with the
+ * retried copy complete, and a record written on the source after that must replicate to it.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert';
-import { setTimeout as delay } from 'node:timers/promises';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog } from './clusterShared.mjs';
+import { sendOperation, readLog, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -54,8 +53,11 @@ const COPY_STALL_TIMEOUT_MS = 5000; // REPLICATION_BLOBTIMEOUT → the copy-prog
 // and the byte watchdog never fires during the stall (it would at the 3s pingTimeout if copy mode didn't
 // widen it). This also pins the #460 behavior: the byte watchdog tolerates a long copy-phase silence.
 const COPY_TIMEOUT_MS = 30000;
+const SETUP_PHASE_TIMEOUT_MS = 30000;
 const RECOVERY_TIMEOUT_MS = 40000;
 const POLL_INTERVAL_MS = 250;
+const NODE_STARTUP_ALLOWANCE_MS = 60000;
+const SUITE_TIMEOUT_MS = NODE_STARTUP_ALLOWANCE_MS + 2 * SETUP_PHASE_TIMEOUT_MS + 2 * RECOVERY_TIMEOUT_MS;
 
 function nodeStartOptions(node, { stall = false } = {}) {
 	return {
@@ -77,14 +79,27 @@ function nodeStartOptions(node, { stall = false } = {}) {
 	};
 }
 
-async function dataSocketConnected(node) {
-	const status = await sendOperation(node, { operation: 'cluster_status' });
-	return status.connections.some(
-		(conn) => conn.database_sockets?.length > 0 && conn.database_sockets.every((socket) => socket.connected === true)
-	);
+async function postOperation(node, operation, signal) {
+	const response = await fetch(node.operationsAPIURL, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(operation),
+		signal,
+	});
+	return { status: response.status, body: await response.json() };
 }
 
-suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => {
+async function dataSocketTo(node, peer, signal) {
+	const status = await sendOperation(node, { operation: 'cluster_status' }, { signal });
+	return status.connections
+		.find((connection) => connection.name === peer.hostname)
+		?.database_sockets?.find((socket) => socket.database === STALL_DB);
+}
+
+const dataDbTag = `(db: "${STALL_DB}")`;
+const isDataCopyStartLine = (line) => line.includes('bulk copy starting from') && line.includes(dataDbTag);
+
+suite('Replication copy-progress wedge recovery', { timeout: SUITE_TIMEOUT_MS }, (ctx) => {
 	before(async () => {
 		// node[0] is the source (arms the one-shot copy stall); node[1] is the subscriber that wedges.
 		ctx.nodes = [];
@@ -123,52 +138,91 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 	});
 
 	test('a copy stalled connected:true recovers on its own via the copy-progress watchdog (no restart)', async () => {
+		const [source, subscriber] = ctx.nodes;
 		// node1 subscribes to node0 for `data`. The first outbound copy from node0 stalls right after
-		// COPY_START; node1 is left connected:true / "Receiving" with the copy frozen while pings flow.
-		await sendOperation(ctx.nodes[1], {
-			operation: 'add_node',
-			rejectUnauthorized: false,
-			hostname: ctx.nodes[0].hostname,
-			authorization: ctx.nodes[1].admin,
+		// COPY_START; node1 is left connected:true with the copy frozen while pings flow.
+		// add_node sends its CSR to node0's replication port; under load that listener can still be binding.
+		// Only a refused connection is retried: the peer never saw the request, so no state was written.
+		let lastAddNode;
+		await waitForCondition(
+			async (signal) => {
+				lastAddNode = await postOperation(
+					subscriber,
+					{
+						operation: 'add_node',
+						rejectUnauthorized: false,
+						hostname: source.hostname,
+						authorization: subscriber.admin,
+					},
+					signal
+				);
+				if (lastAddNode.status === 200) return true;
+				if (JSON.stringify(lastAddNode.body).includes('ECONNREFUSED')) return false;
+				throw new Error(`add_node failed (${lastAddNode.status}): ${JSON.stringify(lastAddNode.body)}`);
+			},
+			{
+				timeoutMs: SETUP_PHASE_TIMEOUT_MS,
+				pollMs: POLL_INTERVAL_MS,
+				description: () => `add_node to be accepted; last response ${JSON.stringify(lastAddNode)}`,
+			}
+		);
+
+		// The watchdog's detection bound below is measured from this line, and no cluster_status field marks
+		// COPY_START during this stall: connected:true is stamped at the handshake, and the source's
+		// `sendingMessage: 'Copying'` only once it sends a record, which the stall precedes.
+		await waitForCondition(async () => (await readLog(subscriber)).split('\n').some(isDataCopyStartLine), {
+			timeoutMs: SETUP_PHASE_TIMEOUT_MS,
+			pollMs: POLL_INTERVAL_MS,
+			description: 'the subscriber to log the start of the data copy',
 		});
 
-		// Let the copy-progress watchdog fire (COPY_STALL_TIMEOUT plus its 2×pingInterval
-		// transport-evidence confirmation) and forceReconnect re-establish, so the retried copy can
-		// complete. The byte watchdog (pingTimeout) is deliberately shorter yet must NOT recover
-		// anything, because pings keep bytesRead advancing — proving copy-progress is the recovery path.
-		await delay(COPY_STALL_TIMEOUT_MS + 8000);
+		// The copy-progress watchdog fires (COPY_STALL_TIMEOUT plus its 2×pingInterval transport-evidence
+		// confirmation), forceReconnect re-establishes, and the retried copy completes. The byte watchdog
+		// (pingTimeout) is deliberately shorter yet must NOT recover anything, because pings keep bytesRead
+		// advancing — proving copy-progress is the recovery path. lastReceivedVersion is frozen at 0 for the
+		// whole copy and advances only on the copy's final end_txn, so a positive value means the retried
+		// copy finished its walk.
+		let lastSocket;
+		await waitForCondition(
+			async (signal) => {
+				lastSocket = await dataSocketTo(subscriber, source, signal);
+				return lastSocket?.connected === true && lastSocket.lastReceivedVersion > 0;
+			},
+			{
+				timeoutMs: RECOVERY_TIMEOUT_MS,
+				pollMs: POLL_INTERVAL_MS,
+				description: () =>
+					`the stalled copy to recover: data socket connected with the retried copy complete; last ${JSON.stringify(lastSocket)}`,
+			}
+		);
 
+		// A record written after the retried copy's snapshot only replicates through live audit replay, so its
+		// arrival proves replication resumed without a restart.
 		const recordId = 'after-stall-1';
-		await sendOperation(ctx.nodes[0], {
+		await sendOperation(source, {
 			operation: 'insert',
 			database: STALL_DB,
 			table: 'test',
 			records: [{ id: recordId, name: 'recovered' }],
 		});
-
-		// Poll the wedged subscriber until the post-stall write lands — recovery without a restart. A record
-		// written after copyStartTime only replicates once the copy reaches COPY_COMPLETE and live audit
-		// replay resumes, so its arrival proves the stalled copy converged.
-		const deadline = Date.now() + RECOVERY_TIMEOUT_MS;
-		let replicated = false;
-		while (Date.now() < deadline) {
-			const result = await sendOperation(ctx.nodes[1], {
-				operation: 'search_by_id',
-				database: STALL_DB,
-				table: 'test',
-				ids: [recordId],
-				get_attributes: ['*'],
-			});
-			if (Array.isArray(result) && result.some((r) => r?.id === recordId)) {
-				replicated = true;
-				break;
+		await waitForCondition(
+			async (signal) => {
+				const result = await sendOperation(
+					subscriber,
+					{ operation: 'search_by_id', database: STALL_DB, table: 'test', ids: [recordId], get_attributes: ['*'] },
+					{ signal }
+				);
+				return Array.isArray(result) && result.some((r) => r?.id === recordId);
+			},
+			{
+				timeoutMs: RECOVERY_TIMEOUT_MS,
+				pollMs: POLL_INTERVAL_MS,
+				description: 'the record written after recovery to replicate to the subscriber (no restart)',
 			}
-			await delay(POLL_INTERVAL_MS);
-		}
-		ok(replicated, 'record written after the copy stall must replicate to the recovered subscriber (no restart)');
+		);
 
 		// The seed record copied in the base copy should also be present once the copy completed.
-		const seed = await sendOperation(ctx.nodes[1], {
+		const seed = await sendOperation(subscriber, {
 			operation: 'search_by_id',
 			database: STALL_DB,
 			table: 'test',
@@ -180,24 +234,11 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 			'the base-copy seed record must be present after the copy converged'
 		);
 
-		// And the socket-level view should be back to connected.
-		const deadlineConnected = Date.now() + RECOVERY_TIMEOUT_MS;
-		let connected = false;
-		while (Date.now() < deadlineConnected) {
-			if (await dataSocketConnected(ctx.nodes[1])) {
-				connected = true;
-				break;
-			}
-			await delay(POLL_INTERVAL_MS);
-		}
-		ok(connected, 'cluster_status should report the recovered data socket as connected');
-
 		// The recovery actor must be the copy-progress watchdog, within its documented bound and
 		// with no byte-level fire — scoped to the data connection so the system database's own
 		// socket cannot leak into the oracles (harper-pro#697).
-		const log = await readLog(ctx.nodes[1]);
+		const log = await readLog(subscriber);
 		const lineTime = (line) => Date.parse(line.slice(0, 24));
-		const dataDbTag = `(db: "${STALL_DB}")`;
 		const fires = log
 			.split('\n')
 			.filter((line) => line.includes('Copy-progress watchdog:') && line.includes(dataDbTag));
@@ -206,10 +247,7 @@ suite('Replication copy-progress wedge recovery', { timeout: 120000 }, (ctx) => 
 		ok(byteFires.length === 0, 'no byte-level watchdog may act on this ping-alive wedge');
 		// The bound is measured from COPY_START — where noteCopyProgress() first arms the timer —
 		// not from the subscription request, whose setup gates can add unbounded scheduling delay.
-		const copyStartLine = log
-			.split('\n')
-			.find((line) => line.includes('bulk copy starting from') && line.includes(dataDbTag));
-		ok(copyStartLine, 'subscriber log must show the data copy starting');
+		const copyStartLine = log.split('\n').find(isDataCopyStartLine);
 		const detectionMs = lineTime(fires[0]) - lineTime(copyStartLine);
 		ok(
 			detectionMs <= COPY_STALL_TIMEOUT_MS * 2 + PING_INTERVAL_MS * 2 + 5000,

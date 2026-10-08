@@ -235,6 +235,8 @@ export {
 const SUSTAINED_BLOB_FAILURE_THRESHOLD = 5;
 export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
+// SENDING_TIME_POSITION while a bulk copy is sending records; a real sending time is an audit key, never 1.
+export const SENDING_TIME_COPYING = 1;
 export const CONNECTION_STATE_DOWN = 0;
 export const CONNECTION_STATE_CONNECTED = 2;
 // LAST_ERROR_CODE for a disconnect this node INFERRED rather than observed on the wire: the worker thread
@@ -7097,7 +7099,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 															entry.key,
 															entry.localTime
 														);
-														getSharedStatus()[SENDING_TIME_POSITION] = 1;
+														getSharedStatus()[SENDING_TIME_POSITION] = SENDING_TIME_COPYING;
 														// The record's ORIGIN, not ours: stamping a copy with the copier's id
 														// re-attributes every copied record, so it can never tie against its true
 														// origin on the follower. `entry.nodeId` is this node's local id for that
@@ -8024,7 +8026,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (sequenceIdReceived) {
 						lastSequenceIdCommitted = sequenceIdReceived;
 					}
-					logger.debug?.('last sequence committed', new Date(lastSequenceIdCommitted), databaseName);
+					logger.debug?.(
+						'last sequence committed',
+						lastSequenceIdCommitted ? new Date(lastSequenceIdCommitted) : 'none',
+						databaseName
+					);
 					if (frameBarriers && isValidFrameTxnLogKey(frameTxnLogKey)) {
 						for (const { originId, nonce } of frameBarriers) {
 							const origin = getNodeNameForId(auditStore, originId, true);

@@ -10,6 +10,7 @@ import {
 	RECEIVED_VERSION_POSITION,
 	RECEIVED_TIME_POSITION,
 	SENDING_TIME_POSITION,
+	SENDING_TIME_COPYING,
 	RECEIVING_STATUS_POSITION,
 	RECEIVING_STATUS_RECEIVING,
 	BACK_PRESSURE_RATIO_POSITION,
@@ -63,28 +64,7 @@ export async function clusterStatus() {
 				if (!socket.connected) socket.peerCapabilities = undefined;
 				continue;
 			}
-			let replicationSharedStatus = getReplicationSharedStatus(auditStore, databaseName, remoteNodeName);
-			socket.lastCommitConfirmed = asDate(replicationSharedStatus[CONFIRMATION_STATUS_POSITION]);
-			socket.lastReceivedRemoteTime = asDate(replicationSharedStatus[RECEIVED_VERSION_POSITION]);
-			socket.lastReceivedLocalTime = asDate(replicationSharedStatus[RECEIVED_TIME_POSITION]);
-			// Raw version timestamp for precise sync comparison (preserves float64 precision)
-			socket.lastReceivedVersion = replicationSharedStatus[RECEIVED_VERSION_POSITION];
-			socket.sendingMessage = asDate(replicationSharedStatus[SENDING_TIME_POSITION]);
-			socket.backPressurePercent = replicationSharedStatus[BACK_PRESSURE_RATIO_POSITION] * 100;
-			socket.lastReceivedStatus =
-				replicationSharedStatus[RECEIVING_STATUS_POSITION] === RECEIVING_STATUS_RECEIVING ? 'Receiving' : 'Waiting';
-			// Blob-replication divergence (harper-pro#386): a non-zero count means replicated blobs failed
-			// to save durably on this link. `connected: true` alone can hide that; surface it here so an
-			// operator (or alert) sees the divergence and its recency.
-			// `|| undefined` so a healthy link omits the field entirely (matching lastBlobFailure's asDate(0)).
-			socket.blobReplicationFailures = replicationSharedStatus[BLOB_FAILURE_COUNT_POSITION] || undefined;
-			socket.lastBlobFailure = asDate(replicationSharedStatus[LAST_BLOB_FAILURE_TIME_POSITION]);
-			// Per-mechanism recovery-fire counts for this link (harper-pro#431) — how often each watchdog
-			// or reconcile net fired while the shared-memory truth already read down (`redundant`) versus
-			// while it still read up (`loadBearing`, i.e. that mechanism was the only layer that saw the
-			// problem). This is the evidence the later watchdog-demotion decision is meant to rest on; nothing
-			// in the recovery paths reads it. Omitted entirely for a link where nothing has ever fired.
-			socket.recoveryFires = readFireCounters(replicationSharedStatus);
+			applySharedStatus(socket, getReplicationSharedStatus(auditStore, databaseName, remoteNodeName));
 			// W1 (harper-pro#431): the shared-memory connection truth is authoritative over the edge-triggered
 			// map mirror in requestClusterStatus, which can still read connected:true for an open-but-idle
 			// wedge that never delivered a disconnect (#289/#233). Also surface the last disconnect (#214).
@@ -121,8 +101,35 @@ export async function clusterStatus() {
 
 	return response;
 }
+/** Copies one (database, peer) link's shared-status slots onto its `cluster_status` database socket. */
+export function applySharedStatus(socket, replicationSharedStatus: Float64Array) {
+	socket.lastCommitConfirmed = asDate(replicationSharedStatus[CONFIRMATION_STATUS_POSITION]);
+	socket.lastReceivedRemoteTime = asDate(replicationSharedStatus[RECEIVED_VERSION_POSITION]);
+	socket.lastReceivedLocalTime = asDate(replicationSharedStatus[RECEIVED_TIME_POSITION]);
+	// Raw version timestamp for precise sync comparison (preserves float64 precision)
+	socket.lastReceivedVersion = replicationSharedStatus[RECEIVED_VERSION_POSITION];
+	// one read: another worker can start or finish a copy between two reads of the slot
+	const sendingTime = replicationSharedStatus[SENDING_TIME_POSITION];
+	socket.sendingMessage = sendingTime === SENDING_TIME_COPYING ? 'Copying' : asDate(sendingTime);
+	socket.backPressurePercent = replicationSharedStatus[BACK_PRESSURE_RATIO_POSITION] * 100;
+	socket.lastReceivedStatus =
+		replicationSharedStatus[RECEIVING_STATUS_POSITION] === RECEIVING_STATUS_RECEIVING ? 'Receiving' : 'Waiting';
+	// Blob-replication divergence (harper-pro#386): a non-zero count means replicated blobs failed
+	// to save durably on this link. `connected: true` alone can hide that; surface it here so an
+	// operator (or alert) sees the divergence and its recency.
+	// `|| undefined` so a healthy link omits the field entirely (matching lastBlobFailure's asDate(0)).
+	socket.blobReplicationFailures = replicationSharedStatus[BLOB_FAILURE_COUNT_POSITION] || undefined;
+	socket.lastBlobFailure = asDate(replicationSharedStatus[LAST_BLOB_FAILURE_TIME_POSITION]);
+	// Per-mechanism recovery-fire counts for this link (harper-pro#431) — how often each watchdog
+	// or reconcile net fired while the shared-memory truth already read down (`redundant`) versus
+	// while it still read up (`loadBearing`, i.e. that mechanism was the only layer that saw the
+	// problem). This is the evidence the later watchdog-demotion decision is meant to rest on; nothing
+	// in the recovery paths reads it. Omitted entirely for a link where nothing has ever fired.
+	socket.recoveryFires = readFireCounters(replicationSharedStatus);
+}
+
 function asDate(date) {
-	return date ? (date === 1 ? 'Copying' : new Date(date).toUTCString()) : undefined;
+	return date ? new Date(date).toUTCString() : undefined;
 }
 
 server.registerOperation?.({
