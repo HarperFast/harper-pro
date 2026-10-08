@@ -12,12 +12,13 @@ import {
 	recordTableDrop,
 	isDeadGeneration,
 	isDroppedPeerGeneration,
+	catalogCreatedBefore,
 	catalogCreatedTime,
 	stampTableCreatedTime,
 	tableLifecycleTime,
 } from '../core/resources/databases.ts';
 import { TableGenerationDroppedError } from '../core/utility/errors/hdbError.ts';
-import { validateDropMarkers, rowsAround } from './tableLifecycle.ts';
+import { validateDropMarkers, rowsAround, MAX_DROP_MARKERS_PER_FRAME } from './tableLifecycle.ts';
 import {
 	createAuditEntry,
 	Decoder,
@@ -5462,6 +5463,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						tableDecoders[tableId] = {
 							name: tableName,
 							decoder,
+							table,
+							createdTime: data.createdTime,
 							getEntry(id) {
 								return table.primaryStore.getEntry(id);
 							},
@@ -7450,6 +7453,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					close(1011, 'missing table structure; reconnecting to resync');
 					return;
 				}
+				// Records resolve by name, so once the local generation changes (a marker learned since this structure was
+				// accepted), the peer's generation is judged again rather than written into its replacement.
+				if (!tableDecoder.refused && tables[tableDecoder.name] !== tableDecoder.table) {
+					if (isDroppedPeerGeneration(databaseName, tableDecoder.name, tableDecoder.createdTime))
+						tableDecoder.refused = true;
+					else tableDecoder.table = tables[tableDecoder.name];
+				}
 				if (tableDecoder.refused) {
 					// A dead generation's records are skipped, and its peer retires the table once it learns the marker.
 					logger.trace?.(
@@ -9313,7 +9323,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// Sender-side gating discipline: the marker list goes only to a peer that reads it.
 		const dropMarkers =
 			peerCapabilitiesLearned && peerSupportsTableLifecycle(peerCapabilities)
-				? getTableDrops(databaseName).filter((marker) => tableSentToPeer(marker.table))
+				? getTableDrops(databaseName)
+						.filter((marker) => tableSentToPeer(marker.table))
+						// a receiver keeps the first MAX_DROP_MARKERS_PER_FRAME; the newest are the ones a peer most likely missed
+						.sort((a, b) => b.droppedTime - a.droppedTime)
+						.slice(0, MAX_DROP_MARKERS_PER_FRAME)
 				: [];
 		ws.send(
 			dropMarkers.length > 0
@@ -9398,8 +9412,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	/**
-	 * Upgrade-only, for a table created on a build that stored no stamp: one holding no row older than the drop is
-	 * stamped newer when the frame carries the peer's newer definition or it holds a row written after the drop.
+	 * Upgrade-only, for a table created on a build that stored no stamp, against a drop older than its `createdBefore`:
+	 * one holding no row older than the drop is stamped newer when the frame carries the peer's newer definition or it
+	 * holds a row written after the drop.
 	 */
 	function adoptPreStampGeneration(
 		schemaDatabaseName: string,
@@ -9407,6 +9422,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		droppedTime: number,
 		definitions: Array<{ table: string; createdTime?: unknown }>
 	) {
+		// created before a drop recorded after its bound: core retires it
+		const createdBefore = catalogCreatedBefore(localTable);
+		if (createdBefore !== undefined && droppedTime > createdBefore) return;
 		const rows = rowsAround(localTable, droppedTime);
 		if (rows.older) return;
 		const definitionStamp = definitions.find((definition) => definition.table === localTable.tableName)?.createdTime;
