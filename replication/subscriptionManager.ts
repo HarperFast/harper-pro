@@ -419,18 +419,23 @@ function dispatchSubscribeSetup(url: string, database: string, nodes: any[]) {
 	});
 }
 
+/**
+ * The one gate between a placed subscription request and the thread that opens it. `mainFallback` lets the
+ * main thread open it when no live worker owns it; never while the replication pool runs, since the pool
+ * then owns every replication socket, even while all of its members are restarting.
+ */
 export function dispatchSubscriptionRequest(
 	entry: { worker?: { postMessage: (request: any) => void } },
 	request: any,
 	liveWorkers: any[],
-	mainIsWorker: boolean,
+	mainFallback: boolean,
 	dispatchOnMain: (request: any) => void
 ): 'worker' | 'main' | 'deferred' {
 	if (entry.worker && liveWorkers.includes(entry.worker)) {
 		entry.worker.postMessage(request);
 		return 'worker';
 	}
-	if (mainIsWorker) {
+	if (mainFallback && !isWorkerPoolActive(THREAD_TYPES.REPLICATION)) {
 		dispatchOnMain(request);
 		return 'main';
 	}
@@ -1728,11 +1733,8 @@ export async function startOnMainThread(options) {
 			nodes: [node],
 			exclusionOrigins: computeExclusionOrigins(database),
 		};
-		if (worker) {
-			worker.postMessage(request);
-		} else if (!isWorkerPoolActive(THREAD_TYPES.REPLICATION)) subscribeToNode(request);
-		// the main thread does not own replication sockets while the pool runs
-		else logger.warn('No replication workers available to fail over', database, 'to node', connectingNode.name);
+		if (dispatchSubscriptionRequest({ worker }, request, replicationPool, true, subscribeToNode) === 'deferred')
+			logger.warn('No replication workers available to fail over', database, 'to node', connectingNode.name);
 	}
 	// Read the per-(database, node) replication progress out of the process-shared status buffer the owning
 	// worker writes (the same buffer cluster_status reports from). Used by findStalledReceivingNodeUrls to

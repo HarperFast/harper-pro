@@ -16,7 +16,6 @@ export function isReplicationWorker(worker: any): boolean {
 	return worker.name === THREAD_TYPES.HTTP && worker.application === undefined;
 }
 
-/** Main thread: the live workers that may own replication work, in start order. */
 export function replicationWorkers(liveWorkers: any[] = workers): any[] {
 	return liveWorkers.filter(isReplicationWorker);
 }

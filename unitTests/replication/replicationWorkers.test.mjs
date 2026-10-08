@@ -75,6 +75,22 @@ describe('replicationWorkers with the replication pool (replication.threads)', (
 		assert.deepStrictEqual(replicationWorkers([http, isolated, job]), []);
 	});
 
+	it('never opens a subscription on the main thread while the pool runs, even where main may fall back', () => {
+		const onMain = [];
+		setActiveWorkerPools(['replication']);
+		assert.strictEqual(
+			dispatchSubscriptionRequest({}, { id: 1 }, [], true, (r) => onMain.push(r)),
+			'deferred'
+		);
+		assert.deepStrictEqual(onMain, []);
+		setActiveWorkerPools([]);
+		assert.strictEqual(
+			dispatchSubscriptionRequest({}, { id: 2 }, [], true, (r) => onMain.push(r)),
+			'main'
+		);
+		assert.deepStrictEqual(onMain, [{ id: 2 }]);
+	});
+
 	it('fences every worker that can hold a cluster lock, whatever the placement', () => {
 		assert.deepStrictEqual(recordLockParticipantWorkers(all), [http, isolated, pooled]);
 		setActiveWorkerPools(['replication']);
