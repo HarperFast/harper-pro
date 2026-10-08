@@ -5317,8 +5317,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// Markers drop tables, so they need the authority the subscription path requires to receive.
 						const markersAuthorized =
 							authorization?.name || authorization?.replicates || authorization?.role?.permission?.super_user;
+						// filtered by this peer's receive route here, so held markers keep their sender's rules
+						const routeExcluded = excludedTablesFromPeer(schemaDatabaseName);
 						const peerDropMarkers =
-							markersAuthorized && checkDatabaseAccess(schemaDatabaseName) ? validateDropMarkers(message[4]) : [];
+							markersAuthorized && checkDatabaseAccess(schemaDatabaseName)
+								? validateDropMarkers(message[4]).filter((marker) => !routeExcluded?.has(marker.table))
+								: [];
 						// A stale local generation goes before this frame's definitions are compared. Markers for a database
 						// not open here wait, refusing what they retire, until a definition opens it.
 						const waiting = markersAwaitingDatabase.get(schemaDatabaseName);
@@ -5326,6 +5330,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (!databases[schemaDatabaseName]) {
 							if (pendingMarkers.length > 0) markersAwaitingDatabase.set(schemaDatabaseName, pendingMarkers);
 						} else if (pendingMarkers.length > 0) {
+							if (waiting) markersAwaitingDatabase.set(schemaDatabaseName, pendingMarkers);
 							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
 							if (connectionSuperseded()) return;
 							if (waiting) markersAwaitingDatabase.delete(schemaDatabaseName);
@@ -9397,10 +9402,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		markers: Array<{ table: string; droppedTime: number }>,
 		definitions: Array<{ table: string; createdTime?: unknown }>
 	) {
-		const excluded = excludedTablesFromPeer(schemaDatabaseName);
 		for (const { table: tableName, droppedTime } of markers) {
 			if (connectionSuperseded()) return;
-			if (excluded?.has(tableName)) continue;
 			const localTable = databases[schemaDatabaseName]?.[tableName];
 			if (!localTable) {
 				recordTableDrop(schemaDatabaseName, tableName, droppedTime);
