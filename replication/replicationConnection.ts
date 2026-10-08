@@ -2765,9 +2765,8 @@ const originFloorIntervalMs =
 const FLOOR_SCRATCH = new Float64Array(1);
 const FLOOR_BITS = new BigInt64Array(FLOOR_SCRATCH.buffer);
 /**
- * The float64 just below a certified floor: the direct resume start is exclusive, and a floor can equal the key of a
- * transaction still open at the origin (the floor is that reservation's bound), so resuming at the floor itself
- * would skip it.
+ * The direct resume start is exclusive, and a floor can equal the key of a transaction still open at the origin (the
+ * floor is that reservation's bound), so resume starts just below it.
  */
 export function cursorBelowFloor(floor: number): number {
 	FLOOR_SCRATCH[0] = floor;
@@ -2775,12 +2774,10 @@ export function cursorBelowFloor(floor: number): number {
 	return FLOOR_SCRATCH[0];
 }
 
-/** The resume value a stored floor contributes beside an applied position, or the position alone without one. */
 export function resumeStartWithFloor(position: number, closedFloor: unknown): number {
 	return isValidFloor(closedFloor) ? Math.max(position, cursorBelowFloor(closedFloor)) : position;
 }
 
-/** A peer-supplied `{ originName: floor }` vector as a Map of its valid entries; a malformed entry is dropped. */
 export function parseOriginFloors(value: unknown): Map<string, number> {
 	const floors = new Map<string, number>();
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return floors;
@@ -4714,6 +4711,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (status) {
 			recordPeerLockCapability(status, peerSupportsRecordLocks(peerCapabilities));
 			recordPeerLockLevel(status, peerCapabilities.recordLocks);
+			status[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
 		}
 	}
 	if (databaseName) {
@@ -5197,8 +5195,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								handshakeStatus[CONNECTION_STATE_POSITION] = CONNECTION_STATE_CONNECTED;
 								handshakeStatus[LAST_LIVENESS_TIME_POSITION] = Date.now();
 							}
-							if (handshakeStatus)
-								handshakeStatus[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
 							//const url = message[3] ?? thisNodeUrl;
 							logger.debug?.(connectionId, 'received node name:', remoteNodeName, 'db:', databaseName ?? message[2]);
 							if (!databaseName) {
@@ -6397,6 +6393,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						auditSubscription.once('close', () => {
 							closed = true;
 							subscriptionToHdbNodes?.end();
+							wakeSender?.(); // an idle sender settles now rather than at the next transaction
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
@@ -6516,6 +6513,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								let floorEmissionLatchedRange: unknown; // a range that lost an entry certifies nothing more
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
+								const originCertifies = (name: string) =>
+									getReplicationSharedStatus(auditStore, databaseName, name)[PEER_CERTIFIES_FLOORS_POSITION] === 1;
 								const captureOriginFloors = (): Map<string, number> | undefined => {
 									let floors: Map<string, number> | undefined;
 									try {
@@ -6537,14 +6536,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												const seqRows = collectSeqRows(
 													dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([0xff])] })
 												);
-												const certifies = (name: string) =>
-													getReplicationSharedStatus(auditStore, databaseName, name)[PEER_CERTIFIES_FLOORS_POSITION] ===
-													1;
 												for (const [name, floor] of collectRelayableFloors(
 													seqRows,
 													names,
 													exportIdMapping(auditStore),
-													certifies
+													originCertifies
 												))
 													(floors ??= new Map()).set(name, floor);
 											}
@@ -6563,9 +6559,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								};
 								const certifyOriginFloors = (floors: Map<string, number>) => {
 									let rising: Map<string, number> | undefined;
+									const thisNodeName = getThisNodeName();
 									for (const [name, floor] of floors) {
-										// an origin a SUBSCRIPTION_UPDATE excluded during the pass had its scan cut short
+										// an origin a SUBSCRIPTION_UPDATE excluded during the pass had its scan cut short, and
+										// one whose socket stopped certifying during it may be an older binary now
 										if (excludedNodes?.includes(name) || certifiedFloors.get(name) >= floor) continue;
+										if (name !== thisNodeName && !originCertifies(name)) continue;
 										(rising ??= new Map()).set(name, floor);
 									}
 									if (!rising || closed || wsClosed) return;
@@ -7119,14 +7118,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
 									// an `includeNodes` update re-admits a log whose entries are already committed
 									let wake: () => void;
-									// one timer per loop, re-armed per wait; a wake after close is inert, so an exit that skips
-									// the clear below leaks nothing but one unreferenced timer
+									// one timer per loop, re-armed per wait; a wake after close ends the loop below, so an exit
+									// that skips the clear leaks nothing but one unreferenced timer
 									if (certifiesOriginFloors()) {
 										if (floorTimer) floorTimer.refresh();
-										else
-											floorTimer = setTimeout(() => {
-												if (!closed && !wsClosed) wakeSender?.();
-											}, originFloorIntervalMs).unref();
+										else floorTimer = setTimeout(() => wakeSender?.(), originFloorIntervalMs).unref();
 									}
 									try {
 										await new Promise<void>((resolve, reject) => {
