@@ -33,6 +33,8 @@ const ROWS_PER_NODE = 20;
 // Replication has no "nothing more is coming" signal, so a check that something did NOT arrive
 // waits this long after both directions report connected.
 const SETTLE_MS = 5000;
+// A single probe outside a wait still must not outlive a node that accepts the request and never answers.
+const PROBE_MS = 30000;
 const FIXTURES = import.meta.dirname ?? new URL('.', import.meta.url).pathname;
 
 async function postOperation(node, operation, signal) {
@@ -45,12 +47,12 @@ async function postOperation(node, operation, signal) {
 	return { status: response.status, body: await response.json() };
 }
 
-async function tableExists(node, table, signal) {
+async function tableExists(node, table, signal = AbortSignal.timeout(PROBE_MS)) {
 	const described = await sendOperation(node, { operation: 'describe_database', database: 'data' }, { signal });
 	return Object.hasOwn(described, table);
 }
 
-async function idsIn(node, table, signal) {
+async function idsIn(node, table, signal = AbortSignal.timeout(PROBE_MS)) {
 	const { status, body } = await postOperation(
 		node,
 		{
@@ -110,9 +112,9 @@ function nodeConfig(hostname, { legacyPeer = false } = {}) {
 				databases: ['data'],
 			},
 		},
-		// The same hook protocolCapabilityRegistry.test.mjs uses: no NODE_NAME capability bag, and with it no
-		// lifecycle stamps on the definitions this node sends, which is what a pre-#1212 peer looks like.
-		env: legacyPeer ? { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' } : {},
+		// A pre-#1212 peer: no NODE_NAME capability bag (the hook protocolCapabilityRegistry.test.mjs uses), so no
+		// stamps on the wire, and none in its catalog.
+		env: legacyPeer ? { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1', HARPER_TEST_OMIT_TABLE_LIFECYCLE: '1' } : {},
 	};
 }
 

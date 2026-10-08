@@ -5307,14 +5307,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (markersPending && databases[schemaDatabaseName]) {
 							markersPending = false;
 							await applyPeerDropMarkers(schemaDatabaseName, peerDropMarkers, data);
-							if (wsClosed) return;
+							if (connectionSuperseded()) return;
 						}
 						for (const tableDefinition of data) {
 							const newDatabaseName = schemaDatabaseName;
 							tableDefinition.database = newDatabaseName;
 							let table: any;
 							if (checkDatabaseAccess(newDatabaseName)) {
-								if (isDroppedPeerGeneration(newDatabaseName, tableDefinition.table, tableDefinition.createdTime)) {
+								if (
+									isDroppedPeerGeneration(newDatabaseName, tableDefinition.table, tableDefinition.createdTime) ||
+									(markersPending && frameRetires(peerDropMarkers, tableDefinition))
+								) {
 									refuseDeadDefinition(newDatabaseName, tableDefinition, 'DB_SCHEMA');
 									continue;
 								}
@@ -5902,11 +5905,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const { resolve, reject, tableId, key } = awaitingResponse.get(message[1]);
 						const entry = message[2];
 						if (entry?.error) reject(new Error(entry.error));
-						else if (entry && (!tableDecoders[tableId]?.decoder || tableDecoders[tableId].refused))
+						else if (entry && (!tableDecoders[tableId]?.decoder || tableDecoders[tableId].refused)) {
+							if (tableDecoders[tableId]?.decoder && entry.value)
+								discardRecordBlobs({ getBinaryValue: () => entry.value, recordId: key } as any, tableDecoders[tableId]);
 							reject(
 								new Error(`No usable structure for table id ${tableId}; the peer's generation of the table was refused`)
 							);
-						else if (entry) {
+						} else if (entry) {
 							let blobsToDelete: any[];
 							decodeBlobsWithWrites(
 								() => {
@@ -9352,10 +9357,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		pendingSchemaResends.add(database);
 	}
 	/**
-	 * Core applies each peer drop under its catalog lock: never to a node-local table nor to a generation created
-	 * after it, with the peer's time so a relayed marker never moves forward per hop, and records the marker either
-	 * way. A failed drop records the marker and rethrows, closing the connection so the frame is re-delivered rather
-	 * than its definitions merging the new generation's records into the stale store.
+	 * Core decides each drop under its catalog lock (`replication/DESIGN.md` item 27). A failed drop rethrows, closing the
+	 * connection, so the frame is re-delivered rather than its definitions merging into the stale store.
 	 */
 	async function applyPeerDropMarkers(
 		schemaDatabaseName: string,
@@ -9364,7 +9367,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	) {
 		const excluded = excludedTablesFromPeer(schemaDatabaseName);
 		for (const { table: tableName, droppedTime } of markers) {
-			if (wsClosed) return;
+			if (connectionSuperseded()) return;
 			if (excluded?.has(tableName)) continue;
 			const localTable = databases[schemaDatabaseName]?.[tableName];
 			if (!localTable) {
@@ -9395,11 +9398,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 	}
 	/**
-	 * Upgrade-only. A table created on a build that stored no stamp is the generation a peer's drop retired if it holds
-	 * a row written before the drop. Without one it is stamped as newer when the peer's frame carries a newer
-	 * definition, or when it holds a row written after the drop (recreated and used here while on that build); an
-	 * empty copy with neither stays unstamped, so core's conditional drop retires it. A stale copy whose every row was
-	 * rewritten after the drop passes: those rows are post-drop writes, not the pre-drop data the marker retires.
+	 * Upgrade-only, for a table created on a build that stored no stamp: one holding no row older than the drop is
+	 * stamped newer when the frame carries the peer's newer definition or it holds a row written after the drop.
 	 */
 	function adoptPreStampGeneration(
 		schemaDatabaseName: string,
@@ -9420,6 +9420,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				connectionId,
 				`Stamped ${schemaDatabaseName}.${localTable.tableName} as a generation newer than the drop ${remoteNodeName} relays: it was created on a build that kept no stamp and holds no row older than the drop`
 			);
+	}
+	/** A frame's own marker for a definition, while the frame's database is not open here to record it in. */
+	function frameRetires(markers: Array<{ table: string; droppedTime: number }>, definition: any) {
+		const marker = markers.find((candidate) => candidate.table === definition.table);
+		return marker !== undefined && isDeadGeneration(definition.createdTime, marker.droppedTime);
 	}
 	function refuseDeadDefinition(
 		schemaDatabaseName: string,
@@ -9594,7 +9599,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		if (hasChanges) {
 			logger.debug?.('(Re)creating', tableDefinition);
-			const table: any = ensureTable({
+			return ensureTable({
 				table: tableDefinition.table,
 				database: tableDefinition.database,
 				schemaDefined: tableDefinition.schemaDefined,
@@ -9605,18 +9610,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				origin: 'cluster',
 				createdTime: typeof tableDefinition.createdTime === 'number' ? tableDefinition.createdTime : undefined,
 			});
-			if (TEST_OMIT_CAPABILITIES && !existingTable.tableName) unstampForTest(table);
-			return table;
 		}
 		return existingTable;
-	}
-	/** Test-only: a build before the stamps left the catalog row of a table it created without one. */
-	function unstampForTest(table: any) {
-		const key = table.tableName + '/';
-		const row = table.dbisDB?.getSync(key);
-		if (!row) return;
-		delete row.createdTime;
-		table.dbisDB.putSync(key, row);
-		table.createdTime = undefined;
 	}
 }
