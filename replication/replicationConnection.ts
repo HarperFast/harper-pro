@@ -9279,7 +9279,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		const tableDefinitions = tableDefinitionsForPeer(databaseName, tableSentToPeer);
 		// The stamp rides only the DB_SCHEMA frame, not the shared NODE_NAME[3] definitions, so it is
 		// attached here rather than inside `tableDefinitionsForPeer`.
-		for (const definition of tableDefinitions) definition.createdTime = advertisedCreatedTime(database[definition.table]);
+		for (const definition of tableDefinitions)
+			definition.createdTime = advertisedCreatedTime(database[definition.table]);
 		// Sender-side gating discipline: the marker list goes only to a peer that reads it.
 		const dropMarkers =
 			peerCapabilitiesLearned && peerSupportsTableLifecycle(peerCapabilities)
