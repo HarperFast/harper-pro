@@ -4888,7 +4888,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * exclusion-origin set), which is what lets a relay forward the floor to its own subscribers.
 	 */
 	function receivedOriginFloors(value: unknown): [number, number, boolean][] | undefined {
-		if (!certifiesOriginFloors() || (inCopyMode && !copyCompleteReceived)) return undefined;
+		if (value == null || !certifiesOriginFloors() || (inCopyMode && !copyCompleteReceived)) return undefined;
 		const floors = parseOriginFloors(value);
 		if (floors.size === 0) return undefined;
 		let entries: [number, number, boolean][] | undefined;
