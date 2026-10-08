@@ -11,7 +11,3 @@ Why it matters beyond cost: a running sampler inflates core's `utilization` for 
 ## `profiler-sampling` marks the utilization samples the sampler invalidated
 
 `markProfilerSampling` is registered with core's `addAnalyticsListener`, which runs on the worker at every report flush with the outgoing `metrics`. When the sampler ran at any point since the thread's previous report, it pushes `{ metric: 'profiler-sampling', total: <ms sampled since that report>, count: 1 }`. Core appends the same report's `utilization` sample on the main thread, so a raw `hdb_raw_analytics` row carrying `profiler-sampling` is one whose utilization sample is inflated; an idle worker that reports nothing during a window flags its first report afterwards, which is the sample that spanned the window. In `hdb_analytics` the period's `total` is the sampled milliseconds and `count` the number of flagged reports. Core does not yet suppress those samples; it could, by skipping the `utilization` push when the report carries this metric.
-
-## Running harper-pro from a VS Code-hosted agent
-
-`ELECTRON_RUN_AS_NODE=1` is inherited from the VS Code extension host. node-gyp-build then looks for an _electron_ prebuild of `@datadog/pprof`, finds none, and the `analytics` component fails to load (`No native build was found for platform=darwin ... runtime=electron`). Unset it (`env -u ELECTRON_RUN_AS_NODE`) for builds, unit tests, and local instances.

@@ -19,7 +19,6 @@ describe('Analytics profiler startup gate', () => {
 		userCodeFolders.push(new URL('../testApp/', import.meta.url).toString());
 	});
 	afterEach(async () => {
-		// A terminal capture also cancels a sampling window that has not opened yet.
 		await captureProfile(-1);
 		assert.equal(timeProfiler.isStarted(), false);
 	});
@@ -73,29 +72,29 @@ describe('Analytics profiler startup gate', () => {
 		assert.equal(timeProfiler.isStarted(), true);
 	});
 	it('samples across the two startup captures and stops after the second', async () => {
-		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.1 })), true);
-		await sleep(150);
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.3 })), true);
+		await sleep(450);
 		assert.equal(timeProfiler.isStarted(), true);
-		await sleep(250);
+		await sleep(550);
 		assert.equal(timeProfiler.isStarted(), false);
 	});
 	it('samples only in the one-period window before a capture', async () => {
-		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.2 })), true);
-		await captureProfile(600);
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.5 })), true);
+		await captureProfile(1500);
 		assert.equal(timeProfiler.isStarted(), false);
-		await sleep(200);
+		await sleep(500);
 		assert.equal(timeProfiler.isStarted(), false);
-		await sleep(300);
+		await sleep(750);
 		assert.equal(timeProfiler.isStarted(), true);
-		await sleep(300);
+		await sleep(750);
 		assert.equal(timeProfiler.isStarted(), false);
 	});
 	it('cancels a sampling window that has not opened when profiling is disabled', async () => {
-		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.1 })), true);
-		await captureProfile(300);
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.2 })), true);
+		await captureProfile(600);
 		assert.equal(timeProfiler.isStarted(), false);
-		assert.equal(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 0.1 })), false);
-		await sleep(400);
+		assert.equal(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 0.2 })), false);
+		await sleep(800);
 		assert.equal(timeProfiler.isStarted(), false);
 	});
 });

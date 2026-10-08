@@ -81,11 +81,8 @@ export function startAutomaticProfiling(options: Scope['options']): boolean {
 	return scheduleCapture(capturePeriod, capturePeriod);
 }
 
-// The sampler runs for one aggregate period before each capture and is off in between. A period is
-// the capture's own unit: cpu-usage is CPU seconds per period and the hot-location threshold assumes
-// a period of 50ms samples. A running sampler also inflates core's `utilization` for the thread
-// (SIGPROF interrupts the poll wait and libuv drops the interrupted wait's idle time), so with a
-// capture every period this window would have to shrink; see shippedRescheduleDelay.
+// One period keeps cpu-usage and the hot-location threshold meaning what they do; with a capture
+// every period it would be always-on again, which inflates `utilization` (analytics/DESIGN.md).
 function samplingWindow(): number {
 	return capturePeriod > 0 ? capturePeriod : Infinity;
 }
@@ -98,8 +95,6 @@ function cancelScheduledCapture() {
 // A capture's successor runs after the delay that capture was asked for, and is itself asked for
 // `delayAfterThat`. Automatic profiling asks the first capture for one period and every later one
 // for the shipped default, so captures land at one and two periods and then a thousand periods out.
-// The sampler starts one window before the capture: now when the delay fits in the window, otherwise
-// from a timer, so that a thread between captures has no profiler running.
 function scheduleCapture(delay: number, delayAfterThat = shippedRescheduleDelay()): boolean {
 	cancelScheduledCapture();
 	const windowDelay = Math.max(0, delay - samplingWindow());
@@ -153,10 +148,8 @@ function stopProfiler(restart: boolean): Profile {
 	}
 }
 
-// Core appends each worker report's `utilization` sample on the main thread, and a sample whose
-// interval overlapped the sampler is inflated. The report carries how long the sampler ran since the
-// thread's previous report, so a consumer can set those rows aside; a thread that reports nothing
-// while sampling flags its first report afterwards, which is the sample that spanned the window.
+// Rides on the report whose `utilization` sample (appended by core on the main thread) overlapped the
+// sampler, including a thread's first report after a window it reported nothing in.
 export function markProfilerSampling(metrics: { metric: string; total?: number; count?: number }[]) {
 	let sampledMs = unreportedSamplingMs;
 	unreportedSamplingMs = 0;
@@ -207,7 +200,6 @@ export async function captureProfile(delayToNextCapture = shippedRescheduleDelay
 	// Start GPU measurement early so it runs in parallel with CPU profiling work
 	const gpuPromise = getWorkerIndex() === 0 && gpuAvailable ? getGpuUtilization() : null;
 	try {
-		// Restart in the same native call only when the next window opens now, as between the two startup captures.
 		const profile = stopProfiler(continuous && delayToNextCapture <= samplingWindow());
 		const strings = profile.stringTable.strings;
 		for (let func of profile.function) {
