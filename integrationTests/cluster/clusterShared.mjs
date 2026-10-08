@@ -17,7 +17,7 @@ export async function sendOperation(node, operation, options) {
 	return body;
 }
 
-async function postOperation(node, operation, options) {
+export async function postOperation(node, operation, options) {
 	const response = await fetch(node.operationsAPIURL, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },

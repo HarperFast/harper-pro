@@ -101,7 +101,6 @@ export async function clusterStatus() {
 
 	return response;
 }
-/** Copies one (database, peer) link's shared-status slots onto its `cluster_status` database socket. */
 export function applySharedStatus(socket, replicationSharedStatus: Float64Array) {
 	socket.lastCommitConfirmed = asDate(replicationSharedStatus[CONFIRMATION_STATUS_POSITION]);
 	socket.lastReceivedRemoteTime = asDate(replicationSharedStatus[RECEIVED_VERSION_POSITION]);

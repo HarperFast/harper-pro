@@ -1,7 +1,5 @@
 /**
- * `cluster_status` reads each link's shared-status slots through applySharedStatus. The `'Copying'`
- * sentinel belongs to the sending-time slot only: the copy sender writes SENDING_TIME_COPYING there, and
- * every other date slot holds an epoch-ms value, so a 1 in one of them formats as a date.
+ * Only the sending-time slot carries the copy sentinel; every other date slot holds epoch ms.
  */
 import { expect } from 'chai';
 import { applySharedStatus } from '#src/replication/clusterStatus';

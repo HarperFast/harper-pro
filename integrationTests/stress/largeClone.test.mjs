@@ -223,10 +223,8 @@ if (!stressEnabled()) {
 							available = true;
 							availableAt = Date.now();
 							cloneSampler.stop();
-							// The count is taken on the tick that first reads Available, with no catch-up retry:
-							// a clone that reports Available while still short of the leader must fail here.
-							// exact_count forces a full value scan; the default record_count is a rounded RocksDB
-							// estimate that diverges between nodes during bulk copy.
+							// No catch-up retry: a clone that reports Available while still short must fail.
+							// exact_count, because the default record_count is an estimate during bulk copy.
 							try {
 								const countResp = await sendOperation(
 									cloneCtx.harper,

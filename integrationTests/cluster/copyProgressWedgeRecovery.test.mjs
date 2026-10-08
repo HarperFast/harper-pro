@@ -28,7 +28,7 @@ import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert';
 import { startHarper, teardownHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
 import { join } from 'node:path';
-import { sendOperation, readLog, waitForCondition } from './clusterShared.mjs';
+import { sendOperation, postOperation, readLog, waitForCondition } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? module.path,
@@ -77,16 +77,6 @@ function nodeStartOptions(node, { stall = false } = {}) {
 		// (peer, db) copy gets stalled right after COPY_START.
 		env: stall ? { HARPER_TEST_COPY_STALL_ONCE_DB: STALL_DB } : undefined,
 	};
-}
-
-async function postOperation(node, operation, signal) {
-	const response = await fetch(node.operationsAPIURL, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(operation),
-		signal,
-	});
-	return { status: response.status, body: await response.json() };
 }
 
 async function dataSocketTo(node, peer, signal) {
@@ -154,7 +144,7 @@ suite('Replication copy-progress wedge recovery', { timeout: SUITE_TIMEOUT_MS },
 						hostname: source.hostname,
 						authorization: subscriber.admin,
 					},
-					signal
+					{ signal }
 				);
 				if (lastAddNode.status === 200) return true;
 				if (JSON.stringify(lastAddNode.body).includes('ECONNREFUSED')) return false;
