@@ -1,0 +1,281 @@
+name: NPM Package
+
+# Installs the release tarball as users do, on each supported npm major and OS (build-tools/DESIGN.md).
+
+on:
+  pull_request:
+    paths:
+      - core
+      - package.json
+      - package-lock.json
+      - build-tools/**
+      - unitTests/build-tools/**
+      - Dockerfile*
+      - .github/workflows/npm-package.yaml
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-package:
+    name: Build release npm package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.node-version'
+          package-manager-cache: false
+
+      - name: Build release package
+        run: npm run package
+
+      - name: Verify package contents
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(harperfast-harper-pro-*.tgz)
+          if [[ ${#packages[@]} -ne 1 ]]; then
+            echo "Expected exactly one harperfast-harper-pro-*.tgz, found ${#packages[@]}" >&2
+            exit 1
+          fi
+          tar -tzf "${packages[0]}" > package-contents.txt
+          grep -qx 'package/node_modules/fastify/package.json' package-contents.txt
+          for unexpected in npm-shrinkwrap.json node_modules/re2/package.json node_modules/@datadog/pprof/package.json \
+            node_modules/argon2/package.json node_modules/@harperfast/rocksdb-js/package.json node_modules/lmdb/package.json \
+            node_modules/uWebSockets.js/package.json; do
+            if grep -qx "package/$unexpected" package-contents.txt; then
+              echo "The release must not contain $unexpected" >&2
+              exit 1
+            fi
+          done
+          mkdir package-artifact
+          cp "${packages[0]}" package-artifact/harper-pro.tgz
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harper-pro-npm-package
+          path: package-artifact/harper-pro.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  consumer-install:
+    name: Consumer install (npm ${{ matrix.npm }}, ${{ matrix.os }})
+    needs: build-package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, node: 22, npm: 10 }
+          - { os: ubuntu-latest, node: 24, npm: 11 }
+          - { os: ubuntu-latest, node: 26, npm: 12 }
+          - { os: ubuntu-24.04-arm, node: 24, npm: 11 }
+          - { os: macos-latest, node: 24, npm: 11 }
+          - { os: windows-latest, node: 24, npm: 11 }
+    defaults:
+      run:
+        shell: bash
+    env:
+      PACKAGE: ${{ github.workspace }}/package/harper-pro.tgz
+      LOCK: ${{ github.workspace }}/package-lock.json
+      BUNDLE_CHECK: ${{ github.workspace }}/core/build-tools/bundleDependencies.ts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Select npm ${{ matrix.npm }}
+        run: |
+          npm install --global --ignore-scripts npm@${{ matrix.npm }}
+          npm --version
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harper-pro-npm-package
+          path: package
+
+      # allowScripts is npm 12's per-project script approval; npm 10/11 ignore the field and run
+      # every install script.
+      - name: Install as a dependency, then rebuild from the consumer lock
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/consumer"
+          mkdir -p "$consumer"
+          printf '%s\n' '{"name":"harper-pro-consumer","private":true,"allowScripts":{"re2":true}}' > "$consumer/package.json"
+          npm install --prefix "$consumer" "$PACKAGE" --no-audit --no-fund
+          node "$BUNDLE_CHECK" installed "$consumer/node_modules/@harperfast/harper-pro" "$LOCK"
+          rm -rf "$consumer/node_modules"
+          npm ci --prefix "$consumer" --no-audit --no-fund
+          node "$BUNDLE_CHECK" installed "$consumer/node_modules/@harperfast/harper-pro" "$LOCK"
+          npm ls --prefix "$consumer" --all > /dev/null
+
+      - name: Bundled files are byte-identical to the archive
+        run: |
+          set -euo pipefail
+          mkdir package-extract
+          # Relative paths: GNU tar on Windows reads "D:\..." as a remote host.
+          tar -xzf package/harper-pro.tgz --strip-components=1 -C package-extract
+          node --input-type=module - package-extract "$RUNNER_TEMP/consumer/node_modules/@harperfast/harper-pro" <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readdirSync, readFileSync } from 'node:fs';
+          import { join, relative } from 'node:path';
+          const [archive, installed] = process.argv.slice(2);
+          function digests(root) {
+            const files = new Map();
+            for (const entry of readdirSync(join(root, 'node_modules'), { recursive: true, withFileTypes: true })) {
+              if (!entry.isFile()) continue;
+              const file = join(entry.parentPath, entry.name);
+              files.set(relative(root, file).replaceAll('\\', '/'), createHash('sha256').update(readFileSync(file)).digest('hex'));
+            }
+            return files;
+          }
+          const expected = digests(archive);
+          const actual = digests(installed);
+          let differences = 0;
+          for (const [file, digest] of expected) {
+            if (actual.get(file) !== digest) {
+              console.error(`${file}: ${actual.has(file) ? 'content differs' : 'missing'}`);
+              differences++;
+            }
+          }
+          if (differences) process.exit(1);
+          console.log(`${expected.size} bundled files match the archive`);
+          JS
+
+      - name: Native modules load from the installed package
+        env:
+          HARPER_PRO_ROOT: ${{ runner.temp }}/consumer/node_modules/@harperfast/harper-pro
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert';
+          import { mkdtempSync, rmSync } from 'node:fs';
+          import { createRequire } from 'node:module';
+          import { tmpdir } from 'node:os';
+          import { join } from 'node:path';
+          const requirePro = createRequire(join(process.env.HARPER_PRO_ROOT, 'package.json'));
+          const { SKIP } = requirePro('@harperfast/extended-iterable');
+          assert.strictEqual(typeof requirePro('argon2').hash, 'function');
+          const RE2 = requirePro('re2');
+          assert.ok(new RE2('^a+$').test('aaa'));
+          const profile = await requirePro('@datadog/pprof').time.profile({ durationMillis: 200 });
+          assert.ok(profile.sample.length >= 0);
+          const directory = mkdtempSync(join(tmpdir(), 'harper-pro-engines-'));
+          try {
+            for (const engine of ['rocksdb', 'lmdb']) {
+              const db = engine === 'rocksdb'
+                ? requirePro('@harperfast/rocksdb-js').RocksDatabase.open(join(directory, engine), { name: 'records' })
+                : requirePro('lmdb').open(join(directory, engine), { name: 'records' });
+              try {
+                await db.put('drop', { keep: false });
+                await db.put('keep', { keep: true });
+                assert.deepStrictEqual(Array.from(db.getRange().map((entry) => (entry.key === 'keep' ? entry.value : SKIP))), [{ keep: true }]);
+              } finally {
+                await db.close();
+              }
+            }
+          } finally {
+            rmSync(directory, { recursive: true, force: true });
+          }
+          JS
+
+      - name: Install globally and run the CLI
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/global"
+          npm install --global --prefix "$prefix" --allow-scripts=re2 "$PACKAGE" --no-audit --no-fund
+          root=$(node -p 'require("node:path").join(process.argv[1], process.platform === "win32" ? "" : "lib", "node_modules/@harperfast/harper-pro")' "$prefix")
+          node "$BUNDLE_CHECK" installed "$root" "$LOCK"
+          node "$root/dist/bin/harper.js" version
+          echo "HARPER_PRO_GLOBAL_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Globally installed Harper Pro boots and serves operations
+        env:
+          ROOTPATH: ${{ runner.temp }}/harper-root
+          TC_AGREEMENT: 'yes'
+          HDB_ADMIN_USERNAME: admin
+          HDB_ADMIN_PASSWORD: smoke-password
+          DEFAULTS_MODE: dev
+          LOGGING_STDSTREAMS: 'true'
+          OPERATIONSAPI_NETWORK_PORT: 29925
+          OPERATIONSAPI_NETWORK_SECUREPORT: 29935
+          HTTP_PORT: 29926
+          HTTP_SECUREPORT: 29936
+          MQTT_NETWORK_PORT: 21883
+          MQTT_NETWORK_SECUREPORT: 28883
+          REPLICATION_SECUREPORT: 29933
+        run: |
+          set -euo pipefail
+          node "$HARPER_PRO_GLOBAL_ROOT/dist/bin/harper.js" run > "$RUNNER_TEMP/harper.log" 2>&1 &
+          operation() {
+            curl -sf --max-time 10 -u "$HDB_ADMIN_USERNAME:$HDB_ADMIN_PASSWORD" -H 'Content-Type: application/json' \
+              -X POST "http://127.0.0.1:$OPERATIONSAPI_NETWORK_PORT" -d "$1"
+          }
+          for attempt in $(seq 1 90); do
+            if operation '{"operation":"describe_all"}' > /dev/null; then break; fi
+            if [[ $attempt -eq 90 ]]; then cat "$RUNNER_TEMP/harper.log"; exit 1; fi
+            sleep 2
+          done
+          operation '{"operation":"create_table","database":"smoke","table":"records","primary_key":"id"}'
+          operation '{"operation":"insert","database":"smoke","table":"records","records":[{"id":"a","value":1}]}'
+          for attempt in $(seq 1 15); do
+            if operation '{"operation":"search_by_id","database":"smoke","table":"records","ids":["a"],"get_attributes":["*"]}' | grep -q '"value":1'; then break; fi
+            if [[ $attempt -eq 15 ]]; then cat "$RUNNER_TEMP/harper.log"; exit 1; fi
+            sleep 1
+          done
+          operation '{"operation":"list_waf_rules"}'
+          node "$HARPER_PRO_GLOBAL_ROOT/dist/bin/harper.js" stop
+
+      - name: npm 12 default script policy leaves re2 unbuilt
+        if: matrix.npm == 12
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/global-default"
+          npm install --global --prefix "$prefix" "$PACKAGE" --no-audit --no-fund
+          root=$(node -p 'require("node:path").join(process.argv[1], process.platform === "win32" ? "" : "lib", "node_modules/@harperfast/harper-pro")' "$prefix")
+          if node -e "require(require.resolve('re2', { paths: [process.argv[1]] }))" "$root"; then
+            echo 're2 loaded without an install-script allowance; update build-tools/DESIGN.md and README.md' >&2
+            exit 1
+          fi
+
+  docker-image:
+    name: Docker image installs the bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: harper-pro:ci
+
+      - name: Image runs the installed CLI
+        run: docker run --rm --entrypoint harper harper-pro:ci version
