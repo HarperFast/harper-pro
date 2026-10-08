@@ -102,8 +102,7 @@ describe('Analytics profiler startup gate', () => {
 });
 
 describe('Analytics profiler sampling marker', () => {
-	// Core's own report flushes call the same listener and would consume the state these tests read;
-	// the restore recomputes core's initial value, which has no getter.
+	// Core's own report flushes call the same listener and would consume the state these tests read.
 	before(() => setAnalyticsEnabled(false));
 	after(() => setAnalyticsEnabled(envGet(CONFIG_PARAMS.ANALYTICS_AGGREGATEPERIOD) > -1));
 	afterEach(async () => {

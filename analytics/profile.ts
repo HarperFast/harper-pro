@@ -27,8 +27,6 @@ if (process.env.RUN_HDB_APP) userCodeFolders.push(realpathSync(process.env.RUN_H
 let profilerTimer: NodeJS.Timeout | undefined;
 let profilerStarted = false;
 export const PROFILER_SAMPLING_METRIC = 'profiler-sampling';
-// Sampler time not yet carried by this thread's analytics report: when the running sampler was last
-// accounted for, and the time of stretches that already ended.
 let samplingSince: number | undefined;
 let unreportedSamplingMs = 0;
 // @datadog/pprof prebuilds link the raw V8 ABI and segfault under V8 pointer compression. The
