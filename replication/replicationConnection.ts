@@ -6510,7 +6510,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								let floorTimer: ReturnType<typeof setTimeout> | undefined;
 								let capturedFloors: Map<string, number> | undefined;
 								const certifiedFloors = new Map<string, number>();
-								let floorEmissionLatchedRange: unknown; // a range that lost an entry certifies nothing more
+								let floorEmissionLatchedRange: unknown;
 								let attachedNextTransaction: Promise<void> | undefined;
 								let wakeSenderFailed: ((error: unknown) => void) | undefined;
 								const originCertifies = (name: string) =>
@@ -7957,7 +7957,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		instanceRetired = true;
 		wsClosed = true;
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
-		if (options.connection?.peerCapabilities === peerCapabilities) options.connection.peerCapabilities = undefined;
+		if (options.connection?.peerCapabilities === peerCapabilities) {
+			options.connection.peerCapabilities = undefined;
+			// the peer's floor capability describes this socket; the replacement writes its own
+			if (peerCapabilitiesLearned && replicationSharedStatus)
+				replicationSharedStatus[PEER_CERTIFIES_FLOORS_POSITION] = 0;
+		}
 		pendingSubscriptionSetupRequestId = undefined;
 		clearInterval(sendPingInterval);
 		receiveWatchdog?.stop();
