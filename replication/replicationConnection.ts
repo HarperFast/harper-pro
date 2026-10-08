@@ -776,6 +776,10 @@ const TEST_OMIT_CAPABILITIES = process.env.HARPER_TEST_OMIT_REPLICATION_CAPABILI
 const TEST_ORIGIN_FLOOR_INTERVAL_MS = Number(process.env.HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS);
 /** Authorized drop markers for a database not open on this thread yet: they cannot be recorded until it is. */
 const markersAwaitingDatabase = new Map<string, TableDropMarker[]>();
+/** Clears the held list a pass recorded, unless an overlapping pass has since merged in markers it has not. */
+function releaseHeldMarkers(databaseName: string, recorded: TableDropMarker[]) {
+	if (markersAwaitingDatabase.get(databaseName) === recorded) markersAwaitingDatabase.delete(databaseName);
+}
 /**
  * The catalog's stamp when this thread's class predates another thread's backfill. Test-only: a pre-stamp sender
  * has no capability bag and no lifecycle stamps on its definitions.
@@ -5333,9 +5337,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (waiting) markersAwaitingDatabase.set(schemaDatabaseName, pendingMarkers);
 							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
 							if (connectionSuperseded()) return;
-							// an overlapping pass may have merged in markers it has not recorded yet
-							if (markersAwaitingDatabase.get(schemaDatabaseName) === pendingMarkers)
-								markersAwaitingDatabase.delete(schemaDatabaseName);
+							releaseHeldMarkers(schemaDatabaseName, pendingMarkers);
 							pendingMarkers = [];
 						}
 						for (const tableDefinition of data) {
@@ -5378,7 +5380,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 						if (pendingMarkers.length > 0 && databases[schemaDatabaseName]) {
 							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
-							if (!connectionSuperseded()) markersAwaitingDatabase.delete(schemaDatabaseName);
+							if (!connectionSuperseded()) releaseHeldMarkers(schemaDatabaseName, pendingMarkers);
 						}
 						break;
 					}
