@@ -20,17 +20,24 @@ suite('a replication pool refuses a table with application-resolved computed ind
 		const started = await Promise.allSettled(
 			[0, 1].map(async () => {
 				const hostname = await getNextAvailableLoopbackAddress();
-				const dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
-				await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
-				const node = { name: ctx.name, harper: { hostname, dataRootDir } };
-				await startHarper(node, {
-					config: {
-						analytics: { aggregatePeriod: -1 },
-						logging: { colors: false, console: true, level: 'warn' },
-						replication: { securePort: hostname + ':9933', threads: 2 },
-					},
-				});
-				return node.harper;
+				let dataRootDir;
+				try {
+					dataRootDir = await mkdtemp(join(tmpdir(), 'harper-integration-test-'));
+					await cp(FIXTURE, join(dataRootDir, 'components', basename(FIXTURE)), { recursive: true });
+					const node = { name: ctx.name, harper: { hostname, dataRootDir } };
+					await startHarper(node, {
+						config: {
+							analytics: { aggregatePeriod: -1 },
+							logging: { colors: false, console: true, level: 'warn' },
+							replication: { securePort: hostname + ':9933', threads: 2 },
+						},
+					});
+					return node.harper;
+				} catch (error) {
+					// not yet in ctx.nodes, so release the reserved address and data root here
+					await teardownHarper({ harper: { hostname, dataRootDir } }).catch(() => {});
+					throw error;
+				}
 			})
 		);
 		// a node that did start must still reach after()'s teardown when its sibling failed

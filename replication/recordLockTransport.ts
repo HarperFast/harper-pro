@@ -1211,9 +1211,11 @@ export function handleOwnerThreadAck(message: { requestId: number }, port?: { th
  * Tell every LIVE http and replication worker the database is now ownerless and WAIT for each to confirm it has fenced
  * the relayed handles it held, before the successor is assigned. Resolves once every worker has acked
  * OR exited; REJECTS if a live worker fails to ack within the timeout (handoff fails, database stays
- * unowned and fail-closed). The caller passes the already-filtered live set (the just-exited owner
- * excluded) — recomputing it here could include the departed owner, whose `exit` has already fired and
+ * unowned and fail-closed). The set must not include a departed owner, whose `exit` has already fired and
  * whose closed port neither throws on post nor fires `exit` again, stalling the wait to its timeout.
+ * `recordLockOwnerFor` passes the live participants (read from `workers`) plus its candidates; core's own
+ * `exit` listener, registered when the worker starts, removes it from `workers` before `watchOwnerExit`'s
+ * listener runs, so the departed owner is already gone from both.
  *
  * A worker that EXITS is resolved as fenced even though an in-flight async write it submitted could
  * still land, and an abandoned commit is NOT cancelled by its thread's death. What holds the case is

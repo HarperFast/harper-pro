@@ -5200,7 +5200,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (isDedicatedPoolWorker()) {
 							const unresolved = table?.unresolvedComputedIndexes?.();
 							if (unresolved?.length) {
-								const reason = `${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code, which replication.threads workers cannot run; use replication.threads: 0`;
+								const reason = `${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code, which replication.threads workers cannot run; no table of ${databaseName} replicates from this peer, use replication.threads: 0`;
 								logger.error?.(connectionId, `Refusing to replicate: ${reason}`);
 								wsClosed = true;
 								delete tableDecoders[tableId];

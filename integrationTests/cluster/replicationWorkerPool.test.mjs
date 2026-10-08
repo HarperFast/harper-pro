@@ -65,14 +65,20 @@ suite('replication runs on the dedicated worker pool', (ctx) => {
 		const started = await Promise.allSettled(
 			Array.from({ length: NODE_COUNT }, async () => {
 				const nodeCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
-				await startHarper(nodeCtx, {
-					config: {
-						analytics: { aggregatePeriod: -1 },
-						logging: { colors: false, stdStreams: false, console: true, level: 'debug' },
-						replication: { securePort: nodeCtx.harper.hostname + ':9933', threads: POOL_SIZE },
-					},
-					env: { HARPER_NO_FLUSH_ON_EXIT: true },
-				});
+				try {
+					await startHarper(nodeCtx, {
+						config: {
+							analytics: { aggregatePeriod: -1 },
+							logging: { colors: false, stdStreams: false, console: true, level: 'debug' },
+							replication: { securePort: nodeCtx.harper.hostname + ':9933', threads: POOL_SIZE },
+						},
+						env: { HARPER_NO_FLUSH_ON_EXIT: true },
+					});
+				} catch (error) {
+					// not yet in ctx.nodes, so release the reserved address (and any data root) here
+					await teardownHarper(nodeCtx).catch(() => {});
+					throw error;
+				}
 				return nodeCtx.harper;
 			})
 		);

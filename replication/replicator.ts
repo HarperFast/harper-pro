@@ -353,7 +353,7 @@ function warnOfUnresolvedComputedIndexes() {
 			const unresolved = databases[databaseName][tableName]?.unresolvedComputedIndexes?.();
 			if (unresolved?.length)
 				logger.error(
-					`${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code; replication.threads workers will refuse to replicate it, use replication.threads: 0`
+					`${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code; replication.threads workers will refuse to replicate any table of ${databaseName}, use replication.threads: 0`
 				);
 		}
 	}
