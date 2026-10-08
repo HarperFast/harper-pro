@@ -2,7 +2,7 @@
  * This module is responsible for profiling threads so we can determine how much CPU usage can be attributed
  * to user code, harper code, and individual "hot" functions
  */
-import { recordAction } from '../core/resources/analytics/write.ts';
+import { addAnalyticsListener, recordAction } from '../core/resources/analytics/write.ts';
 import { getHdbBasePath } from '../core/utility/environment/environmentManager.js';
 import { PACKAGE_ROOT } from '../core/utility/packageUtils.js';
 import { existsSync, realpathSync, readFileSync, readdirSync } from 'node:fs';
@@ -26,6 +26,9 @@ if (process.env.RUN_HDB_APP) userCodeFolders.push(realpathSync(process.env.RUN_H
 
 let profilerTimer: NodeJS.Timeout | undefined;
 let profilerStarted = false;
+export const PROFILER_SAMPLING_METRIC = 'profiler-sampling';
+let samplingSince: number | undefined;
+let unreportedSamplingMs = 0;
 // @datadog/pprof prebuilds link the raw V8 ABI and segfault under V8 pointer compression. The
 // pointer-compression Docker image swaps in a binary rebuilt for that ABI and marks the package
 // with .pointer-compression-build; without the marker, skip profiling instead of crashing.
@@ -68,21 +71,43 @@ export function startAutomaticProfiling(options: Scope['options']): boolean {
 				: undefined;
 	if (disabledReason) {
 		log.info?.(disabledReason);
+		cancelScheduledCapture();
 		if (profilerStarted) captureProfile(-1);
 		return false;
 	}
 	if (profilerUnavailable()) return false;
-	if (!profilerStarted && !startProfiler()) return false;
-	scheduleCapture(capturePeriod, capturePeriod);
-	return true;
+	return scheduleCapture(capturePeriod, capturePeriod);
+}
+
+// One period keeps cpu-usage and the hot-location threshold meaning what they do; with a capture
+// every period it would be always-on again, which inflates `utilization` (analytics/DESIGN.md).
+function samplingWindow(): number {
+	return capturePeriod > 0 ? capturePeriod : Infinity;
+}
+
+function cancelScheduledCapture() {
+	clearTimeout(profilerTimer);
+	captureGeneration++;
 }
 
 // A capture's successor runs after the delay that capture was asked for, and is itself asked for
 // `delayAfterThat`. Automatic profiling asks the first capture for one period and every later one
 // for the shipped default, so captures land at one and two periods and then a thousand periods out.
-function scheduleCapture(delay: number, delayAfterThat = shippedRescheduleDelay()) {
-	clearTimeout(profilerTimer);
-	captureGeneration++;
+function scheduleCapture(delay: number, delayAfterThat = shippedRescheduleDelay()): boolean {
+	cancelScheduledCapture();
+	const windowDelay = Math.max(0, delay - samplingWindow());
+	if (windowDelay === 0) {
+		if (!profilerStarted && !startProfiler()) return false;
+		armCapture(delay, delayAfterThat);
+		return true;
+	}
+	profilerTimer = setTimeout(() => {
+		if (startProfiler()) armCapture(delay - windowDelay, delayAfterThat);
+	}, windowDelay).unref();
+	return true;
+}
+
+function armCapture(delay: number, delayAfterThat: number) {
 	profilerTimer = setTimeout(() => {
 		captureProfile(delayAfterThat);
 	}, delay).unref();
@@ -101,6 +126,7 @@ function startProfiler(): boolean {
 	} finally {
 		profilerStarted = timeProfiler.isStarted();
 	}
+	samplingSince = performance.now();
 	log.debug?.(`Profiler started in ${(performance.now() - startedAt).toFixed(1)}ms`);
 	return true;
 }
@@ -112,9 +138,28 @@ function stopProfiler(restart: boolean): Profile {
 		return timeProfiler.stop(restart);
 	} finally {
 		profilerStarted = timeProfiler.isStarted();
+		if (!profilerStarted && samplingSince !== undefined) {
+			unreportedSamplingMs += performance.now() - samplingSince;
+			samplingSince = undefined;
+		}
 		log.debug?.(`Profiler stop returned after ${(performance.now() - startedAt).toFixed(1)}ms (restart=${restart})`);
 	}
 }
+
+// Rides on the report whose `utilization` sample (appended by core on the main thread) overlapped the
+// sampler, including a thread's first report after a window it reported nothing in.
+export function markProfilerSampling(metrics: { metric: string; total?: number; count?: number }[]) {
+	let sampledMs = unreportedSamplingMs;
+	unreportedSamplingMs = 0;
+	if (samplingSince !== undefined) {
+		const now = performance.now();
+		sampledMs += now - samplingSince;
+		samplingSince = now;
+	}
+	if (sampledMs > 0) metrics.push({ metric: PROFILER_SAMPLING_METRIC, total: Math.ceil(sampledMs), count: 1 });
+}
+addAnalyticsListener(markProfilerSampling);
+
 let lastChildCpuTime = 0;
 let gpuAvailable = true;
 // Bumped by every capture and lifecycle change, so a capture still awaiting GPU measurement when a
@@ -134,12 +179,12 @@ function shippedRescheduleDelay(): number {
 }
 
 export async function captureProfile(delayToNextCapture = shippedRescheduleDelay()): Promise<void> {
-	clearTimeout(profilerTimer);
+	cancelScheduledCapture();
 	if (profilerUnavailable()) return;
 	const continuous = delayToNextCapture > 0;
-	const generation = ++captureGeneration;
+	const generation = captureGeneration;
 	if (!profilerStarted) {
-		if (continuous && startProfiler()) scheduleCapture(delayToNextCapture);
+		if (continuous && startProfiler()) armCapture(delayToNextCapture, shippedRescheduleDelay());
 		return;
 	}
 	const hitCountThreshold = 100;
@@ -153,7 +198,7 @@ export async function captureProfile(delayToNextCapture = shippedRescheduleDelay
 	// Start GPU measurement early so it runs in parallel with CPU profiling work
 	const gpuPromise = getWorkerIndex() === 0 && gpuAvailable ? getGpuUtilization() : null;
 	try {
-		const profile = stopProfiler(continuous);
+		const profile = stopProfiler(continuous && delayToNextCapture <= samplingWindow());
 		const strings = profile.stringTable.strings;
 		for (let func of profile.function) {
 			fileNameById.set(func.id as number, strings[func.filename as number]);
