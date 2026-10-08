@@ -19,7 +19,7 @@ import {
 	tableLifecycleTime,
 } from '../core/resources/databases.ts';
 import { TableGenerationDroppedError } from '../core/utility/errors/hdbError.ts';
-import { validateDropMarkers, rowsAround, MAX_DROP_MARKERS_PER_FRAME } from './tableLifecycle.ts';
+import { validateDropMarkers, mergeDropMarkers, rowsAround, MAX_DROP_MARKERS_PER_FRAME } from './tableLifecycle.ts';
 import type { TableDropMarker } from '../core/resources/databases.ts';
 import {
 	createAuditEntry,
@@ -5322,13 +5322,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// A stale local generation goes before this frame's definitions are compared. Markers for a database
 						// not open here wait, refusing what they retire, until a definition opens it.
 						const waiting = markersAwaitingDatabase.get(schemaDatabaseName);
-						let pendingMarkers = waiting ? validateDropMarkers([...waiting, ...peerDropMarkers]) : peerDropMarkers;
+						let pendingMarkers = waiting ? mergeDropMarkers(waiting, peerDropMarkers) : peerDropMarkers;
 						if (!databases[schemaDatabaseName]) {
 							if (pendingMarkers.length > 0) markersAwaitingDatabase.set(schemaDatabaseName, pendingMarkers);
 						} else if (pendingMarkers.length > 0) {
-							markersAwaitingDatabase.delete(schemaDatabaseName);
 							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
 							if (connectionSuperseded()) return;
+							if (waiting) markersAwaitingDatabase.delete(schemaDatabaseName);
 							pendingMarkers = [];
 						}
 						for (const tableDefinition of data) {
@@ -5370,8 +5370,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							}
 						}
 						if (pendingMarkers.length > 0 && databases[schemaDatabaseName]) {
-							markersAwaitingDatabase.delete(schemaDatabaseName);
 							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
+							if (!connectionSuperseded()) markersAwaitingDatabase.delete(schemaDatabaseName);
 						}
 						break;
 					}

@@ -22,6 +22,20 @@ export function validateDropMarkers(raw: unknown): TableDropMarker[] {
 
 const ROWS_PER_TURN = 10000;
 
+/** The newest drop per table across lists, keeping the newest MAX_DROP_MARKERS_PER_FRAME. */
+export function mergeDropMarkers(...lists: TableDropMarker[][]): TableDropMarker[] {
+	const byTable = new Map<string, TableDropMarker>();
+	for (const list of lists)
+		for (const marker of list) {
+			const existing = byTable.get(marker.table);
+			if (!existing || existing.droppedTime < marker.droppedTime) byTable.set(marker.table, marker);
+		}
+	const merged = [...byTable.values()];
+	return merged.length > MAX_DROP_MARKERS_PER_FRAME
+		? merged.sort((a, b) => b.droppedTime - a.droppedTime).slice(0, MAX_DROP_MARKERS_PER_FRAME)
+		: merged;
+}
+
 /**
  * Where a table's rows sit relative to `time`. Versions are origin write times, so a row of a generation
  * created after a drop is never older than that drop; one that is proves the table is the generation the

@@ -1,7 +1,12 @@
 /** `DB_SCHEMA[4]` can make this node drop a table, so what a peer sends is validated and bounded first. */
 
 import assert from 'node:assert/strict';
-import { validateDropMarkers, rowsAround, MAX_DROP_MARKERS_PER_FRAME } from '#src/replication/tableLifecycle';
+import {
+	validateDropMarkers,
+	mergeDropMarkers,
+	rowsAround,
+	MAX_DROP_MARKERS_PER_FRAME,
+} from '#src/replication/tableLifecycle';
 
 describe('validateDropMarkers', () => {
 	it('keeps only well-formed entries and the newest drop per table', () => {
@@ -33,6 +38,22 @@ describe('validateDropMarkers', () => {
 	it('bounds the list a peer can send', () => {
 		const raw = Array.from({ length: MAX_DROP_MARKERS_PER_FRAME + 5 }, (_, i) => ({ table: 't' + i, droppedTime: 1 }));
 		assert.equal(validateDropMarkers(raw).length, MAX_DROP_MARKERS_PER_FRAME);
+	});
+});
+
+describe('mergeDropMarkers', () => {
+	it('keeps the newest drop per table across lists, deduplicating before it bounds', () => {
+		const cached = Array.from({ length: MAX_DROP_MARKERS_PER_FRAME }, (_, i) => ({ table: 't' + i, droppedTime: 10 }));
+		const merged = mergeDropMarkers(cached, [
+			{ table: 't0', droppedTime: 20 },
+			{ table: 'fresh', droppedTime: 30 },
+		]);
+		assert.equal(merged.length, MAX_DROP_MARKERS_PER_FRAME);
+		assert.equal(merged.find((marker) => marker.table === 't0').droppedTime, 20, 'a newer drop for a cached name wins');
+		assert.ok(
+			merged.some((marker) => marker.table === 'fresh'),
+			"the new frame's marker survives the bound"
+		);
 	});
 });
 
