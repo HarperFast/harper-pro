@@ -2,6 +2,8 @@ import assert from 'node:assert';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { time as timeProfiler } from '@datadog/pprof';
 import { setAnalyticsEnabled } from '#src/core/resources/analytics/write';
+import { get as envGet } from '#src/core/utility/environment/environmentManager';
+import { CONFIG_PARAMS } from '#src/core/utility/hdbTerms';
 import {
 	captureProfile,
 	markProfilerSampling,
@@ -72,10 +74,10 @@ describe('Analytics profiler startup gate', () => {
 		assert.equal(timeProfiler.isStarted(), true);
 	});
 	it('samples across the two startup captures and stops after the second', async () => {
-		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.3 })), true);
-		await sleep(450);
+		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.5 })), true);
+		await sleep(750);
 		assert.equal(timeProfiler.isStarted(), true);
-		await sleep(550);
+		await sleep(750);
 		assert.equal(timeProfiler.isStarted(), false);
 	});
 	it('samples only in the one-period window before a capture', async () => {
@@ -100,9 +102,10 @@ describe('Analytics profiler startup gate', () => {
 });
 
 describe('Analytics profiler sampling marker', () => {
-	// Core's own report flushes call the same listener and would consume the state these tests read.
+	// Core's own report flushes call the same listener and would consume the state these tests read;
+	// the restore recomputes core's initial value, which has no getter.
 	before(() => setAnalyticsEnabled(false));
-	after(() => setAnalyticsEnabled(true));
+	after(() => setAnalyticsEnabled(envGet(CONFIG_PARAMS.ANALYTICS_AGGREGATEPERIOD) > -1));
 	afterEach(async () => {
 		await captureProfile(-1);
 	});
