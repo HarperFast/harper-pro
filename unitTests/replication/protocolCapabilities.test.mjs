@@ -6,12 +6,14 @@ import {
 	LOCAL_PROTOCOL_VERSION,
 	MINIMUM_PROTOCOL_VERSION,
 	ORIGIN_CURSORS_CAPABILITY,
+	ORIGIN_FLOORS_CAPABILITY,
 	RECORD_LOCKS_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
 	peerSupportsOriginCursors,
+	peerSupportsOriginFloors,
 	peerSupportsRecordLocks,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
@@ -32,6 +34,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				subscriptionSetupBudgetMs: undefined,
 				recordLocks: 0,
 				originCursors: 0,
+				originFloors: 0,
 			}
 		);
 	});
@@ -52,6 +55,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 		const resolved = resolvePeerCapabilities({ subscriptionSetupAck: 1, futureThing: 3, somethingElse: 'x' });
 		assert.deepStrictEqual(Object.keys(resolved).sort(), [
 			'originCursors',
+			'originFloors',
 			'protocolVersion',
 			'recordLocks',
 			'safeCopyAudit',
@@ -228,6 +232,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
 				originCursors: ORIGIN_CURSORS_CAPABILITY,
+				originFloors: ORIGIN_FLOORS_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -267,6 +272,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				subscriptionSetupBudgetMs: 90_000,
 				recordLocks: RECORD_LOCKS_CAPABILITY,
 				originCursors: ORIGIN_CURSORS_CAPABILITY,
+				originFloors: ORIGIN_FLOORS_CAPABILITY,
 			}
 		);
 	});
@@ -352,6 +358,35 @@ describe('samePeerCapabilities', () => {
 		const withCursors = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
 		const withoutCursors = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, false));
 		assert.strictEqual(samePeerCapabilities(withCursors, withoutCursors), false);
+	});
+
+	it('reports a change in originFloors alone', () => {
+		const full = resolvePeerCapabilities(buildLocalCapabilities(90_000, true, true));
+		const withoutFloors = resolvePeerCapabilities({ ...buildLocalCapabilities(90_000, true, true), originFloors: 0 });
+		assert.strictEqual(peerSupportsOriginCursors(withoutFloors), true);
+		assert.strictEqual(samePeerCapabilities(full, withoutFloors), false);
+	});
+});
+
+describe('resolvePeerCapabilities — originFloors is a level, absent means no certificates either way', () => {
+	it('resolves absent, malformed and pre-#922 bags to 0', () => {
+		for (const bag of [undefined, {}, { originFloors: 'yes' }, { originFloors: NaN }, { originCursors: 1 }]) {
+			assert.strictEqual(peerSupportsOriginFloors(resolvePeerCapabilities(bag)), false, inspect(bag));
+		}
+	});
+
+	it('clamps a newer level to the one this build implements', () => {
+		assert.strictEqual(resolvePeerCapabilities({ originFloors: 7 }).originFloors, ORIGIN_FLOORS_CAPABILITY);
+		assert.strictEqual(peerSupportsOriginFloors(resolvePeerCapabilities({ originFloors: '1' })), true);
+	});
+
+	it('is advertised only with per-origin transaction logs, like originCursors', () => {
+		assert.strictEqual(buildLocalCapabilities(90_000, true, false).originFloors, 0);
+		assert.strictEqual(peerSupportsOriginFloors(resolvePeerCapabilities(buildLocalCapabilities(1, true, true))), true);
+		assert.strictEqual(
+			peerSupportsOriginFloors(resolvePeerCapabilities(buildLocalCapabilities(1, true, false))),
+			false
+		);
 	});
 });
 
