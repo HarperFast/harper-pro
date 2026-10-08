@@ -75,7 +75,7 @@ suite('cluster record locks: three-node full mesh', { timeout: 420_000 }, (ctx) 
 			assert.equal(typeof locks.ownerThreadId, 'number', 'the single http worker coordinates the database');
 			assert.equal(locks.granted, 0);
 			assert.equal(locks.admitted, 0);
-			assert.equal(locks.droppedOffOwner, 0, 'nothing is applied off the coordinating worker');
+			assert.equal(locks.droppedOffOwner, 0, 'no control entry failed to reach the coordinating worker');
 			rings.push(JSON.stringify(locks.members));
 		}
 		// The whole point of deriving the home from an agreed set: every node computes the same ring.
@@ -454,3 +454,109 @@ suite('cluster record locks at threads.count > 1 (harper-pro#852)', { timeout: 4
 		// land off the owner is routing-dependent. Exclusion across the node boundary is the real proof.
 	});
 });
+
+suite(
+	'cluster record locks: a release applied off the coordinating worker (harper-pro#977)',
+	{ timeout: 420_000 },
+	(ctx) => {
+		const contexts = [];
+		let multi; // the home: several http workers, subscriptions placed round-robin across them
+		let peers; // two single-worker delegates, so one of their streams provably lands off multi's owner
+		let nodes;
+
+		before(async () => {
+			const started = await Promise.allSettled([
+				startNode(ctx.name, {}, 3),
+				startNode(ctx.name, {}, 1),
+				startNode(ctx.name, {}, 1),
+			]);
+			for (const result of started) if (result.status === 'fulfilled') contexts.push(result.value);
+			const failed = started.find((result) => result.status === 'rejected');
+			if (failed) throw failed.reason;
+			[multi, ...peers] = contexts.map((c) => c.harper);
+			nodes = [multi, ...peers];
+			await connectMesh(nodes);
+			await bootstrapHomeMap(nodes);
+			await waitForRing(nodes, nodes.length);
+		});
+
+		after(async () => {
+			for (const c of contexts) await stopNode(c);
+		});
+
+		async function offOwnerDelegate() {
+			const status = await clusterStatusOf(multi);
+			const ownerThreadId = status.recordLocks?.[DB]?.ownerThreadId;
+			const placement = status.connections.map((connection) => ({
+				peer: connection.name,
+				threadId: connection.database_sockets.find((socket) => socket.database === DB)?.threadId,
+			}));
+			const off = placement.find((entry) => typeof entry.threadId === 'number' && entry.threadId !== ownerThreadId);
+			assert.ok(
+				off,
+				`no peer's ${DB} subscription is applied off multi's coordinating worker ${ownerThreadId}: ${JSON.stringify(placement)}`
+			);
+			const delegate = peers.find((peer) => peer.hostname === off.peer || off.peer.startsWith(peer.hostname));
+			assert.ok(delegate, `peer ${off.peer} is not one of ${peers.map((peer) => peer.hostname)}`);
+			return { delegate, contender: peers.find((peer) => peer !== delegate), ownerThreadId, placement };
+		}
+
+		/** multi's `granted` gauge moves only for its own grants. */
+		async function holdKeyHomedOnMulti(delegate) {
+			for (let i = 0; i < 40; i++) {
+				const id = `relay-${Date.now()}-${i}`;
+				const before = (await clusterStatusOf(multi)).recordLocks[DB].granted;
+				const held = await call(delegate, 'LockHold/', { id, lease: 30_000, timeout: 5_000 });
+				assert.equal(held.status, 200, `hold ${id} on ${delegate.hostname}: ${JSON.stringify(held.body)}`);
+				if ((await clusterStatusOf(multi)).recordLocks[DB].granted > before) return { id, token: held.body.token };
+				await call(delegate, 'LockRelease/', { token: held.body.token });
+			}
+			assert.fail('no key homed on multi in 40 tries');
+		}
+
+		test("a delegate's release reaches the home from a non-owner worker, so a contender is admitted fresh", async () => {
+			const { delegate, contender, ownerThreadId, placement } = await offOwnerDelegate();
+			const { id, token } = await holdKeyHomedOnMulti(delegate);
+			const written = await call(delegate, 'LockWrite/', { token, n: 7 });
+			assert.equal(written.status, 200, JSON.stringify(written.body));
+			const released = await call(delegate, 'LockRelease/', { token });
+			assert.equal(released.status, 200);
+			// The delegation stays with `delegate` after unlock. A contender makes multi recall it; the
+			// delegate's lockRelease then replicates to multi over the stream placed OFF its coordinating
+			// worker, and only the relay lets the home clear the grant before the delegation's own lease
+			// (minutes) — inside this timeout, a dropped release answers 423.
+			const before = (await clusterStatusOf(multi)).recordLocks[DB];
+			const contended = await call(contender, 'LockedIncrement/', { id, timeout: 30_000 });
+			assert.equal(
+				contended.status,
+				200,
+				`${contender.hostname} was not admitted after ${delegate.hostname} released (placement ${JSON.stringify(placement)}, owner ${ownerThreadId}): ${JSON.stringify(contended.body)}`
+			);
+			assert.equal(contended.body.n, 8, "the successor read the predecessor's write (successor freshness)");
+			// And the home itself as the next successor: its own lock() relays to the owner worker, and the
+			// contender's release in turn reaches it over whichever worker applies that stream.
+			const own = await call(multi, 'LockedIncrement/', { id, timeout: 30_000 });
+			assert.equal(own.status, 200, JSON.stringify(own.body));
+			assert.equal(own.body.n, 9);
+			const after = (await clusterStatusOf(multi)).recordLocks[DB];
+			assert.ok(
+				(after.relayedControlEntries ?? 0) > (before.relayedControlEntries ?? 0),
+				`no control entry was relayed to multi's coordinating worker: ${JSON.stringify(after)}`
+			);
+			assert.equal(
+				after.droppedOffOwner,
+				0,
+				`a release failed to reach the coordinating worker: ${JSON.stringify(after)}`
+			);
+			assert.equal(after.controlEntryRelayDrops, 0, `releases could not be relayed: ${JSON.stringify(after)}`);
+			assert.ok(after.outbound, 'the owner reports how its lock operations reached the peers');
+			assert.equal(
+				after.outbound.fresh,
+				0,
+				`the owner opened a connection per call: ${JSON.stringify(after.outbound)}`
+			);
+			const finalValues = await waitForCounter(nodes, id, 9);
+			assert.deepEqual(finalValues, [9, 9, 9]);
+		});
+	}
+);

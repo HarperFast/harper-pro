@@ -23,4 +23,4 @@ home map: operator-agreed list of nodes participating in record locks, published
 home generation: version number of the home map, which staging refuses unless above every generation the node has seen
 quiesce: post-staging drain in which a node surrenders every delegation it holds and recalls every grant it issued
 lock barrier: record-lock control entry whose commit, matched on origin, position and nonce, proves that origin's prior writes applied
-coordinating worker: the one worker thread per database that owns its record-lock coordination and, with recordLocks on, its peer subscriptions
+coordinating worker: the one worker thread per database that owns its record-lock coordination; peer subscriptions are placed independently and relay control entries to it
