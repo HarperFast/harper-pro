@@ -211,22 +211,26 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
-  # Rolling upgrade from previous releases onto this build, and a one-node rollback. Its own job so the
+  # Rolling upgrade from a previous release onto this build, and a one-node rollback. Its own job so the
   # previous releases are installed only here; in the cluster shards the file finds no installs and skips.
   run-mixed-version-tests:
-    name: Mixed-version Cluster Tests (Node.js v${{ matrix.node-version }})
+    name: Mixed-version Cluster Tests from ${{ matrix.previous-release }} (Node.js v${{ matrix.node-version }})
     runs-on: ubuntu-latest
     needs: [generate-node-version-matrix, build]
-    # 15 + 15: three sequential retry.sh calls (re2 rebuild, two release installs) can each burn the full
-    # 30/60/90s backoff before succeeding on the last attempt.
+    # 15 + 15: three sequential retry.sh calls (two re2 rebuilds, the release install) can each burn the
+    # full 30/60/90s backoff before succeeding on the last attempt.
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.node-versions) }}
+        # Bump as the release lines move. The rollback crosses the minor-downgrade gate only from a release
+        # of an older minor than this build.
+        previous-release: ['5.2.15', '5.3.1']
     env:
-      # Bump the releases as the release lines move; the test reads each version from its package.json.
-      PREVIOUS_RELEASES: '5.2.15 5.3.1'
+      PREVIOUS_RELEASE: ${{ matrix.previous-release }}
+      PREVIOUS_INSTALL_DIR: /tmp/harper-pro-${{ matrix.previous-release }}
+      HARPER_PRO_PREVIOUS_VERSION_PATHS: /tmp/harper-pro-${{ matrix.previous-release }}/node_modules/@harperfast/harper-pro
       TEST_FILE: integrationTests/cluster/mixedVersionRollingUpgrade.test.mjs
 
     steps:
@@ -253,16 +257,13 @@ jobs:
       - name: Build re2 native binary
         run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
 
-      - name: Install previous harper-pro releases
+      # --ignore-scripts skips re2's binary download here too, and the release's waf component needs it.
+      - name: Install harper-pro ${{ matrix.previous-release }}
         run: |
-          installs=()
-          for version in $PREVIOUS_RELEASES; do
-            mkdir -p "/tmp/harper-pro-$version"
-            .github/scripts/retry.sh "npm install @harperfast/harper-pro@$version" -- \
-              npm install --ignore-scripts --no-audit --no-fund --prefix "/tmp/harper-pro-$version" "@harperfast/harper-pro@$version"
-            installs+=("/tmp/harper-pro-$version/node_modules/@harperfast/harper-pro")
-          done
-          echo "HARPER_PRO_PREVIOUS_VERSION_PATHS=$(IFS=:; echo "${installs[*]}")" >> "$GITHUB_ENV"
+          mkdir -p "$PREVIOUS_INSTALL_DIR"
+          .github/scripts/retry.sh "npm install @harperfast/harper-pro@$PREVIOUS_RELEASE" -- \
+            npm install --ignore-scripts --no-audit --no-fund --prefix "$PREVIOUS_INSTALL_DIR" "@harperfast/harper-pro@$PREVIOUS_RELEASE"
+          .github/scripts/retry.sh "npm rebuild re2 for $PREVIOUS_RELEASE" -- npm rebuild re2 --prefix "$PREVIOUS_INSTALL_DIR"
 
       # The file skips when it finds no installs, which would make this job a false green.
       - name: Guard mixed-version test inputs
@@ -271,17 +272,16 @@ jobs:
             echo "::error::mixed-version test file '$TEST_FILE' does not exist — this job would run no tests."
             exit 1
           fi
-          IFS=: read -ra installs <<< "$HARPER_PRO_PREVIOUS_VERSION_PATHS"
-          if [ "${#installs[@]}" -eq 0 ]; then
-            echo "::error::HARPER_PRO_PREVIOUS_VERSION_PATHS is empty — the mixed-version suite would skip."
-            exit 1
-          fi
-          for install in "${installs[@]}"; do
-            if [ ! -f "$install/package.json" ] || [ ! -f "$install/dist/bin/harper.js" ]; then
-              echo "::error::no harper-pro install at '$install'."
+          for file in package.json dist/bin/harper.js; do
+            if [ ! -f "$HARPER_PRO_PREVIOUS_VERSION_PATHS/$file" ]; then
+              echo "::error::the harper-pro $PREVIOUS_RELEASE install has no $file."
               exit 1
             fi
           done
+          if ! find "$PREVIOUS_INSTALL_DIR/node_modules" -path '*/re2/build/Release/re2.node' | grep -q .; then
+            echo "::error::the harper-pro $PREVIOUS_RELEASE install has no re2 native binary."
+            exit 1
+          fi
 
       - name: Run mixed-version cluster tests
         env:
@@ -292,7 +292,7 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: harper-mixed-version-logs-node-${{ matrix.node-version }}
+          name: harper-mixed-version-logs-${{ matrix.previous-release }}-node-${{ matrix.node-version }}
           path: /tmp/harper-integration-test-logs/
           retention-days: 3
           if-no-files-found: ignore
