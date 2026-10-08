@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const scriptPath = join(root, 'scripts/patch-release.js');
-const { milestoneTargetsRelease, isPRPresent } = createRequire(import.meta.url)(scriptPath);
+const { milestoneTargetsRelease, isPRPresent, backportVerificationApplies, evaluateWorkflowRuns } = createRequire(
+	import.meta.url
+)(scriptPath);
 
 describe('patch-release milestone backport verification', function () {
 	it('rejects obsolete label selection with milestone guidance', function () {
@@ -38,6 +40,147 @@ describe('patch-release milestone backport verification', function () {
 				assert.equal(milestoneTargetsRelease(milestone, line), expected);
 			});
 		}
+	});
+
+	describe('backportVerificationApplies', function () {
+		it('does not apply when the release branch is the source branch', function () {
+			assert.equal(backportVerificationApplies('main', 'main'), false);
+		});
+
+		it('applies to a release branch cut from the source branch', function () {
+			assert.equal(backportVerificationApplies('v5.3', 'main'), true);
+			assert.equal(backportVerificationApplies('rc/5.3.1-core', 'main'), true);
+		});
+	});
+
+	describe('evaluateWorkflowRuns', function () {
+		let runId = 0;
+		const job = (name, conclusion = 'success', status = 'completed') => ({
+			name,
+			status,
+			conclusion: status === 'completed' ? conclusion : null,
+			html_url: `https://github.com/HarperFast/harper/actions/runs/1/job/${name.length}`,
+		});
+		const run = (run_number, jobs, extra = {}) => ({
+			id: ++runId,
+			run_number,
+			event: 'push',
+			status: 'completed',
+			conclusion: jobs.every((j) => j.conclusion === 'success' || j.conclusion === 'skipped') ? 'success' : 'failure',
+			html_url: `https://github.com/HarperFast/harper/actions/runs/${runId}`,
+			jobs,
+			...extra,
+		});
+		const states = (runs) => evaluateWorkflowRuns(runs).blocking.map((b) => [b.job ?? null, b.state]);
+
+		it('is green when every job of the only run passed or was skipped', function () {
+			assert.deepEqual(states([run(1, [job('Unit Test (Node.js v22)'), job('Docs', 'skipped')])]), []);
+			assert.equal(evaluateWorkflowRuns([run(1, [job('a'), job('b')])]).jobCount, 2);
+		});
+
+		it('reports missing when no run exists', function () {
+			assert.deepEqual(states([]), [[null, 'missing']]);
+		});
+
+		it('ignores pull_request runs, which test the merge ref rather than the commit', function () {
+			assert.deepEqual(states([run(1, [job('a')], { event: 'pull_request' })]), [[null, 'missing']]);
+		});
+
+		it('blocks on each failed or cancelled job', function () {
+			assert.deepEqual(states([run(1, [job('v22', 'failure'), job('v24'), job('v26', 'cancelled')])]), [
+				['v22', 'failure'],
+				['v26', 'cancelled'],
+			]);
+		});
+
+		it('blocks while the latest run is still running instead of using an older success', function () {
+			assert.deepEqual(
+				states([
+					run(1, [job('a')]),
+					run(2, [job('a', null, 'in_progress')], { status: 'in_progress', conclusion: null }),
+				]),
+				[[null, 'in_progress']]
+			);
+		});
+
+		it('lets a later run of the same job supersede a flaky failure', function () {
+			assert.deepEqual(states([run(7, [job('v22', 'failure'), job('v24')]), run(8, [job('v22'), job('v24')])]), []);
+		});
+
+		it('blocks when the latest run of a job failed after an earlier success', function () {
+			assert.deepEqual(states([run(7, [job('v22'), job('v24')]), run(8, [job('v22', 'failure'), job('v24')])]), [
+				['v22', 'failure'],
+			]);
+		});
+
+		it('lets a re-run of an older run supersede a newer run of the same job', function () {
+			const at = (time) => ({ completed_at: `2026-10-05T${time}:00Z` });
+			const full = run(10, [{ ...job('v24', 'failure'), ...at('12:00') }]);
+			const narrow = run(11, [{ ...job('v24'), ...at('11:00') }], { event: 'workflow_dispatch' });
+			assert.deepEqual(states([full, narrow]), [['v24', 'failure']]);
+		});
+
+		it('passes once a re-run of an older run supersedes a newer run that failed', function () {
+			const at = (time) => ({ completed_at: `2026-10-05T${time}:00Z` });
+			const full = run(1, [
+				{ ...job('v22'), ...at('12:00') },
+				{ ...job('v24'), ...at('12:00') },
+			]);
+			const narrow = run(2, [{ ...job('v22', 'failure'), ...at('11:00') }], { event: 'workflow_dispatch' });
+			assert.deepEqual(states([full, narrow]), []);
+		});
+
+		it('blocks a job re-run that started after the runs were listed', function () {
+			const done = run(9, [{ ...job('a'), completed_at: '2026-10-05T10:00:00Z' }]);
+			const rerunning = run(10, [job('a', null, 'in_progress')], { conclusion: 'success' });
+			assert.deepEqual(states([done, rerunning]), [['a', 'in_progress']]);
+		});
+
+		it('blocks a run cancelled before any job started, even beside a later green run', function () {
+			const cancelled = run(10, [], { conclusion: 'cancelled' });
+			const narrow = run(11, [job('Unit Test (Node.js v24)')], { event: 'workflow_dispatch' });
+			assert.deepEqual(states([cancelled, narrow]), [[null, 'cancelled']]);
+		});
+
+		it('orders by run_number, not by response order', function () {
+			assert.deepEqual(states([run(8, [job('v22')]), run(7, [job('v22', 'failure')])]), []);
+		});
+
+		it('does not let a narrower later run mask a job that failed in an earlier full run', function () {
+			const full = run(10, [job('Unit Test (Node.js v22)', 'failure'), job('Unit Test (Node.js v24)')]);
+			const narrow = run(11, [job('Unit Test (Node.js v24)')], { event: 'workflow_dispatch' });
+			assert.deepEqual(states([full, narrow]), [['Unit Test (Node.js v22)', 'failure']]);
+		});
+
+		it('blocks while an earlier run is still queued behind a completed narrower run', function () {
+			const queuedFull = run(10, [], { status: 'queued', conclusion: null });
+			const narrow = run(11, [job('Unit Test (Node.js v24)')], { event: 'workflow_dispatch' });
+			assert.deepEqual(states([queuedFull, narrow]), [[null, 'queued']]);
+		});
+
+		it('blocks a successful run that lists no jobs, even beside a run that has jobs', function () {
+			assert.deepEqual(states([run(1, [])]), [[null, 'no-jobs']]);
+			assert.deepEqual(states([run(1, [job('a')]), run(2, [])]), [[null, 'no-jobs']]);
+		});
+
+		it('keeps a failure from an earlier attempt that the re-run did not repeat', function () {
+			const attempts = run(5, [
+				{ ...job('v22', 'failure'), completed_at: '2026-10-05T10:00:00Z' },
+				{ ...job('v24', 'failure'), completed_at: '2026-10-05T10:00:00Z' },
+				{ ...job('v22'), completed_at: '2026-10-05T11:00:00Z' },
+			]);
+			assert.deepEqual(states([attempts]), [['v24', 'failure']]);
+		});
+
+		it('blocks on a run that failed without any jobs', function () {
+			assert.deepEqual(states([run(1, [job('a')]), run(2, [], { conclusion: 'startup_failure' })]), [
+				[null, 'startup_failure'],
+			]);
+		});
+
+		it('rejects a run without a numeric run_number', function () {
+			assert.throws(() => evaluateWorkflowRuns([run('7', [job('a')])]), /Invalid run_number/);
+		});
 	});
 
 	describe('isPRPresent', function () {
@@ -91,6 +234,7 @@ describe('patch-release milestone backport verification', function () {
 		let core;
 		let env;
 		let prs;
+		let runs;
 		const remote = (repo) => join(fixture, 'github.com', 'HarperFast', repo === core ? 'harper.git' : 'harper-pro.git');
 		const git = (repo, ...args) =>
 			execFileSync('git', ['-C', repo, ...args], { env, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
@@ -102,6 +246,7 @@ describe('patch-release milestone backport verification', function () {
 			}));
 		const runCli = (args = ['--yes', '--json'], input = '') => {
 			writeFileSync(join(fixture, 'prs.json'), JSON.stringify(prs));
+			writeFileSync(join(fixture, 'runs.json'), JSON.stringify(runs));
 			return spawnSync(process.execPath, [join(pro, 'scripts', 'patch-release.js'), '--branch', 'v5.1', ...args], {
 				env,
 				input,
@@ -147,7 +292,7 @@ describe('patch-release milestone backport verification', function () {
 			env = {
 				...process.env,
 				GIT_CEILING_DIRECTORIES: fixture,
-				GIT_CONFIG_COUNT: '4',
+				GIT_CONFIG_COUNT: '5',
 				GIT_CONFIG_KEY_0: 'core.hooksPath',
 				GIT_CONFIG_VALUE_0: '/dev/null',
 				GIT_CONFIG_KEY_1: 'commit.gpgsign',
@@ -156,10 +301,13 @@ describe('patch-release milestone backport verification', function () {
 				GIT_CONFIG_VALUE_2: 'always',
 				GIT_CONFIG_KEY_3: 'push.recurseSubmodules',
 				GIT_CONFIG_VALUE_3: 'no',
+				GIT_CONFIG_KEY_4: 'tag.gpgSign',
+				GIT_CONFIG_VALUE_4: 'false',
 				NODE_PATH: join(root, 'node_modules'),
 				PATCH_RELEASE_FIXTURE: fixture,
 			};
 			prs = { core: [], pro: [] };
+			runs = {};
 			mkdirSync(core, { recursive: true });
 			for (const repo of [core, pro]) {
 				git(repo, 'init', '-b', 'main');
@@ -195,7 +343,23 @@ const fixture = process.env.PATCH_RELEASE_FIXTURE;
 fs.appendFileSync(path.join(fixture, 'gh-calls.jsonl'), JSON.stringify(args) + '\\n');
 if (args[0] === '--version') console.log('gh fixture');
 else if (args[0] === 'pr' && args[1] === 'list') console.log('[]');
-else if (args[0] === 'api' && args.includes('--paginate')) {
+else if (args[0] === 'api' && args[1].includes('/actions/')) {
+    // runs.json: { "<repo>/<workflow file>": [run rows with jobs] | "error" }; absent means one green push run.
+    const runs = JSON.parse(fs.readFileSync(path.join(fixture, 'runs.json'), 'utf8'));
+    const workflowRuns = args[1].match(new RegExp('^repos/[^/]+/([^/]+)/actions/workflows/([^/]+)/runs[?]head_sha=([0-9a-f]{40})&'));
+    const jobs = args[1].match(new RegExp('/actions/runs/([^/]+)/jobs[?]filter=all&'));
+    if (workflowRuns) {
+        const key = workflowRuns[1] + '/' + workflowRuns[2];
+        const onWorkflowQuery = path.join(fixture, 'on-workflow-query.sh');
+        if (fs.existsSync(onWorkflowQuery)) execFileSync('bash', [onWorkflowQuery], { stdio: 'inherit' });
+        if (runs[key] === 'error') { console.error('gh: Not Found (HTTP 404)'); process.exit(1); }
+        const rows = runs[key] ?? [{ id: 'green-' + key.replace('/', '-'), run_number: 1, event: 'push', status: 'completed', conclusion: 'success', html_url: 'https://example.invalid/' + key }];
+        for (const { jobs, ...row } of rows) console.log(JSON.stringify(row));
+    } else if (jobs) {
+        const row = Object.values(runs).flat().find((row) => String(row.id) === jobs[1]);
+        for (const job of row?.jobs ?? [{ name: 'test', status: 'completed', conclusion: 'success', html_url: 'https://example.invalid/job' }]) console.log(JSON.stringify(job));
+    } else process.exit(1);
+} else if (args[0] === 'api' && args.includes('--paginate')) {
     const prs = JSON.parse(fs.readFileSync(path.join(fixture, 'prs.json'), 'utf8'));
     let rows = args[1].includes('/harper-pro/') ? prs.pro : prs.core;
     const commits = args[1].match(new RegExp('/pulls/([0-9]+)/commits'));
@@ -480,6 +644,275 @@ else if (args[0] === 'api' && args.includes('--paginate')) {
 			assert.equal(resultOf(r).ok, false);
 			assert.match(resultOf(r).error, /Local v5\.1 has commits absent from origin\/v5\.1/);
 			assert.deepEqual(snapshot(), before);
+		});
+
+		describe('release-candidate CI gate', function () {
+			const remoteSnapshot = () => [core, pro].map((repo) => git(remote(repo), 'show-ref'));
+			const ghCalls = () =>
+				readFileSync(join(fixture, 'gh-calls.jsonl'), 'utf8')
+					.trim()
+					.split('\n')
+					.map((line) => JSON.parse(line));
+			const failingRun = (key) => [
+				{
+					id: 9001,
+					run_number: 12,
+					event: 'push',
+					status: 'completed',
+					conclusion: 'failure',
+					html_url: `https://example.invalid/${key}/runs/9001`,
+					jobs: [
+						{
+							name: 'Unit Test (Node.js v22)',
+							status: 'completed',
+							conclusion: 'failure',
+							html_url: 'https://example.invalid/job/1',
+						},
+						{
+							name: 'Unit Test (Node.js v24)',
+							status: 'completed',
+							conclusion: 'success',
+							html_url: 'https://example.invalid/job/2',
+						},
+					],
+				},
+			];
+			const allowRelease = () => {
+				mkdirSync(join(pro, 'build-tools'));
+				writeFileSync(join(pro, 'build-tools', 'sync-core.sh'), '#!/bin/sh\n', { mode: 0o755 });
+			};
+
+			for (const [which, repoName, workflow] of [
+				['core', 'harper', 'unit-test.yml'],
+				['pro', 'harper-pro', 'unit-tests.yaml'],
+			]) {
+				it(`--yes aborts before tagging when a required ${which} check failed, even without --json`, function () {
+					runs[`${repoName}/${workflow}`] = failingRun(`${repoName}/${workflow}`);
+					const before = [snapshot(), remoteSnapshot()];
+					const r = runCli(['--yes']);
+					assert.equal(r.status, 1, r.stdout + r.stderr);
+					const result = resultOf(r);
+					assert.equal(result.ok, false);
+					assert.equal(result.pushed, false);
+					assert.equal(result.cmTriggered, false);
+					assert.match(result.error, /Release candidate CI is not green/);
+					const candidate = git(which === 'core' ? core : pro, 'rev-parse', 'refs/remotes/origin/v5.1');
+					assert.deepEqual(
+						result.ciFailures.map((f) => [f.repo, f.workflow, f.job, f.state, f.sha]),
+						[[`HarperFast/${repoName}`, workflow, 'Unit Test (Node.js v22)', 'failure', candidate]]
+					);
+					assert.ok(
+						ghCalls().some(
+							([, endpoint]) =>
+								endpoint ===
+								`repos/HarperFast/${repoName}/actions/workflows/${workflow}/runs?head_sha=${candidate}&per_page=100`
+						)
+					);
+					assert.match(
+						r.stderr,
+						new RegExp(`✗ ${workflow.replace('.', '\\.')} / Unit Test \\(Node\\.js v22\\): failure`)
+					);
+					assert.deepEqual([snapshot(), remoteSnapshot()], before);
+				});
+			}
+
+			it('--yes --dry-run aborts when CI evidence cannot be read', function () {
+				runs['harper-pro/integration-tests.yaml'] = 'error';
+				const r = runCli(['--yes', '--dry-run', '--json']);
+				assert.equal(r.status, 1, r.stdout + r.stderr);
+				const [failure, ...rest] = resultOf(r).ciFailures;
+				assert.deepEqual(rest, []);
+				assert.equal(failure.workflow, 'integration-tests.yaml');
+				assert.equal(failure.state, 'error');
+				assert.match(failure.error, /HTTP 404/);
+			});
+
+			it('names the dispatch command when a candidate has no run of a required workflow', function () {
+				runs['harper/integration-tests.yml'] = [];
+				const r = runCli(['--yes', '--dry-run', '--json']);
+				assert.equal(r.status, 1, r.stdout + r.stderr);
+				assert.deepEqual(
+					resultOf(r).ciFailures.map((f) => [f.workflow, f.state]),
+					[['integration-tests.yml', 'missing']]
+				);
+				assert.match(r.stderr, /gh workflow run integration-tests\.yml --repo HarperFast\/harper --ref v5\.1/);
+			});
+
+			it('--ci-override proceeds past non-green CI and records the reason', function () {
+				runs['harper-pro/unit-tests.yaml'] = failingRun('harper-pro/unit-tests.yaml');
+				const r = runCli(['--yes', '--dry-run', '--json', '--ci-override', ' incident 123 hotfix ']);
+				assert.equal(r.status, 0, r.stdout + r.stderr);
+				const result = resultOf(r);
+				assert.equal(result.ok, true);
+				assert.deepEqual(result.ciOverride, { reason: 'incident 123 hotfix' });
+				assert.deepEqual(
+					result.ciFailures.map((f) => [f.workflow, f.job]),
+					[['unit-tests.yaml', 'Unit Test (Node.js v22)']]
+				);
+				assert.match(r.stderr, /CI gate overridden with --ci-override \(1 failing checks above\): incident 123 hotfix/);
+			});
+
+			it('--ci-override does not waive a missing backport', function () {
+				addPR(pro);
+				runs['harper-pro/unit-tests.yaml'] = failingRun('harper-pro/unit-tests.yaml');
+				const r = runCli(['--yes', '--json', '--ci-override', 'incident']);
+				assert.equal(r.status, 1, r.stdout + r.stderr);
+				const result = resultOf(r);
+				assert.equal(result.missingPRs[0].number, 42);
+				assert.doesNotMatch(result.error, /CI is not green/);
+			});
+
+			it('rejects a blank --ci-override reason', function () {
+				const r = runCli(['--yes', '--json', '--ci-override', '   ']);
+				assert.equal(r.status, 1, r.stdout + r.stderr);
+				assert.match(resultOf(r).error, /--ci-override requires a non-blank reason/);
+			});
+
+			for (const [label, input] of [
+				['declining', 'n\n'],
+				['closed stdin at', ''],
+			]) {
+				it(`interactive mode prints the failing checks and aborts on ${label} the override prompt`, function () {
+					runs['harper/unit-test.yml'] = failingRun('harper/unit-test.yml');
+					const before = [snapshot(), remoteSnapshot()];
+					const r = runCli(['--json'], input);
+					assert.equal(r.status, 0, r.stdout + r.stderr);
+					assert.match(r.stderr, /✗ unit-test\.yml \/ Unit Test \(Node\.js v22\): failure/);
+					assert.match(r.stdout, /Required CI is NOT green .* overriding the CI gate\? \[y\/N\]/);
+					const result = resultOf(r);
+					assert.equal(result.aborted, true);
+					assert.deepEqual(
+						result.ciFailures.map((f) => [f.workflow, f.job]),
+						[['unit-test.yml', 'Unit Test (Node.js v22)']]
+					);
+					assert.deepEqual(result.backportVerification, { core: 'passed', pro: 'passed' });
+					assert.deepEqual([snapshot(), remoteSnapshot()], before);
+				});
+			}
+
+			it('records an interactive override and declines the CM deploy prompt when stdin closes', function () {
+				allowRelease();
+				runs['harper-pro/integration-tests.yaml'] = failingRun('harper-pro/integration-tests.yaml');
+				const r = runCli(['--json'], 'y\n');
+				assert.equal(r.status, 0, r.stdout + r.stderr);
+				const result = resultOf(r);
+				assert.equal(result.pushed, true);
+				assert.equal(result.cmTriggered, false);
+				assert.deepEqual(result.ciOverride, { reason: 'interactive confirmation' });
+				assert.equal(result.ciFailures[0].workflow, 'integration-tests.yaml');
+				assert.match(r.stderr, /Skipped\. Manually trigger release-to-environments/);
+				assert.equal(
+					git(remote(pro), 'rev-parse', 'refs/tags/v5.1.1^{commit}^'),
+					git(remote(pro), 'rev-parse', 'v5.1.0^{commit}')
+				);
+			});
+
+			it('tags the verified candidate even when origin/<branch> moves during the CI check', function () {
+				allowRelease();
+				const candidate = git(pro, 'rev-parse', 'v5.1');
+				git(pro, 'checkout', '-b', 'unverified', 'v5.1');
+				git(pro, 'commit', '--allow-empty', '-m', 'Unverified commit');
+				const unverified = git(pro, 'rev-parse', 'HEAD');
+				git(pro, 'checkout', 'main');
+				writeFileSync(
+					join(fixture, 'on-workflow-query.sh'),
+					`git -C "${pro}" update-ref refs/remotes/origin/v5.1 ${unverified}\n`
+				);
+				const r = runCli(['--yes', '--json']);
+				assert.equal(r.status, 0, r.stdout + r.stderr);
+				const result = resultOf(r);
+				assert.equal(result.ok, true);
+				assert.equal(result.pushed, true);
+				assert.deepEqual(result.ciFailures, []);
+				assert.equal(result.ciOverride, null);
+				assert.deepEqual(result.backportVerification, { core: 'passed', pro: 'passed' });
+				const coreCandidate = git(remote(core), 'rev-parse', 'v5.1');
+				assert.deepEqual(result.candidates, { core: coreCandidate, pro: candidate, proCoreGitlink: coreCandidate });
+				assert.equal(git(remote(pro), 'rev-parse', 'refs/tags/v5.1.1^{commit}^'), candidate);
+				assert.equal(git(remote(pro), 'rev-parse', 'v5.1'), git(remote(pro), 'rev-parse', 'refs/tags/v5.1.1^{commit}'));
+			});
+
+			it('refuses a staged change before creating any release commit or tag', function () {
+				allowRelease();
+				git(core, 'checkout', 'v5.1');
+				git(core, 'commit', '--allow-empty', '-m', 'Core backport');
+				publish(core, 'v5.1:refs/heads/v5.1');
+				git(core, 'checkout', 'main');
+				writeFileSync(join(pro, 'unreviewed.txt'), 'not part of the candidate\n');
+				git(pro, 'add', 'unreviewed.txt');
+				const remoteBefore = remoteSnapshot();
+				const r = runCli(['--yes', '--json']);
+				assert.equal(r.status, 1, r.stdout + r.stderr);
+				assert.match(
+					resultOf(r).error,
+					/harper-pro has local changes that would be folded into the release commit: unreviewed\.txt/
+				);
+				assert.equal(git(core, 'tag', '--list', 'v5.1.1'), '');
+				assert.equal(git(pro, 'tag', '--list', 'v5.1.1'), '');
+				assert.equal(git(core, 'rev-parse', 'v5.1'), git(remote(core), 'rev-parse', 'v5.1'));
+				assert.deepEqual(remoteSnapshot(), remoteBefore);
+			});
+
+			it('builds core on its candidate even when git recurses into submodules', function () {
+				allowRelease();
+				// harper-pro main pins a different core commit than v5.1, so a recursive checkout moves core.
+				addPR(core, 41, 'v6.0');
+				git(core, 'checkout', 'v5.1');
+				git(core, 'commit', '--allow-empty', '-m', 'Core backport');
+				publish(core, 'v5.1:refs/heads/v5.1');
+				git(core, 'checkout', 'main');
+				const coreCandidate = git(core, 'rev-parse', 'v5.1');
+				env.GIT_CONFIG_COUNT = '6';
+				env.GIT_CONFIG_KEY_5 = 'submodule.recurse';
+				env.GIT_CONFIG_VALUE_5 = 'true';
+				const r = runCli(['--yes', '--json']);
+				assert.equal(r.status, 0, r.stdout + r.stderr);
+				assert.equal(resultOf(r).coreVersion, 'v5.1.1');
+				const coreRelease = git(remote(core), 'rev-parse', 'refs/tags/v5.1.1^{commit}');
+				assert.equal(git(remote(core), 'rev-parse', `${coreRelease}^`), coreCandidate);
+				assert.equal(git(remote(core), 'rev-parse', 'v5.1'), coreRelease);
+				assert.equal(git(remote(pro), 'rev-parse', 'refs/tags/v5.1.1^{commit}:core'), coreRelease);
+			});
+
+			it('warns when harper-pro CI ran against a different core than the release builds on', function () {
+				git(core, 'checkout', 'v5.1');
+				git(core, 'commit', '--allow-empty', '-m', 'Core backport');
+				publish(core, 'v5.1:refs/heads/v5.1');
+				git(core, 'checkout', 'main');
+				const r = runCli(['--yes', '--dry-run', '--json']);
+				assert.equal(r.status, 0, r.stdout + r.stderr);
+				const { candidates } = resultOf(r);
+				assert.notEqual(candidates.proCoreGitlink, candidates.core);
+				assert.match(
+					r.stderr,
+					/harper-pro CI ran against core [0-9a-f]{8}, but this release builds on core [0-9a-f]{8}/
+				);
+			});
+		});
+
+		describe('release cut from the source branch', function () {
+			it('reports backport verification as not applicable instead of passed', function () {
+				addPR(pro, 42, 'v5.1');
+				const r = runCli(['--yes', '--dry-run', '--json', '--branch', 'main']);
+				assert.equal(r.status, 0, r.stdout + r.stderr);
+				assert.deepEqual(resultOf(r).backportVerification, { core: 'not-applicable', pro: 'not-applicable' });
+				assert.match(r.stderr, /Backport verification not applicable: release cut from source branch main/);
+				assert.doesNotMatch(r.stdout + r.stderr, /Backport verification passed/);
+				const calls = readFileSync(join(fixture, 'gh-calls.jsonl'), 'utf8');
+				assert.doesNotMatch(calls, /\/pulls\?/);
+			});
+
+			it('decides applicability per repository', function () {
+				addPR(core, 41);
+				const r = runCli(['--yes', '--dry-run', '--json', '--branch', 'main', '--core-branch', 'v5.1']);
+				assert.equal(r.status, 1, r.stdout + r.stderr);
+				const result = resultOf(r);
+				assert.deepEqual(result.backportVerification, { core: 'missing', pro: 'not-applicable' });
+				assert.deepEqual(
+					result.missingPRs.map((pr) => pr.number),
+					[41]
+				);
+			});
 		});
 	});
 });
