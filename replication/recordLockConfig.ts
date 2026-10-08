@@ -4,11 +4,8 @@ import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import * as logger from '../core/utility/logging/harper_logger.js';
 
 /**
- * `replication.recordLocks: true` admits this node to cluster-wide record locks (harper-pro#438). It
- * is an explicit opt-in because enabling it changes subscription placement — every subscription for a
- * database moves to the worker that coordinates the database's locks — which concentrates a
- * single-database cluster's inbound apply work on one worker. Off, nothing about replication changes
- * and a cluster-scoped `lock()` fails closed rather than silently arbitrating on one node.
+ * `replication.recordLocks: true` admits this node to cluster-wide record locks (harper-pro#438); off,
+ * a cluster-scoped `lock()` fails closed rather than silently arbitrating on one node.
  *
  * Read from the raw config tree, NOT `env.get`: `env.get` resolves only keys registered in core's
  * `CONFIG_PARAM_MAP` (`knownNodes.ts` notes the same limit for other replication knobs), and this key

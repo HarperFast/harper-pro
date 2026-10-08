@@ -89,6 +89,41 @@ export class BenchWrite extends Resource {
 	}
 }
 
+export class BenchWriteBatched extends Resource {
+	async post(data) {
+		const started = performance.now();
+		const batch = data.batch ?? 50;
+		for (let i = 0; i < data.count; i += batch) {
+			const context = {};
+			const end = Math.min(i + batch, data.count);
+			await transaction(context, async () => {
+				const puts = [];
+				let thrown;
+				for (let j = i; j < end; j++) {
+					try {
+						puts.push(tables.Counter.put({ id: `${data.prefix}-${j}`, n: j }, context));
+					} catch (error) {
+						thrown ??= error;
+						break;
+					}
+				}
+				const settled = await Promise.allSettled(puts);
+				const failed = settled.find((result) => result.status === 'rejected');
+				if (thrown) throw thrown;
+				if (failed) throw failed.reason;
+			});
+		}
+		return { elapsedMs: performance.now() - started };
+	}
+}
+
+export class BenchCount extends Resource {
+	async get() {
+		const { recordCount } = await tables.Counter.getRecordCount({ exactCount: true });
+		return { recordCount };
+	}
+}
+
 /** What a cluster-scoped lock() answers here: the observable for which enablement arm a node is in. */
 export class LockProbe extends Resource {
 	async post(data) {

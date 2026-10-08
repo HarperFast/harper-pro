@@ -1,0 +1,26 @@
+# Terms with a situational meaning in harper-pro. PR descriptions define them at first use as <ins title="…">term</ins>.
+# One "term: definition" per line; keep each definition to one clause.
+base copy: full copy of every table in a database for a peer starting at 0 or before retained history
+retention floor: later of oldest retained entry and now minus audit retention, below which a start forces a base copy
+copy cursor: follower's persisted base-copy position (copyStartTime, currentTable, afterKey, copyOrder) that lets a copy resume mid-table
+copy anchor: a base copy's copyStartTime, usually the sender's last committed RocksDB local-log key, otherwise wall-clock time
+copyApply: RocksDB receiver mode that applies base-copy rows as audit-less, WAL-off snapshots, firing no per-row change events
+clone attempt: in-flight bootstrap of a new node from a leader, tracked by .cloneAttempt.json plus HARPER_CLONE_ATTEMPT
+wedge: link or subscription stuck without progress, whether silently or by failing the same way on every reconnect
+reconcile: periodic main-thread sweep that repairs subscription state, rebinding dead-worker entries and re-driving wedged or stalled links
+resume cursor: persisted position a subscription restarts from, the [seq] row or, during a base copy, the copy cursor
+blob gap: per-connection latch that holds the resume cursor after a received blob fails to save for a retryable reason
+replication frame: one sender message holding every entry at one log key across logs, possibly several origins' transactions
+identity tie: incoming write with the stored record's version and origin node, which apply skips as already applied
+leading-duplicate skip: pre-apply drop of re-streamed records at or below their source node's resume cursor that are durable identity ties
+echo: a node's own write or delete returned to it by a peer in the mesh
+protocol capability: key in the NODE_NAME[4] map a peer advertises, giving a feature level, version or parameter
+node id mapping: each node's own per-database map of node names to short ids, itself 0, sent lazily to receiving peers
+residency partial: stub on a non-resident node holding only stored indexed fields, so searches still work
+directional route: route whose replicates object (sends/receives or sendsTo/receivesFrom) limits replication direction instead of a full mesh
+hdb_nodes: system table registering each known node with its url, routes, replication settings and subscriptions
+home map: operator-agreed list of nodes participating in record locks, published per generation, never derived
+home generation: version number of the home map, which staging refuses unless above every generation the node has seen
+quiesce: post-staging drain in which a node surrenders every delegation it holds and recalls every grant it issued
+lock barrier: record-lock control entry whose commit, matched on origin, position and nonce, proves that origin's prior writes applied
+coordinating worker: the one worker thread per database that owns its record-lock coordination; peer subscriptions are placed independently and relay control entries to it

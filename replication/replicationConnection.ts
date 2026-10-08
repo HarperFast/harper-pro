@@ -39,6 +39,23 @@ import {
 import { redactOperationForLog } from './logRedaction.ts';
 import { CopyCursorWatermark } from './copyCursorWatermark.ts';
 import {
+	CONFIRMATION_STATUS_POSITION,
+	RECEIVED_VERSION_POSITION,
+	RECEIVED_TIME_POSITION,
+	SENDING_TIME_POSITION,
+	LATENCY_POSITION,
+	RECEIVING_STATUS_POSITION,
+	BACK_PRESSURE_RATIO_POSITION,
+	BLOB_FAILURE_COUNT_POSITION,
+	LAST_BLOB_FAILURE_TIME_POSITION,
+	CONNECTION_STATE_POSITION,
+	LAST_LIVENESS_TIME_POSITION,
+	LAST_ERROR_CODE_POSITION,
+	LAST_ERROR_TIME_POSITION,
+	FIRE_MECHANISMS,
+	FIRE_COUNTER_BASE_POSITION,
+} from './sharedStatusSlots.ts';
+import {
 	recordPeerLockCapability,
 	recordPeerLockLevel,
 	recordPeerHomesDigest,
@@ -48,6 +65,7 @@ import {
 import { ANY_TABLE, markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
 import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
+import { verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -64,6 +82,7 @@ import {
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
+	peerSupportsOriginCursors,
 	peerSupportsRecordLocks,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
@@ -99,6 +118,7 @@ import {
 	routeEntriesIncludePeer,
 	resolveNodeForSendAuth,
 	isGenuineNodeDeletion,
+	probeNodeRow,
 	SEND_AUTH_UNCHANGED,
 } from './knownNodes.ts';
 import * as process from 'node:process';
@@ -127,6 +147,7 @@ import { PassThrough, Transform, pipeline, type Readable } from 'node:stream';
 import { createInflate } from 'node:zlib';
 import { getLastVersion } from 'lmdb';
 import { FrameWriter } from './frameWriter.ts';
+import { tableReplicates } from './replicatedDatabases.ts';
 import { cloneAttemptSource } from '../cloneNode/cloneAttempt.ts';
 import { createBackoff, type Backoff, type BackoffOptions } from './backoff.ts';
 
@@ -173,34 +194,28 @@ const RECORD_LOCK_HOMES_DIGEST = 150;
 // changes so a leader resuming a cursor stamped with a different (or absent) version recopies from
 // scratch instead of silently skipping tables the old order had not yet reached (#421).
 const COPY_ORDER_VERSION = 1;
-export const CONFIRMATION_STATUS_POSITION = 0;
-export const RECEIVED_VERSION_POSITION = 1;
-export const RECEIVED_TIME_POSITION = 2;
-export const SENDING_TIME_POSITION = 3;
-export const LATENCY_POSITION = 4;
-export const RECEIVING_STATUS_POSITION = 5;
-export const BACK_PRESSURE_RATIO_POSITION = 6;
-// Blob-replication divergence signals (harper-pro#386). A blob save failure on the receive side means
-// a record committed but its bytes are not durably stored — the resume cursor holds (see `hasBlobGap`)
-// and, on a sustained failing link, the peer can silently diverge to the point of unrecoverable loss.
-// These slots surface that divergence in cluster_status so it is observable (count + recency) rather
-// than visible only as per-blob error spam in the logs.
-export const BLOB_FAILURE_COUNT_POSITION = 7; // cumulative count of blob save failures for this peer/db
-export const LAST_BLOB_FAILURE_TIME_POSITION = 8; // wall-clock time (ms) of the most recent blob failure
+export {
+	CONFIRMATION_STATUS_POSITION,
+	RECEIVED_VERSION_POSITION,
+	RECEIVED_TIME_POSITION,
+	SENDING_TIME_POSITION,
+	LATENCY_POSITION,
+	RECEIVING_STATUS_POSITION,
+	BACK_PRESSURE_RATIO_POSITION,
+	BLOB_FAILURE_COUNT_POSITION,
+	LAST_BLOB_FAILURE_TIME_POSITION,
+	CONNECTION_STATE_POSITION,
+	LAST_LIVENESS_TIME_POSITION,
+	LAST_ERROR_CODE_POSITION,
+	LAST_ERROR_TIME_POSITION,
+	FIRE_MECHANISMS,
+	FIRE_COUNTER_BASE_POSITION,
+};
 // Per-connection blob save failures before we log one escalation line (above the per-blob errors). A
 // handful of failures on one connection indicates a persistently failing link, not a one-off blip.
 const SUSTAINED_BLOB_FAILURE_THRESHOLD = 5;
 export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
-// W1 (harper-pro#431): authoritative connection-health slots, written by the worker thread that owns the
-// outbound (db, peer) subscription socket and read by the main thread as the source of truth for link
-// state — rather than relying solely on the edge-triggered worker→main postMessage mirror, which desyncs
-// when a terminal state is reached without a 'close' (open-but-idle wedge, #289/#233). State is paired with
-// a liveness timestamp so a worker that died/wedged without writing DOWN cannot leave a stale CONNECTED.
-export const CONNECTION_STATE_POSITION = 9;
-export const LAST_LIVENESS_TIME_POSITION = 10; // wall-clock ms of last confirmed liveness (pong or received message)
-export const LAST_ERROR_CODE_POSITION = 11; // close code of the most recent disconnect
-export const LAST_ERROR_TIME_POSITION = 12; // wall-clock ms of the most recent disconnect
 export const CONNECTION_STATE_DOWN = 0;
 export const CONNECTION_STATE_CONNECTED = 2;
 // LAST_ERROR_CODE for a disconnect this node INFERRED rather than observed on the wire: the worker thread
@@ -303,21 +318,7 @@ export function describeRefusedWorkerExitStamp(status: Float64Array | undefined,
 // This is measurement only. No net is demoted, no threshold moves, and no fire predicate consults it — the
 // demotion decision (the byte-silence receive watchdog is the candidate) is a later, data-driven one.
 export type FireClassification = 'redundant' | 'load-bearing' | 'unknown';
-// Append only: the index into this list picks the counter slot pair, so reordering or removing a name
-// reassigns existing counters to a different mechanism.
-export const FIRE_MECHANISMS = [
-	'receive-watchdog',
-	'pause-stall',
-	'copy-progress',
-	'blob-gap',
-	'copy-finalize',
-	'subscription-setup',
-	'wedge-reconcile',
-	'receive-stall-net',
-] as const;
 export type FireMechanism = (typeof FIRE_MECHANISMS)[number];
-// Two counter slots per mechanism (redundant, load-bearing) starting here — see the slot map in DESIGN.md.
-export const FIRE_COUNTER_BASE_POSITION = 13;
 // These counters are the one read-modify-write on this buffer, safe only under the single-writer-per-slot-
 // pair invariant stated in DESIGN.md. unitTests/replication/fireCounters.test.mjs pins its disjointness half.
 export function fireCounterPositions(mechanism: string): { redundant: number; loadBearing: number } | undefined {
@@ -567,6 +568,20 @@ export function hostnameFromNodeUrl(url: unknown): string | undefined {
 	}
 }
 
+// WS close reasons are capped at 123 UTF-8 bytes (RFC 6455) or ws.close() throws. A raw byte cut can
+// split a character; decoding the split tail as U+FFFD can then re-encode past 123 again, so shrink
+// until what decoding produced actually re-encodes within the limit.
+export function truncateCloseReason(reason: unknown): string | undefined {
+	if (typeof reason !== 'string') return undefined;
+	const buffer = Buffer.from(reason, 'utf8');
+	let end = buffer.byteLength;
+	if (end <= 123) return reason;
+	end = 123;
+	let truncated = buffer.subarray(0, end).toString('utf8');
+	while (Buffer.byteLength(truncated, 'utf8') > 123) truncated = buffer.subarray(0, --end).toString('utf8');
+	return truncated;
+}
+
 /**
  * Is this indexed attribute's value owned by a resolver (`@computed`/`@relationship`)? Resolver
  * output is never replicated (HarperFast/harper#2359): a residency partial carries stored indexed
@@ -726,7 +741,11 @@ const SUBSCRIPTION_SETUP_TIMEOUT_MS = positiveMsOr(
 const SEND_SUBSCRIPTION_SETUP_BUDGET_MS = SEND_SUBSCRIPTION_RESOLVE_TIMEOUT * 2 + PING_INTERVAL;
 // Built once and sent by reference on every handshake, so the advertised bag and the gate that reads a
 // peer's cannot drift apart.
-const LOCAL_CAPABILITIES = buildLocalCapabilities(SEND_SUBSCRIPTION_SETUP_BUDGET_MS, CLUSTER_RECORD_LOCKS_ENABLED);
+const LOCAL_CAPABILITIES = buildLocalCapabilities(
+	SEND_SUBSCRIPTION_SETUP_BUDGET_MS,
+	CLUSTER_RECORD_LOCKS_ENABLED,
+	STORAGE_IS_ROCKSDB
+);
 // Shared by every socket in this worker thread, so one peer cannot emit a warn line per socket per
 // window by sending a single unrecognized frame on each. Per-socket counts stay on each connection.
 const unknownCommandWarnThrottle = createThrottleState();
@@ -2722,6 +2741,150 @@ export function collectLastTxnTimes(seqEntries: Iterable<{ value: any }>): Map<a
 }
 
 /**
+ * How far below a subscriber's per-origin cursor a sender starts that origin's log (harper-pro#989). A log is
+ * appended in commit order, not key order, so an entry can land after a higher-keyed one; the overlap resends
+ * what may have landed late rather than skip it. Not a proven bound — harper-pro#922's closed floor replaces it.
+ */
+export const ORIGIN_CURSOR_OVERLAP_MS = 60_000;
+
+/** The `[Symbol.for('seq'), id]` rows of `__dbis__` by id, skipping any row that does not decode (harper-pro#352). */
+export function collectSeqRows(seqEntries: Iterable<{ key: any; value: any }>): Map<number, DbisCursor> {
+	const rows = new Map<number, DbisCursor>();
+	for (const entry of seqEntries) {
+		let value: any;
+		try {
+			value = entry.value;
+		} catch {
+			continue;
+		}
+		const id = entry.key?.[1];
+		if (typeof id === 'number' && value && typeof value === 'object') rows.set(id, value);
+	}
+	return rows;
+}
+
+/**
+ * Never borrows another peer's row: that subscription can cover a different table scope. A removed origin (its
+ * `hdb_nodes` row deleted) was excluded on every relay while it was a direct peer, so only its own connection's
+ * row records what this node holds of it: its own-origin cursor, or `seqId` on a row older than origin cursors.
+ */
+export function buildOriginCursorVector(
+	seqRows: Map<number, DbisCursor>,
+	peerId: number,
+	nameForId: (id: number) => string | undefined,
+	isMember: (name: string) => boolean
+): Record<string, number> {
+	const cursors = new Map<string, number>();
+	const peerNodes = seqRows.get(peerId)?.nodes;
+	for (const node of Array.isArray(peerNodes) ? peerNodes : []) {
+		if (!node || typeof node !== 'object' || node.id === 0 || !isValidFrameTxnLogKey(node.originLogKey)) continue;
+		const name = nameForId(node.id);
+		if (name !== undefined) cursors.set(name, node.originLogKey);
+	}
+	for (const [id, row] of seqRows) {
+		if (id === peerId || id === 0) continue;
+		const name = nameForId(id);
+		if (name === undefined || cursors.has(name) || isMember(name)) continue;
+		const ownNodes = Array.isArray(row.nodes) ? row.nodes : [];
+		const ownCursor = ownNodes.find((node) => node?.id === id)?.originLogKey;
+		const cursor = isValidFrameTxnLogKey(ownCursor) ? ownCursor : row.seqId;
+		if (isValidFrameTxnLogKey(cursor) && cursor > 1) cursors.set(name, cursor);
+	}
+	return Object.fromEntries(cursors);
+}
+
+/**
+ * A peer-supplied `{ originName: logKey }` map — a cursor vector or a copy's relayed-log anchors — as a Map of its
+ * valid entries. A malformed map or entry is dropped: that origin then starts at 0, as without the capability.
+ */
+export function parseOriginKeyMap(value: unknown): Map<string, number> {
+	const keys = new Map<string, number>();
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return keys;
+	for (const [name, logKey] of Object.entries(value)) {
+		if (isValidFrameTxnLogKey(logKey)) keys.set(name, logKey as number);
+	}
+	return keys;
+}
+
+export function resolveOriginFloors(
+	vector: unknown,
+	nameToId: Record<string, number> | undefined
+): Map<string, number> {
+	const floors = new Map<string, number>();
+	if (!nameToId) return floors;
+	for (const [name, cursor] of parseOriginKeyMap(vector)) {
+		// An origin this node has no id for has no log here to bound, and a lookup must not mint one.
+		if (!Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number') continue;
+		const floor = cursor - ORIGIN_CURSOR_OVERLAP_MS;
+		if (floor > 0) floors.set(name, floor);
+	}
+	return floors;
+}
+
+/**
+ * `timeRange` is `false` for an excluded origin, `{ startTime, endTime }` for a listed one, and `undefined` for
+ * neither, which matches only under an exclusion list (a multi-log range) and only above the origin's `floor`.
+ */
+export function matchesSubscriptionPosition(
+	timeRange: { startTime: number; endTime?: number } | false | undefined,
+	includesUnlisted: boolean,
+	floor: number | undefined,
+	position: number
+): boolean {
+	if (timeRange === undefined) return includesUnlisted && !(position <= floor);
+	return !!timeRange && timeRange.startTime < position && (!timeRange.endTime || timeRange.endTime > position);
+}
+
+/**
+ * The last committed key of every log a base copy's tail reads besides the sender's own (`skipLogs` names the
+ * rest). The copy holds everything committed before its anchor, so the tail resumes each such log in append
+ * order past this key (`resumeAfterExactStart`), with no time assumption. An empty or unreadable log gets no
+ * anchor and starts at 0.
+ */
+export function collectRelayedLogAnchors(auditStore: any, skipLogs: Set<string>): Map<string, number> {
+	const anchors = new Map<string, number>();
+	auditStore.loadLogs?.();
+	for (const logName of auditStore.logByName?.keys() ?? []) {
+		if (logName === 'local' || skipLogs.has(logName)) continue;
+		const key = findLastCommittedLogKey(auditStore, logName);
+		if (key) anchors.set(logName, key);
+	}
+	return anchors;
+}
+
+/**
+ * Pulls one entry so every exact boundary in `rangeOptions` has been checked. A throw is the same outcome as a recorded
+ * failure. When the failure is attributed to particular logs, it is the set of their names; a corrupt frame is not.
+ */
+export function rangeBoundaryFailure(auditStore: any, rangeOptions: any): unknown {
+	try {
+		const probe: any = auditStore.getRange(rangeOptions);
+		const probeIterator = probe[Symbol.iterator]();
+		try {
+			probeIterator.next();
+		} finally {
+			// releases the single-log iterator now; a no-op on the multi-log aggregate, which has no teardown hook
+			probeIterator.return?.();
+		}
+		if (probe.corruptFrameStop?.breaks > 0) return true;
+		if (!(probe.exactStartFailures?.size > 0 || probe.failedLogs?.size > 0)) return false;
+		return new Set<string>([...(probe.exactStartFailures?.keys() ?? []), ...(probe.failedLogs ?? [])]);
+	} catch (error) {
+		return error;
+	}
+}
+
+/** The anchors a failed boundary probe did not name, or undefined when that leaves nothing narrower to probe. */
+export function anchorsWithoutFailedLogs(
+	anchors: Map<string, number>,
+	failure: unknown
+): Map<string, number> | undefined {
+	if (!(failure instanceof Set)) return undefined;
+	const kept = new Map([...anchors].filter(([logName]) => !failure.has(logName)));
+	return kept.size > 0 && kept.size < anchors.size ? kept : undefined;
+}
+
+/**
  * Receive-side silence watchdog. Arm with `reset()` whenever incoming activity is observed
  * (peer ping, pong, message). If `intervalMs` elapses with the underlying socket's `bytesRead`
  * unchanged, `onSilence` is invoked exactly once.
@@ -3086,6 +3249,9 @@ export class NodeReplicationConnection extends EventEmitter {
 	socket: ReplicationWebSocket;
 	startTime: number;
 	retryBackoff?: Backoff;
+	creditedDurableSequence = 0;
+	sendFailed = false;
+	progressWhileSendFailed = false;
 
 	random = Math.random;
 	setReconnectTimer = setTimeout;
@@ -3194,9 +3360,9 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.socket._socket.unref();
 			// in normal startup, just use info, but adjust log level to warn if we were previously disconnected, because there was a warn message on the disconnect and we want to keep symmetry
 			logger[this.isConnected ? 'info' : 'warn']?.(`Connected to ${this.url}, db: ${this.databaseName}`);
-			// Reset backoff on first successful SEND (onFrameSent), not here on open: a leg that reopens and
-			// immediately fails to send (an oversized frame throws and closes it) must keep escalating toward
-			// the 30 s cap instead of hot-looping at 500 ms and accumulating native TLS state (harper-pro#339).
+			// Reset backoff on progress (onFrameSent / onDurableProgress), not here on open: a leg that reopens and
+			// immediately fails to send (an oversized frame throws and closes it) must keep escalating toward the
+			// 30 s cap instead of hot-looping at 500 ms and accumulating native TLS state (harper-pro#339).
 			// if we have already connected, we need to send a reconnected event
 			if (this.nodeSubscriptions && this.socket === socket) {
 				connectedToNode({
@@ -3346,13 +3512,34 @@ export class NodeReplicationConnection extends EventEmitter {
 			this.connect();
 		}, delay).unref();
 	}
-	// Called by replicateOverWS after a frame is actually sent: real progress, so it is safe to reset the
-	// backoff. Gated on a non-zero retries so the healthy hot path (already reset) does nothing.
-	onFrameSent() {
+	resetRetryBackoff() {
 		if (this.retries !== 0 || this.retryBackoff?.attempts) {
 			this.retries = 0;
 			this.retryBackoff?.reset();
 		}
+	}
+	onFrameSent() {
+		this.sendFailed = false;
+		this.progressWhileSendFailed = false;
+		this.resetRetryBackoff();
+	}
+	onSendFailed() {
+		this.sendFailed = true;
+	}
+	// A loop stuck on an oversized frame never catches up, so this cannot clear the veto for it.
+	onSenderCaughtUp() {
+		if (!this.sendFailed) return;
+		this.sendFailed = false;
+		if (this.progressWhileSendFailed) this.resetRetryBackoff();
+		this.progressWhileSendFailed = false;
+	}
+	// A subscriber's outbound leg sends no transaction frames, so this is its progress signal. A watermark this
+	// connection already credited is a replay, not progress, and a leg whose own sends fail has not recovered.
+	onDurableProgress(sequence: number) {
+		if (!(sequence > this.creditedDurableSequence) || !isValidReplicationClock(sequence)) return;
+		this.creditedDurableSequence = sequence;
+		if (this.sendFailed) this.progressWhileSendFailed = true;
+		else this.resetRetryBackoff();
 	}
 	// Retire the live replicateOverWS instance: the single enforcement point for "at most one live session
 	// per connection". Every path that supersedes a session (socket replaced in connect(), forceReconnect)
@@ -3528,8 +3715,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// User-DB tables that received at least one audit-less copy-apply snapshot row in the current copy
 	// pass (harper-pro#495). Only these need a reload marker: an empty (or fully-audited) table delivered
 	// nothing invisible to its live subscribers, so emitting a marker for it would be wasted work. Reset
-	// on every COPY_START; the send path skips non-replicated tables, so this set is inherently
-	// replicated-only. (System-DB reload tables are a fixed list and don't consult this.)
+	// on every COPY_START; the sender's table gate (`tableToTableEntry`) skips non-replicated tables, so
+	// this set is inherently replicated-only. (System-DB reload tables are a fixed list and don't consult this.)
 	const copiedTablesThisPass = new Set<string>();
 	// Durable-eligible copy resume cursor awaiting persist (#426). The copy cursor
 	// (`{currentTable, afterKey, ...}` = "fully copied through this key") is KEY-based and, exactly like
@@ -3665,6 +3852,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// (received-version watermark suppressed) and it could never reach Available.
 			if (copyFromNodeId !== undefined) getDatabaseStores().dbisDB?.remove([Symbol.for('copyCursor'), copyFromNodeId]);
 			inCopyMode = false;
+			if (copyOriginAnchors?.size && auditStore) {
+				try {
+					// a peer-supplied name must not mint an id; an origin the copy carried rows for already has one
+					const nameToId = exportIdMapping(auditStore);
+					for (const [originName, anchor] of copyOriginAnchors) {
+						if (Object.hasOwn(nameToId, originName) && typeof nameToId[originName] === 'number')
+							noteOriginProgress(nameToId[originName], anchor);
+					}
+				} catch (error) {
+					// without the anchors those origins resume from 0, as they would without the capability
+					logger.warn?.(connectionId, 'could not record the copy anchors for', databaseName, error);
+				}
+				copyOriginAnchors = undefined;
+				if (frameOpen) drainEndTxnDeferred = true;
+				else
+					tableSubscriptionToReplicator.send(
+						seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+					);
+			}
+			creditDurableProgress();
 			subscriptionSetupWatchdog?.resume();
 			// Retired before the flags its onStall re-checks are cleared, so the timer stops waking the
 			// event loop for the rest of the connection's life.
@@ -3907,9 +4114,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// those rows are WAL-off with no transaction-log entry. The final copy sequence update (seqId >=
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
-	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn exactly as before, so this
-	// adds no per-seq-update overhead and does not alter non-copyApply paths. (harper-pro#480)
+	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn with no flush gate. (harper-pro#480)
 	function seqUpdateEndTxn(seqId: number): any {
+		const originCursors = takeDurableOriginCursors();
 		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && seqId >= copyModeStartTime) {
 			return {
 				type: 'end_txn',
@@ -3917,6 +4124,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				remoteNodeIds: receivingDataFromNodeIds,
 				txnStream,
 				onFailure: onFrameFailure,
+				originCursors,
 				async onCommit() {
 					await flushCopyRowsDurable();
 				},
@@ -3928,6 +4136,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			remoteNodeIds: receivingDataFromNodeIds,
 			txnStream,
 			onFailure: onFrameFailure,
+			originCursors,
 		};
 	}
 	// Returns true to hold: core then records no cursor for this connection's later frames either.
@@ -4398,7 +4607,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	let schemaUpdateListener, dbRemovalListener;
 	const tableDecoders = [];
-	const remoteTableById = [];
+	// The declaration to judge a send by. The live map wins: a drop removes the entry and a recreate
+	// replaces the object, so a cached class can outlive both. A connection that never resolved its
+	// database keeps the cached one instead, since treating that as "dropped" would stop replication
+	// rather than protect anything.
+	const liveDeclaration = (cached: any, tableName: string) => (tables ? tables[tableName] : cached);
 	let receivingDataFromNodeNames;
 	const residencyMap = [];
 	const sentResidencyLists = [];
@@ -4461,10 +4674,23 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let subscriptionRequest, auditSubscription;
 	let nodeSubscriptions;
 	let excludedNodes: string[]; // list of nodes to exclude from this subscription
-	// undefined = not yet computed; null = computed, no exclusions; Set = tables to drop on receive
-	let receiveExcludedTables: Set<string> | null | undefined;
+	// undefined = not yet computed; null = nothing blocked; Map = table name -> why it is dropped.
+	let receiveBlockedTables: Map<string, string> | null | undefined;
+	// Discarded on a table replacement, or a pre-fix sender keeps writing into a table that has left
+	// the live map for the life of the socket. Per connection: the receive path also runs on
+	// inbound-only sockets, which never reach the sender-side listener below.
+	const blockedTablesInvalidator = onUpdatedTable((table) => {
+		if (!databaseName || table?.databaseName === databaseName) receiveBlockedTables = undefined;
+	});
+	ws.on('close', () => blockedTablesInvalidator.remove());
 	let remoteShortIdToLocalId: Map<number, number>;
 	let subscribedNodeIds: Array<boolean | { startTime: number; endTime?: number }> | undefined; // map of node IDs to their subscription time ranges
+	// `liveStartByLog` is the live incremental range's own map, so an `includeNodes` update reaches the range
+	let requestedOriginCursors: Record<string, number> | undefined;
+	let originFloors: Map<string, number> | undefined;
+	let originFloorById: number[] | undefined;
+	let liveStartByLog: Map<string, number> | undefined;
+	let wakeSender: (() => void) | undefined;
 	// Serialize message handling so that async backpressure inside onWSMessage doesn't allow
 	// the WS library to start processing the next frame before the current one is fully decoded.
 	// Without serialization, awaiting inside the handler would let concurrent message handlers
@@ -4498,6 +4724,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	let hasBlobGap = false;
 	let lastDurableSequenceId = 0;
 	let committedSequence = 0;
+	function creditDurableProgress() {
+		// Copy-apply rows are not durable until the copy's final flush, so they are not progress yet.
+		if (!(copyApplyActive() && inCopyMode) && !supersededOrClosed())
+			options.connection?.onDurableProgress?.(lastDurableSequenceId);
+	}
+	function advanceDurableWatermark() {
+		lastDurableSequenceId = committedSequence;
+		creditDurableProgress();
+	}
 	// Blob-divergence escalation (harper-pro#386). Each blob save failure already logs at `error`, but a
 	// sustained failing link emits that per-blob spam without a single line naming it as ongoing
 	// divergence. Once this connection crosses SUSTAINED_BLOB_FAILURE_THRESHOLD failures we log one
@@ -4512,6 +4747,22 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// `outstandingBlobsToFinish` before it clamps, so it only needs `hasBlobGap`; the sequence-update sites
 	// don't await, so they also gate on outstanding blobs.
 	const cursorBlockedByBlob = () => hasBlobGap || outstandingBlobsToFinish.length > 0;
+	// Origin progress is held under the durable watermark's blob rule; a copy's anchors wait for the copy to finish.
+	let pendingOriginCursors: Map<number, number> | undefined;
+	let copyOriginAnchors: Map<string, number> | undefined;
+	// A frame's log key is its origin's own log key only on RocksDB, on both ends.
+	const recordsOriginCursors = () =>
+		STORAGE_IS_ROCKSDB && peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities);
+	function noteOriginProgress(originId: number, logKey: number) {
+		pendingOriginCursors ??= new Map();
+		if (!(pendingOriginCursors.get(originId) >= logKey)) pendingOriginCursors.set(originId, logKey);
+	}
+	function takeDurableOriginCursors(): [number, number][] | undefined {
+		if (!pendingOriginCursors?.size || cursorBlockedByBlob()) return undefined;
+		const cursors = [...pendingOriginCursors];
+		pendingOriginCursors.clear();
+		return cursors;
+	}
 
 	// ── Leading-duplicate fast-skip state ───────────────────────────────────────────────────────────
 	// Per *source node* (NOT a single global flag): the resume cursor we asked this node to re-stream
@@ -5044,6 +5295,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// Copy-order version (message[2]); undefined from a pre-versioning leader. Persisted in the
 						// cursor and echoed back so a future leader can reject a cursor built under a different order. (#421)
 						copyModeOrderVersion = message[2];
+						copyOriginAnchors = recordsOriginCursors() ? parseOriginKeyMap(message[3]) : undefined;
 						copyFromNodeId = getIdOfRemoteNode(remoteNodeName, auditStore);
 						const cloneAttempt = process.env.HARPER_CLONE_ATTEMPT;
 						const sharedStatus = getSharedStatus();
@@ -5289,9 +5541,26 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						let responseData: Buffer;
 						try {
 							const recordId = message[3];
-							const table = remoteTableById[tableId] || (remoteTableById[tableId] = tables[message[4]]);
-							if (!table) {
-								return logger.warn?.('Unknown table id trying to handle record request', tableId);
+							// Resolved per request, not cached: a cached class outlives a drop.
+							const table = tables?.[message[4]];
+							if (!table || !tableReplicates(table)) {
+								// One wording for every case, so a guessing peer cannot tell them apart.
+								logger.warn?.(
+									connectionId,
+									'Refusing record request for',
+									databaseName,
+									message[4],
+									'from',
+									remoteNodeName
+								);
+								ws.send(
+									encode([
+										GET_RECORD_RESPONSE,
+										requestId,
+										{ error: `Table ${databaseName}.${message[4]} is not available for replication` },
+									])
+								);
+								break;
 							}
 							// we are sending raw binary data back, so we have to send the typed structure information so the
 							// receiving side can properly decode it. We only need to send this once until it changes again, so we can check if the structure
@@ -5435,6 +5704,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						}
 
 						// Remove nodes from exclusion list (add their logs to the iterator)
+						const includeFloors =
+							auditStore?.reusableIterable === true &&
+							peerCapabilitiesLearned &&
+							peerSupportsOriginCursors(peerCapabilities)
+								? resolveOriginFloors(data?.originCursors, exportIdMapping(auditStore))
+								: undefined;
 						for (const nodeName of nodesToInclude) {
 							const index = excludedNodes.indexOf(nodeName);
 							if (index !== -1) {
@@ -5443,9 +5718,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								if (auditStore && subscribedNodeIds) {
 									const localId = getIdOfRemoteNode(nodeName, auditStore);
 									delete subscribedNodeIds[localId];
+									// Bound the log before addLog re-admits it: the live range reads its start from this map.
+									const floor = includeFloors?.get(nodeName);
+									if (floor === undefined) {
+										originFloors?.delete(nodeName);
+										if (originFloorById) delete originFloorById[localId];
+										liveStartByLog?.delete(nodeName);
+									} else {
+										(originFloors ??= new Map()).set(nodeName, floor);
+										(originFloorById ??= [])[localId] = floor;
+										liveStartByLog?.set(nodeName, floor);
+									}
 								}
 								// Add this log back to the iterator
 								auditLogIterable?.addLog(nodeName);
+								wakeSender?.();
 								logger.debug?.(connectionId, 'added log to iterator:', nodeName);
 							}
 						}
@@ -5456,6 +5743,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						nodeSubscriptions = data;
 						excludedNodes = message[2]; // use the third argument for exclusion list
 						const subscriptionSetupRequestId = message[3];
+						requestedOriginCursors =
+							peerCapabilitiesLearned && peerSupportsOriginCursors(peerCapabilities)
+								? Object.fromEntries(parseOriginKeyMap(message[4]))
+								: undefined;
+						originFloors = undefined;
+						originFloorById = undefined;
+						liveStartByLog = undefined;
 						// permission check to make sure that this node is allowed to subscribe to this database, that is that
 						// we have publish permission for this node/database
 						let subscriptionToHdbNodes, whenSubscribedToHdbNodes;
@@ -5577,20 +5871,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// this means we are unsubscribing
 							return;
 						const firstNode = nodeSubscriptions[0];
-						const tableToTableEntry = (table) => {
-							if (
-								table &&
-								(firstNode.replicateByDefault
-									? !firstNode.tables.includes(table.tableName)
-									: firstNode.tables.includes(table.tableName))
-							) {
-								return { table };
-							}
-						};
-						const currentTransaction = { txnLogKey: 0 };
-						let tableById;
-						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
-						let sentSequenceId; // the last sequence number we have sent
 						// Tables excluded from outgoing replication to this peer+database. Prefer this node's
 						// config-route sendsTo (the `sendRoute` resolved above), falling back to the peer's hdb_nodes
 						// authorization.replicates.sendsTo for add_node-configured peers. Previously this read only
@@ -5605,6 +5885,25 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							remoteNodeName,
 							databaseName
 						);
+						// Route exclusions belong here rather than per record: the copy loop opens a row's blobs
+						// before the per-record filters run, so a skipped table's blobs would stream anyway.
+						// The live database map also reflects drop/recreate replacements.
+						const tableToTableEntry = (table) => {
+							if (
+								table &&
+								tableReplicates(liveDeclaration(table, table.tableName)) &&
+								!sendExcludedTables?.has(table.tableName) &&
+								(firstNode.replicateByDefault
+									? !firstNode.tables.includes(table.tableName)
+									: firstNode.tables.includes(table.tableName))
+							) {
+								return { table };
+							}
+						};
+						const currentTransaction = { txnLogKey: 0 };
+						let tableById;
+						let currentSequenceId = Infinity; // the last sequence number in the audit log that we have processed, set this with a finite number from the subscriptions
+						let sentSequenceId; // the last sequence number we have sent
 						const sendAuditRecord = (auditRecord, cursor, subscriptionNodeId = auditRecord.nodeId) => {
 							if (auditRecord.type === 'end_txn') {
 								if (currentTransaction.txnLogKey) {
@@ -5658,7 +5957,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								}
 							}
 							const table = tableEntry.table;
-							if (sendExcludedTables?.has(table.tableName)) {
+							const liveTable = liveDeclaration(table, table.tableName);
+							if (!liveTable || !tableReplicates(liveTable)) {
 								return skipAuditRecord();
 							}
 							const primaryStore = table.primaryStore;
@@ -5691,12 +5991,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const timeRange = subscribedNodeIds?.[subscriptionNodeId];
 							// if we have a list of excluded nodes, that means we are including nodes by default so if the nodeId is not
 							// in the subscribedNodeIds list, than it matches the subscription
-							const matchesSubscription =
-								(excludedNodes && timeRange === undefined) ||
-								// if it is in the list, we check the timestamps to verify it matches
-								(timeRange &&
-									(timeRange as any).startTime < subscriptionPosition &&
-									(!(timeRange as any).endTime || (timeRange as any).endTime > subscriptionPosition));
+							const matchesSubscription = matchesSubscriptionPosition(
+								timeRange as any,
+								!!excludedNodes,
+								originFloorById?.[subscriptionNodeId],
+								subscriptionPosition
+							);
 							if (!matchesSubscription) {
 								if (DEBUG_MODE)
 									logger.trace?.(
@@ -5930,7 +6230,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								ws.send(frame.encodingBuffer.subarray(frame.encodingStart, frame.position));
 								// A frame actually went out: tell the outbound connection so it can reset its reconnect
 								// backoff on genuine progress rather than on bare socket-open (harper-pro#339).
-								options.connection?.onFrameSent?.();
+								if (!supersededOrClosed()) options.connection?.onFrameSent?.();
 								logger.debug?.(connectionId, 'Sent message, size:', frame.position - frame.encodingStart);
 								if (databaseName !== 'system') {
 									recordAction(
@@ -6013,6 +6313,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									subscribedNodeIds[localId] = { startTime, endTime };
 									subscribedNodeName = name;
 								}
+								// Only a multi-log range reads unlisted origins, and only per-origin logs carry their keys.
+								if (excludedNodes && auditStore.reusableIterable === true) {
+									const nameToId = exportIdMapping(auditStore);
+									originFloors = resolveOriginFloors(requestedOriginCursors, nameToId);
+									for (const name of [
+										getThisNodeName(),
+										...excludedNodes,
+										...nodeSubscriptions.map(({ name }) => name),
+									])
+										originFloors.delete(name);
+									// left undefined without floors, so the per-record predicate pays one check
+									originFloorById = originFloors.size > 0 ? [] : undefined;
+									for (const [name, floor] of originFloors) originFloorById[nameToId[name]] = floor;
+								}
 
 								sendDBSchema(databaseName, subscriptionSetupRequestId);
 								if (!schemaUpdateListener) {
@@ -6091,6 +6405,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											}
 										}
 										if (currentSequenceId === 0) {
+											// Capability-only gate, never version: the LMDB no-op-write hole predates this
+											// capability existing at all (DESIGN.md's v5+LMDB note).
+											const legacyCopy = !peerCapabilities.safeCopyAudit;
+											if (legacyCopy) copyResume = undefined;
+											if (closed || wsClosed) return;
 											logger.info?.('Replicating all tables to', remoteNodeName);
 											// Anchored in this node's own `local` log only. It does NOT depend on the tail being single-log:
 											// `excluded` is always an array here, so the range below is normally the multi-log aggregate, and
@@ -6159,6 +6478,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											// An empty log (anchorKey 0) still sends the wall clock, never a sentinel below every key: the
 											// follower persists it, and shouldForceBaseCopyForRetention reads such a cursor as purged history.
 											const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
+											// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
+											const relayedAnchors =
+												!copyResume && canResumePastAnchor && excludedNodes
+													? collectRelayedLogAnchors(
+															auditStore,
+															new Set([...excludedNodes, ...nodeSubscriptions.map(({ name }) => name)])
+														)
+													: undefined;
+											const boundaryFailure = (rangeOptions: any) => rangeBoundaryFailure(auditStore, rangeOptions);
+											// only anchors the tail resumes past are the receiver's to keep
+											let announcedAnchors: Map<string, number> | undefined;
 											// A resumed copy resumes in append order only if its anchor still NAMES an entry of the log;
 											// anything else — a pre-#876 wall-clock anchor, a purged entry, a log that cannot be read — keeps
 											// the timestamp resume every build before this one used for every cursor. `resumeAnchorKind`
@@ -6167,12 +6497,30 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (anchorKey === 0) {
 												// An empty log: everything it will ever yield commits after this point, so an ordinary range from
 												// its start is already the boundary.
-												auditLogIterable = auditStore.getRange({
+												const emptyLogRange = {
 													start: 0,
 													log: excludedNodes ? undefined : logName,
 													excludeLogs: excludedNodes,
 													snapshot: false,
-												});
+												};
+												let anchors = relayedAnchors;
+												let relayedRange: any;
+												while (anchors?.size) {
+													relayedRange = {
+														...emptyLogRange,
+														exactStart: true,
+														resumeAfterExactStart: true,
+														startByLog: anchors,
+													};
+													const failure = boundaryFailure(relayedRange);
+													if (!failure) break;
+													anchors = anchorsWithoutFailedLogs(anchors, failure);
+												}
+												if (anchors?.size) {
+													auditLogIterable = auditStore.getRange(relayedRange);
+													boundaryLogName = logName;
+													announcedAnchors = anchors;
+												} else auditLogIterable = auditStore.getRange(emptyLogRange);
 												anchoredInLogOrder = true;
 											} else if (
 												canResumePastAnchor &&
@@ -6188,33 +6536,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													exclusiveStart: true,
 													resumeAfterExactStart: true,
 													log: excludedNodes ? undefined : logName,
-													startByLog: new Map([[logName, copyStartTime]]),
+													startByLog: new Map([[logName, copyStartTime], ...(relayedAnchors ?? [])]),
 													excludeLogs: excludedNodes,
 													snapshot: false,
 												};
-												// Prove the boundary forms UNDER THESE OPTIONS. A freshly built iterable cannot answer: core
-												// fills `exactStartFailures` during `next()`, so the map is empty until something pulls.
-												let unusable: unknown;
-												try {
-													const probe: any = auditStore.getRange(boundaryRange);
-													const probeIterator = probe[Symbol.iterator]();
-													try {
-														probeIterator.next();
-													} finally {
-														// Single-pull probe: release the underlying log iterator now rather than leaving
-														// it for GC. `return` is wired through for exactly this on the single-log path;
-														// a no-op where it isn't (the multi-log aggregate has no teardown hook at all).
-														probeIterator.return?.();
-													}
-													unusable =
-														probe.exactStartFailures?.size > 0 ||
-														probe.failedLogs?.size > 0 ||
-														probe.corruptFrameStop?.breaks > 0;
-												} catch (error) {
-													// A throw here is the same outcome as a recorded failure and must not escape into the outer
-													// catch, which would close and reconnect into the same failing boundary, copying nothing.
-													unusable = error;
+												let anchors = relayedAnchors;
+												let unusable = boundaryFailure(boundaryRange);
+												while (unusable && anchors?.size) {
+													anchors = anchorsWithoutFailedLogs(anchors, unusable);
+													boundaryRange.startByLog = new Map([[logName, copyStartTime], ...(anchors ?? [])]);
+													unusable = boundaryFailure(boundaryRange);
 												}
+												if (!unusable) announcedAnchors = anchors;
 												if (unusable) {
 													// Degrade rather than refuse, for the same reason. The anchor stays the entry's key, which
 													// under the timestamp range still replays everything keyed after it.
@@ -6228,6 +6561,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													anchoredInLogOrder = true;
 												}
 											}
+											if (announcedAnchors && originFloorById) {
+												// resumed past their exact anchors: a key floor would drop entries appended later with older keys
+												const nameToId = exportIdMapping(auditStore);
+												for (const logName of announcedAnchors.keys()) delete originFloorById[nameToId[logName]];
+											}
 											if (!anchoredInLogOrder && (copyResume || orderedTableNames.length > 0)) {
 												// A degraded anchor is otherwise indistinguishable from a log-order one in the logs.
 												logger.warn?.(
@@ -6235,9 +6573,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												);
 											}
 											const nodeId = getThisNodeId(auditStore);
+											if (legacyCopy) {
+												// Legacy no-op puts can corrupt the receiver's audit log.
+												await verifyLegacyCopyBaseline({
+													peerName: remoteNodeName,
+													databaseName,
+													tables: Object.fromEntries(
+														Object.entries(tables ?? {}).filter(
+															([name, table]) => !sendExcludedTables?.has(name) && tableToTableEntry(table)
+														)
+													),
+													request: (operation) => sendOperation(operation, 30_000),
+													isClosed: () => closed || wsClosed,
+												});
+												if (closed || wsClosed) return;
+											}
 											// Tell the follower a bulk copy is starting, its anchor, and the copy-cursor version, so it tracks
 											// a resume cursor a later leader can validate before trusting the skip or the anchor.
-											ws.send(encode([COPY_START, copyStartTime, COPY_ORDER_VERSION]));
+											ws.send(
+												encode(
+													announcedAnchors?.size &&
+														peerCapabilitiesLearned &&
+														peerSupportsOriginCursors(peerCapabilities)
+														? [COPY_START, copyStartTime, COPY_ORDER_VERSION, Object.fromEntries(announcedAnchors)]
+														: [COPY_START, copyStartTime, COPY_ORDER_VERSION]
+												)
+											);
 											// Test-only (#453): one-shot stall here leaves the follower in copy mode with no
 											// further frames while pings keep flowing — the connected:true copy wedge.
 											const copyStallForTest = maybeStallCopyForTest(databaseName);
@@ -6254,7 +6615,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											let withheldOriginNodeId: number | undefined;
 											let withheldRecordCount = 0;
 											try {
-												const peerNodeRow = getHDBNodeTable().primaryStore.getSync(remoteNodeName);
+												const peerNodeRow = !legacyCopy && getHDBNodeTable().primaryStore.getSync(remoteNodeName);
 												if (
 													shouldWithholdPeerOwnRecords({
 														cloneSource: cloneAttemptSource(),
@@ -6283,7 +6644,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													error
 												);
 											}
-											for (const tableName of orderedTableNames) {
+											for (const tableName of legacyCopy ? [] : orderedTableNames) {
 												const table = tables[tableName];
 												if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
 												if (!reachedResumeTable) {
@@ -6319,6 +6680,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														await new Promise(setImmediate);
 														if (closed) return;
 													}
+													// After the yield, so no await separates this from the encode below, which opens the
+													// row's blobs. See DESIGN.md note 24 for what a live change can and cannot be.
+													const liveCopyTable = liveDeclaration(table, tableName);
+													if (!liveCopyTable || !tableReplicates(liveCopyTable)) break;
 													// Local-only records must never be full-copied to a peer. metadataFlags is the
 													// already-available record metadata integer from the range entry — a pure bitmask
 													// test, no record value decode added to this send path.
@@ -6450,12 +6815,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										// older-keyed entry this range would correctly yield is dropped by the subscription predicate
 										// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
 										boundaryLogName = undefined;
+										liveStartByLog = new Map([[logName, currentSequenceId || 1], ...(originFloors ?? [])]);
 										auditLogIterable = auditStore.getRange({
 											start: currentSequenceId || 1,
 											exclusiveStart: true,
 											exactStart: false,
 											log: excludedNodes ? undefined : logName,
-											startByLog: new Map([[logName, currentSequenceId || 1]]),
+											startByLog: liveStartByLog,
 											excludeLogs: excludedNodes,
 											snapshot: false, // don't want to use a snapshot, and we want to see new entries
 										});
@@ -6515,11 +6881,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										);
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									await nextTransaction;
+									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
+									// an `includeNodes` update re-admits a log whose entries are already committed
+									let wake: () => void;
+									await new Promise<void>((resolve, reject) => {
+										wake = wakeSender = resolve;
+										nextTransaction.then(resolve, reject);
+									});
+									// a superseded loop must not clear the live loop's waker
+									if (wakeSender === wake) wakeSender = undefined;
 								} while (!closed);
 							})
 							.catch((error) => {
 								logger.error?.(connectionId, 'Error handling subscription to node', error);
+								if (!supersededOrClosed()) options.connection?.onSendFailed?.();
 								// An authorization-watch rejection before it resolves reaches this chain too (the setup
 								// gate awaits the same promise), and that chain has already closed with a more accurate
 								// code — so a second close here would only overwrite the reason.
@@ -6597,6 +6972,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// COPY_COMPLETE could otherwise flip copyCompleteReceived mid-body and make trailing rows fall back to
 			// the audited/resequencing path — reintroducing the O(n) copy-time work this avoids. (harper-pro#480)
 			const messageIsCopyFrame = inCopyMode && !copyCompleteReceived;
+			// a copy frame's key is a walk position, not a log key
+			const recordFrameOrigins = !messageIsCopyFrame && recordsOriginCursors();
+			// almost every frame holds one origin; a second one allocates
+			let frameOrigin: number | undefined;
+			let frameMoreOrigins: number[] | undefined;
 			// Copy frames get a walk position, and everything staging or blob-tagging against it is
 			// captured NOW (decode time): onCommit runs later from the apply queue, by which time a
 			// same-socket COPY_START may have replaced the pass and its copyStartTime/copyOrder — staging
@@ -6667,32 +7047,54 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					close(1011, 'missing table structure; reconnecting to resync');
 					return;
 				}
-				// Lazily compute receive-side exclusions once remoteNodeName is known.
-				// Prefer routeReplicates from the subscriber-side connection; fall back to
-				// authorization.replicates when this is the server-side handler.
-				if (receiveExcludedTables === undefined) {
+				// Route exclusions plus this node's non-replicating tables: a backstop for an older
+				// sender that still forwards both. The sender's gate is the enforcement point.
+				if (receiveBlockedTables === undefined) {
 					const firstNode = options.connection?.nodeSubscriptions?.[0];
 					const receivesFromEntries =
 						firstNode?.routeReplicates?.receivesFrom ??
 						(authorization?.replicates && typeof authorization.replicates === 'object'
 							? authorization.replicates.receivesFrom
 							: undefined);
-					receiveExcludedTables =
-						getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName) ?? null;
+					const blocked = new Map<string, string>();
+					const routeExcluded = getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, databaseName);
+					if (routeExcluded)
+						for (const tableName of routeExcluded) blocked.set(tableName, 'table excluded by the receive route');
+					for (const tableName in tables)
+						if (!tableReplicates(tables[tableName]) && !blocked.has(tableName))
+							blocked.set(tableName, 'table does not replicate on this node');
+					receiveBlockedTables = blocked.size > 0 ? blocked : null;
 				}
-				if (tableDecoder && receiveExcludedTables?.has(tableDecoder.name)) {
+				const dropReason = receiveBlockedTables && tableDecoder && receiveBlockedTables.get(tableDecoder.name);
+				if (dropReason) {
 					logger.trace?.(
 						connectionId,
-						'dropping incoming replication for excluded table',
+						'dropping incoming replication for',
 						databaseName + '.' + tableDecoder.name,
 						'from',
-						remoteNodeName
+						remoteNodeName,
+						dropReason
 					);
+					if (auditRecord.extendedType & HAS_BLOBS) {
+						// Blobs are announced ahead of their record, so they are already buffered; without this
+						// they would sit until the blobsTimer sweep a blobTimeout later (900s default).
+						try {
+							for (const blob of collectAuditRecordBlobsFromBinary(auditRecord, tableDecoder, auditStore?.rootStore))
+								discardIncomingBlobStream(blob);
+						} catch (error) {
+							logger.trace?.(
+								connectionId,
+								'could not enumerate the blobs of a dropped record',
+								auditRecord.recordId,
+								error
+							);
+						}
+					}
 					if (
 						!(await recordReplicationHole(
 							remoteShortIdToLocalId.get(auditRecord.nodeId),
 							tableDecoder.name,
-							'table excluded by the receive route'
+							dropReason
 						))
 					)
 						return;
@@ -6782,6 +7184,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				// references (unbounded recursion).
 				const localSourceNodeId = remoteShortIdToLocalId.get(auditRecord.nodeId);
 				if (localSourceNodeId === undefined) throw new Error(`No node name mapped for origin id ${auditRecord.nodeId}`);
+				if (recordFrameOrigins) {
+					if (frameOrigin === undefined) frameOrigin = localSourceNodeId;
+					else if (frameOrigin !== localSourceNodeId && !frameMoreOrigins?.includes(localSourceNodeId))
+						(frameMoreOrigins ??= []).push(localSourceNodeId);
+				}
 				if (auditRecord.type === 'lockBarrier') {
 					// Captured now, reported from this frame's onCommit: a barrier is proof only once committed.
 					let barrier;
@@ -7110,8 +7517,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// (`hasBlobGap`) holds the watermark until a reconnect re-streams it. Because the watermark
 					// only ever includes durable blobs, the persisted cursor never advances past an unfinished or
 					// failed blob — preserving the no-data-loss guarantee — while the apply loop never blocks.
-					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) lastDurableSequenceId = committedSequence;
+					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) advanceDurableWatermark();
 					endTxnEvent.localTime = lastDurableSequenceId;
+					if (frameOrigin !== undefined) noteOriginProgress(frameOrigin, frameTxnLogKey);
+					if (frameMoreOrigins) for (const originId of frameMoreOrigins) noteOriginProgress(originId, frameTxnLogKey);
+					// core reads this after awaiting onCommit
+					endTxnEvent.originCursors = takeDurableOriginCursors();
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
 					// (version < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
 					// core persists [seq] = copyStartTime. Otherwise a small copy that finished before the cadence
@@ -7345,7 +7756,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// worker's connections map).
 			if (intentional && options.connection) options.connection.intentionallyUnsubscribed = true;
 			logger.debug?.(connectionId, 'closing', remoteNodeName, databaseName, code, reason);
-			ws.close(code, reason);
+			ws.close(code, truncateCloseReason(reason));
 			if (intentional) options.connection?.emit('finished'); // synchronously indicate that the connection is finished, so it is not accidentally reused
 		} catch (error) {
 			logger.error?.(connectionId, 'Error closing connection', error);
@@ -7973,7 +8384,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// `hasBlobGap` unset, see the `.catch`) — lets the watermark catch up to the highest committed
 					// sequence, which the next end_txn/sequence-update persists as the resume cursor.
 					if (outstandingBlobsToFinish.length === 0 && !hasBlobGap) {
-						lastDurableSequenceId = committedSequence;
+						advanceDurableWatermark();
 						// The last in-flight blob is now durable. Any resume-cursor update we sent earlier while it
 						// was outstanding was clamped to the pre-drain watermark (cursorBlockedByBlob() at the
 						// REMOTE_SEQUENCE_UPDATE / SEQUENCE_ID_UPDATE sites). Re-emit an end_txn at the now-durable
@@ -8000,6 +8411,29 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		return localBlob;
 	}
 	let lastSentExcludedNodes: string[] = [];
+	function currentOriginCursorVector(): Record<string, number> | undefined {
+		const connectedNodeName = options.connection?.nodeSubscriptions?.[0]?.name;
+		if (!connectedNodeName || !recordsOriginCursors()) return undefined;
+		const { auditStore: databaseAuditStore, dbisDB } = getDatabaseStores();
+		const store = auditStore ?? databaseAuditStore;
+		if (!store || !dbisDB) return undefined;
+		try {
+			const seqRows = collectSeqRows(
+				dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([0xff])] })
+			);
+			return buildOriginCursorVector(
+				seqRows,
+				getIdOfRemoteNode(connectedNodeName, store),
+				(id) => getNodeNameForId(store, id, true),
+				// a removed node leaves a tombstone, which reads as a clean null; an undecodable row stays a member
+				(name) => probeNodeRow(getHDBNodeTable().primaryStore, name).outcome !== 'deleted'
+			);
+		} catch (error) {
+			// Without cursors every unlisted origin starts at 0, as it would without the capability.
+			logger.warn?.(connectionId, 'could not read the per-origin resume cursors for', databaseName, error);
+			return undefined;
+		}
+	}
 	function sendSubscriptionRequestUpdate() {
 		// once we have received the node name, and we know the database name that this connection is for,
 		// we can send a subscription request, if no other threads have subscribed.
@@ -8027,7 +8461,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					}
 					if (includeNodes.length) {
 						logger.debug?.(connectionId, 'sending subscription update to include nodes:', includeNodes);
-						ws.send(encode([SUBSCRIPTION_UPDATE, { includeNodes }]));
+						const vector = currentOriginCursorVector();
+						const originCursors =
+							vector &&
+							Object.fromEntries(
+								includeNodes.filter((name) => Object.hasOwn(vector, name)).map((name) => [name, vector[name]])
+							);
+						ws.send(encode([SUBSCRIPTION_UPDATE, originCursors ? { includeNodes, originCursors } : { includeNodes }]));
 					}
 					if (excludeNodes.length || includeNodes.length) lastSentExcludedNodes = [...shouldExclude];
 				});
@@ -8072,7 +8512,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					// if there is an explicit subscription listed
 					if (subscription.subscribe && (subscription.schema || subscription.database) === databaseName) {
 						const tableName = subscription.table;
-						if (tables?.[tableName]?.replicate !== false && !receiverExcludedTables?.has(tableName))
+						if (tableReplicates(tables?.[tableName]) && !receiverExcludedTables?.has(tableName))
 							// if replication is enabled for this table and not excluded
 							tableSubs.push(tableName);
 					}
@@ -8083,7 +8523,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				for (const tableName in tables) {
 					if (
 						replicateByDefault
-							? tables[tableName].replicate === false || receiverExcludedTables?.has(tableName)
+							? !tableReplicates(tables[tableName]) || receiverExcludedTables?.has(tableName)
 							: tables[tableName].replicate && !receiverExcludedTables?.has(tableName)
 					) {
 						tableSubs.push(tableName);
@@ -8299,7 +8739,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			clearTimeout(delayedClose);
 			if (nodeSubscriptions.length > 0) {
 				const requestId = peerSupportsSubscriptionSetupAck ? ++nextSubscriptionSetupRequestId : undefined;
-				ws.send(encode([SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded, requestId]));
+				const originCursors = currentOriginCursorVector();
+				logger.debug?.(connectionId, 'per-origin resume cursors', originCursors);
+				ws.send(
+					encode(
+						originCursors
+							? [SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded, requestId, originCursors]
+							: [SUBSCRIPTION_REQUEST, nodeSubscriptions, excluded, requestId]
+					)
+				);
 				// Start a fresh request -> first application-response window on every non-empty request. This is
 				// intentionally after send(): a synchronous send failure must not leave an orphaned timer.
 				if (requestId === undefined) {
@@ -8383,12 +8831,18 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		sendNodeDBName(thisNodeName, databaseName);
 		return true;
 	}
-	function sendNodeDBName(thisNodeName, databaseName) {
+	// The table definitions a peer may learn from this node. A non-replicating table is never among
+	// them: the frame cannot carry the flag, so the peer would materialize a replicated-by-default
+	// twin of it. `subscribed` further scopes them where a subscription does.
+	function tableDefinitionsForPeer(databaseName: string, subscribed?: (tableName: string) => boolean) {
 		const database = getDatabases()?.[databaseName];
-		const tables = [];
+		const definitions = [];
 		for (const tableName in database) {
 			const table = database[tableName];
-			tables.push({
+			// A non-table property on the map has no `attributes` to read below, and reads as replicating.
+			if (!table?.attributes) continue;
+			if (!tableReplicates(table) || (subscribed && !subscribed(tableName))) continue;
+			definitions.push({
 				table: tableName,
 				schemaDefined: table.schemaDefined,
 				attributes: table.attributes.map((attr) => ({
@@ -8398,17 +8852,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				})),
 			});
 		}
+		return definitions;
+	}
+	function sendNodeDBName(thisNodeName, databaseName) {
+		const tableDefinitions = tableDefinitionsForPeer(databaseName);
 		logger.trace?.('Sending database info for node', thisNodeName, 'database name', databaseName);
 		// Test-only: a pre-#646 peer that sends no capability element, and a peer speaking a frame code this
 		// build does not know.
-		if (TEST_OMIT_CAPABILITIES) ws.send(encode([NODE_NAME, thisNodeName, databaseName, tables]));
+		if (TEST_OMIT_CAPABILITIES) ws.send(encode([NODE_NAME, thisNodeName, databaseName, tableDefinitions]));
 		else
 			ws.send(
 				encode([
 					NODE_NAME,
 					thisNodeName,
 					databaseName,
-					tables,
+					tableDefinitions,
 					{ ...LOCAL_CAPABILITIES, acceptBlobCodecs: acceptedBlobCodecs() },
 				])
 			);
@@ -8433,29 +8891,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
 	}
 	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
-		const database = getDatabases()?.[databaseName];
-		const tables = [];
-		for (const tableName in database) {
-			if (
-				nodeSubscriptions &&
-				!nodeSubscriptions.some((node) => {
-					return node.replicateByDefault ? !node.tables.includes(tableName) : node.tables.includes(tableName);
-				})
-			)
-				continue;
-			const table = database[tableName];
-			tables.push({
-				table: tableName,
-				schemaDefined: table.schemaDefined,
-				attributes: table.attributes.map((attr) => ({
-					name: attr.name,
-					type: attr.type,
-					isPrimaryKey: attr.isPrimaryKey,
-				})),
-			});
-		}
-
-		ws.send(encode([DB_SCHEMA, tables, databaseName, subscriptionSetupRequestId]));
+		const tableDefinitions = tableDefinitionsForPeer(
+			databaseName,
+			nodeSubscriptions &&
+				((tableName) =>
+					nodeSubscriptions.some((node) =>
+						node.replicateByDefault ? !node.tables.includes(tableName) : node.tables.includes(tableName)
+					))
+		);
+		ws.send(encode([DB_SCHEMA, tableDefinitions, databaseName, subscriptionSetupRequestId]));
 	}
 	blobsTimer = setInterval(
 		() => {
@@ -8486,6 +8930,37 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	).unref();
 
 	let nextId = 1;
+	function sendOperation(operation, timeoutMs?: number): Promise<any> {
+		const requestId = nextId++;
+		return new Promise((resolve, reject) => {
+			// Retire the entry ourselves: a peer that never answers must not pin it (and the caller) for
+			// the life of the socket.
+			const timer = timeoutMs
+				? setTimeout(() => {
+						if (awaitingResponse.delete(requestId))
+							reject(new Error(`${operation.operation} to ${remoteNodeName} did not answer within ${timeoutMs}ms`));
+					}, timeoutMs).unref()
+				: undefined;
+			awaitingResponse.set(requestId, {
+				resolve(result) {
+					clearTimeout(timer);
+					resolve(result);
+				},
+				reject(error) {
+					clearTimeout(timer);
+					reject(error);
+				},
+			});
+			try {
+				if (wsClosed) throw new Error('Connection closed before operation request');
+				ws.send(encode([OPERATION_REQUEST, { ...operation, requestId }]));
+			} catch (error) {
+				awaitingResponse.delete(requestId);
+				clearTimeout(timer);
+				reject(error);
+			}
+		});
+	}
 	const sentTableNames = [];
 	return {
 		end() {
@@ -8532,33 +9007,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		 * Send an operation request to the remote node, returning a promise for the result
 		 * @param operation
 		 */
-		sendOperation(operation, timeoutMs?: number) {
-			const requestId = nextId++;
-			operation.requestId = requestId;
-			ws.send(encode([OPERATION_REQUEST, operation]));
-			return new Promise((resolve, reject) => {
-				if (timeoutMs === undefined) {
-					awaitingResponse.set(requestId, { resolve, reject });
-					return;
-				}
-				// Retire the entry ourselves: a peer that never answers must not pin it (and the caller) for
-				// the life of the socket.
-				const timer = setTimeout(() => {
-					if (awaitingResponse.delete(requestId))
-						reject(new Error(`${operation.operation} to ${remoteNodeName} did not answer within ${timeoutMs}ms`));
-				}, timeoutMs).unref();
-				awaitingResponse.set(requestId, {
-					resolve: (value: any) => {
-						clearTimeout(timer);
-						resolve(value);
-					},
-					reject: (error: any) => {
-						clearTimeout(timer);
-						reject(error);
-					},
-				});
-			});
-		},
+		sendOperation,
 		// A standalone re-announce for this live socket (harper-pro#825, RECORD_LOCK_HOMES_DESIGN.md §6):
 		// activation does not otherwise reach an already-connected peer, since the capability bag is only
 		// sent at handshake. No-op while this node has no active generation yet — the peer's own fail-closed
@@ -8587,6 +9036,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	}
 	// Check the attributes in the msg vs the table and if they dont match call ensureTable to create them
 	function ensureTableIfChanged(tableDefinition: any, existingTable: any) {
+		if (existingTable && !tableReplicates(existingTable)) return existingTable;
 		if (!existingTable) existingTable = {};
 		const wasSchemaDefined = existingTable.schemaDefined;
 		let hasChanges = false;

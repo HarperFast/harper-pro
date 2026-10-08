@@ -46,6 +46,34 @@ export class RecordLogs extends Resource {
 	}
 }
 
+export class LogEntryCount extends Resource {
+	static loadAsInstance = false;
+	post(target, data) {
+		const auditStore = databases.data[data.table].auditStore;
+		auditStore.loadLogs();
+		// getRange would create a log it does not find
+		if (!auditStore.logByName.has(data.log)) return { count: 0 };
+		let count = 0;
+		for (const _entry of auditStore.getRange({ start: 0, log: data.log, snapshot: false })) count++;
+		return { count };
+	}
+}
+
+export class OriginCursors extends Resource {
+	static loadAsInstance = false;
+	post(target, data) {
+		const Table = databases.data[data.table];
+		const auditStore = Table.auditStore;
+		const nodeLogs = auditStore.loadLogs();
+		const nameById = new Map([...auditStore.logByName].map(([name, log]) => [nodeLogs.indexOf(log), name]));
+		const peerId = nodeLogs.indexOf(auditStore.logByName.get(data.peer));
+		const nodes = Table.dbisDB.getSync([Symbol.for('seq'), peerId])?.nodes ?? [];
+		return Object.fromEntries(
+			nodes.filter((node) => node.originLogKey).map((node) => [nameById.get(node.id) ?? node.id, node.originLogKey])
+		);
+	}
+}
+
 export class ReplicationCursor extends Resource {
 	static loadAsInstance = false;
 	post(target, data) {

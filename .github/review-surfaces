@@ -1,0 +1,28 @@
+# Risk surfaces: how much human and agent review attention a change to a path deserves.
+# The pre-push review reads this file from the BASE branch, so a PR cannot lower the tier of its
+# own files. Format: `<tier> <glob>`, last match wins. A glob containing `/` is anchored at the
+# repository root; one without matches at any depth.
+#
+# critical  — correctness or durability of stored data, replication (including its wire
+#             format), cluster membership, node cloning
+# sensitive — authentication, authorization, keys and certificates, licensing, request
+#             filtering, keeping secrets out of logs and child processes
+# hot       — per-request paths where a regression is a performance incident
+# ordinary  — overrides a broader line above it
+
+critical  replication/**
+critical  cloneNode/**
+critical  bin/repairDeleteEchoRuns.ts
+
+sensitive security/**
+sensitive cloneNode/jwtKeyClone.ts
+sensitive cloneNode/sshKeyClone.ts
+sensitive licensing/**
+sensitive waf/**
+sensitive replication/logRedaction.ts
+# Closes the injected cluster-key fd before anything spawns a worker or subprocess.
+sensitive bin/harper.js
+
+ordinary  replication/blobSendWarnThrottle.ts
+ordinary  replication/subscribeDeferralForTest.ts
+ordinary  replication/record-lock-*-runs/**

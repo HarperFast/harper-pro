@@ -7,7 +7,7 @@
  * review).
  */
 import assert from 'node:assert';
-import { notifyThreadExit, setMainIsWorker } from '#js/core/server/threads/manageThreads';
+import { notifyThreadExit, setMainIsWorker, workers } from '#js/core/server/threads/manageThreads';
 import {
 	HOMES_AGREEMENT_MATCH,
 	HOMES_AGREEMENT_MISMATCH,
@@ -37,6 +37,14 @@ import {
 	recordPeerHomesAgreement,
 	recordPeerLockCapability,
 	releaseRecordLockOwner,
+	cachedActiveGeneration,
+	controlEntryRelayDropCount,
+	forgetRecordLockHomesCache,
+	handleRelayedControlEntry,
+	refreshRecordLockHomesCache,
+	setRecordLockHomesRowReader,
+	relayLockControlEntry,
+	relayedControlEntryCount,
 } from '#src/replication/recordLockTransport';
 import { DELEGATE_OPERATION, RECALL_OPERATION } from '#src/replication/recordLockRpc';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
@@ -561,6 +569,61 @@ describe('recordLockOwnerFor (main thread)', () => {
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-nobody'], undefined);
 	});
 
+	it('never picks an isolated application worker as owner, for any database', () => {
+		const isolated = Object.assign(fakeWorker(141), { application: 'isolated-app' });
+		const plain = fakeWorker(142);
+		for (const database of ['iso-a', 'iso-b', 'iso-c']) {
+			assert.strictEqual(recordLockOwnerFor(database, [isolated, plain]), plain);
+			assert.strictEqual(recordLockOwnerFor(database, [plain, isolated]), plain);
+		}
+		assert.ok(!isolated.posted.some((m) => m.type === 'record-lock-owner'), 'never conferred or revoked');
+		assert.strictEqual(recordLockOwnerFor('iso-only', [isolated]), undefined, 'unowned rather than isolated');
+		assert.strictEqual(recordLockOwnerThreadIds()['iso-only'], undefined);
+		for (const database of ['iso-a', 'iso-b', 'iso-c', 'iso-only']) releaseRecordLockOwner(database);
+	});
+
+	it('tells an isolated application worker which thread owns a database, since it can serve lock()', () => {
+		const isolated = Object.assign(fakeWorker(161), { application: 'isolated-app' });
+		const plain = fakeWorker(162);
+		workers.push(isolated, plain);
+		try {
+			assert.strictEqual(recordLockOwnerFor('iso-broadcast'), plain);
+			assert.ok(
+				isolated.posted.some(
+					(m) => m.type === 'record-lock-owner-thread' && m.database === 'iso-broadcast' && m.threadId === 162
+				)
+			);
+		} finally {
+			releaseRecordLockOwner('iso-broadcast');
+			workers.splice(workers.indexOf(isolated), 1);
+			workers.splice(workers.indexOf(plain), 1);
+		}
+	});
+
+	it('withholds the successor until an isolated application worker acks its fence, since it can hold relayed handles', async () => {
+		const departing = fakeWorker(151);
+		const isolated = Object.assign(fenceAckWorker(152), { application: 'isolated-app' });
+		const successor = fakeWorker(153);
+		assert.strictEqual(recordLockOwnerFor('iso-handoff', [departing]), departing);
+		assert.strictEqual(
+			recordLockOwnerFor('iso-handoff', [isolated, successor], async () => 1),
+			undefined
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(
+			recordLockOwnerThreadIds()['iso-handoff'],
+			undefined,
+			'the bump and the pool fence resolved, but the isolated worker has not confirmed its fence'
+		);
+		const requestId = isolated.fenceRequestId();
+		assert.ok(requestId !== undefined, 'the isolated worker was asked to fence');
+		handleOwnerThreadAck({ requestId }, { threadId: 152 });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.strictEqual(recordLockOwnerThreadIds()['iso-handoff'], successor.threadId);
+		assert.ok(!isolated.posted.some((m) => m.type === 'record-lock-owner'), 'never conferred');
+		releaseRecordLockOwner('iso-handoff');
+	});
+
 	it('a release racing an in-flight handoff supersedes it — the bump completing does not resurrect it', async () => {
 		const dead = fakeWorker(71);
 		const live = fakeWorker(72);
@@ -713,5 +776,175 @@ describe('createRecordLockTransport().establishLockFreshness', () => {
 			{ table: 'Counter', dependencies: null, deadlineMs: 300 },
 		]);
 		assert.strictEqual(homeMapReader(), undefined, 'the barrier reads the map the transport itself would answer');
+	});
+});
+
+describe('relaying a peer control entry to the coordinating worker (harper-pro#977)', () => {
+	const entry = { type: 'lockRelease', key: 'k', requester: 'alpha', token: [1, 1, 1], dependencies: null };
+	let port;
+	beforeEach(() => {
+		port = { threadId: 9101, posted: [], postMessage: (message) => port.posted.push(message) };
+		globalThis.threads.push(port);
+	});
+	afterEach(() => {
+		globalThis.threads.splice(globalThis.threads.indexOf(port), 1);
+	});
+
+	it('sends the entry, author and position straight to the owner thread over the mesh', () => {
+		const owner = fakeWorker(9101);
+		recordLockOwnerFor('relay-a', [owner]);
+		try {
+			relayLockControlEntry('relay-a', 't', entry, 'alpha', 42);
+			assert.deepStrictEqual(port.posted, [
+				{ type: 'record-lock-control-entry', database: 'relay-a', table: 't', entry, author: 'alpha', position: 42 },
+			]);
+		} finally {
+			releaseRecordLockOwner('relay-a');
+		}
+	});
+
+	it('counts the entry as a relay drop while the owner is unknown or its port is gone, never throws', () => {
+		assert.doesNotThrow(() => relayLockControlEntry('relay-unknown', 't', entry, 'alpha', 1));
+		assert.strictEqual(controlEntryRelayDropCount('relay-unknown'), 1);
+		const owner = fakeWorker(9999);
+		recordLockOwnerFor('relay-gone', [owner]);
+		try {
+			assert.doesNotThrow(() => relayLockControlEntry('relay-gone', 't', entry, 'alpha', 1));
+			assert.strictEqual(port.posted.length, 0);
+			assert.strictEqual(controlEntryRelayDropCount('relay-gone'), 1);
+		} finally {
+			releaseRecordLockOwner('relay-gone');
+		}
+	});
+
+	it('applies a relayed entry only on the thread that coordinates the database, from a stamped sender', () => {
+		const message = { database: 'relay-recv', table: 't', entry, author: 'alpha', position: 5 };
+		handleRelayedControlEntry(message, port);
+		assert.strictEqual(relayedControlEntryCount('relay-recv'), 0, 'not the owner: dropped');
+		setMainIsWorker(true);
+		try {
+			recordLockOwnerFor('relay-recv', []);
+			handleRelayedControlEntry(message, { threadId: undefined });
+			assert.strictEqual(relayedControlEntryCount('relay-recv'), 0, 'unstamped sender: dropped');
+			assert.strictEqual(controlEntryRelayDropCount('relay-recv'), 2, 'both refusals counted as drops');
+			handleRelayedControlEntry({ ...message, entry: null }, port);
+			handleRelayedControlEntry({ ...message, author: 7 }, port);
+			assert.strictEqual(relayedControlEntryCount('relay-recv'), 0, 'malformed envelope: dropped');
+			handleRelayedControlEntry(message, port);
+			assert.strictEqual(relayedControlEntryCount('relay-recv'), 1);
+		} finally {
+			releaseRecordLockOwner('relay-recv');
+			setMainIsWorker(false);
+		}
+	});
+});
+
+describe('refreshing the home-map cache (harper-pro#853 startup latch)', () => {
+	const generation = (n) => ({ active: { generation: n, homes: ['a'], digest: `d${n}` } });
+	const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+	let previous;
+	beforeEach(() => (previous = setRecordLockHomesRowReader(previous ?? (() => Promise.reject(new Error('unset'))))));
+	afterEach(() => setRecordLockHomesRowReader(previous));
+
+	it('retries a failed read on a backoff until one succeeds, then stops', async () => {
+		let reads = 0;
+		setRecordLockHomesRowReader(async () => {
+			reads++;
+			if (reads < 3) throw new Error('storage hiccup');
+			return generation(5);
+		});
+		await refreshRecordLockHomesCache('refresh-retry');
+		assert.strictEqual(cachedActiveGeneration('refresh-retry'), undefined, 'a failed read caches nothing');
+		await settle(400);
+		assert.strictEqual(cachedActiveGeneration('refresh-retry'), 5);
+		await settle(200);
+		assert.strictEqual(reads, 3, 'no retry after a success');
+		forgetRecordLockHomesCache('refresh-retry');
+	});
+
+	it('a read that resolves after a newer refresh began installs nothing', async () => {
+		let release;
+		const slow = new Promise((resolve) => (release = resolve));
+		setRecordLockHomesRowReader(() => slow);
+		const stale = refreshRecordLockHomesCache('refresh-fence');
+		setRecordLockHomesRowReader(async () => generation(2));
+		await refreshRecordLockHomesCache('refresh-fence');
+		assert.strictEqual(cachedActiveGeneration('refresh-fence'), 2);
+		release(generation(1));
+		await stale;
+		assert.strictEqual(cachedActiveGeneration('refresh-fence'), 2, 'the retracted generation did not come back');
+		forgetRecordLockHomesCache('refresh-fence');
+	});
+
+	it('a failed homes-changed refresh after a failed startup read keeps the retry budget alive', async () => {
+		let reads = 0;
+		setRecordLockHomesRowReader(async () => {
+			reads++;
+			if (reads < 3) throw new Error('down');
+			return generation(7);
+		});
+		await refreshRecordLockHomesCache('refresh-budget');
+		await refreshRecordLockHomesCache('refresh-budget');
+		assert.strictEqual(reads, 2);
+		await settle(600);
+		assert.strictEqual(cachedActiveGeneration('refresh-budget'), 7, 'recovered once storage came back');
+		forgetRecordLockHomesCache('refresh-budget');
+	});
+
+	it('keeps probing at the backoff ceiling once the budget is spent, and an operator refresh restores the budget', async () => {
+		let reads = 0;
+		setRecordLockHomesRowReader(async () => {
+			reads++;
+			throw new Error('down');
+		});
+		await refreshRecordLockHomesCache('refresh-exhausted');
+		await settle(1_500);
+		const spent = reads;
+		assert.ok(spent >= 7, `the budget was spent: ${reads} reads`);
+		await settle(700);
+		assert.ok(reads > spent, 'still probing at the ceiling after the budget');
+		setRecordLockHomesRowReader(async () => generation(9));
+		await settle(700);
+		assert.strictEqual(cachedActiveGeneration('refresh-exhausted'), 9, 'recovered without an operator');
+		let failOnce = true;
+		setRecordLockHomesRowReader(async () => {
+			if (failOnce) {
+				failOnce = false;
+				throw new Error('one transient failure');
+			}
+			return generation(10);
+		});
+		await refreshRecordLockHomesCache('refresh-exhausted', true);
+		await settle(200);
+		assert.strictEqual(
+			cachedActiveGeneration('refresh-exhausted'),
+			10,
+			'a fresh budget retried the operator refresh promptly'
+		);
+		forgetRecordLockHomesCache('refresh-exhausted');
+	});
+
+	it('a read from a torn-down lifetime cannot install into, or clear, its replacement', async () => {
+		let release;
+		const slow = new Promise((resolve) => (release = resolve));
+		setRecordLockHomesRowReader(() => slow);
+		const old = refreshRecordLockHomesCache('refresh-lifetime');
+		forgetRecordLockHomesCache('refresh-lifetime');
+		setRecordLockHomesRowReader(async () => generation(2));
+		await refreshRecordLockHomesCache('refresh-lifetime');
+		release(generation(1));
+		await old;
+		assert.strictEqual(cachedActiveGeneration('refresh-lifetime'), 2, 'the old lifetime installed nothing');
+		let reject;
+		const failing = new Promise((_, r) => (reject = r));
+		setRecordLockHomesRowReader(() => failing);
+		const oldFailure = refreshRecordLockHomesCache('refresh-lifetime');
+		forgetRecordLockHomesCache('refresh-lifetime');
+		setRecordLockHomesRowReader(async () => generation(3));
+		await refreshRecordLockHomesCache('refresh-lifetime');
+		reject(new Error('late failure'));
+		await oldFailure;
+		assert.strictEqual(cachedActiveGeneration('refresh-lifetime'), 3, 'the old lifetime cleared nothing');
+		forgetRecordLockHomesCache('refresh-lifetime');
 	});
 });

@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
-import { isExplicitDatabaseSubscription, isReplicatedDatabase } from '#src/replication/replicatedDatabases';
+import {
+	isExplicitDatabaseSubscription,
+	isReplicatedDatabase,
+	tableReplicates,
+} from '#src/replication/replicatedDatabases';
 
 describe('isReplicatedDatabase', () => {
 	it('accepts everything when replication.databases is unset or a wildcard', () => {
@@ -55,5 +59,29 @@ describe('isReplicatedDatabase', () => {
 		assert.equal(isExplicitDatabaseSubscription([{ database: 'data', subscribe: true }], 'data'), true);
 		assert.equal(isExplicitDatabaseSubscription([{ schema: 'data', subscribe: false }], 'data'), false);
 		assert.equal(isExplicitDatabaseSubscription([null, 'data'], 'data'), false);
+	});
+});
+
+describe('tableReplicates', () => {
+	it('treats only an explicit replicate: false as non-replicating', () => {
+		assert.equal(tableReplicates({ replicate: false }), false);
+		assert.equal(tableReplicates({ replicate: true }), true);
+		assert.equal(tableReplicates({}), true);
+	});
+
+	it('reads a describe_all entry and a live Table alike', () => {
+		assert.equal(tableReplicates({ name: 'LocalKeyspace', replicate: false, attributes: [] }), false);
+		assert.equal(
+			tableReplicates(
+				class Table {
+					static replicate = false;
+				}
+			),
+			false
+		);
+	});
+
+	it('is true for an absent table, so an unknown name is not itself an exclusion', () => {
+		assert.equal(tableReplicates(undefined), true);
 	});
 });

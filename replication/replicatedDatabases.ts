@@ -21,3 +21,7 @@ export function isExplicitDatabaseSubscription(subscriptions: unknown, dbName: s
 		)
 	);
 }
+
+export function tableReplicates(table: { replicate?: boolean } | undefined): boolean {
+	return table?.replicate !== false;
+}

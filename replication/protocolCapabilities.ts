@@ -32,12 +32,21 @@ export const SUBSCRIPTION_SETUP_ACK_CAPABILITY = 1;
  */
 export const RECORD_LOCKS_CAPABILITY = 4;
 
+/**
+ * Level at which a peer sends and applies the per-origin cursor vector (harper-pro#989, W4 harper-pro#434):
+ * `SUBSCRIPTION_REQUEST[4]`, `originCursors` on an `includeNodes` update, and the relayed-log anchors on
+ * `COPY_START[3]`. Advertised only by a build whose transaction logs are per origin (RocksDB).
+ */
+export const ORIGIN_CURSORS_CAPABILITY = 1;
+
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
+	safeCopyAudit: number;
 	protocolVersion: number;
 	subscriptionSetupAck: number;
 	subscriptionSetupBudgetMs: number | undefined;
 	recordLocks: number;
+	originCursors: number;
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -73,16 +82,22 @@ function resolveBudget(value: unknown): number | undefined {
 /** Keys this build does not know are dropped, so nothing downstream can consult one by accident. */
 export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 	return Object.freeze({
+		safeCopyAudit: bag?.safeCopyAudit === 1 ? 1 : 0,
 		protocolVersion: resolveLevel(bag?.protocolVersion, LOCAL_PROTOCOL_VERSION, MINIMUM_PROTOCOL_VERSION),
 		subscriptionSetupAck: resolveLevel(bag?.subscriptionSetupAck, SUBSCRIPTION_SETUP_ACK_CAPABILITY, 0),
 		subscriptionSetupBudgetMs: resolveBudget(bag?.subscriptionSetupBudgetMs),
 		recordLocks: resolveExactLevel(bag?.recordLocks, 0),
+		originCursors: resolveLevel(bag?.originCursors, ORIGIN_CURSORS_CAPABILITY, 0),
 	});
 }
 
 /** The only reader of the `recordLocks` level: the send gate and the participant set both go through here. */
 export function peerSupportsRecordLocks(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.recordLocks === RECORD_LOCKS_CAPABILITY;
+}
+
+export function peerSupportsOriginCursors(resolved: ResolvedPeerCapabilities): boolean {
+	return resolved.originCursors >= ORIGIN_CURSORS_CAPABILITY;
 }
 
 /** A peer that advertised nothing — the pre-registry baseline. */
@@ -107,14 +122,18 @@ export function advertisedRecordLocksLevel(recordLocksEnabled: boolean, bagOmitt
 
 export function buildLocalCapabilities(
 	subscriptionSetupBudgetMs: number,
-	recordLocksEnabled: boolean
+	recordLocksEnabled: boolean,
+	perOriginLogs: boolean
 ): Readonly<Record<string, number>> {
 	return Object.freeze({
+		safeCopyAudit: 1,
 		protocolVersion: LOCAL_PROTOCOL_VERSION,
 		subscriptionSetupAck: SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 		subscriptionSetupBudgetMs,
 		// A node that has not enabled cluster locks never grants, so it must not claim it would.
 		recordLocks: advertisedRecordLocksLevel(recordLocksEnabled, false),
+		// LMDB keys one shared audit log by local time, so it has no origin cursor to send or apply.
+		originCursors: perOriginLogs ? ORIGIN_CURSORS_CAPABILITY : 0,
 	});
 }
 
@@ -122,10 +141,12 @@ export function buildLocalCapabilities(
 export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b: ResolvedPeerCapabilities): boolean {
 	return (
 		a !== undefined &&
+		a.safeCopyAudit === b.safeCopyAudit &&
 		a.protocolVersion === b.protocolVersion &&
 		a.subscriptionSetupAck === b.subscriptionSetupAck &&
 		a.subscriptionSetupBudgetMs === b.subscriptionSetupBudgetMs &&
-		a.recordLocks === b.recordLocks
+		a.recordLocks === b.recordLocks &&
+		a.originCursors === b.originCursors
 	);
 }
 

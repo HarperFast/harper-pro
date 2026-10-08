@@ -51,6 +51,7 @@ import { createBackoff } from '../replication/backoff.ts';
 import {
 	isExplicitDatabaseSubscription,
 	isReplicatedDatabase as isReplicatedDatabaseUnder,
+	tableReplicates,
 } from '../replication/replicatedDatabases.ts';
 
 /**
@@ -307,7 +308,11 @@ export async function cloneNode(): Promise<void> {
 	harperLogger = logger.loggerWithTag('cloneNode');
 
 	const syncStartedAt: number = resumeMarker?.startedAt ?? Date.now();
-	let targetTimestamps: Record<string, number> | undefined = resumeMarker?.targetTimestamps;
+	let targetTimestamps: Record<string, number> | undefined = resumeMarker?.targetsExcludeLocalTables
+		? resumeMarker.targetTimestamps
+		: undefined;
+	if (resumeMarker?.targetTimestamps && !resumeMarker.targetsExcludeLocalTables)
+		log('Re-deriving clone sync targets: the resumed marker predates excluding non-replicating tables');
 	let totalBytes: number = resumeMarker?.totalBytes ?? 0;
 
 	try {
@@ -324,7 +329,13 @@ export async function cloneNode(): Promise<void> {
 			// and a base copy already running resumes from its durable cursor rather than restarting.
 			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: false });
 			await establishReplicationSetup();
-			writeSyncStartedMarker({ startedAt: syncStartedAt, replicationEstablished: true, targetTimestamps, totalBytes });
+			writeSyncStartedMarker({
+				startedAt: syncStartedAt,
+				replicationEstablished: true,
+				targetTimestamps,
+				totalBytes,
+				targetsExcludeLocalTables: true,
+			});
 		}
 
 		if (!targetTimestamps) {
@@ -338,6 +349,7 @@ export async function cloneNode(): Promise<void> {
 			writeSyncStartedMarker({
 				startedAt: syncStartedAt,
 				replicationEstablished: true,
+				targetsExcludeLocalTables: true,
 				targetTimestamps,
 				totalBytes,
 				setupComplete: true,
@@ -592,6 +604,12 @@ type SyncStartedMarker = {
 	startedAt?: number;
 	replicationEstablished?: boolean;
 	targetTimestamps?: Record<string, number>;
+	/**
+	 * Whether `targetTimestamps` was derived with non-replicating tables excluded. Absent means
+	 * re-derive: a marker that kept a database whose every table is local names a socket no side
+	 * opens, and a resume reusing it waits out the whole clone ceiling.
+	 */
+	targetsExcludeLocalTables?: boolean;
 	totalBytes?: number;
 	setupComplete?: boolean;
 };
@@ -842,6 +860,7 @@ async function fetchAndPersistSnapshot(
 	writeSyncStartedMarker({
 		startedAt: syncStartedAt,
 		replicationEstablished: true,
+		targetsExcludeLocalTables: true,
 		targetTimestamps: snapshot.targetTimestamps,
 		totalBytes: snapshot.totalBytes,
 	});
@@ -899,6 +918,10 @@ async function getLastUpdatedRecord(): Promise<{ targetTimestamps: Record<string
 		if (typeof allDb[db] !== 'object') continue;
 		if (!isReplicatedDatabase(db, shardedReplicates) && !isExplicitDatabaseSubscription(leaderNode?.subscriptions, db))
 			continue;
+		// A database whose every table is non-replicating gets no target and no required socket: nothing
+		// subscribes it on either side, so a target for it would leave the clone waiting for a socket
+		// that is never opened.
+		if (!hasReplicatedTable(allDb[db])) continue;
 		lastUpdated[db] = findMostRecentTimestamp(allDb[db]);
 		totalBytes += sumTableSizes(allDb[db]);
 	}
@@ -920,7 +943,7 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 	for (const table in dbObj) {
 		const tableObj = dbObj[table];
 		// requestId is part of the describe response so we ignore it
-		if (typeof tableObj !== 'object' || tableObj == null) continue;
+		if (typeof tableObj !== 'object' || tableObj == null || !tableReplicates(tableObj)) continue;
 		if (tableObj.last_updated_record > mostRecent) {
 			mostRecent = tableObj.last_updated_record;
 		}
@@ -929,12 +952,21 @@ function findMostRecentTimestamp(dbObj: Record<string, any>): number {
 	return mostRecent;
 }
 
+/** Whether a describe response holds any table this node would actually receive. */
+function hasReplicatedTable(dbObj: Record<string, any>): boolean {
+	for (const table in dbObj) {
+		const tableObj = dbObj[table];
+		if (typeof tableObj === 'object' && tableObj != null && tableReplicates(tableObj)) return true;
+	}
+	return false;
+}
+
 /** Sum the on-disk table sizes in one describe response, for sizing the sync wait's ceiling. */
 function sumTableSizes(dbObj: Record<string, any>): number {
 	let total = 0;
 	for (const table in dbObj) {
 		const tableObj = dbObj[table];
-		if (typeof tableObj !== 'object' || tableObj == null) continue;
+		if (typeof tableObj !== 'object' || tableObj == null || !tableReplicates(tableObj)) continue;
 		const size = tableObj.db_size ?? tableObj.table_size;
 		if (typeof size === 'number' && size > 0) total += size;
 	}
@@ -1264,6 +1296,11 @@ async function cloneSchemas(): Promise<void> {
 		const dbDescribe = allDb[dbName];
 		if (!dbDescribe || typeof dbDescribe !== 'object' || dbName === SYSTEM_SCHEMA_NAME) continue;
 		if (!isReplicatedDatabase(dbName)) continue;
+		const replicatedTableNames = Object.keys(dbDescribe).filter((tableName) => {
+			const tableDesc = dbDescribe[tableName];
+			return tableDesc && typeof tableDesc === 'object' && tableReplicates(tableDesc);
+		});
+		if (replicatedTableNames.length === 0) continue;
 		if (!databases[dbName]) {
 			try {
 				await createSchema({ database: dbName, operation: OPERATIONS_ENUM.CREATE_DATABASE });
@@ -1279,9 +1316,8 @@ async function cloneSchemas(): Promise<void> {
 			}
 		}
 
-		for (const tableName of Object.keys(dbDescribe)) {
+		for (const tableName of replicatedTableNames) {
 			const tableDesc = dbDescribe[tableName];
-			if (!tableDesc || typeof tableDesc !== 'object') continue;
 			if (databases[dbName]?.[tableName]) continue;
 
 			// describe_all `attributes` entries use `{ attribute, type, is_primary_key }` — translate to

@@ -114,7 +114,7 @@ When a feature spans both, prefer landing as much as possible in `core/` and glu
 ### Pro non-source
 
 - **`build-tools/`** — `build-pro.sh` orchestrates the build; `sync-core.sh` syncs the core submodule; `download-prebuilds.js` fetches native prebuilds; `set-core-branch.sh` pins core's branch.
-- **`scripts/`** — `patch-release.js` (~12KB). Cherry-picks PRs labeled `patch` from `main` onto a release branch in both core and Pro, bumps the version, syncs the submodule. See `CONTRIBUTING.md` for usage.
+- **`scripts/`** — `patch-release.js` verifies milestone-targeted merged PRs on the release branches in both core and Pro, bumps versions, syncs the submodule, and pushes the branches and tags. The cherry-pick workflow lands backports separately. See `CONTRIBUTING.md` for usage.
 - **`dev/`** — `sync-commits.js`. One-time repo-migration utility, not part of normal runtime.
 - **`static/`** — `defaultConfig.yaml` template, `ascii_logo.txt`.
 
@@ -130,12 +130,13 @@ When a feature spans both, prefer landing as much as possible in `core/` and glu
 - **Storage substrate**: same as core — RocksDB primary, LMDB available via `HARPER_STORAGE_ENGINE=lmdb`.
 - **Documentation scope**: https://docs.harperdb.io is authoritative for Harper mechanics. Pro docs describe Pro-only surface, not core behavior.
 - **Submodule pointer**: when changing core, commit there first, then bump the submodule pointer in Pro in a separate commit. Don't combine core changes with submodule bumps — they need to be reviewable separately.
-- **Patch releases**: PRs that should land in a stable release branch must carry the **`patch`** label. See `CONTRIBUTING.md` for the patch-release workflow.
+- **Patch releases**: a PR's milestone selects its earliest stable release line and newer minor lines of the same major; the **`patch`** label does not select backports. See `CONTRIBUTING.md` for the patch-release workflow.
 
 ---
 
 ## Cross-references
 
+- **[DESIGN.md](DESIGN.md)** — Pro design-note index, including the release verification invariant.
 - **[core/AGENTS.md](core/AGENTS.md)** — substrate architecture (Resources, Server, Components, Data Layer). Read first for substrate questions.
 - **[core/DESIGN.md](core/DESIGN.md)** — non-obvious internals (RecordObject prototype, getFromSource timing, blob orphan cleanup).
 - **[core/resources/DESIGN.md](core/resources/DESIGN.md)** — `Table.ts` and `Resource.ts` section indexes.
