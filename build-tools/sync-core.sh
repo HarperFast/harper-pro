@@ -67,6 +67,22 @@ sync_pkg_field devDependencies
 sync_pkg_field overrides
 sync_pkg_field optionalDependencies
 
+# One spec per shipped package; see build-tools/DESIGN.md.
+node -e '
+	const { readFileSync, writeFileSync } = require("node:fs");
+	const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+	for (const field of ["dependencies", "optionalDependencies"]) {
+		for (const name of Object.keys(manifest[field] ?? {})) {
+			const spec = manifest.devDependencies?.[name];
+			if (spec === undefined) continue;
+			console.error(`  ↳ ${field} ${name}: ${manifest[field][name]} -> ${spec} (was also a devDependency)`);
+			manifest[field][name] = spec;
+			delete manifest.devDependencies[name];
+		}
+	}
+	writeFileSync("package.json", JSON.stringify(manifest, null, "\t") + "\n");
+'
+
 if [[ "$SKIP_INSTALL" != "true" ]]; then
   echo -e "\n📦 Installing core deps"
   npm install
