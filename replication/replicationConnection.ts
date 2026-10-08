@@ -6565,7 +6565,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									let rising: Map<string, number> | undefined;
 									for (const [name, floor] of floors) {
 										// an origin a SUBSCRIPTION_UPDATE excluded during the pass had its scan cut short
-										if (excludedNodes?.includes(name) || !(certifiedFloors.get(name) >= floor)) continue;
+										if (excludedNodes?.includes(name) || certifiedFloors.get(name) >= floor) continue;
 										(rising ??= new Map()).set(name, floor);
 									}
 									if (!rising || closed || wsClosed) return;
