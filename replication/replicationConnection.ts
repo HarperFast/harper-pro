@@ -5333,7 +5333,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (waiting) markersAwaitingDatabase.set(schemaDatabaseName, pendingMarkers);
 							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
 							if (connectionSuperseded()) return;
-							if (waiting) markersAwaitingDatabase.delete(schemaDatabaseName);
+							// an overlapping pass may have merged in markers it has not recorded yet
+							if (markersAwaitingDatabase.get(schemaDatabaseName) === pendingMarkers)
+								markersAwaitingDatabase.delete(schemaDatabaseName);
 							pendingMarkers = [];
 						}
 						for (const tableDefinition of data) {
