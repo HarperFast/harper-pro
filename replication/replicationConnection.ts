@@ -14,6 +14,7 @@ import {
 	isDroppedPeerGeneration,
 	catalogCreatedBefore,
 	catalogCreatedTime,
+	tableDropEpoch,
 	stampTableCreatedTime,
 	tableLifecycleTime,
 } from '../core/resources/databases.ts';
@@ -5029,6 +5030,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		stream.destroy?.();
 	}
 
+	/**
+	 * Records resolve by table name, so a peer generation accepted earlier is judged again once the local table changes
+	 * or a drop marker is recorded on any thread, rather than written into a generation that retired it.
+	 */
+	function peerGenerationRefused(tableDecoder: any): boolean {
+		if (tableDecoder.refused) return true;
+		const epoch = tableDropEpoch();
+		if (tableDecoder.dropEpoch === epoch && tables[tableDecoder.name] === tableDecoder.table) return false;
+		tableDecoder.dropEpoch = epoch;
+		tableDecoder.table = tables[tableDecoder.name];
+		return (tableDecoder.refused = isDroppedPeerGeneration(databaseName, tableDecoder.name, tableDecoder.createdTime));
+	}
+
 	// Blobs are announced ahead of their record, so a skipped record's are already buffered; without this they
 	// would sit until the blobsTimer sweep a blobTimeout later (900s default).
 	function discardRecordBlobs(auditRecord: AuditRecord, tableDecoder: { decoder: any }) {
@@ -5465,8 +5479,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							decoder,
 							table,
 							createdTime: data.createdTime,
+							dropEpoch: tableDropEpoch(),
+							// the class a rejudge rebinds to, not the one this structure was first accepted against
 							getEntry(id) {
-								return table.primaryStore.getEntry(id);
+								return this.table.primaryStore.getEntry(id);
 							},
 							rootStore: table.primaryStore.rootStore,
 						};
@@ -5908,7 +5924,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const { resolve, reject, tableId, key } = awaitingResponse.get(message[1]);
 						const entry = message[2];
 						if (entry?.error) reject(new Error(entry.error));
-						else if (entry && (!tableDecoders[tableId]?.decoder || tableDecoders[tableId].refused)) {
+						else if (entry && (!tableDecoders[tableId]?.decoder || peerGenerationRefused(tableDecoders[tableId]))) {
 							if (tableDecoders[tableId]?.decoder && entry.value)
 								discardRecordBlobs({ getBinaryValue: () => entry.value, recordId: key } as any, tableDecoders[tableId]);
 							reject(
@@ -7453,14 +7469,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					close(1011, 'missing table structure; reconnecting to resync');
 					return;
 				}
-				// Records resolve by name, so once the local generation changes (a marker learned since this structure was
-				// accepted), the peer's generation is judged again rather than written into its replacement.
-				if (!tableDecoder.refused && tables[tableDecoder.name] !== tableDecoder.table) {
-					if (isDroppedPeerGeneration(databaseName, tableDecoder.name, tableDecoder.createdTime))
-						tableDecoder.refused = true;
-					else tableDecoder.table = tables[tableDecoder.name];
-				}
-				if (tableDecoder.refused) {
+				if (peerGenerationRefused(tableDecoder)) {
 					// A dead generation's records are skipped, and its peer retires the table once it learns the marker.
 					logger.trace?.(
 						connectionId,
@@ -9388,8 +9397,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				recordTableDrop(schemaDatabaseName, tableName, droppedTime);
 				continue;
 			}
-			if (tableReplicates(localTable) && catalogCreatedTime(localTable) === undefined)
-				adoptPreStampGeneration(schemaDatabaseName, localTable, droppedTime, definitions);
+			if (tableReplicates(localTable) && catalogCreatedTime(localTable) === undefined) {
+				await adoptPreStampGeneration(schemaDatabaseName, localTable, droppedTime, definitions);
+				if (connectionSuperseded()) return;
+			}
 			try {
 				if (await localTable.dropTable({ peer: true, droppedTime }))
 					logger.warn?.(
@@ -9416,7 +9427,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	 * one holding no row older than the drop is stamped newer when the frame carries the peer's newer definition or it
 	 * holds a row written after the drop.
 	 */
-	function adoptPreStampGeneration(
+	async function adoptPreStampGeneration(
 		schemaDatabaseName: string,
 		localTable: any,
 		droppedTime: number,
@@ -9425,7 +9436,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		// created before a drop recorded after its bound: core retires it
 		const createdBefore = catalogCreatedBefore(localTable);
 		if (createdBefore !== undefined && droppedTime > createdBefore) return;
-		const rows = rowsAround(localTable, droppedTime);
+		const rows = await rowsAround(localTable, droppedTime);
 		if (rows.older) return;
 		const definitionStamp = definitions.find((definition) => definition.table === localTable.tableName)?.createdTime;
 		const peerStamp =

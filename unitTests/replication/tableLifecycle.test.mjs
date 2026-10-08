@@ -44,10 +44,21 @@ describe('rowsAround', () => {
 			},
 		},
 	});
-	it('reports a row written before the drop, and whether any row was written after it', () => {
-		assert.deepEqual(rowsAround(tableWith(150, 99, 200), 100), { older: true, newer: true });
-		assert.deepEqual(rowsAround(tableWith(99), 100), { older: true, newer: false });
-		assert.deepEqual(rowsAround(tableWith(100, 150), 100), { older: false, newer: true });
-		assert.deepEqual(rowsAround(tableWith(), 100), { older: false, newer: false });
+	it('reports a row written before the drop, and whether any row was written after it', async () => {
+		assert.deepEqual(await rowsAround(tableWith(150, 99, 200), 100), { older: true, newer: true });
+		assert.deepEqual(await rowsAround(tableWith(99), 100), { older: true, newer: false });
+		assert.deepEqual(await rowsAround(tableWith(100, 150), 100), { older: false, newer: true });
+		assert.deepEqual(await rowsAround(tableWith(), 100), { older: false, newer: false });
+	});
+	it('yields the worker while it reads a large table in full', async () => {
+		let turns = 0;
+		const ticker = setInterval(() => turns++, 0);
+		try {
+			const versions = Array.from({ length: 50000 }, () => 200);
+			assert.deepEqual(await rowsAround(tableWith(...versions), 100), { older: false, newer: true });
+		} finally {
+			clearInterval(ticker);
+		}
+		assert.ok(turns > 0, 'other work ran during the scan');
 	});
 });
