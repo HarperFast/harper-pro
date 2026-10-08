@@ -217,8 +217,8 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
-  # Rolling upgrade from a previous release onto this build, and a one-node rollback. Its own job so the
-  # previous releases are installed only here; in the cluster shards the file finds no installs and skips.
+  # Its own job so the previous releases are installed only here; in the cluster shards the file finds
+  # no installs and skips.
   run-mixed-version-tests:
     name: Mixed-version Cluster Tests from ${{ matrix.previous-release }} (Node.js v${{ matrix.node-version }})
     runs-on: ubuntu-latest
