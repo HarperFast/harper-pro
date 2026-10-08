@@ -211,6 +211,92 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
+  # Rolling upgrade from previous releases onto this build, and a one-node rollback. Its own job so the
+  # previous releases are installed only here; in the cluster shards the file finds no installs and skips.
+  run-mixed-version-tests:
+    name: Mixed-version Cluster Tests (Node.js v${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    needs: [generate-node-version-matrix, build]
+    # 15 + 15: three sequential retry.sh calls (re2 rebuild, two release installs) can each burn the full
+    # 30/60/90s backoff before succeeding on the last attempt.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ${{ fromJSON(needs.generate-node-version-matrix.outputs.node-versions) }}
+    env:
+      # Bump the releases as the release lines move; the test reads each version from its package.json.
+      PREVIOUS_RELEASES: '5.2.15 5.3.1'
+      TEST_FILE: integrationTests/cluster/mixedVersionRollingUpgrade.test.mjs
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: 'recursive'
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          package-manager-cache: false
+          check-latest: ${{ matrix.node-version == '26' }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: harper-build-artifacts-node-${{ matrix.node-version }}
+
+      - name: Relink bin scripts
+        run: npm rebuild --ignore-scripts --offline
+
+      - name: Build re2 native binary
+        run: .github/scripts/retry.sh "npm rebuild re2" -- npm rebuild re2
+
+      - name: Install previous harper-pro releases
+        run: |
+          installs=()
+          for version in $PREVIOUS_RELEASES; do
+            mkdir -p "/tmp/harper-pro-$version"
+            .github/scripts/retry.sh "npm install @harperfast/harper-pro@$version" -- \
+              npm install --ignore-scripts --no-audit --no-fund --prefix "/tmp/harper-pro-$version" "@harperfast/harper-pro@$version"
+            installs+=("/tmp/harper-pro-$version/node_modules/@harperfast/harper-pro")
+          done
+          echo "HARPER_PRO_PREVIOUS_VERSION_PATHS=$(IFS=:; echo "${installs[*]}")" >> "$GITHUB_ENV"
+
+      # The file skips when it finds no installs, which would make this job a false green.
+      - name: Guard mixed-version test inputs
+        run: |
+          if [ ! -f "$TEST_FILE" ]; then
+            echo "::error::mixed-version test file '$TEST_FILE' does not exist — this job would run no tests."
+            exit 1
+          fi
+          IFS=: read -ra installs <<< "$HARPER_PRO_PREVIOUS_VERSION_PATHS"
+          if [ "${#installs[@]}" -eq 0 ]; then
+            echo "::error::HARPER_PRO_PREVIOUS_VERSION_PATHS is empty — the mixed-version suite would skip."
+            exit 1
+          fi
+          for install in "${installs[@]}"; do
+            if [ ! -f "$install/package.json" ] || [ ! -f "$install/dist/bin/harper.js" ]; then
+              echo "::error::no harper-pro install at '$install'."
+              exit 1
+            fi
+          done
+
+      - name: Run mixed-version cluster tests
+        env:
+          HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
+        run: npm run test:integration -- "$TEST_FILE"
+
+      - name: Upload Harper server logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: harper-mixed-version-logs-node-${{ matrix.node-version }}
+          path: /tmp/harper-integration-test-logs/
+          retention-days: 3
+          if-no-files-found: ignore
+
   run-copy-gap-runtime-regression:
     name: Copy-gap Runtime Regression (Node.js v${{ matrix.node-version }})
     if: github.event_name == 'pull_request'

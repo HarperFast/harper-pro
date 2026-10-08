@@ -1,0 +1,16 @@
+type MixedVersionItem @table(audit: true) @export {
+	id: ID @primaryKey
+	category: String @indexed
+	rank: Int
+	payload: Blob
+}
+
+type MixedVersionTyped @table(audit: true, randomAccessFields: true) @export {
+	id: ID @primaryKey
+	category: String @indexed
+	label: String
+	count: Int
+	ratio: Float
+	flag: Boolean
+	tags: [String]
+}
