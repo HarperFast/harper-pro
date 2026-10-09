@@ -253,6 +253,10 @@ describe('sync-core.sh', function () {
 		const result = spawnSync('bash', [syncCore, '--skip-install'], { cwd: clone, env: gitEnv, encoding: 'utf8' });
 		assert.strictEqual(result.status, 0, result.stdout + result.stderr);
 		assert.strictEqual(git(join(clone, 'core'), 'rev-parse', 'HEAD'), git(upstream, 'rev-parse', 'main'));
+		git(clone, 'submodule', 'deinit', '-f', 'core');
+		const afterDeinit = spawnSync('bash', [syncCore, '--skip-install'], { cwd: clone, env: gitEnv, encoding: 'utf8' });
+		assert.notStrictEqual(afterDeinit.status, 0, 'a deinitialized core is not re-initialized');
+		assert.match(afterDeinit.stderr, /deinitialized/);
 	});
 
 	it("tracks the superproject's own branch when submodule.core.branch is `.`", () => {

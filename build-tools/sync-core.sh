@@ -29,7 +29,14 @@ fi
 
 if use_git; then
   echo -e "\n📦 Updating core submodule"
-  [[ -e core/.git ]] || git submodule update --init core
+  if [[ ! -e core/.git ]]; then
+    # a deinitialized core must not be re-initialized here (AGENTS.md, Submodule / Git Setup)
+    if [[ -e "$(git rev-parse --git-dir)/modules/core" ]]; then
+      echo "core is deinitialized; re-initializing it corrupts its git dir (see AGENTS.md) — restore it by hand first" >&2
+      exit 1
+    fi
+    git submodule update --init core
+  fi
   # as `git submodule update --remote` resolves it; `.` means the superproject's own branch
   CORE_BRANCH=$(git config --get submodule.core.branch || git config -f .gitmodules --get submodule.core.branch || echo HEAD)
   if [[ "$CORE_BRANCH" == "." ]]; then
