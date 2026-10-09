@@ -39,6 +39,7 @@ A persistent connection to one remote node. Owns the WebSocket lifecycle, reconn
 The protocol decoder. Reads incoming binary commands — each is a top-level named const in the same file:
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 | Command constant                           | Value     | Meaning                                                                                           |
 | ------------------------------------------ | --------- | ------------------------------------------------------------------------------------------------- |
 | `SUBSCRIPTION_REQUEST`                     | 129       | Client wants to subscribe to a table                                                              |
@@ -73,6 +74,25 @@ The protocol decoder. Reads incoming binary commands — each is a top-level nam
 | `COPY_START`                               | 148       | Leader → follower: a bulk table copy is starting (carries `copyStartTime` + `COPY_ORDER_VERSION`)    |
 | `COPY_COMPLETE`                            | 149       | Leader → follower: the bulk copy finished; the follower clears its resume cursor                      |
 | `RECORD_LOCK_HOMES_DIGEST`                 | 150       | Record-lock home-map digest for one database; sender-gated like the lock control entries              |
+=======
+| Command constant                           | Value     | Meaning                                                                                                              |
+| ------------------------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------- |
+| `SUBSCRIPTION_REQUEST`                     | 129       | Client wants to subscribe to a table                                                                                 |
+| `RESIDENCY_LIST`                           | 130       | Negotiate which records each node holds                                                                              |
+| `TABLE_FIXED_STRUCTURE`                    | 132       | Schema sync                                                                                                          |
+| `GET_RECORD` / `GET_RECORD_RESPONSE`       | 133 / 134 | Cache-miss fetch                                                                                                     |
+| `OPERATION_REQUEST` / `OPERATION_RESPONSE` | 136 / 137 | Forwarded operations                                                                                                 |
+| `NODE_NAME` / `NODE_NAME_TO_ID_MAP`        | 140 / 141 | Identity exchange                                                                                                    |
+| `DISCONNECT`                               | 142       | Graceful close (not used on auth failure)                                                                            |
+| `SEQUENCE_ID_UPDATE`                       | 143       | Audit sequence cursor                                                                                                |
+| `COMMITTED_UPDATE`                         | 144       | Confirm-on-commit                                                                                                    |
+| `DB_SCHEMA`                                | 145       | Database schema replication; `[4]` carries the sender's table drop markers (harper#1212)                             |
+| `BLOB_CHUNK`                               | 146       | Blob bytes                                                                                                           |
+| `SUBSCRIPTION_UPDATE`                      | 147       | Audit record forwarded to subscribers                                                                                |
+| `COPY_START`                               | 148       | Leader → follower: a bulk table copy is starting (carries `copyStartTime` + `COPY_ORDER_VERSION`)                    |
+| `COPY_COMPLETE`                            | 149       | Leader → follower: the bulk copy finished; the follower clears its resume cursor                                     |
+| `RECORD_LOCK_HOMES_DIGEST`                 | 150       | Record-lock home-map digest for one database; sender-gated like the lock control entries                             |
+>>>>>>> f289a90 (Apply prettier formatting the rebase's manual DESIGN.md table merge left misaligned)
 | `HANDOFF_RECEIPT`                          | 151       | Receiver → sender: it durably holds a complete row, blobs included, for `[tableId, recordId, version]` (harper#2257) |
 <<<<<<< HEAD
 | `HANDOFF_RECEIPT_REQUEST`                  | 152       | Sender → receiver: asks for that receipt after putting a complete transition image on the wire        |
