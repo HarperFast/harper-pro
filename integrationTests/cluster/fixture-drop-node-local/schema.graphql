@@ -1,0 +1,3 @@
+type NodeLocalDrop @table(replicate: false) {
+	id: ID @primaryKey
+}

@@ -9,6 +9,7 @@ import {
 	ORIGIN_FLOORS_CAPABILITY,
 	RECORD_LOCKS_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
+	TABLE_LIFECYCLE_CAPABILITY,
 	buildLocalCapabilities,
 	createUnknownCommandState,
 	noteUnknownCommand,
@@ -35,6 +36,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				recordLocks: 0,
 				originCursors: 0,
 				originFloors: 0,
+				tableLifecycle: 0,
 			}
 		);
 	});
@@ -61,6 +63,7 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 			'safeCopyAudit',
 			'subscriptionSetupAck',
 			'subscriptionSetupBudgetMs',
+			'tableLifecycle',
 		]);
 	});
 
@@ -233,6 +236,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				recordLocks: RECORD_LOCKS_CAPABILITY,
 				originCursors: ORIGIN_CURSORS_CAPABILITY,
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
+				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -273,6 +277,7 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				recordLocks: RECORD_LOCKS_CAPABILITY,
 				originCursors: ORIGIN_CURSORS_CAPABILITY,
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
+				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
 			}
 		);
 	});
