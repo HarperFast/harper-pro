@@ -327,6 +327,10 @@ export function createRecordLockTransport(
 	let freshness: FreshnessBarrier | undefined;
 	const transport: ClusterLockTransport = {
 		grantableAfterMono,
+		coordinationIncarnation() {
+			const incarnation = deps.homeIncarnation();
+			return Number.isSafeInteger(incarnation) && incarnation > 0 ? incarnation : undefined;
+		},
 		establishLockFreshness(db: string, table: string, _key: unknown, dependencies, deadlineMs: number) {
 			freshness ??= deps.freshness(db, () => transport.homeMap(db));
 			return freshness.establish(table, dependencies, deadlineMs);
@@ -500,15 +504,7 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		}, state.backoff.nextDelay() ?? REFRESH_RETRY_MAX_MS).unref();
 	}
 	const after = activeCache.get(database);
-	// Core's coordinator seeds its restart-quarantine incarination tracking (`#coordinatingIncarnation`)
-	// from THIS transport's `homeMap()` return value at the coordinator's own construction instant —
-	// and only there; it is never re-seeded later from a homeMap() call that starts succeeding after
-	// construction. A coordinator lazily built while this database still had no active generation (the
-	// ordinary case — `cluster_status` polling during bootstrap reads `lockCoordinator` well before
-	// `bootstrapHomeMap` finishes) gets stuck with that gap for its whole lifetime unless something
-	// forces a fresh one. Recreating the transport the instant an active generation first appears (or
-	// changes) is what gives core a fresh coordinator to lazily build next, this time with `homeMap()`
-	// already answering something real at its construction instant.
+	// A generation change retires outstanding freshness waits.
 	if (before?.generation !== after?.generation) recreateRecordLockTransport(database);
 }
 
