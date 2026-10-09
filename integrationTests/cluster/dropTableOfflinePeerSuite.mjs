@@ -98,6 +98,18 @@ async function waitForConnected(node, maxMs = 90000, peers = 1) {
 	);
 }
 
+/** Fails unless the node runs `size` replication workers and every outbound database socket is on one of them. */
+async function assertReplicationOnPool(node, size) {
+	const { threads } = await sendOperation(node, { operation: 'system_information', attributes: ['threads'] });
+	const pool = threads.filter((thread) => thread.name === 'replication').map((thread) => thread.threadId);
+	equal(pool.length, size, `${node.hostname} runs ${pool.length} replication workers`);
+	const { connections } = await sendOperation(node, { operation: 'cluster_status' });
+	const sockets = connections.flatMap((connection) => connection.database_sockets);
+	ok(sockets.length > 0, `${node.hostname} has no database socket`);
+	for (const socket of sockets)
+		ok(pool.includes(socket.threadId), `${socket.database} is on thread ${socket.threadId}, not the pool ${pool}`);
+}
+
 async function waitForBothConnected(ctx, what) {
 	ok(await waitForConnected(ctx.nodeA), `A did not connect to B ${what}`);
 	ok(await waitForConnected(ctx.nodeB), `B did not connect to A ${what}`);
@@ -236,6 +248,8 @@ export function dropTableOfflinePeerSuite({ replicationThreads, scenarios } = {}
 				authorization: ctx.nodeB.admin,
 			});
 			await waitForBothConnected(ctx, 'at setup');
+			if (replicationThreads)
+				for (const node of [ctx.nodeA, ctx.nodeB]) await assertReplicationOnPool(node, replicationThreads);
 		});
 
 		after(async () => {
