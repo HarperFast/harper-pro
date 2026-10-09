@@ -29,7 +29,14 @@ fi
 
 if use_git; then
   echo -e "\n📦 Updating core submodule"
-  git submodule update --remote --recursive
+  # the branch `git submodule update --remote` would track: .git/config over .gitmodules, else the remote's default
+  CORE_BRANCH=$(git config --get submodule.core.branch || git config -f .gitmodules --get submodule.core.branch || echo HEAD)
+  CORE_BEFORE=$(git rev-parse HEAD:core)
+  git -C core fetch --quiet origin "$CORE_BRANCH"
+  CORE_AFTER=$(git -C core rev-parse FETCH_HEAD)
+  # validated before anything moves, and the validated commit is the one applied
+  "$(dirname "$0")/core-sync-guard.sh" core "$CORE_BEFORE" "$CORE_AFTER"
+  git -C core checkout --quiet --detach "$CORE_AFTER"
 fi
 
 echo -e "\n📦 Copying lock file from core"
