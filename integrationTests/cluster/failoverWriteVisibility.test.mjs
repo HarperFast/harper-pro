@@ -49,7 +49,7 @@ const PRE_KILL_WRITE_DELAY_MS = 20; // paces the stream so the poll loop can int
 const POST_KILL_COUNT = 25; // writes taken on survivor B after A is dead
 
 // Restart must re-pass the original config (analytics + replication.securePort) —
-// startHarper({harper:node}, options) without options.config wipes it, killing
+// startHarper({name:ctx.name, harper:node}, options) without options.config wipes it, killing
 // replication silently. Keep this as the single source of truth for both the
 // initial start and any later restart.
 function nodeStartOptions(hostname) {

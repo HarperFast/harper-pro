@@ -26,7 +26,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 
 const NODE_COUNT = 4;
 // Build the harper config for a node. Captured as a function (not a constant) so a
-// restart (`startHarper({ harper: ctx.nodes[i] }, nodeStartOptions(node))`) reuses the
+// restart (`startHarper({ name: ctx.name, harper: ctx.nodes[i] }, nodeStartOptions(node))`) reuses the
 // same `replication.databases` filter the node was originally started with. Without
 // this, the restart call passed no `options.config`, which set HARPER_SET_CONFIG to
 // `{}` and the env-config layer then *deletes* the previously-set replication settings
