@@ -71,7 +71,7 @@ jobs:
             echo 'for manual review.'
           } >"$BODY_FILE"
           if [[ -s "$WARNING_FILE" ]]; then
-            cat "$WARNING_FILE" >>"$GITHUB_STEP_SUMMARY"
+            { cat "$WARNING_FILE"; echo; } >>"$GITHUB_STEP_SUMMARY"
             echo "::warning title=Core sync may drop changes::See the job summary and the Sync Core PR body"
           fi
 

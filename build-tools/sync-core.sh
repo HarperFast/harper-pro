@@ -46,11 +46,13 @@ if use_git; then
   CORE_BEFORE=$(git rev-parse HEAD:core)
   git -C core fetch --quiet "$CORE_REMOTE" "$CORE_BRANCH"
   CORE_AFTER=$(git -C core rev-parse FETCH_HEAD)
-  # advisory: the warning goes to the log and to CORE_SYNC_WARNING_FILE (the Sync Core PR body); the sync proceeds
+  # advisory: nothing below may stop the sync
   CORE_SYNC_WARNING=$("$(dirname "$0")/core-sync-guard.sh" core "$CORE_BEFORE" "$CORE_AFTER" "$CORE_REMOTE") ||
     CORE_SYNC_WARNING="core sync guard failed (exit $?); compare $CORE_BEFORE and $CORE_AFTER by hand"
   [[ -z "$CORE_SYNC_WARNING" ]] || echo "$CORE_SYNC_WARNING" >&2
-  [[ -z "${CORE_SYNC_WARNING_FILE:-}" ]] || printf '%s' "$CORE_SYNC_WARNING" >"$CORE_SYNC_WARNING_FILE"
+  if [[ -n "${CORE_SYNC_WARNING_FILE:-}" ]]; then
+    printf '%s' "$CORE_SYNC_WARNING" >"$CORE_SYNC_WARNING_FILE" || echo "could not write $CORE_SYNC_WARNING_FILE" >&2
+  fi
   git -C core checkout --quiet --detach "$CORE_AFTER"
   git -C core submodule update --init --recursive
 fi

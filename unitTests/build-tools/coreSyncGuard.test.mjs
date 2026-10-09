@@ -238,8 +238,13 @@ describe('sync-core.sh', function () {
 		const clone = join(tmp, 'pro-clone');
 		git(tmp, 'clone', '-q', `file://${pro}`, clone);
 		assert.strictEqual(git(clone, 'submodule', 'status').trim()[0], '-', 'core starts uninitialized');
-		const result = spawnSync('bash', [syncCore, '--skip-install'], { cwd: clone, env: gitEnv, encoding: 'utf8' });
+		const result = spawnSync('bash', [syncCore, '--skip-install'], {
+			cwd: clone,
+			env: { ...gitEnv, CORE_SYNC_WARNING_FILE: join(tmp, 'missing-dir', 'warning.md') },
+			encoding: 'utf8',
+		});
 		assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+		assert.match(result.stderr, /could not write/, 'an unwritable warning file does not stop the sync');
 		assert.strictEqual(git(join(clone, 'core'), 'rev-parse', 'HEAD'), git(upstream, 'rev-parse', 'main'));
 		git(clone, 'checkout', '--', 'package.json');
 		git(clone, 'submodule', 'deinit', '-f', 'core');

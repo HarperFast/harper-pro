@@ -54,8 +54,8 @@ if [[ "$(git_core rev-parse --is-shallow-repository)" == "true" ]]; then
 fi
 
 # A squash- or rebase-merged companion is not an ancestor but adds nothing when merged back in.
-commits=$(git_core log --oneline --no-decorate -n 50 "$after..$before")
-errors=$(mktemp)
+commits=$(git_core log --no-color --oneline --no-decorate -n 50 "$after..$before")
+errors=$(mktemp) || undecidable "mktemp failed"
 trap 'rm -f "$errors"' EXIT
 output=$(git_core merge-tree --write-tree "$after" "$before" 2>"$errors")
 merge_rc=$?
@@ -65,7 +65,7 @@ if [[ $merge_rc -eq 0 && "$merged" == "$(git_core rev-parse "$after^{tree}")" ]]
   exit 0
 fi
 
-stat=$(git_core diff --stat=100 --stat-count=100 "$after" "$merged")
+stat=$(git_core diff --no-color --stat=100 --stat-count=100 "$after" "$merged")
 if [[ $merge_rc -eq 0 ]]; then
   warn "The previous pointer is not on the tracked branch, and the new one lacks some of its changes." \
     "What merging the previous pointer back in would add (the content this sync drops):"
