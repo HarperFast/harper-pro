@@ -29,14 +29,17 @@ fi
 
 if use_git; then
   echo -e "\n📦 Updating core submodule"
-  # the branch `git submodule update --remote` would track: .git/config over .gitmodules, else the remote's default
+  # the ref `git submodule update --remote` would track: submodule.core.branch from .git/config over
+  # .gitmodules (`.` meaning the superproject's own branch), else the remote's default branch
   CORE_BRANCH=$(git config --get submodule.core.branch || git config -f .gitmodules --get submodule.core.branch || echo HEAD)
+  [[ "$CORE_BRANCH" == "." ]] && CORE_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  CORE_REMOTE=$(git -C core config --get "branch.$(git -C core symbolic-ref --short -q HEAD || echo -).remote" || echo origin)
   CORE_BEFORE=$(git rev-parse HEAD:core)
-  git -C core fetch --quiet origin "$CORE_BRANCH"
+  git -C core fetch --quiet "$CORE_REMOTE" "$CORE_BRANCH"
   CORE_AFTER=$(git -C core rev-parse FETCH_HEAD)
-  # validated before anything moves, and the validated commit is the one applied
   "$(dirname "$0")/core-sync-guard.sh" core "$CORE_BEFORE" "$CORE_AFTER"
   git -C core checkout --quiet --detach "$CORE_AFTER"
+  git -C core submodule update --init --recursive
 fi
 
 echo -e "\n📦 Copying lock file from core"

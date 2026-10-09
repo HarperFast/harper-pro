@@ -34,7 +34,6 @@ function runGuard(dir, before, after, env = {}) {
 	return { status: result.status, stderr: result.stderr };
 }
 
-/** upstream: base -> main1 -> main2 on main; companion branches from base and changes Table.txt */
 function makeUpstream(tmp) {
 	const upstream = join(tmp, 'upstream');
 	git(tmp, 'init', '-q', '-b', 'main', upstream);
@@ -69,7 +68,9 @@ describe('core-sync-guard.sh', function () {
 		git(core, 'fetch', '-q', 'origin', 'companion');
 	});
 
-	after(() => rmSync(tmp, { recursive: true, force: true }));
+	after(() => {
+		if (tmp) rmSync(tmp, { recursive: true, force: true });
+	});
 
 	it('passes an unchanged pointer and a pointer the tip descends from', () => {
 		assert.strictEqual(runGuard(core, shas.main2, shas.main2).status, 0);
@@ -167,7 +168,6 @@ describe('sync-core.sh', function () {
 	let shas;
 	let pro;
 
-	/** a harper-pro-shaped repo whose `core` submodule is pinned at the companion head */
 	before(() => {
 		tmp = mkdtempSync(join(tmpdir(), 'sync-core-'));
 		({ upstream, shas } = makeUpstream(tmp));
@@ -186,7 +186,9 @@ describe('sync-core.sh', function () {
 		git(pro, 'commit', '-q', '-m', 'pin core at the companion');
 	});
 
-	after(() => rmSync(tmp, { recursive: true, force: true }));
+	after(() => {
+		if (tmp) rmSync(tmp, { recursive: true, force: true });
+	});
 
 	const sync = () => spawnSync('bash', [syncCore, '--skip-install'], { cwd: pro, env: gitEnv, encoding: 'utf8' });
 
@@ -205,5 +207,18 @@ describe('sync-core.sh', function () {
 		assert.strictEqual(result.status, 0, result.stdout + result.stderr);
 		assert.strictEqual(git(join(pro, 'core'), 'rev-parse', 'HEAD'), tip);
 		assert.match(git(pro, 'status', '--porcelain'), /package-lock\.json/);
+	});
+
+	it("tracks the superproject's own branch when submodule.core.branch is `.`", () => {
+		git(pro, 'checkout', '-q', '-B', 'release', 'main');
+		git(upstream, 'checkout', '-q', '-b', 'release');
+		writeFileSync(join(upstream, 'other.txt'), 'release\n');
+		git(upstream, 'commit', '-q', '-am', 'release-only');
+		const releaseTip = git(upstream, 'rev-parse', 'HEAD');
+		git(pro, 'submodule', 'set-branch', '--branch', '.', 'core');
+		git(pro, 'commit', '-q', '-am', 'track the same-named branch');
+		const result = sync();
+		assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+		assert.strictEqual(git(join(pro, 'core'), 'rev-parse', 'HEAD'), releaseTip);
 	});
 });

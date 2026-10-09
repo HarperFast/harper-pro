@@ -1,12 +1,9 @@
 /**
- * The seam between this receiver and core: `seqUpdateEndTxn` (replicationConnection.ts) attaches the
- * floors it certified to its `end_txn` from `onCommit`, and core's apply loop (core
- * `resources/Table.ts`, `updateRecordedSequenceId`) stores them as `nodes[].closedFloor` /
- * `nodes[].relayable` in the `[seq, peer]` row that resume reads. The two halves land in different
- * repos through the `core` pointer, so this drives a real core table with the exact event shape the
- * receiver builds; a core that ignores `originFloors` fails here in seconds, where
- * integrationTests/cluster/idleOriginFloorResume.test.mjs waits 90 s per case on every cluster leg
- * (harper-pro#1016 moved `core` to a harper main without harper#3109 and did exactly that).
+ * The seam between this receiver and core: `seqUpdateEndTxn` (replicationConnection.ts) attaches
+ * certified floors to its `end_txn` from `onCommit`, and core's apply loop (`updateRecordedSequenceId`
+ * in core `resources/Table.ts`) stores them in the `[seq, peer]` row that resume reads. The halves land
+ * through the `core` pointer, so a core that ignores `originFloors` must fail here, not after 90 s per
+ * case in integrationTests/cluster/idleOriginFloorResume.test.mjs.
  */
 import assert from 'node:assert';
 import { createRequire } from 'node:module';
@@ -38,15 +35,16 @@ describe('a certified origin floor reaches the seq row through core', () => {
 		setMainIsWorker(true);
 	});
 
-	after(() => release?.());
+	after(() => {
+		release?.();
+		setMainIsWorker(false);
+	});
 
 	it('stores closedFloor and relayable beside the applied cursor, on a floor-only sequence update', async function () {
 		this.timeout(20_000);
 		const held = new Promise((resolve) => (release = resolve));
 		const now = Date.now();
 		const txnStream = {};
-		// the standalone SEQUENCE_ID_UPDATE a receiver applies after the sender drained: no records, the
-		// floors attached only in the update's own onCommit
 		const floorUpdate = (localTime, originFloors) => {
 			const event = { type: 'end_txn', localTime, timestamp: localTime, remoteNodeIds: [PEER], txnStream };
 			event.onFailure = () => false;

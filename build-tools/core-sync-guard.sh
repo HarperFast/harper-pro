@@ -23,18 +23,19 @@ ancestor() {
 
 [[ "$before" == "$after" ]] && exit 0
 ancestor && exit 0
-# a shallow checkout has no base to merge from, so only this non-ancestor path pays to unshallow
 if [[ "$(git_core rev-parse --is-shallow-repository)" == "true" ]]; then
   git_core fetch --quiet --unshallow origin || undecidable "could not unshallow $dir to compare the pointers"
   ancestor && exit 0
 fi
 
 # A squash- or rebase-merged companion is not an ancestor but adds nothing when merged back in.
-output=$(git_core merge-tree --write-tree "$after" "$before" 2>&1)
+errors=$(mktemp)
+output=$(git_core merge-tree --write-tree "$after" "$before" 2>"$errors")
 merge_rc=$?
-[[ $merge_rc -le 1 ]] || undecidable "merge-tree failed (exit $merge_rc): $output"
+[[ $merge_rc -le 1 ]] || undecidable "merge-tree failed (exit $merge_rc; needs git >= 2.38): $(cat "$errors")"
+rm -f "$errors"
 merged=${output%%$'\n'*}
-if [[ $merge_rc -eq 0 ]] && git_core diff --quiet "$after" "$merged"; then
+if [[ $merge_rc -eq 0 && "$merged" == "$(git_core rev-parse "$after^{tree}")" ]]; then
   exit 0
 fi
 
