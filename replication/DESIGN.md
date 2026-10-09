@@ -528,7 +528,7 @@ Most replication behavior is exercised via integration tests that spin up multi-
 | Where is per-route table exclusion logic? | `knownNodes.ts → getExcludedTablesForRouteEntries`; threaded via `subscriptionManager.ts → routeReplicates` |
 =======
 | Question                                    | Where                                                                                                                                                                           |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Where does a remote message get decoded?    | `replicationConnection.ts → replicateOverWS`                                                                                                                                    |
 | Where do cache-miss fetches pick a peer?    | `replicator.ts → Replicator.load` (declared inside `setReplicator`)                                                                                                             |
 | Where is the connection retry loop?         | `replicationConnection.ts → NodeReplicationConnection.scheduleReconnect` (uses `INITIAL_RETRY_TIME`)                                                                            |
