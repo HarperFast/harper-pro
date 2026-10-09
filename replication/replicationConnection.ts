@@ -67,6 +67,7 @@ import { decodeLockControlPayload } from '../core/resources/recordLockCoordinato
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
 import { verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
+import { isDedicatedPoolWorker } from '../core/server/threads/workerPools.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
 import { registerBlobSend, noteBlobSendProgress, endBlobSend, isDrainingBlobSends } from './blobSendDrain.ts';
@@ -5193,6 +5194,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							},
 							table
 						);
+						// A pool worker never ran the application, so it cannot maintain an index whose resolver the
+						// application assigns; applying here would leave the index silently wrong. Latch inbound off
+						// and drop a decoder from an earlier structure message, so queued frames cannot apply either.
+						if (isDedicatedPoolWorker()) {
+							const unresolved = table?.unresolvedComputedIndexes?.();
+							if (unresolved?.length) {
+								const reason = `${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code, which replication.threads workers cannot run; no table of ${databaseName} replicates from this peer, use replication.threads: 0`;
+								logger.error?.(connectionId, `Refusing to replicate: ${reason}`);
+								wsClosed = true;
+								delete tableDecoders[tableId];
+								close(1011, reason);
+								return;
+							}
+						}
 						// replication messages come across in binary format of audit log entries from the source node,
 						// so we need to have the same structure and decoder configuration to decode them. We keep a map
 						// of the table id to the decoder so we can decode the binary data for each table.

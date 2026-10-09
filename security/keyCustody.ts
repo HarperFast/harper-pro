@@ -105,10 +105,10 @@ export function buildCustody({ keys, activeKid }: CustodyKeys): SecretCustody {
 	};
 }
 
-/** The workerData provider for the injected tier: key material to request (http) workers only. */
+/** The workerData provider for the injected tier: key material to request (http) and replication workers only. */
 export function makeWorkerDataProvider(custodyKeys: CustodyKeys) {
 	return (options: { name?: string }) =>
-		options.name === THREAD_TYPES.HTTP
+		options.name === THREAD_TYPES.HTTP || options.name === THREAD_TYPES.REPLICATION
 			? { mode: 'injected', keys: Object.fromEntries(custodyKeys.keys), activeKid: custodyKeys.activeKid }
 			: undefined;
 }
@@ -227,8 +227,7 @@ export function start(options?: { provider?: string }): void {
 	const ambient =
 		typeof workerData === 'object' && workerData !== null ? (workerData as Record<string, unknown>) : undefined;
 	const delivered = ambient?.[CUSTODY_WORKER_DATA_KEY] as
-		| { mode: string; keys?: Record<string, string>; activeKid?: string }
-		| undefined;
+		{ mode: string; keys?: Record<string, string>; activeKid?: string } | undefined;
 	if (ambient && CUSTODY_WORKER_DATA_KEY in ambient) {
 		// Hardening: remove the material from the ambient workerData object as early as this
 		// component runs, so later component/user code cannot read it. Residual: trusted built-ins

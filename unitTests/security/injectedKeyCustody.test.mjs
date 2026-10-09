@@ -191,13 +191,14 @@ describe('injectedKeyCustody', () => {
 		assert.equal(custody.getPublicKey().fingerprint, custodyKeys.activeKid);
 	});
 
-	it('supplies key material to http workers only', () => {
+	it('supplies key material to http and replication workers only', () => {
 		const custodyKeys = custodyKeysFromPem(makePem());
 		const provider = makeWorkerDataProvider(custodyKeys);
 		const forHttp = provider({ name: 'http' });
 		assert.equal(forHttp.mode, 'injected');
 		assert.equal(forHttp.activeKid, custodyKeys.activeKid);
 		assert.deepEqual(forHttp.keys, Object.fromEntries(custodyKeys.keys));
+		assert.deepEqual(provider({ name: 'replication' }), forHttp);
 		assert.equal(provider({ name: 'job' }), undefined);
 		assert.equal(provider({}), undefined);
 	});

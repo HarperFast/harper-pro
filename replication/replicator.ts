@@ -52,7 +52,8 @@ import {
 	isValidNodeRecord,
 	readNodeForAuth,
 } from './knownNodes.ts';
-import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import { CONFIG_PARAMS, THREAD_TYPES } from '../core/utility/hdbTerms.ts';
+import { isWorkerPoolActive, isDedicatedPoolWorker, poolMemberIndex } from '../core/server/threads/workerPools.ts';
 import { exportIdMapping, getIdOfRemoteNode } from '../core/resources/nodeIdMapping.ts';
 import * as tls from 'node:tls';
 import { ServerError } from '../core/utility/errors/hdbError.js';
@@ -143,6 +144,7 @@ export function start(options) {
 		routeByHostname.set(node.name, node);
 	}
 	assignReplicationSource(options);
+	if (isDedicatedPoolWorker() && poolMemberIndex() === 0) warnOfUnresolvedComputedIndexes();
 
 	// Build mTLS configuration with certificate verification support
 	// mTLS is always enabled for replication (required for security)
@@ -154,6 +156,9 @@ export function start(options) {
 		maxPayload: 10 * 1024 * 1024 * 1024, // 10 GB max payload, primarily to support replicating applications
 		...options,
 		mtls: mtlsConfig, // mTLS with optional certificate verification (always overrides)
+		// With the dedicated pool running, only its workers bind the replication port, so every inbound
+		// replication socket lands there; HTTP workers still run the rest of start() for cache-miss retrieval.
+		threadType: isWorkerPoolActive(THREAD_TYPES.REPLICATION) ? THREAD_TYPES.REPLICATION : undefined,
 	};
 	// noinspection JSVoidFunctionReturnValueUsed
 	// @ts-expect-error
@@ -341,6 +346,19 @@ export function start(options) {
 		for (const updateContexts of contextUpdaters) updateContexts();
 	});
 }
+function warnOfUnresolvedComputedIndexes() {
+	const databases = getDatabases();
+	for (const databaseName in databases) {
+		for (const tableName in databases[databaseName]) {
+			const unresolved = databases[databaseName][tableName]?.unresolvedComputedIndexes?.();
+			if (unresolved?.length)
+				logger.error(
+					`${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code; replication.threads workers will refuse to replicate any table of ${databaseName}, use replication.threads: 0`
+				);
+		}
+	}
+}
+
 export function monitorNodeCAs(listener: () => void) {
 	let lastCaCount = 0;
 	// keyed 'ca-monitor' so this watcher runs concurrently with the subscription-manager and
