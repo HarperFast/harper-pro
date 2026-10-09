@@ -113,6 +113,8 @@ async function assertReplicationOnPool(node, size) {
 async function waitForBothConnected(ctx, what) {
 	ok(await waitForConnected(ctx.nodeA), `A did not connect to B ${what}`);
 	ok(await waitForConnected(ctx.nodeB), `B did not connect to A ${what}`);
+	if (ctx.replicationThreads)
+		for (const node of [ctx.nodeA, ctx.nodeB]) await assertReplicationOnPool(node, ctx.replicationThreads);
 }
 
 function nodeConfig(hostname, { legacyPeer = false, replicationThreads } = {}) {
@@ -248,8 +250,6 @@ export function dropTableOfflinePeerSuite({ replicationThreads, scenarios } = {}
 				authorization: ctx.nodeB.admin,
 			});
 			await waitForBothConnected(ctx, 'at setup');
-			if (replicationThreads)
-				for (const node of [ctx.nodeA, ctx.nodeB]) await assertReplicationOnPool(node, replicationThreads);
 		});
 
 		after(async () => {
@@ -674,6 +674,7 @@ export function dropTableOfflinePeerSuite({ replicationThreads, scenarios } = {}
 						authorization: ctx.nodeA.admin,
 					});
 					ok(await waitForConnected(ctx.nodeJ, 120000, 2), 'J did not connect to both A and B');
+					if (replicationThreads) await assertReplicationOnPool(ctx.nodeJ, replicationThreads);
 					ok(
 						await waitFor(async (signal) => !(await tableExists(ctx.nodeJ, table, signal)), 60000),
 						'J kept the stale copy after learning the drop'
