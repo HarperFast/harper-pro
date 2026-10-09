@@ -29,10 +29,12 @@ fi
 
 if use_git; then
   echo -e "\n📦 Updating core submodule"
-  # the ref `git submodule update --remote` would track: submodule.core.branch from .git/config over
-  # .gitmodules (`.` meaning the superproject's own branch), else the remote's default branch
+  [[ -e core/.git ]] || git submodule update --init core
+  # as `git submodule update --remote` resolves it; `.` means the superproject's own branch
   CORE_BRANCH=$(git config --get submodule.core.branch || git config -f .gitmodules --get submodule.core.branch || echo HEAD)
-  [[ "$CORE_BRANCH" == "." ]] && CORE_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  if [[ "$CORE_BRANCH" == "." ]]; then
+    CORE_BRANCH=$(git symbolic-ref --short -q HEAD) || { echo "core tracks the superproject's branch, but HEAD is detached" >&2; exit 1; }
+  fi
   CORE_REMOTE=$(git -C core config --get "branch.$(git -C core symbolic-ref --short -q HEAD || echo -).remote" || echo origin)
   CORE_BEFORE=$(git rev-parse HEAD:core)
   git -C core fetch --quiet "$CORE_REMOTE" "$CORE_BRANCH"

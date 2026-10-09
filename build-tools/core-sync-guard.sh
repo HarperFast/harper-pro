@@ -50,7 +50,9 @@ fi
   fi
   git_core diff --stat "$after" "$merged"
 } >&2
-if [[ -n "${CORE_SYNC_SUPERSEDED_BY:-}" ]] && git_core merge-base --is-ancestor "$CORE_SYNC_SUPERSEDED_BY" "$after"; then
+# a merge commit of the pointer's own pull request is never behind the pointer, so one that is cannot be the proof
+if [[ -n "${CORE_SYNC_SUPERSEDED_BY:-}" ]] && git_core merge-base --is-ancestor "$CORE_SYNC_SUPERSEDED_BY" "$after" &&
+  ! git_core merge-base --is-ancestor "$CORE_SYNC_SUPERSEDED_BY" "$before"; then
   echo "CORE_SYNC_SUPERSEDED_BY: $before's pull request merged as $CORE_SYNC_SUPERSEDED_BY, which $after contains; syncing." >&2
   exit 0
 fi

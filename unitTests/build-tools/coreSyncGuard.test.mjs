@@ -1,4 +1,3 @@
-/** Runs the real guard and sync scripts against throwaway upstream/clone repositories. */
 import assert from 'node:assert';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -121,8 +120,7 @@ describe('core-sync-guard.sh', function () {
 	});
 
 	it("refuses a companion that merged with later revisions, unless told its merged pull request's commit", () => {
-		// the companion revised the line it added, then was squash-merged: the pointer's exact content is on
-		// no tip, and only the merged pull request proves the pointer was superseded rather than dropped
+		// the pointer's exact content is on no tip once the companion revised its own lines before merging
 		git(core, 'checkout', '-q', '--detach', shas.companion);
 		writeFileSync(join(core, 'Table.txt'), 'cursors\nfloors, revised\n');
 		git(core, 'add', 'Table.txt');
@@ -146,6 +144,11 @@ describe('core-sync-guard.sh', function () {
 		);
 		assert.notStrictEqual(git(core, 'rev-parse', `${squashedRevision}^{tree}`), revisedMerge);
 		assert.strictEqual(runGuard(core, shas.companion, squashedRevision).status, 1);
+		assert.strictEqual(
+			runGuard(core, shas.companion, squashedRevision, { CORE_SYNC_SUPERSEDED_BY: shas.base }).status,
+			1,
+			'a commit behind the pointer is not its merged pull request'
+		);
 		const { status, stderr } = runGuard(core, shas.companion, squashedRevision, {
 			CORE_SYNC_SUPERSEDED_BY: squashedRevision,
 		});
@@ -241,6 +244,15 @@ describe('sync-core.sh', function () {
 		assert.strictEqual(result.status, 0, result.stdout + result.stderr);
 		assert.strictEqual(git(join(pro, 'core'), 'rev-parse', 'HEAD'), tip);
 		assert.match(git(pro, 'status', '--porcelain'), /package-lock\.json/);
+	});
+
+	it('initializes a submodule a plain clone left empty before syncing it', () => {
+		const clone = join(tmp, 'pro-clone');
+		git(tmp, 'clone', '-q', `file://${pro}`, clone);
+		assert.strictEqual(git(clone, 'submodule', 'status').trim()[0], '-', 'core starts uninitialized');
+		const result = spawnSync('bash', [syncCore, '--skip-install'], { cwd: clone, env: gitEnv, encoding: 'utf8' });
+		assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+		assert.strictEqual(git(join(clone, 'core'), 'rev-parse', 'HEAD'), git(upstream, 'rev-parse', 'main'));
 	});
 
 	it("tracks the superproject's own branch when submodule.core.branch is `.`", () => {

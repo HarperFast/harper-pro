@@ -55,8 +55,6 @@ jobs:
         if: github.ref_name == github.event.repository.default_branch
         run: git submodule set-branch --branch main core
 
-      # The guard (build-tools/core-sync-guard.sh) refuses a sync that would lose the committed
-      # pointer's changes; a human supplies the proof or the decision it cannot derive by itself.
       - name: Sync core
         env:
           CORE_SYNC_SUPERSEDED_BY: ${{ inputs.superseded_by }}
