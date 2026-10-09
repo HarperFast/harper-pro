@@ -5736,7 +5736,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								tableId: requestTableId,
 								recordId,
 								version,
-								getEntry: requestDecoder.getEntry,
+								// A bare property copy would lose `this`: getEntry reads `this.table`, which a
+								// rejudge rebinds on requestDecoder itself (see the TABLE_FIXED_STRUCTURE handler's
+								// own comment) -- bind to that object so a later rejudge is still visible here, same
+								// as calling it as requestDecoder.getEntry(id) would see.
+								getEntry: requestDecoder.getEntry.bind(requestDecoder),
 								expiresAt: now + RECEIPT_REQUEST_TTL_MS,
 							});
 							arrived.push(key);
