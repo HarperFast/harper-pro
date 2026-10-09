@@ -233,6 +233,14 @@ suite('Idle origins keep a certified resume floor (harper-pro#922)', { timeout: 
 		await upsert(A, 'after-restarts');
 		await Promise.all([B, C, E].map((node) => waitForRecord(node, 'after-restarts')));
 
+		// B's post-restart resume to A used an ordinary (non-boundary) range: a scan-failure latch that
+		// over-fires on the healthy `exactStartFailures` case would silently stop certification here, past
+		// the point every earlier assertion in this test already checked.
+		const bFloorAtReconnect = await floorFor(B, A, A);
+		const cFloorAtReconnect = await floorFor(C, B, A);
+		await waitForFloor(B, A, A, bFloorAtReconnect, "B's floor for A keeps advancing after B's own restart");
+		await waitForFloor(C, B, A, cFloorAtReconnect, "C's relayed floor for A keeps advancing after C's restart");
+
 		const logA = linesAbout(await logSince(A, markA), B);
 		ok(!logA.some((line) => line.includes(FORCED_COPY)), `A forced a copy for B:\n${logA.join('\n')}`);
 		ok(!logA.some((line) => line.includes('Replicating all tables to')), 'A copied everything to B again');

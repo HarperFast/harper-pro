@@ -7106,8 +7106,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 									if (capturedFloors) {
 										const liveRange: any = auditLogIterable;
+										// exactStartFailures alone is not a scan-integrity signal on an ordinary range: core
+										// reports `missing` whenever the first polled entry isn't exactly the cursor, which is
+										// the ordinary, healthy case for a plain (non-boundary) resume (see boundaryLogName's
+										// comment above). failedLogs and corruptFrameStop are genuine scan failures on ANY
+										// range and must still withhold certification even when there is no boundary.
 										if (
-											liveRange?.exactStartFailures?.size > 0 ||
+											(boundaryLogName && liveRange?.exactStartFailures?.size > 0) ||
 											liveRange?.failedLogs?.size > 0 ||
 											liveRange?.corruptFrameStop?.breaks > 0
 										) {
@@ -7123,6 +7128,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									}
 									getSharedStatus()[SENDING_TIME_POSITION] = 0;
 									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
+									// a timed wake can land after the socket was marked closed, before the close event
+									if (closed || wsClosed) return;
+									// A commit that landed during the scan rotated the promise captured before it: rescan
+									// immediately, without paying for timer setup, a Promise/executor allocation or a waker.
+									if (whenNextTransaction(auditStore) !== nextTransaction) continue;
 									// an `includeNodes` update re-admits a log whose entries are already committed
 									let wake: () => void;
 									// one timer per loop; an exit that skips the clear leaks nothing but one unreferenced timer
@@ -7134,8 +7144,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										await new Promise<void>((resolve, reject) => {
 											wake = wakeSender = resolve;
 											wakeSenderFailed = reject;
-											// a commit that landed during the scan rotated the promise captured before it
-											if (whenNextTransaction(auditStore) !== nextTransaction) return resolve();
 											// One reaction per transaction generation: a timed wake sees the same pending promise
 											// again, and a reaction per wake would accumulate on an idle database.
 											if (attachedNextTransaction !== nextTransaction) {
