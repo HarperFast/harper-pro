@@ -210,7 +210,9 @@ suite('QA-689: interrupted bulk copy resume cursor vs. an undelivered range', { 
 			interruptions.push({ frac, countAtKill: count });
 			console.log(`[qa689] interrupting at frac=${frac}, receiver count=${count}/${TOTAL_RECORDS}`);
 			await hardKill(ctx.receiver);
-			ctx.receiver = (await startHarper({ harper: ctx.receiver }, nodeOptions(ctx.receiver.hostname))).harper;
+			ctx.receiver = (
+				await startHarper({ name: ctx.name, harper: ctx.receiver }, nodeOptions(ctx.receiver.hostname))
+			).harper;
 		}
 
 		ok(

@@ -47,7 +47,7 @@ const nodeOptions = (node, env = {}) => ({
 });
 
 async function startNode(node) {
-	const started = (await startHarper({ harper: node }, nodeOptions(node, node.testEnv))).harper;
+	const started = (await startHarper({ name: node.name, harper: node }, nodeOptions(node, node.testEnv))).harper;
 	return Object.assign(node, started);
 }
 
@@ -59,8 +59,8 @@ async function restartNode(node) {
 async function startNewNode(suiteName, testEnv) {
 	const nodeCtx = { name: suiteName, harper: { hostname: await getNextAvailableLoopbackAddress(), testEnv } };
 	await startHarper(nodeCtx, nodeOptions(nodeCtx.harper, testEnv));
-	// the harness replaces the context's node object, and every restart must carry the same environment
-	const node = Object.assign(nodeCtx.harper, { testEnv });
+	// the harness replaces the context's node object, and every restart must carry the same environment and name
+	const node = Object.assign(nodeCtx.harper, { testEnv, name: nodeCtx.name });
 	await sendOperation(node, { operation: 'create_table', database: 'data', table: TABLE, primary_key: 'id' });
 	// the fixture's resources register at boot, and a table created afterwards unregisters them
 	return restartNode(node);

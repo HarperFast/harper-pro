@@ -151,7 +151,7 @@ suite(
 			await killHarper({ harper: ctx.A });
 			match(runRepairTool(ctx.rootOfA), new RegExp(`log local: .* would drop ${Z_COPIES} echoed deletes`));
 			match(runRepairTool(ctx.rootOfA, '--apply'), new RegExp(`log local: .* dropped ${Z_COPIES} echoed deletes`));
-			ctx.A = (await startHarper({ harper: ctx.A }, nodeConfig(ctx.A.hostname))).harper;
+			ctx.A = (await startHarper({ name: ctx.name, harper: ctx.A }, nodeConfig(ctx.A.hostname))).harper;
 			const { A } = ctx;
 			equal(await deleteEntryCount(A, 'z'), 1, 'the repair kept one z delete');
 			equal(await hasRecord(A, 'z'), false, 'z is still deleted on A after the repair and restart');
@@ -169,7 +169,7 @@ suite(
 			});
 			equal(await deleteEntryCount(A, 'x'), XY_ROUNDS + 1, 'premise: A holds the planted run');
 
-			ctx.B = (await startHarper({ harper: ctx.B }, nodeConfig(ctx.B.hostname))).harper;
+			ctx.B = (await startHarper({ name: ctx.name, harper: ctx.B }, nodeConfig(ctx.B.hostname))).harper;
 			const { B } = ctx;
 			await waitForCondition(eventuallyHasRecord(B, 'marker'), {
 				timeoutMs: 90000,

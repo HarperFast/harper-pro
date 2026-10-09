@@ -363,7 +363,7 @@ suite(
 				// replication.databases and silently breaks replication.
 				ctx.receiver = (
 					await startHarper(
-						{ harper: { dataRootDir: ctx.receiver.dataRootDir, hostname: ctx.receiver.hostname } },
+						{ name: ctx.name, harper: { dataRootDir: ctx.receiver.dataRootDir, hostname: ctx.receiver.hostname } },
 						nodeOptions(ctx.receiver.hostname)
 					)
 				).harper;

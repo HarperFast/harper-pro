@@ -190,7 +190,7 @@ suite('Replication Reconnect', { timeout: 120000 }, (ctx) => {
 
 		// Restart node0. If the retry loop was not properly stopped, node1 would
 		// reconnect once node0 is reachable again. Verify it does not.
-		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
+		ctx.nodes[0] = (await startHarper({ name: ctx.name, harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
 		await delay(2000);
 		status = await sendOperation(ctx.nodes[1], { operation: 'cluster_status' });
 		equal(status.connections.length, 0, 'node1 must not reconnect to a removed node even after that node restarts');
@@ -217,7 +217,7 @@ suite('Replication Reconnect', { timeout: 120000 }, (ctx) => {
 		// Brief pause so the disconnect is observable before restart.
 		await delay(500);
 
-		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
+		ctx.nodes[0] = (await startHarper({ name: ctx.name, harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
 
 		// Connectivity should restore without manual re-add. This is the
 		// regression guard for "any breakage of the retry path would strand

@@ -250,7 +250,7 @@ suite('Replication Topology', { timeout: 120000 }, (ctx) => {
 		// Reapply the original config on restart — without it, HARPER_SET_CONFIG=`{}`
 		// would delete `replication.databases: ['data']` and the restarted node would
 		// try to open `db: system` replication to its peers (which they reject).
-		ctx.nodes[0] = (await startHarper({ harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
+		ctx.nodes[0] = (await startHarper({ name: ctx.name, harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
 		// A killed node must restart, re-subscribe, and replay the audit log to catch
 		// up — on a loaded CI runner that can take several seconds, so poll generously
 		// (25 * 200ms = 5s) rather than the old ~2.2s, which a slow-but-healthy catchup

@@ -400,7 +400,7 @@ suite('QA-651: post-failover write-visibility divergence', { timeout: 480000 }, 
 		// --- Phase 6: restart survivor C and re-probe — does anything change across a restart? ---
 		console.log('[QA-651] restarting C to probe self-heal-vs-restart-regression');
 		await killHarper({ harper: nodeC });
-		ctx.nodeC = (await startHarper({ harper: nodeC }, nodeStartOptions(nodeC.hostname))).harper;
+		ctx.nodeC = (await startHarper({ name: ctx.name, harper: nodeC }, nodeStartOptions(nodeC.hostname))).harper;
 		// after()'s teardown loop walks ctx.nodes — keep the restarted process's handle
 		// in sync there too, or teardown targets the pre-restart (now-dead) process and
 		// leaks the new one.

@@ -237,7 +237,7 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		// deletion was a persisted write, not an in-memory-only side effect that a
 		// fresh process would forget).
 		await killHarper({ harper: ctx.nodeA });
-		ctx.nodeA = (await startHarper({ harper: ctx.nodeA }, nodeStartOptions(ctx.nodeA))).harper;
+		ctx.nodeA = (await startHarper({ name: ctx.name, harper: ctx.nodeA }, nodeStartOptions(ctx.nodeA))).harper;
 		await delay(3000); // give any spurious reconnect attempt a window to appear
 		const aConnectedToB = await connected(ctx.nodeA, ctx.hostnameB);
 		equal(aConnectedToB, false, 'A must not show a reconnected socket to B after restarting — removal is durable on A');
@@ -374,7 +374,7 @@ suite('QA-758: remove_node blast radius', { timeout: 180000 }, (ctx) => {
 		);
 
 		await killHarper({ harper: ctx.nodeB });
-		ctx.nodeB = (await startHarper({ harper: ctx.nodeB }, nodeStartOptions(ctx.nodeB))).harper;
+		ctx.nodeB = (await startHarper({ name: ctx.name, harper: ctx.nodeB }, nodeStartOptions(ctx.nodeB))).harper;
 
 		const hdbNodesOnRestartedB = await sendOperation(ctx.nodeB, {
 			operation: 'search_by_value',

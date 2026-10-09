@@ -410,7 +410,7 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ct
 			'expected the wedge-reconcile fire log line to carry its classification'
 		);
 
-		ctx.nodes[0] = (await startHarper({ harper: peer }, nodeStartOptions(peer))).harper;
+		ctx.nodes[0] = (await startHarper({ name: ctx.name, harper: peer }, nodeStartOptions(peer))).harper;
 		await pollPeerSocket(subscriber, ctx.nodes[0].hostname, (socket) => socket?.connected === true, {
 			timeoutMs: RECONNECT_AFTER_RESTART_MS,
 			description: `${subscriber.hostname} to reconnect after ${peer.hostname} restarts`,
