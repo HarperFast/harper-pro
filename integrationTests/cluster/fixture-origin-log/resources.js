@@ -83,3 +83,58 @@ export class ReplicationCursor extends Resource {
 		return { seqId: Table.dbisDB.getSync([Symbol.for('seq'), nodeId])?.seqId ?? null };
 	}
 }
+
+export class ClosedFloors extends Resource {
+	static loadAsInstance = false;
+	post(target, data) {
+		const Table = databases.data[data.table];
+		const auditStore = Table.auditStore;
+		const nodeLogs = auditStore.loadLogs();
+		const nameById = new Map([...auditStore.logByName].map(([name, log]) => [nodeLogs.indexOf(log), name]));
+		const peerId = nodeLogs.indexOf(auditStore.logByName.get(data.peer));
+		const row = Table.dbisDB.getSync([Symbol.for('seq'), peerId]);
+		const nodes = {};
+		for (const node of row?.nodes ?? []) {
+			nodes[nameById.get(node.id) ?? node.id] = {
+				originLogKey: node.originLogKey ?? null,
+				closedFloor: node.closedFloor ?? null,
+				relayable: node.relayable ?? null,
+			};
+		}
+		return { seqId: row?.seqId ?? null, nodes };
+	}
+}
+
+export class OriginFloor extends Resource {
+	static loadAsInstance = false;
+	post(target, data) {
+		const stored = databases.data[data.table].auditStore.getBinary(Symbol.for('origin-closed-floor'));
+		return { floor: stored?.byteLength === 8 ? Buffer.from(stored).readDoubleLE(0) : null };
+	}
+}
+
+// A transaction held open with a staged write: its reserved key holds this node's floor until it is released.
+let releaseHeldTransaction;
+export class HoldTransaction extends Resource {
+	static loadAsInstance = false;
+	post(target, data) {
+		const Table = databases.data[data.table];
+		const context = {};
+		const released = new Promise((resolve) => (releaseHeldTransaction = resolve));
+		transaction(context, async () => {
+			await Table.put({ id: data.id, name: 'held' }, context);
+			await released;
+		}).catch(() => {});
+		return { held: data.id };
+	}
+}
+
+export class ReleaseTransaction extends Resource {
+	static loadAsInstance = false;
+	post() {
+		const released = releaseHeldTransaction !== undefined;
+		releaseHeldTransaction?.();
+		releaseHeldTransaction = undefined;
+		return { released };
+	}
+}
