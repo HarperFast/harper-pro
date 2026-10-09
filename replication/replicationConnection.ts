@@ -799,6 +799,10 @@ const markersAwaitingDatabase = new Map<string, TableDropMarker[]>();
 function releaseHeldMarkers(databaseName: string, recorded: TableDropMarker[]) {
 	if (markersAwaitingDatabase.get(databaseName) === recorded) markersAwaitingDatabase.delete(databaseName);
 }
+/** Test-only read of the markers this thread holds for `databaseName`. */
+export function heldDropMarkersFor(databaseName: string): readonly TableDropMarker[] | undefined {
+	return markersAwaitingDatabase.get(databaseName);
+}
 /**
  * The catalog's stamp when this thread's class predates another thread's backfill. Test-only: a pre-stamp sender
  * has no capability bag and no lifecycle stamps on its definitions.
