@@ -102,7 +102,6 @@ describe('held drop markers (harper-pro#956)', function () {
 		assert.equal(databases[databaseName].Stale, Stale, 'premise: the stale generation is live');
 		assert.equal(isDroppedPeerGeneration(databaseName, 'Stale', droppedTime - 60_000), false);
 
-		// The holder's next schema frame finds the database open and records what it held.
 		socket.emit('message', schemaFrame(databaseName, [], []));
 		await until(() => !databases[databaseName].Stale, 'core to retire the stale generation');
 		await until(() => !heldDropMarkersFor(databaseName), 'the held entry to be released');
