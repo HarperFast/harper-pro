@@ -438,7 +438,7 @@ suite('drop_table with an offline peer (harper#1212)', { timeout: 900000 }, (ctx
 			);
 			// The table B recreated on the old build is stamped as newer than the drop and reaches A at last. The
 			// rows B wrote to it while on the old build stay on B: A refused that generation's records then and
-			// advanced past them (see replication/DESIGN.md item 27). New writes flow.
+			// advanced past them (see replication/DESIGN.md item 28). New writes flow.
 			ok(
 				await waitFor((signal) => tableExists(ctx.nodeA, onLegacy, signal)),
 				"the table recreated on the pre-stamp node did not reach A after B's upgrade"
