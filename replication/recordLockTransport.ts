@@ -504,8 +504,7 @@ async function refreshCache(database: string, freshBudget = false): Promise<void
 		}, state.backoff.nextDelay() ?? REFRESH_RETRY_MAX_MS).unref();
 	}
 	const after = activeCache.get(database);
-	// A generation change retires outstanding freshness waits. Core adopts the existing authority
-	// when the replacement transport next builds a coordinator.
+	// A generation change retires outstanding freshness waits.
 	if (before?.generation !== after?.generation) recreateRecordLockTransport(database);
 }
 

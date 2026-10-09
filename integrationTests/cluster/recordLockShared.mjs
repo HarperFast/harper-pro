@@ -171,6 +171,7 @@ export function waitForRing(nodes, expectedSize) {
  * the two — `HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS=0` (set in `optionsFor`) disables even the
  * small backstop, so this bootstraps immediately; that is safe here specifically because every node is
  * freshly started with no prior generation, not something a real reconfiguration could skip.
+ * `afterActivate`, when supplied, runs after each activation response and before starting the next.
  */
 export async function bootstrapHomeMap(nodes, afterActivate) {
 	const homes = [];
