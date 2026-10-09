@@ -476,7 +476,12 @@ suite(
 			[multi, ...peers] = contexts.map((c) => c.harper);
 			nodes = [multi, ...peers];
 			await connectMesh(nodes);
-			await bootstrapHomeMap(nodes);
+			await bootstrapHomeMap(nodes, async (node) => {
+				if (node !== multi) return;
+				const locks = (await clusterStatusOf(multi)).recordLocks[DB];
+				assert.equal(locks.members, undefined, 'peers have not activated, so the home map must be withheld');
+				assert.equal(typeof locks.unprovenMs, 'number', 'status must build the coordinator before agreement');
+			});
 			await waitForRing(nodes, nodes.length);
 		});
 

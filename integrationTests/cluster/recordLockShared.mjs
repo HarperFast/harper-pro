@@ -172,7 +172,7 @@ export function waitForRing(nodes, expectedSize) {
  * small backstop, so this bootstraps immediately; that is safe here specifically because every node is
  * freshly started with no prior generation, not something a real reconfiguration could skip.
  */
-export async function bootstrapHomeMap(nodes) {
+export async function bootstrapHomeMap(nodes, afterActivate) {
 	const homes = [];
 	for (const node of nodes) {
 		const status = await clusterStatusOf(node);
@@ -187,7 +187,7 @@ export async function bootstrapHomeMap(nodes) {
 			quiesce: homes,
 			authorization: node.admin,
 		});
-	for (const node of nodes)
+	for (const node of nodes) {
 		await sendOperation(node, {
 			operation: 'record_lock_activate_generation',
 			database: DB,
@@ -195,6 +195,8 @@ export async function bootstrapHomeMap(nodes) {
 			homes,
 			authorization: node.admin,
 		});
+		await afterActivate?.(node);
+	}
 	return homes;
 }
 

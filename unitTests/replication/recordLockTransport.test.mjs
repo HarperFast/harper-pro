@@ -239,6 +239,18 @@ describe('createRecordLockTransport().homeMap', () => {
 		assert.strictEqual(transport.homeMap('data'), undefined);
 	});
 
+	it('knows its coordination incarnation before activation or agreement, but never publishes an unknown one', () => {
+		for (const options of [{ active: undefined }, { agreements: { 'peer-a': false } }]) {
+			const { transport } = transportFor(options);
+			assert.strictEqual(transport.homeMap('data'), undefined);
+			assert.strictEqual(transport.coordinationIncarnation(), 3);
+		}
+		for (const homeIncarnation of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+			const { transport } = transportFor({ homeIncarnation });
+			assert.strictEqual(transport.coordinationIncarnation(), undefined);
+		}
+	});
+
 	it('is undefined on a digest mismatch with any named peer — not a shrunk ring', () => {
 		// A shrunk ring (excluding only the disagreeing peer) is itself a two-arbiter bug: with
 		// homes {A,B}, A deriving {A} and B deriving {B} both self-home every key.
