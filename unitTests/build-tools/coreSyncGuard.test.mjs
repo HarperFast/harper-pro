@@ -1,6 +1,6 @@
 import assert from 'node:assert';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,9 +24,9 @@ const git = (cwd, ...args) =>
 		.toString()
 		.trim();
 
-function runGuard(dir, before, after, env = {}) {
-	const result = spawnSync('bash', [guard, dir, before, after], { env: { ...gitEnv, ...env }, encoding: 'utf8' });
-	return { status: result.status, stderr: result.stderr };
+function runGuard(dir, before, after) {
+	const result = spawnSync('bash', [guard, dir, before, after], { env: gitEnv, encoding: 'utf8' });
+	return { status: result.status, warning: result.stdout };
 }
 
 function makeUpstream(tmp) {
@@ -67,20 +67,21 @@ describe('core-sync-guard.sh', function () {
 		if (tmp) rmSync(tmp, { recursive: true, force: true });
 	});
 
-	it('passes an unchanged pointer and a pointer the tip descends from', () => {
-		assert.strictEqual(runGuard(core, shas.main2, shas.main2).status, 0);
-		assert.strictEqual(runGuard(core, shas.main1, shas.main2).status, 0);
+	it('is silent on an unchanged pointer and on a pointer the tip descends from', () => {
+		assert.deepStrictEqual(runGuard(core, shas.main2, shas.main2), { status: 0, warning: '' });
+		assert.deepStrictEqual(runGuard(core, shas.main1, shas.main2), { status: 0, warning: '' });
 	});
 
-	it("refuses a tip that lacks the pointer's changes, naming the files it would drop", () => {
-		const { status, stderr } = runGuard(core, shas.companion, shas.main2);
-		assert.strictEqual(status, 1);
-		assert.match(stderr, /core sync refused/);
-		assert.match(stderr, /Table\.txt/);
-		assert.doesNotMatch(stderr, /other\.txt/);
+	it("warns, without failing, when the tip lacks the pointer's changes, naming the commits and files it drops", () => {
+		const { status, warning } = runGuard(core, shas.companion, shas.main2);
+		assert.strictEqual(status, 0);
+		assert.match(warning, /may drop changes/);
+		assert.match(warning, /companion: merge floors/);
+		assert.match(warning, /Table\.txt \| 1 \+/);
+		assert.doesNotMatch(warning, /other\.txt/);
 	});
 
-	it('passes a tip that carries the changes as a squash, and a merge commit of the companion with main', () => {
+	it('is silent on a tip that carries the changes as a squash, and on a merge commit of the companion with main', () => {
 		const companionTree = git(core, 'rev-parse', `${shas.companion}^{tree}`);
 		const mergedTree = git(core, 'merge-tree', '--write-tree', shas.main2, shas.companion).split('\n')[0];
 		const squashed = git(core, 'commit-tree', mergedTree, '-p', shas.main2, '-m', 'companion (squashed)');
@@ -95,76 +96,48 @@ describe('core-sync-guard.sh', function () {
 			'-m',
 			'merge main'
 		);
-		assert.strictEqual(runGuard(core, shas.companion, squashed).status, 0);
-		assert.strictEqual(runGuard(core, mergeCommit, squashed).status, 0);
+		assert.deepStrictEqual(runGuard(core, shas.companion, squashed), { status: 0, warning: '' });
+		assert.deepStrictEqual(runGuard(core, mergeCommit, squashed), { status: 0, warning: '' });
 		assert.notStrictEqual(companionTree, mergedTree);
 	});
 
-	it('refuses when merging the pointer into the tip conflicts, since preservation cannot be shown', () => {
+	it('warns when merging the pointer into the tip conflicts, since preservation cannot be shown', () => {
 		writeFileSync(join(core, 'Table.txt'), 'cursors\nsomething else\n');
 		git(core, 'add', 'Table.txt');
 		const conflicting = git(core, 'commit-tree', git(core, 'write-tree'), '-p', shas.main2, '-m', 'conflicting');
 		git(core, 'reset', '-q', '--hard', 'HEAD');
-		const { status, stderr } = runGuard(core, shas.companion, conflicting);
-		assert.strictEqual(status, 1);
-		assert.match(stderr, /conflicts/);
-		assert.match(stderr, /Table\.txt/);
-	});
-
-	it('drops the changes only on CORE_SYNC_DROP_CONTENT=true exactly, saying which pointers it moved between', () => {
-		assert.strictEqual(runGuard(core, shas.companion, shas.main2, { CORE_SYNC_DROP_CONTENT: 'false' }).status, 1);
-		assert.strictEqual(runGuard(core, shas.companion, shas.main2, { CORE_SYNC_DROP_CONTENT: '1' }).status, 1);
-		const { status, stderr } = runGuard(core, shas.companion, shas.main2, { CORE_SYNC_DROP_CONTENT: 'true' });
+		const { status, warning } = runGuard(core, shas.companion, conflicting);
 		assert.strictEqual(status, 0);
-		assert.match(stderr, new RegExp(`${shas.companion} -> ${shas.main2}`));
+		assert.match(warning, /conflicts/);
+		assert.match(warning, /Table\.txt/);
 	});
 
-	it("refuses a companion that merged with later revisions, unless told its merged pull request's commit", () => {
+	it('warns, without failing, on a companion that merged with later revisions to its own lines', () => {
 		// the pointer's exact content is on no tip once the companion revised its own lines before merging
 		git(core, 'checkout', '-q', '--detach', shas.companion);
 		writeFileSync(join(core, 'Table.txt'), 'cursors\nfloors, revised\n');
 		git(core, 'add', 'Table.txt');
-		const revisedTree = git(core, 'write-tree');
+		const revised = git(core, 'commit-tree', git(core, 'write-tree'), '-p', shas.base, '-m', 'companion revised');
 		git(core, 'reset', '-q', '--hard', shas.main2);
-		const revisedMerge = git(core, 'merge-tree', '--write-tree', shas.main2, shas.companion).split('\n')[0];
 		const squashedRevision = git(
 			core,
 			'commit-tree',
-			git(
-				core,
-				'merge-tree',
-				'--write-tree',
-				shas.main2,
-				git(core, 'commit-tree', revisedTree, '-p', shas.base, '-m', 'c2')
-			).split('\n')[0],
+			git(core, 'merge-tree', '--write-tree', shas.main2, revised).split('\n')[0],
 			'-p',
 			shas.main2,
 			'-m',
 			'companion revised (squashed)'
 		);
-		assert.notStrictEqual(git(core, 'rev-parse', `${squashedRevision}^{tree}`), revisedMerge);
-		assert.strictEqual(runGuard(core, shas.companion, squashedRevision).status, 1);
-		assert.strictEqual(
-			runGuard(core, shas.companion, squashedRevision, { CORE_SYNC_SUPERSEDED_BY: shas.base }).status,
-			1,
-			'a commit behind the pointer is not its merged pull request'
-		);
-		const { status, stderr } = runGuard(core, shas.companion, squashedRevision, {
-			CORE_SYNC_SUPERSEDED_BY: squashedRevision,
-		});
+		const { status, warning } = runGuard(core, shas.companion, squashedRevision);
 		assert.strictEqual(status, 0);
-		assert.match(stderr, /pull request merged as/);
-		assert.strictEqual(
-			runGuard(core, shas.companion, shas.main2, { CORE_SYNC_SUPERSEDED_BY: squashedRevision }).status,
-			1,
-			'the tip must contain the merged pull request'
-		);
+		assert.match(warning, /companion: merge floors/);
+		assert.match(warning, /Table\.txt/);
 	});
 
-	it('cannot decide on an unknown object and does not pretend the move is safe', () => {
-		const { status, stderr } = runGuard(core, shas.companion, '0'.repeat(40));
-		assert.strictEqual(status, 2);
-		assert.match(stderr, /cannot compare/);
+	it('warns that it cannot decide on an unknown object rather than calling the move safe', () => {
+		const { status, warning } = runGuard(core, shas.companion, '0'.repeat(40));
+		assert.strictEqual(status, 0);
+		assert.match(warning, /could not be determined/);
 	});
 
 	it('never moves the clone', () => {
@@ -184,15 +157,18 @@ describe('core-sync-guard.sh', function () {
 		it('decides a forward move from the fetched history alone', () => {
 			git(upstream, 'branch', '-q', 'behind', shas.main1);
 			const dir = shallowClone('behind');
-			assert.strictEqual(runGuard(dir, shas.main1, git(dir, 'rev-parse', 'FETCH_HEAD')).status, 0);
+			assert.deepStrictEqual(runGuard(dir, shas.main1, git(dir, 'rev-parse', 'FETCH_HEAD')), {
+				status: 0,
+				warning: '',
+			});
 			assert.strictEqual(git(dir, 'rev-parse', '--is-shallow-repository'), 'true');
 		});
 
-		it('deepens only to compare a divergent pointer, then refuses the same way', () => {
+		it('deepens only to compare a divergent pointer, then warns the same way', () => {
 			const dir = shallowClone('companion');
-			const { status, stderr } = runGuard(dir, shas.companion, git(dir, 'rev-parse', 'FETCH_HEAD'));
-			assert.strictEqual(status, 1);
-			assert.match(stderr, /Table\.txt/);
+			const { status, warning } = runGuard(dir, shas.companion, git(dir, 'rev-parse', 'FETCH_HEAD'));
+			assert.strictEqual(status, 0);
+			assert.match(warning, /Table\.txt/);
 			assert.strictEqual(git(dir, 'rev-parse', '--is-shallow-repository'), 'false');
 		});
 	});
@@ -227,21 +203,33 @@ describe('sync-core.sh', function () {
 		if (tmp) rmSync(tmp, { recursive: true, force: true });
 	});
 
-	const sync = () => spawnSync('bash', [syncCore, '--skip-install'], { cwd: pro, env: gitEnv, encoding: 'utf8' });
+	const warningFile = () => join(tmp, 'core-sync-warning.md');
+	const sync = () =>
+		spawnSync('bash', [syncCore, '--skip-install'], {
+			cwd: pro,
+			env: { ...gitEnv, CORE_SYNC_WARNING_FILE: warningFile() },
+			encoding: 'utf8',
+		});
 
-	it('refuses to move core off the companion before touching anything', () => {
+	it('moves core off the companion to the fetched tip anyway, writing the warning for the PR body', () => {
 		const result = sync();
-		assert.notStrictEqual(result.status, 0, result.stdout + result.stderr);
-		assert.match(result.stderr, /core sync refused/);
-		assert.strictEqual(git(join(pro, 'core'), 'rev-parse', 'HEAD'), shas.companion);
-		assert.strictEqual(git(pro, 'status', '--porcelain'), '');
+		assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+		assert.strictEqual(git(join(pro, 'core'), 'rev-parse', 'HEAD'), shas.main3);
+		const warning = readFileSync(warningFile(), 'utf8');
+		assert.match(warning, /may drop changes/);
+		assert.match(warning, /Table\.txt/);
+		assert.match(result.stderr, /may drop changes/);
+		git(pro, 'checkout', '--', 'package.json');
+		git(pro, 'submodule', 'update', '-q', 'core');
+		rmSync(join(pro, 'package-lock.json'));
 	});
 
-	it('moves core to the tip once main carries the companion, and then copies the manifest', () => {
+	it('moves core to the tip once main carries the companion without a warning, and then copies the manifest', () => {
 		git(upstream, 'merge', '-q', '--no-edit', 'companion');
 		const tip = git(upstream, 'rev-parse', 'HEAD');
 		const result = sync();
 		assert.strictEqual(result.status, 0, result.stdout + result.stderr);
+		assert.strictEqual(readFileSync(warningFile(), 'utf8'), '');
 		assert.strictEqual(git(join(pro, 'core'), 'rev-parse', 'HEAD'), tip);
 		assert.match(git(pro, 'status', '--porcelain'), /package-lock\.json/);
 	});

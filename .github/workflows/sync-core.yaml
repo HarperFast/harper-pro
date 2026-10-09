@@ -7,15 +7,6 @@ on:
   repository_dispatch:
     types: [sync_core]
   workflow_dispatch:
-    inputs:
-      superseded_by:
-        description: "The merge commit of the committed core pointer's own pull request, when it merged with later revisions (CORE_SYNC_SUPERSEDED_BY)"
-        type: string
-        default: ''
-      drop_content:
-        description: 'Move core even if the tracked tip lacks changes the committed pointer has (CORE_SYNC_DROP_CONTENT)'
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -57,9 +48,32 @@ jobs:
 
       - name: Sync core
         env:
-          CORE_SYNC_SUPERSEDED_BY: ${{ inputs.superseded_by }}
-          CORE_SYNC_DROP_CONTENT: ${{ inputs.drop_content && 'true' || '' }}
+          CORE_SYNC_WARNING_FILE: ${{ runner.temp }}/core-sync-warning.md
         run: npm run core:sync
+
+      # core-sync-guard.sh's warning, when the move drops changes the previous pointer had, leads the PR body
+      - name: Compose pull request body
+        env:
+          WARNING_FILE: ${{ runner.temp }}/core-sync-warning.md
+          BODY_FILE: ${{ runner.temp }}/core-sync-body.md
+        run: |
+          {
+            if [[ -s "$WARNING_FILE" ]]; then
+              cat "$WARNING_FILE"
+              echo
+              echo
+            fi
+            echo 'Sync core submodule and update package.json dependencies.'
+            echo 'This PR was automatically created by the Sync Core workflow.'
+            echo
+            echo 'Auto-merge is enabled: this PR will merge automatically once'
+            echo 'required status checks pass. If checks fail, the PR stays open'
+            echo 'for manual review.'
+          } >"$BODY_FILE"
+          if [[ -s "$WARNING_FILE" ]]; then
+            cat "$WARNING_FILE" >>"$GITHUB_STEP_SUMMARY"
+            echo "::warning title=Core sync may drop changes::See the job summary and the Sync Core PR body"
+          fi
 
       - name: Create Pull Request
         id: cpr
@@ -69,13 +83,7 @@ jobs:
           commit-message: 'feat: Sync Core'
           branch: sync-core-submodule
           title: 'chore: Sync Core'
-          body: |
-            Sync core submodule and update package.json dependencies.
-            This PR was automatically created by the Sync Core workflow.
-
-            Auto-merge is enabled: this PR will merge automatically once
-            required status checks pass. If checks fail, the PR stays open
-            for manual review.
+          body-path: ${{ runner.temp }}/core-sync-body.md
           labels: |
             automated pr
             core sync
