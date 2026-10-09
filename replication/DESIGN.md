@@ -492,7 +492,7 @@ Regressions: `unitTests/replication/replicateFalseSendPaths.test.mjs` (frames), 
 
 ---
 
-28. **Audit sender fairness is shared per worker.** `yieldSendLoop` shares one pending macrotask and restarts its 2 ms monotonic budget on resume, pinned by `sendLoopYield.test.mjs`. Normal sends consult it when neither drain nor blob saturation requires a wait; skips consult it so their sequence-update timer can fire. The copy-flush pacer paces on its own separate cadence (`copyFlushPacer.due`), including copy-only skipped rows.
+28. **Audit sender fairness is shared per worker.** `yieldSendLoop` shares one pending macrotask and restarts its monotonic budget on resume: 2 ms on dedicated replication workers, 0.5 ms on HTTP workers and the main-thread fallback, selected by this thread's `workerData.name`, pinned by `sendLoopYield.test.mjs`. Normal sends (including base-copy records) consult it when neither drain nor blob saturation requires a wait; skips consult it so their sequence-update timer can fire. The copy-flush pacer paces on its own separate cadence (`copyFlushPacer.due`), including copy-only skipped rows.
 
 ## Tests
 

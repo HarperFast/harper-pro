@@ -72,7 +72,7 @@ import { verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { isDedicatedPoolWorker } from '../core/server/threads/workerPools.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
-import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import { CONFIG_PARAMS, THREAD_TYPES } from '../core/utility/hdbTerms.ts';
 import { registerBlobSend, noteBlobSendProgress, endBlobSend, isDrainingBlobSends } from './blobSendDrain.ts';
 import {
 	PARK_WARN_MS,
@@ -105,7 +105,7 @@ import {
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
 import { WebSocket } from 'ws';
-import { threadId } from 'worker_threads';
+import { threadId, workerData } from 'node:worker_threads';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 const { forComponent, errorToString } = harperLogger;
 import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptionManager.ts';
@@ -473,7 +473,7 @@ export function holdFailedFrame(
 const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 100;
 
 // One pending turn is shared across senders so the yield cost does not multiply with peer count.
-const SEND_YIELD_INTERVAL = 2;
+const SEND_YIELD_INTERVAL = workerData?.name === THREAD_TYPES.REPLICATION ? 2 : 0.5;
 let lastSendYieldTime = 0;
 let pendingSendYield: Promise<void> | undefined;
 
