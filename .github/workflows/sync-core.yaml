@@ -7,6 +7,11 @@ on:
   repository_dispatch:
     types: [sync_core]
   workflow_dispatch:
+    inputs:
+      drop_content:
+        description: 'Move core even if the tracked tip lacks changes the committed pointer has (CORE_SYNC_DROP_CONTENT)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -46,7 +51,24 @@ jobs:
         if: github.ref_name == github.event.repository.default_branch
         run: git submodule set-branch --branch main core
 
+      # A coordinated PR merges with core pinned at its companion's branch commit; if the companion
+      # then merged with later revisions, that commit's content is on main only in revised form and
+      # the sync guard cannot prove it kept. Its merged pull request is the proof the guard accepts.
+      - name: Find the merged pull request of the committed core pointer
+        id: core-pointer
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          pointer=$(git rev-parse HEAD:core)
+          repo=$(git config -f .gitmodules --get submodule.core.url | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')
+          merged=$(gh api "repos/$repo/commits/$pointer/pulls" --jq '[.[] | select(.merged_at != null) | .merge_commit_sha] | first // empty' || true)
+          echo "pointer=$pointer merged-pr-commit=${merged:-none}"
+          echo "superseded_by=$merged" >> "$GITHUB_OUTPUT"
+
       - name: Sync core
+        env:
+          CORE_SYNC_SUPERSEDED_BY: ${{ steps.core-pointer.outputs.superseded_by }}
+          CORE_SYNC_DROP_CONTENT: ${{ inputs.drop_content && 'true' || '' }}
         run: npm run core:sync
 
       - name: Create Pull Request

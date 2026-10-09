@@ -124,6 +124,44 @@ describe('core-sync-guard.sh', function () {
 		assert.match(stderr, new RegExp(`${shas.companion} -> ${shas.main2}`));
 	});
 
+	it("refuses a companion that merged with later revisions, unless told its merged pull request's commit", () => {
+		// the companion revised the line it added, then was squash-merged: the pointer's exact content is on
+		// no tip, and only the merged pull request proves the pointer was superseded rather than dropped
+		git(core, 'checkout', '-q', '--detach', shas.companion);
+		writeFileSync(join(core, 'Table.txt'), 'cursors\nfloors, revised\n');
+		git(core, 'add', 'Table.txt');
+		const revisedTree = git(core, 'write-tree');
+		git(core, 'reset', '-q', '--hard', shas.main2);
+		const revisedMerge = git(core, 'merge-tree', '--write-tree', shas.main2, shas.companion).split('\n')[0];
+		const squashedRevision = git(
+			core,
+			'commit-tree',
+			git(
+				core,
+				'merge-tree',
+				'--write-tree',
+				shas.main2,
+				git(core, 'commit-tree', revisedTree, '-p', shas.base, '-m', 'c2')
+			).split('\n')[0],
+			'-p',
+			shas.main2,
+			'-m',
+			'companion revised (squashed)'
+		);
+		assert.notStrictEqual(squashedRevision, revisedMerge);
+		assert.strictEqual(runGuard(core, shas.companion, squashedRevision).status, 1);
+		const { status, stderr } = runGuard(core, shas.companion, squashedRevision, {
+			CORE_SYNC_SUPERSEDED_BY: squashedRevision,
+		});
+		assert.strictEqual(status, 0);
+		assert.match(stderr, /pull request merged as/);
+		assert.strictEqual(
+			runGuard(core, shas.companion, shas.main2, { CORE_SYNC_SUPERSEDED_BY: squashedRevision }).status,
+			1,
+			'the tip must contain the merged pull request'
+		);
+	});
+
 	it('cannot decide on an unknown object and does not pretend the move is safe', () => {
 		const { status, stderr } = runGuard(core, shas.companion, '0'.repeat(40));
 		assert.strictEqual(status, 2);

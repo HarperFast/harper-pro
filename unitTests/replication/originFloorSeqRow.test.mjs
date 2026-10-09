@@ -46,7 +46,7 @@ describe('a certified origin floor reaches the seq row through core', () => {
 		const now = Date.now();
 		const txnStream = {};
 		const floorUpdate = (localTime, originFloors) => {
-			const event = { type: 'end_txn', localTime, timestamp: localTime, remoteNodeIds: [PEER], txnStream };
+			const event = { type: 'end_txn', localTime, remoteNodeIds: [PEER], txnStream };
 			event.onFailure = () => false;
 			event.onCommit = () => {
 				event.originFloors = originFloors;
@@ -58,7 +58,6 @@ describe('a certified origin floor reaches the seq row through core', () => {
 			{
 				type: 'end_txn',
 				localTime: now,
-				timestamp: now,
 				remoteNodeIds: [PEER],
 				txnStream,
 				onFailure: () => false,

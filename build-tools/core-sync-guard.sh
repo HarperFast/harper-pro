@@ -2,7 +2,9 @@
 # Decides whether moving the core submodule from <committed-sha> to <candidate-sha> keeps every
 # change the committed pointer has (build-tools/DESIGN.md, "A core sync never removes content").
 # Usage: core-sync-guard.sh <submodule-dir> <committed-sha> <candidate-sha>
-# Exit 0: safe to apply (or CORE_SYNC_DROP_CONTENT=true overrode a refusal); 1: refused; 2: undecidable.
+# Exit 0: safe to apply, or a refusal overridden by CORE_SYNC_SUPERSEDED_BY=<sha> (the merge commit of
+# the pointer's own pull request, which the candidate must contain) or by CORE_SYNC_DROP_CONTENT=true;
+# 1: refused; 2: undecidable.
 # Never changes the submodule's HEAD, index or files; it may fetch objects.
 set -u
 dir="$1" before="$2" after="$3"
@@ -48,9 +50,13 @@ fi
   fi
   git_core diff --stat "$after" "$merged"
 } >&2
+if [[ -n "${CORE_SYNC_SUPERSEDED_BY:-}" ]] && git_core merge-base --is-ancestor "$CORE_SYNC_SUPERSEDED_BY" "$after"; then
+  echo "CORE_SYNC_SUPERSEDED_BY: $before's pull request merged as $CORE_SYNC_SUPERSEDED_BY, which $after contains; syncing." >&2
+  exit 0
+fi
 if [[ "${CORE_SYNC_DROP_CONTENT:-}" == "true" ]]; then
   echo "CORE_SYNC_DROP_CONTENT=true: syncing $before -> $after anyway and dropping them." >&2
   exit 0
 fi
-echo "Merge the core companion PR first and re-run, or set CORE_SYNC_DROP_CONTENT=true to drop them." >&2
+echo "Merge the core companion PR first and re-run; if it merged with later revisions, re-run with CORE_SYNC_SUPERSEDED_BY=<its merge commit>; CORE_SYNC_DROP_CONTENT=true drops them." >&2
 exit 1
