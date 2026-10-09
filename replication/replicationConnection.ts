@@ -7513,7 +7513,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 																copyReceiptRequest = [table.tableId, entry.key, entry.version];
 														}
 														// same origin normalization as recordNodeId below: undefined means we authored it
-														if (withheldOriginNodeId !== undefined && (entry.nodeId ?? nodeId) === withheldOriginNodeId) {
+														if (
+															withheldOriginNodeId !== undefined &&
+															(entry.nodeId ?? nodeId) === withheldOriginNodeId
+														) {
 															withheldRecordCount++;
 															continue;
 														}
@@ -7729,7 +7732,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													// implementation may be receiver-sensitive (e.g. a private field)
 													const redelivery = Object.create(retained, {
 														isHandoffRedelivery: { value: true, enumerable: true },
-														getTransitionImage: { value: retained.getTransitionImage?.bind(retained), enumerable: true },
+														getTransitionImage: {
+															value: retained.getTransitionImage?.bind(retained),
+															enumerable: true,
+														},
 													});
 													await sendAuditRecord(redelivery, key);
 													redelivered++;
