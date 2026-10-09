@@ -8,6 +8,10 @@ on:
     types: [sync_core]
   workflow_dispatch:
     inputs:
+      superseded_by:
+        description: "The merge commit of the committed core pointer's own pull request, when it merged with later revisions (CORE_SYNC_SUPERSEDED_BY)"
+        type: string
+        default: ''
       drop_content:
         description: 'Move core even if the tracked tip lacks changes the committed pointer has (CORE_SYNC_DROP_CONTENT)'
         type: boolean
@@ -51,23 +55,11 @@ jobs:
         if: github.ref_name == github.event.repository.default_branch
         run: git submodule set-branch --branch main core
 
-      # A coordinated PR merges with core pinned at its companion's branch commit; if the companion
-      # then merged with later revisions, that commit's content is on main only in revised form and
-      # the sync guard cannot prove it kept. Its merged pull request is the proof the guard accepts.
-      - name: Find the merged pull request of the committed core pointer
-        id: core-pointer
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          pointer=$(git rev-parse HEAD:core)
-          repo=$(git config -f .gitmodules --get submodule.core.url | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')
-          merged=$(gh api "repos/$repo/commits/$pointer/pulls" --jq '[.[] | select(.merged_at != null) | .merge_commit_sha] | first // empty' || true)
-          echo "pointer=$pointer merged-pr-commit=${merged:-none}"
-          echo "superseded_by=$merged" >> "$GITHUB_OUTPUT"
-
+      # The guard (build-tools/core-sync-guard.sh) refuses a sync that would lose the committed
+      # pointer's changes; a human supplies the proof or the decision it cannot derive by itself.
       - name: Sync core
         env:
-          CORE_SYNC_SUPERSEDED_BY: ${{ steps.core-pointer.outputs.superseded_by }}
+          CORE_SYNC_SUPERSEDED_BY: ${{ inputs.superseded_by }}
           CORE_SYNC_DROP_CONTENT: ${{ inputs.drop_content && 'true' || '' }}
         run: npm run core:sync
 

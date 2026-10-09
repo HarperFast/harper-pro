@@ -1,8 +1,4 @@
-/**
- * `build-tools/core-sync-guard.sh` decides whether re-pointing `core` keeps every change the
- * committed pointer has (build-tools/DESIGN.md). Each case builds a throwaway upstream with a
- * `main` and a companion branch and runs the real script against a clone of it.
- */
+/** Runs the real guard and sync scripts against throwaway upstream/clone repositories. */
 import assert from 'node:assert';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -148,7 +144,7 @@ describe('core-sync-guard.sh', function () {
 			'-m',
 			'companion revised (squashed)'
 		);
-		assert.notStrictEqual(squashedRevision, revisedMerge);
+		assert.notStrictEqual(git(core, 'rev-parse', `${squashedRevision}^{tree}`), revisedMerge);
 		assert.strictEqual(runGuard(core, shas.companion, squashedRevision).status, 1);
 		const { status, stderr } = runGuard(core, shas.companion, squashedRevision, {
 			CORE_SYNC_SUPERSEDED_BY: squashedRevision,

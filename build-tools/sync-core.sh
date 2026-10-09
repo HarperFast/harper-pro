@@ -37,7 +37,7 @@ if use_git; then
   CORE_BEFORE=$(git rev-parse HEAD:core)
   git -C core fetch --quiet "$CORE_REMOTE" "$CORE_BRANCH"
   CORE_AFTER=$(git -C core rev-parse FETCH_HEAD)
-  "$(dirname "$0")/core-sync-guard.sh" core "$CORE_BEFORE" "$CORE_AFTER"
+  "$(dirname "$0")/core-sync-guard.sh" core "$CORE_BEFORE" "$CORE_AFTER" "$CORE_REMOTE"
   git -C core checkout --quiet --detach "$CORE_AFTER"
   git -C core submodule update --init --recursive
 fi
