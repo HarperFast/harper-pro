@@ -9398,7 +9398,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		pendingSchemaResends.add(database);
 	}
 	/**
-	 * Core decides each drop under its catalog lock (`replication/DESIGN.md` item 27). A failed drop rethrows, closing the
+	 * Core decides each drop under its catalog lock (`replication/DESIGN.md` item 28). A failed drop rethrows, closing the
 	 * connection, so the frame is re-delivered rather than its definitions merging into the stale store.
 	 */
 	async function applyPeerDropMarkers(
