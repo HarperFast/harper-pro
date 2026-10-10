@@ -68,7 +68,7 @@ const nodeOptions = (node) => ({
 });
 
 async function startNode(node) {
-	const started = (await startHarper({ harper: node }, nodeOptions(node))).harper;
+	const started = (await startHarper({ name: node.name, harper: node }, nodeOptions(node))).harper;
 	return Object.assign(node, started);
 }
 
@@ -80,7 +80,7 @@ async function restartNode(node) {
 async function startNewNode(suiteName) {
 	const nodeCtx = { name: suiteName, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 	await startHarper(nodeCtx, nodeOptions(nodeCtx.harper));
-	const node = nodeCtx.harper;
+	const node = Object.assign(nodeCtx.harper, { name: nodeCtx.name });
 	await sendOperation(node, { operation: 'create_table', database: 'data', table: TABLE, primary_key: 'id' });
 	// the fixture's resources register at boot, and a table created afterwards unregisters them
 	return restartNode(node);

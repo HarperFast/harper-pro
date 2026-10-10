@@ -49,7 +49,7 @@ const PRE_KILL_WRITE_DELAY_MS = 20; // paces the stream so the poll loop can int
 const POST_KILL_COUNT = 25; // writes taken on survivor B after A is dead
 
 // Restart must re-pass the original config (analytics + replication.securePort) —
-// startHarper({harper:node}, options) without options.config wipes it, killing
+// startHarper({name:ctx.name, harper:node}, options) without options.config wipes it, killing
 // replication silently. Keep this as the single source of truth for both the
 // initial start and any later restart.
 function nodeStartOptions(hostname) {
@@ -400,7 +400,7 @@ suite('QA-651: post-failover write-visibility divergence', { timeout: 480000 }, 
 		// --- Phase 6: restart survivor C and re-probe — does anything change across a restart? ---
 		console.log('[QA-651] restarting C to probe self-heal-vs-restart-regression');
 		await killHarper({ harper: nodeC });
-		ctx.nodeC = (await startHarper({ harper: nodeC }, nodeStartOptions(nodeC.hostname))).harper;
+		ctx.nodeC = (await startHarper({ name: ctx.name, harper: nodeC }, nodeStartOptions(nodeC.hostname))).harper;
 		// after()'s teardown loop walks ctx.nodes — keep the restarted process's handle
 		// in sync there too, or teardown targets the pre-restart (now-dead) process and
 		// leaks the new one.

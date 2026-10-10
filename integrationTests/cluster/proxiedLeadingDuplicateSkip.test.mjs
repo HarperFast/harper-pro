@@ -194,7 +194,7 @@ suite('Proxied Leading Duplicate Fast-Skip', { timeout: 240000 }, (ctx) => {
 		// data) re-streams L's already-applied tail to M — the proxied leading duplicates #399 targets.
 		await killHarper({ harper: nodeB });
 		await delay(1000);
-		ctx.nodeB = (await startHarper({ harper: nodeB }, meshConfig(nodeB.hostname))).harper;
+		ctx.nodeB = (await startHarper({ name: ctx.name, harper: nodeB }, meshConfig(nodeB.hostname))).harper;
 
 		// Re-wait for the mesh to come back so the relay is flowing again.
 		meshed = false;

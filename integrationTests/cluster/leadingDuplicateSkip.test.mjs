@@ -166,7 +166,7 @@ suite('Leading Duplicate Fast-Skip', { timeout: 180000 }, (ctx) => {
 		// phase-1 records the follower already has — the leading duplicates the fast-skip targets.
 		await killHarper({ harper: source });
 		await delay(800);
-		ctx.nodes[0] = (await startHarper({ harper: source }, nodeStartOptions(source))).harper;
+		ctx.nodes[0] = (await startHarper({ name: ctx.name, harper: source }, nodeStartOptions(source))).harper;
 		const restartedSource = ctx.nodes[0];
 		await waitForConnected(follower, 1);
 

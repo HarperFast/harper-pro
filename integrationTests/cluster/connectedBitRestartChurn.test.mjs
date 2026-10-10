@@ -492,7 +492,7 @@ suite(
 					// Restart re-passing the ORIGINAL config (critical gotcha: omitting it wipes
 					// replication.databases and silently breaks replication on the restarted node).
 					await delay(300); // let the OS finish releasing the ports
-					ctx.leader = (await startHarper({ harper: ctx.leader }, nodeStartOptions(ctx.leader))).harper;
+					ctx.leader = (await startHarper({ name: ctx.name, harper: ctx.leader }, nodeStartOptions(ctx.leader))).harper;
 					const restartedAt = Date.now();
 
 					// Concurrently: resume write load on the leader, flood the follower's own admin
@@ -627,7 +627,7 @@ suite(
 						`disruptive wedge-reconcile fired during outage: ${cycleResult.wedgeReconcileFiredDuringOutage}`
 				);
 
-				ctx.leader = (await startHarper({ harper: ctx.leader }, nodeStartOptions(ctx.leader))).harper;
+				ctx.leader = (await startHarper({ name: ctx.name, harper: ctx.leader }, nodeStartOptions(ctx.leader))).harper;
 				const restartedAt = Date.now();
 
 				let convergedAt = null;
