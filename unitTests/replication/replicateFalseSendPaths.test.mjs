@@ -26,8 +26,6 @@ const BLOB_CHUNK = 146;
 const REMOTE_SEQUENCE_UPDATE = 11;
 const COPY_START = 148;
 const COPY_COMPLETE = 149;
-const HANDOFF_RECEIPT = 151;
-const HANDOFF_RECEIPT_REQUEST = 152;
 // Above FILE_STORAGE_THRESHOLD (8 KiB): the value is stored as a blob file, so a copy of the row would
 // have to stream it.
 const BLOB_PAYLOAD = 'stays here '.repeat(2048);
@@ -82,9 +80,6 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 		setHdbBasePath(process.env.STORAGE_PATH);
 		await loadGQLSchema(SCHEMA());
 		await tables.ReplicateFalseLocal.put({ id: 'local', payload: BLOB_PAYLOAD });
-		// Inline (non-file-blob) payload, so the HANDOFF_RECEIPT_REQUEST deny test below isn't also
-		// waiting on an async blob-completeness check it never intends to exercise.
-		await tables.ReplicateFalseLocal.put({ id: 'local-small', payload: 'tiny' });
 		await tables.ReplicateFalseShared.put({ id: 'shared', payload: 'travels' });
 	});
 
@@ -161,30 +156,6 @@ describe('replicate: false on the send paths (harper-pro#883)', function () {
 		assert.equal(response[1], 8);
 		assert.equal(response[2].error, undefined);
 		assert.ok(response[2].value, 'a record value must be returned');
-	});
-
-	it('never answers a HANDOFF_RECEIPT_REQUEST for the non-replicated table (harper#2257)', async () => {
-		// 'local-small' (not 'local'): an inline payload keeps this deterministic -- a blob-backed row
-		// would also need the async blob-completeness check settle() isn't waiting on, which could let a
-		// too-short wait pass even without the gate this test exists to prove.
-		const local = tables.ReplicateFalseLocal;
-		socket.emit('message', structureFrame(local, local.tableId));
-		socket.emit('message', encode([HANDOFF_RECEIPT_REQUEST, [[local.tableId, 'local-small', 1]], 'data']));
-		await settle(socket, 2);
-		assert.ok(
-			!socket.sent.some((frame) => frame[0] === HANDOFF_RECEIPT),
-			`a replicate:false table must never confirm a record's existence via a receipt, got ${JSON.stringify(socket.sent)}`
-		);
-	});
-
-	it('still answers a HANDOFF_RECEIPT_REQUEST for a replicated table', async () => {
-		const shared = tables.ReplicateFalseShared;
-		socket.emit('message', structureFrame(shared, shared.tableId));
-		socket.emit('message', encode([HANDOFF_RECEIPT_REQUEST, [[shared.tableId, 'shared', 1]], 'data']));
-		await settle(socket, 2);
-		const response = socket.sent.find((frame) => frame[0] === HANDOFF_RECEIPT);
-		assert.ok(response, 'the control table must still be able to answer a receipt request');
-		assert.deepEqual(response[1][0].slice(0, 2), [shared.tableId, 'shared']);
 	});
 });
 

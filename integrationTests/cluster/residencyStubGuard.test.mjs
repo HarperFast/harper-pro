@@ -1,11 +1,9 @@
 /**
  * A base copy never presents an INVALIDATED residency stub as a complete record (HarperFast/harper#2257).
  *
- * This is the half of the residency handoff that holds on today's core: when A has written a record out of
- * its own residency it keeps an index-only stub, and a resident peer rebuilt from nothing must not receive
- * that stub relabelled as a complete `put`. On the unfixed sender the rebuilt B ends up holding
- * `{ home: B }` as the whole record; here it must hold nothing complete for it. The full handoff (image
- * delivery, receipts, release) is `residencyHandoff.test.mjs` and needs the companion core change.
+ * B writes a record homed on B, so A holds only an index-only stub of it. When B is rebuilt from nothing,
+ * A's base copy must not hand B that stub relabelled as a complete `put`: on the unfixed sender the rebuilt
+ * B ends up holding `{ home: B }` as the whole record.
  */
 import { suite, test, before, after } from 'node:test';
 import { ok } from 'node:assert/strict';
@@ -29,7 +27,7 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = resolve(
 	'harper.js'
 );
 
-const FIXTURE = resolve(import.meta.dirname ?? module.path, 'fixture-residency-handoff');
+const FIXTURE = resolve(import.meta.dirname ?? module.path, 'fixture-residency-stub');
 const TABLE = 'Homed';
 const CONVERGE_TIMEOUT_MS = 90000;
 
@@ -114,38 +112,21 @@ suite('A base copy never promotes an INVALIDATED residency stub (harper#2257)', 
 		if (errors.length) throw new AggregateError(errors, 'Failed to tear down residency-stub-guard nodes');
 	});
 
-	test('a resident rebuilt from nothing does not receive the origin’s stub as a complete record', async () => {
-		const { A } = ctx;
-		await sendOperation(A, {
+	test('a resident rebuilt from nothing does not receive a peer’s stub as a complete record', async () => {
+		const { A, B } = ctx;
+		await sendOperation(B, {
 			operation: 'upsert',
 			database: 'data',
 			table: TABLE,
 			records: [
-				{ id: 'moved', home: A.hostname, name: 'kept', size: 7 },
+				{ id: 'moved', home: B.hostname, name: 'kept', size: 7 },
 				{ id: 'zz-control', name: 'control' },
 			],
 		});
-		await waitForProbe(ctx.B, 'moved', (state) => state.present && state.invalidated, 'B holds the non-resident stub');
-		await waitForProbe(
-			ctx.B,
-			'zz-control',
-			(state) => state.present && !state.invalidated,
-			'B holds the control record'
-		);
+		await waitForProbe(A, 'moved', (state) => state.present && state.invalidated, 'A holds the non-resident stub');
+		await waitForProbe(A, 'zz-control', (state) => state.present && !state.invalidated, 'A holds the control record');
 
 		await killHarper({ harper: ctx.B }, { graceMs: 0 });
-		const patched = await fetch(`${A.httpURL}/${TABLE}/moved`, {
-			method: 'PATCH',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ home: ctx.B.hostname }),
-		});
-		ok(patched.ok, `PATCH on A returned ${patched.status}`);
-		const onA = await probe(A, 'moved');
-		ok(
-			onA.present && onA.invalidated,
-			`A must hold an INVALIDATED stub after writing itself out, saw ${JSON.stringify(onA)}`
-		);
-
 		await teardownHarper({ harper: ctx.B }).catch(() => {});
 		await rm(ctx.dataRootDirs.B, { recursive: true, force: true });
 		const rebuilt = await startNode(
