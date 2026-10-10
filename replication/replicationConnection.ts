@@ -5716,6 +5716,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							const requestDecoder = tableDecoders[requestTableId];
 							// no structure for the table yet, or the queue is full: the sender's next sweep asks again
 							if (!requestDecoder) continue;
+							// A refused dropped-generation decoder (see TABLE_FIXED_STRUCTURE's `refused` branch) has
+							// no `getEntry`; GET_RECORD already gates on this via `peerGenerationRefused` and this
+							// handler must too, or binding below throws and closes the connection.
+							if (peerGenerationRefused(requestDecoder)) continue;
 							// Same boundary GET_RECORD's own `table`/`tableReplicates` gate enforces: a
 							// `replicate: false` table's records never leave this node on any path, including
 							// confirming one exists via a receipt. A dropped table resolves to no live entry here,
