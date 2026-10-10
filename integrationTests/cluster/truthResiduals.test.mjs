@@ -31,7 +31,14 @@ import {
 } from '@harperfast/integration-testing';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { sendOperation, readLog, readNodePid, waitForCondition, fetchWithRetry } from './clusterShared.mjs';
+import {
+	sendOperation,
+	readLog,
+	readNodePid,
+	waitForCondition,
+	fetchWithRetry,
+	replicationPoolOffEnv,
+} from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
 	import.meta.dirname ?? new URL('.', import.meta.url).pathname,
@@ -208,11 +215,13 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ct
 		await startHarper(peerCtx, nodeStartOptions(peerCtx.harper));
 		const subscriberOptions = nodeStartOptions(subscriberCtx.harper);
 		// One HTTP worker, so the thread that answers the kill endpoint is provably the thread that owns the
-		// subscription — the test asserts that identity rather than assuming it.
+		// subscription — the test asserts that identity rather than assuming it. Pool off: a pool worker would
+		// own the subscription, and the fixture's endpoints run only on HTTP workers.
 		subscriberOptions.config.threads = { count: 1 };
 		await setupHarperWithFixture(subscriberCtx, join(import.meta.dirname, 'fixture-worker-exit'), {
 			...subscriberOptions,
 			env: {
+				...replicationPoolOffEnv(),
 				HARPER_TEST_KILL_HTTP_WORKER: '1',
 				HARPER_TEST_ALLOW_SUBSCRIBE_AFTER_OPEN_HOOK: '1',
 			},

@@ -158,6 +158,19 @@ export async function restartNode(node, opts) {
 }
 
 /**
+ * Env that keeps one node's replication off the pool on the pool-on CI legs, which set `replication.threads` for
+ * every node through HARPER_CONFIG. For a node whose fault injection is application code: pool workers load
+ * none, so an injector armed over HTTP never runs on the thread that owns the replication socket.
+ *
+ * @returns {Object} env entries to pass to startHarper/setupHarperWithFixture (empty when the pool is off)
+ */
+export function replicationPoolOffEnv() {
+	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
+	if (!(shared?.replication?.threads > 0)) return {};
+	return { HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared.replication, threads: 0 } }) };
+}
+
+/**
  * Wait until a node's main process is no longer `previousPid` — for a caller that issues `restart`
  * itself because it must act inside the shutdown window (`restartNode` otherwise).
  *

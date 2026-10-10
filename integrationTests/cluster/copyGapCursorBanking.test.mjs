@@ -41,6 +41,7 @@ import {
 	sendOperation,
 	fetchWithRetry,
 	readLog,
+	replicationPoolOffEnv,
 	restartNode,
 	stopNodeProcess,
 	waitForCondition,
@@ -113,7 +114,9 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 				...sharedConfig(nodeB.harper.hostname),
 				replication: { securePort: nodeB.harper.hostname + ':9933', blobGapReconnectMs: GAP_RECONNECT_MS },
 			},
+			// Pool off on B: its receiving sockets must be on the HTTP workers, where the injector is loaded.
 			env: {
+				...replicationPoolOffEnv(),
 				HARPER_NO_FLUSH_ON_EXIT: true,
 				HARPER_TEST_BLOB_FAIL_SAVES: FAIL_SAVES.join(','),
 				HARPER_TEST_BLOB_SLOW_MS: String(BLOB_SLOW_MS),
