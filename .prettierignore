@@ -7,3 +7,7 @@
 # Prettier reads .gitignore but not .git/info/exclude, so without this a
 # whole-tree format run from the main checkout recurses into every worktree.
 /.claude/
+
+# Same reason as .claude/ above: untracked local scratch state excluded only
+# via .git/info/exclude, which Prettier doesn't read.
+/integrationTests/cluster/qa-scratch/
