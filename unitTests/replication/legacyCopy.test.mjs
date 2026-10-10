@@ -1,7 +1,58 @@
 import assert from 'node:assert';
-import { verifyLegacyCopyBaseline } from '#src/replication/legacyCopy';
+import { requiresLegacyCopyVerification, verifyLegacyCopyBaseline } from '#src/replication/legacyCopy';
 import { LOCAL_ONLY } from '../../dist/core/resources/auditStore.js';
 
+describe('base-copy peer safety', () => {
+	it('accepts safeCopyAudit without probing the peer', async () => {
+		assert.strictEqual(await requiresLegacyCopyVerification(1, () => assert.fail('unexpected version probe')), false);
+	});
+	for (const version of ['5.0.0', '5.2.15', '5.3.1', 'v5.3.1', '5.0.0-alpha', '5.9.0-beta.2+build.3']) {
+		it(`accepts a peer reporting ${version} without the capability`, async () => {
+			const result = await requiresLegacyCopyVerification(0, async (operation, timeoutMs) => {
+				assert.deepStrictEqual(operation, { operation: 'registration_info' });
+				assert.strictEqual(timeoutMs, 30_000);
+				return { version };
+			});
+			assert.strictEqual(result, false);
+		});
+	}
+	for (const version of [
+		'4.3.7',
+		'v4.9.9',
+		'6.0.0',
+		'5',
+		'5.x',
+		'release 5.3.1',
+		'5.3.1 trailing',
+		5,
+		{},
+		null,
+		undefined,
+	]) {
+		it(`requires baseline verification for version ${JSON.stringify(version)}`, async () => {
+			assert.strictEqual(await requiresLegacyCopyVerification(0, async () => ({ version })), true);
+		});
+	}
+	it('requires verification for a missing response', async () => {
+		assert.strictEqual(await requiresLegacyCopyVerification(0, async () => undefined), true);
+	});
+	it('requires verification when the bounded operation rejects', async () => {
+		assert.strictEqual(
+			await requiresLegacyCopyVerification(0, async () => {
+				throw new Error('registration_info timed out');
+			}),
+			true
+		);
+	});
+	it('requires verification when issuing the operation throws synchronously', async () => {
+		assert.strictEqual(
+			await requiresLegacyCopyVerification(0, () => {
+				throw new Error('connection closed');
+			}),
+			true
+		);
+	});
+});
 let nextPeer = 0;
 function fixture(entries, remoteEntries = entries) {
 	// Real getRange({ versions: true }) reports a live row's value; only a tombstone omits it.

@@ -1,4 +1,5 @@
 import { toBufferKey } from 'ordered-binary';
+import { satisfies } from 'semver';
 import { LOCAL_ONLY } from '../core/resources/auditStore.ts';
 
 const BATCH_SIZE = 256;
@@ -9,6 +10,21 @@ interface VerifyEntry {
 	version: number;
 	metadataFlags?: number;
 	isTombstone: boolean;
+}
+
+export async function requiresLegacyCopyVerification(
+	safeCopyAudit: number,
+	request: (operation: any, timeoutMs?: number) => Promise<any>
+): Promise<boolean> {
+	if (safeCopyAudit === 1) return false;
+	try {
+		const registration = await request({ operation: 'registration_info' }, 30_000);
+		return !(
+			typeof registration?.version === 'string' && satisfies(registration.version, '5.x', { includePrerelease: true })
+		);
+	} catch {
+		return true;
+	}
 }
 
 export async function verifyLegacyCopyBaseline({
