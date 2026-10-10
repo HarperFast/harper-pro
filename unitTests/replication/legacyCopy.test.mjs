@@ -37,12 +37,21 @@ describe('base-copy peer safety', () => {
 		assert.strictEqual(await requiresLegacyCopyVerification(0, async () => undefined), true);
 	});
 	it('requires verification when the bounded operation rejects', async () => {
+		const error = new Error('registration_info timed out');
+		let probeError;
 		assert.strictEqual(
-			await requiresLegacyCopyVerification(0, async () => {
-				throw new Error('registration_info timed out');
-			}),
+			await requiresLegacyCopyVerification(
+				0,
+				async () => {
+					throw error;
+				},
+				(error) => {
+					probeError = error;
+				}
+			),
 			true
 		);
+		assert.strictEqual(probeError, error);
 	});
 	it('requires verification when issuing the operation throws synchronously', async () => {
 		assert.strictEqual(

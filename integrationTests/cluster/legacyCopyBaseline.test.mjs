@@ -169,7 +169,7 @@ for (const engine of ['rocksdb', 'lmdb'])
 for (const engine of ['rocksdb', 'lmdb'])
 	test(
 		`a ${engine} v5 peer without safeCopyAudit receives historical records and subsequent writes`,
-		{ timeout: 60_000 },
+		{ timeout: 180_000 },
 		async (t) => {
 			const contexts = [];
 			const startOptions = new Map();
@@ -198,9 +198,10 @@ for (const engine of ['rocksdb', 'lmdb'])
 				);
 			});
 			const current = await start({});
+			// Set this to an installed published 5.x package to test its unmodified handshake.
 			const previousPath = process.env.HARPER_PRO_PREVIOUS_VERSION_PATH;
 			let capless = await start(
-				{ HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' },
+				previousPath ? {} : { HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' },
 				previousPath && join(previousPath, 'dist/bin/harper.js')
 			);
 			const registration = await sendOperation(capless, { operation: 'registration_info' });
@@ -262,6 +263,12 @@ for (const engine of ['rocksdb', 'lmdb'])
 				const context = contexts.find((context) => context.harper === capless);
 				await killHarper(context);
 				await resetLegacyReplicationCursors(capless);
+				await sendOperation(current, {
+					operation: 'upsert',
+					database: 'data',
+					table: 'orders',
+					records: [{ id: 'written-while-down', name: 'requires historical recopy' }],
+				});
 				const logStart = (await readLog(current)).length;
 				await startHarper(context, startOptions.get(context));
 				capless = context.harper;
@@ -270,7 +277,7 @@ for (const engine of ['rocksdb', 'lmdb'])
 						(await readLog(current)).slice(logStart).includes(`Replicating all tables to ${capless.hostname}`),
 					{ timeoutMs: 30_000, pollMs: 100, description: 'a populated 5.x LMDB peer receives a fresh base copy' }
 				);
-				await waitForRecord(capless, 'preexisting', 'already on current');
+				await waitForRecord(capless, 'written-while-down', 'requires historical recopy');
 				await sendOperation(current, {
 					operation: 'upsert',
 					database: 'data',

@@ -6291,7 +6291,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											if (currentSequenceId === 0) {
 												const legacyCopy = await requiresLegacyCopyVerification(
 													peerCapabilities.safeCopyAudit,
-													sendOperation
+													sendOperation,
+													(error) =>
+														logger.warn?.(
+															`Version probe for peer ${remoteNodeName} failed; using baseline verification`,
+															error
+														)
 												);
 												if (legacyCopy) copyResume = undefined;
 												if (closed || wsClosed) return;
