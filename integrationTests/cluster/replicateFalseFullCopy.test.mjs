@@ -174,6 +174,13 @@ for (const redeclare of [false, true]) {
 				});
 				if (redeclare) {
 					await deployFixture(ctx.nodeA, FIXTURE_PATH);
+					await waitForCondition(
+						async (signal) => {
+							const described = await describeTable(ctx.nodeA, LOCAL_TABLE, signal).catch(() => null);
+							return described?.status === 200 && described.body.replicate === false;
+						},
+						{ timeoutMs: 60_000, description: `${LOCAL_TABLE} to become local after redeploy` }
+					);
 					const rows = await sendOperation(ctx.nodeA, {
 						operation: 'search_by_id',
 						database: DATABASE,
