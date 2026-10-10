@@ -7013,6 +7013,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												// the outer catch and close the channel, turning a metadata hiccup into a reconnect loop.
 												let withheldOriginNodeId: number | undefined;
 												let withheldRecordCount = 0;
+												let withheldStubCount = 0;
 												try {
 													const peerNodeRow = !legacyCopy && getHDBNodeTable().primaryStore.getSync(remoteNodeName);
 													if (
@@ -7091,7 +7092,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// `invalidate` only for a peer the residency excludes; a stub may go to that peer alone.
 														if (entry.metadataFlags & INVALIDATED) {
 															const stubResidency = getResidence(entry.residencyId, table);
-															if (!stubResidency || stubResidency.includes(remoteNodeName)) continue;
+															if (!stubResidency || stubResidency.includes(remoteNodeName)) {
+																withheldStubCount++;
+																continue;
+															}
 														}
 														// same origin normalization as recordNodeId below: undefined means we authored it
 														if (
@@ -7185,6 +7189,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												if (withheldOriginNodeId !== undefined)
 													logger.warn?.(
 														`Copied ${databaseName} to ${remoteNodeName} without ${withheldRecordCount} record(s) that peer originated (harper-pro#737)`
+													);
+												if (withheldStubCount > 0)
+													logger.info?.(
+														`Copied ${databaseName} to ${remoteNodeName} without ${withheldStubCount} INVALIDATED stub(s) that peer would have stored as complete records (harper#2257)`
 													);
 												currentSequenceId = copyStartTime;
 												if (!currentTransaction.txnLogKey) {
