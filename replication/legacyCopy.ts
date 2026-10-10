@@ -14,7 +14,8 @@ interface VerifyEntry {
 
 export async function requiresLegacyCopyVerification(
 	safeCopyAudit: number,
-	request: (operation: any, timeoutMs?: number) => Promise<any>
+	request: (operation: any, timeoutMs?: number) => Promise<any>,
+	onProbeError?: (error: unknown) => void
 ): Promise<boolean> {
 	if (safeCopyAudit === 1) return false;
 	try {
@@ -22,7 +23,8 @@ export async function requiresLegacyCopyVerification(
 		return !(
 			typeof registration?.version === 'string' && satisfies(registration.version, '5.x', { includePrerelease: true })
 		);
-	} catch {
+	} catch (error) {
+		onProbeError?.(error);
 		return true;
 	}
 }
