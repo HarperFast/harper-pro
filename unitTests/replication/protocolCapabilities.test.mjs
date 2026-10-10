@@ -6,7 +6,6 @@ import {
 	LOCAL_PROTOCOL_VERSION,
 	MINIMUM_PROTOCOL_VERSION,
 	RECORD_LOCKS_CAPABILITY,
-	RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
 	SUBSCRIPTION_SETUP_ACK_CAPABILITY,
 	buildLocalCapabilities,
 	createUnknownCommandState,
@@ -15,8 +14,11 @@ import {
 =======
 	peerSupportsOriginCursors,
 	peerSupportsOriginFloors,
+<<<<<<< HEAD
 	peerSupportsHandoffReceipts,
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 	peerSupportsRecordLocks,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
@@ -41,8 +43,11 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 				originCursors: 0,
 				originFloors: 0,
 				tableLifecycle: 0,
+<<<<<<< HEAD
 				residencyHandoffReceipt: 0,
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 			}
 		);
 	});
@@ -64,7 +69,6 @@ describe('resolvePeerCapabilities — absent and legacy shapes', () => {
 		assert.deepStrictEqual(Object.keys(resolved).sort(), [
 			'protocolVersion',
 			'recordLocks',
-			'residencyHandoffReceipt',
 			'safeCopyAudit',
 			'subscriptionSetupAck',
 			'subscriptionSetupBudgetMs',
@@ -243,8 +247,11 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originCursors: ORIGIN_CURSORS_CAPABILITY,
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
+<<<<<<< HEAD
 				residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 			}
 		);
 		assert.strictEqual(Object.isFrozen(local), true);
@@ -279,8 +286,11 @@ describe('buildLocalCapabilities / the advertised NODE_NAME frame', () => {
 				originCursors: ORIGIN_CURSORS_CAPABILITY,
 				originFloors: ORIGIN_FLOORS_CAPABILITY,
 				tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
+<<<<<<< HEAD
 				residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 			}
 		);
 	});
@@ -398,27 +408,5 @@ describe('safeCopyAudit', () => {
 			samePeerCapabilities(resolvePeerCapabilities({}), resolvePeerCapabilities({ safeCopyAudit: 1 })),
 			false
 		);
-	});
-});
-
-describe('residencyHandoffReceipt — record-residency handoff receipts (harper#2257)', () => {
-	it('is absent for a legacy bag and for a bag that omits the key', () => {
-		assert.strictEqual(peerSupportsHandoffReceipts(resolvePeerCapabilities(undefined)), false);
-		assert.strictEqual(peerSupportsHandoffReceipts(resolvePeerCapabilities({ subscriptionSetupAck: 1 })), false);
-	});
-
-	it('is supported at the local level and clamps a future level down to it', () => {
-		assert.strictEqual(peerSupportsHandoffReceipts(resolvePeerCapabilities(buildLocalCapabilities(1000, false))), true);
-		assert.strictEqual(
-			resolvePeerCapabilities({ residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY + 5 })
-				.residencyHandoffReceipt,
-			RESIDENCY_HANDOFF_RECEIPT_CAPABILITY
-		);
-	});
-
-	it('is part of the equality that decides whether a re-advertised bag changed', () => {
-		const local = resolvePeerCapabilities(buildLocalCapabilities(1000, false));
-		const legacy = resolvePeerCapabilities({ ...buildLocalCapabilities(1000, false), residencyHandoffReceipt: 0 });
-		assert.strictEqual(samePeerCapabilities(local, legacy), false);
 	});
 });

@@ -56,6 +56,7 @@ export const ORIGIN_FLOORS_CAPABILITY = 1;
  */
 export const TABLE_LIFECYCLE_CAPABILITY = 1;
 
+<<<<<<< HEAD
 /**
  * Level at which a peer answers `HANDOFF_RECEIPT_REQUEST` with a `HANDOFF_RECEIPT` once it durably holds
  * the complete row a residency transition handed it (HarperFast/harper#2257). The image itself travels as
@@ -65,6 +66,8 @@ export const TABLE_LIFECYCLE_CAPABILITY = 1;
 export const RESIDENCY_HANDOFF_RECEIPT_CAPABILITY = 1;
 
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 /** Effective values for one socket: versions and levels are already `min(local, peer)`. */
 export interface ResolvedPeerCapabilities {
 	safeCopyAudit: number;
@@ -77,8 +80,11 @@ export interface ResolvedPeerCapabilities {
 	originCursors: number;
 	originFloors: number;
 	tableLifecycle: number;
+<<<<<<< HEAD
 	residencyHandoffReceipt: number;
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 }
 
 /** Coerces, because the comparison it replaces did: see the kind table in DESIGN.md. */
@@ -124,8 +130,11 @@ export function resolvePeerCapabilities(bag: any): ResolvedPeerCapabilities {
 		originCursors: resolveLevel(bag?.originCursors, ORIGIN_CURSORS_CAPABILITY, 0),
 		originFloors: resolveLevel(bag?.originFloors, ORIGIN_FLOORS_CAPABILITY, 0),
 		tableLifecycle: resolveLevel(bag?.tableLifecycle, TABLE_LIFECYCLE_CAPABILITY, 0),
+<<<<<<< HEAD
 		residencyHandoffReceipt: resolveLevel(bag?.residencyHandoffReceipt, RESIDENCY_HANDOFF_RECEIPT_CAPABILITY, 0),
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 	});
 }
 
@@ -144,11 +153,14 @@ export function peerSupportsOriginFloors(resolved: ResolvedPeerCapabilities): bo
 	return resolved.originFloors >= ORIGIN_FLOORS_CAPABILITY;
 }
 
+<<<<<<< HEAD
 export function peerSupportsHandoffReceipts(resolved: ResolvedPeerCapabilities): boolean {
 	return resolved.residencyHandoffReceipt >= RESIDENCY_HANDOFF_RECEIPT_CAPABILITY;
 }
 
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 /** A peer that advertised nothing — the pre-registry baseline. */
 export const ABSENT_PEER_CAPABILITIES: ResolvedPeerCapabilities = resolvePeerCapabilities(undefined);
 
@@ -186,8 +198,11 @@ export function buildLocalCapabilities(
 		originCursors: perOriginLogs ? ORIGIN_CURSORS_CAPABILITY : 0,
 		originFloors: perOriginLogs ? ORIGIN_FLOORS_CAPABILITY : 0,
 		tableLifecycle: TABLE_LIFECYCLE_CAPABILITY,
+<<<<<<< HEAD
 		residencyHandoffReceipt: RESIDENCY_HANDOFF_RECEIPT_CAPABILITY,
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 	});
 }
 
@@ -205,9 +220,13 @@ export function samePeerCapabilities(a: ResolvedPeerCapabilities | undefined, b:
 		a.recordLocks === b.recordLocks &&
 		a.originCursors === b.originCursors &&
 		a.originFloors === b.originFloors &&
+<<<<<<< HEAD
 		a.tableLifecycle === b.tableLifecycle &&
 		a.residencyHandoffReceipt === b.residencyHandoffReceipt
 >>>>>>> 36c3ad1 (Hand a record-residency transition's complete image to the new resident, release it only on that resident's durable receipt, and never present an INVALIDATED stub as a complete record)
+=======
+		a.tableLifecycle === b.tableLifecycle
+>>>>>>> ce2948a (Trim to the INVALIDATED-stub guards: drop the residency handoff, receipts and release)
 	);
 }
 
