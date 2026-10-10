@@ -166,91 +166,126 @@ for (const engine of ['rocksdb', 'lmdb'])
 		}
 	);
 
-test(
-	'a v5 peer without the safeCopyAudit capability is gated the same as a legacy v4 peer',
-	{ timeout: 60_000 },
-	async (t) => {
-		const contexts = [];
-		async function start(env) {
-			const context = {
-				name: 'legacy-copy-baseline-capless',
-				harper: { hostname: await getNextAvailableLoopbackAddress() },
-			};
-			contexts.push(context);
-			await startHarper(context, {
-				env,
-				config: {
-					analytics: { aggregatePeriod: -1 },
-					logging: { colors: false, stdStreams: true, console: true },
-					replication: { securePort: context.harper.hostname + ':9933', databases: ['data'] },
-				},
-			});
-			return context.harper;
-		}
-		t.after(async () => {
-			await Promise.all(
-				contexts.filter((context) => context.harper?.process).map((context) => teardownHarper(context))
-			);
-		});
-		const current = await start({});
-		// Omitting the capability bag simulates a pre-safeCopyAudit v5 peer without a real legacy binary.
-		const capless = await start({ HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' });
-		await sendOperation(current, { operation: 'create_database', database: 'data' });
-		await sendOperation(current, { operation: 'create_table', database: 'data', table: 'orders', primary_key: 'id' });
-		await sendOperation(current, {
-			operation: 'upsert',
-			database: 'data',
-			table: 'orders',
-			records: [{ id: 'preexisting', name: 'already on current' }],
-		});
-		await sendOperation(capless, { operation: 'create_database', database: 'data' });
-		await sendOperation(capless, { operation: 'create_table', database: 'data', table: 'orders', primary_key: 'id' });
-		await sendOperation(current, {
-			operation: 'add_node',
-			hostname: capless.hostname,
-			rejectUnauthorized: false,
-			authorization: current.admin,
-		});
-		await waitForCondition(
-			async () => (await readLog(current)).includes('Historical restoration into an unverified peer is unsupported'),
-			{
-				timeoutMs: 30_000,
-				pollMs: 100,
-				description: 'explicit unsupported historical restoration error for the capability-less v5 peer',
-			}
-		);
-		const rows = await sendOperation(capless, {
-			operation: 'search_by_id',
-			database: 'data',
-			table: 'orders',
-			ids: ['preexisting'],
-			get_attributes: ['id'],
-		});
-		assert.deepStrictEqual(rows, [], 'no unverified historical put reached the capability-less peer');
-		// current -> capless stays blocked; capless's own new write has nothing to verify and should
-		// still flow forward, same as the real-v4 case above.
-		await sendOperation(capless, {
-			operation: 'upsert',
-			database: 'data',
-			table: 'orders',
-			records: [{ id: 'forward-write', name: 'after refusal' }],
-		});
-		await waitForCondition(
-			async (signal) => {
-				const forwardRows = await sendOperation(
-					current,
-					{
-						operation: 'search_by_id',
-						database: 'data',
-						table: 'orders',
-						ids: ['forward-write'],
-						get_attributes: ['id'],
+for (const engine of ['rocksdb', 'lmdb'])
+	test(
+		`a ${engine} v5 peer without safeCopyAudit receives historical records and subsequent writes`,
+		{ timeout: 60_000 },
+		async (t) => {
+			const contexts = [];
+			const startOptions = new Map();
+			async function start(env, harperBinPath) {
+				const context = {
+					name: 'legacy-copy-baseline-capless',
+					harper: { hostname: await getNextAvailableLoopbackAddress() },
+				};
+				contexts.push(context);
+				const options = {
+					harperBinPath,
+					env: { HARPER_STORAGE_ENGINE: engine, ...env },
+					config: {
+						analytics: { aggregatePeriod: -1 },
+						logging: { colors: false, stdStreams: true, console: true },
+						replication: { securePort: context.harper.hostname + ':9933', databases: ['data'] },
 					},
-					{ signal }
+				};
+				startOptions.set(context, options);
+				await startHarper(context, options);
+				return context.harper;
+			}
+			t.after(async () => {
+				await Promise.all(
+					contexts.filter((context) => context.harper?.process).map((context) => teardownHarper(context))
 				);
-				return forwardRows.length === 1;
-			},
-			{ timeoutMs: 30_000, pollMs: 100, description: 'forward write from the capability-less peer reaches current' }
-		);
-	}
-);
+			});
+			const current = await start({});
+			const previousPath = process.env.HARPER_PRO_PREVIOUS_VERSION_PATH;
+			let capless = await start(
+				{ HARPER_TEST_OMIT_REPLICATION_CAPABILITIES: '1' },
+				previousPath && join(previousPath, 'dist/bin/harper.js')
+			);
+			const registration = await sendOperation(capless, { operation: 'registration_info' });
+			assert.match(registration.version, /^v?5\./, 'this compatibility regression requires a 5.x peer');
+			await sendOperation(current, { operation: 'create_database', database: 'data' });
+			await sendOperation(current, { operation: 'create_table', database: 'data', table: 'orders', primary_key: 'id' });
+			await sendOperation(current, {
+				operation: 'upsert',
+				database: 'data',
+				table: 'orders',
+				records: [{ id: 'preexisting', name: 'already on current' }],
+			});
+			await sendOperation(capless, { operation: 'create_database', database: 'data' });
+			await sendOperation(capless, { operation: 'create_table', database: 'data', table: 'orders', primary_key: 'id' });
+			await sendOperation(current, {
+				operation: 'add_node',
+				hostname: capless.hostname,
+				rejectUnauthorized: false,
+				authorization: current.admin,
+			});
+			async function waitForRecord(node, id, name) {
+				await waitForCondition(
+					async (signal) => {
+						const rows = await sendOperation(
+							node,
+							{
+								operation: 'search_by_id',
+								database: 'data',
+								table: 'orders',
+								ids: [id],
+								get_attributes: ['*'],
+							},
+							{ signal }
+						);
+						return rows.length === 1 && rows[0].id === id && rows[0].name === name;
+					},
+					{ timeoutMs: 30_000, pollMs: 100, description: `${id} reaches ${node.hostname}` }
+				);
+			}
+			await waitForRecord(capless, 'preexisting', 'already on current');
+			await sendOperation(current, {
+				operation: 'upsert',
+				database: 'data',
+				table: 'orders',
+				records: [{ id: 'later-write', name: 'after base copy' }],
+			});
+			await waitForRecord(capless, 'later-write', 'after base copy');
+			const third = await start({});
+			await sendOperation(third, { operation: 'create_database', database: 'data' });
+			await sendOperation(third, { operation: 'create_table', database: 'data', table: 'orders', primary_key: 'id' });
+			await sendOperation(current, {
+				operation: 'add_node',
+				hostname: third.hostname,
+				rejectUnauthorized: false,
+				authorization: current.admin,
+			});
+			await waitForRecord(third, 'preexisting', 'already on current');
+			if (engine === 'lmdb') {
+				const context = contexts.find((context) => context.harper === capless);
+				await killHarper(context);
+				await resetLegacyReplicationCursors(capless);
+				const logStart = (await readLog(current)).length;
+				await startHarper(context, startOptions.get(context));
+				capless = context.harper;
+				await waitForCondition(
+					async () =>
+						(await readLog(current)).slice(logStart).includes(`Replicating all tables to ${capless.hostname}`),
+					{ timeoutMs: 30_000, pollMs: 100, description: 'a populated 5.x LMDB peer receives a fresh base copy' }
+				);
+				await waitForRecord(capless, 'preexisting', 'already on current');
+				await sendOperation(current, {
+					operation: 'upsert',
+					database: 'data',
+					table: 'orders',
+					records: [{ id: 'after-recopy', name: 'after redundant copy' }],
+				});
+				await waitForRecord(capless, 'after-recopy', 'after redundant copy');
+			}
+			await sendOperation(capless, {
+				operation: 'upsert',
+				database: 'data',
+				table: 'orders',
+				records: [{ id: 'forward-write', name: 'from capability-less peer' }],
+			});
+			await waitForRecord(current, 'forward-write', 'from capability-less peer');
+			await waitForRecord(third, 'forward-write', 'from capability-less peer');
+		}
+	);

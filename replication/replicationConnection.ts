@@ -48,7 +48,7 @@ import {
 import { ANY_TABLE, markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
 import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
-import { verifyLegacyCopyBaseline } from './legacyCopy.ts';
+import { requiresLegacyCopyVerification, verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
 import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
@@ -6282,10 +6282,208 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													anchoredInLogOrder = true;
 												}
 											}
+<<<<<<< HEAD
 											if (!anchoredInLogOrder && (copyResume || orderedTableNames.length > 0)) {
 												// A degraded anchor is otherwise indistinguishable from a log-order one in the logs.
 												logger.warn?.(
 													`Base copy of ${databaseName} to ${remoteNodeName} is anchored on a timestamp, not a log-order position; a transaction in flight now can be missed`
+=======
+											if (currentSequenceId === 0) {
+												const legacyCopy = await requiresLegacyCopyVerification(
+													peerCapabilities.safeCopyAudit,
+													sendOperation
+												);
+												if (legacyCopy) copyResume = undefined;
+												if (closed || wsClosed) return;
+												logger.info?.('Replicating all tables to', remoteNodeName);
+												// Anchored in this node's own `local` log only. It does NOT depend on the tail being single-log:
+												// `excluded` is always an array here, so the range below is normally the multi-log aggregate, and
+												// that aggregate applies `exactStart` only to the logs named in `startByLog`. Gated on the store
+												// itself, not STORAGE_IS_ROCKSDB: that is a config snapshot that can misreport the engine in a
+												// worker, and an LMDB audit store would read these range options as a scan from its start.
+												const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+												const canResumePastAnchor = auditStore.reusableIterable === true && logName === 'local';
+												// If resuming, the follower already committed every table before currentTable (records commit
+												// in stable iteration order), so skip to currentTable and continue after its last committed key.
+												let reachedResumeTable = !copyResume;
+												let anchoredInLogOrder = false;
+												const resumeAnchorKind =
+													copyResume && canResumePastAnchor
+														? classifyResumeAnchor(auditStore, copyResume.copyStartTime, logName)
+														: 'absent';
+												// Validated before the anchor is read below, because a cursor that cannot be honoured must
+												// surrender its ANCHOR as well as its walk position.
+												// currentTable must be one the loop below will actually visit (present in `tables` AND passing
+												// the same replication filter); otherwise the skip loop never reaches it and would omit every
+												// later table. Mirror the loop's own check so a dropped/unreplicated cursor table forces a restart.
+												// `tables` can be undefined on a freshly-joined peer, and a malformed cursor can have an
+												// undefined currentTable (#321); the `?.` makes both fall into the warn-and-recopy branch
+												// instead of throwing, which would bubble to the outer .catch and close the channel (1008).
+												if (copyResume && !isCopyResumeOrderCompatible(copyResume.copyOrder, COPY_ORDER_VERSION)) {
+													// An absent and an explicit-undefined copyOrder both decode to undefined here, and neither is
+													// compatible. Recopy from scratch: idempotent puts, and a fresh anchor. (#421)
+													logger.warn?.(
+														'Copy-resume order version mismatch, restarting full copy',
+														copyResume.copyOrder,
+														'!=',
+														COPY_ORDER_VERSION
+													);
+													copyResume = undefined;
+													reachedResumeTable = true;
+												} else if (copyResume && !isValidFrameTxnLogKey(copyResume.copyStartTime)) {
+													// The anchor is peer-supplied. A non-finite or non-positive value would reach the resume cursor
+													// and the tail's range start, and every reconnect would wedge on the same cursor.
+													logger.warn?.(
+														'Copy-resume anchor is not a valid log key, restarting full copy',
+														copyResume.copyStartTime
+													);
+													copyResume = undefined;
+													reachedResumeTable = true;
+												} else if (copyResume && !tableToTableEntry(tables?.[copyResume.currentTable])) {
+													// cursor table is gone, unreplicated, or the cursor itself is malformed — the skip loop would
+													// never reach it and would omit every later table, so recopy from scratch.
+													logger.warn?.(
+														'Copy-resume table missing or unreplicated, restarting full copy',
+														copyResume.currentTable
+													);
+													copyResume = undefined;
+													reachedResumeTable = true;
+												}
+												// Copy control-plane tables before bulk tables so a large table (hdb_analytics) can't gate
+												// convergence of small tables that gate cluster operations (hdb_deployment). Ordering is a
+												// pure function of the table-name set, so it stays stable across runs — which the skip-loop
+												// above (reachedResumeTable) relies on; cross-version cursors are rejected by the guard above. (#421)
+												const orderedTableNames = orderTablesForCopy(tables ? Object.keys(tables) : []);
+												// A position in the log's APPEND order, not a timestamp: a transaction's key is fixed when it is
+												// created but its batch is appended when it commits, so every transaction in flight here appends
+												// AFTER the last committed entry while it may sort before it numerically. A resumed copy keeps its
+												// original anchor — a later one would lose everything committed between the two. (harper-pro#876)
+												const anchorKey =
+													copyResume || !canResumePastAnchor ? undefined : findLastCommittedLogKey(auditStore, logName);
+												// An empty log (anchorKey 0) still sends the wall clock, never a sentinel below every key: the
+												// follower persists it, and shouldForceBaseCopyForRetention reads such a cursor as purged history.
+												const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
+												// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
+												const relayedAnchors =
+													!copyResume && canResumePastAnchor && excludedNodes
+														? collectRelayedLogAnchors(
+																auditStore,
+																new Set([...excludedNodes, ...nodeSubscriptions.map(({ name }) => name)])
+															)
+														: undefined;
+												const boundaryFailure = (rangeOptions: any) => rangeBoundaryFailure(auditStore, rangeOptions);
+												// only anchors the tail resumes past are the receiver's to keep
+												let announcedAnchors: Map<string, number> | undefined;
+												// A resumed copy resumes in append order only if its anchor still NAMES an entry of the log;
+												// anything else — a pre-#876 wall-clock anchor, a purged entry, a log that cannot be read — keeps
+												// the timestamp resume every build before this one used for every cursor. `resumeAnchorKind`
+												// describes the ORIGINAL copyResume, so it is only trustworthy while that copyResume is still live;
+												// the guards above can null it out, and this must not answer for a resume that no longer exists.
+												if (anchorKey === 0) {
+													// An empty log: everything it will ever yield commits after this point, so an ordinary range from
+													// its start is already the boundary.
+													const emptyLogRange = {
+														start: 0,
+														log: excludedNodes ? undefined : logName,
+														excludeLogs: excludedNodes,
+														snapshot: false,
+													};
+													let anchors = relayedAnchors;
+													let relayedRange: any;
+													while (anchors?.size) {
+														relayedRange = {
+															...emptyLogRange,
+															exactStart: true,
+															resumeAfterExactStart: true,
+															startByLog: anchors,
+														};
+														const failure = boundaryFailure(relayedRange);
+														if (!failure) break;
+														anchors = anchorsWithoutFailedLogs(anchors, failure);
+													}
+													if (anchors?.size) {
+														auditLogIterable = auditStore.getRange(relayedRange);
+														boundaryLogName = logName;
+														announcedAnchors = anchors;
+													} else auditLogIterable = auditStore.getRange(emptyLogRange);
+													anchoredInLogOrder = true;
+												} else if (
+													canResumePastAnchor &&
+													(anchorKey !== undefined || (copyResume && resumeAnchorKind === 'entry'))
+												) {
+													// Built before the walk: getRange resolves the boundary's position and maps the log file
+													// eagerly, so the anchor stays reachable for the whole copy. The options must match the ones
+													// the tail would build for itself, because it reuses this iterable — a single-log range here
+													// would silently stop tailing every peer's log.
+													const boundaryRange = {
+														start: copyStartTime,
+														exactStart: true,
+														exclusiveStart: true,
+														resumeAfterExactStart: true,
+														log: excludedNodes ? undefined : logName,
+														startByLog: new Map([[logName, copyStartTime], ...(relayedAnchors ?? [])]),
+														excludeLogs: excludedNodes,
+														snapshot: false,
+													};
+													let anchors = relayedAnchors;
+													let unusable = boundaryFailure(boundaryRange);
+													while (unusable && anchors?.size) {
+														anchors = anchorsWithoutFailedLogs(anchors, unusable);
+														boundaryRange.startByLog = new Map([[logName, copyStartTime], ...(anchors ?? [])]);
+														unusable = boundaryFailure(boundaryRange);
+													}
+													if (!unusable) announcedAnchors = anchors;
+													if (unusable) {
+														// Degrade rather than refuse, for the same reason. The anchor stays the entry's key, which
+														// under the timestamp range still replays everything keyed after it.
+														logger.error?.(
+															`Base copy of ${databaseName} could not form a resume boundary at ${copyStartTime}; falling back to a timestamp resume, so a transaction in flight now can be missed`,
+															unusable instanceof Error ? unusable : undefined
+														);
+													} else {
+														auditLogIterable = auditStore.getRange(boundaryRange);
+														boundaryLogName = logName;
+														anchoredInLogOrder = true;
+													}
+												}
+												if (announcedAnchors && originFloorById) {
+													// resumed past their exact anchors: a key floor would drop entries appended later with older keys
+													const nameToId = exportIdMapping(auditStore);
+													for (const logName of announcedAnchors.keys()) delete originFloorById[nameToId[logName]];
+												}
+												if (!anchoredInLogOrder && (copyResume || orderedTableNames.length > 0)) {
+													// A degraded anchor is otherwise indistinguishable from a log-order one in the logs.
+													logger.warn?.(
+														`Base copy of ${databaseName} to ${remoteNodeName} is anchored on a timestamp, not a log-order position; a transaction in flight now can be missed`
+													);
+												}
+												const nodeId = getThisNodeId(auditStore);
+												if (legacyCopy) {
+													// Legacy no-op puts can corrupt the receiver's audit log.
+													await verifyLegacyCopyBaseline({
+														peerName: remoteNodeName,
+														databaseName,
+														tables: Object.fromEntries(
+															Object.entries(tables ?? {}).filter(
+																([name, table]) => !sendExcludedTables?.has(name) && tableToTableEntry(table)
+															)
+														),
+														request: (operation) => sendOperation(operation, 30_000),
+														isClosed: () => closed || wsClosed,
+													});
+													if (closed || wsClosed) return;
+												}
+												// Tell the follower a bulk copy is starting, its anchor, and the copy-cursor version, so it tracks
+												// a resume cursor a later leader can validate before trusting the skip or the anchor.
+												ws.send(
+													encode(
+														announcedAnchors?.size &&
+															peerCapabilitiesLearned &&
+															peerSupportsOriginCursors(peerCapabilities)
+															? [COPY_START, copyStartTime, COPY_ORDER_VERSION, Object.fromEntries(announcedAnchors)]
+															: [COPY_START, copyStartTime, COPY_ORDER_VERSION]
+													)
+>>>>>>> 0cfe8a4 (Allow base copies to published 5.x peers during rolling upgrades)
 												);
 											}
 											const nodeId = getThisNodeId(auditStore);
