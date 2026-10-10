@@ -1391,17 +1391,14 @@ async function storedBlobsAreComplete(value: unknown): Promise<boolean> {
  * either one by treating an incomplete local value as durable.
  */
 export async function isDurableIdentityTie(
-	existing: { version?: number; nodeId?: number; value?: unknown; metadataFlags?: number } | undefined,
+	existing: { version?: number; nodeId?: number; value?: unknown } | undefined,
 	incomingVersion: number,
 	sourceNodeId: number | undefined,
 	hasBlobs: boolean,
-	verifyBlobs: (value: unknown) => Promise<boolean> = storedBlobsAreComplete,
-	incomingIsComplete = true
+	verifyBlobs: (value: unknown) => Promise<boolean> = storedBlobsAreComplete
 ): Promise<boolean> {
 	if (sourceNodeId === undefined) return false;
 	if (!existing) return false;
-	// an INVALIDATED stub is not proof that the complete record at this version was applied
-	if (incomingIsComplete && (existing.metadataFlags ?? 0) & INVALIDATED) return false;
 	if (existing.version !== incomingVersion) return false;
 	if ((existing.nodeId ?? 0) !== sourceNodeId) return false;
 	if (!hasBlobs) return true;
@@ -4610,8 +4607,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		incomingVersion: number,
 		incomingTxnLogKey: number,
 		sourceNodeId: number | undefined,
-		hasBlobs: boolean,
-		incomingIsComplete: boolean
+		hasBlobs: boolean
 	): Promise<boolean> {
 		if (!LEADING_DUP_SKIP_ENABLED) return false;
 		// No mapped source node id → cannot reason about its version space. Let it flow.
@@ -4625,14 +4621,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			return false;
 		}
 		// Within the leading-duplicate window. Read the existing record to confirm a TRUE identity tie.
-		return isDurableIdentityTie(
-			readLocalEntry(tableDecoder, id),
-			incomingVersion,
-			sourceNodeId,
-			hasBlobs,
-			undefined,
-			incomingIsComplete
-		);
+		return isDurableIdentityTie(readLocalEntry(tableDecoder, id), incomingVersion, sourceNodeId, hasBlobs);
 	}
 
 	/**
@@ -7329,8 +7318,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							auditRecord.version,
 							frameTxnLogKey,
 							event.nodeId,
-							!!(auditRecord.extendedType & HAS_BLOBS),
-							auditRecord.type === 'put'
+							!!(auditRecord.extendedType & HAS_BLOBS)
 						))
 					) {
 						leadingDuplicateSkipCount++;
