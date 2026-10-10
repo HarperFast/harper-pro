@@ -16,8 +16,7 @@ export class HomedProbe extends Resource {
 	async get(target) {
 		target.checkPermission = false;
 		const id = String(target.id);
-		// getEntry can return a MaybePromise (a RocksDB cache miss resolves asynchronously); unawaited, the
-		// Promise itself is truthy and reads as a present, non-invalidated row with a null version/value.
+		// a RocksDB cache miss returns a Promise
 		const entry = await tables.Homed.primaryStore.getEntry(id);
 		return {
 			id,
