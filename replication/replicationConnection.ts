@@ -6355,6 +6355,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												logger.warn?.(
 													`Base copy of ${databaseName} to ${remoteNodeName} is anchored on a timestamp, not a log-order position; a transaction in flight now can be missed`
 												);
+<<<<<<< HEAD
 											}
 											const nodeId = getThisNodeId(auditStore);
 											if (legacyCopy) {
@@ -6407,6 +6408,49 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 													// our own id resolves for everything we authored, so filtering on it would withhold
 													// this node's whole dataset
 													withheldOriginNodeId = peerOriginNodeId === nodeId ? undefined : peerOriginNodeId;
+=======
+												// Test-only (#453): one-shot stall here leaves the follower in copy mode with no
+												// further frames while pings keep flowing — the connected:true copy wedge.
+												const copyStallForTest = maybeStallCopyForTest(databaseName);
+												if (copyStallForTest) await copyStallForTest;
+												let recordsSinceCheckpoint = 0;
+												// Paces the flush/yield cadence inside the copy loop below (see
+												// COPY_CHECKPOINT_MAX_INTERVAL_MS). Marked on every in-loop flush/yield.
+												const copyFlushPacer = createCopyFlushPacer(COPY_CHECKPOINT_MAX_INTERVAL_MS, Date.now());
+												const resumeCurrentTable = copyResume?.currentTable;
+												const resumeAfterKey = copyResume?.afterKey;
+												// Every read here can come back missing or unreadable, and the answer to all of them is to
+												// copy in full: withholding is the only outcome that can lose data, and a throw would reach
+												// the outer catch and close the channel, turning a metadata hiccup into a reconnect loop.
+												let withheldOriginNodeId: number | undefined;
+												let withheldRecordCount = 0;
+												let withheldStubCount = 0;
+												try {
+													const peerNodeRow = !legacyCopy && getHDBNodeTable().primaryStore.getSync(remoteNodeName);
+													if (
+														shouldWithholdPeerOwnRecords({
+															cloneSource: cloneAttemptSource(),
+															// the marker records the host from the leader URL, which need not be the peer's
+															// node name — match either
+															peerNames: [remoteNodeName, hostnameFromNodeUrl(peerNodeRow?.url)],
+															peerIsOurLeader: !!peerNodeRow?.isLeader,
+														})
+													) {
+														// NOT getIdOfRemoteNode: it mints and persists an id for an unseen name, and a fresh id
+														// matches no stored record — it would withhold nothing while reporting that it had.
+														const peerOriginNodeId = exportIdMapping(auditStore)?.[remoteNodeName];
+														// our own id resolves for everything we authored, so filtering on it would withhold
+														// this node's whole dataset
+														withheldOriginNodeId = peerOriginNodeId === nodeId ? undefined : peerOriginNodeId;
+														logger.warn?.(
+															withheldOriginNodeId === undefined
+																? `Copying ${databaseName} to ${remoteNodeName} in full: the clone-source gate is active for that peer, but this node holds no record attributed to it (harper-pro#737).`
+																: `Copying ${databaseName} to ${remoteNodeName} without the records that peer originated: the clone-source gate is active for it (harper-pro#737).`
+														);
+													}
+												} catch (error) {
+													withheldOriginNodeId = undefined;
+>>>>>>> 7ec686a (Log how many INVALIDATED stubs a base copy withheld from the peer)
 													logger.warn?.(
 														withheldOriginNodeId === undefined
 															? `Copying ${databaseName} to ${remoteNodeName} in full: the clone-source gate is active for that peer, but this node holds no record attributed to it (harper-pro#737).`
@@ -6498,7 +6542,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														// `invalidate` only for a peer the residency excludes; a stub may go to that peer alone.
 														if (entry.metadataFlags & INVALIDATED) {
 															const stubResidency = getResidence(entry.residencyId, table);
-															if (!stubResidency || stubResidency.includes(remoteNodeName)) continue;
+															if (!stubResidency || stubResidency.includes(remoteNodeName)) {
+																withheldStubCount++;
+																continue;
+															}
 														}
 														// same origin normalization as recordNodeId below: undefined means we authored it
 														if (
@@ -6606,6 +6653,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														entry.key,
 														entry.localTime
 													);
+<<<<<<< HEAD
 													getSharedStatus()[SENDING_TIME_POSITION] = 1;
 													// The record's ORIGIN, not ours: stamping a copy with the copier's id
 													// re-attributes every copied record, so it can never tie against its true
@@ -6676,6 +6724,19 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 														frame.encodingStart = frame.position;
 														currentTransaction.txnLogKey = 0;
 													}
+=======
+												if (withheldStubCount > 0)
+													logger.info?.(
+														`Copied ${databaseName} to ${remoteNodeName} without ${withheldStubCount} INVALIDATED stub(s) that peer would have stored as complete records (harper#2257)`
+													);
+												currentSequenceId = copyStartTime;
+												if (!currentTransaction.txnLogKey) {
+													// no records pending (none sent, or the last batch landed on a checkpoint flush):
+													// force a txn so the end_txn below still carries the sequence update
+													currentTransaction.txnLogKey = copyStartTime;
+													frame.encodingStart = frame.position;
+													frame.writeFloat64(copyStartTime);
+>>>>>>> 7ec686a (Log how many INVALIDATED stubs a base copy withheld from the peer)
 												}
 												logger.info?.('Finished copy table', tableName, remoteNodeName);
 											}
