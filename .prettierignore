@@ -2,12 +2,8 @@
 # submodule; it owns its own formatting and CI.
 /core/
 
-# .claude/ is untracked local state (see .git/info/exclude), including every
-# worktree under .claude/worktrees/ and that worktree's own core/ and dist/.
-# Prettier reads .gitignore but not .git/info/exclude, so without this a
-# whole-tree format run from the main checkout recurses into every worktree.
+# Prettier reads .gitignore but not .git/info/exclude; these two paths are
+# excluded only via the latter (per-clone, unversioned), so without entries
+# here a whole-tree format run recurses into them on a clone that has them.
 /.claude/
-
-# Same reason as .claude/ above: untracked local scratch state excluded only
-# via .git/info/exclude, which Prettier doesn't read.
 /integrationTests/cluster/qa-scratch/
