@@ -81,7 +81,7 @@ import {
 import { ANY_TABLE, markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
 import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
-import { verifyLegacyCopyBaseline } from './legacyCopy.ts';
+import { requiresLegacyCopyVerification, verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
 import { isDedicatedPoolWorker } from '../core/server/threads/workerPools.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
@@ -6804,9 +6804,15 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 												}
 											}
 											if (currentSequenceId === 0) {
-												// Capability-only gate, never version: the LMDB no-op-write hole predates this
-												// capability existing at all (DESIGN.md's v5+LMDB note).
-												const legacyCopy = !peerCapabilities.safeCopyAudit;
+												const legacyCopy = await requiresLegacyCopyVerification(
+													peerCapabilities.safeCopyAudit,
+													sendOperation,
+													(error) =>
+														logger.warn?.(
+															`Version probe for peer ${remoteNodeName} failed; using baseline verification`,
+															error
+														)
+												);
 												if (legacyCopy) copyResume = undefined;
 												if (closed || wsClosed) return;
 												logger.info?.('Replicating all tables to', remoteNodeName);
