@@ -39,7 +39,10 @@ Missing backports are listed before interactive confirmation. With `--yes`, any 
 
 ### Running the script
 
+From a fresh clone, install dependencies first. The script loads `semver` from `node_modules` and exits with a message naming this step if it is missing:
+
 ```bash
+npm ci
 node scripts/patch-release.js
 ```
 
