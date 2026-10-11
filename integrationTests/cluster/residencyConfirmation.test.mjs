@@ -66,7 +66,7 @@ function waitForMesh(nodes) {
  * no application code, so `setResidency` would not apply there. `X-Replicate-To: <nodes|*>;confirm=N`.
  * Settles to { status, body } — never rejects, so a pending write can be raced.
  */
-async function put(node, path, body, replicateTo) {
+async function put(node, path, body, replicateTo, signal) {
 	try {
 		const response = await fetch(`${node.httpURL}/${path}`, {
 			method: 'PUT',
@@ -76,6 +76,7 @@ async function put(node, path, body, replicateTo) {
 				'X-Replicate-To': replicateTo,
 			},
 			body: JSON.stringify(body),
+			signal,
 		});
 		return { status: response.status, body: await response.text() };
 	} catch (error) {
@@ -146,7 +147,8 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 			W,
 			'Placed/too-few',
 			{ id: 'too-few', homes: [names.W, names.B], body: 'x' },
-			'*;confirm=2'
+			'*;confirm=2',
+			AbortSignal.timeout(30_000)
 		);
 		assert.equal(response.status, 400, JSON.stringify(response));
 		assert.match(response.body, /resident on 1 other node\(s\)/);
@@ -155,7 +157,8 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 			W,
 			'Placed/unreachable',
 			{ id: 'unreachable', homes: [names.W, names.B, 'retired-node'], body: 'x' },
-			'*;confirm=2'
+			'*;confirm=2',
+			AbortSignal.timeout(30_000)
 		);
 		assert.equal(unreachable.status, 400, JSON.stringify(unreachable));
 		assert.match(unreachable.body, /of which this node replicates to 1/);
@@ -205,6 +208,7 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 
 		B = (await startHarper({ name: ctx.name, harper: B }, optionsFor(B.hostname))).harper;
 		contexts[1].harper = B;
+		await waitForMesh([W, B, C]);
 		for (const label of Object.keys(writes)) {
 			const response = await waitForCondition(() => settled[label], {
 				timeoutMs: 120_000,
