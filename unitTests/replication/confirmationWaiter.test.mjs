@@ -341,6 +341,14 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 		await promise;
 	});
 
+	it('treats an empty list array as no lists: the database-wide count', async () => {
+		const awaiting = new Set();
+		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), []);
+		expect(awaiting.size).to.equal(1);
+		notifyConfirmedWaiters(awaiting, 'any-peer', 0, 200);
+		await promise;
+	});
+
 	it('reports the per-residency shortfall on timeout', async () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 20, new Set(), [['a'], ['b']]);
