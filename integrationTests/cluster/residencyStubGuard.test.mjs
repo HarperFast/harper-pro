@@ -89,9 +89,8 @@ suite('A base copy never promotes an INVALIDATED residency stub (harper#2257)', 
 			mkdtemp(join(tmpdir(), 'harper-integration-test-')),
 			mkdtemp(join(tmpdir(), 'harper-integration-test-')),
 		]);
-		// allSettled, not all: startNode() assigns ctx[role] itself as soon as its own startHarper
-		// resolves, so if one node fails after the other succeeded, after() must still see the
-		// surviving node to stop it instead of leaking its process.
+		// startNode() assigns ctx[role] as soon as its own startHarper resolves, so after() must
+		// still see a surviving node when the other one rejects, rather than leaking its process.
 		const started = await Promise.allSettled([startNode(ctx, 'A', hostA, dirA), startNode(ctx, 'B', hostB, dirB)]);
 		const failed = started.find((result) => result.status === 'rejected');
 		if (failed) throw failed.reason;
