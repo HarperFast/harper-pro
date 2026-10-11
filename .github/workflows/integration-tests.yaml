@@ -294,6 +294,15 @@ jobs:
           HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
         run: npm run test:integration -- "$TEST_FILE"
 
+      # This job is the only place a real published release is installed; elsewhere this file runs
+      # only its HARPER_TEST_OMIT_REPLICATION_CAPABILITIES simulation of a capability-less peer, never
+      # an actual previous-release binary's handshake.
+      - name: Run legacy-copy baseline against the published release
+        env:
+          HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
+          HARPER_PRO_PREVIOUS_VERSION_PATH: ${{ env.HARPER_PRO_PREVIOUS_VERSION_PATHS }}
+        run: npm run test:integration -- integrationTests/cluster/legacyCopyBaseline.test.mjs
+
       - name: Upload Harper server logs
         if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

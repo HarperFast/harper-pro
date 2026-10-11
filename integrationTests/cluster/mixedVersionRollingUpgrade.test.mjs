@@ -441,7 +441,7 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				await assertConverged('after a one-node rollback');
 			});
 
-			step(`a node joining on ${previousVersion} while the others run this build`, async () => {
+			step(`a node joining on ${previousVersion} after nodeC rolled back to it`, async () => {
 				let socket;
 				await waitForCondition(
 					async (signal) => {
@@ -479,9 +479,8 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 					PREVIOUS_SAFE_COPY_AUDIT[previousVersion],
 					`${nodeA.harper.hostname} reported safeCopyAudit=${socket.peerCapabilities.safeCopyAudit} for ${previousVersion} node ${nodeC.harper.hostname}, expected ${PREVIOUS_SAFE_COPY_AUDIT[previousVersion]} — a capability-decode regression, or ${previousVersion} now ships harper-pro#848`
 				);
-				// harper-pro#1007 (fixed by harper-pro#1025): this build no longer refuses a base copy to a peer
-				// that lacks safeCopyAudit — a registration_info version probe backs any published 5.x release —
-				// so the joining node converges whether or not safeCopyAudit itself is set.
+				// harper-pro#1025 backs a peer lacking safeCopyAudit with a registration_info version probe
+				// instead of refusing it (harper-pro#1007), regardless of what safeCopyAudit itself reports.
 				await writeBatch(nodeA, 'join');
 				await assertConverged(`${nodeD.harper.hostname} joining on ${previousVersion}`);
 			});
