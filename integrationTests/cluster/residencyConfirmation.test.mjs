@@ -130,7 +130,8 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 			W,
 			'Placed/warmup',
 			{ id: 'warmup', homes: [names.W, names.B, names.C], body: 'w' },
-			'*;confirm=2'
+			'*;confirm=2',
+			AbortSignal.timeout(60_000)
 		);
 		assert.ok(warmup.status < 300, JSON.stringify(warmup));
 	});
@@ -171,9 +172,16 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 			W,
 			'Placed/homed-on-b',
 			{ id: 'homed-on-b', homes: [names.W, names.B], body: 'b' },
-			'*;confirm=1'
+			'*;confirm=1',
+			AbortSignal.timeout(300_000)
 		);
-		const replicatedToB = put(W, 'Open/to-b', { id: 'to-b', body: 'b' }, `${names.B};confirm=1`);
+		const replicatedToB = put(
+			W,
+			'Open/to-b',
+			{ id: 'to-b', body: 'b' },
+			`${names.B};confirm=1`,
+			AbortSignal.timeout(300_000)
+		);
 		// one transaction (array PUT); C holds the second record, but only B holds the first
 		const mixed = put(
 			W,
@@ -182,7 +190,8 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 				{ id: 'mixed-b', homes: [names.W, names.B], body: 'b' },
 				{ id: 'mixed-c', homes: [names.W, names.C], body: 'c' },
 			],
-			'*;confirm=1'
+			'*;confirm=1',
+			AbortSignal.timeout(300_000)
 		);
 		const writes = { homedOnB, replicatedToB, mixed };
 		const settled = {};
@@ -199,7 +208,8 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 			W,
 			'Placed/later-on-c',
 			{ id: 'later-on-c', homes: [names.W, names.C], body: 'c' },
-			'*;confirm=1'
+			'*;confirm=1',
+			AbortSignal.timeout(60_000)
 		);
 		assert.ok(laterOnC.status < 300, JSON.stringify(laterOnC));
 		assert.equal(await readBody(C, 'Placed', 'later-on-c'), 'c');
