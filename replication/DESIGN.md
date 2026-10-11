@@ -505,6 +505,8 @@ Regressions: `unitTests/replication/replicateFalseSendPaths.test.mjs` (frames), 
 
 28. **Audit sender fairness is shared per worker.** `yieldSendLoop` shares one pending macrotask and restarts its monotonic budget on resume: 2 ms on dedicated replication workers, 0.5 ms on HTTP workers and the main-thread fallback, selected by this thread's `workerData.name`, pinned by `sendLoopYield.test.mjs`. Normal sends (including base-copy records) consult it when neither drain nor blob saturation requires a wait; skips consult it so their sequence-update timer can fire. The copy-flush pacer paces on its own separate cadence (`copyFlushPacer.due`), including copy-only skipped rows.
 
+29. **`replicatedConfirmation` counts a peer only for records it is resident for (harper-pro#1031).** `CONFIRMATION_STATUS_POSITION` is per database, so a non-resident peer (sent an invalidation, or skipped) passes a write's position without holding it. Core passes the confirmation callback one list of other residents per distinct residency among the written records (core `resources/DESIGN.md`); `createConfirmationWaiter` resolves when every list has the requested count of confirmed members, still tracking peers by identity and filtering the `alreadyConfirmedPeers` seed through the same predicate. No lists → the database-wide count, exactly as before. Eligibility is decided on the writer, so receivers need no protocol change. Pinned by `unitTests/replication/confirmationWaiter.test.mjs` and `integrationTests/cluster/residencyConfirmation.test.mjs`.
+
 ## Tests
 
 **Integration tests** live in `../integrationTests/cluster/`:

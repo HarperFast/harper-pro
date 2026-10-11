@@ -278,6 +278,81 @@ describe('createConfirmationWaiter', () => {
 	});
 });
 
+// harper-pro#1031: on a table with residency lists only a resident holds the record; a non-resident
+// receives an invalidation stub (or nothing) yet its applied watermark still passes txnTime. Core hands
+// the waiter one list of other residents per distinct residency among the written records.
+describe('createConfirmationWaiter with resident peer lists', () => {
+	const timedOut = (promise) =>
+		promise.then(
+			() => undefined,
+			(error) => error
+		);
+
+	it('does not count a non-resident peer that has applied the write', async () => {
+		const awaiting = new Set();
+		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 20, new Set(), [['resident']]);
+		notifyConfirmedWaiters(awaiting, 'non-resident', 0, 200);
+		const error = await timedOut(promise);
+		expect(error.statusCode).to.equal(504);
+		expect(error.message).to.include('received 0 from the residents');
+		expect(error.message).to.include('(resident)');
+		expect(awaiting.size).to.equal(0);
+	});
+
+	it('resolves once a resident peer confirms', async () => {
+		const awaiting = new Set();
+		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), [['resident']]);
+		notifyConfirmedWaiters(awaiting, 'non-resident', 0, 200);
+		expect(awaiting.size).to.equal(1);
+		notifyConfirmedWaiters(awaiting, 'resident', 0, 200);
+		await promise;
+		expect(awaiting.size).to.equal(0);
+	});
+
+	it('ignores non-resident peers in the already-confirmed seed', async () => {
+		const awaiting = new Set();
+		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(['non-resident']), [['resident']]);
+		expect(awaiting.size).to.equal(1);
+		notifyConfirmedWaiters(awaiting, 'resident', 0, 200);
+		await promise;
+		await createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(['resident']), [['resident']]);
+		expect(awaiting.size).to.equal(0);
+	});
+
+	it('requires the count from the residents of each record, not one pool of peers', async () => {
+		const awaiting = new Set();
+		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), [['a'], ['b', 'c']]);
+		notifyConfirmedWaiters(awaiting, 'a', 0, 200); // a holds only the first record
+		expect(awaiting.size).to.equal(1);
+		notifyConfirmedWaiters(awaiting, 'c', 0, 200);
+		await promise;
+		expect(awaiting.size).to.equal(0);
+	});
+
+	it('counts one peer toward every record it is resident for', async () => {
+		const awaiting = new Set();
+		const promise = createConfirmationWaiter(awaiting, 'data', 100, 2, 5000, new Set(['a']), [
+			['a', 'b'],
+			['a', 'c'],
+		]);
+		notifyConfirmedWaiters(awaiting, 'b', 0, 200);
+		expect(awaiting.size).to.equal(1); // the second record has only a
+		notifyConfirmedWaiters(awaiting, 'b', 0, 200);
+		expect(awaiting.size).to.equal(1);
+		notifyConfirmedWaiters(awaiting, 'c', 0, 200);
+		await promise;
+	});
+
+	it('reports the per-residency shortfall on timeout', async () => {
+		const awaiting = new Set();
+		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 20, new Set(), [['a'], ['b']]);
+		notifyConfirmedWaiters(awaiting, 'a', 0, 200);
+		const error = await timedOut(promise);
+		expect(error.message).to.include('received 1, 0 from the residents');
+		expect(error.message).to.include('(a; b)');
+	});
+});
+
 describe('countAlreadyConfirmedPeers', () => {
 	it('returns the names of peers whose last-known replicated position already reached txnTime', () => {
 		const confirmationsByNode = new Map([

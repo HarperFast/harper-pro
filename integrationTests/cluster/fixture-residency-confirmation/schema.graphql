@@ -1,0 +1,10 @@
+# Placed: each record names the nodes that hold it. Open: no residency function, so `replicateTo` places it.
+type Placed @table @export {
+	id: ID @primaryKey
+	homes: [String]
+	body: String
+}
+type Open @table @export {
+	id: ID @primaryKey
+	body: String
+}
