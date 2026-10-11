@@ -39,6 +39,7 @@ import {
 	notifyConfirmedWaiters,
 	countAlreadyConfirmedPeers,
 	filterReplicationRecipients,
+	assertResidentsReachable,
 } from '#src/replication/knownNodes';
 
 describe('createConfirmationWaiter', () => {
@@ -390,5 +391,23 @@ describe('filterReplicationRecipients', () => {
 	it('honors a database-scoped sendsTo entry', () => {
 		const selfReplicates = { sendsTo: [{ target: 'a', database: 'other-db' }] };
 		expect(filterReplicationRecipients(nodes, selfReplicates, 'data')).to.deep.equal([]);
+	});
+});
+
+describe('assertResidentsReachable', () => {
+	const recipients = new Set(['a', 'b']);
+
+	it('accepts lists whose residents this node replicates to', () => {
+		assertResidentsReachable([['a'], ['a', 'b']], recipients, 1, 'data');
+		assertResidentsReachable(undefined, recipients, 2, 'data');
+	});
+
+	it('refuses a list whose reachable residents are fewer than the count', () => {
+		expect(() => assertResidentsReachable([['a', 'retired']], recipients, 2, 'data'))
+			.to.throw(/resident on a, retired, of which this node replicates to 1 \(a\)/)
+			.with.property('statusCode', 400);
+		expect(() => assertResidentsReachable([['a', 'b'], ['retired']], recipients, 1, 'data')).to.throw(
+			/replicates to 0$/
+		);
 	});
 });

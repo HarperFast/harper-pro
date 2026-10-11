@@ -964,6 +964,26 @@ export function filterReplicationRecipients(nodes: any[], selfReplicates: any, d
  * legacy full-mesh self-record (`true`, or an absent/unset one) — the common, non-directional case this
  * previously handled correctly.
  */
+/**
+ * Refuse a count some written record's residents can never meet through this node's recipients — a
+ * resident that is no longer a cluster member, or one this node does not send `databaseName` to.
+ */
+export function assertResidentsReachable(
+	residentPeerLists: string[][] | undefined,
+	recipientNames: Set<string>,
+	confirmationCount: number,
+	databaseName: string
+): void {
+	for (const residents of residentPeerLists ?? []) {
+		const reachable = residents.filter((name) => recipientNames.has(name));
+		if (confirmationCount > reachable.length) {
+			throw new ClientError(
+				`Cannot confirm replication to ${confirmationCount} node(s) for database "${databaseName}": a written record is resident on ${residents.join(', ')}, of which this node replicates to ${reachable.length}${reachable.length ? ` (${reachable.join(', ')})` : ''}`
+			);
+		}
+	}
+}
+
 function getReplicationRecipients(databaseName: string) {
 	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
 	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
@@ -977,6 +997,13 @@ replicationConfirmation((databaseName, txnTime, confirmationCount, residentPeerL
 			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
 		);
 	}
+	if (residentPeerLists)
+		assertResidentsReachable(
+			residentPeerLists,
+			new Set(recipients.map((node) => node.name)),
+			confirmationCount,
+			databaseName
+		);
 	if (!commitsAwaitingReplication) {
 		commitsAwaitingReplication = new Map();
 		startSubscriptionToReplications();
