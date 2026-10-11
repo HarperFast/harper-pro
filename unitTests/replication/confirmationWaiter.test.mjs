@@ -279,7 +279,6 @@ describe('createConfirmationWaiter', () => {
 	});
 });
 
-// harper-pro#1031
 describe('createConfirmationWaiter with resident peer lists', () => {
 	const timedOut = (promise) =>
 		promise.then(
@@ -321,7 +320,7 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 	it('requires the count from the residents of each record, not one pool of peers', async () => {
 		const awaiting = new Set();
 		const promise = createConfirmationWaiter(awaiting, 'data', 100, 1, 5000, new Set(), [['a'], ['b', 'c']]);
-		notifyConfirmedWaiters(awaiting, 'a', 0, 200); // a holds only the first record
+		notifyConfirmedWaiters(awaiting, 'a', 0, 200);
 		expect(awaiting.size).to.equal(1);
 		notifyConfirmedWaiters(awaiting, 'c', 0, 200);
 		await promise;
@@ -335,7 +334,7 @@ describe('createConfirmationWaiter with resident peer lists', () => {
 			['a', 'c'],
 		]);
 		notifyConfirmedWaiters(awaiting, 'b', 0, 200);
-		expect(awaiting.size).to.equal(1); // the second record has only a
+		expect(awaiting.size).to.equal(1);
 		notifyConfirmedWaiters(awaiting, 'b', 0, 200);
 		expect(awaiting.size).to.equal(1);
 		notifyConfirmedWaiters(awaiting, 'c', 0, 200);

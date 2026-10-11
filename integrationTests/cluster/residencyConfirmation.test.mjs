@@ -22,7 +22,6 @@ import { sendOperation, stopNodeProcess, waitForCondition } from './clusterShare
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
 
 const FIXTURE = join(import.meta.dirname, 'fixture-residency-confirmation');
-// how long a write C alone could confirm stays unconfirmed after C has provably applied it
 const NOT_CONFIRMED_WINDOW_MS = 3_000;
 
 function optionsFor(hostname) {
@@ -84,14 +83,18 @@ async function put(node, path, body, replicateTo) {
 	}
 }
 
-async function readBody(node, table, id) {
-	const [record] = await sendOperation(node, {
-		operation: 'search_by_id',
-		database: 'data',
-		table,
-		ids: [id],
-		get_attributes: ['id', 'body'],
-	});
+async function readBody(node, table, id, signal) {
+	const [record] = await sendOperation(
+		node,
+		{
+			operation: 'search_by_id',
+			database: 'data',
+			table,
+			ids: [id],
+			get_attributes: ['id', 'body'],
+		},
+		{ signal }
+	);
 	return record?.body;
 }
 
@@ -174,10 +177,10 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 		for (const [label, pending] of Object.entries(writes)) pending.then((response) => (settled[label] = response));
 		// committed on W before the probe below, so C confirming the probe means C has applied them
 		await waitForCondition(
-			async () =>
-				(await readBody(W, 'Placed', 'homed-on-b')) === 'b' &&
-				(await readBody(W, 'Open', 'to-b')) === 'b' &&
-				(await readBody(W, 'Placed', 'mixed-b')) === 'b',
+			async (signal) =>
+				(await readBody(W, 'Placed', 'homed-on-b', signal)) === 'b' &&
+				(await readBody(W, 'Open', 'to-b', signal)) === 'b' &&
+				(await readBody(W, 'Placed', 'mixed-b', signal)) === 'b',
 			{ timeoutMs: 30_000, description: 'the tested writes to commit on W' }
 		);
 		const laterOnC = await put(

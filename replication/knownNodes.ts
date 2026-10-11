@@ -964,6 +964,11 @@ export function filterReplicationRecipients(nodes: any[], selfReplicates: any, d
  * legacy full-mesh self-record (`true`, or an absent/unset one) — the common, non-directional case this
  * previously handled correctly.
  */
+function getReplicationRecipients(databaseName: string) {
+	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
+	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
+}
+
 /**
  * Refuse a count some written record's residents can never meet through this node's recipients — a
  * resident that is no longer a cluster member, or one this node does not send `databaseName` to.
@@ -982,11 +987,6 @@ export function assertResidentsReachable(
 			);
 		}
 	}
-}
-
-function getReplicationRecipients(databaseName: string) {
-	const selfReplicates = selfNodeReplicates(getHDBNodeTable().primaryStore, getThisNodeName());
-	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
 }
 
 replicationConfirmation((databaseName, txnTime, confirmationCount, residentPeerLists?: string[][]): Promise<void> => {
