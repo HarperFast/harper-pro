@@ -880,7 +880,9 @@ export function createConfirmationWaiter(
 	alreadyConfirmedPeers: Set<string> = new Set(),
 	residentPeerLists?: string[][]
 ): Promise<void> {
-	const residentGroups = residentPeerLists?.map((residents) => new Set(residents));
+	const residentGroups = residentPeerLists?.length
+		? residentPeerLists.map((residents) => new Set(residents))
+		: undefined;
 	const isConfirmed = (confirmed: Set<string>) =>
 		residentGroups
 			? residentGroups.every((residents) => countMembers(confirmed, residents) >= confirmationCount)
@@ -895,7 +897,7 @@ export function createConfirmationWaiter(
 		// update can otherwise be credited twice — once via the `alreadyConfirmedPeers` seed and
 		// again via its own first post-registration notifyConfirmedWaiters crossing, since the
 		// shared-buffer write and the JS watcher callback that reacts to it are not atomic
-		// (harper-pro#633 review). `Set.add` on the same name is a no-op, so a peer contributes at
+		// (harper-pro#633 review). A peer already in `confirmed` returns early, so it contributes at
 		// most once regardless of how many times it's reported confirmed.
 		const confirmed = new Set(alreadyConfirmedPeers);
 		const entry: AwaitingReplication = {
