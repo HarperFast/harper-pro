@@ -386,7 +386,8 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				await assertConverged('seed');
 				// A cursor from a base copy is persisted only after a memtable flush, and a peer that switches
 				// binaries before then is asked for a base copy again. A cursor from a live write is persisted
-				// right after it applies, so writing live here closes that window before any switch.
+				// right after it applies, so writing live here narrows that window before any switch (not
+				// confirmed closed: the suite doesn't observe the on-disk cursor directly).
 				await Promise.all([writeBatch(nodeA, 'live-a'), writeBatch(nodeB, 'live-b'), writeBatch(nodeC, 'live-c')]);
 				await assertConverged('first live writes');
 			});
@@ -479,8 +480,6 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 					PREVIOUS_SAFE_COPY_AUDIT[previousVersion],
 					`${nodeA.harper.hostname} reported safeCopyAudit=${socket.peerCapabilities.safeCopyAudit} for ${previousVersion} node ${nodeC.harper.hostname}, expected ${PREVIOUS_SAFE_COPY_AUDIT[previousVersion]} — a capability-decode regression, or ${previousVersion} now ships harper-pro#848`
 				);
-				// harper-pro#1025 backs a peer lacking safeCopyAudit with a registration_info version probe
-				// instead of refusing it (harper-pro#1007), regardless of what safeCopyAudit itself reports.
 				await writeBatch(nodeA, 'join');
 				await assertConverged(`${nodeD.harper.hostname} joining on ${previousVersion}`);
 			});
