@@ -89,7 +89,12 @@ suite('A base copy never promotes an INVALIDATED residency stub (harper#2257)', 
 			mkdtemp(join(tmpdir(), 'harper-integration-test-')),
 			mkdtemp(join(tmpdir(), 'harper-integration-test-')),
 		]);
-		await Promise.all([startNode(ctx, 'A', hostA, dirA), startNode(ctx, 'B', hostB, dirB)]);
+		// allSettled, not all: startNode() assigns ctx[role] itself as soon as its own startHarper
+		// resolves, so if one node fails after the other succeeded, after() must still see the
+		// surviving node to stop it instead of leaking its process.
+		const started = await Promise.allSettled([startNode(ctx, 'A', hostA, dirA), startNode(ctx, 'B', hostB, dirB)]);
+		const failed = started.find((result) => result.status === 'rejected');
+		if (failed) throw failed.reason;
 		await addLeader(ctx.B, ctx.A);
 	});
 
@@ -146,8 +151,8 @@ suite('A base copy never promotes an INVALIDATED residency stub (harper#2257)', 
 		// The copy walks the table in key order and 'zz-control' sorts after 'moved', so the stub's fate is already decided.
 		const onB = await probe(rebuilt, 'moved');
 		ok(
-			!(onB.present && !onB.invalidated),
-			`the base copy must not hand the rebuilt resident A's stub as a complete record, saw ${JSON.stringify(onB)}`
+			!onB.present,
+			`the base copy must withhold the row from the resident it rebuilds, not hand it a stub, saw ${JSON.stringify(onB)}`
 		);
 	});
 });

@@ -79,7 +79,7 @@ describe('GET_RECORD over an INVALIDATED stub (harper#2257)', function () {
 	});
 
 	afterEach(() => {
-		socket.close(1000);
+		socket?.close(1000);
 	});
 
 	it('answers a stub as a miss, not with its bytes', async () => {
