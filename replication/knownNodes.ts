@@ -921,7 +921,7 @@ export function createConfirmationWaiter(
 			awaiting.delete(entry);
 			const received = residentGroups
 				? residentGroups.map((residents) => countMembers(confirmed, residents)).join(', ') +
-					` from the residents of each written record's residency (${residentPeerLists.map((residents) => residents.join(', ')).join('; ')})`
+					` from the residents of each written record's residency (${residentGroups.map((residents) => residents.join(', ')).join('; ')})`
 				: confirmed.size;
 			reject(
 				new ServerError(
