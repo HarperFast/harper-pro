@@ -880,10 +880,11 @@ export function createConfirmationWaiter(
 	residentPeerLists?: string[][]
 ): Promise<void> {
 	const residentGroups = residentPeerLists?.length ? residentPeerLists : undefined;
-	const isConfirmed = (confirmed: Set<string>) =>
-		residentGroups
-			? residentGroups.every((residents) => countMembers(confirmed, residents) >= confirmationCount)
-			: confirmed.size >= confirmationCount;
+	const isConfirmed = (confirmed: Set<string>) => {
+		if (!residentGroups) return confirmed.size >= confirmationCount;
+		for (const residents of residentGroups) if (countMembers(confirmed, residents) < confirmationCount) return false;
+		return true;
+	};
 	// Seeded (not just checked-and-early-returned) so the count-up-to-confirmationCount math below
 	// stays in one place. Computing alreadyConfirmedPeers and adding `entry` to `awaiting` both happen
 	// synchronously in the caller's turn — with nothing awaited between them — so no peer ack can land
@@ -968,6 +969,11 @@ function getReplicationRecipients(databaseName: string) {
 	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
 }
 
+function isRecipient(recipients: { name: string }[], name: string): boolean {
+	for (const node of recipients) if (node.name === name) return true;
+	return false;
+}
+
 /**
  * Refuse a count some written record's residents can never meet through this node's recipients — a
  * resident that is no longer a cluster member, or one this node does not send `databaseName` to.
@@ -980,9 +986,9 @@ export function assertResidentsReachable(
 ): void {
 	for (const residents of residentPeerLists ?? []) {
 		let reachableCount = 0;
-		for (const name of residents) if (recipients.some((node) => node.name === name)) reachableCount++;
+		for (const name of residents) if (isRecipient(recipients, name)) reachableCount++;
 		if (confirmationCount > reachableCount) {
-			const reachable = residents.filter((name) => recipients.some((node) => node.name === name));
+			const reachable = residents.filter((name) => isRecipient(recipients, name));
 			throw new ClientError(
 				`Cannot confirm replication to ${confirmationCount} node(s) for database "${databaseName}": a written record is resident on ${residents.join(', ')}, of which this node replicates to ${reachable.length}${reachable.length ? ` (${reachable.join(', ')})` : ''}`
 			);
