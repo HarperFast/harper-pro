@@ -865,6 +865,10 @@ export function notifyConfirmedWaiters(
  * Build the promise a `replicatedConfirmation` write awaits, and register its waiter entry in
  * `awaiting`. Extracted from the `replicationConfirmation(...)` registration below so the
  * settle/timeout/cleanup behavior is unit-testable directly, without going through a real commit.
+ *
+ * `residentPeerLists`: one list of other resident nodes per distinct residency among the written
+ * records. A non-resident's watermark passes `txnTime` without it holding the record, so each list
+ * must reach `confirmationCount` on its own (harper-pro#1031).
  */
 export function createConfirmationWaiter(
 	awaiting: Set<AwaitingReplication>,
@@ -872,19 +876,26 @@ export function createConfirmationWaiter(
 	txnTime: number,
 	confirmationCount: number,
 	timeoutMs: number = REPLICATION_CONFIRMATION_TIMEOUT_MS,
-	alreadyConfirmedPeers: Set<string> = new Set()
+	alreadyConfirmedPeers: Set<string> = new Set(),
+	residentPeerLists?: string[][]
 ): Promise<void> {
+	const residentGroups = residentPeerLists?.length ? residentPeerLists : undefined;
+	const isConfirmed = (confirmed: Set<string>) => {
+		if (!residentGroups) return confirmed.size >= confirmationCount;
+		for (const residents of residentGroups) if (countMembers(confirmed, residents) < confirmationCount) return false;
+		return true;
+	};
 	// Seeded (not just checked-and-early-returned) so the count-up-to-confirmationCount math below
 	// stays in one place. Computing alreadyConfirmedPeers and adding `entry` to `awaiting` both happen
 	// synchronously in the caller's turn — with nothing awaited between them — so no peer ack can land
 	// in the gap; this is what closes the race, not just an optimization.
-	if (alreadyConfirmedPeers.size >= confirmationCount) return Promise.resolve();
+	if (isConfirmed(alreadyConfirmedPeers)) return Promise.resolve();
 	return new Promise((resolve, reject) => {
 		// Confirmations are tracked by peer identity, not a bare counter: the same peer's status
 		// update can otherwise be credited twice — once via the `alreadyConfirmedPeers` seed and
 		// again via its own first post-registration notifyConfirmedWaiters crossing, since the
 		// shared-buffer write and the JS watcher callback that reacts to it are not atomic
-		// (harper-pro#633 review). `Set.add` on the same name is a no-op, so a peer contributes at
+		// (harper-pro#633 review). A peer already in `confirmed` returns early, so it contributes at
 		// most once regardless of how many times it's reported confirmed.
 		const confirmed = new Set(alreadyConfirmedPeers);
 		const entry: AwaitingReplication = {
@@ -892,8 +903,9 @@ export function createConfirmationWaiter(
 			settled: false,
 			onConfirm: (nodeName) => {
 				if (entry.settled) return; // a peer that acks after we've already timed out is a no-op, not a double-resolve
+				if (confirmed.has(nodeName)) return;
 				confirmed.add(nodeName);
-				if (confirmed.size === confirmationCount) {
+				if (isConfirmed(confirmed)) {
 					entry.settled = true;
 					clearTimeout(timer);
 					awaiting.delete(entry);
@@ -907,9 +919,13 @@ export function createConfirmationWaiter(
 			// O(1) regardless of how many other waiters are pending or expiring in this same tick — an
 			// outage that times out many waiters at once costs O(n) total here, not O(n²).
 			awaiting.delete(entry);
+			const received = residentGroups
+				? residentGroups.map((residents) => countMembers(confirmed, residents)).join(', ') +
+					` from the residents of each written record's residency (${residentGroups.map((residents) => residents.join(', ')).join('; ')})`
+				: confirmed.size;
 			reject(
 				new ServerError(
-					`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${confirmed.size})`,
+					`Timed out after ${timeoutMs}ms waiting for replication confirmation from ${confirmationCount} node(s) for database "${databaseName}" (received ${received})`,
 					504
 				)
 			);
@@ -917,6 +933,13 @@ export function createConfirmationWaiter(
 		timer.unref?.();
 		awaiting.add(entry);
 	});
+}
+
+// residents are distinct (core deduplicates them)
+function countMembers(confirmed: Set<string>, residents: string[]): number {
+	let count = 0;
+	for (const nodeName of residents) if (confirmed.has(nodeName)) count++;
+	return count;
 }
 
 /**
@@ -946,7 +969,38 @@ function getReplicationRecipients(databaseName: string) {
 	return filterReplicationRecipients(server.nodes, selfReplicates, databaseName);
 }
 
-replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void> => {
+function isRecipient(recipients: { name: string }[], name: string): boolean {
+	for (const node of recipients) if (node.name === name) return true;
+	return false;
+}
+
+/**
+ * Refuse a count some written record's residents can never meet through this node's recipients — a
+ * resident that is no longer a cluster member, or one this node does not send `databaseName` to.
+ */
+export function assertResidentsReachable(
+	residentPeerLists: string[][] | undefined,
+	recipients: { name: string }[],
+	confirmationCount: number,
+	databaseName: string
+): void {
+	for (const residents of residentPeerLists ?? []) {
+		let reachableCount = 0;
+		for (const name of residents) if (isRecipient(recipients, name)) reachableCount++;
+		if (confirmationCount > reachableCount) {
+			const reachable = residents.filter((name) => isRecipient(recipients, name));
+			throw new ClientError(
+				`Cannot confirm replication to ${confirmationCount} node(s) for database "${databaseName}": a written record is resident on ${residents.join(', ')}, of which this node replicates to ${reachable.length}${reachable.length ? ` (${reachable.join(', ')})` : ''}`
+			);
+		}
+	}
+}
+
+/**
+ * Refuse, before the write is committed, a confirmation this node could never collect: more peers than it
+ * replicates `databaseName` to, or than a written record's residents among them.
+ */
+function assertConfirmationFeasible(databaseName: string, confirmationCount: number, residentPeerLists?: string[][]) {
 	const recipients = getReplicationRecipients(databaseName);
 	if (confirmationCount > recipients.length) {
 		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
@@ -954,6 +1008,10 @@ replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void
 			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
 		);
 	}
+	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);
+}
+
+replicationConfirmation((databaseName, txnTime, confirmationCount, residentPeerLists?: string[][]): Promise<void> => {
 	if (!commitsAwaitingReplication) {
 		commitsAwaitingReplication = new Map();
 		startSubscriptionToReplications();
@@ -969,9 +1027,10 @@ replicationConfirmation((databaseName, txnTime, confirmationCount): Promise<void
 		txnTime,
 		confirmationCount,
 		undefined,
-		countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime)
+		countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime),
+		residentPeerLists
 	);
-});
+}, assertConfirmationFeasible);
 // Per-node confirmation watchers. Previously the per-node-update callback below called
 // forEachReplicatedDatabase and discarded the returned remove handle, so every hdb_nodes
 // update added two listeners (updateTable + dropDatabase) on the global databaseEventsEmitter

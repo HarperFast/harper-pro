@@ -1,0 +1,9 @@
+type Placed @table @export {
+	id: ID @primaryKey
+	homes: [String]
+	body: String
+}
+type Open @table @export {
+	id: ID @primaryKey
+	body: String
+}
