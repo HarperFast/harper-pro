@@ -4,8 +4,8 @@
  * Every node keeps its data directory across a binary switch — the operation customers run. "Converge"
  * (checked after every step) means exact agreement with an independent oracle — fields, secondary index,
  * blob bytes over HTTP and in local blob files — not merely agreement between nodes. The last step joins
- * a node on the old release: it must converge if that release advertises safeCopyAudit, otherwise this
- * build refuses it a base copy (harper-pro#1007), and the step pins that refusal instead.
+ * a node on the old release and must converge regardless of whether that release advertises safeCopyAudit
+ * (harper-pro#1007: fixed on main by harper-pro#1025, a version probe backs peers that lack the capability).
  *
  * HARPER_PRO_PREVIOUS_VERSION_PATHS lists previous installs (each `.../node_modules/@harperfast/harper-pro`),
  * separated by path.delimiter; one suite runs per install. Unset, the file skips. Set to a path that
@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { startHarper, killHarper, getNextAvailableLoopbackAddress } from '@harperfast/integration-testing';
-import { sendOperation, waitForCondition, stopAndTeardownNodes, readLog } from './clusterShared.mjs';
+import { sendOperation, waitForCondition, stopAndTeardownNodes } from './clusterShared.mjs';
 
 const PACKAGE_ROOT = join(import.meta.dirname, '..', '..');
 const CURRENT_BIN = join(PACKAGE_ROOT, 'dist', 'bin', 'harper.js');
@@ -37,11 +37,10 @@ const FILE_BLOB_BYTES = 20 * 1024;
 const INLINE_BLOB_BYTES = 200;
 const BLOB_HEADER_BYTES = 8;
 const CONVERGE_TIMEOUT_MS = 120_000;
-const KNOWN_ISSUE_TIMEOUT_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 60_000;
 // Known per-release safeCopyAudit advertisement (harper-pro#848 added it; neither pinned release ships it).
-// A fixed table, not a version comparison: this is what decides the join step's branch below, so the test
-// must catch this build misreporting it, not just infer it from "is newer than #848".
+// A fixed table, not a version comparison: this guards against this build misreporting a peer's capability,
+// not just inferring it from "is newer than #848".
 const PREVIOUS_SAFE_COPY_AUDIT = { '5.2.15': 0, '5.3.1': 0 };
 // a rolling upgrade stops each node cleanly; the harness default escalates to SIGKILL after 5 s
 const SHUTDOWN_GRACE_MS = 30_000;
@@ -386,9 +385,8 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 				await waitForMesh();
 				await assertConverged('seed');
 				// A cursor from a base copy is persisted only after a memtable flush, and a peer that switches
-				// binaries before then is asked for a base copy again — which this build refuses to an
-				// old-release peer (harper-pro#1007). A cursor from a live write is persisted right after it
-				// applies, so writing live here closes that window before any switch.
+				// binaries before then is asked for a base copy again. A cursor from a live write is persisted
+				// right after it applies, so writing live here closes that window before any switch.
 				await Promise.all([writeBatch(nodeA, 'live-a'), writeBatch(nodeB, 'live-b'), writeBatch(nodeC, 'live-c')]);
 				await assertConverged('first live writes');
 			});
@@ -481,23 +479,11 @@ for (const previousInstall of PREVIOUS_INSTALLS) {
 					PREVIOUS_SAFE_COPY_AUDIT[previousVersion],
 					`${nodeA.harper.hostname} reported safeCopyAudit=${socket.peerCapabilities.safeCopyAudit} for ${previousVersion} node ${nodeC.harper.hostname}, expected ${PREVIOUS_SAFE_COPY_AUDIT[previousVersion]} — a capability-decode regression, or ${previousVersion} now ships harper-pro#848`
 				);
-				if (socket.peerCapabilities.safeCopyAudit) {
-					await writeBatch(nodeA, 'join');
-					await assertConverged(`${nodeD.harper.hostname} joining on ${previousVersion}`);
-					return;
-				}
-				// Pins https://github.com/HarperFast/harper-pro/issues/1007: this build refuses a base copy to a peer
-				// that does not advertise safeCopyAudit (every 5.x release before it) when a table has no numeric
-				// update-timestamp attribute, and that peer's subscription closes 1008 and retries forever. Once this
-				// times out, the issue is fixed: drop this branch so the joining node must converge.
-				const refusal = new RegExp(
-					`closing ${nodeD.harper.hostname.replaceAll('.', '\\.')} data 1008 .*Cannot verify replication baseline`
-				);
-				await waitForCondition(async () => refusal.test(await readLog(nodeA.harper)), {
-					timeoutMs: KNOWN_ISSUE_TIMEOUT_MS,
-					pollMs: 1000,
-					description: `${nodeA.harper.hostname} to refuse ${nodeD.harper.hostname} a base copy (harper-pro#1007); if that is fixed, drop this branch`,
-				});
+				// harper-pro#1007 (fixed by harper-pro#1025): this build no longer refuses a base copy to a peer
+				// that lacks safeCopyAudit — a registration_info version probe backs any published 5.x release —
+				// so the joining node converges whether or not safeCopyAudit itself is set.
+				await writeBatch(nodeA, 'join');
+				await assertConverged(`${nodeD.harper.hostname} joining on ${previousVersion}`);
 			});
 		}
 	);
