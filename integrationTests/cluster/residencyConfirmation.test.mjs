@@ -141,7 +141,7 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 		}
 	});
 
-	test('a count larger than the other residents fails at once and writes nothing', async () => {
+	test('a count larger than the reachable residents fails at once and writes nothing', async () => {
 		const response = await put(
 			W,
 			'Placed/too-few',
@@ -151,6 +151,15 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 		assert.equal(response.status, 400, JSON.stringify(response));
 		assert.match(response.body, /resident on 1 other node\(s\)/);
 		assert.equal(await readBody(W, 'Placed', 'too-few'), undefined);
+		const unreachable = await put(
+			W,
+			'Placed/unreachable',
+			{ id: 'unreachable', homes: [names.W, names.B, 'retired-node'], body: 'x' },
+			'*;confirm=2'
+		);
+		assert.equal(unreachable.status, 400, JSON.stringify(unreachable));
+		assert.match(unreachable.body, /of which this node replicates to 1/);
+		assert.equal(await readBody(W, 'Placed', 'unreachable'), undefined);
 	});
 
 	test('a non-resident or replicateTo-excluded peer that applied the write does not confirm it', async () => {

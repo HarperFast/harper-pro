@@ -996,7 +996,11 @@ export function assertResidentsReachable(
 	}
 }
 
-replicationConfirmation((databaseName, txnTime, confirmationCount, residentPeerLists?: string[][]): Promise<void> => {
+/**
+ * Refuse, before the write is committed, a confirmation this node could never collect: more peers than it
+ * replicates `databaseName` to, or than a written record's residents among them.
+ */
+function assertConfirmationFeasible(databaseName: string, confirmationCount: number, residentPeerLists?: string[][]) {
 	const recipients = getReplicationRecipients(databaseName);
 	if (confirmationCount > recipients.length) {
 		let nodesInTable = Array.from(databases.system.hdb_nodes.primaryStore.getKeys());
@@ -1005,6 +1009,9 @@ replicationConfirmation((databaseName, txnTime, confirmationCount, residentPeerL
 		);
 	}
 	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);
+}
+
+replicationConfirmation((databaseName, txnTime, confirmationCount, residentPeerLists?: string[][]): Promise<void> => {
 	if (!commitsAwaitingReplication) {
 		commitsAwaitingReplication = new Map();
 		startSubscriptionToReplications();
@@ -1023,7 +1030,7 @@ replicationConfirmation((databaseName, txnTime, confirmationCount, residentPeerL
 		countAlreadyConfirmedPeers(replicationConfirmationFloat64s, databaseName, txnTime),
 		residentPeerLists
 	);
-});
+}, assertConfirmationFeasible);
 // Per-node confirmation watchers. Previously the per-node-update callback below called
 // forEachReplicatedDatabase and discarded the returned remove handle, so every hdb_nodes
 // update added two listeners (updateTable + dropDatabase) on the global databaseEventsEmitter
