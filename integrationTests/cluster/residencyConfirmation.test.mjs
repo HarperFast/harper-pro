@@ -122,7 +122,6 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 		names = {};
 		for (const [label, node] of Object.entries({ W, B, C }))
 			names[label] = (await sendOperation(node, { operation: 'cluster_status' })).node_name;
-		// residency resolves at commit on the writer; confirm the mesh replicates a placed record first
 		const warmup = await put(
 			W,
 			'Placed/warmup',
@@ -170,7 +169,17 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 			],
 			'*;confirm=1'
 		);
-		// a later write C holds: once it confirms, C's watermark has passed every write above
+		const writes = { homedOnB, replicatedToB, mixed };
+		const settled = {};
+		for (const [label, pending] of Object.entries(writes)) pending.then((response) => (settled[label] = response));
+		// committed on W before the probe below, so C confirming the probe means C has applied them
+		await waitForCondition(
+			async () =>
+				(await readBody(W, 'Placed', 'homed-on-b')) === 'b' &&
+				(await readBody(W, 'Open', 'to-b')) === 'b' &&
+				(await readBody(W, 'Placed', 'mixed-b')) === 'b',
+			{ timeoutMs: 30_000, description: 'the tested writes to commit on W' }
+		);
 		const laterOnC = await put(
 			W,
 			'Placed/later-on-c',
@@ -179,9 +188,6 @@ suite('replicatedConfirmation counts only resident peers', { timeout: 600_000 },
 		);
 		assert.ok(laterOnC.status < 300, JSON.stringify(laterOnC));
 		assert.equal(await readBody(C, 'Placed', 'later-on-c'), 'c');
-		const writes = { homedOnB, replicatedToB, mixed };
-		const settled = {};
-		for (const [label, pending] of Object.entries(writes)) pending.then((response) => (settled[label] = response));
 		await new Promise((resolve) => setTimeout(resolve, NOT_CONFIRMED_WINDOW_MS));
 		assert.deepEqual(settled, {}, 'confirmed with the only other resident down');
 

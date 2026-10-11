@@ -866,10 +866,9 @@ export function notifyConfirmedWaiters(
  * `awaiting`. Extracted from the `replicationConfirmation(...)` registration below so the
  * settle/timeout/cleanup behavior is unit-testable directly, without going through a real commit.
  *
- * `residentPeerLists`, when present, holds the other nodes resident for the written records, one
- * list per distinct residency: only a resident holds the record (a non-resident receives an
- * invalidation stub or nothing, yet its applied watermark still passes `txnTime`), so the write is
- * confirmed once every list has `confirmationCount` confirmed members (harper-pro#1031).
+ * `residentPeerLists`: one list of other resident nodes per distinct residency among the written
+ * records. A non-resident's watermark passes `txnTime` without it holding the record, so each list
+ * must reach `confirmationCount` on its own (harper-pro#1031).
  */
 export function createConfirmationWaiter(
 	awaiting: Set<AwaitingReplication>,

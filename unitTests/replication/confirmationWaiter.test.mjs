@@ -278,9 +278,7 @@ describe('createConfirmationWaiter', () => {
 	});
 });
 
-// harper-pro#1031: on a table with residency lists only a resident holds the record; a non-resident
-// receives an invalidation stub (or nothing) yet its applied watermark still passes txnTime. Core hands
-// the waiter one list of other residents per distinct residency among the written records.
+// harper-pro#1031
 describe('createConfirmationWaiter with resident peer lists', () => {
 	const timedOut = (promise) =>
 		promise.then(
