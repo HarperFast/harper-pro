@@ -394,7 +394,7 @@ describe('filterReplicationRecipients', () => {
 });
 
 describe('assertResidentsReachable', () => {
-	const recipients = new Set(['a', 'b']);
+	const recipients = [{ name: 'a' }, { name: 'b' }];
 
 	it('accepts lists whose residents this node replicates to', () => {
 		assertResidentsReachable([['a'], ['a', 'b']], recipients, 1, 'data');

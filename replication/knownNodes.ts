@@ -879,9 +879,7 @@ export function createConfirmationWaiter(
 	alreadyConfirmedPeers: Set<string> = new Set(),
 	residentPeerLists?: string[][]
 ): Promise<void> {
-	const residentGroups = residentPeerLists?.length
-		? residentPeerLists.map((residents) => new Set(residents))
-		: undefined;
+	const residentGroups = residentPeerLists?.length ? residentPeerLists : undefined;
 	const isConfirmed = (confirmed: Set<string>) =>
 		residentGroups
 			? residentGroups.every((residents) => countMembers(confirmed, residents) >= confirmationCount)
@@ -936,9 +934,10 @@ export function createConfirmationWaiter(
 	});
 }
 
-function countMembers(confirmed: Set<string>, residents: Set<string>): number {
+// residents are distinct (core deduplicates them)
+function countMembers(confirmed: Set<string>, residents: string[]): number {
 	let count = 0;
-	for (const nodeName of confirmed) if (residents.has(nodeName)) count++;
+	for (const nodeName of residents) if (confirmed.has(nodeName)) count++;
 	return count;
 }
 
@@ -975,13 +974,15 @@ function getReplicationRecipients(databaseName: string) {
  */
 export function assertResidentsReachable(
 	residentPeerLists: string[][] | undefined,
-	recipientNames: Set<string>,
+	recipients: { name: string }[],
 	confirmationCount: number,
 	databaseName: string
 ): void {
 	for (const residents of residentPeerLists ?? []) {
-		const reachable = residents.filter((name) => recipientNames.has(name));
-		if (confirmationCount > reachable.length) {
+		let reachableCount = 0;
+		for (const name of residents) if (recipients.some((node) => node.name === name)) reachableCount++;
+		if (confirmationCount > reachableCount) {
+			const reachable = residents.filter((name) => recipients.some((node) => node.name === name));
 			throw new ClientError(
 				`Cannot confirm replication to ${confirmationCount} node(s) for database "${databaseName}": a written record is resident on ${residents.join(', ')}, of which this node replicates to ${reachable.length}${reachable.length ? ` (${reachable.join(', ')})` : ''}`
 			);
@@ -997,13 +998,7 @@ replicationConfirmation((databaseName, txnTime, confirmationCount, residentPeerL
 			`Cannot confirm replication to more nodes (${confirmationCount}) than this node replicates database "${databaseName}" to (${recipients.length} node(s): ${recipients.map((node) => node.name).join(', ')}, all in table ${nodesInTable.join(', ')})`
 		);
 	}
-	if (residentPeerLists)
-		assertResidentsReachable(
-			residentPeerLists,
-			new Set(recipients.map((node) => node.name)),
-			confirmationCount,
-			databaseName
-		);
+	if (residentPeerLists) assertResidentsReachable(residentPeerLists, recipients, confirmationCount, databaseName);
 	if (!commitsAwaitingReplication) {
 		commitsAwaitingReplication = new Map();
 		startSubscriptionToReplications();
