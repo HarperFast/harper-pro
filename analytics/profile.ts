@@ -103,6 +103,8 @@ function scheduleCapture(delay: number, delayAfterThat = shippedRescheduleDelay(
 	}
 	profilerTimer = setTimeout(() => {
 		if (startProfiler()) armCapture(delay - windowDelay, delayAfterThat);
+		// The next window must still open, or the worker never profiles again until it restarts.
+		else scheduleCapture(delay - windowDelay + delayAfterThat, delayAfterThat);
 	}, windowDelay).unref();
 	return true;
 }
@@ -146,8 +148,6 @@ function stopProfiler(restart: boolean): Profile {
 	}
 }
 
-// Rides on the report whose `utilization` sample (appended by core on the main thread) overlapped the
-// sampler, including a thread's first report after a window it reported nothing in.
 export function markProfilerSampling(metrics: { metric: string; total?: number; count?: number }[]) {
 	let sampledMs = unreportedSamplingMs;
 	unreportedSamplingMs = 0;

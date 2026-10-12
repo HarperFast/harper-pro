@@ -1,6 +1,7 @@
 import assert from 'node:assert';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { time as timeProfiler } from '@datadog/pprof';
+import sinon from 'sinon';
 import { setAnalyticsEnabled } from '#src/core/resources/analytics/write';
 import { get as envGet } from '#src/core/utility/environment/environmentManager';
 import { CONFIG_PARAMS } from '#src/core/utility/hdbTerms';
@@ -90,6 +91,30 @@ describe('Analytics profiler startup gate', () => {
 		assert.equal(timeProfiler.isStarted(), true);
 		await sleep(750);
 		assert.equal(timeProfiler.isStarted(), false);
+	});
+	it('opens the next window when the sampler fails to start at a window', async () => {
+		const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldClearNativeTimers: true });
+		const realStart = timeProfiler.start;
+		let failures = 0;
+		timeProfiler.start = (...args) => {
+			if (failures-- > 0) throw new Error('simulated profiler start failure');
+			return realStart.apply(timeProfiler, args);
+		};
+		try {
+			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 1 })), true);
+			await captureProfile(3000);
+			assert.equal(timeProfiler.isStarted(), false);
+			failures = 1;
+			await clock.tickAsync(2000);
+			assert.equal(timeProfiler.isStarted(), false);
+			await clock.tickAsync(1_000_000);
+			assert.equal(timeProfiler.isStarted(), true);
+			await clock.tickAsync(1000);
+			assert.equal(timeProfiler.isStarted(), false);
+		} finally {
+			timeProfiler.start = realStart;
+			clock.restore();
+		}
 	});
 	it('cancels a sampling window that has not opened when profiling is disabled', async () => {
 		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.2 })), true);
