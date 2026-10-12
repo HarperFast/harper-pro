@@ -79,8 +79,6 @@ export function startAutomaticProfiling(options: Scope['options']): boolean {
 	return scheduleCapture(capturePeriod, capturePeriod);
 }
 
-// One period keeps cpu-usage and the hot-location threshold meaning what they do; with a capture
-// every period it would be always-on again, which inflates `utilization` (analytics/DESIGN.md).
 function samplingWindow(): number {
 	return capturePeriod > 0 ? capturePeriod : Infinity;
 }
@@ -96,13 +94,15 @@ function cancelScheduledCapture() {
 function scheduleCapture(delay: number, delayAfterThat = shippedRescheduleDelay()): boolean {
 	cancelScheduledCapture();
 	const windowDelay = Math.max(0, delay - samplingWindow());
-	if (windowDelay === 0) {
+	// A sampler that is already running, which a failed stop can leave behind, is captured one
+	// window out rather than left sampling until the next window opens.
+	if (windowDelay === 0 || profilerStarted) {
 		if (!profilerStarted && !startProfiler()) return false;
-		armCapture(delay, delayAfterThat);
+		armCapture(Math.min(delay, samplingWindow()), delayAfterThat);
 		return true;
 	}
 	profilerTimer = setTimeout(() => {
-		if (startProfiler()) armCapture(delay - windowDelay, delayAfterThat);
+		if (profilerStarted || startProfiler()) armCapture(delay - windowDelay, delayAfterThat);
 		// The next window must still open, or the worker never profiles again until it restarts.
 		else scheduleCapture(delay - windowDelay + delayAfterThat, delayAfterThat);
 	}, windowDelay).unref();

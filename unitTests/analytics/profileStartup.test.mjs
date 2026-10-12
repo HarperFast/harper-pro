@@ -116,6 +116,27 @@ describe('Analytics profiler startup gate', () => {
 			clock.restore();
 		}
 	});
+	it('captures one window after a failed stop left the sampler running', async () => {
+		const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldClearNativeTimers: true });
+		const realStop = timeProfiler.stop;
+		let failures = 1;
+		timeProfiler.stop = (...args) => {
+			if (failures-- > 0) throw new Error('simulated profiler stop failure');
+			return realStop.apply(timeProfiler, args);
+		};
+		try {
+			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 1 })), true);
+			await captureProfile(3000);
+			assert.equal(timeProfiler.isStarted(), true);
+			await clock.tickAsync(999);
+			assert.equal(timeProfiler.isStarted(), true);
+			await clock.tickAsync(1);
+			assert.equal(timeProfiler.isStarted(), false);
+		} finally {
+			timeProfiler.stop = realStop;
+			clock.restore();
+		}
+	});
 	it('cancels a sampling window that has not opened when profiling is disabled', async () => {
 		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.2 })), true);
 		await captureProfile(600);
