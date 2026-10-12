@@ -9,7 +9,8 @@
  * restarts the copy from the same cursor: bounded, but zero progress, indefinitely.
  *
  * Setup: A seeds file-backed blob records, then B joins (add_node → base copy A→B). B's
- * fault injector makes every /blobs/ save SLOW (kept in flight across frames — the condition
+ * fault injector (workerFaultInjector.mjs, preloaded on every worker thread, so it also runs on the
+ * replication pool worker that owns the copy on the pool-on legs) makes every /blobs/ save SLOW (kept in flight across frames — the condition
  * that starves the old snapshot) and fails selected records' saves across both the initial and
  * resumed passes. `replication.blobGapReconnectMs` shortens the #683 watchdog so gap cycles take
  * seconds instead of 15 minutes.
@@ -30,6 +31,8 @@ import { ok } from 'node:assert';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import {
 	startHarper,
 	teardownHarper,
@@ -41,10 +44,11 @@ import {
 	sendOperation,
 	fetchWithRetry,
 	readLog,
-	replicationPoolOffEnv,
+	replicationPoolActive,
 	restartNode,
 	stopNodeProcess,
 	waitForCondition,
+	workerFaultInjectorThreads,
 } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '..', '..', 'dist', 'bin', 'harper.js');
@@ -109,15 +113,16 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 		const nodeA = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		const nodeB = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		await startHarper(nodeA, { config: sharedConfig(nodeA.harper.hostname), env: { HARPER_NO_FLUSH_ON_EXIT: true } });
-		await setupHarperWithFixture(nodeB, join(import.meta.dirname, 'fixture-blob-fail-slow-injector'), {
+		ctx.faultDir = await mkdtemp(join(tmpdir(), 'harper-blob-faults-'));
+		await setupHarperWithFixture(nodeB, join(import.meta.dirname, 'fixture-large-location-image'), {
 			config: {
 				...sharedConfig(nodeB.harper.hostname),
 				replication: { securePort: nodeB.harper.hostname + ':9933', blobGapReconnectMs: GAP_RECONNECT_MS },
+				threads: workerFaultInjectorThreads(),
 			},
-			// Pool off on B: its receiving sockets must be on the HTTP workers, where the injector is loaded.
 			env: {
-				...replicationPoolOffEnv(),
 				HARPER_NO_FLUSH_ON_EXIT: true,
+				HARPER_TEST_BLOB_FAULT_DIR: ctx.faultDir,
 				HARPER_TEST_BLOB_FAIL_SAVES: FAIL_SAVES.join(','),
 				HARPER_TEST_BLOB_SLOW_MS: String(BLOB_SLOW_MS),
 			},
@@ -192,12 +197,6 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 					`the seed of LargeLocation/${id} to commit (record_count ${count}, last describe_table error: ${lastCountError?.message})`,
 			});
 		}
-
-		const bootLog = await readLog(ctx.nodes[1]);
-		ok(
-			bootLog.includes('[blob-fail-slow-injector] installed'),
-			'fault injector did not load on B — the test would not exercise the failure path'
-		);
 	});
 
 	after(async () => {
@@ -205,6 +204,7 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			await stopNodeProcess(ctx.nodes[0]).catch(() => null);
 			await Promise.all(ctx.nodes.map((n) => teardownHarper({ harper: n }).catch(() => null)));
 		}
+		if (ctx.faultDir) await rm(ctx.faultDir, { recursive: true, force: true });
 	});
 
 	test('each gap cycle banks the prefix walked before its first fault, and the copy converges', async () => {
@@ -216,8 +216,7 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 			operation: 'create_authentication_tokens',
 			authorization: A.admin,
 		});
-		const armResponse = await fetchWithRetry(B.httpURL + '/ArmBlobFaultInjector');
-		ok(armResponse.ok, `fault injector did not arm: HTTP ${armResponse.status}`);
+		await writeFile(join(ctx.faultDir, 'armed'), '');
 		await sendOperation(B, {
 			operation: 'add_node',
 			rejectUnauthorized: false,
@@ -229,7 +228,7 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 		let bLog = '';
 		let resumeKeys = [];
 		let inPlaceRepairs = 0;
-		let injected = 0;
+		let injected = [];
 		let missing = [];
 		const deadline = Date.now() + 360000;
 		while (Date.now() < deadline) {
@@ -241,10 +240,10 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 				Number(m[1])
 			);
 			inPlaceRepairs = (bLog.match(/Repaired blob file in place/g) ?? []).length;
-			injected = (bLog.match(/\[blob-fail-slow-injector\] failing save /g) ?? []).length;
+			injected = (await readdir(ctx.faultDir)).filter((name) => name.startsWith('failed-'));
 			if (
 				bCount >= aCount &&
-				injected >= FAIL_SAVES.length &&
+				injected.length >= FAIL_SAVES.length &&
 				inPlaceRepairs >= INITIAL_DAMAGED_RECORDS &&
 				(missing = await missingReferencedPayloadIds(B, aCount)).length === 0
 			)
@@ -260,8 +259,13 @@ suite('Copy-cursor banking across repeated transient blob faults (#699)', { time
 		);
 
 		ok(
-			injected === FAIL_SAVES.length,
-			`fault schedule did not fully materialize (${injected}/${FAIL_SAVES.length} injected failures)`
+			injected.length === FAIL_SAVES.length,
+			`fault schedule did not fully materialize (${injected.length}/${FAIL_SAVES.length} injected failures: [${injected}])`
+		);
+		const receivingThreadType = replicationPoolActive() ? 'replication' : 'http';
+		ok(
+			injected.every((name) => name.endsWith('-' + receivingThreadType)),
+			`every fault must land on a ${receivingThreadType} worker, which owns the receiving socket on this leg: [${injected}]`
 		);
 		// A banked cycle reconnects immediately after its final barrier persist; the watchdog only
 		// paces cycles that banked nothing. Either signal proves gap cycles occurred.

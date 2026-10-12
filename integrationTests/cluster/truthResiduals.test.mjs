@@ -1,10 +1,10 @@
 /**
  * What this pins for the W1 connection-truth residuals (harper-pro#431), one case per residual:
  *
- *  - R1: with the peer frozen (so no close will ever arrive and its liveness stays fresh), killing the HTTP
- *    worker that owns the subscription still corrects truth to down, within two reconcile ticks and carrying
- *    the distinct worker-exit close code. The kill comes from fixture-worker-exit; see its resources.js for
- *    why no operation produces this fault.
+ *  - R1: with the peer frozen (so no close will ever arrive and its liveness stays fresh), killing the worker
+ *    that owns the subscription (HTTP or replication pool) still corrects truth to down, within two
+ *    reconcile ticks and carrying the distinct worker-exit close code. The kill comes from fixture-worker-exit;
+ *    see its resources.js for why no operation produces this fault.
  *  - R2: a remove_node + re-add inside one process reconnects with NO lastConnectionError. `unsubscribe()`
  *    closes with 1008 and nothing ever clears the error slots, so this is the field that would carry a
  *    failure the re-added link never suffered.
@@ -37,7 +37,8 @@ import {
 	readNodePid,
 	waitForCondition,
 	fetchWithRetry,
-	replicationPoolOffEnv,
+	replicationPoolActive,
+	workerFaultInjectorThreads,
 } from './clusterShared.mjs';
 
 process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(
@@ -134,12 +135,11 @@ async function ensureSubscribed(node, peer) {
 	});
 }
 
-// Terminate the HTTP worker thread serving this request (fixture-worker-exit). Returns what that endpoint
-// reported, including the thread id it is about to kill, so the caller can assert it really was the thread
-// that owned the subscription.
-async function killOwningWorker(node) {
-	const response = await fetchWithRetry(`${node.httpURL}/KillHttpWorker/`, { retries: 5 });
-	return response.json();
+// Terminate the worker thread `threadId` (fixture-worker-exit through the preloaded injector). Returns that
+// thread's ack — its id and thread type — or undefined when no thread by that id answered.
+async function killWorker(node, threadId) {
+	const response = await fetchWithRetry(`${node.httpURL}/KillWorker/${threadId}`, { retries: 5 });
+	return (await response.json()).killed;
 }
 
 async function armSubscribeAfterOpen(node) {
@@ -214,15 +214,14 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ct
 		const subscriberCtx = { name: ctx.name, harper: { hostname: await getNextAvailableLoopbackAddress() } };
 		await startHarper(peerCtx, nodeStartOptions(peerCtx.harper));
 		const subscriberOptions = nodeStartOptions(subscriberCtx.harper);
-		// One HTTP worker, so the thread that answers the kill endpoint is provably the thread that owns the
-		// subscription — the test asserts that identity rather than assuming it. Pool off: a pool worker would
-		// own the subscription, and the fixture's endpoints run only on HTTP workers.
-		subscriberOptions.config.threads = { count: 1 };
+		// One HTTP worker: with the pool off, the HTTP worker serving the fixture endpoints is the owning
+		// thread. The kill is addressed by thread id either way, so on the pool-on legs it lands on the pool
+		// worker that owns the subscription.
+		subscriberOptions.config.threads = workerFaultInjectorThreads({ count: 1 });
 		await setupHarperWithFixture(subscriberCtx, join(import.meta.dirname, 'fixture-worker-exit'), {
 			...subscriberOptions,
 			env: {
-				...replicationPoolOffEnv(),
-				HARPER_TEST_KILL_HTTP_WORKER: '1',
+				HARPER_TEST_WORKER_COMMANDS: '1',
 				HARPER_TEST_ALLOW_SUBSCRIBE_AFTER_OPEN_HOOK: '1',
 			},
 		});
@@ -273,12 +272,16 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ct
 					'assertion below would pass without the worker-exit stamp'
 			);
 
-			// Kill the HTTP worker thread that owns the subscription. It dies without running its
-			// connection's close handler, so nothing worker-side can record the disconnect — the state
-			// only the main thread can correct.
-			const killed = await killOwningWorker(subscriber);
-			equal(killed.armed, true, 'the worker-kill fixture must be armed');
-			equal(killed.threadId, beforeKill.threadId, 'the killed worker must be the one that owns the subscription');
+			// Kill the worker thread that owns the subscription. It dies without running its connection's
+			// close handler, so nothing worker-side can record the disconnect — the state only the main
+			// thread can correct.
+			const killed = await killWorker(subscriber, beforeKill.threadId);
+			equal(killed?.threadId, beforeKill.threadId, 'the subscription-owning worker must acknowledge the kill');
+			equal(
+				killed.threadType,
+				replicationPoolActive() ? 'replication' : 'http',
+				'the subscription must be owned by the thread type this leg configures'
+			);
 
 			const corrected = await pollPeerSocket(
 				subscriber,
@@ -450,9 +453,11 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ct
 		});
 
 		const armed = await armSubscribeAfterOpen(subscriber);
-		equal(armed.armed, true, 'the runtime control must arm the subscribe-after-open hook');
 		equal(armed.database, 'data');
-		equal(armed.threadId, down.threadId, 'the sole HTTP worker arming the hook must be the subscription-owning worker');
+		ok(
+			armed.armedThreads.some(({ threadId }) => threadId === down.threadId),
+			`the subscription-owning worker ${down.threadId} must arm the hook (armed: ${JSON.stringify(armed.armedThreads)})`
+		);
 
 		const beforeReconnectLog = await readLog(subscriber);
 		const markerBaseline = countOccurrences(beforeReconnectLog, SUBSCRIBE_AFTER_OPEN_MARKER);
