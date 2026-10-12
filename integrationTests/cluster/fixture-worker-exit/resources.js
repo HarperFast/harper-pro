@@ -1,7 +1,5 @@
 // Test-only component for harper-pro#431 connection-truth cases. Its endpoints run on an HTTP worker and
-// relay commands to the `threads.preload` injector (integrationTests/cluster/workerFaultInjector.mjs) on
-// every worker thread, so they reach the thread that owns a replication subscription whether that is an
-// HTTP worker or a `replication` pool worker, which loads no application code.
+// relay commands to workerFaultInjector.mjs, preloaded on every worker thread, pool workers included.
 //
 // Exiting a worker thread stops THAT THREAD, not the process, and it stops it hard — no 'close' on the
 // replication socket, no shared-status DOWN write. That is exactly the fault the worker-exit truth stamp
@@ -14,9 +12,9 @@ import { BroadcastChannel } from 'node:worker_threads';
 
 const COMMAND_CHANNEL = 'harper-test-worker-commands';
 
-// Resolves with the acks that arrive within `windowMs`, or with the first one for a command addressed to a
-// single thread. This thread's own injector receives the command too.
-function sendWorkerCommand(command, windowMs = 1000) {
+// Resolves with the acks that arrive within `windowMs`, or as soon as thread `untilThreadId` acks. This
+// thread's own injector receives the command too.
+function sendWorkerCommand(command, untilThreadId, windowMs = 5000) {
 	const id = `${Date.now()}-${Math.random()}`;
 	const channel = new BroadcastChannel(COMMAND_CHANNEL);
 	const acks = [];
@@ -30,7 +28,7 @@ function sendWorkerCommand(command, windowMs = 1000) {
 		channel.onmessage = ({ data }) => {
 			if (data?.ack !== id) return;
 			acks.push({ threadId: data.threadId, threadType: data.threadType });
-			if (command.threadId !== undefined) finish();
+			if (data.threadId === untilThreadId) finish();
 		};
 		channel.postMessage({ ...command, id });
 	});
@@ -42,24 +40,24 @@ export class KillWorker extends Resource {
 
 	async get(target) {
 		target.checkPermission = false;
-		const [killed] = await sendWorkerCommand({ type: 'exit', threadId: Number(target.id) }, 5000);
+		const threadId = Number(target.id);
+		const [killed] = await sendWorkerCommand({ type: 'exit', threadId }, threadId);
 		return { killed };
 	}
 }
 
-// Arms R5's subscribe-deferral hook at runtime rather than at startup, so R1-R4 run unperturbed. On every
-// thread: the re-subscribe this precedes may be placed on any replication worker, and the hook is a
-// one-shot per thread.
+// GET /ArmSubscribeAfterOpen/<owner threadId>: arms R5's subscribe-deferral hook at runtime, so R1-R4 run
+// unperturbed. On every thread, since the re-subscribe may be placed on another replication worker; returns
+// once the current owner has armed.
 export class ArmSubscribeAfterOpen extends Resource {
 	static loadAsInstance = false;
 
 	async get(target) {
 		target.checkPermission = false;
-		const armedThreads = await sendWorkerCommand({
-			type: 'set-env',
-			name: 'HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB',
-			value: 'data',
-		});
+		const armedThreads = await sendWorkerCommand(
+			{ type: 'set-env', name: 'HARPER_TEST_SUBSCRIBE_AFTER_OPEN_ONCE_DB', value: 'data' },
+			Number(target.id)
+		);
 		return { database: 'data', armedThreads };
 	}
 }
