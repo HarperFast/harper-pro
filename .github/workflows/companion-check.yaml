@@ -68,6 +68,8 @@ jobs:
   evaluate:
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
+    # A sweep takes seconds; a hung API read must not hold the sweep queue.
+    timeout-minutes: 10
     steps:
       - name: Evaluate companion dependencies
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -83,14 +85,13 @@ jobs:
             const apiUrl = context.apiUrl || 'https://api.github.com';
             const depCache = new Map();
 
-            const badSegment = (s) => s.includes('..') || s.startsWith('.');
-
             function parseDeps(body) {
               const deps = [];
               let unparseable = false;
               const lineRe = /^[^\S\r\n]*depends[- ]on:[ \t]*(.*)$/gim;
               const refRe =
                 /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)|([\w.-]+)\/([\w.-]+)#(\d+)|([\w.-]+)#(\d+)/g;
+              const badSegment = (s) => s.includes('..') || s.startsWith('.');
               for (const [, refs] of (body || '').matchAll(lineRe)) {
                 let matched = 0;
                 for (const m of refs.matchAll(refRe)) {
@@ -172,6 +173,8 @@ jobs:
             const readError = (e) => `(${e.status || e.message})`;
             const submoduleUrlRe =
               /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/;
+            // The only segments that would move an API path: the URL pattern admits no `/`.
+            const dotSegment = (s) => s === '.' || s === '..';
 
             const MAX_LISTED_FILES = 3000; // pulls.listFiles stops here, however it is paged
 
@@ -197,7 +200,6 @@ jobs:
               }
             }
 
-            // Resolved at the PR head, never from the parent repo's own remote.
             async function submoduleAt(pr, path) {
               let data;
               try {
@@ -206,13 +208,12 @@ jobs:
                 return { error: `Cannot read submodule ${path} ${readError(e)}` };
               }
               const m = data.type === 'submodule' && submoduleUrlRe.exec(data.submodule_git_url || '');
-              if (!m || badSegment(m[1]) || badSegment(m[2]))
+              if (!m || dotSegment(m[1]) || dotSegment(m[2]))
                 return { error: `Cannot resolve the GitHub repo of submodule ${path}` };
               return { sub: { owner: m[1], repo: m[2] }, sha: data.sha };
             }
 
-            // The submodule branch named like the PR's base, else the submodule's default branch
-            // (same rule as Dispatch's settleBranch, so the pre-PR check and this gate agree).
+            // Keep in step with settleBranch in Dispatch's dispatch/lib/companion.mjs, the pre-PR check.
             function settleBranch(sub, base) {
               return memo(sub, `:settle:${base}`, async () => {
                 try {

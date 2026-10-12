@@ -281,9 +281,10 @@ Object.assign(filesDb, {
 	813: [gitlink('vendor/lib', COMPARE_500, otherHarper), gitlink('core', UNSETTLED)],
 	814: [gitlink('core', UNSETTLED, { status: 'added' })],
 	815: [gitlink('vendor/flaky', SETTLED_MAIN, { url: 'https://github.com/HarperFast/flaky.git' })],
-	816: [gitlink('vendor/evil', SETTLED_MAIN, { url: 'git@github.com:HarperFast/...git' })],
+	816: [gitlink('vendor/evil', SETTLED_MAIN, { url: 'https://github.com/../harper.git' })],
 	817: [gitlink('core', UNSETTLED), gitlink('vendor/lib', COMPARE_500, otherHarper)],
 	818: [gitlink('vendor/look', SETTLED_MAIN, { url: 'https://github.com.evil.com/HarperFast/harper.git' })],
+	828: [gitlink('vendor/dot', SETTLED_MAIN, { url: 'git@github.com:HarperFast/.github.git' })],
 	819: [gitlink('core', UNSETTLED, { patch: false })],
 	820: [
 		textFile('empty.txt', null, { additions: 0, deletions: 0 }),
@@ -327,6 +328,7 @@ const gitlinkPrs = [
 	pr(825, 'patchless gitlink, head tree truncated', 'gl25'),
 	pr(826, 'unsettled gitlink, head tree unreadable', 'gl26'),
 	pr(827, 'binary file, head tree unreadable', 'gl27'),
+	pr(828, 'submodule repo named with a leading dot', 'gl28'),
 ];
 const gl = makeEnv('schedule', gitlinkPrs);
 const glBySha = await run(gl);
@@ -374,9 +376,15 @@ assert.equal(glBySha.gl15.description, 'Cannot read HarperFast/flaky branches (5
 assert.equal(glBySha.gl16.state, 'pending', 'path-traversal submodule URL is never looked up');
 assert.equal(glBySha.gl16.description, 'Cannot resolve the GitHub repo of submodule vendor/evil');
 assert.equal(glBySha.gl18.description, 'Cannot resolve the GitHub repo of submodule vendor/look');
-assert.ok(
-	gl.calls.getBranch.every((b) => b.startsWith('HarperFast/harper:') || b.startsWith('HarperFast/flaky:')),
+assert.deepEqual(
+	[...new Set(gl.calls.getBranch.map((b) => b.split(':')[0]))].sort(),
+	['HarperFast/.github', 'HarperFast/flaky', 'HarperFast/harper'],
 	'only well-formed GitHub submodule repos are queried'
+);
+assert.equal(
+	glBySha.gl28.description,
+	'Cannot read HarperFast/.github branches (404)',
+	'a leading-dot repo name is a real repo'
 );
 assert.equal(glBySha.gl19.state, 'failure', 'a gitlink with no patch is found through the head tree');
 assert.equal(glBySha.gl20.state, 'success', 'patchless regular files are not gitlinks');
