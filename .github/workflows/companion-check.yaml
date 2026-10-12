@@ -21,14 +21,23 @@
 # (Sync Core resets core's branch tracking to the default first, so a merged
 # `core:set-branch` override cannot wedge it).
 #
-# PRs without a marker get an immediate `success` status, so the required
-# check never blocks ordinary PRs. The cron sweep reconciles every open PR,
-# so it also backfills statuses after this workflow first lands and heals
-# any status a dropped webhook left behind.
+# PRs without a marker get `success` unless they move a submodule pointer
+# (e.g. `core`) onto a commit not yet on the submodule repo's settle branch:
+# its branch named like the PR's base if one exists, else its default branch.
+# Such a PR fails until its body declares the companion PR carrying that
+# commit; a PR with a marker is judged on its companions alone. Ordinary PRs,
+# submodule removals and bumps between settled commits stay green, and a PR
+# touching no gitlink costs one PR-files listing (plus one head-tree read when
+# GitHub omits a file's patch). The cron sweep reconciles every open PR, so it
+# also backfills statuses after this workflow first lands, heals any status a
+# dropped webhook left behind, and clears a failure once the pointer's commit
+# lands on the settle branch.
 #
 # Referencing a private repo requires a `COMPANION_CHECK_TOKEN` secret with
 # pull-request read access to that repo; public repos (harper) work with
-# GITHUB_TOKEN. The secret is only used for same-org refs on non-fork PRs.
+# GITHUB_TOKEN. The secret is only used for same-org refs on non-fork PRs, and
+# never for submodule lookups (the submodule URL is PR-controlled), so a
+# private submodule repo reads as unreadable and holds the status at pending.
 #
 # Maintenance rule for `pull_request_target`: never add a checkout step and
 # never interpolate PR-controlled text into `run:` or expressions beyond
@@ -74,13 +83,14 @@ jobs:
             const apiUrl = context.apiUrl || 'https://api.github.com';
             const depCache = new Map();
 
+            const badSegment = (s) => s.includes('..') || s.startsWith('.');
+
             function parseDeps(body) {
               const deps = [];
               let unparseable = false;
               const lineRe = /^[^\S\r\n]*depends[- ]on:[ \t]*(.*)$/gim;
               const refRe =
                 /https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)|([\w.-]+)\/([\w.-]+)#(\d+)|([\w.-]+)#(\d+)/g;
-              const badSegment = (s) => s.includes('..') || s.startsWith('.');
               for (const [, refs] of (body || '').matchAll(lineRe)) {
                 let matched = 0;
                 for (const m of refs.matchAll(refRe)) {
@@ -152,14 +162,161 @@ jobs:
               return 'missing';
             }
 
-            async function evaluate({ deps, unparseable }, allowSecret) {
+            const lookupCache = new Map();
+            // Repo names are case-insensitive; branch names are not.
+            const memo = (sub, key, lookup) => {
+              key = `${sub.owner}/${sub.repo}`.toLowerCase() + key;
+              if (!lookupCache.has(key)) lookupCache.set(key, lookup());
+              return lookupCache.get(key);
+            };
+            const readError = (e) => `(${e.status || e.message})`;
+            const submoduleUrlRe =
+              /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/;
+
+            const MAX_LISTED_FILES = 3000; // pulls.listFiles stops here, however it is paged
+
+            // A gitlink's patch adds `Subproject commit <sha>` with `sha` equal to that commit; a
+            // regular file's `sha` is its blob id, which cannot appear in its own content.
+            const isGitlinkPatch = (f) =>
+              f.patch?.match(/^\+Subproject commit ([0-9a-f]{40})$/m)?.[1] === f.sha;
+
+            // GitHub omits `patch` for binary and empty files, and for every file past a page's
+            // diff-size budget (zeroing its line counts too), so the head tree decides those.
+            async function headGitlinkPaths(pr) {
+              try {
+                const { data } = await github.rest.git.getTree({
+                  owner,
+                  repo,
+                  tree_sha: pr.head.sha,
+                  recursive: 'true',
+                });
+                if (data.truncated) return { error: 'Cannot check submodule pointers: PR head tree truncated' };
+                return { paths: new Set(data.tree.filter((e) => e.type === 'commit').map((e) => e.path)) };
+              } catch (e) {
+                return { error: `Cannot read the PR head tree ${readError(e)}` };
+              }
+            }
+
+            // Resolved at the PR head, never from the parent repo's own remote.
+            async function submoduleAt(pr, path) {
+              let data;
+              try {
+                ({ data } = await github.rest.repos.getContent({ owner, repo, path, ref: pr.head.sha }));
+              } catch (e) {
+                return { error: `Cannot read submodule ${path} ${readError(e)}` };
+              }
+              const m = data.type === 'submodule' && submoduleUrlRe.exec(data.submodule_git_url || '');
+              if (!m || badSegment(m[1]) || badSegment(m[2]))
+                return { error: `Cannot resolve the GitHub repo of submodule ${path}` };
+              return { sub: { owner: m[1], repo: m[2] }, sha: data.sha };
+            }
+
+            // The submodule branch named like the PR's base, else the submodule's default branch
+            // (same rule as Dispatch's settleBranch, so the pre-PR check and this gate agree).
+            function settleBranch(sub, base) {
+              return memo(sub, `:settle:${base}`, async () => {
+                try {
+                  await github.rest.repos.getBranch({ ...sub, branch: base });
+                  return { branch: base };
+                } catch (e) {
+                  if (e.status !== 404) return { error: readError(e) };
+                }
+                try {
+                  const { data } = await github.rest.repos.get(sub);
+                  return { branch: data.default_branch };
+                } catch (e) {
+                  return { error: readError(e) };
+                }
+              });
+            }
+
+            function isSettled(sub, branch, sha) {
+              return memo(sub, `:compare:${branch}...${sha}`, async () => {
+                try {
+                  const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                    ...sub,
+                    basehead: `${branch}...${sha}`,
+                    per_page: 1,
+                  });
+                  if (data.status === 'behind' || data.status === 'identical') return { settled: true };
+                  if (data.status === 'ahead' || data.status === 'diverged') return { settled: false };
+                  return { error: `(compare status ${data.status})` };
+                } catch (e) {
+                  return { error: readError(e) };
+                }
+              });
+            }
+
+            async function evaluateUndeclared(pr) {
+              let files;
+              try {
+                files = await github.paginate(github.rest.pulls.listFiles, {
+                  owner,
+                  repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                });
+              } catch (e) {
+                return { state: 'pending', description: `Cannot list PR files ${readError(e)}` };
+              }
+              if (files.length >= MAX_LISTED_FILES)
+                return {
+                  state: 'pending',
+                  description: `Cannot check submodule pointers past GitHub's ${MAX_LISTED_FILES}-file PR listing`,
+                };
+              const kept = files.filter((f) => f.status !== 'removed');
+              const paths = kept.filter(isGitlinkPatch).map((f) => f.filename);
+              const settled = [];
+              let unreadable;
+              const patchless = kept.filter((f) => !f.patch);
+              if (patchless.length) {
+                const head = await headGitlinkPaths(pr);
+                if (head.error) unreadable = head.error;
+                else paths.push(...patchless.map((f) => f.filename).filter((path) => head.paths.has(path)));
+              }
+              for (const path of paths) {
+                const gitlink = await submoduleAt(pr, path);
+                if (gitlink.error) {
+                  unreadable ??= gitlink.error;
+                  continue;
+                }
+                const { sub, sha } = gitlink;
+                const nwo = `${sub.owner}/${sub.repo}`;
+                const settle = await settleBranch(sub, pr.base.ref);
+                if (settle.error) {
+                  unreadable ??= `Cannot read ${nwo} branches ${settle.error}`;
+                  continue;
+                }
+                const check = await isSettled(sub, settle.branch, sha);
+                if (check.error) {
+                  unreadable ??= `Cannot check ${path} against ${nwo} ${settle.branch} ${check.error}`;
+                  continue;
+                }
+                if (check.settled) {
+                  settled.push(`${path} on ${nwo} ${settle.branch}`);
+                  continue;
+                }
+                return {
+                  state: 'failure',
+                  description: `${path} is on ${nwo}@${sha.slice(0, 7)}, not yet on ${settle.branch}: add "Depends-on: ${nwo}#<PR>" naming its PR, or re-point it`,
+                };
+              }
+              if (unreadable) return { state: 'pending', description: unreadable };
+              return {
+                state: 'success',
+                description: settled.length
+                  ? `No companion dependencies (${settled.join(', ')})`
+                  : 'No companion dependencies',
+              };
+            }
+
+            async function evaluate(pr, { deps, unparseable }, allowSecret) {
               if (unparseable)
                 return {
                   state: 'failure',
                   description: 'Empty or unparseable Depends-on marker (use owner/repo#N or a PR URL)',
                 };
-              if (!deps.length)
-                return { state: 'success', description: 'No companion dependencies' };
+              if (!deps.length) return evaluateUndeclared(pr);
               if (deps.length > MAX_DEPS)
                 return {
                   state: 'failure',
@@ -227,7 +384,12 @@ jobs:
                   repo,
                   pull_number: pr.number,
                 });
-                if (fresh.head.sha !== pr.head.sha || fresh.body !== pr.body) return;
+                if (
+                  fresh.head.sha !== pr.head.sha ||
+                  fresh.body !== pr.body ||
+                  fresh.base.ref !== pr.base.ref
+                )
+                  return;
               }
               await postStatus(pr.head.sha, desired.state, description);
               core.info(`${pr.number} -> ${desired.state}: ${description}`);
@@ -244,21 +406,17 @@ jobs:
                   });
             let failures = 0;
             for (const pr of prs) {
-              let parsed;
               try {
-                parsed = parseDeps(pr.body);
                 const allowSecret =
                   !!pr.head.repo && pr.head.repo.full_name === `${owner}/${repo}`;
-                await postIfChanged(pr, await evaluate(parsed, allowSecret));
+                await postIfChanged(pr, await evaluate(pr, parseDeps(pr.body), allowSecret));
               } catch (e) {
                 failures++;
                 core.warning(`PR #${pr.number}: ${e.message}`);
                 // A failed refresh must not leave a stale success behind.
-                if (parsed && (parsed.deps.length || parsed.unparseable)) {
-                  try {
-                    await postStatus(pr.head.sha, 'pending', 'companion-check errored; next run will retry');
-                  } catch {}
-                }
+                try {
+                  await postStatus(pr.head.sha, 'pending', 'companion-check errored; next run will retry');
+                } catch {}
               }
             }
             if (failures) core.setFailed(`${failures} PR(s) could not be updated`);
