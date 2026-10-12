@@ -142,7 +142,11 @@ describe('Analytics profiler startup gate', () => {
 		await captureProfile(600);
 		assert.equal(timeProfiler.isStarted(), false);
 		assert.equal(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 0.2 })), false);
-		await sleep(800);
+		// Between where the window would have opened (400 ms) and its capture (600 ms), which would
+		// have stopped the sampler again and hidden a window that was never cancelled.
+		await sleep(500);
+		assert.equal(timeProfiler.isStarted(), false);
+		await sleep(300);
 		assert.equal(timeProfiler.isStarted(), false);
 	});
 });
