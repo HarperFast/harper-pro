@@ -250,13 +250,10 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 		// would delete `replication.databases: ['data']` and the restarted node would
 		// try to open `db: system` replication to its peers (which they reject).
 		ctx.nodes[0] = (await startHarper({ name: ctx.name, harper: ctx.nodes[0] }, nodeStartOptions(ctx.nodes[0]))).harper;
-		// One budget for the whole recovery. The restarted hub subscribes to every leaf over sockets
-		// it opens within ~300 ms of boot, so it catches up at once. A leaf receives the hub's data
-		// over the leaf's OWN outbound socket, which has sat in NodeReplicationConnection's reconnect
-		// backoff since the kill (full jitter, ceiling 500 ms * 2^attempt, capped at 30 s), so its
-		// next retry can fire up to the 30 s cap after the hub is back; the rest is delivery. Nothing
-		// is lost in that window (CI runs 38034562676, 38120273091, 38179034420: the record landed
-		// 0.1-0.8 s after a 5.2 s poll window closed), so poll to the schedule's bound instead.
+		// A leaf resumes receiving from the restarted hub only when its own outbound socket's next
+		// backoff retry fires (ceiling capped at 30 s), so the whole recovery shares one budget of
+		// that cap plus delivery — replication/DESIGN.md, "A restarted node's own sockets do not
+		// resume its peers' inbound streams".
 		const RECOVERY_BUDGET_MS = 35_000;
 		const recoveryDeadline = Date.now() + RECOVERY_BUDGET_MS;
 		const remainingBudget = () => Math.max(1, recoveryDeadline - Date.now());
@@ -284,6 +281,11 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 				return `status unavailable (${error.message})`;
 			}
 		};
+		const failWithHubSockets = async (i, what, error) =>
+			new Error(
+				`Node ${i} ${ctx.nodes[i].hostname} ${what} within ${RECOVERY_BUDGET_MS}ms of node 0's restart; node ${i}'s sockets to node 0: ${await describeHubSockets(ctx.nodes[i])}`,
+				{ cause: error }
+			);
 		const waitForRecord = async (i) => {
 			try {
 				return await waitForCondition(
@@ -298,40 +300,37 @@ suite('Replication Topology', { timeout: 180000 }, (ctx) => {
 					{ timeoutMs: remainingBudget(), pollMs: 200, description: `node ${i} to hold record 2` }
 				);
 			} catch (error) {
-				throw new Error(
-					`Node ${i} ${ctx.nodes[i].hostname} did not receive the record written while node 0 was down within ${RECOVERY_BUDGET_MS}ms of its restart; node ${i}'s sockets to node 0: ${await describeHubSockets(ctx.nodes[i])}`,
-					{ cause: error }
-				);
+				throw await failWithHubSockets(i, 'did not receive the record written while node 0 was down', error);
 			}
 		};
-		// ensure the data gets to the central node
 		let response = await waitForRecord(0);
 		equal(response.length, 1);
 		equal(response[0].name, 'test while disconnected');
-		// and is passed on to the other leaves
 		for (let i = 2; i < NODE_COUNT; i++) {
 			response = await waitForRecord(i);
 			equal(response.length, 1, `Node ${i} did not receive the transitively-replicated record from node 0`);
 			equal(response[0].name, 'test while disconnected');
 		}
-		// Node 1 wrote the record itself, so holding it says nothing about its inbound socket from
-		// node 0. The next test's `replicatedConfirmation: NODE_COUNT - 1` write waits on every leaf
-		// and its 1 s TTL expires if one is still in backoff, so leave only once each leaf's socket to
-		// node 0 is back up.
+		// Writer node 1 holds its own row, so only its socket shows its inbound stream is back — the
+		// next test's `replicatedConfirmation: NODE_COUNT - 1` write needs that from every leaf.
 		for (let i = 1; i < NODE_COUNT; i++) {
-			await waitForCondition(
-				async (signal) => {
-					const sockets = hubSocketsSeenBy(
-						await sendOperation(ctx.nodes[i], { operation: 'cluster_status' }, { signal })
-					);
-					return sockets.length > 0 && sockets.every((socket) => socket.connected);
-				},
-				{
-					timeoutMs: remainingBudget(),
-					pollMs: 200,
-					description: `node ${i} to reconnect its replication socket to node 0`,
-				}
-			);
+			try {
+				await waitForCondition(
+					async (signal) => {
+						const sockets = hubSocketsSeenBy(
+							await sendOperation(ctx.nodes[i], { operation: 'cluster_status' }, { signal })
+						);
+						return sockets.length > 0 && sockets.every((socket) => socket.connected);
+					},
+					{
+						timeoutMs: remainingBudget(),
+						pollMs: 200,
+						description: `node ${i} to reconnect its replication socket to node 0`,
+					}
+				);
+			} catch (error) {
+				throw await failWithHubSockets(i, 'did not reconnect its replication socket to node 0', error);
+			}
 		}
 	});
 	test('replicate per-record expiration so records evict on receivers', async () => {
