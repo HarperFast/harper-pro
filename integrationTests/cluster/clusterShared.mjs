@@ -168,14 +168,13 @@ export function replicationPoolActive() {
 }
 
 /**
- * `threads` config that preloads workerFaultInjector.mjs on every worker thread — the only way test fault
- * injection reaches a `replication` pool worker, which loads no application code. Its features are armed by
- * env; see that module.
+ * `threads` config that preloads workerFaultInjector.mjs on every worker thread, `replication` pool workers
+ * included. Its features are armed by env; see that module.
  *
  * @param {Object} [threads] - other `threads` config to keep
  */
 export function workerFaultInjectorThreads(threads) {
-	return { ...threads, preload: [join(import.meta.dirname, 'workerFaultInjector.mjs')] };
+	return { ...threads, preload: [...(threads?.preload ?? []), join(import.meta.dirname, 'workerFaultInjector.mjs')] };
 }
 
 /**

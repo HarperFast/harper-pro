@@ -142,8 +142,8 @@ async function killWorker(node, threadId) {
 	return (await response.json()).killed;
 }
 
-async function armSubscribeAfterOpen(node) {
-	const response = await fetchWithRetry(`${node.httpURL}/ArmSubscribeAfterOpen/`, { retries: 5 });
+async function armSubscribeAfterOpen(node, ownerThreadId) {
+	const response = await fetchWithRetry(`${node.httpURL}/ArmSubscribeAfterOpen/${ownerThreadId}`, { retries: 5 });
 	return response.json();
 }
 
@@ -452,7 +452,7 @@ suite('W1 connection-truth residuals (harper-pro#431)', { timeout: 450000 }, (ct
 			description: `${subscriber.hostname} to retain a disconnected entry for ${peer.hostname}`,
 		});
 
-		const armed = await armSubscribeAfterOpen(subscriber);
+		const armed = await armSubscribeAfterOpen(subscriber, down.threadId);
 		equal(armed.database, 'data');
 		ok(
 			armed.armedThreads.some(({ threadId }) => threadId === down.threadId),

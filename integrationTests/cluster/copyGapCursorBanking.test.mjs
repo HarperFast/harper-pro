@@ -9,9 +9,9 @@
  * restarts the copy from the same cursor: bounded, but zero progress, indefinitely.
  *
  * Setup: A seeds file-backed blob records, then B joins (add_node → base copy A→B). B's
- * fault injector (workerFaultInjector.mjs, preloaded on every worker thread, so it also runs on the
- * replication pool worker that owns the copy on the pool-on legs) makes every /blobs/ save SLOW (kept in flight across frames — the condition
- * that starves the old snapshot) and fails selected records' saves across both the initial and
+ * fault injector (workerFaultInjector.mjs, preloaded on every worker thread, pool workers
+ * included) makes every /blobs/ save SLOW (kept in flight across frames — the condition that
+ * starves the old snapshot) and fails selected records' saves across both the initial and
  * resumed passes. `replication.blobGapReconnectMs` shortens the #683 watchdog so gap cycles take
  * seconds instead of 15 minutes.
  *
