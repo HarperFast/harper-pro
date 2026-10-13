@@ -41,7 +41,12 @@ export async function materializeOperationResponse(response: any): Promise<any> 
 	if (Array.isArray(response)) {
 		return { results: await Promise.all(response) };
 	}
-	if (response !== null && typeof response === 'object' && !Object.isExtensible(response)) {
+	if (
+		response !== null &&
+		typeof response === 'object' &&
+		!Object.isExtensible(response) &&
+		!Object.getOwnPropertyDescriptor(response, 'requestId')?.writable
+	) {
 		const prototype = Object.getPrototypeOf(response);
 		if (prototype === Object.prototype || prototype === null) {
 			const descriptors = Object.getOwnPropertyDescriptors(response);

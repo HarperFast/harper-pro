@@ -73,9 +73,11 @@ describe('materializeOperationResponse', () => {
 		await assert.rejects(materializeOperationResponse(boom()), /mid-stream failure/);
 	});
 
-	it('returns a plain object the caller can extend unchanged (by reference)', async () => {
+	it('returns a plain object the caller can stamp unchanged (by reference)', async () => {
 		const response = { message: 'ok' };
 		assert.equal(await materializeOperationResponse(response), response);
+		const sealed = Object.seal({ message: 'ok', requestId: undefined });
+		assert.equal(await materializeOperationResponse(sealed), sealed, 'its own writable requestId takes the stamp');
 	});
 
 	it('copies a frozen plain object shallowly so the caller can stamp it, leaving the original alone', async () => {

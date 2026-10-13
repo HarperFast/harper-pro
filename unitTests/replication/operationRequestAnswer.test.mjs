@@ -189,6 +189,14 @@ describe('answering an OPERATION_REQUEST', function () {
 			symbolGetter.recalled = true;
 			server.operation = () => Promise.resolve(Object.freeze(symbolGetter));
 			expect(await answerTo(14)).to.deep.equal({ recalled: true, requestId: 14 });
+			server.operation = () =>
+				Promise.resolve({
+					recalled: true,
+					get [Symbol('unencoded')]() {
+						throw new Error('the encoder never reads symbol keys');
+					},
+				});
+			expect(await answerTo(17)).to.deep.equal({ recalled: true, requestId: 17 });
 		});
 
 		it('answers a result whose field throws on read with one correlated error, and keeps the connection', async () => {
