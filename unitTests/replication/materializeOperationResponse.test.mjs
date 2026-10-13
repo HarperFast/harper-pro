@@ -79,24 +79,23 @@ describe('materializeOperationResponse', () => {
 		const copy = await materializeOperationResponse(response);
 		assert.notEqual(copy, response);
 		assert.equal(copy.nested, nested, 'shallow: nested values are shared, not cloned');
+		copy.requestId = 1;
+		assert.deepEqual(copy, { message: 'ok', nested, requestId: 1 });
+		assert.equal(response.requestId, 'stale');
+	});
+
+	it('copies a null-prototype object by descriptor, with a fresh writable requestId slot', async () => {
+		const response = Object.freeze(Object.assign(Object.create(null), { message: 'ok', requestId: 'stale' }));
+		const copy = await materializeOperationResponse(response);
+		assert.notEqual(copy, response);
+		assert.equal(Object.getPrototypeOf(copy), null);
+		assert.equal(copy.message, 'ok');
 		assert.deepEqual(Object.getOwnPropertyDescriptor(copy, 'requestId'), {
 			value: undefined,
 			writable: true,
 			enumerable: true,
 			configurable: true,
 		});
-		copy.requestId = 1;
-		assert.deepEqual({ ...copy }, { message: 'ok', nested, requestId: 1 });
-		assert.equal(response.requestId, 'stale');
-	});
-
-	it('keeps a null prototype on the copy, so the encoder serializes it as it did the original', async () => {
-		const response = Object.freeze(Object.assign(Object.create(null), { message: 'ok' }));
-		const copy = await materializeOperationResponse(response);
-		assert.notEqual(copy, response);
-		assert.equal(Object.getPrototypeOf(copy), null);
-		assert.equal(copy.message, 'ok');
-		assert.ok(Object.isExtensible(copy));
 	});
 
 	it('returns a class instance or an object from another realm unchanged (by reference)', async () => {

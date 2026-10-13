@@ -9,12 +9,11 @@
  * row). Both make a `replicated` get_analytics fan-out lose the peer's analytics. Draining
  * the result into a concrete, fully-resolved array before encoding fixes both.
  *
- * The caller attaches a top-level `requestId` to what this returns. Arrays are wrapped as
- * `{ results }`. A plain object of this realm is copied, because an operation may answer with a
- * shared or frozen object. The copy takes descriptors, not values, so a non-enumerable `toJSON`
- * survives, and it gives `requestId` a fresh writable slot for the caller. Any other value is
- * returned unchanged. `response` is intentionally `any`, because operation results can have any
- * shape.
+ * Arrays are wrapped as `{ results }` so the caller can attach a top-level `requestId`. A plain
+ * object is copied for the same reason, because an operation may answer with a shared or frozen
+ * one. A null-prototype object is copied by descriptor, because the encoder honors a non-enumerable
+ * `toJSON` only on such an object. `response` is intentionally `any`, because operation results can
+ * have any shape.
  *
  * Assumes operation results are bounded (they are for today's operations): the whole response
  * is buffered in memory here, so a future genuinely-large streaming op forwarded over
@@ -43,10 +42,11 @@ export async function materializeOperationResponse(response: any): Promise<any> 
 		return { results: await Promise.all(response) };
 	}
 	const prototype = response !== null && typeof response === 'object' ? Object.getPrototypeOf(response) : undefined;
-	if (prototype === Object.prototype || prototype === null) {
+	if (prototype === Object.prototype) return { ...response };
+	if (prototype === null) {
 		const descriptors = Object.getOwnPropertyDescriptors(response);
 		descriptors.requestId = { value: undefined, writable: true, enumerable: true, configurable: true };
-		return Object.create(prototype, descriptors);
+		return Object.create(null, descriptors);
 	}
 	return response;
 }

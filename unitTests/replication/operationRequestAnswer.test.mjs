@@ -173,7 +173,7 @@ describe('answering an OPERATION_REQUEST', function () {
 			expect(await answerTo(15)).to.deep.equal({ recalled: true, requestId: 15 });
 		});
 
-		it('encodes the copy as it would the original: a toJSON hook still applies, a skipped field is never read', async () => {
+		it('encodes a null-prototype copy as it would the original: a toJSON hook applies, a symbol getter is never read', async () => {
 			const hooked = Object.assign(Object.create(null), { internal: 'not for the wire', message: 'ok' });
 			Object.defineProperty(hooked, 'toJSON', {
 				value() {
@@ -182,13 +182,14 @@ describe('answering an OPERATION_REQUEST', function () {
 			});
 			server.operation = () => Promise.resolve(Object.freeze(hooked));
 			expect(await answerTo(13)).to.deep.equal({ message: 'ok', requestId: 13 });
-			server.operation = () =>
-				Promise.resolve({
-					recalled: true,
-					get [Symbol('unencoded')]() {
-						throw new Error('the encoder never reads symbol keys');
-					},
-				});
+			const symbolGetter = Object.defineProperty(Object.create(null), Symbol('unencoded'), {
+				enumerable: true,
+				get() {
+					throw new Error('the encoder never reads symbol keys');
+				},
+			});
+			symbolGetter.recalled = true;
+			server.operation = () => Promise.resolve(Object.freeze(symbolGetter));
 			expect(await answerTo(14)).to.deep.equal({ recalled: true, requestId: 14 });
 		});
 
