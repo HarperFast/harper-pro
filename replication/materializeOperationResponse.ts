@@ -10,11 +10,11 @@
  * the result into a concrete, fully-resolved array before encoding fixes both.
  *
  * The caller attaches a top-level `requestId` to what this returns. Arrays are wrapped as
- * `{ results }`. A plain object, with an ordinary or a null prototype, is copied because an
- * operation may answer with a shared or frozen object. The copy keeps the prototype and every
- * property descriptor, so nothing is read here and the encoder sees what it would have seen on the
- * original, including a non-enumerable `toJSON`. Any other value is returned unchanged. `response`
- * is intentionally `any`, because operation results can have any shape.
+ * `{ results }`. A plain object (a null prototype, or any realm's `Object.prototype`) is copied,
+ * because an operation may answer with a shared or frozen object. The copy takes descriptors rather
+ * than values, so a non-enumerable `toJSON` survives, and it leaves out `requestId`, which belongs to
+ * the caller. Any other value is returned unchanged. `response` is intentionally `any`, because
+ * operation results can have any shape.
  *
  * Assumes operation results are bounded (they are for today's operations): the whole response
  * is buffered in memory here, so a future genuinely-large streaming op forwarded over
@@ -43,7 +43,10 @@ export async function materializeOperationResponse(response: any): Promise<any> 
 		return { results: await Promise.all(response) };
 	}
 	const prototype = response !== null && typeof response === 'object' ? Object.getPrototypeOf(response) : undefined;
-	if (prototype === Object.prototype || prototype === null)
-		return Object.create(prototype, Object.getOwnPropertyDescriptors(response));
+	if (prototype === null || (prototype && Object.getPrototypeOf(prototype) === null)) {
+		const descriptors = Object.getOwnPropertyDescriptors(response);
+		delete descriptors.requestId;
+		return Object.create(prototype, descriptors);
+	}
 	return response;
 }

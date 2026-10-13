@@ -5,6 +5,7 @@
  */
 import { expect } from 'chai';
 import { EventEmitter } from 'node:events';
+import { runInNewContext } from 'node:vm';
 import { decode, encode } from 'msgpackr';
 import { replicateOverWS } from '#src/replication/replicationConnection';
 // Registers server.operation, which the receive path dispatches through.
@@ -169,6 +170,13 @@ describe('answering an OPERATION_REQUEST', function () {
 			expect(await answerTo(9)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 9 });
 			expect(await answerTo(10)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 10 });
 			expect(shared).to.deep.equal({ granted: false, reason: 'not-home', requestId: 'stale' });
+			server.operation = () => Promise.resolve(Object.freeze({ recalled: true, requestId: 'stale' }));
+			expect(await answerTo(15)).to.deep.equal({ recalled: true, requestId: 15 });
+		});
+
+		it('copies a plain object from another realm, as an application in its own VM context returns', async () => {
+			server.operation = () => Promise.resolve(runInNewContext('Object.freeze({ recalled: true })'));
+			expect(await answerTo(16)).to.deep.equal({ recalled: true, requestId: 16 });
 		});
 
 		it('encodes the copy as it would the original: a toJSON hook still applies, a skipped field is never read', async () => {
