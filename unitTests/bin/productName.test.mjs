@@ -38,6 +38,7 @@ describe('Harper Pro product name', () => {
 				cwd: REPO_ROOT,
 				encoding: 'utf8',
 				timeout: 55_000,
+				shell: process.platform === 'win32',
 			})
 		);
 		const lookupPath = [
