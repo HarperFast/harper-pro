@@ -10,9 +10,9 @@
  * the result into a concrete, fully-resolved array before encoding fixes both.
  *
  * Arrays are wrapped as `{ results }` so the caller can attach a top-level `requestId`. A plain
- * object that cannot take that property (`record_lock_recall` answers with a frozen constant) is
- * copied for the same reason. The copy is by descriptor, so the encoder sees the same properties and
- * hooks. Anything the caller can extend is returned as is, so it encodes exactly as it always has.
+ * object that would throw on that assignment (`record_lock_recall` answers with a frozen constant)
+ * is copied for the same reason. The copy is by descriptor, so the encoder sees the same properties
+ * and hooks. Anything the assignment succeeds on is returned as is, so it encodes as it always has.
  * `response` is intentionally `any`, because operation results can have any shape.
  *
  * Assumes operation results are bounded (they are for today's operations): the whole response
@@ -41,12 +41,9 @@ export async function materializeOperationResponse(response: any): Promise<any> 
 	if (Array.isArray(response)) {
 		return { results: await Promise.all(response) };
 	}
-	if (
-		response !== null &&
-		typeof response === 'object' &&
-		!Object.isExtensible(response) &&
-		!Object.getOwnPropertyDescriptor(response, 'requestId')?.writable
-	) {
+	if (response !== null && typeof response === 'object') {
+		const slot = Object.getOwnPropertyDescriptor(response, 'requestId');
+		if (slot ? slot.writable || slot.set : Object.isExtensible(response)) return response;
 		const prototype = Object.getPrototypeOf(response);
 		if (prototype === Object.prototype || prototype === null) {
 			const descriptors = Object.getOwnPropertyDescriptors(response);

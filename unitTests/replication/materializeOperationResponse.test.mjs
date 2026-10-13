@@ -78,6 +78,24 @@ describe('materializeOperationResponse', () => {
 		assert.equal(await materializeOperationResponse(response), response);
 		const sealed = Object.seal({ message: 'ok', requestId: undefined });
 		assert.equal(await materializeOperationResponse(sealed), sealed, 'its own writable requestId takes the stamp');
+		const withSetter = Object.seal({
+			id: 0,
+			get requestId() {
+				return this.id;
+			},
+			set requestId(value) {
+				this.id = value;
+			},
+		});
+		assert.equal(await materializeOperationResponse(withSetter), withSetter, 'its own setter takes the stamp');
+	});
+
+	it('copies a plain object whose own requestId is read-only, even when it is extensible', async () => {
+		const response = Object.defineProperty({ message: 'ok' }, 'requestId', { value: 'stale', enumerable: true });
+		const copy = await materializeOperationResponse(response);
+		assert.notEqual(copy, response);
+		copy.requestId = 1;
+		assert.deepEqual(copy, { message: 'ok', requestId: 1 });
 	});
 
 	it('copies a frozen plain object shallowly so the caller can stamp it, leaving the original alone', async () => {
