@@ -131,7 +131,6 @@ describe('answering an OPERATION_REQUEST', function () {
 		});
 	});
 
-	// A relayed record_lock_recall answers with a frozen constant.
 	describe('a result the operation still owns', () => {
 		let realOperation;
 
