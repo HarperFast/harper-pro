@@ -238,6 +238,7 @@ jobs:
       PREVIOUS_INSTALL_DIR: /tmp/harper-pro-${{ matrix.previous-release }}
       HARPER_PRO_PREVIOUS_VERSION_PATHS: /tmp/harper-pro-${{ matrix.previous-release }}/node_modules/@harperfast/harper-pro
       TEST_FILE: integrationTests/cluster/mixedVersionRollingUpgrade.test.mjs
+      LEGACY_COPY_TEST_FILE: integrationTests/cluster/legacyCopyBaseline.test.mjs
 
     steps:
       - name: Checkout code
@@ -278,6 +279,10 @@ jobs:
             echo "::error::mixed-version test file '$TEST_FILE' does not exist — this job would run no tests."
             exit 1
           fi
+          if [ ! -f "$LEGACY_COPY_TEST_FILE" ]; then
+            echo "::error::legacy-copy test file '$LEGACY_COPY_TEST_FILE' does not exist — this job would run no tests."
+            exit 1
+          fi
           for file in package.json dist/bin/harper.js; do
             if [ ! -f "$HARPER_PRO_PREVIOUS_VERSION_PATHS/$file" ]; then
               echo "::error::the harper-pro $PREVIOUS_RELEASE install has no $file."
@@ -301,7 +306,7 @@ jobs:
         env:
           HARPER_INTEGRATION_TEST_LOG_DIR: /tmp/harper-integration-test-logs
           HARPER_PRO_PREVIOUS_VERSION_PATH: ${{ env.HARPER_PRO_PREVIOUS_VERSION_PATHS }}
-        run: npm run test:integration -- integrationTests/cluster/legacyCopyBaseline.test.mjs
+        run: npm run test:integration -- "$LEGACY_COPY_TEST_FILE"
 
       - name: Upload Harper server logs
         if: failure() || cancelled()
