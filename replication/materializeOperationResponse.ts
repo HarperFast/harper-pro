@@ -9,12 +9,12 @@
  * row). Both make a `replicated` get_analytics fan-out lose the peer's analytics. Draining
  * the result into a concrete, fully-resolved array before encoding fixes both.
  *
- * The caller attaches a top-level `requestId` to what this returns, so that must be an object the
- * transport owns. Arrays are wrapped as `{ results }`. A plain object, with an ordinary or a null
- * prototype, is shallowly copied with its prototype kept: an operation may answer with a shared or
- * frozen object (`record_lock_recall` does), and stamping that object threw, so the peer received a
- * successful operation as an error. Any other value is returned unchanged. `response` is
- * intentionally `any`, because operation results can have any shape.
+ * The caller attaches a top-level `requestId` to what this returns. Arrays are wrapped as
+ * `{ results }`. A plain object, with an ordinary or a null prototype, is copied because an
+ * operation may answer with a shared or frozen object. The copy keeps the prototype and every
+ * property descriptor, so nothing is read here and the encoder sees what it would have seen on the
+ * original, including a non-enumerable `toJSON`. Any other value is returned unchanged. `response`
+ * is intentionally `any`, because operation results can have any shape.
  *
  * Assumes operation results are bounded (they are for today's operations): the whole response
  * is buffered in memory here, so a future genuinely-large streaming op forwarded over
@@ -43,7 +43,7 @@ export async function materializeOperationResponse(response: any): Promise<any> 
 		return { results: await Promise.all(response) };
 	}
 	const prototype = response !== null && typeof response === 'object' ? Object.getPrototypeOf(response) : undefined;
-	if (prototype === Object.prototype) return { ...response };
-	if (prototype === null) return Object.assign(Object.create(null), response);
+	if (prototype === Object.prototype || prototype === null)
+		return Object.create(prototype, Object.getOwnPropertyDescriptors(response));
 	return response;
 }

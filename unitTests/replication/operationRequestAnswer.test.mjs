@@ -131,8 +131,7 @@ describe('answering an OPERATION_REQUEST', function () {
 		});
 	});
 
-	// A relayed record_lock_recall answers with a frozen constant. Stamping the requestId into it threw, so
-	// the home read a confirmed recall as an error and a planned transition could not prove its drain.
+	// A relayed record_lock_recall answers with a frozen constant.
 	describe('a result the operation still owns', () => {
 		let realOperation;
 
@@ -160,7 +159,7 @@ describe('answering an OPERATION_REQUEST', function () {
 			server.operation = () => Promise.resolve(Object.freeze({ recalled: true }));
 			expect(await answerTo(7)).to.deep.equal({ recalled: true, requestId: 7 });
 			server.operation = () => Promise.resolve(Object.freeze(Object.assign(Object.create(null), { recalled: true })));
-			expect({ ...(await answerTo(8)) }).to.deep.equal({ recalled: true, requestId: 8 });
+			expect(await answerTo(8)).to.deep.equal({ recalled: true, requestId: 8 });
 			expect(socket.closes).to.deep.equal([]);
 		});
 
@@ -170,6 +169,25 @@ describe('answering an OPERATION_REQUEST', function () {
 			expect(await answerTo(9)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 9 });
 			expect(await answerTo(10)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 10 });
 			expect(shared).to.deep.equal({ granted: false, reason: 'not-home', requestId: 'stale' });
+		});
+
+		it('encodes the copy as it would the original: a toJSON hook still applies, a skipped field is never read', async () => {
+			const hooked = Object.assign(Object.create(null), { internal: 'not for the wire', message: 'ok' });
+			Object.defineProperty(hooked, 'toJSON', {
+				value() {
+					return { message: this.message, requestId: this.requestId };
+				},
+			});
+			server.operation = () => Promise.resolve(Object.freeze(hooked));
+			expect(await answerTo(13)).to.deep.equal({ message: 'ok', requestId: 13 });
+			server.operation = () =>
+				Promise.resolve({
+					recalled: true,
+					get [Symbol('unencoded')]() {
+						throw new Error('the encoder never reads symbol keys');
+					},
+				});
+			expect(await answerTo(14)).to.deep.equal({ recalled: true, requestId: 14 });
 		});
 
 		it('answers a result whose field throws on read with one correlated error, and keeps the connection', async () => {
