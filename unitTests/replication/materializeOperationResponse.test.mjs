@@ -73,7 +73,12 @@ describe('materializeOperationResponse', () => {
 		await assert.rejects(materializeOperationResponse(boom()), /mid-stream failure/);
 	});
 
-	it('returns a plain object as a shallow copy the caller can stamp, leaving the original alone', async () => {
+	it('returns a plain object the caller can extend unchanged (by reference)', async () => {
+		const response = { message: 'ok' };
+		assert.equal(await materializeOperationResponse(response), response);
+	});
+
+	it('copies a frozen plain object shallowly so the caller can stamp it, leaving the original alone', async () => {
 		const nested = { token: [1, 2, 3] };
 		const response = Object.freeze({ message: 'ok', nested, requestId: 'stale' });
 		const copy = await materializeOperationResponse(response);
@@ -84,7 +89,7 @@ describe('materializeOperationResponse', () => {
 		assert.equal(response.requestId, 'stale');
 	});
 
-	it('copies a null-prototype object by descriptor, with a fresh writable requestId slot', async () => {
+	it('copies a frozen null-prototype object by descriptor, with a fresh writable requestId slot', async () => {
 		const response = Object.freeze(Object.assign(Object.create(null), { message: 'ok', requestId: 'stale' }));
 		const copy = await materializeOperationResponse(response);
 		assert.notEqual(copy, response);

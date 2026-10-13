@@ -10,10 +10,10 @@
  * the result into a concrete, fully-resolved array before encoding fixes both.
  *
  * Arrays are wrapped as `{ results }` so the caller can attach a top-level `requestId`. A plain
- * object is copied for the same reason, because an operation may answer with a shared or frozen
- * one. A null-prototype object is copied by descriptor, because the encoder honors a non-enumerable
- * `toJSON` only on such an object. `response` is intentionally `any`, because operation results can
- * have any shape.
+ * object that cannot take that property (`record_lock_recall` answers with a frozen constant) is
+ * copied for the same reason. The copy is by descriptor, so the encoder sees the same properties and
+ * hooks. Anything the caller can extend is returned as is, so it encodes exactly as it always has.
+ * `response` is intentionally `any`, because operation results can have any shape.
  *
  * Assumes operation results are bounded (they are for today's operations): the whole response
  * is buffered in memory here, so a future genuinely-large streaming op forwarded over
@@ -41,12 +41,13 @@ export async function materializeOperationResponse(response: any): Promise<any> 
 	if (Array.isArray(response)) {
 		return { results: await Promise.all(response) };
 	}
-	const prototype = response !== null && typeof response === 'object' ? Object.getPrototypeOf(response) : undefined;
-	if (prototype === Object.prototype) return { ...response };
-	if (prototype === null) {
-		const descriptors = Object.getOwnPropertyDescriptors(response);
-		descriptors.requestId = { value: undefined, writable: true, enumerable: true, configurable: true };
-		return Object.create(null, descriptors);
+	if (response !== null && typeof response === 'object' && !Object.isExtensible(response)) {
+		const prototype = Object.getPrototypeOf(response);
+		if (prototype === Object.prototype || prototype === null) {
+			const descriptors = Object.getOwnPropertyDescriptors(response);
+			descriptors.requestId = { value: undefined, writable: true, enumerable: true, configurable: true };
+			return Object.create(prototype, descriptors);
+		}
 	}
 	return response;
 }

@@ -163,17 +163,16 @@ describe('answering an OPERATION_REQUEST', function () {
 			expect(socket.closes).to.deep.equal([]);
 		});
 
-		it('never writes into a shared result, which answers each request with its own requestId', async () => {
+		it("answers a shared result with each request's own requestId", async () => {
 			const shared = { granted: false, reason: 'not-home', requestId: 'stale' };
 			server.operation = () => Promise.resolve(shared);
 			expect(await answerTo(9)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 9 });
 			expect(await answerTo(10)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 10 });
-			expect(shared).to.deep.equal({ granted: false, reason: 'not-home', requestId: 'stale' });
 			server.operation = () => Promise.resolve(Object.freeze({ recalled: true, requestId: 'stale' }));
 			expect(await answerTo(15)).to.deep.equal({ recalled: true, requestId: 15 });
 		});
 
-		it('encodes a null-prototype copy as it would the original: a toJSON hook applies, a symbol getter is never read', async () => {
+		it('encodes a copy as it would the original: a toJSON hook applies, a symbol getter is never read', async () => {
 			const hooked = Object.assign(Object.create(null), { internal: 'not for the wire', message: 'ok' });
 			Object.defineProperty(hooked, 'toJSON', {
 				value() {
