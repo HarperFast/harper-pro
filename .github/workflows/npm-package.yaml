@@ -207,6 +207,7 @@ jobs:
           root=$(node -p 'require("node:path").join(process.argv[1], process.platform === "win32" ? "" : "lib", "node_modules/@harperfast/harper-pro")' "$prefix")
           node "$BUNDLE_CHECK" installed "$root" "$LOCK"
           node "$root/dist/bin/harper.js" version
+          node "$root/dist/bin/harper.js" help | grep -F 'simply run Harper Pro'
           echo "HARPER_PRO_GLOBAL_ROOT=$root" >> "$GITHUB_ENV"
 
       - name: Globally installed Harper Pro boots and serves operations

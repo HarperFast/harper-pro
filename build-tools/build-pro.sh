@@ -23,12 +23,6 @@ function cleanup {
     # re2's binary comes only from its install script; the checkout's WAF and tests need it.
     npm rebuild re2 || echo "npm rebuild re2 failed; run it before testing this checkout"
   fi
-  if use_git; then
-    echo -e "\n📦 Restoring core files"
-    pushd core
-    git restore .
-    popd
-  fi
 }
 
 trap cleanup EXIT
@@ -51,9 +45,6 @@ rm -f npm-shrinkwrap.json
 # No install script may run before the bundle is copied: it could rewrite bundled JavaScript.
 rebuildRe2=1
 npm ci --ignore-scripts
-
-echo -e "\n📦 Applying Harper Pro branding"
-perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/installer.js
 
 echo -e "\n📦 Building project"
 # A stale dist/ would mask a file the compiler stopped emitting.
