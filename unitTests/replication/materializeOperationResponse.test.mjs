@@ -12,6 +12,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import { materializeOperationResponse } from '#src/replication/materializeOperationResponse';
 
 describe('materializeOperationResponse', () => {
@@ -74,13 +75,19 @@ describe('materializeOperationResponse', () => {
 
 	it('returns a plain object as a shallow copy the caller can stamp, leaving the original alone', async () => {
 		const nested = { token: [1, 2, 3] };
-		const response = Object.freeze({ message: 'ok', nested });
+		const response = Object.freeze({ message: 'ok', nested, requestId: 'stale' });
 		const copy = await materializeOperationResponse(response);
 		assert.notEqual(copy, response);
-		assert.deepEqual(copy, { message: 'ok', nested });
 		assert.equal(copy.nested, nested, 'shallow: nested values are shared, not cloned');
+		assert.deepEqual(Object.getOwnPropertyDescriptor(copy, 'requestId'), {
+			value: undefined,
+			writable: true,
+			enumerable: true,
+			configurable: true,
+		});
 		copy.requestId = 1;
-		assert.equal(response.requestId, undefined);
+		assert.deepEqual({ ...copy }, { message: 'ok', nested, requestId: 1 });
+		assert.equal(response.requestId, 'stale');
 	});
 
 	it('keeps a null prototype on the copy, so the encoder serializes it as it did the original', async () => {
@@ -92,12 +99,19 @@ describe('materializeOperationResponse', () => {
 		assert.ok(Object.isExtensible(copy));
 	});
 
-	it('returns a class instance unchanged (by reference)', async () => {
+	it('returns a class instance or an object from another realm unchanged (by reference)', async () => {
 		class Answer {
 			message = 'ok';
 		}
-		const response = new Answer();
-		assert.equal(await materializeOperationResponse(response), response);
+		class Rootless {
+			#message = 'ok';
+			toJSON() {
+				return { message: this.#message };
+			}
+		}
+		Object.setPrototypeOf(Rootless.prototype, null);
+		for (const response of [new Answer(), new Rootless(), runInNewContext('({ message: "ok" })')])
+			assert.equal(await materializeOperationResponse(response), response);
 	});
 
 	it('does not drain a string into characters', async () => {
