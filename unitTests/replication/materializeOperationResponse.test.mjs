@@ -72,8 +72,31 @@ describe('materializeOperationResponse', () => {
 		await assert.rejects(materializeOperationResponse(boom()), /mid-stream failure/);
 	});
 
-	it('returns a plain object response unchanged (by reference)', async () => {
-		const response = { message: 'ok' };
+	it('returns a plain object as a shallow copy the caller can stamp, leaving the original alone', async () => {
+		const nested = { token: [1, 2, 3] };
+		const response = Object.freeze({ message: 'ok', nested });
+		const copy = await materializeOperationResponse(response);
+		assert.notEqual(copy, response);
+		assert.deepEqual(copy, { message: 'ok', nested });
+		assert.equal(copy.nested, nested, 'shallow: nested values are shared, not cloned');
+		copy.requestId = 1;
+		assert.equal(response.requestId, undefined);
+	});
+
+	it('keeps a null prototype on the copy, so the encoder serializes it as it did the original', async () => {
+		const response = Object.freeze(Object.assign(Object.create(null), { message: 'ok' }));
+		const copy = await materializeOperationResponse(response);
+		assert.notEqual(copy, response);
+		assert.equal(Object.getPrototypeOf(copy), null);
+		assert.equal(copy.message, 'ok');
+		assert.ok(Object.isExtensible(copy));
+	});
+
+	it('returns a class instance unchanged (by reference)', async () => {
+		class Answer {
+			message = 'ok';
+		}
+		const response = new Answer();
 		assert.equal(await materializeOperationResponse(response), response);
 	});
 

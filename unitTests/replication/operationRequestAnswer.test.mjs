@@ -130,4 +130,61 @@ describe('answering an OPERATION_REQUEST', function () {
 			expect(received[0].data).to.not.have.property('replicatedFrom');
 		});
 	});
+
+	// A relayed record_lock_recall answers with a frozen constant. Stamping the requestId into it threw, so
+	// the home read a confirmed recall as an error and a planned transition could not prove its drain.
+	describe('a result the operation still owns', () => {
+		let realOperation;
+
+		beforeEach(() => {
+			realOperation = server.operation;
+		});
+
+		afterEach(() => {
+			server.operation = realOperation;
+		});
+
+		async function answerTo(requestId) {
+			const before = socket.sent.length;
+			socket.emit('message', encode([OPERATION_REQUEST, { operation: 'record_lock_recall', requestId }]));
+			for (let turn = 0; turn < 50 && socket.sent.length === before; turn++) {
+				await new Promise((resolve) => setImmediate(resolve));
+			}
+			expect(socket.sent).to.have.length(before + 1);
+			const [command, answer] = socket.sent[before];
+			expect(command).to.equal(OPERATION_RESPONSE);
+			return answer;
+		}
+
+		it('answers a frozen result, ordinary or null-prototype, as a success carrying the requestId', async () => {
+			server.operation = () => Promise.resolve(Object.freeze({ recalled: true }));
+			expect(await answerTo(7)).to.deep.equal({ recalled: true, requestId: 7 });
+			server.operation = () => Promise.resolve(Object.freeze(Object.assign(Object.create(null), { recalled: true })));
+			expect({ ...(await answerTo(8)) }).to.deep.equal({ recalled: true, requestId: 8 });
+			expect(socket.closes).to.deep.equal([]);
+		});
+
+		it('never writes into a shared result, which answers each request with its own requestId', async () => {
+			const shared = { granted: false, reason: 'not-home', requestId: 'stale' };
+			server.operation = () => Promise.resolve(shared);
+			expect(await answerTo(9)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 9 });
+			expect(await answerTo(10)).to.deep.equal({ granted: false, reason: 'not-home', requestId: 10 });
+			expect(shared).to.deep.equal({ granted: false, reason: 'not-home', requestId: 'stale' });
+		});
+
+		it('answers a result whose field throws on read with one correlated error, and keeps the connection', async () => {
+			server.operation = () =>
+				Promise.resolve({
+					get recalled() {
+						throw new Error('unreadable result');
+					},
+				});
+			const answer = await answerTo(11);
+			expect(answer.requestId).to.equal(11);
+			expect(answer.error).to.match(/unreadable result/);
+			server.operation = () => Promise.resolve({ recalled: true });
+			expect(await answerTo(12)).to.deep.equal({ recalled: true, requestId: 12 });
+			expect(socket.closes).to.deep.equal([]);
+		});
+	});
 });
