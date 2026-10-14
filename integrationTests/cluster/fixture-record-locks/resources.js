@@ -1,5 +1,6 @@
 // Endpoints the cluster record-lock tests drive. Every error keeps its statusCode so the test sees
-// core's 423 / 503 / 409 as the HTTP status.
+// core's 423 / 503 / 409 as the HTTP status. Holds live in this worker's memory: at threads.count > 1 a
+// LockWrite/LockRelease must reach the worker that served the LockHold, so take locks with LockOnce.
 import { threadId } from 'node:worker_threads';
 
 const holds = new Map();
@@ -33,13 +34,21 @@ export class LockedIncrement extends Resource {
 	}
 }
 
+/** POST { id, timeout?, scope? }: take and release a lock within one request, so any worker can serve it. */
+export class LockOnce extends Resource {
+	async post(data) {
+		await tables.Counter.lock(data.id, lockOptions(data));
+		return { threadId };
+	}
+}
+
 /** POST { id, lease?, timeout?, scope? }: take a held lock that outlives the request; answers a token. */
 export class LockHold extends Resource {
 	async post(data) {
 		const record = await tables.Counter.lock(data.id, { ...lockOptions(data), hold: true });
-		const token = String(nextToken++);
+		const token = `${threadId}:${nextToken++}`;
 		holds.set(token, record);
-		return { token, n: record.getProperty('n') ?? null };
+		return { token, threadId, n: record.getProperty('n') ?? null };
 	}
 }
 
@@ -54,12 +63,14 @@ export class LockWrite extends Resource {
 	}
 }
 
+/** POST { token }: release a hold; 409 when this worker does not hold the token (a retry may reach the holder). */
 export class LockRelease extends Resource {
 	async post(data) {
 		const record = holds.get(data.token);
+		if (!record) throw Object.assign(new Error(`worker ${threadId} does not hold ${data.token}`), { statusCode: 409 });
 		holds.delete(data.token);
-		if (record) await record.unlock();
-		return { released: !!record };
+		await record.unlock();
+		return { released: true, threadId };
 	}
 }
 

@@ -236,11 +236,13 @@ export function apply(node, fields) {
 	});
 }
 
-/** A cluster lock on `node`: 200 while it serves an active generation, 503 while staged or excluded. */
+/**
+ * A cluster lock on `node`: 200 while it serves an active generation, 503 while staged or excluded.
+ * Taken and released inside one request: a separate release could be served by another http worker
+ * than the one holding the lock.
+ */
 export async function lockStatus(node, id) {
-	const held = await call(node, 'LockHold/', { id, lease: 2_000, timeout: 2_000 });
-	if (held.status === 200) await call(node, 'LockRelease/', { token: held.body.token });
-	return held.status;
+	return (await call(node, 'LockOnce/', { id, timeout: 2_000 })).status;
 }
 
 export async function assertLocks(nodes, expected, why) {
