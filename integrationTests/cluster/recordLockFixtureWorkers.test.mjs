@@ -1,7 +1,6 @@
 /**
- * The record-lock fixture on nodes with two http workers, whose holds live in one worker's memory:
- * a lock taken and released in one request does not depend on the serving worker, and a release
- * served by a worker that does not hold the token answers 409 instead of leaving the hold to its lease.
+ * The record-lock fixture on two-worker nodes: its holds live in one worker's memory, so a release
+ * served by another worker must answer 409 rather than leave the hold to its lease.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -91,7 +90,6 @@ suite(`cluster record locks: the fixture at threads.count ${THREADS}`, { timeout
 		const [holder, successor] = nodes;
 		const tokens = new Set();
 		let refused = 0;
-		// Three rounds for token uniqueness, then on until a release has been refused once.
 		for (let round = 0; round < 40 && (round < 3 || refused === 0); round++) {
 			const id = `hold-${Date.now()}-${round}`;
 			const held = await callFresh(holder, 'LockHold/', { id, lease: 30_000, timeout: 5_000 });
@@ -101,12 +99,13 @@ suite(`cluster record locks: the fixture at threads.count ${THREADS}`, { timeout
 			assert.ok(!tokens.has(token), `token ${token} was issued twice`);
 			tokens.add(token);
 			let released;
-			for (let attempt = 0; attempt < 40 && released?.status !== 200; attempt++) {
+			for (let attempt = 0; attempt < 40; attempt++) {
 				released = await callFresh(holder, 'LockRelease/', { token });
-				if (released.status !== 409) continue;
+				if (released.status === 200) break;
+				assert.equal(released.status, 409, `release of ${token}: ${JSON.stringify(released.body)}`);
 				refused++;
 				if (refused === 1) {
-					const contended = await call(successor, 'LockOnce/', { id, timeout: 300 });
+					const contended = await call(successor, 'LockOnce/', { id, timeout: 1_500 }, AbortSignal.timeout(30_000));
 					assert.equal(
 						contended.status,
 						423,
