@@ -199,6 +199,11 @@ export async function captureProfile(delayToNextCapture = shippedRescheduleDelay
 	const gpuPromise = getWorkerIndex() === 0 && gpuAvailable ? getGpuUtilization() : null;
 	try {
 		const profile = stopProfiler(continuous && delayToNextCapture <= samplingWindow());
+		// Non-zero only after a restarting stop in which pprof found V8's profiler event processor
+		// wedged and replaced it (#1021); a window-ending stop replaces the processor regardless.
+		const stuck = timeProfiler.v8ProfilerStuckEventLoopDetected();
+		if (stuck > 0)
+			log.warn?.(`@datadog/pprof found the V8 profiler event processor stuck (level ${stuck}) and restarted it`);
 		const strings = profile.stringTable.strings;
 		for (let func of profile.function) {
 			fileNameById.set(func.id as number, strings[func.filename as number]);

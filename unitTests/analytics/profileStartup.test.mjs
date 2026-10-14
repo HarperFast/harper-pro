@@ -137,6 +137,25 @@ describe('Analytics profiler startup gate', () => {
 			clock.restore();
 		}
 	});
+	it('logs when pprof reports that it found and restarted a wedged V8 event processor', async () => {
+		const harperLogger = (await import('#src/core/utility/logging/harper_logger')).default;
+		const warnings = [];
+		const originalWarn = harperLogger.warn;
+		const originalDetected = timeProfiler.v8ProfilerStuckEventLoopDetected;
+		harperLogger.warn = (...args) => warnings.push(args.join(' '));
+		timeProfiler.v8ProfilerStuckEventLoopDetected = () => 2;
+		try {
+			await captureProfile(10000);
+			await captureProfile(-1);
+			const found = warnings.find((line) => line.includes('event processor stuck'));
+			assert.ok(found, `expected the detector warning, got: ${JSON.stringify(warnings)}`);
+			assert.match(found, /level 2/);
+		} finally {
+			harperLogger.warn = originalWarn;
+			timeProfiler.v8ProfilerStuckEventLoopDetected = originalDetected;
+		}
+	});
+
 	it('cancels a sampling window that has not opened when profiling is disabled', async () => {
 		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.2 })), true);
 		await captureProfile(600);
