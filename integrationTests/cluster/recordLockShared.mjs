@@ -1,7 +1,7 @@
 /**
  * Fixture, node lifecycle and operator helpers shared by the cluster record-lock suites
- * (`recordLockCluster.test.mjs`, `recordLockApplyHomes.test.mjs`). See the header of the former for
- * what these suites prove and why nodes default to one http worker.
+ * (`recordLockCluster.test.mjs` and the other `recordLock*.test.mjs` suites). See the header of the
+ * former for what these suites prove and why nodes default to one http worker.
  */
 import assert from 'node:assert/strict';
 import { cp, mkdtemp } from 'node:fs/promises';

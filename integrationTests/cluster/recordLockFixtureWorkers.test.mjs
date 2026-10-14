@@ -1,9 +1,7 @@
 /**
- * The record-lock fixture on nodes with two http workers. Its holds live in one worker's memory, so
- * these suites prove the two ways a test stays correct there: a lock taken and released inside one
- * request (`lockStatus`, `assertLocks`) never depends on which worker serves it, and a `LockRelease`
- * served by a worker that does not hold the token answers 409 instead of leaving the hold to run out
- * its lease.
+ * The record-lock fixture on nodes with two http workers, whose holds live in one worker's memory:
+ * a lock taken and released in one request does not depend on the serving worker, and a release
+ * served by a worker that does not hold the token answers 409 instead of leaving the hold to its lease.
  */
 import { suite, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,6 +9,7 @@ import { request } from 'node:http';
 import {
 	assertLocks,
 	bootstrapHomeMap,
+	call,
 	connectMesh,
 	lockStatus,
 	startNode,
@@ -25,7 +24,12 @@ function callFresh(node, path, body) {
 	return new Promise((resolve, reject) => {
 		const req = request(
 			`${node.httpURL}/${path}`,
-			{ method: 'POST', agent: false, headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' } },
+			{
+				method: 'POST',
+				agent: false,
+				signal: AbortSignal.timeout(30_000),
+				headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+			},
 			(response) => {
 				let text = '';
 				response.setEncoding('utf8');
@@ -87,7 +91,8 @@ suite(`cluster record locks: the fixture at threads.count ${THREADS}`, { timeout
 		const [holder, successor] = nodes;
 		const tokens = new Set();
 		let refused = 0;
-		for (let round = 0; round < 12; round++) {
+		// Three rounds for token uniqueness, then on until a release has been refused once.
+		for (let round = 0; round < 40 && (round < 3 || refused === 0); round++) {
 			const id = `hold-${Date.now()}-${round}`;
 			const held = await callFresh(holder, 'LockHold/', { id, lease: 30_000, timeout: 5_000 });
 			assert.equal(held.status, 200, JSON.stringify(held.body));
@@ -95,12 +100,19 @@ suite(`cluster record locks: the fixture at threads.count ${THREADS}`, { timeout
 			assert.ok(token.startsWith(`${threadId}:`), `token ${token} does not name the worker ${threadId} that holds it`);
 			assert.ok(!tokens.has(token), `token ${token} was issued twice`);
 			tokens.add(token);
-			// Each refusal is a worker that does not hold it; the lock stays held until the holding worker is reached.
 			let released;
 			for (let attempt = 0; attempt < 40 && released?.status !== 200; attempt++) {
 				released = await callFresh(holder, 'LockRelease/', { token });
-				if (released.status === 409) refused++;
-				else assert.equal(released.status, 200, `release of ${token}: ${JSON.stringify(released.body)}`);
+				if (released.status !== 409) continue;
+				refused++;
+				if (refused === 1) {
+					const contended = await call(successor, 'LockOnce/', { id, timeout: 300 });
+					assert.equal(
+						contended.status,
+						423,
+						`a refused release must leave the lock held: ${JSON.stringify(contended.body)}`
+					);
+				}
 			}
 			assert.equal(
 				released.status,

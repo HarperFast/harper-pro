@@ -37,7 +37,7 @@ export class LockedIncrement extends Resource {
 /** POST { id, timeout?, scope? }: take and release a lock within one request, so any worker can serve it. */
 export class LockOnce extends Resource {
 	async post(data) {
-		await tables.Counter.lock(data.id, lockOptions(data));
+		await tables.Counter.lock(data.id, { ...lockOptions(data), hold: false });
 		return { threadId };
 	}
 }
