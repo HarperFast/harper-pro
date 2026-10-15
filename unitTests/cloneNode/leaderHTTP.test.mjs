@@ -81,26 +81,41 @@ describe('leaderHTTP', () => {
 		});
 	});
 
-	it('fails a leader that stops sending mid-archive, without an unhandled error', async () => {
-		respond = (response) => {
-			response.writeHead(200, { 'Content-Type': 'application/gzip' });
-			response.write(Buffer.from('partial'));
-		};
-		const payload = await readPackageResponse(await postToLeader(target, operation, 200));
-		// Nothing reads yet, as while preparation waits for its lock: the abort must still reach the late reader.
-		await new Promise((resolve) => setTimeout(resolve, 400));
-		await assert.rejects(
-			async () => {
-				for await (const _chunk of payload);
-			},
-			{ code: 'ECONNRESET' }
-		);
+	// The repository runs Mocha without a timeout; these bound themselves so a broken idle timeout fails them.
+	const IDLE_MS = 200;
+	const TEST_DEADLINE_MS = 5000;
+
+	const stallMidArchive = (response) => {
+		response.writeHead(200, { 'Content-Type': 'application/gzip' });
+		response.write(Buffer.from('partial'));
+	};
+	const readAll = async (payload) => {
+		for await (const _chunk of payload);
+	};
+
+	it('fails an archive the leader stops sending, naming the idle timeout', async function () {
+		this.timeout(TEST_DEADLINE_MS);
+		respond = stallMidArchive;
+		const payload = await readPackageResponse(await postToLeader(target, operation, IDLE_MS));
+		await assert.rejects(readAll(payload), {
+			message: `package_component to the leader sent nothing for ${IDLE_MS}ms`,
+		});
 	});
 
-	it('fails a leader that never answers', async () => {
+	it('fails a stalled archive that nothing was reading yet', async function () {
+		this.timeout(TEST_DEADLINE_MS);
+		respond = stallMidArchive;
+		const payload = await readPackageResponse(await postToLeader(target, operation, IDLE_MS));
+		// as while preparation waits for its lock before extracting
+		await new Promise((resolve) => setTimeout(resolve, IDLE_MS * 2));
+		await assert.rejects(readAll(payload));
+	});
+
+	it('fails a leader that never answers', async function () {
+		this.timeout(TEST_DEADLINE_MS);
 		respond = () => {};
-		await assert.rejects(postToLeader(target, { operation: 'get_status' }, 200), {
-			message: 'get_status to the leader sent nothing for 200ms',
+		await assert.rejects(postToLeader(target, { operation: 'get_status' }, IDLE_MS), {
+			message: `get_status to the leader sent nothing for ${IDLE_MS}ms`,
 		});
 	});
 });

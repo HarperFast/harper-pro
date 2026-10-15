@@ -36,7 +36,7 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
-import { cloneFilesystemOnlyApplications } from './applicationClone.ts';
+import { ApplicationCloneError, cloneFilesystemOnlyApplications } from './applicationClone.ts';
 import { postToLeader, readLeaderResponse, readPackageResponse, type LeaderHTTPTarget } from './leaderHTTP.ts';
 import { cloneSSHKeysFromLeader } from './sshKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
@@ -345,8 +345,11 @@ export async function cloneNode(): Promise<void> {
 		}
 	} catch (err) {
 		// Contained rather than thrown: a rejection here reaches bin/harper.js, which exits the
-		// already-started process instead of leaving it queryable.
-		await abandonClone(`Clone from leader node ${leaderURL} failed during setup (${err})`);
+		// already-started process instead of leaving it queryable. An application this node could not
+		// copy ends the attempt like a missing JWT key; other setup failures keep it for a restart to resume.
+		await stopUnfinishedClone(`Clone from leader node ${leaderURL} failed during setup (${err})`, {
+			keepAttempt: !(err instanceof ApplicationCloneError),
+		});
 		return;
 	}
 
@@ -355,14 +358,9 @@ export async function cloneNode(): Promise<void> {
 	// must not be treated as success.
 	const syncOutcome = await monitorSync(syncStartedAt, targetTimestamps, totalBytes);
 	if (syncOutcome === 'failed') {
-		// Return (don't throw) so Harper stays running and queryable. Clear `cloned` explicitly: a
-		// forced reclone has already carried the previous `cloned: true` into the rewritten config.
-		updateConfigValue(CONFIG_PARAMS.CLONED, false);
-		clearCloneAttempt(); // same in-flight signal as the JWT-key failure below (harper-pro#737)
-		log(
-			`Clone from leader node ${leaderURL} did not complete synchronization; node is running but Unavailable and not marked as cloned`,
-			'error'
-		);
+		// Return (don't throw) so Harper stays running and queryable. Clearing `cloned` matters: a forced
+		// reclone has already carried the previous `cloned: true` into the rewritten config.
+		await stopUnfinishedClone(`Clone from leader node ${leaderURL} did not complete synchronization`);
 		return;
 	}
 
@@ -553,10 +551,10 @@ async function finishCloneSetup(): Promise<boolean> {
 }
 
 /**
- * Mirrors the unconfirmed-sync handling: keep Harper running so get_status stays queryable, publish
- * Unavailable, clear the cloned flag so a subsequent start retries the clone, and stop before finalizing.
+ * Keep Harper running so get_status stays queryable, publish Unavailable, clear the cloned flag so a
+ * subsequent start retries the clone, and stop before finalizing.
  */
-async function stopUnfinishedClone(reason: string): Promise<void> {
+async function stopUnfinishedClone(reason: string, { keepAttempt = false } = {}): Promise<void> {
 	const { set: setStatus } = await import('../core/server/status/index.js');
 	try {
 		await setStatus({ id: 'availability', status: 'Unavailable' });
@@ -573,8 +571,9 @@ async function stopUnfinishedClone(reason: string): Promise<void> {
 	// A clone that stops here keeps running, and both halves of the in-flight signal would stay set,
 	// so the replication send path would go on withholding this leader's own records from a base copy
 	// back to it for the life of the process (harper-pro#737) — including from a leader that asked for
-	// that copy because it had lost them. Retiring the attempt costs a retry a fresh base copy.
-	clearCloneAttempt();
+	// that copy because it had lost them. Retiring the attempt costs a retry a fresh base copy, which is
+	// why a stop a restart can resume from keeps it.
+	if (!keepAttempt) clearCloneAttempt();
 	log(`${reason}; node is running but Unavailable${unmarked ? ' and not marked as cloned' : ''}`, 'error');
 }
 
@@ -815,21 +814,9 @@ async function fetchSyncSnapshot(): Promise<
 	try {
 		return await getLastUpdatedRecord();
 	} catch (err) {
-		await abandonClone(`Could not fetch sync targets from leader ${leaderURL} (${err})`);
+		await stopUnfinishedClone(`Could not fetch sync targets from leader ${leaderURL} (${err})`, { keepAttempt: true });
 		return undefined;
 	}
-}
-
-/** Leave Harper running and queryable, reporting Unavailable and not cloned, so a later start retries. */
-async function abandonClone(reason: string): Promise<void> {
-	const { set: setStatus } = await import('../core/server/status/index.js');
-	try {
-		await setStatus({ id: 'availability', status: 'Unavailable' });
-	} catch (statusErr) {
-		log(`Failed to set availability status to Unavailable: ${statusErr}`, 'error');
-	}
-	updateConfigValue(CONFIG_PARAMS.CLONED, false);
-	log(`${reason}; node is running but Unavailable and not marked as cloned`, 'error');
 }
 
 /** Shared by the fresh and resume-retry call sites: fetch the leader snapshot and, if it
@@ -1309,7 +1296,6 @@ function leaderHTTPTarget(): LeaderHTTPTarget {
 	};
 }
 
-/** An application as the leader packages it, node_modules included. */
 async function requestApplicationPackage(project: string): Promise<string | Readable> {
 	const operation = { operation: OPERATIONS_ENUM.PACKAGE_COMPONENT, project, skip_node_modules: false };
 	// The replication socket carries an operation's answer as a single message, so only HTTP can stream it.

@@ -15,7 +15,6 @@ export type LeaderHTTPTarget = {
  */
 export const LEADER_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 
-/** POSTs an operation to the leader's operations API; settles with the response as soon as its headers arrive. */
 export function postToLeader(
 	target: LeaderHTTPTarget,
 	operation: { operation: string; [key: string]: any },
@@ -37,19 +36,26 @@ export function postToLeader(
 		},
 	};
 	return new Promise((resolve, reject) => {
+		let response: IncomingMessage | undefined;
+		const onResponse = (incoming: IncomingMessage) => {
+			response = incoming;
+			resolve(incoming);
+		};
 		const request = isHttps
-			? httpsRequest({ ...options, rejectUnauthorized: target.rejectUnauthorized }, resolve)
-			: httpRequest(options, resolve);
-		// Applies to the response body as well: destroying the request aborts a response still being read.
+			? httpsRequest({ ...options, rejectUnauthorized: target.rejectUnauthorized }, onResponse)
+			: httpRequest(options, onResponse);
+		// Covers the response body too. Once headers have arrived the request's own error goes nowhere, so the
+		// response carries it to whoever is reading the archive.
 		request.setTimeout(idleTimeoutMs, () =>
-			request.destroy(new Error(`${operation.operation} to the leader sent nothing for ${idleTimeoutMs}ms`))
+			(response ?? request).destroy(
+				new Error(`${operation.operation} to the leader sent nothing for ${idleTimeoutMs}ms`)
+			)
 		);
 		request.on('error', reject);
 		request.end(body);
 	});
 }
 
-/** Reads a leader operation's whole answer, throwing on a non-2xx status with the leader's own reason. */
 export async function readLeaderResponse(response: IncomingMessage): Promise<any> {
 	const chunks: Buffer[] = [];
 	for await (const chunk of response) chunks.push(chunk);

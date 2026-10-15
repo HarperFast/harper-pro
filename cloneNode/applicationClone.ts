@@ -1,6 +1,11 @@
 import { basename } from 'node:path';
 import { Readable } from 'node:stream';
 
+/** An application the clone could not copy, which ends the clone attempt. */
+export class ApplicationCloneError extends Error {
+	name = 'ApplicationCloneError';
+}
+
 /**
  * Copies the leader's filesystem-only applications — those without a `package` in its config, which
  * nothing reinstalls on this node — as the leader packages them, node_modules included: npm cannot
@@ -25,13 +30,15 @@ export async function cloneFilesystemOnlyApplications({
 	try {
 		listing = await listComponents();
 	} catch (error) {
-		throw new Error(`Unable to list the leader's applications: ${(error as Error)?.message ?? error}`, {
+		throw new ApplicationCloneError(`Unable to list the leader's applications: ${(error as Error)?.message ?? error}`, {
 			cause: error,
 		});
 	}
 	// get_components answers a components root it could not read with `{ error, entries: [] }`, not a failure.
 	if (listing?.error || !Array.isArray(listing?.entries)) {
-		throw new Error(`Unable to list the leader's applications: ${listing?.error ?? 'its answer has no entries'}`);
+		throw new ApplicationCloneError(
+			`Unable to list the leader's applications: ${listing?.error ?? 'its answer has no entries'}`
+		);
 	}
 
 	const applications = listing.entries.filter((entry: any) => Array.isArray(entry?.entries) && !entry.package);
@@ -59,7 +66,7 @@ export async function cloneFilesystemOnlyApplications({
 		}
 	}
 	if (failed.length > 0) {
-		throw new Error(
+		throw new ApplicationCloneError(
 			`Failed to clone ${failed.length} of ${applications.length} filesystem-only application(s) from the leader: ${failed.join(', ')}`
 		);
 	}
