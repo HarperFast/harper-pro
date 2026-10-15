@@ -246,7 +246,6 @@ suite('Clone Node', (ctx) => {
 		});
 
 		await deployNodeModulesOnlyApplications(nodeCtx.harper);
-		// the fixture itself must work where it was deployed, or a clone failing it proves nothing
 		await assertNodeModulesOnlyApplicationsServe(nodeCtx.harper);
 	});
 

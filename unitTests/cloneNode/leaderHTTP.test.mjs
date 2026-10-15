@@ -106,7 +106,6 @@ describe('leaderHTTP', () => {
 		this.timeout(TEST_DEADLINE_MS);
 		respond = stallMidArchive;
 		const payload = await readPackageResponse(await postToLeader(target, operation, IDLE_MS));
-		// as while preparation waits for its lock before extracting
 		await new Promise((resolve) => setTimeout(resolve, IDLE_MS * 2));
 		await assert.rejects(readAll(payload));
 	});
