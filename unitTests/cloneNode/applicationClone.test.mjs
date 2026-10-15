@@ -138,6 +138,19 @@ describe('cloneFilesystemOnlyApplications', () => {
 		assert.deepEqual(clone.requested, ['app']);
 	});
 
+	it('refuses, without requesting, a name package_component would shorten or reject', async () => {
+		const clone = harness({
+			listing: { entries: [filesystemOnly('app'), filesystemOnly('app.v2'), filesystemOnly('my app')] },
+		});
+		await assert.rejects(clone.run(), {
+			name: 'ApplicationCloneError',
+			message: 'Failed to clone 2 of 3 filesystem-only application(s) from the leader: app.v2, my app',
+		});
+
+		assert.deepEqual(clone.requested, ['app']);
+		assert.match(clone.errors()[0], /'app\.v2'.*rename it on the leader/);
+	});
+
 	it('releases every archive, read or not', async () => {
 		const clone = harness({
 			listing: { entries: [filesystemOnly('first'), filesystemOnly('second')] },
