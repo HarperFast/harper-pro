@@ -1,7 +1,6 @@
 import { basename } from 'node:path';
 import { Readable } from 'node:stream';
 
-/** An application the clone could not copy, which ends the clone attempt. */
 export class ApplicationCloneError extends Error {
 	name = 'ApplicationCloneError';
 }
