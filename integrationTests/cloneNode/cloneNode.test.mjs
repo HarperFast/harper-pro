@@ -716,7 +716,11 @@ suite('Clone Node - SSH key clone failure leaves node Unavailable and uncloned',
 // so the clone's extraction fails as it would on a dropped transfer.
 suite(
 	'Clone Node - application clone failure leaves node Unavailable and uncloned, and a restart retries it',
-	{ skip: process.getuid?.() === 0 && 'root can read a mode-000 file' },
+	{
+		skip:
+			(process.platform === 'win32' && 'Windows cannot make a file unreadable with chmod') ||
+			(process.getuid?.() === 0 && 'root can read a mode-000 file'),
+	},
 	(ctx) => {
 		const unreadableFile = () => join(ctx.leader.dataRootDir, 'components', 'unreadable-app', 'data.bin');
 
