@@ -306,12 +306,12 @@ export async function addNodeBack(req) {
 	if (nodeRecord.replicates) {
 		const thisNode: any = {
 			url: getThisNodeUrl(),
-			ca: repCa?.certificate,
 			// Preserve a directional self-record, not a forced `true` — mirror setNode so the responder side
 			// of the handshake also keeps a constrained topology. systemdb-routing.
 			replicates: selfReplicatesForNodeWrite(),
 			subscriptions: null,
 		};
+		if (repCa) thisNode.ca = repCa.certificate;
 		if (get(CONFIG_PARAMS.REPLICATION_SHARD) !== undefined) {
 			thisNode.shard = get(CONFIG_PARAMS.REPLICATION_SHARD);
 			certs.shard = thisNode.shard;

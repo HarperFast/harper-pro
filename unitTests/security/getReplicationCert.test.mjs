@@ -242,14 +242,23 @@ describe('getReplicationCert and getReplicationCertAuth (Pro security/certificat
 
 	it('allows addNodeBack for a plaintext ws:// peer without a CSR when hdb_certificate is empty', async () => {
 		const nodeTable = getHDBNodeTable();
+		await nodeTable.put(nodeName, {
+			name: nodeName,
+			url: 'wss://127.0.0.1:9933',
+			ca: ca.cert,
+			replicates: true,
+			subscriptions: null,
+		});
 		try {
 			const res = await withTimeout(
-				addNodeBack({ hostname: 'peer-ws-node', url: 'ws://127.0.0.1:9998', subscriptions: [] }),
+				addNodeBack({ hostname: 'peer-ws-node', url: 'ws://127.0.0.1:9998' }),
 				2000,
 				'addNodeBack ws://'
 			);
 			assert.equal(res.nodeName, nodeName);
 			assert.equal(res.usingCA, undefined);
+			const selfRow = await nodeTable.get(nodeName);
+			assert.equal(selfRow?.ca, ca.cert);
 		} finally {
 			await nodeTable.delete('peer-ws-node');
 			await nodeTable.delete(nodeName);
