@@ -7,22 +7,36 @@ export class ApplicationCloneError extends Error {
 }
 
 /**
+ * Whether a leader can package an application's node_modules without its own Harper install. From 5.3.0
+ * the packer leaves out the loader's `node_modules/harper` link; earlier leaders follow it (v4 follows
+ * `node_modules/harperdb`), so every application would carry the whole install.
+ */
+export function packagesNodeModulesWithoutInstall(leaderVersion: string | undefined): boolean {
+	const [, major, minor] = /(\d+)\.(\d+)/.exec(leaderVersion ?? '') ?? [];
+	if (major === undefined) return false;
+	return Number(major) > 5 || (Number(major) === 5 && Number(minor) >= 3);
+}
+
+/**
  * Copies the leader's filesystem-only applications — those without a `package` in its config, which
- * nothing reinstalls on this node — as the leader packages them, node_modules included: npm cannot
- * rebuild a package whose only copy is in node_modules (a `file:` dependency into it, a bundler's private
- * workspace package), nor a deploy's request-scoped install options or registry credentials.
+ * nothing reinstalls on this node — as the leader packages them, node_modules included whenever
+ * `chooseTransfer` allows: npm cannot rebuild a package whose only copy is in node_modules (a `file:`
+ * dependency into it, a bundler's private workspace package), nor a deploy's request-scoped install
+ * options or registry credentials.
  *
  * Every application is attempted, then any failure throws, so clone setup stops before this node can be
  * marked cloned or Available without an application the leader serves.
  */
 export async function cloneFilesystemOnlyApplications({
 	listComponents,
+	chooseTransfer,
 	requestPackage,
 	prepareApplication,
 	log,
 }: {
 	listComponents: () => Promise<any>;
-	requestPackage: (name: string) => Promise<string | Readable>;
+	chooseTransfer: () => Promise<{ withNodeModules: boolean; reason?: string }>;
+	requestPackage: (name: string, withNodeModules: boolean) => Promise<string | Readable>;
 	prepareApplication: (name: string, payload: string | Readable) => Promise<unknown>;
 	log: (message: string, level?: 'notify' | 'error') => void;
 }): Promise<void> {
@@ -49,6 +63,12 @@ export async function cloneFilesystemOnlyApplications({
 		return;
 	}
 	log(`Cloning ${applications.length} application(s) not referenced in harper-config`);
+	const { withNodeModules, reason } = await chooseTransfer();
+	if (!withNodeModules) {
+		log(
+			`Reinstalling each application's dependencies with npm instead of copying node_modules (${reason}); a package that exists only in an application's node_modules will be missing`
+		);
+	}
 
 	const failed: string[] = [];
 	for (const { name } of applications) {
@@ -62,7 +82,7 @@ export async function cloneFilesystemOnlyApplications({
 					`package_component cannot fetch it by that name; rename it on the leader to letters, digits, '-' and '_' only`
 				);
 			}
-			payload = await requestPackage(name);
+			payload = await requestPackage(name, withNodeModules);
 			await prepareApplication(name, payload);
 			log(`Successfully cloned application: ${name}`);
 		} catch (error) {
