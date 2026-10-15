@@ -64,6 +64,16 @@ describe('cloneFilesystemOnlyApplications', () => {
 		assert.deepEqual(clone.requested, ['app']);
 	});
 
+	it('skips dot-prefixed directories, which the loader never loads', async () => {
+		const clone = harness({
+			listing: { entries: [filesystemOnly('.git'), filesystemOnly('.deploy-aside'), filesystemOnly('app')] },
+		});
+		await clone.run();
+
+		assert.deepEqual(clone.requested, ['app']);
+		assert.deepEqual(clone.errors(), []);
+	});
+
 	it('clones nothing, and does not throw, when the leader has no filesystem-only application', async () => {
 		const clone = harness({ listing: { entries: [] } });
 		await clone.run();
