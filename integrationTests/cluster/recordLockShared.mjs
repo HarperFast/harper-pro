@@ -15,6 +15,20 @@ process.env.HARPER_INTEGRATION_TEST_INSTALL_SCRIPT = join(import.meta.dirname, '
 const FIXTURE = join(import.meta.dirname, 'fixture-record-locks');
 export const DB = 'data';
 export const CONVERGE_TIMEOUT_MS = 90_000;
+/**
+ * With the replication pool on (the pool-on CI jobs set `replication.threads` for every node through
+ * `HARPER_CONFIG`), the pool owns subscriptions and record-lock coordination, so a multi-worker node gets as
+ * many pool workers as http workers. At 2 pool workers, round-robin over (peer, database) with two databases
+ * would put every peer's `data` stream on one worker, never off the coordinating one.
+ */
+function poolEnv(threadsCount) {
+	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
+	if (threadsCount <= 1 || !(shared?.replication?.threads > 0)) return {};
+	return {
+		HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared.replication, threads: threadsCount } }),
+	};
+}
+
 function optionsFor(hostname, env = {}, threadsCount = 1) {
 	return {
 		config: {
@@ -29,7 +43,12 @@ function optionsFor(hostname, env = {}, threadsCount = 1) {
 				pingTimeout: 3000,
 			},
 		},
-		env: { HARPER_NO_FLUSH_ON_EXIT: true, HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS: '0', ...env },
+		env: {
+			HARPER_NO_FLUSH_ON_EXIT: true,
+			HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS: '0',
+			...poolEnv(threadsCount),
+			...env,
+		},
 	};
 }
 
@@ -152,8 +171,9 @@ export function waitForRing(nodes, expectedSize) {
  * the two — `HARPER_TEST_RECORD_LOCK_MIN_DRAIN_BACKSTOP_MS=0` (set in `optionsFor`) disables even the
  * small backstop, so this bootstraps immediately; that is safe here specifically because every node is
  * freshly started with no prior generation, not something a real reconfiguration could skip.
+ * `afterActivate`, when supplied, runs after each activation response and before starting the next.
  */
-export async function bootstrapHomeMap(nodes) {
+export async function bootstrapHomeMap(nodes, afterActivate) {
 	const homes = [];
 	for (const node of nodes) {
 		const status = await clusterStatusOf(node);
@@ -168,7 +188,7 @@ export async function bootstrapHomeMap(nodes) {
 			quiesce: homes,
 			authorization: node.admin,
 		});
-	for (const node of nodes)
+	for (const node of nodes) {
 		await sendOperation(node, {
 			operation: 'record_lock_activate_generation',
 			database: DB,
@@ -176,6 +196,8 @@ export async function bootstrapHomeMap(nodes) {
 			homes,
 			authorization: node.admin,
 		});
+		await afterActivate?.(node);
+	}
 	return homes;
 }
 

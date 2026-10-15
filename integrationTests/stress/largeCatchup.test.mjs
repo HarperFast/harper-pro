@@ -34,6 +34,10 @@
  * Run at CI scale (10 GB):
  *   HARPER_RUN_STRESS_TESTS=1 HARPER_STRESS_LARGE_DATA_GB=10 \
  *     npm run test:integration -- integrationTests/stress/largeCatchup.test.mjs
+ *
+ * Pool comparison (harper-pro#975): HARPER_STRESS_LARGE_REPLICATION_THREADS sets replication.threads on
+ * both nodes, and HARPER_STRESS_LARGE_HTTP_LOAD sets how many concurrent HTTP request loops run against
+ * each node during catch-up; their latency (p50/p99) is reported with the catch-up throughput.
  */
 
 import { suite, test, before, after } from 'node:test';
@@ -140,6 +144,47 @@ if (!stressEnabled()) {
 	const PAYLOAD = 'x'.repeat(PAYLOAD_SIZE);
 
 	const RATE_WINDOW_SECS = 180;
+	const REPLICATION_THREADS = Number(process.env.HARPER_STRESS_LARGE_REPLICATION_THREADS ?? 0);
+	const HTTP_LOAD = Number(process.env.HARPER_STRESS_LARGE_HTTP_LOAD ?? 0);
+
+	/**
+	 * `concurrency` back-to-back GET loops against a node's HTTP port, recording each request's latency.
+	 * The path is not exported, so each answer measures the HTTP worker's event loop, not a data read.
+	 */
+	function startHttpLoad(node, concurrency) {
+		const latencies = [];
+		let errors = 0;
+		let running = true;
+		const url = new URL('/large/seed-1', node.httpURL);
+		const loop = async () => {
+			while (running) {
+				const start = performance.now();
+				try {
+					const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+					await response.arrayBuffer();
+					latencies.push(performance.now() - start);
+				} catch {
+					errors++;
+				}
+			}
+		};
+		const loops = Array.from({ length: concurrency }, loop);
+		return {
+			async stop() {
+				running = false;
+				await Promise.all(loops);
+				latencies.sort((a, b) => a - b);
+				const at = (quantile) => latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * quantile))];
+				return {
+					requests: latencies.length,
+					errors,
+					p50Ms: Number((at(0.5) ?? 0).toFixed(2)),
+					p99Ms: Number((at(0.99) ?? 0).toFixed(2)),
+					maxMs: Number((latencies[latencies.length - 1] ?? 0).toFixed(2)),
+				};
+			},
+		};
+	}
 
 	/**
 	 * Catch-up throughput is strongly BIMODAL, so a single averaged MB/s is not a diagnosis.
@@ -242,7 +287,7 @@ if (!stressEnabled()) {
 			const cfg = (host) => ({
 				analytics: { aggregatePeriod: -1 },
 				logging: { colors: false, console: true, level: 'warn' },
-				replication: { securePort: host + ':9933' },
+				replication: { securePort: host + ':9933', threads: REPLICATION_THREADS },
 				storage: { rocks },
 				threads: { count: 4 },
 			});
@@ -320,6 +365,7 @@ if (!stressEnabled()) {
 			// attribute a slow run to a busy runner after the fact.
 			const hostSampler = sampleHostCounters({ intervalMs: 5_000 });
 			let bSampler = null;
+			let httpLoads;
 			let testDone = false;
 			try {
 				const writeStart = Date.now();
@@ -394,7 +440,7 @@ if (!stressEnabled()) {
 					config: {
 						analytics: { aggregatePeriod: -1 },
 						logging: { colors: false, console: true, level: 'warn' },
-						replication: { securePort: B.hostname + ':9933' },
+						replication: { securePort: B.hostname + ':9933', threads: REPLICATION_THREADS },
 						storage: { rocks: fabricRocksConfig() },
 						threads: { count: 4 },
 					},
@@ -404,6 +450,7 @@ if (!stressEnabled()) {
 				B = bRestartCtx.harper;
 
 				const catchupStart = Date.now();
+				httpLoads = HTTP_LOAD > 0 ? { A: startHttpLoad(A, HTTP_LOAD), B: startHttpLoad(B, HTTP_LOAD) } : undefined;
 				bSampler = sampleMetrics(B, { intervalMs: 5_000 });
 				// Re-baseline the host counters here so both the per-poll lines and the
 				// catch-up summary measure the catch-up phase alone, excluding B's restart.
@@ -466,6 +513,8 @@ if (!stressEnabled()) {
 					await delay(CATCHUP_POLL_SECS * 1000);
 				}
 
+				const httpLatency = httpLoads && { A: await httpLoads.A.stop(), B: await httpLoads.B.stop() };
+				httpLoads = undefined;
 				const aSummary = summariseSamples(aSampler.stop());
 				const bSummary = summariseSamples(bSampler.stop());
 				const hostSummary = summariseHostSamples(hostSampler.stop().slice(hostCatchupFrom));
@@ -484,6 +533,11 @@ if (!stressEnabled()) {
 						`throughput=${catchupMBps.toFixed(1)} MB/s ` +
 						`A_peakRSS=${mb(aSummary.peakRss)} B_peakRSS=${mb(bSummary.peakRss)}`
 				);
+				if (httpLatency)
+					console.log(
+						`[large-catchup] http load (replication.threads=${REPLICATION_THREADS}, ${HTTP_LOAD} loops/node): ` +
+							`A ${JSON.stringify(httpLatency.A)} B ${JSON.stringify(httpLatency.B)}`
+					);
 				// Phase profile — the averaged throughput above cannot distinguish uniformly-slow replay
 				// from a stall-bound run that never recovered. See summariseCatchupRate.
 				console.log(`[large-catchup] rate profile: ${formatRateProfile(rateProfile)}`);
@@ -543,6 +597,9 @@ if (!stressEnabled()) {
 					},
 					hostWritePhase: writeHost,
 					hostCatchup: hostSummary,
+					replicationThreads: REPLICATION_THREADS,
+					httpLoadPerNode: HTTP_LOAD,
+					httpLatency,
 				};
 				writeStressMetrics('large-catchup', metrics);
 				writeJobSummary(
@@ -600,6 +657,7 @@ if (!stressEnabled()) {
 				aSampler.stop();
 				bSampler?.stop();
 				hostSampler.stop();
+				if (httpLoads) await Promise.all([httpLoads.A.stop(), httpLoads.B.stop()]);
 			}
 		});
 	});

@@ -36,7 +36,7 @@ export async function startOriginLogNodes(suiteName, names, table, replication =
 				},
 			};
 			await startHarper(nodeCtx, startOptions(nodeCtx.harper));
-			return Object.assign(nodeCtx.harper, { replication: replication[name], env: env[name] });
+			return Object.assign(nodeCtx.harper, { replication: replication[name], env: env[name], name: nodeCtx.name });
 		})
 	);
 	await Promise.all(
@@ -63,9 +63,10 @@ async function restartNode(node) {
 }
 
 export async function startNode(node) {
-	const started = (await startHarper({ harper: node }, startOptions(node))).harper;
+	const started = (await startHarper({ name: node.name, harper: node }, startOptions(node))).harper;
 	started.replication = node.replication;
 	started.env = node.env;
+	started.name = node.name;
 	return started;
 }
 

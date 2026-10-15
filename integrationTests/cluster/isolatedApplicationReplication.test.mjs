@@ -58,7 +58,10 @@ async function threadsOf(node) {
 	const dedicated = threads.filter((thread) => thread.application === ISOLATED_APP).map((t) => t.threadId);
 	equal(dedicated.length, 1, `expected one dedicated worker: ${JSON.stringify(threads)}`);
 	equal(pool.length, 1, `expected one pool worker: ${JSON.stringify(threads)}`);
-	return { pool, dedicated: dedicated[0] };
+	// With replication.threads (the pool-on CI jobs set it through HARPER_CONFIG), the replication pool owns
+	// subscriptions and record-lock coordination instead of the http workers.
+	const replicationPool = threads.filter((thread) => thread.name === 'replication').map((t) => t.threadId);
+	return { pool: replicationPool.length > 0 ? replicationPool : pool, dedicated: dedicated[0] };
 }
 
 suite('replication stays off an isolated application worker', { skip: UNSUPPORTED_HERE, timeout: 240_000 }, (ctx) => {

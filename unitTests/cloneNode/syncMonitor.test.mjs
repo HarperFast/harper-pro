@@ -183,10 +183,11 @@ describe('checkSyncStatus', () => {
 		});
 	});
 
-	it('ignores non-date sentinel strings in the arrival field', async () => {
+	it('ignores an unparseable arrival stamp', async () => {
 		const result = await checkSyncStatus(
 			{ system: 1000 },
-			async () => statusResponse([{ database: 'system', lastReceivedVersion: 500, lastReceivedLocalTime: 'Copying' }]),
+			async () =>
+				statusResponse([{ database: 'system', lastReceivedVersion: 500, lastReceivedLocalTime: 'not a date' }]),
 			LEADER_URL,
 			noopLog
 		);

@@ -17,7 +17,7 @@ export async function sendOperation(node, operation, options) {
 	return body;
 }
 
-async function postOperation(node, operation, options) {
+export async function postOperation(node, operation, options) {
 	const response = await fetch(node.operationsAPIURL, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
@@ -155,6 +155,19 @@ export async function restartNode(node, opts) {
 	// The response can be lost if the socket closes first; the pid check is what we trust.
 	await sendOperation(node, { operation: 'restart' }).catch(() => {});
 	return waitForNewPid(node, previousPid, opts);
+}
+
+/**
+ * Env that keeps one node's replication off the pool on the pool-on CI legs, which set `replication.threads` for
+ * every node through HARPER_CONFIG. For a node whose fault injection is application code: pool workers load
+ * none, so an injector armed over HTTP never runs on the thread that owns the replication socket.
+ *
+ * @returns {Object} env entries to pass to startHarper/setupHarperWithFixture (empty when the pool is off)
+ */
+export function replicationPoolOffEnv() {
+	const shared = process.env.HARPER_CONFIG ? JSON.parse(process.env.HARPER_CONFIG) : undefined;
+	if (!(shared?.replication?.threads > 0)) return {};
+	return { HARPER_CONFIG: JSON.stringify({ ...shared, replication: { ...shared.replication, threads: 0 } }) };
 }
 
 /**

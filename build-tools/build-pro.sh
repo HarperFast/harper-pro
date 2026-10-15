@@ -12,16 +12,22 @@ function use_git {
   fi
 }
 
+stage=""
+rebuildRe2=""
+
 function cleanup {
+  if [[ -n "$stage" ]]; then
+    rm -rf "$stage"
+  fi
+  if [[ -n "$rebuildRe2" ]]; then
+    # re2's binary comes only from its install script; the checkout's WAF and tests need it.
+    npm rebuild re2 || echo "npm rebuild re2 failed; run it before testing this checkout"
+  fi
   if use_git; then
     echo -e "\n📦 Restoring core files"
     pushd core
     git restore .
     popd
-    echo -e "\n📦 Restoring package-lock.json"
-    git restore package-lock.json
-    echo -e "\n📦 Removing npm-shrinkwrap.json"
-    rm npm-shrinkwrap.json
   fi
 }
 
@@ -34,27 +40,55 @@ if [[ "$IGNORE_PACKAGE_JSON_DIFF" != "true" ]]; then
   fi
 fi
 
-echo -e "\n📦 Installing production deps"
-npm ci
+version=$(npm pkg get version | tr -d \")
+packageFile="harperfast-harper-pro-${version}.tgz"
+# A failed rebuild must not leave an earlier release archive available to publish.
+rm -f harperfast-harper-pro-*.tgz
+
+echo -e "\n📦 Installing locked deps"
+# npm ci would install from a leftover shrinkwrap instead of the lock the bundle is checked against.
+rm -f npm-shrinkwrap.json
+# No install script may run before the bundle is copied: it could rewrite bundled JavaScript.
+rebuildRe2=1
+npm ci --ignore-scripts
 
 echo -e "\n📦 Applying Harper Pro branding"
 perl -pi -e 's/Harper/Harper Pro/g' ./core/bin/*.js ./core/utility/install/installer.js
 
 echo -e "\n📦 Building project"
-npm run build || true
-
-echo -e "\n📦 Creating shrinkwrap"
-npm shrinkwrap
-
-echo -e "\n📦 Pruning devDependencies from shrinkwrap"
-node build-tools/prune-shrinkwrap-dev.mjs npm-shrinkwrap.json
+# A stale dist/ would mask a file the compiler stopped emitting.
+rm -rf dist
+npm run build
 
 ./build-tools/build-studio.sh
 
-echo -e "\n📦 Building package"
-npm pack
+echo -e "\n📦 Preparing portable dependency bundle"
+mkdir -p node_modules/.cache
+stage=$(mktemp -d "$PWD/node_modules/.cache/harper-pro-package.XXXXXX")
+node core/build-tools/bundleDependencies.ts prepare "$PWD" "$stage/bundle"
 
-version=$(npm pkg get version | tr -d \")
-packageFile="harperfast-harper-pro-${version}.tgz"
+echo -e "\n📦 Building package"
+npm pack "$stage/bundle/package" --ignore-scripts --pack-destination "$stage"
+mkdir "$stage/packed"
+tar -xzf "$stage/$packageFile" --strip-components=1 -C "$stage/packed"
+node core/build-tools/bundleDependencies.ts check "$stage/packed" "$PWD/package-lock.json"
+node -e '
+	const { existsSync, readFileSync } = require("node:fs");
+	const { join } = require("node:path");
+	const root = process.argv[1];
+	const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+	const assets = [
+		...Object.values(manifest.bin),
+		manifest.main,
+		manifest.exports["."],
+		"index.d.ts",
+		"static/defaultConfig.yaml",
+		"studio/web/index.html",
+	];
+	const missing = assets.filter((asset) => !existsSync(join(root, asset)));
+	if (missing.length) throw new Error(`Release archive is missing ${missing.join(", ")}`);
+' "$stage/packed"
+mv "$stage/$packageFile" "$packageFile"
+
 echo -e "\n📦 Built Harper Pro ${version} in ${packageFile}"
 echo "📦 Run 'npm publish ${packageFile}' to release"

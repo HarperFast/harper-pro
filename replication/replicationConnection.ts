@@ -7,7 +7,20 @@ import {
 	table as ensureTable,
 	onUpdatedTable,
 	onRemovedDB,
+	onTableDropRecorded,
+	getTableDrops,
+	recordTableDrop,
+	isDeadGeneration,
+	isDroppedPeerGeneration,
+	catalogCreatedBefore,
+	catalogCreatedTime,
+	tableDropEpoch,
+	stampTableCreatedTime,
+	tableLifecycleTime,
 } from '../core/resources/databases.ts';
+import { TableGenerationDroppedError } from '../core/utility/errors/hdbError.ts';
+import { validateDropMarkers, mergeDropMarkers, rowsAround, MAX_DROP_MARKERS_PER_FRAME } from './tableLifecycle.ts';
+import type { TableDropMarker } from '../core/resources/databases.ts';
 import {
 	createAuditEntry,
 	Decoder,
@@ -21,7 +34,9 @@ import {
 	auditRetention,
 	LOCAL_ONLY,
 	isLockControlType,
+	readOriginClosedFloor,
 } from '../core/resources/auditStore.ts';
+import { isValidFloor } from '../core/resources/originClosedFloor.ts';
 import {
 	exportIdMapping,
 	getIdOfRemoteNode,
@@ -54,6 +69,7 @@ import {
 	LAST_ERROR_TIME_POSITION,
 	FIRE_MECHANISMS,
 	FIRE_COUNTER_BASE_POSITION,
+	PEER_CERTIFIES_FLOORS_POSITION,
 } from './sharedStatusSlots.ts';
 import {
 	recordPeerLockCapability,
@@ -65,10 +81,11 @@ import {
 import { ANY_TABLE, markRecloned, poison as poisonRecordLockPair } from './recordLockPoison.ts';
 import { decodeLockControlPayload } from '../core/resources/recordLockCoordinator.ts';
 import { CLUSTER_RECORD_LOCKS_ENABLED } from './recordLockConfig.ts';
-import { verifyLegacyCopyBaseline } from './legacyCopy.ts';
+import { requiresLegacyCopyVerification, verifyLegacyCopyBaseline } from './legacyCopy.ts';
 import { getThisNodeName } from '../core/server/nodeName.ts';
+import { isDedicatedPoolWorker } from '../core/server/threads/workerPools.ts';
 import * as env from '../core/utility/environment/environmentManager.js';
-import { CONFIG_PARAMS } from '../core/utility/hdbTerms.ts';
+import { CONFIG_PARAMS, THREAD_TYPES } from '../core/utility/hdbTerms.ts';
 import { registerBlobSend, noteBlobSendProgress, endBlobSend, isDrainingBlobSends } from './blobSendDrain.ts';
 import {
 	PARK_WARN_MS,
@@ -83,7 +100,9 @@ import {
 	createUnknownCommandState,
 	noteUnknownCommand,
 	peerSupportsOriginCursors,
+	peerSupportsOriginFloors,
 	peerSupportsRecordLocks,
+	peerSupportsTableLifecycle,
 	resolvePeerCapabilities,
 	samePeerCapabilities,
 	subscriptionSetupCapabilityFrom,
@@ -100,7 +119,7 @@ import {
 import { decode, encode, Packr } from 'msgpackr';
 import { createStructon } from 'structon';
 import { WebSocket } from 'ws';
-import { threadId } from 'worker_threads';
+import { threadId, workerData } from 'node:worker_threads';
 import harperLogger from '../core/utility/logging/harper_logger.js';
 const { forComponent, errorToString } = harperLogger;
 import { disconnectedFromNode, connectedToNode, ensureNode } from './subscriptionManager.ts';
@@ -216,6 +235,8 @@ export {
 const SUSTAINED_BLOB_FAILURE_THRESHOLD = 5;
 export const RECEIVING_STATUS_WAITING = 0;
 export const RECEIVING_STATUS_RECEIVING = 1;
+// SENDING_TIME_POSITION while a bulk copy is sending records; a real sending time is an audit key, never 1.
+export const SENDING_TIME_COPYING = 1;
 export const CONNECTION_STATE_DOWN = 0;
 export const CONNECTION_STATE_CONNECTED = 2;
 // LAST_ERROR_CODE for a disconnect this node INFERRED rather than observed on the wire: the worker thread
@@ -466,6 +487,25 @@ export function holdFailedFrame(
 // (MAX_EVENT_DELAY_TIME = 3 s). Yield the event loop at least this often (ms) while decoding so the
 // worker stays responsive during a bulk copy/clone.
 const RECEIVE_YIELD_INTERVAL = env.get('replication_receiveYieldInterval') ?? 100;
+
+// One pending turn is shared across senders so the yield cost does not multiply with peer count.
+const SEND_YIELD_INTERVAL = workerData?.name === THREAD_TYPES.REPLICATION ? 2 : 0.5;
+let lastSendYieldTime = 0;
+let pendingSendYield: Promise<void> | undefined;
+
+export function yieldSendLoop(): Promise<void> | undefined {
+	if (pendingSendYield) return pendingSendYield;
+	if (performance.now() - lastSendYieldTime >= SEND_YIELD_INTERVAL) {
+		return (pendingSendYield = new Promise<void>((resolve) => {
+			setImmediate(() => {
+				lastSendYieldTime = performance.now();
+				pendingSendYield = undefined;
+				resolve();
+			});
+		}));
+	}
+}
+
 // A queued frame is usually a subarray of the socket read chunk it arrived in, so it pins the whole
 // chunk, not its own length. Both the frame ceiling and the honest retention bound are stated in these
 // units rather than in frame lengths.
@@ -754,6 +794,24 @@ const unknownCommandWarnThrottle = createThrottleState();
 // millisecond, and an NTP step backwards would make every later session compare older.
 let nextConnectionSessionOrdinal = 0;
 const TEST_OMIT_CAPABILITIES = process.env.HARPER_TEST_OMIT_REPLICATION_CAPABILITIES === '1';
+const TEST_ORIGIN_FLOOR_INTERVAL_MS = Number(process.env.HARPER_TEST_ORIGIN_FLOOR_INTERVAL_MS);
+/** Authorized drop markers for a database not open on this thread yet: they cannot be recorded until it is. */
+const markersAwaitingDatabase = new Map<string, TableDropMarker[]>();
+/** Clears the held list a pass recorded, unless an overlapping pass has since merged in markers it has not. */
+function releaseHeldMarkers(databaseName: string, recorded: TableDropMarker[]) {
+	if (markersAwaitingDatabase.get(databaseName) === recorded) markersAwaitingDatabase.delete(databaseName);
+}
+/** Test-only read of the markers this thread holds for `databaseName`. */
+export function heldDropMarkersFor(databaseName: string): readonly TableDropMarker[] | undefined {
+	return markersAwaitingDatabase.get(databaseName);
+}
+/**
+ * The catalog's stamp when this thread's class predates another thread's backfill. Test-only: a pre-stamp sender
+ * has no capability bag and no lifecycle stamps on its definitions.
+ */
+function advertisedCreatedTime(table: any): number | undefined {
+	return TEST_OMIT_CAPABILITIES ? undefined : (table.createdTime ?? catalogCreatedTime(table));
+}
 // Only 200-255: every allocated command code is below 200, so a mis-set value cannot make a real node
 // emit a live DISCONNECT or drive its peer into copy mode.
 const TEST_UNKNOWN_COMMAND_CODE = Number(process.env.HARPER_TEST_SEND_UNKNOWN_COMMAND_CODE);
@@ -2747,6 +2805,80 @@ export function collectLastTxnTimes(seqEntries: Iterable<{ value: any }>): Map<a
  */
 export const ORIGIN_CURSOR_OVERLAP_MS = 60_000;
 
+/**
+ * How often a sender certifies floors to one peer: the idle wake of its subscription loop and the minimum interval
+ * between two floor vectors. The certifier itself ticks every `ORIGIN_FLOOR_TICK_MS`.
+ */
+const ORIGIN_FLOOR_INTERVAL_MS = 30_000;
+const originFloorIntervalMs =
+	Number.isFinite(TEST_ORIGIN_FLOOR_INTERVAL_MS) && TEST_ORIGIN_FLOOR_INTERVAL_MS > 0
+		? TEST_ORIGIN_FLOOR_INTERVAL_MS
+		: ORIGIN_FLOOR_INTERVAL_MS;
+
+const FLOOR_SCRATCH = new Float64Array(1);
+const FLOOR_BITS = new BigInt64Array(FLOOR_SCRATCH.buffer);
+/**
+ * The direct resume start is exclusive, and a floor can equal the key of a transaction still open at the origin (the
+ * floor is that reservation's bound), so resume starts just below it.
+ */
+export function cursorBelowFloor(floor: number): number {
+	FLOOR_SCRATCH[0] = floor;
+	FLOOR_BITS[0] -= 1n;
+	return FLOOR_SCRATCH[0];
+}
+
+export function resumeStartWithFloor(position: number, closedFloor: unknown): number {
+	return isValidFloor(closedFloor) ? Math.max(position, cursorBelowFloor(closedFloor)) : position;
+}
+
+export function parseOriginFloors(value: unknown): Map<string, number> {
+	const floors = new Map<string, number>();
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return floors;
+	for (const [name, floor] of Object.entries(value)) if (isValidFloor(floor)) floors.set(name, floor);
+	return floors;
+}
+
+/** `certifies`: an origin whose current socket no longer certifies may be an older binary writing below its floor. */
+export function collectRelayableFloors(
+	seqRows: Map<number, DbisCursor>,
+	originNames: Iterable<string>,
+	nameToId: Record<string, number> | undefined,
+	certifies: (name: string) => boolean
+): Map<string, number> {
+	const floors = new Map<string, number>();
+	if (!nameToId) return floors;
+	for (const name of originNames) {
+		if (!Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number' || !certifies(name)) continue;
+		const id = nameToId[name];
+		const nodes = seqRows.get(id)?.nodes;
+		const state = Array.isArray(nodes) ? nodes.find((node) => node?.id === id) : undefined;
+		if (state?.relayable === true && isValidFloor(state.closedFloor)) floors.set(name, state.closedFloor);
+	}
+	return floors;
+}
+
+/** Keeps the floors a sequence update carried until the blob rule lets them be persisted. */
+export class PendingOriginFloors {
+	private pending: Map<number, [number, number, boolean]> | undefined;
+	note(floors: Iterable<[number, number, boolean]> | undefined): void {
+		if (!floors) return;
+		for (const floor of floors) {
+			const existing = (this.pending ??= new Map()).get(floor[0]);
+			if (!existing || existing[1] < floor[1]) this.pending.set(floor[0], floor);
+			else if (existing[1] === floor[1] && floor[2] && !existing[2]) existing[2] = true;
+		}
+	}
+	take(blocked: boolean): [number, number, boolean][] | undefined {
+		if (!this.pending?.size || blocked) return undefined;
+		const floors = [...this.pending.values()];
+		this.pending.clear();
+		return floors;
+	}
+	get size(): number {
+		return this.pending?.size ?? 0;
+	}
+}
+
 /** The `[Symbol.for('seq'), id]` rows of `__dbis__` by id, skipping any row that does not decode (harper-pro#352). */
 export function collectSeqRows(seqEntries: Iterable<{ key: any; value: any }>): Map<number, DbisCursor> {
 	const rows = new Map<number, DbisCursor>();
@@ -2772,22 +2904,31 @@ export function buildOriginCursorVector(
 	seqRows: Map<number, DbisCursor>,
 	peerId: number,
 	nameForId: (id: number) => string | undefined,
-	isMember: (name: string) => boolean
+	isMember: (name: string) => boolean,
+	useFloors = false
 ): Record<string, number> {
+	const cursorOf = (node: any): number | undefined => {
+		const position = isValidFrameTxnLogKey(node?.originLogKey) ? node.originLogKey : undefined;
+		if (!useFloors || !isValidFloor(node?.closedFloor)) return position;
+		return position === undefined
+			? cursorBelowFloor(node.closedFloor)
+			: resumeStartWithFloor(position, node.closedFloor);
+	};
 	const cursors = new Map<string, number>();
 	const peerNodes = seqRows.get(peerId)?.nodes;
 	for (const node of Array.isArray(peerNodes) ? peerNodes : []) {
-		if (!node || typeof node !== 'object' || node.id === 0 || !isValidFrameTxnLogKey(node.originLogKey)) continue;
+		if (!node || typeof node !== 'object' || node.id === 0) continue;
+		const cursor = cursorOf(node);
+		if (cursor === undefined) continue;
 		const name = nameForId(node.id);
-		if (name !== undefined) cursors.set(name, node.originLogKey);
+		if (name !== undefined) cursors.set(name, cursor);
 	}
 	for (const [id, row] of seqRows) {
 		if (id === peerId || id === 0) continue;
 		const name = nameForId(id);
 		if (name === undefined || cursors.has(name) || isMember(name)) continue;
 		const ownNodes = Array.isArray(row.nodes) ? row.nodes : [];
-		const ownCursor = ownNodes.find((node) => node?.id === id)?.originLogKey;
-		const cursor = isValidFrameTxnLogKey(ownCursor) ? ownCursor : row.seqId;
+		const cursor = cursorOf(ownNodes.find((node) => node?.id === id)) ?? row.seqId;
 		if (isValidFrameTxnLogKey(cursor) && cursor > 1) cursors.set(name, cursor);
 	}
 	return Object.fromEntries(cursors);
@@ -3008,7 +3149,7 @@ export function createReceiveWatchdog(opts: {
  * Wall-clock pacer for the bulk-copy send loop. The copy normally flushes to the socket on a
  * record-count checkpoint, but reading a large cold table dominates copy cost, so a single
  * count-batch can exceed the receive watchdog window with no bytes on the wire — and the LOCAL_ONLY
- * skip path bypasses the per-record flush+yield entirely. Either starves the watchdog into killing
+ * skip path bypasses normal record sending and its budgeted yield. Either starves the watchdog into killing
  * the connection mid-copy. This bounds the wall-clock gap between flushes/yields: `due(now)` reports
  * whether at least `intervalMs` has elapsed since the last one, and callers `mark(now)` after each
  * flush or yield (whether triggered by this pacer or the count checkpoint) so the window restarts.
@@ -3868,7 +4009,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				if (frameOpen) drainEndTxnDeferred = true;
 				else
 					tableSubscriptionToReplicator.send(
-						seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+						seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId), undefined, true)
 					);
 			}
 			creditDurableProgress();
@@ -4115,7 +4256,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 	// copyStartTime) gets an onCommit that flushes before core persists [seq] (core awaits onCommit, then
 	// updateRecordedSequenceId). Every other seq-update — normal replication, LMDB (copy rows stay
 	// audited/durable), and mid-copy updates below copyStartTime — is a plain end_txn with no flush gate. (harper-pro#480)
-	function seqUpdateEndTxn(seqId: number): any {
+	function seqUpdateEndTxn(seqId: number, originFloors?: [number, number, boolean][], releasePending = false): any {
 		const originCursors = takeDurableOriginCursors();
 		if (copyApplyActive() && inCopyMode && copyModeStartTime > 0 && seqId >= copyModeStartTime) {
 			return {
@@ -4130,14 +4271,32 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				},
 			};
 		}
-		return {
+		// only an update that carries floors, or a blob drain releasing held ones, pays for a commit callback
+		if (!originFloors && !(releasePending && pendingOriginFloors.size > 0)) {
+			return {
+				type: 'end_txn',
+				localTime: seqId,
+				remoteNodeIds: receivingDataFromNodeIds,
+				txnStream,
+				onFailure: onFrameFailure,
+				originCursors,
+			};
+		}
+		// eligible only in this update's own onCommit: an earlier frame's late commit must not persist a floor
+		// past records still queued below it
+		const event: any = {
 			type: 'end_txn',
 			localTime: seqId,
 			remoteNodeIds: receivingDataFromNodeIds,
 			txnStream,
 			onFailure: onFrameFailure,
 			originCursors,
+			onCommit() {
+				pendingOriginFloors.note(originFloors);
+				event.originFloors = pendingOriginFloors.take(cursorBlockedByBlob());
+			},
 		};
+		return event;
 	}
 	// Returns true to hold: core then records no cursor for this connection's later frames either.
 	function onFrameFailure(error: unknown, position: number): boolean {
@@ -4572,8 +4731,20 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// Make the buffer available to the connection's lifecycle methods (close/forceReconnect) so they
 			// can record DOWN/error without re-resolving auditStore. See W1 (harper-pro#431).
 			if (options.connection) options.connection.sharedStatus = replicationSharedStatus;
+			publishPeerCertifiesFloors(replicationSharedStatus);
 		}
 		return replicationSharedStatus;
+	}
+	/**
+	 * Only this node's direct subscription link to the peer owns the slot: it is the socket that receives the
+	 * peer's certificates. A retrieval socket, an inbound socket and a failover subscription that reaches another
+	 * node's data through this peer share the peer's buffer and must neither set nor clear it.
+	 */
+	const ownsPeerCertifiesFloorsSlot = () =>
+		peerCapabilitiesLearned && options.connection?.nodeSubscriptions?.[0]?.name === remoteNodeName;
+	function publishPeerCertifiesFloors(status: Float64Array) {
+		if (instanceRetired || !ownsPeerCertifiesFloorsSlot()) return;
+		status[PEER_CERTIFIES_FLOORS_POSITION] = peerSupportsOriginFloors(peerCapabilities) ? 1 : 0;
 	}
 	// A record this node will not apply is a hole in that origin's stream for that table. It is
 	// recorded durably BEFORE the drop completes, so no later barrier can certify past it; a store
@@ -4600,12 +4771,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (status) {
 			recordPeerLockCapability(status, peerSupportsRecordLocks(peerCapabilities));
 			recordPeerLockLevel(status, peerCapabilities.recordLocks);
+			publishPeerCertifiesFloors(status);
 		}
 	}
 	if (databaseName) {
 		setDatabase(databaseName);
 	}
-	let schemaUpdateListener, dbRemovalListener;
+	let schemaUpdateListener, dbRemovalListener, dropRecordedListener;
 	const tableDecoders = [];
 	// The declaration to judge a send by. The live map wins: a drop removes the entry and a recreate
 	// replaces the object, so a cached class can outlive both. A connection that never resolved its
@@ -4763,6 +4935,36 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		pendingOriginCursors.clear();
 		return cursors;
 	}
+	const certifiesOriginFloors = () =>
+		STORAGE_IS_ROCKSDB && peerCapabilitiesLearned && peerSupportsOriginFloors(peerCapabilities);
+	const pendingOriginFloors = new PendingOriginFloors();
+	/**
+	 * A received floor vector as `[localOriginId, floor, relayable]` entries. Names resolve through the durable id
+	 * mapping and never mint an id; this node's own floor is not a certificate for it; a copy's updates carry none.
+	 * `relayable` records whether this node receives the origin directly with full table coverage (the main thread's
+	 * exclusion-origin set), which is what lets a relay forward the floor to its own subscribers.
+	 */
+	function receivedOriginFloors(value: unknown): [number, number, boolean][] | undefined {
+		if (value == null || !certifiesOriginFloors() || (inCopyMode && !copyCompleteReceived)) return undefined;
+		const floors = parseOriginFloors(value);
+		if (floors.size === 0) return undefined;
+		let entries: [number, number, boolean][] | undefined;
+		try {
+			const store = auditStore ?? getDatabaseStores().auditStore;
+			const nameToId = exportIdMapping(store);
+			const thisNodeName = getThisNodeName();
+			const directFullCoverage: string[] = options.connection?.exclusionOrigins ?? [];
+			for (const [name, floor] of floors) {
+				if (name === thisNodeName || !Object.hasOwn(nameToId, name) || typeof nameToId[name] !== 'number') continue;
+				(entries ??= []).push([nameToId[name], floor, directFullCoverage.includes(name)]);
+			}
+		} catch (error) {
+			// Without the mapping no floor is recorded; the position update itself still applies.
+			logger.warn?.(connectionId, 'could not resolve the origins of a floor certificate for', databaseName, error);
+			return undefined;
+		}
+		return entries;
+	}
 
 	// ── Leading-duplicate fast-skip state ───────────────────────────────────────────────────────────
 	// Per *source node* (NOT a single global flag): the resume cursor we asked this node to re-stream
@@ -4858,6 +5060,30 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		}
 		skippedBlobIds.set(streamKey, Date.now());
 		stream.destroy?.();
+	}
+
+	/**
+	 * Records resolve by table name, so a peer generation accepted earlier is judged again once the local table changes
+	 * or a drop marker is recorded on any thread, rather than written into a generation that retired it.
+	 */
+	function peerGenerationRefused(tableDecoder: any): boolean {
+		if (tableDecoder.refused) return true;
+		const epoch = tableDropEpoch();
+		if (tableDecoder.dropEpoch === epoch && tables[tableDecoder.name] === tableDecoder.table) return false;
+		tableDecoder.dropEpoch = epoch;
+		tableDecoder.table = tables[tableDecoder.name];
+		return (tableDecoder.refused = isDroppedPeerGeneration(databaseName, tableDecoder.name, tableDecoder.createdTime));
+	}
+
+	// Blobs are announced ahead of their record, so a skipped record's are already buffered; without this they
+	// would sit until the blobsTimer sweep a blobTimeout later (900s default).
+	function discardRecordBlobs(auditRecord: AuditRecord, tableDecoder: { decoder: any }) {
+		try {
+			for (const blob of collectAuditRecordBlobsFromBinary(auditRecord, tableDecoder, auditStore?.rootStore))
+				discardIncomingBlobStream(blob);
+		} catch (error) {
+			logger.trace?.(connectionId, 'could not enumerate the blobs of a skipped record', auditRecord.recordId, error);
+		}
 	}
 
 	/**
@@ -5063,15 +5289,21 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										schemaUpdateListener = forEachReplicatedDatabase(options, (database, databaseName) => {
 											if (checkDatabaseAccess(databaseName)) sendDBSchema(databaseName);
 										});
+										dropRecordedListener = onTableDropRecorded((database) => {
+											if (databases[database] && checkDatabaseAccess(database)) scheduleSchemaResend(database);
+										});
 										// onWSMessage is async, so the WS may have already closed by the time we get
 										// here — in that case 'close' has fired and adding the cleanup listener now
 										// would silently leak. Drop the registration immediately.
 										if (wsClosed) {
 											schemaUpdateListener.remove();
+											dropRecordedListener.remove();
 											schemaUpdateListener = undefined;
+											dropRecordedListener = undefined;
 										} else {
 											ws.on('close', () => {
 												schemaUpdateListener?.remove();
+												dropRecordedListener?.remove();
 											});
 										}
 									}
@@ -5110,27 +5342,70 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							'Received table definitions for',
 							data.map((t) => t.table)
 						);
+						const schemaDatabaseName = message[2];
+						// Markers drop tables, so they need the authority the subscription path requires to receive.
+						const markersAuthorized =
+							authorization?.name || authorization?.replicates || authorization?.role?.permission?.super_user;
+						// filtered by this peer's receive route here, so held markers keep their sender's rules
+						const routeExcluded = excludedTablesFromPeer(schemaDatabaseName);
+						const peerDropMarkers =
+							markersAuthorized && checkDatabaseAccess(schemaDatabaseName)
+								? validateDropMarkers(message[4]).filter((marker) => !routeExcluded?.has(marker.table))
+								: [];
+						// A stale local generation goes before this frame's definitions are compared. Markers for a database
+						// not open here wait, refusing what they retire, until a definition opens it.
+						const waiting = markersAwaitingDatabase.get(schemaDatabaseName);
+						let pendingMarkers = waiting ? mergeDropMarkers(waiting, peerDropMarkers) : peerDropMarkers;
+						if (!databases[schemaDatabaseName]) {
+							if (pendingMarkers.length > 0) markersAwaitingDatabase.set(schemaDatabaseName, pendingMarkers);
+						} else if (pendingMarkers.length > 0) {
+							if (waiting) markersAwaitingDatabase.set(schemaDatabaseName, pendingMarkers);
+							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
+							if (connectionSuperseded()) return;
+							releaseHeldMarkers(schemaDatabaseName, pendingMarkers);
+							pendingMarkers = [];
+						}
 						for (const tableDefinition of data) {
-							const newDatabaseName = message[2];
+							const newDatabaseName = schemaDatabaseName;
 							tableDefinition.database = newDatabaseName;
 							let table: any;
 							if (checkDatabaseAccess(newDatabaseName)) {
-								if (databaseName === 'system') {
-									// the system connection allows us to create new databases (which wouldn't otherwise have an existing connection)
-									if (!databases[newDatabaseName]?.[tableDefinition.table]) {
+								if (
+									isDroppedPeerGeneration(newDatabaseName, tableDefinition.table, tableDefinition.createdTime) ||
+									frameRetires(pendingMarkers, tableDefinition)
+								) {
+									refuseDeadDefinition(newDatabaseName, tableDefinition, 'DB_SCHEMA');
+									continue;
+								}
+								try {
+									if (databaseName === 'system') {
+										// the system connection allows us to create new databases (which wouldn't otherwise have an existing connection)
+										if (!databases[newDatabaseName]?.[tableDefinition.table]) {
+											table = ensureTableIfChanged(
+												tableDefinition,
+												databases[newDatabaseName]?.[tableDefinition.table]
+											);
+										}
+									} else {
+										// a database connection is not allowed to create new databases, so we need to check if the database exists
+										if (newDatabaseName !== 'data' && !databases[newDatabaseName]) {
+											logger.warn?.('Database not found', newDatabaseName);
+											return;
+										}
 										table = ensureTableIfChanged(tableDefinition, databases[newDatabaseName]?.[tableDefinition.table]);
 									}
-								} else {
-									// a database connection is not allowed to create new databases, so we need to check if the database exists
-									if (newDatabaseName !== 'data' && !databases[newDatabaseName]) {
-										logger.warn?.('Database not found', newDatabaseName);
-										return;
-									}
-									table = ensureTableIfChanged(tableDefinition, databases[newDatabaseName]?.[tableDefinition.table]);
+								} catch (error) {
+									if (!(error instanceof TableGenerationDroppedError)) throw error;
+									refuseDeadDefinition(newDatabaseName, tableDefinition, 'DB_SCHEMA');
+									continue;
 								}
 								if (!auditStore) auditStore = table?.auditStore;
 								if (!tables) tables = getDatabases()?.[newDatabaseName];
 							}
+						}
+						if (pendingMarkers.length > 0 && databases[schemaDatabaseName]) {
+							await applyPeerDropMarkers(schemaDatabaseName, pendingMarkers, data);
+							if (!connectionSuperseded()) releaseHeldMarkers(schemaDatabaseName, pendingMarkers);
 						}
 						break;
 					}
@@ -5143,7 +5418,14 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							// data may carry a secret (registry token / ssh key / password); redact before
 							// logging. The conditional logger skips arg evaluation when debug is inactive.
 							logger.debug?.('Received operation request', redactOperationForLog(data), 'from', remoteNodeName);
-							server.operation(data, { user: authorization }, !isAuthorizedNode).then(
+							// Core's drop_table applies a forwarded drop as a peer's (conditional on its time, never to a
+							// node-local table); the context carries that, where a client's body cannot. An operation
+							// connection sends no NODE_NAME, so the peer is named by its authorization.
+							const replicatedFrom =
+								isAuthorizedNode && data?.operation === 'drop_table'
+									? (remoteNodeName ?? authorization.name ?? authorization.username)
+									: undefined;
+							server.operation(data, { user: authorization, replicatedFrom }, !isAuthorizedNode).then(
 								async (response) => {
 									try {
 										logger.debug?.('Requested request from finished', remoteNodeName, response);
@@ -5184,28 +5466,66 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							return;
 						}
 						let table = tables[tableName];
-						table = ensureTableIfChanged(
-							{
-								table: tableName,
-								database: databaseName,
-								attributes: data.attributes,
-								schemaDefined: data.schemaDefined,
-							},
-							table
-						);
 						// replication messages come across in binary format of audit log entries from the source node,
 						// so we need to have the same structure and decoder configuration to decode them. We keep a map
 						// of the table id to the decoder so we can decode the binary data for each table.
+						const decoder = new StructonPackr({
+							useBigIntExtension: true,
+							freezeData: true,
+							typedStructs: data.typedStructs,
+							structures: data.structures,
+						} as any);
+						let refused = isDroppedPeerGeneration(databaseName, tableName, data.createdTime);
+						if (!refused) {
+							try {
+								table = ensureTableIfChanged(
+									{
+										table: tableName,
+										database: databaseName,
+										attributes: data.attributes,
+										schemaDefined: data.schemaDefined,
+										createdTime: data.createdTime,
+									},
+									table
+								);
+							} catch (error) {
+								if (!(error instanceof TableGenerationDroppedError)) throw error;
+								refused = true;
+							}
+						}
+						if (refused) {
+							refuseDeadDefinition(
+								databaseName,
+								{ table: tableName, createdTime: data.createdTime },
+								'TABLE_FIXED_STRUCTURE'
+							);
+							// The decoder only enumerates the blobs of the records that are skipped.
+							tableDecoders[tableId] = { name: tableName, refused: true, decoder };
+							break;
+						}
+						// A pool worker never ran the application, so it cannot maintain an index whose resolver the
+						// application assigns; applying here would leave the index silently wrong. Latch inbound off
+						// and drop a decoder from an earlier structure message, so queued frames cannot apply either.
+						if (isDedicatedPoolWorker()) {
+							const unresolved = table?.unresolvedComputedIndexes?.();
+							if (unresolved?.length) {
+								const reason = `${databaseName}.${tableName} has computed indexes (${unresolved.join(', ')}) resolved by application code, which replication.threads workers cannot run; no table of ${databaseName} replicates from this peer, use replication.threads: 0`;
+								logger.error?.(connectionId, `Refusing to replicate: ${reason}`);
+								wsClosed = true;
+								delete tableDecoders[tableId];
+								close(1011, reason);
+								return;
+							}
+						}
 						tableDecoders[tableId] = {
 							name: tableName,
-							decoder: new StructonPackr({
-								useBigIntExtension: true,
-								freezeData: true,
-								typedStructs: data.typedStructs,
-								structures: data.structures,
-							} as any),
+							decoder,
+							table,
+							createdTime: data.createdTime,
+							dropEpoch: tableDropEpoch(),
+							// the class a rejudge rebinds to, not the one this structure was first accepted against
 							getEntry(id) {
-								return table.primaryStore.getEntry(id);
+								return this.table.primaryStore.getEntry(id);
 							},
 							rootStore: table.primaryStore.rootStore,
 						};
@@ -5355,7 +5675,10 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						// yet durable it must not push the resume cursor past the last fully-durable point (same as the
 						// inline REMOTE_SEQUENCE_UPDATE branch below). seqUpdateEndTxn also gates copy-apply durability.
 						tableSubscriptionToReplicator.send(
-							seqUpdateEndTxn(cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived)
+							seqUpdateEndTxn(
+								cursorBlockedByBlob() ? lastDurableSequenceId : lastSequenceIdReceived,
+								receivedOriginFloors(message[2])
+							)
 						);
 						getSharedStatus();
 						replicationSharedStatus[RECEIVED_VERSION_POSITION] = Math.max(
@@ -5576,6 +5899,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										{
 											typedStructs: structure.typed,
 											structures: structure.named,
+											createdTime: advertisedCreatedTime(table),
 										},
 										tableId,
 										table.tableName,
@@ -5643,7 +5967,13 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						const { resolve, reject, tableId, key } = awaitingResponse.get(message[1]);
 						const entry = message[2];
 						if (entry?.error) reject(new Error(entry.error));
-						else if (entry) {
+						else if (entry && (!tableDecoders[tableId]?.decoder || peerGenerationRefused(tableDecoders[tableId]))) {
+							if (tableDecoders[tableId]?.decoder && entry.value)
+								discardRecordBlobs({ getBinaryValue: () => entry.value, recordId: key } as any, tableDecoders[tableId]);
+							reject(
+								new Error(`No usable structure for table id ${tableId}; the peer's generation of the table was refused`)
+							);
+						} else if (entry) {
 							let blobsToDelete: any[];
 							decodeBlobsWithWrites(
 								() => {
@@ -5945,13 +6275,6 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 							if (!tableEntry) {
 								tableEntry = tableById[tableId] = tableToTableEntry(tableSubscriptionToReplicator.tableById[tableId]);
 								if (!tableEntry) {
-									// Must yield like every other skip path: a contiguous run of entries for a
-									// table this peer doesn't subscribe to (or a dropped table, or corrupt-entry
-									// sentinels with tableId undefined) otherwise iterates with await undefined,
-									// which never leaves the microtask queue. Timers, I/O, and watchdogs starve
-									// for the whole run, and the periodic sequence updates skipAuditRecord sends
-									// never go out, so the peer's cursor can't advance past the run and every
-									// reconnect rescans it from the start.
 									logger.debug?.('Not subscribed to table', tableId);
 									return skipAuditRecord();
 								}
@@ -6075,9 +6398,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								// entry is encoded, send it after checks for new structure and residency
 							}
 
-							// when we can skip an audit record, we still need to occasionally send a sequence update:
-							// every skip branch in sendAuditRecord must return this call — its contract is the
-							// trailing yield below, not the logging (see the !tableEntry skip's rationale above, #536).
+							// Every skip branch must share the yield budget so the sequence-update timer can fire.
 							function skipAuditRecord() {
 								logger.trace?.(connectionId, 'skipping audit record', auditRecord.recordId);
 								if (!skippedMessageSequenceUpdateTimer) {
@@ -6091,7 +6412,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 										}
 									}, SKIPPED_MESSAGE_SEQUENCE_UPDATE_DELAY).unref();
 								}
-								return new Promise(setImmediate); // we still need to yield (otherwise we might never send a sequence id update)
+								return yieldSendLoop();
 							}
 							if (!sentNodeIds.has(auditRecord.nodeId)) {
 								sentNodeIds.add(auditRecord.nodeId);
@@ -6128,6 +6449,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											structures,
 											attributes: table.attributes,
 											schemaDefined: table.schemaDefined,
+											createdTime: advertisedCreatedTime(table),
 										},
 										tableId,
 										tableEntry.table.tableName,
@@ -6217,7 +6539,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 								return new Promise((resolve) => {
 									blobSentCallbacks.push(resolve);
 								});
-							} else return new Promise(setImmediate); // yield on each turn for fairness and letting other things run
+							} else return yieldSendLoop();
 						};
 						const sendQueuedData = () => {
 							if (frame.position - frame.encodingStart > 8) {
@@ -6248,6 +6570,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						auditSubscription.once('close', () => {
 							closed = true;
 							subscriptionToHdbNodes?.end();
+							wakeSender?.(); // an idle sender settles now rather than at the next transaction
 						});
 						// find the earliest start time of the subscriptions
 						let copyResume:
@@ -6335,6 +6658,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 											sendDBSchema(databaseName);
 										}
 									});
+									dropRecordedListener = onTableDropRecorded((database) => {
+										if (database === databaseName) scheduleSchemaResend(databaseName);
+									});
 									dbRemovalListener = onRemovedDB((db) => {
 										// I guess if a database is removed then we disconnect. This is kind of weird situation for replication,
 										// as the replication system will try to preserve consistency between nodes and their databases, and
@@ -6349,548 +6675,684 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 									// above would stay subscribed on the global databaseEventsEmitter forever.
 									if (wsClosed) {
 										schemaUpdateListener.remove();
+										dropRecordedListener.remove();
 										dbRemovalListener.remove();
 										schemaUpdateListener = undefined;
+										dropRecordedListener = undefined;
 										dbRemovalListener = undefined;
 										return;
 									}
 									ws.on('close', () => {
 										schemaUpdateListener?.remove();
+										dropRecordedListener?.remove();
 										dbRemovalListener?.remove();
 									});
 								}
 
-								let isFirst = true;
-								do {
-									// We run subscriptions as a loop where retrieve entries from the audit log, since the last entry
-									// and sending out the results while applying back-pressure from the socket. When we are out of entries
-									// then we switch to waiting/listening for the next transaction notifications before resuming the iteration
-									// through the audit log.
-									if (!isFinite(currentSequenceId)) {
-										logger.warn?.('Invalid sequence id ' + currentSequenceId);
-										close(1008, 'Invalid sequence id' + currentSequenceId);
-									}
-									if (isFirst && !closed) {
-										isFirst = false;
-										// If the requested incremental start predates the transaction-log history we still
-										// retain, the entries needed to catch up incrementally have been purged (retention is
-										// time-based). Upgrade to the bounded base-copy path instead of audit replay, which would
-										// otherwise silently skip the purged entries or replay an unbounded history (harper#1114).
-										if (currentSequenceId > 0) {
-											const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
-											let oldestRetainedTime: number | undefined;
-											// Mirror the replay scope below (single log, or all non-excluded logs) and take the
-											// first (oldest) entry; getRange yields ascending by audit-log key. Use the same key
-											// basis as the replay loop (`txnLogKey`) and retention cleanup.
-											for (const entry of auditStore.getRange({
-												start: 1,
-												log: excludedNodes ? undefined : oldestLogName,
-												excludeLogs: excludedNodes,
-												snapshot: false,
-											})) {
-												oldestRetainedTime = entry.txnLogKey;
-												break;
+								let lastFloorCaptureAt = 0;
+								let floorTimer: ReturnType<typeof setTimeout> | undefined;
+								let capturedFloors: Map<string, number> | undefined;
+								const certifiedFloors = new Map<string, number>();
+								let floorEmissionLatchedRange: unknown;
+								let attachedNextTransaction: Promise<void> | undefined;
+								let wakeSenderFailed: ((error: unknown) => void) | undefined;
+								const originCertifies = (name: string) =>
+									getReplicationSharedStatus(auditStore, databaseName, name)[PEER_CERTIFIES_FLOORS_POSITION] === 1;
+								const captureOriginFloors = (): Map<string, number> | undefined => {
+									let floors: Map<string, number> | undefined;
+									try {
+										const thisNodeName = getThisNodeName();
+										const own = readOriginClosedFloor(auditStore);
+										if (isValidFloor(own) && !excludedNodes?.includes(thisNodeName))
+											(floors ??= new Map()).set(thisNodeName, own);
+										// only a multi-log range sends unlisted origins, and only per-origin logs have names
+										if (excludedNodes && auditStore.reusableIterable === true) {
+											const listed = new Set(nodeSubscriptions.map(({ name }) => name));
+											const names: string[] = [];
+											for (const log of auditStore.loadLogs()) {
+												const name = log?.name;
+												if (!name || name === 'local' || name === thisNodeName || listed.has(name)) continue;
+												if (!excludedNodes.includes(name)) names.push(name);
 											}
-											if (
-												shouldForceBaseCopyForRetention(
-													currentSequenceId,
-													oldestRetainedTime,
-													Date.now() - auditRetention
-												)
-											) {
-												logger.warn?.(
-													`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
+											const { dbisDB } = names.length > 0 ? getDatabaseStores() : ({} as any);
+											if (dbisDB) {
+												const seqRows = collectSeqRows(
+													dbisDB.getRange({ start: Symbol.for('seq'), end: [Symbol.for('seq'), Buffer.from([0xff])] })
 												);
-												currentSequenceId = 0;
+												for (const [name, floor] of collectRelayableFloors(
+													seqRows,
+													names,
+													exportIdMapping(auditStore),
+													originCertifies
+												))
+													(floors ??= new Map()).set(name, floor);
 											}
 										}
-										if (currentSequenceId === 0) {
-											// Capability-only gate, never version: the LMDB no-op-write hole predates this
-											// capability existing at all (DESIGN.md's v5+LMDB note).
-											const legacyCopy = !peerCapabilities.safeCopyAudit;
-											if (legacyCopy) copyResume = undefined;
-											if (closed || wsClosed) return;
-											logger.info?.('Replicating all tables to', remoteNodeName);
-											// Anchored in this node's own `local` log only. It does NOT depend on the tail being single-log:
-											// `excluded` is always an array here, so the range below is normally the multi-log aggregate, and
-											// that aggregate applies `exactStart` only to the logs named in `startByLog`. Gated on the store
-											// itself, not STORAGE_IS_ROCKSDB: that is a config snapshot that can misreport the engine in a
-											// worker, and an LMDB audit store would read these range options as a scan from its start.
-											const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
-											const canResumePastAnchor = auditStore.reusableIterable === true && logName === 'local';
-											// If resuming, the follower already committed every table before currentTable (records commit
-											// in stable iteration order), so skip to currentTable and continue after its last committed key.
-											let reachedResumeTable = !copyResume;
-											let anchoredInLogOrder = false;
-											const resumeAnchorKind =
-												copyResume && canResumePastAnchor
-													? classifyResumeAnchor(auditStore, copyResume.copyStartTime, logName)
-													: 'absent';
-											// Validated before the anchor is read below, because a cursor that cannot be honoured must
-											// surrender its ANCHOR as well as its walk position.
-											// currentTable must be one the loop below will actually visit (present in `tables` AND passing
-											// the same replication filter); otherwise the skip loop never reaches it and would omit every
-											// later table. Mirror the loop's own check so a dropped/unreplicated cursor table forces a restart.
-											// `tables` can be undefined on a freshly-joined peer, and a malformed cursor can have an
-											// undefined currentTable (#321); the `?.` makes both fall into the warn-and-recopy branch
-											// instead of throwing, which would bubble to the outer .catch and close the channel (1008).
-											if (copyResume && !isCopyResumeOrderCompatible(copyResume.copyOrder, COPY_ORDER_VERSION)) {
-												// An absent and an explicit-undefined copyOrder both decode to undefined here, and neither is
-												// compatible. Recopy from scratch: idempotent puts, and a fresh anchor. (#421)
-												logger.warn?.(
-													'Copy-resume order version mismatch, restarting full copy',
-													copyResume.copyOrder,
-													'!=',
-													COPY_ORDER_VERSION
-												);
-												copyResume = undefined;
-												reachedResumeTable = true;
-											} else if (copyResume && !isValidFrameTxnLogKey(copyResume.copyStartTime)) {
-												// The anchor is peer-supplied. A non-finite or non-positive value would reach the resume cursor
-												// and the tail's range start, and every reconnect would wedge on the same cursor.
-												logger.warn?.(
-													'Copy-resume anchor is not a valid log key, restarting full copy',
-													copyResume.copyStartTime
-												);
-												copyResume = undefined;
-												reachedResumeTable = true;
-											} else if (copyResume && !tableToTableEntry(tables?.[copyResume.currentTable])) {
-												// cursor table is gone, unreplicated, or the cursor itself is malformed — the skip loop would
-												// never reach it and would omit every later table, so recopy from scratch.
-												logger.warn?.(
-													'Copy-resume table missing or unreplicated, restarting full copy',
-													copyResume.currentTable
-												);
-												copyResume = undefined;
-												reachedResumeTable = true;
-											}
-											// Copy control-plane tables before bulk tables so a large table (hdb_analytics) can't gate
-											// convergence of small tables that gate cluster operations (hdb_deployment). Ordering is a
-											// pure function of the table-name set, so it stays stable across runs — which the skip-loop
-											// above (reachedResumeTable) relies on; cross-version cursors are rejected by the guard above. (#421)
-											const orderedTableNames = orderTablesForCopy(tables ? Object.keys(tables) : []);
-											// A position in the log's APPEND order, not a timestamp: a transaction's key is fixed when it is
-											// created but its batch is appended when it commits, so every transaction in flight here appends
-											// AFTER the last committed entry while it may sort before it numerically. A resumed copy keeps its
-											// original anchor — a later one would lose everything committed between the two. (harper-pro#876)
-											const anchorKey =
-												copyResume || !canResumePastAnchor ? undefined : findLastCommittedLogKey(auditStore, logName);
-											// An empty log (anchorKey 0) still sends the wall clock, never a sentinel below every key: the
-											// follower persists it, and shouldForceBaseCopyForRetention reads such a cursor as purged history.
-											const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
-											// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
-											const relayedAnchors =
-												!copyResume && canResumePastAnchor && excludedNodes
-													? collectRelayedLogAnchors(
-															auditStore,
-															new Set([...excludedNodes, ...nodeSubscriptions.map(({ name }) => name)])
-														)
-													: undefined;
-											const boundaryFailure = (rangeOptions: any) => rangeBoundaryFailure(auditStore, rangeOptions);
-											// only anchors the tail resumes past are the receiver's to keep
-											let announcedAnchors: Map<string, number> | undefined;
-											// A resumed copy resumes in append order only if its anchor still NAMES an entry of the log;
-											// anything else — a pre-#876 wall-clock anchor, a purged entry, a log that cannot be read — keeps
-											// the timestamp resume every build before this one used for every cursor. `resumeAnchorKind`
-											// describes the ORIGINAL copyResume, so it is only trustworthy while that copyResume is still live;
-											// the guards above can null it out, and this must not answer for a resume that no longer exists.
-											if (anchorKey === 0) {
-												// An empty log: everything it will ever yield commits after this point, so an ordinary range from
-												// its start is already the boundary.
-												const emptyLogRange = {
-													start: 0,
-													log: excludedNodes ? undefined : logName,
+									} catch (error) {
+										// metadata only: the data stream is unaffected, and the next interval retries
+										logger.debug?.(
+											connectionId,
+											'could not read the origin floors to certify for',
+											databaseName,
+											error
+										);
+										return undefined;
+									}
+									return floors;
+								};
+								const certifyOriginFloors = (floors: Map<string, number>) => {
+									let rising: Map<string, number> | undefined;
+									const thisNodeName = getThisNodeName();
+									for (const [name, floor] of floors) {
+										// an origin a SUBSCRIPTION_UPDATE excluded during the pass had its scan cut short, and
+										// one whose socket stopped certifying during it may be an older binary now
+										if (excludedNodes?.includes(name) || certifiedFloors.get(name) >= floor) continue;
+										if (name !== thisNodeName && !originCertifies(name)) continue;
+										(rising ??= new Map()).set(name, floor);
+									}
+									if (!rising || closed || wsClosed) return;
+									ws.send(encode([SEQUENCE_ID_UPDATE, currentSequenceId, Object.fromEntries(rising)]));
+									for (const [name, floor] of rising) certifiedFloors.set(name, floor);
+									logger.debug?.(connectionId, 'certified origin floors to', remoteNodeName, rising);
+								};
+								let isFirst = true;
+								// A `return` from inside the loop (close, rejection) still runs this finally, so a timer
+								// armed in the exiting pass can never outlive it to wake a later, superseding loop that
+								// reused the connection-wide `wakeSender`.
+								try {
+									do {
+										// We run subscriptions as a loop where retrieve entries from the audit log, since the last entry
+										// and sending out the results while applying back-pressure from the socket. When we are out of entries
+										// then we switch to waiting/listening for the next transaction notifications before resuming the iteration
+										// through the audit log.
+										if (!isFinite(currentSequenceId)) {
+											logger.warn?.('Invalid sequence id ' + currentSequenceId);
+											close(1008, 'Invalid sequence id' + currentSequenceId);
+										}
+										if (isFirst && !closed) {
+											isFirst = false;
+											// If the requested incremental start predates the transaction-log history we still
+											// retain, the entries needed to catch up incrementally have been purged (retention is
+											// time-based). Upgrade to the bounded base-copy path instead of audit replay, which would
+											// otherwise silently skip the purged entries or replay an unbounded history (harper#1114).
+											if (currentSequenceId > 0) {
+												const oldestLogName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+												let oldestRetainedTime: number | undefined;
+												// Mirror the replay scope below (single log, or all non-excluded logs) and take the
+												// first (oldest) entry; getRange yields ascending by audit-log key. Use the same key
+												// basis as the replay loop (`txnLogKey`) and retention cleanup.
+												for (const entry of auditStore.getRange({
+													start: 1,
+													log: excludedNodes ? undefined : oldestLogName,
 													excludeLogs: excludedNodes,
 													snapshot: false,
-												};
-												let anchors = relayedAnchors;
-												let relayedRange: any;
-												while (anchors?.size) {
-													relayedRange = {
-														...emptyLogRange,
-														exactStart: true,
-														resumeAfterExactStart: true,
-														startByLog: anchors,
-													};
-													const failure = boundaryFailure(relayedRange);
-													if (!failure) break;
-													anchors = anchorsWithoutFailedLogs(anchors, failure);
+												})) {
+													oldestRetainedTime = entry.txnLogKey;
+													break;
 												}
-												if (anchors?.size) {
-													auditLogIterable = auditStore.getRange(relayedRange);
-													boundaryLogName = logName;
-													announcedAnchors = anchors;
-												} else auditLogIterable = auditStore.getRange(emptyLogRange);
-												anchoredInLogOrder = true;
-											} else if (
-												canResumePastAnchor &&
-												(anchorKey !== undefined || (copyResume && resumeAnchorKind === 'entry'))
-											) {
-												// Built before the walk: getRange resolves the boundary's position and maps the log file
-												// eagerly, so the anchor stays reachable for the whole copy. The options must match the ones
-												// the tail would build for itself, because it reuses this iterable — a single-log range here
-												// would silently stop tailing every peer's log.
-												const boundaryRange = {
-													start: copyStartTime,
-													exactStart: true,
-													exclusiveStart: true,
-													resumeAfterExactStart: true,
-													log: excludedNodes ? undefined : logName,
-													startByLog: new Map([[logName, copyStartTime], ...(relayedAnchors ?? [])]),
-													excludeLogs: excludedNodes,
-													snapshot: false,
-												};
-												let anchors = relayedAnchors;
-												let unusable = boundaryFailure(boundaryRange);
-												while (unusable && anchors?.size) {
-													anchors = anchorsWithoutFailedLogs(anchors, unusable);
-													boundaryRange.startByLog = new Map([[logName, copyStartTime], ...(anchors ?? [])]);
-													unusable = boundaryFailure(boundaryRange);
-												}
-												if (!unusable) announcedAnchors = anchors;
-												if (unusable) {
-													// Degrade rather than refuse, for the same reason. The anchor stays the entry's key, which
-													// under the timestamp range still replays everything keyed after it.
-													logger.error?.(
-														`Base copy of ${databaseName} could not form a resume boundary at ${copyStartTime}; falling back to a timestamp resume, so a transaction in flight now can be missed`,
-														unusable instanceof Error ? unusable : undefined
-													);
-												} else {
-													auditLogIterable = auditStore.getRange(boundaryRange);
-													boundaryLogName = logName;
-													anchoredInLogOrder = true;
-												}
-											}
-											if (announcedAnchors && originFloorById) {
-												// resumed past their exact anchors: a key floor would drop entries appended later with older keys
-												const nameToId = exportIdMapping(auditStore);
-												for (const logName of announcedAnchors.keys()) delete originFloorById[nameToId[logName]];
-											}
-											if (!anchoredInLogOrder && (copyResume || orderedTableNames.length > 0)) {
-												// A degraded anchor is otherwise indistinguishable from a log-order one in the logs.
-												logger.warn?.(
-													`Base copy of ${databaseName} to ${remoteNodeName} is anchored on a timestamp, not a log-order position; a transaction in flight now can be missed`
-												);
-											}
-											const nodeId = getThisNodeId(auditStore);
-											if (legacyCopy) {
-												// Legacy no-op puts can corrupt the receiver's audit log.
-												await verifyLegacyCopyBaseline({
-													peerName: remoteNodeName,
-													databaseName,
-													tables: Object.fromEntries(
-														Object.entries(tables ?? {}).filter(
-															([name, table]) => !sendExcludedTables?.has(name) && tableToTableEntry(table)
-														)
-													),
-													request: (operation) => sendOperation(operation, 30_000),
-													isClosed: () => closed || wsClosed,
-												});
-												if (closed || wsClosed) return;
-											}
-											// Tell the follower a bulk copy is starting, its anchor, and the copy-cursor version, so it tracks
-											// a resume cursor a later leader can validate before trusting the skip or the anchor.
-											ws.send(
-												encode(
-													announcedAnchors?.size &&
-														peerCapabilitiesLearned &&
-														peerSupportsOriginCursors(peerCapabilities)
-														? [COPY_START, copyStartTime, COPY_ORDER_VERSION, Object.fromEntries(announcedAnchors)]
-														: [COPY_START, copyStartTime, COPY_ORDER_VERSION]
-												)
-											);
-											// Test-only (#453): one-shot stall here leaves the follower in copy mode with no
-											// further frames while pings keep flowing — the connected:true copy wedge.
-											const copyStallForTest = maybeStallCopyForTest(databaseName);
-											if (copyStallForTest) await copyStallForTest;
-											let recordsSinceCheckpoint = 0;
-											// Paces the flush/yield cadence inside the copy loop below (see
-											// COPY_CHECKPOINT_MAX_INTERVAL_MS). Marked on every in-loop flush/yield.
-											const copyFlushPacer = createCopyFlushPacer(COPY_CHECKPOINT_MAX_INTERVAL_MS, Date.now());
-											const resumeCurrentTable = copyResume?.currentTable;
-											const resumeAfterKey = copyResume?.afterKey;
-											// Every read here can come back missing or unreadable, and the answer to all of them is to
-											// copy in full: withholding is the only outcome that can lose data, and a throw would reach
-											// the outer catch and close the channel, turning a metadata hiccup into a reconnect loop.
-											let withheldOriginNodeId: number | undefined;
-											let withheldRecordCount = 0;
-											try {
-												const peerNodeRow = !legacyCopy && getHDBNodeTable().primaryStore.getSync(remoteNodeName);
 												if (
-													shouldWithholdPeerOwnRecords({
-														cloneSource: cloneAttemptSource(),
-														// the marker records the host from the leader URL, which need not be the peer's
-														// node name — match either
-														peerNames: [remoteNodeName, hostnameFromNodeUrl(peerNodeRow?.url)],
-														peerIsOurLeader: !!peerNodeRow?.isLeader,
-													})
+													shouldForceBaseCopyForRetention(
+														currentSequenceId,
+														oldestRetainedTime,
+														Date.now() - auditRetention
+													)
 												) {
-													// NOT getIdOfRemoteNode: it mints and persists an id for an unseen name, and a fresh id
-													// matches no stored record — it would withhold nothing while reporting that it had.
-													const peerOriginNodeId = exportIdMapping(auditStore)?.[remoteNodeName];
-													// our own id resolves for everything we authored, so filtering on it would withhold
-													// this node's whole dataset
-													withheldOriginNodeId = peerOriginNodeId === nodeId ? undefined : peerOriginNodeId;
 													logger.warn?.(
-														withheldOriginNodeId === undefined
-															? `Copying ${databaseName} to ${remoteNodeName} in full: the clone-source gate is active for that peer, but this node holds no record attributed to it (harper-pro#737).`
-															: `Copying ${databaseName} to ${remoteNodeName} without the records that peer originated: the clone-source gate is active for it (harper-pro#737).`
+														`Peer ${remoteNodeName} requested replication of database ${databaseName} from ${new Date(currentSequenceId).toISOString()}, which predates retained transaction-log history (oldest retained ${oldestRetainedTime ? new Date(oldestRetainedTime).toISOString() : 'none'}, retention ${auditRetention}ms); forcing a bounded base-copy resync.`
 													);
+													currentSequenceId = 0;
 												}
-											} catch (error) {
-												withheldOriginNodeId = undefined;
-												logger.warn?.(
-													`Could not determine whether ${remoteNodeName} is this node's clone source; copying ${databaseName} in full`,
-													error
-												);
 											}
-											for (const tableName of legacyCopy ? [] : orderedTableNames) {
-												const table = tables[tableName];
-												if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
-												if (!reachedResumeTable) {
-													if (tableName !== resumeCurrentTable) continue; // already committed on the follower
+											if (currentSequenceId === 0) {
+												const legacyCopy = await requiresLegacyCopyVerification(
+													peerCapabilities.safeCopyAudit,
+													sendOperation,
+													(error) =>
+														logger.warn?.(
+															`Version probe for peer ${remoteNodeName} failed; using baseline verification`,
+															error
+														)
+												);
+												if (legacyCopy) copyResume = undefined;
+												if (closed || wsClosed) return;
+												logger.info?.('Replicating all tables to', remoteNodeName);
+												// Anchored in this node's own `local` log only. It does NOT depend on the tail being single-log:
+												// `excluded` is always an array here, so the range below is normally the multi-log aggregate, and
+												// that aggregate applies `exactStart` only to the logs named in `startByLog`. Gated on the store
+												// itself, not STORAGE_IS_ROCKSDB: that is a config snapshot that can misreport the engine in a
+												// worker, and an LMDB audit store would read these range options as a scan from its start.
+												const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+												const canResumePastAnchor = auditStore.reusableIterable === true && logName === 'local';
+												// If resuming, the follower already committed every table before currentTable (records commit
+												// in stable iteration order), so skip to currentTable and continue after its last committed key.
+												let reachedResumeTable = !copyResume;
+												let anchoredInLogOrder = false;
+												const resumeAnchorKind =
+													copyResume && canResumePastAnchor
+														? classifyResumeAnchor(auditStore, copyResume.copyStartTime, logName)
+														: 'absent';
+												// Validated before the anchor is read below, because a cursor that cannot be honoured must
+												// surrender its ANCHOR as well as its walk position.
+												// currentTable must be one the loop below will actually visit (present in `tables` AND passing
+												// the same replication filter); otherwise the skip loop never reaches it and would omit every
+												// later table. Mirror the loop's own check so a dropped/unreplicated cursor table forces a restart.
+												// `tables` can be undefined on a freshly-joined peer, and a malformed cursor can have an
+												// undefined currentTable (#321); the `?.` makes both fall into the warn-and-recopy branch
+												// instead of throwing, which would bubble to the outer .catch and close the channel (1008).
+												if (copyResume && !isCopyResumeOrderCompatible(copyResume.copyOrder, COPY_ORDER_VERSION)) {
+													// An absent and an explicit-undefined copyOrder both decode to undefined here, and neither is
+													// compatible. Recopy from scratch: idempotent puts, and a fresh anchor. (#421)
+													logger.warn?.(
+														'Copy-resume order version mismatch, restarting full copy',
+														copyResume.copyOrder,
+														'!=',
+														COPY_ORDER_VERSION
+													);
+													copyResume = undefined;
+													reachedResumeTable = true;
+												} else if (copyResume && !isValidFrameTxnLogKey(copyResume.copyStartTime)) {
+													// The anchor is peer-supplied. A non-finite or non-positive value would reach the resume cursor
+													// and the tail's range start, and every reconnect would wedge on the same cursor.
+													logger.warn?.(
+														'Copy-resume anchor is not a valid log key, restarting full copy',
+														copyResume.copyStartTime
+													);
+													copyResume = undefined;
+													reachedResumeTable = true;
+												} else if (copyResume && !tableToTableEntry(tables?.[copyResume.currentTable])) {
+													// cursor table is gone, unreplicated, or the cursor itself is malformed — the skip loop would
+													// never reach it and would omit every later table, so recopy from scratch.
+													logger.warn?.(
+														'Copy-resume table missing or unreplicated, restarting full copy',
+														copyResume.currentTable
+													);
+													copyResume = undefined;
 													reachedResumeTable = true;
 												}
-												const rangeOptions: any = { snapshot: false, versions: true };
-												// values: false, // TODO: eventually, we don't want to decode, we want to use fast binary transfer
-												if (tableName === resumeCurrentTable) {
-													// resume this table after the last key the follower committed
-													rangeOptions.start = resumeAfterKey;
-													rangeOptions.exclusiveStart = true;
+												// Copy control-plane tables before bulk tables so a large table (hdb_analytics) can't gate
+												// convergence of small tables that gate cluster operations (hdb_deployment). Ordering is a
+												// pure function of the table-name set, so it stays stable across runs — which the skip-loop
+												// above (reachedResumeTable) relies on; cross-version cursors are rejected by the guard above. (#421)
+												const orderedTableNames = orderTablesForCopy(tables ? Object.keys(tables) : []);
+												// A position in the log's APPEND order, not a timestamp: a transaction's key is fixed when it is
+												// created but its batch is appended when it commits, so every transaction in flight here appends
+												// AFTER the last committed entry while it may sort before it numerically. A resumed copy keeps its
+												// original anchor — a later one would lose everything committed between the two. (harper-pro#876)
+												const anchorKey =
+													copyResume || !canResumePastAnchor ? undefined : findLastCommittedLogKey(auditStore, logName);
+												// An empty log (anchorKey 0) still sends the wall clock, never a sentinel below every key: the
+												// follower persists it, and shouldForceBaseCopyForRetention reads such a cursor as purged history.
+												const copyStartTime = copyResume?.copyStartTime ?? (anchorKey || Date.now());
+												// The copy holds every relayed entry committed before now. A resumed copy's walk began earlier.
+												const relayedAnchors =
+													!copyResume && canResumePastAnchor && excludedNodes
+														? collectRelayedLogAnchors(
+																auditStore,
+																new Set([...excludedNodes, ...nodeSubscriptions.map(({ name }) => name)])
+															)
+														: undefined;
+												const boundaryFailure = (rangeOptions: any) => rangeBoundaryFailure(auditStore, rangeOptions);
+												// only anchors the tail resumes past are the receiver's to keep
+												let announcedAnchors: Map<string, number> | undefined;
+												// A resumed copy resumes in append order only if its anchor still NAMES an entry of the log;
+												// anything else — a pre-#876 wall-clock anchor, a purged entry, a log that cannot be read — keeps
+												// the timestamp resume every build before this one used for every cursor. `resumeAnchorKind`
+												// describes the ORIGINAL copyResume, so it is only trustworthy while that copyResume is still live;
+												// the guards above can null it out, and this must not answer for a resume that no longer exists.
+												if (anchorKey === 0) {
+													// An empty log: everything it will ever yield commits after this point, so an ordinary range from
+													// its start is already the boundary.
+													const emptyLogRange = {
+														start: 0,
+														log: excludedNodes ? undefined : logName,
+														excludeLogs: excludedNodes,
+														snapshot: false,
+													};
+													let anchors = relayedAnchors;
+													let relayedRange: any;
+													while (anchors?.size) {
+														relayedRange = {
+															...emptyLogRange,
+															exactStart: true,
+															resumeAfterExactStart: true,
+															startByLog: anchors,
+														};
+														const failure = boundaryFailure(relayedRange);
+														if (!failure) break;
+														anchors = anchorsWithoutFailedLogs(anchors, failure);
+													}
+													if (anchors?.size) {
+														auditLogIterable = auditStore.getRange(relayedRange);
+														boundaryLogName = logName;
+														announcedAnchors = anchors;
+													} else auditLogIterable = auditStore.getRange(emptyLogRange);
+													anchoredInLogOrder = true;
+												} else if (
+													canResumePastAnchor &&
+													(anchorKey !== undefined || (copyResume && resumeAnchorKind === 'entry'))
+												) {
+													// Built before the walk: getRange resolves the boundary's position and maps the log file
+													// eagerly, so the anchor stays reachable for the whole copy. The options must match the ones
+													// the tail would build for itself, because it reuses this iterable — a single-log range here
+													// would silently stop tailing every peer's log.
+													const boundaryRange = {
+														start: copyStartTime,
+														exactStart: true,
+														exclusiveStart: true,
+														resumeAfterExactStart: true,
+														log: excludedNodes ? undefined : logName,
+														startByLog: new Map([[logName, copyStartTime], ...(relayedAnchors ?? [])]),
+														excludeLogs: excludedNodes,
+														snapshot: false,
+													};
+													let anchors = relayedAnchors;
+													let unusable = boundaryFailure(boundaryRange);
+													while (unusable && anchors?.size) {
+														anchors = anchorsWithoutFailedLogs(anchors, unusable);
+														boundaryRange.startByLog = new Map([[logName, copyStartTime], ...(anchors ?? [])]);
+														unusable = boundaryFailure(boundaryRange);
+													}
+													if (!unusable) announcedAnchors = anchors;
+													if (unusable) {
+														// Degrade rather than refuse, for the same reason. The anchor stays the entry's key, which
+														// under the timestamp range still replays everything keyed after it.
+														logger.error?.(
+															`Base copy of ${databaseName} could not form a resume boundary at ${copyStartTime}; falling back to a timestamp resume, so a transaction in flight now can be missed`,
+															unusable instanceof Error ? unusable : undefined
+														);
+													} else {
+														auditLogIterable = auditStore.getRange(boundaryRange);
+														boundaryLogName = logName;
+														anchoredInLogOrder = true;
+													}
 												}
-												for (const entry of table.primaryStore.getRange(rangeOptions)) {
-													if (closed) return;
-													// Bound the wall-clock gap between socket flushes and event-loop yields,
-													// independent of record count. The count checkpoint below alone can let a cold
-													// batch run past the watchdog window with no bytes flushed (reads dominate cost),
-													// and the LOCAL_ONLY `continue` below skips the normal per-record flush+yield
-													// entirely — a contiguous skipped run would then never reach the timers phase, so
-													// the ping timer and receive side starve. Flush any pending batch (plain flush, NOT
-													// an end_txn — see the watermark note below) and yield a macrotask on this cadence
-													// so both watchdog variants stay satisfied regardless of which records we walk.
-													const now = Date.now();
-													if (copyFlushPacer.due(now)) {
-														copyFlushPacer.mark(now);
-														if (frame.position - frame.encodingStart > 8) {
+												if (announcedAnchors && originFloorById) {
+													// resumed past their exact anchors: a key floor would drop entries appended later with older keys
+													const nameToId = exportIdMapping(auditStore);
+													for (const logName of announcedAnchors.keys()) delete originFloorById[nameToId[logName]];
+												}
+												if (!anchoredInLogOrder && (copyResume || orderedTableNames.length > 0)) {
+													// A degraded anchor is otherwise indistinguishable from a log-order one in the logs.
+													logger.warn?.(
+														`Base copy of ${databaseName} to ${remoteNodeName} is anchored on a timestamp, not a log-order position; a transaction in flight now can be missed`
+													);
+												}
+												const nodeId = getThisNodeId(auditStore);
+												if (legacyCopy) {
+													// Legacy no-op puts can corrupt the receiver's audit log.
+													await verifyLegacyCopyBaseline({
+														peerName: remoteNodeName,
+														databaseName,
+														tables: Object.fromEntries(
+															Object.entries(tables ?? {}).filter(
+																([name, table]) => !sendExcludedTables?.has(name) && tableToTableEntry(table)
+															)
+														),
+														request: (operation) => sendOperation(operation, 30_000),
+														isClosed: () => closed || wsClosed,
+													});
+													if (closed || wsClosed) return;
+												}
+												// Tell the follower a bulk copy is starting, its anchor, and the copy-cursor version, so it tracks
+												// a resume cursor a later leader can validate before trusting the skip or the anchor.
+												ws.send(
+													encode(
+														announcedAnchors?.size &&
+															peerCapabilitiesLearned &&
+															peerSupportsOriginCursors(peerCapabilities)
+															? [COPY_START, copyStartTime, COPY_ORDER_VERSION, Object.fromEntries(announcedAnchors)]
+															: [COPY_START, copyStartTime, COPY_ORDER_VERSION]
+													)
+												);
+												// Test-only (#453): one-shot stall here leaves the follower in copy mode with no
+												// further frames while pings keep flowing — the connected:true copy wedge.
+												const copyStallForTest = maybeStallCopyForTest(databaseName);
+												if (copyStallForTest) await copyStallForTest;
+												let recordsSinceCheckpoint = 0;
+												// Paces the flush/yield cadence inside the copy loop below (see
+												// COPY_CHECKPOINT_MAX_INTERVAL_MS). Marked on every in-loop flush/yield.
+												const copyFlushPacer = createCopyFlushPacer(COPY_CHECKPOINT_MAX_INTERVAL_MS, Date.now());
+												const resumeCurrentTable = copyResume?.currentTable;
+												const resumeAfterKey = copyResume?.afterKey;
+												// Every read here can come back missing or unreadable, and the answer to all of them is to
+												// copy in full: withholding is the only outcome that can lose data, and a throw would reach
+												// the outer catch and close the channel, turning a metadata hiccup into a reconnect loop.
+												let withheldOriginNodeId: number | undefined;
+												let withheldRecordCount = 0;
+												try {
+													const peerNodeRow = !legacyCopy && getHDBNodeTable().primaryStore.getSync(remoteNodeName);
+													if (
+														shouldWithholdPeerOwnRecords({
+															cloneSource: cloneAttemptSource(),
+															// the marker records the host from the leader URL, which need not be the peer's
+															// node name — match either
+															peerNames: [remoteNodeName, hostnameFromNodeUrl(peerNodeRow?.url)],
+															peerIsOurLeader: !!peerNodeRow?.isLeader,
+														})
+													) {
+														// NOT getIdOfRemoteNode: it mints and persists an id for an unseen name, and a fresh id
+														// matches no stored record — it would withhold nothing while reporting that it had.
+														const peerOriginNodeId = exportIdMapping(auditStore)?.[remoteNodeName];
+														// our own id resolves for everything we authored, so filtering on it would withhold
+														// this node's whole dataset
+														withheldOriginNodeId = peerOriginNodeId === nodeId ? undefined : peerOriginNodeId;
+														logger.warn?.(
+															withheldOriginNodeId === undefined
+																? `Copying ${databaseName} to ${remoteNodeName} in full: the clone-source gate is active for that peer, but this node holds no record attributed to it (harper-pro#737).`
+																: `Copying ${databaseName} to ${remoteNodeName} without the records that peer originated: the clone-source gate is active for it (harper-pro#737).`
+														);
+													}
+												} catch (error) {
+													withheldOriginNodeId = undefined;
+													logger.warn?.(
+														`Could not determine whether ${remoteNodeName} is this node's clone source; copying ${databaseName} in full`,
+														error
+													);
+												}
+												for (const tableName of legacyCopy ? [] : orderedTableNames) {
+													const table = tables[tableName];
+													if (!tableToTableEntry(table)) continue; // if we aren't replicating this table, skip it
+													if (!reachedResumeTable) {
+														if (tableName !== resumeCurrentTable) continue; // already committed on the follower
+														reachedResumeTable = true;
+													}
+													const rangeOptions: any = { snapshot: false, versions: true };
+													// values: false, // TODO: eventually, we don't want to decode, we want to use fast binary transfer
+													if (tableName === resumeCurrentTable) {
+														// resume this table after the last key the follower committed
+														rangeOptions.start = resumeAfterKey;
+														rangeOptions.exclusiveStart = true;
+													}
+													for (const entry of table.primaryStore.getRange(rangeOptions)) {
+														if (closed) return;
+														// Bound the wall-clock gap between socket flushes and event-loop yields,
+														// independent of record count. The count checkpoint below alone can let a cold
+														// batch run past the watchdog window with no bytes flushed (reads dominate cost),
+														// and the LOCAL_ONLY `continue` below skips normal record sending and its budgeted yield
+														// entirely — a contiguous skipped run would then never reach the timers phase, so
+														// the ping timer and receive side starve. Flush any pending batch (plain flush, NOT
+														// an end_txn — see the watermark note below) and yield a macrotask on this cadence
+														// so both watchdog variants stay satisfied regardless of which records we walk.
+														const now = Date.now();
+														if (copyFlushPacer.due(now)) {
+															copyFlushPacer.mark(now);
+															if (frame.position - frame.encodingStart > 8) {
+																recordsSinceCheckpoint = 0;
+																sendQueuedData();
+																frame.encodingStart = frame.position;
+																currentTransaction.txnLogKey = 0;
+															}
+															await new Promise(setImmediate);
+															if (closed) return;
+														}
+														// After the yield, so no await separates this from the encode below, which opens the
+														// row's blobs. See DESIGN.md note 24 for what a live change can and cannot be.
+														const liveCopyTable = liveDeclaration(table, tableName);
+														if (!liveCopyTable || !tableReplicates(liveCopyTable)) break;
+														// Local-only records must never be full-copied to a peer. metadataFlags is the
+														// already-available record metadata integer from the range entry — a pure bitmask
+														// test, no record value decode added to this send path.
+														if (entry.metadataFlags & LOCAL_ONLY) continue;
+														// same origin normalization as recordNodeId below: undefined means we authored it
+														if (
+															withheldOriginNodeId !== undefined &&
+															(entry.nodeId ?? nodeId) === withheldOriginNodeId
+														) {
+															withheldRecordCount++;
+															continue;
+														}
+														logger.trace?.(
+															connectionId,
+															'Copying record from',
+															databaseName,
+															tableName,
+															entry.key,
+															entry.localTime
+														);
+														getSharedStatus()[SENDING_TIME_POSITION] = SENDING_TIME_COPYING;
+														// The record's ORIGIN, not ours: stamping a copy with the copier's id
+														// re-attributes every copied record, so it can never tie against its true
+														// origin on the follower. `entry.nodeId` is this node's local id for that
+														// origin (undefined/0 = us) — the same id space the wire uses.
+														const recordNodeId = entry.nodeId ?? nodeId;
+														const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
+														const encodeCopyRecord = () =>
+															createAuditEntry({
+																version: entry.version,
+																tableId: table.tableId,
+																recordId: entry.key,
+																previousVersion: null,
+																nodeId: recordNodeId,
+																type: 'put',
+																encodedRecord: encodeCopyRecordValue(table.primaryStore, entry.value, (blob) =>
+																	sendBlobs(blob, entry.key)
+																),
+																extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
+																residencyId: entry.residencyId,
+																previousResidencyId: null,
+																expiresAt: entry.expiresAt,
+															} as any);
+														const encoded =
+															entry.metadataFlags & HAS_BLOBS
+																? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
+																: encodeCopyRecord();
+														await sendAuditRecord(
+															{
+																// make it look like an audit record
+																recordId: entry.key,
+																tableId: table.tableId,
+																type: 'put',
+																getValue() {
+																	return entry.value;
+																},
+																encoded,
+																version: entry.version,
+																residencyId: entry.residencyId,
+																nodeId: recordNodeId,
+																extendedType: entry.metadataFlags,
+															},
+															copyTxnLogKey,
+															nodeId
+														);
+														logger.debug?.(
+															'sent record from table',
+															entry.key,
+															'length:',
+															encoded.length,
+															encoded.slice(0, 10)
+														);
+														// Periodically flush the accumulated records as a message so the follower commits this
+														// batch and advances its resume cursor. This is a plain flush with NO sequence update:
+														// emitting an end_txn here would advance the follower's received-version watermark to
+														// copyStartTime mid-copy, which monitorSync could read as "caught up" and mark the clone
+														// Available/cloned with rows still uncopied. (Records with differing versions already flush
+														// naturally above; this also bounds same-version bulk data into committable batches.) The
+														// watermark is only advanced to copyStartTime by the single end_txn after the whole copy.
+														if (
+															(++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS ||
+																frame.position - frame.encodingStart >= COPY_FLUSH_BYTES) &&
+															frame.position - frame.encodingStart > 8
+														) {
 															recordsSinceCheckpoint = 0;
+															copyFlushPacer.mark(Date.now());
 															sendQueuedData();
 															frame.encodingStart = frame.position;
 															currentTransaction.txnLogKey = 0;
 														}
-														await new Promise(setImmediate);
-														if (closed) return;
 													}
-													// After the yield, so no await separates this from the encode below, which opens the
-													// row's blobs. See DESIGN.md note 24 for what a live change can and cannot be.
-													const liveCopyTable = liveDeclaration(table, tableName);
-													if (!liveCopyTable || !tableReplicates(liveCopyTable)) break;
-													// Local-only records must never be full-copied to a peer. metadataFlags is the
-													// already-available record metadata integer from the range entry — a pure bitmask
-													// test, no record value decode added to this send path.
-													if (entry.metadataFlags & LOCAL_ONLY) continue;
-													// same origin normalization as recordNodeId below: undefined means we authored it
-													if (withheldOriginNodeId !== undefined && (entry.nodeId ?? nodeId) === withheldOriginNodeId) {
-														withheldRecordCount++;
-														continue;
-													}
-													logger.trace?.(
-														connectionId,
-														'Copying record from',
-														databaseName,
-														tableName,
-														entry.key,
-														entry.localTime
-													);
-													getSharedStatus()[SENDING_TIME_POSITION] = 1;
-													// The record's ORIGIN, not ours: stamping a copy with the copier's id
-													// re-attributes every copied record, so it can never tie against its true
-													// origin on the follower. `entry.nodeId` is this node's local id for that
-													// origin (undefined/0 = us) — the same id space the wire uses.
-													const recordNodeId = entry.nodeId ?? nodeId;
-													const copyTxnLogKey = getCopyTxnLogKey(entry, auditStore, table.tableId, recordNodeId);
-													const encodeCopyRecord = () =>
-														createAuditEntry({
-															version: entry.version,
-															tableId: table.tableId,
-															recordId: entry.key,
-															previousVersion: null,
-															nodeId: recordNodeId,
-															type: 'put',
-															encodedRecord: encodeCopyRecordValue(table.primaryStore, entry.value, (blob) =>
-																sendBlobs(blob, entry.key)
-															),
-															extendedType: entry.metadataFlags & ~0xff & ~(ACTION_32_BIT << 24), // exclude lower type byte and ACTION_32_BIT format marker
-															residencyId: entry.residencyId,
-															previousResidencyId: null,
-															expiresAt: entry.expiresAt,
-														} as any);
-													const encoded =
-														entry.metadataFlags & HAS_BLOBS
-															? encodeWithCopyBlobTransferTags(entry.value, encodeCopyRecord)
-															: encodeCopyRecord();
-													await sendAuditRecord(
-														{
-															// make it look like an audit record
-															recordId: entry.key,
-															tableId: table.tableId,
-															type: 'put',
-															getValue() {
-																return entry.value;
-															},
-															encoded,
-															version: entry.version,
-															residencyId: entry.residencyId,
-															nodeId: recordNodeId,
-															extendedType: entry.metadataFlags,
-														},
-														copyTxnLogKey,
-														nodeId
-													);
-													logger.debug?.(
-														'sent record from table',
-														entry.key,
-														'length:',
-														encoded.length,
-														encoded.slice(0, 10)
-													);
-													// Periodically flush the accumulated records as a message so the follower commits this
-													// batch and advances its resume cursor. This is a plain flush with NO sequence update:
-													// emitting an end_txn here would advance the follower's received-version watermark to
-													// copyStartTime mid-copy, which monitorSync could read as "caught up" and mark the clone
-													// Available/cloned with rows still uncopied. (Records with differing versions already flush
-													// naturally above; this also bounds same-version bulk data into committable batches.) The
-													// watermark is only advanced to copyStartTime by the single end_txn after the whole copy.
-													if (
-														(++recordsSinceCheckpoint >= COPY_CHECKPOINT_RECORDS ||
-															frame.position - frame.encodingStart >= COPY_FLUSH_BYTES) &&
-														frame.position - frame.encodingStart > 8
-													) {
-														recordsSinceCheckpoint = 0;
-														copyFlushPacer.mark(Date.now());
-														sendQueuedData();
-														frame.encodingStart = frame.position;
-														currentTransaction.txnLogKey = 0;
-													}
+													logger.info?.('Finished copy table', tableName, remoteNodeName);
 												}
-												logger.info?.('Finished copy table', tableName, remoteNodeName);
-											}
-											if (withheldOriginNodeId !== undefined)
-												logger.warn?.(
-													`Copied ${databaseName} to ${remoteNodeName} without ${withheldRecordCount} record(s) that peer originated (harper-pro#737)`
+												if (withheldOriginNodeId !== undefined)
+													logger.warn?.(
+														`Copied ${databaseName} to ${remoteNodeName} without ${withheldRecordCount} record(s) that peer originated (harper-pro#737)`
+													);
+												currentSequenceId = copyStartTime;
+												if (!currentTransaction.txnLogKey) {
+													// no records pending (none sent, or the last batch landed on a checkpoint flush):
+													// force a txn so the end_txn below still carries the sequence update
+													currentTransaction.txnLogKey = copyStartTime;
+													frame.encodingStart = frame.position;
+													frame.writeFloat64(copyStartTime);
+												}
+												// ALWAYS emit the final end_txn at copyStartTime. It carries the REMOTE_SEQUENCE_UPDATE
+												// that advances the follower's seqId and received-version watermark to copyStartTime —
+												// the sole signal that the copy is synced (per-record watermark advance is suppressed
+												// during the copy). Skipping it when the last rows landed exactly on a checkpoint flush
+												// would leave the clone unable to ever reach Available.
+												sendAuditRecord(
+													{
+														type: 'end_txn',
+													},
+													currentSequenceId
 												);
-											currentSequenceId = copyStartTime;
-											if (!currentTransaction.txnLogKey) {
-												// no records pending (none sent, or the last batch landed on a checkpoint flush):
-												// force a txn so the end_txn below still carries the sequence update
-												currentTransaction.txnLogKey = copyStartTime;
-												frame.encodingStart = frame.position;
-												frame.writeFloat64(copyStartTime);
+												// The full copy is done — tell the follower to clear its resume cursor and fall back to
+												// normal audit-log replication from the persisted seqId (which is copyStartTime).
+												ws.send(encode([COPY_COMPLETE]));
+												getSharedStatus()[SENDING_TIME_POSITION] = 0;
+												currentSequenceId = copyStartTime;
 											}
-											// ALWAYS emit the final end_txn at copyStartTime. It carries the REMOTE_SEQUENCE_UPDATE
-											// that advances the follower's seqId and received-version watermark to copyStartTime —
-											// the sole signal that the copy is synced (per-record watermark advance is suppressed
-											// during the copy). Skipping it when the last rows landed exactly on a checkpoint flush
-											// would leave the clone unable to ever reach Available.
+										}
+										const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
+										// Capture the current generation before scanning. A commit after this live scan
+										// drains must wake this iteration; subscribing afterward can miss that commit.
+										const nextTransaction = whenNextTransaction(auditStore);
+										capturedFloors = undefined;
+										if (certifiesOriginFloors() && Date.now() - lastFloorCaptureAt >= originFloorIntervalMs) {
+											lastFloorCaptureAt = Date.now();
+											capturedFloors = captureOriginFloors();
+										}
+										if (!(auditStore.reusableIterable && auditLogIterable)) {
+											// No append-order resume here — only the copy's own pre-positioned range above does that. A
+											// reconnect resumes with the subscription's startTime at the anchor key, and
+											// `matchesSubscription` below requires that startTime to be BELOW an entry's key, so an
+											// older-keyed entry this range would correctly yield is dropped by the subscription predicate
+											// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
+											boundaryLogName = undefined;
+											liveStartByLog = new Map([[logName, currentSequenceId || 1], ...(originFloors ?? [])]);
+											auditLogIterable = auditStore.getRange({
+												start: currentSequenceId || 1,
+												exclusiveStart: true,
+												exactStart: false,
+												log: excludedNodes ? undefined : logName,
+												startByLog: liveStartByLog,
+												excludeLogs: excludedNodes,
+												snapshot: false, // don't want to use a snapshot, and we want to see new entries
+											});
+										}
+										for (const auditRecord of auditLogIterable) {
+											const key: number = auditRecord.txnLogKey;
+											if (closed) return;
+											logger.debug?.('sending audit record', key, auditRecord.recordId);
+											if (tables?.test)
+												logger.debug?.(
+													'audit record version',
+													auditRecord.version,
+													'table record version',
+													tables.test.primaryStore.getEntry(auditRecord.recordId)?.version
+												);
+											// Clamped like the cursors below: append order is not key order, so a late-committed
+											// older entry would otherwise report send progress going backwards in cluster_status.
+											const status = getSharedStatus();
+											if (key > status[SENDING_TIME_POSITION]) status[SENDING_TIME_POSITION] = key;
+											// The frame carries the real key; this cursor only climbs. Append order is not key order, so a
+											// late-committed older entry would otherwise drag the resume point back over records sent.
+											if (key > currentSequenceId) currentSequenceId = key;
+											await sendAuditRecord(auditRecord, key);
+											if (key > auditSubscription.startTime) auditSubscription.startTime = key; // don't double send
+										}
+										// Backstop for the pre-COPY_START probe, which pulled a different iterable. Every failure signal
+										// counts, not just the boundary one: a local iterator that dies mid-pass leaves the reusable
+										// iterable exhausted while the follower's cursor keeps advancing. Drop the append-order range and
+										// let the next pass rebuild an ordinary one — closing instead would reconnect straight back into
+										// the same failing boundary.
+										const range: any = auditLogIterable;
+										if (
+											boundaryLogName &&
+											(range?.exactStartFailures?.size > 0 ||
+												range?.failedLogs?.size > 0 ||
+												range?.corruptFrameStop?.breaks > 0)
+										) {
+											logger.error?.(
+												connectionId,
+												'the resume boundary failed while tailing; falling back to a timestamp resume',
+												databaseName,
+												boundaryLogName
+											);
+											boundaryLogName = undefined;
+											auditLogIterable = undefined;
+											// Retry now, not on the next commit: whatever this boundary failed to deliver needs an
+											// ordinary range rebuilt from currentSequenceId, not a wait for unrelated future activity
+											// that may never come on an otherwise-idle database.
+											continue;
+										}
+										if (frame.position - frame.encodingStart > 8) {
 											sendAuditRecord(
 												{
 													type: 'end_txn',
 												},
 												currentSequenceId
 											);
-											// The full copy is done — tell the follower to clear its resume cursor and fall back to
-											// normal audit-log replication from the persisted seqId (which is copyStartTime).
-											ws.send(encode([COPY_COMPLETE]));
-											getSharedStatus()[SENDING_TIME_POSITION] = 0;
-											currentSequenceId = copyStartTime;
 										}
-									}
-									const logName = subscribedNodeName === getThisNodeName() ? 'local' : subscribedNodeName;
-									// Capture the current generation before scanning. A commit after this live scan
-									// drains must wake this iteration; subscribing afterward can miss that commit.
-									const nextTransaction = whenNextTransaction(auditStore);
-									if (!(auditStore.reusableIterable && auditLogIterable)) {
-										// No append-order resume here — only the copy's own pre-positioned range above does that. A
-										// reconnect resumes with the subscription's startTime at the anchor key, and
-										// `matchesSubscription` below requires that startTime to be BELOW an entry's key, so an
-										// older-keyed entry this range would correctly yield is dropped by the subscription predicate
-										// anyway. Delivering it needs that predicate to carry append-order mode too (harper-pro#876).
-										boundaryLogName = undefined;
-										liveStartByLog = new Map([[logName, currentSequenceId || 1], ...(originFloors ?? [])]);
-										auditLogIterable = auditStore.getRange({
-											start: currentSequenceId || 1,
-											exclusiveStart: true,
-											exactStart: false,
-											log: excludedNodes ? undefined : logName,
-											startByLog: liveStartByLog,
-											excludeLogs: excludedNodes,
-											snapshot: false, // don't want to use a snapshot, and we want to see new entries
-										});
-									}
-									for (const auditRecord of auditLogIterable) {
-										const key: number = auditRecord.txnLogKey;
-										if (closed) return;
-										logger.debug?.('sending audit record', key, auditRecord.recordId);
-										if (tables?.test)
-											logger.debug?.(
-												'audit record version',
-												auditRecord.version,
-												'table record version',
-												tables.test.primaryStore.getEntry(auditRecord.recordId)?.version
-											);
-										// Clamped like the cursors below: append order is not key order, so a late-committed
-										// older entry would otherwise report send progress going backwards in cluster_status.
-										const status = getSharedStatus();
-										if (key > status[SENDING_TIME_POSITION]) status[SENDING_TIME_POSITION] = key;
-										// The frame carries the real key; this cursor only climbs. Append order is not key order, so a
-										// late-committed older entry would otherwise drag the resume point back over records sent.
-										if (key > currentSequenceId) currentSequenceId = key;
-										await sendAuditRecord(auditRecord, key);
-										if (key > auditSubscription.startTime) auditSubscription.startTime = key; // don't double send
-									}
-									// Backstop for the pre-COPY_START probe, which pulled a different iterable. Every failure signal
-									// counts, not just the boundary one: a local iterator that dies mid-pass leaves the reusable
-									// iterable exhausted while the follower's cursor keeps advancing. Drop the append-order range and
-									// let the next pass rebuild an ordinary one — closing instead would reconnect straight back into
-									// the same failing boundary.
-									const range: any = auditLogIterable;
-									if (
-										boundaryLogName &&
-										(range?.exactStartFailures?.size > 0 ||
-											range?.failedLogs?.size > 0 ||
-											range?.corruptFrameStop?.breaks > 0)
-									) {
-										logger.error?.(
-											connectionId,
-											'the resume boundary failed while tailing; falling back to a timestamp resume',
-											databaseName,
-											boundaryLogName
-										);
-										boundaryLogName = undefined;
-										auditLogIterable = undefined;
-										// Retry now, not on the next commit: whatever this boundary failed to deliver needs an
-										// ordinary range rebuilt from currentSequenceId, not a wait for unrelated future activity
-										// that may never come on an otherwise-idle database.
-										continue;
-									}
-									if (frame.position - frame.encodingStart > 8) {
-										sendAuditRecord(
-											{
-												type: 'end_txn',
-											},
-											currentSequenceId
-										);
-									}
-									getSharedStatus()[SENDING_TIME_POSITION] = 0;
-									if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
-									// an `includeNodes` update re-admits a log whose entries are already committed
-									let wake: () => void;
-									await new Promise<void>((resolve, reject) => {
-										wake = wakeSender = resolve;
-										nextTransaction.then(resolve, reject);
-									});
-									// a superseded loop must not clear the live loop's waker
-									if (wakeSender === wake) wakeSender = undefined;
-								} while (!closed);
+										if (capturedFloors) {
+											const liveRange: any = auditLogIterable;
+											// exactStartFailures alone is not a scan-integrity signal on an ordinary range: core
+											// reports `missing` whenever the first polled entry isn't exactly the cursor, which is
+											// the ordinary, healthy case for a plain (non-boundary) resume (see boundaryLogName's
+											// comment above). failedLogs and corruptFrameStop are genuine scan failures on ANY
+											// range and must still withhold certification even when there is no boundary.
+											if (
+												(boundaryLogName && liveRange?.exactStartFailures?.size > 0) ||
+												liveRange?.failedLogs?.size > 0 ||
+												liveRange?.corruptFrameStop?.breaks > 0
+											) {
+												// a scan that may have skipped an entry can certify nothing more on this range
+												if (floorEmissionLatchedRange !== liveRange)
+													logger.warn?.(
+														connectionId,
+														`A transaction-log scan for ${remoteNodeName} reported a failure; origin floors are no longer certified on this connection until it reconnects`
+													);
+												floorEmissionLatchedRange = liveRange;
+											} else if (floorEmissionLatchedRange !== liveRange) certifyOriginFloors(capturedFloors);
+											capturedFloors = undefined;
+										}
+										getSharedStatus()[SENDING_TIME_POSITION] = 0;
+										if (!supersededOrClosed()) options.connection?.onSenderCaughtUp?.();
+										// a timed wake can land after the socket was marked closed, before the close event
+										if (closed || wsClosed) return;
+										// A commit that landed during the scan rotated the promise captured before it: rescan
+										// immediately, without paying for timer setup, a Promise/executor allocation or a waker.
+										if (whenNextTransaction(auditStore) !== nextTransaction) continue;
+										// an `includeNodes` update re-admits a log whose entries are already committed
+										let wake: () => void;
+										// one timer per loop; an exit that skips the clear leaks nothing but one unreferenced timer
+										if (certifiesOriginFloors()) {
+											if (floorTimer) floorTimer.refresh();
+											else floorTimer = setTimeout(() => wakeSender?.(), originFloorIntervalMs).unref();
+										}
+										try {
+											await new Promise<void>((resolve, reject) => {
+												wake = wakeSender = resolve;
+												wakeSenderFailed = reject;
+												// One reaction per transaction generation: a timed wake sees the same pending promise
+												// again, and a reaction per wake would accumulate on an idle database.
+												if (attachedNextTransaction !== nextTransaction) {
+													attachedNextTransaction = nextTransaction;
+													nextTransaction.then(
+														() => wakeSender?.(),
+														(error) => wakeSenderFailed?.(error)
+													);
+												}
+											});
+										} finally {
+											// a superseded loop must not clear the live loop's waker
+											if (wakeSender === wake) wakeSender = undefined;
+										}
+										// a timed wake can land after the socket was marked closed, before the close event
+										if (closed || wsClosed) return;
+									} while (!closed);
+								} finally {
+									clearTimeout(floorTimer);
+								}
 							})
 							.catch((error) => {
 								logger.error?.(connectionId, 'Error handling subscription to node', error);
@@ -7047,6 +7509,17 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					close(1011, 'missing table structure; reconnecting to resync');
 					return;
 				}
+				if (peerGenerationRefused(tableDecoder)) {
+					// A dead generation's records are skipped, and its peer retires the table once it learns the marker.
+					logger.trace?.(
+						connectionId,
+						'skipping record of a dropped table generation',
+						databaseName + '.' + tableDecoder.name
+					);
+					if (auditRecord.extendedType & HAS_BLOBS) discardRecordBlobs(auditRecord, tableDecoder);
+					decoder.position = start + eventLength;
+					continue;
+				}
 				// Route exclusions plus this node's non-replicating tables: a backstop for an older
 				// sender that still forwards both. The sender's gate is the enforcement point.
 				if (receiveBlockedTables === undefined) {
@@ -7075,21 +7548,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						remoteNodeName,
 						dropReason
 					);
-					if (auditRecord.extendedType & HAS_BLOBS) {
-						// Blobs are announced ahead of their record, so they are already buffered; without this
-						// they would sit until the blobsTimer sweep a blobTimeout later (900s default).
-						try {
-							for (const blob of collectAuditRecordBlobsFromBinary(auditRecord, tableDecoder, auditStore?.rootStore))
-								discardIncomingBlobStream(blob);
-						} catch (error) {
-							logger.trace?.(
-								connectionId,
-								'could not enumerate the blobs of a dropped record',
-								auditRecord.recordId,
-								error
-							);
-						}
-					}
+					if (auditRecord.extendedType & HAS_BLOBS) discardRecordBlobs(auditRecord, tableDecoder);
 					if (
 						!(await recordReplicationHole(
 							remoteShortIdToLocalId.get(auditRecord.nodeId),
@@ -7521,8 +7980,9 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					endTxnEvent.localTime = lastDurableSequenceId;
 					if (frameOrigin !== undefined) noteOriginProgress(frameOrigin, frameTxnLogKey);
 					if (frameMoreOrigins) for (const originId of frameMoreOrigins) noteOriginProgress(originId, frameTxnLogKey);
-					// core reads this after awaiting onCommit
+					// core reads these after awaiting onCommit
 					endTxnEvent.originCursors = takeDurableOriginCursors();
+					endTxnEvent.originFloors = pendingOriginFloors.take(cursorBlockedByBlob());
 					// When this end_txn advances the durable seq to copyStartTime, the copyApply snapshot rows
 					// (version < copyStartTime, WAL-off, no transaction-log entry) must be flushed to SST BEFORE
 					// core persists [seq] = copyStartTime. Otherwise a small copy that finished before the cadence
@@ -7576,7 +8036,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 					if (sequenceIdReceived) {
 						lastSequenceIdCommitted = sequenceIdReceived;
 					}
-					logger.debug?.('last sequence committed', new Date(lastSequenceIdCommitted), databaseName);
+					logger.debug?.(
+						'last sequence committed',
+						lastSequenceIdCommitted ? new Date(lastSequenceIdCommitted) : 'none',
+						databaseName
+					);
 					if (frameBarriers && isValidFrameTxnLogKey(frameTxnLogKey)) {
 						for (const { originId, nonce } of frameBarriers) {
 							const origin = getNodeNameForId(auditStore, originId, true);
@@ -7590,7 +8054,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			if (drainEndTxnDeferred) {
 				drainEndTxnDeferred = false;
 				tableSubscriptionToReplicator.send(
-					seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+					seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId), undefined, true)
 				);
 			}
 		} catch (error) {
@@ -7699,7 +8163,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		instanceRetired = true;
 		wsClosed = true;
 		// Identity-guarded: a late-retiring superseded instance must not clear its replacement's mirror.
-		if (options.connection?.peerCapabilities === peerCapabilities) options.connection.peerCapabilities = undefined;
+		if (options.connection?.peerCapabilities === peerCapabilities) {
+			options.connection.peerCapabilities = undefined;
+			// the peer's floor capability describes this socket; the replacement writes its own
+			if (replicationSharedStatus && ownsPeerCertifiesFloorsSlot())
+				replicationSharedStatus[PEER_CERTIFIES_FLOORS_POSITION] = 0;
+		}
 		pendingSubscriptionSetupRequestId = undefined;
 		clearInterval(sendPingInterval);
 		receiveWatchdog?.stop();
@@ -8397,7 +8866,7 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 						if (frameOpen) drainEndTxnDeferred = true;
 						else
 							tableSubscriptionToReplicator.send(
-								seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId))
+								seqUpdateEndTxn(Math.max(lastSequenceIdReceived ?? 0, lastDurableSequenceId), undefined, true)
 							);
 					}
 					// In copy mode, the last blob draining is also what makes the staged key-based copy cursor
@@ -8426,7 +8895,8 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				getIdOfRemoteNode(connectedNodeName, store),
 				(id) => getNodeNameForId(store, id, true),
 				// a removed node leaves a tombstone, which reads as a clean null; an undecodable row stays a member
-				(name) => probeNodeRow(getHDBNodeTable().primaryStore, name).outcome !== 'deleted'
+				(name) => probeNodeRow(getHDBNodeTable().primaryStore, name).outcome !== 'deleted',
+				certifiesOriginFloors()
 			);
 		} catch (error) {
 			// Without cursors every unlisted origin starts at 0, as it would without the capability.
@@ -8576,6 +9046,12 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 			// a proxied/indirect subscription has no direct cursor and instead arms from `proxiedSkipCursor`
 			// (set in the indirect block below).
 			const hasPersistedResumeCursor = (sequenceEntry?.seqId ?? 0) > 1;
+			// A floor the peer certified is a proven start, used only while the peer still certifies: a
+			// downgraded peer may write below a floor it saved.
+			if (hasPersistedResumeCursor && connectedNode === node && certifiesOriginFloors()) {
+				const ownState = sequenceEntry?.nodes?.find?.((state: any) => state?.id === nodeId);
+				startTime = resumeStartWithFloor(startTime, ownState?.closedFloor);
+			}
 			// For a proxied/indirect subscription: the relayed per-source resume cursor, used ONLY to arm the
 			// leading-duplicate fast-skip (it does not move `startTime` — see the indirect block for why).
 			let proxiedSkipCursor: number | undefined;
@@ -8891,15 +9367,146 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 		if (digest) ws.send(encode([RECORD_LOCK_HOMES_DIGEST, digest, databaseName]));
 	}
 	function sendDBSchema(databaseName, subscriptionSetupRequestId?) {
-		const tableDefinitions = tableDefinitionsForPeer(
-			databaseName,
-			nodeSubscriptions &&
-				((tableName) =>
-					nodeSubscriptions.some((node) =>
-						node.replicateByDefault ? !node.tables.includes(tableName) : node.tables.includes(tableName)
-					))
+		const database = getDatabases()?.[databaseName];
+		const tableDefinitions = tableDefinitionsForPeer(databaseName, tableSentToPeer);
+		// The stamp rides only the DB_SCHEMA frame, not the shared NODE_NAME[3] definitions, so it is
+		// attached here rather than inside `tableDefinitionsForPeer`.
+		for (const definition of tableDefinitions)
+			definition.createdTime = advertisedCreatedTime(database[definition.table]);
+		// Sender-side gating discipline: the marker list goes only to a peer that reads it.
+		const dropMarkers =
+			peerCapabilitiesLearned && peerSupportsTableLifecycle(peerCapabilities)
+				? getTableDrops(databaseName)
+						.filter((marker) => tableSentToPeer(marker.table))
+						// a receiver keeps the first MAX_DROP_MARKERS_PER_FRAME; the newest are the ones a peer most likely missed
+						.sort((a, b) => b.droppedTime - a.droppedTime)
+						.slice(0, MAX_DROP_MARKERS_PER_FRAME)
+				: [];
+		ws.send(
+			dropMarkers.length > 0
+				? encode([DB_SCHEMA, tableDefinitions, databaseName, subscriptionSetupRequestId, dropMarkers])
+				: encode([DB_SCHEMA, tableDefinitions, databaseName, subscriptionSetupRequestId])
 		);
-		ws.send(encode([DB_SCHEMA, tableDefinitions, databaseName, subscriptionSetupRequestId]));
+	}
+	function tableSentToPeer(tableName: string): boolean {
+		return (
+			!nodeSubscriptions ||
+			nodeSubscriptions.some((node) =>
+				node.replicateByDefault ? !node.tables.includes(tableName) : node.tables.includes(tableName)
+			)
+		);
+	}
+	function excludedTablesFromPeer(forDatabase: string): Set<string> | null {
+		const firstNode = options.connection?.nodeSubscriptions?.[0];
+		const receivesFromEntries =
+			firstNode?.routeReplicates?.receivesFrom ??
+			(authorization?.replicates && typeof authorization.replicates === 'object'
+				? authorization.replicates.receivesFrom
+				: undefined);
+		return getExcludedTablesForRouteEntries(receivesFromEntries, remoteNodeName, forDatabase) ?? null;
+	}
+	const pendingSchemaResends = new Set<string>();
+	/** One re-announce per database per tick, however many markers a frame taught this node. */
+	function scheduleSchemaResend(database: string) {
+		if (pendingSchemaResends.size === 0)
+			setImmediate(() => {
+				const databasesToSend = [...pendingSchemaResends];
+				pendingSchemaResends.clear();
+				if (wsClosed) return;
+				try {
+					for (const db of databasesToSend) sendDBSchema(db);
+				} catch (error) {
+					// the reconnect's handshake re-announces every marker
+					logger.error?.(connectionId, 'Could not re-announce a schema after a drop marker', error);
+					close(1011, 'schema re-announce failed');
+				}
+			});
+		pendingSchemaResends.add(database);
+	}
+	/**
+	 * Core decides each drop under its catalog lock (`replication/DESIGN.md` item 28). A failed drop rethrows, closing the
+	 * connection, so the frame is re-delivered rather than its definitions merging into the stale store.
+	 */
+	async function applyPeerDropMarkers(
+		schemaDatabaseName: string,
+		markers: Array<{ table: string; droppedTime: number }>,
+		definitions: Array<{ table: string; createdTime?: unknown }>
+	) {
+		for (const { table: tableName, droppedTime } of markers) {
+			if (connectionSuperseded()) return;
+			const localTable = databases[schemaDatabaseName]?.[tableName];
+			if (!localTable) {
+				recordTableDrop(schemaDatabaseName, tableName, droppedTime);
+				continue;
+			}
+			if (tableReplicates(localTable) && catalogCreatedTime(localTable) === undefined) {
+				await adoptPreStampGeneration(schemaDatabaseName, localTable, droppedTime, definitions);
+				if (connectionSuperseded()) return;
+			}
+			try {
+				if (await localTable.dropTable({ peer: true, droppedTime }))
+					logger.warn?.(
+						connectionId,
+						`Dropped ${schemaDatabaseName}.${tableName}: a drop relayed by ${remoteNodeName} postdates this generation, which missed it`
+					);
+			} catch (error) {
+				logger.error?.(
+					connectionId,
+					`Could not drop ${schemaDatabaseName}.${tableName} for a peer's drop marker`,
+					error
+				);
+				try {
+					recordTableDrop(schemaDatabaseName, tableName, droppedTime);
+				} catch (recordError) {
+					logger.error?.(connectionId, `Could not record the drop of ${schemaDatabaseName}.${tableName}`, recordError);
+				}
+				throw error;
+			}
+		}
+	}
+	/**
+	 * Upgrade-only, for a table created on a build that stored no stamp, against a drop older than its `createdBefore`:
+	 * one holding no row older than the drop is stamped newer when the frame carries the peer's newer definition or it
+	 * holds a row written after the drop.
+	 */
+	async function adoptPreStampGeneration(
+		schemaDatabaseName: string,
+		localTable: any,
+		droppedTime: number,
+		definitions: Array<{ table: string; createdTime?: unknown }>
+	) {
+		// created before a drop recorded after its bound: core retires it
+		const createdBefore = catalogCreatedBefore(localTable);
+		if (createdBefore !== undefined && droppedTime > createdBefore) return;
+		const rows = await rowsAround(localTable, droppedTime, connectionSuperseded);
+		if (!rows || rows.older) return;
+		const definitionStamp = definitions.find((definition) => definition.table === localTable.tableName)?.createdTime;
+		const peerStamp =
+			typeof definitionStamp === 'number' && !isDeadGeneration(definitionStamp, droppedTime)
+				? definitionStamp
+				: undefined;
+		if (peerStamp === undefined && !rows.newer) return;
+		if (connectionSuperseded()) return;
+		if (stampTableCreatedTime(localTable, peerStamp ?? tableLifecycleTime(droppedTime)))
+			logger.warn?.(
+				connectionId,
+				`Stamped ${schemaDatabaseName}.${localTable.tableName} as a generation newer than the drop ${remoteNodeName} relays: it was created on a build that kept no stamp and holds no row older than the drop`
+			);
+	}
+	/** A peer's marker for a definition, while its database is not open here to record it in. */
+	function frameRetires(markers: Array<{ table: string; droppedTime: number }>, definition: any) {
+		const marker = markers.find((candidate) => candidate.table === definition.table);
+		return marker !== undefined && isDeadGeneration(definition.createdTime, marker.droppedTime);
+	}
+	function refuseDeadDefinition(
+		schemaDatabaseName: string,
+		definition: { table: string; createdTime?: unknown },
+		frame: string
+	) {
+		logger.warn?.(
+			connectionId,
+			`Refusing ${frame} for ${schemaDatabaseName}.${definition.table} from ${remoteNodeName}: its generation (created ${definition.createdTime ?? 'before stamps'}) predates a drop of that table`
+		);
 	}
 	blobsTimer = setInterval(
 		() => {
@@ -9069,9 +9676,11 @@ export function replicateOverWS(ws: ReplicationWebSocket, options: any, authoriz
 				database: tableDefinition.database,
 				schemaDefined: tableDefinition.schemaDefined,
 				...existingTable,
-				// keep after the spread — a live Table's own attributes/origin would otherwise override the merge
+				// keep after the spread — a live Table's own attributes/origin/createdTime would otherwise override
+				// the merge; the stamp only matters on a create, where there is no live Table to spread
 				attributes,
 				origin: 'cluster',
+				createdTime: typeof tableDefinition.createdTime === 'number' ? tableDefinition.createdTime : undefined,
 			});
 		}
 		return existingTable;

@@ -452,6 +452,7 @@ export function sampleMetrics(node, opts = {}) {
 			operation: 'system_information',
 			attributes: ['memory', 'threads', 'metrics'],
 		});
+		if (stopped) return;
 		if (info) {
 			samples.push({
 				t: Date.now(),

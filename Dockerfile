@@ -57,14 +57,19 @@ ENV PATH=/home/harperdb/.npm-global/bin:$PATH
 # exit status of the cleanup commands that follow it, and `harper version` asserts
 # the installed bin actually resolves and runs: v5.2.0-beta.4 published an image
 # with no harper in it off a green build when npm install hit a transient ETARGET.
+# re2 (the WAF's regex engine) gets its binary only from its install script,
+# which npm 12 skips unless allowed; npm 10/11 run it regardless.
 RUN <<-EOF
   set -e
-  npm install --global harperfast-harper-pro-*.tgz
+  npm install --global --allow-scripts=re2 harperfast-harper-pro-*.tgz
   harper version
   rm harperfast-harper-pro-*.tgz
   mkdir -p /home/harperdb/harper
   chown harperdb:harperdb /home/harperdb/harper
 EOF
+RUN --mount=type=bind,from=build,source=/usr/src/harper-pro,target=/tmp/harper-pro-source \
+  node /tmp/harper-pro-source/core/build-tools/bundleDependencies.ts installed \
+    "$NPM_CONFIG_PREFIX/lib/node_modules/@harperfast/harper-pro" /tmp/harper-pro-source/package-lock.json
 
 # uWS is opt-in for npm consumers but remains bundled in official images.
 COPY --from=build --chown=harperdb:harperdb /usr/src/harper-pro/node_modules/uWebSockets.js /home/harperdb/.npm-global/lib/node_modules/@harperfast/harper-pro/node_modules/uWebSockets.js/

@@ -1,0 +1,6 @@
+type ComputedRow @table @export {
+	id: ID @primaryKey
+	name: String
+	upper: String @computed @indexed
+	shout: String @computed(from: "name + '!'") @indexed
+}

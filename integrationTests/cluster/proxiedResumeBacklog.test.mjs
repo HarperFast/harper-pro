@@ -201,7 +201,7 @@ suite('Proxied resume backlog (harper-pro#426)', { timeout: 240000 }, (ctx) => {
 
 		// Bring the bridge back. B resumes its DIRECT subscription to L and re-acquires phase 2; M then
 		// reconnects and resumes its PROXIED subscription to L with no resolved cursor.
-		ctx.nodeB = (await startHarper({ harper: ctx.nodeB }, meshConfig(ctx.nodeB.hostname))).harper;
+		ctx.nodeB = (await startHarper({ name: ctx.name, harper: ctx.nodeB }, meshConfig(ctx.nodeB.hostname))).harper;
 		ok(await waitForSystemMesh(ctx.nodeB), 'B and M should re-mesh after the bridge bounce');
 
 		// The bridge itself (direct follower of L) must recover the backlog — sanity that L still has it.

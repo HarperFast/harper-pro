@@ -49,6 +49,7 @@ import {
 import { DELEGATE_OPERATION, RECALL_OPERATION } from '#src/replication/recordLockRpc';
 import { REPLICATION_SHARED_STATUS_SLOTS, getReplicationSharedStatus } from '#src/replication/knownNodes';
 import { FIRE_COUNTER_BASE_POSITION, FIRE_MECHANISMS } from '#src/replication/replicationConnection';
+import { setActiveWorkerPools } from '#src/core/server/threads/workerPools';
 
 /** Enough of an audit store for `getReplicationSharedStatus`: one stable buffer per (db, peer) key. */
 function fakeAuditStore() {
@@ -236,6 +237,18 @@ describe('createRecordLockTransport().homeMap', () => {
 	it('is undefined until the home incarnation is known', () => {
 		const { transport } = transportFor({ homeIncarnation: 0, agreements: { 'peer-a': true } });
 		assert.strictEqual(transport.homeMap('data'), undefined);
+	});
+
+	it('knows its coordination incarnation before activation or agreement, but never publishes an unknown one', () => {
+		for (const options of [{ active: undefined }, { agreements: { 'peer-a': false } }]) {
+			const { transport } = transportFor(options);
+			assert.strictEqual(transport.homeMap('data'), undefined);
+			assert.strictEqual(transport.coordinationIncarnation(), 3);
+		}
+		for (const homeIncarnation of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+			const { transport } = transportFor({ homeIncarnation });
+			assert.strictEqual(transport.coordinationIncarnation(), undefined);
+		}
 	});
 
 	it('is undefined on a digest mismatch with any named peer — not a shrunk ring', () => {
@@ -698,6 +711,35 @@ describe('recordLockOwnerFor (main thread)', () => {
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.strictEqual(recordLockOwnerThreadIds()['owner-ack'], 102, 'the ack is what releases the handoff');
 		releaseRecordLockOwner('owner-ack');
+	});
+
+	it('fences every HTTP worker before conferring on a pool successor, not just the owner candidates', async () => {
+		// With the replication pool on, owner candidates are pool workers, but a lock() on any HTTP worker
+		// relays to the owner and may hold a handle; the successor must wait for that worker's fence too.
+		const departing = fakeWorker(111);
+		departing.name = 'replication';
+		const successor = fakeWorker(112);
+		successor.name = 'replication';
+		const httpWorker = fenceAckWorker(113);
+		workers.push(httpWorker);
+		setActiveWorkerPools(['replication']);
+		try {
+			recordLockOwnerFor('owner-pool', [departing]);
+			recordLockOwnerFor('owner-pool', [successor], async () => 1);
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.strictEqual(
+				recordLockOwnerThreadIds()['owner-pool'],
+				undefined,
+				'conferred before the HTTP worker fenced'
+			);
+			handleOwnerThreadAck({ requestId: httpWorker.fenceRequestId() }, { threadId: 113 });
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.strictEqual(recordLockOwnerThreadIds()['owner-pool'], 112, 'the HTTP worker’s ack releases the handoff');
+		} finally {
+			setActiveWorkerPools([]);
+			workers.splice(workers.indexOf(httpWorker), 1);
+			releaseRecordLockOwner('owner-pool');
+		}
 	});
 });
 

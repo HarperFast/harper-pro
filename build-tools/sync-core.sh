@@ -29,7 +29,32 @@ fi
 
 if use_git; then
   echo -e "\n📦 Updating core submodule"
-  git submodule update --remote --recursive
+  if [[ ! -e core/.git ]]; then
+    # a deinitialized core must not be re-initialized here (AGENTS.md, Submodule / Git Setup)
+    if [[ -e "$(git rev-parse --git-dir)/modules/core" ]]; then
+      echo "core is deinitialized; re-initializing it corrupts its git dir (see AGENTS.md) — restore it by hand first" >&2
+      exit 1
+    fi
+    git submodule update --init core
+  fi
+  # as `git submodule update --remote` resolves it; `.` means the superproject's own branch
+  CORE_BRANCH=$(git config --get submodule.core.branch || git config -f .gitmodules --get submodule.core.branch || echo HEAD)
+  if [[ "$CORE_BRANCH" == "." ]]; then
+    CORE_BRANCH=$(git symbolic-ref --short -q HEAD) || { echo "core tracks the superproject's branch, but HEAD is detached" >&2; exit 1; }
+  fi
+  CORE_REMOTE=$(git -C core config --get "branch.$(git -C core symbolic-ref --short -q HEAD || echo -).remote" || echo origin)
+  CORE_BEFORE=$(git rev-parse HEAD:core)
+  git -C core fetch --quiet "$CORE_REMOTE" "$CORE_BRANCH"
+  CORE_AFTER=$(git -C core rev-parse FETCH_HEAD)
+  # advisory: nothing below may stop the sync
+  CORE_SYNC_WARNING=$("$(dirname "$0")/core-sync-guard.sh" core "$CORE_BEFORE" "$CORE_AFTER" "$CORE_REMOTE") ||
+    CORE_SYNC_WARNING="core sync guard failed (exit $?); compare $CORE_BEFORE and $CORE_AFTER by hand"
+  [[ -z "$CORE_SYNC_WARNING" ]] || echo "$CORE_SYNC_WARNING" >&2
+  if [[ -n "${CORE_SYNC_WARNING_FILE:-}" ]]; then
+    printf '%s' "$CORE_SYNC_WARNING" >"$CORE_SYNC_WARNING_FILE" || echo "could not write $CORE_SYNC_WARNING_FILE" >&2
+  fi
+  git -C core checkout --quiet --detach "$CORE_AFTER"
+  git -C core submodule update --init --recursive
 fi
 
 echo -e "\n📦 Copying lock file from core"
@@ -66,6 +91,22 @@ sync_pkg_field dependencies
 sync_pkg_field devDependencies
 sync_pkg_field overrides
 sync_pkg_field optionalDependencies
+
+# One spec per shipped package; see build-tools/DESIGN.md.
+node -e '
+	const { readFileSync, writeFileSync } = require("node:fs");
+	const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+	for (const field of ["dependencies", "optionalDependencies"]) {
+		for (const name of Object.keys(manifest[field] ?? {})) {
+			const spec = manifest.devDependencies?.[name];
+			if (spec === undefined) continue;
+			console.error(`  ↳ ${field} ${name}: ${manifest[field][name]} -> ${spec} (was also a devDependency)`);
+			manifest[field][name] = spec;
+			delete manifest.devDependencies[name];
+		}
+	}
+	writeFileSync("package.json", JSON.stringify(manifest, null, "\t") + "\n");
+'
 
 if [[ "$SKIP_INSTALL" != "true" ]]; then
   echo -e "\n📦 Installing core deps"
