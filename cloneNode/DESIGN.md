@@ -19,7 +19,8 @@ operation's answer as one message. Tests: `unitTests/cloneNode/applicationClone.
 `integrationTests/cloneNode/cloneNode.test.mjs`.
 
 **Limits.** The copy is core's package of the leader's tree: links dereferenced, core's exclusions
-applied (leaders before 5.3.0 also pack the target of the loader-owned `node_modules/harper` link, which
-the clone's loader replaces). It assumes leader and clone share a platform, as any payload deploy that
+applied. The leader packs the target of the loader-owned `node_modules/harper` link inside every npm
+sub-component (HarperFast/harper#3207), and at the top level too before 5.3.0; the clone's loader
+replaces each copy with its own link. It assumes leader and clone share a platform, as any payload deploy that
 carries `node_modules` already does. Success means the application was prepared, not that its workers
 loaded it.

@@ -78,6 +78,7 @@ describe('cloneFilesystemOnlyApplications', () => {
 			failPrepare: ['third'],
 		});
 		await assert.rejects(clone.run(), {
+			name: 'ApplicationCloneError',
 			message: 'Failed to clone 2 of 3 filesystem-only application(s) from the leader: first, third',
 		});
 
@@ -95,6 +96,7 @@ describe('cloneFilesystemOnlyApplications', () => {
 	it('throws when the leader cannot list its applications', async () => {
 		const clone = harness({ failListing: true });
 		await assert.rejects(clone.run(), {
+			name: 'ApplicationCloneError',
 			message: "Unable to list the leader's applications: Leader request failed: 503 Service Unavailable",
 		});
 		assert.deepEqual(clone.requested, []);
@@ -103,6 +105,7 @@ describe('cloneFilesystemOnlyApplications', () => {
 	it('throws when the leader answers that it could not read its applications', async () => {
 		const clone = harness({ listing: { error: 'Error: EACCES: permission denied, scandir', entries: [] } });
 		await assert.rejects(clone.run(), {
+			name: 'ApplicationCloneError',
 			message: "Unable to list the leader's applications: Error: EACCES: permission denied, scandir",
 		});
 	});
@@ -110,6 +113,7 @@ describe('cloneFilesystemOnlyApplications', () => {
 	it('throws when the listing has no entries', async () => {
 		const clone = harness({ listing: { requestId: 1 } });
 		await assert.rejects(clone.run(), {
+			name: 'ApplicationCloneError',
 			message: "Unable to list the leader's applications: its answer has no entries",
 		});
 	});
@@ -117,6 +121,7 @@ describe('cloneFilesystemOnlyApplications', () => {
 	it('refuses an application listed under a name that is not a directory name', async () => {
 		const clone = harness({ listing: { entries: [filesystemOnly('../escape'), filesystemOnly('app')] } });
 		await assert.rejects(clone.run(), {
+			name: 'ApplicationCloneError',
 			message: 'Failed to clone 1 of 2 filesystem-only application(s) from the leader: ../escape',
 		});
 

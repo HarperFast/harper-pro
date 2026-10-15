@@ -60,9 +60,10 @@ async function waitForAvailableStatus(node, timeoutMs = 120000, checkInterval = 
 }
 
 // Applications whose dependencies exist only in node_modules, in the two shapes harper-pro#1047 hit:
-// a `file:` dependency into node_modules, loaded as a component, and a monorepo workspace package a
-// Next.js standalone build copies into node_modules without listing it. npm can reinstall neither.
-// Built at run time because the repository ignores node_modules.
+// a `file:` dependency into node_modules, and a monorepo workspace package a Next.js standalone build
+// copies into node_modules without listing it. npm can reinstall neither. Built at run time because the
+// repository ignores node_modules. The `file:` package is imported rather than loaded as a component: a
+// nested component's loader link to the Harper install would make the leader package the whole install.
 const NODE_MODULES_ONLY_APPLICATIONS = {
 	'vendored-loader-app': {
 		endpoint: 'VendoredLoader',
@@ -71,13 +72,19 @@ const NODE_MODULES_ONLY_APPLICATIONS = {
 			'package.json': JSON.stringify({
 				name: 'vendored-loader-app',
 				version: '1.0.0',
+				type: 'module',
 				dependencies: { 'vendored-loader': 'file:./node_modules/vendored-loader' },
 			}),
-			'config.yaml': 'rest: true\nvendored-loader:\n  package: vendored-loader\n',
-			'node_modules/vendored-loader/package.json': JSON.stringify({ name: 'vendored-loader', version: '1.0.0' }),
-			'node_modules/vendored-loader/config.yaml': 'jsResource:\n  files: resources.js\n',
-			'node_modules/vendored-loader/resources.js':
-				"export class VendoredLoader extends Resource {\n\tget() {\n\t\treturn { loadedFrom: 'vendored-loader' };\n\t}\n}\n",
+			'config.yaml': 'rest: true\njsResource:\n  files: resources.js\n',
+			'resources.js':
+				"import { loadedFrom } from 'vendored-loader';\n\nexport class VendoredLoader extends Resource {\n\tget() {\n\t\treturn { loadedFrom };\n\t}\n}\n",
+			'node_modules/vendored-loader/package.json': JSON.stringify({
+				name: 'vendored-loader',
+				version: '1.0.0',
+				type: 'module',
+				exports: './index.js',
+			}),
+			'node_modules/vendored-loader/index.js': "export const loadedFrom = 'vendored-loader';\n",
 		},
 	},
 	'standalone-build-app': {
@@ -121,7 +128,6 @@ async function deployNodeModulesOnlyApplications(node) {
 	}
 }
 
-/** Polls each node_modules-only application's endpoint until it answers as deployed, then asserts it. */
 async function assertNodeModulesOnlyApplicationsServe(node, timeoutMs = 60000) {
 	for (const [project, { endpoint, expected }] of Object.entries(NODE_MODULES_ONLY_APPLICATIONS)) {
 		const deadline = Date.now() + timeoutMs;
@@ -779,6 +785,10 @@ suite(
 			equal(availability?.status, 'Unavailable', 'a clone missing an application must report availability Unavailable');
 			const config = await sendOperation(cloneCtx.harper, { operation: 'get_configuration' });
 			ok(config.cloned !== true, 'a clone missing an application must not be marked cloned');
+			ok(
+				!existsSync(join(cloneCtx.harper.dataRootDir, '.cloneAttempt.json')),
+				'a clone stopped by an application must retire its attempt (harper-pro#737)'
+			);
 
 			chmodSync(unreadableFile(), 0o644);
 			await killHarper(cloneCtx);
