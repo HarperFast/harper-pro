@@ -13,10 +13,8 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { request as httpsRequest } from 'node:https';
-import { request as httpRequest } from 'node:http';
+import type { Readable } from 'node:stream';
 import yaml from 'yaml';
-import { decode as cborDecode } from 'cbor-x';
 
 import * as envMgr from '../core/utility/environment/environmentManager.js';
 import * as logger from '../core/utility/logging/harper_logger.js';
@@ -38,6 +36,8 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
+import { cloneFilesystemOnlyApplications } from './applicationClone.ts';
+import { postToLeader, readLeaderResponse, readPackageResponse, type LeaderHTTPTarget } from './leaderHTTP.ts';
 import { cloneSSHKeysFromLeader } from './sshKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
 import {
@@ -1184,49 +1184,15 @@ async function cloneConfig(): Promise<Record<string, any>> {
  */
 async function cloneApplications(): Promise<void> {
 	log('Cloning filesystem-only applications from leader');
-
-	let applicationsResponse: Record<string, any>;
-	try {
-		applicationsResponse = await leaderRequest({ operation: OPERATIONS_ENUM.GET_COMPONENTS });
-	} catch (err) {
-		log(`Failed to get applications from leader: ${err}`, 'error');
-		return;
-	}
-
-	const entries: Array<Record<string, any>> = applicationsResponse?.entries ?? [];
-	// filesystem-only applications will not have a `package` property
-	const filesystemOnlyApplications = entries.filter((entry) => Array.isArray(entry.entries) && !entry.package);
-
-	if (filesystemOnlyApplications.length === 0) {
-		log('No filesystem-only applications found on leader to clone');
-		return;
-	}
-
-	log(`Cloning ${filesystemOnlyApplications.length} application(s) not referenced in harper-config`);
-
-	const { Application, prepareApplication } = await import('../core/components/Application.ts');
-
-	for (const entry of filesystemOnlyApplications) {
-		const applicationName: string = entry.name;
-		log(`Cloning application: ${applicationName}`);
-		try {
-			const packageResponse = await leaderRequest({
-				operation: OPERATIONS_ENUM.PACKAGE_COMPONENT,
-				project: applicationName,
-				skip_node_modules: true,
-			});
-
-			const application = new Application({
-				name: applicationName,
-				payload: packageResponse.payload,
-			});
-
-			await prepareApplication(application);
-			log(`Successfully cloned application: ${applicationName}`);
-		} catch (err) {
-			log(`Failed to clone application '${applicationName}': ${err}`, 'error');
-		}
-	}
+	await cloneFilesystemOnlyApplications({
+		listComponents: () => leaderRequest({ operation: OPERATIONS_ENUM.GET_COMPONENTS }),
+		requestPackage: requestApplicationPackage,
+		prepareApplication: async (name, payload) => {
+			const { Application, prepareApplication } = await import('../core/components/Application.ts');
+			await prepareApplication(new Application({ name, payload }));
+		},
+		log,
+	});
 }
 
 /**
@@ -1330,75 +1296,25 @@ async function leaderRequest(operation: { operation: string; [key: string]: any 
 		});
 	}
 
-	const headers: Record<string, string> = {
-		'Content-Type': 'application/json',
-		'Accept': 'application/cbor',
+	return readLeaderResponse(await postToLeader(leaderHTTPTarget(), operation));
+}
+
+function leaderHTTPTarget(): LeaderHTTPTarget {
+	return {
+		url: leaderURL,
+		authorization: leaderToken
+			? `Bearer ${leaderToken}`
+			: `Basic ${Buffer.from(`${leaderUsername}:${leaderPassword}`).toString('base64')}`,
+		rejectUnauthorized: !allowSelfSigned,
 	};
+}
 
-	if (leaderToken) {
-		headers.Authorization = `Bearer ${leaderToken}`;
-	} else {
-		headers.Authorization = `Basic ${Buffer.from(`${leaderUsername}:${leaderPassword}`).toString('base64')}`;
-	}
-
-	const body = JSON.stringify(operation);
-	const url = new URL(leaderURL);
-	const isHttps = url.protocol === 'https:';
-	const port = url.port ? parseInt(url.port, 10) : isHttps ? 443 : 80;
-	const path = url.pathname + url.search;
-	const requestHeaders = { ...headers, 'Content-Length': Buffer.byteLength(body) };
-
-	const { statusCode, statusMessage, contentType, responseBody } = await new Promise<{
-		statusCode: number;
-		statusMessage: string;
-		contentType: string;
-		responseBody: Buffer;
-	}>((resolve, reject) => {
-		const callback = (res: import('node:http').IncomingMessage) => {
-			const chunks: Buffer[] = [];
-			res.on('data', (chunk: Buffer) => chunks.push(chunk));
-			res.on('end', () =>
-				resolve({
-					statusCode: res.statusCode!,
-					statusMessage: res.statusMessage!,
-					contentType: (res.headers['content-type'] as string) ?? '',
-					responseBody: Buffer.concat(chunks),
-				})
-			);
-			res.on('error', reject);
-		};
-		const req = isHttps
-			? httpsRequest(
-					{
-						hostname: url.hostname,
-						port,
-						path,
-						method: 'POST',
-						headers: requestHeaders,
-						rejectUnauthorized: !allowSelfSigned,
-					},
-					callback
-				)
-			: httpRequest({ hostname: url.hostname, port, path, method: 'POST', headers: requestHeaders }, callback);
-		req.on('error', reject);
-		req.write(body);
-		req.end();
-	});
-
-	if (statusCode < 200 || statusCode >= 300) {
-		let reason: unknown = responseBody.toString('utf8');
-		try {
-			reason =
-				(contentType.includes('cbor') ? cborDecode(responseBody) : JSON.parse(reason as string))?.error ?? reason;
-		} catch {}
-		reason = String(reason).replace(/\s+/g, ' ').trim().slice(0, 500);
-		throw new Error(`Leader request failed: ${statusCode} ${statusMessage}${reason ? `: ${reason}` : ''}`);
-	}
-
-	if (contentType.includes('application/cbor')) {
-		return cborDecode(responseBody);
-	}
-	return JSON.parse(responseBody.toString('utf8'));
+/** An application as the leader packages it, node_modules included. */
+async function requestApplicationPackage(project: string): Promise<string | Readable> {
+	const operation = { operation: OPERATIONS_ENUM.PACKAGE_COMPONENT, project, skip_node_modules: false };
+	// The replication socket carries an operation's answer as a single message, so only HTTP can stream it.
+	if (usingCertAuth) return (await leaderRequest(operation)).payload;
+	return readPackageResponse(await postToLeader(leaderHTTPTarget(), { ...operation, stream: true }));
 }
 
 /**
