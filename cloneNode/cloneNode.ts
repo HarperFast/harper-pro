@@ -36,7 +36,11 @@ import {
 	JWT_ENUM,
 } from '../core/utility/hdbTerms.ts';
 import { fetchJWTKeyWithRetry } from './jwtKeyClone.ts';
-import { ApplicationCloneError, cloneFilesystemOnlyApplications } from './applicationClone.ts';
+import {
+	ApplicationCloneError,
+	cloneFilesystemOnlyApplications,
+	packagesNodeModulesWithoutInstall,
+} from './applicationClone.ts';
 import { postToLeader, readLeaderResponse, readPackageResponse, type LeaderHTTPTarget } from './leaderHTTP.ts';
 import { cloneSSHKeysFromLeader } from './sshKeyClone.ts';
 import { monitorSyncLoop } from './syncMonitor.ts';
@@ -725,33 +729,16 @@ async function monitorSync(
 	// Leader capability: a legacy (v4) leader never replicates the system database either, while a
 	// v5+ leader must have it required up front — otherwise a small user database completing before
 	// the system subscription registers could finish the clone with the system copy unverified.
-	// registration_info is the version probe present on every leader version (see
-	// core/bin/cliOperations.ts). Fail CLOSED on that probe: only a positively-read legacy major
-	// version exempts system; a missing/unparseable version or a persistently failing probe requires
-	// it, so a transient probe error against a v5 leader cannot reopen the premature-Available race.
+	// Fail CLOSED on the version probe: only a positively-read legacy major version exempts system; a
+	// missing/unparseable version or a persistently failing probe requires it, so a transient probe
+	// error against a v5 leader cannot reopen the premature-Available race.
 	let systemSocketRequired = isReplicatedDatabase(SYSTEM_SCHEMA_NAME);
 	if (!systemSocketRequired) {
 		log(`'${SYSTEM_SCHEMA_NAME}' is not in this node's replication.databases; not requiring its socket`, 'debug');
-	}
-	const versionProbeBackoff = createBackoff({
-		initialMs: VERSION_PROBE_RETRY_DELAY_MS,
-		maxMs: VERSION_PROBE_MAX_DELAY_MS,
-		minMs: VERSION_PROBE_RETRY_DELAY_MS,
-	});
-	for (let attempt = 1; systemSocketRequired && attempt <= 3; attempt++) {
-		try {
-			const registration: any = await leaderRequest({ operation: 'registration_info' });
-			// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
-			const leaderMajorVersion = Number(String(registration?.version ?? '').match(/\d+/)?.[0] ?? NaN);
-			systemSocketRequired = !(leaderMajorVersion >= 1 && leaderMajorVersion < 5);
-			break;
-		} catch (err) {
-			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
-			if (attempt < 3) {
-				const delay = versionProbeBackoff.nextDelay();
-				if (delay !== undefined) await sleep(delay);
-			}
-		}
+	} else {
+		// First digit run tolerates prefixed version strings (e.g. "v4.3.7"), which parseInt would NaN.
+		const leaderMajorVersion = Number((await leaderVersion())?.match(/\d+/)?.[0] ?? NaN);
+		systemSocketRequired = !(leaderMajorVersion >= 1 && leaderMajorVersion < 5);
 	}
 
 	const outcome = await monitorSyncLoop({
@@ -1173,6 +1160,16 @@ async function cloneApplications(): Promise<void> {
 	log('Cloning filesystem-only applications from leader');
 	await cloneFilesystemOnlyApplications({
 		listComponents: () => leaderRequest({ operation: OPERATIONS_ENUM.GET_COMPONENTS }),
+		chooseTransfer: async () => {
+			// The replication socket carries an operation's answer as one buffered message, so only HTTP streams.
+			if (usingCertAuth) return { withNodeModules: false, reason: 'certificate authentication cannot stream it' };
+			const version = await leaderVersion();
+			if (packagesNodeModulesWithoutInstall(version)) return { withNodeModules: true };
+			return {
+				withNodeModules: false,
+				reason: version ? `leader ${version} would include its own install` : "the leader's version is unknown",
+			};
+		},
 		requestPackage: requestApplicationPackage,
 		prepareApplication: async (name, payload) => {
 			const { Application, prepareApplication } = await import('../core/components/Application.ts');
@@ -1296,11 +1293,41 @@ function leaderHTTPTarget(): LeaderHTTPTarget {
 	};
 }
 
-async function requestApplicationPackage(project: string): Promise<string | Readable> {
-	const operation = { operation: OPERATIONS_ENUM.PACKAGE_COMPONENT, project, skip_node_modules: false };
-	// The replication socket carries an operation's answer as a single message, so only HTTP can stream it.
-	if (usingCertAuth) return (await leaderRequest(operation)).payload;
+async function requestApplicationPackage(project: string, withNodeModules: boolean): Promise<string | Readable> {
+	const operation = { operation: OPERATIONS_ENUM.PACKAGE_COMPONENT, project, skip_node_modules: !withNodeModules };
+	if (!withNodeModules) return (await leaderRequest(operation)).payload;
 	return readPackageResponse(await postToLeader(leaderHTTPTarget(), { ...operation, stream: true }));
+}
+
+let probedLeaderVersion: string | undefined;
+
+/**
+ * The leader's Harper version from `registration_info`, which every leader version answers (see
+ * core/bin/cliOperations.ts), or undefined when three attempts fail. Only an answer is kept, so a later
+ * caller retries a probe that failed.
+ */
+async function leaderVersion(): Promise<string | undefined> {
+	if (probedLeaderVersion !== undefined) return probedLeaderVersion;
+	const backoff = createBackoff({
+		initialMs: VERSION_PROBE_RETRY_DELAY_MS,
+		maxMs: VERSION_PROBE_MAX_DELAY_MS,
+		minMs: VERSION_PROBE_RETRY_DELAY_MS,
+	});
+	for (let attempt = 1; attempt <= 3; attempt++) {
+		try {
+			const registration: any = await leaderRequest({ operation: 'registration_info' });
+			if (registration?.version == null) return undefined;
+			probedLeaderVersion = String(registration.version);
+			return probedLeaderVersion;
+		} catch (err) {
+			log(`Leader version probe failed (attempt ${attempt}/3): ${err}`);
+			if (attempt < 3) {
+				const delay = backoff.nextDelay();
+				if (delay !== undefined) await sleep(delay);
+			}
+		}
+	}
+	return undefined;
 }
 
 /**

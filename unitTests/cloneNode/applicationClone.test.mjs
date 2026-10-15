@@ -1,18 +1,30 @@
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
-import { cloneFilesystemOnlyApplications } from '#src/cloneNode/applicationClone';
+import { cloneFilesystemOnlyApplications, packagesNodeModulesWithoutInstall } from '#src/cloneNode/applicationClone';
 
 const filesystemOnly = (name) => ({ name, entries: [] });
 
-function harness({ listing, failListing, failPackage = [], failPrepare = [], streamed = false } = {}) {
+function harness({
+	listing,
+	failListing,
+	failPackage = [],
+	failPrepare = [],
+	streamed = false,
+	transfer = { withNodeModules: true },
+} = {}) {
 	const requested = [];
+	const transfers = [];
 	const prepared = [];
 	const logged = [];
 	const archives = [];
+	let transferChoices = 0;
 	return {
 		requested,
+		transfers,
 		prepared,
 		archives,
+		logged,
+		transferChoices: () => transferChoices,
 		errors: () => logged.filter(({ level }) => level === 'error').map(({ message }) => message),
 		run: () =>
 			cloneFilesystemOnlyApplications({
@@ -20,8 +32,13 @@ function harness({ listing, failListing, failPackage = [], failPrepare = [], str
 					if (failListing) throw new Error('Leader request failed: 503 Service Unavailable');
 					return listing;
 				},
-				requestPackage: async (name) => {
+				chooseTransfer: async () => {
+					transferChoices++;
+					return transfer;
+				},
+				requestPackage: async (name, withNodeModules) => {
 					requested.push(name);
+					transfers.push(withNodeModules);
 					if (failPackage.includes(name)) throw new Error(`Unable to locate project '${name}'`);
 					if (!streamed) return `payload:${name}`;
 					const archive = Readable.from([Buffer.from(name)]);
@@ -165,4 +182,52 @@ describe('cloneFilesystemOnlyApplications', () => {
 			'an archive preparation never read must not stay open'
 		);
 	});
+
+	it('chooses the transfer once and asks for every application with it', async () => {
+		const clone = harness({ listing: { entries: [filesystemOnly('first'), filesystemOnly('second')] } });
+		await clone.run();
+
+		assert.equal(clone.transferChoices(), 1);
+		assert.deepEqual(clone.transfers, [true, true]);
+		assert.ok(!clone.logged.some(({ message }) => message.includes('instead of copying node_modules')));
+	});
+
+	it('says once why it reinstalls dependencies when the leader cannot send node_modules', async () => {
+		const clone = harness({
+			listing: { entries: [filesystemOnly('first'), filesystemOnly('second')] },
+			transfer: { withNodeModules: false, reason: 'leader 4.7.41 would include its own install' },
+		});
+		await clone.run();
+
+		assert.deepEqual(clone.transfers, [false, false]);
+		const explained = clone.logged.filter(({ message }) => message.includes('instead of copying node_modules'));
+		assert.equal(explained.length, 1);
+		assert.match(explained[0].message, /leader 4\.7\.41 would include its own install/);
+	});
+
+	it('does not probe the leader when it has no filesystem-only application', async () => {
+		const clone = harness({ listing: { entries: [{ name: 'config-app', entries: [], package: 'pkg' }] } });
+		await clone.run();
+
+		assert.equal(clone.transferChoices(), 0);
+	});
+
+});
+
+describe('packagesNodeModulesWithoutInstall', () => {
+	for (const [version, expected] of [
+		['4.7.41', false],
+		['5.2.15', false],
+		['5.3.0', true],
+		['5.3.2', true],
+		['v5.3.1', true],
+		['5.10.0', true],
+		['6.0.0', true],
+		[undefined, false],
+		['unknown', false],
+	]) {
+		it(`${expected ? 'trusts' : 'does not trust'} a leader reporting ${version}`, () => {
+			assert.equal(packagesNodeModulesWithoutInstall(version), expected);
+		});
+	}
 });
