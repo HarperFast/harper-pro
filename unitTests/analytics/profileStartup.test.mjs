@@ -156,6 +156,56 @@ describe('Analytics profiler startup gate', () => {
 		}
 	});
 
+	it('keeps one sampled period per thousand when a period is longer than Node can time', async () => {
+		const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldClearNativeTimers: true });
+		const stop = sinon.spy(timeProfiler, 'stop');
+		const day = 86_400_000;
+		try {
+			// 25.5 days, longer than the 2^31-1 ms one timer can wait
+			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 2_200_000 })), true);
+			await clock.tickAsync(day);
+			assert.equal(stop.callCount, 0, 'the first capture waits its period instead of firing after 1 ms');
+			assert.equal(timeProfiler.isStarted(), true);
+			await clock.tickAsync(51 * day);
+			assert.equal(timeProfiler.isStarted(), false, 'off after the two startup captures');
+			await clock.tickAsync(120 * day);
+			assert.equal(timeProfiler.isStarted(), false, 'still off: the next window is a thousand periods out');
+		} finally {
+			stop.restore();
+			clock.restore();
+		}
+	});
+	it('opens the window on time after a delay longer than Node can time', async () => {
+		const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldClearNativeTimers: true });
+		const maxTimeout = 2 ** 31 - 1;
+		try {
+			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 1 })), true);
+			await captureProfile(3 * maxTimeout);
+			assert.equal(timeProfiler.isStarted(), false);
+			await clock.tickAsync(3 * maxTimeout - 1000 - 10);
+			assert.equal(timeProfiler.isStarted(), false, 'not before the window');
+			await clock.tickAsync(20);
+			assert.equal(timeProfiler.isStarted(), true, 'the window opens one period before the capture');
+			await clock.tickAsync(1000);
+			assert.equal(timeProfiler.isStarted(), false, 'and closes at the capture');
+		} finally {
+			clock.restore();
+		}
+	});
+	it('stops a long wait when profiling is disabled partway through it', async () => {
+		const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldClearNativeTimers: true });
+		const maxTimeout = 2 ** 31 - 1;
+		try {
+			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 1 })), true);
+			await captureProfile(3 * maxTimeout);
+			await clock.tickAsync(maxTimeout + 1000);
+			assert.equal(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 1 })), false);
+			await clock.tickAsync(3 * maxTimeout);
+			assert.equal(timeProfiler.isStarted(), false);
+		} finally {
+			clock.restore();
+		}
+	});
 	it('cancels a sampling window that has not opened when profiling is disabled', async () => {
 		assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 0.2 })), true);
 		await captureProfile(600);

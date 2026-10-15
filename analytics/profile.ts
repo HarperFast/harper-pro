@@ -101,18 +101,27 @@ function scheduleCapture(delay: number, delayAfterThat = shippedRescheduleDelay(
 		armCapture(Math.min(delay, samplingWindow()), delayAfterThat);
 		return true;
 	}
-	profilerTimer = setTimeout(() => {
+	setProfilerTimer(() => {
 		if (profilerStarted || startProfiler()) armCapture(delay - windowDelay, delayAfterThat);
 		// The next window must still open, or the worker never profiles again until it restarts.
 		else scheduleCapture(delay - windowDelay + delayAfterThat, delayAfterThat);
-	}, windowDelay).unref();
+	}, windowDelay);
 	return true;
 }
 
 function armCapture(delay: number, delayAfterThat: number) {
-	profilerTimer = setTimeout(() => {
-		captureProfile(delayAfterThat);
-	}, delay).unref();
+	setProfilerTimer(() => captureProfile(delayAfterThat), delay);
+}
+
+// Node fires a timer longer than 2^31-1 ms after 1 ms, so a longer delay waits in hops. Capping the
+// delay instead made the one-period window a growing share of the interval once a period passed
+// about 36 minutes, and the whole of it past about 24.8 days.
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+function setProfilerTimer(callback: () => void, delay: number) {
+	profilerTimer =
+		delay > MAX_TIMEOUT_MS
+			? setTimeout(() => setProfilerTimer(callback, delay - MAX_TIMEOUT_MS), MAX_TIMEOUT_MS).unref()
+			: setTimeout(callback, delay).unref();
 }
 
 // Entry and completion markers place a wedge inside the native call (harper-pro#788); the entry
@@ -171,11 +180,8 @@ let captureGeneration = 0;
 // purpose — a capture every period (a synchronous V8 profiler stop/start on every thread) at a short
 // period loses db-write analytics in integrationTests/cluster/replicatedAnalyticsUnion.test.mjs;
 // restoring per-period captures needs that interaction understood first.
-// Capped at Node's largest timeout: past 2^31-1 ms a timer fires after 1 ms, which for
-// aggregatePeriod >= 2148 s meant a profiler stop/start every millisecond on every thread.
-const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 function shippedRescheduleDelay(): number {
-	return Math.min((capturePeriod ?? 60) * 1000, MAX_TIMEOUT_MS);
+	return (capturePeriod ?? 60) * 1000;
 }
 
 export async function captureProfile(delayToNextCapture = shippedRescheduleDelay()): Promise<void> {
