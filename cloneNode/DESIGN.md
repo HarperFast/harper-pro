@@ -5,7 +5,8 @@
 **Invariant.** A clone marked `cloned` and `Available` holds every filesystem-only application of its
 leader — one without a config `package`, so nothing reinstalls it on start — including the leader's
 `node_modules`. An application it could not copy stops clone setup: the node stays running, Unavailable
-and uncloned, and the next start replays setup.
+and uncloned, and the next start replays setup. A dot-prefixed directory (`.git`) is not an application:
+the loader never loads one and `package_component` refuses its name, so the clone skips it.
 
 **Why.** Rebuilding `node_modules` with `npm install` loses whatever npm cannot reproduce: a `file:`
 dependency into `node_modules`, a bundler's private workspace packages (a Next.js standalone build), and

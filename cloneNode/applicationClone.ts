@@ -40,7 +40,9 @@ export async function cloneFilesystemOnlyApplications({
 		);
 	}
 
-	const applications = listing.entries.filter((entry: any) => Array.isArray(entry?.entries) && !entry.package);
+	const applications = listing.entries.filter(
+		(entry: any) => Array.isArray(entry?.entries) && !entry.package && !isHiddenDirectory(entry.name)
+	);
 	if (applications.length === 0) {
 		log('No filesystem-only applications found on leader to clone');
 		return;
@@ -69,6 +71,12 @@ export async function cloneFilesystemOnlyApplications({
 			`Failed to clone ${failed.length} of ${applications.length} filesystem-only application(s) from the leader: ${failed.join(', ')}`
 		);
 	}
+}
+
+// The loader never loads a dot-prefixed directory (`.git`, editor state, Harper's own staging), and
+// package_component refuses the name. A malformed name such as `../escape` is not hidden: it is refused.
+function isHiddenDirectory(name: unknown): boolean {
+	return isComponentName(name) && name.startsWith('.');
 }
 
 function isComponentName(name: unknown): name is string {
