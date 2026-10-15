@@ -2,7 +2,7 @@ import assert from 'node:assert';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { time as timeProfiler } from '@datadog/pprof';
 import sinon from 'sinon';
-import { setAnalyticsEnabled } from '#src/core/resources/analytics/write';
+import { addAnalyticsListener, recordAction, setAnalyticsEnabled } from '#src/core/resources/analytics/write';
 import { get as envGet } from '#src/core/utility/environment/environmentManager';
 import { CONFIG_PARAMS } from '#src/core/utility/hdbTerms';
 import {
@@ -158,19 +158,24 @@ describe('Analytics profiler startup gate', () => {
 
 	it('keeps one sampled period per thousand when a period is longer than Node can time', async () => {
 		const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldClearNativeTimers: true });
+		const start = sinon.spy(timeProfiler, 'start');
 		const stop = sinon.spy(timeProfiler, 'stop');
-		const day = 86_400_000;
+		// 25.5 days, longer than the 2^31-1 ms one timer can wait
+		const period = 2_200_000_000;
 		try {
-			// 25.5 days, longer than the 2^31-1 ms one timer can wait
-			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 2_200_000 })), true);
-			await clock.tickAsync(day);
-			assert.equal(stop.callCount, 0, 'the first capture waits its period instead of firing after 1 ms');
-			assert.equal(timeProfiler.isStarted(), true);
-			await clock.tickAsync(51 * day);
+			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: period / 1000 })), true);
+			await clock.tickAsync(period - 1000);
+			assert.equal(stop.callCount, 0, 'no capture before the first period ends');
+			await clock.tickAsync(2000);
+			assert.equal(stop.callCount, 1, 'the first capture lands at one period');
+			await clock.tickAsync(period);
+			assert.equal(stop.callCount, 2, 'the second capture lands at two periods');
 			assert.equal(timeProfiler.isStarted(), false, 'off after the two startup captures');
-			await clock.tickAsync(120 * day);
-			assert.equal(timeProfiler.isStarted(), false, 'still off: the next window is a thousand periods out');
+			const startsSoFar = start.callCount;
+			await clock.tickAsync(120 * 86_400_000);
+			assert.equal(start.callCount, startsSoFar, 'no window for 120 days: the next is a thousand periods out');
 		} finally {
+			start.restore();
 			stop.restore();
 			clock.restore();
 		}
@@ -178,31 +183,41 @@ describe('Analytics profiler startup gate', () => {
 	it('opens the window on time after a delay longer than Node can time', async () => {
 		const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldClearNativeTimers: true });
 		const maxTimeout = 2 ** 31 - 1;
+		let start;
 		try {
 			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 1 })), true);
 			await captureProfile(3 * maxTimeout);
 			assert.equal(timeProfiler.isStarted(), false);
+			start = sinon.spy(timeProfiler, 'start');
 			await clock.tickAsync(3 * maxTimeout - 1000 - 10);
-			assert.equal(timeProfiler.isStarted(), false, 'not before the window');
+			assert.equal(start.callCount, 0, 'no window opens during the wait');
 			await clock.tickAsync(20);
+			assert.equal(start.callCount, 1);
 			assert.equal(timeProfiler.isStarted(), true, 'the window opens one period before the capture');
 			await clock.tickAsync(1000);
 			assert.equal(timeProfiler.isStarted(), false, 'and closes at the capture');
 		} finally {
+			start?.restore();
 			clock.restore();
 		}
 	});
 	it('stops a long wait when profiling is disabled partway through it', async () => {
 		const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'], shouldClearNativeTimers: true });
 		const maxTimeout = 2 ** 31 - 1;
+		let start;
 		try {
 			assert.equal(startAutomaticProfiling(optionsWith({ aggregatePeriod: 1 })), true);
 			await captureProfile(3 * maxTimeout);
 			await clock.tickAsync(maxTimeout + 1000);
 			assert.equal(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 1 })), false);
-			await clock.tickAsync(3 * maxTimeout);
+			start = sinon.spy(timeProfiler, 'start');
+			// inside the window an uncancelled wait would have opened at 3 * maxTimeout - 1000
+			await clock.tickAsync(2 * maxTimeout - 1500);
 			assert.equal(timeProfiler.isStarted(), false);
+			await clock.tickAsync(maxTimeout);
+			assert.equal(start.callCount, 0, 'no window opened after the cancel');
 		} finally {
+			start?.restore();
 			clock.restore();
 		}
 	});
@@ -211,12 +226,35 @@ describe('Analytics profiler startup gate', () => {
 		await captureProfile(600);
 		assert.equal(timeProfiler.isStarted(), false);
 		assert.equal(startAutomaticProfiling(optionsWith({ profiling: false, aggregatePeriod: 0.2 })), false);
-		// Between where the window would have opened (400 ms) and its capture (600 ms), which would
-		// have stopped the sampler again and hidden a window that was never cancelled.
+		// inside the window an uncancelled schedule would open (400 ms), before its capture (600 ms)
 		await sleep(500);
 		assert.equal(timeProfiler.isStarted(), false);
 		await sleep(300);
 		assert.equal(timeProfiler.isStarted(), false);
+	});
+});
+
+describe("Analytics profiler sampling marker in core's report flush", () => {
+	before(() => setAnalyticsEnabled(true));
+	after(async () => {
+		await captureProfile(-1);
+		setAnalyticsEnabled(envGet(CONFIG_PARAMS.ANALYTICS_AGGREGATEPERIOD) > -1);
+	});
+
+	it('is on the metrics core flushes with the report that overlapped the sampler', async () => {
+		const flushed = [];
+		addAnalyticsListener((metrics) => {
+			if (metrics.some(({ metric }) => metric === 'marker-flush-probe'))
+				flushed.push(metrics.map(({ metric }) => metric));
+		});
+		await captureProfile(-1);
+		await captureProfile(10000);
+		await sleep(60);
+		recordAction(1, 'marker-flush-probe');
+		const deadline = performance.now() + 5000;
+		while (!flushed.length && performance.now() < deadline) await sleep(25);
+		assert.equal(flushed.length, 1, 'core flushed the report carrying the probe');
+		assert.ok(flushed[0].includes(PROFILER_SAMPLING_METRIC), JSON.stringify(flushed[0]));
 	});
 });
 

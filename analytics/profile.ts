@@ -5,6 +5,7 @@
 import { addAnalyticsListener, recordAction } from '../core/resources/analytics/write.ts';
 import { getHdbBasePath } from '../core/utility/environment/environmentManager.js';
 import { PACKAGE_ROOT } from '../core/utility/packageUtils.js';
+import { MAX_SET_TIMEOUT_MS } from '../core/utility/hdbTerms.ts';
 import { existsSync, realpathSync, readFileSync, readdirSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -113,14 +114,12 @@ function armCapture(delay: number, delayAfterThat: number) {
 	setProfilerTimer(() => captureProfile(delayAfterThat), delay);
 }
 
-// Node fires a timer longer than 2^31-1 ms after 1 ms, so a longer delay waits in hops. Capping the
-// delay instead made the one-period window a growing share of the interval once a period passed
-// about 36 minutes, and the whole of it past about 24.8 days.
-const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+// Node fires a timer longer than 2^31-1 ms after 1 ms, so a longer delay waits in hops; capping it
+// would shorten the thousand-period interval until a long period's window filled it.
 function setProfilerTimer(callback: () => void, delay: number) {
 	profilerTimer =
-		delay > MAX_TIMEOUT_MS
-			? setTimeout(() => setProfilerTimer(callback, delay - MAX_TIMEOUT_MS), MAX_TIMEOUT_MS).unref()
+		delay > MAX_SET_TIMEOUT_MS
+			? setTimeout(() => setProfilerTimer(callback, delay - MAX_SET_TIMEOUT_MS), MAX_SET_TIMEOUT_MS).unref()
 			: setTimeout(callback, delay).unref();
 }
 
@@ -206,7 +205,7 @@ export async function captureProfile(delayToNextCapture = shippedRescheduleDelay
 	try {
 		const profile = stopProfiler(continuous && delayToNextCapture <= samplingWindow());
 		// Non-zero only after a restarting stop in which pprof found V8's profiler event processor
-		// wedged and replaced it (#1021); a window-ending stop replaces the processor regardless.
+		// wedged and replaced it; a window-ending stop replaces the processor regardless.
 		const stuck = timeProfiler.v8ProfilerStuckEventLoopDetected();
 		if (stuck > 0)
 			log.warn?.(`@datadog/pprof found the V8 profiler event processor stuck (level ${stuck}) and restarted it`);

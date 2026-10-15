@@ -40,16 +40,22 @@ describe('Analytics profiling user code', () => {
 		const start = Date.now();
 		await new Promise((resolve) => setTimeout(resolve, 60));
 		recordAction(1, 'marker-probe');
-		await new Promise((resolve) => setTimeout(resolve, 250));
-		const rows = await databases.system.hdb_raw_analytics.search({
-			conditions: [{ attribute: 'id', comparator: 'greater_than_equal', value: start }],
-		});
 		let probe, marker;
-		for await (const { metrics } of rows) {
-			const probeHere = metrics.find(({ metric }) => metric === 'marker-probe');
-			if (!probeHere) continue;
-			probe = probeHere;
-			marker = metrics.find(({ metric }) => metric === PROFILER_SAMPLING_METRIC);
+		const deadline = Date.now() + 5000;
+		while (!probe && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			// the raw table exists once core has stored its first report
+			const rawAnalytics = databases.system.hdb_raw_analytics;
+			if (!rawAnalytics) continue;
+			const rows = await rawAnalytics.search({
+				conditions: [{ attribute: 'id', comparator: 'greater_than_equal', value: start }],
+			});
+			for await (const { metrics } of rows) {
+				const probeHere = metrics.find(({ metric }) => metric === 'marker-probe');
+				if (!probeHere) continue;
+				probe = probeHere;
+				marker = metrics.find(({ metric }) => metric === PROFILER_SAMPLING_METRIC);
+			}
 		}
 		assert(probe, 'the report carrying the probe action was stored');
 		assert(marker, 'profiler-sampling is in the same raw row as the probe');
